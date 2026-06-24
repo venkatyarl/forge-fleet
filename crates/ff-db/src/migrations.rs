@@ -698,6 +698,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "project_git_policy",
         sql: schema::SCHEMA_V143_PROJECT_GIT_POLICY,
     },
+    PgMigration {
+        version: 144,
+        name: "code_community_levels",
+        sql: schema::SCHEMA_V144_CODE_COMMUNITY_LEVELS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

@@ -6,7 +6,7 @@
 
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Summary of community detection results.
 pub struct CommunitySummary {
@@ -310,6 +310,79 @@ pub fn cluster_calls_graph(n: usize, adj: &[Vec<usize>], order: &[usize]) -> Vec
     comm
 }
 
+/// Full multi-level (hierarchical) Louvain. Repeatedly run single-level
+/// local-moving ([`cluster_calls_graph`]) then AGGREGATE the graph — each
+/// community becomes a super-node and inter-community edges (plus intra-community
+/// self-loops, which preserve degree so modularity stays correct) become the
+/// next level's edges — until a pass merges nothing.
+///
+/// Returns one community labeling **over the original `n` nodes per level**:
+/// `result[0]` is the finest partition (identical to [`cluster_calls_graph`]'s,
+/// dense-relabelled), each subsequent level is strictly coarser, and the last
+/// level is the coarsest stable partition. Always returns ≥1 level (even a
+/// no-edge graph yields one all-singletons level). This is the GraphRAG
+/// community hierarchy: fine levels = tight call clusters, coarse levels =
+/// subsystems.
+pub fn cluster_calls_graph_levels(
+    n: usize,
+    adj: &[Vec<usize>],
+    order: &[usize],
+) -> Vec<Vec<usize>> {
+    let mut levels: Vec<Vec<usize>> = Vec::new();
+
+    // Mapping original node → its node id in the CURRENT (possibly condensed)
+    // graph. Starts as identity; after each aggregation it points at the
+    // super-node a node now lives in.
+    let mut orig_to_cur: Vec<usize> = (0..n).collect();
+    let mut cur_n = n;
+    let mut cur_adj: Vec<Vec<usize>> = adj.to_vec();
+    let mut cur_order: Vec<usize> = order.to_vec();
+
+    loop {
+        // Local-move on the current graph, then dense-relabel to 0..k.
+        let raw = cluster_calls_graph(cur_n, &cur_adj, &cur_order);
+        let mut relabel: HashMap<usize, usize> = HashMap::new();
+        let mut k = 0usize;
+        let mut comm_of_cur: Vec<usize> = vec![0; cur_n];
+        for (i, c) in comm_of_cur.iter_mut().enumerate() {
+            *c = *relabel.entry(raw[i]).or_insert_with(|| {
+                let x = k;
+                k += 1;
+                x
+            });
+        }
+
+        // Project onto the original nodes and record this level.
+        let level_labels: Vec<usize> = (0..n).map(|o| comm_of_cur[orig_to_cur[o]]).collect();
+        levels.push(level_labels);
+
+        // No community absorbed another → coarsest stable partition reached.
+        if k == cur_n {
+            break;
+        }
+
+        // Aggregate into the condensed graph: every current edge i→j becomes
+        // comm(i)→comm(j). Intra-community edges become self-loops, which keeps
+        // each super-node's degree (= sum of its members' degrees) intact so the
+        // next level's modularity is computed on the right `2m`.
+        let mut new_adj: Vec<Vec<usize>> = vec![Vec::new(); k];
+        for (i, nbrs) in cur_adj.iter().enumerate() {
+            let ci = comm_of_cur[i];
+            for &j in nbrs {
+                new_adj[ci].push(comm_of_cur[j]);
+            }
+        }
+
+        orig_to_cur = (0..n).map(|o| comm_of_cur[orig_to_cur[o]]).collect();
+        cur_n = k;
+        cur_adj = new_adj;
+        // Deterministic visit order on the condensed graph: ascending super-node id.
+        cur_order = (0..k).collect();
+    }
+
+    levels
+}
+
 /// Run cortex code-community detection: label propagation over the `calls`
 /// subgraph among non-extern `code:*` nodes. Writes each node's
 /// `code_community_id` and reconciles the `brain_code_communities` registry
@@ -374,7 +447,10 @@ pub async fn detect_code_communities(pool: &PgPool) -> Result<CommunitySummary, 
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| node_rows[a].1.cmp(&node_rows[b].1));
 
-    let label = cluster_calls_graph(n, &adj, &order);
+    // Full multi-level Louvain: levels[0] is the finest partition (drives
+    // code_community_id, as before); coarser levels feed the hierarchy.
+    let levels = cluster_calls_graph_levels(n, &adj, &order);
+    let label = &levels[0];
 
     // Relabel raw labels → dense community ids; group members.
     let mut label_to_cid: HashMap<usize, i32> = HashMap::new();
@@ -409,47 +485,69 @@ pub async fn detect_code_communities(pool: &PgPool) -> Result<CommunitySummary, 
     let communities_found = members.len();
     let largest_community = members.values().map(|m| m.len()).max().unwrap_or(0);
 
-    // Reconcile the registry — only multi-member communities (singletons are
-    // noise + not worth a summary). Stable member_hash so summaries survive.
+    // Reconcile the registry across ALL hierarchy levels — only multi-member
+    // communities (singletons are noise + not worth a summary). Each distinct
+    // grouping (member_hash) is recorded ONCE, at the FINEST level it appears:
+    // iterating levels[0] (finest) → coarsest and skipping already-seen hashes
+    // means a community that never merges stays at level 0 and only genuinely
+    // coarser super-communities get a higher level. Stable member_hash so
+    // summaries survive across runs.
     let mut hashes: Vec<String> = Vec::new();
     let mut god_ids: Vec<uuid::Uuid> = Vec::new();
     let mut counts: Vec<i32> = Vec::new();
-    for idxs in members.values() {
-        if idxs.len() < 2 {
-            continue;
+    let mut row_levels: Vec<i32> = Vec::new();
+    let mut seen_hashes: HashSet<String> = HashSet::new();
+    for (lvl, labels) in levels.iter().enumerate() {
+        let mut by_label: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, &l) in labels.iter().enumerate() {
+            by_label.entry(l).or_default().push(i);
         }
-        let member_paths: Vec<String> = idxs.iter().map(|&i| node_rows[i].1.clone()).collect();
-        let hash = community_member_hash(&member_paths);
-        // God node: highest call fan-in (most-called member), ties → smallest path.
-        let god = idxs
-            .iter()
-            .copied()
-            .max_by(|&a, &b| {
-                in_degree[a]
-                    .cmp(&in_degree[b])
-                    .then_with(|| node_rows[b].1.cmp(&node_rows[a].1))
-            })
-            .expect("multi-member community has at least one member");
-        hashes.push(hash);
-        god_ids.push(node_rows[god].0);
-        counts.push(idxs.len() as i32);
+        for idxs in by_label.values() {
+            if idxs.len() < 2 {
+                continue;
+            }
+            let member_paths: Vec<String> = idxs.iter().map(|&i| node_rows[i].1.clone()).collect();
+            let hash = community_member_hash(&member_paths);
+            if !seen_hashes.insert(hash.clone()) {
+                continue; // identical grouping already recorded at a finer level
+            }
+            // God node: highest call fan-in (most-called member), ties → smallest path.
+            let god = idxs
+                .iter()
+                .copied()
+                .max_by(|&a, &b| {
+                    in_degree[a]
+                        .cmp(&in_degree[b])
+                        .then_with(|| node_rows[b].1.cmp(&node_rows[a].1))
+                })
+                .expect("multi-member community has at least one member");
+            hashes.push(hash);
+            god_ids.push(node_rows[god].0);
+            counts.push(idxs.len() as i32);
+            row_levels.push(lvl as i32);
+        }
     }
 
     // GC stale rows (and legacy NULL-hash), then upsert — preserving summaries on
-    // unchanged communities.
+    // unchanged (member_hash, level) rows.
     sqlx::query(
-        "DELETE FROM brain_code_communities WHERE member_hash IS NULL OR member_hash <> ALL($1)",
+        "DELETE FROM brain_code_communities
+          WHERE member_hash IS NULL
+             OR (member_hash, level) NOT IN (
+                 SELECT h, l FROM UNNEST($1::text[], $2::int[]) AS t(h, l)
+             )",
     )
     .bind(&hashes)
+    .bind(&row_levels)
     .execute(pool)
     .await
     .map_err(|e| format!("DB error pruning stale code communities: {e}"))?;
 
     sqlx::query(
-        "INSERT INTO brain_code_communities (member_hash, god_node_id, member_count, updated_at)
-         SELECT h, g, c, NOW()
-         FROM UNNEST($1::text[], $2::uuid[], $3::int[]) AS t(h, g, c)
-         ON CONFLICT (member_hash) DO UPDATE
+        "INSERT INTO brain_code_communities (member_hash, god_node_id, member_count, level, updated_at)
+         SELECT h, g, c, l, NOW()
+         FROM UNNEST($1::text[], $2::uuid[], $3::int[], $4::int[]) AS t(h, g, c, l)
+         ON CONFLICT (member_hash, level) DO UPDATE
            SET member_count = EXCLUDED.member_count,
                god_node_id  = EXCLUDED.god_node_id,
                updated_at   = NOW()",
@@ -457,6 +555,7 @@ pub async fn detect_code_communities(pool: &PgPool) -> Result<CommunitySummary, 
     .bind(&hashes)
     .bind(&god_ids)
     .bind(&counts)
+    .bind(&row_levels)
     .execute(pool)
     .await
     .map_err(|e| format!("DB error upserting code communities: {e}"))?;
@@ -470,7 +569,95 @@ pub async fn detect_code_communities(pool: &PgPool) -> Result<CommunitySummary, 
 
 #[cfg(test)]
 mod tests {
-    use super::{cluster_calls_graph, community_member_hash};
+    use super::{cluster_calls_graph, cluster_calls_graph_levels, community_member_hash};
+
+    /// True if `a` and `b` induce the SAME partition (group nodes identically),
+    /// ignoring the actual label values.
+    fn same_partition(a: &[usize], b: &[usize]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let n = a.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if (a[i] == a[j]) != (b[i] == b[j]) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// `coarse` is a coarsening of `fine` iff every pair grouped in `fine` is
+    /// still grouped in `coarse` (merges only, never splits).
+    fn is_coarsening(fine: &[usize], coarse: &[usize]) -> bool {
+        let n = fine.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if fine[i] == fine[j] && coarse[i] != coarse[j] {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn levels_level0_matches_single_level() {
+        let adj = two_cliques();
+        let order: Vec<usize> = (0..6).collect();
+        let levels = cluster_calls_graph_levels(6, &adj, &order);
+        assert!(!levels.is_empty(), "always at least one level");
+        let flat = cluster_calls_graph(6, &adj, &order);
+        assert!(
+            same_partition(&levels[0], &flat),
+            "finest level must match single-level Louvain's partition"
+        );
+    }
+
+    #[test]
+    fn levels_no_edges_all_singletons() {
+        let adj: Vec<Vec<usize>> = vec![vec![]; 5];
+        let order: Vec<usize> = (0..5).collect();
+        let levels = cluster_calls_graph_levels(5, &adj, &order);
+        assert_eq!(levels.len(), 1, "no edges → no aggregation → one level");
+        // Every node its own singleton.
+        let l = &levels[0];
+        for i in 0..5 {
+            for j in (i + 1)..5 {
+                assert_ne!(l[i], l[j], "isolated nodes are singletons");
+            }
+        }
+    }
+
+    #[test]
+    fn levels_are_monotonically_coarsening() {
+        // A denser, multi-cluster graph: three triangles fully bridged to each
+        // other — exercises aggregation without asserting an exact level count
+        // (that depends on modularity thresholds; coarsening is the invariant).
+        let adj = vec![
+            vec![1, 2],       // 0  ┐ T1
+            vec![0, 2],       // 1  │
+            vec![0, 1, 3, 6], // 2  ┘ bridges → T2, T3
+            vec![4, 5, 2],    // 3  ┐ T2
+            vec![3, 5],       // 4  │
+            vec![3, 4, 6],    // 5  ┘ bridge → T3
+            vec![7, 8, 2, 5], // 6  ┐ T3 bridges → T1, T2
+            vec![6, 8],       // 7  │
+            vec![6, 7],       // 8  ┘
+        ];
+        let order: Vec<usize> = (0..9).collect();
+        let levels = cluster_calls_graph_levels(9, &adj, &order);
+        assert!(!levels.is_empty());
+        for w in levels.windows(2) {
+            assert!(
+                is_coarsening(&w[0], &w[1]),
+                "each level must only merge communities, never split: {:?} -> {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
 
     // Two triangles {0,1,2} and {3,4,5} joined by a single 2-3 bridge edge.
     fn two_cliques() -> Vec<Vec<usize>> {

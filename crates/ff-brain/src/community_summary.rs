@@ -120,6 +120,11 @@ pub async fn summarize_communities<F: Fn(usize, usize)>(
            AND ($2 OR c.summary IS NULL)
            AND g.code_community_id IS NOT NULL
            AND g.valid_until IS NULL
+           -- level 0 only: this summarizer resolves members via the god node's
+           -- code_community_id (a level-0 label), so it can only correctly
+           -- summarize finest-level communities. Coarse (level>0) hierarchy rows
+           -- are summarized by the map-reduce pass (GraphRAG slice 2).
+           AND c.level = 0
          ORDER BY c.member_count DESC
          LIMIT $3",
     )
@@ -532,7 +537,8 @@ async fn communities_needing_summary(pool: &PgPool, min_members: usize) -> Resul
           WHERE c.member_count >= $1
             AND c.summary IS NULL
             AND g.code_community_id IS NOT NULL
-            AND g.valid_until IS NULL",
+            AND g.valid_until IS NULL
+            AND c.level = 0",
     )
     .bind(min_members as i32)
     .fetch_one(pool)

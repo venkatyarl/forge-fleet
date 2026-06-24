@@ -42,8 +42,18 @@ Source: kimi analysis + online SOTA research (2026-06-17). Full transcript: `/tm
   `reads`/`writes` (dataflow), `has_field` (types), `implements`/`extends` (trait relationships)
   are all live in the graph. Only intra-function control-flow (`branches_to`/`loops_over`) is
   unbuilt — low value, skipped.
-- ~ **P0.3 GraphRAG** — communities + per-community summaries exist (single-level Louvain);
-  hierarchical/multi-level is the remaining part.
+- 🔨 **P0.3 GraphRAG hierarchical** — IN PROGRESS (multi-slice):
+  - ✅ slice 1 (this PR): full multi-level Louvain (`cluster_calls_graph_levels` —
+    local-move → aggregate condensed graph → repeat; unit-tested: level-0 match,
+    no-edge singletons, monotonic coarsening). V144 adds `level` to
+    `brain_code_communities` (per-level unique index); `detect_code_communities`
+    stores every level's communities (each distinct grouping once, at its finest
+    level). Summarizer scoped to `level = 0` (it resolves members via the level-0
+    `code_community_id`, so coarse rows wait for slice 2).
+  - ⏳ slice 2: per-level map-reduce summaries (level N+1 summary from its level-N
+    children's summaries).
+  - ⏳ slice 3: wire the hierarchy into `cortex_explain` so "explain this
+    subsystem" traverses levels.
 - 🔨 **P0.2 hybrid retrieval** — vector (`find_symbols_semantic`) + graph-neighborhood
   expansion + bge-reranker rescoring, combined into one `cortex_search`.
 - (OPS.1 — auto-refresh the Cortex SQLite mirror — removed: the mirror was deleted in #531;

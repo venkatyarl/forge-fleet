@@ -8527,13 +8527,14 @@ CREATE TABLE IF NOT EXISTS brain_code_communities (
     member_hash        TEXT,
     god_node_id        UUID REFERENCES brain_vault_nodes(id) ON DELETE SET NULL,
     member_count       INT NOT NULL DEFAULT 0,
+    level              INT NOT NULL DEFAULT 0,
     summary            TEXT,
     summary_model      TEXT,
     summary_updated_at TIMESTAMPTZ,
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_brain_code_communities_member_hash
-    ON brain_code_communities (member_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_brain_code_communities_member_hash_level
+    ON brain_code_communities (member_hash, level);
 "#;
 
 /// V128: per-file `pub use` re-export ledger so an incremental Cortex reindex can
@@ -9129,4 +9130,16 @@ ALTER TABLE projects ADD COLUMN IF NOT EXISTS git_remote           TEXT NOT NULL
 
 -- HireFlow integrates onto dev, not main.
 UPDATE projects SET default_branch = 'dev' WHERE id = 'hireflow360' AND default_branch = 'main';
+"#;
+
+pub const SCHEMA_V144_CODE_COMMUNITY_LEVELS: &str = r#"
+-- Hierarchical GraphRAG: brain_code_communities gains a community LEVEL.
+-- level 0 = finest call clusters (single-level Louvain, the prior behaviour);
+-- higher levels = progressively coarser subsystems from multi-level Louvain
+-- aggregation. The member_hash uniqueness becomes per-level so the same grouping
+-- can be recorded at more than one granularity.
+ALTER TABLE brain_code_communities ADD COLUMN IF NOT EXISTS level INT NOT NULL DEFAULT 0;
+DROP INDEX IF EXISTS idx_brain_code_communities_member_hash;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_brain_code_communities_member_hash_level
+    ON brain_code_communities (member_hash, level);
 "#;
