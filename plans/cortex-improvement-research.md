@@ -42,7 +42,9 @@ Source: kimi analysis + online SOTA research (2026-06-17). Full transcript: `/tm
   `reads`/`writes` (dataflow), `has_field` (types), `implements`/`extends` (trait relationships)
   are all live in the graph. Only intra-function control-flow (`branches_to`/`loops_over`) is
   unbuilt — low value, skipped.
-- 🔨 **P0.3 GraphRAG hierarchical** — IN PROGRESS (multi-slice):
+- ✅ **P0.3 GraphRAG hierarchical** — COMPLETE (#551/#552/#553/slice-3): multi-level
+  Louvain hierarchy + parent tree + per-level map-reduce summaries, surfaced in
+  cortex_explain as a symbol's subsystem chain. Slices:
   - ✅ slice 1 (this PR): full multi-level Louvain (`cluster_calls_graph_levels` —
     local-move → aggregate condensed graph → repeat; unit-tested: level-0 match,
     no-edge singletons, monotonic coarsening). V144 adds `level` to
@@ -62,8 +64,12 @@ Source: kimi analysis + online SOTA research (2026-06-17). Full transcript: `/tm
     unit-tested) — map-reduce, not raw code. Removed the `eligible==0` early-return
     so the hierarchy pass runs even when level 0 is fully summarized. No migration
     (reuses summary*/parent/level columns).
-  - ⏳ slice 3: wire the hierarchy into `cortex_explain` so "explain this subsystem"
-    traverses levels top-down.
+  - ✅ slice 3 (this PR): `explain_community` walks `parent_member_hash` (recursive
+    CTE) from a symbol's finest community up the tree, returning a `subsystem_chain`
+    (each ancestor's level + member_count + summary + god symbol). Surfaced in the
+    `cortex_explain` MCP tool JSON and `ff cortex explain` (JSON + a human-readable
+    "subsystem hierarchy" section). Answers "what larger subsystem is this part of,
+    and what does it do?" at increasing scope.
   - ⏳ slice 3: wire the hierarchy into `cortex_explain` so "explain this
     subsystem" traverses levels.
 - 🔨 **P0.2 hybrid retrieval** — vector (`find_symbols_semantic`) + graph-neighborhood

@@ -1409,6 +1409,12 @@ fn print_explanation(
                 "summary_model": e.summary_model,
                 "god_symbol": e.god_symbol,
                 "members": members,
+                "subsystem_chain": e.subsystem_chain.iter().map(|s| serde_json::json!({
+                    "level": s.level,
+                    "member_count": s.member_count,
+                    "summary": s.summary,
+                    "god_symbol": s.god_symbol,
+                })).collect::<Vec<_>>(),
             })
         );
         return;
@@ -1459,6 +1465,24 @@ fn print_explanation(
                 m.node_type.strip_prefix("code:").unwrap_or(&m.node_type),
                 m.qualified_name
             );
+        }
+    }
+
+    // GraphRAG subsystem hierarchy: what larger subsystem this is part of, at
+    // each scope, with that subsystem's summary.
+    if !e.subsystem_chain.is_empty() {
+        println!("{CYAN}subsystem hierarchy{RESET} (this cluster rolls up into):");
+        for s in &e.subsystem_chain {
+            let core = s
+                .god_symbol
+                .as_deref()
+                .map(|g| format!(", core: {g}"))
+                .unwrap_or_default();
+            print!("  L{} ({} symbols{core}): ", s.level, s.member_count);
+            match &s.summary {
+                Some(sum) => println!("{}", sum.replace('\n', " ")),
+                None => println!("{YELLOW}(not summarized yet){RESET}"),
+            }
         }
     }
 }
