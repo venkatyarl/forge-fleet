@@ -2611,11 +2611,16 @@ fn pick_version_target(
         .map(|m| (m.to_string(), false))
 }
 
-pub async fn handle_fleet_versions(pool: &sqlx::PgPool, verbose: bool, live: bool) -> Result<()> {
+pub async fn handle_fleet_versions(
+    pool: &sqlx::PgPool,
+    verbose: bool,
+    live: bool,
+    json: bool,
+) -> Result<()> {
     use ff_core::build_version::{BuildVersion, display_version_short};
 
     if live {
-        return handle_fleet_versions_live(pool, verbose).await;
+        return handle_fleet_versions_live(pool, verbose, json).await;
     }
 
     // Pull the installed_version cell stored on each (computer, software_id)
@@ -2763,7 +2768,28 @@ pub async fn handle_fleet_versions(pool: &sqlx::PgPool, verbose: bool, live: boo
 /// cached path (one SSH round-trip per host, capped at ~5s each) but
 /// truthful right after a fleet upgrade when the version_check tick
 /// hasn't refreshed `installed_version` yet.
-pub async fn handle_fleet_versions_live(pool: &sqlx::PgPool, verbose: bool) -> Result<()> {
+/// Plain-text convergence status for one host, given its on-disk SHA, its
+/// RUNNING /health SHA (None = gateway unreachable), and the fleet target SHA.
+/// The RUNNING SHA is the truth: a host whose binary is on target but whose
+/// process is not is `stale-daemon` (installed-but-not-restarted). Pure.
+fn versions_live_status(
+    disk_sha: &str,
+    running_sha: Option<&str>,
+    target: Option<&str>,
+) -> &'static str {
+    match target {
+        Some(t) if running_sha == Some(t) => "converged",
+        Some(t) if disk_sha == t => "stale-daemon",
+        Some(_) => "drift",
+        None => "unknown",
+    }
+}
+
+pub async fn handle_fleet_versions_live(
+    pool: &sqlx::PgPool,
+    verbose: bool,
+    json: bool,
+) -> Result<()> {
     use ff_core::build_version::BuildVersion;
     use futures::stream::{FuturesUnordered, StreamExt};
     use tokio::process::Command;
@@ -2839,6 +2865,36 @@ pub async fn handle_fleet_versions_live(pool: &sqlx::PgPool, verbose: bool) -> R
         .max_by_key(|(_, n)| *n)
         .map(|(sha, _)| sha.clone());
 
+    if json {
+        let hosts: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(name, raw, parsed, running_sha)| match parsed {
+                Some(v) => serde_json::json!({
+                    "name": name,
+                    "disk_sha": v.short_sha(),
+                    "running_sha": running_sha,
+                    "status": versions_live_status(
+                        &v.sha, running_sha.as_deref(), target_sha.as_deref()),
+                }),
+                None => serde_json::json!({
+                    "name": name,
+                    "disk_sha": serde_json::Value::Null,
+                    "running_sha": serde_json::Value::Null,
+                    "status": "unreachable",
+                    "error": raw.chars().take(60).collect::<String>(),
+                }),
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "target_sha": target_sha,
+                "hosts": hosts,
+            }))?
+        );
+        return Ok(());
+    }
+
     if verbose {
         println!(
             "{:<12} {:<10} {:<10} {:<8} {:<8} {:<10}",
@@ -2864,17 +2920,21 @@ pub async fn handle_fleet_versions_live(pool: &sqlx::PgPool, verbose: bool) -> R
                 // on-disk binary is on target but whose process is NOT was
                 // installed-but-not-restarted — the deploy "succeeded" yet stale
                 // code is live (ace 2026-06-25). Flag it distinctly + actionably.
-                let status = match target_sha.as_deref() {
-                    Some(t) if running_sha.as_deref() == Some(t) => {
+                let status = match versions_live_status(
+                    &v.sha,
+                    running_sha.as_deref(),
+                    target_sha.as_deref(),
+                ) {
+                    "converged" => {
                         converged += 1;
                         "✓".to_string()
                     }
-                    Some(t) if v.sha == t => {
+                    "stale-daemon" => {
                         stale += 1;
                         "⚠ stale-daemon".to_string()
                     }
-                    Some(_) => "drift".to_string(),
-                    None => "?".to_string(),
+                    "drift" => "drift".to_string(),
+                    _ => "?".to_string(),
                 };
                 if verbose {
                     println!(
@@ -3162,8 +3222,12 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         FleetCommand::Health { json } => {
             handle_fleet_health(&pool, json).await?;
         }
-        FleetCommand::Versions { verbose, live } => {
-            handle_fleet_versions(&pool, verbose, live).await?;
+        FleetCommand::Versions {
+            verbose,
+            live,
+            json,
+        } => {
+            handle_fleet_versions(&pool, verbose, live, json).await?;
         }
         FleetCommand::Gossip => {
             handle_fleet_gossip().await?;
@@ -4837,8 +4901,36 @@ mod version_target_tests {
 mod route_tests {
     use super::{
         extract_health_build_sha, fmt_route_load, normalize_route_limit,
-        route_require_tool_calling, route_warns_below_agent_floor, short10,
+        route_require_tool_calling, route_warns_below_agent_floor, short10, versions_live_status,
     };
+
+    // Authored by a fleet model (qwen36 on lily) via `ff offload`, then reviewed
+    // + verified here — dogfooding the fleet for test generation (#576).
+    #[test]
+    fn versions_live_status_cases() {
+        // 1. running matches target -> "converged"
+        assert_eq!(
+            versions_live_status("aaa", Some("aaa"), Some("aaa")),
+            "converged"
+        );
+        // 2. disk matches target but running does not (running is an OLD sha) -> "stale-daemon"
+        assert_eq!(
+            versions_live_status("bbb", Some("aaa"), Some("bbb")),
+            "stale-daemon"
+        );
+        // 3. disk does NOT match target -> "drift"
+        assert_eq!(
+            versions_live_status("aaa", Some("bbb"), Some("ccc")),
+            "drift"
+        );
+        // 4. target is None -> "unknown"
+        assert_eq!(versions_live_status("aaa", Some("aaa"), None), "unknown");
+        // 5. running is None (gateway down) but disk matches target -> "stale-daemon"
+        assert_eq!(
+            versions_live_status("bbb", None, Some("bbb")),
+            "stale-daemon"
+        );
+    }
 
     #[test]
     fn route_load_unsampled_host_shows_dash() {

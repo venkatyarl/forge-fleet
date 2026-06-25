@@ -1562,6 +1562,11 @@ enum FleetCommand {
         /// after an upgrade.
         #[arg(long, default_value_t = false)]
         live: bool,
+        /// With --live: emit lossless JSON (one object per host: name, disk_sha,
+        /// running_sha, status) instead of the human table. Scriptable — e.g.
+        /// CI asserts every host's status == "converged".
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Workload-aware routing: given a workload tag (e.g. "code",
     /// "embedding", "reranking", "reasoning", "chat", "tool_calling",
