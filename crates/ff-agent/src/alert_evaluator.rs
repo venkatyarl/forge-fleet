@@ -136,6 +136,93 @@ fn eval_string(cond: &Condition, v: &str) -> bool {
     }
 }
 
+/// Metrics the evaluator poll (`evaluate_current`) knows how to read each tick
+/// from a Pulse beat or the DB. KEEP IN SYNC with the `match metric` arms in
+/// `evaluate_current` — a policy on a metric NOT in this list (and not in
+/// [`IMPERATIVE_METRICS`]) silently never fires.
+pub const EVALUATOR_METRICS: &[&str] = &[
+    "cpu_pct",
+    "ram_pct",
+    "ram_used_gb",
+    "disk_free_gb",
+    "gpu_pct",
+    "llm_queue_depth",
+    "llm_active_requests",
+    "llm_tokens_per_sec",
+    "computer_status",
+    "leader_heartbeat_age_secs",
+    "beat_age_secs",
+];
+
+/// The complete value domain the `computer_status` metric can emit (see the
+/// `computer_status` arm of `evaluate_current`). KEEP IN SYNC with it. A
+/// `== '<x>'` policy whose `<x>` is outside this set can never match — exactly
+/// the `computer_offline == 'odown'` dead-policy bug (V146).
+pub const COMPUTER_STATUS_VALUES: &[&str] = &["offline", "online", "sdown"];
+
+/// Metrics whose policies are fired IMPERATIVELY by a dedicated leader tick
+/// (the tick resolves the policy by name, then INSERTs an `alert_event` and
+/// calls [`dispatch_alert`]) rather than by the evaluator poll. KEEP IN SYNC
+/// with the `POLICY_NAME`/metric used in `db_integrity`, `fleet_integrity`,
+/// `ha::restore_drill`, `upgrade_rollout`, and `secrets_rotation`.
+pub const IMPERATIVE_METRICS: &[&str] = &[
+    "db_index_corruption",
+    "fleet_integrity_degraded",
+    "backup_restore_drill_failed",
+    "upgrade_rollout_halted",
+    "secret_expiry_days_remaining",
+];
+
+/// How (or whether) a policy can ever fire — the result of [`classify_policy_fireability`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyFireability {
+    /// Metric is read by the evaluator poll each tick.
+    EvaluatorPolled,
+    /// Fired by a dedicated imperative tick (resolved by policy name).
+    ImperativelyFired,
+    /// Condition string doesn't parse → every evaluation is false → never fires.
+    Unparseable,
+    /// Metric is handled by neither path → watches nothing → never fires.
+    UnknownMetric,
+    /// Known metric, parseable condition, but a `== '<x>'` test against a value
+    /// the metric can never emit (e.g. `computer_status == 'odown'`).
+    UnsatisfiableValue,
+}
+
+impl PolicyFireability {
+    /// True when the policy is structurally CAPABLE of firing (a typo'd metric,
+    /// unparseable condition, or unsatisfiable value test is not).
+    pub fn can_fire(self) -> bool {
+        matches!(self, Self::EvaluatorPolled | Self::ImperativelyFired)
+    }
+}
+
+/// Classify whether a policy can ever fire from its `metric` + `condition`.
+/// Pure — the engine behind `ff alert doctor`, which flags the dead-policy
+/// class (e.g. the `computer_offline == 'odown'` policy disabled in V146).
+pub fn classify_policy_fireability(metric: &str, condition: &str) -> PolicyFireability {
+    let cond = parse_condition(condition);
+    if matches!(cond, Condition::Unparseable) {
+        return PolicyFireability::Unparseable;
+    }
+    // Value-domain check for the one enum-valued metric: `== '<x>'` where `<x>`
+    // is outside what the metric can emit can never match. (`!= '<x>'` is fine —
+    // it just always matches — so only StrEq is unsatisfiable here.)
+    if metric == "computer_status"
+        && let Condition::StrEq(v) = &cond
+        && !COMPUTER_STATUS_VALUES.contains(&v.as_str())
+    {
+        return PolicyFireability::UnsatisfiableValue;
+    }
+    if EVALUATOR_METRICS.contains(&metric) {
+        PolicyFireability::EvaluatorPolled
+    } else if IMPERATIVE_METRICS.contains(&metric) {
+        PolicyFireability::ImperativelyFired
+    } else {
+        PolicyFireability::UnknownMetric
+    }
+}
+
 pub struct AlertEvaluator {
     pg: PgPool,
     pulse: PulseReader,
@@ -720,6 +807,80 @@ mod tests {
         assert!(matches!(c, Condition::Unparseable));
         assert!(!eval_numeric(&c, 100.0));
         assert!(!eval_string(&c, "anything"));
+    }
+
+    #[test]
+    fn classify_policy_fireability_cases() {
+        // Evaluator-polled metric, valid condition.
+        assert_eq!(
+            classify_policy_fireability("cpu_pct", "> 90"),
+            PolicyFireability::EvaluatorPolled
+        );
+        // String condition on an evaluator metric.
+        assert_eq!(
+            classify_policy_fireability("computer_status", "!= 'online'"),
+            PolicyFireability::EvaluatorPolled
+        );
+        // Imperatively-fired metric.
+        assert_eq!(
+            classify_policy_fireability("db_index_corruption", "> 0"),
+            PolicyFireability::ImperativelyFired
+        );
+        // Unknown metric — typo or unimplemented → cannot fire.
+        assert_eq!(
+            classify_policy_fireability("cpu_percent", "> 90"),
+            PolicyFireability::UnknownMetric
+        );
+        // Known metric but garbage condition → cannot fire (Unparseable wins).
+        assert_eq!(
+            classify_policy_fireability("cpu_pct", "definitely not a condition"),
+            PolicyFireability::Unparseable
+        );
+        // The motivating bug: computer_status == 'odown' (odown is never emitted).
+        assert_eq!(
+            classify_policy_fireability("computer_status", "== 'odown'"),
+            PolicyFireability::UnsatisfiableValue
+        );
+        // A status value the metric DOES emit is fine.
+        assert_eq!(
+            classify_policy_fireability("computer_status", "== 'sdown'"),
+            PolicyFireability::EvaluatorPolled
+        );
+        // != against an out-of-domain value always matches → fireable, not dead.
+        assert_eq!(
+            classify_policy_fireability("computer_status", "!= 'odown'"),
+            PolicyFireability::EvaluatorPolled
+        );
+        assert!(!PolicyFireability::UnsatisfiableValue.can_fire());
+        // can_fire() only for the two real firing paths.
+        assert!(PolicyFireability::EvaluatorPolled.can_fire());
+        assert!(PolicyFireability::ImperativelyFired.can_fire());
+        assert!(!PolicyFireability::UnknownMetric.can_fire());
+        assert!(!PolicyFireability::Unparseable.can_fire());
+    }
+
+    #[test]
+    fn every_live_seeded_metric_can_fire() {
+        // Guards the EVALUATOR_METRICS/IMPERATIVE_METRICS lists against drift:
+        // every metric the V34+ seed ships must be classifiable as fireable, or
+        // `ff alert doctor` would (correctly) flag a seeded policy as dead.
+        for metric in [
+            "cpu_pct",
+            "disk_free_gb",
+            "llm_queue_depth",
+            "leader_heartbeat_age_secs",
+            "beat_age_secs",
+            "db_index_corruption",
+            "fleet_integrity_degraded",
+            "secret_expiry_days_remaining",
+            "backup_restore_drill_failed",
+            "upgrade_rollout_halted",
+        ] {
+            assert!(
+                classify_policy_fireability(metric, "> 0").can_fire(),
+                "seeded metric {metric} classified as non-fireable",
+            );
+        }
     }
 
     #[test]
