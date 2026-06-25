@@ -105,6 +105,10 @@ pub enum TopCortexCommand {
         /// 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED, 0.0 = all (default).
         #[arg(long, default_value_t = 0.0)]
         min_confidence: f32,
+        /// Cross-repo: match the symbol name in EVERY indexed corpus and union
+        /// the results, each tagged with its corpus (ignores --corpus).
+        #[arg(long)]
+        all_corpora: bool,
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
@@ -117,6 +121,10 @@ pub enum TopCortexCommand {
         /// 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED, 0.0 = all (default).
         #[arg(long, default_value_t = 0.0)]
         min_confidence: f32,
+        /// Cross-repo: match the symbol name in EVERY indexed corpus and union
+        /// the results, each tagged with its corpus (ignores --corpus).
+        #[arg(long)]
+        all_corpora: bool,
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
@@ -888,29 +896,49 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
             symbol,
             corpus,
             min_confidence,
+            all_corpora,
             format,
         } => {
-            let corpus = corpus.unwrap_or_else(cwd_slug);
-            let rows = cortex::callers(&pool, &corpus, &symbol, min_confidence).await?;
-            crate::cortex_cmd::print_symbols(
-                &rows,
-                format.as_str(),
-                &format!("callers of {symbol}"),
-            );
+            if all_corpora {
+                let hits = cortex::callers_all_corpora(&pool, &symbol, min_confidence).await?;
+                print_cross_corpus_call_refs(
+                    &hits,
+                    format.as_str(),
+                    &format!("callers of {symbol} (all corpora)"),
+                );
+            } else {
+                let corpus = corpus.unwrap_or_else(cwd_slug);
+                let rows = cortex::callers(&pool, &corpus, &symbol, min_confidence).await?;
+                crate::cortex_cmd::print_symbols(
+                    &rows,
+                    format.as_str(),
+                    &format!("callers of {symbol}"),
+                );
+            }
         }
         TopCortexCommand::Callees {
             symbol,
             corpus,
             min_confidence,
+            all_corpora,
             format,
         } => {
-            let corpus = corpus.unwrap_or_else(cwd_slug);
-            let rows = cortex::callees(&pool, &corpus, &symbol, min_confidence).await?;
-            crate::cortex_cmd::print_symbols(
-                &rows,
-                format.as_str(),
-                &format!("callees of {symbol}"),
-            );
+            if all_corpora {
+                let hits = cortex::callees_all_corpora(&pool, &symbol, min_confidence).await?;
+                print_cross_corpus_call_refs(
+                    &hits,
+                    format.as_str(),
+                    &format!("callees of {symbol} (all corpora)"),
+                );
+            } else {
+                let corpus = corpus.unwrap_or_else(cwd_slug);
+                let rows = cortex::callees(&pool, &corpus, &symbol, min_confidence).await?;
+                crate::cortex_cmd::print_symbols(
+                    &rows,
+                    format.as_str(),
+                    &format!("callees of {symbol}"),
+                );
+            }
         }
         TopCortexCommand::Find {
             query,
@@ -1817,6 +1845,57 @@ fn print_cross_corpus_hits(hits: &[(String, cortex::SymbolHit)], format: &str, q
                 println!(
                     "  {GREEN}{corpus:<18}{RESET}  {kind:<9}  fanin={:<3}  {}  ({loc})",
                     h.fan_in, h.qualified_name
+                );
+            }
+        }
+    }
+}
+
+/// Render cross-corpus callers/callees: each [`cortex::SymbolRef`] tagged with
+/// the corpus it lives in. `json` / `names` / table formats, mirroring
+/// [`print_cross_corpus_hits`].
+fn print_cross_corpus_call_refs(hits: &[(String, cortex::SymbolRef)], format: &str, label: &str) {
+    match format {
+        "json" => {
+            let v: Vec<_> = hits
+                .iter()
+                .map(|(corpus, r)| {
+                    serde_json::json!({
+                        "corpus": corpus,
+                        "id": r.id,
+                        "qualified_name": r.qualified_name,
+                        "node_type": r.node_type,
+                        "file": r.file,
+                        "start_line": r.start_line,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        }
+        "names" => {
+            for (corpus, r) in hits {
+                println!("{corpus}\t{}", r.qualified_name);
+            }
+        }
+        _ => {
+            println!(
+                "{CYAN}\u{25b6} cortex {label} \u{2014} {} hit(s) across corpora:{RESET}",
+                hits.len()
+            );
+            if hits.is_empty() {
+                println!("  (none \u{2014} the symbol isn't called/calling in any indexed corpus)");
+                return;
+            }
+            for (corpus, r) in hits {
+                let kind = r.node_type.strip_prefix("code:").unwrap_or(&r.node_type);
+                let loc = match (&r.file, r.start_line) {
+                    (Some(f), Some(l)) => format!("{f}:{l}"),
+                    (Some(f), None) => f.clone(),
+                    _ => "-".to_string(),
+                };
+                println!(
+                    "  {GREEN}{corpus:<18}{RESET}  {kind:<9}  {}  ({loc})",
+                    r.qualified_name
                 );
             }
         }
