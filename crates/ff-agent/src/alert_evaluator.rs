@@ -479,7 +479,11 @@ async fn evaluate_current(
             Ok((eval_numeric(cond, v), Some(v), None))
         }
         "computer_status" => {
-            // 'odown' | 'sdown' | 'online'
+            // Emits 'offline' (beat present, going_offline set) | 'online' (beat
+            // present) | 'sdown' (no beat). NB: never 'odown' — that quorum
+            // status has no producer, which is why the V34 `computer_offline`
+            // policy (== 'odown') was disabled in V146; real down-detection is
+            // the numeric `beat_age_secs` policies.
             let status = match beat {
                 Some(b) if b.going_offline => "offline",
                 Some(_) => "online",

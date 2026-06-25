@@ -9157,3 +9157,33 @@ ALTER TABLE brain_code_communities ADD COLUMN IF NOT EXISTS parent_member_hash T
 CREATE INDEX IF NOT EXISTS idx_brain_code_communities_parent
     ON brain_code_communities (parent_member_hash);
 "#;
+
+// V146: disable the structurally-dead `computer_offline` alert policy.
+//
+// The V34 seed fires on `computer_status == 'odown'`, but NOTHING in the live
+// system ever produces the status `odown`: the pulse materializer writes only
+// `online`/`offline`, and the alert evaluator's `computer_status` metric
+// derives `online`/`offline`/`sdown` from beat presence — never `odown`. So the
+// policy has fired 0 times since V34 and is structurally INCAPABLE of firing,
+// presenting a FALSE sense of coverage (an enabled `critical` "computer
+// offline" alert that watches nothing).
+//
+// Real "computer is down" coverage already exists and works via the numeric,
+// duration-gated `beat_age_secs` policies — `member_stale_beat` (>300s warning)
+// and `member_beat_dead` (>1800s critical) — which read `computers.last_seen_at`
+// and survive Redis TTL expiry. Disabling the dead duplicate loses zero real
+// coverage and stops the misleading "enabled" listing.
+//
+// GUARDED: only the UNMODIFIED V34 default is disabled (condition still
+// `== 'odown'` AND currently enabled), so an operator who has since rewired or
+// re-enabled the policy is left untouched. To restore a faster critical, rewire
+// onto `beat_age_secs` (e.g. `> 600` critical, duration 120) rather than the
+// quorum-only `odown` status.
+pub const SCHEMA_V146_DISABLE_DEAD_COMPUTER_OFFLINE_ALERT: &str = r#"
+UPDATE alert_policies
+   SET enabled = false
+ WHERE name = 'computer_offline'
+   AND metric = 'computer_status'
+   AND condition = '== ''odown'''
+   AND enabled = true;
+"#;
