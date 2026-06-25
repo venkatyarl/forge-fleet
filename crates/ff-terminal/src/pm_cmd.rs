@@ -222,6 +222,14 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
         crate::PmCommand::Doctor => {
             print_pm_doctor(&pool).await?;
         }
+        crate::PmCommand::Stats { json } => {
+            let stats = collect_pm_stats(&pool).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            } else {
+                print!("{}", render_pm_stats(&stats));
+            }
+        }
         crate::PmCommand::Cancel { id } => {
             let uid = uuid::Uuid::parse_str(&id)
                 .map_err(|e| anyhow::anyhow!("invalid work item id '{id}': {e}"))?;
@@ -701,4 +709,231 @@ pub async fn handle_pm_import_claude_tasks(
         snapshot.len()
     );
     Ok(())
+}
+
+/// A `label → count` bucket in a [`PmStats`] rollup (status / kind / project).
+#[derive(Debug, Clone, serde::Serialize)]
+struct LabeledCount {
+    label: String,
+    count: i64,
+}
+
+/// Backlog + throughput snapshot for `ff pm stats`. Plain data so the render is
+/// a pure function (unit-tested) and `--json` is a trivial serialization.
+#[derive(Debug, Clone, serde::Serialize)]
+struct PmStats {
+    total: i64,
+    by_status: Vec<LabeledCount>,
+    by_kind: Vec<LabeledCount>,
+    by_project: Vec<LabeledCount>,
+    created_24h: i64,
+    created_7d: i64,
+    completed_24h: i64,
+    completed_7d: i64,
+    failed_total: i64,
+    /// Age of the oldest `status='ready'` item (still waiting for a slot), or
+    /// `None` when nothing is ready.
+    oldest_ready_age_secs: Option<i64>,
+}
+
+/// Run the rollup queries against live Postgres. NULL `kind`/`project_id` fold
+/// into `(none)` so every item is accounted for.
+async fn collect_pm_stats(pool: &sqlx::PgPool) -> Result<PmStats> {
+    let buckets = |sql: &str| {
+        let sql = sql.to_string();
+        async move {
+            let rows: Vec<(String, i64)> = sqlx::query_as(&sql)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("pm stats query: {e}"))?;
+            Ok::<_, anyhow::Error>(
+                rows.into_iter()
+                    .map(|(label, count)| LabeledCount { label, count })
+                    .collect::<Vec<_>>(),
+            )
+        }
+    };
+
+    let by_status = buckets(
+        "SELECT status, count(*) FROM work_items GROUP BY status ORDER BY count(*) DESC, status",
+    )
+    .await?;
+    let by_kind = buckets(
+        "SELECT COALESCE(kind, '(none)'), count(*) FROM work_items \
+         GROUP BY kind ORDER BY count(*) DESC, 1",
+    )
+    .await?;
+    let by_project = buckets(
+        "SELECT COALESCE(project_id, '(none)'), count(*) FROM work_items \
+         GROUP BY project_id ORDER BY count(*) DESC, 1 LIMIT 12",
+    )
+    .await?;
+
+    let scalar = |sql: &str| {
+        let sql = sql.to_string();
+        async move {
+            sqlx::query_scalar::<_, i64>(&sql)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("pm stats scalar: {e}"))
+        }
+    };
+    let total = scalar("SELECT count(*) FROM work_items").await?;
+    let created_24h =
+        scalar("SELECT count(*) FROM work_items WHERE created_at > NOW() - INTERVAL '24 hours'")
+            .await?;
+    let created_7d =
+        scalar("SELECT count(*) FROM work_items WHERE created_at > NOW() - INTERVAL '7 days'")
+            .await?;
+    let completed_24h =
+        scalar("SELECT count(*) FROM work_items WHERE completed_at > NOW() - INTERVAL '24 hours'")
+            .await?;
+    let completed_7d =
+        scalar("SELECT count(*) FROM work_items WHERE completed_at > NOW() - INTERVAL '7 days'")
+            .await?;
+    let failed_total = scalar("SELECT count(*) FROM work_items WHERE status = 'failed'").await?;
+
+    let oldest_ready_age_secs: Option<i64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM (NOW() - MIN(created_at)))::bigint \
+           FROM work_items WHERE status = 'ready'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("pm stats oldest ready: {e}"))?;
+
+    Ok(PmStats {
+        total,
+        by_status,
+        by_kind,
+        by_project,
+        created_24h,
+        created_7d,
+        completed_24h,
+        completed_7d,
+        failed_total,
+        oldest_ready_age_secs,
+    })
+}
+
+/// Render a coarse human duration (`45m`, `3h`, `5d`) for the oldest-ready age.
+/// Pure.
+fn humanize_age_secs(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// Format a [`PmStats`] as the `ff pm stats` report. Pure (no I/O, no color
+/// codes) so it is unit-testable and stable for snapshotting.
+fn render_pm_stats(s: &PmStats) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("work_items — {} rows total\n", s.total));
+
+    let section = |out: &mut String, title: &str, buckets: &[LabeledCount]| {
+        out.push_str(&format!("\n  by {title}:\n"));
+        if buckets.is_empty() {
+            out.push_str("    (none)\n");
+            return;
+        }
+        for b in buckets {
+            out.push_str(&format!("    {:<14} {}\n", b.label, b.count));
+        }
+    };
+    section(&mut out, "status", &s.by_status);
+    section(&mut out, "kind", &s.by_kind);
+    section(&mut out, "project", &s.by_project);
+
+    out.push_str("\n  throughput:\n");
+    out.push_str(&format!(
+        "    created    {} in 24h · {} in 7d\n",
+        s.created_24h, s.created_7d
+    ));
+    out.push_str(&format!(
+        "    completed  {} in 24h · {} in 7d\n",
+        s.completed_24h, s.completed_7d
+    ));
+    out.push_str(&format!("    failed     {} (lifetime)\n", s.failed_total));
+
+    match s.oldest_ready_age_secs {
+        Some(age) => out.push_str(&format!(
+            "\n  oldest pending (ready): {} old\n",
+            humanize_age_secs(age)
+        )),
+        None => out.push_str("\n  oldest pending (ready): (none) ✓\n"),
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> PmStats {
+        PmStats {
+            total: 870,
+            by_status: vec![
+                LabeledCount {
+                    label: "idea".into(),
+                    count: 784,
+                },
+                LabeledCount {
+                    label: "done".into(),
+                    count: 50,
+                },
+            ],
+            by_kind: vec![LabeledCount {
+                label: "audit".into(),
+                count: 777,
+            }],
+            by_project: vec![LabeledCount {
+                label: "forge-fleet".into(),
+                count: 870,
+            }],
+            created_24h: 3,
+            created_7d: 40,
+            completed_24h: 2,
+            completed_7d: 12,
+            failed_total: 4,
+            oldest_ready_age_secs: Some(9000),
+        }
+    }
+
+    #[test]
+    fn humanize_age_buckets() {
+        assert_eq!(humanize_age_secs(30), "30s");
+        assert_eq!(humanize_age_secs(90), "1m");
+        assert_eq!(humanize_age_secs(7200), "2h");
+        assert_eq!(humanize_age_secs(180_000), "2d");
+    }
+
+    #[test]
+    fn render_includes_totals_sections_and_throughput() {
+        let out = render_pm_stats(&sample());
+        assert!(out.contains("work_items — 870 rows total"));
+        assert!(out.contains("by status:"));
+        assert!(out.contains("idea           784"));
+        assert!(out.contains("by kind:"));
+        assert!(out.contains("audit          777"));
+        assert!(out.contains("created    3 in 24h · 40 in 7d"));
+        assert!(out.contains("completed  2 in 24h · 12 in 7d"));
+        assert!(out.contains("failed     4 (lifetime)"));
+        // 9000s = 2h30m → coarsened to "2h"
+        assert!(out.contains("oldest pending (ready): 2h old"));
+    }
+
+    #[test]
+    fn render_handles_empty_and_no_ready() {
+        let mut s = sample();
+        s.by_status.clear();
+        s.oldest_ready_age_secs = None;
+        let out = render_pm_stats(&s);
+        assert!(out.contains("by status:\n    (none)"));
+        assert!(out.contains("oldest pending (ready): (none) ✓"));
+    }
 }

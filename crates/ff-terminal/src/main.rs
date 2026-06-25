@@ -2932,6 +2932,15 @@ pub enum PmCommand {
     },
     /// Check the Pillar-4 work_item pipeline health from live Postgres.
     Doctor,
+    /// Work_item backlog + throughput rollup: counts by status / kind /
+    /// project, items created vs completed in the last 24h / 7d, failure
+    /// count, and the oldest still-pending `ready` item. The PM analogue of
+    /// `ff defer stats` / `ff interactions stats`.
+    Stats {
+        /// Emit JSON instead of the formatted table.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Import Claude Code session tasks into projects.work_items.
     ///
     /// Claude Code's TaskCreate/TaskList/TaskUpdate tools keep their state
