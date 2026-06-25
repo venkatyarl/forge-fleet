@@ -200,35 +200,42 @@ fn detect_memory_macos() -> (u64, MemoryType) {
 fn detect_memory_linux() -> (u64, MemoryType) {
     let gib = std::fs::read_to_string("/proc/meminfo")
         .ok()
-        .and_then(|content| {
-            content
-                .lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| {
-                    l.split_whitespace()
-                        .nth(1)
-                        .and_then(|kb| kb.parse::<u64>().ok())
-                })
-        })
+        .and_then(|content| parse_meminfo_total_kb(&content))
         .map(|kb| kb.div_ceil(1024 * 1024)) // kB → GiB (rounded up)
         .unwrap_or(0);
 
     // Try to detect memory type from dmidecode (requires root).
     let mem_type = run_command("dmidecode", &["-t", "memory"])
-        .map(|output| {
-            if output.contains("DDR5") {
-                MemoryType::Ddr5
-            } else if output.contains("DDR4") {
-                MemoryType::Ddr4
-            } else if output.contains("LPDDR") {
-                MemoryType::Lpddr
-            } else {
-                MemoryType::Unknown
-            }
-        })
+        .map(|output| classify_mem_type_dmidecode(&output))
         .unwrap_or(MemoryType::Unknown);
 
     (gib, mem_type)
+}
+
+/// Parse the `MemTotal:` value (in kB) out of `/proc/meminfo` contents. Pure.
+pub fn parse_meminfo_total_kb(content: &str) -> Option<u64> {
+    content
+        .lines()
+        .find(|l| l.starts_with("MemTotal:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|kb| kb.parse::<u64>().ok())
+}
+
+/// Classify DRAM generation from `dmidecode -t memory` output. Pure.
+///
+/// LPDDR is checked FIRST: `"LPDDR5".contains("DDR5")` is true, so an earlier
+/// DDR5/DDR4 check would misclassify low-power memory (the DGX Sparks' GB10 and
+/// Apple Silicon report LPDDR) as plain DDR.
+pub fn classify_mem_type_dmidecode(output: &str) -> MemoryType {
+    if output.contains("LPDDR") {
+        MemoryType::Lpddr
+    } else if output.contains("DDR5") {
+        MemoryType::Ddr5
+    } else if output.contains("DDR4") {
+        MemoryType::Ddr4
+    } else {
+        MemoryType::Unknown
+    }
 }
 
 // ─── Interconnect detection ──────────────────────────────────────────────────
@@ -274,16 +281,22 @@ pub fn detect_interconnect() -> Interconnect {
                     }
                 }
             }
-            return match best_speed {
-                s if s >= 10000 => Interconnect::Ethernet10g,
-                s if s >= 2500 => Interconnect::Ethernet2_5g,
-                s if s >= 1000 => Interconnect::Ethernet1g,
-                _ => Interconnect::Unknown,
-            };
+            return classify_interconnect_mbps(best_speed);
         }
     }
 
     Interconnect::Unknown
+}
+
+/// Classify a NIC link speed (Mbps, as reported by `/sys/class/net/*/speed`)
+/// into an [`Interconnect`] tier. Pure. `0`/sub-gigabit → `Unknown`.
+pub fn classify_interconnect_mbps(mbps: u64) -> Interconnect {
+    match mbps {
+        s if s >= 10_000 => Interconnect::Ethernet10g,
+        s if s >= 2_500 => Interconnect::Ethernet2_5g,
+        s if s >= 1_000 => Interconnect::Ethernet1g,
+        _ => Interconnect::Unknown,
+    }
 }
 
 // ─── Runtime detection ───────────────────────────────────────────────────────
@@ -353,6 +366,65 @@ fn command_exists(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The three pure-parser tests below were authored by a fleet model (qwen36
+    // on lily) via `ff offload`, hand-verified, then integrated — dogfooding the
+    // fleet for test-gen. They pin the parsers extracted from the detect_* fns,
+    // including the LPDDR-precedence fix (LPDDR5 was misclassified as DDR5).
+    #[test]
+    fn parse_meminfo_total_kb_works() {
+        assert_eq!(
+            parse_meminfo_total_kb("MemTotal:   32841036 kB\n"),
+            Some(32841036)
+        );
+        assert_eq!(parse_meminfo_total_kb("some other info\n"), None);
+        assert_eq!(parse_meminfo_total_kb("MemTotal: not_a_number kB\n"), None);
+    }
+
+    #[test]
+    fn classify_mem_type_dmidecode_lpddr_precedence() {
+        // The bug case: "LPDDR5" contains "DDR5" but must classify as Lpddr.
+        assert!(matches!(
+            classify_mem_type_dmidecode("Some info about LPDDR5 memory"),
+            MemoryType::Lpddr
+        ));
+        assert!(matches!(
+            classify_mem_type_dmidecode("Some info about DDR5 memory"),
+            MemoryType::Ddr5
+        ));
+        assert!(matches!(
+            classify_mem_type_dmidecode("Some info about DDR4 memory"),
+            MemoryType::Ddr4
+        ));
+        assert!(matches!(
+            classify_mem_type_dmidecode(""),
+            MemoryType::Unknown
+        ));
+    }
+
+    #[test]
+    fn classify_interconnect_mbps_tiers() {
+        assert!(matches!(
+            classify_interconnect_mbps(10000),
+            Interconnect::Ethernet10g
+        ));
+        assert!(matches!(
+            classify_interconnect_mbps(2500),
+            Interconnect::Ethernet2_5g
+        ));
+        assert!(matches!(
+            classify_interconnect_mbps(1000),
+            Interconnect::Ethernet1g
+        ));
+        assert!(matches!(
+            classify_interconnect_mbps(100),
+            Interconnect::Unknown
+        ));
+        assert!(matches!(
+            classify_interconnect_mbps(0),
+            Interconnect::Unknown
+        ));
+    }
 
     #[test]
     fn test_detect_os() {
