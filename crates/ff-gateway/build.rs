@@ -31,8 +31,12 @@ fn main() {
     // `(pushed <sha>)`. Never fails: falls back to "unknown".
     let sha = git_short_sha().unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=FF_GATEWAY_GIT_SHA={sha}");
-    // HEAD moves on every checkout/commit → rebuild so the baked SHA stays true.
+    // On a branch, `.git/HEAD` is a static `ref: refs/heads/main` line — it does
+    // NOT change when `main` advances; only the ref target file does. Watch BOTH
+    // so the baked fallback re-bakes on new commits. (The authoritative value is
+    // injected at runtime via set_runtime_build_sha, so this is belt-and-braces.)
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/refs/heads/main");
 }
 
 fn git_short_sha() -> Option<String> {

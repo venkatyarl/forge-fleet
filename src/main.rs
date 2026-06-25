@@ -2218,6 +2218,13 @@ fn start_gateway_subsystem(
         ..GatewayConfig::default()
     };
 
+    // Report THIS binary's git SHA on /health (build_sha). Sourced from the
+    // root build script's always-fresh FF_GIT_SHA — ff-gateway's own
+    // compile-time bake can go stale across deploys (its build script's
+    // `.git/HEAD` watch is a branch ref that never changes when `main` advances),
+    // which made /health lie about the running code. (2026-06-25.)
+    ff_gateway::server::set_runtime_build_sha(env!("FF_GIT_SHA"));
+
     tokio::spawn(async move {
         if let Err(err) = ff_gateway::run(gateway_config).await {
             error!(error = %err, "gateway subsystem exited with error");
