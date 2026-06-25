@@ -216,6 +216,25 @@ async fn enqueue_upgrade_tasks(
     current: &BTreeMap<String, String>,
     latest: &BTreeMap<String, String>,
 ) -> Result<usize, String> {
+    // GATE: when the operator has paused auto-upgrade
+    // (`fleet_secrets.auto_upgrade_enabled` not truthy) version-check must still
+    // DETECT + report drift (done by the caller — tooling row + Redis publish)
+    // but must NOT DISPATCH it. Before this gate the tick enqueued `upgrade`
+    // tasks unconditionally and the deferred worker ran them, so "pausing"
+    // auto-upgrade paused nothing — the leader self-upgrade tick and the wave
+    // were gated, but this independent enqueue path was not. (Reuses the SAME
+    // gate `auto_upgrade::run_once` checks, so the two paths can't disagree.)
+    if !crate::auto_upgrade::is_enabled(pool).await {
+        return Ok(0);
+    }
+    // LEADER EXCLUSION: source-built tools (ff_git/forgefleetd_git) upgrade via
+    // `git reset --hard origin/main && cargo build` IN ~/projects/forge-fleet —
+    // the operator's LIVE dev tree. A deferred worker running that playbook on
+    // the leader hard-resets the working tree and clobbers in-progress branch
+    // work (observed every ~140s on Taylor 2026-06-24, wiping an unmerged fix).
+    // The leader self-upgrades ONLY via the separately-gated leader-self-upgrade
+    // path, so never enqueue a source-build upgrade that targets the leader.
+    let node_is_leader = crate::auto_upgrade::is_leader(pool, node).await;
     let existing = ff_db::pg_list_deferred(pool, Some("pending"), 500)
         .await
         .map_err(|e| format!("pg_list_deferred: {e}"))?;
@@ -229,6 +248,9 @@ async fn enqueue_upgrade_tasks(
     let mut created = 0;
     for tool in drifted {
         if already(tool) {
+            continue;
+        }
+        if node_is_leader && is_source_build_tool(tool) {
             continue;
         }
         let cur = current.get(tool).cloned().unwrap_or_default();
@@ -261,6 +283,16 @@ async fn enqueue_upgrade_tasks(
         }
     }
     Ok(created)
+}
+
+/// Tools that build from the forge-fleet source checkout (`git reset --hard …
+/// && cargo build` in `~/projects/forge-fleet`). Their upgrade playbook mutates
+/// the working tree, so on the leader — where that tree is the operator's live
+/// dev clone — a worker-run upgrade clobbers in-progress work. Used to exclude
+/// the leader from auto-enqueued source-build upgrades (it self-upgrades via the
+/// separately-gated leader path instead).
+fn is_source_build_tool(tool: &str) -> bool {
+    matches!(tool, "ff" | "ff_git" | "forgefleetd" | "forgefleetd_git")
 }
 
 /// Best-effort version equivalence. Tool `--version` output and upstream
@@ -476,6 +508,18 @@ async fn pypi_version(client: &reqwest::Client, pkg: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_build_tools_are_the_git_built_ones_only() {
+        // These mutate ~/projects/forge-fleet on upgrade → must be leader-excluded.
+        for t in ["ff", "ff_git", "forgefleetd", "forgefleetd_git"] {
+            assert!(is_source_build_tool(t), "{t} should be source-build");
+        }
+        // Package-manager tools don't touch the dev tree → safe on the leader.
+        for t in ["gh", "op", "openclaw", "mlx_lm", "vllm", "llama.cpp", "os"] {
+            assert!(!is_source_build_tool(t), "{t} should NOT be source-build");
+        }
+    }
 
     #[test]
     fn resolve_own_bin_falls_back_to_bare_name_when_not_installed() {

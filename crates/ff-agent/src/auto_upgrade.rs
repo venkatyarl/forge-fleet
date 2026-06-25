@@ -448,7 +448,7 @@ async fn seed_auto_install_rows(pool: &PgPool) -> Result<u64> {
 }
 
 /// Is this pool's leader the computer whose name matches `my_name`?
-async fn is_leader(pool: &PgPool, my_name: &str) -> bool {
+pub(crate) async fn is_leader(pool: &PgPool, my_name: &str) -> bool {
     match sqlx::query_scalar::<_, String>("SELECT member_name FROM fleet_leader_state LIMIT 1")
         .fetch_optional(pool)
         .await
@@ -466,7 +466,7 @@ async fn is_leader(pool: &PgPool, my_name: &str) -> bool {
 /// expected posture is auto-upgrades flowing). Permanent-off rows
 /// (no `expires_at`) still suppress the tick, so existing operators
 /// who explicitly disable via `ff secrets set` are unaffected.
-async fn is_enabled(pool: &PgPool) -> bool {
+pub(crate) async fn is_enabled(pool: &PgPool) -> bool {
     // default_when_missing = false   (preserve pre-V58 "off if no row")
     // restore_when_expired = true    (TTL'd disable auto-restores to ON,
     //                                 fleet's expected posture)
