@@ -1269,6 +1269,16 @@ pub enum DeferCommand {
     },
     /// Retry a failed or cancelled task (resets attempts-aware status, runs ASAP).
     Retry { id: String },
+    /// Queue health snapshot: depth by status, recent failure patterns, recent
+    /// creation rate by title (flood detector), and the oldest pending task.
+    Stats {
+        /// Trailing window (hours) for the failure + creation-rate rollups.
+        #[arg(long, default_value_t = 3)]
+        window_hours: i64,
+        /// Emit JSON instead of the human report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]

@@ -39,6 +39,8 @@ pub use queries::{
     CortexResolutionStats,
     CortexSuspiciousExtern,
     CortexSuspiciousReport,
+    DeferredCount,
+    DeferredStats,
     DeferredTaskRow,
     // Orchestrator P2 — per-session demand sensing (V116)
     DemandVector,
@@ -103,6 +105,7 @@ pub use queries::{
     pg_create_training_job,
     // Orchestrator P2 — demand sensing (V116)
     pg_current_demand_vector,
+    pg_deferred_stats,
     pg_delete_deployment,
     pg_delete_library,
     pg_delete_mesh_status_for_node,

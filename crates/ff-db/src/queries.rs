@@ -3291,6 +3291,105 @@ pub async fn pg_list_deferred(
     Ok(rows.iter().map(row_to_deferred).collect())
 }
 
+/// A `(label, count)` pair used across the deferred-queue stats rollups.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeferredCount {
+    pub label: String,
+    pub count: i64,
+}
+
+/// Aggregate health snapshot of the `deferred_tasks` queue. Powers `ff defer
+/// stats` (and any dashboard/API): depth by status, recent failure patterns,
+/// recent creation rate by title-prefix (a flood detector), and the oldest
+/// still-pending task (a stuck-trigger detector).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct DeferredStats {
+    pub window_hours: i64,
+    pub by_status: Vec<DeferredCount>,
+    pub recent_failures: Vec<DeferredCount>,
+    pub recent_created: Vec<DeferredCount>,
+    pub oldest_pending_id: Option<String>,
+    pub oldest_pending_age_secs: Option<i64>,
+}
+
+/// Compute a [`DeferredStats`] over a trailing `window_hours` window.
+pub async fn pg_deferred_stats(pool: &PgPool, window_hours: i64) -> Result<DeferredStats> {
+    let by_status = sqlx::query(
+        "SELECT status AS label, COUNT(*) AS count FROM deferred_tasks
+         GROUP BY status ORDER BY COUNT(*) DESC",
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|r| DeferredCount {
+        label: r.get("label"),
+        count: r.get("count"),
+    })
+    .collect();
+
+    let recent_failures = sqlx::query(
+        "SELECT LEFT(COALESCE(last_error, '(no error text)'), 60) AS label, COUNT(*) AS count
+           FROM deferred_tasks
+          WHERE status = 'failed'
+            AND created_at > now() - make_interval(hours => $1::int)
+          GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 10",
+    )
+    .bind(window_hours as i32)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|r| DeferredCount {
+        label: r.get("label"),
+        count: r.get("count"),
+    })
+    .collect();
+
+    // Flood detector: tasks created per (first two title words) in the window.
+    let recent_created = sqlx::query(
+        "SELECT split_part(title, ' ', 1) || ' ' || split_part(title, ' ', 2) AS label,
+                COUNT(*) AS count
+           FROM deferred_tasks
+          WHERE created_at > now() - make_interval(hours => $1::int)
+          GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 10",
+    )
+    .bind(window_hours as i32)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|r| DeferredCount {
+        label: r.get("label"),
+        count: r.get("count"),
+    })
+    .collect();
+
+    let oldest = sqlx::query(
+        "SELECT id::text AS id,
+                EXTRACT(EPOCH FROM (now() - created_at))::bigint AS age_secs
+           FROM deferred_tasks
+          WHERE status = 'pending'
+          ORDER BY created_at ASC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let (oldest_pending_id, oldest_pending_age_secs) = match oldest {
+        Some(r) => (
+            Some(r.get::<String, _>("id")),
+            Some(r.get::<i64, _>("age_secs")),
+        ),
+        None => (None, None),
+    };
+
+    Ok(DeferredStats {
+        window_hours,
+        by_status,
+        recent_failures,
+        recent_created,
+        oldest_pending_id,
+        oldest_pending_age_secs,
+    })
+}
+
 /// Fetch a single deferred task by id. Returns None if missing.
 pub async fn pg_get_deferred(pool: &PgPool, id: &str) -> Result<Option<DeferredTaskRow>> {
     let uuid = sqlx::types::Uuid::parse_str(id)
