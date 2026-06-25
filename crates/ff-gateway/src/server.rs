@@ -883,6 +883,14 @@ struct HealthResponse {
     status: &'static str,
     service: &'static str,
     version: &'static str,
+    /// Git SHA (10-char) the RUNNING daemon was compiled from — baked at build
+    /// time (ff-gateway/build.rs). Lets `curl <node>:PORT/health` answer "what
+    /// code is this daemon actually executing?" without deriving it from
+    /// process-start-time vs binary mtime. Distinct from `version` (the static
+    /// crate version) and from `computer_software.installed_version` (which can
+    /// momentarily reflect the on-disk binary after a deploy whose restart
+    /// hasn't swapped the process yet — the exact gap this surfaces).
+    build_sha: &'static str,
     uptime_epoch: i64,
     ws_clients: usize,
     inbound_buffered: usize,
@@ -911,6 +919,7 @@ async fn health(State(state): State<Arc<GatewayState>>) -> Json<HealthResponse> 
         status: "ok",
         service: "ff-gateway",
         version: ff_core::VERSION,
+        build_sha: env!("FF_GATEWAY_GIT_SHA"),
         uptime_epoch: Utc::now().timestamp(),
         ws_clients: state.web_clients.len(),
         inbound_buffered: state.inbound_messages.len(),
@@ -6049,4 +6058,24 @@ fn parse_autoload_url(url: &str) -> Option<(String, u16)> {
     let (host, port_str) = rest.rsplit_once(':')?;
     let port: u16 = port_str.parse().ok()?;
     Some((host.to_string(), port))
+}
+
+#[cfg(test)]
+mod build_sha_tests {
+    /// The /health build_sha is baked by ff-gateway/build.rs. `env!` already
+    /// fails the build if the var is missing; this pins that it is non-empty
+    /// and, when git was available at build time, a 10-char short SHA (matching
+    /// forgefleetd's `(pushed <sha>)`) rather than the "unknown" fallback.
+    #[test]
+    fn build_sha_is_baked_and_well_formed() {
+        let sha = env!("FF_GATEWAY_GIT_SHA");
+        assert!(!sha.is_empty(), "FF_GATEWAY_GIT_SHA must be baked");
+        if sha != "unknown" {
+            assert_eq!(sha.len(), 10, "short SHA should be 10 chars, got {sha:?}");
+            assert!(
+                sha.chars().all(|c| c.is_ascii_hexdigit()),
+                "SHA must be hex, got {sha:?}"
+            );
+        }
+    }
 }
