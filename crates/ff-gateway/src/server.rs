@@ -912,6 +912,30 @@ struct TelegramTransportStatus {
     last_error: Option<String>,
 }
 
+/// Runtime override for the daemon's build SHA, set once at startup by the
+/// hosting binary (which has the always-fresh `env!("FF_GIT_SHA")`).
+static RUNTIME_BUILD_SHA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Inject the running daemon's git SHA. Call ONCE at startup from the binary
+/// (`forgefleetd`) whose root build script keeps `FF_GIT_SHA` fresh. Preferred
+/// over the compile-time `FF_GATEWAY_GIT_SHA` bake because ff-gateway's build
+/// script does NOT re-run when only `main` advances (its `.git/HEAD` watch is a
+/// branch ref that never changes), so the baked value goes stale across deploys
+/// — which made /health report an old SHA while the process ran new code
+/// (false "stale-daemon" in `ff fleet versions --live`, 2026-06-25).
+pub fn set_runtime_build_sha(sha: impl Into<String>) {
+    let _ = RUNTIME_BUILD_SHA.set(sha.into());
+}
+
+/// The build SHA to report: the runtime-injected value if set, else the
+/// compile-time bake (which may be stale — see [`set_runtime_build_sha`]).
+fn current_build_sha() -> &'static str {
+    RUNTIME_BUILD_SHA
+        .get()
+        .map(String::as_str)
+        .unwrap_or(env!("FF_GATEWAY_GIT_SHA"))
+}
+
 async fn health(State(state): State<Arc<GatewayState>>) -> Json<HealthResponse> {
     let telegram_transport = telegram_transport_snapshot(state.as_ref()).await;
 
@@ -919,7 +943,7 @@ async fn health(State(state): State<Arc<GatewayState>>) -> Json<HealthResponse> 
         status: "ok",
         service: "ff-gateway",
         version: ff_core::VERSION,
-        build_sha: env!("FF_GATEWAY_GIT_SHA"),
+        build_sha: current_build_sha(),
         uptime_epoch: Utc::now().timestamp(),
         ws_clients: state.web_clients.len(),
         inbound_buffered: state.inbound_messages.len(),
@@ -6077,5 +6101,12 @@ mod build_sha_tests {
                 "SHA must be hex, got {sha:?}"
             );
         }
+    }
+
+    #[test]
+    fn current_build_sha_falls_back_to_compile_time_bake() {
+        // Without a runtime injection, /health reports the compile-time bake —
+        // never empty (the binary always has SOME identity to report).
+        assert!(!super::current_build_sha().is_empty());
     }
 }
