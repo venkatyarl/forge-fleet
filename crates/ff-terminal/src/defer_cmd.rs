@@ -350,8 +350,71 @@ pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
                 std::process::exit(1);
             }
         }
+        crate::DeferCommand::Stats { window_hours, json } => {
+            let stats = ff_db::pg_deferred_stats(&pool, window_hours).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            } else {
+                print!("{}", render_deferred_stats(&stats));
+            }
+        }
     }
     Ok(())
+}
+
+/// Render a [`ff_db::DeferredStats`] as a human report (pure; unit-tested).
+fn render_deferred_stats(s: &ff_db::DeferredStats) -> String {
+    let mut out = String::new();
+    let total: i64 = s.by_status.iter().map(|c| c.count).sum();
+    out.push_str(&format!("deferred_tasks queue — {total} rows total\n"));
+
+    out.push_str("\n  by status:\n");
+    for c in &s.by_status {
+        out.push_str(&format!("    {:<12} {}\n", c.label, c.count));
+    }
+
+    out.push_str(&format!(
+        "\n  created in last {}h (flood detector):\n",
+        s.window_hours
+    ));
+    if s.recent_created.is_empty() {
+        out.push_str("    (none)\n");
+    }
+    for c in &s.recent_created {
+        out.push_str(&format!("    {:>5}  {}\n", c.count, c.label));
+    }
+
+    out.push_str(&format!("\n  failures in last {}h:\n", s.window_hours));
+    if s.recent_failures.is_empty() {
+        out.push_str("    (none) ✓\n");
+    }
+    for c in &s.recent_failures {
+        out.push_str(&format!("    {:>5}  {}\n", c.count, c.label));
+    }
+
+    match (&s.oldest_pending_id, s.oldest_pending_age_secs) {
+        (Some(id), Some(age)) => out.push_str(&format!(
+            "\n  oldest pending: {id} ({})\n",
+            humanize_secs(age)
+        )),
+        _ => out.push_str("\n  oldest pending: (none)\n"),
+    }
+    out
+}
+
+/// Compact human duration for an age in seconds (e.g. `2h13m`, `4d1h`, `45s`).
+fn humanize_secs(secs: i64) -> String {
+    let s = secs.max(0);
+    let (d, h, m) = (s / 86_400, (s % 86_400) / 3600, (s % 3600) / 60);
+    if d > 0 {
+        format!("{d}d{h}h")
+    } else if h > 0 {
+        format!("{h}h{m}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{s}s")
+    }
 }
 
 #[cfg(test)]
@@ -368,6 +431,65 @@ mod tests {
         for s in ["pending", "dispatchable", "running", "Pending"] {
             assert!(!is_terminal_defer_status(s), "{s} should NOT be terminal");
         }
+    }
+
+    #[test]
+    fn humanize_secs_picks_the_right_unit() {
+        assert_eq!(humanize_secs(45), "45s");
+        assert_eq!(humanize_secs(130), "2m");
+        assert_eq!(humanize_secs(3 * 3600 + 13 * 60), "3h13m");
+        assert_eq!(humanize_secs(4 * 86_400 + 3600), "4d1h");
+        assert_eq!(humanize_secs(-5), "0s"); // clamped, never panics
+    }
+
+    #[test]
+    fn render_deferred_stats_shows_sections_and_totals() {
+        let s = ff_db::DeferredStats {
+            window_hours: 3,
+            by_status: vec![
+                ff_db::DeferredCount {
+                    label: "completed".into(),
+                    count: 100,
+                },
+                ff_db::DeferredCount {
+                    label: "failed".into(),
+                    count: 5,
+                },
+            ],
+            recent_failures: vec![ff_db::DeferredCount {
+                label: "exit 1: boom".into(),
+                count: 2,
+            }],
+            recent_created: vec![ff_db::DeferredCount {
+                label: "rsync postgres".into(),
+                count: 56,
+            }],
+            oldest_pending_id: Some("abc-123".into()),
+            oldest_pending_age_secs: Some(7200),
+        };
+        let out = render_deferred_stats(&s);
+        assert!(out.contains("105 rows total")); // 100 + 5
+        assert!(out.contains("completed    100"));
+        assert!(out.contains("flood detector"));
+        assert!(out.contains("rsync postgres"));
+        assert!(out.contains("exit 1: boom"));
+        assert!(out.contains("oldest pending: abc-123 (2h0m)"));
+    }
+
+    #[test]
+    fn render_deferred_stats_handles_clean_and_empty() {
+        let s = ff_db::DeferredStats {
+            window_hours: 6,
+            by_status: vec![],
+            recent_failures: vec![],
+            recent_created: vec![],
+            oldest_pending_id: None,
+            oldest_pending_age_secs: None,
+        };
+        let out = render_deferred_stats(&s);
+        assert!(out.contains("0 rows total"));
+        assert!(out.contains("(none) ✓")); // no failures
+        assert!(out.contains("oldest pending: (none)"));
     }
 
     #[test]
