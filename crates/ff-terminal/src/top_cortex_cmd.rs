@@ -211,6 +211,10 @@ pub enum TopCortexCommand {
         /// 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED, 0.0 = all (default).
         #[arg(long, default_value_t = 0.0)]
         min_confidence: f32,
+        /// Cross-repo: seed the closure from the symbol name in EVERY indexed
+        /// corpus and tag each affected symbol with its corpus (ignores --corpus).
+        #[arg(long)]
+        all_corpora: bool,
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
@@ -1005,20 +1009,31 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
             corpus,
             max_depth,
             min_confidence,
+            all_corpora,
             format,
         } => {
-            let corpus = corpus.unwrap_or_else(cwd_slug);
-            crate::cortex_cmd::handle_cortex(
-                &pool,
-                crate::CortexCommand::Impact {
-                    corpus,
-                    symbol,
-                    max_depth,
-                    min_confidence,
-                    format,
-                },
-            )
-            .await?;
+            if all_corpora {
+                let hits =
+                    cortex::impact_all_corpora(&pool, &symbol, max_depth, min_confidence).await?;
+                print_cross_corpus_call_refs(
+                    &hits,
+                    format.as_str(),
+                    &format!("impact of {symbol} (all corpora, depth {max_depth})"),
+                );
+            } else {
+                let corpus = corpus.unwrap_or_else(cwd_slug);
+                crate::cortex_cmd::handle_cortex(
+                    &pool,
+                    crate::CortexCommand::Impact {
+                        corpus,
+                        symbol,
+                        max_depth,
+                        min_confidence,
+                        format,
+                    },
+                )
+                .await?;
+            }
         }
         TopCortexCommand::Tests {
             symbol,
