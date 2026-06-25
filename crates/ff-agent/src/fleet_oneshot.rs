@@ -30,6 +30,11 @@ pub struct FleetOneshot {
     /// The catalog model name that answered (best-effort).
     pub model: String,
     pub latency_ms: u128,
+    /// Prompt/completion tokens from the response `usage` block (0 when the
+    /// server omits it), so callers can attribute the turn's cost in
+    /// `ff_interactions` instead of logging 0/0.
+    pub tokens_in: i32,
+    pub tokens_out: i32,
 }
 
 /// Dispatch `prompt` to one healthy fleet deployment and return its answer.
@@ -109,13 +114,26 @@ pub async fn fleet_oneshot(
         .filter(|t| !t.trim().is_empty())
         .ok_or_else(|| anyhow!("{worker_name} ({model}) returned an empty completion"))?;
 
+    let (tokens_in, tokens_out) = usage_tokens_i32(&payload);
     Ok(FleetOneshot {
         text,
         endpoint,
         worker_name,
         model,
         latency_ms: start.elapsed().as_millis(),
+        tokens_in,
+        tokens_out,
     })
+}
+
+/// Read `(tokens_in, tokens_out)` from a chat-completion `usage` block, clamped
+/// into `i32` for the `ff_interactions` columns. Reuses the canonical
+/// `research::parse_completion_usage` walk (no forked JSON parsing); a server
+/// that omits `usage`, or absurd values, degrade to `0`/`i32::MAX`. Pure.
+fn usage_tokens_i32(payload: &Value) -> (i32, i32) {
+    let (pt, ct) = crate::research::parse_completion_usage(payload);
+    let clamp = |n: u64| i32::try_from(n).unwrap_or(i32::MAX);
+    (clamp(pt), clamp(ct))
 }
 
 /// Choose a candidate: the first whose catalog id OR name contains `model_hint`
@@ -185,6 +203,24 @@ mod tests {
         let p = json!({"choices":[{"text":"legacy"}]});
         assert_eq!(extract_completion_text(&p).as_deref(), Some("legacy"));
         assert_eq!(extract_completion_text(&json!({})), None);
+    }
+
+    // Authored by a fleet model (qwen36 on lily) via `ff offload`, hand-verified,
+    // then integrated — dogfooding the fleet for test-gen (grows ff_interactions).
+    // Pins the usage→i32 clamp that feeds council token attribution.
+    #[test]
+    fn usage_tokens_i32_reads_usage() {
+        assert_eq!(
+            usage_tokens_i32(&json!({"usage":{"prompt_tokens":123,"completion_tokens":45}})),
+            (123, 45)
+        );
+        assert_eq!(usage_tokens_i32(&json!({})), (0, 0));
+        assert_eq!(
+            usage_tokens_i32(
+                &json!({"usage":{"prompt_tokens":5000000000u64,"completion_tokens":0}})
+            ),
+            (i32::MAX, 0)
+        );
     }
 
     #[test]

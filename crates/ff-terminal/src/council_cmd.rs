@@ -33,6 +33,11 @@ struct MemberRaw {
     endpoint: Option<String>,
     /// The fleet computer that answered (local members only).
     worker_name: Option<String>,
+    /// Prompt/completion tokens for this dispatch. Populated for local fleet
+    /// members (the endpoint returns a `usage` block); `0` for vendor CLIs,
+    /// which don't report token counts.
+    tokens_in: i32,
+    tokens_out: i32,
 }
 
 impl MemberRaw {
@@ -43,6 +48,8 @@ impl MemberRaw {
             latency_ms: None,
             endpoint: None,
             worker_name: None,
+            tokens_in: 0,
+            tokens_out: 0,
         }
     }
 }
@@ -194,6 +201,8 @@ async fn dispatch_member(
                 latency_ms: i32::try_from(o.latency_ms).ok(),
                 endpoint: Some(format!("{} ({})", o.endpoint, o.model)),
                 worker_name: Some(o.worker_name),
+                tokens_in: o.tokens_in,
+                tokens_out: o.tokens_out,
             },
             Err(e) => MemberRaw::fail(e.to_string()),
         };
@@ -207,6 +216,8 @@ async fn dispatch_member(
             latency_ms: i32::try_from(r.duration_ms).ok(),
             endpoint: Some(format!("ff council/{member}")),
             worker_name: None,
+            tokens_in: 0,
+            tokens_out: 0,
         },
         Ok(r) => MemberRaw {
             answer: None,
@@ -222,6 +233,8 @@ async fn dispatch_member(
             latency_ms: i32::try_from(r.duration_ms).ok(),
             endpoint: Some(format!("ff council/{member}")),
             worker_name: None,
+            tokens_in: 0,
+            tokens_out: 0,
         },
         Err(e) => MemberRaw::fail(e.to_string()),
     }
@@ -258,6 +271,8 @@ async fn log_council(
         engine: Some(member.to_string()),
         response_text,
         latency_ms: raw.latency_ms,
+        tokens_in: raw.tokens_in,
+        tokens_out: raw.tokens_out,
         outcome,
         error_text,
         endpoint: raw

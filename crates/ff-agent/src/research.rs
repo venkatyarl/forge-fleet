@@ -1861,7 +1861,10 @@ async fn update_session_status(pool: &PgPool, session_id: Uuid, status: &str) ->
 /// the assistant's text content.
 /// Extract `(prompt_tokens, completion_tokens)` from an OpenAI-compatible
 /// chat-completion response's `usage` block; `(0, 0)` when absent. Pure.
-fn parse_completion_usage(v: &Value) -> (u64, u64) {
+///
+/// `pub(crate)` so other in-crate dispatchers (e.g. `fleet_oneshot`) reuse the
+/// one canonical usage parser instead of forking the JSON walk.
+pub(crate) fn parse_completion_usage(v: &Value) -> (u64, u64) {
     let g = |k: &str| {
         v.get("usage")
             .and_then(|u| u.get(k))
