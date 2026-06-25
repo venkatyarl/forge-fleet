@@ -74,6 +74,28 @@ pub(crate) fn base_family(os_family: &str) -> Option<&'static str> {
     }
 }
 
+/// Robust repo-sync prelude for every forge-fleet upgrade playbook.
+///
+/// Replaces the fragile `git pull --ff-only`, which dies
+/// `fatal: Cannot fast-forward to multiple branches` (and `Not possible to
+/// fast-forward, aborting`) the moment the local checkout has diverged from
+/// origin — a force-pushed/rebased history upstream, a stray local commit, a
+/// multi-merge-head FETCH_HEAD, or a detached HEAD. Because the pull fails the
+/// build never runs, the binary never updates, and the auto-upgrade tick
+/// re-queues the SAME upgrade every cycle: 748 `Cannot fast-forward` failures
+/// in 24h on marcus+logan alone (the #1 deferred-task failure fleet-wide).
+///
+/// `git fetch && git reset --hard origin/main` lands EXACTLY on the upgrade
+/// target regardless of the prior tree state — idempotent and divergence-proof.
+/// This is the same approach the two paths that DON'T fail already use:
+/// `ff fleet deploy` and the leader self-upgrade (auto_upgrade.rs both do
+/// `git fetch origin` + `git reset --hard <ref>`). The `git clean` drops build
+/// artifacts (graphify-out / node-compile-cache) that could shadow the fresh
+/// tree. Fleet worker checkouts are pure deployments (Taylor, the only dev
+/// tree, is excluded from auto-upgrade), so a hard reset never clobbers work.
+const GIT_SYNC_FORGE_FLEET: &str = "cd ~/projects/forge-fleet && git fetch origin --prune && \
+     git reset --hard origin/main && git clean -fdx graphify-out node-compile-cache";
+
 fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
     match (tool, os_family) {
         ("gh", "linux") => {
@@ -118,16 +140,16 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
         // (POSIX `source`) so dash + bash both load it.
         ("ff_git" | "ff", "macos") => Some(format!(
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
-             cd ~/projects/forge-fleet && git pull --ff-only && \
+             {sync} && \
              cargo build -p ff-terminal --release && {install}",
+            sync = GIT_SYNC_FORGE_FLEET,
             install = atomic_install_cmd("ff", "$HOME/.local/bin/ff", true),
         )),
         ("ff_git" | "ff", "linux") => Some(format!(
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
-             cd ~/projects/forge-fleet && git reset --hard HEAD && \
-             git clean -fdx graphify-out node-compile-cache && \
-             git pull --ff-only && \
+             {sync} && \
              cargo build -p ff-terminal --release && {install}",
+            sync = GIT_SYNC_FORGE_FLEET,
             install = atomic_install_cmd("ff", "$HOME/.local/bin/ff", false),
         )),
         // forgefleetd build + install + RESTART. Without the restart step
@@ -165,7 +187,7 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
         // before the daemon is bounced.
         ("forgefleetd_git" | "forgefleetd", "macos") => Some(format!(
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
-             cd ~/projects/forge-fleet && git pull --ff-only && \
+             {sync} && \
              cargo build --bin forgefleetd --release && {install} && \
              USER_ID=$(stat -f %u \"$HOME\" 2>/dev/null || id -u); \
              launchctl kickstart -k \"gui/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
@@ -173,13 +195,12 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
                || (pkill -TERM -f \"$HOME/.local/bin/forgefleetd\" 2>/dev/null; sleep 1; \
                    nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
                    </dev/null >/tmp/forgefleetd.log 2>&1 & disown)",
+            sync = GIT_SYNC_FORGE_FLEET,
             install = atomic_install_cmd("forgefleetd", "$HOME/.local/bin/forgefleetd", true),
         )),
         ("forgefleetd_git" | "forgefleetd", "linux") => Some(format!(
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
-             cd ~/projects/forge-fleet && git reset --hard HEAD && \
-             git clean -fdx graphify-out node-compile-cache && \
-             git pull --ff-only && \
+             {sync} && \
              cargo build --bin forgefleetd --release && {install} && \
              export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
              setsid bash -c 'sleep 2; \
@@ -191,6 +212,7 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
                </dev/null >/tmp/forgefleetd-restart.log 2>&1 & \
              disown; \
              echo \"build+install OK; restart dispatched detached (setsid + --no-block; survives worker self-kill)\"",
+            sync = GIT_SYNC_FORGE_FLEET,
             install = atomic_install_cmd("forgefleetd", "$HOME/.local/bin/forgefleetd", false),
         )),
         // DGX Sparks: aarch64 + 4 cores. Default cargo parallelism uses all
@@ -200,9 +222,7 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
         // (DGX.1, 2026-05-19.)
         ("forgefleetd_git" | "forgefleetd", "linux-dgx") => Some(format!(
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
-             cd ~/projects/forge-fleet && git reset --hard HEAD && \
-             git clean -fdx graphify-out node-compile-cache && \
-             git pull --ff-only && \
+             {sync} && \
              cargo build --bin forgefleetd --release -j 2 && {install} && \
              export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
              setsid bash -c 'sleep 2; \
@@ -214,6 +234,7 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
                </dev/null >/tmp/forgefleetd-restart.log 2>&1 & \
              disown; \
              echo \"build+install OK; restart dispatched detached (setsid + --no-block; survives worker self-kill)\"",
+            sync = GIT_SYNC_FORGE_FLEET,
             install = atomic_install_cmd("forgefleetd", "$HOME/.local/bin/forgefleetd", false),
         )),
         ("os", "linux") => Some("sudo apt-get update && sudo apt-get -y upgrade".into()),
@@ -265,6 +286,32 @@ mod tests {
     #[test]
     fn unknown_os_is_none() {
         assert!(playbook_for("forgefleetd_git", "plan9").is_none());
+    }
+
+    #[test]
+    fn forge_fleet_upgrades_reset_hard_never_pull() {
+        // The 748/24h `fatal: Cannot fast-forward to multiple branches` failures
+        // (marcus+logan): `git pull --ff-only` can't recover a diverged checkout.
+        // Every forge-fleet build playbook must sync via `git reset --hard
+        // origin/main` (divergence-proof, same as deploy) and NEVER `git pull`.
+        for tool in ["ff_git", "forgefleetd_git"] {
+            for fam in ["macos", "macos-15", "linux", "linux-ubuntu", "linux-dgx"] {
+                let p = playbook_for(tool, fam)
+                    .unwrap_or_else(|| panic!("no playbook for {tool}/{fam}"));
+                assert!(
+                    p.contains("git reset --hard origin/main"),
+                    "{tool}/{fam} must hard-reset to origin/main"
+                );
+                assert!(
+                    p.contains("git fetch origin"),
+                    "{tool}/{fam} must fetch before reset"
+                );
+                assert!(
+                    !p.contains("git pull"),
+                    "{tool}/{fam} must NOT use the fragile git pull"
+                );
+            }
+        }
     }
 
     #[test]
