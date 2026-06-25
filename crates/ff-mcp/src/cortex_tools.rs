@@ -8,8 +8,8 @@
 //! `ff cortex index`; these tools only query it.
 
 use ff_brain::{
-    call_path, callees, callers, corpus, cortex, find_symbols, find_symbols_all_corpora,
-    find_symbols_semantic, impact, tests_for,
+    call_path, callees, callees_all_corpora, callers, callers_all_corpora, corpus, cortex,
+    find_symbols, find_symbols_all_corpora, find_symbols_semantic, impact, tests_for,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -535,9 +535,22 @@ fn min_confidence_param(params: &Option<Value>) -> f32 {
 
 /// Callers of a code symbol (who calls it).
 pub async fn cortex_callers(params: Option<Value>) -> HandlerResult {
-    let (corpus_slug, symbol) = corpus_and_symbol(&params)?;
     let min_confidence = min_confidence_param(&params);
     let pool = get_pool().await?;
+    if bool_param(&params, "all_corpora", false) {
+        let symbol = symbol_param(&params)?;
+        let hits = callers_all_corpora(&pool, &symbol, min_confidence)
+            .await
+            .map_err(|e| format!("callers: {e}"))?;
+        return Ok(json!({
+            "symbol": symbol,
+            "all_corpora": true,
+            "min_confidence": min_confidence,
+            "count": hits.len(),
+            "callers": cross_corpus_symbols_json(&hits),
+        }));
+    }
+    let (corpus_slug, symbol) = corpus_and_symbol(&params)?;
     let rows = callers(&pool, &corpus_slug, &symbol, min_confidence)
         .await
         .map_err(|e| format!("callers: {e}"))?;
@@ -550,11 +563,40 @@ pub async fn cortex_callers(params: Option<Value>) -> HandlerResult {
     }))
 }
 
+/// Serialize cross-corpus callers/callees, each tagged with its corpus.
+fn cross_corpus_symbols_json(hits: &[(String, ff_brain::SymbolRef)]) -> Vec<Value> {
+    hits.iter()
+        .map(|(corpus, s)| {
+            json!({
+                "corpus": corpus,
+                "qualified_name": s.qualified_name,
+                "node_type": s.node_type,
+                "file": s.file,
+                "start_line": s.start_line,
+                "id": s.id.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Callees of a code symbol (what it calls).
 pub async fn cortex_callees(params: Option<Value>) -> HandlerResult {
-    let (corpus_slug, symbol) = corpus_and_symbol(&params)?;
     let min_confidence = min_confidence_param(&params);
     let pool = get_pool().await?;
+    if bool_param(&params, "all_corpora", false) {
+        let symbol = symbol_param(&params)?;
+        let hits = callees_all_corpora(&pool, &symbol, min_confidence)
+            .await
+            .map_err(|e| format!("callees: {e}"))?;
+        return Ok(json!({
+            "symbol": symbol,
+            "all_corpora": true,
+            "min_confidence": min_confidence,
+            "count": hits.len(),
+            "callees": cross_corpus_symbols_json(&hits),
+        }));
+    }
+    let (corpus_slug, symbol) = corpus_and_symbol(&params)?;
     let rows = callees(&pool, &corpus_slug, &symbol, min_confidence)
         .await
         .map_err(|e| format!("callees: {e}"))?;
@@ -852,4 +894,41 @@ fn git_changed_line_ranges(
         .into_iter()
         .map(|(rel, ranges)| (root.join(rel).to_string_lossy().to_string(), ranges))
         .collect())
+}
+
+#[cfg(test)]
+mod all_corpora_param_tests {
+    use super::{bool_param, symbol_param};
+    use serde_json::json;
+
+    #[test]
+    fn all_corpora_flag_reads_bool_default_false() {
+        assert!(bool_param(
+            &Some(json!({"all_corpora": true})),
+            "all_corpora",
+            false
+        ));
+        assert!(!bool_param(
+            &Some(json!({"all_corpora": false})),
+            "all_corpora",
+            false
+        ));
+        // absent → default false
+        assert!(!bool_param(
+            &Some(json!({"symbol": "x"})),
+            "all_corpora",
+            false
+        ));
+        assert!(!bool_param(&None, "all_corpora", false));
+    }
+
+    #[test]
+    fn symbol_param_requires_symbol_no_corpus() {
+        assert_eq!(
+            symbol_param(&Some(json!({"symbol": "load_model"}))).unwrap(),
+            "load_model"
+        );
+        assert!(symbol_param(&Some(json!({"corpus": "forge-fleet"}))).is_err());
+        assert!(symbol_param(&None).is_err());
+    }
 }
