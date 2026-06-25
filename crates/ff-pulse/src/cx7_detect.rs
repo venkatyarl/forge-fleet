@@ -11,20 +11,32 @@ use crate::beat_v2::Ip;
 pub fn detect_fabric_kind(iface: &str) -> Option<String> {
     let out = Command::new("ethtool").arg("-i").arg(iface).output().ok()?;
     let txt = String::from_utf8_lossy(&out.stdout);
-    let is_mlx = txt
-        .lines()
-        .any(|l| l.starts_with("driver:") && l.contains("mlx5_core"));
-    if !is_mlx {
+    if !is_mlx5_driver(&txt) {
         return None;
     }
     Some("cx7-fabric".to_string())
+}
+
+/// True when `ethtool -i <iface>` output reports the `mlx5_core` driver
+/// (Mellanox ConnectX family). Pure.
+pub fn is_mlx5_driver(ethtool_i_output: &str) -> bool {
+    ethtool_i_output
+        .lines()
+        .any(|l| l.starts_with("driver:") && l.contains("mlx5_core"))
 }
 
 /// Parse `ethtool <iface>` output to extract link speed in Gbps.
 pub fn link_speed_gbps(iface: &str) -> Option<u32> {
     let out = Command::new("ethtool").arg(iface).output().ok()?;
     let txt = String::from_utf8_lossy(&out.stdout);
-    for line in txt.lines() {
+    parse_ethtool_speed_gbps(&txt)
+}
+
+/// Extract link speed in Gbps from `ethtool <iface>` output (the `Speed:` line,
+/// e.g. `Speed: 200000Mb/s` → `200`). `None` when the line is absent or
+/// non-numeric (`Speed: Unknown!`). Pure.
+pub fn parse_ethtool_speed_gbps(ethtool_output: &str) -> Option<u32> {
+    for line in ethtool_output.lines() {
         let t = line.trim();
         if let Some(rest) = t.strip_prefix("Speed:") {
             let num: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
@@ -77,5 +89,37 @@ pub fn enrich_ip(ip: &mut Ip, my_computer_name: &str) {
     // 10.44.x IPs. Fill paired_with from the static map.
     if ip.kind == "tb-fabric" {
         ip.paired_with = paired_peer_for(my_computer_name);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The three pure-parser tests below were authored by a fleet model (qwen36
+    // on lily) via `ff offload`, hand-verified, then integrated — dogfooding the
+    // fleet for test-gen. They pin the CX-7 fabric-detection parsing layer
+    // (previously 0 tests) that annotates beats for the DGX TP=2 vLLM pairs.
+    #[test]
+    fn is_mlx5_driver_detects() {
+        assert!(is_mlx5_driver("driver: mlx5_core\nversion: 5.x\n"));
+        assert!(!is_mlx5_driver("driver: e1000e\nversion: 1.0\n"));
+        assert!(!is_mlx5_driver(""));
+    }
+
+    #[test]
+    fn parse_ethtool_speed_gbps_works() {
+        assert_eq!(parse_ethtool_speed_gbps("\tSpeed: 200000Mb/s\n"), Some(200));
+        assert_eq!(parse_ethtool_speed_gbps("Speed: Unknown!"), None);
+        assert_eq!(parse_ethtool_speed_gbps("Duplex: Full"), None);
+        assert_eq!(parse_ethtool_speed_gbps("Speed: 400000Mb/s"), Some(400));
+    }
+
+    #[test]
+    fn paired_peer_for_pairs() {
+        assert_eq!(paired_peer_for("sia").as_deref(), Some("adele"));
+        assert_eq!(paired_peer_for("ADELE").as_deref(), Some("sia"));
+        assert_eq!(paired_peer_for("taylor").as_deref(), Some("james"));
+        assert_eq!(paired_peer_for("nobody").as_deref(), None);
     }
 }
