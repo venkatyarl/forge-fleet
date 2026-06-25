@@ -178,6 +178,166 @@ pub async fn deps(pool: &PgPool, corpus_slug: Option<&str>) -> Result<Vec<DepPac
         .collect())
 }
 
+/// One dependency edge out of a specific crate (forward direction).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CrateDepEdge {
+    pub name: String,
+    pub version: Option<String>,
+    pub section: Option<String>,
+    pub ecosystem: Option<String>,
+    /// True when a `code:crate` node with this name exists in the corpus — i.e.
+    /// a workspace-internal dependency rather than a third-party package.
+    pub internal: bool,
+}
+
+/// One crate that depends ON the queried crate (reverse direction).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CrateDependent {
+    pub name: String,
+    pub node_type: String,
+}
+
+/// Forward (what it needs) + reverse (what needs it) dependency view for a
+/// single crate. The reverse list is the workspace rebuild "blast radius".
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CrateDeps {
+    pub crate_name: String,
+    pub corpus: Option<String>,
+    pub dependencies: Vec<CrateDepEdge>,
+    pub dependents: Vec<CrateDependent>,
+}
+
+// Generation-liveness predicate shared by both per-crate queries: a row is live
+// when its generation is 0 (base) or the corpus's current generation. Mirrors
+// the filter in `deps()` so per-crate queries can't surface stale-generation rows.
+const GEN_LIVE: &str = "COALESCE({alias}.generation, 0) IN (
+    0, COALESCE((SELECT current_generation FROM cortex_generations
+                  WHERE project = {proj}), 0))";
+
+/// Per-crate dependency graph: what `crate_name` depends on (forward) and what
+/// depends on it (reverse). `corpus_slug = None` searches every indexed corpus.
+pub async fn deps_for_crate(
+    pool: &PgPool,
+    crate_name: &str,
+    corpus_slug: Option<&str>,
+) -> Result<CrateDeps> {
+    let fwd_gen_c = GEN_LIVE
+        .replace("{alias}", "c")
+        .replace("{proj}", "c.project");
+    let fwd_gen_e = GEN_LIVE
+        .replace("{alias}", "e")
+        .replace("{proj}", "c.project");
+    let fwd_gen_d = GEN_LIVE
+        .replace("{alias}", "d")
+        .replace("{proj}", "c.project");
+    let fwd_sql = format!(
+        r#"SELECT d.title AS package,
+                  e.evidence->>'version'   AS version,
+                  e.evidence->>'section'   AS section,
+                  e.evidence->>'ecosystem' AS ecosystem,
+                  EXISTS (SELECT 1 FROM brain_vault_nodes ic
+                           WHERE ic.node_type = 'code:crate'
+                             AND ic.title = d.title
+                             AND ic.project = c.project) AS internal
+             FROM brain_vault_nodes c
+             JOIN brain_vault_edges e ON e.src_id = c.id AND e.edge_type = 'depends_on'
+             JOIN brain_vault_nodes d ON d.id = e.dst_id
+            WHERE c.node_type = 'code:crate'
+              AND c.title = $1
+              AND ($2::text IS NULL OR c.project = $2)
+              AND {fwd_gen_c} AND {fwd_gen_e} AND {fwd_gen_d}
+            ORDER BY internal DESC, d.title"#
+    );
+    let dependencies = sqlx::query(&fwd_sql)
+        .bind(crate_name)
+        .bind(corpus_slug)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|r| CrateDepEdge {
+            name: r.get("package"),
+            version: r.try_get("version").ok(),
+            section: r.try_get("section").ok(),
+            ecosystem: r.try_get("ecosystem").ok(),
+            internal: r.try_get("internal").unwrap_or(false),
+        })
+        .collect();
+
+    let rev_gen_p = GEN_LIVE
+        .replace("{alias}", "p")
+        .replace("{proj}", "p.project");
+    let rev_gen_e = GEN_LIVE
+        .replace("{alias}", "e")
+        .replace("{proj}", "p.project");
+    let rev_gen_c = GEN_LIVE
+        .replace("{alias}", "c")
+        .replace("{proj}", "p.project");
+    let rev_sql = format!(
+        r#"SELECT DISTINCT c.title AS dependent, c.node_type AS node_type
+             FROM brain_vault_nodes p
+             JOIN brain_vault_edges e ON e.dst_id = p.id AND e.edge_type = 'depends_on'
+             JOIN brain_vault_nodes c ON c.id = e.src_id
+            WHERE p.title = $1
+              AND p.node_type IN ('dep:package', 'code:crate')
+              AND c.node_type IN ('code:crate', 'code:mod')
+              AND ($2::text IS NULL OR p.project = $2)
+              AND {rev_gen_p} AND {rev_gen_e} AND {rev_gen_c}
+            ORDER BY c.title"#
+    );
+    let dependents = sqlx::query(&rev_sql)
+        .bind(crate_name)
+        .bind(corpus_slug)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|r| CrateDependent {
+            name: r.get("dependent"),
+            node_type: r.get("node_type"),
+        })
+        .collect();
+
+    Ok(CrateDeps {
+        crate_name: crate_name.to_string(),
+        corpus: corpus_slug.map(ToString::to_string),
+        dependencies,
+        dependents,
+    })
+}
+
+/// Render a [`CrateDeps`] as a human-readable report (pure; used by the CLI).
+pub fn render_crate_deps(cd: &CrateDeps) -> String {
+    let mut out = String::new();
+    let scope = cd.corpus.as_deref().unwrap_or("all corpora");
+    out.push_str(&format!("crate '{}' ({scope})\n", cd.crate_name));
+
+    let (internal, external): (Vec<_>, Vec<_>) = cd.dependencies.iter().partition(|d| d.internal);
+    out.push_str(&format!(
+        "\n  depends on ({} internal, {} external):\n",
+        internal.len(),
+        external.len()
+    ));
+    if cd.dependencies.is_empty() {
+        out.push_str("    (none — crate not found, or has no manifest deps)\n");
+    }
+    for d in internal.iter().chain(external.iter()) {
+        let tag = if d.internal { "crate" } else { "pkg" };
+        let ver = d.version.as_deref().unwrap_or("*");
+        out.push_str(&format!("    → [{tag}] {} {ver}\n", d.name));
+    }
+
+    out.push_str(&format!(
+        "\n  depended on by ({} — rebuild blast radius):\n",
+        cd.dependents.len()
+    ));
+    if cd.dependents.is_empty() {
+        out.push_str("    (none)\n");
+    }
+    for c in &cd.dependents {
+        out.push_str(&format!("    ← {}\n", c.name));
+    }
+    out
+}
+
 fn parse_manifest(path: &Path) -> Result<Option<Manifest>> {
     match path.file_name().and_then(|name| name.to_str()) {
         Some("Cargo.toml") => parse_cargo_manifest(path),
@@ -318,4 +478,69 @@ fn crate_path(corpus: &str, crate_name: &str) -> String {
 
 fn package_path(corpus: &str, package: &str) -> String {
     format!("dep://{corpus}/{package}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn edge(name: &str, ver: &str, internal: bool) -> CrateDepEdge {
+        CrateDepEdge {
+            name: name.into(),
+            version: Some(ver.into()),
+            section: Some("dependencies".into()),
+            ecosystem: Some("cargo".into()),
+            internal,
+        }
+    }
+
+    #[test]
+    fn render_groups_internal_first_and_lists_blast_radius() {
+        let cd = CrateDeps {
+            crate_name: "ff-agent".into(),
+            corpus: Some("forge-fleet".into()),
+            dependencies: vec![
+                edge("tokio", "1", false),
+                edge("ff-db", "*", true),
+                edge("ff-core", "*", true),
+            ],
+            dependents: vec![
+                CrateDependent {
+                    name: "ff-terminal".into(),
+                    node_type: "code:crate".into(),
+                },
+                CrateDependent {
+                    name: "forge-fleet".into(),
+                    node_type: "code:crate".into(),
+                },
+            ],
+        };
+        let out = render_crate_deps(&cd);
+        assert!(out.contains("crate 'ff-agent' (forge-fleet)"));
+        assert!(out.contains("2 internal, 1 external"));
+        // Internal deps render before external ones.
+        let ffdb = out.find("ff-db").unwrap();
+        let tokio = out.find("tokio").unwrap();
+        assert!(
+            ffdb < tokio,
+            "internal crate deps must list before external pkgs"
+        );
+        assert!(out.contains("[crate] ff-db"));
+        assert!(out.contains("[pkg] tokio"));
+        assert!(out.contains("blast radius"));
+        assert!(out.contains("← ff-terminal"));
+    }
+
+    #[test]
+    fn render_handles_empty_both_directions() {
+        let cd = CrateDeps {
+            crate_name: "ghost".into(),
+            corpus: None,
+            ..Default::default()
+        };
+        let out = render_crate_deps(&cd);
+        assert!(out.contains("ghost' (all corpora)"));
+        assert!(out.contains("crate not found"));
+        assert!(out.contains("(none)"));
+    }
 }
