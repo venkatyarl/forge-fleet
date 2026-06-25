@@ -489,8 +489,9 @@ impl ResearchSession {
         };
 
         #[allow(clippy::type_complexity)]
-        let mut handles: Vec<tokio::task::JoinHandle<(Uuid, Result<(String, u64)>)>> =
-            Vec::with_capacity(plan.sub_questions.len());
+        let mut handles: Vec<
+            tokio::task::JoinHandle<(Uuid, Result<(String, u64, u64, u64)>)>,
+        > = Vec::with_capacity(plan.sub_questions.len());
         for (i, ((q, row), backend)) in plan
             .sub_questions
             .iter()
@@ -545,9 +546,11 @@ impl ResearchSession {
                     } else {
                         base_prompt
                     };
-                    let out = openai_single_completion(&endpoint, &model, &prompt, 8192, &client)
-                        .await
-                        .map(|s| (s, t0.elapsed().as_millis() as u64));
+                    let out = openai_single_completion_with_usage(
+                        &endpoint, &model, &prompt, 8192, &client,
+                    )
+                    .await
+                    .map(|(s, tin, tout)| (s, t0.elapsed().as_millis() as u64, tin, tout));
                     (row_id, out)
                 }
             }));
@@ -560,11 +563,17 @@ impl ResearchSession {
             let (_row_id, res) = handle
                 .await
                 .unwrap_or_else(|e| (row.id, Err(anyhow::anyhow!("subagent panic: {e}"))));
-            let (status, output, dur) = match res {
-                Ok((text, dur)) => (TaskStatus::Completed, text, dur),
+            let (status, output, dur, tin, tout) = match res {
+                Ok((text, dur, tin, tout)) => (TaskStatus::Completed, text, dur, tin, tout),
                 Err(e) => {
                     warn!(subtask = %row.id, error = %e, "research sub-agent failed");
-                    (TaskStatus::Failed, format!("(sub-agent error: {e})"), 0)
+                    (
+                        TaskStatus::Failed,
+                        format!("(sub-agent error: {e})"),
+                        0,
+                        0,
+                        0,
+                    )
                 }
             };
             results.push(AgentTaskResult {
@@ -574,6 +583,8 @@ impl ResearchSession {
                 events: Vec::new(),
                 duration_ms: dur,
                 turn_count: 1,
+                tokens_in: tin,
+                tokens_out: tout,
             });
         }
 
@@ -597,7 +608,7 @@ impl ResearchSession {
             } else {
                 failed += 1;
             }
-            let (tin, tout) = extract_token_counts(&result.events);
+            let (tin, tout) = (result.tokens_in, result.tokens_out);
             total_tokens_in += tin;
             total_tokens_out += tout;
             self.store_subtask_result(row.id, result, tin, tout).await?;
@@ -831,6 +842,10 @@ impl ResearchSession {
                 events: Vec::new(),
                 duration_ms: 0,
                 turn_count: 1,
+                // Reconstructed from persisted rows for the synthesizer; not
+                // re-logged to ff_interactions, so token counts aren't needed.
+                tokens_in: 0,
+                tokens_out: 0,
             });
         }
         if usable_outputs == 0 {
@@ -1844,6 +1859,19 @@ async fn update_session_status(pool: &PgPool, session_id: Uuid, status: &str) ->
 /// One-shot OpenAI-compatible completion call via the fleet gateway.
 /// Uses the chat-completions endpoint with a single user message. Returns
 /// the assistant's text content.
+/// Extract `(prompt_tokens, completion_tokens)` from an OpenAI-compatible
+/// chat-completion response's `usage` block; `(0, 0)` when absent. Pure.
+fn parse_completion_usage(v: &Value) -> (u64, u64) {
+    let g = |k: &str| {
+        v.get("usage")
+            .and_then(|u| u.get(k))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    (g("prompt_tokens"), g("completion_tokens"))
+}
+
+/// Back-compat wrapper: returns just the completion text (drops usage).
 pub async fn openai_single_completion(
     gateway_url: &str,
     model: &str,
@@ -1851,6 +1879,23 @@ pub async fn openai_single_completion(
     max_tokens: u32,
     client: &reqwest::Client,
 ) -> Result<String> {
+    openai_single_completion_with_usage(gateway_url, model, prompt, max_tokens, client)
+        .await
+        .map(|(text, _, _)| text)
+}
+
+/// Single chat completion that ALSO returns the server-reported token usage
+/// `(text, prompt_tokens, completion_tokens)`. The usage feeds ff_interactions
+/// (the training corpus) — research sub-agents previously logged 0 tokens
+/// because the usage block was parsed-then-discarded here (a dead
+/// `extract_token_counts` stub downstream).
+pub async fn openai_single_completion_with_usage(
+    gateway_url: &str,
+    model: &str,
+    prompt: &str,
+    max_tokens: u32,
+    client: &reqwest::Client,
+) -> Result<(String, u64, u64)> {
     let url = ff_core::url::normalize_chat_completions_url(gateway_url);
     let body = json!({
         "model": model,
@@ -1899,7 +1944,8 @@ pub async fn openai_single_completion(
                  and .reasoning in {v}"
             )
         })?;
-    Ok(content)
+    let (tin, tout) = parse_completion_usage(&v);
+    Ok((content, tin, tout))
 }
 
 fn strip_json_fences(s: &str) -> &str {
@@ -1964,18 +2010,34 @@ fn parse_findings(output: &str) -> Vec<(String, Option<f64>, Option<String>)> {
     out
 }
 
-/// Token counts per sub-agent are not yet surfaced through the AgentEvent
-/// stream. Return zeros — the synthesizer doesn't depend on these numbers
-/// and the overall session token count is captured at the HTTP layer
-/// (planner + synthesizer call openai_single_completion, whose response
-/// includes usage). Wire this up properly in a follow-up by extending
-/// `AgentEvent::TurnComplete` with prompt/completion token fields.
-fn extract_token_counts(_events: &[crate::agent_loop::AgentEvent]) -> (u64, u64) {
-    (0, 0)
-}
-
 fn whoami_tag() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "unknown".into())
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::parse_completion_usage;
+    use serde_json::json;
+
+    #[test]
+    fn parses_openai_usage_block() {
+        let v = json!({
+            "choices": [{"message": {"content": "hi"}}],
+            "usage": {"prompt_tokens": 123, "completion_tokens": 45, "total_tokens": 168}
+        });
+        assert_eq!(parse_completion_usage(&v), (123, 45));
+    }
+
+    #[test]
+    fn degrades_to_zero_when_usage_absent_or_partial() {
+        // No usage block at all (some servers omit it).
+        assert_eq!(parse_completion_usage(&json!({"choices": []})), (0, 0));
+        // Partial: only prompt_tokens present.
+        assert_eq!(
+            parse_completion_usage(&json!({"usage": {"prompt_tokens": 7}})),
+            (7, 0)
+        );
+    }
 }
