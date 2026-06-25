@@ -895,7 +895,20 @@ async fn do_load(
             true
         })
     } else {
-        // Cross-node: enqueue an `ff model autoload --node` defer-shell task.
+        // Cross-node: enqueue an `ff model autoload --node` defer-shell task —
+        // but FIRST guard against re-enqueuing. The autoscaler re-decides every
+        // tick (~6min); without this guard a model that is still loading (large
+        // gguf, minutes) OR that keeps failing gets a FRESH task every tick. A
+        // broken autoload (e.g. the pre-#563 'resolve gguf' bug) flooded the
+        // deferred queue with ~10 identical tasks/hour — the same retry-forever
+        // pattern behind the 748/248-per-day failure floods. Skip if an autoload
+        // for this (host, model) is already in-flight, or if the last one FAILED
+        // within the cooldown window.
+        let title = format!("autoscaler: autoload {catalog_id} on {host}");
+        if let Some(reason) = autoload_enqueue_block_reason(pg, &title, host).await {
+            debug!(host = %host, %catalog_id, reason, "autoscaler: skipping cross-node autoload");
+            return Ok(false);
+        }
         let command = format!(
             "~/.local/bin/ff model autoload {} --node {} --agent",
             shell_quote(catalog_id),
@@ -903,7 +916,6 @@ async fn do_load(
         );
         let payload = serde_json::json!({ "command": command });
         let trigger_spec = serde_json::json!({});
-        let title = format!("autoscaler: autoload {catalog_id} on {host}");
         ff_db::pg_enqueue_deferred(
             pg,
             &title,
@@ -922,6 +934,43 @@ async fn do_load(
             true
         })
         .map_err(|e| format!("pg_enqueue_deferred(load on {host}): {e}"))
+    }
+}
+
+/// After a cross-node autoload fails, wait this long before the autoscaler is
+/// allowed to re-enqueue the SAME (host, model) load. Long enough to break a
+/// tight retry-flood (tick is ~6min) yet short enough that a transient failure
+/// (brief OOM, host blip) recovers within a few ticks.
+const AUTOLOAD_FAILURE_COOLDOWN_SECS: i64 = 30 * 60;
+
+/// Return `Some(reason)` if the autoscaler should NOT enqueue a fresh cross-node
+/// autoload for `title` (the deterministic `autoscaler: autoload <model> on
+/// <host>` string) targeting `host`. Looks at the MOST RECENT prior autoload
+/// task for this exact (host, model) pair and defers to the pure
+/// [`autoload_skip_reason`] policy. Best-effort: on a DB error we do NOT block
+/// (returns None) so a transient query failure can't wedge autoscaling.
+async fn autoload_enqueue_block_reason(
+    pg: &PgPool,
+    title: &str,
+    host: &str,
+) -> Option<&'static str> {
+    let recent = ff_db::pg_list_deferred(pg, None, 300).await.ok()?;
+    let prior = recent
+        .iter()
+        .find(|t| t.title == title && t.preferred_node.as_deref() == Some(host))?;
+    let age_secs = (chrono::Utc::now() - prior.created_at).num_seconds();
+    autoload_skip_reason(&prior.status, age_secs, AUTOLOAD_FAILURE_COOLDOWN_SECS)
+}
+
+/// Pure re-enqueue policy given the most recent prior autoload task's `status`
+/// and `age_secs`. In-flight states always block (don't pile on a load that is
+/// still running); a `failed` task blocks only inside the cooldown window;
+/// anything else (completed/cancelled/none) permits a fresh enqueue.
+fn autoload_skip_reason(status: &str, age_secs: i64, cooldown_secs: i64) -> Option<&'static str> {
+    match status {
+        "pending" | "dispatchable" | "running" | "claimed" => Some("autoload already in-flight"),
+        "failed" if age_secs < cooldown_secs => Some("recent autoload failure (cooldown)"),
+        _ => None,
     }
 }
 
@@ -1195,6 +1244,33 @@ pub fn spawn_autoscaler_tick(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autoload_skip_inflight_states_always_block() {
+        // A still-loading large model must not get a duplicate task piled on.
+        for s in ["pending", "dispatchable", "running", "claimed"] {
+            assert!(
+                autoload_skip_reason(s, 999_999, AUTOLOAD_FAILURE_COOLDOWN_SECS).is_some(),
+                "{s} should block regardless of age"
+            );
+        }
+    }
+
+    #[test]
+    fn autoload_skip_failed_respects_cooldown() {
+        let cd = AUTOLOAD_FAILURE_COOLDOWN_SECS;
+        // Just failed → block (cooldown).
+        assert!(autoload_skip_reason("failed", 60, cd).is_some());
+        // Failed long ago → allow a retry.
+        assert!(autoload_skip_reason("failed", cd + 1, cd).is_none());
+    }
+
+    #[test]
+    fn autoload_skip_terminal_success_permits_reenqueue() {
+        // A model that loaded then got unloaded must be reloadable immediately.
+        assert!(autoload_skip_reason("completed", 1, AUTOLOAD_FAILURE_COOLDOWN_SECS).is_none());
+        assert!(autoload_skip_reason("cancelled", 1, AUTOLOAD_FAILURE_COOLDOWN_SECS).is_none());
+    }
 
     fn host(
         name: &str,
