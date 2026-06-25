@@ -4024,6 +4024,15 @@ fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
     };
 
     match os_family {
+        // macOS: install + codesign, then restart via launchd. CRITICAL: kill
+        // ALL forgefleetd FIRST, including non-launchd ORPHANS. `launchctl
+        // kickstart -k` only restarts the *managed* job, so a stray bare
+        // `forgefleetd` (e.g. from an old nohup fallback) survives every deploy
+        // and squats the gateway port (:51002) — the managed daemon then runs
+        // but can't bind, so /health is dead and `ff fleet versions --live`
+        // reports the node unreachable (ace had a 2-day-old orphan, 2026-06-25).
+        // After the pre-kill, launchd brings up exactly ONE daemon on the fresh
+        // binary; RESTART_DUP flags it loudly if somehow >1 survive.
         "macos" => format!(
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
              {git_sync} && \
@@ -4033,15 +4042,16 @@ fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
              codesign --force --sign - ~/.local/bin/forgefleetd && \
              codesign --force --sign - ~/.local/bin/ff && \
              USER_ID=$(stat -f %u \"$HOME\" 2>/dev/null || id -u); \
+             for p in $(pgrep -x forgefleetd); do kill -TERM \"$p\" 2>/dev/null; done; sleep 2; \
+             for p in $(pgrep -x forgefleetd); do kill -KILL \"$p\" 2>/dev/null; done; \
              launchctl kickstart -k \"gui/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
                || launchctl kickstart -k \"user/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
-               || ( for p in $(pgrep -x forgefleetd); do kill -TERM \"$p\" 2>/dev/null; done; sleep 2; \
-                    for p in $(pgrep -x forgefleetd); do kill -KILL \"$p\" 2>/dev/null; done; \
-                    nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
+               || ( nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
                     </dev/null >/tmp/forgefleetd.log 2>&1 & disown ); \
              sleep 4; ~/.local/bin/ff model resume-from-build 2>/dev/null || true; \
              RN=$(pgrep -x forgefleetd 2>/dev/null | wc -l | tr -d ' '); \
-             echo \"RESTART_VERIFY count=$RN (macos: launchd-managed)\""
+             echo \"RESTART_VERIFY count=$RN (macos: launchd-managed, orphans cleared)\"; \
+             [ \"$RN\" -le 1 ] || echo \"RESTART_DUP: $RN forgefleetd running — orphan not cleared\" >&2"
         ),
         // linux + linux-dgx share the same restart idiom; only -j differs
         // (folded into cargo_build above). Prefer the systemd user unit; the
@@ -4915,5 +4925,29 @@ mod route_tests {
         assert_eq!(short10("da5b077946abcdef"), "da5b077946");
         assert_eq!(short10("abc"), "abc");
         assert_eq!(short10(""), "");
+    }
+
+    #[test]
+    fn macos_deploy_kills_orphans_before_kickstart() {
+        let p = super::deploy_playbook("macos", "~/projects/forge-fleet");
+        let kill = p.find("kill -KILL").expect("must kill stray forgefleetd");
+        let kick = p
+            .find("launchctl kickstart")
+            .expect("must kickstart launchd");
+        // The pre-kill (clearing non-launchd orphans that squat :51002) MUST run
+        // before kickstart, else the orphan survives the managed-job restart.
+        assert!(kill < kick, "orphan kill must precede kickstart");
+        assert!(p.contains("RESTART_DUP"), "must flag surviving duplicates");
+        assert!(
+            p.contains("codesign --force --sign -"),
+            "macOS still code-signs"
+        );
+    }
+
+    #[test]
+    fn linux_deploy_uses_systemd_not_launchctl() {
+        let p = super::deploy_playbook("linux", "~/projects/forge-fleet");
+        assert!(p.contains("systemctl --user"));
+        assert!(!p.contains("launchctl"));
     }
 }
