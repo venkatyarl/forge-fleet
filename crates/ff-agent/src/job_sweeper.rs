@@ -20,6 +20,9 @@ pub struct SweepSummary {
     /// their `last_health_at` went stale (the node wedged/went offline and its
     /// per-node reconciler stopped refreshing them).
     pub deployments_marked_unhealthy: usize,
+    /// Terminal (`completed`/`cancelled`/`failed`) `deferred_tasks` rows deleted
+    /// past the retention window — keeps the queue table from growing unbounded.
+    pub deferred_pruned: usize,
 }
 
 /// Configuration for what counts as "stale".
@@ -48,6 +51,14 @@ pub struct SweepPolicy {
     /// own reconciler re-flips it `healthy` with a fresh `last_health_at`, so
     /// the flip is self-correcting.
     pub deployment_health_stale_after: Duration,
+    /// Terminal (`completed`/`cancelled`/`failed`) `deferred_tasks` rows older
+    /// than this are deleted. The table is an operational work queue, not a
+    /// history store — without a retention cap it grows forever (48k rows /
+    /// 6 weeks observed, ~450 HA-backup rsync rows/day alone), bloating the
+    /// table and slowing every `pg_list_deferred` / claim scan (the worker, the
+    /// autoscaler enqueue guard, version-check). 14 days keeps ample recent
+    /// failure history for debugging while bounding growth.
+    pub terminal_retention: Duration,
 }
 
 impl Default for SweepPolicy {
@@ -70,9 +81,23 @@ impl Default for SweepPolicy {
             // stale this long does the persistent healthy→unhealthy flip fire —
             // so a transient one-tick reconciler miss never flaps the data.
             deployment_health_stale_after: Duration::minutes(10),
+            // Keep two weeks of terminal queue history, then prune.
+            terminal_retention: Duration::days(14),
         }
     }
 }
+
+/// Statuses that are TERMINAL (the task is done and will never run again) and
+/// therefore safe to prune past the retention window. Deliberately excludes
+/// `running`/`pending`/`dispatchable`/`claimed` (live work the sweeper recovers
+/// rather than deletes).
+pub fn is_prunable_terminal_status(status: &str) -> bool {
+    matches!(status, "completed" | "cancelled" | "failed")
+}
+
+/// Max terminal rows deleted per sweep pass — bounds the DELETE so draining a
+/// large backlog never takes a long lock; steady-state churn is well under this.
+const TERMINAL_PRUNE_BATCH: i64 = 5000;
 
 /// Run one sweep pass. Marks stale jobs as failed with a descriptive error.
 /// Returns counts.
@@ -159,6 +184,29 @@ pub async fn sweep_stale(
         } else {
             summary.deferred_failed += 1;
         }
+    }
+
+    // ── deferred_tasks retention prune ───────────────────────────────────
+    // Terminal rows (completed/cancelled/failed) are never otherwise deleted,
+    // so the queue table grows forever. Delete those older than the retention
+    // window, bounded to TERMINAL_PRUNE_BATCH per pass (ctid sub-select) so
+    // draining a large backlog never holds a long lock. Aged off created_at
+    // (every row has it; completed_at can be NULL for sweeper-failed rows).
+    let prune_cutoff = now - policy.terminal_retention;
+    match sqlx::query(
+        "DELETE FROM deferred_tasks WHERE ctid IN (
+             SELECT ctid FROM deferred_tasks
+              WHERE status IN ('completed', 'cancelled', 'failed')
+                AND created_at < $1
+              LIMIT $2)",
+    )
+    .bind(prune_cutoff)
+    .bind(TERMINAL_PRUNE_BATCH)
+    .execute(pool)
+    .await
+    {
+        Ok(r) => summary.deferred_pruned = r.rows_affected() as usize,
+        Err(e) => tracing::warn!("deferred_tasks retention prune: {e}"),
     }
 
     // ── research_sessions / research_subtasks ────────────────────────────
@@ -268,6 +316,21 @@ mod tests {
             p.deployment_health_stale_after.num_seconds()
                 > ff_db::queries::DISPATCH_HEALTH_MAX_AGE_SEC as i64
         );
+        // Retention must be long enough to keep useful recent history but
+        // finite so the queue table can't grow unbounded.
+        assert_eq!(p.terminal_retention, Duration::days(14));
+    }
+
+    #[test]
+    fn only_terminal_statuses_are_prunable() {
+        // Live/recoverable states must NEVER be deleted by the retention prune —
+        // the sweeper recovers those, it doesn't drop them.
+        for s in ["completed", "cancelled", "failed"] {
+            assert!(is_prunable_terminal_status(s), "{s} should be prunable");
+        }
+        for s in ["pending", "running", "dispatchable", "claimed"] {
+            assert!(!is_prunable_terminal_status(s), "{s} must NOT be prunable");
+        }
     }
 
     #[test]
@@ -363,13 +426,15 @@ impl StaleJobSweeperTick {
                                 + s.deferred_failed
                                 + s.research_sessions_failed
                                 + s.research_subtasks_failed
-                                + s.deployments_marked_unhealthy > 0 => tracing::info!(
+                                + s.deployments_marked_unhealthy
+                                + s.deferred_pruned > 0 => tracing::info!(
                                 jobs_failed = s.jobs_failed,
                                 deferred_failed = s.deferred_failed,
                                 research_sessions_failed = s.research_sessions_failed,
                                 research_subtasks_failed = s.research_subtasks_failed,
                                 deployments_marked_unhealthy = s.deployments_marked_unhealthy,
-                                "stale-job sweeper: recovered stuck running rows"
+                                deferred_pruned = s.deferred_pruned,
+                                "stale-job sweeper: recovered stuck running rows + pruned terminal queue"
                             ),
                             Ok(_) => {}
                             Err(e) => tracing::warn!(error = %e, "stale-job sweeper: pass failed"),
