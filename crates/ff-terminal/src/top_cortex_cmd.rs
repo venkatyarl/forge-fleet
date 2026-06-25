@@ -288,8 +288,12 @@ pub enum TopCortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
-    /// List dependency packages and how many crates depend on each.
+    /// Dependency graph. With no CRATE: list dependency packages and how many
+    /// crates depend on each. With a CRATE: show that crate's dependencies
+    /// (forward) and its dependents (reverse — the rebuild blast radius).
     Deps {
+        /// A crate name (e.g. `ff-db`) for the per-crate forward+reverse view.
+        krate: Option<String>,
         #[arg(long)]
         corpus: Option<String>,
     },
@@ -1076,10 +1080,16 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
             )
             .await?;
         }
-        TopCortexCommand::Deps { corpus } => {
-            let rows = cortex::deps::deps(&pool, corpus.as_deref()).await?;
-            print_deps(&rows);
-        }
+        TopCortexCommand::Deps { krate, corpus } => match krate {
+            Some(name) => {
+                let cd = cortex::deps::deps_for_crate(&pool, &name, corpus.as_deref()).await?;
+                print!("{}", cortex::deps::render_crate_deps(&cd));
+            }
+            None => {
+                let rows = cortex::deps::deps(&pool, corpus.as_deref()).await?;
+                print_deps(&rows);
+            }
+        },
         TopCortexCommand::Topic {
             subject,
             corpus,
