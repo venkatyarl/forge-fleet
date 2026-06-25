@@ -1071,17 +1071,22 @@ impl ToolRegistry {
     fn cortex_callers() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_callers".to_string(),
-            description: "Cortex code graph: list the callers of a code symbol (who calls it). Token-cheaper than grepping for call sites. Symbol may be a bare leaf (e.g. 'load_model') or a fully-qualified name.".to_string(),
+            description: "Cortex code graph: list the callers of a code symbol (who calls it). Token-cheaper than grepping for call sites. Symbol may be a bare leaf (e.g. 'load_model') or a fully-qualified name. Pass all_corpora=true to find callers in EVERY indexed repo (omit corpus).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "corpus": {
                         "type": "string",
-                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'"
+                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'. Required UNLESS all_corpora=true."
                     },
                     "symbol": {
                         "type": "string",
                         "description": "Code symbol — bare leaf ('load_model') or qualified ('ff_agent::model_runtime::load_model')"
+                    },
+                    "all_corpora": {
+                        "type": "boolean",
+                        "description": "Cross-repo: match the symbol name in EVERY indexed corpus and union the callers, each tagged with its corpus (ignores corpus). Answers 'who calls this name anywhere in our codebases?'.",
+                        "default": false
                     },
                     "min_confidence": {
                         "type": "number",
@@ -1089,7 +1094,7 @@ impl ToolRegistry {
                         "default": 0.0
                     }
                 },
-                "required": ["corpus", "symbol"]
+                "required": ["symbol"]
             }),
         }
     }
@@ -1097,17 +1102,22 @@ impl ToolRegistry {
     fn cortex_callees() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_callees".to_string(),
-            description: "Cortex code graph: list the callees of a code symbol (what it calls). Symbol may be a bare leaf or a fully-qualified name.".to_string(),
+            description: "Cortex code graph: list the callees of a code symbol (what it calls). Symbol may be a bare leaf or a fully-qualified name. Pass all_corpora=true to search EVERY indexed repo (omit corpus).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "corpus": {
                         "type": "string",
-                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'"
+                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'. Required UNLESS all_corpora=true."
                     },
                     "symbol": {
                         "type": "string",
                         "description": "Code symbol — bare leaf or qualified name"
+                    },
+                    "all_corpora": {
+                        "type": "boolean",
+                        "description": "Cross-repo: match the symbol name in EVERY indexed corpus and union the callees, each tagged with its corpus (ignores corpus).",
+                        "default": false
                     },
                     "min_confidence": {
                         "type": "number",
@@ -1115,7 +1125,7 @@ impl ToolRegistry {
                         "default": 0.0
                     }
                 },
-                "required": ["corpus", "symbol"]
+                "required": ["symbol"]
             }),
         }
     }
