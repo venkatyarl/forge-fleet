@@ -1133,17 +1133,22 @@ impl ToolRegistry {
     fn cortex_impact() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_impact".to_string(),
-            description: "Cortex code graph: transitive caller closure (blast radius) of a code symbol — every symbol that could be affected by changing it, up to max_depth hops.".to_string(),
+            description: "Cortex code graph: transitive caller closure (blast radius) of a code symbol — every symbol that could be affected by changing it, up to max_depth hops. Pass all_corpora=true to compute the blast radius in EVERY indexed repo (omit corpus).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "corpus": {
                         "type": "string",
-                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'"
+                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'. Required UNLESS all_corpora=true."
                     },
                     "symbol": {
                         "type": "string",
                         "description": "Code symbol — bare leaf or qualified name"
+                    },
+                    "all_corpora": {
+                        "type": "boolean",
+                        "description": "Cross-repo: seed the closure from the symbol name in EVERY indexed corpus and tag each affected symbol with its corpus (ignores corpus).",
+                        "default": false
                     },
                     "max_depth": {
                         "type": "integer",
@@ -1156,7 +1161,7 @@ impl ToolRegistry {
                         "default": 0.0
                     }
                 },
-                "required": ["corpus", "symbol"]
+                "required": ["symbol"]
             }),
         }
     }

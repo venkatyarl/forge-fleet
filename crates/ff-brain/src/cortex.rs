@@ -2211,16 +2211,12 @@ fn cross_corpus_edge_cols(want_callers: bool) -> (&'static str, &'static str) {
 /// Caveat: `calls` edges are intra-corpus (tree-sitter resolves within a repo),
 /// so this UNIONS the per-corpus callers of every same-named definition — it
 /// does NOT resolve a call in repo A to a definition that lives only in repo B.
-async fn cross_corpus_call_refs(
-    pool: &PgPool,
-    sel: &str,
-    min_confidence: f32,
-    want_callers: bool,
-) -> Result<Vec<(String, SymbolRef)>> {
-    // 1. Definitions named `sel` in any corpus (generation-live). Titles are
-    //    QUALIFIED, so match the bare name OR a `…::sel` suffix (mirrors
-    //    resolve_symbol's bare-name handling).
-    let def_ids: Vec<Uuid> = sqlx::query_scalar(
+/// Resolve a bare/qualified symbol NAME to its definition ids in EVERY corpus
+/// (generation-live). Titles are QUALIFIED, so match the bare name OR a `…::sel`
+/// suffix (mirrors resolve_symbol's bare-name handling). Shared by every
+/// cross-corpus traversal.
+async fn resolve_def_ids_all_corpora(pool: &PgPool, sel: &str) -> Result<Vec<Uuid>> {
+    let ids: Vec<Uuid> = sqlx::query_scalar(
         r#"SELECT id FROM brain_vault_nodes
             WHERE node_type LIKE 'code:%'
               AND (title = $1 OR title LIKE $2)
@@ -2232,6 +2228,45 @@ async fn cross_corpus_call_refs(
     .bind(format!("%::{sel}"))
     .fetch_all(pool)
     .await?;
+    Ok(ids)
+}
+
+/// Tag each [`SymbolRef`] with its owning corpus (project) via an id→project
+/// lookup; preserves input order. Used when the traversal (e.g. `impact_of_ids`)
+/// doesn't already carry the project.
+async fn tag_refs_with_corpus(
+    pool: &PgPool,
+    refs: Vec<SymbolRef>,
+) -> Result<Vec<(String, SymbolRef)>> {
+    if refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<Uuid> = refs.iter().map(|r| r.id).collect();
+    let rows = sqlx::query("SELECT id, project FROM brain_vault_nodes WHERE id = ANY($1)")
+        .bind(&ids)
+        .fetch_all(pool)
+        .await?;
+    let by_id: std::collections::HashMap<Uuid, String> = rows
+        .into_iter()
+        .map(|r| (r.get::<Uuid, _>("id"), r.get::<String, _>("project")))
+        .collect();
+    Ok(refs
+        .into_iter()
+        .map(|r| {
+            let proj = by_id.get(&r.id).cloned().unwrap_or_default();
+            (proj, r)
+        })
+        .collect())
+}
+
+async fn cross_corpus_call_refs(
+    pool: &PgPool,
+    sel: &str,
+    min_confidence: f32,
+    want_callers: bool,
+) -> Result<Vec<(String, SymbolRef)>> {
+    // 1. Definitions named `sel` in any corpus.
+    let def_ids = resolve_def_ids_all_corpora(pool, sel).await?;
     if def_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -2285,6 +2320,25 @@ pub async fn callees_all_corpora(
     min_confidence: f32,
 ) -> Result<Vec<(String, SymbolRef)>> {
     cross_corpus_call_refs(pool, sel, min_confidence, false).await
+}
+
+/// Cross-repo impact (transitive caller closure / blast radius) of `sel`:
+/// resolve its definitions in EVERY corpus, run the transitive closure from all
+/// of them, and tag each affected symbol with its corpus. Same intra-corpus
+/// caveat as [`callers_all_corpora`].
+pub async fn impact_all_corpora(
+    pool: &PgPool,
+    sel: &str,
+    max_depth: usize,
+    min_confidence: f32,
+) -> Result<Vec<(String, SymbolRef)>> {
+    let seed_ids = resolve_def_ids_all_corpora(pool, sel).await?;
+    if seed_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut refs = impact_of_ids(pool, &seed_ids, max_depth, min_confidence).await?;
+    resolve_ref_files(pool, &mut refs).await?;
+    tag_refs_with_corpus(pool, refs).await
 }
 
 /// Transitive caller closure up to `max_depth` (impact / blast radius).

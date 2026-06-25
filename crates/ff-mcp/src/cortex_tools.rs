@@ -9,7 +9,8 @@
 
 use ff_brain::{
     call_path, callees, callees_all_corpora, callers, callers_all_corpora, corpus, cortex,
-    find_symbols, find_symbols_all_corpora, find_symbols_semantic, impact, tests_for,
+    find_symbols, find_symbols_all_corpora, find_symbols_semantic, impact, impact_all_corpora,
+    tests_for,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -611,7 +612,6 @@ pub async fn cortex_callees(params: Option<Value>) -> HandlerResult {
 
 /// Transitive caller closure / blast radius of a code symbol.
 pub async fn cortex_impact(params: Option<Value>) -> HandlerResult {
-    let (corpus_slug, symbol) = corpus_and_symbol(&params)?;
     let min_confidence = min_confidence_param(&params);
     let max_depth = params
         .as_ref()
@@ -620,6 +620,21 @@ pub async fn cortex_impact(params: Option<Value>) -> HandlerResult {
         .map(|d| d.clamp(1, 20) as usize)
         .unwrap_or(5);
     let pool = get_pool().await?;
+    if bool_param(&params, "all_corpora", false) {
+        let symbol = symbol_param(&params)?;
+        let hits = impact_all_corpora(&pool, &symbol, max_depth, min_confidence)
+            .await
+            .map_err(|e| format!("impact: {e}"))?;
+        return Ok(json!({
+            "symbol": symbol,
+            "all_corpora": true,
+            "max_depth": max_depth,
+            "min_confidence": min_confidence,
+            "count": hits.len(),
+            "impacted": cross_corpus_symbols_json(&hits),
+        }));
+    }
+    let (corpus_slug, symbol) = corpus_and_symbol(&params)?;
     let rows = impact(&pool, &corpus_slug, &symbol, max_depth, min_confidence)
         .await
         .map_err(|e| format!("impact: {e}"))?;

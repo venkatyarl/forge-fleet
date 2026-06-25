@@ -55,8 +55,8 @@ pub use cortex::{
     OutlineEntry, SymbolHit, SymbolRef, SymbolSource, TestHit, call_path, callees,
     callees_all_corpora, callers, callers_all_corpora, cortex_alerts, cortex_search,
     explain_community, export_neighborhood, find_symbols, find_symbols_all_corpora,
-    find_symbols_semantic, graph_to_dot, graph_to_graphml, impact, index, outline_file,
-    show_symbol, tests_for,
+    find_symbols_semantic, graph_to_dot, graph_to_graphml, impact, impact_all_corpora, index,
+    outline_file, show_symbol, tests_for,
 };
 pub use cortex_embed::{EmbedStats, embed_cortex_nodes, spawn_embed_refresh_loop};
 pub use cortex_reindex::{reindex_self_corpus, spawn_reindex_loop};
