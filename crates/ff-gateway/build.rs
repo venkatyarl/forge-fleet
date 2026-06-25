@@ -22,4 +22,26 @@ fn main() {
     }
     // Re-run if the placeholder or the real dist output changes.
     println!("cargo:rerun-if-changed=../../dashboard/dist");
+
+    // Bake the build-time git SHA so the gateway's /health endpoint can report
+    // the code the RUNNING daemon was compiled from. The forgefleetd binary
+    // already bakes FF_GIT_SHA (root build.rs), but that env is per-crate and
+    // not visible to this dependency crate — so probe git here too. `--short=10`
+    // matches build_version.rs so the value equals forgefleetd's own
+    // `(pushed <sha>)`. Never fails: falls back to "unknown".
+    let sha = git_short_sha().unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=FF_GATEWAY_GIT_SHA={sha}");
+    // HEAD moves on every checkout/commit → rebuild so the baked SHA stays true.
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+}
+
+fn git_short_sha() -> Option<String> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short=10", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
