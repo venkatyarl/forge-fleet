@@ -52,7 +52,9 @@ pub use queries::{
     FreeSlot,
     HostCapacity,
     // Interaction log (V121 ff_interactions)
+    InteractionChannelStat,
     InteractionRecord,
+    InteractionStats,
     MergeQueueItem,
     MeshStatusRow,
     ModelCatalogRow,
@@ -148,6 +150,7 @@ pub use queries::{
     pg_insert_work_intent,
     // Interaction log (V121 ff_interactions)
     pg_interaction_channel_counts,
+    pg_interaction_stats,
     pg_latest_demand_snapshot,
     pg_latest_disk_usage,
     pg_list_agents,

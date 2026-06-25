@@ -59,6 +59,7 @@ mod github_cmd;
 mod health_cmd;
 mod helpers;
 mod init_cmd;
+mod interactions_cmd;
 mod lifecycle_cmd;
 mod llm_cmd;
 mod logs_cmd;
@@ -487,6 +488,11 @@ enum Command {
     Defer {
         #[command(subcommand)]
         command: DeferCommand,
+    },
+    /// Inspect the `ff_interactions` training corpus (the dogfooding LLM log).
+    Interactions {
+        #[command(subcommand)]
+        command: InteractionsCommand,
     },
     /// Model lifecycle management (catalog, library, deployments, jobs).
     Model {
@@ -1274,6 +1280,20 @@ pub enum DeferCommand {
     Stats {
         /// Trailing window (hours) for the failure + creation-rate rollups.
         #[arg(long, default_value_t = 3)]
+        window_hours: i64,
+        /// Emit JSON instead of the human report.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum InteractionsCommand {
+    /// Training-corpus health: volume, lifetime token totals, a token-logging-
+    /// gap meter, per-channel rollup (count/success/tokens), and recent errors.
+    Stats {
+        /// Trailing window (hours) for the recency + error rollups.
+        #[arg(long, default_value_t = 24)]
         window_hours: i64,
         /// Emit JSON instead of the human report.
         #[arg(long)]
@@ -3835,6 +3855,9 @@ async fn main() -> Result<()> {
             return secrets_cmd::handle_secrets(command.clone()).await;
         }
         Some(Command::Defer { command }) => return defer_cmd::handle_defer(command.clone()).await,
+        Some(Command::Interactions { command }) => {
+            return interactions_cmd::handle_interactions(command.clone()).await;
+        }
         Some(Command::Model { command }) => return model_cmd::handle_model(command.clone()).await,
         Some(Command::DeferWorker {
             as_node,
@@ -4171,6 +4194,9 @@ async fn main() -> Result<()> {
         Some(Command::Init { global, project }) => init_cmd::handle_init(global, project).await,
         Some(Command::Secrets { command }) => secrets_cmd::handle_secrets(command).await,
         Some(Command::Defer { command }) => defer_cmd::handle_defer(command).await,
+        Some(Command::Interactions { command }) => {
+            interactions_cmd::handle_interactions(command).await
+        }
         Some(Command::Model { command }) => model_cmd::handle_model(command).await,
         Some(Command::DeferWorker {
             as_node,

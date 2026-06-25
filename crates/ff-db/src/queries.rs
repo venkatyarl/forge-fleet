@@ -6566,6 +6566,97 @@ pub async fn pg_interaction_channel_counts(pool: &PgPool) -> Result<Vec<JsonValu
         .collect())
 }
 
+/// Per-channel rollup of the `ff_interactions` training corpus.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InteractionChannelStat {
+    pub channel: String,
+    pub count: i64,
+    pub success: i64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+}
+
+/// Health snapshot of the `ff_interactions` training corpus (the dogfooding
+/// req+resp+tokens log). Powers `ff interactions stats`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct InteractionStats {
+    pub window_hours: i64,
+    pub total: i64,
+    pub recent: i64,
+    pub total_tokens_in: i64,
+    pub total_tokens_out: i64,
+    /// Rows in the window whose token columns are 0/NULL — a logging-gap meter.
+    pub recent_zero_token: i64,
+    pub by_channel: Vec<InteractionChannelStat>,
+    pub recent_errors: Vec<DeferredCount>,
+}
+
+/// Compute an [`InteractionStats`] over a trailing `window_hours` window.
+pub async fn pg_interaction_stats(pool: &PgPool, window_hours: i64) -> Result<InteractionStats> {
+    let totals = sqlx::query(
+        "SELECT COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE ts > now() - make_interval(hours => $1::int)) AS recent,
+                COALESCE(SUM(tokens_in), 0)  AS tin,
+                COALESCE(SUM(tokens_out), 0) AS tout,
+                COUNT(*) FILTER (WHERE ts > now() - make_interval(hours => $1::int)
+                                   AND COALESCE(tokens_out, 0) = 0) AS zero_tok
+           FROM ff_interactions",
+    )
+    .bind(window_hours as i32)
+    .fetch_one(pool)
+    .await?;
+
+    let by_channel = sqlx::query(
+        "SELECT channel,
+                COUNT(*) AS n,
+                COUNT(*) FILTER (WHERE outcome IN ('success', 'ok')) AS ok,
+                COALESCE(SUM(tokens_in), 0)  AS tin,
+                COALESCE(SUM(tokens_out), 0) AS tout
+           FROM ff_interactions
+          GROUP BY channel ORDER BY n DESC LIMIT 12",
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|r| InteractionChannelStat {
+        channel: r.get("channel"),
+        count: r.get("n"),
+        success: r.get("ok"),
+        tokens_in: r.get("tin"),
+        tokens_out: r.get("tout"),
+    })
+    .collect();
+
+    let recent_errors = sqlx::query(
+        "SELECT COALESCE(NULLIF(error_signature, ''), LEFT(COALESCE(error_text, '(no text)'), 50))
+                  AS label,
+                COUNT(*) AS count
+           FROM ff_interactions
+          WHERE outcome = 'error' AND ts > now() - make_interval(hours => $1::int)
+          GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 8",
+    )
+    .bind(window_hours as i32)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|r| DeferredCount {
+        label: r.get("label"),
+        count: r.get("count"),
+    })
+    .collect();
+
+    Ok(InteractionStats {
+        window_hours,
+        total: totals.get("total"),
+        recent: totals.get("recent"),
+        total_tokens_in: totals.get("tin"),
+        total_tokens_out: totals.get("tout"),
+        recent_zero_token: totals.get("zero_tok"),
+        by_channel,
+        recent_errors,
+    })
+}
+
 // ── agent_memory ("Scratchpad") ──────────────────────────────────────────
 // Small, byte-capped, agent-self-editable working memory. ff-db owns the
 // transactional SQL primitives; the consolidate-and-forget driver (which
