@@ -296,6 +296,14 @@ pub enum TopCortexCommand {
         krate: Option<String>,
         #[arg(long)]
         corpus: Option<String>,
+        /// With a CRATE: also compute the FULL transitive reverse-dependency
+        /// closure (every crate that eventually rebuilds if this one changes).
+        #[arg(long)]
+        transitive: bool,
+        /// Emit lossless JSON instead of the human report (scriptable for CI /
+        /// tooling — e.g. assert a crate's reverse-dependent count).
+        #[arg(long)]
+        json: bool,
     },
     /// Inspect publishers and subscribers for one event topic.
     Topic {
@@ -1080,14 +1088,33 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
             )
             .await?;
         }
-        TopCortexCommand::Deps { krate, corpus } => match krate {
+        TopCortexCommand::Deps {
+            krate,
+            corpus,
+            transitive,
+            json,
+        } => match krate {
             Some(name) => {
-                let cd = cortex::deps::deps_for_crate(&pool, &name, corpus.as_deref()).await?;
-                print!("{}", cortex::deps::render_crate_deps(&cd));
+                let mut cd = cortex::deps::deps_for_crate(&pool, &name, corpus.as_deref()).await?;
+                if transitive {
+                    cd.transitive_dependents = Some(
+                        cortex::deps::transitive_dependents(&pool, &name, corpus.as_deref())
+                            .await?,
+                    );
+                }
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&cd)?);
+                } else {
+                    print!("{}", cortex::deps::render_crate_deps(&cd));
+                }
             }
             None => {
                 let rows = cortex::deps::deps(&pool, corpus.as_deref()).await?;
-                print_deps(&rows);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else {
+                    print_deps(&rows);
+                }
             }
         },
         TopCortexCommand::Topic {

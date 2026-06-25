@@ -205,6 +205,11 @@ pub struct CrateDeps {
     pub corpus: Option<String>,
     pub dependencies: Vec<CrateDepEdge>,
     pub dependents: Vec<CrateDependent>,
+    /// All crates that TRANSITIVELY depend on this one (the full rebuild
+    /// closure), populated only when requested (`--transitive`). `None` = not
+    /// computed; `Some([])` = computed and nothing depends on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transitive_dependents: Option<Vec<String>>,
 }
 
 // Generation-liveness predicate shared by both per-crate queries: a row is live
@@ -301,7 +306,61 @@ pub async fn deps_for_crate(
         corpus: corpus_slug.map(ToString::to_string),
         dependencies,
         dependents,
+        transitive_dependents: None,
     })
+}
+
+/// All crates that TRANSITIVELY depend on `crate_name` — the full workspace
+/// rebuild closure ("if I change ff-core, what eventually rebuilds?"), which the
+/// direct reverse list does not give. Walks `depends_on` edges BACKWARD via a
+/// recursive CTE: from a name, find the dep:package/code:crate node with that
+/// title, the crates whose `depends_on` points at it, then recurse on each
+/// crate's name. `UNION` dedups so dependency cycles terminate. Generation-
+/// filtered like the other queries so stale-generation edges don't leak in.
+pub async fn transitive_dependents(
+    pool: &PgPool,
+    crate_name: &str,
+    corpus_slug: Option<&str>,
+) -> Result<Vec<String>> {
+    // Generation-liveness predicate; `proj` is the project column to scope by.
+    let gen_pred = |alias: &str, proj: &str| -> String {
+        format!(
+            "COALESCE({alias}.generation, 0) IN (0, COALESCE((SELECT current_generation \
+             FROM cortex_generations WHERE project = {proj}), 0))"
+        )
+    };
+    let sql = format!(
+        r#"WITH RECURSIVE rev(name) AS (
+               SELECT $1::text
+             UNION
+               SELECT c.title
+                 FROM rev
+                 JOIN brain_vault_nodes p
+                   ON p.title = rev.name
+                  AND p.node_type IN ('dep:package', 'code:crate')
+                  AND ($2::text IS NULL OR p.project = $2)
+                  AND {gen_p}
+                 JOIN brain_vault_edges e
+                   ON e.dst_id = p.id AND e.edge_type = 'depends_on' AND {gen_e}
+                 JOIN brain_vault_nodes c
+                   ON c.id = e.src_id
+                  AND c.node_type IN ('code:crate', 'code:mod')
+                  AND {gen_c}
+           )
+           SELECT DISTINCT name FROM rev WHERE name <> $1 ORDER BY name"#,
+        gen_p = gen_pred("p", "p.project"),
+        gen_e = gen_pred("e", "p.project"),
+        gen_c = gen_pred("c", "c.project"),
+    );
+    let rows = sqlx::query(&sql)
+        .bind(crate_name)
+        .bind(corpus_slug)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| r.get::<String, _>("name"))
+        .collect())
 }
 
 /// Render a [`CrateDeps`] as a human-readable report (pure; used by the CLI).
@@ -334,6 +393,19 @@ pub fn render_crate_deps(cd: &CrateDeps) -> String {
     }
     for c in &cd.dependents {
         out.push_str(&format!("    ← {}\n", c.name));
+    }
+
+    if let Some(tr) = &cd.transitive_dependents {
+        out.push_str(&format!(
+            "\n  transitively depended on by ({} — full rebuild closure):\n",
+            tr.len()
+        ));
+        if tr.is_empty() {
+            out.push_str("    (none)\n");
+        }
+        for name in tr {
+            out.push_str(&format!("    ⇐ {name}\n"));
+        }
     }
     out
 }
@@ -514,6 +586,7 @@ mod tests {
                     node_type: "code:crate".into(),
                 },
             ],
+            transitive_dependents: None,
         };
         let out = render_crate_deps(&cd);
         assert!(out.contains("crate 'ff-agent' (forge-fleet)"));
@@ -529,6 +602,25 @@ mod tests {
         assert!(out.contains("[pkg] tokio"));
         assert!(out.contains("blast radius"));
         assert!(out.contains("← ff-terminal"));
+        // No --transitive requested → no transitive section.
+        assert!(!out.contains("full rebuild closure"));
+    }
+
+    #[test]
+    fn render_shows_transitive_closure_when_present() {
+        let cd = CrateDeps {
+            crate_name: "ff-core".into(),
+            corpus: Some("forge-fleet".into()),
+            transitive_dependents: Some(vec!["ff-agent".into(), "ff-db".into()]),
+            ..Default::default()
+        };
+        let out = render_crate_deps(&cd);
+        assert!(out.contains("transitively depended on by (2 — full rebuild closure)"));
+        assert!(out.contains("⇐ ff-agent"));
+        assert!(out.contains("⇐ ff-db"));
+        // Serializes losslessly for --json (Option present → field emitted).
+        let j = serde_json::to_string(&cd).unwrap();
+        assert!(j.contains("\"transitive_dependents\""));
     }
 
     #[test]
