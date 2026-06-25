@@ -488,11 +488,8 @@ impl AgentTool for ClusterInferenceTool {
 
                 let node_count = nodes.len();
                 let model_lower = model.to_ascii_lowercase();
-                let estimated_ram = if model_lower.contains("405b") { 250 }
-                    else if model_lower.contains("70b") || model_lower.contains("72b") { 45 }
-                    else if model_lower.contains("32b") || model_lower.contains("34b") { 20 }
-                    else { 15 };
-                let ram_per_node = estimated_ram / node_count;
+                let estimated_ram = estimate_model_ram_gb(&model_lower);
+                let ram_per_node = estimated_ram / node_count as u64;
 
                 let recommended_method = if nodes.iter().all(|n| n.starts_with("192.168.5.1")) {
                     // DGX Sparks or EVO-X2 (high bandwidth) → llama.cpp RPC
@@ -580,5 +577,70 @@ impl AgentTool for ClusterInferenceTool {
 
             _ => AgentToolResult::err(format!("Unknown action: {action}. Use: plan, setup, status, benchmark, teardown")),
         }
+    }
+}
+
+/// Rough RAM (GiB) to serve a model at ~Q4, keyed off the parameter-count token
+/// in the lowercased model id. Used by the multi-host `plan` action to size
+/// per-node RAM.
+///
+/// Ordered LARGEST-FIRST on purpose: `"235b".contains("35b")` and
+/// `"405b".contains("5b")` are both true, so checking a smaller token first
+/// would misclassify the big models — the same substring trap that mislabeled
+/// LPDDR as DDR (#585). Unknown sizes fall back to a conservative-ish 15.
+pub fn estimate_model_ram_gb(model_lower: &str) -> u64 {
+    let has = |t: &str| model_lower.contains(t);
+    if has("405b") {
+        250
+    } else if has("235b") {
+        140
+    } else if has("180b") {
+        110
+    } else if has("120b") || has("123b") {
+        75
+    } else if has("70b") || has("72b") {
+        45
+    } else if has("30b") || has("32b") || has("34b") || has("35b") {
+        22
+    } else if has("13b") || has("14b") {
+        11
+    } else if has("7b") || has("8b") || has("9b") {
+        7
+    } else {
+        15
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn estimate_model_ram_gb_largest_first() {
+        // Big models must NOT collapse to the 15 GB fallback (the prior bug):
+        // 235b/405b were the worst — 405b was right, but 235b/30b/35b all fell
+        // through to 15.
+        assert_eq!(estimate_model_ram_gb("llama-3.1-405b-instruct"), 250);
+        assert_eq!(estimate_model_ram_gb("qwen3-235b-a22b"), 140);
+        assert_eq!(estimate_model_ram_gb("llama-3.1-70b"), 45);
+        assert_eq!(estimate_model_ram_gb("qwen3-72b"), 45);
+        // The fleet's main MoE coder (30b/35b active-3b) — used to be 15.
+        assert_eq!(estimate_model_ram_gb("qwen36-35b-a3b"), 22);
+        assert_eq!(estimate_model_ram_gb("qwen3-coder-30b-a3b"), 22);
+        assert_eq!(estimate_model_ram_gb("qwen2.5-coder-32b"), 22);
+        assert_eq!(estimate_model_ram_gb("mistral-small-7b"), 7);
+        assert_eq!(estimate_model_ram_gb("gemma-2-9b"), 7);
+        // Unknown / no size token → conservative fallback.
+        assert_eq!(estimate_model_ram_gb("some-mystery-model"), 15);
+    }
+
+    #[test]
+    fn estimate_substring_trap_guarded() {
+        // The whole point: a smaller token that is a substring of a larger one
+        // must not win. "235b" contains "35b"; "405b" contains "5b"-ish tokens.
+        // Both must resolve to their TRUE (large) tier, not the 30b/7b tiers.
+        assert_eq!(estimate_model_ram_gb("qwen3-235b-a22b"), 140);
+        assert_ne!(estimate_model_ram_gb("qwen3-235b-a22b"), 22);
+        assert_eq!(estimate_model_ram_gb("llama-405b"), 250);
     }
 }
