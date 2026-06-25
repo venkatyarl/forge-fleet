@@ -39,6 +39,10 @@ pub struct AgentTaskResult {
     pub events: Vec<AgentEvent>,
     pub duration_ms: u64,
     pub turn_count: u32,
+    /// Server-reported token usage for this task (0 when the runner couldn't
+    /// capture it). Feeds ff_interactions (the training corpus).
+    pub tokens_in: u64,
+    pub tokens_out: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +117,8 @@ impl MultiAgentOrchestrator {
                         events: Vec::new(),
                         duration_ms: 0,
                         turn_count: 0,
+                        tokens_in: 0,
+                        tokens_out: 0,
                     });
                 }
             }
@@ -198,6 +204,10 @@ async fn run_single_agent_task(
         result = session.run(&task.prompt, Some(event_tx)) => result,
     };
 
+    // Capture token usage BEFORE dropping the session — the agent loop records
+    // it from each response's `usage` block (agent_loop.rs record_turn).
+    let tokens_in = session.usage.total_input_tokens;
+    let tokens_out = session.usage.total_output_tokens;
     drop(session);
     let events = events_collector.await.unwrap_or_default();
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -225,6 +235,8 @@ async fn run_single_agent_task(
         events,
         duration_ms,
         turn_count: 0,
+        tokens_in,
+        tokens_out,
     }
 }
 
