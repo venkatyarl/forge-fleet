@@ -3703,6 +3703,16 @@ pub enum AlertCommand {
         #[arg(long, default_value_t = 50)]
         limit: i64,
     },
+    /// Audit policies for ones that CANNOT fire: an enabled policy whose metric
+    /// is neither evaluated by the poll (`evaluate_current`) nor fired by a
+    /// named imperative tick, or whose condition won't parse, watches nothing —
+    /// a false sense of coverage (the `computer_offline == 'odown'` class fixed
+    /// in V146). Catches the whole dead-policy class at a glance.
+    Doctor {
+        /// Emit JSON instead of the formatted report.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
