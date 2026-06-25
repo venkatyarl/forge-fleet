@@ -1483,6 +1483,24 @@ mod tests {
         assert!(anticipate(&[1.0, 4.0, 2.0]) >= 2.0);
     }
 
+    // Authored by a fleet model (qwen36 on lily) via `ff offload`, then verified
+    // by hand and integrated — dogfooding the fleet for test-gen. Pins the
+    // model-placement RAM working-set formula (size*1.15 overhead + a constant
+    // 2GB KV cache for the 32K AGENT_MIN_CTX slot) so a careless edit can't
+    // silently change placement RAM accounting.
+    #[test]
+    fn agent_working_set_gb_formula() {
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // size_gb = 0.0 -> 0.0 * 1.15 + 2.0 = 2.0
+        assert!(approx(agent_working_set_gb(0.0), 2.0));
+        // size_gb = 10.0 -> 11.5 + 2.0 = 13.5
+        assert!(approx(agent_working_set_gb(10.0), 13.5));
+        // size_gb = 20.0 -> 23.0 + 2.0 = 25.0
+        assert!(approx(agent_working_set_gb(20.0), 25.0));
+        // size_gb = 100.0 -> 115.0 + 2.0 = 117.0
+        assert!(approx(agent_working_set_gb(100.0), 117.0));
+    }
+
     #[test]
     fn rank_deficits_orders_and_filters() {
         // Below-deadband kinds are dropped; remaining sorted most-starved first.
