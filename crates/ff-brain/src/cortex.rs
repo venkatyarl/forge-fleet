@@ -2192,6 +2192,101 @@ pub async fn callees(
     Ok(out)
 }
 
+/// Edge endpoints for a cross-corpus call query. For CALLERS we want rows where
+/// the definition is the `dst` (it is called) and the matched node is the `src`
+/// (the caller); for CALLEES it's the reverse. Pure — pinned by a unit test.
+fn cross_corpus_edge_cols(want_callers: bool) -> (&'static str, &'static str) {
+    if want_callers {
+        ("e.src_id", "e.dst_id") // (node-to-return, def-filter)
+    } else {
+        ("e.dst_id", "e.src_id")
+    }
+}
+
+/// Cross-repo `callers`/`callees`: resolve a bare symbol NAME to its definitions
+/// in EVERY indexed corpus, then return its callers (`want_callers=true`) or
+/// callees (false) across all corpora — each tagged with the OWNING corpus.
+/// Answers "who calls `foo` anywhere in the fleet's codebases?".
+///
+/// Caveat: `calls` edges are intra-corpus (tree-sitter resolves within a repo),
+/// so this UNIONS the per-corpus callers of every same-named definition — it
+/// does NOT resolve a call in repo A to a definition that lives only in repo B.
+async fn cross_corpus_call_refs(
+    pool: &PgPool,
+    sel: &str,
+    min_confidence: f32,
+    want_callers: bool,
+) -> Result<Vec<(String, SymbolRef)>> {
+    // 1. Definitions named `sel` in any corpus (generation-live). Titles are
+    //    QUALIFIED, so match the bare name OR a `…::sel` suffix (mirrors
+    //    resolve_symbol's bare-name handling).
+    let def_ids: Vec<Uuid> = sqlx::query_scalar(
+        r#"SELECT id FROM brain_vault_nodes
+            WHERE node_type LIKE 'code:%'
+              AND (title = $1 OR title LIKE $2)
+              AND COALESCE(generation, 0) IN (
+                  0, COALESCE((SELECT current_generation FROM cortex_generations
+                                WHERE project = brain_vault_nodes.project), 0))"#,
+    )
+    .bind(sel)
+    .bind(format!("%::{sel}"))
+    .fetch_all(pool)
+    .await?;
+    if def_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // 2. Callers/callees, tagged with the matched node's project.
+    let (node_col, def_col) = cross_corpus_edge_cols(want_callers);
+    let sql = format!(
+        r#"SELECT DISTINCT n.id, n.project, n.title, n.node_type, n.start_line
+             FROM brain_vault_edges e
+             JOIN brain_vault_nodes n ON n.id = {node_col}
+            WHERE e.edge_type = 'calls' AND {def_col} = ANY($1)
+              AND e.confidence >= $2
+              AND COALESCE(e.generation, 0) IN (
+                  0, COALESCE((SELECT current_generation FROM cortex_generations
+                                WHERE project = n.project), 0))
+            ORDER BY n.project, n.title"#
+    );
+    let rows = sqlx::query(&sql)
+        .bind(&def_ids)
+        .bind(min_confidence)
+        .fetch_all(pool)
+        .await?;
+    let mut projects = Vec::with_capacity(rows.len());
+    let mut refs = Vec::with_capacity(rows.len());
+    for r in rows {
+        projects.push(r.get::<String, _>("project"));
+        refs.push(SymbolRef {
+            id: r.get("id"),
+            qualified_name: r.get("title"),
+            node_type: r.get("node_type"),
+            file: None,
+            start_line: r.get("start_line"),
+        });
+    }
+    resolve_ref_files(pool, &mut refs).await?;
+    Ok(projects.into_iter().zip(refs).collect())
+}
+
+/// Cross-repo callers of `sel` (every corpus), each tagged with its corpus.
+pub async fn callers_all_corpora(
+    pool: &PgPool,
+    sel: &str,
+    min_confidence: f32,
+) -> Result<Vec<(String, SymbolRef)>> {
+    cross_corpus_call_refs(pool, sel, min_confidence, true).await
+}
+
+/// Cross-repo callees of `sel` (every corpus), each tagged with its corpus.
+pub async fn callees_all_corpora(
+    pool: &PgPool,
+    sel: &str,
+    min_confidence: f32,
+) -> Result<Vec<(String, SymbolRef)>> {
+    cross_corpus_call_refs(pool, sel, min_confidence, false).await
+}
+
 /// Transitive caller closure up to `max_depth` (impact / blast radius).
 pub async fn impact(
     pool: &PgPool,
@@ -9223,6 +9318,20 @@ class Session {
         );
         // unknown lower-case receiver stays as written (extern)
         assert_eq!(resolve_call("userRepo::save", login, &fp), "userRepo::save");
+    }
+
+    #[test]
+    fn cross_corpus_edge_cols_direction() {
+        // callers: the matched node is the call SOURCE; the def is the dst.
+        assert_eq!(
+            super::cross_corpus_edge_cols(true),
+            ("e.src_id", "e.dst_id")
+        );
+        // callees: reversed — the def is the src, the matched node is the dst.
+        assert_eq!(
+            super::cross_corpus_edge_cols(false),
+            ("e.dst_id", "e.src_id")
+        );
     }
 
     #[test]
