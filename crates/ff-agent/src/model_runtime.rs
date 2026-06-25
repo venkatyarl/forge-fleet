@@ -4,7 +4,7 @@
 //! Processes are spawned detached from the caller. When loaded, a row is upserted into
 //! `fleet_model_deployments` so the rest of the fleet can discover the new endpoint.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(reqwest::Client::new);
@@ -1006,31 +1006,51 @@ fn resolve_gguf_for_llamacpp(path: &str) -> std::io::Result<String> {
             format!("{path} is neither a .gguf file nor a directory"),
         ));
     }
-    let mut best: Option<(u64, PathBuf)> = None;
-    for entry in std::fs::read_dir(&p)? {
-        let entry = entry?;
-        let ep = entry.path();
-        if !ep.is_file() {
-            continue;
-        }
-        let Some(name) = ep.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !name.ends_with(".gguf") {
-            continue;
-        }
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        if best.as_ref().is_none_or(|(s, _)| size > *s) {
-            best = Some((size, ep));
-        }
-    }
-    match best {
-        Some((_, ep)) => Ok(ep.to_string_lossy().to_string()),
+    // Walk the tree (not just the top level) for the largest .gguf. HF- and
+    // ollama-style downloads frequently NEST the weights one or more levels
+    // deep — e.g. veronica's `qwen3-coder-30b-a3b/qwen3-coder-30b-a3b/*.gguf`
+    // (a doubled-name dir), or `snapshots/<hash>/*.gguf`. The library scanner
+    // registers the model-root dir as `file_path`, so a single-level scan
+    // misses the nested file and load fails `no .gguf files in <dir>` forever
+    // (248 autoscaler autoload retries in 12h on veronica alone). Bounded depth
+    // + no symlink-following keeps the walk cycle-safe.
+    match largest_gguf_under(&p, 8)? {
+        Some(ep) => Ok(ep.to_string_lossy().to_string()),
         None => Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("no .gguf files in {path}"),
+            format!("no .gguf files under {path} (searched recursively)"),
         )),
     }
+}
+
+/// Recursively find the largest `.gguf` regular file under `dir`, descending at
+/// most `depth` more levels. Directory symlinks are NOT followed (cycle-safe);
+/// unreadable subdirectories are skipped rather than aborting the whole walk.
+fn largest_gguf_under(dir: &Path, depth: u32) -> std::io::Result<Option<PathBuf>> {
+    let mut best: Option<(u64, PathBuf)> = None;
+    let consider = |size: u64, p: PathBuf, best: &mut Option<(u64, PathBuf)>| {
+        if best.as_ref().is_none_or(|(s, _)| size > *s) {
+            *best = Some((size, p));
+        }
+    };
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let Ok(ft) = entry.file_type() else { continue };
+        let ep = entry.path();
+        if ft.is_file() {
+            if ep.extension().and_then(|e| e.to_str()) == Some("gguf") {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                consider(size, ep, &mut best);
+            }
+        } else if ft.is_dir() && depth > 0 {
+            // Skip subdirs we can't read instead of failing the whole resolve.
+            if let Ok(Some(found)) = largest_gguf_under(&ep, depth - 1) {
+                let size = std::fs::metadata(&found).map(|m| m.len()).unwrap_or(0);
+                consider(size, found, &mut best);
+            }
+        }
+    }
+    Ok(best.map(|(_, p)| p))
 }
 
 /// Look for a multimodal projector (`mmproj*.gguf`) alongside a resolved model
@@ -1608,6 +1628,51 @@ async fn write_systemd_unit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_gguf_finds_nested_weights() {
+        // veronica's real layout: <root>/<dup-name>/<file>.gguf — the .gguf is
+        // two levels below the registered file_path. The pre-fix single-level
+        // scan returned "no .gguf files" and the autoscaler retried forever.
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("qwen3-coder-30b-a3b").join("inner");
+        std::fs::create_dir_all(&nested).unwrap();
+        let gguf = nested.join("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf");
+        std::fs::write(&gguf, b"GGUF-bytes").unwrap();
+        let resolved =
+            resolve_gguf_for_llamacpp(tmp.path().to_str().unwrap()).expect("should find nested");
+        assert_eq!(resolved, gguf.to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_gguf_picks_largest_across_subdirs() {
+        // When multiple .gguf exist at different depths, the largest wins.
+        let tmp = tempfile::tempdir().unwrap();
+        let small = tmp.path().join("small.gguf");
+        std::fs::write(&small, vec![0u8; 10]).unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let big = sub.join("big.gguf");
+        std::fs::write(&big, vec![0u8; 5000]).unwrap();
+        let resolved = resolve_gguf_for_llamacpp(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(resolved, big.to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_gguf_direct_file_passthrough() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gguf = tmp.path().join("model.gguf");
+        std::fs::write(&gguf, b"x").unwrap();
+        let s = gguf.to_string_lossy().to_string();
+        assert_eq!(resolve_gguf_for_llamacpp(&s).unwrap(), s);
+    }
+
+    #[test]
+    fn resolve_gguf_errors_when_truly_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("empty")).unwrap();
+        assert!(resolve_gguf_for_llamacpp(tmp.path().to_str().unwrap()).is_err());
+    }
 
     #[test]
     fn tool_calling_chat_gets_jinja() {
