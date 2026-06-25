@@ -708,6 +708,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "code_community_parent",
         sql: schema::SCHEMA_V145_CODE_COMMUNITY_PARENT,
     },
+    PgMigration {
+        version: 146,
+        name: "disable_dead_computer_offline_alert",
+        sql: schema::SCHEMA_V146_DISABLE_DEAD_COMPUTER_OFFLINE_ALERT,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
