@@ -2784,7 +2784,13 @@ pub async fn handle_fleet_versions_live(pool: &sqlx::PgPool, verbose: bool) -> R
         let user = n.ssh_user.clone();
         let is_me = me.eq_ignore_ascii_case(&name);
         futs.push(async move {
-            let cmd = "~/.local/bin/forgefleetd --version 2>&1 | head -1";
+            // On-disk binary SHA (`--version`) AND the RUNNING process SHA
+            // (`/health` build_sha, #568). They disagree when a deploy installed
+            // the new binary but the daemon restart lagged (the ace
+            // false-converged case) — `--version` alone can't see that.
+            let cmd = "~/.local/bin/forgefleetd --version 2>&1 | head -1; \
+                       echo '@@H@@'; \
+                       curl -s --max-time 4 http://localhost:51002/health 2>/dev/null";
             let out = if is_me {
                 Command::new("sh").args(["-c", cmd]).output().await
             } else {
@@ -2808,20 +2814,22 @@ pub async fn handle_fleet_versions_live(pool: &sqlx::PgPool, verbose: bool) -> R
                 Ok(o) => format!("ssh-exit:{}", o.status.code().unwrap_or(-1)),
                 Err(e) => format!("ssh-error:{e}"),
             };
-            (name, raw)
+            let (ver_line, health) = raw.split_once("@@H@@").unwrap_or((raw.as_str(), ""));
+            let running_sha = extract_health_build_sha(health.trim());
+            (name, ver_line.trim().to_string(), running_sha)
         });
     }
 
-    let mut rows: Vec<(String, String, Option<BuildVersion>)> = Vec::new();
-    while let Some((name, raw)) = futs.next().await {
+    let mut rows: Vec<(String, String, Option<BuildVersion>, Option<String>)> = Vec::new();
+    while let Some((name, raw, running_sha)) = futs.next().await {
         let parsed = BuildVersion::parse(&raw);
-        rows.push((name, raw, parsed));
+        rows.push((name, raw, parsed, running_sha));
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Pick the most-common SHA as the fleet target.
+    // Pick the most-common on-disk SHA as the fleet target.
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for (_, _, parsed) in &rows {
+    for (_, _, parsed, _) in &rows {
         if let Some(p) = parsed {
             *counts.entry(p.sha.clone()).or_insert(0) += 1;
         }
@@ -2833,45 +2841,71 @@ pub async fn handle_fleet_versions_live(pool: &sqlx::PgPool, verbose: bool) -> R
 
     if verbose {
         println!(
-            "{:<12} {:<10} {:<8} {:<8} {:<8}",
-            "NAME", "SHA", "STATE", "BUILD#", "STATUS"
+            "{:<12} {:<10} {:<10} {:<8} {:<8} {:<10}",
+            "NAME", "DISK", "RUNNING", "STATE", "BUILD#", "STATUS"
         );
     } else {
-        println!("{:<12} {:<10} {:<8}", "NAME", "SHA", "STATUS");
+        println!(
+            "{:<12} {:<10} {:<10} {:<10}",
+            "NAME", "DISK", "RUNNING", "STATUS"
+        );
     }
     let mut converged = 0usize;
+    let mut stale = 0usize;
     let mut unreachable = 0usize;
-    for (name, raw, parsed) in &rows {
+    for (name, raw, parsed, running_sha) in &rows {
         match parsed {
             Some(v) => {
+                let run_disp = running_sha
+                    .as_deref()
+                    .map(short10)
+                    .unwrap_or_else(|| "?".to_string());
+                // The RUNNING process SHA is the convergence truth. A node whose
+                // on-disk binary is on target but whose process is NOT was
+                // installed-but-not-restarted — the deploy "succeeded" yet stale
+                // code is live (ace 2026-06-25). Flag it distinctly + actionably.
                 let status = match target_sha.as_deref() {
-                    Some(t) if v.sha == t => {
+                    Some(t) if running_sha.as_deref() == Some(t) => {
                         converged += 1;
                         "✓".to_string()
+                    }
+                    Some(t) if v.sha == t => {
+                        stale += 1;
+                        "⚠ stale-daemon".to_string()
                     }
                     Some(_) => "drift".to_string(),
                     None => "?".to_string(),
                 };
                 if verbose {
                     println!(
-                        "{:<12} {:<10} {:<8} {:<8} {:<8}",
+                        "{:<12} {:<10} {:<10} {:<8} {:<8} {:<10}",
                         name,
                         v.short_sha(),
+                        run_disp,
                         v.state,
                         v.build_count,
                         status
                     );
                 } else {
-                    println!("{:<12} {:<10} {:<8}", name, v.short_sha(), status);
+                    println!(
+                        "{:<12} {:<10} {:<10} {:<10}",
+                        name,
+                        v.short_sha(),
+                        run_disp,
+                        status
+                    );
                 }
             }
             None => {
                 unreachable += 1;
                 let snippet: String = raw.chars().take(20).collect();
                 if verbose {
-                    println!("{:<12} {:<10} {:<8} {:<8} {snippet}", name, "?", "?", "?");
+                    println!(
+                        "{:<12} {:<10} {:<10} {:<8} {:<8} {snippet}",
+                        name, "?", "?", "?", "?"
+                    );
                 } else {
-                    println!("{:<12} {:<10} {snippet}", name, "?");
+                    println!("{:<12} {:<10} {:<10} {snippet}", name, "?", "?");
                 }
             }
         }
@@ -2880,24 +2914,38 @@ pub async fn handle_fleet_versions_live(pool: &sqlx::PgPool, verbose: bool) -> R
     let total = rows.len();
     let target_disp = target_sha
         .as_deref()
-        .map(|s| {
-            let n = s.chars().count().min(8);
-            s[..n].to_string()
-        })
+        .map(short10)
         .unwrap_or_else(|| "-".into());
     println!();
-    if unreachable == 0 && converged == total {
-        println!("{GREEN}✓ converged{RESET}: all {total} host(s) live at {target_disp}");
+    if unreachable == 0 && stale == 0 && converged == total {
+        println!("{GREEN}✓ converged{RESET}: all {total} host(s) RUNNING {target_disp}");
     } else {
         println!(
-            "{YELLOW}⚠ {}/{total} live at {target_disp}{RESET}; {} drifted, {} unreachable",
-            converged,
-            total - converged - unreachable,
-            unreachable,
+            "{YELLOW}⚠ {converged}/{total} RUNNING {target_disp}{RESET}; \
+             {stale} stale-daemon (binary OK, needs restart), {} drifted, {unreachable} unreachable",
+            total - converged - stale - unreachable,
         );
+        if stale > 0 {
+            println!(
+                "  {YELLOW}↳ stale-daemon: on-disk binary is current but the process is old — \
+                 restart forgefleetd on those hosts.{RESET}"
+            );
+        }
     }
 
     Ok(())
+}
+
+/// Truncate a git SHA to 10 chars for display (char-safe).
+fn short10(s: &str) -> String {
+    s.chars().take(10).collect()
+}
+
+/// Extract `build_sha` from a `/health` JSON body (#568). Pure — returns None
+/// on empty/garbage/missing-field so an unreachable gateway degrades to "?".
+fn extract_health_build_sha(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("build_sha")?.as_str().map(|s| s.to_string())
 }
 
 pub async fn handle_fleet_gossip() -> Result<()> {
@@ -4778,8 +4826,8 @@ mod version_target_tests {
 #[cfg(test)]
 mod route_tests {
     use super::{
-        fmt_route_load, normalize_route_limit, route_require_tool_calling,
-        route_warns_below_agent_floor,
+        extract_health_build_sha, fmt_route_load, normalize_route_limit,
+        route_require_tool_calling, route_warns_below_agent_floor, short10,
     };
 
     #[test]
@@ -4848,5 +4896,24 @@ mod route_tests {
         assert_eq!(normalize_route_limit(-5), 3);
         assert_eq!(normalize_route_limit(1), 1);
         assert_eq!(normalize_route_limit(10), 10);
+    }
+
+    #[test]
+    fn extract_health_build_sha_parses_and_degrades() {
+        assert_eq!(
+            extract_health_build_sha(r#"{"status":"ok","build_sha":"da5b077946","version":"x"}"#),
+            Some("da5b077946".to_string())
+        );
+        // Missing field, empty body, and garbage all degrade to None (→ "?").
+        assert_eq!(extract_health_build_sha(r#"{"status":"ok"}"#), None);
+        assert_eq!(extract_health_build_sha(""), None);
+        assert_eq!(extract_health_build_sha("not json"), None);
+    }
+
+    #[test]
+    fn short10_is_char_safe_and_bounded() {
+        assert_eq!(short10("da5b077946abcdef"), "da5b077946");
+        assert_eq!(short10("abc"), "abc");
+        assert_eq!(short10(""), "");
     }
 }
