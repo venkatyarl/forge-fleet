@@ -53,6 +53,37 @@ pub struct TickStats {
     /// Child steps inserted by auto-applying a completed planner's plan
     /// (Orchestrator P4 autonomous decomposition).
     pub steps_fanned_out: usize,
+    /// Pending steps cancelled because a dependency failed/was cancelled and
+    /// they can therefore never run (prevents the deadlocked-session class).
+    pub steps_cancelled: usize,
+}
+
+/// Outcome of evaluating a pending step against the state of its dependencies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DepGate {
+    /// Every dependency reached a successful terminal state — dispatch now.
+    Dispatch,
+    /// One or more dependencies are still active (pending/running) — wait.
+    Wait,
+    /// One or more dependencies reached a terminal FAILURE (failed/cancelled).
+    /// The step can never run, so it must be cancelled — otherwise it lingers
+    /// `pending` forever and its session never finalises (a deadlock the
+    /// planner-failure and budget-cap paths already guard against, but a plain
+    /// step failure did not).
+    Cancel,
+}
+
+/// Decide what to do with a pending step from the terminal/active state of its
+/// dependencies. A failed dependency wins over a still-active one: if any dep
+/// has already failed, the step is unreachable regardless of the rest.
+fn dep_gate(failed_deps: i64, active_deps: i64) -> DepGate {
+    if failed_deps > 0 {
+        DepGate::Cancel
+    } else if active_deps > 0 {
+        DepGate::Wait
+    } else {
+        DepGate::Dispatch
+    }
 }
 
 /// Insert a new session. `goal` is the user-stated outcome; `team`
@@ -350,17 +381,47 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
             .filter_map(|v| v.as_str().and_then(|s| uuid::Uuid::parse_str(s).ok()))
             .collect();
         if !dep_ids.is_empty() {
-            let row: (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM agent_steps
-                  WHERE id = ANY($1)
-                    AND status NOT IN ('completed', 'skipped')",
+            // Classify the deps in one pass: how many reached a terminal
+            // FAILURE (failed/cancelled) vs. how many are still active
+            // (anything that is neither a success nor a failure terminal).
+            let (failed_deps, active_deps): (i64, i64) = sqlx::query_as(
+                "SELECT
+                    COUNT(*) FILTER (WHERE status IN ('failed', 'cancelled')),
+                    COUNT(*) FILTER (WHERE status NOT IN ('completed', 'skipped', 'failed', 'cancelled'))
+                   FROM agent_steps
+                  WHERE id = ANY($1)",
             )
             .bind(&dep_ids)
             .fetch_one(pool)
             .await
-            .context("count unsatisfied deps")?;
-            if row.0 > 0 {
-                continue; // deps not yet terminal
+            .context("classify dep states")?;
+            match dep_gate(failed_deps, active_deps) {
+                DepGate::Dispatch => {}
+                DepGate::Wait => continue, // deps not yet terminal
+                DepGate::Cancel => {
+                    // A dependency failed — this step is unreachable. Cancel it
+                    // so the session can finalise instead of hanging forever.
+                    // The cascade is transitive: on a later tick any step that
+                    // depended on *this* one sees a `cancelled` dep and follows.
+                    sqlx::query(
+                        "UPDATE agent_steps
+                            SET status = 'cancelled',
+                                error  = 'dependency failed or was cancelled',
+                                completed_at = NOW()
+                          WHERE id = $1",
+                    )
+                    .bind(step_id)
+                    .execute(pool)
+                    .await
+                    .context("cancel step blocked by failed dependency")?;
+                    stats.steps_cancelled += 1;
+                    info!(
+                        session = %session_id,
+                        step = %step_id,
+                        "cancelled — dependency failed or was cancelled"
+                    );
+                    continue;
+                }
             }
         }
 
@@ -524,7 +585,7 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
         let sid: uuid::Uuid = r.get("id");
         let any_failed: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM agent_steps
-              WHERE session_id = $1 AND status = 'failed'",
+              WHERE session_id = $1 AND status IN ('failed', 'cancelled')",
         )
         .bind(sid)
         .fetch_one(pool)
@@ -1460,4 +1521,40 @@ pub async fn get_session(pool: &PgPool, id: uuid::Uuid) -> Result<Value> {
             "completed_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("completed_at").ok(),
         })).collect::<Vec<_>>(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dep_gate_dispatches_when_all_deps_succeeded() {
+        // No failures, nothing still active → every dep reached a successful
+        // terminal state (completed/skipped) → dispatch.
+        assert_eq!(dep_gate(0, 0), DepGate::Dispatch);
+    }
+
+    #[test]
+    fn dep_gate_waits_while_deps_are_active() {
+        // Some deps still pending/running, none failed → keep waiting.
+        assert_eq!(dep_gate(0, 1), DepGate::Wait);
+        assert_eq!(dep_gate(0, 5), DepGate::Wait);
+    }
+
+    #[test]
+    fn dep_gate_cancels_on_any_failed_dep() {
+        // A failed dependency makes the step unreachable — cancel it so the
+        // session can finalise instead of deadlocking pending forever. This is
+        // the bug the fix targets: a synthesiser step depends on all prior
+        // steps, one fails, and the old code left it pending indefinitely.
+        assert_eq!(dep_gate(1, 0), DepGate::Cancel);
+    }
+
+    #[test]
+    fn dep_gate_cancel_wins_over_active() {
+        // Even with other deps still running, a single failed dep is fatal —
+        // the step can never succeed, so cancel rather than wait.
+        assert_eq!(dep_gate(1, 3), DepGate::Cancel);
+        assert_eq!(dep_gate(2, 1), DepGate::Cancel);
+    }
 }
