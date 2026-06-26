@@ -50,7 +50,7 @@ use tracing::{info, warn};
 /// safety layers line up: a task is group-killed here at 2h, and anything that
 /// still escapes (a `setsid`'d grandchild) is reaped by the orphan-reaper tick.
 /// Per-task override via `payload.max_duration_secs`.
-const DEFAULT_DEFER_MAX_DURATION: Duration = Duration::from_secs(7200);
+pub(crate) const DEFAULT_DEFER_MAX_DURATION: Duration = Duration::from_secs(7200);
 
 /// Resolve a deferred task's wall-clock cap from its payload, falling back to
 /// [`DEFAULT_DEFER_MAX_DURATION`]. A `max_duration_secs` of 0 (or absent /
