@@ -487,10 +487,17 @@ fn match_library_to_path(
     if let Some(exact) = libs.iter().find(|r| r.file_path == model_path) {
         return (Some(exact.id.clone()), Some(exact.catalog_id.clone()));
     }
+    // A deployment whose model path lives INSIDE a library directory matches
+    // that library. Use component-wise `Path::starts_with` ONLY — a byte-wise
+    // `str::starts_with` mis-attributes across models that merely share a string
+    // prefix (e.g. a deployment under ".../qwen3-coder-30b" byte-starts-with a
+    // ".../qwen3" library). Skip empty library paths, which `starts_with` would
+    // otherwise treat as a prefix of every path.
     let path = Path::new(model_path);
     if let Some(by_prefix) = libs
         .iter()
-        .find(|r| path.starts_with(&r.file_path) || model_path.starts_with(&r.file_path))
+        .filter(|r| !r.file_path.is_empty())
+        .find(|r| path.starts_with(&r.file_path))
     {
         return (
             Some(by_prefix.id.clone()),
@@ -578,5 +585,49 @@ mod tests {
         // Stray operator-launched ports are non-canonical.
         assert!(!port_is_canonical(8082));
         assert!(!port_is_canonical(CANONICAL_PORT_MAX + 1));
+    }
+
+    #[test]
+    fn match_library_exact_path_wins() {
+        let libs = vec![lib("id-a", "qwen3"), lib("id-b", "qwen3-coder-30b")];
+        let (lib_id, cat) = match_library_to_path(&libs, "/home/duncan/models/qwen3-coder-30b");
+        assert_eq!(lib_id.as_deref(), Some("id-b"));
+        assert_eq!(cat.as_deref(), Some("qwen3-coder-30b"));
+    }
+
+    #[test]
+    fn match_library_dir_prefix_matches_weights_inside() {
+        // A deployment pointed at a file inside the library dir resolves to it.
+        let libs = vec![lib("id-b", "qwen3-coder-30b")];
+        let (lib_id, _) = match_library_to_path(
+            &libs,
+            "/home/duncan/models/qwen3-coder-30b/model-00001.safetensors",
+        );
+        assert_eq!(lib_id.as_deref(), Some("id-b"));
+    }
+
+    #[test]
+    fn match_library_does_not_confuse_string_prefix_models() {
+        // Regression: ".../qwen3-coder-30b/x" byte-starts-with the ".../qwen3"
+        // library path, but they are different models. Component-wise matching
+        // must resolve to qwen3-coder-30b, never qwen3 (listed first).
+        let libs = vec![lib("id-a", "qwen3"), lib("id-b", "qwen3-coder-30b")];
+        let (lib_id, cat) = match_library_to_path(
+            &libs,
+            "/home/duncan/models/qwen3-coder-30b/model.safetensors",
+        );
+        assert_eq!(lib_id.as_deref(), Some("id-b"));
+        assert_eq!(cat.as_deref(), Some("qwen3-coder-30b"));
+    }
+
+    #[test]
+    fn match_library_empty_path_never_matches() {
+        let mut l = lib("id-empty", "weird");
+        l.file_path = String::new();
+        let libs = vec![l];
+        assert_eq!(
+            match_library_to_path(&libs, "/home/duncan/models/anything"),
+            (None, None)
+        );
     }
 }
