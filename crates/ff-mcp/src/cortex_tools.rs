@@ -648,6 +648,44 @@ pub async fn cortex_impact(params: Option<Value>) -> HandlerResult {
     }))
 }
 
+/// Dependency graph. With no `crate`: list dependency packages and how many
+/// crates depend on each. With a `crate`: that crate's forward dependencies
+/// (what it needs) + reverse dependents (what needs it — the rebuild blast
+/// radius); `transitive=true` adds the full transitive-dependents closure.
+pub async fn cortex_deps(params: Option<Value>) -> HandlerResult {
+    let pool = get_pool().await?;
+    let corpus_slug = corpus_or_cwd_slug(&params)?;
+    let crate_name = params
+        .as_ref()
+        .and_then(|p| p.get("crate"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+
+    match crate_name {
+        Some(name) => {
+            let mut cd = cortex::deps::deps_for_crate(&pool, name, Some(&corpus_slug))
+                .await
+                .map_err(|e| format!("deps: {e}"))?;
+            if bool_param(&params, "transitive", false) {
+                cd.transitive_dependents = Some(
+                    cortex::deps::transitive_dependents(&pool, name, Some(&corpus_slug))
+                        .await
+                        .map_err(|e| format!("transitive_dependents: {e}"))?,
+                );
+            }
+            let deps_json = serde_json::to_value(&cd).map_err(|e| format!("serialize: {e}"))?;
+            Ok(json!({ "corpus": corpus_slug, "crate": name, "deps": deps_json }))
+        }
+        None => {
+            let rows = cortex::deps::deps(&pool, Some(&corpus_slug))
+                .await
+                .map_err(|e| format!("deps: {e}"))?;
+            let packages = serde_json::to_value(&rows).map_err(|e| format!("serialize: {e}"))?;
+            Ok(json!({ "corpus": corpus_slug, "count": rows.len(), "packages": packages }))
+        }
+    }
+}
+
 /// Shortest call chain from one symbol to another (HOW does `from` reach `to`).
 /// `callers`/`callees` answer one hop and `impact` the whole closure; this returns
 /// the ordered FROM → … → TO path (each hop a real `calls` edge). An empty `path`
