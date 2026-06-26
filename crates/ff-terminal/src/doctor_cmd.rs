@@ -87,6 +87,20 @@ fn dead_alert_health(n: i64) -> Health {
     if n > 0 { Health::Warn } else { Health::Pass }
 }
 
+/// Hours a session may sit `running`/`pending` before it counts as stuck.
+/// Real sessions finish in minutes, so a multi-hour one is almost certainly
+/// wedged (a step whose fleet_task hung/was deleted, a dead worker, or a
+/// dependency deadlock like the one fixed in #602).
+const STUCK_SESSION_HOURS: i32 = 6;
+
+/// Sessions wedged in `running`/`pending` past [`STUCK_SESSION_HOURS`]. The
+/// session orchestrator has no staleness watchdog, so these are otherwise
+/// invisible until an operator goes looking. A non-zero count is a warning
+/// (investigate / `ff session cancel`), not a fleet-fatal failure.
+fn stuck_session_health(n: i64) -> Health {
+    if n > 0 { Health::Warn } else { Health::Pass }
+}
+
 /// Leader liveness: a stale/absent leader heartbeat fails — leader-gated ticks
 /// (autoscaler, reapers, upgrades) stop running without a fresh leader.
 fn leader_health(fresh: bool) -> Health {
@@ -184,7 +198,25 @@ pub async fn handle_doctor(json: bool) -> Result<()> {
         detail: format!("{dead_alerts} enabled but cannot fire"),
     });
 
-    // 5) Leader liveness (fresh heartbeat within 60s).
+    // 5) Stuck sessions (running/pending past STUCK_SESSION_HOURS). The session
+    //    orchestrator has no staleness watchdog, so a wedged session is
+    //    otherwise invisible — this is its only health signal.
+    let stuck_sessions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_sessions
+          WHERE status IN ('running', 'pending')
+            AND COALESCE(started_at, created_at) < NOW() - make_interval(hours => $1)",
+    )
+    .bind(STUCK_SESSION_HOURS)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("stuck-session check: {e}"))?;
+    checks.push(DoctorCheck {
+        name: "stuck sessions".into(),
+        status: stuck_session_health(stuck_sessions),
+        detail: format!("{stuck_sessions} running/pending >{STUCK_SESSION_HOURS}h"),
+    });
+
+    // 6) Leader liveness (fresh heartbeat within 60s).
     let fresh_leaders: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM fleet_leader_state WHERE heartbeat_at > NOW() - INTERVAL '60 seconds'",
     )
@@ -270,6 +302,8 @@ mod tests {
         assert_eq!(orphan_health(3), Health::Warn);
         assert_eq!(dead_alert_health(0), Health::Pass);
         assert_eq!(dead_alert_health(1), Health::Warn);
+        assert_eq!(stuck_session_health(0), Health::Pass);
+        assert_eq!(stuck_session_health(2), Health::Warn);
         assert_eq!(leader_health(true), Health::Pass);
         assert_eq!(leader_health(false), Health::Fail);
     }
