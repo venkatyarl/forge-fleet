@@ -206,8 +206,6 @@ pub fn classify_bash_command(command: &str) -> PermissionLevel {
         "du ",
         "wc ",
         "which ",
-        "env",
-        "printenv",
         "git status",
         "git log",
         "git diff",
@@ -225,6 +223,16 @@ pub fn classify_bash_command(command: &str) -> PermissionLevel {
         .iter()
         .any(|p| lower.starts_with(p) || lower.starts_with(&format!(" {p}")))
     {
+        return PermissionLevel::ReadOnly;
+    }
+
+    // `env`/`printenv` need care: a bare `env` (or `printenv [VAR…]`) only reads
+    // the environment, but `env VAR=val CMD` RUNS CMD — so a blanket `env`
+    // prefix would auto-allow arbitrary execution (ReadOnly → Allow). Treat
+    // `env` as read-only only when it is the entire command; `printenv` never
+    // executes a command, so it stays prefix-safe.
+    let trimmed = lower.trim();
+    if trimmed == "env" || trimmed == "printenv" || trimmed.starts_with("printenv ") {
         return PermissionLevel::ReadOnly;
     }
 
@@ -293,6 +301,32 @@ mod tests {
         assert_eq!(
             classify_bash_command("mkdir -p /tmp/test"),
             PermissionLevel::Execute
+        );
+    }
+
+    #[test]
+    fn env_prefix_does_not_auto_allow_command_execution() {
+        // Bare `env` / `printenv` only read the environment → read-only.
+        assert_eq!(classify_bash_command("env"), PermissionLevel::ReadOnly);
+        assert_eq!(classify_bash_command("printenv"), PermissionLevel::ReadOnly);
+        assert_eq!(
+            classify_bash_command("printenv PATH"),
+            PermissionLevel::ReadOnly
+        );
+        // `env VAR=val CMD` RUNS CMD — it must NOT be auto-allowed as read-only.
+        assert_eq!(
+            classify_bash_command("env FOO=1 ./deploy.sh"),
+            PermissionLevel::Execute
+        );
+        assert_eq!(
+            classify_bash_command("env make install"),
+            PermissionLevel::Execute
+        );
+        // Destructive `env …` is still caught (the dangerous/forbidden lists
+        // run before the read-only check, so the env prefix can't downgrade it).
+        assert_eq!(
+            classify_bash_command("env FOO=1 rm -rf ./build"),
+            PermissionLevel::Dangerous
         );
     }
 
