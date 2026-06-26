@@ -211,31 +211,34 @@ impl InferenceRouter {
         }
         // All endpoints are in cooldown — return the least-recently-failed one
         // so the caller can attempt a recovery request rather than giving up.
-        // Prefer a tool-capable endpoint here too when tools are required.
-        self.endpoints
+        // "Least-recently-failed" = the one whose last failure is furthest in
+        // the past (largest time-since-failure, or never failed), since it is
+        // the most likely to have recovered and its cooldown is closest to
+        // expiring. Prefer a tool-capable endpoint when tools are required.
+        let pool: Vec<&RouterEndpoint> = if require_tools {
+            let tools: Vec<&RouterEndpoint> = self
+                .endpoints
+                .iter()
+                .filter(|ep| ep.supports_tools)
+                .collect();
+            // No tool-capable endpoint at all — fall back to any.
+            if tools.is_empty() {
+                self.endpoints.iter().collect()
+            } else {
+                tools
+            }
+        } else {
+            self.endpoints.iter().collect()
+        };
+        let since_failure: Vec<Option<Duration>> = pool
             .iter()
-            .filter(|ep| !require_tools || ep.supports_tools)
-            .min_by_key(|ep| {
-                state
-                    .failed_at
-                    .get(&ep.url)
-                    .map(|t| t.elapsed())
-                    .unwrap_or(Duration::MAX)
-            })
-            .or_else(|| {
-                // No tool-capable endpoint at all — fall back to any.
-                self.endpoints.iter().min_by_key(|ep| {
-                    state
-                        .failed_at
-                        .get(&ep.url)
-                        .map(|t| t.elapsed())
-                        .unwrap_or(Duration::MAX)
-                })
-            })
-            .map(|ep| {
-                warn!(label = %ep.label, "all endpoints in cooldown — returning least-recently-failed");
-                ep.url.clone()
-            })
+            .map(|ep| state.failed_at.get(&ep.url).map(|t| t.elapsed()))
+            .collect();
+        recovery_pick_idx(&since_failure).map(|i| {
+            let ep = pool[i];
+            warn!(label = %ep.label, "all endpoints in cooldown — returning least-recently-failed");
+            ep.url.clone()
+        })
     }
 
     /// Mark an endpoint as failed. It will be skipped for `cooldown` seconds,
@@ -552,6 +555,19 @@ fn model_supports_tools(model_id: &str) -> bool {
     id.contains("qwen") || id.contains("mistral") || id.contains("llama-3") || id == "auto"
 }
 
+/// All-cooling-down recovery: index of the endpoint that failed *longest ago*
+/// (or never), which is the most likely to have recovered and whose cooldown is
+/// closest to expiring. `since_failure[i]` is the time since endpoint `i` last
+/// failed, or `None` if it has no recorded failure (treated as infinitely long
+/// ago — i.e. most preferred). Returns `None` only for an empty slice.
+fn recovery_pick_idx(since_failure: &[Option<Duration>]) -> Option<usize> {
+    since_failure
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, since)| since.unwrap_or(Duration::MAX))
+        .map(|(i, _)| i)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,5 +790,34 @@ mod tests {
             router.active_url_filtered(true).await.as_deref(),
             Some("http://sophie-32b")
         );
+    }
+
+    #[test]
+    fn recovery_prefers_the_endpoint_that_failed_longest_ago() {
+        // Regression: the all-cooling-down fallback used min_by_key, which
+        // returned the *most* recently failed endpoint (still broken). It must
+        // pick the one whose failure is furthest in the past.
+        let since = [
+            Some(Duration::from_secs(2)),  // just failed — worst choice
+            Some(Duration::from_secs(59)), // failed long ago — most recovered
+            Some(Duration::from_secs(10)),
+        ];
+        assert_eq!(recovery_pick_idx(&since), Some(1));
+    }
+
+    #[test]
+    fn recovery_prefers_a_never_failed_endpoint() {
+        // `None` (no recorded failure) is treated as infinitely long ago.
+        let since = [
+            Some(Duration::from_secs(59)),
+            None,
+            Some(Duration::from_secs(2)),
+        ];
+        assert_eq!(recovery_pick_idx(&since), Some(1));
+    }
+
+    #[test]
+    fn recovery_empty_slice_is_none() {
+        assert_eq!(recovery_pick_idx(&[]), None);
     }
 }
