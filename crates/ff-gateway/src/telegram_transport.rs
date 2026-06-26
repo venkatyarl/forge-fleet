@@ -1291,4 +1291,59 @@ mod tests {
             "/tmp/forgefleet-telegram/upd42_msg88_99_1_file.JPG"
         );
     }
+
+    #[test]
+    fn media_download_path_neutralizes_traversal() {
+        // `file_path` comes from Telegram's getFile response (external input).
+        // The download path must never escape `base_dir`, regardless of what
+        // traversal sequence, absolute path, or metacharacter it carries.
+        let base = std::path::Path::new("/tmp/forgefleet-telegram");
+        let hostile = [
+            "../../../etc/passwd",
+            "/etc/shadow",
+            "..\\..\\windows\\system32",
+            "a/b/../../../../root/.ssh/id_rsa",
+            "file; rm -rf $HOME",
+            "na`me`.png",
+        ];
+        for fp in hostile {
+            let path = build_media_download_path(base, 1, "m", 0, fp);
+            // Always lands directly under base_dir — exactly one component below.
+            assert_eq!(
+                path.parent(),
+                Some(base),
+                "path escaped base_dir for input {fp:?}: {path:?}"
+            );
+            let leaf = path.file_name().and_then(|n| n.to_str()).unwrap();
+            // Only the sanitized character set survives, which by construction
+            // means no path separators ('/' and '\\' both map to '_'). A '..'
+            // *substring* inside this single filename component is harmless —
+            // the security property is that `parent() == base` (asserted
+            // above), i.e. the join never escapes base_dir.
+            assert!(
+                leaf.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+                "leaf has an unsanitized char for {fp:?}: {leaf}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_download_path_falls_back_when_no_filename() {
+        // A path with no usable final component must not panic or produce an
+        // empty/odd name — it falls back to the default basename.
+        // Inputs whose `file_name()` is `None`: empty, root, and bare
+        // parent/current-dir refs (which also doubles as a traversal check —
+        // a lone ".." resolves to the safe fallback, never a literal "..").
+        let base = std::path::Path::new("/tmp/forgefleet-telegram");
+        for fp in ["", "/", "..", "."] {
+            let path = build_media_download_path(base, 7, "m", 2, fp);
+            assert_eq!(path.parent(), Some(base));
+            let leaf = path.file_name().and_then(|n| n.to_str()).unwrap();
+            assert!(
+                leaf.ends_with("telegram-media.bin"),
+                "expected fallback basename for {fp:?}: {leaf}"
+            );
+        }
+    }
 }
