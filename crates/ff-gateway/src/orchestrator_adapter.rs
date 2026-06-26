@@ -218,42 +218,59 @@ fn map_runtime(rt: &str) -> Option<Runtime> {
     }
 }
 
-/// Infer tier from model name heuristics.
-fn infer_tier(model_id: &str) -> Tier {
+/// Parse the parameter count (billions) out of a model name by reading the
+/// actual `<number>b` token(s), rather than substring-matching a fixed list.
+///
+/// The old enumerated `contains("8b")` approach had the param-size substring
+/// trap (cf. #585/#586): `128b` contains `8b` → read as 8B, and `235b` (the
+/// fleet's real big model) matched no pattern → fell back to 7B. This scans for
+/// `<digits[.digits]>b` runs and takes the LARGEST (so a MoE id like
+/// `qwen3-30b-a3b` reads its 30B total, not the 3B active). A `b` followed by a
+/// letter is NOT a size — `8bit`/`4bit` quant markers are skipped. Pure.
+fn parse_params_b(model_id: &str) -> Option<f32> {
     let lower = model_id.to_ascii_lowercase();
-    // Check for explicit size markers
-    if lower.contains("200b") || lower.contains("405b") || lower.contains("70b") {
-        Tier::Tier4
-    } else if lower.contains("72b") || lower.contains("65b") || lower.contains("40b") {
-        Tier::Tier3
-    } else if lower.contains("32b") || lower.contains("27b") || lower.contains("30b") {
-        Tier::Tier2
-    } else if lower.contains("9b")
-        || lower.contains("7b")
-        || lower.contains("8b")
-        || lower.contains("3b")
-        || lower.contains("2b")
-        || lower.contains("1b")
-    {
-        Tier::Tier1
-    } else {
-        Tier::Tier2
+    let bytes = lower.as_bytes();
+    let mut best: Option<f32> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+            i += 1;
+        }
+        // A size token is `<number>b` where the char after `b` is not a letter
+        // (so `8bit`/`bf16` aren't misread as a parameter count).
+        if i < bytes.len() && bytes[i] == b'b' {
+            let after_is_letter = bytes.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic());
+            if !after_is_letter && let Ok(n) = lower[start..i].parse::<f32>() {
+                best = Some(best.map_or(n, |b: f32| b.max(n)));
+            }
+            i += 1; // consume the 'b'
+        }
+    }
+    best
+}
+
+/// Infer tier from a model's parameter count. Thresholds reproduce the legacy
+/// enumerated mapping (≥70B→Tier4, ≥40B→Tier3, ≥20B→Tier2, >0→Tier1) while
+/// correctly classifying sizes the old substring list missed (128B, 235B).
+/// Unknown size → Tier2 (mid default), as before.
+fn infer_tier(model_id: &str) -> Tier {
+    match parse_params_b(model_id) {
+        Some(p) if p >= 70.0 => Tier::Tier4,
+        Some(p) if p >= 40.0 => Tier::Tier3,
+        Some(p) if p >= 20.0 => Tier::Tier2,
+        Some(p) if p > 0.0 => Tier::Tier1,
+        _ => Tier::Tier2,
     }
 }
 
-/// Extract parameter count (billions) from model name.
+/// Extract parameter count (billions) from a model name; 7.0 when unknown.
 fn infer_params_b(model_id: &str) -> f32 {
-    let lower = model_id.to_ascii_lowercase();
-    // Try to find patterns like "32b", "7b", "200b", "405b"
-    for pat in [
-        "405b", "200b", "72b", "70b", "65b", "40b", "32b", "30b", "27b", "9b", "8b", "7b", "3b",
-        "2b", "1b",
-    ] {
-        if lower.contains(pat) {
-            return pat.trim_end_matches('b').parse::<f32>().unwrap_or(7.0);
-        }
-    }
-    7.0
+    parse_params_b(model_id).unwrap_or(7.0)
 }
 
 // ─── HTTP dispatch closure ──────────────────────────────────────────────────
@@ -644,8 +661,16 @@ mod tests {
         assert_eq!(infer_tier("llama-3-70b"), Tier::Tier4);
         assert_eq!(infer_tier("qwen3-32b"), Tier::Tier2);
         assert_eq!(infer_tier("gemma-2b"), Tier::Tier1);
-        assert_eq!(infer_tier("qwen3-0.5b"), Tier::Tier2); // 0.5b not explicitly matched
+        // 0.5b is now correctly parsed as a real (tiny) size → Tier1 (was the
+        // unknown-default Tier2 under the old substring list).
+        assert_eq!(infer_tier("qwen3-0.5b"), Tier::Tier1);
         assert_eq!(infer_tier("unknown"), Tier::Tier2);
+        // BUG FIXES: sizes the old substring list misclassified.
+        assert_eq!(infer_tier("model-128b"), Tier::Tier4); // contained "8b" → was Tier1
+        assert_eq!(infer_tier("qwen3-235b-a22b"), Tier::Tier4); // matched nothing → was Tier2
+        assert_eq!(infer_tier("llama-3.1-405b"), Tier::Tier4);
+        // A quant marker is NOT a parameter size.
+        assert_eq!(infer_tier("qwen3-coder-30b-a3b-8bit"), Tier::Tier2); // 30B total
     }
 
     #[test]
@@ -653,8 +678,14 @@ mod tests {
         assert_eq!(infer_params_b("llama-3-70b"), 70.0);
         assert_eq!(infer_params_b("qwen3-32b"), 32.0);
         assert_eq!(infer_params_b("gemma-2b"), 2.0);
-        assert_eq!(infer_params_b("qwen3-0.5b"), 7.0); // 0.5b doesn't match any pattern
+        assert_eq!(infer_params_b("qwen3-0.5b"), 0.5); // now parsed correctly (was 7.0)
         assert_eq!(infer_params_b("unknown"), 7.0);
+        // BUG FIXES.
+        assert_eq!(infer_params_b("model-128b"), 128.0); // was 8.0 (contained "8b")
+        assert_eq!(infer_params_b("qwen3-235b-a22b"), 235.0); // was 7.0 (no pattern); MoE → total
+        assert_eq!(infer_params_b("qwen3-coder-30b-a3b"), 30.0); // MoE total, not 3B active
+        assert_eq!(infer_params_b("llama-3.1-8b"), 8.0); // version 3.1 ignored
+        assert_eq!(infer_params_b("qwen2.5-coder-7b-4bit"), 7.0); // quant marker ignored
     }
 
     #[test]
