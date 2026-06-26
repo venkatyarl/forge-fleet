@@ -2950,6 +2950,32 @@ pub enum PmCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Bulk-delete NON-LIVE work_items (e.g. clear a one-time audit run's
+    /// stale `idea` rows). DRY-RUN by default — prints what would be deleted;
+    /// pass `--yes` to actually delete. Only ever touches terminal/never-started
+    /// rows (idea / done / cancelled / failed); live work (ready / claimed /
+    /// in_progress / in_review / blocked) is NEVER purged. Requires at least one
+    /// filter so a bare `ff pm purge` can't wipe the table.
+    Purge {
+        /// Only this kind (e.g. `audit`, `dispatch`).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only this status (must be a purgeable one: idea/done/cancelled/failed).
+        #[arg(long)]
+        status: Option<String>,
+        /// Only this project_id.
+        #[arg(long)]
+        project: Option<String>,
+        /// Only rows created before this age (e.g. `7d`, `48h`, `30m`).
+        #[arg(long)]
+        older_than: Option<String>,
+        /// Actually delete (default is a dry-run preview).
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+        /// Emit JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Import Claude Code session tasks into projects.work_items.
     ///
     /// Claude Code's TaskCreate/TaskList/TaskUpdate tools keep their state
