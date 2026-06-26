@@ -467,6 +467,27 @@ async fn call_anthropic_messages(
 /// - `system` messages concatenated into top-level `system`
 /// - Remaining `user`/`assistant` messages become `messages`
 /// - `max_tokens` is REQUIRED by Anthropic; default 4096 when absent.
+/// Flatten an OpenAI message `content` field into plain text. OpenAI allows
+/// `content` to be EITHER a string OR an array of content parts
+/// (`[{"type":"text","text":"…"}, {"type":"image_url",…}]`). The cloud
+/// translators previously read only `content.as_str()`, so an array-valued
+/// `content` silently became empty — dropping the message (or the system
+/// prompt). This joins the `text` of every text part; non-text parts (images)
+/// are skipped. `""` when there is no text. Pure.
+fn flatten_text_content(content: &Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = content.as_array() {
+        return arr
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+    }
+    String::new()
+}
+
 fn translate_openai_to_anthropic(body: &Value) -> Result<(Value, bool), CloudCallError> {
     let empty: Vec<Value> = Vec::new();
     let messages = body
@@ -481,8 +502,11 @@ fn translate_openai_to_anthropic(body: &Value) -> Result<(Value, bool), CloudCal
         let content = m.get("content").cloned().unwrap_or(Value::Null);
         match role {
             "system" => {
-                if let Some(s) = content.as_str() {
-                    system_parts.push(s.to_string());
+                // Handle both string and array-of-parts system content — an
+                // array-valued system message used to be silently dropped.
+                let s = flatten_text_content(&content);
+                if !s.is_empty() {
+                    system_parts.push(s);
                 }
             }
             "user" | "assistant" => {
@@ -657,11 +681,12 @@ fn translate_openai_to_google(body: &Value) -> Value {
     let mut contents: Vec<Value> = Vec::new();
     for m in messages {
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        // Both string and array-of-parts content — an array-valued message used
+        // to flatten to "" here, dropping the whole message's text.
         let text = m
             .get("content")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
+            .map(flatten_text_content)
+            .unwrap_or_default();
         match role {
             "system" => system_parts.push(text),
             "user" => contents.push(json!({ "role": "user", "parts": [{"text": text}] })),
@@ -768,6 +793,54 @@ async fn record_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flatten_text_content_handles_string_and_parts() {
+        assert_eq!(flatten_text_content(&json!("hello")), "hello");
+        assert_eq!(
+            flatten_text_content(&json!([
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b"}
+            ])),
+            "ab"
+        );
+        // Non-text parts (images) are skipped, text kept.
+        assert_eq!(
+            flatten_text_content(&json!([
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:…"}}
+            ])),
+            "describe"
+        );
+        assert_eq!(flatten_text_content(&json!(null)), "");
+    }
+
+    #[test]
+    fn anthropic_system_array_content_is_not_dropped() {
+        // BUG FIX: a system message with array-of-parts content used to be
+        // dropped (only `content.as_str()` was read).
+        let body = json!({
+            "messages": [
+                { "role": "system", "content": [{"type": "text", "text": "You are helpful."}] },
+                { "role": "user", "content": "Hi" },
+            ],
+        });
+        let (anth, had_sys) = translate_openai_to_anthropic(&body).unwrap();
+        assert!(had_sys);
+        assert_eq!(anth["system"], "You are helpful.");
+    }
+
+    #[test]
+    fn google_array_content_is_not_emptied() {
+        // BUG FIX: ANY role with array content used to flatten to "" for Google.
+        let body = json!({
+            "messages": [
+                { "role": "user", "content": [{"type": "text", "text": "Hi there"}] },
+            ],
+        });
+        let g = translate_openai_to_google(&body);
+        assert_eq!(g["contents"][0]["parts"][0]["text"], "Hi there");
+    }
 
     #[test]
     fn openai_to_anthropic_extracts_system_and_defaults_max_tokens() {
