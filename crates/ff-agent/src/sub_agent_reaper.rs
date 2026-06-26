@@ -2,20 +2,30 @@
 //!
 //! ## Role
 //!
-//! Runs on the leader every 10 minutes. Resets any `sub_agents` row whose
-//! `status` is `'error'` or `'busy'` AND whose `started_at` is either NULL
-//! or older than 10 minutes. The dispatch queue depends on slots cycling
-//! back to `'idle'` — when a worker crashes mid-task or flips to `'error'`
-//! without a later cleanup, the slot is effectively dead. A NULL
-//! `started_at` on an `'error'`/`'busy'` row means the slot was never
-//! meaningfully running, so it should be reset too. This tick automates
-//! the manual `UPDATE sub_agents SET status='idle' ...` the operator used
-//! to run by hand.
+//! Runs on the leader every 10 minutes. Resets any stuck `sub_agents` row back
+//! to `'idle'` so the dispatch queue can reuse the slot — when a worker crashes
+//! mid-task or flips to `'error'` without a later cleanup, the slot is
+//! effectively dead and would otherwise leak forever.
 //!
-//! Schema note: the V23 `sub_agents` table has no `claimed_at` or
-//! `last_error` columns. We use `started_at` as the staleness clock and
-//! surface the reap reason via `tracing::info!` + the audit trail the
-//! caller controls, not a per-row text column.
+//! ## Per-status staleness clock (the important part)
+//!
+//! `started_at` is the only clock available — there is NO periodic mid-task
+//! heartbeat on `sub_agents` (every `UPDATE sub_agents` is a claim/release
+//! state transition, so `last_heartbeat_at == started_at` for a busy slot).
+//! That means a flat short timeout is WRONG for `'busy'`: a legitimately
+//! long-running task (cold builds run ~45 min) whose `started_at` is older than
+//! the timeout would be reset to `'idle'` mid-run, and the scheduler would then
+//! dispatch a SECOND task onto the same slot (oversubscription) while the first
+//! process is still alive. So we split the threshold:
+//!
+//! - `'error'` (dead) or NULL `started_at` (never really ran) → reset after
+//!   [`ERROR_STALE_MINS`] (free dead slots quickly).
+//! - `'busy'` with a `started_at` → reset only after the generous
+//!   [`BUSY_STALE_MINS`] ceiling (a "hung task" guard that still gives real
+//!   long tasks room to finish).
+//!
+//! The reap reason is surfaced via `tracing::info!` + the caller's audit trail,
+//! not a per-row text column (the V23 table has no `last_error`).
 
 use std::time::Duration;
 
@@ -23,6 +33,37 @@ use anyhow::{Context, Result};
 use sqlx::{PgPool, Row};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+
+/// Minutes a dead/errored or never-started slot may sit before being freed.
+const ERROR_STALE_MINS: i64 = 10;
+/// Minutes a `'busy'` slot may run before it's assumed hung. Must exceed the
+/// longest legitimate task (cold builds via the wave run ~45 min) so a live
+/// slot is never reset mid-task (which would let the scheduler oversubscribe
+/// it). 60 min is comfortably above 45 and well below "obviously wedged".
+const BUSY_STALE_MINS: i64 = 60;
+
+/// Staleness ceiling (minutes) for a reapable `status`. `'busy'` gets the long
+/// ceiling; everything else we reap (`'error'`) gets the short one.
+fn reap_threshold_mins(status: &str) -> i64 {
+    match status {
+        "busy" => BUSY_STALE_MINS,
+        _ => ERROR_STALE_MINS,
+    }
+}
+
+/// Pure mirror of the reaper's SQL WHERE clause (for tests + as the spec). A
+/// slot is reaped when its status is reapable AND it either never meaningfully
+/// started (NULL `started_at`) or its `started_at` is older than the per-status
+/// threshold. `started_at_age_mins` is `None` for a NULL `started_at`.
+fn should_reap(status: &str, started_at_age_mins: Option<i64>) -> bool {
+    if status != "error" && status != "busy" {
+        return false;
+    }
+    match started_at_age_mins {
+        None => true,
+        Some(age) => age > reap_threshold_mins(status),
+    }
+}
 
 /// Is this pool's leader the computer whose name matches `my_name`?
 async fn is_leader(pool: &PgPool, my_name: &str) -> bool {
@@ -52,19 +93,29 @@ impl SubAgentReaper {
             return Ok(0);
         }
 
-        let rows = sqlx::query(
+        // Per-status thresholds, interpolated from the consts so the SQL and
+        // `should_reap` (the tested spec) can't drift. The values are i64
+        // literals we control — no injection surface.
+        let sql = format!(
             "UPDATE sub_agents AS s
                 SET status               = 'idle',
                     current_work_item_id = NULL
                FROM computers c
               WHERE s.computer_id = c.id
-                AND s.status IN ('error','busy')
-                AND (s.started_at IS NULL OR s.started_at < NOW() - INTERVAL '10 minutes')
-              RETURNING c.name AS computer_name, s.slot AS slot, s.status AS status",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("reap stuck sub_agents")?;
+                AND (
+                     (s.status = 'error'
+                        AND (s.started_at IS NULL
+                             OR s.started_at < NOW() - INTERVAL '{ERROR_STALE_MINS} minutes'))
+                  OR (s.status = 'busy'
+                        AND (s.started_at IS NULL
+                             OR s.started_at < NOW() - INTERVAL '{BUSY_STALE_MINS} minutes'))
+                )
+              RETURNING c.name AS computer_name, s.slot AS slot, s.status AS status"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .context("reap stuck sub_agents")?;
 
         for row in &rows {
             let computer: String = row.get("computer_name");
@@ -74,7 +125,8 @@ impl SubAgentReaper {
                 computer = %computer,
                 slot = slot,
                 prior_status = %prior,
-                "reaped stuck sub_agent slot after 10min timeout"
+                threshold_mins = reap_threshold_mins(&prior),
+                "reaped stuck sub_agent slot"
             );
         }
         Ok(rows.len())
@@ -108,5 +160,46 @@ impl SubAgentReaper {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn busy_long_task_is_protected_until_ceiling() {
+        // THE BUG FIX: a live 'busy' slot running a 30-min task (well under the
+        // 60-min ceiling) must NOT be reaped — reaping it mid-run would let the
+        // scheduler oversubscribe the slot.
+        assert!(!should_reap("busy", Some(30)));
+        assert!(!should_reap("busy", Some(BUSY_STALE_MINS))); // exactly at ceiling: not yet
+        // A genuinely hung 'busy' slot past the ceiling IS reaped.
+        assert!(should_reap("busy", Some(BUSY_STALE_MINS + 5)));
+        // A 'busy' slot that never recorded a start is dead → reaped.
+        assert!(should_reap("busy", None));
+    }
+
+    #[test]
+    fn error_slots_freed_quickly() {
+        assert!(!should_reap("error", Some(5))); // within the short window
+        assert!(should_reap("error", Some(ERROR_STALE_MINS + 1)));
+        assert!(should_reap("error", None));
+    }
+
+    #[test]
+    fn non_reapable_status_never_reaped() {
+        assert!(!should_reap("idle", None));
+        assert!(!should_reap("idle", Some(999)));
+        assert!(!should_reap("planning", Some(999)));
+    }
+
+    #[test]
+    fn thresholds_are_distinct_and_busy_is_generous() {
+        assert_eq!(reap_threshold_mins("error"), ERROR_STALE_MINS);
+        assert_eq!(reap_threshold_mins("busy"), BUSY_STALE_MINS);
+        // Busy ceiling must clear the ~45-min cold-build worst case.
+        assert!(BUSY_STALE_MINS > 45);
+        assert!(BUSY_STALE_MINS > ERROR_STALE_MINS);
     }
 }
