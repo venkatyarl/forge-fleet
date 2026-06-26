@@ -430,13 +430,22 @@ fn match_catalog(needle: &str, catalog: &[ff_db::ModelCatalogRow]) -> Option<Str
             .collect()
     };
     let n = canon(needle);
+    // An empty needle (e.g. a filename that canonicalises to nothing) must not
+    // match anything: `id_c.contains("")` is always true, so without this guard
+    // every catalog row would "match" and the longest id would be returned.
+    if n.is_empty() {
+        return None;
+    }
+    // Substring match in either direction, but an EMPTY pattern is never a
+    // match — `"".contains(...)`/`n.contains("")` would otherwise let a catalog
+    // row with a punctuation-only id or name match every needle.
+    let contains_either = |p: &str| -> bool { !p.is_empty() && (n.contains(p) || p.contains(&n)) };
     let mut best: Option<(usize, String)> = None;
     for row in catalog {
         let id_c = canon(&row.id);
         let name_c = canon(&row.name);
         // Direct-contains match (either direction)
-        let hit =
-            n.contains(&id_c) || id_c.contains(&n) || n.contains(&name_c) || name_c.contains(&n);
+        let hit = contains_either(&id_c) || contains_either(&name_c);
         if hit {
             // Prefer longer catalog-id match — "qwen3-coder-30b" over "qwen3-14b" when both hit.
             let score = id_c.len();
@@ -502,5 +511,60 @@ mod tests {
             extract_gguf_quant("merged-Q4_0-then-final-Q8_0"),
             Some("Q8_0".to_string())
         );
+    }
+
+    fn row(id: &str, name: &str) -> ff_db::ModelCatalogRow {
+        ff_db::ModelCatalogRow {
+            id: id.to_string(),
+            name: name.to_string(),
+            family: String::new(),
+            parameters: String::new(),
+            tier: 0,
+            description: None,
+            gated: false,
+            preferred_workloads: serde_json::json!([]),
+            variants: serde_json::json!([]),
+            tool_calling: false,
+        }
+    }
+
+    #[test]
+    fn match_catalog_prefers_longer_id() {
+        let cat = vec![
+            row("qwen3", "Qwen3"),
+            row("qwen3-coder-30b", "Qwen3 Coder 30B"),
+        ];
+        // A discovered name that contains both ids resolves to the more
+        // specific (longer) catalog id.
+        assert_eq!(
+            match_catalog("qwen3-coder-30b-instruct", &cat),
+            Some("qwen3-coder-30b".to_string())
+        );
+    }
+
+    #[test]
+    fn match_catalog_empty_needle_matches_nothing() {
+        // Regression: an empty needle used to match every row via
+        // `id_c.contains("")` and return the longest id.
+        let cat = vec![
+            row("qwen3-coder-30b", "Qwen3 Coder 30B"),
+            row("llama-3-8b", "Llama 3 8B"),
+        ];
+        assert_eq!(match_catalog("---", &cat), None);
+        assert_eq!(match_catalog("", &cat), None);
+    }
+
+    #[test]
+    fn match_catalog_empty_catalog_pattern_matches_nothing() {
+        // Regression: a catalog row whose id+name canonicalise to empty used to
+        // match every needle via `n.contains("")`.
+        let cat = vec![row("", "")];
+        assert_eq!(match_catalog("totally-unrelated-model-xyz", &cat), None);
+    }
+
+    #[test]
+    fn match_catalog_no_match_returns_none() {
+        let cat = vec![row("qwen3-coder-30b", "Qwen3 Coder 30B")];
+        assert_eq!(match_catalog("mistral-7b-instruct", &cat), None);
     }
 }
