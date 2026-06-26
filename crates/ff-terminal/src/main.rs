@@ -1548,6 +1548,15 @@ enum FleetCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show every forgefleetd subsystem GATE (the `fleet_secrets.*_mode` /
+    /// `*_enabled` flags that arm or disarm each daemon tick) with its current
+    /// effective value, default, and what it controls. Most gates are unset in
+    /// `fleet_secrets` and run on their code default, so they're invisible to
+    /// `ff secrets list` — this is the canonical "what is my daemon doing?" view.
+    Gates {
+        #[arg(long)]
+        json: bool,
+    },
     /// Show per-host code identity (SHA) + convergence status. Designed
     /// to answer "is the whole fleet on the same code?" without the
     /// per-machine build counter confusing the picture.
