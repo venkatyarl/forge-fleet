@@ -726,6 +726,36 @@ async fn cortex_column_accessors(params: Option<Value>, reads: bool) -> HandlerR
     }))
 }
 
+/// Config/env/secret/feature-flag keys. With NO `key`: list every config key
+/// extracted in the corpus. With a `key`: the functions that READ it (the
+/// config-change impact — who breaks if you rename/retire it).
+pub async fn cortex_config_key(params: Option<Value>) -> HandlerResult {
+    let pool = get_pool().await?;
+    let corpus_slug = corpus_or_cwd_slug(&params)?;
+    let key = params
+        .as_ref()
+        .and_then(|p| p.get("key"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+
+    match key {
+        Some(k) => {
+            let rows = cortex::config_key(&pool, Some(&corpus_slug), k)
+                .await
+                .map_err(|e| format!("config_key: {e}"))?;
+            let readers = serde_json::to_value(&rows).map_err(|e| format!("serialize: {e}"))?;
+            Ok(json!({ "corpus": corpus_slug, "key": k, "count": rows.len(), "readers": readers }))
+        }
+        None => {
+            let rows = cortex::config(&pool, Some(&corpus_slug))
+                .await
+                .map_err(|e| format!("config: {e}"))?;
+            let keys = serde_json::to_value(&rows).map_err(|e| format!("serialize: {e}"))?;
+            Ok(json!({ "corpus": corpus_slug, "count": rows.len(), "keys": keys }))
+        }
+    }
+}
+
 /// Shortest call chain from one symbol to another (HOW does `from` reach `to`).
 /// `callers`/`callees` answer one hop and `impact` the whole closure; this returns
 /// the ordered FROM → … → TO path (each hop a real `calls` edge). An empty `path`
