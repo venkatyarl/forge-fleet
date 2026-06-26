@@ -66,8 +66,16 @@ impl Default for SweepPolicy {
         Self {
             // Downloads can legitimately take 30+ min for big models; be conservative.
             job_stale_after: Duration::hours(2),
-            // Shell deferred tasks should finish in minutes; if they don't, something's wrong.
-            deferred_stale_after: Duration::minutes(30),
+            // MUST be >= the defer-worker's own wall-clock cap
+            // (`DEFAULT_DEFER_MAX_DURATION` = 2h). The deferred queue runs
+            // legitimate LONG tasks — multi-GB cross-node model downloads and
+            // the HA-backup rsync fan-out — blocking, for up to 2h. There is no
+            // mid-task heartbeat on `deferred_tasks` (claimed_at is set once at
+            // claim), so a shorter window swept a HEALTHY long-running download
+            // back to `pending` and a second worker re-dispatched it — a racing
+            // duplicate multi-GB HF fetch onto the same target. Only once a task
+            // has outlived the worker's cap is it genuinely stuck. (Was 30min.)
+            deferred_stale_after: Duration::hours(2),
             // A live `ff research` run (planner + N parallel sub-agents at the
             // default depth on slow local models) can take a while; 1h is well
             // past any legitimate run, so only genuinely orphaned sessions
@@ -302,7 +310,17 @@ mod tests {
     fn default_policy_thresholds_are_stable() {
         let p = SweepPolicy::default();
         assert_eq!(p.job_stale_after, Duration::hours(2));
-        assert_eq!(p.deferred_stale_after, Duration::minutes(30));
+        assert_eq!(p.deferred_stale_after, Duration::hours(2));
+        // INVARIANT (the fix): the deferred sweep window must be >= the
+        // defer-worker's own wall-clock cap, or it would reap a HEALTHY
+        // long-running task (e.g. a 45-min multi-GB model download) and let a
+        // second worker re-dispatch a racing duplicate. There is no mid-task
+        // heartbeat on deferred_tasks, so this coupling is the only guard.
+        assert!(
+            p.deferred_stale_after.num_seconds() as u64
+                >= crate::defer_worker::DEFAULT_DEFER_MAX_DURATION.as_secs(),
+            "deferred sweep must not fire before the worker's max-duration cap"
+        );
         // Research sessions: generous enough not to reap a live `ff research`
         // run, short enough that orphans (process killed) clear within the hour.
         assert_eq!(p.research_stale_after, Duration::hours(1));
