@@ -52,3 +52,14 @@ handling, confirm which table the feature targets.
 - Reaper stale-window < worker max-runtime → couple the consts with a test (#590/#591).
 - Cloud model routing namespace → `bare_model_name` strips up-to-last-slash (#593/#594).
 - OpenAI message `content` may be string OR array → `flatten_text_content` (#592).
+
+## iter59 — session-DAG failed-dependency deadlock (FIXED, PR #602)
+
+`session_runner::tick` treated a dep as satisfied only at `completed`/`skipped`.
+A `failed`/`cancelled` dep left dependents `pending` forever → session never
+finalised (hung in `running`). Reachable via planner P4 fan-out: the planner is
+instructed to emit a final synthesiser step depending on ALL prior steps, so any
+partial failure deadlocks the session. Fix: pure `dep_gate` (Dispatch|Wait|Cancel)
+— a failed dep cancels the step, cascades transitively over ticks, session
+finalises as `failed`. Finalisation also counts `cancelled` as non-success.
+Latent today (0 live multi-dep sessions) but a real correctness bug. +4 unit tests.
