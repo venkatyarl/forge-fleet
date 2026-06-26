@@ -19,7 +19,12 @@ use uuid::Uuid;
 
 use crate::sub_agents::ensure_workspaces;
 
-const HEARTBEAT_SECS: u64 = 45;
+/// How often the dispatch loop bumps a work_item lease's `heartbeat_at` while a
+/// build runs. The lease reapers (`lease_takeover`, `work_item_scheduler`) MUST
+/// use a stale window comfortably larger than this, or they'd reclaim a live
+/// lease mid-build (the #589/#590 reaper bug class). `pub(crate)` so those
+/// reapers' regression tests can assert the coupling.
+pub(crate) const HEARTBEAT_SECS: u64 = 45;
 const COMMAND_POLL_MS: u64 = 250;
 const FF_TIMEOUT_SECS: u64 = 1800;
 const MAX_DISPATCH_PER_TICK: i64 = 1;

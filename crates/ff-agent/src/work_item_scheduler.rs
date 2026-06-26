@@ -153,3 +153,20 @@ pub fn spawn_work_item_scheduler(
         info!("work_item_scheduler loop stopped");
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// REGRESSION GUARD (reaper bug class #589/#590): same coupling as
+    /// `lease_takeover` — the scheduler's own lease-reap window must clear at
+    /// least two dispatch heartbeats so a live build's lease is never reclaimed.
+    #[test]
+    fn lease_stale_window_clears_two_heartbeats() {
+        let cadence = crate::work_item_dispatch::HEARTBEAT_SECS as i64;
+        assert!(
+            LEASE_STALE_SECS >= 2 * cadence,
+            "LEASE_STALE_SECS ({LEASE_STALE_SECS}) must be >= 2x the dispatch heartbeat ({cadence})"
+        );
+    }
+}
