@@ -121,6 +121,8 @@ impl ToolRegistry {
         self.register(Self::cortex_callees());
         self.register(Self::cortex_impact());
         self.register(Self::cortex_deps());
+        self.register(Self::cortex_readers());
+        self.register(Self::cortex_writers());
         self.register(Self::cortex_path());
         self.register(Self::cortex_tests());
         self.register(Self::cortex_review());
@@ -1192,6 +1194,36 @@ impl ToolRegistry {
         }
     }
 
+    fn cortex_readers() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_readers".to_string(),
+            description: "Cortex data-flow: functions that READ a database column — who consumes its value. Use before changing a column's type/meaning to see every reader. Pair with cortex_writers (who sets it).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "corpus": { "type": "string", "description": "Indexed repo slug (see cortex_corpora). Defaults to the cwd's slug." },
+                    "column": { "type": "string", "description": "DB column, e.g. 'work_items.status' or bare 'status'." }
+                },
+                "required": ["column"]
+            }),
+        }
+    }
+
+    fn cortex_writers() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_writers".to_string(),
+            description: "Cortex data-flow: functions that WRITE a database column — who produces its value. Use before changing a column's invariants to see every write site. Pair with cortex_readers (who consumes it).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "corpus": { "type": "string", "description": "Indexed repo slug (see cortex_corpora). Defaults to the cwd's slug." },
+                    "column": { "type": "string", "description": "DB column, e.g. 'work_items.status' or bare 'status'." }
+                },
+                "required": ["column"]
+            }),
+        }
+    }
+
     fn cortex_path() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_path".to_string(),
@@ -1720,6 +1752,8 @@ mod tests {
             "cortex_callees",
             "cortex_impact",
             "cortex_deps",
+            "cortex_readers",
+            "cortex_writers",
             "cortex_path",
             "cortex_tests",
             "cortex_review",

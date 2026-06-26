@@ -686,6 +686,46 @@ pub async fn cortex_deps(params: Option<Value>) -> HandlerResult {
     }
 }
 
+/// Functions that READ a database column (the column's data-flow inbound side).
+/// Use before changing a column's type/meaning to see who consumes it.
+pub async fn cortex_readers(params: Option<Value>) -> HandlerResult {
+    cortex_column_accessors(params, true).await
+}
+
+/// Functions that WRITE a database column (who produces its value). Use before
+/// changing a column's invariants to see every write site.
+pub async fn cortex_writers(params: Option<Value>) -> HandlerResult {
+    cortex_column_accessors(params, false).await
+}
+
+async fn cortex_column_accessors(params: Option<Value>, reads: bool) -> HandlerResult {
+    let pool = get_pool().await?;
+    let corpus_slug = corpus_or_cwd_slug(&params)?;
+    let column = params
+        .as_ref()
+        .and_then(|p| p.get("column"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "missing required parameter: column (a DB column, e.g. 'work_items.status' or 'status')"
+                .to_string()
+        })?;
+    let rows = if reads {
+        cortex::dataflow::readers(&pool, Some(&corpus_slug), column).await
+    } else {
+        cortex::dataflow::writers(&pool, Some(&corpus_slug), column).await
+    }
+    .map_err(|e| format!("{}: {e}", if reads { "readers" } else { "writers" }))?;
+    let accessors = serde_json::to_value(&rows).map_err(|e| format!("serialize: {e}"))?;
+    Ok(json!({
+        "corpus": corpus_slug,
+        "column": column,
+        "direction": if reads { "reads" } else { "writes" },
+        "count": rows.len(),
+        "accessors": accessors,
+    }))
+}
+
 /// Shortest call chain from one symbol to another (HOW does `from` reach `to`).
 /// `callers`/`callees` answer one hop and `impact` the whole closure; this returns
 /// the ordered FROM → … → TO path (each hop a real `calls` edge). An empty `path`
