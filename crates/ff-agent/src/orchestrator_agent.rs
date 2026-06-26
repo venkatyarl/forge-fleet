@@ -158,11 +158,21 @@ fn infer_strengths(model: &ff_db::FleetModelRow) -> Vec<Strength> {
     set
 }
 
-/// Parse a model's parameter count from its name (e.g. "Qwen3.6-35B-A3B" → 72e9).
+/// Parse a model's parameter count from its name (e.g. "Qwen3.6-35B-A3B" → 35e9,
+/// the total — not the "A3B" active count).
+///
+/// Scans every `<number>b` token and takes the LARGEST, with two guards so a
+/// marker that merely looks like a size doesn't win:
+///   - the `b` must NOT be followed by another letter, so a quant tag like
+///     "4bit" (or a stray "b16") is ignored rather than read as "4B";
+///   - taking the largest (not the first) means an MoE's total params win over
+///     its active count regardless of order ("30B-A3B" or "A3B-30B" → 30B), and
+///     a quant marker before the size ("q4bit-7b" → 7B) can't shadow it.
 fn infer_params_from_name(name: &str) -> u64 {
     let lower = name.to_ascii_lowercase();
     // Look for patterns like "7b", "32b", "405b".
     let bytes = lower.as_bytes();
+    let mut best: f64 = 0.0;
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i].is_ascii_digit() {
@@ -170,17 +180,18 @@ fn infer_params_from_name(name: &str) -> u64 {
             while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
                 i += 1;
             }
-            if i < bytes.len()
-                && bytes[i] == b'b'
-                && let Ok(n) = lower[start..i].parse::<f64>()
-            {
-                return (n * 1_000_000_000.0) as u64;
+            if i < bytes.len() && bytes[i] == b'b' {
+                // Reject a `b` that is part of a longer word (e.g. "4bit").
+                let followed_by_letter = bytes.get(i + 1).is_some_and(u8::is_ascii_alphabetic);
+                if !followed_by_letter && let Ok(n) = lower[start..i].parse::<f64>() {
+                    best = best.max(n);
+                }
             }
         } else {
             i += 1;
         }
     }
-    0
+    (best * 1_000_000_000.0) as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -723,4 +734,40 @@ pub async fn training_data_count() -> usize {
         }
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn params_takes_total_not_active_for_moe() {
+        // The total (35B) wins over the active count (A3B), regardless of order.
+        assert_eq!(infer_params_from_name("Qwen3.6-35B-A3B"), 35_000_000_000);
+        assert_eq!(infer_params_from_name("Qwen3-30B-A3B"), 30_000_000_000);
+    }
+
+    #[test]
+    fn params_ignores_quant_marker_before_size() {
+        // Regression: "4bit" must not be read as a 4B param count and shadow the
+        // real "7b". The `b`-followed-by-letter guard + largest-wins handle it.
+        assert_eq!(infer_params_from_name("llama-q4bit-7b"), 7_000_000_000);
+        assert_eq!(infer_params_from_name("mistral-8bit-12b"), 12_000_000_000);
+    }
+
+    #[test]
+    fn params_plain_and_decimal_sizes() {
+        assert_eq!(infer_params_from_name("Qwen2.5-72B"), 72_000_000_000);
+        assert_eq!(infer_params_from_name("Qwen3.5-9B"), 9_000_000_000);
+        assert_eq!(
+            infer_params_from_name("llama-3.2-1b-instruct"),
+            1_000_000_000
+        );
+    }
+
+    #[test]
+    fn params_zero_when_no_size_token() {
+        assert_eq!(infer_params_from_name("gemma-4"), 0);
+        assert_eq!(infer_params_from_name("some-model-4bit"), 0);
+    }
 }
