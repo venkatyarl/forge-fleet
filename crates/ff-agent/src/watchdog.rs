@@ -29,23 +29,135 @@ pub async fn evaluate_task(
         "SELECT cpu_pct, pid_state, probed_at FROM task_liveness_probes WHERE task_id = $1 ORDER BY probed_at DESC LIMIT 1"
     ).bind(task_id).fetch_optional(pool).await?;
     let Some((cpu_pct, pid_state, probed_at)) = row else {
+        // No probe recorded yet (e.g. a just-started task) — give it the
+        // benefit of the doubt rather than classifying it killable.
         return Ok(TaskLiveness::Alive);
     };
-    if matches!(pid_state.as_deref(), Some("Z") | Some("z")) {
-        return Ok(TaskLiveness::Dead);
-    }
-    let cpu = cpu_pct.unwrap_or(0.0);
     let probe_age = probed_at
         .map(|t| (Utc::now() - t).num_seconds())
         .unwrap_or(0);
-    if cpu > 5.0 {
-        return Ok(TaskLiveness::Alive);
+    Ok(classify_liveness(
+        pid_state.as_deref(),
+        cpu_pct,
+        probe_age,
+        max_idle_secs,
+    ))
+}
+
+/// Pure liveness classification from the latest probe's `pid_state`, CPU%, and
+/// the age (seconds) of that probe. Extracted from [`evaluate_task`] so the
+/// kill-decision logic — which decides whether to hard-cancel a running task —
+/// is unit-testable without a database.
+///
+/// Precedence is deliberate and load-bearing:
+///   1. a zombie process is `Dead` regardless of CPU/age;
+///   2. otherwise high CPU means `Alive` even if the probe is stale (a busy
+///      task that simply hasn't been re-probed recently must not be killed);
+///   3. otherwise a probe older than `max_idle_secs` is `Stuck`;
+///   4. otherwise near-zero CPU is `Slow`; anything else is `Alive`.
+fn classify_liveness(
+    pid_state: Option<&str>,
+    cpu_pct: Option<f32>,
+    probe_age_secs: i64,
+    max_idle_secs: i64,
+) -> TaskLiveness {
+    if matches!(pid_state, Some("Z") | Some("z")) {
+        return TaskLiveness::Dead;
     }
-    if probe_age > max_idle_secs {
-        return Ok(TaskLiveness::Stuck);
+    let cpu = cpu_pct.unwrap_or(0.0);
+    if cpu > 5.0 {
+        return TaskLiveness::Alive;
+    }
+    if probe_age_secs > max_idle_secs {
+        return TaskLiveness::Stuck;
     }
     if cpu < 1.0 {
-        return Ok(TaskLiveness::Slow);
+        return TaskLiveness::Slow;
     }
-    Ok(TaskLiveness::Alive)
+    TaskLiveness::Alive
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAX_IDLE: i64 = 600;
+
+    #[test]
+    fn zombie_is_dead_regardless_of_cpu_or_age() {
+        // Precedence rule 1: a zombie wins over everything, even pegged CPU
+        // and a fresh probe.
+        assert_eq!(
+            classify_liveness(Some("Z"), Some(99.0), 0, MAX_IDLE),
+            TaskLiveness::Dead
+        );
+        assert_eq!(
+            classify_liveness(Some("z"), Some(0.0), 10_000, MAX_IDLE),
+            TaskLiveness::Dead
+        );
+    }
+
+    #[test]
+    fn high_cpu_is_alive_even_when_probe_is_stale() {
+        // Precedence rule 2: busy-but-not-recently-probed must not be killed.
+        assert_eq!(
+            classify_liveness(Some("R"), Some(42.0), 10_000, MAX_IDLE),
+            TaskLiveness::Alive
+        );
+    }
+
+    #[test]
+    fn low_cpu_and_stale_is_stuck() {
+        assert_eq!(
+            classify_liveness(Some("S"), Some(0.2), MAX_IDLE + 1, MAX_IDLE),
+            TaskLiveness::Stuck
+        );
+    }
+
+    #[test]
+    fn low_cpu_but_recent_is_slow() {
+        assert_eq!(
+            classify_liveness(Some("S"), Some(0.5), 10, MAX_IDLE),
+            TaskLiveness::Slow
+        );
+    }
+
+    #[test]
+    fn mid_cpu_and_recent_is_alive() {
+        // Between the Slow (<1.0) and Alive (>5.0) thresholds, with a fresh
+        // probe, the task is considered Alive.
+        assert_eq!(
+            classify_liveness(Some("S"), Some(3.0), 10, MAX_IDLE),
+            TaskLiveness::Alive
+        );
+    }
+
+    #[test]
+    fn boundaries_are_exclusive() {
+        // cpu == 5.0 is NOT > 5.0, and a fresh probe at exactly the idle limit
+        // is NOT > max_idle, so cpu 5.0 / age == limit falls through to Alive.
+        assert_eq!(
+            classify_liveness(Some("S"), Some(5.0), MAX_IDLE, MAX_IDLE),
+            TaskLiveness::Alive
+        );
+        // cpu == 1.0 is NOT < 1.0 → Alive (not Slow) when recent.
+        assert_eq!(
+            classify_liveness(Some("S"), Some(1.0), 10, MAX_IDLE),
+            TaskLiveness::Alive
+        );
+    }
+
+    #[test]
+    fn missing_cpu_defaults_to_zero() {
+        // No CPU reading + recent probe → treated as near-zero → Slow.
+        assert_eq!(
+            classify_liveness(Some("S"), None, 10, MAX_IDLE),
+            TaskLiveness::Slow
+        );
+        // No CPU reading + stale probe → Stuck.
+        assert_eq!(
+            classify_liveness(None, None, MAX_IDLE + 1, MAX_IDLE),
+            TaskLiveness::Stuck
+        );
+    }
 }
