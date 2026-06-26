@@ -239,9 +239,29 @@ pub async fn try_route_to_cloud(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // The vendor wants the BARE model name, but the request arrived with the
+    // routing namespace still attached (e.g. `openai/gpt-4o`,
+    // `anthropic/claude-3-5-sonnet`). The openai/anthropic formats carry the
+    // model in the request BODY, so strip the slash-namespace there before
+    // dispatch — otherwise the vendor 404s on the namespaced name. (Google
+    // builds the name into the URL and strips internally; OAuth providers use a
+    // dash-lead prefix that is the real name, so bare_model_name leaves it.)
+    let bare = bare_model_name(model_id, &provider.model_prefix);
+    let routed_body = if bare != model_id && body.get("model").and_then(|m| m.as_str()).is_some() {
+        let mut b = body.clone();
+        b["model"] = json!(bare);
+        std::borrow::Cow::Owned(b)
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    };
+
     let res = match provider.request_format.as_str() {
-        "openai_chat" => call_openai_chat(client, &provider, &api_key, body, streaming).await,
-        "anthropic_messages" => call_anthropic_messages(client, &provider, &api_key, body).await,
+        "openai_chat" => {
+            call_openai_chat(client, &provider, &api_key, &routed_body, streaming).await
+        }
+        "anthropic_messages" => {
+            call_anthropic_messages(client, &provider, &api_key, &routed_body).await
+        }
         "google_generate_content" => {
             call_google_generate_content(client, &provider, &api_key, model_id, body).await
         }
@@ -488,17 +508,20 @@ fn flatten_text_content(content: &Value) -> String {
     String::new()
 }
 
-/// Strip a provider's ROUTING NAMESPACE prefix off a model id to get the bare
-/// vendor model name for the URL path. Only a SLASH-terminated prefix (e.g.
-/// `gemini/`, the api_key provider) is a separable namespace and is stripped. A
-/// dash-terminated routing prefix (e.g. `gemini-`, the oauth provider whose
-/// `model_prefix` is the real model-name lead) is left intact — stripping it
-/// would turn `gemini-2.5-flash` into `2.5-flash` and Google would 404. Pure.
+/// Strip a provider's ROUTING NAMESPACE off a model id to get the bare vendor
+/// model name. The namespace is everything in `model_prefix` UP TO AND INCLUDING
+/// its last `/` — so `openai/` strips `openai/`, and `anthropic/claude-` strips
+/// only `anthropic/` (the `claude-` is the real model-name lead). A prefix with
+/// NO `/` (the oauth leads `gemini-` / `claude-` / `gpt-`) is itself the real
+/// model name and is left intact — stripping it would turn `gemini-2.5-flash`
+/// into `2.5-flash` and the vendor 404s. Pure.
 fn bare_model_name<'a>(model_id: &'a str, model_prefix: &str) -> &'a str {
-    if model_prefix.ends_with('/') {
-        model_id.strip_prefix(model_prefix).unwrap_or(model_id)
-    } else {
-        model_id
+    match model_prefix.rfind('/') {
+        Some(i) => {
+            let namespace = &model_prefix[..=i]; // includes the trailing '/'
+            model_id.strip_prefix(namespace).unwrap_or(model_id)
+        }
+        None => model_id,
     }
 }
 
@@ -843,21 +866,29 @@ mod tests {
     }
 
     #[test]
-    fn bare_model_name_strips_only_slash_namespace() {
-        // api_key google: "gemini/" is a separable namespace → stripped.
+    fn bare_model_name_strips_only_routing_namespace() {
+        // api_key with a plain slash namespace → stripped.
         assert_eq!(
             bare_model_name("gemini/gemini-2.5-flash", "gemini/"),
             "gemini-2.5-flash"
         );
-        // BUG FIX: oauth google's prefix "gemini-" is the real model lead and
-        // must NOT be stripped (was → "2.5-flash" → Google 404).
+        assert_eq!(bare_model_name("openai/gpt-4o", "openai/"), "gpt-4o");
+        // api_key anthropic: prefix "anthropic/claude-" — only the "anthropic/"
+        // namespace (up to the last '/') is stripped; "claude-" is the real
+        // model-name lead and stays.
+        assert_eq!(
+            bare_model_name("anthropic/claude-3-5-sonnet", "anthropic/claude-"),
+            "claude-3-5-sonnet"
+        );
+        // oauth dash-leads have NO '/' → left intact (the #593 fix preserved).
         assert_eq!(
             bare_model_name("gemini-2.5-flash", "gemini-"),
             "gemini-2.5-flash"
         );
+        assert_eq!(bare_model_name("gpt-4o", "gpt-"), "gpt-4o");
         assert_eq!(
-            bare_model_name("gemini-1.5-pro", "gemini-"),
-            "gemini-1.5-pro"
+            bare_model_name("claude-3-5-sonnet", "claude-"),
+            "claude-3-5-sonnet"
         );
         // No matching prefix → unchanged.
         assert_eq!(
