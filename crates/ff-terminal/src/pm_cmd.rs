@@ -230,6 +230,25 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
                 print!("{}", render_pm_stats(&stats));
             }
         }
+        crate::PmCommand::Purge {
+            kind,
+            status,
+            project,
+            older_than,
+            yes,
+            json,
+        } => {
+            handle_pm_purge(
+                &pool,
+                kind.as_deref(),
+                status.as_deref(),
+                project.as_deref(),
+                older_than.as_deref(),
+                yes,
+                json,
+            )
+            .await?;
+        }
         crate::PmCommand::Cancel { id } => {
             let uid = uuid::Uuid::parse_str(&id)
                 .map_err(|e| anyhow::anyhow!("invalid work item id '{id}': {e}"))?;
@@ -870,6 +889,138 @@ fn render_pm_stats(s: &PmStats) -> String {
     out
 }
 
+/// Statuses `ff pm purge` is allowed to delete: terminal or never-started rows.
+/// Live work (ready/claimed/in_progress/in_review/blocked/building/reviewing) is
+/// NEVER purgeable — deleting a leased/running item would orphan its slot.
+const PURGEABLE_STATUSES: &[&str] = &["idea", "done", "cancelled", "failed"];
+
+fn is_purgeable_status(s: &str) -> bool {
+    PURGEABLE_STATUSES.contains(&s)
+}
+
+/// Validate a purge request BEFORE touching the DB. Pure. Enforces (a) at least
+/// one filter so a bare `ff pm purge` can't wipe the table, and (b) an explicit
+/// `--status` must be a purgeable one (no deleting live work).
+fn validate_purge_request(
+    kind: Option<&str>,
+    status: Option<&str>,
+    project: Option<&str>,
+    older_than: Option<&str>,
+) -> Result<(), String> {
+    if kind.is_none() && status.is_none() && project.is_none() && older_than.is_none() {
+        return Err(
+            "refusing to purge with no filter — pass at least one of --kind/--status/--project/--older-than"
+                .to_string(),
+        );
+    }
+    if let Some(s) = status
+        && !is_purgeable_status(s)
+    {
+        return Err(format!(
+            "status '{s}' is not purgeable (live work is protected); purgeable: {}",
+            PURGEABLE_STATUSES.join("/")
+        ));
+    }
+    Ok(())
+}
+
+/// The shared WHERE clause for the purge preview + delete. `$1` is the
+/// purgeable-status floor (the safety net), `$2..$5` are the optional filters.
+const PURGE_WHERE: &str = "status = ANY($1) \
+     AND ($2::text IS NULL OR kind = $2) \
+     AND ($3::text IS NULL OR status = $3) \
+     AND ($4::text IS NULL OR project_id = $4) \
+     AND ($5::text IS NULL OR created_at < NOW() - ($5 || ' seconds')::interval)";
+
+/// `ff pm purge` — dry-run by default; `--yes` deletes.
+async fn handle_pm_purge(
+    pool: &sqlx::PgPool,
+    kind: Option<&str>,
+    status: Option<&str>,
+    project: Option<&str>,
+    older_than: Option<&str>,
+    yes: bool,
+    json: bool,
+) -> Result<()> {
+    validate_purge_request(kind, status, project, older_than).map_err(|e| anyhow::anyhow!(e))?;
+    let age_secs: Option<String> = match older_than {
+        Some(spec) => Some(
+            crate::utils::parse_duration_secs(spec)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("invalid --older-than '{spec}' (use e.g. 7d/48h/30m)")
+                })?
+                .to_string(),
+        ),
+        None => None,
+    };
+    let purgeable: Vec<String> = PURGEABLE_STATUSES.iter().map(|s| s.to_string()).collect();
+
+    // Preview: per (status, kind) breakdown of what matches.
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(&format!(
+        "SELECT status, COALESCE(kind, '(none)'), count(*) FROM work_items \
+         WHERE {PURGE_WHERE} GROUP BY status, kind ORDER BY count(*) DESC, status, kind"
+    ))
+    .bind(&purgeable)
+    .bind(kind)
+    .bind(status)
+    .bind(project)
+    .bind(&age_secs)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("purge preview: {e}"))?;
+
+    let total: i64 = rows.iter().map(|(_, _, n)| n).sum();
+
+    if json && !yes {
+        let breakdown: Vec<_> = rows
+            .iter()
+            .map(|(s, k, n)| serde_json::json!({"status": s, "kind": k, "count": n}))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"dry_run": true, "would_delete": total, "breakdown": breakdown})
+            )?
+        );
+        return Ok(());
+    }
+
+    if total == 0 {
+        println!("(no matching purgeable work_items)");
+        return Ok(());
+    }
+
+    if !yes {
+        println!("{CYAN}▶ DRY-RUN — would delete {total} work_item(s):{RESET}");
+        for (s, k, n) in &rows {
+            println!("    {s:<12} {k:<16} {n}");
+        }
+        println!("\n{YELLOW}Re-run with --yes to delete.{RESET}");
+        return Ok(());
+    }
+
+    let deleted = sqlx::query(&format!("DELETE FROM work_items WHERE {PURGE_WHERE}"))
+        .bind(&purgeable)
+        .bind(kind)
+        .bind(status)
+        .bind(project)
+        .bind(&age_secs)
+        .execute(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("purge delete: {e}"))?
+        .rows_affected();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"deleted": deleted}))?
+        );
+    } else {
+        println!("{GREEN}✓ deleted {deleted} work_item(s){RESET}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,5 +1086,34 @@ mod tests {
         let out = render_pm_stats(&s);
         assert!(out.contains("by status:\n    (none)"));
         assert!(out.contains("oldest pending (ready): (none) ✓"));
+    }
+
+    #[test]
+    fn purge_only_terminal_statuses_are_purgeable() {
+        for s in ["idea", "done", "cancelled", "failed"] {
+            assert!(is_purgeable_status(s), "{s} should be purgeable");
+        }
+        // Live statuses must NEVER be purgeable.
+        for s in ["ready", "claimed", "in_progress", "in_review", "blocked"] {
+            assert!(!is_purgeable_status(s), "{s} must be protected");
+        }
+    }
+
+    #[test]
+    fn purge_validation_requires_a_filter() {
+        // A bare purge (no filter) is refused so it can't wipe the table.
+        assert!(validate_purge_request(None, None, None, None).is_err());
+        // Any single filter is enough.
+        assert!(validate_purge_request(Some("audit"), None, None, None).is_ok());
+        assert!(validate_purge_request(None, None, None, Some("30d")).is_ok());
+    }
+
+    #[test]
+    fn purge_validation_rejects_live_status() {
+        // Asking to purge a live status is rejected even though a filter is set.
+        assert!(validate_purge_request(None, Some("in_progress"), None, None).is_err());
+        assert!(validate_purge_request(None, Some("ready"), None, None).is_err());
+        // A purgeable status passes.
+        assert!(validate_purge_request(None, Some("idea"), None, None).is_ok());
     }
 }
