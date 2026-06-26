@@ -51,6 +51,7 @@ mod council_cmd;
 mod daemon_cmd;
 mod db_cmd;
 mod defer_cmd;
+mod doctor_cmd;
 mod events_cmd;
 mod ext_cmd;
 mod fabric_cmd;
@@ -184,6 +185,14 @@ enum Command {
     },
     Models,
     Health,
+    /// Aggregate fleet self-check: one PASS/WARN/FAIL verdict composed from the
+    /// deferred-task failure flood, the ff_interactions token-logging gap,
+    /// orphaned work_items, alert policies that can't fire, and leader liveness
+    /// — the health signals an operator otherwise checks one command at a time.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
     Proxy {
         #[arg(long, default_value_t = 4000)]
         port: u16,
@@ -3949,6 +3958,7 @@ async fn main() -> Result<()> {
             return config_cmd::handle_config(command.clone(), &config_path).await;
         }
         Some(Command::Status) => return status_cmd::handle_status(&config_path).await,
+        Some(Command::Doctor { json }) => return doctor_cmd::handle_doctor(*json).await,
         Some(Command::Nodes { gpu, json }) => {
             return helpers::handle_nodes(gpu.as_deref(), *json).await;
         }
@@ -4282,6 +4292,7 @@ async fn main() -> Result<()> {
             .await
         }
         Some(Command::Versions { node, json }) => versions_cmd::handle_versions(node, json).await,
+        Some(Command::Doctor { json }) => doctor_cmd::handle_doctor(json).await,
         Some(Command::Fleet { command }) => fleet_cmd::handle_fleet(command).await,
         Some(Command::Ssh {
             worker,
