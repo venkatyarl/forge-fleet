@@ -488,6 +488,20 @@ fn flatten_text_content(content: &Value) -> String {
     String::new()
 }
 
+/// Strip a provider's ROUTING NAMESPACE prefix off a model id to get the bare
+/// vendor model name for the URL path. Only a SLASH-terminated prefix (e.g.
+/// `gemini/`, the api_key provider) is a separable namespace and is stripped. A
+/// dash-terminated routing prefix (e.g. `gemini-`, the oauth provider whose
+/// `model_prefix` is the real model-name lead) is left intact — stripping it
+/// would turn `gemini-2.5-flash` into `2.5-flash` and Google would 404. Pure.
+fn bare_model_name<'a>(model_id: &'a str, model_prefix: &str) -> &'a str {
+    if model_prefix.ends_with('/') {
+        model_id.strip_prefix(model_prefix).unwrap_or(model_id)
+    } else {
+        model_id
+    }
+}
+
 fn translate_openai_to_anthropic(body: &Value) -> Result<(Value, bool), CloudCallError> {
     let empty: Vec<Value> = Vec::new();
     let messages = body
@@ -596,13 +610,11 @@ async fn call_google_generate_content(
     model_id: &str,
     body: &Value,
 ) -> Result<CallOutcome, CloudCallError> {
-    // Strip the prefix so the bare model name flows to the URL. Both
-    // `gemini/` (api_key path) and `gemini-` (oauth path) prefixes are
-    // valid model-name leads today.
-    let bare_model = model_id
-        .strip_prefix("gemini/")
-        .or_else(|| model_id.strip_prefix("gemini-"))
-        .unwrap_or(model_id);
+    // Strip only the provider's ROUTING NAMESPACE prefix so the bare model name
+    // flows into the URL path. See `bare_model_name` — a dash-terminated prefix
+    // like `gemini-` (the oauth provider) is the real model-name LEAD, not a
+    // separable namespace, so it must be left intact.
+    let bare_model = bare_model_name(model_id, &provider.model_prefix);
     // Google supports either `?key=API_KEY` (api-key billing) or
     // `Authorization: Bearer <oauth_token>` (subscription). Pick by
     // auth_kind so the OAuth-harvested token works for `google_oauth`.
@@ -828,6 +840,30 @@ mod tests {
         let (anth, had_sys) = translate_openai_to_anthropic(&body).unwrap();
         assert!(had_sys);
         assert_eq!(anth["system"], "You are helpful.");
+    }
+
+    #[test]
+    fn bare_model_name_strips_only_slash_namespace() {
+        // api_key google: "gemini/" is a separable namespace → stripped.
+        assert_eq!(
+            bare_model_name("gemini/gemini-2.5-flash", "gemini/"),
+            "gemini-2.5-flash"
+        );
+        // BUG FIX: oauth google's prefix "gemini-" is the real model lead and
+        // must NOT be stripped (was → "2.5-flash" → Google 404).
+        assert_eq!(
+            bare_model_name("gemini-2.5-flash", "gemini-"),
+            "gemini-2.5-flash"
+        );
+        assert_eq!(
+            bare_model_name("gemini-1.5-pro", "gemini-"),
+            "gemini-1.5-pro"
+        );
+        // No matching prefix → unchanged.
+        assert_eq!(
+            bare_model_name("gemini-2.5-flash", "openai/"),
+            "gemini-2.5-flash"
+        );
     }
 
     #[test]
