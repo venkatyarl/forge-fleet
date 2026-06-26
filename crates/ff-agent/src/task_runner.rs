@@ -2516,3 +2516,23 @@ mod shell_payload_tests {
         let _ = std::fs::remove_file(&pidfile);
     }
 }
+
+#[cfg(test)]
+mod watchdog_threshold_tests {
+    use super::*;
+
+    /// REGRESSION GUARD (reaper bug class #589/#590): the fleet_tasks watchdog
+    /// re-queues a `running` row whose `last_heartbeat_at` is older than
+    /// STUCK_AFTER_SECS. That window MUST tolerate at least two missed
+    /// heartbeats — otherwise a single late beat from a HEALTHY worker would
+    /// hand its task to a peer, double-dispatching live work. Couple the two
+    /// consts so a careless edit can't narrow the window under the cadence.
+    #[test]
+    fn watchdog_window_tolerates_missed_heartbeats() {
+        let cadence = HEARTBEAT_EVERY.as_secs() as i64;
+        assert!(
+            STUCK_AFTER_SECS >= 2 * cadence,
+            "STUCK_AFTER_SECS ({STUCK_AFTER_SECS}) must be >= 2x the heartbeat cadence ({cadence})"
+        );
+    }
+}

@@ -67,3 +67,23 @@ pub fn spawn_lease_takeover(
         info!("lease_takeover loop stopped");
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// REGRESSION GUARD (reaper bug class #589/#590): the lease reaper reclaims
+    /// a work_item lease whose `heartbeat_at` is older than STALE_HEARTBEAT_SECS.
+    /// The dispatch loop bumps that heartbeat every
+    /// `work_item_dispatch::HEARTBEAT_SECS`, so the window MUST clear at least
+    /// two beats or a live build (which heartbeats fine) gets its lease yanked
+    /// and re-leased — a duplicate build. Couple the consts.
+    #[test]
+    fn stale_window_clears_two_heartbeats() {
+        let cadence = crate::work_item_dispatch::HEARTBEAT_SECS as i64;
+        assert!(
+            STALE_HEARTBEAT_SECS >= 2 * cadence,
+            "STALE_HEARTBEAT_SECS ({STALE_HEARTBEAT_SECS}) must be >= 2x the dispatch heartbeat ({cadence})"
+        );
+    }
+}
