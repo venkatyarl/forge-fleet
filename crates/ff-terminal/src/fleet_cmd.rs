@@ -3222,6 +3222,9 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         FleetCommand::Health { json } => {
             handle_fleet_health(&pool, json).await?;
         }
+        FleetCommand::Gates { json } => {
+            handle_fleet_gates(&pool, json).await?;
+        }
         FleetCommand::Versions {
             verbose,
             live,
@@ -5041,5 +5044,213 @@ mod route_tests {
         let p = super::deploy_playbook("linux", "~/projects/forge-fleet");
         assert!(p.contains("systemctl --user"));
         assert!(!p.contains("launchctl"));
+    }
+}
+
+/// Canonical descriptor for one forgefleetd subsystem gate.
+struct GateSpec {
+    key: &'static str,
+    default: &'static str,
+    controls: &'static str,
+}
+
+/// Every gate the daemon reads via `pg_read_gate_value` / `auto_upgrade::is_enabled`
+/// to arm or disarm a subsystem tick. KEEP IN SYNC with the `*_MODE_KEY` /
+/// `*_ENABLED_KEY` consts across ff-agent + ff-brain (autoscaler, arbiter,
+/// conformance, disk_reconcile, fleet_integrity, upgrade_rollout, auto_upgrade,
+/// work_item_merge_drain, cortex_reindex/embed/summary).
+const DAEMON_GATES: &[GateSpec] = &[
+    GateSpec {
+        key: "auto_upgrade_enabled",
+        default: "false",
+        controls: "auto-upgrade pipeline (drift→dispatch→build)",
+    },
+    GateSpec {
+        key: "leader_self_upgrade",
+        default: "false",
+        controls: "leader rebuilds itself during a fleet upgrade",
+    },
+    GateSpec {
+        key: "autoscaler_mode",
+        default: "off",
+        controls: "adaptive serving-mix autoscaler (off|dry_run|active)",
+    },
+    GateSpec {
+        key: "arbiter_mode",
+        default: "off",
+        controls: "V119 resource arbiter actuation",
+    },
+    GateSpec {
+        key: "conformance_mode",
+        default: "off",
+        controls: "conformance verify-gate enforcement",
+    },
+    GateSpec {
+        key: "disk_policy_mode",
+        default: "off",
+        controls: "disk-reconcile policy actuation",
+    },
+    GateSpec {
+        key: "fleet_integrity_mode",
+        default: "off",
+        controls: "fleet-integrity verify sweep",
+    },
+    GateSpec {
+        key: "staged_rollout_mode",
+        default: "off",
+        controls: "staged upgrade rollout + auto-halt",
+    },
+    GateSpec {
+        key: "work_item_automerge_mode",
+        default: "off",
+        controls: "Pillar-4 merge-queue auto-merge",
+    },
+    GateSpec {
+        key: "cortex_index_mode",
+        default: "on",
+        controls: "cortex reindex tick",
+    },
+    GateSpec {
+        key: "cortex_embed_mode",
+        default: "on",
+        controls: "cortex embed-refresh tick",
+    },
+    GateSpec {
+        key: "cortex_summary_mode",
+        default: "on",
+        controls: "cortex community-summary refresh",
+    },
+];
+
+/// One gate's resolved state for `ff fleet gates`.
+#[derive(serde::Serialize)]
+struct GateRow {
+    key: String,
+    value: String,
+    default: String,
+    /// "set" when an explicit `fleet_secrets` row exists, else "default".
+    source: &'static str,
+    controls: String,
+}
+
+/// Resolve every canonical gate against the explicitly-set `fleet_secrets`
+/// values (key→value). Gates absent from the map run on their code default.
+/// Pure.
+fn build_gate_rows(set: &std::collections::HashMap<String, String>) -> Vec<GateRow> {
+    DAEMON_GATES
+        .iter()
+        .map(|g| {
+            let (value, source) = match set.get(g.key) {
+                Some(v) => (v.clone(), "set"),
+                None => (g.default.to_string(), "default"),
+            };
+            GateRow {
+                key: g.key.to_string(),
+                value,
+                default: g.default.to_string(),
+                source,
+                controls: g.controls.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Render the `ff fleet gates` table. Pure (no color / I/O) for testability.
+/// A `*` in the SET column marks a gate whose live value was explicitly written
+/// to `fleet_secrets` (i.e. an operator override of the code default).
+fn render_gates(rows: &[GateRow]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "forgefleetd subsystem gates — {} total\n\n",
+        rows.len()
+    ));
+    out.push_str(&format!(
+        "{:<26} {:<8} {:<8} {:<4} CONTROLS\n",
+        "GATE", "VALUE", "DEFAULT", "SET"
+    ));
+    for r in rows {
+        let set_mark = if r.source == "set" { "*" } else { "" };
+        out.push_str(&format!(
+            "{:<26} {:<8} {:<8} {:<4} {}\n",
+            r.key, r.value, r.default, set_mark, r.controls
+        ));
+    }
+    let overridden = rows.iter().filter(|r| r.source == "set").count();
+    out.push_str(&format!(
+        "\n{overridden} gate(s) explicitly set in fleet_secrets; the rest run on their code default.\n"
+    ));
+    out
+}
+
+/// `ff fleet gates` — show every daemon subsystem gate, its effective value,
+/// default, and what it controls.
+async fn handle_fleet_gates(pool: &sqlx::PgPool, json: bool) -> Result<()> {
+    let keys: Vec<String> = DAEMON_GATES.iter().map(|g| g.key.to_string()).collect();
+    let live: Vec<(String, String)> =
+        sqlx::query_as("SELECT key, value FROM fleet_secrets WHERE key = ANY($1)")
+            .bind(&keys)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("read fleet_secrets gates: {e}"))?;
+    let set: std::collections::HashMap<String, String> = live.into_iter().collect();
+    let rows = build_gate_rows(&set);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        print!("{}", render_gates(&rows));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod gates_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn defaults_when_unset() {
+        let rows = build_gate_rows(&HashMap::new());
+        assert_eq!(rows.len(), DAEMON_GATES.len());
+        // Every row falls back to its default + is marked "default".
+        assert!(rows.iter().all(|r| r.source == "default"));
+        let auto = rows
+            .iter()
+            .find(|r| r.key == "auto_upgrade_enabled")
+            .unwrap();
+        assert_eq!(auto.value, "false");
+        let idx = rows.iter().find(|r| r.key == "cortex_index_mode").unwrap();
+        assert_eq!(idx.value, "on");
+    }
+
+    #[test]
+    fn explicit_set_overrides_and_marks_source() {
+        let mut set = HashMap::new();
+        set.insert("autoscaler_mode".to_string(), "active".to_string());
+        set.insert("leader_self_upgrade".to_string(), "false".to_string());
+        let rows = build_gate_rows(&set);
+        let asc = rows.iter().find(|r| r.key == "autoscaler_mode").unwrap();
+        assert_eq!(asc.value, "active");
+        assert_eq!(asc.source, "set");
+        assert_eq!(asc.default, "off");
+        // A gate set to its default value is still "set" (operator wrote it).
+        let leader = rows
+            .iter()
+            .find(|r| r.key == "leader_self_upgrade")
+            .unwrap();
+        assert_eq!(leader.source, "set");
+        // Untouched gates stay default.
+        let arb = rows.iter().find(|r| r.key == "arbiter_mode").unwrap();
+        assert_eq!(arb.source, "default");
+    }
+
+    #[test]
+    fn render_includes_header_and_override_count() {
+        let mut set = HashMap::new();
+        set.insert("autoscaler_mode".to_string(), "active".to_string());
+        let out = render_gates(&build_gate_rows(&set));
+        assert!(out.contains("forgefleetd subsystem gates"));
+        assert!(out.contains("autoscaler_mode"));
+        assert!(out.contains("active"));
+        assert!(out.contains("1 gate(s) explicitly set"));
     }
 }
