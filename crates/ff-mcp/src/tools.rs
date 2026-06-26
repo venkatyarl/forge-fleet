@@ -123,6 +123,7 @@ impl ToolRegistry {
         self.register(Self::cortex_deps());
         self.register(Self::cortex_readers());
         self.register(Self::cortex_writers());
+        self.register(Self::cortex_config_key());
         self.register(Self::cortex_path());
         self.register(Self::cortex_tests());
         self.register(Self::cortex_review());
@@ -1224,6 +1225,20 @@ impl ToolRegistry {
         }
     }
 
+    fn cortex_config_key() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_config_key".to_string(),
+            description: "Cortex config impact. With NO `key`: list every config/env/secret/feature-flag key extracted in the corpus. With a `key`: the functions that READ it — who breaks if you rename, retire, or change that env var / flag. The config analogue of cortex_readers for DB columns.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "corpus": { "type": "string", "description": "Indexed repo slug (see cortex_corpora). Defaults to the cwd's slug." },
+                    "key": { "type": "string", "description": "A config/env/secret/feature-flag key, e.g. 'FORGEFLEET_REDIS_URL'. Omit to list all keys." }
+                }
+            }),
+        }
+    }
+
     fn cortex_path() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_path".to_string(),
@@ -1754,6 +1769,7 @@ mod tests {
             "cortex_deps",
             "cortex_readers",
             "cortex_writers",
+            "cortex_config_key",
             "cortex_path",
             "cortex_tests",
             "cortex_review",

@@ -2785,6 +2785,7 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "cortex_deps" => crate::cortex_tools::cortex_deps(params).await,
         "cortex_readers" => crate::cortex_tools::cortex_readers(params).await,
         "cortex_writers" => crate::cortex_tools::cortex_writers(params).await,
+        "cortex_config_key" => crate::cortex_tools::cortex_config_key(params).await,
         "cortex_path" => crate::cortex_tools::cortex_path(params).await,
         "cortex_tests" => crate::cortex_tools::cortex_tests(params).await,
         "cortex_review" => crate::cortex_tools::cortex_review(params).await,
