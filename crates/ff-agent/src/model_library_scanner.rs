@@ -386,16 +386,22 @@ fn extract_gguf_quant(stem: &str) -> Option<String> {
         "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_0", "Q4_1", "Q4_K_S", "Q4_K_M", "Q5_0", "Q5_1",
         "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0", "F16", "FP16", "BF16", "F32",
     ];
-    let mut best: Option<(usize, &str)> = None;
+    // Rank by rightmost END position, tie-breaking on the LONGER tag. Ranking
+    // by start index alone misclassifies overlapping tags: "F16" is a substring
+    // of "BF16" (`B F 1 6`), so its rfind start sits one byte to the right and
+    // would wrongly win — tagging a bf16 model as f16. Both share the same end
+    // index, so the length tie-break correctly prefers "BF16". A genuinely
+    // later tag (e.g. "…Q4_K_M…Q8_0") still wins on end position.
+    let mut best: Option<(usize, usize, &str)> = None; // (end_idx, len, tag)
     for c in candidates {
         if let Some(idx) = upper.rfind(c) {
-            // Prefer the rightmost match.
-            if best.map(|(i, _)| idx > i).unwrap_or(true) {
-                best = Some((idx, c));
+            let key = (idx + c.len(), c.len());
+            if best.map(|(e, l, _)| key > (e, l)).unwrap_or(true) {
+                best = Some((key.0, key.1, c));
             }
         }
     }
-    best.map(|(_, c)| c.to_string())
+    best.map(|(_, _, c)| c.to_string())
 }
 
 /// Pull a quant hint from an HF directory name ("4bit", "8bit", "fp16").
@@ -456,4 +462,45 @@ fn slugify(s: &str) -> String {
         }
     }
     out.trim_matches('-').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gguf_quant_does_not_confuse_bf16_with_f16() {
+        // Regression: "F16" is a substring of "BF16", so a start-index ranking
+        // tagged a bf16 model as f16. The end-position + length tie-break must
+        // keep BF16 distinct.
+        assert_eq!(
+            extract_gguf_quant("Meta-Llama-3-8B.BF16"),
+            Some("BF16".to_string())
+        );
+        assert_eq!(extract_gguf_quant("model-F16"), Some("F16".to_string()));
+        assert_eq!(extract_gguf_quant("model-FP16"), Some("FP16".to_string()));
+    }
+
+    #[test]
+    fn gguf_quant_picks_common_llamacpp_tags() {
+        assert_eq!(
+            extract_gguf_quant("qwen2.5-coder-7b-instruct-q4_k_m"),
+            Some("Q4_K_M".to_string())
+        );
+        assert_eq!(
+            extract_gguf_quant("some-model.Q8_0"),
+            Some("Q8_0".to_string())
+        );
+        assert_eq!(extract_gguf_quant("plain-model-name"), None);
+    }
+
+    #[test]
+    fn gguf_quant_prefers_the_rightmost_tag() {
+        // When two genuine tags appear, the one nearest the extension (the
+        // actual quant) wins by end position.
+        assert_eq!(
+            extract_gguf_quant("merged-Q4_0-then-final-Q8_0"),
+            Some("Q8_0".to_string())
+        );
+    }
 }
