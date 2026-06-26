@@ -191,3 +191,26 @@ pub fn parse_duration_secs(s: &str) -> Option<u64> {
     };
     Some((n * mult).round() as u64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_duration_secs;
+
+    #[test]
+    fn parses_units_and_bare_seconds() {
+        assert_eq!(parse_duration_secs("45s"), Some(45));
+        assert_eq!(parse_duration_secs("30m"), Some(1800));
+        assert_eq!(parse_duration_secs("2h"), Some(7200));
+        assert_eq!(parse_duration_secs("7d"), Some(604_800));
+        assert_eq!(parse_duration_secs("3600"), Some(3600)); // bare = seconds
+        assert_eq!(parse_duration_secs("1.5h"), Some(5400)); // fractional
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert_eq!(parse_duration_secs(""), None);
+        assert_eq!(parse_duration_secs("xyz"), None);
+        assert_eq!(parse_duration_secs("5w"), None); // unsupported unit
+        assert_eq!(parse_duration_secs("d"), None); // unit with no number
+    }
+}

@@ -35,7 +35,8 @@ pub async fn handle_reserve(
     if hosts.is_empty() {
         return Err(anyhow!("no hosts parsed from --hosts '{hosts_spec}'"));
     }
-    let requested_secs = parse_duration_secs(for_dur)
+    let requested_secs = crate::utils::parse_duration_secs(for_dur)
+        .map(|u| u as i64)
         .ok_or_else(|| anyhow!("could not parse --for '{for_dur}' (try 2h, 30m, 3600s)"))?;
 
     let requester = ff_agent::fleet_info::resolve_this_worker_name().await;
@@ -260,38 +261,6 @@ pub async fn handle_arbiter(command: ArbiterCommand) -> Result<()> {
     }
 }
 
-/// Parse a duration like "2h", "30m", "45s", "3600" (bare = seconds).
-fn parse_duration_secs(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let (num, mult) = if let Some(n) = s.strip_suffix('h') {
-        (n, 3600)
-    } else if let Some(n) = s.strip_suffix('m') {
-        (n, 60)
-    } else if let Some(n) = s.strip_suffix('s') {
-        (n, 1)
-    } else {
-        (s, 1)
-    };
-    num.trim()
-        .parse::<f64>()
-        .ok()
-        .map(|v| (v * mult as f64) as i64)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn duration_parsing() {
-        assert_eq!(parse_duration_secs("2h"), Some(7200));
-        assert_eq!(parse_duration_secs("30m"), Some(1800));
-        assert_eq!(parse_duration_secs("45s"), Some(45));
-        assert_eq!(parse_duration_secs("3600"), Some(3600));
-        assert_eq!(parse_duration_secs(""), None);
-        assert_eq!(parse_duration_secs("xyz"), None);
-    }
-}
+// Duration parsing is shared via `crate::utils::parse_duration_secs` (single
+// source of truth — this module's old private copy lacked `d`/days support and
+// was tested separately; consolidated so a fix lands in one place).
