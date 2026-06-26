@@ -120,6 +120,7 @@ impl ToolRegistry {
         self.register(Self::cortex_callers());
         self.register(Self::cortex_callees());
         self.register(Self::cortex_impact());
+        self.register(Self::cortex_deps());
         self.register(Self::cortex_path());
         self.register(Self::cortex_tests());
         self.register(Self::cortex_review());
@@ -1166,6 +1167,31 @@ impl ToolRegistry {
         }
     }
 
+    fn cortex_deps() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_deps".to_string(),
+            description: "Cortex dependency graph. With NO `crate`: list dependency packages and how many crates depend on each (the most-depended-on first). With a `crate`: that crate's forward dependencies (what it needs) AND reverse dependents (what needs it — the workspace rebuild blast radius); set transitive=true to also get the full transitive-dependents closure. Use before a refactor to see what recompiles / what breaks.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "corpus": {
+                        "type": "string",
+                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'. Defaults to the cwd's slug."
+                    },
+                    "crate": {
+                        "type": "string",
+                        "description": "A crate/package name. Omit to list all dependency packages with their dependent counts."
+                    },
+                    "transitive": {
+                        "type": "boolean",
+                        "description": "When a `crate` is given, also compute the full transitive-dependents closure (everything that would rebuild).",
+                        "default": false
+                    }
+                }
+            }),
+        }
+    }
+
     fn cortex_path() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_path".to_string(),
@@ -1693,6 +1719,7 @@ mod tests {
             "cortex_callers",
             "cortex_callees",
             "cortex_impact",
+            "cortex_deps",
             "cortex_path",
             "cortex_tests",
             "cortex_review",
