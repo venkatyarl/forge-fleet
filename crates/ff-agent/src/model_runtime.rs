@@ -1784,4 +1784,37 @@ mod tests {
             None
         ));
     }
+
+    #[test]
+    fn parse_flag_value_space_and_equals_forms() {
+        let cmd = "llama-server --model /m/x.gguf --port 55001 --ctx-size 32768";
+        assert_eq!(
+            parse_flag_value(cmd, "--model").as_deref(),
+            Some("/m/x.gguf")
+        );
+        assert_eq!(parse_flag_value(cmd, "--port").as_deref(), Some("55001"));
+        // `--flag=value` form.
+        assert_eq!(
+            parse_flag_value("vllm serve --port=8000 --tp=2", "--port").as_deref(),
+            Some("8000")
+        );
+    }
+
+    #[test]
+    fn parse_flag_value_does_not_prefix_match_a_longer_flag() {
+        // Asking for `--model` must NOT pick up `--model-path`'s value — a naive
+        // prefix match would mis-adopt the wrong path into the deployment row.
+        let cmd = "srv --model-path /wrong/dir --model /right/x.gguf";
+        assert_eq!(
+            parse_flag_value(cmd, "--model").as_deref(),
+            Some("/right/x.gguf")
+        );
+    }
+
+    #[test]
+    fn parse_flag_value_missing_or_dangling_is_none() {
+        assert_eq!(parse_flag_value("llama-server --port 1", "--model"), None);
+        // Flag present as the final token with no value.
+        assert_eq!(parse_flag_value("llama-server --model", "--model"), None);
+    }
 }
