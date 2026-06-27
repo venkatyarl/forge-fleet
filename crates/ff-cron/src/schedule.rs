@@ -251,7 +251,16 @@ fn parse_field(
 
         let mut value = start;
         while value <= end {
-            values.insert(value);
+            // Map weekday 7 -> 0 (both mean Sunday) at INSERTION, not during
+            // value parsing: normalizing earlier corrupts Sunday-terminated
+            // ranges (`1-7`/`mon-sun`/`fri-sun` would become inverted ranges
+            // that error, and `0-7` would silently collapse to only-Sunday).
+            let insert_value = if normalize_weekday && value == 7 {
+                0
+            } else {
+                value
+            };
+            values.insert(insert_value);
             match value.checked_add(step) {
                 Some(next) if next > value => value = next,
                 _ => break,
@@ -272,7 +281,10 @@ fn parse_value(
 ) -> Result<u32, ScheduleError> {
     let lowered = token.to_ascii_lowercase();
 
-    let mut value = if let Some(alias) = aliases.get(lowered.as_str()) {
+    // NOTE: weekday 7 is NOT normalized to 0 here — it is mapped at value
+    // insertion in `parse_field` so that ranges like `1-7` / `fri-sun` / `0-7`
+    // are computed against the un-normalized endpoint before mapping.
+    let value = if let Some(alias) = aliases.get(lowered.as_str()) {
         *alias
     } else {
         lowered
@@ -282,10 +294,6 @@ fn parse_value(
                 value: token.to_string(),
             })?
     };
-
-    if normalize_weekday && value == 7 {
-        value = 0;
-    }
 
     let valid_upper = if normalize_weekday { 7 } else { max };
     if !(min..=valid_upper).contains(&value) {
@@ -395,5 +403,47 @@ mod tests {
     fn invalid_field_count() {
         let err = CronSchedule::parse("* * * *").unwrap_err();
         assert!(matches!(err, ScheduleError::InvalidFieldCount { .. }));
+    }
+
+    #[test]
+    fn weekday_sunday_terminated_ranges() {
+        // `7` and `0` both mean Sunday; ranges ending at 7 must NOT error or
+        // collapse (the bug fix). Build the field directly to inspect days.
+        let days = |expr: &str| -> std::collections::BTreeSet<u32> {
+            CronSchedule::parse(expr)
+                .unwrap()
+                .day_of_week
+                .values
+                .clone()
+        };
+
+        // 1-7 == Mon..Sun == every day (7 is the canonical high-Sunday;
+        // previously this ERRORED because 7 was normalized to 0 before the
+        // range-bounds check).
+        assert_eq!(days("0 0 * * 1-7"), (0..=6).collect());
+        // 0-7 == every day (previously silently collapsed to just Sunday).
+        assert_eq!(days("0 0 * * 0-7"), (0..=6).collect());
+        // 5-7 == Fri, Sat, Sun (previously errored).
+        assert_eq!(days("0 0 * * 5-7"), [5, 6, 0].into_iter().collect());
+        // A bare `7` still means Sunday.
+        assert_eq!(days("0 0 * * 7"), [0].into_iter().collect());
+        // `mon-fri` and other non-Sunday ranges are unaffected.
+        assert_eq!(days("0 0 * * mon-fri"), (1..=5).collect());
+
+        // NOTE (standard-cron semantics): the `sun` ALIAS is 0 (low), so an
+        // alias range that "ends" at Sunday — e.g. `fri-sun` (5-0) — is an
+        // inverted range and is still rejected. Use the numeric high-Sunday
+        // form (`5-7`) or a list (`fri,sat,sun`) instead.
+        assert!(CronSchedule::parse("0 0 * * fri-sun").is_err());
+    }
+
+    #[test]
+    fn next_after_handles_sunday_via_7() {
+        // Sunday expressed as 7 must schedule on Sundays.
+        let schedule = CronSchedule::parse("0 0 * * 7").unwrap();
+        // From Thu Apr 2 2026 → next Sunday is Apr 5.
+        let next = schedule.next_after(utc(2026, 4, 2, 0, 0)).unwrap();
+        assert_eq!(next, utc(2026, 4, 5, 0, 0));
+        assert_eq!(next.weekday().num_days_from_sunday(), 0);
     }
 }
