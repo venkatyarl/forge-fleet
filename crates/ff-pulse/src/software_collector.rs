@@ -547,17 +547,30 @@ fn classify_ff_source(path: &str) -> String {
 /// `%ProgramData%\chocolatey\`). Falls through to `None` when unclear.
 /// UNTESTED — gated on a real Windows node joining the fleet.
 fn classify_pkg_source(path: &str) -> Option<String> {
+    classify_pkg_source_for(path, std::env::consts::OS)
+}
+
+/// OS-parameterized core of [`classify_pkg_source`] so the per-OS branches are
+/// testable on any host (`std::env::consts::OS` is fixed at compile time).
+fn classify_pkg_source_for(path: &str, os: &str) -> Option<String> {
     // Normalize — on Windows paths come back with backslashes; treat
     // lowercase substrings to avoid case-sensitivity headaches.
     let p = path.to_lowercase().replace('\\', "/");
 
-    if path.starts_with("/opt/homebrew/bin/") || path.starts_with("/usr/local/bin/") {
+    // /opt/homebrew is unambiguously Homebrew (Apple Silicon) on any host.
+    if path.starts_with("/opt/homebrew/bin/") {
         return Some("brew".to_string());
     }
-    if std::env::consts::OS == "linux" && path.starts_with("/usr/bin/") {
+    // /usr/local/bin is Intel-mac Homebrew ONLY on macOS. On Linux it's a
+    // manual / `make install` location (linuxbrew lives under
+    // /home/linuxbrew/.linuxbrew), so labelling it "brew" was wrong.
+    if os == "macos" && path.starts_with("/usr/local/bin/") {
+        return Some("brew".to_string());
+    }
+    if os == "linux" && path.starts_with("/usr/bin/") {
         return Some("apt".to_string());
     }
-    if std::env::consts::OS == "windows" {
+    if os == "windows" {
         if p.contains("/chocolatey/") {
             return Some("choco".to_string());
         }
@@ -664,6 +677,42 @@ mod tests {
         let p = parse_ff_version_line("forgefleet 2026.4.21_5 (pushed abcdef0123)");
         assert_eq!(p.git_state.as_deref(), Some("pushed"));
         assert_eq!(p.sha.as_deref(), Some("abcdef0123"));
+    }
+
+    #[test]
+    fn classify_pkg_source_is_os_aware() {
+        // /opt/homebrew is brew everywhere.
+        assert_eq!(
+            classify_pkg_source_for("/opt/homebrew/bin/jq", "macos"),
+            Some("brew".to_string())
+        );
+        assert_eq!(
+            classify_pkg_source_for("/opt/homebrew/bin/jq", "linux"),
+            Some("brew".to_string())
+        );
+        // /usr/local/bin is Intel-mac brew on macOS …
+        assert_eq!(
+            classify_pkg_source_for("/usr/local/bin/jq", "macos"),
+            Some("brew".to_string())
+        );
+        // … but on Linux it's manual/make-install, NOT brew (the bug fix).
+        assert_eq!(classify_pkg_source_for("/usr/local/bin/jq", "linux"), None);
+        // /usr/bin is apt on Linux.
+        assert_eq!(
+            classify_pkg_source_for("/usr/bin/jq", "linux"),
+            Some("apt".to_string())
+        );
+        // /usr/bin on macOS is system, not apt.
+        assert_eq!(classify_pkg_source_for("/usr/bin/jq", "macos"), None);
+        // Windows package managers by path.
+        assert_eq!(
+            classify_pkg_source_for(r"C:\ProgramData\chocolatey\bin\jq.exe", "windows"),
+            Some("choco".to_string())
+        );
+        assert_eq!(
+            classify_pkg_source_for(r"C:\Program Files\WindowsApps\jq\jq.exe", "windows"),
+            Some("winget".to_string())
+        );
     }
 
     #[test]
