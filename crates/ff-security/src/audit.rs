@@ -54,13 +54,19 @@ impl AuditLog {
     }
 
     pub fn append(&self, input: AuditEventInput) -> AuditResult<AuditEvent> {
-        let sequence = self.next_sequence.fetch_add(1, Ordering::SeqCst) + 1;
-        let timestamp = Utc::now();
-
+        // Hold the hash-chain lock across the ENTIRE sequence+hash allocation so
+        // that sequence numbers are assigned in the same order the chain is
+        // linked. Allocating the sequence before taking the lock let a
+        // later-sequenced append win the lock first, producing a chain where
+        // event N carries event N+1's hash as its `prev_hash` — which then
+        // fails its own `verify_chain` even though no tampering occurred.
         let mut guard = self
             .last_hash
             .lock()
             .map_err(|_| AuditError::LockPoisoned)?;
+
+        let sequence = self.next_sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        let timestamp = Utc::now();
         let prev_hash = guard.clone();
 
         let hash = compute_event_hash(
@@ -156,4 +162,94 @@ fn compute_event_hash(
     let mut hasher = DefaultHasher::new();
     payload.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::thread;
+
+    fn input(actor: &str) -> AuditEventInput {
+        AuditEventInput {
+            actor: actor.to_string(),
+            action: "test".to_string(),
+            target: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn sequential_append_chains_and_verifies() {
+        let log = AuditLog::new();
+        let a = log.append(input("a")).unwrap();
+        let b = log.append(input("b")).unwrap();
+        let c = log.append(input("c")).unwrap();
+
+        assert_eq!((a.sequence, b.sequence, c.sequence), (1, 2, 3));
+        assert_eq!(a.prev_hash, None);
+        assert_eq!(b.prev_hash.as_deref(), Some(a.hash.as_str()));
+        assert_eq!(c.prev_hash.as_deref(), Some(b.hash.as_str()));
+        log.verify_chain().unwrap();
+    }
+
+    #[test]
+    fn verify_chain_detects_tampering() {
+        let log = AuditLog::new();
+        log.append(input("a")).unwrap();
+        log.append(input("b")).unwrap();
+
+        // Corrupt a stored event's metadata without re-linking the chain.
+        if let Some(mut entry) = log.events.get_mut(&1) {
+            entry.metadata = serde_json::json!({"tampered": true});
+        }
+
+        assert!(matches!(
+            log.verify_chain(),
+            Err(AuditError::ChainVerificationFailed { sequence: 1 })
+        ));
+    }
+
+    // Regression guard for the seq/hash-chain race: when the sequence was
+    // allocated OUTSIDE the `last_hash` mutex, concurrent appends could link
+    // the chain in a different order than the sequence numbers, so the ledger
+    // failed its own `verify_chain`. With allocation moved under the lock this
+    // is always a valid, contiguous chain regardless of interleaving.
+    #[test]
+    fn concurrent_append_preserves_chain_integrity() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 64;
+
+        let log = Arc::new(AuditLog::new());
+        let barrier = Arc::new(Barrier::new(THREADS));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let log = Arc::clone(&log);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..PER_THREAD {
+                        log.append(input(&format!("actor-{t}-{i}"))).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let events = log.list();
+        assert_eq!(events.len(), THREADS * PER_THREAD);
+
+        // Sequences must be exactly 1..=N with no gaps or duplicates.
+        for (idx, event) in events.iter().enumerate() {
+            assert_eq!(event.sequence, idx as u64 + 1);
+        }
+
+        // The chain must validate end-to-end.
+        log.verify_chain().unwrap();
+    }
 }
