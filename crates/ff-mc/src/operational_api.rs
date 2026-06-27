@@ -1867,10 +1867,28 @@ async fn list_due_soon_filings(
         .map(|obligation| (obligation.id.clone(), obligation))
         .collect::<HashMap<_, _>>();
 
+    let items = select_due_soon_filings(filings, &entities, &obligations, today, end_date);
+    Json(items).into_response()
+}
+
+/// Build the "due soon" filing list: every still-outstanding filing due on or
+/// before `end_date`, **including already-overdue ones** (`due_date < today`) so
+/// a passed compliance deadline never silently drops off the radar — the old
+/// `due_date >= today` lower bound hid filings exactly when they became most
+/// urgent. Resolved filings (`Filed` / `Waived`) are excluded. Sorted by
+/// `due_date` ascending (most-overdue first), then `created_at`. Overdue items
+/// carry a negative `days_until_due`.
+fn select_due_soon_filings(
+    filings: Vec<Filing>,
+    entities: &HashMap<String, LegalEntity>,
+    obligations: &HashMap<String, ComplianceObligation>,
+    today: chrono::NaiveDate,
+    end_date: chrono::NaiveDate,
+) -> Vec<FilingDueItem> {
     let mut items = filings
         .into_iter()
-        .filter(|filing| filing.due_date >= today && filing.due_date <= end_date)
-        .filter(|filing| filing.status != FilingStatus::Filed)
+        .filter(|filing| filing.due_date <= end_date)
+        .filter(|filing| !matches!(filing.status, FilingStatus::Filed | FilingStatus::Waived))
         .filter_map(|filing| {
             let entity_name = entities.get(&filing.entity_id)?.name.clone();
             let obligation_title = filing
@@ -1893,8 +1911,7 @@ async fn list_due_soon_filings(
             .cmp(&b.filing.due_date)
             .then_with(|| a.filing.created_at.cmp(&b.filing.created_at))
     });
-
-    Json(items).into_response()
+    items
 }
 
 async fn list_filings_from_store(
@@ -2178,4 +2195,97 @@ async fn generate_work_items(Json(_body): Json<Value>) -> impl IntoResponse {
 /// GET /api/mc/fleet/status — fleet-wide MC status.
 async fn fleet_mc_status() -> impl IntoResponse {
     not_implemented("fleet Mission Control status")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{NaiveDate, TimeZone};
+
+    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    fn filing(id: &str, due: NaiveDate, status: FilingStatus) -> Filing {
+        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        Filing {
+            id: id.to_string(),
+            entity_id: "ent1".to_string(),
+            obligation_id: None,
+            jurisdiction: "US".to_string(),
+            due_date: due,
+            status,
+            filed_on: None,
+            notes: None,
+            created_at: ts,
+            updated_at: ts,
+        }
+    }
+
+    fn entities() -> HashMap<String, LegalEntity> {
+        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut m = HashMap::new();
+        m.insert(
+            "ent1".to_string(),
+            LegalEntity {
+                id: "ent1".to_string(),
+                name: "Acme LLC".to_string(),
+                entity_type: "llc".to_string(),
+                jurisdiction: "US".to_string(),
+                registration_number: None,
+                status: "active".to_string(),
+                created_at: ts,
+                updated_at: ts,
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn due_soon_includes_overdue_and_excludes_resolved() {
+        let today = date(2026, 6, 27);
+        let end_date = today + chrono::Duration::days(30);
+        let obligations = HashMap::new();
+        let filings = vec![
+            // Overdue & unfiled — MUST be surfaced (the bug fix).
+            filing("overdue", date(2026, 6, 1), FilingStatus::Pending),
+            // Explicitly flagged overdue — also surfaced.
+            filing("overdue2", date(2026, 6, 20), FilingStatus::Overdue),
+            // Due within the window — surfaced.
+            filing("soon", date(2026, 7, 10), FilingStatus::Pending),
+            // Already filed — excluded.
+            filing("filed", date(2026, 6, 15), FilingStatus::Filed),
+            // Waived — excluded (resolved).
+            filing("waived", date(2026, 6, 10), FilingStatus::Waived),
+            // Due far in the future, beyond the window — excluded.
+            filing("later", date(2026, 9, 1), FilingStatus::Pending),
+        ];
+
+        let items = select_due_soon_filings(filings, &entities(), &obligations, today, end_date);
+        let ids: Vec<&str> = items.iter().map(|i| i.filing.id.as_str()).collect();
+
+        // Overdue first (sorted by due_date asc), then the in-window upcoming one.
+        assert_eq!(ids, vec!["overdue", "overdue2", "soon"]);
+
+        // Overdue items carry negative days_until_due; upcoming is positive.
+        assert_eq!(items[0].days_until_due, -26);
+        assert!(items[1].days_until_due < 0);
+        assert!(items[2].days_until_due > 0);
+
+        // Filed and waived must never appear.
+        assert!(!ids.contains(&"filed"));
+        assert!(!ids.contains(&"waived"));
+        // Beyond-window must not appear.
+        assert!(!ids.contains(&"later"));
+    }
+
+    #[test]
+    fn due_soon_drops_filings_with_unknown_entity() {
+        let today = date(2026, 6, 27);
+        let end_date = today + chrono::Duration::days(30);
+        let mut f = filing("orphan", date(2026, 6, 1), FilingStatus::Pending);
+        f.entity_id = "ghost".to_string();
+        let items = select_due_soon_filings(vec![f], &entities(), &HashMap::new(), today, end_date);
+        assert!(items.is_empty());
+    }
 }
