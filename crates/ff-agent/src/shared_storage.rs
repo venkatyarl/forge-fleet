@@ -448,3 +448,50 @@ fn shell_quote(s: &str) -> String {
     out.push('\'');
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run `printf %s <shell_quote(s)>` through a real `/bin/sh` and return what
+    /// the shell actually produced. The security contract is that this equals
+    /// `s` EXACTLY — no expansion, word-splitting, or command execution.
+    fn sh_roundtrip(s: &str) -> String {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf %s {}", shell_quote(s)))
+            .output()
+            .expect("spawn sh");
+        assert!(out.status.success(), "sh failed for {s:?}");
+        String::from_utf8(out.stdout).expect("utf8")
+    }
+
+    #[test]
+    fn shell_quote_neutralises_injection_in_a_real_shell() {
+        // Payloads are side-effect-free (`echo`) so a quoting REGRESSION shows up
+        // as a mismatched round-trip rather than as a destructive side effect.
+        for s in [
+            "plain",
+            "/srv/forgefleet/models",
+            "path with spaces",
+            "has'apostrophe",
+            "$(echo pwned)",
+            "`echo pwned`",
+            "; echo INJECTED ;",
+            "a|b&c;d>e<f",
+            "$HOME ${X}",
+            "tab\tand\nnewline",
+            "",
+        ] {
+            assert_eq!(sh_roundtrip(s), s, "quoting failed to neutralise {s:?}");
+        }
+    }
+
+    #[test]
+    fn shell_quote_structure() {
+        assert_eq!(shell_quote("abc"), "'abc'");
+        assert_eq!(shell_quote(""), "''");
+        // A single quote becomes close-quote, escaped-quote, reopen-quote.
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+}
