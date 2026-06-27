@@ -140,8 +140,16 @@ impl JobDefinition {
         self.updated_at = Utc::now();
     }
 
+    /// Whether a just-failed run may be retried.
+    ///
+    /// `max_attempts` is the TOTAL number of attempts (the initial run counts
+    /// as attempt 1), so `max_attempts = 1` means "run once, never retry".
+    /// This is called by the engine *before* `note_failure_with_retry`
+    /// increments `consecutive_failures`, so the in-flight failure isn't yet
+    /// reflected — we add it here. Without the `+ 1` the job would run
+    /// `max_attempts + 1` times (e.g. `max_attempts = 1` would still retry once).
     pub fn can_retry(&self) -> bool {
-        self.consecutive_failures < self.retry.max_attempts
+        self.consecutive_failures.saturating_add(1) < self.retry.max_attempts
     }
 }
 
@@ -274,6 +282,37 @@ mod tests {
         .unwrap();
 
         assert!(job.next_run_at.is_some());
+    }
+
+    #[test]
+    fn can_retry_treats_max_attempts_as_total_attempts() {
+        let mut job = JobDefinition::new(
+            "retry-job",
+            "*/5 * * * *",
+            JobTask::LocalCommand {
+                command: "false".into(),
+                timeout_secs: None,
+            },
+            JobPriority::Normal,
+        )
+        .unwrap();
+
+        // max_attempts = 1 → run exactly once, NEVER retry (the bug: the old
+        // `cf < max_attempts` retried once → 2 attempts).
+        job.retry.max_attempts = 1;
+        job.consecutive_failures = 0;
+        assert!(!job.can_retry());
+
+        // max_attempts = 3 → retry after the 1st and 2nd failures, stop before
+        // a 4th attempt. can_retry is evaluated BEFORE the current failure is
+        // recorded, so consecutive_failures is one behind the attempt number.
+        job.retry.max_attempts = 3;
+        job.consecutive_failures = 0; // 1st attempt just failed
+        assert!(job.can_retry());
+        job.consecutive_failures = 1; // 2nd attempt just failed
+        assert!(job.can_retry());
+        job.consecutive_failures = 2; // 3rd attempt just failed → exhausted
+        assert!(!job.can_retry());
     }
 
     #[test]
