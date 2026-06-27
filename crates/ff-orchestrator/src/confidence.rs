@@ -397,11 +397,15 @@ impl ConfidenceExtractor {
             if line.contains("medium") || line.contains("moderate") {
                 return Some(0.6);
             }
-            if line.contains("low") {
-                return Some(0.3);
-            }
+            // "very low" must be checked BEFORE "low" — "very low" contains the
+            // substring "low", so the broader check would otherwise shadow it
+            // and misclassify a critically-uncertain response as merely
+            // uncertain (0.3 → escalate, instead of 0.15 → human review).
             if line.contains("very low") {
                 return Some(0.15);
+            }
+            if line.contains("low") {
+                return Some(0.3);
             }
         }
 
@@ -673,6 +677,33 @@ mod tests {
         assert_eq!(ConfidenceScore::new(1.5).value(), 1.0);
         assert_eq!(ConfidenceScore::new(-0.5).value(), 0.0);
         assert_eq!(ConfidenceScore::new(0.7).value(), 0.7);
+    }
+
+    #[test]
+    fn explicit_qualitative_very_low_is_not_shadowed_by_low() {
+        let extractor = ConfidenceExtractor::new();
+        // "very low" must map to the critical 0.15 tier, not be shadowed by the
+        // broader "low" substring (which would yield 0.3). Extract blends
+        // 70% explicit + 30% heuristic; with the heuristic ~0.6 the two
+        // explicit values give clearly different outputs.
+        let very_low = extractor
+            .extract("Here is my answer. Confidence: very low.")
+            .value();
+        let low = extractor
+            .extract("Here is my answer. Confidence: low.")
+            .value();
+        assert!(
+            very_low < low,
+            "very low ({very_low}) must score below low ({low})"
+        );
+        // And the symmetric high side still resolves very-high above high.
+        let very_high = extractor
+            .extract("Here is my answer. Confidence: very high.")
+            .value();
+        let high = extractor
+            .extract("Here is my answer. Confidence: high.")
+            .value();
+        assert!(very_high > high, "very high ({very_high}) > high ({high})");
     }
 
     #[test]
