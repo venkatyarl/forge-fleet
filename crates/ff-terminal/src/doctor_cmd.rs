@@ -100,6 +100,17 @@ fn disk_quota_health(over: i64, near: i64) -> Health {
     }
 }
 
+/// Active model deployments (`desired_state = 'active'`) that are unhealthy or
+/// whose health probe has gone stale. The reconciler re-adopts/restarts them,
+/// but while degraded the gateway routes requests to a model that can't answer.
+fn deployment_health(degraded: i64) -> Health {
+    if degraded > 0 {
+        Health::Warn
+    } else {
+        Health::Pass
+    }
+}
+
 /// Recently-checked mesh edges (node→node SSH reachability in `fleet_mesh_status`)
 /// that are NOT `ok`. A handful is transient and the leader-gated mesh-refresh
 /// tick self-heals it; a wide spread means the fleet is fragmenting and
@@ -286,7 +297,24 @@ pub async fn handle_doctor(json: bool) -> Result<()> {
         detail: format!("{mesh_failed} edges not ok (last 1h)"),
     });
 
-    // 7) Leader liveness (fresh heartbeat within 60s).
+    // 7b) Model deployments that should be serving but are unhealthy/stale.
+    let degraded_deployments: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fleet_model_deployments
+          WHERE desired_state = 'active'
+            AND (health_status IS DISTINCT FROM 'healthy'
+                 OR last_health_at IS NULL
+                 OR last_health_at < NOW() - INTERVAL '15 minutes')",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("deployment-health check: {e}"))?;
+    checks.push(DoctorCheck {
+        name: "model deployments".into(),
+        status: deployment_health(degraded_deployments),
+        detail: format!("{degraded_deployments} active but unhealthy/stale"),
+    });
+
+    // 8) Leader liveness (fresh heartbeat within 60s).
     let fresh_leaders: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM fleet_leader_state WHERE heartbeat_at > NOW() - INTERVAL '60 seconds'",
     )
@@ -381,6 +409,8 @@ mod tests {
         assert_eq!(disk_quota_health(0, 2), Health::Warn);
         assert_eq!(disk_quota_health(1, 0), Health::Fail);
         assert_eq!(disk_quota_health(1, 3), Health::Fail); // over wins over near
+        assert_eq!(deployment_health(0), Health::Pass);
+        assert_eq!(deployment_health(1), Health::Warn);
         assert_eq!(leader_health(true), Health::Pass);
         assert_eq!(leader_health(false), Health::Fail);
     }
