@@ -87,6 +87,18 @@ fn dead_alert_health(n: i64) -> Health {
     if n > 0 { Health::Warn } else { Health::Pass }
 }
 
+/// Recently-checked mesh edges (node→node SSH reachability in `fleet_mesh_status`)
+/// that are NOT `ok`. A handful is transient and the leader-gated mesh-refresh
+/// tick self-heals it; a wide spread means the fleet is fragmenting and
+/// coordination (deploys, dispatch, failover) is unreliable.
+fn mesh_health(failed: i64) -> Health {
+    match failed {
+        0 => Health::Pass,
+        1..=10 => Health::Warn,
+        _ => Health::Fail,
+    }
+}
+
 /// Hours a session may sit `running`/`pending` before it counts as stuck.
 /// Real sessions finish in minutes, so a multi-hour one is almost certainly
 /// wedged (a step whose fleet_task hung/was deleted, a dead worker, or a
@@ -216,7 +228,24 @@ pub async fn handle_doctor(json: bool) -> Result<()> {
         detail: format!("{stuck_sessions} running/pending >{STUCK_SESSION_HOURS}h"),
     });
 
-    // 6) Leader liveness (fresh heartbeat within 60s).
+    // 6) Mesh degradation: recently-checked node→node edges that aren't `ok`.
+    //    Stale rows (offline nodes) are excluded via last_checked so this only
+    //    flags live reachability loss, which breaks deploys/dispatch/failover.
+    let mesh_failed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fleet_mesh_status
+          WHERE status <> 'ok'
+            AND last_checked > NOW() - INTERVAL '1 hour'",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("mesh check: {e}"))?;
+    checks.push(DoctorCheck {
+        name: "mesh reachability".into(),
+        status: mesh_health(mesh_failed),
+        detail: format!("{mesh_failed} edges not ok (last 1h)"),
+    });
+
+    // 7) Leader liveness (fresh heartbeat within 60s).
     let fresh_leaders: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM fleet_leader_state WHERE heartbeat_at > NOW() - INTERVAL '60 seconds'",
     )
@@ -304,6 +333,9 @@ mod tests {
         assert_eq!(dead_alert_health(1), Health::Warn);
         assert_eq!(stuck_session_health(0), Health::Pass);
         assert_eq!(stuck_session_health(2), Health::Warn);
+        assert_eq!(mesh_health(0), Health::Pass);
+        assert_eq!(mesh_health(5), Health::Warn);
+        assert_eq!(mesh_health(25), Health::Fail);
         assert_eq!(leader_health(true), Health::Pass);
         assert_eq!(leader_health(false), Health::Fail);
     }
