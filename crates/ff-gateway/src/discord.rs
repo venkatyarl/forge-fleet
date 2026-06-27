@@ -368,3 +368,55 @@ pub fn looks_like_discord_payload(payload: &Value) -> bool {
 pub fn log_discord_error(context: &str, error: &DiscordError) {
     warn!(target: "ff_gateway::discord", %context, %error, "discord operation failed");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_encode_leaves_unreserved_and_escapes_the_rest() {
+        // RFC 3986 unreserved set passes through untouched.
+        assert_eq!(percent_encode_component("abc-_.~XYZ09"), "abc-_.~XYZ09");
+        // Path-dangerous characters MUST be escaped so a hostile id/filename
+        // can't inject extra path segments into the Discord API URL.
+        assert_eq!(percent_encode_component("a/b"), "a%2Fb");
+        assert_eq!(percent_encode_component("a b"), "a%20b");
+        assert_eq!(percent_encode_component("x?y#z"), "x%3Fy%23z");
+        assert_eq!(percent_encode_component("p&q=r"), "p%26q%3Dr");
+        assert_eq!(percent_encode_component(""), "");
+    }
+
+    #[test]
+    fn percent_encode_is_per_byte_for_utf8() {
+        // "é" is U+00E9 = 0xC3 0xA9 in UTF-8 → two percent triplets, uppercase.
+        assert_eq!(percent_encode_component("é"), "%C3%A9");
+    }
+
+    #[test]
+    fn media_kind_maps_content_type_prefix() {
+        assert!(matches!(
+            media_kind_from_content_type(Some("image/png")),
+            MessageMediaKind::Image
+        ));
+        assert!(matches!(
+            media_kind_from_content_type(Some("video/mp4")),
+            MessageMediaKind::Video
+        ));
+        assert!(matches!(
+            media_kind_from_content_type(Some("audio/ogg")),
+            MessageMediaKind::Audio
+        ));
+        assert!(matches!(
+            media_kind_from_content_type(Some("application/pdf")),
+            MessageMediaKind::Document
+        ));
+        assert!(matches!(
+            media_kind_from_content_type(Some("")),
+            MessageMediaKind::Other
+        ));
+        assert!(matches!(
+            media_kind_from_content_type(None),
+            MessageMediaKind::Other
+        ));
+    }
+}
