@@ -510,14 +510,27 @@ fn render_skill_md(s: &SkillRow) -> String {
     out
 }
 
-fn strip_frontmatter(s: &str) -> &str {
+/// Split a SKILL.md into `(frontmatter, body)`. Recognises a leading `---\n`
+/// fence closed by a line that is exactly `---`, whether followed by a newline
+/// (`\n---\n`) OR at end-of-input with no trailing newline (`\n---`). The latter
+/// used to be missed, so a SKILL.md not ending in a newline had its frontmatter
+/// leak into the body / its metadata dropped. Returns `(None, body)` when there
+/// is no frontmatter. A leading BOM is stripped either way.
+fn split_frontmatter(s: &str) -> (Option<&str>, &str) {
     let trimmed = s.trim_start_matches('\u{feff}');
-    if let Some(rest) = trimmed.strip_prefix("---\n")
-        && let Some(end) = rest.find("\n---\n")
-    {
-        return &rest[end + 5..];
+    if let Some(rest) = trimmed.strip_prefix("---\n") {
+        if let Some(end) = rest.find("\n---\n") {
+            return (Some(&rest[..end]), &rest[end + 5..]);
+        }
+        if let Some(fm) = rest.strip_suffix("\n---") {
+            return (Some(fm), "");
+        }
     }
-    s
+    (None, trimmed)
+}
+
+fn strip_frontmatter(s: &str) -> &str {
+    split_frontmatter(s).1
 }
 
 fn sha256_hex(s: &str) -> String {
@@ -675,19 +688,12 @@ struct Frontmatter {
 
 fn read_skill_file(path: &Path) -> Result<(Frontmatter, String)> {
     let raw = std::fs::read_to_string(path)?;
-    let trimmed = raw.trim_start_matches('\u{feff}');
     let mut fm = Frontmatter::default();
-    let body: String;
-    if let Some(rest) = trimmed.strip_prefix("---\n")
-        && let Some(end) = rest.find("\n---\n")
-    {
-        let fm_text = &rest[..end];
-        body = rest[end + 5..].to_string();
+    let (fm_text, body) = split_frontmatter(&raw);
+    if let Some(fm_text) = fm_text {
         parse_frontmatter_loose(fm_text, &mut fm);
-    } else {
-        body = raw.clone();
     }
-    Ok((fm, body))
+    Ok((fm, body.to_string()))
 }
 
 /// Cheap YAML parser — only handles the subset we expect in SKILL.md
@@ -880,5 +886,36 @@ mod tests {
         let b = write_skill(root, "src", "fam", "b");
         let wanted: HashSet<PathBuf> = [a, b].into_iter().collect();
         assert!(compute_orphans(root, &wanted).unwrap().is_empty());
+    }
+
+    #[test]
+    fn split_frontmatter_handles_close_with_and_without_trailing_newline() {
+        // Standard: closing `---` followed by a newline.
+        let (fm, body) = split_frontmatter("---\nname: x\ndescription: y\n---\nBODY\n");
+        assert_eq!(fm, Some("name: x\ndescription: y"));
+        assert_eq!(body, "BODY\n");
+
+        // Regression: closing `---` at end-of-input with NO trailing newline.
+        // This used to leave the frontmatter unparsed and leaking into the body.
+        let (fm, body) = split_frontmatter("---\nname: x\n---");
+        assert_eq!(fm, Some("name: x"));
+        assert_eq!(body, "");
+
+        // Close + newline, empty body.
+        let (fm, body) = split_frontmatter("---\nname: x\n---\n");
+        assert_eq!(fm, Some("name: x"));
+        assert_eq!(body, "");
+    }
+
+    #[test]
+    fn split_frontmatter_no_fence_and_bom() {
+        // No frontmatter → whole (BOM-stripped) string is the body.
+        let (fm, body) = split_frontmatter("just a body\nno fence");
+        assert_eq!(fm, None);
+        assert_eq!(body, "just a body\nno fence");
+        // Leading BOM is stripped.
+        let (fm, body) = split_frontmatter("\u{feff}---\nname: x\n---\nB");
+        assert_eq!(fm, Some("name: x"));
+        assert_eq!(body, "B");
     }
 }
