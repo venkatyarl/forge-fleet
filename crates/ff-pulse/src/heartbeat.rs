@@ -79,12 +79,13 @@ impl HeartbeatPublisher {
         let ram_used_gb = sys.used_memory() as f64 / 1_073_741_824.0;
 
         let disks = Disks::new_with_refreshed_list();
-        let (disk_total, disk_used) = disks.iter().fold((0u64, 0u64), |(total, used), disk| {
-            (
-                total + disk.total_space(),
-                used + (disk.total_space() - disk.available_space()),
-            )
-        });
+        // Saturating fold — pseudo-filesystems can report available > total
+        // (or total == 0), which a raw `total - available` underflows: a panic
+        // in debug, a garbage huge u64 in release. Shares the same guarded
+        // helper + tests as the v2 publisher (see heartbeat_v2.rs).
+        let (disk_total, disk_used) = crate::heartbeat_v2::aggregate_disk_bytes(
+            disks.iter().map(|d| (d.total_space(), d.available_space())),
+        );
         let disk_total_gb = disk_total as f64 / 1_073_741_824.0;
         let disk_used_gb = disk_used as f64 / 1_073_741_824.0;
 
