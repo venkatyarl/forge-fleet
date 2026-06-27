@@ -6189,3 +6189,110 @@ mod ci_status_tests {
         assert!(!update_applies("completed", "unknown"));
     }
 }
+
+#[cfg(test)]
+mod node_status_tests {
+    use super::{
+        HealthStatus, classify_heartbeat_freshness, derive_node_status,
+        normalize_status_for_runtime, parse_heartbeat_timestamp,
+    };
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn derive_node_status_prefers_live_health_over_db() {
+        // Live health wins regardless of db status.
+        assert_eq!(
+            derive_node_status(Some(&HealthStatus::Healthy), Some("offline")),
+            "online"
+        );
+        assert_eq!(
+            derive_node_status(Some(&HealthStatus::Degraded), None),
+            "degraded"
+        );
+        assert_eq!(
+            derive_node_status(Some(&HealthStatus::Unreachable), Some("online")),
+            "offline"
+        );
+    }
+
+    #[test]
+    fn derive_node_status_db_fallback_and_unknown() {
+        assert_eq!(derive_node_status(None, Some("online")), "online");
+        // starting/maintenance collapse to degraded.
+        assert_eq!(derive_node_status(None, Some("starting")), "degraded");
+        assert_eq!(derive_node_status(None, Some("maintenance")), "degraded");
+        assert_eq!(derive_node_status(None, Some("offline")), "offline");
+        // Case/space-insensitive.
+        assert_eq!(derive_node_status(None, Some("  ONLINE ")), "online");
+        // No signal / unrecognized → unknown.
+        assert_eq!(derive_node_status(None, None), "unknown");
+        assert_eq!(derive_node_status(None, Some("weird")), "unknown");
+    }
+
+    #[test]
+    fn normalize_status_aliases() {
+        for s in ["online", "healthy", "ok", "  OK "] {
+            assert_eq!(normalize_status_for_runtime(Some(s.to_string())), "online");
+        }
+        for s in ["degraded", "starting", "maintenance", "busy"] {
+            assert_eq!(
+                normalize_status_for_runtime(Some(s.to_string())),
+                "degraded"
+            );
+        }
+        for s in ["offline", "unreachable", "down"] {
+            assert_eq!(normalize_status_for_runtime(Some(s.to_string())), "offline");
+        }
+        // None defaults to online; unrecognized → unknown.
+        assert_eq!(normalize_status_for_runtime(None), "online");
+        assert_eq!(
+            normalize_status_for_runtime(Some("garbage".to_string())),
+            "unknown"
+        );
+    }
+
+    fn freshness_at(age_secs: i64) -> String {
+        let ts = (Utc::now() - Duration::seconds(age_secs)).to_rfc3339();
+        classify_heartbeat_freshness(&ts).0
+    }
+
+    #[test]
+    fn heartbeat_freshness_thresholds() {
+        // <=90s fresh, <=300s stale, else expired (use values away from the
+        // exact boundaries to avoid sub-second races).
+        assert_eq!(freshness_at(10), "fresh");
+        assert_eq!(freshness_at(80), "fresh");
+        assert_eq!(freshness_at(120), "stale");
+        assert_eq!(freshness_at(280), "stale");
+        assert_eq!(freshness_at(400), "expired");
+
+        // A future timestamp clamps age to 0 → fresh, never negative.
+        let future = (Utc::now() + Duration::seconds(120)).to_rfc3339();
+        let (fresh, age) = classify_heartbeat_freshness(&future);
+        assert_eq!(fresh, "fresh");
+        assert_eq!(age, Some(0));
+
+        // Unparseable / unknown → ("unknown", None).
+        assert_eq!(
+            classify_heartbeat_freshness("not-a-timestamp"),
+            ("unknown".to_string(), None)
+        );
+        assert_eq!(
+            classify_heartbeat_freshness("unknown"),
+            ("unknown".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn parse_heartbeat_timestamp_formats() {
+        assert!(parse_heartbeat_timestamp("2026-06-27T04:05:06Z").is_some());
+        // Space-separated "YYYY-MM-DD HH:MM:SS[.f]" (Postgres timestamp text).
+        assert!(parse_heartbeat_timestamp("2026-06-27 04:05:06").is_some());
+        assert!(parse_heartbeat_timestamp("2026-06-27 04:05:06.123").is_some());
+        // Empty / unknown / junk → None.
+        assert!(parse_heartbeat_timestamp("").is_none());
+        assert!(parse_heartbeat_timestamp("   ").is_none());
+        assert!(parse_heartbeat_timestamp("UNKNOWN").is_none());
+        assert!(parse_heartbeat_timestamp("nonsense").is_none());
+    }
+}
