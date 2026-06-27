@@ -555,7 +555,7 @@ async fn publish_beat(
 /// `total - available` underflows there — panicking in debug, and in release
 /// (how `forgefleetd` ships) silently wrapping to a garbage huge `u64` that
 /// corrupts the disk metrics reported in the beat.
-fn aggregate_disk_bytes(disks: impl IntoIterator<Item = (u64, u64)>) -> (u64, u64) {
+pub(crate) fn aggregate_disk_bytes(disks: impl IntoIterator<Item = (u64, u64)>) -> (u64, u64) {
     disks
         .into_iter()
         .fold((0u64, 0u64), |(total_acc, used_acc), (total, available)| {
