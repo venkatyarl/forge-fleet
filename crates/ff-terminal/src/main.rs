@@ -192,6 +192,10 @@ enum Command {
     Doctor {
         #[arg(long)]
         json: bool,
+        /// Exit non-zero on WARN too (default: only FAIL exits non-zero). Lets
+        /// scripts/CI gate on "anything not green".
+        #[arg(long)]
+        strict: bool,
     },
     Proxy {
         #[arg(long, default_value_t = 4000)]
@@ -3958,7 +3962,9 @@ async fn main() -> Result<()> {
             return config_cmd::handle_config(command.clone(), &config_path).await;
         }
         Some(Command::Status) => return status_cmd::handle_status(&config_path).await,
-        Some(Command::Doctor { json }) => return doctor_cmd::handle_doctor(*json).await,
+        Some(Command::Doctor { json, strict }) => {
+            return doctor_cmd::handle_doctor(*json, *strict).await;
+        }
         Some(Command::Nodes { gpu, json }) => {
             return helpers::handle_nodes(gpu.as_deref(), *json).await;
         }
@@ -4292,7 +4298,7 @@ async fn main() -> Result<()> {
             .await
         }
         Some(Command::Versions { node, json }) => versions_cmd::handle_versions(node, json).await,
-        Some(Command::Doctor { json }) => doctor_cmd::handle_doctor(json).await,
+        Some(Command::Doctor { json, strict }) => doctor_cmd::handle_doctor(json, strict).await,
         Some(Command::Fleet { command }) => fleet_cmd::handle_fleet(command).await,
         Some(Command::Ssh {
             worker,
