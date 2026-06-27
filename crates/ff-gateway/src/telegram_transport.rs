@@ -117,6 +117,17 @@ impl TelegramPollingTransport {
             "telegram polling transport started"
         );
 
+        // Security footgun: an empty allowed_chat_ids fails OPEN (is_allowed_chat
+        // returns true for every chat), so anyone who finds the bot can command
+        // the fleet. We keep that behavior for backwards-compat but make it loud
+        // rather than silent so a misconfigured node is obvious at startup.
+        if self.config.allowed_chat_ids.is_empty() {
+            warn!(
+                node = %self.worker_name,
+                "telegram transport has an EMPTY allowed_chat_ids — ANY chat that finds this bot can command the fleet; set transport.telegram.allowed_chat_ids to restrict access"
+            );
+        }
+
         self.set_runtime_status(Self::STATUS_ENABLED_KEY, self.config.enabled.to_string())
             .await;
         self.set_runtime_status(Self::STATUS_RUNNING_KEY, "true".to_string())
@@ -1263,6 +1274,25 @@ mod tests {
         assert!(is_allowed_chat(&config, "8496613333"));
         assert!(!is_allowed_chat(&config, "1111111111"));
         assert!(!is_allowed_chat(&config, "not-a-number"));
+    }
+
+    #[test]
+    fn empty_allowlist_fails_open_allow_all() {
+        // KNOWN SECURITY FOOTGUN (kept for backwards-compat): an empty
+        // allowed_chat_ids permits EVERY chat. The transport now emits a loud
+        // startup warning when this is the case. This test pins the current
+        // behavior so any future switch to fail-closed is a deliberate,
+        // test-breaking decision rather than a silent change.
+        let config = TelegramTransportConfig {
+            enabled: true,
+            allowed_chat_ids: vec![],
+            ..Default::default()
+        };
+        assert!(is_allowed_chat(&config, "8496613333"));
+        assert!(is_allowed_chat(&config, "1111111111"));
+        // Even a non-numeric chat id is allowed when the allowlist is empty,
+        // because the empty-list branch returns before parsing.
+        assert!(is_allowed_chat(&config, "anything"));
     }
 
     #[test]
