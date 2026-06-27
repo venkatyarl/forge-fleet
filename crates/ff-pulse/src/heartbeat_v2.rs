@@ -193,7 +193,10 @@ impl HeartbeatV2Publisher {
                 let ram_total_gb = (sys.total_memory() as f64 / 1_073_741_824.0).round() as i32;
                 let ram_used_bytes = sys.used_memory();
                 let ram_used_gb = ram_used_bytes as f64 / 1_073_741_824.0;
-                let ram_free_gb = (sys.total_memory() - ram_used_bytes) as f64 / 1_073_741_824.0;
+                // saturating: used should be <= total, but never underflow-panic
+                // the per-heartbeat hot path if a platform reports otherwise.
+                let ram_free_gb =
+                    sys.total_memory().saturating_sub(ram_used_bytes) as f64 / 1_073_741_824.0;
                 let ram_pct = if sys.total_memory() > 0 {
                     (ram_used_bytes as f64 / sys.total_memory() as f64) * 100.0
                 } else {
@@ -207,14 +210,11 @@ impl HeartbeatV2Publisher {
                         );
                         Disks::new()
                     });
-                let (disk_total, disk_used) = disks.iter().fold((0u64, 0u64), |(t, u), d| {
-                    (
-                        t + d.total_space(),
-                        u + (d.total_space() - d.available_space()),
-                    )
-                });
+                let (disk_total, disk_used) = aggregate_disk_bytes(
+                    disks.iter().map(|d| (d.total_space(), d.available_space())),
+                );
                 let disk_total_gb = (disk_total as f64 / 1_073_741_824.0) as i32;
-                let disk_free_gb = (disk_total - disk_used) as f64 / 1_073_741_824.0;
+                let disk_free_gb = disk_total.saturating_sub(disk_used) as f64 / 1_073_741_824.0;
 
                 beat.hardware = HardwareInfo {
                     cpu_cores,
@@ -547,6 +547,23 @@ async fn publish_beat(
     let _: () = conn.publish("pulse:events", &signed).await?;
 
     Ok(())
+}
+
+/// Sum `(total, used)` bytes across disks, guarding against pseudo-filesystems
+/// that report `available_space > total_space` (overlay/tmpfs/FUSE mounts, or
+/// mounts reporting `total = 0` with `available > 0`). A plain
+/// `total - available` underflows there — panicking in debug, and in release
+/// (how `forgefleetd` ships) silently wrapping to a garbage huge `u64` that
+/// corrupts the disk metrics reported in the beat.
+fn aggregate_disk_bytes(disks: impl IntoIterator<Item = (u64, u64)>) -> (u64, u64) {
+    disks
+        .into_iter()
+        .fold((0u64, 0u64), |(total_acc, used_acc), (total, available)| {
+            (
+                total_acc.saturating_add(total),
+                used_acc.saturating_add(total.saturating_sub(available)),
+            )
+        })
 }
 
 // ─── GPU / network / OS detection helpers ───────────────────────────────
@@ -1213,6 +1230,37 @@ fn classify_iface(iface: &str, ip: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregate_disk_bytes_sums_normal_mounts() {
+        // (total, available) → used = total - available.
+        let (total, used) = aggregate_disk_bytes([
+            (1_000u64, 400u64), // used 600
+            (2_000u64, 500u64), // used 1500
+        ]);
+        assert_eq!(total, 3_000);
+        assert_eq!(used, 2_100);
+        assert_eq!(total.saturating_sub(used), 900); // free
+    }
+
+    #[test]
+    fn aggregate_disk_bytes_survives_pseudo_filesystems() {
+        // A pseudo-fs reporting available > total (or total == 0) must NOT
+        // underflow — used contribution clamps to 0, never a garbage huge u64.
+        let (total, used) = aggregate_disk_bytes([
+            (0u64, 100u64),     // total=0, available=100 → used 0
+            (500u64, 900u64),   // available > total → used 0
+            (1_000u64, 250u64), // normal → used 750
+        ]);
+        assert_eq!(total, 1_500);
+        assert_eq!(used, 750);
+        assert_eq!(total.saturating_sub(used), 750);
+    }
+
+    #[test]
+    fn aggregate_disk_bytes_empty_is_zero() {
+        assert_eq!(aggregate_disk_bytes(std::iter::empty()), (0, 0));
+    }
 
     #[tokio::test]
     async fn build_beat_roundtrips_through_json() {
