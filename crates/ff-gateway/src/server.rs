@@ -1033,6 +1033,30 @@ fn verify_github_signature(body: &[u8], signature: &str, secret: &str) -> bool {
     result.as_slice().ct_eq(&expected).into()
 }
 
+/// Map GitHub's `workflow_run` (status, conclusion) pair onto the
+/// `project_ci_runs.status` enum.
+fn map_workflow_run_status(gh_status: &str, conclusion: &str) -> &'static str {
+    match (gh_status, conclusion) {
+        ("queued", _) => "queued",
+        ("in_progress", _) => "in_progress",
+        ("completed", "success") => "success",
+        ("completed", "failure") => "failure",
+        ("completed", "cancelled") => "cancelled",
+        ("completed", _) => "completed",
+        _ => "unknown",
+    }
+}
+
+/// Terminal CI statuses — a run that reached one of these is finished. GitHub
+/// does NOT guarantee webhook delivery order and retries failed deliveries, so
+/// a late/retried `queued`/`in_progress` event can arrive after `completed`.
+/// We must never regress a terminal run back to a non-terminal status. NOTE:
+/// this set MUST stay in sync with the `status IN (...)` list in the
+/// `project_ci_runs` UPDATE guard below.
+fn is_terminal_ci_status(status: &str) -> bool {
+    matches!(status, "success" | "failure" | "cancelled" | "completed")
+}
+
 /// GitHub webhook receiver — drops `workflow_run` + `check_run` events
 /// into `project_ci_runs` so `ff project status <id>` + the dashboard
 /// can show live CI state without polling the GitHub API.
@@ -1145,16 +1169,7 @@ async fn github_webhook_handler(
                 .unwrap_or("")
                 .to_string();
             let conclusion = wr.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
-            // Map GH's (status, conclusion) onto project_ci_runs.status enum.
-            let status = match (gh_status.as_str(), conclusion) {
-                ("queued", _) => "queued",
-                ("in_progress", _) => "in_progress",
-                ("completed", "success") => "success",
-                ("completed", "failure") => "failure",
-                ("completed", "cancelled") => "cancelled",
-                ("completed", _) => "completed",
-                _ => "unknown",
-            };
+            let status = map_workflow_run_status(gh_status.as_str(), conclusion);
             let started_at = wr
                 .get("run_started_at")
                 .and_then(|v| v.as_str())
@@ -1204,17 +1219,24 @@ async fn github_webhook_handler(
 
             // Update status if the row already existed (same run_id reappears on
             // subsequent action=in_progress / action=completed deliveries).
+            // Guard against out-of-order / retried deliveries: never regress a
+            // run that already reached a terminal status back to a non-terminal
+            // one. The update applies when the NEW status is terminal ($5) OR the
+            // stored status is still non-terminal. (GitHub does not order webhook
+            // deliveries — see is_terminal_ci_status.)
             if run_id.is_some() {
                 let _ = sqlx::query(
                     "UPDATE project_ci_runs
                         SET status = $1,
                             completed_at = COALESCE($2::timestamptz, completed_at)
-                      WHERE project_id = $3 AND run_id = $4",
+                      WHERE project_id = $3 AND run_id = $4
+                        AND ($5 OR status NOT IN ('success', 'failure', 'cancelled', 'completed'))",
                 )
                 .bind(status)
                 .bind(&completed_at)
                 .bind(&project_id)
                 .bind(run_id.as_deref())
+                .bind(is_terminal_ci_status(status))
                 .execute(pool)
                 .await;
             }
@@ -6108,5 +6130,62 @@ mod build_sha_tests {
         // Without a runtime injection, /health reports the compile-time bake —
         // never empty (the binary always has SOME identity to report).
         assert!(!super::current_build_sha().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ci_status_tests {
+    use super::{is_terminal_ci_status, map_workflow_run_status};
+
+    #[test]
+    fn maps_github_status_conclusion_pairs() {
+        assert_eq!(map_workflow_run_status("queued", ""), "queued");
+        assert_eq!(map_workflow_run_status("in_progress", ""), "in_progress");
+        assert_eq!(map_workflow_run_status("completed", "success"), "success");
+        assert_eq!(map_workflow_run_status("completed", "failure"), "failure");
+        assert_eq!(
+            map_workflow_run_status("completed", "cancelled"),
+            "cancelled"
+        );
+        // completed with an unusual conclusion (timed_out, neutral, …) → completed.
+        assert_eq!(
+            map_workflow_run_status("completed", "timed_out"),
+            "completed"
+        );
+        // Anything unexpected → unknown.
+        assert_eq!(map_workflow_run_status("waiting", ""), "unknown");
+    }
+
+    #[test]
+    fn terminal_status_classification() {
+        for s in ["success", "failure", "cancelled", "completed"] {
+            assert!(is_terminal_ci_status(s), "{s} should be terminal");
+        }
+        for s in ["queued", "in_progress", "unknown", ""] {
+            assert!(!is_terminal_ci_status(s), "{s} should be non-terminal");
+        }
+    }
+
+    /// Models the UPDATE guard `($5 OR status NOT IN (terminal))`: an update is
+    /// applied iff the new status is terminal OR the stored one is non-terminal.
+    fn update_applies(stored: &str, new: &str) -> bool {
+        is_terminal_ci_status(new) || !is_terminal_ci_status(stored)
+    }
+
+    #[test]
+    fn out_of_order_delivery_never_regresses_a_terminal_run() {
+        // Forward progress always allowed.
+        assert!(update_applies("queued", "in_progress"));
+        assert!(update_applies("in_progress", "success"));
+        assert!(update_applies("queued", "queued"));
+        // Terminal refinements (both terminal) allowed.
+        assert!(update_applies("completed", "success"));
+        assert!(update_applies("success", "failure"));
+        // THE FIX: a late/retried non-terminal delivery must NOT clobber a
+        // finished run.
+        assert!(!update_applies("success", "in_progress"));
+        assert!(!update_applies("failure", "queued"));
+        assert!(!update_applies("cancelled", "in_progress"));
+        assert!(!update_applies("completed", "unknown"));
     }
 }
