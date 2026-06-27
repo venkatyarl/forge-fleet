@@ -175,8 +175,8 @@ fn render_doctor(checks: &[DoctorCheck], overall: Health) -> String {
     out
 }
 
-/// `ff doctor [--json]`.
-pub async fn handle_doctor(json: bool) -> Result<()> {
+/// `ff doctor [--json] [--strict]`.
+pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
         .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
@@ -344,16 +344,39 @@ pub async fn handle_doctor(json: bool) -> Result<()> {
         print!("{}", render_doctor(&checks, overall));
     }
 
-    // Non-zero exit on FAIL so the loop / scripts can gate on it.
-    if overall == Health::Fail {
+    // Non-zero exit so the loop / scripts / CI can gate on it: always on FAIL,
+    // and on WARN too under --strict ("anything not green").
+    if doctor_exit_code(overall, strict) != 0 {
         std::process::exit(1);
     }
     Ok(())
 }
 
+/// Process exit code for an overall verdict: FAIL always fails; WARN fails only
+/// under `--strict`; PASS always succeeds. Pure, so the gating is unit-tested.
+fn doctor_exit_code(overall: Health, strict: bool) -> i32 {
+    match overall {
+        Health::Fail => 1,
+        Health::Warn if strict => 1,
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_exit_code_gates_on_warn() {
+        // Default: only FAIL is non-zero.
+        assert_eq!(doctor_exit_code(Health::Pass, false), 0);
+        assert_eq!(doctor_exit_code(Health::Warn, false), 0);
+        assert_eq!(doctor_exit_code(Health::Fail, false), 1);
+        // --strict: WARN is non-zero too; PASS still succeeds.
+        assert_eq!(doctor_exit_code(Health::Pass, true), 0);
+        assert_eq!(doctor_exit_code(Health::Warn, true), 1);
+        assert_eq!(doctor_exit_code(Health::Fail, true), 1);
+    }
 
     #[test]
     fn overall_is_worst_of() {
