@@ -87,6 +87,19 @@ fn dead_alert_health(n: i64) -> Health {
     if n > 0 { Health::Warn } else { Health::Pass }
 }
 
+/// Disk usage vs each worker's `disk_quota_pct`. Over quota = the node can no
+/// longer accept model downloads and risks filling its root fs; approaching
+/// quota (within 10 points) is an early warning the operator should prune.
+fn disk_quota_health(over: i64, near: i64) -> Health {
+    if over > 0 {
+        Health::Fail
+    } else if near > 0 {
+        Health::Warn
+    } else {
+        Health::Pass
+    }
+}
+
 /// Recently-checked mesh edges (node→node SSH reachability in `fleet_mesh_status`)
 /// that are NOT `ok`. A handful is transient and the leader-gated mesh-refresh
 /// tick self-heals it; a wide spread means the fleet is fragmenting and
@@ -228,7 +241,35 @@ pub async fn handle_doctor(json: bool) -> Result<()> {
         detail: format!("{stuck_sessions} running/pending >{STUCK_SESSION_HOURS}h"),
     });
 
-    // 6) Mesh degradation: recently-checked node→node edges that aren't `ok`.
+    // 6) Disk quota: latest sample per worker vs its disk_quota_pct. Stale
+    //    samples (offline nodes) excluded via sampled_at.
+    let (disk_over, disk_near): (i64, i64) = sqlx::query_as(
+        "WITH latest AS (
+             SELECT DISTINCT ON (worker_name) worker_name, used_bytes, total_bytes
+               FROM fleet_disk_usage
+              WHERE sampled_at > NOW() - INTERVAL '24 hours'
+              ORDER BY worker_name, sampled_at DESC
+         )
+         SELECT
+             COUNT(*) FILTER (
+                 WHERE l.total_bytes > 0
+                   AND l.used_bytes * 100.0 / l.total_bytes >= w.disk_quota_pct),
+             COUNT(*) FILTER (
+                 WHERE l.total_bytes > 0
+                   AND l.used_bytes * 100.0 / l.total_bytes >= w.disk_quota_pct - 10
+                   AND l.used_bytes * 100.0 / l.total_bytes <  w.disk_quota_pct)
+           FROM latest l JOIN fleet_workers w ON w.name = l.worker_name",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("disk-quota check: {e}"))?;
+    checks.push(DoctorCheck {
+        name: "disk quota".into(),
+        status: disk_quota_health(disk_over, disk_near),
+        detail: format!("{disk_over} over / {disk_near} near quota"),
+    });
+
+    // 7) Mesh degradation: recently-checked node→node edges that aren't `ok`.
     //    Stale rows (offline nodes) are excluded via last_checked so this only
     //    flags live reachability loss, which breaks deploys/dispatch/failover.
     let mesh_failed: i64 = sqlx::query_scalar(
@@ -336,6 +377,10 @@ mod tests {
         assert_eq!(mesh_health(0), Health::Pass);
         assert_eq!(mesh_health(5), Health::Warn);
         assert_eq!(mesh_health(25), Health::Fail);
+        assert_eq!(disk_quota_health(0, 0), Health::Pass);
+        assert_eq!(disk_quota_health(0, 2), Health::Warn);
+        assert_eq!(disk_quota_health(1, 0), Health::Fail);
+        assert_eq!(disk_quota_health(1, 3), Health::Fail); // over wins over near
         assert_eq!(leader_health(true), Health::Pass);
         assert_eq!(leader_health(false), Health::Fail);
     }
