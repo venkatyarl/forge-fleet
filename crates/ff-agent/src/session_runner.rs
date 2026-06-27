@@ -1557,4 +1557,32 @@ mod tests {
         assert_eq!(dep_gate(1, 3), DepGate::Cancel);
         assert_eq!(dep_gate(2, 1), DepGate::Cancel);
     }
+
+    #[test]
+    fn sanitize_filename_strips_path_separators_and_control_chars() {
+        // This guards the on-disk vault mirror: a session name must not be able
+        // to escape the vault directory or inject control bytes into a path.
+        assert_eq!(sanitize_filename("a/b\\c"), "a_b_c");
+        // 7 special chars (: * ? " < > |) → 7 underscores.
+        assert_eq!(sanitize_filename("c:*?\"<>|d"), "c_______d");
+        assert_eq!(sanitize_filename("tab\there"), "tab_here");
+        assert_eq!(sanitize_filename("null\0byte"), "null_byte");
+
+        // Path traversal is neutralised — every separator becomes '_', so the
+        // result is a single (harmless) path component.
+        let traversal = sanitize_filename("../../etc/cron.d/evil");
+        assert!(!traversal.contains('/'));
+        assert!(!traversal.contains('\\'));
+        assert_eq!(traversal, ".._.._etc_cron.d_evil");
+
+        // Long names are bounded to 120 chars (by char count, not bytes).
+        let long = "x".repeat(500);
+        assert_eq!(sanitize_filename(&long).chars().count(), 120);
+
+        // Ordinary names pass through unchanged.
+        assert_eq!(
+            sanitize_filename("session-2026-06-27"),
+            "session-2026-06-27"
+        );
+    }
 }
