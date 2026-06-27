@@ -224,19 +224,33 @@ struct ParsedAgent {
 /// Parse an `AGENT.md` — YAML frontmatter (name/role/description/triggers/
 /// tools/require_tool_calling/min_ctx) + a markdown body used as the
 /// system_prompt. Falls back to the directory name when `name` is absent.
+/// Split an AGENT.md into `(frontmatter, body)`. A leading `---\n` fence closed
+/// by a line that is exactly `---`, whether followed by a newline (`\n---\n`) OR
+/// at end-of-input (`\n---`, no trailing newline). The EOF case used to be
+/// missed, so an AGENT.md not ending in a newline had its YAML frontmatter leak
+/// into the body (the agent's system prompt) and its name/description dropped —
+/// the same bug fixed for SKILL.md in #623. A leading BOM is stripped.
+fn split_agent_frontmatter(s: &str) -> (Option<&str>, &str) {
+    let trimmed = s.trim_start_matches('\u{feff}');
+    if let Some(rest) = trimmed.strip_prefix("---\n") {
+        if let Some(end) = rest.find("\n---\n") {
+            return (Some(&rest[..end]), &rest[end + 5..]);
+        }
+        if let Some(fm) = rest.strip_suffix("\n---") {
+            return (Some(fm), "");
+        }
+    }
+    (None, trimmed)
+}
+
 fn parse_agent_file(path: &Path) -> Result<ParsedAgent> {
     let raw = std::fs::read_to_string(path)?;
-    let trimmed = raw.trim_start_matches('\u{feff}');
     let mut a = ParsedAgent::default();
-    let body: String;
-    if let Some(rest) = trimmed.strip_prefix("---\n")
-        && let Some(end) = rest.find("\n---\n")
-    {
-        parse_frontmatter(&rest[..end], &mut a);
-        body = rest[end + 5..].trim().to_string();
-    } else {
-        body = raw.trim().to_string();
+    let (fm_text, body) = split_agent_frontmatter(&raw);
+    if let Some(fm_text) = fm_text {
+        parse_frontmatter(fm_text, &mut a);
     }
+    let body = body.trim().to_string();
     if a.name.is_empty() {
         a.name = path
             .parent()
@@ -362,5 +376,24 @@ mod tests {
         let a = parse_agent_file(&agent_dir.join("AGENT.md")).unwrap();
         assert_eq!(a.name, "explorer");
         assert_eq!(a.system_prompt, "Just a body, no frontmatter.");
+    }
+
+    #[test]
+    fn split_agent_frontmatter_handles_eof_close_and_bom() {
+        // Standard close with trailing newline.
+        let (fm, body) = split_agent_frontmatter("---\nname: a\n---\nprompt\n");
+        assert_eq!(fm, Some("name: a"));
+        assert_eq!(body, "prompt\n");
+
+        // Regression (#623 class): closing `---` at EOF with no trailing newline.
+        // Used to leave the frontmatter unparsed and leaking into the body.
+        let (fm, body) = split_agent_frontmatter("---\nname: a\ndescription: d\n---");
+        assert_eq!(fm, Some("name: a\ndescription: d"));
+        assert_eq!(body, "");
+
+        // No fence → whole (BOM-stripped) string is the body.
+        let (fm, body) = split_agent_frontmatter("\u{feff}plain body");
+        assert_eq!(fm, None);
+        assert_eq!(body, "plain body");
     }
 }
