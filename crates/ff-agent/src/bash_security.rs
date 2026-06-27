@@ -433,6 +433,39 @@ fn detect_privilege_escalation(cmd: &str, threats: &mut Vec<SecurityThreat>) {
     }
 }
 
+/// True if `lower` (already lowercased) WRITES to a raw block device — either a
+/// `dd … of=/dev/<disk>` output or a `>`/`>>` redirect to `/dev/<disk>`. A disk
+/// is any name under `/dev/` beginning with a block-device prefix (sd, nvme, vd,
+/// xvd, hd, mmcblk, loop, dm-); safe character devices (`/dev/null`, `/dev/zero`,
+/// …) and reads (`dd if=/dev/sda of=file`) are deliberately NOT matched.
+fn writes_to_block_device(lower: &str) -> bool {
+    const BLOCK_PREFIXES: &[&str] = &["sd", "nvme", "vd", "xvd", "hd", "mmcblk", "loop", "dm-"];
+    fn dev_name(after: &str) -> &str {
+        after
+            .split(['/', ' ', '\t', ';', '|', '&', '>', '\'', '"'])
+            .next()
+            .unwrap_or("")
+    }
+    let is_block = |dev: &str| BLOCK_PREFIXES.iter().any(|p| dev.starts_with(p));
+
+    // `dd … of=/dev/<disk>`
+    for seg in lower.split("of=/dev/").skip(1) {
+        if is_block(dev_name(seg)) {
+            return true;
+        }
+    }
+    // `> /dev/<disk>` / `>> /dev/<disk>` redirects.
+    for seg in lower.split('>').skip(1) {
+        let seg = seg.trim_start_matches('>').trim_start();
+        if let Some(rest) = seg.strip_prefix("/dev/")
+            && is_block(dev_name(rest))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn detect_destructive_operations(cmd: &str, threats: &mut Vec<SecurityThreat>) {
     let lower = cmd.to_ascii_lowercase();
 
@@ -443,9 +476,6 @@ fn detect_destructive_operations(cmd: &str, threats: &mut Vec<SecurityThreat>) {
         ("rm -rf /*", "Delete all root contents"),
         ("mkfs.", "Format filesystem"),
         (":(){ :|:& };:", "Fork bomb"),
-        ("dd if=/dev/zero of=/dev/sd", "Overwrite disk"),
-        ("dd if=/dev/random of=/dev/sd", "Overwrite disk with random"),
-        ("> /dev/sda", "Overwrite disk device"),
         ("systemctl poweroff", "Systemd power off"),
         ("systemctl reboot", "Systemd reboot"),
     ];
@@ -458,6 +488,20 @@ fn detect_destructive_operations(cmd: &str, threats: &mut Vec<SecurityThreat>) {
                 matched_pattern: pat.to_string(),
             });
         }
+    }
+
+    // Writing to a raw block device wipes a disk. The old `> /dev/sda` /
+    // `of=/dev/sd` substrings only covered legacy SCSI/SATA names — modern
+    // hardware (DGX nvme, VMs vd/xvd, SD cards mmcblk) slipped through and was
+    // NOT hard-blocked. Match the write target generically (and leave safe
+    // character devices like /dev/null alone).
+    if writes_to_block_device(&lower) {
+        threats.push(SecurityThreat {
+            category: ThreatCategory::DestructiveOperation,
+            description: "Overwrite raw block device".to_string(),
+            severity: Severity::Critical,
+            matched_pattern: "/dev/<disk>".to_string(),
+        });
     }
 
     // System-control words that are destructive ONLY when invoked as a command.
@@ -867,6 +911,45 @@ mod tests {
                     .iter()
                     .any(|t| t.category == ThreatCategory::PipeInjection),
                 "did NOT expect PipeInjection for {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_device_writes_are_hard_blocked_on_modern_hardware() {
+        // Regression: only legacy /dev/sda was caught; nvme/vd/mmcblk slipped
+        // through and were NOT hard-blocked despite wiping a disk.
+        for cmd in [
+            "dd if=/dev/zero of=/dev/nvme0n1",
+            "cat /dev/zero > /dev/vda",
+            "echo x > /dev/nvme0n1",
+            "dd if=/dev/zero of=/dev/mmcblk0",
+            "dd if=/dev/zero of=/dev/sda", // still works
+            "echo x >> /dev/sda",
+        ] {
+            assert!(
+                block_reason(cmd).is_some(),
+                "expected hard block for {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_device_writes_are_not_blocked() {
+        // Character devices and ordinary file redirects must stay allowed.
+        for cmd in [
+            "echo ok > /dev/null",
+            "dd if=/dev/zero of=/dev/null bs=1M count=10",
+            "dd if=/dev/sda of=backup.img", // a READ of the disk, not a write
+            "cat file > out.txt",
+            "echo hi > /tmp/x",
+        ] {
+            assert!(
+                !scan_command(cmd)
+                    .threats
+                    .iter()
+                    .any(|t| t.description == "Overwrite raw block device"),
+                "did NOT expect block-device threat for {cmd:?}"
             );
         }
     }
