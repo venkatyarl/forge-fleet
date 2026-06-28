@@ -198,14 +198,13 @@ fn classify_file(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disc
     }
 
     let size = std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0);
-    let stem = name
-        .trim_end_matches(['f', 'F'])
-        .trim_end_matches(['g', 'G'])
-        .trim_end_matches(['g', 'G'])
-        .trim_end_matches('.')
-        .to_string();
-    // Simpler: strip .gguf extension case-insensitively.
-    let stem = strip_ext(&name, ".gguf").unwrap_or(stem);
+    // Strip the `.gguf` extension case-insensitively. The suffix is guaranteed
+    // by the check above so this always succeeds; fall back to the full name
+    // defensively. (Previously a hand-rolled trim_end_matches('f'/'g'/'g'/'.')
+    // chain computed a stem here first — but it dropped the `u`, yielding
+    // `model.ggu`, and was always overwritten by this strip_ext. Removed the
+    // dead+buggy chain so a future edit can't silently resurrect it.)
+    let stem = strip_ext(&name, ".gguf").unwrap_or_else(|| name.clone());
 
     let quant = extract_gguf_quant(&stem);
     // Base name without the quant suffix (best-effort).
