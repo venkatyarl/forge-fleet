@@ -202,7 +202,13 @@ fn claude_desktop_config_path(home: &std::path::Path) -> PathBuf {
 
 fn install_claude_desktop(home: &std::path::Path, server_url: &str, dry_run: bool) -> Result<()> {
     let config = claude_desktop_config_path(home);
-    upsert_mcp_server_json(&config, "forgefleet", server_url, dry_run)?;
+    // The Claude DESKTOP app (unlike the Claude Code CLI) does NOT accept
+    // `{"type":"http","url":...}` MCP entries in its config file — it silently
+    // skips them ("The following entries … are not valid MCP server
+    // configurations and were skipped: forgefleet"). Desktop only launches
+    // stdio servers, so bridge the remote HTTP endpoint through `npx
+    // mcp-remote`, which Desktop CAN spawn. (Claude Code keeps the http form.)
+    upsert_mcp_server_stdio_bridge(&config, "forgefleet", server_url, dry_run)?;
     println!("  ✓ claude-desktop: {}", config.display());
     Ok(())
 }
@@ -293,6 +299,37 @@ fn upsert_mcp_server_json(
     server_url: &str,
     dry_run: bool,
 ) -> Result<()> {
+    // Claude Code / Cursor / Kimi / Windsurf / Grok accept a native remote
+    // (`type:"http"`) MCP entry.
+    let entry = json!({ "type": "http", "url": server_url });
+    upsert_mcp_entry(path, server_name, entry, dry_run)
+}
+
+/// Like [`upsert_mcp_server_json`] but writes a STDIO entry that bridges the
+/// remote HTTP MCP endpoint through `npx mcp-remote`. Required by the Claude
+/// Desktop app, whose config loader only launches stdio (`command`) servers and
+/// silently skips `type:"http"` entries.
+fn upsert_mcp_server_stdio_bridge(
+    path: &std::path::Path,
+    server_name: &str,
+    server_url: &str,
+    dry_run: bool,
+) -> Result<()> {
+    let entry = json!({
+        "command": "npx",
+        "args": ["-y", "mcp-remote", server_url, "--transport", "http-only"],
+    });
+    upsert_mcp_entry(path, server_name, entry, dry_run)
+}
+
+/// Insert/replace `mcpServers.<server_name>` with `entry` in a JSON config,
+/// preserving every other key in the file. Idempotent.
+fn upsert_mcp_entry(
+    path: &std::path::Path,
+    server_name: &str,
+    entry: Value,
+    dry_run: bool,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -312,11 +349,6 @@ fn upsert_mcp_server_json(
         .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?
         .entry("mcpServers")
         .or_insert_with(|| json!({}));
-
-    let entry = json!({
-        "type": "http",
-        "url": server_url
-    });
 
     if let Some(obj) = servers.as_object_mut() {
         if obj.get(server_name) == Some(&entry) {
