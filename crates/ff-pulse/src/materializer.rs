@@ -618,12 +618,27 @@ impl Materializer {
         // Capture the result: this is a self-heal path for a column that drifted
         // undetected for weeks (9/15 computers wrong). Silently swallowing a
         // failure here would re-hide exactly that class of bug, so log it.
+        // Also self-heal ram_gb + cpu_cores, which drifted exactly like ip did:
+        // they were never updated after enrollment, so 13/15 workers were stuck
+        // at the 8GB/4-core enrollment placeholder while `computers` carried the
+        // real hardware (marcus is 31GB/12c). Wrong specs make the autoscaler /
+        // placement skip these nodes — why so many sat with no model. Guard each
+        // with `$N > 0` so a degenerate beat can't zero a good value.
         match sqlx::query(
-            "UPDATE fleet_workers SET ip = $1, updated_at = NOW() \
-             WHERE name = $2 AND ip <> $1",
+            "UPDATE fleet_workers SET \
+                 ip = $1, \
+                 ram_gb = CASE WHEN $3 > 0 THEN $3 ELSE ram_gb END, \
+                 cpu_cores = CASE WHEN $4 > 0 THEN $4 ELSE cpu_cores END, \
+                 updated_at = NOW() \
+             WHERE name = $2 AND ( \
+                 ip <> $1 \
+                 OR ($3 > 0 AND ram_gb IS DISTINCT FROM $3) \
+                 OR ($4 > 0 AND cpu_cores IS DISTINCT FROM $4))",
         )
         .bind(&beat.network.primary_ip)
         .bind(&beat.computer_name)
+        .bind(beat.hardware.ram_gb)
+        .bind(beat.hardware.cpu_cores)
         .execute(&self.pg)
         .await
         {
@@ -631,14 +646,16 @@ impl Materializer {
                 tracing::info!(
                     computer = %beat.computer_name,
                     ip = %beat.network.primary_ip,
-                    "materializer: reconciled drifted fleet_workers.ip"
+                    ram_gb = beat.hardware.ram_gb,
+                    cpu_cores = beat.hardware.cpu_cores,
+                    "materializer: reconciled drifted fleet_workers ip/ram_gb/cpu_cores"
                 );
             }
             Ok(_) => {}
             Err(e) => tracing::warn!(
                 computer = %beat.computer_name,
                 error = %e,
-                "materializer: fleet_workers.ip self-heal UPDATE failed"
+                "materializer: fleet_workers ip/ram/cpu self-heal UPDATE failed"
             ),
         }
 
