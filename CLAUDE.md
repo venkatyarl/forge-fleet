@@ -143,3 +143,31 @@ install -m 755 target/release/ff ~/.local/bin/ff
 codesign --force --sign - ~/.local/bin/ff
 ```
 Same for `~/.cargo/bin/ff`.
+
+<!-- ff-build-methodology -->
+## ForgeFleet build methodology (DEFAULT for every terminal: Claude Code, Codex, Kimi)
+
+For any substantive build/code work in a ForgeFleet-related project, the DEFAULT
+is to build **with the whole fleet and all its LLMs**, not solo on one machine:
+
+1. **Build with all the computers + their sub-agents.** Route real work through
+   ForgeFleet's distributed build (Pillar-4: `ff pm` work_items → scheduler →
+   sub-agent worktrees on every computer, under `~/.forgefleet/sub-agents/sub-agent-N/`).
+   Every computer runs sub-agent slots; the scheduler fans work across all of them.
+   Don't build everything on one box when the fleet can parallelize it.
+2. **Use ALL the LLMs (Hybrid LLM Architecture).** A sub-agent is an orchestrator,
+   not bound to its host's RAM — it can call ANY available LLM: a local model on
+   another fleet node (tiered cascade 9B→30B→70B→235B via `fleet_run` / capability
+   router / `ff offload`), OR a cloud CLI (claude / codex / kimi) on its own machine.
+   Pick the cheapest capable LLM per task; escalate only when needed.
+3. **Use the LLM Council for hard decisions.** For non-trivial design/architecture/
+   tradeoff calls, run `ff council --members codex,kimi` (multi-LLM consensus) before
+   committing to an approach.
+4. **Use ALL of ff's resources.** Prefer the `forgefleet` MCP tools + ff skills +
+   ff agents over generic primitives: `fleet_run`/`fleet_crew`, `cortex_*` (code graph),
+   `brain_*` (memory), `ff offload`/`ff supervise`/`ff research`, `ff db query` (live
+   schema). `ff mcp install --for all` wires these into every CLI.
+5. **Dogfood ff.** Route work through `ff` verbs (logged to `ff_interactions` =
+   training data), not raw codex/kimi/ssh. If ff lacks a verb, add it — don't route
+   around it. Solo/inline is only for trivial edits or conversational turns.
+<!-- /ff-build-methodology -->
