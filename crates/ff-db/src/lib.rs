@@ -238,6 +238,7 @@ pub use queries::{
     pg_upsert_brain_vault_node,
     pg_upsert_catalog,
     pg_upsert_channel_identity,
+    pg_upsert_computer_backend,
     pg_upsert_deployment,
     pg_upsert_library,
     pg_upsert_mesh_status,

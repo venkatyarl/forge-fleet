@@ -725,6 +725,22 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 15f) Backend availability detector — every 1h, PER-HOST (capability A2).
+    // Each host probes which LLM-CLI backends (claude/codex/kimi/gemini/grok) are
+    // installed AND authenticated locally and upserts computer_backends, so the
+    // dispatch picker can route a build to a node+backend that actually works.
+    // Hourly (not 15s): auth probes are real CLI invocations; dispatch re-probes
+    // when a cached row is stale.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: backend availability detector (1h, per-host)");
+        subsystem_tasks.push(ff_agent::backend_detect::spawn_backend_detector(
+            pg_pool,
+            worker_name.clone(),
+            3600,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 16) Procedural memory consolidation — every 6h, leader-gated.
     // Phase 14: scans completed sessions, extracts successful patterns into agent_procedures.
     if let Some(pg_pool) = operational_store.pg_pool().cloned() {

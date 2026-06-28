@@ -7193,6 +7193,47 @@ pub async fn pg_agent_viable_computer_ids(pool: &PgPool) -> Result<Vec<uuid::Uui
     Ok(rows)
 }
 
+/// Upsert one node's availability for an LLM-CLI backend (capability A2). Called
+/// by the per-node detector tick from `backend_detect::detect_backends`.
+/// `last_auth_ok_at` advances only on a passing auth probe; `last_checked_at`
+/// always advances so the picker can tell fresh rows from stale ones.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_upsert_computer_backend(
+    pool: &PgPool,
+    computer_id: uuid::Uuid,
+    backend: &str,
+    installed: bool,
+    authenticated: bool,
+    version: Option<&str>,
+    detail: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO computer_backends
+             (computer_id, backend, installed, authenticated, version,
+              last_auth_ok_at, last_checked_at, detail)
+         VALUES ($1, $2, $3, $4, $5,
+                 CASE WHEN $4 THEN NOW() ELSE NULL END, NOW(), $6)
+         ON CONFLICT (computer_id, backend) DO UPDATE SET
+             installed       = EXCLUDED.installed,
+             authenticated   = EXCLUDED.authenticated,
+             version         = EXCLUDED.version,
+             last_auth_ok_at = CASE WHEN EXCLUDED.authenticated
+                                    THEN NOW()
+                                    ELSE computer_backends.last_auth_ok_at END,
+             last_checked_at = NOW(),
+             detail          = EXCLUDED.detail",
+    )
+    .bind(computer_id)
+    .bind(backend)
+    .bind(installed)
+    .bind(authenticated)
+    .bind(version)
+    .bind(detail)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Atomically assign a ready work_item to a free slot: write the lease, mark the
 /// slot busy, and flip the work_item to 'claimed'. The partial-unique active
 /// lease index makes a duplicate claim a no-op (returns false). Returns true if

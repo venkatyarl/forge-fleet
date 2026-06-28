@@ -147,6 +147,87 @@ pub async fn detect_backends(probe_auth: bool, timeout: Duration) -> Vec<Backend
     out
 }
 
+/// Resolve THIS node's `computers.id` from its worker name. `None` if no row
+/// (node not enrolled yet) — the tick skips rather than erroring.
+async fn resolve_computer_id(pool: &sqlx::PgPool, worker_name: &str) -> Option<uuid::Uuid> {
+    sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM computers WHERE name = $1")
+        .bind(worker_name)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Spawn the per-node backend-detector tick (capability A2). PER-HOST, NOT
+/// leader-gated: every host detects + persists ITS OWN backends so the dispatch
+/// picker sees fleet-wide availability. Auth-probes are real CLI invocations, so
+/// the interval is intentionally coarse (hourly) — dispatch does a fresh probe
+/// when a cached row is stale (council guard).
+pub fn spawn_backend_detector(
+    pg: sqlx::PgPool,
+    worker_name: String,
+    interval_secs: u64,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let Some(cid) = resolve_computer_id(&pg, &worker_name).await else {
+                        tracing::warn!(worker_name = %worker_name,
+                            "backend_detector: no computers row for this node; skipping");
+                        continue;
+                    };
+                    match detect_and_persist(&pg, cid, Duration::from_secs(30)).await {
+                        Ok(n) => tracing::info!(
+                            backends = n,
+                            "backend_detector: refreshed computer_backends"
+                        ),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "backend_detector: detect/persist failed"
+                        ),
+                    }
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+        tracing::info!("backend_detector loop stopped");
+    })
+}
+
+/// Detect this node's backends (with auth probe) and persist each to
+/// `computer_backends` for `computer_id` (capability A2 — the per-node detector
+/// tick's body). Returns how many rows were upserted. Errors on the first DB
+/// failure; the caller (a periodic tick) just logs and retries next interval.
+pub async fn detect_and_persist(
+    pool: &sqlx::PgPool,
+    computer_id: uuid::Uuid,
+    timeout: Duration,
+) -> anyhow::Result<usize> {
+    let statuses = detect_backends(true, timeout).await;
+    let mut n = 0usize;
+    for s in &statuses {
+        ff_db::pg_upsert_computer_backend(
+            pool,
+            computer_id,
+            s.name,
+            s.installed,
+            s.authenticated.unwrap_or(false),
+            s.version.as_deref(),
+            &s.detail,
+        )
+        .await?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// `<binary> --version`, first line, best-effort (short timeout).
 async fn probe_version(binary: &str) -> Option<String> {
     let mut cmd = tokio::process::Command::new(binary);

@@ -718,6 +718,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "telegram_sessions",
         sql: schema::SCHEMA_V147_TELEGRAM_SESSIONS,
     },
+    PgMigration {
+        version: 148,
+        name: "computer_backends",
+        sql: schema::SCHEMA_V148_COMPUTER_BACKENDS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
