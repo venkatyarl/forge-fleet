@@ -427,6 +427,36 @@ impl TelegramPollingTransport {
             return Ok(());
         }
 
+        // ── Grounded fleet/PM questions → answer from REAL Postgres state ──
+        // Intercept "what are you working on" / "which computers" BEFORE the
+        // ungrounded LLM path so they can never be hallucinated (roadmap E1).
+        if let Some(pool) = pool
+            && let Some(text) = incoming.text.as_deref()
+        {
+            use crate::telegram_grounding::{TelegramIntent, classify_intent};
+            let grounded = match classify_intent(text) {
+                TelegramIntent::WorkStatus => {
+                    Some(crate::telegram_grounding::answer_work_status(pool).await)
+                }
+                TelegramIntent::FleetRoster => {
+                    Some(crate::telegram_grounding::answer_fleet_roster(pool).await)
+                }
+                TelegramIntent::General => None,
+            };
+            if let Some(answer) = grounded {
+                let body = answer.unwrap_or_else(|e| format!("(could not read fleet state: {e})"));
+                let mut outgoing =
+                    OutgoingMessage::text(Channel::Telegram, incoming.chat_id.clone(), body);
+                outgoing.reply_to = incoming.external_id.clone();
+                outgoing.thread_id = incoming.thread_id.clone();
+                self.client
+                    .send_message(&outgoing)
+                    .await
+                    .context("failed to send grounded telegram answer")?;
+                return Ok(());
+            }
+        }
+
         // ── Regular message → brain chat with LLM ────────────────────────
         if let Some(pool) = pool {
             return self
