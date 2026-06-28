@@ -7165,6 +7165,34 @@ pub async fn pg_free_slots(
         .collect())
 }
 
+/// Computer ids that currently host a LIVE, agent-capable model deployment:
+/// healthy, with enough per-slot context to actually drive a coding agent, and a
+/// recent health check (so a model that died after its row was written doesn't
+/// keep reading "healthy" forever). The Pillar-4 scheduler prefers these when
+/// leasing agent work so it doesn't hand a build to a node with no live LLM
+/// endpoint (the gap that wasted a ~6min lease cycle on priya during E3 — the
+/// same preflight `ff swarm` got in #645). NOTE: this is a *preference*, not a
+/// gate — callers must fall back to any free slot so assignment never starves if
+/// the deployment rows are momentarily stale (e.g. right after a deploy).
+pub async fn pg_agent_viable_computer_ids(pool: &PgPool) -> Result<Vec<uuid::Uuid>> {
+    // Keep MIN_AGENT_CTX in lockstep with the swarm preflight (swarm_cmd.rs).
+    const MIN_AGENT_CTX: i64 = 16_384;
+    const HEALTH_FRESH_SECS: i64 = 180;
+    let rows = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT DISTINCT c.id
+           FROM fleet_model_deployments d
+           JOIN computers c ON c.name = d.worker_name
+          WHERE d.health_status = 'healthy'
+            AND COALESCE(d.usable_agent_ctx, 0) >= $1
+            AND d.last_health_at > NOW() - make_interval(secs => $2)",
+    )
+    .bind(MIN_AGENT_CTX)
+    .bind(HEALTH_FRESH_SECS as f64)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// Atomically assign a ready work_item to a free slot: write the lease, mark the
 /// slot busy, and flip the work_item to 'claimed'. The partial-unique active
 /// lease index makes a duplicate claim a no-op (returns false). Returns true if

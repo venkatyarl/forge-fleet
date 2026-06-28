@@ -82,6 +82,7 @@ pub use queries::{
     pg_active_deployment_counts,
     pg_advance_intent_cursor,
     pg_agent_readiness,
+    pg_agent_viable_computer_ids,
     pg_append_benchmark_result,
     pg_append_routing_log,
     pg_append_training_loss_sample,
