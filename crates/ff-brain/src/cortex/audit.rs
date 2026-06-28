@@ -395,19 +395,38 @@ async fn emit_findings_as_work_items(
         return Ok(());
     };
 
+    // Two guards so the audit stops flooding the PM board (it had dumped 700+
+    // untriaged `idea` rows): (1) a severity GATE — only high-severity findings
+    // (e.g. unguarded endpoints) become work_items; the hundreds of medium
+    // `dead-column` + low `unreferenced-migration` cleanup hints are reported as
+    // a count, not inserted; (2) DEDUP — skip a finding that already has an OPEN
+    // audit work_item for the same (rule, node_path) so re-running can't pile up
+    // duplicates.
     let mut inserted = 0usize;
+    let mut deduped = 0usize;
+    let mut gated_out = 0usize;
     for finding in findings {
+        if !finding_passes_emit_gate(&finding.severity) {
+            gated_out += 1;
+            continue;
+        }
         let title = format!("[cortex audit] {}: {}", finding.rule, finding.node_title);
-        sqlx::query(
+        let res = sqlx::query(
             r#"INSERT INTO work_items
                    (project_id, kind, title, description, priority, created_by, metadata)
-               VALUES ($1, 'audit', $2, $3, $4, 'ff cortex audit',
-                       jsonb_build_object(
-                           'node_path', $5::text,
-                           'rule', $6::text,
-                           'severity', $7::text,
-                           'source', 'cortex audit'
-                       ))"#,
+               SELECT $1, 'audit', $2, $3, $4, 'ff cortex audit',
+                      jsonb_build_object(
+                          'node_path', $5::text,
+                          'rule', $6::text,
+                          'severity', $7::text,
+                          'source', 'cortex audit'
+                      )
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM work_items
+                    WHERE created_by = 'ff cortex audit'
+                      AND metadata->>'rule' = $6
+                      AND metadata->>'node_path' = $5
+                      AND status NOT IN ('done', 'cancelled', 'failed'))"#,
         )
         .bind(&project_id)
         .bind(title)
@@ -418,12 +437,30 @@ async fn emit_findings_as_work_items(
         .bind(&finding.severity)
         .execute(pool)
         .await?;
-        inserted += 1;
+        if res.rows_affected() > 0 {
+            inserted += 1;
+        } else {
+            deduped += 1;
+        }
     }
 
-    println!("emitted {inserted} work item(s) into project {project_id}");
+    println!(
+        "emitted {inserted} high-severity work item(s) into project {project_id} \
+         (deduped {deduped} already-open, gated-out {gated_out} medium/low as report-only)"
+    );
     Ok(())
 }
+
+/// Only high-severity audit findings become work_items by default; medium/low
+/// (`dead-column` / `unreferenced-migration` cleanup hints) are reported as a
+/// count instead, so the audit can't flood the PM board with hundreds of
+/// untriaged `idea` rows. Pure → unit-tested.
+fn finding_passes_emit_gate(severity: &str) -> bool {
+    severity_rank(severity) <= AUDIT_EMIT_MAX_RANK
+}
+
+/// Max `severity_rank` (0 = high) emitted as a work_item. high-only by default.
+const AUDIT_EMIT_MAX_RANK: u8 = 0;
 
 async fn resolve_emit_project(
     pool: &PgPool,
@@ -497,4 +534,19 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(3)).collect();
     out.push_str("...");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emit_gate_keeps_high_drops_medium_and_low() {
+        // The flood was 481 medium `dead-column` + 38 low rows; only the 258
+        // high `endpoints-no-guard` security findings should become work_items.
+        assert!(finding_passes_emit_gate("high"));
+        assert!(!finding_passes_emit_gate("medium"));
+        assert!(!finding_passes_emit_gate("low"));
+        assert!(!finding_passes_emit_gate("info"));
+    }
 }
