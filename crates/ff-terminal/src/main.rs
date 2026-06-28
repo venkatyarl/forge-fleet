@@ -38,6 +38,7 @@ mod agent_cmd;
 mod agents_cmd;
 mod alert_cmd;
 mod arbiter_cmd;
+mod backends_cmd;
 mod brain_cmd;
 mod build_cmd;
 mod cli_bridge_cmd;
@@ -174,6 +175,18 @@ enum Command {
     /// Stop ForgeFleet daemon
     Stop,
     Status,
+    /// List the LLM-CLI backends available on this node (claude/codex/kimi/…).
+    Backends {
+        /// Also run an authenticated health check per installed backend (slower).
+        #[arg(long)]
+        probe_auth: bool,
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Per-backend auth-probe timeout (seconds).
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
     /// List fleet nodes with hardware/GPU info from Postgres.
     Nodes {
         /// Filter by GPU kind substring (e.g. amd, nvidia, apple, none).
@@ -3962,6 +3975,11 @@ async fn main() -> Result<()> {
             return config_cmd::handle_config(command.clone(), &config_path).await;
         }
         Some(Command::Status) => return status_cmd::handle_status(&config_path).await,
+        Some(Command::Backends {
+            probe_auth,
+            json,
+            timeout,
+        }) => return backends_cmd::handle_backends(*probe_auth, *json, *timeout).await,
         Some(Command::Doctor { json, strict }) => {
             return doctor_cmd::handle_doctor(*json, *strict).await;
         }
@@ -4142,6 +4160,11 @@ async fn main() -> Result<()> {
         }
         Some(Command::Stop) => lifecycle_cmd::handle_stop().await,
         Some(Command::Status) => status_cmd::handle_status(&config_path).await,
+        Some(Command::Backends {
+            probe_auth,
+            json,
+            timeout,
+        }) => backends_cmd::handle_backends(probe_auth, json, timeout).await,
         Some(Command::Nodes { gpu, json }) => helpers::handle_nodes(gpu.as_deref(), json).await,
         Some(Command::Models) => lifecycle_cmd::handle_models(&agent_config).await,
         Some(Command::Health) => health_cmd::handle_health(&agent_config).await,

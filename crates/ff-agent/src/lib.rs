@@ -7,6 +7,7 @@ pub mod agent_roles;
 pub mod arbiter;
 pub mod auto_upgrade;
 pub mod autoscaler;
+pub mod backend_detect;
 pub mod circuit_breaker;
 pub mod deadlines;
 pub mod defer_worker;
