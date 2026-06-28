@@ -104,6 +104,23 @@ impl McpServer {
                 "instructions":
                     "ForgeFleet MCP — distributed AI fleet across LAN.\n\
                      \n\
+                     ⚡ DEFAULT METHODOLOGY — when the operator says `ff` or `the\n\
+                     fleet` (e.g. \"use ff\", \"run this on the fleet\", \"build this\"),\n\
+                     it means the FULL ForgeFleet methodology, not opt-in:\n\
+                     • Build with ALL the computers + their sub-agents (Pillar-4:\n\
+                       `ff pm` work_items → scheduler → per-node sub-agent worktrees),\n\
+                       not solo on one box, when the work can be parallelized.\n\
+                     • Use ALL the LLMs / the Hybrid LLM Architecture: a sub-agent\n\
+                       calls ANY available LLM — a local model on another node (tiered\n\
+                       cascade via `fleet_run` / capability router / `ff offload`) OR a\n\
+                       cloud CLI (claude/codex/kimi/gemini/grok) on its own machine.\n\
+                       Cheapest capable first; escalate only when needed.\n\
+                     • Use the LLM Council (`ff council --members codex,kimi`) for hard\n\
+                       design/architecture/tradeoff decisions before committing.\n\
+                     • Prefer these ff tools + ff skills/agents/resources over generic\n\
+                       primitives; dogfood ff (logged to ff_interactions). Solo/inline\n\
+                       is only for trivial edits or conversational turns.\n\
+                     \n\
                      Pick the tool that matches the task shape:\n\
                      • `fleet_run` — single LLM call (tiered 9B→32B→72B→235B). Self-\n\
                        contained prompts: definitions, summaries, classifications, \n\
