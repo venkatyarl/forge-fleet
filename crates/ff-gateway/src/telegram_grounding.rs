@@ -177,7 +177,9 @@ mod tests {
             TelegramIntent::WorkStatus
         );
         assert_eq!(
-            classify_intent("Show me the full list of items that ur working on now and items u have planned"),
+            classify_intent(
+                "Show me the full list of items that ur working on now and items u have planned"
+            ),
             TelegramIntent::WorkStatus
         );
         assert_eq!(
