@@ -1,3 +1,4 @@
+//! This module holds the ff-agent's in-memory shared runtime state.
 use chrono::{DateTime, Utc};
 use ff_core::{ActivityLevel, AgentTask, WorkerRole};
 use ff_discovery::{HardwareProfile, HealthSnapshot};
