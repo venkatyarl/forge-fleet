@@ -137,6 +137,17 @@ impl TelegramPollingTransport {
         self.set_runtime_status(Self::STATUS_LAST_ERROR_KEY, String::new())
             .await;
 
+        // Register the bot's command list with Telegram so typing `/` shows
+        // them (the ForgeFleet bot previously had NONE registered — E6).
+        let cmds: Vec<(&str, &str)> = crate::telegram_commands::COMMANDS
+            .iter()
+            .map(|c| (c.command, c.description))
+            .collect();
+        match self.client.set_my_commands(&cmds).await {
+            Ok(()) => info!(count = cmds.len(), "telegram: registered bot commands"),
+            Err(e) => warn!(error = %e, "telegram: setMyCommands failed (/ menu may be empty)"),
+        }
+
         loop {
             tokio::select! {
                 changed = shutdown_rx.changed() => {
@@ -361,6 +372,13 @@ impl TelegramPollingTransport {
                     .to_string(),
                 "ping" => "pong".to_string(),
                 "status" => format!("node: {}\nroute: {:?}", self.worker_name, _route.target),
+
+                // ── Command registry + multi-session router (E6) ───────
+                "commands" => crate::telegram_commands::commands_help(),
+                "sessions" => match pool {
+                    Some(pool) => format_sessions(pool).await,
+                    None => "Sessions unavailable (no Postgres).".to_string(),
+                },
 
                 // ── Brain thread commands ──────────────────────────────
                 "threads" => {
@@ -1015,6 +1033,43 @@ fn media_kind_label(kind: &MessageMediaKind) -> &'static str {
         MessageMediaKind::Document => "document",
         MessageMediaKind::Other => "other",
     }
+}
+
+/// Format the coding sessions connected to this bot for the `/sessions` reply
+/// (E6). Reads `telegram_sessions` — informative names, never bare hashes.
+async fn format_sessions(pool: &PgPool) -> String {
+    use sqlx::Row;
+    let rows = match sqlx::query(
+        "SELECT session_name, kind, COALESCE(project,'-') AS project, focused, update_freq_secs \
+         FROM telegram_sessions WHERE status <> 'ended' \
+         ORDER BY focused DESC, last_active_at DESC LIMIT 30",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return format!("(could not read sessions: {e})"),
+    };
+    if rows.is_empty() {
+        return "No coding sessions are connected yet. A session registers \
+                automatically when you ask it to work with ff."
+            .to_string();
+    }
+    let mut out = format!("Connected sessions ({}):\n", rows.len());
+    for r in &rows {
+        let name: String = r.get("session_name");
+        let kind: String = r.get("kind");
+        let project: String = r.get("project");
+        let focused: bool = r.get("focused");
+        let freq: i32 = r.get("update_freq_secs");
+        let star = if focused { "⭐ " } else { "" };
+        out.push_str(&format!(
+            "{star}{name} [{kind}] · {project} · every {}m\n",
+            freq / 60
+        ));
+    }
+    out.push_str("\n⭐ = focused (your replies route here).");
+    out.trim_end().to_string()
 }
 
 fn is_allowed_chat(config: &TelegramTransportConfig, chat_id: &str) -> bool {
