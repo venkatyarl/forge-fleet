@@ -4507,11 +4507,43 @@ async fn handle_fleet_deploy(
         }
     };
 
+    // Non-leader hosts that `--all` EXCLUDED — offline or reserved/drained. The
+    // target query silently drops these, so without surfacing them a host that
+    // briefly lost its heartbeat at deploy time (seen repeatedly on the DGX
+    // nodes beyonce/rihanna) just vanishes from the run and the convergence
+    // summary reports "N/N converged" as if it covered the whole fleet. Report
+    // them so the operator knows to re-deploy once they're back online.
+    let skipped: Vec<(String, String, String)> = if all {
+        sqlx::query_as::<_, (String, String, String)>(
+            "SELECT c.name,
+                    COALESCE(c.status, '?')                       AS status,
+                    COALESCE(c.reservation_state, 'available')    AS resv
+               FROM computers c
+               LEFT JOIN fleet_workers fw ON fw.name = c.name
+              WHERE COALESCE(fw.role, '') <> 'leader'
+                AND (c.status <> 'online'
+                     OR COALESCE(c.reservation_state, 'available') <> 'available')
+              ORDER BY string_to_array(c.primary_ip, '.')::int[]",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     if targets.is_empty() {
         if json {
-            println!("[]");
+            println!(
+                "{}",
+                serde_json::json!({ "results": [], "skipped": skipped
+                    .iter()
+                    .map(|(n, s, r)| serde_json::json!({"host": n, "status": s, "reservation": r}))
+                    .collect::<Vec<_>>() })
+            );
         } else {
             println!("{YELLOW}No deploy targets (no online non-leader computers).{RESET}");
+            report_skipped_hosts(&skipped);
         }
         return Ok(());
     }
@@ -4536,6 +4568,7 @@ async fn handle_fleet_deploy(
                 }
             );
         }
+        report_skipped_hosts(&skipped);
     }
 
     // Drive the deploys with bounded concurrency: keep at most `concurrency`
@@ -4621,6 +4654,10 @@ async fn handle_fleet_deploy(
             "target_sha": target_sha,
             "converged": converged,
             "total": total,
+            "skipped": skipped
+                .iter()
+                .map(|(n, s, r)| serde_json::json!({"host": n, "status": s, "reservation": r}))
+                .collect::<Vec<_>>(),
             "leader_refresh": leader_refresh.as_ref().map(|(ok, detail)| serde_json::json!({
                 "ok": ok, "detail": detail,
             })),
@@ -4664,7 +4701,41 @@ async fn handle_fleet_deploy(
         );
         std::process::exit(1);
     }
+    // Re-surface skipped hosts at the END too — the convergence line above only
+    // counts TARGETED hosts, so "N/N converged" can otherwise read as full-fleet
+    // coverage while offline/reserved hosts were silently left behind.
+    report_skipped_hosts(&skipped);
     Ok(())
+}
+
+/// Print the non-leader hosts `--all` excluded (offline or reserved) with the
+/// reason, so a silently-skipped host (e.g. a DGX node that lost its heartbeat
+/// at deploy time) is visible and the operator knows to re-deploy it. No-op when
+/// nothing was skipped.
+fn report_skipped_hosts(skipped: &[(String, String, String)]) {
+    if skipped.is_empty() {
+        return;
+    }
+    eprintln!(
+        "{YELLOW}⚠ {} non-leader host(s) skipped (not deploy-eligible):{RESET}",
+        skipped.len()
+    );
+    for (name, status, resv) in skipped {
+        let reason = skip_reason(status, resv);
+        eprintln!(
+            "    {name:<12} {reason}  → re-run `ff fleet deploy --node {name}` once it's back"
+        );
+    }
+}
+
+/// Why a host was excluded from `--all`: an offline status takes precedence over
+/// a reservation (an offline host can't be reserved-and-building). Pure for test.
+fn skip_reason(status: &str, reservation: &str) -> String {
+    if status != "online" {
+        format!("status={status}")
+    } else {
+        format!("reserved={reservation}")
+    }
 }
 
 async fn handle_fleet_computers(
@@ -4857,6 +4928,22 @@ fn parse_duration(spec: &str) -> Option<chrono::Duration> {
         "m" | "min" => Some(chrono::Duration::minutes(n)),
         "d" | "day" => Some(chrono::Duration::days(n)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod skip_reason_tests {
+    use super::skip_reason;
+
+    #[test]
+    fn offline_status_takes_precedence_over_reservation() {
+        // The DGX-miss case: a host that lost its heartbeat reads status=offline.
+        assert_eq!(skip_reason("offline", "available"), "status=offline");
+        // Status precedence even if also reserved.
+        assert_eq!(skip_reason("offline", "reserved"), "status=offline");
+        // Online-but-reserved (e.g. autoscaler held it) reports the reservation.
+        assert_eq!(skip_reason("online", "reserved"), "reserved=reserved");
+        assert_eq!(skip_reason("online", "draining"), "reserved=draining");
     }
 }
 
