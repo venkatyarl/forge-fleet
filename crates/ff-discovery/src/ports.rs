@@ -1,4 +1,4 @@
-//! Standard ForgeFleet/network port conventions.
+//! Defines ForgeFleet's canonical service ports.
 
 /// Default LLM model ports used across the fleet.
 /// Convention: each node uses 55000 for first model, 55001 for second, etc.
