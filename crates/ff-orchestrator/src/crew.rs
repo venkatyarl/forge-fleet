@@ -294,11 +294,20 @@ impl CrewDefinition {
         self.assignments.push(assignment);
     }
 
-    /// Roles used in this crew (deduplicated).
+    /// Roles used in this crew (deduplicated, first-seen order preserved).
+    ///
+    /// Uses a `HashSet` rather than `Vec::dedup` because crews are ordered by
+    /// execution stage, so the same role can recur non-adjacently (e.g.
+    /// `Coder → Reviewer → Coder`); `Vec::dedup` only collapses *consecutive*
+    /// duplicates and would leave those in. Mirrors
+    /// [`crate::agent_team::TeamConfig::roles`].
     pub fn roles(&self) -> Vec<&AgentRole> {
-        let mut roles: Vec<&AgentRole> = self.assignments.iter().map(|a| &a.role).collect();
-        roles.dedup();
-        roles
+        let mut seen = std::collections::HashSet::new();
+        self.assignments
+            .iter()
+            .filter(|a| seen.insert(&a.role))
+            .map(|a| &a.role)
+            .collect()
     }
 
     /// Number of assignments.
@@ -483,6 +492,39 @@ mod tests {
         assert_eq!(assignments[0].role, AgentRole::Researcher);
         assert_eq!(assignments[1].role, AgentRole::Coder);
         assert_eq!(assignments[2].role, AgentRole::Reviewer);
+    }
+
+    #[test]
+    fn test_roles_dedup_non_adjacent() {
+        // A crew can revisit a role at a later stage (Coder → Reviewer →
+        // Coder). The old `Vec::dedup` only collapsed consecutive repeats and
+        // would leave the second Coder in; `roles()` must return each role
+        // once, in first-seen order.
+        let mut crew = CrewDefinition::new("Revisit Crew", "Coder → Reviewer → Coder");
+        crew.assign(CrewAssignment::with_role(Uuid::new_v4(), AgentRole::Coder));
+        crew.assign(CrewAssignment::with_role(
+            Uuid::new_v4(),
+            AgentRole::Reviewer,
+        ));
+        crew.assign(CrewAssignment::with_role(Uuid::new_v4(), AgentRole::Coder));
+
+        let roles = crew.roles();
+        assert_eq!(roles, vec![&AgentRole::Coder, &AgentRole::Reviewer]);
+    }
+
+    #[test]
+    fn test_roles_dedup_consecutive() {
+        // Consecutive duplicates must also collapse to a single entry.
+        let mut crew = CrewDefinition::new("Dup Crew", "Reviewer → Reviewer");
+        crew.assign(CrewAssignment::with_role(
+            Uuid::new_v4(),
+            AgentRole::Reviewer,
+        ));
+        crew.assign(CrewAssignment::with_role(
+            Uuid::new_v4(),
+            AgentRole::Reviewer,
+        ));
+        assert_eq!(crew.roles(), vec![&AgentRole::Reviewer]);
     }
 
     #[test]
