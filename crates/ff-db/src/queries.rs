@@ -4000,6 +4000,21 @@ pub async fn load_fleet_config_from_postgres(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_rank_orders_cheapest_capable_first() {
+        // codex is the proven build backend → leads; unknowns sink to the back.
+        assert!(backend_rank("codex") < backend_rank("claude"));
+        assert!(backend_rank("claude") < backend_rank("kimi"));
+        assert!(backend_rank("kimi") < backend_rank("gemini"));
+        assert!(backend_rank("gemini") < backend_rank("grok"));
+        assert!(backend_rank("grok") < backend_rank("totally-unknown"));
+        // A jumbled list sorts into the documented preference order.
+        let mut v = vec!["grok", "claude", "codex", "kimi", "gemini"];
+        v.sort_by_key(|b| backend_rank(b));
+        assert_eq!(v, ["codex", "claude", "kimi", "gemini", "grok"]);
+    }
+
     #[test]
     fn test_classify_collision_buckets() {
         // 0 same-language candidates ⇒ collides only across a language boundary.
@@ -7232,6 +7247,47 @@ pub async fn pg_upsert_computer_backend(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Dispatch-preference rank for an LLM-CLI backend (capability A3). Lower =
+/// preferred (cheapest-capable-first). `codex` is the proven build backend so it
+/// leads; the rest follow by general reliability for autonomous code edits.
+/// Pure + total so the picker's ordering is unit-testable.
+pub fn backend_rank(backend: &str) -> u8 {
+    match backend {
+        "codex" => 0,
+        "claude" => 1,
+        "kimi" => 2,
+        "gemini" => 3,
+        "grok" => 4,
+        _ => 9,
+    }
+}
+
+/// The backends a node can actually dispatch to RIGHT NOW (capability A3):
+/// installed AND authenticated AND auth-checked within `fresh_secs`, ordered
+/// cheapest-capable-first via [`backend_rank`]. Empty ⇒ no usable backend on
+/// this node (caller falls back / re-probes). The freshness bound is the
+/// council guard against routing to a backend whose cached auth has gone stale.
+pub async fn pg_dispatchable_backends(
+    pool: &PgPool,
+    computer_id: uuid::Uuid,
+    fresh_secs: i64,
+) -> Result<Vec<String>> {
+    let mut backends: Vec<String> = sqlx::query_scalar::<_, String>(
+        "SELECT backend
+           FROM computer_backends
+          WHERE computer_id = $1
+            AND installed
+            AND authenticated
+            AND last_checked_at > NOW() - make_interval(secs => $2)",
+    )
+    .bind(computer_id)
+    .bind(fresh_secs as f64)
+    .fetch_all(pool)
+    .await?;
+    backends.sort_by_key(|b| backend_rank(b));
+    Ok(backends)
 }
 
 /// Atomically assign a ready work_item to a free slot: write the lease, mark the
