@@ -46,13 +46,28 @@ async fn endpoints_no_guard(pool: &PgPool, corpus: Option<&str>) -> Result<Vec<F
     query_findings(
         pool,
         corpus,
+        // Severity is `medium`, NOT `high`, on purpose. This rule only sees
+        // PER-HANDLER guards (a gate token in the handler body). It is blind to
+        // app-level tower middleware — e.g.
+        // `app.layer(middleware::from_fn(jwt_auth_middleware))` — which guards
+        // every route under a router without touching any handler. So "no
+        // guarded_by edge" means "this analysis can't PROVE a guard", not
+        // "definitely unauthenticated". Asserting `high` produced 258 false
+        // positives (every ff-gateway route is covered by the global JWT layer).
+        // `medium-needs-verification` keeps the finding visible in
+        // `ff cortex audit` but, via the emit gate (high-only), stops it
+        // auto-flooding the work board. ff-council consensus (codex+kimi):
+        // downgrade unprovable cases rather than overconfidently flag them, and
+        // never mark them guarded either (that would hide a real hole). A future
+        // router-scope pass can re-promote PROVABLY-unguarded, non-exempt routes.
         r#"SELECT 'endpoints-no-guard' AS rule,
-                  'high' AS severity,
+                  'medium' AS severity,
                   ep.path AS node_path,
                   ep.title AS node_title,
-                  'candidate unauthenticated route: handler '
+                  'needs-verification: handler '
                       || COALESCE(h.title, '<unresolved>')
-                      || ' has no guarded_by security:gate edge' AS detail
+                      || ' has no per-handler guarded_by security:gate edge '
+                      || '(may still be covered by app-level auth middleware)' AS detail
              FROM brain_vault_nodes ep
              JOIN brain_vault_edges se
                ON se.src_id = ep.id
@@ -542,8 +557,11 @@ mod tests {
 
     #[test]
     fn emit_gate_keeps_high_drops_medium_and_low() {
-        // The flood was 481 medium `dead-column` + 38 low rows; only the 258
-        // high `endpoints-no-guard` security findings should become work_items.
+        // Only `high` findings auto-promote to work_items. `endpoints-no-guard`
+        // is now `medium` (it can't prove a guard past app-level middleware —
+        // see the rule's doc comment), so it no longer floods the board; the
+        // 481 `dead-column` rows were already medium. A future router-scope pass
+        // that can PROVE a route is unguarded + non-exempt may emit `high`.
         assert!(finding_passes_emit_gate("high"));
         assert!(!finding_passes_emit_gate("medium"));
         assert!(!finding_passes_emit_gate("low"));
