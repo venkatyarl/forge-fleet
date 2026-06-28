@@ -747,12 +747,18 @@ async fn run_ff_dispatch(
         ),
     }
 
-    // Lane 2: codex backstop (the prior behavior).
+    // Lane 2: dispatch to an AVAILABLE backend (capability A4). The picker
+    // returns this node's installed+authenticated CLIs cheapest-capable-first;
+    // we take the best. Falls back to `codex` (the prior hardcoded behavior)
+    // when nothing is dispatchable here yet — e.g. a follower whose cloud creds
+    // haven't been distributed. So behavior is unchanged until backends are
+    // authed, then sub-agents transparently use the best available LLM.
+    let backend = pick_dispatch_backend(pg, item.computer_id).await;
     let cwd = worktree.worktree_path.clone();
     tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new("ff");
         cmd.arg("cli")
-            .arg("codex")
+            .arg(&backend)
             .arg("--cwd")
             .arg(&cwd)
             .arg("--timeout")
@@ -765,6 +771,28 @@ async fn run_ff_dispatch(
     })
     .await
     .context("join ff dispatch task")?
+}
+
+/// Choose the LLM-CLI backend for lane-2 dispatch on THIS node (capability A4):
+/// the best dispatchable backend (installed + authenticated + auth-fresh) per
+/// `pg_dispatchable_backends`, ordered cheapest-capable-first. Falls back to
+/// `codex` (the historical hardcode) when none is known dispatchable — so a node
+/// whose creds aren't distributed yet behaves exactly as before. 90-minute
+/// freshness window (auth is re-probed hourly by the detector tick).
+async fn pick_dispatch_backend(pg: &PgPool, computer_id: Uuid) -> String {
+    match ff_db::pg_dispatchable_backends(pg, computer_id, 5400).await {
+        Ok(backends) => {
+            if let Some(first) = backends.into_iter().next() {
+                info!(backend = %first, "run_ff_dispatch: dispatching via picked backend");
+                return first;
+            }
+            "codex".to_string()
+        }
+        Err(e) => {
+            warn!(error = %e, "run_ff_dispatch: backend picker failed; falling back to codex");
+            "codex".to_string()
+        }
+    }
 }
 
 /// Build a success `Output` for the local-codegen lane so `dispatch_one`'s
