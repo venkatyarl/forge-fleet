@@ -1212,6 +1212,75 @@ struct ChatCompletionMessage {
     content: Option<String>,
 }
 
+/// Pure: assemble the grounded brain system prompt from live fleet facts (E6b).
+/// Isolated so the anti-hallucination wording is unit-tested without a database.
+fn format_grounded_brain_prompt(
+    total_computers: i64,
+    online: i64,
+    names: &[String],
+    local_models: i64,
+    cloud_providers: i64,
+    display_name: &str,
+    thread_slug: &str,
+) -> String {
+    format!(
+        "You are the assistant for ForgeFleet (ff) — a REAL, running distributed AI agent \
+         platform on Vinny's fleet of {total_computers} computers ({online} online): {names}. \
+         ff runs a hybrid local+cloud LLM cascade ({local_models} local models on the fleet + \
+         {cloud_providers} cloud providers), a Pillar-4 autonomous build pipeline that builds \
+         work_items across the fleet, an LLM council, and a Cortex code graph. ForgeFleet is NOT \
+         hypothetical and NOT a supercomputer fantasy. CRITICAL: never invent computer names, \
+         work items, progress percentages, or ETAs — these have caused real confusion. For live \
+         fleet/work data, tell the user to run /computers, /llms, /sessions, or /commands. If you \
+         don't know something, say so plainly. User: {display_name}. Thread: {thread_slug}. \
+         Answer concisely; keep replies under 2000 chars.",
+        names = names.join(", ")
+    )
+}
+
+/// Build the grounded brain system prompt by reading live fleet counts.
+async fn grounded_brain_system_prompt(
+    pool: &PgPool,
+    display_name: &str,
+    thread_slug: &str,
+) -> String {
+    use sqlx::Row;
+    let (total, online) = sqlx::query(
+        "SELECT count(*)::bigint AS total, \
+                count(*) FILTER (WHERE status = 'online')::bigint AS online FROM fleet_workers",
+    )
+    .fetch_one(pool)
+    .await
+    .map(|r| (r.get::<i64, _>("total"), r.get::<i64, _>("online")))
+    .unwrap_or((0, 0));
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM fleet_workers ORDER BY ip")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+    let local_models: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM fleet_model_deployments \
+         WHERE health_status = 'healthy' AND catalog_id IS NOT NULL AND catalog_id <> ''",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    let cloud: i64 =
+        sqlx::query_scalar("SELECT count(*)::bigint FROM cloud_llm_providers WHERE enabled = true")
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+
+    format_grounded_brain_prompt(
+        total,
+        online,
+        &names,
+        local_models,
+        cloud,
+        display_name,
+        thread_slug,
+    )
+}
+
 async fn call_fleet_llm(
     pool: &PgPool,
     thread_slug: &str,
@@ -1222,13 +1291,10 @@ async fn call_fleet_llm(
     // Build conversation messages
     let mut messages = Vec::new();
 
-    // System prompt
-    let system_prompt = format!(
-        "You are ForgeFleet's Virtual Brain assistant. \
-         User: {display_name}. Thread: {thread_slug}. \
-         Answer concisely and helpfully. Use markdown formatting sparingly \
-         (Telegram supports basic markdown). Keep replies under 2000 chars."
-    );
+    // System prompt — GROUNDED with real fleet facts (E6b). The old generic
+    // prompt let the model invent computer names/work-items and even call ff
+    // "hypothetical"; this injects who ff actually is + live counts.
+    let system_prompt = grounded_brain_system_prompt(pool, display_name, thread_slug).await;
     messages.push(json!({"role": "system", "content": system_prompt}));
 
     // Load recent history (returned newest-first, so reverse)
@@ -1421,6 +1487,30 @@ impl UpdateDedupe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grounded_brain_prompt_states_real_identity_and_forbids_invention() {
+        let p = format_grounded_brain_prompt(
+            15,
+            15,
+            &["taylor".to_string(), "marcus".to_string()],
+            17,
+            12,
+            "Vinny",
+            "general",
+        );
+        // Must assert ff is REAL (the model called it "hypothetical" before).
+        assert!(p.contains("NOT hypothetical"));
+        // Must forbid the exact failure mode (invented names/items/ETAs).
+        assert!(p.contains("never invent"));
+        // Must carry real facts: the computer count, names, and model counts.
+        assert!(p.contains("15 computers"));
+        assert!(p.contains("taylor, marcus"));
+        assert!(p.contains("17 local models"));
+        assert!(p.contains("12 cloud providers"));
+        // Points the user at the grounded commands.
+        assert!(p.contains("/computers"));
+    }
 
     #[test]
     fn dedupe_rejects_seen_update_ids() {
