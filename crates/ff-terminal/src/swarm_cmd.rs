@@ -142,7 +142,38 @@ async fn run_swarm(
     // Resolve --exclude names → computer_ids once; every sub-task carries
     // the same exclusion set. Unknown names are surfaced as a warning and
     // skipped (no silent drop), mirroring `ff tasks add --exclude`.
-    let exclude_ids = resolve_exclude_ids(&pool, exclude).await;
+    let mut exclude_ids = resolve_exclude_ids(&pool, exclude).await;
+
+    // Capacity preflight (ff council consensus): the swarm used to fan agentic
+    // sub-tasks out to ANY worker with the capability — including nodes with no
+    // model deployed (marcus/sophie/priya/sia/aura) or a slot whose per-slot
+    // context (8K) can't fit the tool/system prompt. Those claim the task and
+    // hang with NO output → the observed "8/8 failed (no output)". Exclude every
+    // node that can't actually run an agent so sub-tasks only land on viable
+    // slots; fail fast (don't launch doomed tasks) if none exist.
+    let (nonviable_ids, viable_count, excluded_names) = nonviable_agent_node_ids(&pool).await;
+    if viable_count == 0 {
+        return Err(anyhow!(
+            "swarm capacity preflight: NO agent-capable nodes (need a healthy model \
+             deployment with >= {MIN_AGENT_CTX} usable_agent_ctx). Load a coder model on \
+             at least one node (e.g. `ff model load`) and retry."
+        ));
+    }
+    eprintln!(
+        "preflight: {viable_count} agent-capable node(s) (>= {MIN_AGENT_CTX} ctx); \
+         excluding {} non-viable (no model / ctx too small){}",
+        excluded_names.len(),
+        if excluded_names.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", excluded_names.join(", "))
+        }
+    );
+    for id in nonviable_ids {
+        if !exclude_ids.contains(&id) {
+            exclude_ids.push(id);
+        }
+    }
 
     eprintln!("planner: decomposing goal into {fanout} sub-tasks…");
     let subtasks = plan_subtasks(goal, fanout, llm, model).await?;
@@ -596,6 +627,54 @@ fn parse_exclude_names(exclude: &str) -> Vec<String> {
 /// names are surfaced as a warning and skipped (never silently dropped),
 /// so a typo can't quietly fail to exclude the host you meant — same
 /// contract as `ff tasks add --exclude`.
+/// Minimum per-slot agent context a node must serve to receive an agentic
+/// swarm sub-task. Slots below this (e.g. 8K) overflow the tool/system prompt
+/// and hang with no output — the "8/8 failed (no output)" root cause that the
+/// ff council traced to invalid capacity accounting.
+const MIN_AGENT_CTX: i64 = 16_384;
+
+/// Pure: can a node with this `usable_agent_ctx` run an agentic sub-task?
+/// `None` (no deployment) and anything below [`MIN_AGENT_CTX`] cannot.
+fn node_is_agent_viable(usable_agent_ctx: Option<i64>) -> bool {
+    usable_agent_ctx.unwrap_or(0) >= MIN_AGENT_CTX
+}
+
+/// Capacity preflight (ff council fix): the `computers.id`s of nodes that
+/// CANNOT run an agentic sub-task — no healthy model deployment with at least
+/// [`MIN_AGENT_CTX`] usable agent context. Added to the sub-task exclusion set
+/// so the swarm never dispatches a doomed task to a model-less or too-small
+/// node. Returns `(excluded_ids, viable_count, excluded_names)`.
+async fn nonviable_agent_node_ids(pool: &PgPool) -> (Vec<Uuid>, usize, Vec<String>) {
+    use sqlx::Row;
+    // Worker names that CAN run agentic work: healthy deployment + enough ctx.
+    let viable: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT worker_name FROM fleet_model_deployments \
+         WHERE health_status = 'healthy' AND COALESCE(usable_agent_ctx, 0) >= $1",
+    )
+    .bind(MIN_AGENT_CTX)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    // Every computer NOT in the viable set is excluded (empty viable → all).
+    let rows = sqlx::query("SELECT id, name FROM computers WHERE name <> ALL($1)")
+        .bind(&viable)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+    let mut ids = Vec::with_capacity(rows.len());
+    let mut names = Vec::with_capacity(rows.len());
+    for r in &rows {
+        if let (Ok(id), Ok(name)) = (r.try_get::<Uuid, _>("id"), r.try_get::<String, _>("name")) {
+            ids.push(id);
+            names.push(name);
+        }
+    }
+    names.sort();
+    (ids, viable.len(), names)
+}
+
 async fn resolve_exclude_ids(pool: &PgPool, exclude: &str) -> Vec<Uuid> {
     let names = parse_exclude_names(exclude);
     let mut ids: Vec<Uuid> = Vec::new();
@@ -630,7 +709,19 @@ async fn resolve_exclude_ids(pool: &PgPool, exclude: &str) -> Vec<Uuid> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_exclude_names;
+    use super::{MIN_AGENT_CTX, node_is_agent_viable, parse_exclude_names};
+
+    #[test]
+    fn agent_viability_excludes_no_model_and_tiny_ctx() {
+        // No deployment (None) → cannot run an agent.
+        assert!(!node_is_agent_viable(None));
+        // 8K slot overflows the tool prompt → excluded.
+        assert!(!node_is_agent_viable(Some(8_192)));
+        // Exactly the threshold and above are viable.
+        assert!(node_is_agent_viable(Some(MIN_AGENT_CTX)));
+        assert!(node_is_agent_viable(Some(32_768)));
+        assert!(node_is_agent_viable(Some(65_536)));
+    }
 
     #[test]
     fn parse_exclude_names_trims_dedups_and_drops_empties() {
