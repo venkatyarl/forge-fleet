@@ -4371,17 +4371,32 @@ async fn deploy_one_host(t: DeployTarget) -> DeployResult {
     //    moment, then read its version SHA. We read forgefleetd (the daemon
     //    we just bounced) so the SHA reflects the running process, not just
     //    the on-disk binary.
-    let (vcode, vout, verr) = deploy_ssh(
-        &t,
-        "sleep 3; ~/.local/bin/forgefleetd --version 2>&1 | head -1",
-        60,
-    )
-    .await;
-    let raw = if vcode == 0 {
-        vout.trim().to_string()
-    } else {
-        format!("version-probe exit {vcode}: {}", verr.trim())
-    };
+    // The version-probe over SSH can transiently fail (exit 255 — a host-key
+    // "Warning: Permanently added …" on first connect, or a flaky link), which
+    // would mark a SUCCESSFUL build+restart as a scary ✗ "version unparsable".
+    // Retry a few times and strip SSH warning noise before parsing. `tail -3`
+    // (not `head -1`) so a leading warning line doesn't hide the version.
+    let mut raw = String::new();
+    for attempt in 0..3 {
+        let (vcode, vout, verr) = deploy_ssh(
+            &t,
+            "sleep 3; ~/.local/bin/forgefleetd --version 2>&1 | tail -3",
+            60,
+        )
+        .await;
+        if vcode == 0 {
+            let cleaned = clean_version_line(&vout);
+            if !cleaned.is_empty() {
+                raw = cleaned;
+                break;
+            }
+        } else {
+            raw = format!("version-probe exit {vcode}: {}", clean_version_line(&verr));
+        }
+        if attempt < 2 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
     match BuildVersion::parse(&raw) {
         Some(v) => DeployResult {
             name: t.name,
@@ -4403,6 +4418,24 @@ async fn deploy_one_host(t: DeployTarget) -> DeployResult {
             }
         }
     }
+}
+
+/// Pick the version-looking line out of an SSH probe's output, dropping the
+/// host-key / pseudo-terminal warnings SSH emits to the same stream. Returns the
+/// first non-warning, non-empty line (BuildVersion::parse is the real validator,
+/// so this only needs to get the noise out of the way). Empty if none.
+fn clean_version_line(out: &str) -> String {
+    out.lines()
+        .map(str::trim)
+        .find(|l| {
+            !l.is_empty()
+                && !l.starts_with("Warning:")
+                && !l.starts_with("Permanently added")
+                && !l.contains("to the list of known hosts")
+                && !l.starts_with("Pseudo-terminal")
+        })
+        .unwrap_or("")
+        .to_string()
 }
 
 /// `ff fleet deploy --all | --node <name>` — fast PARALLEL self-built deploy.
@@ -4928,6 +4961,35 @@ fn parse_duration(spec: &str) -> Option<chrono::Duration> {
         "m" | "min" => Some(chrono::Duration::minutes(n)),
         "d" | "day" => Some(chrono::Duration::days(n)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod clean_version_line_tests {
+    use super::clean_version_line;
+
+    #[test]
+    fn strips_ssh_warnings_and_finds_version() {
+        // The adele false-✗ shape: a host-key warning ahead of the version.
+        let out = "Warning: Permanently added 'sia' (ED25519) to the list of known hosts.\n\
+                   forgefleet 2026.6.28_24 (pushed 94c28a69f6)";
+        assert_eq!(
+            clean_version_line(out),
+            "forgefleet 2026.6.28_24 (pushed 94c28a69f6)"
+        );
+    }
+
+    #[test]
+    fn clean_version_line_handles_clean_and_empty() {
+        assert_eq!(
+            clean_version_line("forgefleet 2026.1.1_1 (pushed abc)"),
+            "forgefleet 2026.1.1_1 (pushed abc)"
+        );
+        assert_eq!(clean_version_line(""), "");
+        assert_eq!(
+            clean_version_line("Warning: Permanently added 'x' to the list of known hosts."),
+            ""
+        );
     }
 }
 
