@@ -4394,7 +4394,7 @@ async fn deploy_one_host(t: DeployTarget) -> DeployResult {
             raw = format!("version-probe exit {vcode}: {}", clean_version_line(&verr));
         }
         if attempt < 2 {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
     }
     match BuildVersion::parse(&raw) {
