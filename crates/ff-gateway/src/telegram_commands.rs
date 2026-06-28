@@ -35,6 +35,14 @@ pub const COMMANDS: &[BotCommand] = &[
         description: "List coding sessions connected to this bot",
     },
     BotCommand {
+        command: "computers",
+        description: "List all fleet computers + stats",
+    },
+    BotCommand {
+        command: "llms",
+        description: "List all LLMs in the swarm (local + cloud)",
+    },
+    BotCommand {
         command: "status",
         description: "This node + routing info",
     },
