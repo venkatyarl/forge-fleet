@@ -379,6 +379,14 @@ impl TelegramPollingTransport {
                     Some(pool) => format_sessions(pool).await,
                     None => "Sessions unavailable (no Postgres).".to_string(),
                 },
+                "computers" => match pool {
+                    Some(pool) => format_computers(pool).await,
+                    None => "Computers unavailable (no Postgres).".to_string(),
+                },
+                "llms" => match pool {
+                    Some(pool) => format_llms(pool).await,
+                    None => "LLMs unavailable (no Postgres).".to_string(),
+                },
 
                 // ── Brain thread commands ──────────────────────────────
                 "threads" => {
@@ -1033,6 +1041,86 @@ fn media_kind_label(kind: &MessageMediaKind) -> &'static str {
         MessageMediaKind::Document => "document",
         MessageMediaKind::Other => "other",
     }
+}
+
+/// Format all fleet computers + stats for the `/computers` reply (E6b). Reads
+/// `fleet_workers` — the REAL roster, so the bot can never invent names.
+async fn format_computers(pool: &PgPool) -> String {
+    use sqlx::Row;
+    let rows = match sqlx::query(
+        "SELECT name, COALESCE(ip,'?') AS ip, COALESCE(status,'?') AS status, \
+                COALESCE(role,'worker') AS role, COALESCE(ram_gb,0)::bigint AS ram, \
+                COALESCE(cpu_cores,0)::bigint AS cpu \
+         FROM fleet_workers ORDER BY ip",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return format!("(could not read computers: {e})"),
+    };
+    if rows.is_empty() {
+        return "No computers registered in fleet_workers.".to_string();
+    }
+    let online = rows
+        .iter()
+        .filter(|r| r.get::<String, _>("status") == "online")
+        .count();
+    let mut out = format!("🖥️ {} computers ({} online):\n", rows.len(), online);
+    for r in &rows {
+        let name: String = r.get("name");
+        let ip: String = r.get("ip");
+        let status: String = r.get("status");
+        let role: String = r.get("role");
+        let ram: i64 = r.get("ram");
+        let cpu: i64 = r.get("cpu");
+        out.push_str(&format!(
+            "• {name} ({ip}) — {status}, {role}, {ram}GB, {cpu}c\n"
+        ));
+    }
+    out.trim_end().to_string()
+}
+
+/// Format every LLM in the swarm for the `/llms` reply (E6b): local model
+/// deployments (`fleet_model_deployments`) + enabled cloud providers
+/// (`cloud_llm_providers`), marking which local slots are agent-capable.
+async fn format_llms(pool: &PgPool) -> String {
+    use sqlx::Row;
+    let local = sqlx::query(
+        "SELECT worker_name, catalog_id, COALESCE(usable_agent_ctx,0)::bigint AS ctx \
+         FROM fleet_model_deployments \
+         WHERE health_status = 'healthy' AND catalog_id IS NOT NULL AND catalog_id <> '' \
+         ORDER BY worker_name, catalog_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let cloud = sqlx::query(
+        "SELECT display_name FROM cloud_llm_providers WHERE enabled = true ORDER BY display_name",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let mut out = String::from("🤖 LLMs in the swarm\n");
+    out.push_str(&format!("\nLocal ({}):\n", local.len()));
+    if local.is_empty() {
+        out.push_str("  (none healthy)\n");
+    } else {
+        for r in &local {
+            let w: String = r.get("worker_name");
+            let m: String = r.get("catalog_id");
+            let ctx: i64 = r.get("ctx");
+            let kind = if ctx >= 16_384 { "🛠 agent" } else { "chat" };
+            out.push_str(&format!("• {w}: {m} ({}K, {kind})\n", ctx / 1024));
+        }
+    }
+    out.push_str(&format!("\nCloud ({} enabled):\n", cloud.len()));
+    for r in &cloud {
+        let d: String = r.get("display_name");
+        out.push_str(&format!("• {d}\n"));
+    }
+    out.trim_end().to_string()
 }
 
 /// Format the coding sessions connected to this bot for the `/sessions` reply
