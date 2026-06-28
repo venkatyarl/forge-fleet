@@ -9222,3 +9222,31 @@ CREATE TABLE IF NOT EXISTS telegram_session_inbox (
 CREATE INDEX IF NOT EXISTS idx_tg_inbox_undelivered
     ON telegram_session_inbox(session_id, delivered, created_at);
 "#;
+
+// ─── V148: per-node LLM-CLI backend availability (capability roadmap A2) ──
+//
+// Records which CLI backends (claude/codex/gemini/kimi/grok) are installed AND
+// authenticated on each computer, refreshed by a per-node forgefleetd detector
+// tick (`ff_agent::backend_detect::detect_backends`). The dispatch picker reads
+// this to route a build to a node+backend that is actually usable — the
+// "sub-agents call any available LLM" capability. Purpose-built (not folded into
+// `computer_external_tools`) because backend *auth-freshness* has a different
+// lifecycle than tool *version-tracking*, and to avoid the FK-to-external_tools
+// seeding tangle.
+pub const SCHEMA_V148_COMPUTER_BACKENDS: &str = r#"
+CREATE TABLE IF NOT EXISTS computer_backends (
+    computer_id      UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    backend          TEXT NOT NULL,                       -- claude | codex | gemini | kimi | grok
+    installed        BOOLEAN NOT NULL DEFAULT false,
+    authenticated    BOOLEAN NOT NULL DEFAULT false,
+    version          TEXT,
+    last_auth_ok_at  TIMESTAMPTZ,                          -- last time an auth probe passed
+    last_checked_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    detail           TEXT,
+    PRIMARY KEY (computer_id, backend)
+);
+-- The picker's hot path: "which backends are dispatchable on this node?"
+CREATE INDEX IF NOT EXISTS computer_backends_dispatchable_idx
+    ON computer_backends(computer_id)
+    WHERE installed AND authenticated;
+"#;
