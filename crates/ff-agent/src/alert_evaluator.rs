@@ -136,6 +136,29 @@ fn eval_string(cond: &Condition, v: &str) -> bool {
     }
 }
 
+/// Metrics whose live value is read from the computer's current Pulse beat.
+/// When the beat is ABSENT (computer offline / beat key expired) the value is
+/// UNKNOWN — not `0` — so [`evaluate_current`] must not evaluate a content
+/// condition against a phantom `0`. Otherwise the seeded `low_disk_space`
+/// policy (`disk_free_gb < 20`) fires for every offline computer (`0 < 20`),
+/// even though its disk is fine — it's just unreachable. Down/offline detection
+/// is handled separately by `computer_status` (absent beat → `sdown`) and the
+/// DB-sourced `beat_age_secs` / `leader_heartbeat_age_secs` metrics, which are
+/// deliberately NOT in this set.
+fn is_beat_sourced_numeric(metric: &str) -> bool {
+    matches!(
+        metric,
+        "cpu_pct"
+            | "ram_pct"
+            | "ram_used_gb"
+            | "disk_free_gb"
+            | "gpu_pct"
+            | "llm_queue_depth"
+            | "llm_active_requests"
+            | "llm_tokens_per_sec"
+    )
+}
+
 /// Metrics the evaluator poll (`evaluate_current`) knows how to read each tick
 /// from a Pulse beat or the DB. KEEP IN SYNC with the `match metric` arms in
 /// `evaluate_current` — a policy on a metric NOT in this list (and not in
@@ -521,6 +544,14 @@ async fn evaluate_current(
 ) -> Result<(bool, Option<f64>, Option<String>), AlertError> {
     let beat = beats.iter().find(|b| b.computer_name == computer_name);
 
+    // No beat → this computer's live metrics are UNKNOWN, not 0. Evaluating a
+    // beat-sourced numeric condition against a phantom 0 false-fires content
+    // alerts for offline computers (e.g. `low_disk_space: disk_free_gb < 20`).
+    // Report no-match; offline detection is `computer_status`/`beat_age_secs`.
+    if beat.is_none() && is_beat_sourced_numeric(metric) {
+        return Ok((false, None, None));
+    }
+
     match metric {
         "cpu_pct" => {
             let v = beat.map(|b| b.load.cpu_pct).unwrap_or(0.0);
@@ -879,6 +910,44 @@ mod tests {
             assert!(
                 classify_policy_fireability(metric, "> 0").can_fire(),
                 "seeded metric {metric} classified as non-fireable",
+            );
+        }
+    }
+
+    #[test]
+    fn beat_sourced_numeric_excludes_status_and_db_metrics() {
+        // Beat-sourced numeric metrics: a phantom 0 on absent beat would
+        // false-fire content alerts, so these short-circuit to no-match.
+        assert!(is_beat_sourced_numeric("disk_free_gb"));
+        assert!(is_beat_sourced_numeric("cpu_pct"));
+        assert!(is_beat_sourced_numeric("llm_tokens_per_sec"));
+        // computer_status maps absent-beat to "sdown" itself — must NOT
+        // short-circuit, or `computer_status == 'sdown'` would never fire.
+        assert!(!is_beat_sourced_numeric("computer_status"));
+        // DB-sourced age metrics read their own value with no beat.
+        assert!(!is_beat_sourced_numeric("beat_age_secs"));
+        assert!(!is_beat_sourced_numeric("leader_heartbeat_age_secs"));
+        // Unknown metric.
+        assert!(!is_beat_sourced_numeric("nonsense"));
+    }
+
+    #[test]
+    fn beat_sourced_numeric_partitions_evaluator_metrics() {
+        // Drift guard: every EVALUATOR_METRIC is beat-sourced-numeric EXCEPT the
+        // three that source their value elsewhere (status enum + DB age). If a
+        // new beat-sourced metric is added to the poll, this forces updating
+        // is_beat_sourced_numeric so absent-beat handling stays correct.
+        let non_beat_numeric = [
+            "computer_status",
+            "leader_heartbeat_age_secs",
+            "beat_age_secs",
+        ];
+        for metric in EVALUATOR_METRICS {
+            let expected = !non_beat_numeric.contains(metric);
+            assert_eq!(
+                is_beat_sourced_numeric(metric),
+                expected,
+                "metric {metric} misclassified",
             );
         }
     }
