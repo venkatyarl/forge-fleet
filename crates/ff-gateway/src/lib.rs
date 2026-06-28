@@ -29,6 +29,7 @@ pub mod server;
 pub mod static_files;
 pub mod tasks;
 pub mod telegram;
+pub mod telegram_commands;
 pub mod telegram_grounding;
 pub mod telegram_transport;
 pub mod tool_registry_api;

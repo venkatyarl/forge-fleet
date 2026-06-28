@@ -713,6 +713,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "disable_dead_computer_offline_alert",
         sql: schema::SCHEMA_V146_DISABLE_DEAD_COMPUTER_OFFLINE_ALERT,
     },
+    PgMigration {
+        version: 147,
+        name: "telegram_sessions",
+        sql: schema::SCHEMA_V147_TELEGRAM_SESSIONS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

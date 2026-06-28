@@ -62,6 +62,33 @@ impl TelegramClient {
         &self.http_client
     }
 
+    /// Register the bot's command list with Telegram via `setMyCommands` so
+    /// typing `/` shows them. Idempotent — safe to call on every startup. The
+    /// ForgeFleet bot previously had NONE registered (empty `getMyCommands`),
+    /// which is why `/` showed nothing.
+    pub async fn set_my_commands(&self, commands: &[(&str, &str)]) -> Result<(), TelegramError> {
+        let cmds: Vec<Value> = commands
+            .iter()
+            .map(|(c, d)| json!({ "command": c, "description": d }))
+            .collect();
+        let url = format!("{}/bot{}/setMyCommands", self.api_base, self.token);
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&json!({ "commands": cmds }))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(TelegramError::Api {
+                status,
+                message: format!("setMyCommands failed: {}", body.trim()),
+            });
+        }
+        Ok(())
+    }
+
     pub async fn set_webhook(&self, webhook_url: &str) -> Result<(), TelegramError> {
         let payload = json!({
             "url": webhook_url,

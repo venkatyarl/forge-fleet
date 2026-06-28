@@ -9187,3 +9187,38 @@ UPDATE alert_policies
    AND condition = '== ''odown'''
    AND enabled = true;
 "#;
+
+/// V147 — multi-session Telegram router (roadmap E6). One ForgeFleet bot fans
+/// out to many coding sessions (this Claude Code session, another, codex, kimi).
+/// Each session registers with an INFORMATIVE name so the operator can tell them
+/// apart; the operator focuses one and replies route to it; each session polls
+/// `telegram_session_inbox` for messages addressed to it.
+pub const SCHEMA_V147_TELEGRAM_SESSIONS: &str = r#"
+CREATE TABLE IF NOT EXISTS telegram_sessions (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_name     TEXT NOT NULL,
+    kind             TEXT NOT NULL DEFAULT 'claude_code',
+    project          TEXT,
+    chat_id          TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'active',
+    focused          BOOLEAN NOT NULL DEFAULT FALSE,
+    update_freq_secs INTEGER NOT NULL DEFAULT 1800,
+    external_key     TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_active_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_sessions_status ON telegram_sessions(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_sessions_extkey
+    ON telegram_sessions(external_key) WHERE external_key IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS telegram_session_inbox (
+    id          BIGSERIAL PRIMARY KEY,
+    session_id  UUID NOT NULL REFERENCES telegram_sessions(id) ON DELETE CASCADE,
+    text        TEXT NOT NULL,
+    from_chat   TEXT,
+    delivered   BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_tg_inbox_undelivered
+    ON telegram_session_inbox(session_id, delivered, created_at);
+"#;
