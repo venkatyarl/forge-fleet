@@ -780,10 +780,14 @@ async fn run_ff_dispatch(
 /// whose creds aren't distributed yet behaves exactly as before. 90-minute
 /// freshness window (auth is re-probed hourly by the detector tick).
 async fn pick_dispatch_backend(pg: &PgPool, computer_id: Uuid) -> String {
-    match ff_db::pg_dispatchable_backends(pg, computer_id, 5400).await {
+    // Headroom-aware routing (A5): prefers the backend with the most usage
+    // headroom + cheapest rank, skipping breaker-open providers. Degrades to
+    // bare backend_rank order when no usage rows exist yet, so it is always a
+    // safe superset of the A3 picker.
+    match ff_db::pg_routed_backends(pg, computer_id, 5400).await {
         Ok(backends) => {
             if let Some(first) = backends.into_iter().next() {
-                info!(backend = %first, "run_ff_dispatch: dispatching via picked backend");
+                info!(backend = %first, "run_ff_dispatch: dispatching via headroom-routed backend");
                 return first;
             }
             "codex".to_string()
