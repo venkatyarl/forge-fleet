@@ -165,6 +165,51 @@ pub struct ProviderStatus {
     pub token_preview: Option<String>,
 }
 
+/// Read the leader's raw credential bytes for one provider.
+///
+/// Source-of-truth varies by OS / vendor:
+///  • Linux: every vendor CLI stores creds in a file at `cred_path`.
+///  • macOS: Claude Code stores creds in the macOS Keychain (service name
+///    "Claude Code-credentials") instead of `~/.claude/.credentials.json`.
+///    Other vendor CLIs on macOS still use a file.
+///
+/// Keychain-first, file-fallback for `claude` on macOS; file-only otherwise.
+/// Shared by `import_token` (extract token → fleet_secrets) and
+/// `distribute_token` (push the cred to followers) so both honor the same
+/// source — otherwise `distribute` reads a file that doesn't exist on a
+/// macOS leader and claude silently fails to fan out.
+async fn read_leader_cred_bytes(provider: &OauthProvider) -> Result<Vec<u8>> {
+    let path = expand_home(provider.cred_path).ok_or_else(|| {
+        anyhow!(
+            "provider {} has no cred_path configured — set the token manually with `ff secrets set {}`",
+            provider.name,
+            provider.secret_key
+        )
+    })?;
+
+    if cfg!(target_os = "macos")
+        && provider.name == "claude"
+        && let Ok(b) = keychain_read("Claude Code-credentials").await
+        && !b.is_empty()
+    {
+        return Ok(b);
+    }
+
+    tokio::fs::read(&path).await.with_context(|| {
+        let kc = if cfg!(target_os = "macos") && provider.name == "claude" {
+            " (also tried macOS Keychain `Claude Code-credentials`)"
+        } else {
+            ""
+        };
+        format!(
+            "read cred file {} for provider {} — run `{} login` first{kc}",
+            path.display(),
+            provider.name,
+            provider.name
+        )
+    })
+}
+
 /// Read the leader's credential file for one provider, extract the
 /// access token, write to `fleet_secrets[<provider>.oauth_token]`.
 ///
@@ -175,35 +220,7 @@ pub async fn import_token(pool: &PgPool, provider: &OauthProvider) -> Result<()>
     let path = expand_home(provider.cred_path)
         .ok_or_else(|| anyhow!("provider {} has no cred_path configured — set the token manually with `ff secrets set {}`", provider.name, provider.secret_key))?;
 
-    // Source-of-truth for credentials varies by OS / vendor:
-    //  • Linux: every vendor CLI stores creds in a file at `cred_path`.
-    //  • macOS: Claude Code stores creds in macOS Keychain (service name
-    //    "Claude Code-credentials") instead of `~/.claude/.credentials.json`.
-    //    Other vendor CLIs on macOS still use a file.
-    // Keychain-first, file-fallback for `claude` on macOS; file-only otherwise.
-    let bytes = if cfg!(target_os = "macos") && provider.name == "claude" {
-        match keychain_read("Claude Code-credentials").await {
-            Ok(b) if !b.is_empty() => b,
-            _ => tokio::fs::read(&path).await.with_context(|| {
-                format!(
-                    "read cred file {} for provider {} — run `{} login` first \
-                     (also tried macOS Keychain `Claude Code-credentials`)",
-                    path.display(),
-                    provider.name,
-                    provider.name
-                )
-            })?,
-        }
-    } else {
-        tokio::fs::read(&path).await.with_context(|| {
-            format!(
-                "read cred file {} for provider {} — run `{} login` first",
-                path.display(),
-                provider.name,
-                provider.name
-            )
-        })?
-    };
+    let bytes = read_leader_cred_bytes(provider).await?;
 
     let json: Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse cred for provider {} as JSON", provider.name))?;
@@ -267,16 +284,10 @@ pub async fn import_token(pool: &PgPool, provider: &OauthProvider) -> Result<()>
 /// the local CLI sees the same login the leader did. Members without
 /// the directory get it created (`mkdir -p`) before write.
 pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result<usize> {
-    let path = expand_home(provider.cred_path).ok_or_else(|| {
-        anyhow!(
-            "provider {} has no cred_path — distribute is N/A",
-            provider.name
-        )
-    })?;
-
-    let bytes = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("read leader cred file {}", path.display()))?;
+    // Keychain-first (macOS claude) / file source — same resolver as
+    // `import_token`, so a macOS leader can fan out its Keychain-held claude
+    // creds instead of failing on a nonexistent `~/.claude/.credentials.json`.
+    let bytes = read_leader_cred_bytes(provider).await?;
     let b64 = BASE64.encode(&bytes);
 
     // Target list = every fleet member EXCEPT the leader (the leader's
@@ -289,9 +300,13 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
         .map(|l| l.computer_id);
 
     let rows = sqlx::query(
+        // 'online' is the live status the heartbeat materializer writes;
+        // ('ok','pending','maintenance') are legacy/transitional vocab kept
+        // for compat. Omitting 'online' made distribute resolve ZERO targets
+        // on a fleet whose members are all 'online' (silent enqueued=0).
         "SELECT id, name, ssh_user, primary_ip
            FROM computers
-          WHERE status IN ('ok', 'pending', 'maintenance')",
+          WHERE status IN ('online', 'ok', 'pending', 'maintenance')",
     )
     .fetch_all(pool)
     .await
