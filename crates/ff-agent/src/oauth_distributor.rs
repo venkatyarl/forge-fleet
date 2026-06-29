@@ -80,7 +80,10 @@ pub const OAUTH_PROVIDERS: &[OauthProvider] = &[
     },
     OauthProvider {
         name: "kimi",
-        cred_path: "~/.moonshot/auth.json",
+        // Kimi Code stores its OAuth creds at ~/.kimi/credentials/kimi-code.json
+        // (flat {access_token, refresh_token, expires_at, ...}), NOT the
+        // Moonshot-CLI ~/.moonshot/auth.json path.
+        cred_path: "~/.kimi/credentials/kimi-code.json",
         secret_key: "moonshot.oauth_token",
         token_fields: &["access_token", "accessToken", "token"],
     },
