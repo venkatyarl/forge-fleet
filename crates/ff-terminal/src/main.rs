@@ -1144,7 +1144,7 @@ pub enum ConfigCommand {
     Nodes,
 }
 
-#[derive(clap::Subcommand)]
+#[derive(Debug, clap::Subcommand)]
 pub enum InstructionsCommand {
     /// Materialize the methodology block into this node's global TUI configs
     /// (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.kimi/AGENTS.md) + the shared
