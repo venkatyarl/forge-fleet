@@ -4016,6 +4016,32 @@ mod tests {
     }
 
     #[test]
+    fn backend_score_prefers_headroom_then_rank() {
+        // With equal (no) usage data, score follows rank: codex > claude.
+        assert!(backend_score("codex", None, "closed") > backend_score("claude", None, "closed"));
+        // A low-rank backend with lots of headroom beats a high-rank one that's
+        // nearly exhausted — quota dominates (0.60 weight).
+        let idle_kimi = backend_score("kimi", Some(99.0), "closed");
+        let drained_codex = backend_score("codex", Some(5.0), "closed");
+        assert!(
+            idle_kimi > drained_codex,
+            "idle kimi {idle_kimi} should beat drained codex {drained_codex}"
+        );
+        // A half-open breaker drags the health term down vs a closed one.
+        assert!(
+            backend_score("codex", Some(50.0), "closed")
+                > backend_score("codex", Some(50.0), "half_open")
+        );
+        // Scores stay within [0,1].
+        for s in [
+            backend_score("codex", Some(100.0), "closed"),
+            backend_score("grok", Some(0.0), "half_open"),
+        ] {
+            assert!((0.0..=1.0).contains(&s), "score {s} out of range");
+        }
+    }
+
+    #[test]
     fn test_classify_collision_buckets() {
         // 0 same-language candidates ⇒ collides only across a language boundary.
         assert_eq!(classify_collision(0), SuspiciousBucket::CrossLanguage);
@@ -7262,6 +7288,79 @@ pub fn backend_rank(backend: &str) -> u8 {
         "grok" => 4,
         _ => 9,
     }
+}
+
+/// Council-tuned routing score for one backend (higher = pick first).
+///
+/// `score = 0.60*headroom + 0.30*preference + 0.10*health` (+ caller jitter).
+/// `headroom` = remaining-quota fraction (0..1); `preference` = normalized
+/// [`backend_rank`] (best rank → 1.0); `health` = {closed 1.0, half_open 0.5}.
+/// Breaker-open backends are excluded upstream, not scored. Pure fn → unit
+/// testable; the SQL feeds it `remaining_pct` + `breaker_state`.
+pub fn backend_score(backend: &str, remaining_pct: Option<f64>, breaker_state: &str) -> f64 {
+    let headroom = (remaining_pct.unwrap_or(100.0) / 100.0).clamp(0.0, 1.0);
+    // backend_rank 0 (best) → 1.0, 9 (unknown) → ~0.0.
+    let preference = 1.0 - (backend_rank(backend) as f64 / 9.0);
+    let health = match breaker_state {
+        "half_open" => 0.5,
+        "open" => 0.0,
+        _ => 1.0,
+    };
+    0.60 * headroom + 0.30 * preference + 0.10 * health
+}
+
+/// Headroom-aware routing (capability A5): the backends a node can dispatch to
+/// RIGHT NOW, ordered by [`backend_score`] (most usage-headroom + cheapest
+/// first) instead of bare rank. Excludes breaker-open providers and those
+/// under the council headroom floor (15%). Degrades gracefully: when no
+/// `fleet_provider_usage` rows exist yet, every backend scores at full
+/// headroom and the order collapses to [`backend_rank`] — so this is always
+/// safe to use in place of [`pg_dispatchable_backends`].
+pub async fn pg_routed_backends(
+    pool: &PgPool,
+    computer_id: uuid::Uuid,
+    fresh_secs: i64,
+) -> Result<Vec<String>> {
+    let rows: Vec<(String, Option<f64>, String)> = sqlx::query_as(
+        "SELECT cb.backend,
+                u.remaining_pct,
+                COALESCE(h.breaker_state, 'closed') AS breaker_state
+           FROM computer_backends cb
+           LEFT JOIN fleet_backend_health h
+             ON h.computer_id = cb.computer_id AND h.provider = cb.backend
+           LEFT JOIN LATERAL (
+                SELECT remaining_pct
+                  FROM fleet_provider_usage fu
+                 WHERE fu.computer_id = cb.computer_id AND fu.provider = cb.backend
+                 ORDER BY fu.sampled_at DESC
+                 LIMIT 1
+           ) u ON true
+          WHERE cb.computer_id = $1
+            AND cb.installed
+            AND cb.authenticated
+            AND cb.last_checked_at > NOW() - make_interval(secs => $2)
+            AND COALESCE(h.breaker_state, 'closed') <> 'open'
+            AND COALESCE(u.remaining_pct, 100) >= 15",
+    )
+    .bind(computer_id)
+    .bind(fresh_secs as f64)
+    .fetch_all(pool)
+    .await?;
+
+    let mut scored: Vec<(String, f64)> = rows
+        .into_iter()
+        .map(|(b, rem, state)| {
+            let s = backend_score(&b, rem, &state);
+            (b, s)
+        })
+        .collect();
+    // Highest score first; tie-break by rank for determinism.
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| backend_rank(&a.0).cmp(&backend_rank(&b.0)))
+    });
+    Ok(scored.into_iter().map(|(b, _)| b).collect())
 }
 
 /// The backends a node can actually dispatch to RIGHT NOW (capability A3):
