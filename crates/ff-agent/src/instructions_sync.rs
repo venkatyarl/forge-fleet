@@ -100,7 +100,9 @@ fn global_config_paths(home: &std::path::Path) -> Vec<PathBuf> {
 /// that were written. Creates parent dirs + files as needed.
 pub fn sync_local() -> std::io::Result<Vec<String>> {
     let Some(home) = home() else {
-        return Err(std::io::Error::other("HOME unset; cannot locate config files"));
+        return Err(std::io::Error::other(
+            "HOME unset; cannot locate config files",
+        ));
     };
     let mut written = Vec::new();
 
@@ -150,13 +152,14 @@ mod tests {
 
     #[test]
     fn upsert_replaces_stale_block_in_place() {
-        let stale = format!(
-            "# cfg\n\n{START_MARKER}\nOLD CONTENT\n{END_MARKER}\n\n## keep me\n"
-        );
+        let stale = format!("# cfg\n\n{START_MARKER}\nOLD CONTENT\n{END_MARKER}\n\n## keep me\n");
         let out = upsert_marked_block(&stale, FF_METHODOLOGY_BLOCK);
         assert!(!out.contains("OLD CONTENT"));
         assert!(out.contains("Hybrid LLM Architecture"));
-        assert!(out.contains("## keep me"), "content after the block survives");
+        assert!(
+            out.contains("## keep me"),
+            "content after the block survives"
+        );
         assert_eq!(out.matches(START_MARKER).count(), 1);
     }
 
