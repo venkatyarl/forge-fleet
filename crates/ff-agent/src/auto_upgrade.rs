@@ -1020,7 +1020,15 @@ impl AutoUpgradeTick {
 /// since `latest_version` flows from the leader, no other member could
 /// either. Reading from git decouples the source of truth from any node's
 /// current binary; drift now fires on the leader too.
-async fn refresh_self_built_latest_versions(pool: &PgPool) -> Result<u64> {
+/// Recompute the "latest" SHA for self-built software (and the fleet's own
+/// `ff_git` / `forgefleetd_git`) from the leader's checkout of origin/main, and
+/// write it to `software_registry.latest_version`. `pub` + leader-safe so the
+/// UN-GATED version-check tick can call it — version *checking* must not be
+/// gated behind the auto-*upgrade* secret, or `ff fleet versions` shows a frozen
+/// phantom LATEST whenever auto-upgrade is paused (the recurring "why aren't all
+/// my machines the same version"). MUST run on the leader (it `git`s the leader's
+/// source tree).
+pub async fn refresh_self_built_latest_versions(pool: &PgPool) -> Result<u64> {
     // 1. Resolve the leader's source_tree_path. If we can't (no leader
     //    elected, no source_tree set), bail with 0 affected rather than
     //    erroring the whole upgrade tick.
@@ -1046,7 +1054,8 @@ async fn refresh_self_built_latest_versions(pool: &PgPool) -> Result<u64> {
     //    and write the SHA back. ref defaults to origin/main.
     let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
         "SELECT id, version_source FROM software_registry \
-         WHERE version_source->>'method' = 'self_built'",
+         WHERE version_source->>'method' = 'self_built' \
+            OR id IN ('ff_git', 'forgefleetd_git')",
     )
     .fetch_all(pool)
     .await
