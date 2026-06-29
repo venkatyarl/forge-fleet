@@ -9250,3 +9250,80 @@ CREATE INDEX IF NOT EXISTS computer_backends_dispatchable_idx
     ON computer_backends(computer_id)
     WHERE installed AND authenticated;
 "#;
+
+// ─── V149: multi-provider routing — cloud error taxonomy + usage + breaker ───
+//
+// Layers 2/4/5 of the multi-provider routing epic (plans/cloud-error-handling.md).
+// EXTENDS the V107 failure-taxonomy/retry/breaker spine rather than forking it:
+//   * adds cloud-provider failure categories (= CloudErrorClass::as_str()) so
+//     ff_agent::retry_policy::should_retry reuses the existing backoff;
+//   * fleet_provider_usage — latest usage headroom per (computer, provider);
+//   * fleet_backend_health — durable PROVIDER-level circuit breaker (the V107
+//     host breaker is keyed on worker_name; a claude 529 is not a host fault);
+//   * fleet_session_dispatch — durable per-headless-session retry/continue
+//     state so sessions survive crashes/deploys (ff council item 5).
+pub const SCHEMA_V149_PROVIDER_ROUTING: &str = r#"
+-- Cloud-provider failure categories (names match CloudErrorClass::as_str()).
+INSERT INTO failure_taxonomy (category, description, transient, retryable, notify_threshold)
+VALUES
+    ('overloaded',       'Cloud provider temporarily overloaded (claude 529 / openai-gemini 503)', true,  true,  5),
+    ('rate_limited',     'Provider rate limit hit (RPM/TPM) — honor Retry-After',                  true,  true,  5),
+    ('quota_exhausted',  'Subscription quota / credits exhausted — switch provider + alert',       false, false, 1),
+    ('unauthenticated',  'Provider auth/token expired (401) — re-auth + switch',                   false, false, 1),
+    ('forbidden',        'Provider permission / geo / precondition denied',                        false, false, 1),
+    ('context_too_long', 'Prompt exceeds the model context window — compact then continue',        false, true,  0),
+    ('transient_5xx',    'Provider generic upstream 5xx (not overload)',                           true,  true,  3),
+    ('model_not_found',  'Model id unknown / deprecated / no access (404)',                        false, false, 1),
+    ('bad_request',      'Malformed request (400/422) — our bug, do not blind-retry',              false, false, 0),
+    ('content_filtered', 'Output blocked by a content/safety filter',                              false, false, 0)
+ON CONFLICT (category) DO NOTHING;
+
+-- Latest usage-headroom snapshot per (computer, provider, window).
+CREATE TABLE IF NOT EXISTS fleet_provider_usage (
+    computer_id     UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    provider        TEXT NOT NULL,                 -- claude|codex|kimi|gemini|grok
+    used_pct        DOUBLE PRECISION,              -- 0..100 (NULL if unknown)
+    remaining_pct   DOUBLE PRECISION,              -- 100-used, or header-derived
+    window_kind     TEXT NOT NULL DEFAULT 'unknown', -- session|5h|weekly|monthly
+    resets_at       TIMESTAMPTZ,
+    source          TEXT,                          -- ratelimit_header|usage_api|portal
+    raw             JSONB,
+    sampled_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (computer_id, provider, window_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_fleet_provider_usage_provider
+    ON fleet_provider_usage (provider, sampled_at DESC);
+
+-- Durable PROVIDER-level circuit-breaker state per (computer, provider).
+CREATE TABLE IF NOT EXISTS fleet_backend_health (
+    computer_id          UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    provider             TEXT NOT NULL,
+    breaker_state        TEXT NOT NULL DEFAULT 'closed',   -- closed|open|half_open
+    breaker_open_until   TIMESTAMPTZ,
+    recent_error_count   INTEGER NOT NULL DEFAULT 0,
+    recent_req_count     INTEGER NOT NULL DEFAULT 0,
+    window_start         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    half_open_successes  INTEGER NOT NULL DEFAULT 0,
+    last_error_class     TEXT,
+    last_error_at        TIMESTAMPTZ,
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (computer_id, provider)
+);
+CREATE INDEX IF NOT EXISTS idx_fleet_backend_health_open
+    ON fleet_backend_health (breaker_open_until)
+    WHERE breaker_state <> 'closed';
+
+-- Durable per-headless-session retry/continue state (council item 5).
+CREATE TABLE IF NOT EXISTS fleet_session_dispatch (
+    session_id          TEXT PRIMARY KEY,
+    provider            TEXT NOT NULL,
+    attempt_count       INTEGER NOT NULL DEFAULT 0,
+    auto_continue_count INTEGER NOT NULL DEFAULT 0,
+    last_error_class    TEXT,
+    last_error_at       TIMESTAMPTZ,
+    last_retry_at       TIMESTAMPTZ,
+    resume_token        TEXT,
+    context_digest      TEXT,
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"#;
