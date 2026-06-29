@@ -25,7 +25,7 @@ pub enum McpCommand {
     Install {
         /// Which client to install for. Pass `all` to install everywhere
         /// we can detect a config file.
-        #[arg(long, value_parser = ["all", "claude-code", "claude-desktop", "codex", "kimi", "cursor", "windsurf", "goose", "grok"])]
+        #[arg(long, value_parser = ["all", "claude-code", "claude-desktop", "codex", "kimi", "kimi-desktop", "cursor", "windsurf", "goose", "grok"])]
         r#for: String,
         /// MCP server URL. Defaults to the per-computer federation endpoint
         /// (`http://localhost:50001/mcp`) which every fleet computer hosts.
@@ -125,6 +125,7 @@ fn resolve_targets(arg: &str) -> Vec<&'static str> {
             "claude-desktop",
             "codex",
             "kimi",
+            "kimi-desktop",
             "cursor",
             "windsurf",
             "goose",
@@ -135,6 +136,7 @@ fn resolve_targets(arg: &str) -> Vec<&'static str> {
             "claude-desktop" => "claude-desktop",
             "codex" => "codex",
             "kimi" => "kimi",
+            "kimi-desktop" => "kimi-desktop",
             "cursor" => "cursor",
             "windsurf" => "windsurf",
             "goose" => "goose",
@@ -157,6 +159,7 @@ async fn install_one(
         "claude-desktop" => install_claude_desktop(&home, server_url, dry_run),
         "codex" => install_codex(&home, server_url, write_instructions, dry_run),
         "kimi" => install_kimi(&home, server_url, write_instructions, dry_run),
+        "kimi-desktop" => install_kimi_desktop(&home, server_url, dry_run),
         "cursor" => install_cursor(&home, server_url, dry_run),
         "windsurf" => install_windsurf(&home, server_url, dry_run),
         "goose" => install_goose(&home, server_url, dry_run),
@@ -251,6 +254,33 @@ fn install_kimi(
         append_instructions_md(&agents_md, dry_run)?;
         println!("    + ff routing rule: {}", agents_md.display());
     }
+    Ok(())
+}
+
+// ─── Kimi Desktop (Kimi Work / Vivace app) ───────────────────────────────────
+/// Config path for the Kimi DESKTOP app, which bundles a kimi-code runtime
+/// with its own `mcpServers` file (distinct from the standalone Kimi CLI's
+/// `~/.kimi/config.json`). macOS keeps the app data under
+/// `~/Library/Application Support/kimi-desktop/`; the runtime's MCP config is
+/// `daimon-share/daimon/runtime/kimi-code/home/mcp.json`. Same `mcpServers`
+/// JSON shape as the CLI.
+fn kimi_desktop_config_path(home: &std::path::Path) -> PathBuf {
+    let rel = "daimon-share/daimon/runtime/kimi-code/home/mcp.json";
+    if cfg!(target_os = "macos") {
+        home.join("Library")
+            .join("Application Support")
+            .join("kimi-desktop")
+            .join(rel)
+    } else {
+        // Best-effort Linux location (Electron apps use ~/.config/<app>).
+        home.join(".config").join("kimi-desktop").join(rel)
+    }
+}
+
+fn install_kimi_desktop(home: &std::path::Path, server_url: &str, dry_run: bool) -> Result<()> {
+    let config = kimi_desktop_config_path(home);
+    upsert_mcp_server_json(&config, "forgefleet", server_url, dry_run)?;
+    println!("  ✓ kimi-desktop: {}", config.display());
     Ok(())
 }
 
@@ -543,6 +573,7 @@ fn print_status(as_json: bool) {
         ("claude-desktop", vec![claude_desktop_config_path(&home)]),
         ("codex", vec![home.join(".codex").join("config.toml")]),
         ("kimi", vec![home.join(".kimi").join("config.json")]),
+        ("kimi-desktop", vec![kimi_desktop_config_path(&home)]),
         ("cursor", vec![home.join(".cursor").join("mcp.json")]),
         (
             "windsurf",
