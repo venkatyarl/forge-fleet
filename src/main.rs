@@ -1168,6 +1168,29 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                             ),
                             Err(e) => warn!(node = %ver_worker, error = %e, "version-check pass failed"),
                         }
+                        // Self-built LATEST refresh — UN-GATED (version CHECK is
+                        // not the auto-UPGRADE; otherwise `ff fleet versions`
+                        // shows a frozen phantom LATEST whenever auto-upgrade is
+                        // paused). Leader-only: it git-resolves the leader's tree.
+                        let is_leader: bool = sqlx::query_scalar::<_, bool>(
+                            "SELECT EXISTS(SELECT 1 FROM fleet_leader_state \
+                              WHERE member_name = $1 \
+                                AND heartbeat_at > NOW() - INTERVAL '60 seconds')",
+                        )
+                        .bind(&ver_worker)
+                        .fetch_one(&pg_pool)
+                        .await
+                        .unwrap_or(false);
+                        if is_leader {
+                            match ff_agent::auto_upgrade::refresh_self_built_latest_versions(
+                                &pg_pool,
+                            )
+                            .await
+                            {
+                                Ok(n) => info!(updated = n, "self-built LATEST refreshed (un-gated)"),
+                                Err(e) => warn!(error = %e, "self-built LATEST refresh failed"),
+                            }
+                        }
                     }
                 }
             }
