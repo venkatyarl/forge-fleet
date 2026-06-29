@@ -291,6 +291,19 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         }
     }
 
+    // 0b) Self-sync the methodology fallback block into this node's global TUI
+    // configs on boot (roadmap D). Idempotent + best-effort — every node keeps
+    // its ~/.claude/CLAUDE.md / ~/.codex/AGENTS.md / ~/.kimi/AGENTS.md in sync
+    // without an SSH fan-out, so `ff fleet deploy --all` (which restarts each
+    // daemon) propagates the latest methodology fleet-wide.
+    match ff_agent::instructions_sync::sync_local() {
+        Ok(paths) => info!(
+            files = paths.len(),
+            "methodology fallback synced to global configs"
+        ),
+        Err(e) => warn!(error = %e, "methodology self-sync failed (non-fatal)"),
+    }
+
     // 1) discovery — fleet node scanning + subnet scanning
     info!("starting subsystem: discovery");
     let scan_targets = build_fleet_scan_targets(&config).await;

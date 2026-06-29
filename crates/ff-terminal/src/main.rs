@@ -61,6 +61,7 @@ mod github_cmd;
 mod health_cmd;
 mod helpers;
 mod init_cmd;
+mod instructions_cmd;
 mod interactions_cmd;
 mod lifecycle_cmd;
 mod llm_cmd;
@@ -221,6 +222,11 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// Sync the ForgeFleet methodology block into this node's global TUI configs.
+    Instructions {
+        #[command(subcommand)]
+        command: InstructionsCommand,
     },
     Version,
     /// Inject the ForgeFleet operating contract into AI CLI memory files.
@@ -1136,6 +1142,14 @@ pub enum ConfigCommand {
     },
     /// Show per-node configuration (runtime, models_dir, disk_quota_pct).
     Nodes,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum InstructionsCommand {
+    /// Materialize the methodology block into this node's global TUI configs
+    /// (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.kimi/AGENTS.md) + the shared
+    /// ~/.forgefleet/instructions/ff-methodology.md. Idempotent.
+    Sync,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -3974,6 +3988,11 @@ async fn main() -> Result<()> {
         Some(Command::Config { command }) => {
             return config_cmd::handle_config(command.clone(), &config_path).await;
         }
+        Some(Command::Instructions { command }) => {
+            return match command {
+                InstructionsCommand::Sync => instructions_cmd::handle_sync().await,
+            };
+        }
         Some(Command::Status) => return status_cmd::handle_status(&config_path).await,
         Some(Command::Backends {
             probe_auth,
@@ -4177,6 +4196,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Config { command }) => config_cmd::handle_config(command, &config_path).await,
+        Some(Command::Instructions { command }) => match command {
+            InstructionsCommand::Sync => instructions_cmd::handle_sync().await,
+        },
         Some(Command::Version) => {
             print_ff_version_long();
             Ok(())

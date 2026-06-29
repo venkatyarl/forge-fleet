@@ -68,6 +68,7 @@ pub mod hf_version_check;
 pub mod hive_sync;
 pub mod hooks;
 pub mod inference_router;
+pub mod instructions_sync;
 pub mod job_sweeper;
 pub mod leader_tick;
 pub mod learning;
