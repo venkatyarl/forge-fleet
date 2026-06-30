@@ -747,14 +747,105 @@ async fn run_ff_dispatch(
         ),
     }
 
-    // Lane 2: dispatch to an AVAILABLE backend (capability A4). The picker
-    // returns this node's installed+authenticated CLIs cheapest-capable-first;
-    // we take the best. Falls back to `codex` (the prior hardcoded behavior)
-    // when nothing is dispatchable here yet — e.g. a follower whose cloud creds
-    // haven't been distributed. So behavior is unchanged until backends are
-    // authed, then sub-agents transparently use the best available LLM.
-    let backend = pick_dispatch_backend(pg, item.computer_id).await;
-    let cwd = worktree.worktree_path.clone();
+    // Lane 2: dispatch to an AVAILABLE backend (capability A4/A5) with the full
+    // cloud-error nervous system wired in. The router returns this node's
+    // dispatchable backends headroom/rank-ordered. For each, we run `ff cli
+    // <backend>`; on a cloud failure we CLASSIFY the CLI output
+    // (`cloud_error::classify`), record it to the provider circuit-breaker, then:
+    //   • transient (529/429/5xx/timeout/network) → back off + AUTO-CONTINUE in
+    //     place (council: ≤2 re-injections, 5s then 20s) — the headless "continue"
+    //     a human would otherwise have to type;
+    //   • breaker-tripped / terminal-for-this-backend (auth/quota/overload-after-
+    //     retries) → SWITCH to the next backend.
+    // So a 529 on codex retries then fails over to claude unattended, instead of
+    // dying. Falls back to `codex` only when no backend is known dispatchable.
+    let routed = ff_db::pg_routed_backends(pg, item.computer_id, 5400)
+        .await
+        .unwrap_or_default();
+    let backends = if routed.is_empty() {
+        vec!["codex".to_string()]
+    } else {
+        routed
+    };
+    let computer_id = item.computer_id;
+    let mut last_output: Option<Output> = None;
+
+    for backend in &backends {
+        if crate::circuit_breaker::is_provider_open(pg, computer_id, backend)
+            .await
+            .unwrap_or(false)
+        {
+            info!(backend = %backend, "run_ff_dispatch: skipping breaker-open backend");
+            continue;
+        }
+        let mut attempt: u32 = 0;
+        loop {
+            let out = run_backend_cli(backend, &worktree.worktree_path, &prompt).await?;
+            if out.status.success() {
+                let _ =
+                    crate::circuit_breaker::record_provider_success(pg, computer_id, backend).await;
+                // Clean run → full headroom signal (self-corrects a prior limit).
+                let _ =
+                    crate::circuit_breaker::record_usage_signal(pg, computer_id, backend, 100.0)
+                        .await;
+                if attempt > 0 || backend != &backends[0] {
+                    info!(backend = %backend, attempt, "run_ff_dispatch: recovered via auto-continue/failover");
+                }
+                return Ok(out);
+            }
+            // A `--require-change` no-op (exit 3) is a task-level failure, not a
+            // provider fault — surface it without classify/retry/switch.
+            if out.status.code() == Some(3) {
+                return Ok(out);
+            }
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let class = crate::cloud_error::classify(backend, out.status.code(), &combined);
+            let tripped = crate::circuit_breaker::record_provider_failure(
+                pg,
+                computer_id,
+                backend,
+                class.as_str(),
+            )
+            .await
+            .unwrap_or(false);
+            warn!(
+                backend = %backend, class = class.as_str(), attempt, breaker_tripped = tripped,
+                "run_ff_dispatch: backend error classified"
+            );
+            // Capture a usage-headroom signal from limit/quota/overload errors so
+            // the router deprioritizes this provider until it recovers.
+            if let Some(rem) = crate::circuit_breaker::headroom_hint_for_category(class.as_str()) {
+                let _ = crate::circuit_breaker::record_usage_signal(pg, computer_id, backend, rem)
+                    .await;
+            }
+            last_output = Some(out);
+            if class.is_transient() && attempt < AUTO_CONTINUE_MAX && !tripped {
+                let backoff = if attempt == 0 { 5 } else { 20 };
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                attempt += 1;
+                continue; // auto-continue on the same backend
+            }
+            break; // exhausted / terminal-for-this-backend → try the next one
+        }
+    }
+    last_output
+        .map(Ok)
+        .unwrap_or_else(|| bail!("run_ff_dispatch: no dispatchable backend on this node"))
+}
+
+/// Council cap: how many headless auto-continue re-injections to attempt on a
+/// transient cloud error before switching providers.
+const AUTO_CONTINUE_MAX: u32 = 2;
+
+/// Run `ff cli <backend>` against the worktree once and capture its Output.
+async fn run_backend_cli(backend: &str, cwd: &Path, prompt: &str) -> Result<Output> {
+    let backend = backend.to_string();
+    let cwd = cwd.to_path_buf();
+    let prompt = prompt.to_string();
     tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new("ff");
         cmd.arg("cli")
@@ -763,40 +854,14 @@ async fn run_ff_dispatch(
             .arg(&cwd)
             .arg("--timeout")
             .arg(FF_TIMEOUT_SECS.to_string())
-            // Fail (exit 3) if codex exits 0 but changes nothing — a no-op run is
+            // Fail (exit 3) if the CLI exits 0 but changes nothing — a no-op run is
             // a failed work_item, not a silent 'done' (catches stdin-pipe no-ops).
             .arg("--require-change")
-            .arg(prompt);
+            .arg(&prompt);
         run_command_timeout(cmd, Duration::from_secs(FF_TIMEOUT_SECS + 30))
     })
     .await
     .context("join ff dispatch task")?
-}
-
-/// Choose the LLM-CLI backend for lane-2 dispatch on THIS node (capability A4):
-/// the best dispatchable backend (installed + authenticated + auth-fresh) per
-/// `pg_dispatchable_backends`, ordered cheapest-capable-first. Falls back to
-/// `codex` (the historical hardcode) when none is known dispatchable — so a node
-/// whose creds aren't distributed yet behaves exactly as before. 90-minute
-/// freshness window (auth is re-probed hourly by the detector tick).
-async fn pick_dispatch_backend(pg: &PgPool, computer_id: Uuid) -> String {
-    // Headroom-aware routing (A5): prefers the backend with the most usage
-    // headroom + cheapest rank, skipping breaker-open providers. Degrades to
-    // bare backend_rank order when no usage rows exist yet, so it is always a
-    // safe superset of the A3 picker.
-    match ff_db::pg_routed_backends(pg, computer_id, 5400).await {
-        Ok(backends) => {
-            if let Some(first) = backends.into_iter().next() {
-                info!(backend = %first, "run_ff_dispatch: dispatching via headroom-routed backend");
-                return first;
-            }
-            "codex".to_string()
-        }
-        Err(e) => {
-            warn!(error = %e, "run_ff_dispatch: backend picker failed; falling back to codex");
-            "codex".to_string()
-        }
-    }
 }
 
 /// Build a success `Output` for the local-codegen lane so `dispatch_one`'s
