@@ -20,6 +20,48 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Record a usage-headroom signal for a (computer, provider) into
+/// `fleet_provider_usage`, which the headroom router (`pg_routed_backends`)
+/// reads. `remaining_pct` is the best estimate from the most recent call
+/// outcome: 100 on a clean success, low on a rate-limit/overload, 0 on quota
+/// exhaustion. A single `live` row per (computer, provider) is overwritten each
+/// call so the latest outcome wins — self-correcting (a later success lifts a
+/// provider back above the router's headroom floor). The dispatch path has no
+/// HTTP headers to read, so the call OUTCOME is the signal.
+pub async fn record_usage_signal(
+    pool: &PgPool,
+    computer_id: Uuid,
+    provider: &str,
+    remaining_pct: f64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO fleet_provider_usage
+            (computer_id, provider, used_pct, remaining_pct, window_kind, source, sampled_at)
+         VALUES ($1, $2, 100 - $3, $3, 'live', 'dispatch_outcome', NOW())
+         ON CONFLICT (computer_id, provider, window_kind) DO UPDATE SET
+            used_pct = 100 - $3, remaining_pct = $3, source = 'dispatch_outcome', sampled_at = NOW()",
+    )
+    .bind(computer_id)
+    .bind(provider)
+    .bind(remaining_pct)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Map a cloud-error category to the headroom it implies, when the error is a
+/// usage/capacity signal. `None` for errors that say nothing about quota (auth,
+/// bad-request, etc.). Quota → 0 (skip), rate-limit/overload → below the
+/// router's 15% floor so the provider is deprioritized until it recovers.
+pub fn headroom_hint_for_category(category: &str) -> Option<f64> {
+    match category {
+        "quota_exhausted" => Some(0.0),
+        "rate_limited" => Some(8.0),
+        "overloaded" => Some(12.0),
+        _ => None,
+    }
+}
+
 /// Council cooldown (minutes) by failure category. Rate-limit / quota take a
 /// longer rest than a transient overload/5xx blip.
 fn provider_cooldown_minutes(category: &str) -> i64 {
