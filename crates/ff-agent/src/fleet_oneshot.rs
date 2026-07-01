@@ -89,59 +89,85 @@ pub async fn fleet_oneshot(
     } else {
         &named
     };
-    let cand = pick_candidate(candidates, model_hint);
-    let worker_name = cand.worker_name.clone();
-    let endpoint = cand.endpoint.clone();
-    let model = cand
-        .catalog_name
-        .clone()
-        .or_else(|| model_hint.map(|s| s.to_string()))
-        .unwrap_or_else(|| "local".to_string());
+    // Ordered try-list: model-hint match first (if any), then the rest in
+    // pg_route_deployments preference order. FAIL OVER across candidates — a
+    // single transient transport error (a busy/restarting endpoint, e.g.
+    // veronica:55000 mid-load) previously errored the WHOLE call with no retry,
+    // blocking every fleet_oneshot caller (decompose / research / council-local)
+    // even though other healthy endpoints were available (dogfooded 2026-07-01).
+    // pick_candidate applies the model-hint preference (lowercased; matches both
+    // catalog_id and catalog_name) — put its choice first, then the rest of the
+    // healthy candidates in preference order as fail-over targets.
+    let preferred = pick_candidate(candidates, model_hint);
+    let mut ordered: Vec<&RouteCandidate> = vec![preferred];
+    ordered.extend(candidates.iter().filter(|c| !std::ptr::eq(*c, preferred)));
 
-    let url = ff_core::url::normalize_chat_completions_url(&endpoint);
-    let body = json!({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": false,
-    });
     let client = reqwest::Client::builder()
         .timeout(timeout.unwrap_or(Duration::from_secs(180)))
         .build()
         .map_err(|e| anyhow!("build http client: {e}"))?;
 
-    let start = std::time::Instant::now();
-    let resp = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| anyhow!("POST {url}: {e}"))?;
-    let status = resp.status();
-    let payload: Value = resp
-        .json()
-        .await
-        .map_err(|e| anyhow!("decode response from {worker_name}: {e}"))?;
-    if !status.is_success() {
-        return Err(anyhow!(
-            "{worker_name} ({model}) returned HTTP {status}: {}",
-            payload.to_string().chars().take(400).collect::<String>()
-        ));
-    }
-    let text = extract_completion_text(&payload)
-        .map(|t| strip_think_block(&t))
-        .filter(|t| !t.trim().is_empty())
-        .ok_or_else(|| anyhow!("{worker_name} ({model}) returned an empty completion"))?;
+    let mut last_err: Option<anyhow::Error> = None;
+    for cand in ordered {
+        let worker_name = cand.worker_name.clone();
+        let endpoint = cand.endpoint.clone();
+        let model = cand
+            .catalog_name
+            .clone()
+            .or_else(|| model_hint.map(|s| s.to_string()))
+            .unwrap_or_else(|| "local".to_string());
+        let url = ff_core::url::normalize_chat_completions_url(&endpoint);
+        let body = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": false,
+        });
+        let start = std::time::Instant::now();
 
-    let (tokens_in, tokens_out) = usage_tokens_i32(&payload);
-    Ok(FleetOneshot {
-        text,
-        endpoint,
-        worker_name,
-        model,
-        latency_ms: start.elapsed().as_millis(),
-        tokens_in,
-        tokens_out,
-    })
+        let attempt: anyhow::Result<FleetOneshot> = async {
+            let resp = client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| anyhow!("POST {url}: {e}"))?;
+            let status = resp.status();
+            let payload: Value = resp
+                .json()
+                .await
+                .map_err(|e| anyhow!("decode response from {worker_name}: {e}"))?;
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "{worker_name} ({model}) returned HTTP {status}: {}",
+                    payload.to_string().chars().take(400).collect::<String>()
+                ));
+            }
+            let text = extract_completion_text(&payload)
+                .map(|t| strip_think_block(&t))
+                .filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| anyhow!("{worker_name} ({model}) returned an empty completion"))?;
+            let (tokens_in, tokens_out) = usage_tokens_i32(&payload);
+            Ok(FleetOneshot {
+                text,
+                endpoint: endpoint.clone(),
+                worker_name: worker_name.clone(),
+                model: model.clone(),
+                latency_ms: start.elapsed().as_millis(),
+                tokens_in,
+                tokens_out,
+            })
+        }
+        .await;
+
+        match attempt {
+            Ok(ok) => return Ok(ok),
+            Err(e) => {
+                tracing::warn!(worker = %worker_name, error = %e, "fleet_oneshot: candidate failed — failing over to next");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("all fleet candidates failed")))
 }
 
 /// Read `(tokens_in, tokens_out)` from a chat-completion `usage` block, clamped
