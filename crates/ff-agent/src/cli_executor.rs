@@ -104,18 +104,27 @@ pub const BACKENDS: &[CliBackend] = &[
         port: 51101,
         // Codex `exec` is the headless equivalent. `--skip-git-repo-check`
         // lets it run outside a git repo (matches `ff cli` running anywhere).
-        // `--sandbox workspace-write` lets codex actually WRITE files in its
-        // working dir — `codex exec` defaults to a read-only sandbox, so without
-        // this every build dispatch returned made_file_changes=false and codex
-        // (our best backend lane) couldn't be used to build anything (operator-
-        // reported 2026-06-20 from the HireFlow port loop). `workspace-write` is
-        // scoped to the cwd (set via `-C` below) — NOT the full-FS / approvals
-        // bypass — so it's the minimal grant that unblocks autonomous builds.
+        //
+        // `--sandbox danger-full-access` DISABLES codex's OS-level filesystem
+        // sandbox. Codex's `workspace-write` (and `read-only`) sandboxes shell
+        // out to **bubblewrap**, which needs to create a user namespace + uid
+        // map. On the Linux fleet followers that fails with
+        // `bwrap: setting up uid map: Permission denied` (unprivileged userns is
+        // restricted on these hosts), so EVERY codex file-write silently failed
+        // ("Failed to write file …") and a real multi-file dispatch retried/
+        // reasoned until it hit the 1800s timeout — the "codex hangs 30 min,
+        // 0 PRs" symptom (dogfooded 2026-06-30). The bwrap sandbox is redundant
+        // here anyway: `ff cli` already runs codex inside a DEDICATED per-task
+        // git worktree under `~/.forgefleet/sub-agents/`, so isolation comes from
+        // the worktree, not bwrap. `danger-full-access` is the minimal change
+        // that lets codex actually write (approval policy is unchanged — `exec`
+        // is `approval: never` regardless). Verified on adele: file created,
+        // exit 0, seconds not minutes.
         default_flags: &[
             "exec",
             "--skip-git-repo-check",
             "--sandbox",
-            "workspace-write",
+            "danger-full-access",
         ],
         // `-C/--cd <dir>` sets the agent's working root.
         cwd_mode: CwdMode::Flag("-C"),

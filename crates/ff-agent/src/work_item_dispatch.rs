@@ -780,7 +780,24 @@ async fn run_ff_dispatch(
         }
         let mut attempt: u32 = 0;
         loop {
-            let out = run_backend_cli(backend, &worktree.worktree_path, &prompt).await?;
+            let out = match run_backend_cli(backend, &worktree.worktree_path, &prompt).await {
+                Ok(o) => o,
+                Err(e) => {
+                    // A timeout / spawn error is a `Timeout`-class provider fault:
+                    // record it and SWITCH to the next backend rather than
+                    // `?`-propagating out (which would abort failover — the
+                    // "codex hangs 30min → whole dispatch dies" bug).
+                    warn!(backend = %backend, error = %e, "run_ff_dispatch: backend run errored (timeout/spawn) — switching");
+                    let _ = crate::circuit_breaker::record_provider_failure(
+                        pg,
+                        computer_id,
+                        backend,
+                        "timeout",
+                    )
+                    .await;
+                    break; // try the next routed backend
+                }
+            };
             if out.status.success() {
                 let _ =
                     crate::circuit_breaker::record_provider_success(pg, computer_id, backend).await;
