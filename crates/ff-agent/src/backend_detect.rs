@@ -285,6 +285,7 @@ pub async fn detect_and_persist(
             s.installed,
             s.authenticated.unwrap_or(false),
             s.version.as_deref(),
+            s.path.as_deref(),
             &s.detail,
         )
         .await?;
@@ -293,9 +294,14 @@ pub async fn detect_and_persist(
     Ok(n)
 }
 
-/// `<binary> --version`, first line, best-effort (short timeout).
+/// `<binary> --version`, first line, best-effort (short timeout). Resolves the
+/// binary via [`which_on_path`] (which searches known install dirs beyond
+/// `$PATH`) and runs it with an augmented PATH, so version probing works under
+/// the daemon's minimal non-interactive PATH.
 async fn probe_version(binary: &str) -> Option<String> {
-    let mut cmd = tokio::process::Command::new(binary);
+    let resolved = which_on_path(binary).unwrap_or_else(|| binary.to_string());
+    let mut cmd = tokio::process::Command::new(resolved);
+    cmd.env("PATH", crate::cli_executor::augmented_path_env());
     cmd.arg("--version");
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());

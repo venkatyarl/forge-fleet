@@ -248,6 +248,10 @@ pub async fn execute_cli_in_dir(
     })?;
 
     let mut cmd = tokio::process::Command::new(bin_path.as_str());
+    // Give the child a PATH that includes the known install dirs, so the CLI and
+    // any node/git subprocess it forks resolve even under a minimal
+    // non-interactive PATH (same reason we resolve `bin_path` absolutely above).
+    cmd.env("PATH", augmented_path_env());
     // Tell the CLI which directory to operate in (sets the process cwd and,
     // where the vendor has one, the dedicated working-dir flag).
     //
@@ -358,14 +362,65 @@ pub async fn execute_cli_in_dir(
 /// `pub` so the `ff cli` front-door can probe which vendor CLIs are
 /// installed before dispatching (and list them in the not-installed error).
 pub fn which_on_path(bin: &str) -> Option<String> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
+    // 1. Honor `$PATH` (an operator override or a login shell wins).
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(bin);
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    // 2. Fall back to the well-known install dirs a NON-INTERACTIVE shell
+    //    (SSH / systemd / launchd / sub-agent) drops from `$PATH`. Without this,
+    //    `which codex` returns nothing under a login-less shell even though
+    //    /opt/homebrew/bin/codex exists — the "`codex` not on PATH" false
+    //    negative that made ff blind to installed vendor CLIs.
+    for dir in known_bin_dirs() {
         let candidate = dir.join(bin);
         if candidate.is_file() {
             return Some(candidate.to_string_lossy().into_owned());
         }
     }
     None
+}
+
+/// Directories where vendor CLIs commonly install but that a non-interactive
+/// shell does NOT put on `$PATH`. macOS Homebrew → /opt/homebrew/bin; uv/pipx
+/// tools (e.g. `kimi-cli`) → ~/.local/bin; `cargo install` → ~/.cargo/bin; npm
+/// user-global → ~/.npm-global/bin. Searched AFTER `$PATH` so an explicit PATH
+/// entry still wins. Order is precedence order.
+pub fn known_bin_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join(".cargo/bin"));
+        dirs.push(home.join(".npm-global/bin"));
+    }
+    for p in [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+    ] {
+        dirs.push(std::path::PathBuf::from(p));
+    }
+    dirs
+}
+
+/// `$PATH` with [`known_bin_dirs`] prepended (deduped, order-preserving). Set on
+/// spawned vendor-CLI processes so the CLI itself — and any node/git subprocess
+/// IT forks — can resolve tools even when ff was launched under a minimal
+/// non-interactive PATH. Falls back to the raw `$PATH` if joining fails.
+pub fn augmented_path_env() -> std::ffi::OsString {
+    let mut parts: Vec<std::path::PathBuf> = known_bin_dirs();
+    if let Some(path_var) = std::env::var_os("PATH") {
+        parts.extend(std::env::split_paths(&path_var));
+    }
+    let mut seen = std::collections::HashSet::new();
+    parts.retain(|p| seen.insert(p.clone()));
+    std::env::join_paths(parts).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
 }
 
 #[cfg(test)]

@@ -9383,3 +9383,17 @@ ON CONFLICT (id) DO UPDATE SET
   version_source   = EXCLUDED.version_source,
   upgrade_playbook = EXCLUDED.upgrade_playbook;
 "#;
+
+// ─── V151: record WHERE each vendor CLI lives per computer ──────────────────
+//
+// `computer_backends` tracked installed/authenticated/version but NOT the
+// resolved absolute path. Combined with `which_on_path` only searching `$PATH`
+// (a non-interactive daemon shell drops /opt/homebrew/bin + ~/.local/bin), ff
+// re-guessed each CLI by bare name every time and reported "not on PATH" false
+// negatives for installed CLIs. The detector now resolves via known install
+// dirs and persists the absolute path here so the executor + operator can see
+// exactly where codex/claude/kimi live on each node (e.g. macOS
+// /opt/homebrew/bin, linux ~/.local/bin).
+pub const SCHEMA_V151_COMPUTER_BACKENDS_PATH: &str = r#"
+ALTER TABLE computer_backends ADD COLUMN IF NOT EXISTS path TEXT;
+"#;

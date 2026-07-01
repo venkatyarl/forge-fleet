@@ -7324,18 +7324,20 @@ pub async fn pg_upsert_computer_backend(
     installed: bool,
     authenticated: bool,
     version: Option<&str>,
+    path: Option<&str>,
     detail: &str,
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO computer_backends
-             (computer_id, backend, installed, authenticated, version,
+             (computer_id, backend, installed, authenticated, version, path,
               last_auth_ok_at, last_checked_at, detail)
-         VALUES ($1, $2, $3, $4, $5,
+         VALUES ($1, $2, $3, $4, $5, $7,
                  CASE WHEN $4 THEN NOW() ELSE NULL END, NOW(), $6)
          ON CONFLICT (computer_id, backend) DO UPDATE SET
              installed       = EXCLUDED.installed,
              authenticated   = EXCLUDED.authenticated,
              version         = EXCLUDED.version,
+             path            = EXCLUDED.path,
              last_auth_ok_at = CASE WHEN EXCLUDED.authenticated
                                     THEN NOW()
                                     ELSE computer_backends.last_auth_ok_at END,
@@ -7348,6 +7350,7 @@ pub async fn pg_upsert_computer_backend(
     .bind(authenticated)
     .bind(version)
     .bind(detail)
+    .bind(path)
     .execute(pool)
     .await?;
     Ok(())

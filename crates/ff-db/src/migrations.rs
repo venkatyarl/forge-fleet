@@ -733,6 +733,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "kimi_cli_external_tool",
         sql: schema::SCHEMA_V150_KIMI_CLI_EXTERNAL_TOOL,
     },
+    PgMigration {
+        version: 151,
+        name: "computer_backends_path",
+        sql: schema::SCHEMA_V151_COMPUTER_BACKENDS_PATH,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
