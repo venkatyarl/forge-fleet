@@ -14,9 +14,14 @@ export default defineConfig({
   build: {
     rollupOptions: {
       output: {
-        manualChunks: {
-          vendor: ['react', 'react-dom'],
-          router: ['react-router-dom'],
+        manualChunks(id: string | null) {
+          if (!id) return
+          if (id.includes('node_modules')) {
+            if (id.includes('react-router') || id.includes('@remix-run')) return 'router'
+            if (id.includes('@tanstack')) return 'tanstack'
+            if (id.includes('cmdk') || id.includes('radix') || id.includes('lucide')) return 'ui'
+            return 'vendor'
+          }
         },
       },
     },

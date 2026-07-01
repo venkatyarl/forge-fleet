@@ -1,5 +1,10 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
+import { Badge } from '../components/ui/badge'
+import { Button } from '../components/ui/button'
+import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { StatusBadge } from '../components/ui/status-badge'
 import { getJson, patchJson, postJson } from '../lib/api'
+import { cn } from '../lib/utils'
 
 type EpicStatus = 'open' | 'in_progress' | 'done' | 'cancelled'
 
@@ -59,6 +64,12 @@ type WorkItem = {
 }
 
 const EPIC_STATUSES: EpicStatus[] = ['open', 'in_progress', 'done', 'cancelled']
+
+const fieldClass =
+  'w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-dim focus:border-primary disabled:cursor-not-allowed disabled:opacity-60'
+
+const compactFieldClass =
+  'rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-dim focus:border-primary disabled:cursor-not-allowed disabled:opacity-60'
 
 function labelize(value: string): string {
   return value
@@ -301,118 +312,157 @@ export function PlanningHub() {
   }
 
   return (
-    <section className="space-y-6">
-      <div className="flex flex-wrap items-center justify-between gap-3">
+    <section className="min-h-full space-y-6 bg-background text-foreground">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">Planning Hub</h1>
-          <p className="mt-1 text-sm text-slate-400">
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="text-2xl font-bold text-foreground">Planning Hub</h1>
+            {loading ? <Badge variant="info">loading</Badge> : saving ? <Badge variant="warn">saving</Badge> : null}
+          </div>
+          <p className="mt-1 text-sm text-dim">
             Mission Control planning parity for epics, sprints, progress metrics, and work-item assignment.
           </p>
         </div>
-        <button
+        <Button
+          type="button"
+          variant="outline"
           onClick={() => void loadCore()}
           disabled={loading || saving}
-          className="rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-sky-500 disabled:opacity-60"
         >
-          ↻ Refresh
-        </button>
+          Refresh
+        </Button>
       </div>
 
       {error ? (
-        <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
-          {error}
-        </div>
+        <Card className="border-border bg-panel">
+          <p className="text-sm text-status-crit">{error}</p>
+        </Card>
       ) : null}
       {notice ? (
-        <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-200">
-          {notice}
-        </div>
+        <Card className="border-border bg-panel">
+          <p className="text-sm text-status-ok">{notice}</p>
+        </Card>
       ) : null}
 
+      <div className="grid gap-4 md:grid-cols-3">
+        <Metric label="Epics" value={epics.length} detail={`${items.filter((item) => item.epic_id).length} assigned`} />
+        <Metric
+          label="Sprints"
+          value={sprints.length}
+          detail={`${items.filter((item) => item.sprint_id).length} scheduled`}
+        />
+        <Metric
+          label="Work Items"
+          value={items.length}
+          detail={`${items.filter((item) => item.status === 'done').length} done`}
+        />
+      </div>
+
       <div className="grid gap-4 xl:grid-cols-2">
-        <form onSubmit={createEpic} className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 space-y-2">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">Create epic</h2>
-          <input
-            value={newEpicTitle}
-            onChange={(event) => setNewEpicTitle(event.target.value)}
-            placeholder="Epic title"
-            className="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
-            required
-          />
-          <input
-            value={newEpicDescription}
-            onChange={(event) => setNewEpicDescription(event.target.value)}
-            placeholder="Description"
-            className="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
-          />
-          <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
-            <select
-              value={newEpicStatus}
-              onChange={(event) => setNewEpicStatus(event.target.value as EpicStatus)}
-              className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
-            >
-              {EPIC_STATUSES.map((status) => (
-                <option key={status} value={status}>
-                  {labelize(status)}
-                </option>
-              ))}
-            </select>
-            <button
-              type="submit"
-              disabled={saving}
-              className="rounded-md border border-sky-500/40 bg-sky-500/15 px-3 py-2 text-sm text-sky-300 hover:bg-sky-500/25 disabled:opacity-60"
-            >
-              Create epic
-            </button>
-          </div>
+        <form onSubmit={createEpic}>
+          <Card className="space-y-3 bg-panel">
+            <CardHeader className="items-start gap-3">
+              <div>
+                <CardTitle>Create Epic</CardTitle>
+                <CardDescription>Define a planning container and starting state</CardDescription>
+              </div>
+              <Badge variant="neutral">{EPIC_STATUSES.length} states</Badge>
+            </CardHeader>
+            <input
+              aria-label="Epic title"
+              value={newEpicTitle}
+              onChange={(event) => setNewEpicTitle(event.target.value)}
+              placeholder="Epic title"
+              className={fieldClass}
+              required
+            />
+            <input
+              aria-label="Epic description"
+              value={newEpicDescription}
+              onChange={(event) => setNewEpicDescription(event.target.value)}
+              placeholder="Description"
+              className={fieldClass}
+            />
+            <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
+              <select
+                aria-label="Epic status"
+                value={newEpicStatus}
+                onChange={(event) => setNewEpicStatus(event.target.value as EpicStatus)}
+                className={compactFieldClass}
+              >
+                {EPIC_STATUSES.map((status) => (
+                  <option key={status} value={status}>
+                    {labelize(status)}
+                  </option>
+                ))}
+              </select>
+              <Button type="submit" disabled={saving}>
+                Create epic
+              </Button>
+            </div>
+          </Card>
         </form>
 
-        <form onSubmit={createSprint} className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 space-y-2">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">Create sprint</h2>
-          <input
-            value={newSprintName}
-            onChange={(event) => setNewSprintName(event.target.value)}
-            placeholder="Sprint name"
-            className="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
-            required
-          />
-          <div className="grid gap-2 sm:grid-cols-2">
+        <form onSubmit={createSprint}>
+          <Card className="space-y-3 bg-panel">
+            <CardHeader className="items-start">
+              <div>
+                <CardTitle>Create Sprint</CardTitle>
+                <CardDescription>Set a sprint window and goal for scheduled work</CardDescription>
+              </div>
+            </CardHeader>
             <input
-              type="date"
-              value={newSprintStartDate}
-              onChange={(event) => setNewSprintStartDate(event.target.value)}
-              className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
+              aria-label="Sprint name"
+              value={newSprintName}
+              onChange={(event) => setNewSprintName(event.target.value)}
+              placeholder="Sprint name"
+              className={fieldClass}
+              required
             />
+            <div className="grid gap-2 sm:grid-cols-2">
+              <input
+                aria-label="Sprint start date"
+                type="date"
+                value={newSprintStartDate}
+                onChange={(event) => setNewSprintStartDate(event.target.value)}
+                className={compactFieldClass}
+              />
+              <input
+                aria-label="Sprint end date"
+                type="date"
+                value={newSprintEndDate}
+                onChange={(event) => setNewSprintEndDate(event.target.value)}
+                className={compactFieldClass}
+              />
+            </div>
             <input
-              type="date"
-              value={newSprintEndDate}
-              onChange={(event) => setNewSprintEndDate(event.target.value)}
-              className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
+              aria-label="Sprint goal"
+              value={newSprintGoal}
+              onChange={(event) => setNewSprintGoal(event.target.value)}
+              placeholder="Sprint goal"
+              className={fieldClass}
             />
-          </div>
-          <input
-            value={newSprintGoal}
-            onChange={(event) => setNewSprintGoal(event.target.value)}
-            placeholder="Sprint goal"
-            className="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
-          />
-          <button
-            type="submit"
-            disabled={saving}
-            className="rounded-md border border-sky-500/40 bg-sky-500/15 px-3 py-2 text-sm text-sky-300 hover:bg-sky-500/25 disabled:opacity-60"
-          >
-            Create sprint
-          </button>
+            <Button type="submit" disabled={saving} className="w-full sm:w-fit">
+              Create sprint
+            </Button>
+          </Card>
         </form>
       </div>
 
-      <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 space-y-2">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">Assign work item</h2>
+      <Card className="space-y-3 bg-surface">
+        <CardHeader className="items-start gap-3">
+          <div>
+            <CardTitle>Assign Work Item</CardTitle>
+            <CardDescription>Move work between epics and sprints without changing item status</CardDescription>
+          </div>
+          <Badge variant="neutral">{items.length} items</Badge>
+        </CardHeader>
         <div className="grid gap-2 md:grid-cols-4">
           <select
+            aria-label="Work item"
             value={assignmentWorkItemId}
             onChange={(event) => setAssignmentWorkItemId(event.target.value)}
-            className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
+            className={compactFieldClass}
           >
             <option value="">Select work item…</option>
             {items.map((item) => (
@@ -422,9 +472,10 @@ export function PlanningHub() {
             ))}
           </select>
           <select
+            aria-label="Epic assignment"
             value={assignmentEpicId}
             onChange={(event) => setAssignmentEpicId(event.target.value)}
-            className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
+            className={compactFieldClass}
           >
             <option value="">No epic</option>
             {epics.map((epic) => (
@@ -434,9 +485,10 @@ export function PlanningHub() {
             ))}
           </select>
           <select
+            aria-label="Sprint assignment"
             value={assignmentSprintId}
             onChange={(event) => setAssignmentSprintId(event.target.value)}
-            className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
+            className={compactFieldClass}
           >
             <option value="">No sprint</option>
             {sprints.map((sprint) => (
@@ -445,98 +497,119 @@ export function PlanningHub() {
               </option>
             ))}
           </select>
-          <button
+          <Button
+            type="button"
             onClick={() => void assignItem()}
             disabled={saving || !assignmentWorkItemId}
-            className="rounded-md border border-sky-500/40 bg-sky-500/15 px-3 py-2 text-sm text-sky-300 hover:bg-sky-500/25 disabled:opacity-60"
           >
             Save assignment
-          </button>
+          </Button>
         </div>
-      </div>
+      </Card>
 
       <div className="grid gap-4 xl:grid-cols-2">
         <div className="space-y-4">
-          <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-            <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-300">
-              Epics ({epics.length})
-            </h2>
+          <Card className="bg-panel">
+            <CardHeader>
+              <div>
+                <CardTitle>Epics</CardTitle>
+                <CardDescription>Current planning containers and status controls</CardDescription>
+              </div>
+              <Badge variant="neutral">{epics.length}</Badge>
+            </CardHeader>
             {epics.length === 0 ? (
-              <p className="text-sm text-slate-500">No epics yet.</p>
+              <p className="text-sm text-dim">No epics yet.</p>
             ) : (
               <div className="space-y-2">
                 {epics.map((epic) => (
                   <div
                     key={epic.id}
-                    className={`rounded-md border px-3 py-2 ${
+                    className={cn(
+                      'rounded-lg border px-3 py-3 transition',
                       epic.id === selectedEpicId
-                        ? 'border-sky-500/40 bg-sky-500/10'
-                        : 'border-slate-800 bg-slate-950/70'
-                    }`}
+                        ? 'border-primary bg-primary-subtle'
+                        : 'border-border bg-surface hover:border-border-subtle hover:bg-elevated',
+                    )}
                   >
                     <button
                       type="button"
                       onClick={() => setSelectedEpicId(epic.id)}
                       className="w-full text-left"
                     >
-                      <p className="font-medium text-slate-100">{epic.title}</p>
-                      <p className="text-xs text-slate-400">{labelize(String(epic.status))}</p>
+                      <div className="flex flex-wrap items-start justify-between gap-2">
+                        <p className="font-medium text-foreground">{epic.title}</p>
+                        <StatusBadge status={String(epic.status)}>{labelize(String(epic.status))}</StatusBadge>
+                      </div>
+                      {epic.description ? <p className="mt-1 text-xs text-muted">{epic.description}</p> : null}
                     </button>
-                    <div className="mt-2 flex flex-wrap gap-1">
+                    <div className="mt-3 flex flex-wrap gap-1.5">
                       {EPIC_STATUSES.map((status) => (
-                        <button
+                        <Button
                           key={`${epic.id}-${status}`}
+                          type="button"
+                          variant="outline"
+                          size="sm"
                           onClick={() => void updateEpicStatus(epic.id, status)}
                           disabled={saving}
-                          className={`rounded-md border px-2 py-1 text-xs ${
+                          className={cn(
                             String(epic.status) === status
-                              ? 'border-sky-500/40 bg-sky-500/10 text-sky-300'
-                              : 'border-slate-700 text-slate-300 hover:bg-slate-800'
-                          }`}
+                              ? 'border-primary bg-primary-subtle text-primary'
+                              : 'border-border-subtle text-muted hover:bg-elevated hover:text-foreground',
+                          )}
                         >
                           {labelize(status)}
-                        </button>
+                        </Button>
                       ))}
                     </div>
                   </div>
                 ))}
               </div>
             )}
-          </div>
+          </Card>
 
-          <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-            <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-300">
-              Epic progress detail
-            </h2>
+          <Card className="bg-panel">
+            <CardHeader>
+              <div>
+                <CardTitle>Epic Progress</CardTitle>
+                <CardDescription>Completion detail for the selected epic</CardDescription>
+              </div>
+            </CardHeader>
             {!selectedEpic ? (
-              <p className="text-sm text-slate-500">Select an epic.</p>
+              <p className="text-sm text-dim">Select an epic.</p>
             ) : !epicProgress ? (
-              <p className="text-sm text-slate-500">No progress data available.</p>
+              <p className="text-sm text-dim">No progress data available.</p>
             ) : (
               <div className="space-y-2">
-                <p className="font-medium text-slate-100">{epicProgress.title}</p>
-                <p className="text-sm text-slate-400">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <p className="font-medium text-foreground">{epicProgress.title}</p>
+                  <StatusBadge status={String(epicProgress.status)}>{labelize(String(epicProgress.status))}</StatusBadge>
+                </div>
+                <p className="text-sm text-muted">
                   {epicProgress.done_items} / {epicProgress.total_items} work items complete
                 </p>
-                <div className="h-2 overflow-hidden rounded-full bg-slate-800">
+                <div className="h-2 overflow-hidden rounded-full bg-elevated">
                   <div
-                    className="h-full rounded-full bg-sky-500"
+                    className="h-full rounded-full bg-primary"
                     style={{ width: `${Math.max(0, Math.min(100, epicProgress.progress_pct))}%` }}
                   />
                 </div>
-                <p className="text-xs text-slate-500">{epicProgress.progress_pct.toFixed(1)}% complete</p>
+                <p className="text-xs text-dim">{epicProgress.progress_pct.toFixed(1)}% complete</p>
               </div>
             )}
-          </div>
+          </Card>
         </div>
 
         <div className="space-y-4">
-          <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-            <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-300">
-              Sprints ({sprints.length})
-            </h2>
+          <Card className="bg-panel">
+            <CardHeader>
+              <div>
+                <CardTitle>Sprints</CardTitle>
+                <CardDescription>Timeboxed goals and selected sprint context</CardDescription>
+              </div>
+              <Badge variant="neutral">{sprints.length}</Badge>
+            </CardHeader>
             {sprints.length === 0 ? (
-              <p className="text-sm text-slate-500">No sprints yet.</p>
+              <p className="text-sm text-dim">No sprints yet.</p>
             ) : (
               <div className="space-y-2">
                 {sprints.map((sprint) => (
@@ -544,29 +617,35 @@ export function PlanningHub() {
                     key={sprint.id}
                     type="button"
                     onClick={() => setSelectedSprintId(sprint.id)}
-                    className={`w-full rounded-md border px-3 py-2 text-left ${
+                    className={cn(
+                      'w-full rounded-lg border px-3 py-3 text-left transition',
                       sprint.id === selectedSprintId
-                        ? 'border-sky-500/40 bg-sky-500/10'
-                        : 'border-slate-800 bg-slate-950/70 hover:border-slate-600'
-                    }`}
+                        ? 'border-primary bg-primary-subtle'
+                        : 'border-border bg-surface hover:border-border-subtle hover:bg-elevated',
+                    )}
                   >
-                    <p className="font-medium text-slate-100">{sprint.name}</p>
-                    <p className="text-xs text-slate-400">
+                    <p className="font-medium text-foreground">{sprint.name}</p>
+                    <p className="text-xs text-muted">
                       {fmtDate(sprint.start_date)} → {fmtDate(sprint.end_date)}
                     </p>
-                    {sprint.goal ? <p className="mt-1 text-xs text-slate-500">{sprint.goal}</p> : null}
+                    {sprint.goal ? <p className="mt-1 text-xs text-dim">{sprint.goal}</p> : null}
                   </button>
                 ))}
               </div>
             )}
-          </div>
+          </Card>
 
-          <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 space-y-3">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">Sprint stats + burndown</h2>
+          <Card className="space-y-3 bg-panel">
+            <CardHeader>
+              <div>
+                <CardTitle>Sprint Stats + Burndown</CardTitle>
+                <CardDescription>Throughput and recent remaining-work points</CardDescription>
+              </div>
+            </CardHeader>
             {!selectedSprint ? (
-              <p className="text-sm text-slate-500">Select a sprint.</p>
+              <p className="text-sm text-dim">Select a sprint.</p>
             ) : !sprintStats ? (
-              <p className="text-sm text-slate-500">No sprint stats available.</p>
+              <p className="text-sm text-dim">No sprint stats available.</p>
             ) : (
               <>
                 <div className="grid grid-cols-2 gap-2 text-sm">
@@ -575,19 +654,19 @@ export function PlanningHub() {
                   <Metric label="In Progress" value={sprintStats.in_progress_items} />
                   <Metric label="Blocked" value={sprintStats.blocked_items} />
                 </div>
-                <p className="text-xs text-slate-400">Velocity: {sprintStats.velocity.toFixed(2)}</p>
+                <p className="text-xs text-muted">Velocity: {sprintStats.velocity.toFixed(2)}</p>
 
                 {burndown.length === 0 ? (
-                  <p className="text-xs text-slate-500">No burndown points yet.</p>
+                  <p className="text-xs text-dim">No burndown points yet.</p>
                 ) : (
                   <div className="space-y-1">
                     {burndown.slice(-7).map((point, idx) => (
                       <div
                         key={`${point.date}-${idx}`}
-                        className="flex items-center justify-between rounded-md border border-slate-800 bg-slate-950/70 px-3 py-1.5 text-xs"
+                        className="flex items-center justify-between gap-3 rounded-lg border border-border bg-surface px-3 py-1.5 text-xs"
                       >
-                        <span className="text-slate-400">{fmtDate(point.date)}</span>
-                        <span className="text-slate-300">
+                        <span className="text-dim">{fmtDate(point.date)}</span>
+                        <span className="text-muted">
                           ideal {point.ideal_remaining.toFixed(1)} · actual {point.actual_remaining}
                         </span>
                       </div>
@@ -596,18 +675,19 @@ export function PlanningHub() {
                 )}
               </>
             )}
-          </div>
+          </Card>
         </div>
       </div>
     </section>
   )
 }
 
-function Metric({ label, value }: { label: string; value: number }) {
+function Metric({ label, value, detail }: { label: string; value: number; detail?: string }) {
   return (
-    <div className="rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2">
-      <p className="text-xs uppercase tracking-wider text-slate-500">{label}</p>
-      <p className="text-lg font-semibold text-slate-200">{value}</p>
+    <div className="rounded-lg border border-border bg-surface px-3 py-2">
+      <p className="text-xs font-medium uppercase tracking-wider text-dim">{label}</p>
+      <p className="text-lg font-semibold text-foreground">{value}</p>
+      {detail ? <p className="text-xs text-muted">{detail}</p> : null}
     </div>
   )
 }

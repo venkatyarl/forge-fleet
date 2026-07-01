@@ -9,7 +9,9 @@
 //! - Token/context usage visualization
 //! - Session management
 
+pub mod api_client;
 pub mod app;
+pub mod data_cmd;
 pub mod input;
 pub mod messages;
 pub mod render;

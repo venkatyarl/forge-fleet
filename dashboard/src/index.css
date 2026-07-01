@@ -4,6 +4,39 @@
 
 :root {
   color-scheme: dark;
+
+  /* Canvas */
+  --color-background: #050505;
+  --color-surface: #0a0a0b;
+  --color-panel: #111113;
+  --color-elevated: #18181b;
+
+  /* Borders */
+  --color-border: #27272a;
+  --color-border-subtle: #3f3f46;
+
+  /* Text */
+  --color-foreground: #fafafa;
+  --color-muted: #a1a1aa;
+  --color-dim: #71717a;
+
+  /* Accent (violet) */
+  --color-primary: #8b5cf6;
+  --color-primary-muted: #a78bfa;
+  --color-primary-subtle: rgba(139, 92, 246, 0.16);
+
+  /* Status */
+  --color-status-ok: #34d399;
+  --color-status-warn: #f59e0b;
+  --color-status-crit: #fb7185;
+  --color-status-info: #38bdf8;
+
+  /* Density */
+  --space-xs: 0.25rem;
+  --space-sm: 0.5rem;
+  --space-md: 0.75rem;
+  --space-lg: 1rem;
+  --space-xl: 1.5rem;
 }
 
 html,
@@ -13,10 +46,41 @@ body,
 }
 
 body {
-  @apply m-0 bg-slate-950 text-slate-100 antialiased;
+  @apply m-0 bg-background text-foreground antialiased;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
 }
 
 * {
-  scrollbar-color: #334155 #0f172a;
+  scrollbar-color: var(--color-border-subtle) var(--color-surface);
+  scrollbar-width: thin;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-surface);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-subtle);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-muted);
+}
+
+/* Focus rings */
+*:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+/* Selection */
+::selection {
+  background: var(--color-primary-subtle);
+  color: var(--color-foreground);
 }

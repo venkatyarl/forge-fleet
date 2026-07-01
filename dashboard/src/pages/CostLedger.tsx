@@ -1,4 +1,9 @@
 import { useEffect, useState } from 'react'
+import { Badge } from '../components/ui/badge'
+import { Button } from '../components/ui/button'
+import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { StatusBadge } from '../components/ui/status-badge'
+import { cn } from '../lib/utils'
 
 type ModelStats = {
   model: string
@@ -54,8 +59,8 @@ export function CostLedger() {
         if (!budgetRes.ok) throw new Error('Failed to load budget')
         setSummary(await summaryRes.json())
         setBudget(await budgetRes.json())
-      } catch (e: any) {
-        setError(e.message)
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Failed to load cost ledger')
       } finally {
         setLoading(false)
       }
@@ -67,17 +72,33 @@ export function CostLedger() {
 
   if (loading) {
     return (
-      <div className="flex h-full items-center justify-center">
-        <div className="text-zinc-400">Loading cost ledger...</div>
-      </div>
+      <section className="flex h-full items-center justify-center bg-background text-foreground">
+        <Card className="bg-panel">
+          <CardHeader className="mb-0 gap-3">
+            <div>
+              <CardTitle>Cost Ledger</CardTitle>
+              <CardDescription>Loading token usage and budget state</CardDescription>
+            </div>
+            <Badge variant="info">loading</Badge>
+          </CardHeader>
+        </Card>
+      </section>
     )
   }
 
   if (error) {
     return (
-      <div className="flex h-full items-center justify-center">
-        <div className="text-red-400">Error: {error}</div>
-      </div>
+      <section className="flex h-full items-center justify-center bg-background text-foreground">
+        <Card className="border-status-crit bg-panel">
+          <CardHeader className="mb-0 gap-3">
+            <div>
+              <CardTitle>Cost Ledger</CardTitle>
+              <CardDescription className="text-status-crit">Error: {error}</CardDescription>
+            </div>
+            <StatusBadge status="error">error</StatusBadge>
+          </CardHeader>
+        </Card>
+      </section>
     )
   }
 
@@ -86,75 +107,96 @@ export function CostLedger() {
 
   const formatUsd = (n: number) => `$${n.toFixed(6)}`
   const formatTokens = (n: number) => n.toLocaleString()
+  const avgLatencyMs =
+    s.models.length > 0
+      ? s.models.reduce((a, m) => a + m.avg_latency_ms, 0) / s.models.length
+      : 0
+  const budgetTone = budgetStatus(s.budget_percent_used, b.alert_threshold)
+  const budgetLabel =
+    budgetTone === 'crit' ? 'critical' : budgetTone === 'warn' ? 'warning' : 'healthy'
 
   return (
-    <div className="h-full overflow-y-auto p-6">
-      <div className="mb-6 flex items-center justify-between">
+    <section className="h-full overflow-y-auto bg-background p-6 text-foreground">
+      <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-zinc-100">💰 Cost Ledger</h1>
-          <p className="text-sm text-zinc-400">Token usage and cost tracking across the fleet</p>
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="text-2xl font-bold tracking-tight text-foreground">Cost Ledger</h1>
+            <StatusBadge status={budgetLabel}>{budgetLabel}</StatusBadge>
+            <Badge variant="neutral">{s.models.length} models</Badge>
+          </div>
+          <p className="mt-1 text-sm text-dim">Token usage and cost tracking across the fleet</p>
         </div>
-        <div className="flex gap-2">
-          <button
-            onClick={async () => {
-              await fetch('/api/ledger/flush', { method: 'POST' })
-              window.location.reload()
-            }}
-            className="rounded-md bg-violet-600 px-3 py-1.5 text-sm text-white hover:bg-violet-500"
-          >
-            Flush to DB
-          </button>
-        </div>
+        <Button
+          onClick={async () => {
+            await fetch('/api/ledger/flush', { method: 'POST' })
+            window.location.reload()
+          }}
+        >
+          Flush to DB
+        </Button>
       </div>
 
-      {/* Budget bar */}
-      <div className="mb-6 rounded-lg border border-zinc-800 bg-zinc-900/50 p-4">
-        <div className="mb-2 flex items-center justify-between">
-          <span className="text-sm font-medium text-zinc-300">Daily Cloud Budget</span>
-          <span className="text-sm text-zinc-400">
-            {formatUsd(s.daily_cost_usd)} / {formatUsd(s.daily_budget_usd)}
-          </span>
-        </div>
-        <div className="h-2 overflow-hidden rounded-full bg-zinc-800">
+      <Card className="mb-6 bg-panel">
+        <CardHeader className="items-start gap-3">
+          <div>
+            <CardTitle>Daily Cloud Budget</CardTitle>
+            <CardDescription>
+              {formatUsd(s.daily_cost_usd)} used of {formatUsd(s.daily_budget_usd)}
+            </CardDescription>
+          </div>
+          <StatusBadge status={budgetLabel}>{s.budget_percent_used.toFixed(1)}% used</StatusBadge>
+        </CardHeader>
+
+        <div className="h-2 overflow-hidden rounded-full bg-elevated">
           <div
-            className={`h-full rounded-full transition-all ${
-              s.budget_percent_used > 90 ? 'bg-red-500' : s.budget_percent_used > 70 ? 'bg-yellow-500' : 'bg-green-500'
-            }`}
+            className={cn('h-full rounded-full transition-all', budgetProgressClass(budgetTone))}
             style={{ width: `${Math.min(s.budget_percent_used, 100)}%` }}
           />
         </div>
-        <div className="mt-1 flex justify-between text-xs text-zinc-500">
-          <span>{s.budget_percent_used.toFixed(1)}% used</span>
-          <span>{formatUsd(s.budget_remaining_usd)} remaining</span>
-        </div>
-      </div>
 
-      {/* Summary cards */}
+        <div className="mt-4 grid gap-3 text-sm sm:grid-cols-3">
+          <BudgetMetric
+            label="Remaining"
+            value={formatUsd(s.budget_remaining_usd)}
+            tone={budgetTone === 'crit' ? 'crit' : 'ok'}
+          />
+          <BudgetMetric label="Cloud Cost" value={formatUsd(s.cloud_cost_usd)} tone="warn" />
+          <BudgetMetric
+            label="Enforcement"
+            value={b.enforce_budget ? 'Enabled' : 'Monitoring'}
+            tone={b.enforce_budget ? 'ok' : 'info'}
+          />
+        </div>
+      </Card>
+
       <div className="mb-6 grid grid-cols-2 gap-4 md:grid-cols-4">
         <StatCard label="Total Requests" value={s.total_requests.toLocaleString()} />
         <StatCard label="Total Tokens" value={formatTokens(s.total_tokens)} />
         <StatCard label="Total Cost" value={formatUsd(s.total_cost_usd)} />
-        <StatCard label="Local Requests" value={s.local_requests.toLocaleString()} color="green" />
-        <StatCard label="Cloud Requests" value={s.cloud_requests.toLocaleString()} color="yellow" />
-        <StatCard label="Cloud Cost" value={formatUsd(s.cloud_cost_usd)} color="yellow" />
-        <StatCard label="Est. Savings" value={formatUsd(s.savings_vs_cloud_only_usd)} color="green" />
-        <StatCard label="Avg Latency" value={`${s.models.length > 0 ? (s.models.reduce((a, m) => a + m.avg_latency_ms, 0) / s.models.length).toFixed(0) : 0} ms`} />
+        <StatCard label="Local Requests" value={s.local_requests.toLocaleString()} tone="ok" />
+        <StatCard label="Cloud Requests" value={s.cloud_requests.toLocaleString()} tone="warn" />
+        <StatCard label="Cloud Cost" value={formatUsd(s.cloud_cost_usd)} tone="warn" />
+        <StatCard label="Est. Savings" value={formatUsd(s.savings_vs_cloud_only_usd)} tone="ok" />
+        <StatCard label="Avg Latency" value={`${avgLatencyMs.toFixed(0)} ms`} tone="info" />
       </div>
 
-      {/* Model breakdown */}
-      <div className="rounded-lg border border-zinc-800 bg-zinc-900/50">
-        <div className="border-b border-zinc-800 px-4 py-3">
-          <h2 className="text-sm font-semibold text-zinc-200">Per-Model Breakdown</h2>
-        </div>
+      <Card className="overflow-hidden bg-panel p-0">
+        <CardHeader className="mb-0 border-b border-border px-4 py-3">
+          <div>
+            <CardTitle>Per-Model Breakdown</CardTitle>
+            <CardDescription>Requests, tokens, cost, routing, and latency by model</CardDescription>
+          </div>
+          <Badge variant="neutral">{formatTokens(s.total_tokens)} tokens</Badge>
+        </CardHeader>
         {s.models.length === 0 ? (
-          <div className="px-4 py-8 text-center text-sm text-zinc-500">
+          <div className="px-4 py-8 text-center text-sm text-dim">
             No usage recorded yet. Make some LLM requests to see data here.
           </div>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm">
               <thead>
-                <tr className="border-b border-zinc-800 text-xs text-zinc-500">
+                <tr className="border-b border-border bg-surface text-xs text-dim">
                   <th className="px-4 py-2">Model</th>
                   <th className="px-4 py-2 text-right">Requests</th>
                   <th className="px-4 py-2 text-right">Tokens</th>
@@ -166,72 +208,113 @@ export function CostLedger() {
               </thead>
               <tbody>
                 {s.models.map((m) => (
-                  <tr key={m.model} className="border-b border-zinc-800/50 hover:bg-zinc-800/30">
-                    <td className="px-4 py-2 font-mono text-zinc-300">{m.model}</td>
-                    <td className="px-4 py-2 text-right text-zinc-400">{m.request_count.toLocaleString()}</td>
-                    <td className="px-4 py-2 text-right text-zinc-400">{formatTokens(m.total_tokens)}</td>
-                    <td className="px-4 py-2 text-right text-zinc-400">{formatUsd(m.total_cost_usd)}</td>
-                    <td className="px-4 py-2 text-right text-green-400">{m.local_request_count.toLocaleString()}</td>
-                    <td className="px-4 py-2 text-right text-yellow-400">{m.cloud_request_count.toLocaleString()}</td>
-                    <td className="px-4 py-2 text-right text-zinc-400">{m.avg_latency_ms.toFixed(0)} ms</td>
+                  <tr
+                    key={m.model}
+                    className="border-b border-border transition last:border-0 hover:bg-elevated"
+                  >
+                    <td className="px-4 py-2 font-mono text-foreground">{m.model}</td>
+                    <td className="px-4 py-2 text-right text-muted">
+                      {m.request_count.toLocaleString()}
+                    </td>
+                    <td className="px-4 py-2 text-right text-muted">{formatTokens(m.total_tokens)}</td>
+                    <td className="px-4 py-2 text-right text-muted">{formatUsd(m.total_cost_usd)}</td>
+                    <td className="px-4 py-2 text-right text-status-ok">
+                      {m.local_request_count.toLocaleString()}
+                    </td>
+                    <td className="px-4 py-2 text-right text-status-warn">
+                      {m.cloud_request_count.toLocaleString()}
+                    </td>
+                    <td className="px-4 py-2 text-right text-muted">{m.avg_latency_ms.toFixed(0)} ms</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
         )}
-      </div>
+      </Card>
 
-      {/* Budget config */}
       {b && (
-        <div className="mt-6 rounded-lg border border-zinc-800 bg-zinc-900/50 p-4">
-          <h2 className="mb-2 text-sm font-semibold text-zinc-200">Budget Configuration</h2>
+        <Card className="mt-6 bg-panel">
+          <CardHeader>
+            <div>
+              <CardTitle>Budget Configuration</CardTitle>
+              <CardDescription>Current ledger guardrails and alert threshold</CardDescription>
+            </div>
+            <Badge variant={b.enforce_budget ? 'ok' : 'info'}>
+              {b.enforce_budget ? 'enforced' : 'monitoring'}
+            </Badge>
+          </CardHeader>
           <div className="grid grid-cols-2 gap-4 text-sm md:grid-cols-4">
-            <div>
-              <span className="text-zinc-500">Daily Budget</span>
-              <div className="text-zinc-300">{formatUsd(b.daily_budget_usd)}</div>
-            </div>
-            <div>
-              <span className="text-zinc-500">Cloud Budget</span>
-              <div className="text-zinc-300">{formatUsd(b.cloud_daily_budget_usd)}</div>
-            </div>
-            <div>
-              <span className="text-zinc-500">Enforced</span>
-              <div className="text-zinc-300">{b.enforce_budget ? 'Yes' : 'No'}</div>
-            </div>
-            <div>
-              <span className="text-zinc-500">Alert Threshold</span>
-              <div className="text-zinc-300">{(b.alert_threshold * 100).toFixed(0)}%</div>
-            </div>
+            <ConfigItem label="Daily Budget" value={formatUsd(b.daily_budget_usd)} />
+            <ConfigItem label="Cloud Budget" value={formatUsd(b.cloud_daily_budget_usd)} />
+            <ConfigItem label="Enforced" value={b.enforce_budget ? 'Yes' : 'No'} />
+            <ConfigItem label="Alert Threshold" value={`${(b.alert_threshold * 100).toFixed(0)}%`} />
           </div>
-        </div>
+        </Card>
       )}
-    </div>
+    </section>
   )
 }
 
 function StatCard({
   label,
   value,
-  color = 'default',
+  tone = 'default',
 }: {
   label: string
   value: string
-  color?: 'default' | 'green' | 'yellow' | 'red'
+  tone?: 'default' | 'ok' | 'warn' | 'crit' | 'info'
 }) {
-  const colorClass =
-    color === 'green'
-      ? 'text-green-400'
-      : color === 'yellow'
-      ? 'text-yellow-400'
-      : color === 'red'
-      ? 'text-red-400'
-      : 'text-zinc-200'
-
   return (
-    <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-3">
-      <div className="text-xs text-zinc-500">{label}</div>
-      <div className={`mt-1 text-lg font-semibold ${colorClass}`}>{value}</div>
+    <Card className="bg-panel p-3">
+      <CardDescription>{label}</CardDescription>
+      <div className={cn('mt-1 truncate text-lg font-semibold', textToneClass(tone))}>{value}</div>
+    </Card>
+  )
+}
+
+function BudgetMetric({
+  label,
+  value,
+  tone,
+}: {
+  label: string
+  value: string
+  tone: 'ok' | 'warn' | 'crit' | 'info'
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-surface px-3 py-2">
+      <div className="text-xs text-dim">{label}</div>
+      <div className={cn('mt-1 text-sm font-semibold', textToneClass(tone))}>{value}</div>
     </div>
   )
+}
+
+function ConfigItem({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg border border-border bg-surface px-3 py-2">
+      <div className="text-xs text-dim">{label}</div>
+      <div className="mt-1 text-sm font-medium text-foreground">{value}</div>
+    </div>
+  )
+}
+
+function budgetStatus(percentUsed: number, alertThreshold: number): 'ok' | 'warn' | 'crit' {
+  if (percentUsed >= 90) return 'crit'
+  if (percentUsed >= alertThreshold * 100) return 'warn'
+  return 'ok'
+}
+
+function budgetProgressClass(tone: 'ok' | 'warn' | 'crit') {
+  if (tone === 'crit') return 'bg-status-crit'
+  if (tone === 'warn') return 'bg-status-warn'
+  return 'bg-status-ok'
+}
+
+function textToneClass(tone: 'default' | 'ok' | 'warn' | 'crit' | 'info') {
+  if (tone === 'ok') return 'text-status-ok'
+  if (tone === 'warn') return 'text-status-warn'
+  if (tone === 'crit') return 'text-status-crit'
+  if (tone === 'info') return 'text-status-info'
+  return 'text-foreground'
 }

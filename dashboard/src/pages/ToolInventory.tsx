@@ -1,123 +1,9 @@
-import { useEffect, useMemo, useState } from 'react'
-
-// Static fallback catalog — shown when the backend tool registry is empty
-// (e.g. during development or before agents have registered their tools).
-const STATIC_TOOLS: StaticToolInfo[] = [
-  { name: 'Bash', category: 'File Ops', description: 'Execute shell commands with persistent state' },
-  { name: 'Read', category: 'File Ops', description: 'Read files with line numbers, offset/limit' },
-  { name: 'Write', category: 'File Ops', description: 'Create or overwrite files' },
-  { name: 'Edit', category: 'File Ops', description: 'Exact string replacement in files' },
-  { name: 'Glob', category: 'File Ops', description: 'Find files by pattern (e.g. **/*.rs)' },
-  { name: 'Grep', category: 'File Ops', description: 'Search file contents with regex' },
-  { name: 'Agent', category: 'Agent', description: 'Spawn sub-agents on fleet nodes' },
-  { name: 'SendMessage', category: 'Agent', description: 'Inter-agent messaging' },
-  { name: 'Delegate', category: 'Agent', description: 'Route subtask to specialized agent role' },
-  { name: 'TaskCreate', category: 'Tasks', description: 'Create a task to track work' },
-  { name: 'TaskGet', category: 'Tasks', description: 'Get task details by ID' },
-  { name: 'TaskUpdate', category: 'Tasks', description: 'Update task status or details' },
-  { name: 'TaskList', category: 'Tasks', description: 'List all tasks' },
-  { name: 'TaskStop', category: 'Tasks', description: 'Cancel a running task' },
-  { name: 'TaskOutput', category: 'Tasks', description: 'Get task output/result' },
-  { name: 'WebFetch', category: 'Web', description: 'Fetch web pages and convert to text' },
-  { name: 'WebSearch', category: 'Web', description: 'Search the web via DuckDuckGo' },
-  { name: 'HttpRequest', category: 'Web', description: 'Generic HTTP client (GET/POST/PUT/DELETE)' },
-  { name: 'DeepResearch', category: 'Research', description: 'Multi-source research with summarization' },
-  { name: 'WikiLookup', category: 'Research', description: 'Wikipedia article lookup' },
-  { name: 'ScholarSearch', category: 'Research', description: 'Academic paper search (Semantic Scholar)' },
-  { name: 'GitPR', category: 'Git', description: 'GitHub PR management (create/list/merge/review)' },
-  { name: 'GitBlame', category: 'Git', description: 'Git blame analysis with porcelain parsing' },
-  { name: 'GithubIssues', category: 'Git', description: 'Create/list/manage GitHub issues' },
-  { name: 'TestGen', category: 'Git', description: 'Extract code for test generation' },
-  { name: 'EnterWorktree', category: 'Git', description: 'Create isolated git worktree' },
-  { name: 'ExitWorktree', category: 'Git', description: 'Remove git worktree' },
-  { name: 'Docker', category: 'DevOps', description: 'Container management (ps/build/run/compose)' },
-  { name: 'LintFix', category: 'DevOps', description: 'Run linter/formatter/tests with auto-fix' },
-  { name: 'DocGen', category: 'DevOps', description: 'Generate documentation (rustdoc/JSDoc)' },
-  { name: 'DepCheck', category: 'DevOps', description: 'Audit dependencies for vulnerabilities' },
-  { name: 'CronSchedule', category: 'DevOps', description: 'Schedule recurring fleet tasks' },
-  { name: 'ProjectEstimate', category: 'Project Mgmt', description: 'Story points and hour estimates from descriptions' },
-  { name: 'VelocityTracker', category: 'Project Mgmt', description: 'Calculate team velocity from sprint history' },
-  { name: 'DeadlineProjector', category: 'Project Mgmt', description: 'Project completion date from remaining work' },
-  { name: 'SprintPlanner', category: 'Project Mgmt', description: 'Auto-assign items to sprint by priority/capacity' },
-  { name: 'RiskAssessor', category: 'Project Mgmt', description: 'Identify blocked items, scope creep, bottlenecks' },
-  { name: 'WorkloadBalancer', category: 'Project Mgmt', description: 'Distribute work evenly across assignees' },
-  { name: 'DependencyMapper', category: 'Project Mgmt', description: 'Analyze dependency chains, find critical path' },
-  { name: 'BudgetTracker', category: 'Finance', description: 'Income/expense tracking with category breakdown' },
-  { name: 'ProfitLoss', category: 'Finance', description: 'P&L statement (revenue, COGS, net income)' },
-  { name: 'CashFlowForecast', category: 'Finance', description: 'Project N months of cash flow' },
-  { name: 'InvoiceGen', category: 'Finance', description: 'Generate professional invoices' },
-  { name: 'StatsCalc', category: 'Analytics', description: 'Mean, median, std dev, percentiles, correlation' },
-  { name: 'TimeSeriesAnalysis', category: 'Analytics', description: 'Trend detection, moving averages, outliers' },
-  { name: 'NodeSetup', category: 'Fleet Ops', description: 'Install prerequisites on new machines via SSH' },
-  { name: 'NodeEnroll', category: 'Fleet Ops', description: 'Register node in fleet.toml' },
-  { name: 'ModelDeploy', category: 'Fleet Ops', description: 'Download and deploy models to fleet nodes' },
-  { name: 'FleetInventory', category: 'Fleet Ops', description: 'Scan fleet, report all nodes and models' },
-  { name: 'NodeHealthCheck', category: 'Fleet Ops', description: 'Deep health check via SSH' },
-  { name: 'BinaryDeploy', category: 'Fleet Ops', description: 'Build and deploy ForgeFleet binary to nodes' },
-  { name: 'PatternLearner', category: 'Intelligence', description: 'Track successful patterns per task type' },
-  { name: 'ModelScorecard', category: 'Intelligence', description: 'Track model quality, generate leaderboards' },
-  { name: 'ReviewQueue', category: 'Intelligence', description: 'Queue work for human review' },
-  { name: 'RollbackManager', category: 'Intelligence', description: 'Preview/stash/rollback git changes' },
-  { name: 'SmartSearch', category: 'Intelligence', description: 'Search across code, memory, git, docs' },
-  { name: 'WatchAndReact', category: 'Intelligence', description: 'Event-driven triggers for agent tasks' },
-  { name: 'ProjectScaffold', category: 'Intelligence', description: 'Generate new projects from templates' },
-  { name: 'Screenshot', category: 'Media', description: 'Capture web page screenshots' },
-  { name: 'ImageAnalyze', category: 'Media', description: 'Image dimensions, EXIF, OCR' },
-  { name: 'VideoDownload', category: 'Media', description: 'Download videos via yt-dlp' },
-  { name: 'LinkPreview', category: 'Media', description: 'Fetch OpenGraph metadata from URLs' },
-  { name: 'ImageConvert', category: 'Media', description: 'Resize, convert, compress images' },
-  { name: 'PhotoAnalysis', category: 'Multimodal', description: 'Full photo analysis (OCR, EXIF, colors)' },
-  { name: 'VideoAnalysis', category: 'Multimodal', description: 'Video metadata, frame extraction, transcription' },
-  { name: 'AudioAnalysis', category: 'Multimodal', description: 'Audio transcription (Whisper), conversion' },
-  { name: 'ProcessManager', category: 'Computer', description: 'List/search/kill processes' },
-  { name: 'Clipboard', category: 'Computer', description: 'Read/write system clipboard' },
-  { name: 'SystemControl', category: 'Computer', description: 'Open apps/URLs, notifications, system info' },
-  { name: 'ServiceManager', category: 'Computer', description: 'Manage system services (systemd/launchd)' },
-  { name: 'PackageManager', category: 'Computer', description: 'Install/update system packages' },
-  { name: 'DatabaseQuery', category: 'Database', description: 'Run SQL against PostgreSQL/SQLite/MySQL' },
-  { name: 'HashGenerator', category: 'Crypto', description: 'SHA256/SHA512/MD5 for strings and files' },
-  { name: 'PasswordGen', category: 'Crypto', description: 'Secure random passwords and passphrases' },
-  { name: 'TextTransform', category: 'Crypto', description: 'Base64, URL encode/decode, JSON format' },
-  { name: 'Calculator', category: 'Crypto', description: 'Evaluate math expressions' },
-  { name: 'ModelBrowser', category: 'Models', description: 'Search HuggingFace, Ollama, fleet models' },
-  { name: 'ModelDownloader', category: 'Models', description: 'Download models (Ollama/HF/URL)' },
-  { name: 'ModelCompare', category: 'Models', description: 'Side-by-side model comparison' },
-  { name: 'ModelDiscovery', category: 'Models', description: 'Discover models from all sources' },
-  { name: 'ClusterInference', category: 'Models', description: 'Distributed inference across fleet nodes' },
-  { name: 'VersionManager', category: 'Version', description: 'Version management, upgrades, fleet deploy' },
-  { name: 'Reminder', category: 'Utility', description: 'Set time-based reminders' },
-  { name: 'Timer', category: 'Utility', description: 'Benchmark command execution time' },
-  { name: 'Regex', category: 'Utility', description: 'Test and debug regex patterns' },
-  { name: 'Diagram', category: 'Utility', description: 'Generate Mermaid diagrams' },
-  { name: 'Diff', category: 'Utility', description: 'Generate diffs (files, git versions)' },
-  { name: 'JsonQuery', category: 'Utility', description: 'Query JSON with jq expressions' },
-  { name: 'FileCompress', category: 'Utility', description: 'Zip/tar compress and decompress' },
-  { name: 'FileSync', category: 'Utility', description: 'Rsync between local and fleet nodes' },
-  { name: 'HealthMonitor', category: 'Utility', description: 'Check URL health with timing' },
-  { name: 'SelfHeal', category: 'Automation', description: 'Diagnose and auto-fix fleet failures' },
-  { name: 'AutoFleet', category: 'Automation', description: 'Autonomous fleet management' },
-  { name: 'TaskDecomposer', category: 'Automation', description: 'Break complex tasks into subtrees' },
-  { name: 'ToolBuilder', category: 'Builders', description: 'Create new compiled Rust tools at runtime' },
-  { name: 'SkillBuilder', category: 'Builders', description: 'Create loadable SKILL.md skills at runtime' },
-  { name: 'AskUserQuestion', category: 'Planning', description: 'Request user input/clarification' },
-  { name: 'EnterPlanMode', category: 'Planning', description: 'Switch to read-only planning mode' },
-  { name: 'ExitPlanMode', category: 'Planning', description: 'Exit planning, start implementing' },
-  { name: 'VerifyAndRetry', category: 'Agentic', description: 'Run verification, report pass/fail' },
-  { name: 'PdfExtract', category: 'Agentic', description: 'Extract text from PDFs' },
-  { name: 'SpreadsheetQuery', category: 'Agentic', description: 'Read/query CSV and Excel files' },
-  { name: 'ChangelogGen', category: 'Content', description: 'Generate changelogs from git history' },
-  { name: 'ReportGen', category: 'Content', description: 'Generate structured markdown reports' },
-  { name: 'MeetingNotes', category: 'Content', description: 'Structure notes into action items' },
-  { name: 'CodeComplexity', category: 'Code Quality', description: 'Analyze code complexity and file sizes' },
-  { name: 'DuplicateDetector', category: 'Code Quality', description: 'Find duplicate code patterns' },
-  { name: 'LogAnalyzer', category: 'Code Quality', description: 'Parse and analyze log files' },
-]
-
-type StaticToolInfo = {
-  name: string
-  category: string
-  description: string
-}
+import { useEffect, useMemo, useState, type ButtonHTMLAttributes } from 'react'
+import { Badge } from '../components/ui/badge'
+import { Button } from '../components/ui/button'
+import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { StatusBadge } from '../components/ui/status-badge'
+import { cn } from '../lib/utils'
 
 type LiveTool = {
   tool_name: string
@@ -129,10 +15,12 @@ type LiveTool = {
   healthy: boolean
 }
 
+type Tone = 'ok' | 'warn' | 'crit' | 'info' | 'neutral'
+
 async function fetchTools(): Promise<LiveTool[]> {
   try {
     const res = await fetch('/api/tools')
-    if (!res.ok) return []
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
     const data = await res.json()
     return Array.isArray(data.tools) ? data.tools : []
   } catch {
@@ -140,40 +28,36 @@ async function fetchTools(): Promise<LiveTool[]> {
   }
 }
 
-function staticToLive(t: StaticToolInfo): LiveTool {
-  return {
-    tool_name: t.name,
-    worker_name: 'fleet',
-    description: t.description,
-    health_checked_at: new Date().toISOString(),
-    call_count: 0,
-    avg_latency_ms: null,
-    healthy: true,
-  }
-}
-
 export function ToolInventory() {
   const [liveTools, setLiveTools] = useState<LiveTool[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null)
 
+  const load = async () => {
+    try {
+      setError(null)
+      const tools = await fetchTools()
+      setLiveTools(tools)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load tool registry')
+      setLiveTools([])
+    }
+  }
+
   useEffect(() => {
-    fetchTools().then(setLiveTools)
+    void load()
   }, [])
 
-  const tools = useMemo<LiveTool[]>(() => {
-    if (liveTools === null) return []
-    if (liveTools.length > 0) return liveTools
-    return STATIC_TOOLS.map(staticToLive)
-  }, [liveTools])
-
-  const isFallback = liveTools !== null && liveTools.length === 0
+  const tools = useMemo<LiveTool[]>(() => liveTools ?? [], [liveTools])
+  const isLoading = liveTools === null
 
   const filtered = useMemo(() => {
-    return tools.filter(t => {
-      const matchesSearch = !search
-        || t.tool_name.toLowerCase().includes(search.toLowerCase())
-        || t.description.toLowerCase().includes(search.toLowerCase())
+    return tools.filter((t) => {
+      const matchesSearch =
+        !search ||
+        t.tool_name.toLowerCase().includes(search.toLowerCase()) ||
+        t.description.toLowerCase().includes(search.toLowerCase())
       const matchesCategory = !selectedCategory || t.worker_name === selectedCategory
       return matchesSearch && matchesCategory
     })
@@ -181,81 +65,281 @@ export function ToolInventory() {
 
   const categories = useMemo(() => {
     const cats = new Set<string>()
-    tools.forEach(t => cats.add(t.worker_name))
+    tools.forEach((t) => cats.add(t.worker_name))
     return [...cats].sort()
   }, [tools])
 
   const categoryCounts = useMemo(() => {
     const counts: Record<string, number> = {}
-    tools.forEach(t => { counts[t.worker_name] = (counts[t.worker_name] || 0) + 1 })
+    tools.forEach((t) => {
+      counts[t.worker_name] = (counts[t.worker_name] || 0) + 1
+    })
     return counts
   }, [tools])
 
+  const healthyCount = useMemo(() => tools.filter((t) => t.healthy).length, [tools])
+  const unhealthyCount = Math.max(tools.length - healthyCount, 0)
+  const totalCalls = useMemo(() => tools.reduce((total, t) => total + (t.call_count ?? 0), 0), [tools])
+  const avgLatency = useMemo(() => {
+    const latencies = tools
+      .map((t) => t.avg_latency_ms)
+      .filter((latency): latency is number => latency != null)
+    if (latencies.length === 0) return null
+    return Math.round(latencies.reduce((total, latency) => total + latency, 0) / latencies.length)
+  }, [tools])
+
   return (
-    <section className="space-y-4">
-      <div className="flex items-center justify-between">
+    <section className="min-h-full space-y-6 bg-background text-foreground">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <h2 className="text-xl font-semibold text-slate-100">Tool Inventory</h2>
-          <p className="text-sm text-slate-400">
-            {tools.length} tool{tools.length !== 1 ? 's' : ''} across {categories.length} node{categories.length !== 1 ? 's' : ''}
-            {isFallback && ' (static fallback — no live registry data)'}
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="text-2xl font-bold text-foreground">Tool Inventory</h1>
+            {isLoading ? <Badge variant="info">loading</Badge> : <Badge variant="ok">live</Badge>}
+          </div>
+          <p className="mt-1 text-sm text-dim">
+            {isLoading
+              ? 'Loading live tool registry'
+              : `${tools.length} tool${tools.length !== 1 ? 's' : ''} across ${categories.length} node${categories.length !== 1 ? 's' : ''}`}
           </p>
         </div>
         <input
           type="text"
           placeholder="Search tools..."
           value={search}
-          onChange={e => setSearch(e.target.value)}
-          className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 w-64"
+          onChange={(e) => setSearch(e.target.value)}
+          aria-label="Search tools"
+          className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-dim focus:border-primary sm:w-72"
         />
       </div>
 
-      <div className="flex gap-2 flex-wrap">
-        <button
-          onClick={() => setSelectedCategory(null)}
-          className={`rounded-full px-3 py-1 text-xs ${!selectedCategory ? 'bg-violet-500/30 text-violet-200 border border-violet-500/50' : 'bg-slate-800 text-slate-400 border border-slate-700'}`}
-        >
-          All ({tools.length})
-        </button>
-        {categories.map(cat => (
-          <button
-            key={cat}
-            onClick={() => setSelectedCategory(selectedCategory === cat ? null : cat)}
-            className={`rounded-full px-3 py-1 text-xs ${selectedCategory === cat ? 'bg-violet-500/30 text-violet-200 border border-violet-500/50' : 'bg-slate-800 text-slate-400 border border-slate-700'}`}
-          >
-            {cat} ({categoryCounts[cat] || 0})
-          </button>
-        ))}
-      </div>
+      {error ? (
+        <Card className="border-status-crit bg-panel px-4 py-3 text-sm text-status-crit">
+          {error}
+        </Card>
+      ) : null}
 
-      <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-        {filtered.map(tool => (
-          <article key={`${tool.tool_name}-${tool.worker_name}`} className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 hover:border-slate-600 transition">
-            <div className="flex items-start justify-between">
-              <h3 className="font-mono font-semibold text-emerald-400">{tool.tool_name}</h3>
-              <div className="flex items-center gap-1.5">
-                {tool.healthy !== undefined && (
-                  <span className={`inline-block h-2 w-2 rounded-full ${tool.healthy ? 'bg-emerald-500' : 'bg-red-500'}`} title={tool.healthy ? 'Healthy' : 'Unhealthy'} />
-                )}
-                <span className="rounded-full bg-slate-800 px-2 py-0.5 text-xs text-slate-400">{tool.worker_name}</span>
-              </div>
-            </div>
-            <p className="mt-2 text-sm text-slate-400">{tool.description}</p>
-            {(tool.call_count > 0 || tool.avg_latency_ms != null) && (
-              <div className="mt-2 flex gap-3 text-xs text-slate-500">
-                {tool.call_count > 0 && <span>{tool.call_count.toLocaleString()} calls</span>}
-                {tool.avg_latency_ms != null && <span>{Math.round(tool.avg_latency_ms)}ms avg</span>}
-              </div>
-            )}
-          </article>
-        ))}
-      </div>
-
-      {filtered.length === 0 && (
-        <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-8 text-center text-slate-500">
-          No tools matching "{search}" {selectedCategory ? `in ${selectedCategory}` : ''}
+      {isLoading ? (
+        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+          {[1, 2, 3, 4, 5, 6, 7, 8].map((item) => (
+            <ToolSkeleton key={item} />
+          ))}
         </div>
+      ) : (
+        <>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <SummaryCard
+              label="Healthy Tools"
+              value={healthyCount}
+              detail={`${unhealthyCount} unhealthy`}
+              tone={unhealthyCount > 0 ? 'warn' : 'ok'}
+            />
+            <SummaryCard
+              label="Registered Tools"
+              value={tools.length}
+              detail="live registry"
+              tone="info"
+            />
+            <SummaryCard
+              label="Call Volume"
+              value={totalCalls.toLocaleString()}
+              detail="total recorded calls"
+              tone="neutral"
+            />
+            <SummaryCard
+              label="Latency"
+              value={avgLatency == null ? 'n/a' : `${avgLatency}ms`}
+              detail="average when reported"
+              tone="info"
+            />
+          </div>
+
+          <Card className="bg-surface">
+            <CardHeader className="items-start gap-3">
+              <div>
+                <CardTitle>Registry Filters</CardTitle>
+                <CardDescription>
+                  {filtered.length} matching {filtered.length === 1 ? 'tool' : 'tools'}
+                  {selectedCategory ? ` on ${selectedCategory}` : ''}
+                </CardDescription>
+              </div>
+              <Badge variant={tools.length === 0 ? 'warn' : 'ok'}>
+                {tools.length === 0 ? 'no live registry data' : 'live'}
+              </Badge>
+            </CardHeader>
+
+            <div className="flex flex-wrap gap-2">
+              <FilterButton active={!selectedCategory} onClick={() => setSelectedCategory(null)}>
+                All ({tools.length})
+              </FilterButton>
+              {categories.map((cat) => (
+                <FilterButton
+                  key={cat}
+                  active={selectedCategory === cat}
+                  onClick={() => setSelectedCategory(selectedCategory === cat ? null : cat)}
+                >
+                  {cat} ({categoryCounts[cat] || 0})
+                </FilterButton>
+              ))}
+            </div>
+          </Card>
+
+          {tools.length === 0 ? (
+            <Card className="flex flex-col items-center justify-center bg-panel px-8 py-12 text-center">
+              <CardTitle>No tools registered</CardTitle>
+              <CardDescription className="mt-2 max-w-md">
+                The live tool registry returned no tools. Agents register tools via{' '}
+                <code className="rounded bg-elevated px-1 font-mono text-primary">/api/tools/register</code>.
+              </CardDescription>
+            </Card>
+          ) : filtered.length === 0 ? (
+            <Card className="flex flex-col items-center justify-center bg-panel px-8 py-12 text-center">
+              <CardTitle>No tools found</CardTitle>
+              <CardDescription className="mt-2 max-w-md">
+                No tools matching &quot;{search}&quot; {selectedCategory ? `in ${selectedCategory}` : ''}
+              </CardDescription>
+            </Card>
+          ) : (
+            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+              {filtered.map((tool) => (
+                <ToolCard key={`${tool.tool_name}-${tool.worker_name}`} tool={tool} />
+              ))}
+            </div>
+          )}
+        </>
       )}
     </section>
   )
+}
+
+function SummaryCard({
+  label,
+  value,
+  detail,
+  tone,
+}: {
+  label: string
+  value: string | number
+  detail: string
+  tone: Tone
+}) {
+  return (
+    <Card className="bg-panel">
+      <CardHeader className="mb-2">
+        <CardDescription>{label}</CardDescription>
+      </CardHeader>
+      <div className={cn('truncate text-2xl font-bold', textToneClass(tone))}>{value}</div>
+      <div className="mt-1 text-xs text-dim">{detail}</div>
+    </Card>
+  )
+}
+
+function FilterButton({
+  active,
+  className,
+  ...props
+}: ButtonHTMLAttributes<HTMLButtonElement> & { active: boolean }) {
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      size="sm"
+      className={cn(
+        'rounded-full border-border bg-panel text-muted hover:border-border-subtle hover:bg-elevated hover:text-foreground',
+        active && 'border-primary/40 bg-primary-subtle text-primary hover:bg-primary-subtle hover:text-primary',
+        className,
+      )}
+      {...props}
+    />
+  )
+}
+
+function ToolCard({ tool }: { tool: LiveTool }) {
+  const healthStatus = tool.healthy ? 'healthy' : 'offline'
+  const tone = tool.healthy ? 'ok' : 'crit'
+  const callCount = tool.call_count ?? 0
+
+  return (
+    <Card className="h-full bg-panel transition hover:border-border-subtle hover:bg-elevated">
+      <CardHeader className="items-start gap-3">
+        <div className="min-w-0">
+          <CardTitle className="truncate font-mono text-base text-status-info">{tool.tool_name}</CardTitle>
+          <CardDescription className="mt-1 truncate">{tool.worker_name}</CardDescription>
+        </div>
+        <span
+          className={cn('mt-1 h-2.5 w-2.5 flex-shrink-0 rounded-full bg-current', textToneClass(tone))}
+          title={tool.healthy ? 'Healthy' : 'Unhealthy'}
+        />
+      </CardHeader>
+
+      <p className="min-h-10 text-sm leading-5 text-muted">{tool.description}</p>
+
+      <div className="mt-4 flex flex-wrap gap-1.5">
+        <StatusBadge status={healthStatus}>{healthStatus}</StatusBadge>
+        <Badge variant="neutral">{tool.worker_name}</Badge>
+      </div>
+
+      <dl className="mt-4 grid grid-cols-2 gap-3 border-t border-border pt-3 text-sm">
+        <Field label="Calls" value={callCount.toLocaleString()} tone={callCount > 0 ? 'info' : 'neutral'} />
+        <Field
+          label="Avg Latency"
+          value={tool.avg_latency_ms == null ? 'n/a' : `${Math.round(tool.avg_latency_ms)}ms`}
+          tone={tool.avg_latency_ms == null ? 'neutral' : 'info'}
+        />
+        <div className="col-span-2">
+          <dt className="text-xs text-dim">Health Check</dt>
+          <dd className="truncate text-sm text-muted">{formatHealthCheck(tool.health_checked_at)}</dd>
+        </div>
+      </dl>
+    </Card>
+  )
+}
+
+function Field({ label, value, tone }: { label: string; value: string; tone: Tone }) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-xs text-dim">{label}</dt>
+      <dd className={cn('truncate text-sm font-medium', textToneClass(tone))}>{value}</dd>
+    </div>
+  )
+}
+
+function ToolSkeleton() {
+  return (
+    <Card className="space-y-4 bg-panel">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1 space-y-2">
+          <div className="h-4 w-32 animate-pulse rounded bg-elevated" />
+          <div className="h-3 w-24 animate-pulse rounded bg-elevated" />
+        </div>
+        <div className="h-2.5 w-2.5 animate-pulse rounded-full bg-elevated" />
+      </div>
+      <div className="space-y-2">
+        <div className="h-3 w-full animate-pulse rounded bg-elevated" />
+        <div className="h-3 w-3/4 animate-pulse rounded bg-elevated" />
+      </div>
+      <div className="grid grid-cols-2 gap-3 border-t border-border pt-3">
+        {[1, 2].map((item) => (
+          <div key={item} className="space-y-2">
+            <div className="h-3 w-14 animate-pulse rounded bg-elevated" />
+            <div className="h-4 w-20 animate-pulse rounded bg-elevated" />
+          </div>
+        ))}
+      </div>
+    </Card>
+  )
+}
+
+function formatHealthCheck(value: string): string {
+  if (!value) return 'unreported'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString()
+}
+
+function textToneClass(tone: Tone) {
+  if (tone === 'ok') return 'text-status-ok'
+  if (tone === 'warn') return 'text-status-warn'
+  if (tone === 'crit') return 'text-status-crit'
+  if (tone === 'info') return 'text-status-info'
+  return 'text-foreground'
 }

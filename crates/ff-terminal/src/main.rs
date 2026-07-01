@@ -5661,6 +5661,17 @@ async fn run_tui(config: AgentSessionConfig) -> Result<()> {
         "Switch backend: /backend <local|claude|codex|kimi|gemini|grok>",
     ));
     command_list.push(("backends", "List backends and which CLIs are installed"));
+    // Data commands — fetch live dashboard data from the gateway
+    command_list.push(("fleet", "Show fleet status and computers: /fleet"));
+    command_list.push(("models", "Show LLM servers: /models"));
+    command_list.push(("tools", "Show tool registry: /tools"));
+    command_list.push(("alerts", "Show alert events: /alerts"));
+    command_list.push(("interactions", "Show recent interactions: /interactions [limit]"));
+    command_list.push(("settings", "Show runtime settings: /settings"));
+    command_list.push(("config", "Show fleet.toml: /config"));
+    command_list.push(("skills", "List skills: /skills"));
+    command_list.push(("brain", "List brain threads: /brain"));
+    command_list.push(("status", "Show gateway status: /status"));
     command_list.sort();
 
     // Async fleet health check on startup
@@ -6081,6 +6092,14 @@ async fn run_event_loop(
                             tab.input.cursor = 0;
                             tab.input.suggestions.clear();
                             tab.input.suggestion_index = None;
+                            continue;
+                        }
+
+                        // Data slash commands — live dashboard data from the gateway
+                        if let Some(output) = ff_terminal::data_cmd::run(app, &trimmed).await {
+                            app.tab_mut().messages.push(ff_terminal::messages::render_user_message(&trimmed));
+                            app.tab_mut().messages.push(ff_terminal::messages::render_assistant_message(&output));
+                            app.tab_mut().input.submit();
                             continue;
                         }
 

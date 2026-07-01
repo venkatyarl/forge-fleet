@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Badge } from '../components/ui/badge'
+import { Button } from '../components/ui/button'
+import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { StatusBadge } from '../components/ui/status-badge'
 import { detectClient } from '../lib/browserDetect'
 import type { DetectedClient, MachineKind } from '../lib/browserDetect'
+import { cn } from '../lib/utils'
 import { Checklist } from './onboard/Checklist'
 import { DetailPanel } from './onboard/DetailPanel'
 import { OnboardChat } from './onboard/OnboardChat'
@@ -16,6 +21,10 @@ const MACHINE_KINDS: { value: MachineKind; label: string }[] = [
   { value: 'windows', label: 'Windows (llama.cpp)' },
   { value: 'windows-gpu', label: 'Windows + NVIDIA GPU (vllm)' },
 ]
+
+const fieldClass =
+  'min-h-9 w-full rounded-lg border border-border bg-elevated px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-dim focus:border-primary disabled:cursor-not-allowed disabled:opacity-60'
+const labelClass = 'text-xs font-medium uppercase tracking-wide text-dim'
 
 function runtimeFor(kind: MachineKind): string {
   switch (kind) {
@@ -168,103 +177,128 @@ export function OperatorOnboarding() {
   }, [name])
 
   return (
-    <div className="h-full flex flex-col bg-slate-950 text-slate-100">
-      {/* Detection card + form + copy-paste command */}
-      <div className="p-4 border-b border-slate-800 space-y-3">
-        <div className="flex items-start gap-6 flex-wrap">
-          <div className="flex-1 min-w-[320px]">
-            <div className="text-[11px] uppercase tracking-wider text-slate-500 mb-1">
-              Detected this computer
-            </div>
-            {detected ? (
-              <div className="text-sm text-slate-200 font-mono space-y-0.5">
-                <div>OS family: {detected.os_family}</div>
-                <div>Cores: {detected.cores}</div>
-                <div>RAM hint: {detected.ram_gb_hint || '?'} GB</div>
-                <div>LAN IP: {detected.lan_ip || '(WebRTC blocked)'}</div>
-                <div>
-                  GPU hint: <span className="text-slate-400">{detected.webgl_renderer || '—'}</span>
-                </div>
-                <div>Timezone: {detected.timezone}</div>
+    <section className="flex h-full min-h-0 flex-col bg-background text-foreground">
+      <div className="border-b border-border bg-surface p-4">
+        <div className="grid gap-4 xl:grid-cols-[minmax(280px,0.9fr)_minmax(420px,1.15fr)]">
+          <Card className="bg-panel">
+            <CardHeader className="items-start gap-3">
+              <div>
+                <CardTitle>Detected Computer</CardTitle>
+                <CardDescription>Browser-reported hints for this workstation.</CardDescription>
               </div>
+              <StatusBadge status={detected ? 'ready' : 'pending'}>
+                {detected ? 'ready' : 'detecting'}
+              </StatusBadge>
+            </CardHeader>
+            {detected ? (
+              <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
+                <dt className="text-dim">OS family</dt>
+                <dd className="font-mono text-foreground">{detected.os_family}</dd>
+                <dt className="text-dim">Cores</dt>
+                <dd className="font-mono text-foreground">{detected.cores}</dd>
+                <dt className="text-dim">RAM hint</dt>
+                <dd className="font-mono text-foreground">{detected.ram_gb_hint || '?'} GB</dd>
+                <dt className="text-dim">LAN IP</dt>
+                <dd className="font-mono text-foreground">{detected.lan_ip || '(WebRTC blocked)'}</dd>
+                <dt className="text-dim">GPU hint</dt>
+                <dd className="min-w-0 truncate font-mono text-muted">
+                  {detected.webgl_renderer || '-'}
+                </dd>
+                <dt className="text-dim">Timezone</dt>
+                <dd className="font-mono text-foreground">{detected.timezone}</dd>
+              </dl>
             ) : (
-              <div className="text-sm text-slate-500">Detecting…</div>
+              <div className="text-sm text-muted">Detecting...</div>
             )}
-          </div>
-          <div className="flex-1 min-w-[320px] grid grid-cols-2 gap-2 text-sm">
-            <label className="text-slate-400 self-center">Name</label>
-            <input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              className="bg-slate-900 border border-slate-700 rounded px-2 py-1"
-            />
-            <label className="text-slate-400 self-center">IP</label>
-            <input
-              value={ip}
-              onChange={(e) => setIp(e.target.value)}
-              placeholder="auto"
-              className="bg-slate-900 border border-slate-700 rounded px-2 py-1"
-            />
-            <label className="text-slate-400 self-center">SSH user</label>
-            <input
-              value={sshUser}
-              onChange={(e) => setSshUser(e.target.value)}
-              className="bg-slate-900 border border-slate-700 rounded px-2 py-1"
-            />
-            <label className="text-slate-400 self-center">Role</label>
-            <select
-              value={role}
-              onChange={(e) => setRole(e.target.value as typeof role)}
-              className="bg-slate-900 border border-slate-700 rounded px-2 py-1"
-            >
-              <option value="builder">builder</option>
-              <option value="gateway">gateway</option>
-              <option value="testbed">testbed</option>
-            </select>
-            <label className="text-slate-400 self-center">Machine kind</label>
-            <select
-              value={machineKind}
-              onChange={(e) => setMachineKind(e.target.value as MachineKind)}
-              className="bg-slate-900 border border-slate-700 rounded px-2 py-1"
-            >
-              {MACHINE_KINDS.map((k) => (
-                <option key={k.value} value={k.value}>
-                  {k.label}
-                </option>
-              ))}
-            </select>
-          </div>
-        </div>
-        <div className="bg-slate-900 border border-indigo-500/30 rounded p-3">
-          <div className="flex items-center justify-between mb-1">
-            <div className="text-[11px] uppercase tracking-wider text-indigo-300">
-              Copy-paste on the new computer
+          </Card>
+
+          <Card className="bg-panel">
+            <CardHeader className="items-start gap-3">
+              <div>
+                <CardTitle>Node Profile</CardTitle>
+                <CardDescription>Values used to generate the bootstrap command.</CardDescription>
+              </div>
+              <Badge variant="default">{runtime}</Badge>
+            </CardHeader>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="space-y-1.5">
+                <span className={labelClass}>Name</span>
+                <input value={name} onChange={(e) => setName(e.target.value)} className={fieldClass} />
+              </label>
+              <label className="space-y-1.5">
+                <span className={labelClass}>IP</span>
+                <input
+                  value={ip}
+                  onChange={(e) => setIp(e.target.value)}
+                  placeholder="auto"
+                  className={fieldClass}
+                />
+              </label>
+              <label className="space-y-1.5">
+                <span className={labelClass}>SSH user</span>
+                <input
+                  value={sshUser}
+                  onChange={(e) => setSshUser(e.target.value)}
+                  className={fieldClass}
+                />
+              </label>
+              <label className="space-y-1.5">
+                <span className={labelClass}>Role</span>
+                <select
+                  value={role}
+                  onChange={(e) => setRole(e.target.value as typeof role)}
+                  className={fieldClass}
+                >
+                  <option value="builder">builder</option>
+                  <option value="gateway">gateway</option>
+                  <option value="testbed">testbed</option>
+                </select>
+              </label>
+              <label className="space-y-1.5 sm:col-span-2">
+                <span className={labelClass}>Machine kind</span>
+                <select
+                  value={machineKind}
+                  onChange={(e) => setMachineKind(e.target.value as MachineKind)}
+                  className={fieldClass}
+                >
+                  {MACHINE_KINDS.map((k) => (
+                    <option key={k.value} value={k.value}>
+                      {k.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
             </div>
-            <button
-              onClick={copy}
-              className="text-xs px-2 py-1 rounded border border-indigo-400 text-indigo-200 hover:bg-indigo-500/20"
-            >
+          </Card>
+        </div>
+
+        <Card className="mt-4 bg-panel">
+          <CardHeader className="items-start gap-3">
+            <div>
+              <CardTitle>Bootstrap Command</CardTitle>
+              <CardDescription>Copy-paste on the new computer.</CardDescription>
+            </div>
+            <Button onClick={copy} size="sm">
               Copy
-            </button>
-          </div>
-          <pre className="text-[12px] font-mono text-emerald-200 whitespace-pre-wrap break-all">
+            </Button>
+          </CardHeader>
+          <pre className="whitespace-pre-wrap break-all rounded-lg border border-border bg-background px-3 py-2 font-mono text-xs leading-5 text-status-ok">
             {curlCommand}
           </pre>
           {token === '' && (
-            <div className="mt-2 text-[11px] text-amber-400">
+            <div className="mt-3 rounded-lg border border-border-subtle bg-primary-subtle px-3 py-2 text-xs text-status-warn">
               Warning: enrollment token not yet set. Run{' '}
-              <code className="bg-slate-800 px-1 rounded">
+              <code className="rounded bg-elevated px-1 py-0.5 font-mono text-foreground">
                 ff secrets set enrollment.shared_secret &lt;token&gt;
               </code>{' '}
               on Taylor before running the command above.
             </div>
           )}
-        </div>
+        </Card>
       </div>
 
-      {/* 3-column body */}
-      <div className="flex-1 grid grid-cols-12 min-h-0">
-        <div className="col-span-4 border-r border-slate-800 overflow-hidden">
+      <div className="grid min-h-0 flex-1 grid-cols-1 bg-background lg:grid-cols-12">
+        <div className="min-h-0 overflow-hidden border-b border-border bg-surface lg:col-span-4 lg:border-b-0 lg:border-r">
           <Checklist
             machineKind={machineKind}
             osFamily={osFamily}
@@ -274,50 +308,51 @@ export function OperatorOnboarding() {
             onSelect={setActiveId}
           />
         </div>
-        <div className="col-span-5 border-r border-slate-800 overflow-hidden">
+        <div className="min-h-0 overflow-hidden border-b border-border bg-background lg:col-span-5 lg:border-b-0 lg:border-r">
           <DetailPanel activeId={activeId} />
         </div>
-        <div className="col-span-3 overflow-hidden">
+        <div className="min-h-0 overflow-hidden bg-surface lg:col-span-3">
           <OnboardChat nodeName={name} osFamily={osFamily} machineKind={machineKind} />
         </div>
       </div>
 
-      {/* Progress + verify */}
-      <div className="border-t border-slate-800 p-3 space-y-2">
+      <div className="space-y-3 border-t border-border bg-surface p-4">
         <div className="flex items-center justify-between">
-          <div className="text-[11px] uppercase tracking-wider text-slate-500">
-            Enrollment progress
+          <div>
+            <div className="text-xs font-medium uppercase tracking-wide text-dim">
+              Enrollment progress
+            </div>
+            <div className="text-xs text-muted">{progress.length} recorded events</div>
           </div>
-          <button
-            onClick={runFullVerify}
-            className="text-xs px-2 py-1 rounded border border-emerald-400 text-emerald-200 hover:bg-emerald-500/20"
-          >
+          <Button onClick={runFullVerify} variant="outline" size="sm" className="text-status-ok">
             Run full verify
-          </button>
+          </Button>
         </div>
         {progress.length === 0 ? (
-          <div className="text-sm text-slate-500">
-            Waiting for enrollment-progress events… run the copy-paste command on the new machine.
+          <div className="rounded-lg border border-border bg-panel px-3 py-2 text-sm text-muted">
+            Waiting for enrollment-progress events... run the copy-paste command on the new machine.
           </div>
         ) : (
-          <div className="space-y-0.5 font-mono text-xs max-h-40 overflow-auto">
+          <div className="max-h-40 space-y-1 overflow-auto rounded-lg border border-border bg-panel p-2 font-mono text-xs">
             {progress.slice(-20).map((ev, i) => {
               const color =
                 ev.status === 'ok'
-                  ? 'text-emerald-300'
+                  ? 'text-status-ok'
                   : ev.status === 'failed'
-                    ? 'text-rose-300'
-                    : 'text-amber-300'
+                    ? 'text-status-crit'
+                    : ev.status === 'running'
+                      ? 'text-status-warn'
+                      : 'text-status-info'
               return (
-                <div key={i} className={color}>
+                <div key={i} className={cn('rounded px-2 py-1', color)}>
                   [{ev.at.split('T')[1]?.slice(0, 8) || '--'}] {ev.status.padEnd(8)} {ev.step}
-                  {ev.detail ? ` — ${ev.detail}` : ''}
+                  {ev.detail ? ` - ${ev.detail}` : ''}
                 </div>
               )
             })}
           </div>
         )}
       </div>
-    </div>
+    </section>
   )
 }

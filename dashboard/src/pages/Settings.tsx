@@ -1,4 +1,8 @@
 import { type ReactNode, useCallback, useEffect, useState } from 'react'
+import { Badge } from '../components/ui/badge'
+import { Button } from '../components/ui/button'
+import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { StatusBadge } from '../components/ui/status-badge'
 import { getJson } from '../lib/api'
 import { extractNodes } from '../lib/normalizers'
 import { FleetMemberModal } from '../components/FleetMemberModal'
@@ -6,6 +10,7 @@ import { ModelHub } from './ModelHub'
 import { ToolInventory } from './ToolInventory'
 import { AuditLog } from './AuditLog'
 import { Updates } from './Updates'
+import { cn } from '../lib/utils'
 import type { FleetComputer, FleetStatusResponse } from '../types'
 
 // ---------------------------------------------------------------------------
@@ -69,13 +74,13 @@ type SettingsTab = 'general' | 'fleet' | 'memory' | 'models' | 'tools' | 'llm-pr
 
 const TABS: { id: SettingsTab; label: string; icon: string }[] = [
   { id: 'general', label: 'General', icon: '⚙️' },
-  { id: 'fleet', label: 'Fleet Members', icon: '🖥️' },
-  { id: 'memory', label: 'Memory', icon: '🧠' },
+  { id: 'updates', label: 'Updates', icon: '🔄' },
+  { id: 'fleet', label: 'Health', icon: '🖥️' },
+  { id: 'memory', label: 'Brain', icon: '🧠' },
+  { id: 'audit', label: 'Logs', icon: '📜' },
   { id: 'models', label: 'Models', icon: '🤖' },
   { id: 'tools', label: 'Tools', icon: '🔧' },
   { id: 'llm-proxy', label: 'LLM Proxy', icon: '🔀' },
-  { id: 'audit', label: 'Audit Log', icon: '📜' },
-  { id: 'updates', label: 'Updates', icon: '🆙' },
 ]
 
 // ---------------------------------------------------------------------------
@@ -94,24 +99,34 @@ export function Settings() {
   }, [activeTab])
 
   return (
-    <section className="space-y-6">
-      <h1 className="text-2xl font-bold text-zinc-100">Settings</h1>
+    <section className="min-h-full space-y-5 bg-background text-foreground">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold text-foreground">Settings</h1>
+          <p className="mt-1 text-sm text-muted">
+            Runtime configuration, fleet health, memory layers, updates, and operational logs.
+          </p>
+        </div>
+        <Badge variant="default">ForgeFleet</Badge>
+      </div>
 
       {/* Tab navigation */}
-      <div className="flex flex-wrap gap-1 rounded-lg border border-zinc-800 bg-zinc-900/50 p-1">
+      <div className="flex flex-wrap gap-1 rounded-xl border border-border bg-panel p-1">
         {TABS.map(tab => (
-          <button
+          <Button
             key={tab.id}
+            type="button"
+            variant="ghost"
+            size="sm"
             onClick={() => setActiveTab(tab.id)}
-            className={`flex items-center gap-1.5 rounded-md px-3 py-2 text-sm transition ${
-              activeTab === tab.id
-                ? 'bg-violet-500/20 text-violet-300 font-medium'
-                : 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'
-            }`}
+            className={cn(
+              'h-8 rounded-lg px-3 text-muted hover:bg-elevated hover:text-foreground',
+              activeTab === tab.id && 'bg-primary-subtle text-primary hover:bg-primary-subtle hover:text-primary'
+            )}
           >
             <span className="text-xs">{tab.icon}</span>
             <span>{tab.label}</span>
-          </button>
+          </Button>
         ))}
       </div>
 
@@ -156,7 +171,11 @@ function GeneralTab() {
 
   return (
     <div className="grid gap-4 lg:grid-cols-2">
-      <Card title="Runtime Config" status={<Pill ok={Boolean(runtime?.loaded)} okLabel="loaded" badLabel="not loaded" />}>
+      <SettingsCard
+        title="Runtime Config"
+        description="Loaded runtime values from /api/settings/runtime."
+        status={<StatusBadge status={runtime?.loaded ? 'ready' : 'warning'}>{runtime?.loaded ? 'loaded' : 'not loaded'}</StatusBadge>}
+      >
         <Row label="Config path" value={runtime?.config_path} />
         <Row label="Fleet name" value={runtime?.fleet_name} />
         <Row label="API port" value={runtime?.api_port} />
@@ -166,34 +185,46 @@ function GeneralTab() {
         {runtime?.loops && Object.keys(runtime.loops).length > 0 && (
           <div className="mt-3 grid grid-cols-2 gap-1.5">
             {Object.entries(runtime.loops).map(([name, enabled]) => (
-              <div key={name} className="flex items-center justify-between rounded border border-zinc-800 px-2 py-1 text-xs">
-                <span className="text-zinc-400">{name}</span>
-                <Pill ok={Boolean(enabled)} okLabel="on" badLabel="off" />
+              <div key={name} className="flex items-center justify-between rounded-lg border border-border bg-surface px-2 py-1 text-xs">
+                <span className="text-muted">{name}</span>
+                <Badge variant={enabled ? 'ok' : 'neutral'}>{enabled ? 'on' : 'off'}</Badge>
               </div>
             ))}
           </div>
         )}
-      </Card>
+      </SettingsCard>
 
-      <Card title="Enrollment" status={<Pill ok={Boolean(enrollment?.token?.resolved)} okLabel="healthy" badLabel="needs setup" />}>
+      <SettingsCard
+        title="Enrollment"
+        description="Default member role and enrollment token resolution."
+        status={<StatusBadge status={enrollment?.token?.resolved ? 'healthy' : 'warning'}>{enrollment?.token?.resolved ? 'healthy' : 'needs setup'}</StatusBadge>}
+      >
         <Row label="Default role" value={enrollment?.default_role ?? 'worker'} />
         <Row label="Token source" value={enrollment?.token?.source} />
         <Row label="Token resolved" value={enrollment?.token?.resolved ? 'yes' : 'no'} />
-      </Card>
+      </SettingsCard>
 
-      <Card title="Telegram Transport" status={<Pill ok={Boolean(telegram?.enabled && telegram?.runtime?.running)} okLabel="running" badLabel="inactive" />}>
+      <SettingsCard
+        title="Telegram Transport"
+        description="Transport token and runtime process status."
+        status={<StatusBadge status={telegram?.enabled && telegram?.runtime?.running ? 'running' : 'standby'}>{telegram?.enabled && telegram?.runtime?.running ? 'running' : 'inactive'}</StatusBadge>}
+      >
         <Row label="Enabled" value={telegram?.enabled ? 'yes' : 'no'} />
         <Row label="Token resolved" value={telegram?.token?.resolved ? 'yes' : 'no'} />
         <Row label="Runtime running" value={telegram?.runtime?.running ? 'yes' : 'no'} />
         {telegram?.runtime?.last_error && <Row label="Last error" value={telegram.runtime.last_error} />}
-      </Card>
+      </SettingsCard>
 
-      <Card title="Database" status={<Pill ok={database?.status === 'ready'} okLabel="ready" badLabel={database?.status ?? 'unknown'} />}>
+      <SettingsCard
+        title="Database"
+        description="Active persistence backend reported by the gateway."
+        status={<StatusBadge status={database?.status === 'ready' ? 'ready' : database?.status ?? 'unknown'}>{database?.status === 'ready' ? 'ready' : database?.status ?? 'unknown'}</StatusBadge>}
+      >
         <Row label="Active mode" value={database?.active_mode} />
         <Row label="Status" value={database?.status} />
         {database?.sqlite && <Row label="SQLite path" value={database.sqlite.path} />}
         {database?.error && <Row label="Error" value={database.error} />}
-      </Card>
+      </SettingsCard>
     </div>
   )
 }
@@ -258,10 +289,10 @@ function FleetMembersTab() {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <p className="text-sm text-zinc-500">{members.length} fleet member{members.length !== 1 ? 's' : ''}</p>
-        <a href="/onboarding" className="rounded-md border border-violet-500/40 bg-violet-500/15 px-3 py-1.5 text-sm text-violet-300 hover:bg-violet-500/25 transition">
+        <p className="text-sm text-muted">{members.length} fleet member{members.length !== 1 ? 's' : ''}</p>
+        <Button type="button" variant="outline" onClick={() => { window.location.href = '/onboarding' }}>
           + Add New Member
-        </a>
+        </Button>
       </div>
 
       <div className="space-y-3">
@@ -271,10 +302,10 @@ function FleetMembersTab() {
       </div>
 
       {members.length === 0 && (
-        <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-8 text-center">
-          <p className="text-lg text-zinc-400">No fleet members connected</p>
-          <p className="mt-1 text-sm text-zinc-500">Add your first fleet member to get started</p>
-        </div>
+        <Card className="bg-panel p-8 text-center">
+          <CardTitle className="text-base">No fleet members connected</CardTitle>
+          <CardDescription className="mt-1">Add your first fleet member to get started.</CardDescription>
+        </Card>
       )}
 
       <FleetMemberModal member={selectedMember} onClose={() => setSelectedMember(null)} />
@@ -290,20 +321,22 @@ function FleetMemberRow({ member, onClick }: { member: FleetComputer; onClick: (
   return (
     <button
       onClick={onClick}
-      className="w-full text-left rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 transition hover:border-zinc-700 hover:bg-zinc-900"
+      className="w-full rounded-xl border border-border bg-panel p-4 text-left transition hover:border-border-subtle hover:bg-elevated"
     >
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <span className={`h-2.5 w-2.5 rounded-full flex-shrink-0 ${
-            status === 'online' ? 'bg-emerald-400' : status === 'degraded' ? 'bg-amber-400' : 'bg-zinc-600'
-          }`} />
+          <span className={cn(
+            'h-2.5 w-2.5 flex-shrink-0 rounded-full',
+            status === 'online' ? 'bg-status-ok' : status === 'degraded' ? 'bg-status-warn' : 'bg-border-subtle'
+          )} />
           <div>
-            <span className="font-medium text-zinc-200 capitalize">{member.name}</span>
-            <span className="ml-2 text-sm text-zinc-500">{member.ip ?? 'unknown IP'}</span>
-            {isLeader && <span className="ml-2 rounded-full bg-violet-500/20 px-2 py-0.5 text-[10px] text-violet-300">leader</span>}
+            <span className="font-medium capitalize text-foreground">{member.name}</span>
+            <span className="ml-2 text-sm text-dim">{member.ip ?? 'unknown IP'}</span>
+            {isLeader && <Badge className="ml-2" variant="default">leader</Badge>}
           </div>
         </div>
-        <div className="flex items-center gap-3 text-sm text-zinc-500">
+        <div className="flex items-center gap-3 text-sm text-muted">
+          <StatusBadge status={status}>{status}</StatusBadge>
           <span>{member.cpu ?? member.hardware?.cpu ?? '—'}</span>
           <span>{member.ram ?? member.hardware?.ram ?? '—'}</span>
         </div>
@@ -313,14 +346,12 @@ function FleetMemberRow({ member, onClick }: { member: FleetComputer; onClick: (
       {models.length > 0 && (
         <div className="mt-3 flex flex-wrap gap-2">
           {models.map(name => (
-            <span key={name} className="rounded-md border border-zinc-700 bg-zinc-800/80 px-2 py-1 text-xs text-zinc-300">
-              🤖 {name}
-            </span>
+            <Badge key={name} variant="neutral">🤖 {name}</Badge>
           ))}
         </div>
       )}
       {models.length === 0 && (
-        <p className="mt-2 text-xs text-zinc-600">No models reported</p>
+        <p className="mt-2 text-xs text-dim">No models reported</p>
       )}
     </button>
   )
@@ -357,39 +388,51 @@ function MemoryTab() {
 
   return (
     <div className="space-y-6">
-      <p className="text-sm text-zinc-500">
+      <p className="text-sm text-muted">
         ForgeFleet uses three memory layers: Project Memory (per-project), Fleet Brain (personal), and Hive Mind (shared across fleet).
       </p>
 
       <div className="grid gap-4 lg:grid-cols-3">
         {/* Project Memory */}
-        <Card title="Project Memory" status={<Pill ok={(p?.entries ?? 0) > 0} okLabel={`${p?.entries ?? 0} entries`} badLabel="empty" />}>
+        <SettingsCard
+          title="Project Memory"
+          description="Repository-scoped context that travels with code."
+          status={<StatusBadge status={(p?.entries ?? 0) > 0 ? 'active' : 'standby'}>{(p?.entries ?? 0) > 0 ? `${p?.entries ?? 0} entries` : 'empty'}</StatusBadge>}
+        >
           <Row label="Project" value={p?.name ?? 'none detected'} />
           <Row label="Root" value={p?.root ?? 'not in a project'} />
           <Row label="FORGEFLEET.md" value={p?.has_forgefleet_md ? 'yes' : 'no'} />
           <Row label="context.md" value={p?.has_context_md ? 'yes' : 'no'} />
-          <div className="mt-3 text-xs text-zinc-500">
-            Lives at <code className="text-violet-300">{'{'}project{'}'}.forgefleet/</code> — committed to git, travels with code.
+          <div className="mt-3 text-xs text-muted">
+            Lives at <code className="rounded bg-primary-subtle px-1 text-primary">{'{'}project{'}'}.forgefleet/</code> — committed to git, travels with code.
           </div>
-        </Card>
+        </SettingsCard>
 
         {/* Fleet Brain */}
-        <Card title="Fleet Brain" status={<Pill ok={(b?.entries ?? 0) > 0} okLabel={`${b?.entries ?? 0} entries`} badLabel="empty" />}>
+        <SettingsCard
+          title="Fleet Brain"
+          description="Personal operator memory local to this fleet."
+          status={<StatusBadge status={(b?.entries ?? 0) > 0 ? 'active' : 'standby'}>{(b?.entries ?? 0) > 0 ? `${b?.entries ?? 0} entries` : 'empty'}</StatusBadge>}
+        >
           <Row label="BRAIN.md" value={b?.has_brain_md ? 'yes' : 'no'} />
           <Row label="Entries" value={b?.entries ?? 0} />
-          <div className="mt-3 text-xs text-zinc-500">
-            Personal preferences at <code className="text-violet-300">~/.forgefleet/brain/</code> — never synced to other fleet members.
+          <div className="mt-3 text-xs text-muted">
+            Personal preferences at <code className="rounded bg-primary-subtle px-1 text-primary">~/.forgefleet/brain/</code> — never synced to other fleet members.
           </div>
-        </Card>
+        </SettingsCard>
 
         {/* Hive Mind */}
-        <Card title="Hive Mind" status={<Pill ok={(h?.entries ?? 0) > 0} okLabel={`${h?.entries ?? 0} entries`} badLabel="empty" />}>
+        <SettingsCard
+          title="Hive Mind"
+          description="Shared standards synchronized across the fleet."
+          status={<StatusBadge status={(h?.entries ?? 0) > 0 ? 'active' : 'standby'}>{(h?.entries ?? 0) > 0 ? `${h?.entries ?? 0} entries` : 'empty'}</StatusBadge>}
+        >
           <Row label="HIVE.md" value={h?.has_hive_md ? 'yes' : 'no'} />
           <Row label="Entries" value={h?.entries ?? 0} />
-          <div className="mt-3 text-xs text-zinc-500">
-            Shared standards at <code className="text-violet-300">~/.forgefleet/hive/</code> — synced across all fleet members via git.
+          <div className="mt-3 text-xs text-muted">
+            Shared standards at <code className="rounded bg-primary-subtle px-1 text-primary">~/.forgefleet/hive/</code> — synced across all fleet members via git.
           </div>
-        </Card>
+        </SettingsCard>
       </div>
     </div>
   )
@@ -417,13 +460,13 @@ function UpdatesTab() {
 
 function EmbedMessage({ title, description, linkTo, linkLabel }: { title: string; description: string; linkTo: string; linkLabel: string }) {
   return (
-    <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-8 text-center">
-      <h3 className="text-lg font-medium text-zinc-200">{title}</h3>
-      <p className="mt-1 text-sm text-zinc-500">{description}</p>
-      <a href={linkTo} className="mt-4 inline-block rounded-md bg-violet-500/20 px-4 py-2 text-sm text-violet-300 hover:bg-violet-500/30 transition">
+    <Card className="bg-panel p-8 text-center">
+      <CardTitle className="text-lg">{title}</CardTitle>
+      <CardDescription className="mt-1">{description}</CardDescription>
+      <Button type="button" className="mt-4" onClick={() => { window.location.href = linkTo }}>
         {linkLabel}
-      </a>
-    </div>
+      </Button>
+    </Card>
   )
 }
 
@@ -431,35 +474,28 @@ function EmbedMessage({ title, description, linkTo, linkLabel }: { title: string
 // Shared components
 // ---------------------------------------------------------------------------
 
-function Card({ title, status, children }: { title: string; status?: ReactNode; children: ReactNode }) {
+function SettingsCard({ title, description, status, children }: { title: string; description?: string; status?: ReactNode; children: ReactNode }) {
   return (
-    <article className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-400">{title}</h2>
+    <Card className="bg-panel">
+      <CardHeader>
+        <div>
+          <CardTitle>{title}</CardTitle>
+          {description ? <CardDescription>{description}</CardDescription> : null}
+        </div>
         {status}
-      </div>
+      </CardHeader>
       <div className="space-y-2">{children}</div>
-    </article>
+    </Card>
   )
 }
 
 function Row({ label, value }: { label: string; value: unknown }) {
   const display = value == null || value === '' ? 'unreported' : String(value)
   return (
-    <div className="flex items-start justify-between gap-3 border-b border-zinc-800/60 pb-2 text-sm last:border-b-0 last:pb-0">
-      <dt className="text-zinc-500">{label}</dt>
-      <dd className="text-right text-zinc-200">{display}</dd>
+    <div className="flex items-start justify-between gap-3 border-b border-border pb-2 text-sm last:border-b-0 last:pb-0">
+      <dt className="text-muted">{label}</dt>
+      <dd className="max-w-[65%] text-right text-foreground">{display}</dd>
     </div>
-  )
-}
-
-function Pill({ ok, okLabel, badLabel }: { ok: boolean; okLabel: string; badLabel: string }) {
-  return (
-    <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${
-      ok ? 'bg-emerald-500/20 text-emerald-300' : 'bg-amber-500/20 text-amber-300'
-    }`}>
-      {ok ? okLabel : badLabel}
-    </span>
   )
 }
 
@@ -467,7 +503,7 @@ function LoadingPlaceholder() {
   return (
     <div className="grid gap-4 lg:grid-cols-2">
       {[1,2,3,4].map(i => (
-        <div key={i} className="h-40 animate-pulse rounded-xl border border-zinc-800 bg-zinc-900/30" />
+        <Card key={i} className="h-40 animate-pulse border-border bg-panel" />
       ))}
     </div>
   )

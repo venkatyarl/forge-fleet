@@ -1,20 +1,28 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
+import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { Badge } from '../components/ui/badge'
+import { StatusBadge } from '../components/ui/status-badge'
+import { Button } from '../components/ui/button'
+import { useWorkItems } from '../features/hooks/useDashboardQueries'
 import { getJson, patchJson, postJson } from '../lib/api'
+import { cn, formatElapsed } from '../lib/utils'
 
 type WorkItemStatus = 'backlog' | 'todo' | 'in_progress' | 'review' | 'done' | 'blocked'
 
 type McWorkItem = {
   id: string
   title: string
-  description: string
+  description?: string
   status: WorkItemStatus
-  priority: number | { value?: number }
-  assignee: string
-  labels: string[]
-  updated_at: string
+  priority?: number | { value?: number }
+  assignee?: string
+  labels?: string[]
+  updated_at?: string
+  updatedAt?: string
 }
 
 type ActionKind = 'claim' | 'start' | 'review' | 'complete' | 'fail' | 'escalate'
+type StatTone = 'ok' | 'warn' | 'crit' | 'info'
 
 const STATUS_ORDER: WorkItemStatus[] = ['backlog', 'todo', 'in_progress', 'review', 'blocked', 'done']
 
@@ -26,6 +34,9 @@ const STATUS_LABEL: Record<WorkItemStatus, string> = {
   blocked: 'Blocked',
   done: 'Done',
 }
+
+const fieldClass =
+  'rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-dim focus:border-primary'
 
 function priorityValue(priority: McWorkItem['priority']): number {
   if (typeof priority === 'number') return priority
@@ -52,44 +63,71 @@ function priorityLabel(priority: number): string {
   }
 }
 
-function statusBadge(status: WorkItemStatus): string {
-  switch (status) {
-    case 'done':
-      return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-    case 'blocked':
-      return 'bg-rose-500/15 text-rose-300 border-rose-500/30'
+function itemStatus(item: McWorkItem): WorkItemStatus {
+  return STATUS_ORDER.includes(item.status) ? item.status : 'backlog'
+}
+
+function updatedAt(item: McWorkItem): string | undefined {
+  return item.updated_at ?? item.updatedAt
+}
+
+function updatedLabel(item: McWorkItem): string {
+  const timestamp = updatedAt(item)
+  if (!timestamp) return 'unknown'
+  const parsed = new Date(timestamp).getTime()
+  if (Number.isNaN(parsed)) return 'unknown'
+  const seconds = Math.max(0, Math.floor((Date.now() - parsed) / 1000))
+  if (seconds < 5) return 'just now'
+  return `${formatElapsed(seconds)} ago`
+}
+
+function priorityVariant(priority: number): 'crit' | 'warn' | 'info' | 'neutral' {
+  if (priority <= 1) return 'crit'
+  if (priority === 2) return 'warn'
+  if (priority === 3) return 'info'
+  return 'neutral'
+}
+
+function actionClass(kind: ActionKind): string {
+  switch (kind) {
+    case 'complete':
+      return 'border-status-ok text-status-ok hover:bg-elevated'
+    case 'fail':
+      return 'border-status-crit text-status-crit hover:bg-elevated'
+    case 'escalate':
+      return 'border-status-warn text-status-warn hover:bg-elevated'
     case 'review':
-      return 'bg-purple-500/15 text-purple-300 border-purple-500/30'
-    case 'in_progress':
-      return 'bg-sky-500/15 text-sky-300 border-sky-500/30'
-    case 'todo':
-      return 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+      return 'border-primary text-primary hover:bg-primary-subtle'
+    case 'start':
+      return 'border-status-info text-status-info hover:bg-elevated'
+    case 'claim':
     default:
-      return 'bg-slate-500/15 text-slate-300 border-slate-500/30'
+      return 'border-border-subtle text-muted hover:bg-elevated hover:text-foreground'
   }
 }
 
-function actionButtonStyle(kind: ActionKind): string {
-  switch (kind) {
-    case 'complete':
-      return 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'
-    case 'fail':
-      return 'border-rose-500/40 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20'
-    case 'escalate':
-      return 'border-orange-500/40 bg-orange-500/10 text-orange-300 hover:bg-orange-500/20'
-    case 'review':
-      return 'border-purple-500/40 bg-purple-500/10 text-purple-300 hover:bg-purple-500/20'
-    case 'start':
-      return 'border-sky-500/40 bg-sky-500/10 text-sky-300 hover:bg-sky-500/20'
-    case 'claim':
-    default:
-      return 'border-slate-500/40 bg-slate-500/10 text-slate-300 hover:bg-slate-500/20'
+function statToneClass(tone: StatTone): string {
+  switch (tone) {
+    case 'ok':
+      return 'text-status-ok'
+    case 'warn':
+      return 'text-status-warn'
+    case 'crit':
+      return 'text-status-crit'
+    case 'info':
+      return 'text-status-info'
   }
 }
 
 export function MyTasks() {
-  const [items, setItems] = useState<McWorkItem[]>([])
-  const [loading, setLoading] = useState(true)
+  const {
+    data: queriedItems = [],
+    isLoading: queryLoading,
+    refetch: refetchWorkItems,
+  } = useWorkItems()
+
+  const [filteredItems, setFilteredItems] = useState<McWorkItem[] | null>(null)
+  const [filteredLoading, setFilteredLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [busyItemId, setBusyItemId] = useState<string | null>(null)
@@ -105,20 +143,33 @@ export function MyTasks() {
   const [newLabels, setNewLabels] = useState('')
   const [creating, setCreating] = useState(false)
 
+  const items = assigneeFilter
+    ? filteredItems ?? []
+    : (queriedItems as unknown as McWorkItem[])
+  const loading = assigneeFilter ? filteredLoading || filteredItems === null : queryLoading
+
   const load = useCallback(async () => {
+    const assignee = assigneeFilter.trim()
+    setError(null)
+
+    if (!assignee) {
+      setFilteredItems(null)
+      await refetchWorkItems()
+      return
+    }
+
     try {
-      setError(null)
-      const query = assigneeFilter.trim()
-        ? `?assignee=${encodeURIComponent(assigneeFilter.trim())}`
-        : ''
-      const payload = await getJson<unknown>(`/api/mc/work-items${query}`)
-      setItems(Array.isArray(payload) ? (payload as McWorkItem[]) : [])
+      setFilteredLoading(true)
+      const payload = await getJson<unknown>(
+        `/api/mc/work-items?assignee=${encodeURIComponent(assignee)}`,
+      )
+      setFilteredItems(Array.isArray(payload) ? (payload as McWorkItem[]) : [])
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load work items')
     } finally {
-      setLoading(false)
+      setFilteredLoading(false)
     }
-  }, [assigneeFilter])
+  }, [assigneeFilter, refetchWorkItems])
 
   useEffect(() => {
     void load()
@@ -137,22 +188,21 @@ export function MyTasks() {
     }
 
     for (const item of items) {
-      const status = STATUS_ORDER.includes(item.status) ? item.status : 'backlog'
-      byStatus[status].push(item)
+      byStatus[itemStatus(item)].push(item)
     }
 
     for (const status of STATUS_ORDER) {
       byStatus[status].sort((a, b) => {
         const pDiff = priorityValue(a.priority) - priorityValue(b.priority)
         if (pDiff !== 0) return pDiff
-        return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
+        return new Date(updatedAt(b) ?? 0).getTime() - new Date(updatedAt(a) ?? 0).getTime()
       })
     }
 
     return byStatus
   }, [items])
 
-  const openCount = items.filter((item) => item.status !== 'done').length
+  const openCount = items.filter((item) => itemStatus(item) !== 'done').length
   const blockedCount = grouped.blocked.length
   const inFlightCount = grouped.in_progress.length + grouped.review.length
 
@@ -229,96 +279,102 @@ export function MyTasks() {
   }
 
   return (
-    <section className="space-y-6">
+    <section className="space-y-6 bg-background text-foreground">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">My Tasks</h1>
-          <p className="mt-1 text-sm text-slate-400">
-            Personal queue parity screen for Mission Control work-item workflow.
+          <h1 className="text-2xl font-bold tracking-tight text-foreground">My Tasks</h1>
+          <p className="mt-1 text-sm text-dim">
+            Personal Mission Control queue with live work-item actions.
           </p>
         </div>
-        <button
-          onClick={() => void load()}
-          className="rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-sky-500"
-        >
-          ↻ Refresh
-        </button>
+        <Button onClick={() => void load()} disabled={loading} variant="secondary">
+          {loading ? 'Refreshing' : 'Refresh'}
+        </Button>
       </div>
 
       <div className="grid gap-3 sm:grid-cols-3">
-        <StatCard label="Open" value={openCount} color="text-sky-300" />
-        <StatCard label="In Flight" value={inFlightCount} color="text-purple-300" />
-        <StatCard label="Blocked" value={blockedCount} color="text-rose-300" />
+        <StatCard label="Open" value={openCount} tone="info" />
+        <StatCard label="In Flight" value={inFlightCount} tone="warn" />
+        <StatCard label="Blocked" value={blockedCount} tone="crit" />
       </div>
 
       {error ? (
-        <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+        <div className="rounded-xl border border-status-crit bg-panel px-4 py-3 text-sm text-status-crit">
           {error}
         </div>
       ) : null}
       {notice ? (
-        <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-200">
+        <div className="rounded-xl border border-status-ok bg-panel px-4 py-3 text-sm text-status-ok">
           {notice}
         </div>
       ) : null}
 
-      <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-4">
-        <div className="mb-3 flex flex-wrap items-end gap-2">
-          <label className="flex flex-col gap-1 text-xs text-slate-400">
+      <Card>
+        <CardHeader className="items-start gap-3">
+          <div>
+            <CardTitle>Queue Controls</CardTitle>
+            <CardDescription>Filter work ownership and create new Mission Control items.</CardDescription>
+          </div>
+          {assigneeFilter ? <Badge variant="default">assignee: {assigneeFilter}</Badge> : null}
+        </CardHeader>
+
+        <div className="mb-4 flex flex-wrap items-end gap-2">
+          <label className="flex min-w-64 flex-col gap-1 text-xs font-medium text-muted">
             Assignee filter
             <input
               value={assigneeInput}
               onChange={(event) => setAssigneeInput(event.target.value)}
               placeholder="venkat / taylor / unassigned"
-              className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"
+              className={fieldClass}
             />
           </label>
-          <button
+          <Button
             onClick={() => setAssigneeFilter(assigneeInput.trim())}
-            className="rounded-md border border-slate-700 px-3 py-2 text-sm text-slate-200 hover:bg-slate-800"
+            type="button"
+            variant="outline"
           >
             Apply filter
-          </button>
-          <button
+          </Button>
+          <Button
             onClick={() => {
               setAssigneeInput('')
               setAssigneeFilter('')
             }}
-            className="rounded-md border border-slate-700 px-3 py-2 text-sm text-slate-400 hover:bg-slate-800 hover:text-slate-200"
+            type="button"
+            variant="ghost"
           >
             Clear
-          </button>
-          {assigneeFilter ? (
-            <span className="rounded-full bg-slate-800 px-3 py-1 text-xs text-slate-300">
-              filtering: {assigneeFilter}
-            </span>
-          ) : null}
+          </Button>
         </div>
 
         <form onSubmit={createTask} className="grid gap-2 md:grid-cols-12">
           <input
+            aria-label="New task title"
             value={newTitle}
             onChange={(event) => setNewTitle(event.target.value)}
             placeholder="New task title"
-            className="md:col-span-4 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"
+            className={cn(fieldClass, 'md:col-span-4')}
             required
           />
           <input
+            aria-label="New task description"
             value={newDescription}
             onChange={(event) => setNewDescription(event.target.value)}
             placeholder="Description (optional)"
-            className="md:col-span-4 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"
+            className={cn(fieldClass, 'md:col-span-4')}
           />
           <input
+            aria-label="New task assignee"
             value={newAssignee}
             onChange={(event) => setNewAssignee(event.target.value)}
             placeholder="Assignee"
-            className="md:col-span-2 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"
+            className={cn(fieldClass, 'md:col-span-2')}
           />
           <select
+            aria-label="New task status"
             value={newStatus}
             onChange={(event) => setNewStatus(event.target.value as WorkItemStatus)}
-            className="md:col-span-1 rounded-md border border-slate-700 bg-slate-950 px-2 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"
+            className={cn(fieldClass, 'md:col-span-1')}
           >
             {STATUS_ORDER.map((status) => (
               <option key={status} value={status}>
@@ -327,9 +383,10 @@ export function MyTasks() {
             ))}
           </select>
           <select
+            aria-label="New task priority"
             value={newPriority}
             onChange={(event) => setNewPriority(Number(event.target.value))}
-            className="md:col-span-1 rounded-md border border-slate-700 bg-slate-950 px-2 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"
+            className={cn(fieldClass, 'md:col-span-1')}
           >
             <option value={1}>P1</option>
             <option value={2}>P2</option>
@@ -338,87 +395,81 @@ export function MyTasks() {
             <option value={5}>P5</option>
           </select>
           <input
+            aria-label="New task labels"
             value={newLabels}
             onChange={(event) => setNewLabels(event.target.value)}
             placeholder="labels: backend,urgent"
-            className="md:col-span-10 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"
+            className={cn(fieldClass, 'md:col-span-10')}
           />
-          <button
-            type="submit"
-            disabled={creating}
-            className="md:col-span-2 rounded-md border border-sky-500/50 bg-sky-500/15 px-3 py-2 text-sm font-medium text-sky-300 hover:bg-sky-500/25 disabled:opacity-60"
-          >
-            {creating ? 'Creating…' : 'Create Task'}
-          </button>
+          <Button type="submit" disabled={creating} className="md:col-span-2">
+            {creating ? 'Creating' : 'Create Task'}
+          </Button>
         </form>
-      </div>
+      </Card>
 
       {loading && items.length === 0 ? (
-        <div className="rounded-xl border border-slate-800 bg-slate-900/50 px-4 py-3 text-sm text-slate-300">
-          Loading work items…
-        </div>
+        <Card className="bg-surface">
+          <p className="text-sm text-muted">Loading work items...</p>
+        </Card>
       ) : null}
 
       <div className="grid gap-4 xl:grid-cols-3">
         {STATUS_ORDER.map((status) => (
-          <article key={status} className="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
-            <h2 className="mb-2 text-sm font-semibold uppercase tracking-wide text-slate-300">
-              {STATUS_LABEL[status]} ({grouped[status].length})
-            </h2>
+          <Card key={status} className="bg-panel p-3">
+            <CardHeader className="mb-3">
+              <div>
+                <CardTitle className="uppercase tracking-wide">{STATUS_LABEL[status]}</CardTitle>
+                <CardDescription>{grouped[status].length} work items</CardDescription>
+              </div>
+              <Badge variant="neutral">{grouped[status].length}</Badge>
+            </CardHeader>
+
             <div className="space-y-2">
               {grouped[status].length === 0 ? (
-                <div className="rounded-md border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-500">
+                <div className="rounded-lg border border-border bg-surface px-3 py-2 text-xs text-dim">
                   No tasks
                 </div>
               ) : (
                 grouped[status].map((item) => {
+                  const statusValue = itemStatus(item)
                   const priority = priorityValue(item.priority)
                   const busy = busyItemId === item.id
+                  const labels = item.labels ?? []
 
                   return (
-                    <div key={item.id} className="rounded-lg border border-slate-800 bg-slate-950/70 p-3">
+                    <div
+                      key={item.id}
+                      className="rounded-lg border border-border bg-surface p-3 transition hover:border-border-subtle"
+                    >
                       <div className="flex items-start justify-between gap-2">
-                        <p className="font-medium text-slate-100">{item.title}</p>
-                        <span className="rounded-md border border-slate-700 bg-slate-800 px-2 py-0.5 text-xs text-slate-300">
-                          {priorityLabel(priority)}
-                        </span>
+                        <p className="min-w-0 break-words text-sm font-medium text-foreground">
+                          {item.title}
+                        </p>
+                        <Badge variant={priorityVariant(priority)}>{priorityLabel(priority)}</Badge>
                       </div>
                       {item.description ? (
-                        <p className="mt-1 text-xs text-slate-400">{item.description}</p>
+                        <p className="mt-1 break-words text-xs text-muted">{item.description}</p>
                       ) : null}
 
-                      <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-slate-400">
-                        <span className={`rounded-md border px-2 py-0.5 ${statusBadge(item.status)}`}>
-                          {STATUS_LABEL[item.status]}
-                        </span>
+                      <div className="mt-3 flex flex-wrap items-center gap-1.5 text-xs text-dim">
+                        <StatusBadge status={statusValue}>{STATUS_LABEL[statusValue]}</StatusBadge>
                         <span>assignee: {item.assignee || 'unassigned'}</span>
-                        <span>
-                          updated:{' '}
-                          {new Date(item.updated_at).toLocaleString(undefined, {
-                            month: 'short',
-                            day: 'numeric',
-                            hour: '2-digit',
-                            minute: '2-digit',
-                          })}
-                        </span>
+                        <span>updated: {updatedLabel(item)}</span>
                       </div>
 
-                      {item.labels.length > 0 ? (
+                      {labels.length > 0 ? (
                         <div className="mt-2 flex flex-wrap gap-1">
-                          {item.labels.map((label) => (
-                            <span
-                              key={`${item.id}-${label}`}
-                              className="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-[11px] text-slate-300"
-                            >
+                          {labels.map((label) => (
+                            <Badge key={`${item.id}-${label}`} variant="neutral">
                               {label}
-                            </span>
+                            </Badge>
                           ))}
                         </div>
                       ) : null}
 
-                      {item.status !== 'done' ? (
-                        <div className="mt-2 flex flex-wrap gap-1.5">
-                          {item.status === 'backlog' || item.status === 'todo' ? (
+                      {statusValue !== 'done' ? (
+                        <div className="mt-3 flex flex-wrap gap-1.5">
+                          {statusValue === 'backlog' || statusValue === 'todo' ? (
                             <ActionButton
                               label="Claim"
                               kind="claim"
@@ -427,7 +478,7 @@ export function MyTasks() {
                             />
                           ) : null}
 
-                          {item.status !== 'in_progress' ? (
+                          {statusValue !== 'in_progress' ? (
                             <ActionButton
                               label="Start"
                               kind="start"
@@ -436,7 +487,7 @@ export function MyTasks() {
                             />
                           ) : null}
 
-                          {item.status === 'in_progress' || item.status === 'review' ? (
+                          {statusValue === 'in_progress' || statusValue === 'review' ? (
                             <ActionButton
                               label="Review"
                               kind="review"
@@ -470,7 +521,7 @@ export function MyTasks() {
                 })
               )}
             </div>
-          </article>
+          </Card>
         ))}
       </div>
     </section>
@@ -489,22 +540,26 @@ function ActionButton({
   onClick: () => void
 }) {
   return (
-    <button
+    <Button
       onClick={onClick}
       disabled={disabled}
-      className={`rounded-md border px-2 py-1 text-xs transition disabled:cursor-not-allowed disabled:opacity-60 ${actionButtonStyle(kind)}`}
+      className={cn('bg-transparent', actionClass(kind))}
       type="button"
+      size="sm"
+      variant="outline"
     >
       {label}
-    </button>
+    </Button>
   )
 }
 
-function StatCard({ label, value, color }: { label: string; value: number; color: string }) {
+function StatCard({ label, value, tone }: { label: string; value: number; tone: StatTone }) {
   return (
-    <div className="rounded-xl border border-slate-800 bg-slate-900/50 px-4 py-3">
-      <dt className="text-xs uppercase tracking-wider text-slate-500">{label}</dt>
-      <dd className={`text-2xl font-bold ${color}`}>{value}</dd>
-    </div>
+    <Card>
+      <CardHeader className="mb-2">
+        <CardDescription>{label}</CardDescription>
+      </CardHeader>
+      <div className={cn('text-2xl font-bold', statToneClass(tone))}>{value}</div>
+    </Card>
   )
 }

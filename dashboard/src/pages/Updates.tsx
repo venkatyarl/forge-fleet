@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useState } from 'react'
+import { Badge, type BadgeProps } from '../components/ui/badge'
+import { Button } from '../components/ui/button'
+import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { StatusBadge } from '../components/ui/status-badge'
 import { getJson, postJson } from '../lib/api'
+import { cn } from '../lib/utils'
 
-/* ── types ───────────────────────────────────────────────── */
+/* -- types -------------------------------------------------- */
 
 type NodeVersion = {
   name: string
@@ -44,32 +49,34 @@ type UpdateResponse = {
   [key: string]: unknown
 }
 
-/* ── helpers ─────────────────────────────────────────────── */
+/* -- helpers ------------------------------------------------ */
 
-const STAGE_COLORS: Record<string, string> = {
-  canary: 'text-amber-400',
-  rolling: 'text-sky-400',
-  complete: 'text-emerald-400',
-  paused: 'text-orange-400',
-  aborted: 'text-rose-400',
+const STAGE_TEXT: Record<string, string> = {
+  canary: 'text-status-warn',
+  rolling: 'text-status-info',
+  complete: 'text-status-ok',
+  paused: 'text-status-warn',
+  aborted: 'text-status-crit',
 }
 
-const STATUS_BADGES: Record<string, { bg: string; text: string }> = {
-  success: { bg: 'bg-emerald-500/15', text: 'text-emerald-300' },
-  complete: { bg: 'bg-emerald-500/15', text: 'text-emerald-300' },
-  failed: { bg: 'bg-rose-500/15', text: 'text-rose-300' },
-  aborted: { bg: 'bg-rose-500/15', text: 'text-rose-300' },
-  rolling: { bg: 'bg-sky-500/15', text: 'text-sky-300' },
-  canary: { bg: 'bg-amber-500/15', text: 'text-amber-300' },
-  paused: { bg: 'bg-orange-500/15', text: 'text-orange-300' },
-}
-
-function badge(status: string) {
+function statusVariant(status: string): BadgeProps['variant'] {
   const s = status.toLowerCase()
-  return STATUS_BADGES[s] ?? { bg: 'bg-slate-500/15', text: 'text-slate-300' }
+  if (['success', 'complete', 'completed', 'healthy', 'ready', 'active'].includes(s)) return 'ok'
+  if (['failed', 'failure', 'aborted', 'error', 'critical', 'down'].includes(s)) return 'crit'
+  if (['canary', 'paused', 'warning', 'degraded'].includes(s)) return 'warn'
+  if (['rolling', 'running', 'pending', 'queued', 'checking', 'info'].includes(s)) return 'info'
+  return 'neutral'
 }
 
-/* ── component ───────────────────────────────────────────── */
+function formatDate(value: string) {
+  try {
+    return new Date(value).toLocaleString()
+  } catch {
+    return value
+  }
+}
+
+/* -- component --------------------------------------------- */
 
 export function Updates() {
   const [data, setData] = useState<UpdateResponse | null>(null)
@@ -117,9 +124,10 @@ export function Updates() {
     }
   }, [load])
 
-  const currentVersion = data?.currentVersion ?? '—'
+  const currentVersion = data?.currentVersion ?? '-'
   const rollout = data?.rollout
   const rolloutStage = rollout?.stage?.toLowerCase() ?? ''
+  const progress = Math.min(100, Math.max(0, rollout?.progress ?? 0))
   const hasRolloutState = Boolean(
     rollout && (rollout.id || rollout.version || rollout.progress != null || rolloutStage),
   )
@@ -130,197 +138,249 @@ export function Updates() {
   const nodeVersions = data?.nodeVersions ?? rollout?.nodes ?? []
 
   return (
-    <section className="space-y-6">
-      {/* header */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
+    <section className="min-h-full space-y-5 bg-background text-foreground">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">Update Rollout</h1>
-          <p className="mt-1 text-sm text-slate-400">
-            Manage fleet updates — version status, rollout progress, and history
+          <h2 className="text-xl font-semibold text-foreground">Update Rollout</h2>
+          <p className="mt-1 text-sm text-muted">
+            Fleet version status, rollout progress, and update history.
           </p>
         </div>
-        <button
-          onClick={load}
-          disabled={loading}
-          className="rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-sky-500 disabled:opacity-50"
-        >
-          {loading ? 'Loading…' : '↻ Refresh'}
-        </button>
+        <div className="flex items-center gap-2">
+          {loading ? <Badge variant="info">loading</Badge> : <Badge variant="ok">ready</Badge>}
+          <Button onClick={() => void load()} type="button" variant="outline" disabled={loading}>
+            {loading ? 'Loading' : 'Refresh'}
+          </Button>
+        </div>
       </div>
 
-      {error && (
-        <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
-          {error}
-        </div>
-      )}
-
-      {actionMsg && (
-        <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-200">
-          {actionMsg}
-        </div>
-      )}
-
-      {/* current version + check */}
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-        <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
-          <p className="text-xs uppercase tracking-wider text-slate-500">Current Version</p>
-          <p className="mt-1 text-3xl font-bold text-sky-300">{currentVersion}</p>
-        </div>
-
-        <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
-          <p className="text-xs uppercase tracking-wider text-slate-500">Check for Updates</p>
-          <button
-            onClick={checkForUpdates}
-            disabled={checking}
-            className="mt-2 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-indigo-500 disabled:opacity-50"
-          >
-            {checking ? 'Checking…' : '🔍 Check Now'}
-          </button>
-          {checkResult && (
-            <div className="mt-3 text-sm">
-              {checkResult.available ? (
-                <div className="space-y-1">
-                  <p className="font-medium text-emerald-400">
-                    Update available: {checkResult.latestVersion}
-                  </p>
-                  {checkResult.releaseNotes && (
-                    <p className="text-xs text-slate-400">{checkResult.releaseNotes}</p>
-                  )}
-                </div>
-              ) : (
-                <p className="text-slate-400">You're on the latest version</p>
-              )}
+      {error ? (
+        <Card className="border-border-subtle bg-surface">
+          <CardHeader>
+            <div>
+              <CardTitle className="text-status-crit">Update Error</CardTitle>
+              <CardDescription>The latest update operation did not complete.</CardDescription>
             </div>
-          )}
-        </div>
+            <StatusBadge status="error">error</StatusBadge>
+          </CardHeader>
+          <p className="text-sm text-status-crit">{error}</p>
+        </Card>
+      ) : null}
 
-        {/* rollout status */}
-        <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
-          <p className="text-xs uppercase tracking-wider text-slate-500">Rollout Status</p>
-          {hasRolloutState ? (
-            <div className="mt-2 space-y-2">
-              <div className="flex items-center gap-2">
-                <span className={`text-lg font-bold ${STAGE_COLORS[rollout?.stage ?? ''] ?? 'text-slate-300'}`}>
-                  {rollout?.stage ?? 'unknown'}
-                </span>
-                {rollout?.version && (
-                  <span className="text-xs text-slate-400">v{rollout.version}</span>
+      {actionMsg ? (
+        <Card className="border-border-subtle bg-surface">
+          <CardHeader>
+            <div>
+              <CardTitle className="text-status-ok">Rollout Action</CardTitle>
+              <CardDescription>The fleet accepted the requested rollout action.</CardDescription>
+            </div>
+            <StatusBadge status="success">success</StatusBadge>
+          </CardHeader>
+          <p className="text-sm text-muted">{actionMsg}</p>
+        </Card>
+      ) : null}
+
+      <div className="grid gap-3 md:grid-cols-3">
+        <Card className="bg-panel">
+          <CardHeader>
+            <div>
+              <CardTitle>Current Version</CardTitle>
+              <CardDescription>Version reported by the update controller.</CardDescription>
+            </div>
+            <Badge variant="default">fleet</Badge>
+          </CardHeader>
+          <p className="text-3xl font-semibold text-primary">{currentVersion}</p>
+        </Card>
+
+        <Card className="bg-panel">
+          <CardHeader>
+            <div>
+              <CardTitle>Update Check</CardTitle>
+              <CardDescription>Query the release endpoint for newer builds.</CardDescription>
+            </div>
+            {checking ? <StatusBadge status="running">checking</StatusBadge> : null}
+          </CardHeader>
+          <div className="space-y-3">
+            <Button onClick={checkForUpdates} type="button" disabled={checking}>
+              {checking ? 'Checking' : 'Check Now'}
+            </Button>
+            {checkResult ? (
+              <div className="rounded-lg border border-border bg-surface p-3 text-sm">
+                {checkResult.available ? (
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant="ok">available</Badge>
+                      <span className="font-medium text-status-ok">
+                        {checkResult.latestVersion ?? 'new version'}
+                      </span>
+                    </div>
+                    {checkResult.releaseNotes ? (
+                      <p className="text-xs leading-relaxed text-muted">{checkResult.releaseNotes}</p>
+                    ) : null}
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="neutral">current</Badge>
+                    <span className="text-muted">You're on the latest version.</span>
+                  </div>
                 )}
               </div>
-              {/* progress bar */}
-              {rollout?.progress != null && (
-                <div className="space-y-1">
-                  <div className="h-2 w-full overflow-hidden rounded-full bg-slate-800">
+            ) : null}
+          </div>
+        </Card>
+
+        <Card className="bg-panel">
+          <CardHeader>
+            <div>
+              <CardTitle>Rollout Status</CardTitle>
+              <CardDescription>Current deployment stage and completion.</CardDescription>
+            </div>
+            {hasRolloutState ? (
+              <Badge variant={statusVariant(rollout?.stage ?? 'unknown')}>
+                {rollout?.stage ?? 'unknown'}
+              </Badge>
+            ) : (
+              <Badge variant="neutral">idle</Badge>
+            )}
+          </CardHeader>
+          {hasRolloutState ? (
+            <div className="space-y-3">
+              <div className="flex items-baseline gap-2">
+                <span className={cn('text-2xl font-semibold', STAGE_TEXT[rolloutStage] ?? 'text-muted')}>
+                  {rollout?.stage ?? 'unknown'}
+                </span>
+                {rollout?.version ? (
+                  <span className="text-sm text-muted">v{rollout.version}</span>
+                ) : null}
+              </div>
+              {rollout?.progress != null ? (
+                <div className="space-y-2">
+                  <div className="h-2 w-full overflow-hidden rounded-full bg-elevated">
                     <div
-                      className="h-full rounded-full bg-sky-500 transition-all"
-                      style={{ width: `${Math.min(100, rollout.progress)}%` }}
+                      className="h-full rounded-full bg-primary transition-all"
+                      style={{ width: `${progress}%` }}
                     />
                   </div>
-                  <p className="text-xs text-slate-400">{rollout.progress}% complete</p>
+                  <p className="text-xs text-dim">{rollout.progress}% complete</p>
                 </div>
-              )}
+              ) : null}
             </div>
           ) : (
-            <p className="mt-2 text-sm text-slate-400">No active rollout</p>
+            <p className="text-sm text-muted">No active rollout.</p>
           )}
-        </div>
+        </Card>
       </div>
 
-      {/* rollout controls */}
-      {hasActiveRollout && (
-        <div className="flex flex-wrap gap-3">
-          <button
-            onClick={() => rolloutAction('pause')}
-            disabled={!canPause}
-            className="rounded-lg border border-orange-500/40 bg-orange-500/10 px-4 py-2 text-sm font-medium text-orange-300 transition hover:bg-orange-500/20 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            ⏸ Pause
-          </button>
-          <button
-            onClick={() => rolloutAction('resume')}
-            disabled={!canResume}
-            className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-4 py-2 text-sm font-medium text-emerald-300 transition hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            ▶ Resume
-          </button>
-          <button
-            onClick={() => rolloutAction('abort')}
-            disabled={!hasActiveRollout}
-            className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-4 py-2 text-sm font-medium text-rose-300 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            ✕ Abort
-          </button>
-        </div>
-      )}
+      {hasActiveRollout ? (
+        <Card className="bg-surface">
+          <CardHeader>
+            <div>
+              <CardTitle>Rollout Controls</CardTitle>
+              <CardDescription>Pause, resume, or abort the active deployment.</CardDescription>
+            </div>
+            <StatusBadge status={rolloutStage}>{rolloutStage}</StatusBadge>
+          </CardHeader>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              onClick={() => void rolloutAction('pause')}
+              type="button"
+              variant="outline"
+              disabled={!canPause}
+              className="border-border-subtle text-status-warn hover:bg-elevated"
+            >
+              Pause
+            </Button>
+            <Button
+              onClick={() => void rolloutAction('resume')}
+              type="button"
+              variant="outline"
+              disabled={!canResume}
+              className="border-border-subtle text-status-ok hover:bg-elevated"
+            >
+              Resume
+            </Button>
+            <Button
+              onClick={() => void rolloutAction('abort')}
+              type="button"
+              variant="outline"
+              disabled={!hasActiveRollout}
+              className="border-border-subtle text-status-crit hover:bg-elevated"
+            >
+              Abort
+            </Button>
+          </div>
+        </Card>
+      ) : null}
 
-      {/* per-node versions */}
-      {nodeVersions.length > 0 && (
-        <div className="space-y-3">
-          <h2 className="text-lg font-semibold text-slate-200">Per-Node Versions</h2>
+      {nodeVersions.length > 0 ? (
+        <Card className="bg-surface">
+          <CardHeader>
+            <div>
+              <CardTitle>Per-Node Versions</CardTitle>
+              <CardDescription>Reported version and rollout state by node.</CardDescription>
+            </div>
+            <Badge variant="neutral">{nodeVersions.length} nodes</Badge>
+          </CardHeader>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {nodeVersions.map((nv) => {
-              const b = badge(nv.status ?? nv.stage ?? 'unknown')
+              const status = nv.status ?? nv.stage ?? 'unknown'
               return (
                 <div
                   key={nv.name}
-                  className="rounded-lg border border-slate-800 bg-slate-900/50 px-4 py-3"
+                  className="rounded-lg border border-border bg-panel px-4 py-3"
                 >
                   <div className="flex items-center justify-between gap-2">
-                    <span className="font-medium text-slate-200">{nv.name}</span>
-                    <span className={`rounded-md px-2 py-0.5 text-xs font-medium ${b.bg} ${b.text}`}>
-                      {nv.status ?? nv.stage ?? '—'}
-                    </span>
+                    <span className="min-w-0 truncate font-medium text-foreground">{nv.name}</span>
+                    <Badge variant={statusVariant(status)}>{status}</Badge>
                   </div>
-                  <p className="mt-1 text-sm text-sky-300">{nv.version}</p>
+                  <p className="mt-2 text-sm font-medium text-primary">{nv.version}</p>
                 </div>
               )
             })}
           </div>
-        </div>
-      )}
+        </Card>
+      ) : null}
 
-      {/* rollout history */}
-      <div className="space-y-3">
-        <h2 className="text-lg font-semibold text-slate-200">Rollout History</h2>
+      <Card className="overflow-hidden bg-surface p-0">
+        <CardHeader className="mb-0 border-b border-border px-4 py-3">
+          <div>
+            <CardTitle>Rollout History</CardTitle>
+            <CardDescription>Last recorded update attempts.</CardDescription>
+          </div>
+          <Badge variant="neutral">{history.length} entries</Badge>
+        </CardHeader>
         {history.length === 0 ? (
-          <p className="text-sm text-slate-500">No rollout history available</p>
+          <p className="px-4 py-8 text-center text-sm text-dim">No rollout history available.</p>
         ) : (
-          <div className="overflow-x-auto rounded-xl border border-slate-800">
-            <table className="min-w-full text-sm">
-              <thead>
-                <tr className="border-b border-slate-800 bg-slate-900/80 text-left text-xs uppercase tracking-wider text-slate-400">
-                  <th className="px-4 py-3">Version</th>
-                  <th className="px-4 py-3">Date</th>
-                  <th className="px-4 py-3">Status</th>
-                  <th className="px-4 py-3">Duration</th>
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-left text-sm">
+              <thead className="border-b border-border bg-elevated text-xs uppercase text-dim">
+                <tr>
+                  <th className="px-4 py-2 font-medium">Version</th>
+                  <th className="px-4 py-2 font-medium">Date</th>
+                  <th className="px-4 py-2 font-medium">Status</th>
+                  <th className="px-4 py-2 font-medium">Duration</th>
                 </tr>
               </thead>
               <tbody>
-                {history.slice(0, 10).map((h, idx) => {
-                  const b = badge(h.status)
-                  return (
-                    <tr
-                      key={h.id ?? `${h.version}-${idx}`}
-                      className="border-b border-slate-800/50 transition hover:bg-slate-900/40"
-                    >
-                      <td className="px-4 py-3 font-medium text-sky-300">{h.version}</td>
-                      <td className="px-4 py-3 text-xs text-slate-400">
-                        {(() => { try { return new Date(h.date).toLocaleString() } catch { return h.date } })()}
-                      </td>
-                      <td className="px-4 py-3">
-                        <span className={`inline-block rounded-md px-2 py-0.5 text-xs font-medium ${b.bg} ${b.text}`}>
-                          {h.status}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 text-slate-400">{h.duration ?? '—'}</td>
-                    </tr>
-                  )
-                })}
+                {history.slice(0, 10).map((h, idx) => (
+                  <tr
+                    key={h.id ?? `${h.version}-${idx}`}
+                    className="border-b border-border/70 transition-colors hover:bg-panel"
+                  >
+                    <td className="px-4 py-3 font-medium text-primary">{h.version}</td>
+                    <td className="px-4 py-3 text-xs text-muted">{formatDate(h.date)}</td>
+                    <td className="px-4 py-3">
+                      <Badge variant={statusVariant(h.status)}>{h.status}</Badge>
+                    </td>
+                    <td className="px-4 py-3 text-muted">{h.duration ?? '-'}</td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>
         )}
-      </div>
+      </Card>
     </section>
   )
 }

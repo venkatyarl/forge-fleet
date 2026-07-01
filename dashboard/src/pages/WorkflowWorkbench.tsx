@@ -1,5 +1,10 @@
-import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
+import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
+import { Badge } from '../components/ui/badge'
+import { Button } from '../components/ui/button'
+import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { StatusBadge } from '../components/ui/status-badge'
 import { deleteJson, getJson, patchJson, postJson } from '../lib/api'
+import { cn } from '../lib/utils'
 
 type WorkItemStatus = 'backlog' | 'todo' | 'in_progress' | 'review' | 'done' | 'blocked'
 type ReviewStatus = 'pending' | 'in_progress' | 'approved' | 'changes_requested'
@@ -70,6 +75,11 @@ const STATUS_FILTERS: Array<{ value: ''; label: 'All statuses' } | { value: Work
 
 const REVIEW_STATUSES: ReviewStatus[] = ['pending', 'in_progress', 'approved', 'changes_requested']
 
+const fieldClass =
+  'w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-dim focus:border-primary disabled:cursor-not-allowed disabled:opacity-60'
+
+const rowClass = 'rounded-lg border border-border bg-surface'
+
 function asPriority(priority: WorkItem['priority']): number {
   if (typeof priority === 'number') return priority
   if (priority && typeof priority === 'object' && typeof priority.value === 'number') {
@@ -78,33 +88,24 @@ function asPriority(priority: WorkItem['priority']): number {
   return 3
 }
 
-function statusBadge(status: string): string {
+function statusForBadge(status: string): string {
   switch (status) {
     case 'done':
-      return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
-    case 'review':
-      return 'border-purple-500/30 bg-purple-500/10 text-purple-300'
-    case 'in_progress':
-      return 'border-sky-500/30 bg-sky-500/10 text-sky-300'
-    case 'blocked':
-      return 'border-rose-500/30 bg-rose-500/10 text-rose-300'
-    case 'todo':
-      return 'border-amber-500/30 bg-amber-500/10 text-amber-300'
-    default:
-      return 'border-slate-700 bg-slate-800 text-slate-300'
-  }
-}
-
-function reviewBadge(status: string): string {
-  switch (status) {
     case 'approved':
-      return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+      return 'success'
+    case 'blocked':
     case 'changes_requested':
-      return 'border-rose-500/30 bg-rose-500/10 text-rose-300'
+      return 'error'
+    case 'review':
+      return 'in_review'
     case 'in_progress':
-      return 'border-sky-500/30 bg-sky-500/10 text-sky-300'
+      return 'running'
+    case 'backlog':
+    case 'todo':
+    case 'pending':
+      return 'pending'
     default:
-      return 'border-slate-700 bg-slate-800 text-slate-300'
+      return status
   }
 }
 
@@ -490,46 +491,39 @@ export function WorkflowWorkbench() {
   const reviewCount = items.filter((item) => item.status === 'review').length
 
   return (
-    <section className="space-y-5">
+    <section className="space-y-5 bg-background text-foreground">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">Workflow Workbench</h1>
-          <p className="mt-1 text-sm text-slate-400">
+          <h1 className="text-2xl font-bold tracking-tight text-foreground">Workflow Workbench</h1>
+          <p className="mt-1 text-sm text-muted">
             Mission Control workflow parity for review lifecycle, dependencies, and task-group sequencing.
           </p>
         </div>
-        <button
-          onClick={() => void refreshAll()}
-          disabled={loading || saving}
-          className="rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-sky-500 disabled:opacity-60"
-        >
-          ↻ Refresh
-        </button>
+        <Button type="button" onClick={() => void refreshAll()} disabled={loading || saving}>
+          Refresh
+        </Button>
       </div>
 
       <div className="grid gap-3 sm:grid-cols-3">
-        <Stat label="Open items" value={openCount} color="text-sky-300" />
-        <Stat label="In review" value={reviewCount} color="text-purple-300" />
-        <Stat label="Blocked" value={blockedCount} color="text-rose-300" />
+        <Stat label="Open items" value={openCount} tone="info" />
+        <Stat label="In review" value={reviewCount} tone="warn" />
+        <Stat label="Blocked" value={blockedCount} tone="crit" />
       </div>
 
       {error ? (
-        <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
-          {error}
-        </div>
+        <Card className="border-status-crit bg-panel px-4 py-3 text-sm text-status-crit">{error}</Card>
       ) : null}
       {notice ? (
-        <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-200">
-          {notice}
-        </div>
+        <Card className="border-status-ok bg-panel px-4 py-3 text-sm text-status-ok">{notice}</Card>
       ) : null}
 
-      <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-4">
+      <Card className="bg-panel">
         <div className="grid gap-2 md:grid-cols-4">
           <select
+            aria-label="Status filter"
             value={statusFilter}
             onChange={(event) => setStatusFilter(event.target.value as WorkItemStatus | '')}
-            className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
+            className={fieldClass}
           >
             {STATUS_FILTERS.map((opt) => (
               <option key={opt.label} value={opt.value}>
@@ -538,39 +532,41 @@ export function WorkflowWorkbench() {
             ))}
           </select>
           <input
+            aria-label="Assignee filter"
             value={assigneeFilter}
             onChange={(event) => setAssigneeFilter(event.target.value)}
             placeholder="Assignee filter"
-            className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
+            className={fieldClass}
           />
-          <button
-            onClick={() => void loadCore()}
-            className="rounded-md border border-slate-700 px-3 py-2 text-sm text-slate-200 hover:bg-slate-800"
-          >
+          <Button type="button" variant="outline" onClick={() => void loadCore()}>
             Apply filters
-          </button>
-          <button
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
             onClick={() => {
               setStatusFilter('')
               setAssigneeFilter('')
             }}
-            className="rounded-md border border-slate-700 px-3 py-2 text-sm text-slate-400 hover:bg-slate-800 hover:text-slate-200"
           >
             Clear filters
-          </button>
+          </Button>
         </div>
-      </div>
+      </Card>
 
       <div className="grid gap-4 xl:grid-cols-12">
         <div className="xl:col-span-5">
-          <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
-            <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-300">
-              Work items ({items.length})
-            </h2>
+          <Card className="bg-panel">
+            <CardHeader>
+              <div>
+                <CardTitle>Work Items</CardTitle>
+                <CardDescription>{items.length} item{items.length === 1 ? '' : 's'} loaded</CardDescription>
+              </div>
+            </CardHeader>
             {loading ? (
-              <p className="text-sm text-slate-400">Loading work items…</p>
+              <EmptyState>Loading work items...</EmptyState>
             ) : items.length === 0 ? (
-              <p className="text-sm text-slate-500">No work items match this filter.</p>
+              <EmptyState>No work items match this filter.</EmptyState>
             ) : (
               <div className="space-y-2">
                 {items.map((item) => (
@@ -578,54 +574,71 @@ export function WorkflowWorkbench() {
                     key={item.id}
                     type="button"
                     onClick={() => setSelectedItemId(item.id)}
-                    className={`w-full rounded-lg border p-3 text-left transition ${
+                    className={cn(
+                      'w-full rounded-lg border p-3 text-left transition',
                       item.id === selectedItemId
-                        ? 'border-sky-500/50 bg-sky-500/10'
-                        : 'border-slate-800 bg-slate-950/60 hover:border-slate-600'
-                    }`}
+                        ? 'border-primary bg-primary-subtle'
+                        : 'border-border bg-surface hover:border-border-subtle hover:bg-elevated',
+                    )}
                   >
                     <div className="flex items-start justify-between gap-2">
-                      <p className="font-medium text-slate-100">{item.title}</p>
-                      <span className="rounded-md border border-slate-700 bg-slate-800 px-2 py-0.5 text-xs text-slate-300">
+                      <p className="min-w-0 font-medium text-foreground">{item.title}</p>
+                      <Badge variant="neutral" className="shrink-0">
                         P{asPriority(item.priority)}
-                      </span>
+                      </Badge>
                     </div>
-                    <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-400">
-                      <span className={`rounded border px-2 py-0.5 ${statusBadge(String(item.status))}`}>
+                    <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted">
+                      <StatusBadge status={statusForBadge(String(item.status))}>
                         {labelize(String(item.status))}
-                      </span>
+                      </StatusBadge>
                       <span>{item.assignee || 'unassigned'}</span>
                       <span>updated {fmtDate(item.updated_at)}</span>
                     </div>
+                    {item.labels.length > 0 ? (
+                      <div className="mt-2 flex flex-wrap gap-1">
+                        {item.labels.map((label) => (
+                          <Badge key={`${item.id}-${label}`} variant="default">
+                            {label}
+                          </Badge>
+                        ))}
+                      </div>
+                    ) : null}
                   </button>
                 ))}
               </div>
             )}
-          </div>
+          </Card>
         </div>
 
-        <div className="xl:col-span-7 space-y-4">
+        <div className="space-y-4 xl:col-span-7">
           {!selectedItem ? (
-            <div className="rounded-xl border border-slate-800 bg-slate-900/60 px-4 py-5 text-sm text-slate-400">
-              Select a work item to manage workflow actions.
-            </div>
+            <Card className="bg-panel py-5 text-sm text-muted">Select a work item to manage workflow actions.</Card>
           ) : (
             <>
-              <section className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
+              <Card className="bg-panel">
                 <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <h2 className="text-lg font-semibold text-slate-100">{selectedItem.title}</h2>
-                    <p className="mt-1 text-xs text-slate-400">ID: {selectedItem.id}</p>
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h2 className="text-lg font-semibold text-foreground">{selectedItem.title}</h2>
+                      <StatusBadge status={statusForBadge(String(selectedItem.status))}>
+                        {labelize(String(selectedItem.status))}
+                      </StatusBadge>
+                    </div>
+                    <p className="mt-1 text-xs text-dim">ID: {selectedItem.id}</p>
                     {selectedItem.description ? (
-                      <p className="mt-2 text-sm text-slate-300">{selectedItem.description}</p>
+                      <p className="mt-2 text-sm text-muted">{selectedItem.description}</p>
                     ) : null}
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <Badge variant="neutral">Assignee: {selectedItem.assignee || 'unassigned'}</Badge>
+                      <Badge variant="neutral">Priority: P{asPriority(selectedItem.priority)}</Badge>
+                      {selectedItem.sequence_order != null ? (
+                        <Badge variant="neutral">Sequence: {selectedItem.sequence_order}</Badge>
+                      ) : null}
+                    </div>
                   </div>
-                  <span className={`rounded-md border px-2 py-1 text-xs ${statusBadge(String(selectedItem.status))}`}>
-                    {labelize(String(selectedItem.status))}
-                  </span>
                 </div>
 
-                <div className="mt-3 flex flex-wrap gap-2">
+                <div className="mt-4 flex flex-wrap gap-2">
                   <ActionButton label="Claim" disabled={saving} onClick={() => void runAction('claim')} />
                   <ActionButton label="Start" disabled={saving} onClick={() => void runAction('start')} />
                   <ActionButton
@@ -662,36 +675,46 @@ export function WorkflowWorkbench() {
                     onClick={() => void runAction('escalate')}
                   />
                 </div>
-              </section>
+              </Card>
 
-              <section className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-                <div className="mb-3 flex items-center justify-between">
-                  <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-300">Dependencies</h3>
-                  <button
+              <Card className="bg-panel">
+                <CardHeader>
+                  <div>
+                    <CardTitle>Dependencies</CardTitle>
+                    <CardDescription>
+                      {loadingDetails
+                        ? 'Loading dependency state...'
+                        : depCheck
+                          ? depCheck.can_start
+                            ? 'Ready to start: no open blockers.'
+                            : `${depCheck.blocked_count} blocker(s) still open.`
+                          : 'No dependency state loaded.'}
+                    </CardDescription>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
                     onClick={() => selectedItemId && void loadDetails(selectedItemId)}
-                    className="rounded-md border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800"
                   >
                     Recheck
-                  </button>
-                </div>
+                  </Button>
+                </CardHeader>
 
-                {loadingDetails ? (
-                  <p className="text-xs text-slate-400">Loading dependency state…</p>
-                ) : depCheck ? (
-                  <p className="text-xs text-slate-400">
-                    {depCheck.can_start
-                      ? 'Ready to start: no open blockers.'
-                      : `${depCheck.blocked_count} blocker(s) still open.`}
-                  </p>
+                {depCheck ? (
+                  <StatusBadge status={depCheck.can_start ? 'ready' : 'error'}>
+                    {depCheck.can_start ? 'Can start' : 'Blocked'}
+                  </StatusBadge>
                 ) : null}
 
                 <div className="mt-3 grid gap-2 md:grid-cols-[1fr_auto]">
                   <select
+                    aria-label="Dependency work item"
                     value={newDependencyId}
                     onChange={(event) => setNewDependencyId(event.target.value)}
-                    className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
+                    className={fieldClass}
                   >
-                    <option value="">Select dependency work item…</option>
+                    <option value="">Select dependency work item...</option>
                     {items
                       .filter((item) => item.id !== selectedItem.id)
                       .map((item) => (
@@ -700,18 +723,19 @@ export function WorkflowWorkbench() {
                         </option>
                       ))}
                   </select>
-                  <button
+                  <Button
+                    type="button"
                     onClick={() => void addDependency()}
                     disabled={saving || !newDependencyId}
-                    className="rounded-md border border-sky-500/40 bg-sky-500/15 px-3 py-2 text-sm text-sky-300 hover:bg-sky-500/25 disabled:opacity-60"
+                    className="whitespace-nowrap"
                   >
                     Add dependency
-                  </button>
+                  </Button>
                 </div>
 
                 <div className="mt-3 space-y-2">
                   {dependencies.length === 0 ? (
-                    <p className="text-xs text-slate-500">No dependencies configured.</p>
+                    <EmptyState>No dependencies configured.</EmptyState>
                   ) : (
                     dependencies.map((dep) => {
                       const target = itemById.get(dep.depends_on_id)
@@ -719,148 +743,163 @@ export function WorkflowWorkbench() {
                       return (
                         <div
                           key={`${dep.work_item_id}-${dep.depends_on_id}`}
-                          className="flex items-center justify-between rounded-md border border-slate-800 bg-slate-950/70 px-3 py-2"
+                          className={cn(rowClass, 'flex items-center justify-between gap-3 px-3 py-2')}
                         >
-                          <div>
-                            <p className="text-sm text-slate-200">{target?.title ?? dep.depends_on_id}</p>
-                            <p className="text-xs text-slate-500">
-                              {blocked ? 'Blocking' : 'Resolved'} · {fmtDate(dep.created_at)}
+                          <div className="min-w-0">
+                            <p className="text-sm text-foreground">{target?.title ?? dep.depends_on_id}</p>
+                            <p className="text-xs text-dim">
+                              {blocked ? 'Blocking' : 'Resolved'} / {fmtDate(dep.created_at)}
                             </p>
                           </div>
-                          <button
-                            onClick={() => void removeDependency(dep.depends_on_id)}
-                            className="rounded-md border border-slate-700 px-2 py-1 text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-200"
-                          >
-                            Remove
-                          </button>
+                          <div className="flex shrink-0 items-center gap-2">
+                            <StatusBadge status={blocked ? 'error' : 'success'}>
+                              {blocked ? 'Blocking' : 'Resolved'}
+                            </StatusBadge>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() => void removeDependency(dep.depends_on_id)}
+                            >
+                              Remove
+                            </Button>
+                          </div>
                         </div>
                       )
                     })
                   )}
                 </div>
-              </section>
+              </Card>
 
-              <section className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-                <div className="mb-3 flex items-center justify-between">
-                  <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-300">Review checklist</h3>
-                  <button
+              <Card className="bg-panel">
+                <CardHeader>
+                  <div>
+                    <CardTitle>Review Checklist</CardTitle>
+                    <CardDescription>{reviews.length} review item{reviews.length === 1 ? '' : 's'}</CardDescription>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
                     onClick={() => void resetReviewChecklist()}
                     disabled={saving || reviews.length === 0}
-                    className="rounded-md border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-60"
                   >
                     Reset all
-                  </button>
-                </div>
+                  </Button>
+                </CardHeader>
 
                 <form onSubmit={createReviewItem} className="grid gap-2 md:grid-cols-6">
                   <input
+                    aria-label="Checklist title"
                     value={newReviewTitle}
                     onChange={(event) => setNewReviewTitle(event.target.value)}
                     placeholder="Checklist title"
-                    className="md:col-span-2 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
+                    className={cn(fieldClass, 'md:col-span-2')}
                     required
                   />
                   <input
+                    aria-label="Reviewer"
                     value={newReviewer}
                     onChange={(event) => setNewReviewer(event.target.value)}
                     placeholder="Reviewer"
-                    className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
+                    className={fieldClass}
                   />
                   <input
+                    aria-label="Review notes"
                     value={newReviewNotes}
                     onChange={(event) => setNewReviewNotes(event.target.value)}
                     placeholder="Notes"
-                    className="md:col-span-2 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
+                    className={cn(fieldClass, 'md:col-span-2')}
                   />
-                  <button
-                    type="submit"
-                    disabled={saving}
-                    className="rounded-md border border-sky-500/40 bg-sky-500/15 px-3 py-2 text-sm text-sky-300 hover:bg-sky-500/25 disabled:opacity-60"
-                  >
+                  <Button type="submit" disabled={saving}>
                     Add
-                  </button>
+                  </Button>
                 </form>
 
                 <div className="mt-3 space-y-2">
                   {reviews.length === 0 ? (
-                    <p className="text-xs text-slate-500">No checklist items yet.</p>
+                    <EmptyState>No checklist items yet.</EmptyState>
                   ) : (
                     reviews.map((item) => (
-                      <div key={item.id} className="rounded-md border border-slate-800 bg-slate-950/70 p-3">
+                      <div key={item.id} className={cn(rowClass, 'p-3')}>
                         <div className="flex flex-wrap items-center justify-between gap-2">
-                          <p className="text-sm text-slate-200">{item.title}</p>
+                          <p className="text-sm text-foreground">{item.title}</p>
                           <div className="flex items-center gap-2">
-                            <span className={`rounded border px-2 py-0.5 text-xs ${reviewBadge(String(item.status))}`}>
+                            <StatusBadge status={statusForBadge(String(item.status))}>
                               {labelize(String(item.status))}
-                            </span>
-                            <button
+                            </StatusBadge>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
                               onClick={() => void removeReviewItem(item.id)}
-                              className="rounded-md border border-slate-700 px-2 py-1 text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-200"
                             >
                               Delete
-                            </button>
+                            </Button>
                           </div>
                         </div>
-                        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted">
                           <span>Reviewer: {item.reviewer || 'unassigned'}</span>
                           <span>Updated: {fmtDate(item.updated_at)}</span>
                         </div>
-                        {item.notes ? <p className="mt-1 text-xs text-slate-500">{item.notes}</p> : null}
+                        {item.notes ? <p className="mt-1 text-xs text-dim">{item.notes}</p> : null}
                         <div className="mt-2 flex flex-wrap gap-1">
                           {REVIEW_STATUSES.map((status) => (
-                            <button
+                            <Button
                               key={`${item.id}-${status}`}
+                              type="button"
+                              variant={String(item.status) === status ? 'default' : 'outline'}
+                              size="sm"
                               onClick={() => void updateReviewStatus(item.id, status)}
                               disabled={saving}
-                              className={`rounded-md border px-2 py-1 text-xs transition ${
-                                String(item.status) === status
-                                  ? 'border-sky-500/40 bg-sky-500/10 text-sky-300'
-                                  : 'border-slate-700 text-slate-300 hover:bg-slate-800'
-                              }`}
                             >
                               {labelize(status)}
-                            </button>
+                            </Button>
                           ))}
                         </div>
                       </div>
                     ))
                   )}
                 </div>
-              </section>
+              </Card>
 
-              <section className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-                <h3 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-300">Task groups</h3>
+              <Card className="bg-panel">
+                <CardHeader>
+                  <div>
+                    <CardTitle>Task Groups</CardTitle>
+                    <CardDescription>Create groups and sequence the selected work item.</CardDescription>
+                  </div>
+                </CardHeader>
 
                 <form onSubmit={createTaskGroup} className="grid gap-2 md:grid-cols-4">
                   <input
+                    aria-label="Task group name"
                     value={newGroupName}
                     onChange={(event) => setNewGroupName(event.target.value)}
                     placeholder="New task group"
-                    className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
+                    className={fieldClass}
                     required
                   />
                   <input
+                    aria-label="Task group description"
                     value={newGroupDescription}
                     onChange={(event) => setNewGroupDescription(event.target.value)}
                     placeholder="Description"
-                    className="md:col-span-2 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
+                    className={cn(fieldClass, 'md:col-span-2')}
                   />
-                  <button
-                    type="submit"
-                    disabled={saving}
-                    className="rounded-md border border-sky-500/40 bg-sky-500/15 px-3 py-2 text-sm text-sky-300 hover:bg-sky-500/25 disabled:opacity-60"
-                  >
+                  <Button type="submit" disabled={saving}>
                     Create
-                  </button>
+                  </Button>
                 </form>
 
                 <div className="mt-3 grid gap-2 md:grid-cols-[1fr_120px_auto_auto]">
                   <select
+                    aria-label="Task group selection"
                     value={groupSelection}
                     onChange={(event) => setGroupSelection(event.target.value)}
-                    className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
+                    className={fieldClass}
                   >
-                    <option value="">Select task group…</option>
+                    <option value="">Select task group...</option>
                     {groups.map((group) => (
                       <option key={group.id} value={group.id}>
                         {group.name}
@@ -868,50 +907,56 @@ export function WorkflowWorkbench() {
                     ))}
                   </select>
                   <input
+                    aria-label="Sequence order"
                     value={sequenceOrder}
                     onChange={(event) => setSequenceOrder(event.target.value)}
                     inputMode="numeric"
                     placeholder="Seq"
-                    className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-500 focus:outline-none"
+                    className={fieldClass}
                   />
-                  <button
+                  <Button
+                    type="button"
                     onClick={() => void assignToTaskGroup()}
                     disabled={saving || !groupSelection}
-                    className="rounded-md border border-sky-500/40 bg-sky-500/15 px-3 py-2 text-sm text-sky-300 hover:bg-sky-500/25 disabled:opacity-60"
+                    className="whitespace-nowrap"
                   >
                     Assign selected
-                  </button>
-                  <button
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
                     onClick={() => void unassignTaskGroup()}
                     disabled={saving || !selectedItem.task_group_id}
-                    className="rounded-md border border-slate-700 px-3 py-2 text-sm text-slate-300 hover:bg-slate-800 disabled:opacity-60"
                   >
                     Unassign
-                  </button>
+                  </Button>
                 </div>
 
                 <div className="mt-3 space-y-2">
                   {groups.length === 0 ? (
-                    <p className="text-xs text-slate-500">No task groups yet.</p>
+                    <EmptyState>No task groups yet.</EmptyState>
                   ) : (
                     groups.map((group) => (
                       <div
                         key={group.id}
-                        className={`rounded-md border px-3 py-2 ${
-                          selectedItem.task_group_id === group.id
-                            ? 'border-sky-500/40 bg-sky-500/10'
-                            : 'border-slate-800 bg-slate-950/70'
-                        }`}
+                        className={cn(
+                          rowClass,
+                          'px-3 py-2',
+                          selectedItem.task_group_id === group.id && 'border-primary bg-primary-subtle',
+                        )}
                       >
-                        <p className="text-sm text-slate-200">{group.name}</p>
-                        {group.description ? (
-                          <p className="text-xs text-slate-500">{group.description}</p>
-                        ) : null}
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <p className="text-sm text-foreground">{group.name}</p>
+                          {selectedItem.task_group_id === group.id ? (
+                            <Badge variant="default">Selected item</Badge>
+                          ) : null}
+                        </div>
+                        {group.description ? <p className="text-xs text-dim">{group.description}</p> : null}
                       </div>
                     ))
                   )}
                 </div>
-              </section>
+              </Card>
             </>
           )}
         </div>
@@ -931,32 +976,42 @@ function ActionButton({
   disabled?: boolean
   tone?: 'default' | 'ok' | 'warn' | 'danger'
 }) {
-  let classes = 'border-slate-700 text-slate-300 hover:bg-slate-800'
-  if (tone === 'ok') {
-    classes = 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'
-  } else if (tone === 'warn') {
-    classes = 'border-orange-500/40 bg-orange-500/10 text-orange-300 hover:bg-orange-500/20'
-  } else if (tone === 'danger') {
-    classes = 'border-rose-500/40 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20'
-  }
-
   return (
-    <button
+    <Button
+      type="button"
+      variant="outline"
+      size="sm"
       onClick={onClick}
       disabled={disabled}
-      className={`rounded-md border px-2 py-1 text-xs transition disabled:opacity-60 ${classes}`}
-      type="button"
+      className={cn(
+        tone === 'ok' && 'border-status-ok text-status-ok hover:bg-elevated',
+        tone === 'warn' && 'border-status-warn text-status-warn hover:bg-elevated',
+        tone === 'danger' && 'border-status-crit text-status-crit hover:bg-elevated',
+      )}
     >
       {label}
-    </button>
+    </Button>
   )
 }
 
-function Stat({ label, value, color }: { label: string; value: number; color: string }) {
+function Stat({ label, value, tone }: { label: string; value: number; tone: 'info' | 'warn' | 'crit' }) {
   return (
-    <div className="rounded-xl border border-slate-800 bg-slate-900/50 px-4 py-3">
-      <dt className="text-xs uppercase tracking-wider text-slate-500">{label}</dt>
-      <dd className={`text-2xl font-bold ${color}`}>{value}</dd>
-    </div>
+    <Card className="bg-panel px-4 py-3">
+      <dt className="text-xs uppercase tracking-wider text-dim">{label}</dt>
+      <dd
+        className={cn(
+          'text-2xl font-bold',
+          tone === 'info' && 'text-status-info',
+          tone === 'warn' && 'text-status-warn',
+          tone === 'crit' && 'text-status-crit',
+        )}
+      >
+        {value}
+      </dd>
+    </Card>
   )
+}
+
+function EmptyState({ children }: { children: ReactNode }) {
+  return <p className="rounded-lg border border-border bg-surface px-3 py-2 text-sm text-dim">{children}</p>
 }

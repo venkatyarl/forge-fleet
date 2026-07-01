@@ -567,6 +567,9 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         .route("/api/fleet/enroll", post(fleet_enroll))
         .route("/api/fleet/heartbeat", post(fleet_heartbeat))
         .route("/api/fleet/llm-usage", get(fleet_llm_usage))
+        // ─── Skills registry ─────────────────────────────────────────
+        .route("/api/skills", get(crate::skills_api::list_skills))
+        .route("/api/skills/{*id}", get(crate::skills_api::get_skill))
         // ─── Fleet Tool Registry (Phase 15a) ─────────────────────────
         .route("/api/tools", get(crate::tool_registry_api::list_tools))
         .route(

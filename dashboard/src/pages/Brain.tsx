@@ -1,7 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
+import {
+  BrainCircuit,
+  ChevronDown,
+  Inbox,
+  Layers,
+  MessageSquare,
+  Plus,
+  Search,
+  Send,
+} from 'lucide-react'
 import { getJson, postJson } from '../lib/api'
 import { useWsFeed } from '../hooks/useWsFeed'
+import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { Badge } from '../components/ui/badge'
+import { StatusBadge } from '../components/ui/status-badge'
+import { Button } from '../components/ui/button'
+import { cn, formatElapsed } from '../lib/utils'
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -43,20 +58,27 @@ interface BacklogItem {
 
 function relTime(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime()
-  const mins = Math.floor(diff / 60_000)
-  if (mins < 1) return 'now'
-  if (mins < 60) return `${mins}m`
-  const hrs = Math.floor(mins / 60)
-  if (hrs < 24) return `${hrs}h`
-  const days = Math.floor(hrs / 24)
-  return `${days}d`
+  const secs = Math.max(0, Math.floor(diff / 1000))
+  if (secs < 60) return 'now'
+  return formatElapsed(secs).replace(/\s+/g, '')
 }
 
-const priorityEmoji: Record<string, string> = {
-  urgent: '\u{1F534}',
-  high: '\u{1F7E0}',
-  medium: '\u{1F7E1}',
-  low: '\u{1F7E2}',
+function timeAgo(iso: string): string {
+  const label = relTime(iso)
+  return label === 'now' ? 'just now' : `${label} ago`
+}
+
+function priorityVariant(priority: BacklogItem['priority']): 'crit' | 'warn' | 'info' | 'neutral' {
+  if (priority === 'urgent') return 'crit'
+  if (priority === 'high') return 'warn'
+  if (priority === 'medium') return 'info'
+  return 'neutral'
+}
+
+function messageTone(role: BrainMessage['role']): string {
+  if (role === 'user') return 'ml-auto border-primary/30 bg-primary-subtle text-foreground'
+  if (role === 'assistant') return 'border-border bg-panel text-foreground'
+  return 'border-border-subtle bg-surface text-muted italic'
 }
 
 /* ------------------------------------------------------------------ */
@@ -94,52 +116,74 @@ function ThreadSidebar({
   }, [threads, searchQuery])
 
   return (
-    <div className="flex h-full w-60 flex-shrink-0 flex-col border-r border-slate-800 bg-slate-950/60">
-      <div className="p-2">
-        <input
-          type="text"
-          value={searchQuery}
-          onChange={(e) => onSearchChange(e.target.value)}
-          placeholder="Search threads..."
-          className="w-full rounded border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-slate-200 placeholder-slate-500 outline-none focus:border-violet-500"
-        />
+    <aside className="flex h-full w-72 flex-shrink-0 flex-col border-r border-border bg-surface">
+      <div className="border-b border-border p-3">
+        <CardHeader className="mb-3">
+          <div>
+            <CardTitle className="flex items-center gap-2">
+              <BrainCircuit className="h-4 w-4 text-primary" />
+              Brain
+            </CardTitle>
+            <CardDescription>{threads.length} threads indexed</CardDescription>
+          </div>
+          <Badge variant="info">Cmd+K</Badge>
+        </CardHeader>
+        <label className="relative block">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-dim" />
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => onSearchChange(e.target.value)}
+            placeholder="Search threads..."
+            className="h-9 w-full rounded-lg border border-border bg-panel pl-8 pr-3 text-sm text-foreground placeholder:text-dim outline-none transition focus:border-primary"
+          />
+        </label>
       </div>
-      <div className="flex-1 overflow-y-auto px-1">
+      <div className="flex-1 overflow-y-auto p-2">
         {Array.from(grouped.entries()).map(([project, items]) => (
-          <div key={project} className="mb-1">
+          <div key={project} className="mb-3">
             <button
               onClick={() => setCollapsed((p) => ({ ...p, [project]: !p[project] }))}
-              className="flex w-full items-center gap-1.5 rounded px-2 py-1 text-[11px] font-semibold uppercase tracking-wider text-slate-500 hover:text-slate-300"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-2xs font-semibold uppercase text-dim transition hover:bg-panel hover:text-muted"
             >
-              <span className={`text-[10px] transition-transform ${collapsed[project] ? '-rotate-90' : ''}`}>
-                ▾
-              </span>
-              {project}
+              <ChevronDown
+                className={cn('h-3 w-3 transition-transform', collapsed[project] && '-rotate-90')}
+              />
+              <span className="min-w-0 flex-1 truncate">{project}</span>
+              <Badge variant="neutral">{items.length}</Badge>
             </button>
             {!collapsed[project] &&
-              items.map((t) => (
-                <button
-                  key={t.id}
-                  onClick={() => navigate(`/brain/${t.slug}`)}
-                  className={`flex w-full items-center justify-between rounded px-3 py-1.5 text-left text-sm transition ${
-                    activeSlug === t.slug
-                      ? 'bg-violet-500/15 text-violet-300'
-                      : 'text-slate-400 hover:bg-slate-800/70 hover:text-slate-200'
-                  }`}
-                >
-                  <span className="truncate">{t.title}</span>
-                  <span className="ml-2 flex-shrink-0 text-[10px] text-slate-600">
-                    {relTime(t.last_message_at)}
-                  </span>
-                </button>
-              ))}
+              items.map((t) => {
+                const active = activeSlug === t.slug
+                return (
+                  <button
+                    key={t.id}
+                    onClick={() => navigate(`/brain/${t.slug}`)}
+                    className={cn(
+                      'mt-1 flex w-full items-center gap-2 rounded-lg border px-3 py-2 text-left transition',
+                      active
+                        ? 'border-primary/40 bg-primary-subtle text-foreground'
+                        : 'border-transparent text-muted hover:border-border hover:bg-panel hover:text-foreground',
+                    )}
+                  >
+                    <MessageSquare className="h-3.5 w-3.5 flex-shrink-0 text-dim" />
+                    <span className="min-w-0 flex-1 truncate text-sm">{t.title}</span>
+                    <StatusBadge status={t.status} />
+                    <span className="flex-shrink-0 text-2xs text-dim">
+                      {relTime(t.last_message_at)}
+                    </span>
+                  </button>
+                )
+              })}
           </div>
         ))}
         {grouped.size === 0 && (
-          <div className="px-3 py-4 text-xs text-slate-600">No threads found</div>
+          <Card className="border-border bg-panel p-3">
+            <CardDescription>No threads found</CardDescription>
+          </Card>
         )}
       </div>
-    </div>
+    </aside>
   )
 }
 
@@ -188,58 +232,61 @@ function ChatPanel({
   }
 
   return (
-    <div className="flex flex-1 flex-col">
-      <div className="border-b border-slate-800 px-4 py-2 text-sm font-medium text-slate-300">
-        Thread: {threadSlug}
+    <main className="flex min-w-0 flex-1 flex-col bg-background">
+      <div className="flex items-center justify-between border-b border-border bg-background px-5 py-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <CardTitle className="truncate">Thread: {threadSlug}</CardTitle>
+            <StatusBadge status={loading ? 'running' : error ? 'error' : 'active'} />
+          </div>
+          <CardDescription>Enter sends, Shift+Enter adds a new line</CardDescription>
+        </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
-        {loading && <div className="text-sm text-slate-500">Loading messages...</div>}
-        {error && <div className="text-sm text-rose-400">Error: {error}</div>}
+      <div className="flex-1 space-y-3 overflow-y-auto px-5 py-4">
+        {loading && <div className="text-sm text-dim">Loading messages...</div>}
+        {error && <div className="text-sm text-status-crit">Error: {error}</div>}
         {!loading && !error && messages.length === 0 && (
-          <div className="text-sm text-slate-600">No messages yet. Start the conversation below.</div>
+          <Card className="bg-panel">
+            <CardDescription>No messages yet. Start the conversation below.</CardDescription>
+          </Card>
         )}
         {messages.map((m) => (
           <div
             key={m.id}
-            className={`max-w-[80%] rounded-lg px-3 py-2 text-sm ${
-              m.role === 'user'
-                ? 'ml-auto bg-violet-500/20 text-violet-100'
-                : m.role === 'assistant'
-                  ? 'bg-slate-800/60 text-slate-200'
-                  : 'bg-slate-900/40 text-slate-500 italic text-xs'
-            }`}
+            className={cn(
+              'max-w-[82%] rounded-xl border px-3 py-2 text-sm shadow-sm',
+              messageTone(m.role),
+            )}
           >
-            <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+            <div className="mb-1 flex items-center gap-1.5 text-2xs font-semibold uppercase text-dim">
               {m.role}
-              {m.channel && <span className="ml-1 text-slate-600">via {m.channel}</span>}
+              {m.channel && <Badge variant="neutral">via {m.channel}</Badge>}
             </div>
-            <div className="whitespace-pre-wrap">{m.content}</div>
+            <div className="whitespace-pre-wrap leading-relaxed">{m.content}</div>
           </div>
         ))}
         <div ref={bottomRef} />
       </div>
 
-      <div className="border-t border-slate-800 p-3">
-        <div className="flex gap-2">
+      <div className="border-t border-border bg-surface p-3">
+        <div className="flex gap-2 rounded-xl border border-border bg-panel p-2">
           <textarea
+            aria-label="Message input"
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={onKeyDown}
             placeholder="Send a message..."
             rows={1}
-            className="flex-1 resize-none rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 outline-none focus:border-violet-500"
+            className="min-h-9 flex-1 resize-none bg-transparent px-2 py-2 text-sm text-foreground placeholder:text-dim outline-none"
           />
-          <button
-            onClick={send}
-            disabled={sending || !input.trim()}
-            className="rounded border border-violet-500 px-4 py-2 text-sm font-medium text-violet-300 transition hover:bg-violet-500/20 disabled:opacity-40"
-          >
-            {sending ? '...' : 'Send'}
-          </button>
+          <Button onClick={send} disabled={sending || !input.trim()} className="self-end">
+            <Send className="h-4 w-4" />
+            {sending ? 'Sending' : 'Send'}
+          </Button>
         </div>
       </div>
-    </div>
+    </main>
   )
 }
 
@@ -278,50 +325,75 @@ function RightPanel({
   }, [project])
 
   return (
-    <div className="flex h-full w-[280px] flex-shrink-0 flex-col border-l border-slate-800 bg-slate-950/60 overflow-y-auto">
-      {/* Stack */}
-      <div className="border-b border-slate-800 p-3">
-        <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
-          Stack {threadSlug && <span className="text-slate-600">({threadSlug})</span>}
-        </div>
+    <aside className="flex h-full w-80 flex-shrink-0 flex-col gap-3 overflow-y-auto border-l border-border bg-surface p-3">
+      <Card className="bg-panel">
+        <CardHeader>
+          <div>
+            <CardTitle className="flex items-center gap-2">
+              <Layers className="h-4 w-4 text-primary" />
+              Stack
+            </CardTitle>
+            <CardDescription>{threadSlug || 'No active thread'}</CardDescription>
+          </div>
+          <Badge variant="neutral">{stackItems.length}</Badge>
+        </CardHeader>
         {stackItems.length === 0 ? (
-          <div className="text-xs text-slate-600">No stack items</div>
+          <CardDescription>No stack items</CardDescription>
         ) : (
-          <ul className="space-y-1">
-            {stackItems.map((it, i) => (
-              <li key={i} className="flex items-start gap-1.5 text-sm text-slate-300">
-                <span className="mt-0.5 text-slate-600">▸</span>
-                <span className="flex-1 truncate">{it.title}</span>
-                {it.progress != null && (
-                  <span className="flex-shrink-0 text-[10px] text-slate-500">
-                    {Math.round(it.progress * 100)}%
-                  </span>
-                )}
-              </li>
-            ))}
+          <ul className="space-y-2">
+            {stackItems.map((it, i) => {
+              const pct = it.progress == null ? null : Math.round(it.progress * 100)
+              return (
+                <li key={i} className="rounded-lg border border-border bg-surface p-2">
+                  <div className="flex items-start gap-2 text-sm text-foreground">
+                    <span className="mt-1 h-1.5 w-1.5 flex-shrink-0 rounded-full bg-primary" />
+                    <span className="min-w-0 flex-1 truncate">{it.title}</span>
+                  </div>
+                  {it.context && <p className="mt-1 truncate text-xs text-dim">{it.context}</p>}
+                  {pct != null && (
+                    <div className="mt-2 flex items-center gap-2">
+                      <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-elevated">
+                        <div className="h-full rounded-full bg-primary" style={{ width: `${pct}%` }} />
+                      </div>
+                      <span className="text-2xs text-dim">{pct}%</span>
+                    </div>
+                  )}
+                  <p className="mt-1 text-2xs text-dim">{timeAgo(it.pushed_at)}</p>
+                </li>
+              )
+            })}
           </ul>
         )}
-      </div>
+      </Card>
 
-      {/* Backlog */}
-      <div className="p-3">
-        <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
-          Backlog {project && <span className="text-slate-600">({project})</span>}
-        </div>
+      <Card className="bg-panel">
+        <CardHeader>
+          <div>
+            <CardTitle className="flex items-center gap-2">
+              <Inbox className="h-4 w-4 text-primary" />
+              Backlog
+            </CardTitle>
+            <CardDescription>{project || 'No project selected'}</CardDescription>
+          </div>
+          <Badge variant="neutral">{backlogItems.length}</Badge>
+        </CardHeader>
         {backlogItems.length === 0 ? (
-          <div className="text-xs text-slate-600">No backlog items</div>
+          <CardDescription>No backlog items</CardDescription>
         ) : (
-          <ul className="space-y-1">
+          <ul className="space-y-2">
             {backlogItems.map((it, i) => (
-              <li key={i} className="flex items-start gap-1.5 text-sm text-slate-300">
-                <span className="mt-0.5">{priorityEmoji[it.priority] || ''}</span>
-                <span className="flex-1 truncate">{it.title}</span>
+              <li
+                key={i}
+                className="flex items-center gap-2 rounded-lg border border-border bg-surface p-2"
+              >
+                <Badge variant={priorityVariant(it.priority)}>{it.priority}</Badge>
+                <span className="min-w-0 flex-1 truncate text-sm text-foreground">{it.title}</span>
               </li>
             ))}
           </ul>
         )}
-      </div>
-    </div>
+      </Card>
+    </aside>
   )
 }
 
@@ -348,12 +420,14 @@ function FuzzyPicker({
   const filtered = useMemo(() => {
     if (!q) return threads.slice(0, 20)
     const lq = q.toLowerCase()
-    return threads.filter(
-      (t) =>
-        t.title.toLowerCase().includes(lq) ||
-        t.slug.toLowerCase().includes(lq) ||
-        t.project.toLowerCase().includes(lq),
-    ).slice(0, 20)
+    return threads
+      .filter(
+        (t) =>
+          t.title.toLowerCase().includes(lq) ||
+          t.slug.toLowerCase().includes(lq) ||
+          t.project.toLowerCase().includes(lq),
+      )
+      .slice(0, 20)
   }, [threads, q])
 
   const onKeyDown = (e: React.KeyboardEvent) => {
@@ -361,32 +435,39 @@ function FuzzyPicker({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh]" onClick={onClose}>
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center bg-background/70 pt-[15vh] backdrop-blur-sm"
+      onClick={onClose}
+    >
       <div
-        className="w-full max-w-lg rounded-lg border border-slate-700 bg-slate-900 shadow-2xl"
+        className="w-full max-w-xl rounded-xl border border-border bg-panel shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <input
-          ref={inputRef}
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          onKeyDown={onKeyDown}
-          placeholder="Jump to thread..."
-          className="w-full border-b border-slate-700 bg-transparent px-4 py-3 text-sm text-slate-200 placeholder-slate-500 outline-none"
-        />
+        <label className="relative block border-b border-border">
+          <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-dim" />
+          <input
+            ref={inputRef}
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder="Jump to thread..."
+            className="w-full bg-transparent py-3 pl-10 pr-4 text-sm text-foreground placeholder:text-dim outline-none"
+          />
+        </label>
         <div className="max-h-64 overflow-y-auto">
           {filtered.map((t) => (
             <button
               key={t.id}
               onClick={() => onSelect(t.slug)}
-              className="flex w-full items-center justify-between px-4 py-2 text-left text-sm text-slate-300 transition hover:bg-slate-800"
+              className="flex w-full items-center gap-3 px-4 py-2.5 text-left text-sm text-muted transition hover:bg-surface hover:text-foreground"
             >
-              <span className="truncate">{t.title}</span>
-              <span className="ml-2 flex-shrink-0 text-[10px] text-slate-600">{t.project}</span>
+              <MessageSquare className="h-3.5 w-3.5 flex-shrink-0 text-dim" />
+              <span className="min-w-0 flex-1 truncate">{t.title}</span>
+              <Badge variant="neutral">{t.project}</Badge>
             </button>
           ))}
           {filtered.length === 0 && (
-            <div className="px-4 py-3 text-xs text-slate-600">No matching threads</div>
+            <div className="px-4 py-3 text-xs text-dim">No matching threads</div>
           )}
         </div>
       </div>
@@ -512,13 +593,13 @@ export function Brain() {
 
   // Loading / error for threads
   if (threadsLoading) {
-    return <div className="p-6 text-slate-400">Loading brain threads...</div>
+    return <div className="p-6 text-muted">Loading brain threads...</div>
   }
   if (threadsError && threads.length === 0) {
     return (
       <div className="p-6">
-        <div className="text-rose-400">Could not load brain threads: {threadsError}</div>
-        <div className="mt-2 text-sm text-slate-500">
+        <div className="text-status-crit">Could not load brain threads: {threadsError}</div>
+        <div className="mt-2 text-sm text-dim">
           The Brain API is not running yet. Start the daemon or check logs.
         </div>
       </div>
@@ -526,7 +607,7 @@ export function Brain() {
   }
 
   return (
-    <div className="flex h-full -m-4 md:-m-6">
+    <div className="-m-4 flex h-full min-h-[calc(100vh-4rem)] overflow-hidden bg-background md:-m-6">
       {showPicker && (
         <FuzzyPicker
           threads={threads}
@@ -535,7 +616,6 @@ export function Brain() {
         />
       )}
 
-      {/* Left: Thread sidebar */}
       <ThreadSidebar
         threads={threads}
         activeSlug={threadSlug}
@@ -543,7 +623,6 @@ export function Brain() {
         onSearchChange={setSearchQuery}
       />
 
-      {/* Center: Chat or landing */}
       {threadSlug ? (
         <ChatPanel
           threadSlug={threadSlug}
@@ -552,26 +631,29 @@ export function Brain() {
           error={msgsError}
         />
       ) : (
-        <div className="flex flex-1 flex-col items-center justify-center text-center">
-          <div className="mb-4 text-4xl">🧠</div>
-          <h2 className="mb-2 text-xl font-semibold text-slate-200">Virtual Brain</h2>
-          <p className="mb-6 max-w-md text-sm text-slate-500">
-            Select a thread from the sidebar or create a new one. Press{' '}
-            <kbd className="rounded border border-slate-700 bg-slate-800 px-1.5 py-0.5 text-xs text-slate-300">
-              Cmd+K
-            </kbd>{' '}
-            to quickly jump to any thread.
-          </p>
-          <button
-            onClick={() => navigate('/brain/new')}
-            className="rounded border border-violet-500 px-6 py-2.5 text-sm font-medium text-violet-300 transition hover:bg-violet-500/20"
-          >
-            + New Thread
-          </button>
-        </div>
+        <main className="flex flex-1 flex-col items-center justify-center bg-background p-6 text-center">
+          <Card className="max-w-md bg-panel">
+            <CardHeader className="justify-center">
+              <div className="flex flex-col items-center gap-3">
+                <div className="flex h-12 w-12 items-center justify-center rounded-xl border border-primary/30 bg-primary-subtle text-primary">
+                  <BrainCircuit className="h-6 w-6" />
+                </div>
+                <div>
+                  <CardTitle className="text-lg">Virtual Brain</CardTitle>
+                  <CardDescription className="mt-1">
+                    Select a thread from the sidebar or press Cmd+K to jump directly.
+                  </CardDescription>
+                </div>
+              </div>
+            </CardHeader>
+            <Button onClick={() => navigate('/brain/new')} className="mt-2">
+              <Plus className="h-4 w-4" />
+              New Thread
+            </Button>
+          </Card>
+        </main>
       )}
 
-      {/* Right: Stack + Backlog */}
       <RightPanel threadSlug={threadSlug} project={activeThread?.project} />
     </div>
   )

@@ -41,7 +41,7 @@ export function FleetMemberModal({ member, onClose }: Props) {
               'bg-rose-500/20 text-rose-300'
             }`}>{status}</span>
             {isLeader && <span className="rounded-full bg-violet-500/20 px-2 py-0.5 text-xs text-violet-300">leader</span>}
-            <button onClick={onClose} className="ml-2 rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300">
+            <button onClick={onClose} aria-label="Close" className="ml-2 rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300">
               <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
               </svg>

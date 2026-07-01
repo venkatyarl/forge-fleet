@@ -1,11 +1,17 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
+import { Badge } from '../components/ui/badge'
+import { Button } from '../components/ui/button'
+import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { StatusBadge } from '../components/ui/status-badge'
 import { getJson } from '../lib/api'
 import { extractNodes } from '../lib/normalizers'
+import { cn } from '../lib/utils'
 import type { FleetComputer, FleetStatusResponse } from '../types'
 
 export function NodeDetail() {
   const { nodeId = '' } = useParams()
+  const navigate = useNavigate()
   const [node, setNode] = useState<FleetComputer | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -50,13 +56,26 @@ export function NodeDetail() {
     return (node.models ?? []).map((model) => model.name)
   }, [node])
 
+  const status = node ? String(node.status ?? node.health ?? 'unknown') : 'unknown'
+  const leaderState = node ? node.leader_state ?? (node.is_leader ? 'leader' : 'follower') : 'unknown'
+  const sourceKind = node ? node.source_kind ?? (node.runtime_enrolled ? 'enrolled/live' : 'seed/static') : 'unknown'
+
   return (
-    <section className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h2 className="text-xl font-semibold text-slate-100">Node Detail</h2>
-        <Link to="/" className="text-sm text-sky-300 hover:text-sky-200">
-          ← Back to fleet
-        </Link>
+    <section className="min-h-full space-y-6 bg-background text-foreground">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="text-2xl font-bold text-foreground">Node Detail</h1>
+            {node ? <StatusBadge status={status}>{status}</StatusBadge> : null}
+            {node ? <Badge variant={node.is_leader ? 'default' : 'neutral'}>{leaderState}</Badge> : null}
+          </div>
+          <p className="mt-1 truncate text-sm text-dim">
+            {node ? `${node.name} - ${node.ip ?? node.hostname ?? 'unknown endpoint'}` : nodeId}
+          </p>
+        </div>
+        <Button variant="outline" onClick={() => navigate('/')}>
+          Back to fleet
+        </Button>
       </div>
 
       {loading ? <Info text="Loading node details..." /> : null}
@@ -64,17 +83,21 @@ export function NodeDetail() {
 
       {node ? (
         <div className="grid gap-4 lg:grid-cols-2">
-          <Panel title="Identity & Role">
+          <Panel
+            title="Identity & Role"
+            description="Inventory identity, routing endpoint, leadership, and runtime source"
+            action={<Badge variant={sourceKind === 'enrolled/live' ? 'info' : 'neutral'}>{sourceKind}</Badge>}
+          >
             <Field label="Name" value={node.name} />
             <Field label="IP" value={node.ip} />
             <Field label="Role" value={node.role} />
-            <Field label="Leader State" value={node.leader_state ?? (node.is_leader ? 'leader' : 'follower')} />
-            <Field label="Status" value={node.status ?? node.health} />
-            <Field label="Source" value={node.source_kind ?? (node.runtime_enrolled ? 'enrolled/live' : 'seed/static')} />
+            <Field label="Leader State" value={leaderState} />
+            <Field label="Status" value={<StatusBadge status={status}>{status}</StatusBadge>} />
+            <Field label="Source" value={sourceKind} />
             <Field label="Service Version" value={node.service_version ?? 'unreported'} />
           </Panel>
 
-          <Panel title="Resources">
+          <Panel title="Resources" description="Reported hardware and heartbeat freshness">
             <Field label="CPU" value={node.cpu ?? node.hardware?.cpu} />
             <Field label="RAM" value={node.ram ?? node.hardware?.ram} />
             <Field label="GPU" value={node.gpu ?? node.hardware?.gpu} />
@@ -90,9 +113,16 @@ export function NodeDetail() {
             />
           </Panel>
 
-          <Panel title="Replication">
+          <Panel
+            title="Replication"
+            description="Local replication mode, health, sequence, and detail"
+            action={<StatusBadge status={node.replication_state?.health ?? 'unknown'} />}
+          >
             <Field label="Mode" value={node.replication_state?.mode ?? 'unknown'} />
-            <Field label="Health" value={node.replication_state?.health ?? 'unknown'} />
+            <Field
+              label="Health"
+              value={<StatusBadge status={node.replication_state?.health ?? 'unknown'} />}
+            />
             <Field
               label="Sequence"
               value={
@@ -104,8 +134,15 @@ export function NodeDetail() {
             <Field label="Detail" value={node.replication_state?.detail ?? 'unreported'} />
           </Panel>
 
-          <Panel title="Current Workload">
-            <Field label="Status" value={node.current_workload?.status ?? 'unreported'} />
+          <Panel
+            title="Current Workload"
+            description="Scheduler activity and active task allocation"
+            action={<StatusBadge status={node.current_workload?.status ?? 'unreported'} />}
+          >
+            <Field
+              label="Status"
+              value={<StatusBadge status={node.current_workload?.status ?? 'unreported'} />}
+            />
             <Field
               label="Active Tasks"
               value={
@@ -124,21 +161,27 @@ export function NodeDetail() {
             />
           </Panel>
 
-          <Panel title="Models Loaded">
+          <Panel
+            title="Models Loaded"
+            description="Model inventory reported by the node"
+            action={<Badge variant="neutral">{modelNames.length} models</Badge>}
+          >
             {modelNames.length === 0 ? (
-              <p className="text-sm text-slate-400">
+              <p className="text-sm text-dim">
                 {node.models_loaded_state === 'unreported' ? 'unreported' : 'none'}
               </p>
             ) : (
-              <ul className="list-disc space-y-1 pl-5 text-sm text-slate-200">
+              <div className="flex flex-wrap gap-1.5">
                 {modelNames.map((name) => (
-                  <li key={name}>{name}</li>
+                  <Badge key={name} variant="neutral">
+                    {name}
+                  </Badge>
                 ))}
-              </ul>
+              </div>
             )}
           </Panel>
 
-          <Panel title="Runtime Provenance">
+          <Panel title="Runtime Provenance" description="Signals used to classify this node">
             <Field
               label="Signals"
               value={
@@ -151,7 +194,11 @@ export function NodeDetail() {
             <Field label="Runtime Enrolled" value={node.runtime_enrolled ? 'yes' : 'no'} />
           </Panel>
 
-          <Panel title="Raw Metrics">
+          <Panel
+            title="Raw Metrics"
+            description="Unmodified metrics payload returned by the fleet API"
+            className="lg:col-span-2"
+          >
             <JsonBlock data={node.metrics ?? {}} />
           </Panel>
         </div>
@@ -160,29 +207,49 @@ export function NodeDetail() {
   )
 }
 
-function Panel({ title, children }: { title: string; children: ReactNode }) {
+function Panel({
+  title,
+  description,
+  action,
+  className,
+  children,
+}: {
+  title: string
+  description?: string
+  action?: ReactNode
+  className?: string
+  children: ReactNode
+}) {
   return (
-    <article className="rounded-xl border border-slate-800 bg-slate-900/70 p-4">
-      <h3 className="mb-3 text-sm font-medium uppercase tracking-wide text-slate-400">{title}</h3>
-      {children}
-    </article>
+    <Card className={cn('bg-panel', className)}>
+      <CardHeader className="items-start gap-3">
+        <div className="min-w-0">
+          <CardTitle>{title}</CardTitle>
+          {description ? <CardDescription className="mt-1">{description}</CardDescription> : null}
+        </div>
+        {action ? <div className="flex shrink-0 items-center gap-2">{action}</div> : null}
+      </CardHeader>
+      <div className="grid gap-3 sm:grid-cols-2">{children}</div>
+    </Card>
   )
 }
 
-function Field({ label, value }: { label: string; value: unknown }) {
+function Field({ label, value }: { label: string; value: ReactNode }) {
   const display = typeof value === 'string' && value.trim().length > 0 ? value : String(value ?? 'unknown')
 
   return (
-    <div className="mb-1 text-sm">
-      <span className="text-slate-500">{label}: </span>
-      <span className="text-slate-200">{display}</span>
+    <div className="min-w-0 rounded-lg border border-border bg-surface px-3 py-2">
+      <div className="text-xs text-dim">{label}</div>
+      <div className="mt-1 min-w-0 break-words text-sm text-muted">
+        {typeof value === 'string' || value == null ? display : value}
+      </div>
     </div>
   )
 }
 
 function JsonBlock({ data }: { data: unknown }) {
   return (
-    <pre className="max-h-72 overflow-auto rounded-md bg-slate-950/80 p-3 text-xs text-slate-200">
+    <pre className="max-h-80 overflow-auto rounded-lg border border-border bg-background p-3 text-xs text-muted">
       {JSON.stringify(data, null, 2)}
     </pre>
   )
@@ -190,14 +257,8 @@ function JsonBlock({ data }: { data: unknown }) {
 
 function Info({ text, danger = false }: { text: string; danger?: boolean }) {
   return (
-    <div
-      className={`rounded-xl border px-4 py-3 text-sm ${
-        danger
-          ? 'border-rose-500/30 bg-rose-500/10 text-rose-200'
-          : 'border-slate-800 bg-slate-900/50 text-slate-300'
-      }`}
-    >
-      {text}
-    </div>
+    <Card className={cn('bg-panel', danger ? 'border-status-crit' : 'border-border')}>
+      <div className={cn('text-sm', danger ? 'text-status-crit' : 'text-muted')}>{text}</div>
+    </Card>
   )
 }

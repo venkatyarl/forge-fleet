@@ -1,4 +1,6 @@
 import { useMemo } from 'react'
+import { Badge } from '../../components/ui/badge'
+import { Card, CardDescription, CardHeader, CardTitle } from '../../components/ui/card'
 import type { ChecklistItem } from '../../data/onboardChecklist'
 import { CHECKLIST } from '../../data/onboardChecklist'
 
@@ -21,7 +23,7 @@ function renderMarkdown(md: string): React.ReactNode {
   const flushList = () => {
     if (listBuf.length) {
       out.push(
-        <ul key={`ul-${out.length}`} className="list-disc pl-5 space-y-0.5 text-slate-200">
+        <ul key={`ul-${out.length}`} className="list-disc space-y-1 pl-5 text-foreground">
           {listBuf.map((l, i) => (
             <li key={i}>{renderInline(l)}</li>
           ))}
@@ -35,7 +37,7 @@ function renderMarkdown(md: string): React.ReactNode {
       out.push(
         <pre
           key={`pre-${out.length}`}
-          className="bg-slate-900 border border-slate-700 rounded px-3 py-2 text-[12px] font-mono text-emerald-200 overflow-x-auto"
+          className="overflow-x-auto rounded-lg border border-border bg-background px-3 py-2 font-mono text-xs leading-5 text-status-ok"
         >
           {fenceBuf.join('\n')}
         </pre>
@@ -70,7 +72,7 @@ function renderMarkdown(md: string): React.ReactNode {
       continue
     }
     out.push(
-      <p key={`p-${out.length}`} className="text-slate-200 leading-relaxed">
+      <p key={`p-${out.length}`} className="leading-relaxed text-foreground">
         {renderInline(line)}
       </p>
     )
@@ -90,19 +92,22 @@ function renderInline(s: string): React.ReactNode {
     const tok = m[0]
     if (tok.startsWith('**')) {
       parts.push(
-        <strong key={parts.length} className="text-white font-semibold">
+        <strong key={parts.length} className="font-semibold text-foreground">
           {tok.slice(2, -2)}
         </strong>
       )
     } else if (tok.startsWith('`')) {
       parts.push(
-        <code key={parts.length} className="px-1 py-0.5 rounded bg-slate-800 text-amber-300 text-[13px] font-mono">
+        <code
+          key={parts.length}
+          className="rounded bg-elevated px-1 py-0.5 font-mono text-[13px] text-primary"
+        >
           {tok.slice(1, -1)}
         </code>
       )
     } else {
       parts.push(
-        <a key={parts.length} href={tok} target="_blank" rel="noreferrer" className="text-indigo-300 underline">
+        <a key={parts.length} href={tok} target="_blank" rel="noreferrer" className="text-primary underline">
           {tok}
         </a>
       )
@@ -121,17 +126,27 @@ export function DetailPanel({ activeId }: DetailPanelProps) {
 
   if (!item) {
     return (
-      <div className="h-full p-4 text-sm text-slate-400 flex items-center justify-center">
-        ← Select a checklist item to see details
+      <div className="flex h-full items-center justify-center p-4">
+        <Card className="max-w-sm bg-panel text-center">
+          <CardTitle>Select a checklist item</CardTitle>
+          <CardDescription className="mt-2">Step details will appear here.</CardDescription>
+        </Card>
       </div>
     )
   }
 
   return (
     <div className="h-full overflow-auto p-5">
-      <div className="text-[11px] uppercase tracking-wider text-slate-500">{item.group}</div>
-      <h3 className="text-lg font-semibold text-white mt-1 mb-3">{item.title}</h3>
-      <div className="space-y-2">{renderMarkdown(item.detail_md)}</div>
+      <Card className="bg-panel">
+        <CardHeader className="items-start gap-3">
+          <div>
+            <CardTitle className="text-base">{item.title}</CardTitle>
+            <CardDescription>Checklist detail and commands.</CardDescription>
+          </div>
+          <Badge variant="neutral">{item.group}</Badge>
+        </CardHeader>
+        <div className="space-y-3 text-sm">{renderMarkdown(item.detail_md)}</div>
+      </Card>
     </div>
   )
 }
