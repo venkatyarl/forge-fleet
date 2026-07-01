@@ -113,6 +113,15 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
             println!("  priority: {prio}");
             println!("  created_by: {created_by}");
         }
+        crate::PmCommand::Decompose {
+            goal,
+            project,
+            llm,
+            ready,
+            max,
+        } => {
+            handle_pm_decompose(&pool, goal, project, llm, ready, max).await?;
+        }
         crate::PmCommand::Ready { id, on } => {
             let uid = uuid::Uuid::parse_str(&id)
                 .map_err(|e| anyhow::anyhow!("invalid work item id '{id}': {e}"))?;
@@ -550,6 +559,128 @@ async fn print_board_summary(pool: &sqlx::PgPool) -> Result<()> {
         println!("\x1b[2m  status: {statuses}{RESET}");
     }
     println!();
+    Ok(())
+}
+
+/// The planner→PM bridge: decompose a goal into leaf `task` work_items via a
+/// fleet LLM, create each as a child (parent_id), and optionally flag ready so
+/// the Pillar-4 scheduler fans them across the fleet. This is what turns "give
+/// ff a goal" into a fanned-out fleet build (instead of hand-creating tasks).
+async fn handle_pm_decompose(
+    pool: &sqlx::PgPool,
+    goal: String,
+    project: String,
+    llm: Option<String>,
+    ready: bool,
+    max: usize,
+) -> Result<()> {
+    // If `goal` is a work_item UUID, decompose ITS title+description; else treat
+    // the string itself as the goal. When it's an existing item, the children
+    // hang off it via parent_id.
+    let (parent_id, goal_text): (Option<uuid::Uuid>, String) =
+        match uuid::Uuid::parse_str(goal.trim()) {
+            Ok(uid) => {
+                let row: Option<(String, Option<String>)> =
+                    sqlx::query_as("SELECT title, description FROM work_items WHERE id = $1")
+                        .bind(uid)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("load work item {uid}: {e}"))?;
+                match row {
+                    Some((title, desc)) => (
+                        Some(uid),
+                        format!("{title}\n\n{}", desc.unwrap_or_default()),
+                    ),
+                    None => return Err(anyhow::anyhow!("no work item with id {goal}")),
+                }
+            }
+            Err(_) => (None, goal.clone()),
+        };
+
+    println!("{CYAN}▶ decomposing goal via fleet LLM…{RESET}");
+    let prompt = format!(
+        "You are a senior engineer breaking a goal into independent, well-scoped \
+         LEAF coding tasks for the forge-fleet Rust repo. Each task must be doable \
+         on its own by a coding agent and touch a small, specific set of files. \
+         Output ONLY a JSON array (no prose, no markdown fence) of at most {max} \
+         objects, each: {{\"title\": \"<imperative, <70 chars>\", \"description\": \
+         \"<precise instructions: which file(s), what to add/change, mirror an \
+         existing pattern; end with: Do NOT run cargo; just write the code>\"}}. \
+         GOAL:\n{goal_text}"
+    );
+
+    let resp = ff_agent::fleet_oneshot::fleet_oneshot(
+        pool,
+        &prompt,
+        llm.as_deref(),
+        Some(std::time::Duration::from_secs(180)),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("fleet_oneshot decompose: {e}"))?;
+
+    // Pull the JSON array out of the completion (models sometimes wrap it).
+    let text = resp.text.trim();
+    let json_slice = match (text.find('['), text.rfind(']')) {
+        (Some(a), Some(b)) if b > a => &text[a..=b],
+        _ => {
+            return Err(anyhow::anyhow!(
+                "LLM did not return a JSON array; got: {}",
+                text.chars().take(200).collect::<String>()
+            ));
+        }
+    };
+    #[derive(serde::Deserialize)]
+    struct LeafTask {
+        title: String,
+        description: String,
+    }
+    let tasks: Vec<LeafTask> = serde_json::from_str(json_slice)
+        .map_err(|e| anyhow::anyhow!("parse decomposed tasks JSON: {e}"))?;
+    if tasks.is_empty() {
+        return Err(anyhow::anyhow!("LLM returned zero tasks"));
+    }
+
+    let created_by = ff_agent::fleet_info::resolve_this_worker_name().await;
+    println!(
+        "{GREEN}✓ {} leaf task(s) from {}{RESET}",
+        tasks.len(),
+        resp.worker_name
+    );
+    let mut ids = Vec::new();
+    for t in tasks.into_iter().take(max) {
+        let row: (uuid::Uuid,) = sqlx::query_as(
+            "INSERT INTO work_items (project_id, kind, title, description, priority, created_by, parent_id) \
+             VALUES ($1, 'task', $2, $3, 'normal', $4, $5) RETURNING id",
+        )
+        .bind(&project)
+        .bind(&t.title)
+        .bind(&t.description)
+        .bind(&created_by)
+        .bind(parent_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("insert child task: {e}"))?;
+        ids.push(row.0);
+        println!("  + {} {}", row.0, t.title);
+    }
+
+    if ready {
+        for id in &ids {
+            sqlx::query("UPDATE work_items SET status = 'ready' WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("flag ready {id}: {e}"))?;
+        }
+        println!(
+            "{GREEN}✓ flagged {} task(s) ready — the Pillar-4 scheduler will fan them across the fleet{RESET}",
+            ids.len()
+        );
+    } else {
+        println!(
+            "{YELLOW}note:{RESET} created as 'idea' — re-run with --ready (or `ff pm ready <id>`) to dispatch"
+        );
+    }
     Ok(())
 }
 
