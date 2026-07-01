@@ -73,7 +73,11 @@ async fn render_fleet(app: &App) -> String {
                 lines.push("No computers found.".to_string());
             } else {
                 for n in nodes {
-                    let status = n.status.as_deref().or(n.health.as_deref()).unwrap_or("unknown");
+                    let status = n
+                        .status
+                        .as_deref()
+                        .or(n.health.as_deref())
+                        .unwrap_or("unknown");
                     let role = n.role.as_deref().unwrap_or("worker");
                     let ip = n.ip.as_deref().unwrap_or("-");
                     let models = n
@@ -116,7 +120,11 @@ async fn render_models(app: &App) -> String {
                 ));
                 for s in servers {
                     let status = if s.healthy { "online" } else { "offline" };
-                    let enabled = if s.enabled.unwrap_or(true) { "" } else { " (disabled)" };
+                    let enabled = if s.enabled.unwrap_or(true) {
+                        ""
+                    } else {
+                        " (disabled)"
+                    };
                     lines.push(format!(
                         "{status:<8} {model:<28} {runtime:<10} {node:<12} {throughput:<10.1} {queue:<6}{enabled}",
                         status = status,
@@ -180,7 +188,11 @@ async fn render_alerts(app: &App) -> String {
                 lines.push("No alert events.".to_string());
             } else {
                 for e in events.iter().take(20) {
-                    let resolved = if e.resolved_at.is_some() { "[RESOLVED]" } else { "" };
+                    let resolved = if e.resolved_at.is_some() {
+                        "[RESOLVED]"
+                    } else {
+                        ""
+                    };
                     lines.push(format!(
                         "[{severity}] {policy} ({metric}) {resolved}",
                         severity = e.severity,
@@ -205,7 +217,10 @@ async fn render_alerts(app: &App) -> String {
 }
 
 async fn render_interactions(app: &App, limit: usize) -> String {
-    let mut lines = vec![format!("Recent interactions (last {limit})"), "─".repeat(50)];
+    let mut lines = vec![
+        format!("Recent interactions (last {limit})"),
+        "─".repeat(50),
+    ];
     match app.gateway.get_interactions(limit).await {
         Ok(rows) => {
             if rows.is_empty() {
@@ -213,7 +228,11 @@ async fn render_interactions(app: &App, limit: usize) -> String {
             } else {
                 for r in rows {
                     let outcome = r.outcome.as_deref().unwrap_or("-");
-                    let ts = r.ts.as_deref().or(r.created_at.as_deref()).map(fmt_ts).unwrap_or_else(|| "-".to_string());
+                    let ts =
+                        r.ts.as_deref()
+                            .or(r.created_at.as_deref())
+                            .map(fmt_ts)
+                            .unwrap_or_else(|| "-".to_string());
                     lines.push(format!(
                         "[{outcome}] [{channel}] {text}",
                         outcome = outcome,
@@ -241,7 +260,10 @@ async fn render_settings(app: &App) -> String {
     match app.gateway.get_settings_runtime().await {
         Ok(s) => {
             if let Some(runtime) = s.runtime_config {
-                lines.push(format!("Config loaded: {}", if runtime.loaded { "yes" } else { "no" }));
+                lines.push(format!(
+                    "Config loaded: {}",
+                    if runtime.loaded { "yes" } else { "no" }
+                ));
                 if let Some(path) = runtime.config_path {
                     lines.push(format!("Config path: {path}"));
                 }
@@ -258,8 +280,14 @@ async fn render_settings(app: &App) -> String {
                 ));
             }
             if let Some(db) = s.database {
-                lines.push(format!("Database mode: {}", db.active_mode.as_deref().unwrap_or("-")));
-                lines.push(format!("Database status: {}", db.status.as_deref().unwrap_or("-")));
+                lines.push(format!(
+                    "Database mode: {}",
+                    db.active_mode.as_deref().unwrap_or("-")
+                ));
+                lines.push(format!(
+                    "Database status: {}",
+                    db.status.as_deref().unwrap_or("-")
+                ));
                 if let Some(e) = db.error {
                     lines.push(format!("Database error: {e}"));
                 }
@@ -305,7 +333,11 @@ async fn render_skills(app: &App) -> String {
                     } else {
                         format!(" [{}]", s.tools.join(", "))
                     };
-                    lines.push(format!("{name} ({scope}){tools}", name = s.name, scope = s.scope));
+                    lines.push(format!(
+                        "{name} ({scope}){tools}",
+                        name = s.name,
+                        scope = s.scope
+                    ));
                     if !s.description.is_empty() {
                         lines.push(format!("  {}", truncate(&s.description, 70)));
                     }
@@ -326,14 +358,21 @@ async fn render_brain(app: &App) -> String {
             } else {
                 for t in threads.iter().take(20) {
                     let status = t.status.as_deref().unwrap_or("-");
-                    let ts = t.last_message_at.as_deref().map(fmt_ts).unwrap_or_else(|| "-".to_string());
+                    let ts = t
+                        .last_message_at
+                        .as_deref()
+                        .map(fmt_ts)
+                        .unwrap_or_else(|| "-".to_string());
                     let count = t.message_count.unwrap_or(0);
                     lines.push(format!(
                         "[{status}] {title}",
                         status = status,
                         title = t.title
                     ));
-                    lines.push(format!("  slug: {} · messages: {} · last: {}", t.slug, count, ts));
+                    lines.push(format!(
+                        "  slug: {} · messages: {} · last: {}",
+                        t.slug, count, ts
+                    ));
                 }
             }
         }
@@ -346,7 +385,10 @@ async fn render_status(app: &App) -> String {
     let mut lines = vec!["Gateway status".to_string(), "─".repeat(40)];
     match app.gateway.get_fleet_status().await {
         Ok(s) => {
-            lines.push(format!("Gateway status: {}", s.status.as_deref().unwrap_or("unknown")));
+            lines.push(format!(
+                "Gateway status: {}",
+                s.status.as_deref().unwrap_or("unknown")
+            ));
             if let Some(scanned) = s.scanned_at {
                 lines.push(format!("Scanned at: {}", fmt_ts(&scanned)));
             }

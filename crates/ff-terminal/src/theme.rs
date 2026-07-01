@@ -54,18 +54,18 @@ impl Default for Theme {
     fn default() -> Self {
         Self {
             // Dashboard semantic palette
-            bg: Color::Rgb(2, 6, 23),              // --background
-            surface: Color::Rgb(15, 23, 42),       // --surface
-            panel: Color::Rgb(30, 41, 59),         // --panel
-            elevated: Color::Rgb(51, 65, 85),      // --elevated
-            fg: Color::Rgb(226, 232, 240),         // --foreground
-            muted: Color::Rgb(148, 163, 184),      // --muted
-            dim: Color::Rgb(100, 116, 139),        // --dim
-            border: Color::Rgb(51, 65, 85),        // --border
-            border_subtle: Color::Rgb(71, 85, 105), // --border-subtle
-            primary: Color::Rgb(99, 102, 241),     // --primary
+            bg: Color::Rgb(2, 6, 23),                 // --background
+            surface: Color::Rgb(15, 23, 42),          // --surface
+            panel: Color::Rgb(30, 41, 59),            // --panel
+            elevated: Color::Rgb(51, 65, 85),         // --elevated
+            fg: Color::Rgb(226, 232, 240),            // --foreground
+            muted: Color::Rgb(148, 163, 184),         // --muted
+            dim: Color::Rgb(100, 116, 139),           // --dim
+            border: Color::Rgb(51, 65, 85),           // --border
+            border_subtle: Color::Rgb(71, 85, 105),   // --border-subtle
+            primary: Color::Rgb(99, 102, 241),        // --primary
             primary_muted: Color::Rgb(129, 140, 248), // --primary-muted
-            primary_subtle: Color::Rgb(30, 27, 75), // --primary-subtle
+            primary_subtle: Color::Rgb(30, 27, 75),   // --primary-subtle
 
             status_ok: Color::Rgb(74, 222, 128),
             status_warn: Color::Rgb(251, 191, 36),
@@ -101,9 +101,7 @@ impl Default for Theme {
 impl Theme {
     /// Style for a subtle block title.
     pub fn title_style(&self) -> Style {
-        Style::default()
-            .fg(self.fg)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(self.fg).add_modifier(Modifier::BOLD)
     }
 
     /// Style for dim helper text inside blocks.

@@ -40,7 +40,11 @@ impl GatewayClient {
             .await
             .map_err(|e| format!("request failed: {e}"))?;
         if !res.status().is_success() {
-            return Err(format!("{} {}", res.status().as_u16(), res.status().canonical_reason().unwrap_or("")));
+            return Err(format!(
+                "{} {}",
+                res.status().as_u16(),
+                res.status().canonical_reason().unwrap_or("")
+            ));
         }
         res.json::<T>()
             .await
@@ -56,9 +60,15 @@ impl GatewayClient {
             .await
             .map_err(|e| format!("request failed: {e}"))?;
         if !res.status().is_success() {
-            return Err(format!("{} {}", res.status().as_u16(), res.status().canonical_reason().unwrap_or("")));
+            return Err(format!(
+                "{} {}",
+                res.status().as_u16(),
+                res.status().canonical_reason().unwrap_or("")
+            ));
         }
-        res.text().await.map_err(|e| format!("body read failed: {e}"))
+        res.text()
+            .await
+            .map_err(|e| format!("body read failed: {e}"))
     }
 
     // ── fleet ──────────────────────────────────────────────────────────────
@@ -96,9 +106,7 @@ impl GatewayClient {
         struct Resp {
             tools: Vec<LiveTool>,
         }
-        self.get_json::<Resp>("/api/tools")
-            .await
-            .map(|r| r.tools)
+        self.get_json::<Resp>("/api/tools").await.map(|r| r.tools)
     }
 
     // ── interactions ───────────────────────────────────────────────────────
@@ -157,9 +165,7 @@ impl GatewayClient {
         struct Resp {
             skills: Vec<Skill>,
         }
-        self.get_json::<Resp>("/api/skills")
-            .await
-            .map(|r| r.skills)
+        self.get_json::<Resp>("/api/skills").await.map(|r| r.skills)
     }
 
     // ── brain threads ──────────────────────────────────────────────────────

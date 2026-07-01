@@ -5666,7 +5666,10 @@ async fn run_tui(config: AgentSessionConfig) -> Result<()> {
     command_list.push(("models", "Show LLM servers: /models"));
     command_list.push(("tools", "Show tool registry: /tools"));
     command_list.push(("alerts", "Show alert events: /alerts"));
-    command_list.push(("interactions", "Show recent interactions: /interactions [limit]"));
+    command_list.push((
+        "interactions",
+        "Show recent interactions: /interactions [limit]",
+    ));
     command_list.push(("settings", "Show runtime settings: /settings"));
     command_list.push(("config", "Show fleet.toml: /config"));
     command_list.push(("skills", "List skills: /skills"));
@@ -6097,8 +6100,12 @@ async fn run_event_loop(
 
                         // Data slash commands — live dashboard data from the gateway
                         if let Some(output) = ff_terminal::data_cmd::run(app, &trimmed).await {
-                            app.tab_mut().messages.push(ff_terminal::messages::render_user_message(&trimmed));
-                            app.tab_mut().messages.push(ff_terminal::messages::render_assistant_message(&output));
+                            app.tab_mut()
+                                .messages
+                                .push(ff_terminal::messages::render_user_message(&trimmed));
+                            app.tab_mut()
+                                .messages
+                                .push(ff_terminal::messages::render_assistant_message(&output));
                             app.tab_mut().input.submit();
                             continue;
                         }

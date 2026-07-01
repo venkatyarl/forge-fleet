@@ -85,7 +85,9 @@ fn discover_skill_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -194,7 +196,10 @@ fn summarize(path: &Path, root: &Path) -> Option<SkillSummary> {
     });
 
     let tools = fm.get("tools").map(|s| parse_list(s)).unwrap_or_default();
-    let triggers = fm.get("triggers").map(|s| parse_list(s)).unwrap_or_default();
+    let triggers = fm
+        .get("triggers")
+        .map(|s| parse_list(s))
+        .unwrap_or_default();
 
     Some(SkillSummary {
         id,
