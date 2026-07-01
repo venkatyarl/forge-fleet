@@ -95,6 +95,7 @@ mod tools_cmd;
 mod top_cortex_cmd;
 mod train_cmd;
 mod utils;
+mod usage_cmd;
 mod versions_cmd;
 mod voice_cmd;
 
@@ -187,6 +188,11 @@ enum Command {
         /// Per-backend auth-probe timeout (seconds).
         #[arg(long, default_value_t = 30)]
         timeout: u64,
+    },
+    /// Show provider headroom sampled across fleet computers.
+    Usage {
+        #[arg(long)]
+        json: bool,
     },
     /// List fleet nodes with hardware/GPU info from Postgres.
     Nodes {
@@ -3999,6 +4005,7 @@ async fn main() -> Result<()> {
             json,
             timeout,
         }) => return backends_cmd::handle_backends(*probe_auth, *json, *timeout).await,
+        Some(Command::Usage { json }) => return usage_cmd::handle_usage(*json).await,
         Some(Command::Doctor { json, strict }) => {
             return doctor_cmd::handle_doctor(*json, *strict).await;
         }
@@ -4184,6 +4191,7 @@ async fn main() -> Result<()> {
             json,
             timeout,
         }) => backends_cmd::handle_backends(probe_auth, json, timeout).await,
+        Some(Command::Usage { json }) => usage_cmd::handle_usage(json).await,
         Some(Command::Nodes { gpu, json }) => helpers::handle_nodes(gpu.as_deref(), json).await,
         Some(Command::Models) => lifecycle_cmd::handle_models(&agent_config).await,
         Some(Command::Health) => health_cmd::handle_health(&agent_config).await,
