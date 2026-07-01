@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>J.A.R.V.I.S. — ForgeFleet OS</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+  :root{--cyan:#37c6ff;--cyan2:#7fe7ff;--dim:#1c6f8c;--deep:#0a2230;--gold:#ffcf7a;
+    --bg:#02060b;--grid:rgba(55,198,255,.05);--panel:rgba(7,22,34,.42);--edge:rgba(55,198,255,.30);
+    --ok:#37c6ff;--warn:#ffcf7a;--bad:#ff5d6c}
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--cyan);
+    font-family:'Share Tech Mono',monospace;cursor:crosshair}
+  body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:60;
+    background:repeating-linear-gradient(0deg,transparent 0 2px,rgba(0,0,0,.16) 3px,transparent 4px);
+    mix-blend-mode:overlay;opacity:.45}
+  /* faint outer vignette for cinematic depth */
+  body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:59;
+    background:radial-gradient(ellipse at 50% 49%,transparent 55%,rgba(1,4,8,.65) 100%)}
+  #bg{position:fixed;inset:0;z-index:0;background:
+    radial-gradient(ellipse at 50% 48%,rgba(55,198,255,.07),transparent 62%),
+    linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px),var(--bg);
+    background-size:auto,40px 40px,40px 40px}
+  canvas#scene{position:fixed;inset:0;z-index:1}
+  /* refined L-shaped corner brackets with double rule + tick */
+  .corner{position:fixed;width:46px;height:46px;border:2px solid var(--edge);z-index:6;pointer-events:none}
+  .corner::before{content:'';position:absolute;width:12px;height:12px;border:1px solid rgba(55,198,255,.5)}
+  .corner::after{content:'';position:absolute;width:5px;height:5px;background:var(--gold);box-shadow:0 0 6px var(--gold)}
+  .tl{top:14px;left:14px;border-right:0;border-bottom:0}
+  .tl::before{top:7px;left:7px;border-right:0;border-bottom:0}.tl::after{top:0;left:0}
+  .tr{top:14px;right:14px;border-left:0;border-bottom:0}
+  .tr::before{top:7px;right:7px;border-left:0;border-bottom:0}.tr::after{top:0;right:0}
+  .bl{bottom:14px;left:14px;border-right:0;border-top:0}
+  .bl::before{bottom:7px;left:7px;border-right:0;border-top:0}.bl::after{bottom:0;left:0}
+  .br{bottom:14px;right:14px;border-left:0;border-top:0}
+  .br::before{bottom:7px;right:7px;border-left:0;border-top:0}.br::after{bottom:0;right:0}
+  .hud{position:fixed;z-index:10}
+  /* top */
+  #brand{top:24px;left:40px}
+  .wm{font-family:'Orbitron';font-weight:900;font-size:22px;letter-spacing:8px;color:#dffaff;text-shadow:0 0 16px var(--cyan)}
+  .wm small{display:block;font-size:9.5px;letter-spacing:4px;color:var(--dim);margin-top:3px;font-family:'Share Tech Mono'}
+  #node{margin-top:8px;font-size:11px;color:var(--cyan2)}
+  #clock{top:14px;left:50%;transform:translateX(-50%);text-align:center}
+  #clock .t{font-family:'Orbitron';font-weight:700;font-size:54px;letter-spacing:8px;color:#eafdff;text-shadow:0 0 26px var(--cyan),0 0 4px var(--cyan2);line-height:1}
+  #clock .d{font-size:12px;letter-spacing:6px;color:var(--dim);margin-top:5px}
+  #clock .rail{margin-top:7px;height:6px;width:340px;position:relative}
+  #clock .rail i{position:absolute;top:0;width:1px;height:6px;background:rgba(55,198,255,.35)}
+  #clock .rail i.mj{height:6px;background:var(--cyan);box-shadow:0 0 5px var(--cyan)}
+  #wx{top:24px;right:40px;text-align:right}
+  #wx .big{font-family:'Orbitron';font-size:18px;letter-spacing:3px;color:var(--gold);text-shadow:0 0 12px rgba(255,207,122,.5)}
+  #wx .l{font-size:11px;color:var(--cyan2);line-height:1.65}
+  /* columns of readouts */
+  .col{position:fixed;z-index:10;width:232px;font-size:11px}
+  #lcol{left:40px;top:128px}#rcol{right:40px;top:128px;text-align:right}
+  .grp{margin-bottom:13px}
+  .grp h3{font-family:'Orbitron';font-size:10px;letter-spacing:3px;color:#bff3ff;border-bottom:1px solid var(--edge);
+    padding-bottom:4px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
+  .grp h3 .tag{font-family:'Share Tech Mono';font-size:8.5px;letter-spacing:1px;color:var(--dim)}
+  #rcol .grp h3{flex-direction:row-reverse}
+  .li{display:flex;justify-content:space-between;color:#8fdcf2;padding:2px 0}
+  #rcol .li{flex-direction:row-reverse}
+  .li .v{color:var(--dim)}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin:0 6px;box-shadow:0 0 7px currentColor;vertical-align:middle}
+  .ok{background:var(--ok);color:var(--ok)}.warn{background:var(--warn);color:var(--warn)}.bad{background:var(--bad);color:var(--bad)}
+  /* mini horizontal bar meters for the metrics group */
+  .mrow{padding:3px 0}
+  .mrow .mh{display:flex;justify-content:space-between;color:#8fdcf2;font-size:10px;margin-bottom:2px}
+  .mrow .mh .v{color:var(--cyan2)}
+  .bar{height:4px;background:rgba(55,198,255,.10);border:1px solid rgba(55,198,255,.18);position:relative;overflow:hidden}
+  .bar i{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,var(--dim),var(--cyan));
+    box-shadow:0 0 8px var(--cyan);transition:width .8s ease}
+  .bar.g i{background:linear-gradient(90deg,rgba(255,207,122,.4),var(--gold));box-shadow:0 0 8px var(--gold)}
+  /* ACTIVE MISSIONS rows — same cyan section aesthetic as the .grp cards */
+  .mi{padding:4px 0;border-bottom:1px solid rgba(55,198,255,.10)}
+  .mi:last-child{border-bottom:0}
+  .mi .mtop{display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:3px}
+  #rcol .mi .mtop{flex-direction:row-reverse}
+  .mi .mg{color:#9fe9ff;font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  .mi .pill{font-size:8px;letter-spacing:1px;padding:1px 6px;border-radius:8px;border:1px solid var(--edge);
+    color:var(--cyan2);text-transform:uppercase;flex:none}
+  .mi .pill.running{color:var(--cyan);border-color:var(--cyan);box-shadow:0 0 8px rgba(55,198,255,.4)}
+  .mi .pill.pending{color:var(--gold);border-color:rgba(255,207,122,.5)}
+  .mi .mp{display:flex;align-items:center;gap:6px}
+  #rcol .mi .mp{flex-direction:row-reverse}
+  .mi .mbar{flex:1;height:3px;background:rgba(55,198,255,.10);border:1px solid rgba(55,198,255,.18);position:relative;overflow:hidden}
+  .mi .mbar i{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,var(--dim),var(--cyan));
+    box-shadow:0 0 6px var(--cyan);transition:width .8s ease}
+  .mi .mc{font-size:9px;color:var(--dim);flex:none}
+  .mi-empty{font-size:10px;color:var(--dim);letter-spacing:1px;padding:3px 0}
+  /* center answer */
+  #answer{position:fixed;z-index:11;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;width:240px;pointer-events:none}
+  #answer .big{font-family:'Orbitron';font-size:34px;font-weight:700;color:#eafdff;text-shadow:0 0 20px var(--cyan)}
+  #answer .lab{font-size:10px;letter-spacing:4px;color:var(--dim);margin-top:4px}
+  /* section cards (light up on query) */
+  #cards{position:fixed;z-index:12;bottom:150px;left:50%;transform:translateX(-50%);display:flex;gap:14px}
+  .card{width:150px;background:var(--panel);border:1px solid var(--edge);border-radius:4px;padding:9px 11px;
+    backdrop-filter:blur(5px);transition:all .35s;opacity:.5;position:relative}
+  .card::before{content:'';position:absolute;top:-1px;left:-1px;width:9px;height:9px;border-top:1px solid var(--cyan);border-left:1px solid var(--cyan)}
+  .card::after{content:'';position:absolute;bottom:-1px;right:-1px;width:9px;height:9px;border-bottom:1px solid var(--cyan);border-right:1px solid var(--cyan)}
+  .card.active{opacity:1;border-color:var(--cyan);box-shadow:0 0 24px rgba(55,198,255,.45);transform:translateY(-6px)}
+  .card h4{font-family:'Orbitron';font-size:9px;letter-spacing:2px;color:#bff3ff;margin-bottom:5px}
+  .card .b{font-size:11px;color:#9fe9ff;line-height:1.55}
+  /* dock */
+  #dock{bottom:40px;left:50%;transform:translateX(-50%);z-index:14;width:min(740px,72vw);text-align:center}
+  #transcript{min-height:24px;font-size:15px;color:#dffaff;text-shadow:0 0 9px rgba(55,198,255,.5);letter-spacing:1px;margin-bottom:12px}
+  #transcript .j{color:var(--gold);text-shadow:0 0 12px rgba(255,207,122,.5)}
+  #mic{width:54px;height:54px;border-radius:50%;border:2px solid var(--edge);background:var(--panel);color:var(--cyan);
+    font-size:21px;cursor:pointer;display:grid;place-items:center;margin:0 auto;box-shadow:0 0 18px rgba(55,198,255,.25);transition:.2s}
+  #mic:hover{border-color:var(--cyan);box-shadow:0 0 28px rgba(55,198,255,.6)}
+  #mic.live{border-color:var(--gold);color:var(--gold);box-shadow:0 0 34px rgba(255,207,122,.7);animation:pul 1.1s infinite}
+  @keyframes pul{50%{transform:scale(1.09)}}
+  #hint{font-size:10px;color:var(--dim);letter-spacing:2px;margin-top:10px}
+  #boot{position:fixed;inset:0;z-index:100;background:var(--bg);display:grid;place-items:center;transition:opacity .8s}
+  #boot .x{width:min(640px,82vw);font-size:13px;line-height:1.85;white-space:pre-wrap;color:var(--cyan)}
+  #boot b{color:var(--gold)}.blink{animation:bk 1s steps(2) infinite}@keyframes bk{50%{opacity:0}}
+</style>
+</head>
+<body>
+<div id="bg"></div><canvas id="scene"></canvas>
+<div class="corner tl"></div><div class="corner tr"></div><div class="corner bl"></div><div class="corner br"></div>
+
+<div class="hud" id="brand"><div class="wm">J.A.R.V.I.S.<small>FORGEFLEET OS · MK 0.1</small></div><div id="node">NODE: TAYLOR · LEADER · ONLINE</div></div>
+<div class="hud" id="clock"><div class="t" id="ct">--:--:--</div><div class="d" id="cd">--</div><div class="rail" id="crail"></div></div>
+<div class="hud" id="wx"><div class="big">15 NODES</div><div class="l">offload: warm · marcus<br>schema V114 · main synced<br>0 cloud tokens today</div></div>
+
+<div class="hud col" id="lcol">
+  <div class="grp"><h3>MACS<span class="tag">DARWIN</span></h3>
+    <div class="li"><span><i class="dot ok"></i>taylor</span><span class="v">leader</span></div>
+    <div class="li"><span><i class="dot ok"></i>james</span><span class="v">64G</span></div>
+    <div class="li"><span><i class="dot ok"></i>ace</span><span class="v">16G</span></div></div>
+  <div class="grp"><h3>AMD STRIX<span class="tag">123G</span></h3>
+    <div class="li"><span><i class="dot ok"></i>logan</span><span class="v">gfx1151</span></div>
+    <div class="li"><span><i class="dot ok"></i>veronica</span><span class="v">gfx1151</span></div>
+    <div class="li"><span><i class="dot ok"></i>lily</span><span class="v">gfx1151</span></div>
+    <div class="li"><span><i class="dot ok"></i>duncan</span><span class="v">gfx1151</span></div></div>
+  <div class="grp"><h3>LINUX<span class="tag">32G</span></h3>
+    <div class="li"><span><i class="dot ok"></i>marcus</span><span class="v">coder▸</span></div>
+    <div class="li"><span><i class="dot ok"></i>sophie</span><span class="v">idle</span></div>
+    <div class="li"><span><i class="dot ok"></i>priya</span><span class="v">idle</span></div>
+    <div class="li"><span><i class="dot ok"></i>aura</span><span class="v">idle</span></div></div>
+  <div class="grp"><h3>TELEMETRY<span class="tag">LIVE</span></h3>
+    <div class="mrow"><div class="mh"><span>FLEET LOAD</span><span class="v" id="m-load-v">34%</span></div><div class="bar"><i id="m-load" style="width:34%"></i></div></div>
+    <div class="mrow"><div class="mh"><span>GPU POOL</span><span class="v" id="m-gpu-v">28%</span></div><div class="bar"><i id="m-gpu" style="width:28%"></i></div></div>
+    <div class="mrow"><div class="mh"><span>OFFLOAD</span><span class="v" id="m-off-v">75%</span></div><div class="bar g"><i id="m-off" style="width:75%"></i></div></div>
+  </div>
+</div>
+<div class="hud col" id="rcol">
+  <div class="grp"><h3>DGX GB10<span class="tag">122G</span></h3>
+    <div class="li"><span><i class="dot ok"></i>sia</span><span class="v">vllm</span></div>
+    <div class="li"><span><i class="dot ok"></i>adele</span><span class="v">CX-7</span></div>
+    <div class="li"><span><i class="dot ok"></i>rihanna</span><span class="v">CX-7</span></div>
+    <div class="li"><span><i class="dot ok"></i>beyonce</span><span class="v">vllm</span></div></div>
+  <div class="grp"><h3>SUBSYSTEMS<span class="tag">CORE</span></h3>
+    <div class="li"><span><i class="dot ok" id="ss-orchestrator"></i>orchestrator</span><span class="v">P1</span></div>
+    <div class="li"><span><i class="dot ok" id="ss-offload"></i>offload</span><span class="v">warm</span></div>
+    <div class="li"><span><i class="dot ok" id="ss-reconciler"></i>reconciler</span><span class="v">durable</span></div>
+    <div class="li"><span><i class="dot warn" id="ss-agents"></i>agents</span><span class="v">loading</span></div>
+    <div class="li"><span><i class="dot ok" id="ss-brain"></i>brain</span><span class="v">linked</span></div></div>
+  <div class="grp"><h3>PIPELINE<span class="tag">FLOW</span></h3>
+    <div class="li"><span>active tasks</span><span class="v" id="p-tasks">4</span></div>
+    <div class="li"><span>deployments</span><span class="v" id="p-deploys">8</span></div>
+    <div class="li"><span>brain nodes</span><span class="v" id="p-brain">linked</span></div>
+    <div class="li"><span>cloud tokens</span><span class="v" id="p-tokens">0</span></div></div>
+  <div class="grp"><h3>THROUGHPUT<span class="tag">LIVE</span></h3>
+    <div class="mrow"><div class="mh"><span>TASKS</span><span class="v" id="m-task-v">50%</span></div><div class="bar"><i id="m-task" style="width:50%"></i></div></div>
+    <div class="mrow"><div class="mh"><span>NETWORK</span><span class="v" id="m-net-v">15%</span></div><div class="bar"><i id="m-net" style="width:15%"></i></div></div>
+    <div class="mrow"><div class="mh"><span>BRAIN</span><span class="v" id="m-brain-v">95%</span></div><div class="bar"><i id="m-brain" style="width:95%"></i></div></div>
+  </div>
+  <div class="grp"><h3>ACTIVE MISSIONS<span class="tag" id="mi-tag">IDLE</span></h3>
+    <div id="missions"><div class="mi-empty">no active missions</div></div>
+  </div>
+</div>
+
+<div class="hud" id="answer"><div class="big" id="abig">15</div><div class="lab" id="alab">NODES ONLINE</div></div>
+
+<div id="cards">
+  <div class="card" data-k="fleet"><h4>FLEET</h4><div class="b" id="c-fleet">15 online · 1 leader</div></div>
+  <div class="card" data-k="offload"><h4>OFFLOAD</h4><div class="b" id="c-offload">warm · marcus coder</div></div>
+  <div class="card" data-k="tasks"><h4>TASKS</h4><div class="b" id="c-tasks">4 active builds</div></div>
+  <div class="card" data-k="systems"><h4>SYSTEMS</h4><div class="b" id="c-systems">all nominal</div></div>
+</div>
+
+<div class="hud" id="dock">
+  <div id="transcript">Good evening, sir. J.A.R.V.I.S. online.</div>
+  <div id="mic" title="Press to speak">🎙</div>
+  <div id="hint">CLICK THE REACTOR OR MIC · TRY “STATUS” · “FLEET” · “OFFLOAD” · “WHAT ARE YOU WORKING ON”</div>
+</div>
+
+<div id="boot"><div class="x" id="bx"></div></div>
+
+<script>
+// surface any error on-screen + guarantee the boot overlay clears so the HUD
+// can never get stuck behind a black screen.
+window.onerror=function(m,s,l,c){var d=document.createElement('pre');
+  d.style.cssText='position:fixed;bottom:0;left:0;z-index:9999;color:#ff6;background:rgba(0,0,0,.85);font:11px monospace;padding:6px;margin:0;max-width:100vw;white-space:pre-wrap';
+  d.textContent='JS ERROR: '+m+' @'+l+':'+c;document.body.appendChild(d);};
+setTimeout(function(){var b=document.getElementById('boot');if(b)b.remove();},4200);
+const cv=document.getElementById('scene'),cx=cv.getContext('2d');
+let W,H;function rs(){W=cv.width=innerWidth;H=cv.height=innerHeight}addEventListener('resize',rs);rs();
+let t=0,level=0,target=0;
+// radial gauge — value 0..1, label drawn by the caller. `big` => larger center text.
+function gauge(x,y,r,val,col,segs,label,unit){
+  segs=segs||40;const a0=Math.PI*0.75,a1=Math.PI*2.25,span=a1-a0;
+  cx.lineWidth=2;
+  // faint inner bezel ring for depth
+  cx.beginPath();cx.strokeStyle='rgba(55,198,255,.10)';cx.lineWidth=1;cx.arc(x,y,r+5,0,7);cx.stroke();
+  cx.lineWidth=2;
+  for(let i=0;i<segs;i++){const f=i/(segs-1),a=a0+f*span;
+    cx.strokeStyle=f<=val?col:'rgba(55,198,255,.12)';cx.shadowColor=col;cx.shadowBlur=f<=val?8:0;
+    cx.beginPath();cx.arc(x,y,r,a-0.012,a+0.012);cx.stroke();}
+  cx.shadowBlur=0;cx.fillStyle='#dffaff';
+  cx.font='bold '+(r>26?15:12)+'px Orbitron';cx.textAlign='center';cx.textBaseline='middle';
+  cx.fillText(Math.round(val*100)+(unit||''),x,y);
+  if(label){cx.fillStyle='rgba(127,231,255,.85)';cx.font='9px "Share Tech Mono"';
+    cx.fillText(label,x,y+r+12);}
+}
+function ring(cxp,cyp,r,segs,gap,rot,w,glow,col){cx.lineWidth=w;cx.strokeStyle=col;cx.shadowColor=col;cx.shadowBlur=glow;
+  const st=(Math.PI*2)/segs;for(let i=0;i<segs;i++){const a=rot+i*st;cx.beginPath();cx.arc(cxp,cyp,r,a,a+st-gap);cx.stroke();}cx.shadowBlur=0}
+// segmented perimeter tick-ring — a "dial" of radial ticks (major every `every`)
+function tickRing(cxp,cyp,r,n,len,rot,col,every){
+  for(let i=0;i<n;i++){const a=rot+(i/n)*Math.PI*2,mj=(i%every===0);
+    const r0=r,r1=r+(mj?len*1.9:len);
+    cx.beginPath();cx.lineWidth=mj?2:1;cx.strokeStyle=mj?col:'rgba(55,198,255,.22)';
+    cx.shadowColor=col;cx.shadowBlur=mj?6:0;
+    cx.moveTo(cxp+Math.cos(a)*r0,cyp+Math.sin(a)*r0);
+    cx.lineTo(cxp+Math.cos(a)*r1,cyp+Math.sin(a)*r1);cx.stroke();}
+  cx.shadowBlur=0;
+}
+// gauge layout (fractions of viewport) — dense ring of gauges framing the reactor.
+// `l` is the key the live-data poller targets via gset(); kept stable for wiring.
+// Positions are POLAR — angle (deg, 0=right, clockwise from screen) + radius as
+// a fraction of min(W,H) — so the gauges form a clean, even ring hugging the
+// reactor regardless of aspect ratio. Resolved to x/y each frame around (Cx,Cy).
+const G=[
+  // top arc (3)
+  {ang:248,rad:.255,r:30,c:'#37c6ff',v:.34,l:'GPU'},      // deployments load
+  {ang:270,rad:.275,r:36,c:'#7fe7ff',v:.50,l:'FLEET'},    // online/total nodes
+  {ang:292,rad:.255,r:30,c:'#37c6ff',v:.22,l:'CPU'},      // task throughput
+  // upper flanks (2)
+  {ang:212,rad:.275,r:28,c:'#37c6ff',v:.30,l:'MACS'},     // mac-class load
+  {ang:328,rad:.275,r:28,c:'#37c6ff',v:.90,l:'BRAIN'},    // brain/graph activity
+  // mid flanks (2)
+  {ang:180,rad:.285,r:27,c:'#7fe7ff',v:.48,l:'RAM'},      // ram pressure
+  {ang:0,  rad:.285,r:27,c:'#ffcf7a',v:.70,l:'OFFLOAD'},  // offload warmth
+  // lower flanks (2)
+  {ang:148,rad:.275,r:27,c:'#37c6ff',v:.42,l:'AMD'},      // amd-class load
+  {ang:32, rad:.275,r:27,c:'#37c6ff',v:.66,l:'DGX'},      // dgx-class load
+  // bottom arc (2)
+  {ang:110,rad:.255,r:25,c:'#37c6ff',v:.15,l:'NET'},      // network
+  {ang:70, rad:.255,r:25,c:'#ffcf7a',v:.55,l:'AGENTS'},   // agents readiness
+];
+let gv=G.map(g=>g.v);
+function draw(){try{t+=0.016;level+=(target-level)*0.12;cx.clearRect(0,0,W,H);
+  const Cx=W/2,Cy=H*0.475,base=Math.min(W,H)*0.16,pulse=base*(1+0.04*Math.sin(t*2)+level*0.2);
+  const MIN=Math.min(W,H);
+  // central reactor
+  ring(Cx,Cy,pulse*2.18,3,0.5,-t*0.15,2,12,'rgba(55,198,255,.22)');
+  // segmented perimeter tick-ring (the cinematic dial) — two layers
+  tickRing(Cx,Cy,pulse*2.02,90,8,t*0.05,'rgba(55,198,255,.5)',9);
+  tickRing(Cx,Cy,pulse*1.92,30,5,-t*0.08,'rgba(127,231,255,.4)',5);
+  ring(Cx,Cy,pulse*1.78,72,0.05,t*0.2,1,5,'rgba(55,198,255,.22)');
+  ring(Cx,Cy,pulse*1.55,16,0.16,-t*0.4,3,14+level*26,'rgba(55,198,255,'+(0.5+level*0.4)+')');
+  ring(Cx,Cy,pulse*1.32,40,0.09,t*0.6,2,9,'rgba(127,231,255,.4)');
+  ring(Cx,Cy,pulse*1.10,6,0.3,-t*0.9,5,18+level*36,'rgba(255,207,122,'+(0.32+level*0.5)+')');
+  // spectrum waveform ring (audio-reactive)
+  if(freq){cx.beginPath();const N=110;for(let i=0;i<N;i++){const a=(i/N)*Math.PI*2,m=freq[(i*2)%freq.length]/255;
+    const rr=pulse*0.95+m*pulse*0.85,x=Cx+Math.cos(a)*rr,y=Cy+Math.sin(a)*rr;i?cx.lineTo(x,y):cx.moveTo(x,y);}
+    cx.closePath();cx.strokeStyle='rgba(55,198,255,.55)';cx.lineWidth=2;cx.shadowBlur=12;cx.shadowColor='#37c6ff';cx.stroke();cx.shadowBlur=0;}
+  // core
+  const cr=pulse*(0.6+level*0.25),g=cx.createRadialGradient(Cx,Cy,0,Cx,Cy,cr);
+  g.addColorStop(0,'rgba(223,250,255,.95)');g.addColorStop(.3,'rgba(55,198,255,.9)');g.addColorStop(.7,'rgba(28,111,140,.45)');g.addColorStop(1,'rgba(10,34,48,0)');
+  cx.beginPath();cx.fillStyle=g;cx.shadowColor='#37c6ff';cx.shadowBlur=55+level*70;cx.arc(Cx,Cy,cr,0,7);cx.fill();cx.shadowBlur=0;
+  // thin connector spokes from the reactor out to each gauge (subtle, dense feel)
+  G.forEach((gg)=>{const a=gg.ang*Math.PI/180,rr=gg.rad*MIN;
+    const gx=Cx+Math.cos(a)*rr,gy=Cy+Math.sin(a)*rr;
+    cx.beginPath();cx.strokeStyle='rgba(55,198,255,.10)';cx.lineWidth=1;
+    cx.moveTo(Cx+Math.cos(a)*pulse*2.06,Cy+Math.sin(a)*pulse*2.06);
+    cx.lineTo(gx-Math.cos(a)*(gg.r+8),gy-Math.sin(a)*(gg.r+8));cx.stroke();});
+  // surrounding gauges (dense ring, polar-resolved around the reactor)
+  G.forEach((gg,i)=>{gv[i]+=((gg.v+(Math.random()-.5)*0.025)-gv[i])*0.05;
+    const a=gg.ang*Math.PI/180,rr=gg.rad*MIN;
+    const gx=Cx+Math.cos(a)*rr,gy=Cy+Math.sin(a)*rr;
+    gauge(gx,gy,gg.r,Math.max(0,Math.min(1,gv[i])),gg.c,gg.r>30?44:32,gg.l);});
+  }catch(e){console.error('draw',e)}
+  requestAnimationFrame(draw);}
+requestAnimationFrame(draw);
+
+// clock
+const crail=document.getElementById('crail');
+if(crail){let h='';for(let i=0;i<41;i++){const mj=(i%5===0);h+='<i class="'+(mj?'mj':'')+'" style="left:'+(i*(100/40))+'%"></i>';}crail.innerHTML=h;}
+setInterval(()=>{const d=new Date();document.getElementById('ct').textContent=d.toLocaleTimeString('en-GB');
+  document.getElementById('cd').textContent=d.toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'short'}).toUpperCase();},250);
+
+// audio
+let freq=null,analyser=null;
+async function initAudio(){try{const s=await navigator.mediaDevices.getUserMedia({audio:true});
+  const ac=new(window.AudioContext||window.webkitAudioContext)();analyser=ac.createAnalyser();analyser.fftSize=256;
+  ac.createMediaStreamSource(s).connect(analyser);freq=new Uint8Array(analyser.frequencyBinCount);
+  (function p(){analyser.getByteFrequencyData(freq);let s=0;for(const v of freq)s+=v;target=Math.min(1,(s/freq.length)/85);requestAnimationFrame(p)})();
+}catch(e){console.log('mic',e)}}
+
+// section cards + answer
+const cards={};document.querySelectorAll('.card').forEach(c=>cards[c.dataset.k]=c);
+function showSection(k,big,lab){Object.values(cards).forEach(c=>c.classList.remove('active'));
+  if(cards[k])cards[k].classList.add('active');
+  if(big!=null){document.getElementById('abig').textContent=big;document.getElementById('alab').textContent=lab||'';}}
+
+// speech
+const transcript=document.getElementById('transcript'),mic=document.getElementById('mic');
+let voice=null;function pv(){const vs=speechSynthesis.getVoices();voice=vs.find(v=>/Daniel|UK English Male|British|Arthur|George/i.test(v.name))||vs.find(v=>/en-GB/i.test(v.lang))||vs[0]}
+speechSynthesis.onvoiceschanged=pv;pv();
+function say(txt){transcript.innerHTML='<span class="j">'+txt+'</span>';const u=new SpeechSynthesisUtterance(txt);
+  if(voice)u.voice=voice;u.rate=1.0;u.pitch=.9;speechSynthesis.cancel();speechSynthesis.speak(u);}
+// Canned/local fallback — used when /api/jarvis/ask is unreachable (e.g. the
+// :8472 prototype server with no gateway). Keeps the HUD demoable offline.
+function respondLocal(q){const s=q.toLowerCase();
+  if(/status|systems|report|how are/.test(s)){showSection('systems',15,'NODES ONLINE');return "All systems nominal, sir. Fifteen nodes online, offload warm on Marcus, schema at version one-fourteen.";}
+  if(/fleet|computers|nodes|machines/.test(s)){showSection('fleet',15,'NODES');return "The fleet stands at fifteen: Taylor leads, three Macs, four AMD Strix nodes, and four DGX Sparks. All converged.";}
+  if(/offload|credit|token|save/.test(s)){showSection('offload',0,'CLOUD TOKENS');return "Offload is warm on Marcus's coder. Code tasks run locally — zero cloud tokens spent today, sir.";}
+  if(/working on|tasks|building|busy/.test(s)){showSection('tasks',4,'ACTIVE BUILDS');return "Four builds in progress, sir: the demand-sensing orchestrator, the agent catalog, this interface, and the durability deploy.";}
+  if(/hello|hi |hey|good (morning|evening|night)|jarvis|you there/.test(s)){return "I'm here, sir. At your service.";}
+  if(/thank|cheers|nice|good job|well done/.test(s)){return "A pleasure, sir.";}
+  return "Understood, sir. Routing that to the fleet — full voice command execution is being wired in as we speak.";}
+
+// Update the relevant section card from a /api/jarvis/ask `data` payload so the
+// HUD shows the same live numbers JARVIS just spoke.
+function applyAskData(kind,data){
+  if(!data) return;
+  if(kind==='status'||kind==='fleet'){
+    const on=data.online_count??0, tot=data.total_nodes??on;
+    showSection(kind==='fleet'?'fleet':'systems', on, 'NODES ONLINE');
+    const cf=document.getElementById('c-fleet');
+    if(cf)cf.textContent=on+' online · '+(data.leader||'—')+' leads';
+  }
+  if(kind==='status'||kind==='tasks'){
+    if(data.active_tasks!=null||data.active_count!=null){
+      const n=data.active_count??data.active_tasks??0;
+      showSection('tasks', n, 'ACTIVE BUILDS');
+      const ct=document.getElementById('c-tasks');
+      if(ct)ct.textContent=n+' active'+(data.top_name?' · '+String(data.top_name).slice(0,22):'');
+    }
+  }
+  if(kind==='offload'){
+    showSection('offload', 0, 'CLOUD TOKENS');
+    const co=document.getElementById('c-offload');
+    if(co)co.textContent=(data.status||'cold')+' · '+(data.worker_name||'—');
+  }
+}
+
+// Real answers — POST {query} to /api/jarvis/ask (served by the ff gateway),
+// speak the returned answer, and refresh the matching section card. Falls back
+// to respondLocal() (canned) if the endpoint is unreachable, so the :8472
+// prototype still works.
+async function respond(q){
+  try{
+    const r=await fetch('/api/jarvis/ask',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({query:q}),cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const d=await r.json();
+    if(!d||!d.answer)throw new Error('no answer');
+    applyAskData(d.kind,d.data);
+    return d.answer;
+  }catch(e){
+    return respondLocal(q);
+  }
+}
+const SR=window.SpeechRecognition||window.webkitSpeechRecognition;let rec=null,listening=false;
+if(SR){rec=new SR();rec.lang='en-US';rec.interimResults=true;
+  rec.onresult=e=>{let txt='';for(const r of e.results)txt+=r[0].transcript;transcript.textContent='“'+txt+'”';
+    if(e.results[e.results.length-1].isFinal)setTimeout(()=>{respond(txt).then(say)},300);};
+  rec.onend=()=>{listening=false;mic.classList.remove('live');};}
+function listen(){if(!analyser)initAudio();
+  if(!rec){say("Browser speech needs Chrome, sir. The native ff voice backend is being wired in.");return;}
+  if(listening){rec.stop();return;}listening=true;mic.classList.add('live');transcript.textContent='Listening…';try{rec.start()}catch(e){}}
+mic.onclick=listen;cv.onclick=listen;
+
+// live fleet data — GET /api/jarvis/state (served by the ff gateway). Falls back
+// silently to the static/animated baseline when absent (e.g. the prototype
+// server), so the HUD always renders.
+const gset=(l,v)=>{const g=G.find(x=>x.l===l);if(g)g.v=Math.max(0,Math.min(1,v));};
+// sync a canvas gauge value into its matching DOM bar-meter (if present).
+const meter=(id,v)=>{const b=document.getElementById('m-'+id),bv=document.getElementById('m-'+id+'-v');
+  const p=Math.round(Math.max(0,Math.min(1,v))*100);if(b)b.style.width=p+'%';if(bv)bv.textContent=p+'%';};
+const setDot=(id,st)=>{const e=document.getElementById('ss-'+id);if(e){e.className='dot '+(st==='ok'?'ok':st==='warn'?'warn':st==='unknown'?'warn':'bad');}};
+// Render the ACTIVE MISSIONS card from state.missions. Defensive: a missing or
+// malformed field must never throw (the HUD has had blank-screen regressions
+// from unguarded JS). Builds DOM nodes with textContent so a mission goal can
+// never inject markup.
+function renderMissions(missions){
+  const box=document.getElementById('missions'); if(!box) return;
+  const list=Array.isArray(missions)?missions:[];
+  const tag=document.getElementById('mi-tag'); if(tag)tag.textContent=list.length?(list.length+' LIVE'):'IDLE';
+  box.textContent='';
+  if(!list.length){const e=document.createElement('div');e.className='mi-empty';e.textContent='no active missions';box.appendChild(e);return;}
+  list.forEach(m=>{
+    m=m||{};
+    const total=Number(m.steps_total)||0, done=Number(m.steps_done)||0;
+    const status=String(m.status||'pending').toLowerCase();
+    const pct=total>0?Math.max(0,Math.min(100,Math.round(done/total*100))):0;
+    const goal=String(m.goal||'(untitled mission)');
+    const goalShort=goal.length>40?goal.slice(0,39)+'…':goal;
+    const row=document.createElement('div');row.className='mi';
+    const top=document.createElement('div');top.className='mtop';
+    const g=document.createElement('span');g.className='mg';g.textContent=goalShort;g.title=goal;
+    const pill=document.createElement('span');pill.className='pill '+(status==='running'?'running':'pending');pill.textContent=status;
+    top.appendChild(g);top.appendChild(pill);
+    const mp=document.createElement('div');mp.className='mp';
+    const bar=document.createElement('div');bar.className='mbar';
+    const fill=document.createElement('i');fill.style.width=pct+'%';bar.appendChild(fill);
+    const c=document.createElement('span');c.className='mc';c.textContent=done+'/'+total;
+    mp.appendChild(bar);mp.appendChild(c);
+    row.appendChild(top);row.appendChild(mp);box.appendChild(row);
+  });
+}
+async function pollState(){
+  try{
+    const r=await fetch('/api/jarvis/state',{cache:'no-store'});
+    if(!r.ok)return; const d=await r.json();
+    if(d.fleet){
+      const on=d.fleet.online_count??0, tot=d.fleet.total_nodes??on;
+      document.getElementById('abig').textContent=on;
+      document.getElementById('alab').textContent='NODES ONLINE';
+      const wb=document.querySelector('#wx .big'); if(wb)wb.textContent=tot+' NODES';
+      const cf=document.getElementById('c-fleet'); if(cf)cf.textContent=on+' online · '+(d.fleet.leader||'—')+' leads';
+      const fleetFrac = tot>0 ? on/tot : 0;
+      gset('FLEET', fleetFrac); meter('load', fleetFrac);
+      gset('BRAIN', d.brain&&d.brain.linked?0.95:0.2); meter('brain', d.brain&&d.brain.linked?0.95:0.2);
+      const pb=document.getElementById('p-brain'); if(pb)pb.textContent=(d.brain&&d.brain.linked)?'linked':'cold';
+    }
+    if(d.offload!==undefined){
+      const o=d.offload, co=document.getElementById('c-offload');
+      if(o){ if(co)co.textContent=(o.status||'cold')+' · '+(o.worker_name||'—'); gset('OFFLOAD', o.status==='warm'?0.75:0.1); meter('off', o.status==='warm'?0.75:0.1); }
+      else { if(co)co.textContent='no warm endpoint'; gset('OFFLOAD',0.05); meter('off',0.05); }
+    }
+    if(d.tasks){const ct=document.getElementById('c-tasks');
+      const ac=d.tasks.active_count||0;
+      if(ct)ct.textContent=ac+' active'+(d.tasks.top_name?' · '+d.tasks.top_name.slice(0,22):'');
+      const taskFrac=Math.min(1,ac/8);
+      gset('CPU', taskFrac); meter('task', taskFrac);
+      const pt=document.getElementById('p-tasks'); if(pt)pt.textContent=ac;
+    }
+    if(Array.isArray(d.deployments)){
+      const dl=Math.min(1,d.deployments.length/12);
+      gset('GPU', dl);
+      const pd=document.getElementById('p-deploys'); if(pd)pd.textContent=d.deployments.length;
+      gset('NET', Math.min(1, d.deployments.length/15)); meter('net', Math.min(1, d.deployments.length/15));
+    }
+    // per-node-class load from the live nodes[] array (online fraction by class).
+    if(Array.isArray(d.nodes)){
+      const cls={mac:['taylor','james','ace'],
+        amd:['logan','veronica','lily','duncan'],
+        dgx:['sia','adele','rihanna','beyonce']};
+      const frac=(names)=>{const set=d.nodes.filter(n=>names.includes((n.name||'').toLowerCase()));
+        if(!set.length)return 0;const up=set.filter(n=>(n.status||'').toLowerCase()==='online').length;
+        // load = online fraction blended with models-loaded pressure
+        const ml=set.reduce((a,n)=>a+(n.models_loaded||0),0);
+        return Math.min(1, (up/set.length)*0.6 + Math.min(1,ml/set.length)*0.4);};
+      gset('MACS', frac(cls.mac)); gset('AMD', frac(cls.amd)); gset('DGX', frac(cls.dgx));
+      // RAM gauge — average models-loaded pressure across all nodes as a proxy.
+      const totMl=d.nodes.reduce((a,n)=>a+(n.models_loaded||0),0);
+      gset('RAM', Math.min(1, totMl/Math.max(1,d.nodes.length)*0.5+0.25));
+    }
+    if(d.subsystems){
+      const s=d.subsystems;
+      setDot('orchestrator',s.orchestrator); setDot('offload',s.offload);
+      setDot('reconciler',s.reconciler); setDot('agents',s.agents); setDot('brain',s.brain);
+      gset('AGENTS', s.agents==='ok'?0.85:s.agents==='warn'?0.45:0.2);
+    }
+    renderMissions(d.missions);
+    window.__live=true;
+  }catch(e){/* keep static baseline */}
+}
+setInterval(pollState,5000); pollState();
+
+// boot
+const B=["INITIALIZING J.A.R.V.I.S. ...","> ForgeFleet control plane ........... OK","> 15 compute nodes linked ........... OK",
+"> orchestrator · capability router .. ONLINE","> offload · marcus/qwen3-coder ...... WARM","> virtual brain graph ............... LINKED",
+"> voice interface ................... READY","> arc-reactor HUD ................... OK","","<b>J.A.R.V.I.S. ONLINE.</b>  Good evening, sir."];
+const bx=document.getElementById('bx');let bi=0;
+(function ty(){if(bi<B.length){bx.innerHTML+=(bi?'\n':'')+B[bi++];setTimeout(ty,bi===1?450:230)}
+ else setTimeout(()=>{const b=document.getElementById('boot');b.style.opacity=0;setTimeout(()=>b.remove(),850);
+   setTimeout(()=>say("Good evening, sir. J.A.R.V.I.S. online. Click the reactor and speak to me."),1000)},650)})();
+bx.insertAdjacentHTML('beforeend','<span class="blink">_</span>');
+</script>
+</body>
+</html>
