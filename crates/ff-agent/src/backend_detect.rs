@@ -129,7 +129,24 @@ pub async fn detect_backends(probe_auth: bool, timeout: Duration) -> Vec<Backend
 
         let (authenticated, detail) = if probe_auth {
             let (ok, reason) = probe_auth_once(cfg.name, timeout).await;
-            (Some(ok), reason)
+            if ok {
+                (Some(true), reason)
+            } else if cred_present(cfg.name) {
+                // The live probe can be flaky on the fleet (slow cold-start,
+                // sandbox quirks, transient 5xx) and would leave a genuinely
+                // authenticated backend marked unusable — so the router never
+                // routes to it and dispatch has no fail-over target. If the
+                // vendor cred FILE is present, treat the backend as
+                // authenticated (cred-based). Safe: the dispatch path now
+                // classifies a real 401 as Unauthenticated and switches, so a
+                // cred that's actually expired self-corrects rather than wedging.
+                (
+                    Some(true),
+                    format!("authenticated (cred file present; probe: {reason})"),
+                )
+            } else {
+                (Some(false), reason)
+            }
         } else {
             (None, "installed (auth not probed)".to_string())
         };
@@ -145,6 +162,54 @@ pub async fn detect_backends(probe_auth: bool, timeout: Duration) -> Vec<Backend
         });
     }
     out
+}
+
+/// True if the vendor CLI's OAuth credential file is present + non-empty on
+/// this node (or, for claude on macOS, the Keychain entry exists). Mirrors the
+/// paths `oauth_distributor` writes to. Used as an auth fallback when the live
+/// probe is flaky.
+fn cred_present(backend: &str) -> bool {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return false,
+    };
+    let file_ok = |rel: &str| {
+        home.join(rel)
+            .metadata()
+            .map(|m| m.is_file() && m.len() > 0)
+            .unwrap_or(false)
+    };
+    match backend {
+        "claude" => {
+            if file_ok(".claude/.credentials.json") {
+                return true;
+            }
+            // macOS: Claude Code stores creds in the Keychain, not a file.
+            #[cfg(target_os = "macos")]
+            {
+                std::process::Command::new("security")
+                    .args([
+                        "find-generic-password",
+                        "-s",
+                        "Claude Code-credentials",
+                        "-w",
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                false
+            }
+        }
+        "codex" => file_ok(".codex/auth.json"),
+        "kimi" => file_ok(".kimi/credentials/kimi-code.json"),
+        "gemini" => file_ok(".gemini/oauth_creds.json"),
+        _ => false,
+    }
 }
 
 /// Resolve THIS node's `computers.id` from its worker name. `None` if no row

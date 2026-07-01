@@ -26,7 +26,13 @@ use crate::sub_agents::ensure_workspaces;
 /// reapers' regression tests can assert the coupling.
 pub(crate) const HEARTBEAT_SECS: u64 = 45;
 const COMMAND_POLL_MS: u64 = 250;
-const FF_TIMEOUT_SECS: u64 = 1800;
+// 45 min. A real multi-file task where codex reads the repo, writes, and
+// compile-verifies against the FULL forge-fleet workspace (a cold `cargo check`
+// is minutes) legitimately needs more than 30 min — the old 1800s cap timed out
+// genuinely-progressing dispatches (dogfooded 2026-06-30, `ff usage` task wrote
+// a real diff but hit the wall mid-verify). Followers are 20-core/121GB, so the
+// slot cost is acceptable.
+const FF_TIMEOUT_SECS: u64 = 2700;
 const MAX_DISPATCH_PER_TICK: i64 = 1;
 
 #[derive(Debug, Clone)]
