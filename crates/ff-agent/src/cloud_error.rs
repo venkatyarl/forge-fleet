@@ -372,6 +372,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cloud_error_class_is_transient_matrix() {
+        for class in [
+            CloudErrorClass::Overloaded,
+            CloudErrorClass::RateLimited,
+            CloudErrorClass::Transient5xx,
+            CloudErrorClass::Timeout,
+            CloudErrorClass::Network,
+        ] {
+            assert!(class.is_transient());
+        }
+
+        for class in [
+            CloudErrorClass::QuotaExhausted,
+            CloudErrorClass::Unauthenticated,
+            CloudErrorClass::BadRequest,
+            CloudErrorClass::Forbidden,
+            CloudErrorClass::ContextTooLong,
+        ] {
+            assert!(!class.is_transient());
+        }
+    }
+
+    #[test]
     fn claude_529_is_overloaded() {
         // The exact string from the Claude CLI banner.
         let c = classify(
