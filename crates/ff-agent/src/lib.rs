@@ -112,6 +112,7 @@ pub mod portfolio_maintenance;
 pub mod ports_registry;
 pub mod power_scheduler;
 pub mod pr_integration;
+pub mod pr_integration_branch;
 pub mod pr_merge_executor;
 pub mod pr_verify;
 pub mod project_github_sync;
@@ -162,6 +163,7 @@ pub mod work_stealer;
 pub use alert_policy_seed::{AlertSeedReport, seed_from_toml as seed_alert_policies_from_toml};
 pub use model_catalog_seed::{ModelSeedReport, seed_from_toml as seed_model_catalog_from_toml};
 pub use ports_registry::{SeedReport as PortsSeedReport, seed_from_toml as seed_ports_from_toml};
+pub use crate::pr_integration_branch::{IntegrationPlan, create_integration_plan};
 pub use project_registry::{ProjectSeedReport, seed_from_toml as seed_projects_from_toml};
 pub use software_registry::{SeedReport, seed_from_toml};
 
