@@ -1878,6 +1878,15 @@ enum FleetCommand {
         #[arg(long)]
         role: Option<String>,
     },
+    /// Set sub-agent slot count for one worker, or every worker.
+    SetSlots {
+        /// New sub-agent slot count.
+        #[arg(long)]
+        count: i32,
+        /// Target exactly one fleet worker.
+        #[arg(long)]
+        worker: Option<String>,
+    },
     /// Run a command synchronously on a fleet computer over SSH.
     ///
     /// Resolves the node's ssh_user + best-reachable IP (LAN preferred,
