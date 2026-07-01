@@ -728,6 +728,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "provider_routing",
         sql: schema::SCHEMA_V149_PROVIDER_ROUTING,
     },
+    PgMigration {
+        version: 150,
+        name: "kimi_cli_external_tool",
+        sql: schema::SCHEMA_V150_KIMI_CLI_EXTERNAL_TOOL,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
