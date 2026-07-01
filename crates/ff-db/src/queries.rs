@@ -6617,6 +6617,54 @@ pub struct InteractionChannelStat {
     pub tokens_out: i64,
 }
 
+/// Per-engine rollup of fleet sub-agent dispatch outcomes (roadmap #8: the
+/// outcome feedback loop). Aggregated from the `work_item_dispatch` rows of
+/// `ff_interactions` so the planner/router can learn which engine
+/// (codex / claude / kimi / local:<model>) actually lands work, how fast, and
+/// how many tokens it burns — the raw signal for cheapest-capable routing.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DispatchOutcomeStat {
+    pub engine: String,
+    pub total: i64,
+    pub success: i64,
+    pub error: i64,
+    pub avg_latency_ms: Option<f64>,
+    pub avg_tokens_out: Option<f64>,
+}
+
+/// Per-engine dispatch outcome rollup over the fleet's `work_item_dispatch`
+/// interaction log. `avg_tokens_out` ignores zero rows (`NULLIF(tokens_out,0)`)
+/// so an engine whose token counts aren't parsed yet doesn't drag the average
+/// to zero. Engines with a NULL `engine` column are grouped under "unknown".
+pub async fn pg_dispatch_outcome_stats(pool: &PgPool) -> Result<Vec<DispatchOutcomeStat>> {
+    let rows = sqlx::query(
+        "SELECT COALESCE(engine, 'unknown')                       AS engine,
+                COUNT(*)                                          AS total,
+                COUNT(*) FILTER (WHERE outcome = 'success')       AS success,
+                COUNT(*) FILTER (WHERE outcome = 'error')         AS error,
+                AVG(latency_ms)                                   AS avg_latency_ms,
+                AVG(NULLIF(tokens_out, 0))                        AS avg_tokens_out
+           FROM ff_interactions
+          WHERE channel = 'work_item_dispatch'
+          GROUP BY COALESCE(engine, 'unknown')
+          ORDER BY total DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| DispatchOutcomeStat {
+            engine: r.get("engine"),
+            total: r.get("total"),
+            success: r.get("success"),
+            error: r.get("error"),
+            avg_latency_ms: r.get("avg_latency_ms"),
+            avg_tokens_out: r.get("avg_tokens_out"),
+        })
+        .collect())
+}
+
 /// Health snapshot of the `ff_interactions` training corpus (the dogfooding
 /// req+resp+tokens log). Powers `ff interactions stats`.
 #[derive(Debug, Clone, Default, serde::Serialize)]
