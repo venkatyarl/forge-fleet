@@ -26,13 +26,15 @@ use crate::sub_agents::ensure_workspaces;
 /// reapers' regression tests can assert the coupling.
 pub(crate) const HEARTBEAT_SECS: u64 = 45;
 const COMMAND_POLL_MS: u64 = 250;
-// 45 min. A real multi-file task where codex reads the repo, writes, and
-// compile-verifies against the FULL forge-fleet workspace (a cold `cargo check`
-// is minutes) legitimately needs more than 30 min — the old 1800s cap timed out
-// genuinely-progressing dispatches (dogfooded 2026-06-30, `ff usage` task wrote
-// a real diff but hit the wall mid-verify). Followers are 20-core/121GB, so the
-// slot cost is acceptable.
-const FF_TIMEOUT_SECS: u64 = 2700;
+// 18 min. codex reliably WRITES a complete diff in ~5-8 min but then often fails
+// to EXIT, running until the timeout (dogfooded 2026-06-30/07-01). Since the
+// dispatch now SALVAGES the worktree diff on timeout (worktree_has_diff →
+// commit → PR), we no longer need a long budget for codex to "finish" — we just
+// need enough time for it to write. 18 min gives comfortable headroom over the
+// ~8-min write, then salvages, instead of wasting a slot for 45 min on a
+// non-terminating process. A genuinely longer task simply salvages whatever diff
+// exists at 18 min (CI verifies it). Followers are 20-core/121GB.
+const FF_TIMEOUT_SECS: u64 = 1080;
 const MAX_DISPATCH_PER_TICK: i64 = 1;
 
 #[derive(Debug, Clone)]
