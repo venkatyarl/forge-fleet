@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind,
 };
@@ -3011,6 +3011,8 @@ pub enum PmCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Work_item backlog + throughput rollup.
+    Summary(PmSummary),
     /// Bulk-delete NON-LIVE work_items (e.g. clear a one-time audit run's
     /// stale `idea` rows). DRY-RUN by default — prints what would be deleted;
     /// pass `--yes` to actually delete. Only ever touches terminal/never-started
@@ -3056,6 +3058,13 @@ pub enum PmCommand {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PmSummary {
+    /// Emit JSON instead of the formatted table.
+    #[arg(long, default_value_t = false)]
+    json: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]

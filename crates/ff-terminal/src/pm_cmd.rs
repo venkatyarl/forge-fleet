@@ -239,6 +239,14 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
                 print!("{}", render_pm_stats(&stats));
             }
         }
+        crate::PmCommand::Summary(args) => {
+            let stats = collect_pm_stats(&pool).await?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            } else {
+                print!("{}", render_pm_stats(&stats));
+            }
+        }
         crate::PmCommand::Purge {
             kind,
             status,
