@@ -4053,6 +4053,25 @@ mod tests {
     }
 
     #[test]
+    fn backend_score_headroom_floor_behavior() {
+        assert!(
+            backend_score("codex", Some(100.0), "closed")
+                > backend_score("codex", Some(10.0), "closed")
+        );
+
+        for s in [
+            backend_score("codex", None, "closed"),
+            backend_score("codex", Some(100.0), "closed"),
+            backend_score("codex", Some(10.0), "closed"),
+            backend_score("codex", Some(0.0), "open"),
+            backend_score("claude", Some(50.0), "half_open"),
+            backend_score("grok", Some(120.0), "closed"),
+        ] {
+            assert!((0.0..=1.0).contains(&s), "score {s} out of range");
+        }
+    }
+
+    #[test]
     fn test_classify_collision_buckets() {
         // 0 same-language candidates ⇒ collides only across a language boundary.
         assert_eq!(classify_collision(0), SuspiciousBucket::CrossLanguage);
