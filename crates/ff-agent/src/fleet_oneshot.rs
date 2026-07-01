@@ -63,15 +63,33 @@ pub async fn fleet_oneshot(
         // tier coder deployment), and we'd silently fall back. No hint → top-8.
         limit: if model_hint.is_some() { 64 } else { 8 },
     };
-    let candidates = pg_route_deployments(pool, &filter)
+    let all_candidates = pg_route_deployments(pool, &filter)
         .await
         .map_err(|e| anyhow!("route deployments: {e}"))?;
-    if candidates.is_empty() {
+    if all_candidates.is_empty() {
         return Err(anyhow!(
             "no healthy fleet deployment to serve a local council member"
         ));
     }
-    let cand = pick_candidate(&candidates, model_hint);
+    // Drop deployments with no usable model name (empty catalog_id AND
+    // catalog_name). Those are "unknown model" rows — e.g. ace's mlx:55000,
+    // which is marked healthy but is NOT a real chat-completions server: sending
+    // it `model="local"` makes it try to fetch a HF repo named "local" and
+    // return an HTTP error, which masked as "fleet_oneshot round 1" and forced
+    // every local codegen dispatch to fall back to slow cloud codex
+    // (dogfooded 2026-07-01). Only keep them as a last resort so a fleet with
+    // ONLY unknown-model deployments still attempts a call.
+    let named: Vec<RouteCandidate> = all_candidates
+        .iter()
+        .filter(|c| has_model_name(c))
+        .cloned()
+        .collect();
+    let candidates: &[RouteCandidate] = if named.is_empty() {
+        &all_candidates
+    } else {
+        &named
+    };
+    let cand = pick_candidate(candidates, model_hint);
     let worker_name = cand.worker_name.clone();
     let endpoint = cand.endpoint.clone();
     let model = cand
@@ -134,6 +152,20 @@ fn usage_tokens_i32(payload: &Value) -> (i32, i32) {
     let (pt, ct) = crate::research::parse_completion_usage(payload);
     let clamp = |n: u64| i32::try_from(n).unwrap_or(i32::MAX);
     (clamp(pt), clamp(ct))
+}
+
+/// True if the deployment carries a usable model name (non-empty catalog_id or
+/// catalog_name). A candidate with neither can't be given a valid `model` value
+/// and is often not a real chat server (see the ace mlx:55000 case), so
+/// `fleet_oneshot` excludes these from selection except as a last resort. Pure.
+fn has_model_name(c: &RouteCandidate) -> bool {
+    model_name_present(c.catalog_id.as_deref(), c.catalog_name.as_deref())
+}
+
+/// Pure core of [`has_model_name`]: true when either field is non-empty.
+fn model_name_present(catalog_id: Option<&str>, catalog_name: Option<&str>) -> bool {
+    let present = |s: Option<&str>| s.map(|v| !v.trim().is_empty()).unwrap_or(false);
+    present(catalog_id) || present(catalog_name)
 }
 
 /// Choose a candidate: the first whose catalog id OR name contains `model_hint`
@@ -230,5 +262,18 @@ mod tests {
             "answer"
         );
         assert_eq!(strip_think_block("plain"), "plain");
+    }
+
+    #[test]
+    fn model_name_present_excludes_unknown_deployments() {
+        // A named coder deployment passes.
+        assert!(model_name_present(Some("qwen3-coder-30b"), None));
+        assert!(model_name_present(None, Some("Qwen3 Coder")));
+        // ace's mlx:55000 "unknown model" — empty/whitespace/None both ways — is
+        // excluded so fleet_oneshot never routes local codegen to a non-chat
+        // endpoint that returns HTTP errors (the Lane-1 root cause).
+        assert!(!model_name_present(None, None));
+        assert!(!model_name_present(Some(""), Some("  ")));
+        assert!(!model_name_present(Some("   "), None));
     }
 }
