@@ -59,10 +59,17 @@ impl McpServer {
         let response = match request.method.as_str() {
             // ── MCP lifecycle ────────────────────────────────────────
             "initialize" => self.handle_initialize(request.id.clone()).await,
-            "initialized" => {
-                // Notification — no response needed
-                return None;
-            }
+            // The MCP spec names this notification `notifications/initialized`.
+            // Strict clients (codex's rmcp, claude desktop) send the PREFIXED
+            // form after `initialize`; older/loose clients send bare
+            // `initialized`. Accept both — and, per JSON-RPC, a NOTIFICATION
+            // (no `id`, or the `notifications/` namespace) must NEVER get a
+            // response, error or otherwise. Returning `-32601 Method not found`
+            // here (the old behavior for the prefixed form) closed the transport
+            // mid-handshake ("Transport channel closed, when send initialized
+            // notification"). Swallow all `notifications/*` silently.
+            "initialized" | "notifications/initialized" => return None,
+            m if m.starts_with("notifications/") => return None,
 
             // ── MCP tool discovery ───────────────────────────────────
             "tools/list" => self.handle_tools_list(request.id.clone()).await,
@@ -372,6 +379,28 @@ mod tests {
         let server = McpServer::new();
         let req = make_request("initialized", None);
         let resp = server.handle_request(req).await;
+        assert!(resp.is_none());
+    }
+
+    #[tokio::test]
+    async fn prefixed_initialized_notification_returns_none() {
+        // The MCP-spec form strict clients (codex rmcp, claude desktop) send.
+        // Previously fell through to method_not_found (-32601) and broke the
+        // handshake. Must be swallowed silently like the bare form.
+        let server = McpServer::new();
+        let resp = server
+            .handle_request(make_request("notifications/initialized", None))
+            .await;
+        assert!(resp.is_none());
+    }
+
+    #[tokio::test]
+    async fn arbitrary_notification_returns_none() {
+        // Any notifications/* method is a JSON-RPC notification → no response.
+        let server = McpServer::new();
+        let resp = server
+            .handle_request(make_request("notifications/cancelled", None))
+            .await;
         assert!(resp.is_none());
     }
 }
