@@ -1131,9 +1131,10 @@ async fn run_backend_cli(backend: &str, cwd: &Path, prompt: &str) -> Result<Outp
     .context("join ff dispatch task")?
 }
 
-/// True if the worktree has any uncommitted change (tracked edits or new files).
+/// Runs `git status --porcelain` and returns true if the worktree has any
+/// uncommitted change, including tracked edits or untracked files.
 /// Used to SALVAGE a backend that wrote a valid diff but timed out before
-/// exiting — the work is real even though the process didn't terminate cleanly.
+/// exiting; the work is real even though the process didn't terminate cleanly.
 fn worktree_has_diff(worktree_path: &Path) -> bool {
     Command::new("git")
         .arg("-C")
