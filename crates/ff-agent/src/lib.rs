@@ -73,6 +73,7 @@ pub mod inference_router;
 pub mod instructions_sync;
 pub mod job_sweeper;
 pub mod leader_tick;
+pub mod leader_cache;
 pub mod learning;
 pub mod lease_takeover;
 pub mod legacy_daemon_reaper;

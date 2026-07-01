@@ -43,22 +43,14 @@ use crate::sub_agent_reaper::SubAgentReaper;
 const HOUR: u64 = 3600;
 const MIN: u64 = 60;
 
-/// Is `my_name` the currently-elected fleet leader?
-async fn is_fleet_leader(pool: &PgPool, my_name: &str) -> bool {
-    matches!(
-        ff_db::pg_get_current_leader(pool).await,
-        Ok(Some(l)) if l.member_name.eq_ignore_ascii_case(my_name)
-    )
-}
-
 /// Spawn a background loop that runs `work` every `interval`, but only while
-/// this node is the elected leader. Leadership is re-checked each tick (runtime
-/// gating) so a handoff transfers the work to the new leader without a daemon
-/// restart, and a deposed leader stops doing it. Sleeps `kickoff` before the
-/// first run so the boot rush settles, and exits cleanly on shutdown.
+/// this node is the elected leader. Leadership is read from the process-local
+/// leader cache each tick so the skip path does not touch Postgres. Sleeps
+/// `kickoff` before the first run so the boot rush settles, and exits cleanly
+/// on shutdown.
 fn spawn_leader_gated<F, Fut>(
     pool: PgPool,
-    my_name: String,
+    _my_name: String,
     label: &'static str,
     kickoff: Duration,
     interval: Duration,
@@ -77,7 +69,7 @@ where
             }
         }
         loop {
-            if is_fleet_leader(&pool, &my_name).await {
+            if crate::leader_cache::is_current_leader() {
                 work(pool.clone()).await;
             } else {
                 debug!(tick = label, "portfolio maintenance: skip (not leader)");

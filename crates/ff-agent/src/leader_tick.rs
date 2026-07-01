@@ -42,6 +42,7 @@ use ff_db::leader_state::{
 use ff_pulse::reader::{PulseError, PulseReader};
 
 use crate::ha::pg_failover::{FailoverOutcome, PostgresFailoverManager};
+use crate::leader_cache::{LeaderCache, LeaderInfo};
 
 /// Max revive attempts per computer per [`REVIVE_BACKOFF_WINDOW_MIN`] minutes.
 /// Above this the leader skips (and should escalate via alert channels).
@@ -246,6 +247,25 @@ impl LeaderTick {
         self
     }
 
+    fn self_leader_info(&self, epoch: i64, reason: &'static str) -> LeaderInfo {
+        let now = Utc::now();
+        LeaderInfo {
+            computer_id: Some(self.my_computer_id),
+            member_name: Some(self.my_name.clone()),
+            epoch: Some(epoch),
+            elected_at: Some(now),
+            reason: Some(reason.to_string()),
+            heartbeat_at: Some(now),
+            observed_at: now,
+        }
+    }
+
+    async fn update_leader_cache(&self, is_current_leader: bool, info: LeaderInfo) {
+        LeaderCache::global()
+            .update_state(is_current_leader, info)
+            .await;
+    }
+
     /// Spawn the periodic loop. Runs `tick()` every `interval_secs` until
     /// `shutdown` flips to `true`.
     pub fn spawn(self, interval_secs: u64, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
@@ -364,6 +384,7 @@ impl LeaderTick {
                                 }
                             }
                             Err(err) => {
+                                self.update_leader_cache(false, LeaderInfo::default()).await;
                                 tracing::warn!(
                                     node = %self.my_name,
                                     error = %err,
@@ -453,15 +474,24 @@ impl LeaderTick {
                 .await?;
                 if claimed {
                     (self.on_became_leader)(None);
+                    self.update_leader_cache(
+                        true,
+                        self.self_leader_info(new_epoch, "initial"),
+                    )
+                    .await;
                     Ok(TickOutcome::BecameLeader)
                 } else {
                     // Someone else won the race — we'll see them next tick.
+                    self.update_leader_cache(false, LeaderInfo::default()).await;
                     Ok(TickOutcome::NoOp)
                 }
             }
 
             // No durable leader, but we're not the best candidate.
-            (None, _) => Ok(TickOutcome::NoOp),
+            (None, _) => {
+                self.update_leader_cache(false, LeaderInfo::default()).await;
+                Ok(TickOutcome::NoOp)
+            }
 
             // Leader row exists and it's us.
             (Some(cur), Some(best)) if cur.member_name == self.my_name => {
@@ -470,8 +500,10 @@ impl LeaderTick {
                     let yielded = pg_yield_leader(&self.pg, &self.my_name).await?;
                     if yielded {
                         (self.on_lost_leader)(best.member_name.clone());
+                        self.update_leader_cache(false, LeaderInfo::default()).await;
                         Ok(TickOutcome::Yielded(best.member_name.clone()))
                     } else {
+                        self.update_leader_cache(true, LeaderInfo::from(&cur)).await;
                         Ok(TickOutcome::NoOp)
                     }
                 } else {
@@ -480,10 +512,12 @@ impl LeaderTick {
                     if refreshed {
                         // Keep our in-memory epoch aligned with the row.
                         self.observe_epoch(cur.epoch);
+                        self.update_leader_cache(true, LeaderInfo::from(&cur)).await;
                         Ok(TickOutcome::StillLeader)
                     } else {
                         // Row was deleted/taken under us. Treat as lost.
                         (self.on_lost_leader)(String::new());
+                        self.update_leader_cache(false, LeaderInfo::default()).await;
                         Ok(TickOutcome::Yielded(String::new()))
                     }
                 }
@@ -495,9 +529,11 @@ impl LeaderTick {
                 let refreshed = pg_refresh_leader_heartbeat(&self.pg, &self.my_name).await?;
                 if refreshed {
                     self.observe_epoch(cur.epoch);
+                    self.update_leader_cache(true, LeaderInfo::from(&cur)).await;
                     Ok(TickOutcome::StillLeader)
                 } else {
                     (self.on_lost_leader)(String::new());
+                    self.update_leader_cache(false, LeaderInfo::default()).await;
                     Ok(TickOutcome::Yielded(String::new()))
                 }
             }
@@ -529,8 +565,14 @@ impl LeaderTick {
                     .await?;
                     if took {
                         (self.on_became_leader)(Some(displaced_name.clone()));
+                        self.update_leader_cache(
+                            true,
+                            self.self_leader_info(new_epoch, "takeover"),
+                        )
+                        .await;
                         Ok(TickOutcome::TookOver(displaced_name))
                     } else {
+                        self.update_leader_cache(false, LeaderInfo::from(&cur)).await;
                         Ok(TickOutcome::NoOp)
                     }
                 } else if pulse_silent_long_enough && i_am_best && !stale {
@@ -561,18 +603,28 @@ impl LeaderTick {
                         let mut g = self.leader_pulse_silent_since.lock().await;
                         *g = None;
                         (self.on_became_leader)(Some(displaced_name.clone()));
+                        self.update_leader_cache(
+                            true,
+                            self.self_leader_info(new_epoch, "pulse_silent_takeover"),
+                        )
+                        .await;
                         Ok(TickOutcome::TookOver(displaced_name))
                     } else {
+                        self.update_leader_cache(false, LeaderInfo::from(&cur)).await;
                         Ok(TickOutcome::NoOp)
                     }
                 } else {
+                    self.update_leader_cache(false, LeaderInfo::from(&cur)).await;
                     Ok(TickOutcome::NoOp)
                 }
             }
 
             // Someone else is leader and no peer is alive in Pulse —
             // without evidence that we are the right taker, do nothing.
-            (Some(_), None) => Ok(TickOutcome::NoOp),
+            (Some(cur), None) => {
+                self.update_leader_cache(false, LeaderInfo::from(&cur)).await;
+                Ok(TickOutcome::NoOp)
+            }
         }
     }
 

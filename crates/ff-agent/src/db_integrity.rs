@@ -7,12 +7,9 @@
 //! automatically next time.
 //!
 //! Design notes:
-//!   - **Leader-gated, checked every fire** (NOT at spawn). Uses
-//!     [`ff_db::leader_state::pg_get_current_leader`] and requires the leader
-//!     row's `member_name` to match this node AND its `heartbeat_at` to be
-//!     fresher than [`LEADER_FRESH_SECS`]. We deliberately do NOT copy
-//!     `scheduler_tick`'s gate — that one queries nonexistent columns
-//!     (`leader_name`/`last_heartbeat`) and is broken.
+//!   - **Leader-gated, checked every fire** (NOT at spawn). Uses the
+//!     process-local leader cache published by `leader_tick`, so follower skips
+//!     do not touch Postgres.
 //!   - **Alert-only.** On detecting >=1 corrupt index we INSERT an
 //!     `alert_event` AND call [`crate::alert_evaluator::dispatch_alert`]
 //!     directly. We never write `channel_result='pending'` and rely on a
@@ -30,11 +27,6 @@ use tokio::task::JoinHandle;
 /// How often the integrity check runs. amcheck's `heapallindexed` scan reads
 /// every index AND its heap, so we keep this infrequent.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
-
-/// The leader's Postgres `heartbeat_at` must be fresher than this for us to
-/// consider ourselves the live leader. Matches the 60s window used by the
-/// `leader_heartbeat_stale` alert policy.
-const LEADER_FRESH_SECS: i64 = 60;
 
 /// The alert policy name seeded by migration V110.
 const POLICY_NAME: &str = "db_index_corruption";
@@ -69,23 +61,9 @@ impl AmcheckTick {
         Self { pg, my_name }
     }
 
-    /// Are we the live leader right now? True iff the `fleet_leader_state`
-    /// singleton names us AND its heartbeat is fresh.
+    /// Are we the live leader right now?
     async fn is_live_leader(&self) -> bool {
-        match ff_db::leader_state::pg_get_current_leader(&self.pg).await {
-            Ok(Some(leader)) => {
-                let fresh = chrono::Utc::now()
-                    .signed_duration_since(leader.heartbeat_at)
-                    .num_seconds()
-                    < LEADER_FRESH_SECS;
-                leader.member_name == self.my_name && fresh
-            }
-            Ok(None) => false,
-            Err(e) => {
-                tracing::warn!(error = %e, "amcheck: failed to read leader state");
-                false
-            }
-        }
+        crate::leader_cache::is_current_leader()
     }
 
     /// List every valid btree UNIQUE index in the `public` schema, as

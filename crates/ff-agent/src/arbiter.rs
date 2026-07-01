@@ -451,11 +451,11 @@ async fn execute_step(_pg: &PgPool, step: &serde_json::Value) -> Result<(), Stri
 
 /// Spawn the leader-gated arbiter loop. Structurally cloned from
 /// [`crate::autoscaler::spawn_autoscaler_tick`]: tokio interval, skip-first
-/// tick, per-tick leader gate via the SAME `fleet_leader_state` query, then
-/// `arbiter_pass`. On failover the new leader's forgefleetd picks it up.
+/// tick, per-tick leader gate via the process-local leader cache, then
+/// `arbiter_pass`.
 pub fn spawn_arbiter_tick(
     pg: PgPool,
-    worker_name: String,
+    _worker_name: String,
     interval_secs: u64,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -466,21 +466,7 @@ pub fn spawn_arbiter_tick(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let is_leader: bool = sqlx::query_scalar(
-                        r#"
-                        SELECT EXISTS (
-                            SELECT 1 FROM fleet_leader_state
-                            WHERE member_name = $1
-                              AND heartbeat_at > NOW() - INTERVAL '60 seconds'
-                        )
-                        "#
-                    )
-                    .bind(&worker_name)
-                    .fetch_one(&pg)
-                    .await
-                    .unwrap_or(false);
-
-                    if !is_leader {
+                    if !crate::leader_cache::is_current_leader() {
                         continue;
                     }
 

@@ -197,11 +197,11 @@ impl GitHubSync {
     /// `interval_mins`. Exits cleanly when `shutdown` flips to `true`.
     ///
     /// Leader-gated: spawned unconditionally on every node, but each tick checks
-    /// the live `fleet_leader_state` and skips unless this node is the current
+    /// the process-local leader cache and skips unless this node is the current
     /// leader (only the leader drives the canonical project/GitHub sync).
     pub fn spawn(
         self,
-        worker_name: String,
+        _worker_name: String,
         interval_mins: u64,
         mut shutdown: watch::Receiver<bool>,
     ) -> JoinHandle<()> {
@@ -217,21 +217,7 @@ impl GitHubSync {
             }
 
             loop {
-                let is_leader: bool = sqlx::query_scalar(
-                    r#"
-                    SELECT EXISTS (
-                        SELECT 1 FROM fleet_leader_state
-                        WHERE member_name = $1
-                          AND heartbeat_at > NOW() - INTERVAL '60 seconds'
-                    )
-                    "#,
-                )
-                .bind(&worker_name)
-                .fetch_one(&self.pg)
-                .await
-                .unwrap_or(false);
-
-                if is_leader {
+                if crate::leader_cache::is_current_leader() {
                     match self.sync_all_projects().await {
                         Ok(report) => debug!(
                             total = report.total,

@@ -446,7 +446,7 @@ pub async fn refresh_stale(pool: &PgPool, max_age: chrono::Duration) -> Result<u
 /// node, not per-node.
 pub fn spawn_mesh_refresh_tick(
     pg: PgPool,
-    worker_name: String,
+    _worker_name: String,
     interval_secs: u64,
     max_age_hours: i64,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -457,20 +457,7 @@ pub fn spawn_mesh_refresh_tick(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let is_leader: bool = sqlx::query_scalar(
-                        r#"
-                        SELECT EXISTS (
-                            SELECT 1 FROM fleet_leader_state
-                            WHERE member_name = $1
-                              AND heartbeat_at > NOW() - INTERVAL '60 seconds'
-                        )
-                        "#,
-                    )
-                    .bind(&worker_name)
-                    .fetch_one(&pg)
-                    .await
-                    .unwrap_or(false);
-                    if !is_leader {
+                    if !crate::leader_cache::is_current_leader() {
                         continue;
                     }
                     match refresh_stale(&pg, chrono::Duration::hours(max_age_hours)).await {

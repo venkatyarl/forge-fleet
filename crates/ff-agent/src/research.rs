@@ -1438,10 +1438,6 @@ const RESEARCH_RUNNER_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// spike the leader. A backlog drains across successive ticks.
 const RESEARCH_RUNNER_MAX_PER_TICK: usize = 2;
 
-/// Leader heartbeat freshness window — matches the other leader-gated
-/// forgefleetd ticks (sweeper, amcheck, summary-refresh).
-const RESEARCH_RUNNER_LEADER_FRESH_SECS: i64 = 60;
-
 /// Production tick that drives detached (`ff research --detach`) runs to
 /// completion inside `forgefleetd` on the leader.
 ///
@@ -1458,30 +1454,16 @@ const RESEARCH_RUNNER_LEADER_FRESH_SECS: i64 = 60;
 /// per [`feedback_two_daemons`].
 pub struct ResearchRunnerTick {
     pg: PgPool,
-    my_name: String,
 }
 
 impl ResearchRunnerTick {
-    pub fn new(pg: PgPool, my_name: String) -> Self {
-        Self { pg, my_name }
+    pub fn new(pg: PgPool, _my_name: String) -> Self {
+        Self { pg }
     }
 
-    /// True iff `fleet_leader_state` names us AND its heartbeat is fresh.
+    /// True iff this process currently owns leadership.
     async fn is_live_leader(&self) -> bool {
-        match ff_db::leader_state::pg_get_current_leader(&self.pg).await {
-            Ok(Some(leader)) => {
-                let fresh = chrono::Utc::now()
-                    .signed_duration_since(leader.heartbeat_at)
-                    .num_seconds()
-                    < RESEARCH_RUNNER_LEADER_FRESH_SECS;
-                leader.member_name == self.my_name && fresh
-            }
-            Ok(None) => false,
-            Err(e) => {
-                warn!(error = %e, "research runner: failed to read leader state");
-                false
-            }
-        }
+        crate::leader_cache::is_current_leader()
     }
 
     /// Spawn the 30s detached-run loop. Leadership is gated inside the loop on

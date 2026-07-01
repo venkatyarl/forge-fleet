@@ -440,11 +440,11 @@ pub async fn probe_all(pool: &PgPool) -> Vec<ProbeResult> {
 }
 
 /// Leader-gated: spawned unconditionally on every node, but each tick checks
-/// the live `fleet_leader_state` and skips unless this node is the current
+/// the process-local leader cache and skips unless this node is the current
 /// leader (only the leader probes the shared OAuth credentials).
 pub fn spawn_oauth_probe_tick(
     pg: PgPool,
-    worker_name: String,
+    _worker_name: String,
     interval_secs: u64,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -454,20 +454,7 @@ pub fn spawn_oauth_probe_tick(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let is_leader: bool = sqlx::query_scalar(
-                        r#"
-                        SELECT EXISTS (
-                            SELECT 1 FROM fleet_leader_state
-                            WHERE member_name = $1
-                              AND heartbeat_at > NOW() - INTERVAL '60 seconds'
-                        )
-                        "#,
-                    )
-                    .bind(&worker_name)
-                    .fetch_one(&pg)
-                    .await
-                    .unwrap_or(false);
-                    if !is_leader {
+                    if !crate::leader_cache::is_current_leader() {
                         continue;
                     }
 

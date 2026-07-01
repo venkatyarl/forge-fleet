@@ -65,15 +65,9 @@ fn should_reap(status: &str, started_at_age_mins: Option<i64>) -> bool {
     }
 }
 
-/// Is this pool's leader the computer whose name matches `my_name`?
-async fn is_leader(pool: &PgPool, my_name: &str) -> bool {
-    match sqlx::query_scalar::<_, String>("SELECT member_name FROM fleet_leader_state LIMIT 1")
-        .fetch_optional(pool)
-        .await
-    {
-        Ok(Some(leader)) => leader.eq_ignore_ascii_case(my_name),
-        _ => false,
-    }
+/// Is this process currently the elected leader?
+async fn is_leader(_pool: &PgPool, _my_name: &str) -> bool {
+    crate::leader_cache::is_current_leader()
 }
 
 /// Background stuck-slot reaper.

@@ -500,9 +500,8 @@ pub async fn run_once(pg: &PgPool, my_name: &str) -> Option<IntegritySummary> {
     Some(summary)
 }
 
-/// Spawn the leader-gated fleet-integrity loop. Leadership is checked inside
-/// the loop on every fire (not at spawn), exactly like the other leader ticks,
-/// so this is safe to start on every daemon.
+/// Spawn the leader-gated fleet-integrity loop. The skip path reads the
+/// process-local leader cache, so this is safe to start on every daemon.
 pub fn spawn_fleet_integrity_tick(
     pg: PgPool,
     worker_name: String,
@@ -515,21 +514,7 @@ pub fn spawn_fleet_integrity_tick(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let is_leader: bool = sqlx::query_scalar(
-                        r#"
-                        SELECT EXISTS (
-                            SELECT 1 FROM fleet_leader_state
-                            WHERE member_name = $1
-                              AND heartbeat_at > NOW() - INTERVAL '60 seconds'
-                        )
-                        "#,
-                    )
-                    .bind(&worker_name)
-                    .fetch_one(&pg)
-                    .await
-                    .unwrap_or(false);
-
-                    if !is_leader {
+                    if !crate::leader_cache::is_current_leader() {
                         continue;
                     }
 

@@ -42,26 +42,17 @@ pub struct SampleReport {
 pub struct MetricsDownsampler {
     pg: PgPool,
     pulse: PulseReader,
-    /// Name of this node — used to gate sampling on leadership.
-    my_name: String,
 }
 
 impl MetricsDownsampler {
     /// Build a new downsampler.
-    pub fn new(pg: PgPool, pulse: PulseReader, my_name: String) -> Self {
-        Self { pg, pulse, my_name }
+    pub fn new(pg: PgPool, pulse: PulseReader, _my_name: String) -> Self {
+        Self { pg, pulse }
     }
 
-    /// Check whether this node currently owns the leader singleton.
+    /// Check whether this process currently owns leadership.
     async fn is_leader(&self) -> bool {
-        match sqlx::query_scalar::<_, String>("SELECT member_name FROM fleet_leader_state LIMIT 1")
-            .fetch_optional(&self.pg)
-            .await
-        {
-            Ok(Some(leader)) => leader == self.my_name,
-            Ok(None) => false,
-            Err(_) => false,
-        }
+        crate::leader_cache::is_current_leader()
     }
 
     /// Take one sample: read every live Pulse beat and write one row per

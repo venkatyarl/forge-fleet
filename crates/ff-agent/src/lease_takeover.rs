@@ -13,22 +13,8 @@ use tracing::{info, warn};
 
 const STALE_HEARTBEAT_SECS: i64 = 5 * 60;
 
-async fn is_current_leader(pg: &PgPool, worker_name: &str) -> bool {
-    sqlx::query_scalar(
-        r#"SELECT EXISTS (
-               SELECT 1 FROM fleet_leader_state
-                WHERE member_name = $1
-                  AND heartbeat_at > NOW() - INTERVAL '60 seconds'
-           )"#,
-    )
-    .bind(worker_name)
-    .fetch_one(pg)
-    .await
-    .unwrap_or(false)
-}
-
-pub async fn evaluate_lease_takeover(pg: &PgPool, worker_name: &str) -> Result<usize> {
-    if !is_current_leader(pg, worker_name).await {
+pub async fn evaluate_lease_takeover(pg: &PgPool, _worker_name: &str) -> Result<usize> {
+    if !crate::leader_cache::is_current_leader() {
         return Ok(0);
     }
 
