@@ -287,9 +287,20 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     let heartbeat = spawn_heartbeat(pg.clone(), item.work_item_id, stop_heartbeat_rx);
 
     let started = std::time::Instant::now();
-    let dispatch_result = run_ff_dispatch(&pg, &item, &worktree).await;
+    let dispatch_full = run_ff_dispatch(&pg, &item, &worktree).await;
     let _ = stop_heartbeat_tx.send(true);
     let _ = heartbeat.await;
+
+    // Split (backend, output) into the backend used + a plain Result<Output> for
+    // the existing consumers. On error, no backend is carried, so use the
+    // best-effort primary (for training attribution).
+    let (backend_used, dispatch_result): (String, Result<Output>) = match dispatch_full {
+        Ok((b, out)) => (b, Ok(out)),
+        Err(e) => (
+            primary_dispatch_backend(&pg, item.computer_id).await,
+            Err(e),
+        ),
+    };
 
     // Capture the dispatch I/O in ff_interactions (training data) — `ff cli` is a
     // pass-through that doesn't log itself, so the dispatch records its own turn.
@@ -297,6 +308,7 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         &pg,
         &item,
         &worker_name,
+        &backend_used,
         &dispatch_result,
         started.elapsed(),
     )
@@ -671,6 +683,30 @@ fn dispatch_prompt(item: &AssignedWorkItem) -> String {
     }
 }
 
+/// Parse the token count a vendor CLI reports in its output so the training
+/// corpus captures token economics, not just content. codex prints
+/// `tokens used\n9,332`; kimi/others print variants like `Tokens: 1234` or
+/// `total tokens: 1234`. Best-effort — returns 0 when no count is found.
+fn parse_cli_tokens(output: &str) -> i32 {
+    let lower = output.to_ascii_lowercase();
+    // Find a "tokens" marker, then the nearest number after it (strip commas).
+    for marker in ["tokens used", "total tokens", "tokens:", "tokens"] {
+        if let Some(pos) = lower.find(marker) {
+            let tail = &output[pos + marker.len()..];
+            let digits: String = tail
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_digit() || *c == ',')
+                .filter(|c| *c != ',')
+                .collect();
+            if let Ok(n) = digits.parse::<i32>() {
+                return n;
+            }
+        }
+    }
+    0
+}
+
 /// Record a dispatch turn in `ff_interactions` (training data). Best-effort —
 /// never fails the dispatch. `ff cli` is a thin pass-through that doesn't log,
 /// so the dispatch logs its own request/response here.
@@ -678,34 +714,39 @@ async fn record_dispatch_interaction(
     pg: &PgPool,
     item: &AssignedWorkItem,
     worker_name: &str,
+    backend: &str,
     result: &Result<Output>,
     elapsed: Duration,
 ) {
-    let (response_text, outcome, error_text) = match result {
-        Ok(out) => (
-            String::from_utf8_lossy(&out.stdout)
+    let (response_text, outcome, error_text, tokens_out) = match result {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout)
                 .chars()
                 .take(16000)
-                .collect::<String>(),
-            "success".to_string(),
-            None,
-        ),
+                .collect::<String>();
+            let toks = parse_cli_tokens(&text);
+            (text, "success".to_string(), None, toks)
+        }
         Err(e) => (
             String::new(),
             "error".to_string(),
-            Some(e.to_string().chars().take(2000).collect::<String>()),
+            // Full anyhow chain ({:#}) so the real cause is captured, not just
+            // the top-level wrapper (e.g. "fleet_oneshot round 1").
+            Some(format!("{e:#}").chars().take(2000).collect::<String>()),
+            0,
         ),
     };
     let rec = ff_db::InteractionRecord {
         channel: "work_item_dispatch".to_string(),
         request_text: dispatch_prompt(item),
-        engine: Some("codex".to_string()),
+        engine: Some(backend.to_string()),
         response_text,
+        tokens_out,
         latency_ms: i32::try_from(elapsed.as_millis()).ok(),
         outcome,
         error_text,
         worker_name: Some(worker_name.to_string()),
-        endpoint: Some("ff cli codex".to_string()),
+        endpoint: Some(format!("ff cli {backend}")),
         ..Default::default()
     };
     if let Err(e) = ff_db::pg_record_interaction(pg, &rec).await {
@@ -726,7 +767,7 @@ async fn run_ff_dispatch(
     pg: &PgPool,
     item: &AssignedWorkItem,
     worktree: &WorktreeRecord,
-) -> Result<Output> {
+) -> Result<(String, Output)> {
     let prompt = dispatch_prompt(item);
 
     // Lane 1: local codegen harness.
@@ -737,8 +778,9 @@ async fn run_ff_dispatch(
                 rounds = outcome.rounds,
                 "work_item_dispatch: local codegen harness landed the change"
             );
-            return Ok(synthetic_output(
-                &outcome.final_diff.unwrap_or_else(|| "applied".into()),
+            return Ok((
+                "local".to_string(),
+                synthetic_output(&outcome.final_diff.unwrap_or_else(|| "applied".into())),
             ));
         }
         Ok(outcome) => info!(
@@ -748,7 +790,9 @@ async fn run_ff_dispatch(
         ),
         Err(e) => warn!(
             work_item_id = %item.work_item_id,
-            error = %e,
+            // Full anyhow chain so the REAL cause surfaces (e.g. the underlying
+            // fleet_oneshot failure), not just the "fleet_oneshot round 1" wrapper.
+            error = format!("{e:#}"),
             "work_item_dispatch: local codegen errored; backstop to codex"
         ),
     }
@@ -774,7 +818,7 @@ async fn run_ff_dispatch(
         routed
     };
     let computer_id = item.computer_id;
-    let mut last_output: Option<Output> = None;
+    let mut last_output: Option<(String, Output)> = None;
 
     for backend in &backends {
         if crate::circuit_breaker::is_provider_open(pg, computer_id, backend)
@@ -789,11 +833,31 @@ async fn run_ff_dispatch(
             let out = match run_backend_cli(backend, &worktree.worktree_path, &prompt).await {
                 Ok(o) => o,
                 Err(e) => {
-                    // A timeout / spawn error is a `Timeout`-class provider fault:
-                    // record it and SWITCH to the next backend rather than
-                    // `?`-propagating out (which would abort failover — the
-                    // "codex hangs 30min → whole dispatch dies" bug).
-                    warn!(backend = %backend, error = %e, "run_ff_dispatch: backend run errored (timeout/spawn) — switching");
+                    // A timeout / spawn error is a `Timeout`-class provider fault.
+                    // BUT the CLI (esp. codex) often writes a complete, valid diff
+                    // early and then just fails to EXIT — so a timeout doesn't mean
+                    // "no work done". If the worktree already has a real diff,
+                    // SALVAGE it (treat as success → commit → PR) instead of
+                    // discarding it and failing over. CI verifies the diff anyway.
+                    // (dogfooded 2026-07-01: `ff usage` wrote a full 2-file change
+                    // then timed out, and the work was thrown away.)
+                    if worktree_has_diff(&worktree.worktree_path) {
+                        warn!(backend = %backend, error = %e, "run_ff_dispatch: backend timed out but wrote a real diff — salvaging");
+                        let _ = crate::circuit_breaker::record_provider_success(
+                            pg,
+                            computer_id,
+                            backend,
+                        )
+                        .await;
+                        return Ok((
+                            backend.clone(),
+                            synthetic_output("salvaged diff after backend timeout"),
+                        ));
+                    }
+                    // No diff → genuine failure: record it and SWITCH to the next
+                    // backend rather than `?`-propagating out (which would abort
+                    // failover — the "codex hangs → whole dispatch dies" bug).
+                    warn!(backend = %backend, error = %e, "run_ff_dispatch: backend run errored (timeout/spawn), no diff — switching");
                     let _ = crate::circuit_breaker::record_provider_failure(
                         pg,
                         computer_id,
@@ -814,12 +878,12 @@ async fn run_ff_dispatch(
                 if attempt > 0 || backend != &backends[0] {
                     info!(backend = %backend, attempt, "run_ff_dispatch: recovered via auto-continue/failover");
                 }
-                return Ok(out);
+                return Ok((backend.clone(), out));
             }
             // A `--require-change` no-op (exit 3) is a task-level failure, not a
             // provider fault — surface it without classify/retry/switch.
             if out.status.code() == Some(3) {
-                return Ok(out);
+                return Ok((backend.clone(), out));
             }
             let combined = format!(
                 "{}\n{}",
@@ -845,7 +909,7 @@ async fn run_ff_dispatch(
                 let _ = crate::circuit_breaker::record_usage_signal(pg, computer_id, backend, rem)
                     .await;
             }
-            last_output = Some(out);
+            last_output = Some((backend.clone(), out));
             if class.is_transient() && attempt < AUTO_CONTINUE_MAX && !tripped {
                 let backoff = if attempt == 0 { 5 } else { 20 };
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
@@ -858,6 +922,17 @@ async fn run_ff_dispatch(
     last_output
         .map(Ok)
         .unwrap_or_else(|| bail!("run_ff_dispatch: no dispatchable backend on this node"))
+}
+
+/// The backend name for interaction attribution when a dispatch errored before
+/// any backend produced output (so `run_ff_dispatch` returned Err, carrying no
+/// backend). Best-effort: the first routed backend, else the historical default.
+async fn primary_dispatch_backend(pg: &PgPool, computer_id: Uuid) -> String {
+    ff_db::pg_routed_backends(pg, computer_id, 5400)
+        .await
+        .ok()
+        .and_then(|b| b.into_iter().next())
+        .unwrap_or_else(|| "codex".to_string())
 }
 
 /// Council cap: how many headless auto-continue re-injections to attempt on a
@@ -885,6 +960,19 @@ async fn run_backend_cli(backend: &str, cwd: &Path, prompt: &str) -> Result<Outp
     })
     .await
     .context("join ff dispatch task")?
+}
+
+/// True if the worktree has any uncommitted change (tracked edits or new files).
+/// Used to SALVAGE a backend that wrote a valid diff but timed out before
+/// exiting — the work is real even though the process didn't terminate cleanly.
+fn worktree_has_diff(worktree_path: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["status", "--porcelain"])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 /// Build a success `Output` for the local-codegen lane so `dispatch_one`'s
@@ -1310,4 +1398,27 @@ pub fn spawn_worktree_reaper(
         }
         info!("worktree_reaper loop stopped");
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_cli_tokens;
+
+    #[test]
+    fn parses_codex_tokens_used_with_comma() {
+        // The exact shape codex prints.
+        assert_eq!(parse_cli_tokens("codex\nHELLO\ntokens used\n9,332\n"), 9332);
+    }
+
+    #[test]
+    fn parses_inline_tokens_variants() {
+        assert_eq!(parse_cli_tokens("Total tokens: 1234"), 1234);
+        assert_eq!(parse_cli_tokens("done. tokens: 42"), 42);
+    }
+
+    #[test]
+    fn returns_zero_when_absent() {
+        assert_eq!(parse_cli_tokens("no counts here, just output"), 0);
+        assert_eq!(parse_cli_tokens(""), 0);
+    }
 }
