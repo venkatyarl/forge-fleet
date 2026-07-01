@@ -827,7 +827,10 @@ async fn record_usage(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use ff_agent::cloud_error::classify;
+use ff_agent::circuit_breaker::{record_provider_failure, record_provider_success};
+
+use super::*;
 
     #[test]
     fn flatten_text_content_handles_string_and_parts() {
