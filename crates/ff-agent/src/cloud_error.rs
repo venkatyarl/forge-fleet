@@ -515,6 +515,29 @@ mod tests {
     }
 
     #[test]
+    fn cloud_error_class_as_str_returns_expected_tags() {
+        let cases = [
+            (CloudErrorClass::Overloaded, "overloaded"),
+            (CloudErrorClass::RateLimited, "rate_limited"),
+            (CloudErrorClass::QuotaExhausted, "quota_exhausted"),
+            (CloudErrorClass::Unauthenticated, "unauthenticated"),
+            (CloudErrorClass::Forbidden, "forbidden"),
+            (CloudErrorClass::ContextTooLong, "context_too_long"),
+            (CloudErrorClass::Timeout, "timeout"),
+            (CloudErrorClass::Transient5xx, "transient_5xx"),
+            (CloudErrorClass::ModelNotFound, "model_not_found"),
+            (CloudErrorClass::BadRequest, "bad_request"),
+            (CloudErrorClass::ContentFiltered, "content_filtered"),
+            (CloudErrorClass::Network, "network"),
+            (CloudErrorClass::Unknown, "unknown"),
+        ];
+
+        for (class, expected) in cases {
+            assert_eq!(class.as_str(), expected);
+        }
+    }
+
+    #[test]
     fn claude_529_is_overloaded() {
         // The exact string from the Claude CLI banner.
         let c = classify(
