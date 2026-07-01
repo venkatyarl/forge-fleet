@@ -35,7 +35,33 @@ const COMMAND_POLL_MS: u64 = 250;
 // non-terminating process. A genuinely longer task simply salvages whatever diff
 // exists at 18 min (CI verifies it). Followers are 20-core/121GB.
 const FF_TIMEOUT_SECS: u64 = 1080;
-const MAX_DISPATCH_PER_TICK: i64 = 1;
+/// Ceiling on how many work_items a single host starts in one dispatch tick.
+/// The effective budget per tick is [`dispatch_budget_for_host`], which scales
+/// with the host's free sub-agent slots up to this cap (and drops to 1 under
+/// backpressure). Replaces the old hard `1/tick`, which left the fleet mostly
+/// idle even with many ready tasks and dozens of free slots.
+const MAX_DISPATCH_PER_TICK: i64 = 3;
+
+/// Recent-failure count at/above which the host throttles back to a single
+/// dispatch per tick (backpressure — stop feeding a host that's failing).
+const BACKPRESSURE_FAILURE_THRESHOLD: usize = 3;
+
+/// Capacity-aware per-tick dispatch budget for one host: dispatch up to as many
+/// items as it has free slots, capped at [`MAX_DISPATCH_PER_TICK`]. If the host
+/// has recently failed a lot (`recent_failures >= BACKPRESSURE_FAILURE_THRESHOLD`)
+/// throttle back to 1 so a broken host/lane doesn't burn a batch of tasks. Pure
+/// so it's unit-testable. Always returns at least 1 when there is ≥1 free slot,
+/// and 0 when there are no free slots.
+fn dispatch_budget_for_host(free_slots: usize, recent_failures: usize) -> i64 {
+    if free_slots == 0 {
+        return 0;
+    }
+    if recent_failures >= BACKPRESSURE_FAILURE_THRESHOLD {
+        return 1;
+    }
+    let cap = MAX_DISPATCH_PER_TICK.max(1) as usize;
+    free_slots.min(cap) as i64
+}
 
 #[derive(Debug, Clone)]
 struct AssignedWorkItem {
@@ -57,10 +83,39 @@ struct WorktreeRecord {
     task_branch: String,
 }
 
+/// Count this host's recently-failed work_item dispatches (last 15 min), used
+/// as the backpressure signal for [`dispatch_budget_for_host`]. Best-effort —
+/// the caller treats an error as "0 failures" (no backpressure).
+async fn recent_host_failures(pg: &PgPool, worker_name: &str) -> Result<usize> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM work_item_leases l \
+           JOIN computers c ON c.id = l.computer_id \
+           JOIN work_items w ON w.id = l.work_item_id \
+          WHERE c.name = $1 \
+            AND w.status = 'failed' \
+            AND l.created_at > NOW() - INTERVAL '15 minutes'",
+    )
+    .bind(worker_name)
+    .fetch_one(pg)
+    .await?;
+    Ok(row.0.max(0) as usize)
+}
+
 /// One dispatch pass. Returns the number of work_items started by this host.
 pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Result<usize> {
     let repo_path = std::env::current_dir().context("resolve current repo path")?;
-    let assigned = assigned_work_items(pg, worker_name, &repo_path, MAX_DISPATCH_PER_TICK).await?;
+
+    // Capacity-aware budget: dispatch up to this host's free-slot count, capped
+    // at MAX_DISPATCH_PER_TICK, throttled to 1 under recent-failure backpressure.
+    // Replaces the old hard 1/tick that left the fleet mostly idle.
+    let free_slots = ff_db::pg_free_slots(pg, Some(worker_name), MAX_DISPATCH_PER_TICK)
+        .await
+        .map(|s| s.len())
+        .unwrap_or(1);
+    let recent_failures = recent_host_failures(pg, worker_name).await.unwrap_or(0);
+    let budget = dispatch_budget_for_host(free_slots, recent_failures).max(1);
+
+    let assigned = assigned_work_items(pg, worker_name, &repo_path, budget).await?;
     if assigned.is_empty() {
         return Ok(0);
     }
@@ -1516,7 +1571,9 @@ pub fn spawn_worktree_reaper(
 
 #[cfg(test)]
 mod tests {
-    use super::{DispatchOutcome, classify_dispatch_outcome, parse_cli_tokens};
+    use super::{
+        DispatchOutcome, classify_dispatch_outcome, dispatch_budget_for_host, parse_cli_tokens,
+    };
     use anyhow::anyhow;
     use std::os::unix::process::ExitStatusExt;
     use std::process::Output;
@@ -1573,6 +1630,30 @@ mod tests {
             classify_dispatch_outcome(&r2, false),
             DispatchOutcome::FailedNoDiff
         );
+    }
+
+    #[test]
+    fn budget_zero_free_slots_is_zero() {
+        assert_eq!(dispatch_budget_for_host(0, 0), 0);
+        assert_eq!(dispatch_budget_for_host(0, 10), 0);
+    }
+
+    #[test]
+    fn budget_scales_with_free_slots_up_to_cap() {
+        // 1 free slot → 1; 2 → 2; at/over the cap (3) → capped at 3.
+        assert_eq!(dispatch_budget_for_host(1, 0), 1);
+        assert_eq!(dispatch_budget_for_host(2, 0), 2);
+        assert_eq!(dispatch_budget_for_host(3, 0), 3);
+        assert_eq!(dispatch_budget_for_host(50, 0), 3);
+    }
+
+    #[test]
+    fn budget_backpressure_throttles_to_one() {
+        // Plenty of free slots but a failing host → throttle to 1.
+        assert_eq!(dispatch_budget_for_host(50, 3), 1);
+        assert_eq!(dispatch_budget_for_host(50, 99), 1);
+        // Below the threshold → no throttle.
+        assert_eq!(dispatch_budget_for_host(50, 2), 3);
     }
 
     #[test]
