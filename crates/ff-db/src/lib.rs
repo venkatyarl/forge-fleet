@@ -44,6 +44,8 @@ pub use queries::{
     DeferredTaskRow,
     // Orchestrator P2 — per-session demand sensing (V116)
     DemandVector,
+    // Fleet dispatch outcome feedback (roadmap #8)
+    DispatchOutcomeStat,
     // Fleet agents catalog (V112)
     FleetAgentRow,
     FleetModelRow,
@@ -119,6 +121,7 @@ pub use queries::{
     pg_delete_secret,
     pg_delete_shared_volume_mount,
     pg_disable_safety_gate,
+    pg_dispatch_outcome_stats,
     pg_dispatchable_backends,
     pg_enqueue_deferred,
     pg_enqueue_deferred_delayed,
