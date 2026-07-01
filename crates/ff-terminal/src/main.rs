@@ -6374,6 +6374,19 @@ fn spawn_session_turn(
             Ok(result) => {
                 let mut text = result.stdout;
                 if result.exit_code != 0 {
+                    let cloud_err = ff_agent::cloud_error::CloudError {
+                        provider: backend.clone(),
+                        exit_code: Some(result.exit_code as i32),
+                        output: format!("{text}\n{}", result.stderr),
+                    };
+                    let classified = ff_agent::cloud_error::classify_cloud_error(&cloud_err);
+                    let _ = tx
+                        .send(AgentEvent::System {
+                            session_id: session_id.clone(),
+                            message: classified.friendly_message,
+                        })
+                        .await;
+
                     let tail: String = result.stderr.chars().take(800).collect();
                     text.push_str(&format!("\n[stderr] (exit {}) {}", result.exit_code, tail));
                 }
@@ -6385,6 +6398,24 @@ fn spawn_session_turn(
                     .await;
             }
             Err(e) => {
+                let classified = match e.downcast_ref::<ff_agent::cloud_error::CloudError>() {
+                    Some(err) => ff_agent::cloud_error::classify_cloud_error(err),
+                    None => {
+                        let cloud_err = ff_agent::cloud_error::CloudError {
+                            provider: backend.clone(),
+                            exit_code: None,
+                            output: e.to_string(),
+                        };
+                        ff_agent::cloud_error::classify_cloud_error(&cloud_err)
+                    }
+                };
+                let _ = tx
+                    .send(AgentEvent::System {
+                        session_id: session_id.clone(),
+                        message: classified.friendly_message,
+                    })
+                    .await;
+
                 let _ = tx
                     .send(AgentEvent::AssistantText {
                         session_id: session_id.clone(),
@@ -7092,6 +7123,9 @@ async fn run_headless(
             match &event {
                 AgentEvent::Status { message, .. } => {
                     eprintln!("\x1b[2m  → {message}\x1b[0m");
+                }
+                AgentEvent::System { message, .. } => {
+                    eprintln!("{YELLOW}  note: {message}{RESET}");
                 }
                 AgentEvent::TurnComplete { turn, .. } => {
                     eprintln!("\x1b[2m── turn {turn} ──────────────────────────────\x1b[0m");

@@ -439,6 +439,25 @@ pub fn render_status(message: &str) -> DisplayMessage {
     }
 }
 
+/// Render a system notification.
+pub fn render_system_message(message: &str) -> DisplayMessage {
+    DisplayMessage {
+        lines: vec![Line::from(vec![
+            Span::styled(
+                "  note: ",
+                Style::default()
+                    .fg(Color::Rgb(251, 191, 36))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                message.to_string(),
+                Style::default().fg(Color::Rgb(251, 191, 36)),
+            ),
+        ])],
+        role: MessageRole::System,
+    }
+}
+
 /// Render an error message.
 pub fn render_error(message: &str) -> DisplayMessage {
     DisplayMessage {
@@ -475,6 +494,7 @@ pub fn event_to_display(event: &AgentEvent) -> Option<DisplayMessage> {
             ..
         } => Some(render_tool_end(tool_name, result, *is_error, *duration_ms)),
         AgentEvent::Status { message, .. } => Some(render_status(message)),
+        AgentEvent::System { message, .. } => Some(render_system_message(message)),
         AgentEvent::Error { message, .. } => Some(render_error(message)),
         _ => None,
     }

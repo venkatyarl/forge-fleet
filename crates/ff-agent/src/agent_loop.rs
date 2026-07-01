@@ -663,6 +663,8 @@ pub enum AgentEvent {
     },
     #[serde(rename = "status")]
     Status { session_id: String, message: String },
+    #[serde(rename = "system")]
+    System { session_id: String, message: String },
     #[serde(rename = "error")]
     Error { session_id: String, message: String },
     #[serde(rename = "done")]
