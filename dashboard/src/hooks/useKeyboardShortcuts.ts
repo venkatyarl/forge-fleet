@@ -1,62 +1,56 @@
 import { useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { useUIStore } from '../app/store'
+import { COMMANDS } from '../app/commands'
 
-/**
- * Global keyboard shortcuts for ForgeFleet dashboard.
- * Uses two-key chord pattern: press G then H for Home, G then T for Topology, etc.
- */
 export function useKeyboardShortcuts() {
   const navigate = useNavigate()
+  const setPaletteOpen = useUIStore((s) => s.setCommandPaletteOpen)
   const pendingKey = useRef<string | null>(null)
   const timeout = useRef<ReturnType<typeof setTimeout> | null>(null)
 
+  const chordRoutes = COMMANDS.reduce<Record<string, string>>((acc, cmd) => {
+    if (cmd.shortcut) {
+      const keys = cmd.shortcut.toLowerCase().split(' ')
+      if (keys.length === 2 && keys[0] === 'g' && cmd.path) {
+        acc[keys[1]] = cmd.path
+      }
+    }
+    return acc
+  }, {})
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      // Don't trigger in input fields
       const target = e.target as HTMLElement
       if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) return
 
       const key = e.key.toLowerCase()
 
-      // ? shows help
       if (key === '?' && !e.metaKey && !e.ctrlKey) {
         e.preventDefault()
-        alert('Keyboard Shortcuts:\n\nG then H — Mission Control (Home)\nG then T — Topology\nG then F — Fleet Overview\nG then C — Chat Studio\nG then P — Projects\nG then S — Settings\nG then K — Tools\n\n⌘K — Command Palette\n? — This help')
+        setPaletteOpen(true)
         return
       }
 
-      // Two-key chords starting with G
       if (pendingKey.current === 'g') {
         e.preventDefault()
         pendingKey.current = null
         if (timeout.current) clearTimeout(timeout.current)
-
-        switch (key) {
-          case 'h': navigate('/'); break
-          case 't': navigate('/topology'); break
-          case 'f': navigate('/fleet'); break
-          case 'c': navigate('/chat'); break
-          case 'p': navigate('/projects'); break
-          case 's': navigate('/settings'); break
-          case 'k': navigate('/tools'); break
-          case 'a': navigate('/audit'); break
-          case 'n': navigate('/model-hub'); break
-          case 'w': navigate('/workflow'); break
-          case 'l': navigate('/planning'); break
-        }
+        const path = chordRoutes[key]
+        if (path) navigate(path)
         return
       }
 
-      // Start chord with G
       if (key === 'g' && !e.metaKey && !e.ctrlKey) {
         pendingKey.current = 'g'
         if (timeout.current) clearTimeout(timeout.current)
-        timeout.current = setTimeout(() => { pendingKey.current = null }, 1000)
-        return
+        timeout.current = setTimeout(() => {
+          pendingKey.current = null
+        }, 1000)
       }
     }
 
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [navigate])
+  }, [navigate, setPaletteOpen, chordRoutes])
 }

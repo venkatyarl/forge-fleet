@@ -1,4 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
+import { Badge } from '../../components/ui/badge'
+import { Button } from '../../components/ui/button'
+import { CardTitle } from '../../components/ui/card'
+import { cn } from '../../lib/utils'
 
 interface Msg {
   role: 'user' | 'assistant' | 'system'
@@ -60,7 +64,7 @@ export function OnboardChat({ nodeName, osFamily, machineKind }: Props) {
         data.content ||
         data.output ||
         data.message ||
-        'Session created — streaming response not shown in this lite chat.'
+        'Session created - streaming response not shown in this lite chat.'
       setMessages((m) => [...m, { role: 'assistant', text }])
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -84,39 +88,48 @@ export function OnboardChat({ nodeName, osFamily, machineKind }: Props) {
   }
 
   return (
-    <div className="h-full flex flex-col bg-slate-950 border-l border-slate-800">
-      <div className="px-3 py-2 border-b border-slate-800 text-xs uppercase tracking-wider text-slate-400">
-        Ask ForgeFleet
+    <div className="flex h-full flex-col bg-surface">
+      <div className="border-b border-border px-4 py-3">
+        <CardTitle>Ask ForgeFleet</CardTitle>
+        <div className="mt-1 flex flex-wrap gap-1.5">
+          <Badge variant="neutral">{osFamily}</Badge>
+          <Badge variant="default">{machineKind}</Badge>
+        </div>
       </div>
-      <div ref={scrollRef} className="flex-1 overflow-auto p-3 space-y-3 text-sm">
+      <div ref={scrollRef} className="flex-1 space-y-3 overflow-auto p-3 text-sm">
         {messages
           .filter((m) => m.role !== 'system')
           .map((m, i) => (
             <div
               key={i}
-              className={
+              className={cn(
+                'rounded-lg border px-3 py-2 text-foreground',
                 m.role === 'user'
-                  ? 'bg-indigo-600/20 rounded px-3 py-2 text-slate-100'
-                  : 'bg-slate-800 rounded px-3 py-2 text-slate-100'
-              }
+                  ? 'border-primary bg-primary-subtle text-primary'
+                  : 'border-border bg-panel'
+              )}
             >
-              <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">
-                {m.role}
-              </div>
-              <div className="whitespace-pre-wrap">{m.text}</div>
+              <Badge variant={m.role === 'user' ? 'default' : 'neutral'}>{m.role}</Badge>
+              <div className="mt-2 whitespace-pre-wrap">{m.text}</div>
             </div>
           ))}
-        {busy && <div className="text-xs text-slate-500 italic">thinking…</div>}
+        {busy && <div className="text-xs italic text-dim">thinking...</div>}
       </div>
-      <div className="border-t border-slate-800 p-2">
+      <div className="space-y-2 border-t border-border bg-panel p-3">
         <textarea
+          aria-label="Onboarding chat message"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={onKey}
           rows={2}
-          placeholder="Ask a question… (Enter to send, Shift+Enter for newline)"
-          className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-sm text-slate-100 placeholder:text-slate-500 resize-none"
+          placeholder="Ask a question... (Enter to send, Shift+Enter for newline)"
+          className="w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-dim focus:border-primary"
         />
+        <div className="flex justify-end">
+          <Button onClick={send} disabled={busy || input.trim() === ''} size="sm">
+            Send
+          </Button>
+        </div>
       </div>
     </div>
   )

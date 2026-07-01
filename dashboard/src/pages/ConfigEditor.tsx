@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Badge } from '../components/ui/badge'
+import { Button } from '../components/ui/button'
+import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { StatusBadge } from '../components/ui/status-badge'
 import { getJson, getText, parseJsonSafe } from '../lib/api'
+import { cn } from '../lib/utils'
 
 type ReloadStatus = {
   status?: string
@@ -104,60 +109,61 @@ export function ConfigEditor() {
   }
 
   return (
-    <section className="space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-xl font-semibold text-slate-100">Config Editor (fleet.toml)</h2>
+    <section className="space-y-5">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <h2 className="text-xl font-semibold text-foreground">Config Editor</h2>
+          <p className="mt-1 text-sm text-muted">fleet.toml runtime configuration and hot-reload state.</p>
+        </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="rounded-full bg-slate-800 px-2 py-1 text-xs text-slate-300">Hot-reload: {status}</span>
-          <span
-            className={`rounded-full px-2 py-1 text-xs ${
-              hasUnsavedChanges ? 'bg-amber-500/20 text-amber-300' : 'bg-emerald-500/20 text-emerald-300'
-            }`}
-          >
+          <StatusBadge status={status}>Hot-reload: {status}</StatusBadge>
+          <Badge variant={hasUnsavedChanges ? 'warn' : 'ok'}>
             {hasUnsavedChanges ? 'Unsaved changes' : 'Saved'}
-          </span>
-          <button
-            onClick={() => void load()}
-            disabled={loading || saving}
-            className="rounded-md border border-slate-700 bg-slate-900 px-3 py-1.5 text-sm text-slate-200 hover:border-slate-500 disabled:cursor-not-allowed disabled:opacity-60"
-            type="button"
-          >
-            {loading ? 'Reloading…' : 'Reload'}
-          </button>
-          <button
+          </Badge>
+          {lastSyncedAt ? <Badge variant="neutral">Synced {new Date(lastSyncedAt).toLocaleString()}</Badge> : null}
+          <Button onClick={() => void load()} disabled={loading || saving} type="button" variant="outline">
+            {loading ? 'Reloading...' : 'Reload'}
+          </Button>
+          <Button
             onClick={() => {
               setContent(savedBaseline)
               setStatus('reverted')
             }}
             disabled={loading || saving || !hasUnsavedChanges}
-            className="rounded-md border border-slate-700 bg-slate-900 px-3 py-1.5 text-sm text-slate-200 hover:border-slate-500 disabled:cursor-not-allowed disabled:opacity-60"
             type="button"
+            variant="secondary"
           >
             Revert changes
-          </button>
-          <button
-            onClick={() => void save()}
-            disabled={loading || saving || !hasUnsavedChanges}
-            className="rounded-md border border-sky-600/70 bg-sky-500/20 px-3 py-1.5 text-sm text-sky-200 hover:border-sky-400 disabled:cursor-not-allowed disabled:opacity-60"
-            type="button"
-          >
+          </Button>
+          <Button onClick={() => void save()} disabled={loading || saving || !hasUnsavedChanges} type="button">
             {saving ? 'Saving...' : 'Save config'}
-          </button>
+          </Button>
         </div>
       </div>
 
       <Info text="Security note: keep enrollment/Telegram secrets in host env vars or secured config files; use Settings for token source and runtime health checks." />
 
-      {lastSyncedAt ? <Info text={`Last synced: ${new Date(lastSyncedAt).toLocaleString()}`} subtle /> : null}
       {loading ? <Info text="Loading config..." /> : null}
       {error ? <Info text={`Error: ${error}`} danger /> : null}
 
-      <textarea
-        className="min-h-[420px] w-full rounded-xl border border-slate-800 bg-slate-950/80 p-4 font-mono text-sm text-slate-200 outline-none ring-sky-500 focus:ring"
-        value={content}
-        onChange={(event) => setContent(event.target.value)}
-        spellCheck={false}
-      />
+      <Card className="overflow-hidden bg-surface p-0">
+        <CardHeader className="mb-0 border-b border-border px-4 py-3">
+          <div>
+            <CardTitle>fleet.toml</CardTitle>
+            <CardDescription>Raw configuration loaded from /api/config.</CardDescription>
+          </div>
+          <Badge variant={content ? 'neutral' : 'info'}>
+            {content ? `${content.split('\n').length} lines` : 'empty'}
+          </Badge>
+        </CardHeader>
+        <textarea
+          aria-label="fleet.toml contents"
+          className="min-h-[520px] w-full resize-y border-0 bg-background p-4 font-mono text-sm leading-6 text-foreground outline-none placeholder:text-dim focus:ring-2 focus:ring-primary"
+          value={content}
+          onChange={(event) => setContent(event.target.value)}
+          spellCheck={false}
+        />
+      </Card>
 
       <div className="grid gap-4 xl:grid-cols-2">
         <GuidePanel title="Activation Guidance" steps={ACTIVATION_GUIDE} />
@@ -169,27 +175,33 @@ export function ConfigEditor() {
 
 function GuidePanel({ title, steps }: { title: string; steps: string[] }) {
   return (
-    <article className="rounded-xl border border-slate-800 bg-slate-900/50 p-4">
-      <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-slate-300">{title}</h3>
-      <ol className="list-decimal space-y-2 pl-5 text-sm text-slate-300">
+    <Card className="bg-panel">
+      <CardHeader>
+        <div>
+          <CardTitle>{title}</CardTitle>
+          <CardDescription>Operational checks for config changes.</CardDescription>
+        </div>
+      </CardHeader>
+      <ol className="list-decimal space-y-2 pl-5 text-sm text-muted">
         {steps.map((step, idx) => (
           <li key={`${idx}-${step}`}>{step}</li>
         ))}
       </ol>
-    </article>
+    </Card>
   )
 }
 
 function Info({ text, danger = false, subtle = false }: { text: string; danger?: boolean; subtle?: boolean }) {
   return (
     <div
-      className={`rounded-xl border px-4 py-3 text-sm ${
+      className={cn(
+        'rounded-xl border px-4 py-3 text-sm',
         danger
-          ? 'border-rose-500/30 bg-rose-500/10 text-rose-200'
+          ? 'border-status-crit bg-panel text-status-crit'
           : subtle
-            ? 'border-slate-800 bg-slate-950/60 text-slate-400'
-            : 'border-slate-800 bg-slate-900/50 text-slate-300'
-      }`}
+            ? 'border-border bg-surface text-dim'
+            : 'border-border bg-panel text-muted'
+      )}
     >
       {text}
     </div>

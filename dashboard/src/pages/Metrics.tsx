@@ -1,8 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { RefreshCw } from 'lucide-react'
 import { getJson, getText } from '../lib/api'
 import { extractNodes, extractSummary } from '../lib/normalizers'
 import type { FleetComputer, FleetStatusResponse } from '../types'
 import { GpuHeatmap } from '../components/GpuHeatmap'
+import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { Badge } from '../components/ui/badge'
+import { StatusBadge } from '../components/ui/status-badge'
+import { Button } from '../components/ui/button'
+import { cn } from '../lib/utils'
 
 /* ── types ───────────────────────────────────────────────── */
 
@@ -20,6 +26,8 @@ type ParsedMetrics = {
   latencyP99: number
   perModel: Record<string, { requests: number; errors: number; avgLatency: number }>
 }
+
+type Tone = 'ok' | 'warn' | 'crit' | 'info' | 'neutral'
 
 /* ── prometheus parser ───────────────────────────────────── */
 
@@ -167,81 +175,171 @@ export function Metrics() {
     metrics && metrics.requestRate > 0
       ? ((metrics.errorRate / metrics.requestRate) * 100).toFixed(2)
       : '0.00'
+  const errorPctNum = parseFloat(errorPct)
+  const totalNodes = Math.max(
+    nodes.length,
+    fleetSummary.connected_nodes + fleetSummary.unhealthy_nodes,
+    fleetSummary.enrolled_nodes + fleetSummary.seed_nodes,
+  )
+  const healthPct = totalNodes > 0 ? Math.round((fleetSummary.connected_nodes / totalNodes) * 100) : 0
+  const healthTone: Tone = healthPct >= 80 ? 'ok' : healthPct >= 50 ? 'warn' : 'crit'
+  const errorTone: Tone = errorPctNum > 5 ? 'crit' : errorPctNum > 1 ? 'warn' : 'ok'
+  const p95Tone: Tone = metrics && metrics.latencyP95 >= 1 ? 'warn' : 'info'
+  const gpuReportingNodes = nodes.filter((node) => (node.gpu ?? node.hardware?.gpu ?? 'unknown') !== 'unknown').length
+  const gpuReportingPct =
+    nodes.length > 0 ? Math.round((gpuReportingNodes / nodes.length) * 100) : 0
 
   return (
-    <section className="space-y-6">
-      <div className="flex flex-wrap items-center justify-between gap-3">
+    <section className="min-h-full space-y-6 bg-background text-foreground">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">Metrics</h1>
-          <p className="mt-1 text-sm text-slate-400">
-            Fleet performance, resources, workload, and replication health
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="text-2xl font-bold text-foreground">Metrics</h1>
+            {loading ? <Badge variant="info">loading</Badge> : null}
+          </div>
+          <p className="mt-1 text-sm text-dim">
+            Fleet performance, resources, workload, and replication health.
           </p>
         </div>
-        <button
-          onClick={() => void load()}
-          disabled={loading}
-          className="rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-sky-500 disabled:opacity-50"
-        >
-          {loading ? 'Loading…' : '↻ Refresh'}
-        </button>
+        <Button variant="outline" onClick={() => void load()} disabled={loading}>
+          <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
+          Refresh
+        </Button>
       </div>
 
       {error ? (
-        <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
-          {error}
-        </div>
+        <Card className="border-status-crit bg-panel">
+          <div className="text-sm text-status-crit">{error}</div>
+        </Card>
       ) : null}
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-        <MetricCard label="Total Requests" value={metrics?.requestRate.toLocaleString() ?? '—'} color="text-sky-300" />
+        <MetricCard
+          label="Total Requests"
+          value={metrics?.requestRate.toLocaleString() ?? '—'}
+          description="Prometheus request counter"
+          tone="info"
+        />
         <MetricCard
           label="Error Rate"
           value={`${errorPct}%`}
-          color={parseFloat(errorPct) > 5 ? 'text-rose-400' : 'text-emerald-400'}
+          description={`${metrics?.errorRate.toLocaleString() ?? '0'} failed requests`}
+          tone={errorTone}
         />
-        <MetricCard label="p50 Latency" value={metrics ? fmtMs(metrics.latencyP50) : '—'} color="text-slate-200" />
-        <MetricCard label="p95 Latency" value={metrics ? fmtMs(metrics.latencyP95) : '—'} color="text-amber-300" />
-        <MetricCard label="p99 Latency" value={metrics ? fmtMs(metrics.latencyP99) : '—'} color="text-rose-300" />
+        <MetricCard
+          label="p50 Latency"
+          value={metrics ? fmtMs(metrics.latencyP50) : '—'}
+          description="median response time"
+          tone="neutral"
+        />
+        <MetricCard
+          label="p95 Latency"
+          value={metrics ? fmtMs(metrics.latencyP95) : '—'}
+          description="upper percentile"
+          tone={p95Tone}
+        />
+        <MetricCard
+          label="p99 Latency"
+          value={metrics ? fmtMs(metrics.latencyP99) : '—'}
+          description="tail latency"
+          tone={metrics && metrics.latencyP99 >= 1 ? 'crit' : 'warn'}
+        />
       </div>
 
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
-        <MetricCard label="Connected Nodes" value={String(fleetSummary.connected_nodes)} color="text-emerald-300" />
-        <MetricCard label="Unhealthy Nodes" value={String(fleetSummary.unhealthy_nodes)} color="text-amber-300" />
-        <MetricCard label="Live Enrolled" value={String(fleetSummary.enrolled_nodes)} color="text-sky-300" />
-        <MetricCard label="Seed Static" value={String(fleetSummary.seed_nodes)} color="text-slate-300" />
-        <MetricCard label="Models Loaded" value={String(fleetSummary.model_count)} color="text-sky-300" />
+        <MetricCard
+          label="Connected Nodes"
+          value={String(fleetSummary.connected_nodes)}
+          description={`${totalNodes} known total`}
+          tone={healthTone}
+        />
+        <MetricCard
+          label="Unhealthy Nodes"
+          value={String(fleetSummary.unhealthy_nodes)}
+          description="reported degraded or down"
+          tone={fleetSummary.unhealthy_nodes > 0 ? 'warn' : 'ok'}
+        />
+        <MetricCard
+          label="Live Enrolled"
+          value={String(fleetSummary.enrolled_nodes)}
+          description="runtime members"
+          tone="info"
+        />
+        <MetricCard
+          label="Seed Static"
+          value={String(fleetSummary.seed_nodes)}
+          description="configured inventory"
+          tone="neutral"
+        />
+        <MetricCard
+          label="Models Loaded"
+          value={String(fleetSummary.model_count)}
+          description="across the fleet"
+          tone="info"
+        />
       </div>
 
-      <div className="space-y-3">
-        <h2 className="text-lg font-semibold text-slate-200">Per-Model Stats</h2>
+      <div className="grid gap-4 lg:grid-cols-3">
+        <GaugeCard
+          label="Fleet Health"
+          value={`${healthPct}%`}
+          description={`${fleetSummary.connected_nodes} connected of ${totalNodes || 0}`}
+          pct={healthPct}
+          tone={healthTone}
+        />
+        <GaugeCard
+          label="Request Success"
+          value={`${Math.max(0, 100 - errorPctNum).toFixed(2)}%`}
+          description={`${errorPct}% error rate`}
+          pct={Math.max(0, 100 - errorPctNum)}
+          tone={errorTone === 'crit' ? 'crit' : errorTone === 'warn' ? 'warn' : 'ok'}
+        />
+        <GaugeCard
+          label="GPU Reporting"
+          value={`${gpuReportingPct}%`}
+          description={`${gpuReportingNodes} nodes reporting GPUs`}
+          pct={gpuReportingPct}
+          tone={gpuReportingPct >= 80 ? 'ok' : gpuReportingPct >= 40 ? 'warn' : 'neutral'}
+        />
+      </div>
+
+      <Card className="bg-surface">
+        <CardHeader className="gap-3">
+          <div>
+            <CardTitle>Per-Model Stats</CardTitle>
+            <CardDescription>Request volume, error share, and median latency by model.</CardDescription>
+          </div>
+          <Badge variant="neutral">{modelEntries.length} models</Badge>
+        </CardHeader>
         {modelEntries.length === 0 ? (
-          <p className="text-sm text-slate-500">No per-model data available</p>
+          <p className="text-sm text-dim">No per-model data available</p>
         ) : (
-          <div className="space-y-2">
+          <div className="space-y-3">
             {modelEntries.map(([model, stats]) => {
               const pct = (stats.requests / maxRequests) * 100
               const errPct =
                 stats.requests > 0 ? ((stats.errors / stats.requests) * 100).toFixed(1) : '0.0'
+              const rowTone: Tone = parseFloat(errPct) > 5 ? 'crit' : parseFloat(errPct) > 1 ? 'warn' : 'ok'
 
               return (
-                <div key={model} className="rounded-lg border border-slate-800 bg-slate-900/50 px-4 py-3">
-                  <div className="mb-1 flex items-center justify-between gap-3">
-                    <span className="font-medium text-slate-200">{model}</span>
-                    <div className="flex gap-4 text-xs text-slate-400">
-                      <span>{stats.requests.toLocaleString()} req</span>
-                      <span className={parseFloat(errPct) > 5 ? 'text-rose-400' : ''}>{errPct}% err</span>
-                      {stats.avgLatency > 0 ? <span>{fmtMs(stats.avgLatency)} p50</span> : null}
+                <div key={model} className="rounded-lg border border-border bg-panel px-4 py-3">
+                  <div className="mb-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                    <span className="truncate font-medium text-foreground">{model}</span>
+                    <div className="flex flex-wrap gap-2 text-xs text-muted">
+                      <Badge variant="neutral">{stats.requests.toLocaleString()} req</Badge>
+                      <Badge variant={rowTone}>{errPct}% err</Badge>
+                      {stats.avgLatency > 0 ? <Badge variant="info">{fmtMs(stats.avgLatency)} p50</Badge> : null}
                     </div>
                   </div>
-                  <div className="h-2 w-full overflow-hidden rounded-full bg-slate-800">
-                    <div className="h-full rounded-full bg-sky-500/70 transition-all" style={{ width: `${pct}%` }} />
+                  <div className="h-2 w-full overflow-hidden rounded-full bg-elevated">
+                    <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${pct}%` }} />
                   </div>
                 </div>
               )
             })}
           </div>
         )}
-      </div>
+      </Card>
 
       <div className="space-y-3">
         <GpuHeatmap
@@ -258,29 +356,36 @@ export function Metrics() {
       </div>
 
       <div className="space-y-3">
-        <h2 className="text-lg font-semibold text-slate-200">Node Resource & Workload Metrics</h2>
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h2 className="text-lg font-semibold text-foreground">Node Resource & Workload Metrics</h2>
+            <p className="mt-1 text-sm text-dim">
+              Hardware, source, workload, heartbeat, and replication state per node.
+            </p>
+          </div>
+          <Badge variant="neutral">{nodes.length} nodes</Badge>
+        </div>
         {nodes.length === 0 ? (
-          <p className="text-sm text-slate-500">No node data available</p>
+          <p className="text-sm text-dim">No node data available</p>
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
             {nodes.map((node) => {
               const status = (node.status ?? node.health ?? 'unknown').toLowerCase()
               const ok = status === 'online' || status === 'healthy'
               const degraded = status === 'degraded'
-              const borderClass = ok
-                ? 'border-emerald-500/30 bg-emerald-500/5'
-                : degraded
-                  ? 'border-amber-500/30 bg-amber-500/5'
-                  : 'border-rose-500/30 bg-rose-500/5'
+              const tone: Tone = ok ? 'ok' : degraded ? 'warn' : 'crit'
 
               return (
-                <div key={node.id ?? node.name} className={`rounded-lg border px-4 py-3 ${borderClass}`}>
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-medium text-slate-200">{node.name}</span>
-                    <span className="text-xs text-slate-300">{status}</span>
-                  </div>
+                <Card key={node.id ?? node.name} className={cn('bg-panel', borderToneClass(tone))}>
+                  <CardHeader className="mb-2 items-start gap-3">
+                    <div className="min-w-0">
+                      <CardTitle className="truncate text-base">{node.name}</CardTitle>
+                      <CardDescription>{node.ip ?? node.hostname ?? 'unknown endpoint'}</CardDescription>
+                    </div>
+                    <StatusBadge status={status} />
+                  </CardHeader>
 
-                  <div className="mt-2 grid grid-cols-2 gap-1 text-xs text-slate-300">
+                  <div className="grid grid-cols-2 gap-3">
                     <MetricRow label="CPU" value={node.cpu ?? node.hardware?.cpu ?? 'unknown'} />
                     <MetricRow label="RAM" value={node.ram ?? node.hardware?.ram ?? 'unknown'} />
                     <MetricRow label="GPU" value={node.gpu ?? node.hardware?.gpu ?? 'unknown'} />
@@ -313,7 +418,7 @@ export function Metrics() {
                       value={(node.runtime_provenance ?? []).join(', ') || 'unreported'}
                     />
                   </div>
-                </div>
+                </Card>
               )
             })}
           </div>
@@ -323,22 +428,126 @@ export function Metrics() {
   )
 }
 
-function MetricCard({ label, value, color }: { label: string; value: string; color?: string }) {
+function MetricCard({
+  label,
+  value,
+  description,
+  tone,
+}: {
+  label: string
+  value: string
+  description: string
+  tone: Tone
+}) {
   return (
-    <div className="rounded-xl border border-slate-800 bg-slate-900/50 px-4 py-4">
-      <p className="text-xs uppercase tracking-wider text-slate-500">{label}</p>
-      <p className={`mt-1 text-2xl font-bold ${color ?? 'text-slate-100'}`}>{value}</p>
-    </div>
+    <Card className="bg-panel">
+      <CardHeader className="mb-2">
+        <CardDescription>{label}</CardDescription>
+      </CardHeader>
+      <div className={cn('truncate text-2xl font-bold', textToneClass(tone))}>{value}</div>
+      <div className="mt-1 text-xs text-dim">{description}</div>
+    </Card>
   )
 }
 
 function MetricRow({ label, value }: { label: string; value: unknown }) {
   return (
-    <div>
-      <span className="text-slate-500">{label}: </span>
-      <span>{typeof value === 'string' ? value : String(value ?? 'unknown')}</span>
+    <div className="min-w-0">
+      <p className="text-xs text-dim">{label}</p>
+      <p className="truncate text-sm text-foreground">
+        {typeof value === 'string' ? value : String(value ?? 'unknown')}
+      </p>
     </div>
   )
+}
+
+function GaugeCard({
+  label,
+  value,
+  description,
+  pct,
+  tone,
+}: {
+  label: string
+  value: string
+  description: string
+  pct: number
+  tone: Tone
+}) {
+  const clamped = Math.max(0, Math.min(100, pct))
+
+  return (
+    <Card className="bg-panel">
+      <CardHeader className="mb-4">
+        <div>
+          <CardTitle>{label}</CardTitle>
+          <CardDescription>{description}</CardDescription>
+        </div>
+        <Badge variant={tone === 'neutral' ? 'neutral' : tone}>{value}</Badge>
+      </CardHeader>
+      <div className="flex items-center gap-4">
+        <div
+          className="grid h-24 w-24 shrink-0 place-items-center rounded-full"
+          style={{
+            background: `conic-gradient(${toneColor(tone)} ${clamped * 3.6}deg, var(--color-elevated) 0deg)`,
+          }}
+        >
+          <div className="grid h-16 w-16 place-items-center rounded-full bg-panel text-sm font-semibold text-foreground">
+            {Math.round(clamped)}%
+          </div>
+        </div>
+        <div className="min-w-0">
+          <div className={cn('text-3xl font-bold', textToneClass(tone))}>{value}</div>
+          <p className="mt-1 text-sm text-dim">{description}</p>
+        </div>
+      </div>
+    </Card>
+  )
+}
+
+function textToneClass(tone: Tone): string {
+  switch (tone) {
+    case 'ok':
+      return 'text-status-ok'
+    case 'warn':
+      return 'text-status-warn'
+    case 'crit':
+      return 'text-status-crit'
+    case 'info':
+      return 'text-status-info'
+    default:
+      return 'text-foreground'
+  }
+}
+
+function borderToneClass(tone: Tone): string {
+  switch (tone) {
+    case 'ok':
+      return 'border-status-ok'
+    case 'warn':
+      return 'border-status-warn'
+    case 'crit':
+      return 'border-status-crit'
+    case 'info':
+      return 'border-status-info'
+    default:
+      return 'border-border'
+  }
+}
+
+function toneColor(tone: Tone): string {
+  switch (tone) {
+    case 'ok':
+      return 'var(--color-status-ok)'
+    case 'warn':
+      return 'var(--color-status-warn)'
+    case 'crit':
+      return 'var(--color-status-crit)'
+    case 'info':
+      return 'var(--color-status-info)'
+    default:
+      return 'var(--color-primary)'
+  }
 }
 
 function fmtMs(value: number): string {

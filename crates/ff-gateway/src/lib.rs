@@ -26,6 +26,7 @@ pub mod pulse_api;
 pub mod router;
 pub mod screen_ctrl;
 pub mod server;
+pub mod skills_api;
 pub mod static_files;
 pub mod tasks;
 pub mod telegram;

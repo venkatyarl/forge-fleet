@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useOutletContext } from 'react-router-dom'
+import { Badge } from '../components/ui/badge'
+import { Button } from '../components/ui/button'
+import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { StatusBadge } from '../components/ui/status-badge'
 import { getJson } from '../lib/api'
+import { cn } from '../lib/utils'
 import type { WsEvent } from '../types'
 
 type ProxyStats = {
@@ -59,16 +64,18 @@ export function LLMProxy() {
   }, [wsEvent, load])
 
   return (
-    <section className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h2 className="text-xl font-semibold text-slate-100">LLM Proxy</h2>
-        <button
-          onClick={() => void load()}
-          className="rounded-md border border-slate-700 bg-slate-900 px-3 py-1.5 text-sm text-slate-200 hover:border-slate-500"
-          type="button"
-        >
-          Refresh
-        </button>
+    <section className="space-y-5">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <h2 className="text-xl font-semibold text-foreground">LLM Proxy</h2>
+          <p className="mt-1 text-sm text-muted">Routing health, latency, and recent proxy decisions.</p>
+        </div>
+        <div className="flex items-center gap-2">
+          {loading ? <Badge variant="info">loading</Badge> : <Badge variant="ok">live</Badge>}
+          <Button onClick={() => void load()} type="button" variant="outline" disabled={loading}>
+            Refresh
+          </Button>
+        </div>
       </div>
 
       <div className="grid gap-3 md:grid-cols-4">
@@ -81,55 +88,86 @@ export function LLMProxy() {
       {loading ? <Info text="Loading proxy data..." /> : null}
       {error ? <Info text={`Error: ${error}`} danger /> : null}
 
-      <div className="overflow-hidden rounded-xl border border-slate-800 bg-slate-900/70">
-        <table className="min-w-full text-left text-sm">
-          <thead className="bg-slate-900 text-slate-400">
-            <tr>
-              <th className="px-3 py-2">Time</th>
-              <th className="px-3 py-2">Model</th>
-              <th className="px-3 py-2">Tier</th>
-              <th className="px-3 py-2">Decision</th>
-              <th className="px-3 py-2">Latency</th>
-              <th className="px-3 py-2">Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {requests.map((request, idx) => (
-              <tr key={`${request.id ?? idx}`} className="border-t border-slate-800 text-slate-200">
-                <td className="px-3 py-2">
-                  {request.timestamp ? new Date(request.timestamp).toLocaleTimeString() : '-'}
-                </td>
-                <td className="px-3 py-2">{request.model ?? '-'}</td>
-                <td className="px-3 py-2">{request.tier ?? '-'}</td>
-                <td className="px-3 py-2">{request.decision ?? '-'}</td>
-                <td className="px-3 py-2">{request.latencyMs ?? '-'} ms</td>
-                <td className="px-3 py-2">{request.status ?? '-'}</td>
+      <Card className="overflow-hidden bg-surface p-0">
+        <CardHeader className="mb-0 border-b border-border px-4 py-3">
+          <div>
+            <CardTitle>Recent Requests</CardTitle>
+            <CardDescription>Latest proxy traffic from the request log.</CardDescription>
+          </div>
+          <Badge variant="neutral">{requests.length} rows</Badge>
+        </CardHeader>
+        <div className="overflow-x-auto">
+          <table className="min-w-full text-left text-sm">
+            <thead className="border-b border-border bg-elevated text-xs uppercase text-dim">
+              <tr>
+                <th className="px-4 py-2 font-medium">Time</th>
+                <th className="px-4 py-2 font-medium">Model</th>
+                <th className="px-4 py-2 font-medium">Tier</th>
+                <th className="px-4 py-2 font-medium">Decision</th>
+                <th className="px-4 py-2 font-medium">Latency</th>
+                <th className="px-4 py-2 font-medium">Status</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+            </thead>
+            <tbody>
+              {requests.length === 0 ? (
+                <tr>
+                  <td className="px-4 py-8 text-center text-sm text-dim" colSpan={6}>
+                    No proxy requests reported yet.
+                  </td>
+                </tr>
+              ) : (
+                requests.map((request, idx) => (
+                  <tr
+                    key={`${request.id ?? idx}`}
+                    className="border-t border-border text-muted transition hover:bg-panel hover:text-foreground"
+                  >
+                    <td className="whitespace-nowrap px-4 py-3 text-dim">
+                      {request.timestamp ? new Date(request.timestamp).toLocaleTimeString() : '-'}
+                    </td>
+                    <td className="px-4 py-3 font-mono text-xs text-status-info">{request.model ?? '-'}</td>
+                    <td className="px-4 py-3">
+                      {request.tier == null ? '-' : <Badge variant="neutral">tier {request.tier}</Badge>}
+                    </td>
+                    <td className="px-4 py-3">
+                      {request.decision ? <Badge variant="default">{request.decision}</Badge> : '-'}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-3 text-foreground">
+                      {request.latencyMs ?? '-'} ms
+                    </td>
+                    <td className="px-4 py-3">
+                      <StatusBadge status={request.status ?? 'unknown'}>{request.status ?? '-'}</StatusBadge>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </Card>
     </section>
   )
 }
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (
-    <article className="rounded-xl border border-slate-800 bg-slate-900/70 p-4">
-      <p className="text-xs uppercase tracking-wide text-slate-500">{label}</p>
-      <p className="mt-2 text-xl font-semibold text-slate-100">{value}</p>
-    </article>
+    <Card className="bg-panel">
+      <CardHeader className="mb-2">
+        <CardDescription className="uppercase tracking-wide">{label}</CardDescription>
+      </CardHeader>
+      <p className="text-2xl font-semibold text-foreground">{value}</p>
+    </Card>
   )
 }
 
 function Info({ text, danger = false }: { text: string; danger?: boolean }) {
   return (
     <div
-      className={`rounded-xl border px-4 py-3 text-sm ${
+      className={cn(
+        'rounded-xl border px-4 py-3 text-sm',
         danger
-          ? 'border-rose-500/30 bg-rose-500/10 text-rose-200'
-          : 'border-slate-800 bg-slate-900/50 text-slate-300'
-      }`}
+          ? 'border-status-crit bg-panel text-status-crit'
+          : 'border-border bg-panel text-muted'
+      )}
     >
       {text}
     </div>

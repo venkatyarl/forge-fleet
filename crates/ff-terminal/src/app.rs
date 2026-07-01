@@ -7,6 +7,7 @@ use ff_agent::agent_loop::{AgentEvent, AgentSession, AgentSessionConfig};
 use ff_agent::commands::CommandRegistry;
 use ff_agent::focus_stack::{BacklogPriority, ConversationTracker, PushReason};
 
+use crate::api_client::GatewayClient;
 use crate::input::InputState;
 use crate::messages::{DisplayMessage, render_user_message};
 
@@ -47,6 +48,9 @@ pub struct App {
 
     /// Live task queue displayed in the TUI sidebar.
     pub task_queue: Vec<QueuedTask>,
+
+    /// Gateway API client for real-time dashboard data.
+    pub gateway: GatewayClient,
 }
 
 /// Interactive model picker overlay shown when user runs `/model` with no args.
@@ -317,6 +321,7 @@ impl App {
             brain_status: None,
             picker: None,
             task_queue: Vec::new(),
+            gateway: GatewayClient::default(),
         }
     }
 

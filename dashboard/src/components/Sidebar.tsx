@@ -1,31 +1,19 @@
 import { useState, useEffect } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
+import { useUIStore } from '../app/store'
 
 type NavItem = { to: string; label: string; icon: string }
 type NavSection = {
   id: string
   title: string
   icon: string
-  items: NavItem[]
-  /** If set, the section title itself is a link (no sub-items toggle) */
+  items?: NavItem[]
   link?: string
 }
 
 const mainSections: NavSection[] = [
-  {
-    id: 'mission-control',
-    title: 'Mission Control',
-    icon: '🎯',
-    link: '/',
-    items: [],
-  },
-  {
-    id: 'pulse',
-    title: 'Pulse',
-    icon: '📡',
-    link: '/pulse',
-    items: [],
-  },
+  { id: 'mission-control', title: 'Mission Control', icon: '🎯', link: '/' },
+  { id: 'pulse', title: 'Pulse', icon: '📡', link: '/pulse' },
   {
     id: 'brain',
     title: 'Brain',
@@ -33,6 +21,18 @@ const mainSections: NavSection[] = [
     items: [
       { to: '/brain', label: 'Threads', icon: '💭' },
       { to: '/brain/graph', label: 'Knowledge Graph', icon: '🕸️' },
+    ],
+  },
+  {
+    id: 'intelligence',
+    title: 'Intelligence',
+    icon: '🔮',
+    items: [
+      { to: '/agents', label: 'Agents / Swarm', icon: '🐝' },
+      { to: '/council', label: 'Council', icon: '🏛️' },
+      { to: '/mcp', label: 'MCP', icon: '🔌' },
+      { to: '/skills', label: 'Skills', icon: '📖' },
+      { to: '/interactions', label: 'Interactions', icon: '📡' },
     ],
   },
   {
@@ -46,13 +46,7 @@ const mainSections: NavSection[] = [
       { to: '/workflow', label: 'Workflows', icon: '🔄' },
     ],
   },
-  {
-    id: 'cost-ledger',
-    title: 'Cost Ledger',
-    icon: '💰',
-    link: '/cost-ledger',
-    items: [],
-  },
+  { id: 'cost-ledger', title: 'Cost Ledger', icon: '💰', link: '/cost-ledger' },
   {
     id: 'fleet',
     title: 'Fleet',
@@ -80,6 +74,7 @@ const mainSections: NavSection[] = [
     icon: '⚙️',
     items: [
       { to: '/metrics', label: 'Metrics', icon: '📈' },
+      { to: '/alerts', label: 'Alerts', icon: '🔔' },
       { to: '/audit', label: 'Audit Log', icon: '📜' },
       { to: '/updates', label: 'Updates', icon: '🔄' },
       { to: '/versions', label: 'Versions', icon: '🏷️' },
@@ -102,11 +97,17 @@ function loadExpandedState(): Record<string, boolean> {
     const raw = localStorage.getItem('ff_sidebar_expanded')
     if (raw) return JSON.parse(raw)
   } catch { /* ignore */ }
-  return Object.fromEntries(mainSections.filter(s => s.items.length > 0).map(s => [s.id, true]))
+  return Object.fromEntries(mainSections.filter((s) => (s.items?.length ?? 0) > 0).map((s) => [s.id, true]))
 }
 
-export function Sidebar() {
-  const [collapsed, setCollapsed] = useState(false)
+interface SidebarProps {
+  collapsed?: boolean
+}
+
+export function Sidebar({ collapsed: collapsedProp }: SidebarProps) {
+  const storeCollapsed = useUIStore((s) => s.sidebarCollapsed)
+  const toggleSidebar = useUIStore((s) => s.toggleSidebar)
+  const collapsed = collapsedProp ?? storeCollapsed
   const [expanded, setExpanded] = useState<Record<string, boolean>>(loadExpandedState)
   const location = useLocation()
 
@@ -115,34 +116,36 @@ export function Sidebar() {
   }, [expanded])
 
   const toggleSection = (id: string) => {
-    setExpanded(prev => ({ ...prev, [id]: !prev[id] }))
+    setExpanded((prev) => ({ ...prev, [id]: !prev[id] }))
   }
 
   const isSectionActive = (section: NavSection) => {
     if (section.link) return location.pathname === section.link
-    return section.items.some(item => location.pathname === item.to || location.pathname.startsWith(item.to + '/'))
+    return (section.items ?? []).some(
+      (item) => location.pathname === item.to || location.pathname.startsWith(item.to + '/')
+    )
   }
 
   return (
-    <aside className={`flex-shrink-0 border-b border-zinc-800 bg-[#18181B]/80 transition-all duration-200 md:border-b-0 md:border-r ${
-      collapsed ? 'md:w-14' : 'w-full md:w-56'
-    } flex h-full flex-col overflow-y-auto p-2`}>
-
+    <aside
+      className={`flex h-full flex-shrink-0 flex-col overflow-y-auto border-b border-border bg-elevated/80 transition-all duration-200 md:border-b-0 md:border-r ${
+        collapsed ? 'md:w-14' : 'w-full md:w-56'
+      } p-2`}
+    >
       <button
-        onClick={() => setCollapsed(!collapsed)}
-        className="mb-2 hidden w-full rounded p-1 text-xs text-zinc-600 hover:bg-zinc-800 hover:text-zinc-400 md:block"
+        onClick={toggleSidebar}
+        className="mb-2 hidden w-full rounded p-1 text-xs text-dim hover:bg-panel hover:text-muted md:block"
         title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+        aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
       >
         {collapsed ? '▸▸' : '◂◂'}
       </button>
 
-      {/* Main navigation — grows to fill space */}
       <nav className="flex-1 space-y-1">
         {mainSections.map((section) => {
           const isActive = isSectionActive(section)
           const isExpanded = expanded[section.id] ?? true
 
-          // Direct link section (Mission Control)
           if (section.link) {
             return (
               <div key={section.id}>
@@ -152,36 +155,39 @@ export function Sidebar() {
                   className={({ isActive: linkActive }) =>
                     `flex items-center gap-2 rounded-md px-2 py-2 text-sm font-medium transition ${
                       linkActive
-                        ? 'bg-violet-500/15 text-violet-300'
-                        : 'text-zinc-300 hover:bg-zinc-800/70 hover:text-zinc-100'
+                        ? 'bg-primary-subtle text-primary'
+                        : 'text-muted hover:bg-panel hover:text-foreground'
                     } ${collapsed ? 'justify-center px-0' : ''}`
                   }
                   title={collapsed ? section.title : undefined}
                 >
-                  <span className="text-sm flex-shrink-0">{section.icon}</span>
+                  <span className="flex-shrink-0 text-sm">{section.icon}</span>
                   {!collapsed && <span className="truncate">{section.title}</span>}
                 </NavLink>
               </div>
             )
           }
 
-          // Collapsible section
           return (
             <div key={section.id}>
               <button
                 onClick={() => !collapsed && toggleSection(section.id)}
                 className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs font-semibold uppercase tracking-wider transition ${
-                  isActive && !isExpanded
-                    ? 'text-violet-400'
-                    : 'text-zinc-500 hover:text-zinc-300'
+                  isActive && !isExpanded ? 'text-primary' : 'text-dim hover:text-muted'
                 } ${collapsed ? 'justify-center px-0' : ''}`}
                 title={collapsed ? section.title : undefined}
+                aria-label={section.title}
+                aria-expanded={isExpanded}
               >
-                <span className="text-xs flex-shrink-0">{section.icon}</span>
+                <span className="flex-shrink-0 text-xs">{section.icon}</span>
                 {!collapsed && (
                   <>
                     <span className="flex-1 text-left">{section.title}</span>
-                    <span className={`text-[10px] text-zinc-600 transition-transform duration-150 ${isExpanded ? 'rotate-0' : '-rotate-90'}`}>
+                    <span
+                      className={`text-[10px] text-dim transition-transform duration-150 ${
+                        isExpanded ? 'rotate-0' : '-rotate-90'
+                      }`}
+                    >
                       ▾
                     </span>
                   </>
@@ -189,21 +195,25 @@ export function Sidebar() {
               </button>
 
               {(isExpanded || collapsed) && (
-                <ul className={`space-y-0.5 overflow-hidden transition-all duration-150 ${!collapsed ? 'ml-1 mt-0.5' : 'mt-0.5'}`}>
-                  {section.items.map((item) => (
+                <ul
+                  className={`space-y-0.5 overflow-hidden transition-all duration-150 ${
+                    !collapsed ? 'ml-1 mt-0.5' : 'mt-0.5'
+                  }`}
+                >
+                  {(section.items ?? []).map((item) => (
                     <li key={item.to}>
                       <NavLink
                         to={item.to}
                         className={({ isActive: linkActive }) =>
                           `flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition ${
                             linkActive
-                              ? 'bg-violet-500/15 text-violet-300 font-medium'
-                              : 'text-zinc-400 hover:bg-zinc-800/70 hover:text-zinc-200'
+                              ? 'bg-primary-subtle font-medium text-primary'
+                              : 'text-muted hover:bg-panel hover:text-foreground'
                           } ${collapsed ? 'justify-center px-0' : ''}`
                         }
                         title={collapsed ? item.label : undefined}
                       >
-                        <span className="text-sm flex-shrink-0">{item.icon}</span>
+                        <span className="flex-shrink-0 text-sm">{item.icon}</span>
                         {!collapsed && <span className="truncate">{item.label}</span>}
                       </NavLink>
                     </li>
@@ -215,27 +225,24 @@ export function Sidebar() {
         })}
       </nav>
 
-      {/* Bottom section — pinned to bottom */}
-      <div className="mt-auto border-t border-zinc-800 pt-2 space-y-0.5">
+      <div className="mt-auto space-y-0.5 border-t border-border pt-2">
         <NavLink
           to="/settings"
           className={({ isActive }) =>
             `flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition ${
               isActive
-                ? 'bg-violet-500/15 text-violet-300 font-medium'
-                : 'text-zinc-400 hover:bg-zinc-800/70 hover:text-zinc-200'
+                ? 'bg-primary-subtle font-medium text-primary'
+                : 'text-muted hover:bg-panel hover:text-foreground'
             } ${collapsed ? 'justify-center px-0' : ''}`
           }
           title={collapsed ? 'Settings' : undefined}
         >
-          <span className="text-sm flex-shrink-0">⚙️</span>
+          <span className="flex-shrink-0 text-sm">⚙️</span>
           {!collapsed && <span className="truncate">Settings</span>}
         </NavLink>
 
         {!collapsed && (
-          <div className="px-2 py-1 text-[10px] text-zinc-600">
-            ForgeFleet v2026.4.7
-          </div>
+          <div className="px-2 py-1 text-[10px] text-dim">ForgeFleet v2026.4.7</div>
         )}
       </div>
     </aside>

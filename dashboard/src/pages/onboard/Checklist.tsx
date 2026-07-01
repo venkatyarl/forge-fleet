@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Badge } from '../../components/ui/badge'
+import { Button } from '../../components/ui/button'
+import { Card, CardDescription, CardHeader, CardTitle } from '../../components/ui/card'
 import type { ChecklistItem } from '../../data/onboardChecklist'
 import { CHECKLIST, itemApplies } from '../../data/onboardChecklist'
+import { cn } from '../../lib/utils'
 
 interface ChecklistProps {
   machineKind: string
@@ -96,15 +100,23 @@ export function Checklist({
   const totalItems = visible.length
 
   return (
-    <div className="h-full overflow-auto p-4 space-y-4">
-      <div className="text-xs uppercase tracking-wide text-slate-400">
-        Pre-flight checklist — {totalDone}/{totalItems} done
-      </div>
-      {Object.entries(grouped).map(([group, items]) => (
-        <div key={group} className="space-y-1">
-          <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 pl-1">
-            {group}
+    <div className="h-full space-y-4 overflow-auto p-4">
+      <Card className="bg-panel">
+        <CardHeader className="mb-0 items-start gap-3">
+          <div>
+            <CardTitle>Pre-flight Checklist</CardTitle>
+            <CardDescription>
+              {totalDone}/{totalItems} steps complete
+            </CardDescription>
           </div>
+          <Badge variant={totalDone === totalItems && totalItems > 0 ? 'ok' : 'info'}>
+            {totalDone}/{totalItems}
+          </Badge>
+        </CardHeader>
+      </Card>
+      {Object.entries(grouped).map(([group, items]) => (
+        <section key={group} className="space-y-2">
+          <div className="px-1 text-xs font-semibold uppercase tracking-wide text-dim">{group}</div>
           {items.map((it) => {
             const isActive = activeId === it.id
             const isChecked = !!checked[it.id]
@@ -112,38 +124,53 @@ export function Checklist({
               <div
                 key={it.id}
                 onClick={() => onSelect(it.id)}
-                className={`flex items-start gap-2 rounded px-2 py-1.5 cursor-pointer text-sm select-none ${
-                  isActive ? 'bg-indigo-500/20 text-white' : 'hover:bg-slate-800 text-slate-200'
-                }`}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault()
+                    onSelect(it.id)
+                  }
+                }}
+                className={cn(
+                  'flex w-full cursor-pointer items-start gap-3 rounded-lg border px-3 py-2 text-left text-sm transition',
+                  isActive
+                    ? 'border-primary bg-primary-subtle text-primary'
+                    : 'border-border bg-panel text-foreground hover:border-border-subtle hover:bg-elevated'
+                )}
               >
                 <input
+                  aria-label={`Toggle ${it.title}`}
                   type="checkbox"
                   checked={isChecked}
                   onChange={() => toggle(it.id)}
                   onClick={(e) => e.stopPropagation()}
-                  className="mt-1 accent-emerald-500"
+                  className="mt-1 accent-primary"
                 />
-                <div className="flex-1">
-                  <div className={isChecked ? 'line-through text-slate-400' : ''}>
+                <div className="min-w-0 flex-1">
+                  <div className={cn('leading-5', isChecked && 'text-dim line-through')}>
                     {it.title}
                   </div>
                 </div>
                 {it.verify && it.verify.kind !== 'manual' && (
-                  <button
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
                     onClick={(e) => {
                       e.stopPropagation()
                       runVerify(it)
                     }}
                     disabled={verifying === it.id || !targetIp}
-                    className="text-[11px] px-1.5 py-0.5 rounded border border-slate-700 text-slate-300 hover:bg-slate-700 disabled:opacity-40"
+                    className="h-6 shrink-0 px-2 text-xs"
                   >
-                    {verifying === it.id ? '…' : 'Verify'}
-                  </button>
+                    {verifying === it.id ? '...' : 'Verify'}
+                  </Button>
                 )}
               </div>
             )
           })}
-        </div>
+        </section>
       ))}
     </div>
   )

@@ -1,43 +1,73 @@
-import { useEffect, useState } from 'react'
-import { Navigate, Outlet, Route, Routes } from 'react-router-dom'
+import { Suspense, useEffect, useState } from 'react'
+import { Navigate, Outlet, Route, Routes, useMatches } from 'react-router-dom'
+import { useQueryClient } from '@tanstack/react-query'
 import { Header } from './components/Header'
 import { Sidebar } from './components/Sidebar'
 import { CommandPalette } from './components/CommandPalette'
-import { useWsFeed } from './hooks/useWsFeed'
-import { AuditLog } from './pages/AuditLog'
-import { ConfigEditor } from './pages/ConfigEditor'
-import { FleetOverview } from './pages/FleetOverview'
-import { LLMProxy } from './pages/LLMProxy'
-import { Metrics } from './pages/Metrics'
-import { MissionControl } from './pages/MissionControl'
-import { ModelInventory } from './pages/ModelInventory'
-import { MyTasks } from './pages/MyTasks'
-import { OperatorOnboarding } from './pages/OperatorOnboarding'
-import { Versions } from './pages/Versions'
-import { NodeDetail } from './pages/NodeDetail'
-import { PlanningHub } from './pages/PlanningHub'
-import { Projects } from './pages/Projects'
-import { Pulse } from './pages/Pulse'
-import { Topology } from './pages/Topology'
-import { MeshStatus } from './pages/MeshStatus'
-import { Updates } from './pages/Updates'
-import { WorkflowWorkbench } from './pages/WorkflowWorkbench'
-import { Settings } from './pages/Settings'
-import { ToolInventory } from './pages/ToolInventory'
-import { ModelHub } from './pages/ModelHub'
-import { Brain } from './pages/Brain'
-import { BrainGraph } from './pages/BrainGraph'
-import { CostLedger } from './pages/CostLedger'
+import { ErrorBoundary } from './components/ErrorBoundary'
+import { PageSkeleton } from './components/PageSkeleton'
+import { useDashboardWebSocket } from './sync/ws-client'
+import { reduceDashboardEvent } from './sync/events'
+import { useUIStore } from './app/store'
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts'
-import { NotFound } from './pages/NotFound'
+import { lazyNamed } from './lib/lazy'
+
+// ---------------------------------------------------------------------------
+// Lazy-loaded pages
+// ---------------------------------------------------------------------------
+
+const MissionControl = lazyNamed(() => import('./pages/MissionControl'), 'MissionControl')
+const MyTasks = lazyNamed(() => import('./pages/MyTasks'), 'MyTasks')
+const Projects = lazyNamed(() => import('./pages/Projects'), 'Projects')
+const PlanningHub = lazyNamed(() => import('./pages/PlanningHub'), 'PlanningHub')
+const WorkflowWorkbench = lazyNamed(() => import('./pages/WorkflowWorkbench'), 'WorkflowWorkbench')
+const Brain = lazyNamed(() => import('./pages/Brain'), 'Brain')
+const BrainGraph = lazyNamed(() => import('./pages/BrainGraph'), 'BrainGraph')
+const Pulse = lazyNamed(() => import('./pages/Pulse'), 'Pulse')
+const FleetOverview = lazyNamed(() => import('./pages/FleetOverview'), 'FleetOverview')
+const Topology = lazyNamed(() => import('./pages/Topology'), 'Topology')
+const MeshStatus = lazyNamed(() => import('./pages/MeshStatus'), 'MeshStatus')
+const ModelHub = lazyNamed(() => import('./pages/ModelHub'), 'ModelHub')
+const ModelInventory = lazyNamed(() => import('./pages/ModelInventory'), 'ModelInventory')
+const ToolInventory = lazyNamed(() => import('./pages/ToolInventory'), 'ToolInventory')
+const Metrics = lazyNamed(() => import('./pages/Metrics'), 'Metrics')
+const Alerts = lazyNamed(() => import('./pages/Alerts'), 'Alerts')
+const Settings = lazyNamed(() => import('./pages/Settings'), 'Settings')
+const ConfigEditor = lazyNamed(() => import('./pages/ConfigEditor'), 'ConfigEditor')
+const LLMProxy = lazyNamed(() => import('./pages/LLMProxy'), 'LLMProxy')
+const AuditLog = lazyNamed(() => import('./pages/AuditLog'), 'AuditLog')
+const Updates = lazyNamed(() => import('./pages/Updates'), 'Updates')
+const OperatorOnboarding = lazyNamed(() => import('./pages/OperatorOnboarding'), 'OperatorOnboarding')
+const Versions = lazyNamed(() => import('./pages/Versions'), 'Versions')
+const CostLedger = lazyNamed(() => import('./pages/CostLedger'), 'CostLedger')
+const NodeDetail = lazyNamed(() => import('./pages/NodeDetail'), 'NodeDetail')
+const NotFound = lazyNamed(() => import('./pages/NotFound'), 'NotFound')
+const Agents = lazyNamed(() => import('./pages/Agents'), 'Agents')
+const Council = lazyNamed(() => import('./pages/Council'), 'Council')
+const Mcp = lazyNamed(() => import('./pages/Mcp'), 'Mcp')
+const Skills = lazyNamed(() => import('./pages/Skills'), 'Skills')
+const Interactions = lazyNamed(() => import('./pages/Interactions'), 'Interactions')
+
+function page(Component: React.ComponentType) {
+  return (
+    <Suspense fallback={<PageSkeleton />}>
+      <Component />
+    </Suspense>
+  )
+}
 
 function Shell() {
   useKeyboardShortcuts()
+  useRouteTitle()
+  const queryClient = useQueryClient()
   const [darkMode, setDarkMode] = useState(() => {
     const cached = localStorage.getItem('ff_dark_mode')
     return cached ? cached === 'true' : true
   })
-  const { connected, eventCount, lastEvent } = useWsFeed('/ws')
+  const sidebarCollapsed = useUIStore((s) => s.sidebarCollapsed)
+  const { connected, eventCount, lastEvent } = useDashboardWebSocket('/ws', (event) => {
+    reduceDashboardEvent(queryClient, event)
+  })
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode)
@@ -45,7 +75,7 @@ function Shell() {
   }, [darkMode])
 
   return (
-    <div className="min-h-screen bg-[#09090B] text-zinc-100">
+    <div className="min-h-screen bg-background text-foreground">
       <CommandPalette />
       <Header
         wsConnected={connected}
@@ -56,13 +86,24 @@ function Shell() {
       />
 
       <div className="flex h-[calc(100vh-49px)] flex-col md:flex-row">
-        <Sidebar />
-        <main className="flex-1 overflow-y-auto p-4 md:p-6">
-          <Outlet context={{ wsEvent: lastEvent }} />
+        <Sidebar collapsed={sidebarCollapsed} />
+        <main className="flex-1 overflow-y-auto bg-surface p-4 md:p-6">
+          <ErrorBoundary>
+            <Outlet context={{ wsEvent: lastEvent }} />
+          </ErrorBoundary>
         </main>
       </div>
     </div>
   )
+}
+
+function useRouteTitle() {
+  const matches = useMatches()
+  useEffect(() => {
+    const active = [...matches].reverse().find((m) => m.handle && typeof m.handle === 'object' && 'title' in m.handle)
+    const title = active?.handle && typeof active.handle === 'object' ? (active.handle as { title?: string }).title : undefined
+    document.title = title ? `${title} · ForgeFleet` : 'ForgeFleet'
+  }, [matches])
 }
 
 export default function App() {
@@ -70,44 +111,51 @@ export default function App() {
     <Routes>
       <Route path="/" element={<Shell />}>
         {/* Mission Control = home */}
-        <Route index element={<MissionControl />} />
+        <Route index element={page(MissionControl)} handle={{ title: 'Mission Control' }} />
         {/* Chats — consolidated into Brain */}
         <Route path="chat" element={<Navigate to="/brain" replace />} />
         <Route path="chat/:chatId" element={<Navigate to="/brain" replace />} />
         <Route path="chats" element={<Navigate to="/brain" replace />} />
         {/* Project Management */}
-        <Route path="my-tasks" element={<MyTasks />} />
-        <Route path="projects" element={<Projects />} />
-        <Route path="planning" element={<PlanningHub />} />
-        <Route path="workflow" element={<WorkflowWorkbench />} />
+        <Route path="my-tasks" element={page(MyTasks)} handle={{ title: 'My Tasks' }} />
+        <Route path="projects" element={page(Projects)} handle={{ title: 'Projects' }} />
+        <Route path="planning" element={page(PlanningHub)} handle={{ title: 'Planning Hub' }} />
+        <Route path="workflow" element={page(WorkflowWorkbench)} handle={{ title: 'Workflows' }} />
         {/* Brain */}
-        <Route path="brain" element={<Brain />} />
-        <Route path="brain/graph" element={<BrainGraph />} />
-        <Route path="brain/:threadSlug" element={<Brain />} />
-        {/* Pulse v2 dashboard — unified fleet + LLM + software + HA + alerts + docker */}
-        <Route path="pulse" element={<Pulse />} />
-        {/* Fleet (accessible via Settings or direct link) */}
-        <Route path="fleet" element={<FleetOverview />} />
-        <Route path="topology" element={<Topology />} />
-        <Route path="model-hub" element={<ModelHub />} />
-        <Route path="models" element={<ModelInventory />} />
-        <Route path="tools" element={<ToolInventory />} />
-        <Route path="metrics" element={<Metrics />} />
-        {/* Settings (unified page) */}
-        <Route path="settings" element={<Settings />} />
-        <Route path="config" element={<ConfigEditor />} />
-        <Route path="llm-proxy" element={<LLMProxy />} />
-        <Route path="audit" element={<AuditLog />} />
-        <Route path="updates" element={<Updates />} />
-        <Route path="onboarding" element={<OperatorOnboarding />} />
+        <Route path="brain" element={page(Brain)} handle={{ title: 'Brain' }} />
+        <Route path="brain/graph" element={page(BrainGraph)} handle={{ title: 'Knowledge Graph' }} />
+        <Route path="brain/:threadSlug" element={page(Brain)} handle={{ title: 'Brain Thread' }} />
+        {/* Intelligence / agents */}
+        <Route path="agents" element={page(Agents)} handle={{ title: 'Agents & Swarm' }} />
+        <Route path="council" element={page(Council)} handle={{ title: 'Council' }} />
+        <Route path="mcp" element={page(Mcp)} handle={{ title: 'MCP' }} />
+        <Route path="skills" element={page(Skills)} handle={{ title: 'Skills' }} />
+        <Route path="interactions" element={page(Interactions)} handle={{ title: 'Interactions' }} />
+        {/* Pulse v2 dashboard */}
+        <Route path="pulse" element={page(Pulse)} handle={{ title: 'Pulse' }} />
+        {/* Fleet */}
+        <Route path="fleet" element={page(FleetOverview)} handle={{ title: 'Fleet Overview' }} />
+        <Route path="topology" element={page(Topology)} handle={{ title: 'Topology' }} />
+        <Route path="model-hub" element={page(ModelHub)} handle={{ title: 'Model Hub' }} />
+        <Route path="models" element={page(ModelInventory)} handle={{ title: 'Model Inventory' }} />
+        <Route path="tools" element={page(ToolInventory)} handle={{ title: 'Tool Inventory' }} />
+        <Route path="metrics" element={page(Metrics)} handle={{ title: 'Metrics' }} />
+        <Route path="alerts" element={page(Alerts)} handle={{ title: 'Alerts' }} />
+        {/* Settings */}
+        <Route path="settings" element={page(Settings)} handle={{ title: 'Settings' }} />
+        <Route path="config" element={page(ConfigEditor)} handle={{ title: 'Config Editor' }} />
+        <Route path="llm-proxy" element={page(LLMProxy)} handle={{ title: 'LLM Proxy' }} />
+        <Route path="audit" element={page(AuditLog)} handle={{ title: 'Audit Log' }} />
+        <Route path="updates" element={page(Updates)} handle={{ title: 'Updates' }} />
+        <Route path="onboarding" element={page(OperatorOnboarding)} handle={{ title: 'Onboarding' }} />
         <Route path="onboard" element={<Navigate to="/onboarding" replace />} />
-        <Route path="versions" element={<Versions />} />
-        <Route path="mesh" element={<MeshStatus />} />
-        <Route path="cost-ledger" element={<CostLedger />} />
+        <Route path="versions" element={page(Versions)} handle={{ title: 'Versions' }} />
+        <Route path="mesh" element={page(MeshStatus)} handle={{ title: 'Mesh Status' }} />
+        <Route path="cost-ledger" element={page(CostLedger)} handle={{ title: 'Cost Ledger' }} />
         {/* Legacy redirects */}
         <Route path="mission-control" element={<Navigate to="/" replace />} />
-        <Route path="nodes/:nodeId" element={<NodeDetail />} />
-        <Route path="*" element={<NotFound />} />
+        <Route path="nodes/:nodeId" element={page(NodeDetail)} handle={{ title: 'Node Detail' }} />
+        <Route path="*" element={page(NotFound)} handle={{ title: 'Not Found' }} />
       </Route>
     </Routes>
   )

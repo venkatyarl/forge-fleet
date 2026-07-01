@@ -1607,6 +1607,17 @@ pub async fn pg_route_deployments(
           LEFT JOIN computers c         ON LOWER(c.name) = LOWER(d.worker_name)
           {load_join}
          WHERE d.health_status = 'healthy'
+           -- Never route a CHAT/codegen call to an embedding/reranker model.
+           -- bge-m3 / bge-reranker-v2-m3 etc. are healthy deployments but 500
+           -- on a chat completion ("context does not logits computation"); with
+           -- no workload filter (fleet_oneshot passes workload=None) the
+           -- least-loaded picker would otherwise select them. Exclude a
+           -- deployment only when its model is embedding/reranking-oriented AND
+           -- has no chat-capable workload (a hybrid model still passes).
+           AND NOT (
+                cat.preferred_workloads ?| ARRAY['embedding','embeddings','reranking','rerank','retrieval']
+                AND NOT cat.preferred_workloads ?| ARRAY['chat','code','codegen','code-gen','instruct','reasoning','general','agentic','tool_calling']
+           )
            -- workload filter ($2 = true disables it). `?|` = any synonym present.
            AND ($2 OR cat.preferred_workloads ?| $1)
            -- tool_calling filter ($3 = false disables it)

@@ -1,5 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { Badge } from '../components/ui/badge'
+import { StatusBadge } from '../components/ui/status-badge'
+import { Button } from '../components/ui/button'
 import { getJson } from '../lib/api'
+import { cn } from '../lib/utils'
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -54,6 +59,43 @@ const DAMPING = 0.92
 const CENTER_PULL = 0.01
 const DT = 1
 
+const fallbackColors = [
+  '#6366f1', '#8b5cf6', '#a855f7', '#d946ef', '#ec4899',
+  '#f43f5e', '#f97316', '#eab308', '#22c55e', '#14b8a6',
+]
+
+const tokenFallbacks = {
+  '--color-border-subtle': '#3f3f46',
+  '--color-elevated': '#18181b',
+  '--color-foreground': '#fafafa',
+  '--color-muted': '#a1a1aa',
+  '--color-primary-muted': '#a78bfa',
+} as const
+
+type ColorToken = keyof typeof tokenFallbacks
+
+function tokenColor(token: ColorToken): string {
+  if (typeof window === 'undefined') return tokenFallbacks[token]
+  return (
+    getComputedStyle(document.documentElement).getPropertyValue(token).trim() ||
+    tokenFallbacks[token]
+  )
+}
+
+function tokenRgba(token: ColorToken, alpha: number): string {
+  const hex = tokenColor(token).replace('#', '')
+  const normalized =
+    hex.length === 3
+      ? hex.split('').map((part) => part + part).join('')
+      : hex
+  const value = Number.parseInt(normalized, 16)
+  if (Number.isNaN(value)) return tokenColor(token)
+  const r = (value >> 16) & 255
+  const g = (value >> 8) & 255
+  const b = value & 255
+  return `rgba(${r},${g},${b},${alpha})`
+}
+
 function initSimNodes(
   nodes: GraphNode[],
   communities: Community[],
@@ -62,11 +104,6 @@ function initSimNodes(
 ): SimNode[] {
   const colorMap = new Map<number, string>()
   for (const c of communities) colorMap.set(c.id, c.color)
-
-  const fallbackColors = [
-    '#6366f1', '#8b5cf6', '#a855f7', '#d946ef', '#ec4899',
-    '#f43f5e', '#f97316', '#eab308', '#22c55e', '#14b8a6',
-  ]
 
   return nodes.map((n, i) => {
     const angle = (i / nodes.length) * Math.PI * 2
@@ -177,7 +214,7 @@ function drawGraph(
     ctx.moveTo(a.x, a.y)
     ctx.lineTo(b.x, b.y)
     ctx.lineWidth = Math.max(0.5, e.confidence * 2)
-    ctx.strokeStyle = 'rgba(100,116,139,0.25)'
+    ctx.strokeStyle = tokenRgba('--color-border-subtle', 0.3)
 
     if (e.edge_type === 'extends') {
       ctx.setLineDash([6, 4])
@@ -205,7 +242,7 @@ function drawGraph(
   for (const comm of communities) {
     const c = commCenters.get(comm.id)
     if (!c || c.count === 0) continue
-    ctx.fillStyle = 'rgba(148,163,184,0.3)'
+    ctx.fillStyle = tokenRgba('--color-muted', 0.32)
     ctx.fillText(comm.label, c.x / c.count, c.y / c.count - 20)
   }
 
@@ -217,18 +254,22 @@ function drawGraph(
 
     ctx.beginPath()
     ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2)
-    ctx.fillStyle = dimmed ? 'rgba(51,65,85,0.3)' : n.color
+    ctx.fillStyle = dimmed ? tokenRgba('--color-elevated', 0.55) : n.color
     ctx.fill()
 
     if (isHovered || isSearchHit) {
-      ctx.strokeStyle = isHovered ? '#e2e8f0' : '#a78bfa'
+      ctx.strokeStyle = isHovered
+        ? tokenColor('--color-foreground')
+        : tokenColor('--color-primary-muted')
       ctx.lineWidth = 2
       ctx.stroke()
     }
 
     // Label
     if (isHovered || n.radius > 8) {
-      ctx.fillStyle = dimmed ? 'rgba(148,163,184,0.2)' : 'rgba(226,232,240,0.85)'
+      ctx.fillStyle = dimmed
+        ? tokenRgba('--color-muted', 0.25)
+        : tokenRgba('--color-foreground', 0.85)
       ctx.font = isHovered ? 'bold 11px system-ui' : '10px system-ui'
       ctx.textAlign = 'center'
       ctx.fillText(n.title.slice(0, 30), n.x, n.y - n.radius - 4)
@@ -240,16 +281,40 @@ function drawGraph(
 /*  Detail Panel                                                       */
 /* ------------------------------------------------------------------ */
 
+type BadgeTone = 'default' | 'ok' | 'warn' | 'crit' | 'info' | 'neutral'
+
+function edgeTone(edgeType: string): BadgeTone {
+  if (edgeType === 'extends') return 'info'
+  if (edgeType === 'overrides') return 'warn'
+  if (edgeType === 'link') return 'neutral'
+  return 'default'
+}
+
+function DetailRow({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="grid grid-cols-[5.5rem_minmax(0,1fr)] gap-3 text-xs">
+      <dt className="font-mono uppercase text-dim">{label}</dt>
+      <dd className="min-w-0 font-mono text-muted">{children}</dd>
+    </div>
+  )
+}
+
 function DetailPanel({
   node,
+  nodes,
+  edges,
   communities,
   onClose,
 }: {
   node: SimNode
+  nodes: GraphNode[]
+  edges: GraphEdge[]
   communities: Community[]
   onClose: () => void
 }) {
   const community = communities.find((c) => c.id === node.community_id)
+  const nodeById = new Map(nodes.map((item) => [item.id, item]))
+  const connectedEdges = edges.filter((edge) => edge.src_id === node.id || edge.dst_id === node.id)
 
   const openInObsidian = () => {
     window.open(
@@ -258,50 +323,81 @@ function DetailPanel({
   }
 
   return (
-    <div className="absolute right-4 top-4 z-20 w-72 rounded-lg border border-slate-700 bg-slate-900/95 p-4 shadow-xl backdrop-blur">
-      <div className="mb-3 flex items-start justify-between">
-        <h3 className="text-sm font-semibold text-slate-200">{node.title}</h3>
-        <button onClick={onClose} className="text-slate-500 hover:text-slate-300">
-          ✕
-        </button>
+    <Card className="absolute inset-x-3 top-3 z-20 max-h-[calc(100%-1.5rem)] overflow-y-auto border-border-subtle bg-panel/95 shadow-xl backdrop-blur sm:left-auto sm:right-4 sm:top-4 sm:w-96">
+      <CardHeader className="mb-4 items-start gap-3">
+        <div className="min-w-0">
+          <CardTitle className="truncate">{node.title}</CardTitle>
+          <CardDescription className="mt-1 break-all">{node.id}</CardDescription>
+        </div>
+        <Button variant="ghost" size="sm" onClick={onClose} aria-label="Close node details">
+          Close
+        </Button>
+      </CardHeader>
+
+      <div className="space-y-2">
+        <DetailRow label="type">
+          <StatusBadge status={node.node_type}>{node.node_type}</StatusBadge>
+        </DetailRow>
+        <DetailRow label="path">
+          <span className="break-all">{node.path}</span>
+        </DetailRow>
+        <DetailRow label="community">
+          {community ? (
+            <span className="inline-flex min-w-0 items-center gap-2 text-muted">
+              <span
+                className="h-2 w-2 flex-shrink-0 rounded-full"
+                style={{ backgroundColor: community.color }}
+              />
+              <span className="truncate">{community.label}</span>
+            </span>
+          ) : (
+            <span className="text-dim">-</span>
+          )}
+        </DetailRow>
+        <DetailRow label="hits">{node.hits}</DetailRow>
       </div>
-      <div className="space-y-1.5 text-xs font-mono">
-        <div className="flex gap-2">
-          <span className="text-slate-500">type</span>
-          <span className="text-slate-300">{node.node_type}</span>
+
+      <div className="mt-4 border-t border-border pt-4">
+        <div className="mb-2 flex items-center justify-between gap-3">
+          <CardDescription className="font-mono uppercase tracking-wide">Edges</CardDescription>
+          <Badge variant="neutral">{connectedEdges.length}</Badge>
         </div>
-        <div className="flex gap-2">
-          <span className="text-slate-500">path</span>
-          <span className="text-slate-300 break-all">{node.path}</span>
-        </div>
-        <div className="flex gap-2">
-          <span className="text-slate-500">community</span>
-          <span className="text-slate-300">
-            {community ? (
-              <>
-                <span
-                  className="mr-1 inline-block h-2 w-2 rounded-full"
-                  style={{ backgroundColor: community.color }}
-                />
-                {community.label}
-              </>
-            ) : (
-              '—'
-            )}
-          </span>
-        </div>
-        <div className="flex gap-2">
-          <span className="text-slate-500">hits</span>
-          <span className="text-slate-300">{node.hits}</span>
-        </div>
+        {connectedEdges.length === 0 ? (
+          <p className="text-xs text-dim">No connected edges.</p>
+        ) : (
+          <div className="space-y-2">
+            {connectedEdges.slice(0, 8).map((edge) => {
+              const isOutgoing = edge.src_id === node.id
+              const peer = nodeById.get(isOutgoing ? edge.dst_id : edge.src_id)
+              return (
+                <div
+                  key={`${edge.src_id}-${edge.dst_id}-${edge.edge_type}`}
+                  className="rounded-lg border border-border bg-surface px-3 py-2"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <Badge variant={edgeTone(edge.edge_type)}>{edge.edge_type}</Badge>
+                    <span className="font-mono text-xs text-dim">
+                      {Math.round(edge.confidence * 100)}%
+                    </span>
+                  </div>
+                  <div className="mt-2 min-w-0 text-xs text-muted">
+                    <span className="font-mono text-dim">{isOutgoing ? 'to' : 'from'}</span>{' '}
+                    <span className="break-all text-foreground">{peer?.title ?? (isOutgoing ? edge.dst_id : edge.src_id)}</span>
+                  </div>
+                </div>
+              )
+            })}
+            {connectedEdges.length > 8 ? (
+              <p className="text-xs text-dim">{connectedEdges.length - 8} more edges not shown</p>
+            ) : null}
+          </div>
+        )}
       </div>
-      <button
-        onClick={openInObsidian}
-        className="mt-3 w-full rounded border border-slate-700 px-3 py-1.5 text-xs text-slate-300 transition hover:bg-slate-800"
-      >
+
+      <Button onClick={openInObsidian} variant="outline" className="mt-4 w-full">
         Open in Obsidian
-      </button>
-    </div>
+      </Button>
+    </Card>
   )
 }
 
@@ -490,51 +586,128 @@ export function BrainGraph() {
     [findNodeAt],
   )
 
-  if (loading) return <div className="p-6 text-slate-400">Loading knowledge graph...</div>
+  const nodeCount = graphData?.nodes.length ?? 0
+  const edgeCount = graphData?.edges.length ?? 0
+  const communityCount = graphData?.communities.length ?? 0
+  const searchTerm = searchQuery.trim().toLowerCase()
+  const searchMatchCount = searchTerm
+    ? simNodes.filter((node) =>
+        node.title.toLowerCase().includes(searchTerm) ||
+        node.path.toLowerCase().includes(searchTerm) ||
+        node.node_type.toLowerCase().includes(searchTerm)
+      ).length
+    : null
+
+  if (loading) {
+    return (
+      <section className="min-h-full bg-background p-6 text-foreground">
+        <Card className="bg-panel">
+          <CardHeader className="mb-0 gap-3">
+            <div>
+              <CardTitle>Knowledge Graph</CardTitle>
+              <CardDescription>Loading graph data from /api/brain/graph</CardDescription>
+            </div>
+            <StatusBadge status="running">loading</StatusBadge>
+          </CardHeader>
+          <div className="mt-4 h-80 rounded-lg border border-border bg-surface" />
+        </Card>
+      </section>
+    )
+  }
+
   if (error) {
     return (
-      <div className="p-6">
-        <div className="text-rose-400">Could not load brain graph: {error}</div>
-        <div className="mt-2 text-sm text-slate-500">
-          The Brain graph API is not running yet. Start the daemon or check logs.
-        </div>
-      </div>
+      <section className="min-h-full bg-background p-6 text-foreground">
+        <Card className="border-status-crit bg-panel">
+          <CardHeader className="mb-0 gap-3">
+            <div>
+              <CardTitle className="text-status-crit">Could not load brain graph</CardTitle>
+              <CardDescription>{error}</CardDescription>
+            </div>
+            <StatusBadge status="error">error</StatusBadge>
+          </CardHeader>
+          <p className="mt-4 text-sm text-muted">
+            The Brain graph API is not running yet. Start the daemon or check logs.
+          </p>
+        </Card>
+      </section>
     )
   }
 
   return (
-    <div className="flex h-full flex-col -m-4 md:-m-6">
-      {/* Top bar */}
-      <div className="flex items-center gap-3 border-b border-slate-800 px-4 py-2">
-        <h2 className="text-sm font-semibold text-slate-200">Knowledge Graph</h2>
-        <input
-          type="text"
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          placeholder="Search nodes..."
-          className="w-64 rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200 placeholder-slate-500 outline-none focus:border-violet-500"
-        />
-        <span className="text-[10px] text-slate-600">
-          {graphData?.nodes.length ?? 0} nodes · {graphData?.edges.length ?? 0} edges
-        </span>
+    <section className="-m-4 flex h-full min-h-[640px] flex-col bg-background text-foreground md:-m-6">
+      <div className="border-b border-border bg-surface px-4 py-4 md:px-6">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h1 className="text-2xl font-bold text-foreground">Knowledge Graph</h1>
+              <StatusBadge status={error ? 'error' : 'active'}>{error ? 'error' : 'active'}</StatusBadge>
+            </div>
+            <p className="mt-1 text-sm text-dim">Brain nodes, semantic links, and community clusters.</p>
+          </div>
+
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+            <label className="relative block sm:w-80">
+              <span className="sr-only">Search nodes</span>
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Search nodes..."
+                className={cn(
+                  'h-9 w-full rounded-lg border bg-panel px-3 text-sm text-foreground outline-none transition placeholder:text-dim focus:border-primary',
+                  searchQuery ? 'border-border-subtle' : 'border-border'
+                )}
+              />
+            </label>
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge variant="neutral">{nodeCount} nodes</Badge>
+              <Badge variant="neutral">{edgeCount} edges</Badge>
+              <Badge variant="neutral">{communityCount} communities</Badge>
+              {searchMatchCount != null ? (
+                <Badge variant={searchMatchCount > 0 ? 'info' : 'warn'}>
+                  {searchMatchCount} matches
+                </Badge>
+              ) : null}
+            </div>
+          </div>
+        </div>
       </div>
 
-      {/* Canvas */}
-      <div ref={containerRef} className="relative flex-1">
-        <canvas
-          ref={canvasRef}
-          onMouseMove={onCanvasMouseMove}
-          onClick={onCanvasClick}
-          className="block h-full w-full"
-        />
-        {selectedNode && (
-          <DetailPanel
-            node={selectedNode}
-            communities={communities}
-            onClose={() => setSelectedNode(null)}
+      <Card className="m-3 flex min-h-0 flex-1 flex-col overflow-hidden bg-surface p-0 md:m-4">
+        <CardHeader className="mb-0 border-b border-border px-4 py-3">
+          <div>
+            <CardTitle>Graph Visualization</CardTitle>
+            <CardDescription>Select a node to inspect metadata and connected edges.</CardDescription>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant="info">extends</Badge>
+            <Badge variant="warn">overrides</Badge>
+            <Badge variant="neutral">link</Badge>
+          </div>
+        </CardHeader>
+
+        <div
+          ref={containerRef}
+          className="relative min-h-[520px] flex-1 bg-background bg-[radial-gradient(circle_at_1px_1px,var(--color-border)_1px,transparent_0)] [background-size:24px_24px]"
+        >
+          <canvas
+            ref={canvasRef}
+            onMouseMove={onCanvasMouseMove}
+            onClick={onCanvasClick}
+            className="block h-full w-full"
           />
-        )}
-      </div>
-    </div>
+          {selectedNode ? (
+            <DetailPanel
+              node={selectedNode}
+              nodes={graphData?.nodes ?? []}
+              edges={graphData?.edges ?? []}
+              communities={communities}
+              onClose={() => setSelectedNode(null)}
+            />
+          ) : null}
+        </div>
+      </Card>
+    </section>
   )
 }

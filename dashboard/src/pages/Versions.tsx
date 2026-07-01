@@ -1,5 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { Badge, type BadgeProps } from '../components/ui/badge'
+import { Button } from '../components/ui/button'
+import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { StatusBadge } from '../components/ui/status-badge'
 import { getJson } from '../lib/api'
+import { cn } from '../lib/utils'
 
 interface ToolEntry {
   current?: string
@@ -28,11 +33,22 @@ interface DeferredTask {
   last_error?: string | null
 }
 
-function statusSymbol(entry: ToolEntry | undefined): { icon: string; color: string } {
-  if (!entry || !entry.current) return { icon: '—', color: 'text-slate-600' }
-  if (!entry.latest) return { icon: '?', color: 'text-slate-400' }
-  if (entry.latest === entry.current) return { icon: '✓', color: 'text-emerald-400' }
-  return { icon: '⚠', color: 'text-amber-400' }
+function versionStatus(entry: ToolEntry | undefined): {
+  label: string
+  status: string
+  badge: BadgeProps['variant']
+  textClass: string
+} {
+  if (!entry || !entry.current) {
+    return { label: 'n/a', status: 'unknown', badge: 'neutral', textClass: 'text-dim' }
+  }
+  if (!entry.latest) {
+    return { label: 'unknown', status: 'info', badge: 'info', textClass: 'text-status-info' }
+  }
+  if (entry.latest === entry.current) {
+    return { label: 'current', status: 'active', badge: 'ok', textClass: 'text-status-ok' }
+  }
+  return { label: 'upgrade', status: 'warning', badge: 'warn', textClass: 'text-status-warn' }
 }
 
 export function Versions() {
@@ -40,6 +56,9 @@ export function Versions() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [selected, setSelected] = useState<{ node: string; tool: string } | null>(null)
+  const [upgradeTask, setUpgradeTask] = useState<DeferredTask | null>(null)
+  const [applying, setApplying] = useState(false)
+  const [applyMsg, setApplyMsg] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -63,38 +82,18 @@ export function Versions() {
     }
   }, [])
 
-  const allTools = new Set<string>()
-  for (const n of nodes) {
-    if (n.tooling) {
-      for (const k of Object.keys(n.tooling)) allTools.add(k)
+  const toolKeys = useMemo(() => {
+    const allTools = new Set<string>()
+    for (const n of nodes) {
+      if (n.tooling) {
+        for (const k of Object.keys(n.tooling)) allTools.add(k)
+      }
     }
-  }
-  const toolKeys = Array.from(allTools).sort()
-
-  if (loading) {
-    return <div className="p-6 text-slate-400">Loading version matrix…</div>
-  }
-  if (error) {
-    return <div className="p-6 text-rose-400">Error: {error}</div>
-  }
-  if (toolKeys.length === 0) {
-    return (
-      <div className="p-6 text-slate-400">
-        <div>No tool-version data yet.</div>
-        <div className="text-sm mt-2">
-          Run <code className="bg-slate-800 px-1 rounded">ff daemon</code> on each node for ~6 h
-          OR trigger a manual <code className="bg-slate-800 px-1 rounded">version_check</code>{' '}
-          pass.
-        </div>
-      </div>
-    )
-  }
+    return Array.from(allTools).sort()
+  }, [nodes])
 
   const selEntry =
     selected && nodes.find((n) => n.name === selected.node)?.tooling?.[selected.tool]
-  const [upgradeTask, setUpgradeTask] = useState<DeferredTask | null>(null)
-  const [applying, setApplying] = useState(false)
-  const [applyMsg, setApplyMsg] = useState<string | null>(null)
 
   useEffect(() => {
     if (!selected) {
@@ -134,105 +133,246 @@ export function Versions() {
     }
   }
 
-  return (
-    <div className="p-6 text-slate-100">
-      <h2 className="text-xl font-semibold mb-1">Fleet versions — drift monitor</h2>
-      <p className="text-sm text-slate-400 mb-4">
-        ✓ = current == latest &nbsp;&nbsp;&nbsp; ⚠ = out of date &nbsp;&nbsp;&nbsp; ? = no upstream
-        info &nbsp;&nbsp;&nbsp; — = not applicable
-      </p>
+  const statusCounts = useMemo(() => {
+    const counts = { current: 0, upgrades: 0, unknown: 0, missing: 0 }
+    for (const tool of toolKeys) {
+      for (const node of nodes) {
+        const entry = node.tooling?.[tool]
+        if (!entry || !entry.current) counts.missing += 1
+        else if (!entry.latest) counts.unknown += 1
+        else if (entry.latest === entry.current) counts.current += 1
+        else counts.upgrades += 1
+      }
+    }
+    return counts
+  }, [nodes, toolKeys])
 
-      <div className="overflow-x-auto">
-        <table className="border-collapse text-sm">
-          <thead>
-            <tr>
-              <th className="text-left px-3 py-2 border-b border-slate-700">Tool</th>
-              {nodes.map((n) => (
-                <th key={n.name} className="text-left px-3 py-2 border-b border-slate-700">
-                  {n.name}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {toolKeys.map((tool) => (
-              <tr key={tool} className="hover:bg-slate-900/50">
-                <td className="px-3 py-1.5 font-mono text-slate-300 border-b border-slate-800">
-                  {tool}
-                </td>
-                {nodes.map((n) => {
-                  const e = n.tooling?.[tool]
-                  const sym = statusSymbol(e)
-                  const cur = e?.current || '—'
-                  return (
-                    <td
-                      key={n.name}
-                      onClick={() => setSelected({ node: n.name, tool })}
-                      className="px-3 py-1.5 border-b border-slate-800 cursor-pointer font-mono text-xs"
-                    >
-                      <span className={sym.color}>{sym.icon}</span>{' '}
-                      <span className="text-slate-300">{cur.slice(0, 20)}</span>
-                    </td>
-                  )
-                })}
-              </tr>
-            ))}
-          </tbody>
-        </table>
+  if (loading) {
+    return (
+      <section className="min-h-full space-y-6 bg-background text-foreground">
+        <Card className="bg-panel">
+          <CardHeader>
+            <div>
+              <CardTitle>Fleet Versions</CardTitle>
+              <CardDescription>Loading version matrix...</CardDescription>
+            </div>
+            <Badge variant="info">loading</Badge>
+          </CardHeader>
+          <div className="space-y-3">
+            <div className="h-4 w-48 animate-pulse rounded bg-elevated" />
+            <div className="h-24 animate-pulse rounded-lg bg-elevated" />
+          </div>
+        </Card>
+      </section>
+    )
+  }
+
+  if (error) {
+    return (
+      <section className="min-h-full bg-background text-foreground">
+        <Card className="border-border bg-panel">
+          <CardHeader>
+            <div>
+              <CardTitle>Fleet Versions</CardTitle>
+              <CardDescription>Could not load tooling data</CardDescription>
+            </div>
+            <StatusBadge status="error">error</StatusBadge>
+          </CardHeader>
+          <p className="text-sm text-status-crit">{error}</p>
+        </Card>
+      </section>
+    )
+  }
+
+  if (toolKeys.length === 0) {
+    return (
+      <section className="min-h-full bg-background text-foreground">
+        <Card className="bg-panel">
+          <CardHeader>
+            <div>
+              <CardTitle>Fleet Versions</CardTitle>
+              <CardDescription>No tool-version data yet.</CardDescription>
+            </div>
+            <Badge variant="neutral">empty</Badge>
+          </CardHeader>
+          <p className="text-sm text-muted">
+            Run <code className="rounded bg-elevated px-1 text-foreground">ff daemon</code> on
+            each node for ~6 h OR trigger a manual{' '}
+            <code className="rounded bg-elevated px-1 text-foreground">version_check</code> pass.
+          </p>
+        </Card>
+      </section>
+    )
+  }
+
+  return (
+    <section className="min-h-full space-y-6 bg-background text-foreground">
+      <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+        <div>
+          <h2 className="text-xl font-semibold">Fleet Versions</h2>
+          <p className="mt-1 text-sm text-dim">Drift monitor for tooling versions across fleet nodes.</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Badge variant="ok">{statusCounts.current} current</Badge>
+          <Badge variant="warn">{statusCounts.upgrades} upgrades</Badge>
+          <Badge variant="info">{statusCounts.unknown} unknown</Badge>
+          <Badge variant="neutral">{statusCounts.missing} n/a</Badge>
+        </div>
       </div>
 
-      {selected && selEntry && (
-        <div className="mt-6 border border-slate-700 rounded p-4 bg-slate-900/60">
-          <div className="text-[11px] uppercase tracking-wider text-slate-400 mb-1">
-            {selected.node} / {selected.tool}
+      <Card className="bg-surface">
+        <CardHeader className="items-start gap-3">
+          <div>
+            <CardTitle>Version Matrix</CardTitle>
+            <CardDescription>
+              Select a tool/node cell to inspect the current version, upstream version, and upgrade task.
+            </CardDescription>
           </div>
-          <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-sm font-mono">
-            <div className="text-slate-400">current</div>
-            <div className="text-emerald-200">{selEntry.current || '—'}</div>
-            <div className="text-slate-400">latest</div>
-            <div className="text-amber-200">{selEntry.latest || '(unknown)'}</div>
-            <div className="text-slate-400">checked_at</div>
-            <div className="text-slate-300">{selEntry.checked_at || '—'}</div>
-          </div>
+          <Badge variant="neutral">
+            {toolKeys.length} tools / {nodes.length} nodes
+          </Badge>
+        </CardHeader>
+
+        <div className="overflow-x-auto rounded-lg border border-border bg-panel">
+          <table className="min-w-full border-collapse text-sm">
+            <thead className="bg-elevated text-xs uppercase tracking-wide text-dim">
+              <tr>
+                <th className="whitespace-nowrap border-b border-border px-3 py-2 text-left font-semibold">
+                  Tool
+                </th>
+                {nodes.map((n) => (
+                  <th
+                    key={n.name}
+                    className="whitespace-nowrap border-b border-border px-3 py-2 text-left font-semibold"
+                  >
+                    {n.name}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {toolKeys.map((tool) => (
+                <tr key={tool} className="border-b border-border last:border-0">
+                  <td className="sticky left-0 z-10 whitespace-nowrap border-r border-border bg-panel px-3 py-2 font-mono text-xs text-foreground">
+                    {tool}
+                  </td>
+                  {nodes.map((n) => {
+                    const entry = n.tooling?.[tool]
+                    const status = versionStatus(entry)
+                    const current = entry?.current || '—'
+                    const isSelected = selected?.node === n.name && selected.tool === tool
+                    return (
+                      <td
+                        key={n.name}
+                        onClick={() => setSelected({ node: n.name, tool })}
+                        className={cn(
+                          'min-w-40 cursor-pointer px-3 py-2 align-top transition hover:bg-elevated',
+                          isSelected && 'bg-primary-subtle'
+                        )}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className={cn('truncate font-mono text-xs', status.textClass)}>
+                            {current.slice(0, 20)}
+                          </span>
+                          <Badge variant={status.badge}>{status.label}</Badge>
+                        </div>
+                      </td>
+                    )
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      {selected && (
+        <Card className="bg-panel">
+          <CardHeader className="items-start gap-3">
+            <div>
+              <CardTitle>{selected.tool}</CardTitle>
+              <CardDescription>{selected.node}</CardDescription>
+            </div>
+            <StatusBadge status={versionStatus(selEntry || undefined).status}>
+              {versionStatus(selEntry || undefined).label}
+            </StatusBadge>
+          </CardHeader>
+
+          {selEntry ? (
+            <div className="grid gap-3 text-sm md:grid-cols-3">
+              <VersionField label="current" value={selEntry.current || '—'} tone="ok" />
+              <VersionField label="latest" value={selEntry.latest || '(unknown)'} tone="warn" />
+              <VersionField label="checked_at" value={selEntry.checked_at || '—'} />
+            </div>
+          ) : (
+            <p className="text-sm text-dim">This tool is not reported by the selected node.</p>
+          )}
+
           {upgradeTask ? (
-            <div className="mt-4 pt-3 border-t border-slate-700">
-              <div className="text-[11px] uppercase tracking-wider text-amber-300 mb-1">
-                Upgrade available
-              </div>
-              <div className="text-xs text-slate-300 mb-2">
-                {upgradeTask.title}
+            <div className="mt-4 rounded-lg border border-border bg-surface p-3">
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                <StatusBadge status={upgradeTask.status}>{upgradeTask.status}</StatusBadge>
+                <Badge variant="warn">upgrade available</Badge>
                 {upgradeTask.attempts > 0 && (
-                  <span className="ml-2 text-slate-500">
-                    (attempts: {upgradeTask.attempts}/{upgradeTask.max_attempts})
-                  </span>
+                  <Badge variant="neutral">
+                    attempts {upgradeTask.attempts}/{upgradeTask.max_attempts}
+                  </Badge>
                 )}
               </div>
-              <button
+              <p className="mb-3 text-sm text-muted">{upgradeTask.title}</p>
+              <Button
                 onClick={applyUpgrade}
                 disabled={applying}
-                className="text-xs px-3 py-1.5 rounded border border-emerald-400 text-emerald-200 hover:bg-emerald-500/20 disabled:opacity-50"
+                size="sm"
               >
-                {applying ? 'Promoting…' : `Apply on ${selected?.node}`}
-              </button>
-              {applyMsg && <div className="mt-2 text-xs text-slate-400">{applyMsg}</div>}
+                {applying ? 'Promoting...' : `Apply on ${selected.node}`}
+              </Button>
+              {applyMsg && <div className="mt-2 text-xs text-muted">{applyMsg}</div>}
             </div>
           ) : (
             selEntry &&
             selEntry.latest &&
             selEntry.current !== selEntry.latest && (
-              <div className="mt-4 pt-3 border-t border-slate-700 text-xs text-slate-500">
-                No pending upgrade task — will be enqueued on next version_check pass (every 6h).
+              <div className="mt-4 rounded-lg border border-border bg-surface p-3 text-xs text-dim">
+                No pending upgrade task; it will be enqueued on the next version_check pass.
               </div>
             )
           )}
-          <button
+          <Button
             onClick={() => setSelected(null)}
-            className="mt-3 text-xs px-2 py-1 border border-slate-700 rounded text-slate-300 hover:bg-slate-800"
+            variant="outline"
+            size="sm"
+            className="mt-4"
           >
             Close
-          </button>
-        </div>
+          </Button>
+        </Card>
       )}
+    </section>
+  )
+}
+
+function VersionField({
+  label,
+  value,
+  tone,
+}: {
+  label: string
+  value: string
+  tone?: 'ok' | 'warn'
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-surface px-3 py-2">
+      <div className="text-xs font-medium uppercase tracking-wide text-dim">{label}</div>
+      <div
+        className={cn(
+          'mt-1 break-all font-mono text-sm text-muted',
+          tone === 'ok' && 'text-status-ok',
+          tone === 'warn' && 'text-status-warn'
+        )}
+      >
+        {value}
+      </div>
     </div>
   )
 }
