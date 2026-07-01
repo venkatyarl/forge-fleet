@@ -1,5 +1,5 @@
 import { Suspense, useEffect, useState } from 'react'
-import { Navigate, Outlet, Route, Routes, useMatches } from 'react-router-dom'
+import { Navigate, Outlet, Route, Routes, useLocation } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import { Header } from './components/Header'
 import { Sidebar } from './components/Sidebar'
@@ -97,13 +97,56 @@ function Shell() {
   )
 }
 
+// Browser-tab titles per route. Derived from useLocation()'s pathname rather
+// than useMatches(): useMatches() ONLY works under a DATA router
+// (createBrowserRouter), but this app uses the declarative
+// <BrowserRouter>/<Routes> component router — calling useMatches() there throws
+// "useMatches must be used within a data router", and because Shell renders
+// OUTSIDE the per-page ErrorBoundary that threw blanked the whole dashboard.
+const ROUTE_TITLES: Record<string, string> = {
+  '/': 'Mission Control',
+  '/my-tasks': 'My Tasks',
+  '/projects': 'Projects',
+  '/planning': 'Planning Hub',
+  '/workflow': 'Workflows',
+  '/brain': 'Brain',
+  '/brain/graph': 'Knowledge Graph',
+  '/agents': 'Agents & Swarm',
+  '/council': 'Council',
+  '/mcp': 'MCP',
+  '/skills': 'Skills',
+  '/interactions': 'Interactions',
+  '/pulse': 'Pulse',
+  '/fleet': 'Fleet Overview',
+  '/topology': 'Topology',
+  '/model-hub': 'Model Hub',
+  '/models': 'Model Inventory',
+  '/tools': 'Tool Inventory',
+  '/metrics': 'Metrics',
+  '/alerts': 'Alerts',
+  '/settings': 'Settings',
+  '/config': 'Config Editor',
+  '/llm-proxy': 'LLM Proxy',
+  '/audit': 'Audit Log',
+  '/updates': 'Updates',
+  '/onboarding': 'Onboarding',
+  '/versions': 'Versions',
+  '/mesh': 'Mesh Status',
+  '/cost-ledger': 'Cost Ledger',
+}
+
 function useRouteTitle() {
-  const matches = useMatches()
+  const { pathname } = useLocation()
   useEffect(() => {
-    const active = [...matches].reverse().find((m) => m.handle && typeof m.handle === 'object' && 'title' in m.handle)
-    const title = active?.handle && typeof active.handle === 'object' ? (active.handle as { title?: string }).title : undefined
+    // Exact match first; otherwise longest matching prefix (covers param
+    // sub-routes like /brain/:threadSlug → "Brain").
+    const title =
+      ROUTE_TITLES[pathname] ??
+      Object.entries(ROUTE_TITLES)
+        .filter(([p]) => p !== '/' && pathname.startsWith(p + '/'))
+        .sort((a, b) => b[0].length - a[0].length)[0]?.[1]
     document.title = title ? `${title} · ForgeFleet` : 'ForgeFleet'
-  }, [matches])
+  }, [pathname])
 }
 
 export default function App() {
