@@ -1114,32 +1114,30 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     // over-quota alert, and the V118 disk-reconcile tick all run on stale data.
     if let Some(pg_pool) = operational_store.pg_pool().cloned() {
         info!("starting subsystem: disk sampler tick (5min, per-node)");
-        let mut shutdown_rx_disk = shutdown_rx.clone();
-        subsystem_tasks.push(tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
-            // Fire once promptly so a freshly-(re)started daemon writes a row
-            // immediately instead of waiting a full 5min — this is what makes a
-            // previously-stale host show a FRESH fleet_disk_usage row right after
-            // deploy.
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = shutdown_rx_disk.changed() => break,
-                    _ = tick.tick() => {
-                        match ff_agent::disk_sampler::sample_local_disk(&pg_pool).await {
-                            Ok(s) => tracing::debug!(
-                                node = %s.worker_name,
-                                used_mb = s.used_bytes / 1_048_576,
-                                free_mb = s.free_bytes / 1_048_576,
-                                over_quota = s.over_quota,
-                                "disk sample written"
-                            ),
-                            Err(e) => warn!(error = %e, "disk sampler failed"),
-                        }
+        // Fire once promptly so a freshly-(re)started daemon writes a row
+        // immediately instead of waiting a full 5min — this is what makes a
+        // previously-stale host show a FRESH fleet_disk_usage row right after
+        // deploy.
+        subsystem_tasks.push(ff_agent::tick_registry::TickRegistry::register(
+            "disk-sampler",
+            std::time::Duration::from_secs(300),
+            shutdown_rx.clone(),
+            move || {
+                let pg_pool = pg_pool.clone();
+                async move {
+                    match ff_agent::disk_sampler::sample_local_disk(&pg_pool).await {
+                        Ok(s) => tracing::debug!(
+                            node = %s.worker_name,
+                            used_mb = s.used_bytes / 1_048_576,
+                            free_mb = s.free_bytes / 1_048_576,
+                            over_quota = s.over_quota,
+                            "disk sample written"
+                        ),
+                        Err(e) => warn!(error = %e, "disk sampler failed"),
                     }
                 }
             }
-        }));
+        ));
     }
 
     // 20b) Version-check tick — every 6h, PER-NODE (not leader-gated).
