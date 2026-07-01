@@ -107,6 +107,7 @@ pub mod plugins;
 pub mod portfolio_maintenance;
 pub mod ports_registry;
 pub mod power_scheduler;
+pub mod pr_integration;
 pub mod pr_verify;
 pub mod project_github_sync;
 pub mod project_registry;
