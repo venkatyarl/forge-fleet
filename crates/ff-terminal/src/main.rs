@@ -2958,6 +2958,27 @@ pub enum PmCommand {
     },
     /// Show details of a work item (by UUID).
     Show { id: String },
+    /// Decompose a goal into leaf `task` work_items via a fleet LLM, then (with
+    /// --ready) flag them for the scheduler — the planner→PM bridge. Give it a
+    /// goal string OR an existing work_item UUID (its title+description are the
+    /// goal); each generated task is created as a child (parent_id) and, with
+    /// --ready, immediately fanned across the fleet.
+    Decompose {
+        /// A goal string, or an existing work_item UUID to decompose.
+        goal: String,
+        /// Project id for the created tasks (default: forge-fleet).
+        #[arg(long, default_value = "forge-fleet")]
+        project: String,
+        /// LLM endpoint override (else the fleet router picks one).
+        #[arg(long)]
+        llm: Option<String>,
+        /// Flag every generated task ready so the scheduler dispatches it now.
+        #[arg(long, default_value_t = false)]
+        ready: bool,
+        /// Max leaf tasks to generate (default 6).
+        #[arg(long, default_value_t = 6)]
+        max: usize,
+    },
     /// Flag a work item ready for fleet scheduling (status='ready'). The Pillar 4
     /// scheduler tick then assigns it to a free fleet slot via a lease.
     Ready {
