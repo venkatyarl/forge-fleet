@@ -1,10 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
-
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use ff_agent::pr_merge_executor::PrMergeReport;
 use ff_api::config::ApiConfig;
 use ff_api::registry::{BackendEndpoint, BackendRegistry};
 use ff_control::{BootstrapOptions, ControlPlane};
@@ -28,6 +27,7 @@ use ff_updater::rollback::RollbackConfig;
 use ff_updater::swapper::SwapperConfig;
 use ff_updater::verifier::VerifierConfig;
 use tokio::task::JoinHandle;
+use tokio::time::Duration;
 use tracing::{error, info, warn};
 
 /// clap's `--version` output. Mirrors the `Command::Version` subcommand
@@ -1540,6 +1540,59 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                 shutdown_rx.clone(),
             ),
         );
+    }
+
+    // 20b7a) Fleet PR auto-merge tick — every 120s, leader-gated.
+    // DEFAULT OFF: with `fleet_secrets.pr_automerge_mode` unset or `off`, the
+    // loop is a quiet no-op. When enabled, the current leader evaluates open
+    // fleet-authored `wi/` PRs and lands the ones the decision core clears.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!(
+            "starting subsystem: fleet PR auto-merge tick (120s, leader-gated, gate=fleet_secrets.pr_automerge_mode default off)"
+        );
+        let mut shutdown_rx_pr_merge = shutdown_rx.clone();
+        let pr_merge_worker = worker_name.clone();
+        subsystem_tasks.push(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx_pr_merge.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(120)) => {
+                        let pr_automerge_enabled = matches!(
+                            ff_db::pg_read_gate_value(&pg_pool, "pr_automerge_mode", "off", "off")
+                                .await
+                                .as_deref(),
+                            Ok("on") | Ok("true") | Ok("1") | Ok("active")
+                        );
+                        if !pr_automerge_enabled {
+                            continue;
+                        }
+
+                        let is_leader = match ff_db::leader_state::pg_get_current_leader(&pg_pool).await {
+                            Ok(Some(leader)) => leader.member_name == pr_merge_worker,
+                            _ => false,
+                        };
+                        if !is_leader {
+                            continue;
+                        }
+
+                        match ff_agent::pr_merge_executor::run_pr_merge_pass(&pg_pool).await {
+                            Ok(report) => {
+                                let report: PrMergeReport = report;
+                                info!(
+                                    considered = report.considered,
+                                    merged = report.merged,
+                                    held = report.held,
+                                    blocked = report.blocked,
+                                    "fleet PR auto-merge pass complete"
+                                );
+                            }
+                            Err(e) => warn!(error = %e, "fleet PR auto-merge pass failed"),
+                        }
+                    }
+                }
+            }
+        }));
     }
 
     // 20b8) OAuth probe tick — every 6h, leader-gated inside the tick.
