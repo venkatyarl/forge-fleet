@@ -79,7 +79,7 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
                     error = %e,
                     "work_item_dispatch: dispatch failed"
                 );
-                if let Err(cleanup) = mark_failed_and_release(pg, &item, &e.to_string()).await {
+                if let Err(cleanup) = requeue_or_fail(pg, &item, &e.to_string()).await {
                     warn!(
                         work_item_id = %item.work_item_id,
                         error = %cleanup,
@@ -575,6 +575,118 @@ async fn mark_completed_without_pr(pg: &PgPool, item: &AssignedWorkItem) -> Resu
     .await?;
     release_slot_and_lease_tx(&mut tx, item, "no commits produced").await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// Max dispatch attempts before a work_item is escalated to terminal `failed`
+/// instead of being requeued. Each retry re-runs the dispatch with the prior
+/// error appended to the item's `last_error` so the next attempt has context.
+const MAX_DISPATCH_ATTEMPTS: i32 = 3;
+
+/// Deterministic execution-contract outcome of a dispatch (roadmap item #3).
+/// Formalizes what previously was ad-hoc: a dispatch either succeeds, fails with
+/// no diff (retryable), fails but left a real diff (salvageable — treat as a
+/// success-with-work), or timed out but its diff was salvaged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchOutcome {
+    /// The backend ran to a clean, successful exit.
+    Success,
+    /// The backend errored (or was killed) and left NO usable diff — retryable.
+    FailedNoDiff,
+    /// The backend errored but the worktree has a real diff — salvageable work.
+    FailedWithDiff,
+    /// The backend timed out and its diff was salvaged into a commit.
+    TimeoutSalvaged,
+}
+
+/// Classify a dispatch result into the [`DispatchOutcome`] contract. Pure +
+/// unit-testable. `worktree_has_diff` is the caller's git-status check on the
+/// worktree after the run. A timeout/kill error that nonetheless left a diff is
+/// `TimeoutSalvaged`; any other error with a diff is `FailedWithDiff`; an error
+/// with no diff is `FailedNoDiff` (the only retryable class); `Ok` is `Success`.
+pub fn classify_dispatch_outcome(
+    result: &Result<Output>,
+    worktree_has_diff: bool,
+) -> DispatchOutcome {
+    match result {
+        Ok(_) => DispatchOutcome::Success,
+        Err(e) => {
+            if worktree_has_diff {
+                let msg = e.to_string().to_ascii_lowercase();
+                if msg.contains("timed out") || msg.contains("timeout") {
+                    DispatchOutcome::TimeoutSalvaged
+                } else {
+                    DispatchOutcome::FailedWithDiff
+                }
+            } else {
+                DispatchOutcome::FailedNoDiff
+            }
+        }
+    }
+}
+
+/// Failure-aware retry (roadmap item #2). On a dispatch failure, requeue the
+/// work_item (status → `ready`, `attempts` + 1, prior error appended to
+/// `last_error` so the next run has the failure context) UNTIL `attempts`
+/// reaches [`MAX_DISPATCH_ATTEMPTS`], then escalate to terminal `failed` via
+/// [`mark_failed_and_release`]. Always releases the slot/lease so the scheduler
+/// can re-dispatch. Best-effort: on any DB error, falls back to marking failed
+/// so a stuck item can't hold a slot forever.
+async fn requeue_or_fail(pg: &PgPool, item: &AssignedWorkItem, error: &str) -> Result<()> {
+    let attempts: i32 =
+        sqlx::query_scalar("SELECT COALESCE(attempts, 0) FROM work_items WHERE id = $1")
+            .bind(item.work_item_id)
+            .fetch_optional(pg)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+
+    if attempts + 1 >= MAX_DISPATCH_ATTEMPTS {
+        info!(
+            work_item_id = %item.work_item_id,
+            attempts = attempts + 1,
+            max = MAX_DISPATCH_ATTEMPTS,
+            "work_item_dispatch: retry budget exhausted — escalating to failed"
+        );
+        return mark_failed_and_release(pg, item, error).await;
+    }
+
+    let mut tx = pg.begin().await?;
+    // Requeue: back to 'ready', bump attempts, and append the error to last_error
+    // so the next attempt's prompt/context can see why the prior run failed.
+    sqlx::query(
+        "UPDATE work_items
+            SET status = 'ready',
+                attempts = COALESCE(attempts, 0) + 1,
+                last_error = $2
+          WHERE id = $1",
+    )
+    .bind(item.work_item_id)
+    .bind(truncate_for_db(&format!(
+        "[attempt {}] {}",
+        attempts + 1,
+        error
+    )))
+    .execute(&mut *tx)
+    .await?;
+    // Clear the failed worktree row so a fresh one is created next attempt.
+    sqlx::query(
+        "UPDATE work_item_worktrees
+            SET status = 'failed'
+          WHERE work_item_id = $1
+            AND status IN ('creating', 'active')",
+    )
+    .bind(item.work_item_id)
+    .execute(&mut *tx)
+    .await?;
+    release_slot_and_lease_tx(&mut tx, item, "dispatch failed — requeued for retry").await?;
+    tx.commit().await?;
+    info!(
+        work_item_id = %item.work_item_id,
+        attempts = attempts + 1,
+        "work_item_dispatch: requeued for retry with error context"
+    );
     Ok(())
 }
 
@@ -1404,7 +1516,64 @@ pub fn spawn_worktree_reaper(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_cli_tokens;
+    use super::{DispatchOutcome, classify_dispatch_outcome, parse_cli_tokens};
+    use anyhow::anyhow;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Output;
+
+    fn ok_output() -> anyhow::Result<Output> {
+        Ok(Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"done".to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn classify_success_on_ok() {
+        assert_eq!(
+            classify_dispatch_outcome(&ok_output(), false),
+            DispatchOutcome::Success
+        );
+        // Ok is Success regardless of diff.
+        assert_eq!(
+            classify_dispatch_outcome(&ok_output(), true),
+            DispatchOutcome::Success
+        );
+    }
+
+    #[test]
+    fn classify_failed_no_diff_is_retryable_class() {
+        let r: anyhow::Result<Output> = Err(anyhow!("codex exited 1"));
+        assert_eq!(
+            classify_dispatch_outcome(&r, false),
+            DispatchOutcome::FailedNoDiff
+        );
+    }
+
+    #[test]
+    fn classify_failed_with_diff_when_error_but_diff_present() {
+        let r: anyhow::Result<Output> = Err(anyhow!("codex exited 1: patch apply error"));
+        assert_eq!(
+            classify_dispatch_outcome(&r, true),
+            DispatchOutcome::FailedWithDiff
+        );
+    }
+
+    #[test]
+    fn classify_timeout_salvaged_when_timeout_and_diff() {
+        let r: anyhow::Result<Output> = Err(anyhow!("command timed out after 1080s"));
+        assert_eq!(
+            classify_dispatch_outcome(&r, true),
+            DispatchOutcome::TimeoutSalvaged
+        );
+        // Timeout with NO diff is still just FailedNoDiff (nothing to salvage).
+        let r2: anyhow::Result<Output> = Err(anyhow!("command timed out after 1080s"));
+        assert_eq!(
+            classify_dispatch_outcome(&r2, false),
+            DispatchOutcome::FailedNoDiff
+        );
+    }
 
     #[test]
     fn parses_codex_tokens_used_with_comma() {
