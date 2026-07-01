@@ -141,6 +141,7 @@ pub mod task_coverage_seed;
 pub mod task_runner;
 pub mod telegram;
 pub mod template_registry;
+pub mod tick_registry;
 pub mod thinking;
 pub mod tools;
 pub mod training;

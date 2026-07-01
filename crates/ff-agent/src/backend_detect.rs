@@ -223,47 +223,28 @@ async fn resolve_computer_id(pool: &sqlx::PgPool, worker_name: &str) -> Option<u
         .flatten()
 }
 
-/// Spawn the per-node backend-detector tick (capability A2). PER-HOST, NOT
-/// leader-gated: every host detects + persists ITS OWN backends so the dispatch
-/// picker sees fleet-wide availability. Auth-probes are real CLI invocations, so
-/// the interval is intentionally coarse (hourly) — dispatch does a fresh probe
-/// when a cached row is stale (council guard).
-pub fn spawn_backend_detector(
-    pg: sqlx::PgPool,
-    worker_name: String,
-    interval_secs: u64,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    let Some(cid) = resolve_computer_id(&pg, &worker_name).await else {
-                        tracing::warn!(worker_name = %worker_name,
-                            "backend_detector: no computers row for this node; skipping");
-                        continue;
-                    };
-                    match detect_and_persist(&pg, cid, Duration::from_secs(30)).await {
-                        Ok(n) => tracing::info!(
-                            backends = n,
-                            "backend_detector: refreshed computer_backends"
-                        ),
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            "backend_detector: detect/persist failed"
-                        ),
-                    }
-                }
-                changed = shutdown_rx.changed() => {
-                    if changed.is_err() || *shutdown_rx.borrow() {
-                        break;
-                    }
-                }
-            }
-        }
-        tracing::info!("backend_detector loop stopped");
-    })
+/// Run one backend-detector tick body for THIS node.
+///
+/// PER-HOST, NOT leader-gated: every host detects + persists ITS OWN backends so
+/// the dispatch picker sees fleet-wide availability. Auth-probes are real CLI
+/// invocations, so the scheduler interval is intentionally coarse (hourly) —
+/// dispatch does a fresh probe when a cached row is stale (council guard).
+pub async fn run_backend_detector_tick(pg: &sqlx::PgPool, worker_name: &str) {
+    let Some(cid) = resolve_computer_id(pg, worker_name).await else {
+        tracing::warn!(worker_name = %worker_name,
+            "backend_detector: no computers row for this node; skipping");
+        return;
+    };
+    match detect_and_persist(pg, cid, Duration::from_secs(30)).await {
+        Ok(n) => tracing::info!(
+            backends = n,
+            "backend_detector: refreshed computer_backends"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "backend_detector: detect/persist failed"
+        ),
+    }
 }
 
 /// Detect this node's backends (with auth probe) and persist each to
