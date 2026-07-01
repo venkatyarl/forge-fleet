@@ -9327,3 +9327,59 @@ CREATE TABLE IF NOT EXISTS fleet_session_dispatch (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 "#;
+
+// ─── V150: register kimi-cli as a tracked external tool ────────────────────
+//
+// The Kimi CLI (Moonshot's coding agent, PyPI package `kimi-cli`, installed
+// fleet-side via `uv tool`) was NEVER in the external_tools / software_registry
+// catalog. Every OTHER coding CLI (codex, claude-code, openclaw) is registered
+// and auto-version-checked, but kimi had no row — so the auto-upgrade tick
+// never queried its upstream, never saw drift, and never upgraded it. The CLI
+// nagged "New version available: 1.48.0 — run `uv tool upgrade kimi-cli`" while
+// ff sat blind. This closes that blind spot (fleet-fixes-fleet: the bug was
+// ff's catalog gap, not kimi being stale).
+//
+// version_source.method=pip → the hourly `refresh_pypi_latest_versions` tick
+// (auto_upgrade.rs) + the 6h ExternalToolsUpstreamChecker query
+// https://pypi.org/pypi/kimi-cli/json. Both resolvers already support "pip".
+//
+// install_method=pip (derive_install_source maps it to install_source "pip",
+// so resolve_install_plans picks the `macos`/`linux` playbook keys). The
+// playbook uses `uv tool install --force` (install-or-upgrade in one shot;
+// `uv tool upgrade` errors when the tool isn't installed yet). macOS prepends
+// the homebrew + local bin paths because non-interactive SSH doesn't source
+// the shell profile where `uv` lives (same class of fix as the V46 ace bug).
+//
+// Registering in the catalog does NOT install kimi anywhere — computer_external_tools
+// rows only appear on explicit `ff ext install kimi`. This just makes it
+// trackable + upgradable like its siblings.
+pub const SCHEMA_V150_KIMI_CLI_EXTERNAL_TOOL: &str = r#"
+INSERT INTO software_registry
+    (id, display_name, kind, version_source, upgrade_playbook)
+VALUES
+  ('kimi-cli', 'Kimi CLI (Moonshot)', 'binary',
+   '{"method":"pip","package":"kimi-cli"}'::jsonb,
+   '{"macos":"export PATH=$HOME/.local/bin:/opt/homebrew/bin:$PATH && uv tool install kimi-cli --force","linux":"export PATH=$HOME/.local/bin:$HOME/.cargo/bin:$PATH && uv tool install kimi-cli --force"}'::jsonb)
+ON CONFLICT (id) DO UPDATE SET
+  version_source   = EXCLUDED.version_source,
+  upgrade_playbook = EXCLUDED.upgrade_playbook;
+
+INSERT INTO external_tools
+    (id, display_name, github_url, kind, install_method, install_spec,
+     cli_entrypoint, register_as_mcp, version_source, upgrade_playbook,
+     intake_source, added_by)
+VALUES
+  ('kimi-cli', 'Kimi CLI (Moonshot)',
+   'https://github.com/MoonshotAI/kimi-cli', 'cli', 'pip',
+   '{"package":"kimi-cli"}'::jsonb,
+   'kimi', false,
+   '{"method":"pip","package":"kimi-cli"}'::jsonb,
+   '{"macos":"export PATH=$HOME/.local/bin:/opt/homebrew/bin:$PATH && uv tool install kimi-cli --force","linux":"export PATH=$HOME/.local/bin:$HOME/.cargo/bin:$PATH && uv tool install kimi-cli --force"}'::jsonb,
+   'migration', 'V150')
+ON CONFLICT (id) DO UPDATE SET
+  install_method   = EXCLUDED.install_method,
+  install_spec     = EXCLUDED.install_spec,
+  cli_entrypoint   = EXCLUDED.cli_entrypoint,
+  version_source   = EXCLUDED.version_source,
+  upgrade_playbook = EXCLUDED.upgrade_playbook;
+"#;
