@@ -827,6 +827,9 @@ async fn record_usage(
 
 #[cfg(test)]
 mod tests {
+    use ff_agent::circuit_breaker::{record_provider_failure, record_provider_success};
+    use ff_agent::cloud_error::classify;
+
     use super::*;
 
     #[test]
