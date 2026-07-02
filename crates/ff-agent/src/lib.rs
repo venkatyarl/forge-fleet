@@ -45,6 +45,7 @@ pub mod compaction;
 pub mod conformance;
 pub mod consensus;
 pub mod coverage_guard;
+pub mod daemon;
 pub mod db_integrity;
 pub mod demand_sensor;
 pub mod deployment_catalog_reconciler;
