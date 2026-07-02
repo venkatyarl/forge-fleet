@@ -4108,6 +4108,7 @@ fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
              install -m 755 target/release/ff ~/.local/bin/ff && \
              codesign --force --sign - ~/.local/bin/forgefleetd && \
              codesign --force --sign - ~/.local/bin/ff && \
+             ( install -m 755 target/release/ff ~/.cargo/bin/ff 2>/dev/null && codesign --force --sign - ~/.cargo/bin/ff 2>/dev/null ) || true; \
              USER_ID=$(stat -f %u \"$HOME\" 2>/dev/null || id -u); \
              for p in $(pgrep -x forgefleetd); do kill -TERM \"$p\" 2>/dev/null; done; sleep 2; \
              for p in $(pgrep -x forgefleetd); do kill -KILL \"$p\" 2>/dev/null; done; \
@@ -4131,6 +4132,7 @@ fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
              {cargo_build} && \
              install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
              install -m 755 target/release/ff ~/.local/bin/ff && \
+             install -m 755 target/release/ff ~/.cargo/bin/ff 2>/dev/null || true; \
              export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
              systemctl --user stop forgefleetd.service 2>/dev/null; \
              for p in $(pgrep -x forgefleetd); do kill -TERM \"$p\" 2>/dev/null; done; sleep 2; \
@@ -4184,6 +4186,7 @@ fn leader_refresh_playbook(os_family: &str, source_tree_path: &str) -> String {
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; cd \"{src}\" && {cargo_build} && \
              install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
              install -m 755 target/release/ff ~/.local/bin/ff && \
+             install -m 755 target/release/ff ~/.cargo/bin/ff 2>/dev/null || true; \
              export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
              ( systemctl --user restart --no-block forgefleetd.service 2>/dev/null ) \
                || ( for p in $(pgrep -x forgefleetd); do kill -TERM \"$p\" 2>/dev/null; done; sleep 2; \
