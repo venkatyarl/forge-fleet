@@ -437,8 +437,137 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
         } => {
             handle_pm_import_claude_tasks(&pool, session, &project, dry_run).await?;
         }
+        crate::PmCommand::Integrate { branches, base } => {
+            handle_pm_integrate(cwd, branches, base).await?;
+        }
     }
     Ok(())
+}
+
+/// `ff pm integrate` — build an integration branch by merging a cluster of
+/// fleet PR branches onto a base, in a throwaway git worktree so the operator's
+/// working tree is never disturbed. Reports which children merge clean vs
+/// conflict; leaves the integration branch in the worktree only when clean so
+/// the operator can `git -C <wt> push` it.
+async fn handle_pm_integrate(
+    cwd: Option<PathBuf>,
+    branches: Vec<String>,
+    base: String,
+) -> Result<()> {
+    use ff_agent::pr_integration::IntegrationPlan;
+    use ff_agent::pr_integration_branch::{ChildOutcome, build_integration_branch};
+
+    if branches.is_empty() {
+        anyhow::bail!("pass --branches <a,b,c> (comma-separated fleet PR branches)");
+    }
+
+    // Locate the repo root so `git worktree add` runs against the right repo.
+    let start = cwd.unwrap_or(std::env::current_dir()?);
+    let root = git_repo_root(&start)?;
+
+    // Throwaway worktree. Detach so it doesn't need a fresh branch, and use a
+    // unique path so concurrent runs don't collide.
+    let wt = root.join(format!(
+        ".ff-integrate-{}",
+        std::process::id() // pid — unique per invocation, no clock needed
+    ));
+    let wt_str = wt.to_string_lossy().to_string();
+    run_git(&root, &["worktree", "add", "--detach", "--quiet", &wt_str])
+        .map_err(|e| anyhow::anyhow!("create integration worktree: {e}"))?;
+
+    let plan = IntegrationPlan {
+        child_branches: branches.clone(),
+        pr_numbers: vec![],
+        target_branch: base.clone(),
+    };
+
+    let outcome = build_integration_branch(&wt, &plan).await;
+
+    // Always report, then clean up the worktree unless the run was clean (a
+    // clean integration branch is worth keeping so the operator can push it).
+    match &outcome {
+        Ok(o) => {
+            println!(
+                "{CYAN}Integration: {} ← {}{RESET}",
+                o.integration_branch, base
+            );
+            for (br, res) in &o.results {
+                let (mark, detail) = match res {
+                    ChildOutcome::Merged => {
+                        (format!("{GREEN}✓{RESET}"), "merged clean".to_string())
+                    }
+                    ChildOutcome::Conflicted(files) => (
+                        format!("{RED}✗{RESET}"),
+                        format!("CONFLICT: {}", files.join(", ")),
+                    ),
+                    ChildOutcome::Missing => {
+                        (format!("{YELLOW}?{RESET}"), "branch not found".to_string())
+                    }
+                };
+                println!("  {mark} {br:<28} {detail}");
+            }
+            if o.is_clean() {
+                println!(
+                    "{GREEN}✓ all {} branches integrated clean{RESET} on `{}`.\n  Push it: git -C {} push -u origin HEAD:{}",
+                    o.results.len(),
+                    o.integration_branch,
+                    wt_str,
+                    o.integration_branch,
+                );
+                // Keep the worktree so the operator can push/inspect.
+            } else {
+                println!(
+                    "{YELLOW}⚠ blocked: {}{RESET} — not landable as one branch; resolve or split.",
+                    o.blocked_branches().join(", ")
+                );
+                let _ = run_git(&root, &["worktree", "remove", "--force", &wt_str]);
+            }
+        }
+        Err(e) => {
+            eprintln!("{RED}integration failed: {e}{RESET}");
+            let _ = run_git(&root, &["worktree", "remove", "--force", &wt_str]);
+        }
+    }
+    outcome.map(|_| ())
+}
+
+/// Resolve the git repo root containing `start` (`git rev-parse --show-toplevel`).
+fn git_repo_root(start: &std::path::Path) -> Result<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(start)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawn git: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "not inside a git repo ({}): {}",
+            start.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+    ))
+}
+
+/// Run a git command in `repo`, erroring with stderr on non-zero exit.
+fn run_git(repo: &std::path::Path, args: &[&str]) -> Result<()> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawn git {}: {e}", args.join(" ")))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+    }
 }
 
 async fn print_pm_doctor(pool: &sqlx::PgPool) -> Result<()> {

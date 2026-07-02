@@ -112,6 +112,7 @@ pub mod portfolio_maintenance;
 pub mod ports_registry;
 pub mod power_scheduler;
 pub mod pr_integration;
+pub mod pr_integration_branch;
 pub mod pr_merge_executor;
 pub mod pr_verify;
 pub mod project_github_sync;
