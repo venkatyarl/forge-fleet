@@ -746,11 +746,19 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     // when a cached row is stale.
     if let Some(pg_pool) = operational_store.pg_pool().cloned() {
         info!("starting subsystem: backend availability detector (1h, per-host)");
-        subsystem_tasks.push(ff_agent::backend_detect::spawn_backend_detector(
-            pg_pool,
-            worker_name.clone(),
-            3600,
+        let detector_worker = worker_name.clone();
+        subsystem_tasks.push(ff_agent::tick_registry::TickRegistry::register(
+            "backend-detector",
+            std::time::Duration::from_secs(3600),
             shutdown_rx.clone(),
+            move |_run| {
+                let pg_pool = pg_pool.clone();
+                let detector_worker = detector_worker.clone();
+                async move {
+                    ff_agent::backend_detect::run_backend_detector_tick(&pg_pool, &detector_worker)
+                        .await;
+                }
+            },
         ));
     }
 
