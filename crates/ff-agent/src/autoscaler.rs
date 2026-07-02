@@ -1174,15 +1174,12 @@ pub async fn autoscale_pass(pg: &PgPool) -> Result<AutoscaleSummary, String> {
     Ok(summary)
 }
 
-/// Spawn the leader-gated autoscaler loop. The leader gate is read from Postgres
-/// `fleet_leader_state` EXACTLY like
-/// [`crate::demand_sensor::spawn_demand_tick`] /
-/// [`crate::scheduler_tick::spawn_scheduler_tick`] — the serving mix is global
-/// state, so only the leader plans/actuates (no N-way races). On failover the
-/// new leader's forgefleetd picks the tick up automatically.
+/// Spawn the leader-gated autoscaler loop. The leader gate is read from the
+/// process-local leader cache; the serving mix is global state, so only the
+/// leader plans/actuates (no N-way races).
 pub fn spawn_autoscaler_tick(
     pg: PgPool,
-    worker_name: String,
+    _worker_name: String,
     interval_secs: u64,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -1193,21 +1190,7 @@ pub fn spawn_autoscaler_tick(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let is_leader: bool = sqlx::query_scalar(
-                        r#"
-                        SELECT EXISTS (
-                            SELECT 1 FROM fleet_leader_state
-                            WHERE member_name = $1
-                              AND heartbeat_at > NOW() - INTERVAL '60 seconds'
-                        )
-                        "#
-                    )
-                    .bind(&worker_name)
-                    .fetch_one(&pg)
-                    .await
-                    .unwrap_or(false);
-
-                    if !is_leader {
+                    if !crate::leader_cache::is_current_leader() {
                         continue;
                     }
 

@@ -384,14 +384,12 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// Spawn the leader-gated disk-reconcile loop. The leader gate is read from
-/// Postgres `fleet_leader_state` EXACTLY like
-/// [`crate::autoscaler::spawn_autoscaler_tick`] — disk policy is global state, so
-/// only the leader plans/actuates (no N-way delete races). On failover the new
-/// leader's forgefleetd picks the tick up automatically.
+/// Spawn the leader-gated disk-reconcile loop. The leader gate is read from the
+/// process-local leader cache; disk policy is global state, so only the leader
+/// plans/actuates (no N-way delete races).
 pub fn spawn_disk_reconcile_tick(
     pg: PgPool,
-    worker_name: String,
+    _worker_name: String,
     interval_secs: u64,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -402,21 +400,7 @@ pub fn spawn_disk_reconcile_tick(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let is_leader: bool = sqlx::query_scalar(
-                        r#"
-                        SELECT EXISTS (
-                            SELECT 1 FROM fleet_leader_state
-                            WHERE member_name = $1
-                              AND heartbeat_at > NOW() - INTERVAL '60 seconds'
-                        )
-                        "#
-                    )
-                    .bind(&worker_name)
-                    .fetch_one(&pg)
-                    .await
-                    .unwrap_or(false);
-
-                    if !is_leader {
+                    if !crate::leader_cache::is_current_leader() {
                         continue;
                     }
 

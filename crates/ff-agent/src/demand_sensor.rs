@@ -69,11 +69,11 @@ pub async fn snapshot_demand(pg: &PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Spawn the leader-gated demand-sensing loop. The gate is read from Postgres
-/// `fleet_leader_state` exactly like [`crate::scheduler_tick::spawn_scheduler_tick`].
+/// Spawn the leader-gated demand-sensing loop. The gate is read from the
+/// process-local leader cache.
 pub fn spawn_demand_tick(
     pg: PgPool,
-    worker_name: String,
+    _worker_name: String,
     interval_secs: u64,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -82,21 +82,7 @@ pub fn spawn_demand_tick(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let is_leader: bool = sqlx::query_scalar(
-                        r#"
-                        SELECT EXISTS (
-                            SELECT 1 FROM fleet_leader_state
-                            WHERE member_name = $1
-                              AND heartbeat_at > NOW() - INTERVAL '60 seconds'
-                        )
-                        "#
-                    )
-                    .bind(&worker_name)
-                    .fetch_one(&pg)
-                    .await
-                    .unwrap_or(false);
-
-                    if !is_leader {
+                    if !crate::leader_cache::is_current_leader() {
                         continue;
                     }
 

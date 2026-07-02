@@ -141,7 +141,7 @@ pub async fn reap_pending_parents(pool: &PgPool) -> Result<ReaperReport, sqlx::E
 /// contained so `src/main.rs` only needs one call.
 pub fn spawn_reaper(
     pg: PgPool,
-    worker_name: String,
+    _worker_name: String,
     interval_secs: u64,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -157,14 +157,7 @@ pub fn spawn_reaper(
             }
             // Leader-only: skip when this host isn't the elected leader
             // so we don't have 15 daemons racing on the same parents.
-            let is_leader: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM fleet_leader_state WHERE member_name = $1)",
-            )
-            .bind(&worker_name)
-            .fetch_one(&pg)
-            .await
-            .unwrap_or(false);
-            if !is_leader {
+            if !crate::leader_cache::is_current_leader() {
                 debug!("wave-reaper: skipping (not leader)");
                 continue;
             }

@@ -130,7 +130,7 @@ pub async fn evaluate_schedules(pg: &PgPool, worker_name: &str) -> Result<usize>
 }
 
 /// Spawn a background loop that evaluates schedules every `interval_secs`.
-/// The tick is leader-gated via Postgres `fleet_leader_state`.
+/// The tick is leader-gated via the process-local leader cache.
 pub fn spawn_scheduler_tick(
     pg: PgPool,
     worker_name: String,
@@ -142,21 +142,7 @@ pub fn spawn_scheduler_tick(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let is_leader: bool = sqlx::query_scalar(
-                        r#"
-                        SELECT EXISTS (
-                            SELECT 1 FROM fleet_leader_state
-                            WHERE member_name = $1
-                              AND heartbeat_at > NOW() - INTERVAL '60 seconds'
-                        )
-                        "#
-                    )
-                    .bind(&worker_name)
-                    .fetch_one(&pg)
-                    .await
-                    .unwrap_or(false);
-
-                    if !is_leader {
+                    if !crate::leader_cache::is_current_leader() {
                         continue;
                     }
 

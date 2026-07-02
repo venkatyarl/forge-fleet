@@ -73,6 +73,7 @@ pub mod hooks;
 pub mod inference_router;
 pub mod instructions_sync;
 pub mod job_sweeper;
+pub mod leader_cache;
 pub mod leader_tick;
 pub mod learning;
 pub mod lease_takeover;

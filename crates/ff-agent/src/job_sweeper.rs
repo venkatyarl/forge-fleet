@@ -391,36 +391,20 @@ const LEADER_FRESH_SECS: i64 = 60;
 /// duplicate logging. Safe to start on every daemon; followers no-op.
 pub struct StaleJobSweeperTick {
     pg: sqlx::PgPool,
-    my_name: String,
     policy: SweepPolicy,
 }
 
 impl StaleJobSweeperTick {
-    pub fn new(pg: sqlx::PgPool, my_name: String) -> Self {
+    pub fn new(pg: sqlx::PgPool, _my_name: String) -> Self {
         Self {
             pg,
-            my_name,
             policy: SweepPolicy::default(),
         }
     }
 
-    /// Are we the live leader right now? True iff the `fleet_leader_state`
-    /// singleton names us AND its heartbeat is fresh.
+    /// Are we the live leader right now?
     async fn is_live_leader(&self) -> bool {
-        match ff_db::leader_state::pg_get_current_leader(&self.pg).await {
-            Ok(Some(leader)) => {
-                let fresh = Utc::now()
-                    .signed_duration_since(leader.heartbeat_at)
-                    .num_seconds()
-                    < LEADER_FRESH_SECS;
-                leader.member_name == self.my_name && fresh
-            }
-            Ok(None) => false,
-            Err(e) => {
-                tracing::warn!(error = %e, "stale-job sweeper: failed to read leader state");
-                false
-            }
-        }
+        crate::leader_cache::is_current_leader()
     }
 
     /// Spawn the 5-minute sweep loop. Leadership is gated inside the loop on

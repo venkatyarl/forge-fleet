@@ -249,23 +249,15 @@ pub fn classify_policy_fireability(metric: &str, condition: &str) -> PolicyFirea
 pub struct AlertEvaluator {
     pg: PgPool,
     pulse: PulseReader,
-    my_name: String,
 }
 
 impl AlertEvaluator {
-    pub fn new(pg: PgPool, pulse: PulseReader, my_name: String) -> Self {
-        Self { pg, pulse, my_name }
+    pub fn new(pg: PgPool, pulse: PulseReader, _my_name: String) -> Self {
+        Self { pg, pulse }
     }
 
     async fn is_leader(&self) -> bool {
-        match sqlx::query_scalar::<_, String>("SELECT member_name FROM fleet_leader_state LIMIT 1")
-            .fetch_optional(&self.pg)
-            .await
-        {
-            Ok(Some(leader)) => leader == self.my_name,
-            Ok(None) => false,
-            Err(_) => false,
-        }
+        crate::leader_cache::is_current_leader()
     }
 
     /// Run one evaluation pass.
