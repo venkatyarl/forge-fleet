@@ -57,10 +57,17 @@ impl GatewayLlmExec {
     /// the first hit. Tier-1 wants code-capable scaffolders, tier-2 wants
     /// verifier-grade reasoning, tier-3 wants generalist synthesizers.
     pub fn workload_tags_for_tier(tier: u8) -> &'static [&'static str] {
+        // NOTE: these MUST match the vocabulary actually used in
+        // fleet_model_catalog.preferred_workloads. The live catalog uses
+        // `code-gen` (not `code`), `research` (not `reasoning`), plus `agent`,
+        // `tool_calling`, `chat`. The old tags (`code`/`reasoning`) matched
+        // NOTHING for tier-2, so tier-2 always fell through to the (stale)
+        // hardcoded endpoint — the lily:55001 "single dispatch failed" bug.
+        // Keep the legacy tags too for forward-compat with any re-tagging.
         match tier {
-            1 => &["code", "tool_calling", "chat"],
-            2 => &["reasoning", "code"],
-            3 => &["chat", "reasoning", "tool_calling"],
+            1 => &["code-gen", "code", "tool_calling", "chat"],
+            2 => &["research", "reasoning", "code-gen", "agent"],
+            3 => &["chat", "research", "tool_calling"],
             _ => &["chat", "tool_calling"],
         }
     }
@@ -74,10 +81,12 @@ impl GatewayLlmExec {
                 "http://192.168.5.102:55000".into(),
                 "qwen3-coder-30b-a3b".into(),
             ),
-            2 => (
-                "http://192.168.5.113:55001".into(),
-                "deepseek-r1-distill-qwen-32b".into(),
-            ),
+            // Last-resort only (hit when the DB pool is entirely absent — the
+            // any-healthy resolver covers the pool-present case). Point at the
+            // stable leader, not a node whose per-slot config drifts: the old
+            // value (lily:55001 deepseek) went dead when lily's config changed
+            // and caused "single dispatch failed: POST …:55001".
+            2 => ("http://192.168.5.100:55001".into(), "qwen36-35b-a3b".into()),
             _ => (
                 "http://192.168.5.100:55001".into(),
                 "/Users/venkat/models/qwen36-35b-a3b".into(),
@@ -140,27 +149,77 @@ impl GatewayLlmExec {
         None
     }
 
-    /// Tier-aware endpoint resolution: try the live fleet first, fall back
-    /// to the hardcoded map if the pool is absent or no eligible deployment
-    /// exists.
+    /// Relaxed fallback: the most-recently-healthy CHAT-CAPABLE deployment of
+    /// ANY model, ignoring the tier's specific workload tags. Used when the
+    /// tier-specific resolver finds nothing, so `fleet_run` routes to a LIVE
+    /// endpoint (any of the healthy servers) instead of a stale hardcoded IP.
+    /// This is what prevents the "single dispatch failed: POST
+    /// http://<dead-host>:<port>" class of failure when a tier's preferred
+    /// model isn't currently deployed. Embedding/reranker-only endpoints are
+    /// excluded (they can't answer a chat completion).
+    async fn resolve_any_healthy(pool: &sqlx::PgPool) -> Option<(String, String)> {
+        let row = sqlx::query(
+            r#"
+            SELECT d.port,
+                   COALESCE(c.primary_ip, w.name) AS host,
+                   d.catalog_id
+              FROM fleet_model_deployments d
+              JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
+              LEFT JOIN fleet_workers w     ON w.name = d.worker_name
+              LEFT JOIN computers c         ON LOWER(c.name) = LOWER(d.worker_name)
+             WHERE d.health_status = 'healthy'
+               AND NOT (cat.preferred_workloads @> '["embedding"]'::jsonb
+                        AND NOT (cat.preferred_workloads @> '["chat"]'::jsonb
+                              OR cat.preferred_workloads @> '["code"]'::jsonb
+                              OR cat.preferred_workloads @> '["reasoning"]'::jsonb
+                              OR cat.preferred_workloads @> '["tool_calling"]'::jsonb))
+             ORDER BY d.last_health_at DESC NULLS LAST
+             LIMIT 1
+            "#,
+        )
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()?;
+        use sqlx::Row;
+        let port: i32 = row.try_get("port").ok()?;
+        let host: String = row.try_get("host").ok()?;
+        let catalog_id: String = row.try_get("catalog_id").ok()?;
+        Some((format!("http://{host}:{port}"), catalog_id))
+    }
+
+    /// Tier-aware endpoint resolution: try the tier-specific live fleet match
+    /// first, then ANY healthy chat-capable deployment, and only fall back to
+    /// the hardcoded map if the pool is absent entirely. The any-healthy step
+    /// is what keeps `fleet_run` working when a tier's preferred model isn't
+    /// deployed — routing to a live server beats dialing a stale hardcoded IP.
     async fn endpoint_for_tier(&self, tier: u8) -> (String, String) {
-        if let Some(pool) = &self.pool
-            && let Some(dynamic) = Self::resolve_dynamic(pool, tier).await
-        {
-            tracing::debug!(
-                tier,
-                endpoint = %dynamic.0,
-                model = %dynamic.1,
-                "GatewayLlmExec: dynamic resolution"
-            );
-            return dynamic;
+        if let Some(pool) = &self.pool {
+            if let Some(dynamic) = Self::resolve_dynamic(pool, tier).await {
+                tracing::debug!(
+                    tier,
+                    endpoint = %dynamic.0,
+                    model = %dynamic.1,
+                    "GatewayLlmExec: dynamic resolution"
+                );
+                return dynamic;
+            }
+            if let Some(any) = Self::resolve_any_healthy(pool).await {
+                tracing::warn!(
+                    tier,
+                    endpoint = %any.0,
+                    model = %any.1,
+                    "GatewayLlmExec: no tier-specific match; using any-healthy live endpoint"
+                );
+                return any;
+            }
         }
         let fallback = Self::hardcoded_endpoint_for_tier(tier);
-        tracing::debug!(
+        tracing::warn!(
             tier,
             endpoint = %fallback.0,
             model = %fallback.1,
-            "GatewayLlmExec: fallback to hardcoded endpoint (no dynamic match)"
+            "GatewayLlmExec: no live deployment resolvable; last-resort hardcoded endpoint"
         );
         fallback
     }
@@ -303,14 +362,24 @@ mod tests {
 
     #[test]
     fn tier_1_prefers_code() {
+        // Leads with the catalog's real code tag (`code-gen`), not legacy `code`.
         let tags = GatewayLlmExec::workload_tags_for_tier(1);
-        assert_eq!(tags[0], "code");
+        assert_eq!(tags[0], "code-gen");
     }
 
     #[test]
-    fn tier_2_prefers_reasoning() {
+    fn tier_2_prefers_research_reasoning() {
+        // Must lead with a tag the live catalog actually uses (`research`),
+        // not the legacy `reasoning` that matched nothing.
         let tags = GatewayLlmExec::workload_tags_for_tier(2);
-        assert_eq!(tags[0], "reasoning");
+        assert_eq!(tags[0], "research");
+    }
+
+    #[test]
+    fn tier_1_and_2_use_catalog_vocab() {
+        // Guard against re-introducing tags absent from the catalog.
+        assert!(GatewayLlmExec::workload_tags_for_tier(1).contains(&"code-gen"));
+        assert!(GatewayLlmExec::workload_tags_for_tier(2).contains(&"research"));
     }
 
     #[test]

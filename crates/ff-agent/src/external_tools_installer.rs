@@ -136,6 +136,22 @@ pub async fn resolve_install_plans(
                 v.push(format!("{os_family}-{src}"));
             }
             v.push(os_family.clone());
+            // Broad OS class: catalog playbooks commonly key on the family
+            // ("linux"/"macos") rather than the specific os_family
+            // ("linux-ubuntu"/"linux-dgx"). Without this, `ff ext install`
+            // SKIPS every linux node whose playbook uses the broad "linux" key
+            // — which is the kimi-cli (V150) AND the existing codex/claude/
+            // openclaw (V46) rows. Try the class before falling to "all".
+            let os_class = if os_family.starts_with("linux") {
+                "linux"
+            } else if os_family.starts_with("macos") || os_family.starts_with("darwin") {
+                "macos"
+            } else {
+                os_family.as_str()
+            };
+            if os_class != os_family {
+                v.push(os_class.to_string());
+            }
             v.push("all".to_string());
             v
         };

@@ -340,7 +340,22 @@ async fn execute_shell(
             "ssh",
             vec![
                 "-o".into(),
-                "ConnectTimeout=5".into(),
+                "ConnectTimeout=8".into(),
+                // Retry the TCP connect up to 3× before giving up. Some nodes
+                // (priya, chronically) transiently refuse/drop the connect from
+                // the task worker while an interactive `ff fleet exec` moments
+                // later succeeds — a single attempt failed the task with
+                // `ssh_unreachable` (3× oauth-distribute failures, 2026-07-01).
+                "-o".into(),
+                "ConnectionAttempts=3".into(),
+                // Detect + abort a session that connects then wedges mid-command
+                // (the other half of priya's failure mode): 3 missed 10s keepalive
+                // probes → ssh tears the session down instead of hanging until the
+                // task's max-duration kill.
+                "-o".into(),
+                "ServerAliveInterval=10".into(),
+                "-o".into(),
+                "ServerAliveCountMax=3".into(),
                 "-o".into(),
                 "StrictHostKeyChecking=accept-new".into(),
                 dest,

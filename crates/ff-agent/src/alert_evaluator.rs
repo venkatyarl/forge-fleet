@@ -275,10 +275,40 @@ impl AlertEvaluator {
         let policies = load_enabled_policies(&self.pg).await?;
         report.policies_evaluated = policies.len();
 
+        // Deploy mute window: `ff fleet deploy` restarts every forgefleetd, so
+        // beat ages legitimately spike past the stale threshold mid-deploy and
+        // the evaluator used to spam one member_stale_beat per host per deploy
+        // (operator-reported 2026-07-01). handle_fleet_deploy stamps
+        // fleet_secrets.alert_mute_until (epoch secs) for the deploy window and
+        // clears it on completion; while inside the window, PRESENCE policies
+        // (beat age / heartbeat / status) are skipped. Metric-scoped on purpose:
+        // resource alerts (cpu/ram/disk) still fire during deploys.
+        let presence_muted: bool = sqlx::query_scalar::<_, bool>(
+            "SELECT COALESCE(
+                 (SELECT NULLIF(value, '')::BIGINT
+                    FROM fleet_secrets WHERE key = 'alert_mute_until'),
+                 0) > EXTRACT(EPOCH FROM NOW())::BIGINT",
+        )
+        .fetch_one(&self.pg)
+        .await
+        .unwrap_or(false);
+
         // Snapshot beats once per tick so every policy sees the same world.
         let beats = self.pulse.all_beats().await?;
 
         for policy in &policies {
+            if presence_muted
+                && matches!(
+                    policy.metric.as_str(),
+                    "beat_age_secs" | "leader_heartbeat_age_secs" | "computer_status"
+                )
+            {
+                tracing::debug!(
+                    policy = %policy.name,
+                    "alert mute window active (fleet deploy in progress); skipping presence alert"
+                );
+                continue;
+            }
             let cond = parse_condition(&policy.condition);
             if matches!(cond, Condition::Unparseable) {
                 tracing::warn!(
