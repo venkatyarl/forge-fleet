@@ -412,11 +412,7 @@ mod tests {
 
     #[test]
     fn gemini_requests_per_day_is_quota() {
-        let c = classify(
-            "gemini",
-            None,
-            "429 RESOURCE_EXHAUSTED requests per day",
-        );
+        let c = classify("gemini", None, "429 RESOURCE_EXHAUSTED requests per day");
         assert_eq!(c, CloudErrorClass::QuotaExhausted);
     }
 
