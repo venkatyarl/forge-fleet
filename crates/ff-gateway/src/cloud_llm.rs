@@ -136,7 +136,7 @@ pub async fn try_route_to_cloud(
         };
 
         if let Some(cap) = budget_cap {
-            let today_cost = match sqlx::query_scalar(
+            let today_cost = match sqlx::query_scalar::<_, Option<f64>>(
                 "SELECT COALESCE(SUM(cost_usd)::FLOAT8, 0.0)
                        FROM cloud_llm_usage
                       WHERE used_at > NOW() - INTERVAL '24 hours'",
