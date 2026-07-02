@@ -87,7 +87,11 @@ pub struct CloudError {
 impl std::fmt::Display for CloudError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.exit_code {
-            Some(code) => write!(f, "{} cloud error (exit {code}): {}", self.provider, self.output),
+            Some(code) => write!(
+                f,
+                "{} cloud error (exit {code}): {}",
+                self.provider, self.output
+            ),
             None => write!(f, "{} cloud error: {}", self.provider, self.output),
         }
     }
@@ -227,10 +231,16 @@ pub fn classify_cloud_error(err: &CloudError) -> ClassifiedCloudError {
             )
         }
         CloudErrorClass::ContentFiltered => {
-            format!("{} blocked the response with a content filter.", err.provider)
+            format!(
+                "{} blocked the response with a content filter.",
+                err.provider
+            )
         }
         CloudErrorClass::Network => {
-            format!("Network connectivity to {} failed. Check connectivity or retry.", err.provider)
+            format!(
+                "Network connectivity to {} failed. Check connectivity or retry.",
+                err.provider
+            )
         }
         CloudErrorClass::Unknown => {
             format!("{} failed with an unclassified cloud error.", err.provider)
