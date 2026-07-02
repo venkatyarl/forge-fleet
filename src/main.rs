@@ -755,11 +755,8 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                 let pg_pool = pg_pool.clone();
                 let detector_worker = detector_worker.clone();
                 async move {
-                    ff_agent::backend_detect::run_backend_detector_tick(
-                        &pg_pool,
-                        &detector_worker,
-                    )
-                    .await;
+                    ff_agent::backend_detect::run_backend_detector_tick(&pg_pool, &detector_worker)
+                        .await;
                 }
             },
         ));
