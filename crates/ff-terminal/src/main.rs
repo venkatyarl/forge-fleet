@@ -3081,6 +3081,19 @@ pub enum PmCommand {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+    /// Build an integration branch by merging a cluster of fleet PR branches
+    /// (`wi/<id>`) onto a base, reporting which merge clean vs conflict. Runs in
+    /// a throwaway git worktree so your working tree is never touched — the
+    /// git-plumbing side of the auto-merge bot: land an interdependent cluster
+    /// as ONE verified branch instead of racing per-PR merges.
+    Integrate {
+        /// Child branches to integrate, comma-separated (e.g. `wi/a,wi/b`).
+        #[arg(long, value_delimiter = ',')]
+        branches: Vec<String>,
+        /// Base branch to cut the integration branch from.
+        #[arg(long, default_value = "main")]
+        base: String,
+    },
 }
 
 #[derive(Debug, Clone, Args)]
