@@ -111,7 +111,8 @@ pub async fn try_route_to_cloud(
         Ok(Some(p)) => p,
         Ok(None) => return None,
         Err(e) => {
-            tracing::warn!(error = %e, "cloud_llm: registry lookup failed; skipping cloud path");
+            tracing::error!(error = %e, model = %model_id,
+                "cloud_llm: registry lookup failed; continuing without cloud routing");
             return None;
         }
     };
@@ -123,34 +124,47 @@ pub async fn try_route_to_cloud(
     // for `oauth_subscription` and `local_bridge` rows since those don't
     // accumulate `cost_usd` (subscription = $0/call). Also skipped when
     // the secret is unset, so default behavior is unchanged.
-    if provider.auth_kind == "api_key"
-        && let Some(cap) = pg_get_secret(pool, "budget.daily_usd_cap")
+    if provider.auth_kind == "api_key" {
+        let budget_cap = match pg_get_secret(pool, "budget.daily_usd_cap").await {
+            Ok(Some(cap)) => cap.trim().parse::<f64>().ok(),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!(provider = %provider.id, error = %e,
+                    "cloud_llm: budget cap lookup failed; continuing without budget guard");
+                None
+            }
+        };
+
+        if let Some(cap) = budget_cap {
+            let today_cost = match sqlx::query_scalar::<_, Option<f64>>(
+                "SELECT COALESCE(SUM(cost_usd)::FLOAT8, 0.0)
+                       FROM cloud_llm_usage
+                      WHERE used_at > NOW() - INTERVAL '24 hours'",
+            )
+            .fetch_one(pool)
             .await
-            .ok()
-            .flatten()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-    {
-        let today_cost: Option<f64> = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(cost_usd)::FLOAT8, 0.0)
-                   FROM cloud_llm_usage
-                  WHERE used_at > NOW() - INTERVAL '24 hours'",
-        )
-        .fetch_one(pool)
-        .await
-        .ok();
-        let today_cost = today_cost.unwrap_or(0.0);
-        if today_cost >= cap {
-            tracing::warn!(provider = %provider.id, today_cost, cap,
-                    "cloud_llm: budget.daily_usd_cap reached; refusing api_key call");
-            return Some(Err(error_response(
-                StatusCode::PAYMENT_REQUIRED,
-                format!(
-                    "daily budget cap ${:.2} reached (today: ${:.2}); falling back to local LLM. \
-                         Adjust with `ff secrets set budget.daily_usd_cap <usd>` or wait for the 24h window.",
-                    cap, today_cost
-                ),
-                "budget_cap_reached",
-            )));
+            {
+                Ok(cost) => cost.unwrap_or(0.0),
+                Err(e) => {
+                    tracing::error!(provider = %provider.id, error = %e,
+                        "cloud_llm: budget usage query failed; continuing without budget guard");
+                    0.0
+                }
+            };
+
+            if today_cost >= cap {
+                tracing::warn!(provider = %provider.id, today_cost, cap,
+                        "cloud_llm: budget.daily_usd_cap reached; refusing api_key call");
+                return Some(Err(error_response(
+                    StatusCode::PAYMENT_REQUIRED,
+                    format!(
+                        "daily budget cap ${:.2} reached (today: ${:.2}); falling back to local LLM. \
+                             Adjust with `ff secrets set budget.daily_usd_cap <usd>` or wait for the 24h window.",
+                        cap, today_cost
+                    ),
+                    "budget_cap_reached",
+                )));
+            }
         }
     }
 
@@ -200,12 +214,9 @@ pub async fn try_route_to_cloud(
                 )));
             }
             Err(e) => {
-                tracing::warn!(provider = %provider.id, error = %e, "cloud_llm: fetch secret failed");
-                return Some(Err(error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to load credentials for '{}'", provider.id),
-                    "cloud_auth_error",
-                )));
+                tracing::error!(provider = %provider.id, error = %e,
+                    "cloud_llm: credential lookup failed; continuing without cloud routing");
+                return None;
             }
         },
         "local_bridge" => {
@@ -286,7 +297,7 @@ pub async fn try_route_to_cloud(
             tokens_in,
             tokens_out,
         }) => {
-            let _ = record_usage(
+            if let Err(e) = record_usage(
                 pool,
                 &provider.id,
                 model_id,
@@ -295,7 +306,11 @@ pub async fn try_route_to_cloud(
                 session_id,
                 duration_ms,
             )
-            .await;
+            .await
+            {
+                tracing::error!(provider = %provider.id, model = %model_id, error = %e,
+                    "cloud_llm: usage persistence failed; returning LLM response anyway");
+            }
             Some(Ok(ok_response(rb, &provider, status)))
         }
         Ok(CallOutcome::Stream(resp)) => Some(Ok(resp)),
