@@ -1,6 +1,3 @@
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use ff_agent::pr_merge_executor::PrMergeReport;
@@ -26,6 +23,9 @@ use ff_updater::orchestrator::{OrchestratorConfig, RestartSignal, UpdateOrchestr
 use ff_updater::rollback::RollbackConfig;
 use ff_updater::swapper::SwapperConfig;
 use ff_updater::verifier::VerifierConfig;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tracing::{error, info, warn};
