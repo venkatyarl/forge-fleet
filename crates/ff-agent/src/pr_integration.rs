@@ -11,6 +11,13 @@
 //! size, verify-gate result from [`crate::pr_verify`]) and consume this
 //! decision next.
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrationPlan {
+    pub child_branches: Vec<String>,
+    pub pr_numbers: Vec<u32>,
+    pub target_branch: String,
+}
+
 /// What the merge-drain tick should do with a fleet-authored PR.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeDecision {
