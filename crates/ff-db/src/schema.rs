@@ -9397,3 +9397,21 @@ ON CONFLICT (id) DO UPDATE SET
 pub const SCHEMA_V151_COMPUTER_BACKENDS_PATH: &str = r#"
 ALTER TABLE computer_backends ADD COLUMN IF NOT EXISTS path TEXT;
 "#;
+
+// ─── V152: bind Pillar-4 work_items to the repository they target ──────────
+//
+// `ff build --cwd <polyrepo-child>` and `ff pm decompose` used to plan against
+// the project's primary repo and emitted work_items with no repo binding. In a
+// polyrepo project that let the scheduler/sub-agent fall back to the wrong
+// checkout. These columns make the target explicit on every generated task:
+// a project_repos FK when known, the origin URL for clone/identity, and the
+// operator's local repo path when available.
+pub const SCHEMA_V152_WORK_ITEM_REPO_BINDING: &str = r#"
+ALTER TABLE work_items
+    ADD COLUMN IF NOT EXISTS repo_id   UUID REFERENCES project_repos(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS repo_url  TEXT,
+    ADD COLUMN IF NOT EXISTS repo_path TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_work_items_repo_id ON work_items (repo_id);
+CREATE INDEX IF NOT EXISTS idx_work_items_repo_url ON work_items (repo_url);
+"#;

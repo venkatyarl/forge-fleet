@@ -1,6 +1,7 @@
 use crate::{CYAN, GREEN, RESET, YELLOW};
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -9,7 +10,12 @@ struct PlannedTask {
     description: String,
 }
 
-pub async fn handle_build(goal: String, project: Option<String>) -> Result<()> {
+pub async fn handle_build(
+    goal: String,
+    project: Option<String>,
+    cwd: Option<PathBuf>,
+    repo: Option<String>,
+) -> Result<()> {
     let project = project.unwrap_or_else(|| "forge-fleet".to_string());
     let goal = goal.trim().to_string();
     if goal.is_empty() {
@@ -35,8 +41,21 @@ pub async fn handle_build(goal: String, project: Option<String>) -> Result<()> {
         ));
     }
 
-    let planner_prompt = planner_prompt(&goal);
+    let repo_context =
+        crate::repo_context::resolve_repo_context(&pool, &project, cwd, repo.as_deref()).await?;
+    let planner_prompt = planner_prompt(&goal, repo_context.as_ref());
     println!("{CYAN}▶ Decomposing goal for project `{project}`...{RESET}");
+    if let Some(ctx) = &repo_context {
+        println!(
+            "  target repo: {} ({}, {})",
+            ctx.repo_url.as_deref().unwrap_or("unknown"),
+            ctx.repo_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "no local path".to_string()),
+            ctx.primary_language
+        );
+    }
     let plan = ff_agent::fleet_oneshot::fleet_oneshot(
         &pool,
         &planner_prompt,
@@ -65,13 +84,22 @@ pub async fn handle_build(goal: String, project: Option<String>) -> Result<()> {
 
     for task in tasks {
         let id: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO work_items (project_id, kind, title, description, status, created_by) \
-             VALUES ($1, 'task', $2, $3, 'ready', 'ff build') \
+            "INSERT INTO work_items \
+                (project_id, kind, title, description, status, created_by, repo_id, repo_url, repo_path) \
+             VALUES ($1, 'task', $2, $3, 'ready', 'ff build', $4, $5, $6) \
              RETURNING id",
         )
         .bind(&project)
         .bind(&task.title)
         .bind(&task.description)
+        .bind(repo_context.as_ref().and_then(|ctx| ctx.repo_id))
+        .bind(repo_context.as_ref().and_then(|ctx| ctx.repo_url.as_deref()))
+        .bind(
+            repo_context
+                .as_ref()
+                .and_then(|ctx| ctx.repo_path.as_ref())
+                .map(|p| p.to_string_lossy().to_string()),
+        )
         .fetch_one(&pool)
         .await
         .map_err(|e| anyhow!("insert work_item '{}': {e}", task.title))?;
@@ -85,11 +113,19 @@ pub async fn handle_build(goal: String, project: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn planner_prompt(goal: &str) -> String {
+fn planner_prompt(goal: &str, repo_context: Option<&crate::repo_context::RepoContext>) -> String {
+    let repo_block = repo_context
+        .map(|ctx| format!("{}\n", ctx.prompt_block()))
+        .unwrap_or_else(|| {
+            "Target repository context:\n- unknown; infer cautiously from the goal and do not assume forge-fleet.\n\n".to_string()
+        });
     format!(
         "Decompose this software build goal into 1 to 5 concrete leaf tasks.\n\
          Each task must be independently buildable by an autonomous coding agent.\n\
          Prefer small implementation tasks with clear verification scope.\n\
+         Plan against the target repository context below. Do not use the \
+         project's primary repository unless it is the target repository.\n\n\
+         {repo_block}\
          Return ONLY a JSON array of objects in this exact shape:\n\
          [{{\"title\":\"...\",\"description\":\"...\"}}]\n\n\
          Goal:\n{goal}"
@@ -190,5 +226,22 @@ mod tests {
             {"title":"6","description":"d"}
         ]"#;
         assert!(parse_tasks(raw).is_err());
+    }
+
+    #[test]
+    fn planner_prompt_includes_target_repo_context() {
+        let ctx = crate::repo_context::RepoContext {
+            repo_id: None,
+            repo_url: Some("https://github.com/acme/orders".into()),
+            repo_path: Some(std::path::PathBuf::from("/tmp/orders")),
+            primary_language: "Java".into(),
+            build_system: Some("Maven".into()),
+            key_dirs: vec!["src".into()],
+        };
+        let prompt = planner_prompt("add billing", Some(&ctx));
+        assert!(prompt.contains("https://github.com/acme/orders"));
+        assert!(prompt.contains("primary_language: Java"));
+        assert!(prompt.contains("build_system: Maven"));
+        assert!(!prompt.contains("forge-fleet Rust repo"));
     }
 }

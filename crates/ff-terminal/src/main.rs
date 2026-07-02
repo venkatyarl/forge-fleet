@@ -79,6 +79,7 @@ mod pm_cmd;
 mod ports_cmd;
 mod power_cmd;
 mod project_cmd;
+mod repo_context;
 mod research_cmd;
 mod secrets_cmd;
 mod self_heal_cmd;
@@ -306,6 +307,9 @@ enum Command {
         /// Project id to attach the generated work_items to.
         #[arg(long)]
         project: Option<String>,
+        /// Target repo URL or project_repos id. Wins over --cwd.
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Credit-saver: offload a heavy, low-architectural-subtlety task to a
     /// WARM tool-capable local LLM on the fleet (bulk codegen, mechanical
@@ -2979,6 +2983,9 @@ pub enum PmCommand {
         /// LLM endpoint override (else the fleet router picks one).
         #[arg(long)]
         llm: Option<String>,
+        /// Target repo URL or project_repos id. Wins over --cwd.
+        #[arg(long)]
+        repo: Option<String>,
         /// Flag every generated task ready so the scheduler dispatches it now.
         #[arg(long, default_value_t = false)]
         ready: bool,
@@ -4086,9 +4093,21 @@ async fn main() -> Result<()> {
         Some(Command::Openclaw { command }) => {
             return openclaw_cmd::handle_openclaw(command.clone()).await;
         }
-        Some(Command::Pm { command }) => return pm_cmd::handle_pm(command.clone()).await,
-        Some(Command::Build { goal, project }) => {
-            return build_cmd::handle_build(goal.clone(), project.clone()).await;
+        Some(Command::Pm { command }) => {
+            return pm_cmd::handle_pm(command.clone(), cli.cwd.clone()).await;
+        }
+        Some(Command::Build {
+            goal,
+            project,
+            repo,
+        }) => {
+            return build_cmd::handle_build(
+                goal.clone(),
+                project.clone(),
+                cli.cwd.clone(),
+                repo.clone(),
+            )
+            .await;
         }
         Some(Command::Agent { command }) => return agent_cmd::handle_agent(command.clone()).await,
         Some(Command::Project { command }) => {
@@ -4192,6 +4211,7 @@ async fn main() -> Result<()> {
     }
     let working_dir = cli
         .cwd
+        .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
 
     #[allow(unused_mut)]
@@ -4332,7 +4352,11 @@ async fn main() -> Result<()> {
             rounds,
             no_backstop,
         }) => codegen_cmd::handle_codegen(task, repo, model, rounds, no_backstop).await,
-        Some(Command::Build { goal, project }) => build_cmd::handle_build(goal, project).await,
+        Some(Command::Build {
+            goal,
+            project,
+            repo,
+        }) => build_cmd::handle_build(goal, project, cli.cwd.clone(), repo).await,
         Some(Command::Offload {
             prompt,
             output,
@@ -4405,7 +4429,7 @@ async fn main() -> Result<()> {
         Some(Command::Memory { command }) => memory_cmd::handle_memory(command).await,
         Some(Command::Cortex(args)) => top_cortex_cmd::handle_top_cortex(args).await,
         Some(Command::Openclaw { command }) => openclaw_cmd::handle_openclaw(command).await,
-        Some(Command::Pm { command }) => pm_cmd::handle_pm(command).await,
+        Some(Command::Pm { command }) => pm_cmd::handle_pm(command, cli.cwd.clone()).await,
         Some(Command::Agent { command }) => agent_cmd::handle_agent(command).await,
         Some(Command::Project { command }) => project_cmd::handle_project(command).await,
         // V119 resource arbiter (backlog #7). Handlers open the pool via

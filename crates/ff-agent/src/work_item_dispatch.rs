@@ -70,6 +70,8 @@ struct AssignedWorkItem {
     title: String,
     description: Option<String>,
     base_branch: Option<String>,
+    repo_id: Option<Uuid>,
+    repo_url: Option<String>,
     repo_path: PathBuf,
     sub_agent_id: Uuid,
     computer_id: Uuid,
@@ -192,6 +194,32 @@ fn expand_tilde(p: &str) -> String {
     p.to_string()
 }
 
+fn default_clone_path(project_id: &str, repo_url: &str) -> PathBuf {
+    let slug_source = repo_url
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .rsplit_once('/')
+        .map(|(_, tail)| tail)
+        .unwrap_or(repo_url);
+    let slug: String = slug_source
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-');
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".forgefleet")
+        .join("project-repos")
+        .join(project_id)
+        .join(if slug.is_empty() { "repo" } else { slug })
+}
+
 async fn assigned_work_items(
     pg: &PgPool,
     worker_name: &str,
@@ -207,18 +235,16 @@ async fn assigned_work_items(
             w.title,
             w.description,
             w.base_branch,
-            -- Build path resolution (per-project, V141 project_folders): an
-            -- explicit metadata override wins; else this project's local folder
-            -- on THIS host (host-specific row preferred, then a canonical
-            -- computer_id-NULL row); else the host's source_tree_path (correct
-            -- only for forge-fleet itself); else the daemon's cwd. Without the
-            -- project_folders lookup a non-forge-fleet work_item (e.g. a
-            -- hireflow360 port) worktree'd against the host's forge-fleet tree —
-            -- the wrong repo (operator-reported 2026-06-20). forge-fleet has no
-            -- project_folders rows, so it still falls through to source_tree_path
-            -- exactly as before (backward-compatible).
+            w.repo_id,
+            COALESCE(NULLIF(w.repo_url, ''), NULLIF(wr.github_url, '')) AS repo_url,
+            NULLIF(w.repo_path, '') AS bound_repo_path,
+            NULLIF(w.metadata->>'repo_path', '') AS metadata_repo_path,
+            -- Legacy/default path resolution (per-project, V141 project_folders):
+            -- explicit work_items.repo_path wins in Rust below; else historical
+            -- metadata override; else this project's local folder on THIS host
+            -- (host-specific row preferred, then canonical computer_id-NULL);
+            -- else host source_tree_path; else daemon cwd.
             COALESCE(
-                NULLIF(w.metadata->>'repo_path', ''),
                 (SELECT pf.path
                    FROM project_folders pf
                   WHERE pf.project_id = w.project_id
@@ -231,13 +257,14 @@ async fn assigned_work_items(
                   LIMIT 1),
                 NULLIF(c.source_tree_path, ''),
                 $2
-            ) AS repo_path,
+            ) AS fallback_repo_path,
             sa.id AS sub_agent_id,
             sa.computer_id,
             sa.slot
           FROM sub_agents sa
           JOIN computers c ON c.id = sa.computer_id
           JOIN work_items w ON w.id = sa.current_work_item_id
+          LEFT JOIN project_repos wr ON wr.id = w.repo_id
           JOIN work_item_leases l
             ON l.work_item_id = w.id
            AND l.sub_agent_id = sa.id
@@ -264,13 +291,37 @@ async fn assigned_work_items(
 
     rows.into_iter()
         .map(|r| {
+            let repo_url: Option<String> = r.try_get("repo_url").ok().flatten();
+            let bound_repo_path: Option<PathBuf> = r
+                .try_get::<Option<String>, _>("bound_repo_path")
+                .ok()
+                .flatten()
+                .map(|p| PathBuf::from(expand_tilde(&p)));
+            let metadata_repo_path: Option<PathBuf> = r
+                .try_get::<Option<String>, _>("metadata_repo_path")
+                .ok()
+                .flatten()
+                .map(|p| PathBuf::from(expand_tilde(&p)));
+            let fallback_repo_path: String = r.get("fallback_repo_path");
+            let local_bound_path = bound_repo_path.as_ref().filter(|p| p.exists()).cloned();
+            let repo_path = local_bound_path
+                .or(metadata_repo_path)
+                .or_else(|| {
+                    repo_url
+                        .as_deref()
+                        .map(|url| default_clone_path(&r.get::<String, _>("project_id"), url))
+                })
+                .or(bound_repo_path)
+                .unwrap_or_else(|| PathBuf::from(fallback_repo_path));
             Ok(AssignedWorkItem {
                 work_item_id: r.get("work_item_id"),
                 project_id: r.get("project_id"),
                 title: r.get("title"),
                 description: r.try_get("description").ok().flatten(),
                 base_branch: r.try_get("base_branch").ok().flatten(),
-                repo_path: PathBuf::from(expand_tilde(&r.get::<String, _>("repo_path"))),
+                repo_id: r.try_get("repo_id").ok().flatten(),
+                repo_url,
+                repo_path,
                 sub_agent_id: r.get("sub_agent_id"),
                 computer_id: r.get("computer_id"),
                 slot: r.get("slot"),
@@ -284,24 +335,44 @@ async fn ensure_repo_checked_out(pg: &PgPool, item: &AssignedWorkItem) -> Result
         return Ok(());
     }
 
-    let github_url: Option<String> = sqlx::query_scalar(
-        "SELECT github_url
-           FROM project_repos
-          WHERE project_id = $1
-            AND is_primary = TRUE
-            AND NULLIF(github_url, '') IS NOT NULL
-          LIMIT 1",
-    )
-    .bind(&item.project_id)
-    .fetch_optional(pg)
-    .await
-    .with_context(|| format!("lookup primary repo for project {}", item.project_id))?;
+    let github_url = if item
+        .repo_url
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        item.repo_url.clone()
+    } else if let Some(repo_id) = item.repo_id {
+        sqlx::query_scalar(
+            "SELECT github_url
+               FROM project_repos
+              WHERE id = $1
+                AND NULLIF(github_url, '') IS NOT NULL
+              LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_optional(pg)
+        .await
+        .with_context(|| format!("lookup repo {repo_id} for work_item {}", item.work_item_id))?
+    } else {
+        sqlx::query_scalar(
+            "SELECT github_url
+               FROM project_repos
+              WHERE project_id = $1
+                AND is_primary = TRUE
+                AND NULLIF(github_url, '') IS NOT NULL
+              LIMIT 1",
+        )
+        .bind(&item.project_id)
+        .fetch_optional(pg)
+        .await
+        .with_context(|| format!("lookup primary repo for project {}", item.project_id))?
+    };
 
     let github_url = github_url.ok_or_else(|| {
         anyhow!(
-            "repo path {} is not a git repo and project {} has no primary project_repos github_url",
+            "repo path {} is not a git repo and work_item {} has no repo_url/project repo to clone",
             item.repo_path.display(),
-            item.project_id
+            item.work_item_id
         )
     })?;
 
@@ -846,10 +917,17 @@ async fn mark_worktree_cleaned(pg: &PgPool, work_item_id: Uuid) -> Result<()> {
 
 /// The prompt the dispatch sends to the agent for a work_item.
 fn dispatch_prompt(item: &AssignedWorkItem) -> String {
-    match item.description.as_deref() {
+    let task = match item.description.as_deref() {
         Some(desc) if !desc.trim().is_empty() => format!("{}\n\n{}", item.title, desc.trim()),
         _ => item.title.clone(),
-    }
+    };
+    format!(
+        "Target repo:\n- project_id: {}\n- repo_url: {}\n- checkout: {}\n\n{}",
+        item.project_id,
+        item.repo_url.as_deref().unwrap_or("unknown"),
+        item.repo_path.display(),
+        task
+    )
 }
 
 /// Parse the token count a vendor CLI reports in its output so the training

@@ -738,6 +738,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "computer_backends_path",
         sql: schema::SCHEMA_V151_COMPUTER_BACKENDS_PATH,
     },
+    PgMigration {
+        version: 152,
+        name: "work_item_repo_binding",
+        sql: schema::SCHEMA_V152_WORK_ITEM_REPO_BINDING,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

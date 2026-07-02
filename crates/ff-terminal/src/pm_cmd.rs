@@ -2,7 +2,7 @@ use crate::{CYAN, GREEN, RED, RESET, YELLOW};
 use anyhow::Result;
 use std::path::PathBuf;
 
-pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
+pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
         .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
@@ -117,10 +117,11 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
             goal,
             project,
             llm,
+            repo,
             ready,
             max,
         } => {
-            handle_pm_decompose(&pool, goal, project, llm, ready, max).await?;
+            handle_pm_decompose(&pool, goal, project, llm, repo, cwd, ready, max).await?;
         }
         crate::PmCommand::Ready { id, on } => {
             let uid = uuid::Uuid::parse_str(&id)
@@ -176,9 +177,11 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
                 Option<String>,
                 Option<String>,
                 Option<String>,
+                Option<String>,
+                Option<String>,
             )> = sqlx::query_as(
                 "SELECT w.kind, w.title, w.status, w.assigned_computer, lc.name AS live_host, \
-                        wt.status AS worktree, mq.status AS merge_q, w.pr_url \
+                        wt.status AS worktree, mq.status AS merge_q, w.pr_url, w.repo_url, w.repo_path \
                    FROM work_items w \
                    LEFT JOIN work_item_worktrees wt \
                           ON wt.work_item_id = w.id AND wt.status <> 'cleaned' \
@@ -201,10 +204,22 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{CYAN}{:<8} {:<34} {:<11} {:<8} {:<11} {}{RESET}",
-                "KIND", "TITLE", "STATUS", "HOST", "MERGE-Q", "PR"
+                "{CYAN}{:<8} {:<34} {:<11} {:<8} {:<11} {:<18} PR{RESET}",
+                "KIND", "TITLE", "STATUS", "HOST", "MERGE-Q", "REPO"
             );
-            for (kind, title, status, assigned_host, live_host, _worktree, merge_q, pr) in rows {
+            for (
+                kind,
+                title,
+                status,
+                assigned_host,
+                live_host,
+                _worktree,
+                merge_q,
+                pr,
+                repo_url,
+                repo_path,
+            ) in rows
+            {
                 let t: String = title.chars().take(33).collect();
                 let pr_short = pr
                     .as_deref()
@@ -217,13 +232,19 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
                     Some(h) => format!("{h}\u{25cf}"),
                     None => assigned_host.unwrap_or_default(),
                 };
+                let repo_hint = repo_path
+                    .as_deref()
+                    .or(repo_url.as_deref())
+                    .and_then(|s| s.rsplit('/').next())
+                    .unwrap_or("");
                 println!(
-                    "{:<8} {:<34} {:<11} {:<8} {:<11} {}",
+                    "{:<8} {:<34} {:<11} {:<8} {:<11} {:<18} {}",
                     kind,
                     t,
                     status,
                     host,
                     merge_q.unwrap_or_default(),
+                    repo_hint,
                     pr_short
                 );
             }
@@ -323,9 +344,12 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
                 Option<String>,
                 String,
                 chrono::DateTime<chrono::Utc>,
+                Option<uuid::Uuid>,
+                Option<String>,
+                Option<String>,
             )> = sqlx::query_as(
                 "SELECT id, project_id, kind, title, description, status, priority, \
-                        assigned_to, assigned_computer, created_by, created_at \
+                        assigned_to, assigned_computer, created_by, created_at, repo_id, repo_url, repo_path \
                  FROM work_items WHERE id = $1",
             )
             .bind(uid)
@@ -345,6 +369,9 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
                 computer,
                 created_by,
                 created_at,
+                repo_id,
+                repo_url,
+                repo_path,
             )) = row
             else {
                 return Err(anyhow::anyhow!("work item {uid} not found"));
@@ -361,6 +388,12 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
             println!("  priority:     {prio}");
             println!("  assigned_to:  {}", asgn.as_deref().unwrap_or("-"));
             println!("  computer:     {}", computer.as_deref().unwrap_or("-"));
+            println!(
+                "  repo_id:      {}",
+                repo_id.map(|id| id.to_string()).as_deref().unwrap_or("-")
+            );
+            println!("  repo_url:     {}", repo_url.as_deref().unwrap_or("-"));
+            println!("  repo_path:    {}", repo_path.as_deref().unwrap_or("-"));
             println!("  created_by:   {created_by}");
             println!(
                 "  created_at:   {}",
@@ -579,41 +612,82 @@ async fn handle_pm_decompose(
     goal: String,
     project: String,
     llm: Option<String>,
+    repo: Option<String>,
+    cwd: Option<PathBuf>,
     ready: bool,
     max: usize,
 ) -> Result<()> {
     // If `goal` is a work_item UUID, decompose ITS title+description; else treat
     // the string itself as the goal. When it's an existing item, the children
     // hang off it via parent_id.
-    let (parent_id, goal_text): (Option<uuid::Uuid>, String) =
-        match uuid::Uuid::parse_str(goal.trim()) {
-            Ok(uid) => {
-                let row: Option<(String, Option<String>)> =
-                    sqlx::query_as("SELECT title, description FROM work_items WHERE id = $1")
+    let (parent_id, goal_text, parent_repo): (
+        Option<uuid::Uuid>,
+        String,
+        Option<crate::repo_context::RepoContext>,
+    ) = match uuid::Uuid::parse_str(goal.trim()) {
+        Ok(uid) => {
+            let row: Option<(
+                    String,
+                    Option<String>,
+                    Option<uuid::Uuid>,
+                    Option<String>,
+                    Option<String>,
+                )> =
+                    sqlx::query_as(
+                        "SELECT title, description, repo_id, repo_url, repo_path FROM work_items WHERE id = $1",
+                    )
                         .bind(uid)
                         .fetch_optional(pool)
                         .await
                         .map_err(|e| anyhow::anyhow!("load work item {uid}: {e}"))?;
-                match row {
-                    Some((title, desc)) => (
-                        Some(uid),
-                        format!("{title}\n\n{}", desc.unwrap_or_default()),
-                    ),
-                    None => return Err(anyhow::anyhow!("no work item with id {goal}")),
-                }
+            match row {
+                Some((title, desc, repo_id, repo_url, repo_path)) => (
+                    Some(uid),
+                    format!("{title}\n\n{}", desc.unwrap_or_default()),
+                    repo_context_from_binding(repo_id, repo_url, repo_path),
+                ),
+                None => return Err(anyhow::anyhow!("no work item with id {goal}")),
             }
-            Err(_) => (None, goal.clone()),
-        };
+        }
+        Err(_) => (None, goal.clone(), None),
+    };
+
+    let repo_context = if repo.is_none() && cwd.is_none() && parent_repo.is_some() {
+        parent_repo
+    } else {
+        crate::repo_context::resolve_repo_context(pool, &project, cwd, repo.as_deref()).await?
+    };
 
     println!("{CYAN}▶ decomposing goal via fleet LLM…{RESET}");
+    if let Some(ctx) = &repo_context {
+        println!(
+            "  target repo: {} ({}, {})",
+            ctx.repo_url.as_deref().unwrap_or("unknown"),
+            ctx.repo_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "no local path".to_string()),
+            ctx.primary_language
+        );
+    }
+    let repo_block = repo_context
+        .as_ref()
+        .map(|ctx| format!("{}\n", ctx.prompt_block()))
+        .unwrap_or_else(|| {
+            "Target repository context:\n- unknown; infer cautiously from the goal and do not assume forge-fleet.\n\n".to_string()
+        });
     let prompt = format!(
         "You are a senior engineer breaking a goal into independent, well-scoped \
-         LEAF coding tasks for the forge-fleet Rust repo. Each task must be doable \
+         LEAF coding tasks for the target repository. Each task must be doable \
          on its own by a coding agent and touch a small, specific set of files. \
+         Plan against the target repository context below. Do not use the \
+         project's primary repository unless it is the target repository.\n\n\
+         {repo_block}\
          Output ONLY a JSON array (no prose, no markdown fence) of at most {max} \
          objects, each: {{\"title\": \"<imperative, <70 chars>\", \"description\": \
          \"<precise instructions: which file(s), what to add/change, mirror an \
-         existing pattern; end with: Do NOT run cargo; just write the code>\"}}. \
+         existing pattern; name the correct test/build command for this repo \
+         when useful>\"}}. \
          GOAL:\n{goal_text}"
     );
 
@@ -656,18 +730,16 @@ async fn handle_pm_decompose(
     );
     let mut ids = Vec::new();
     for t in tasks.into_iter().take(max) {
-        let row: (uuid::Uuid,) = sqlx::query_as(
-            "INSERT INTO work_items (project_id, kind, title, description, priority, created_by, parent_id) \
-             VALUES ($1, 'task', $2, $3, 'normal', $4, $5) RETURNING id",
+        let row = insert_decomposed_work_item(
+            pool,
+            &project,
+            &t.title,
+            &t.description,
+            &created_by,
+            parent_id,
+            repo_context.as_ref(),
         )
-        .bind(&project)
-        .bind(&t.title)
-        .bind(&t.description)
-        .bind(&created_by)
-        .bind(parent_id)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("insert child task: {e}"))?;
+        .await?;
         ids.push(row.0);
         println!("  + {} {}", row.0, t.title);
     }
@@ -690,6 +762,69 @@ async fn handle_pm_decompose(
         );
     }
     Ok(())
+}
+
+fn repo_context_from_binding(
+    repo_id: Option<uuid::Uuid>,
+    repo_url: Option<String>,
+    repo_path: Option<String>,
+) -> Option<crate::repo_context::RepoContext> {
+    if repo_id.is_none() && repo_url.is_none() && repo_path.is_none() {
+        return None;
+    }
+    let repo_path = repo_path.map(PathBuf::from);
+    let mut ctx = repo_path
+        .as_deref()
+        .and_then(|p| crate::repo_context::detect_repo_from_cwd(p).ok())
+        .unwrap_or_else(|| crate::repo_context::RepoContext {
+            repo_id: None,
+            repo_url: None,
+            repo_path: repo_path.clone(),
+            primary_language: "unknown".to_string(),
+            build_system: None,
+            key_dirs: Vec::new(),
+        });
+    ctx.repo_id = repo_id;
+    if repo_url.is_some() {
+        ctx.repo_url = repo_url;
+    }
+    if repo_path.is_some() {
+        ctx.repo_path = repo_path;
+    }
+    Some(ctx)
+}
+
+async fn insert_decomposed_work_item(
+    pool: &sqlx::PgPool,
+    project: &str,
+    title: &str,
+    description: &str,
+    created_by: &str,
+    parent_id: Option<uuid::Uuid>,
+    repo_context: Option<&crate::repo_context::RepoContext>,
+) -> Result<(uuid::Uuid,)> {
+    sqlx::query_as(decomposed_work_item_insert_sql())
+        .bind(project)
+        .bind(title)
+        .bind(description)
+        .bind(created_by)
+        .bind(parent_id)
+        .bind(repo_context.and_then(|ctx| ctx.repo_id))
+        .bind(repo_context.and_then(|ctx| ctx.repo_url.as_deref()))
+        .bind(
+            repo_context
+                .and_then(|ctx| ctx.repo_path.as_ref())
+                .map(|p| p.to_string_lossy().to_string()),
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("insert child task: {e}"))
+}
+
+fn decomposed_work_item_insert_sql() -> &'static str {
+    "INSERT INTO work_items \
+        (project_id, kind, title, description, priority, created_by, parent_id, repo_id, repo_url, repo_path) \
+     VALUES ($1, 'task', $2, $3, 'normal', $4, $5, $6, $7, $8) RETURNING id"
 }
 
 pub async fn handle_pm_import_claude_tasks(
@@ -1164,6 +1299,15 @@ async fn handle_pm_purge(
 mod tests {
     use super::*;
 
+    #[test]
+    fn decomposed_work_item_insert_persists_repo_binding() {
+        let sql = decomposed_work_item_insert_sql();
+        assert!(sql.contains("repo_id"));
+        assert!(sql.contains("repo_url"));
+        assert!(sql.contains("repo_path"));
+        assert!(sql.contains("$6, $7, $8"));
+    }
+
     fn sample() -> PmStats {
         PmStats {
             total: 870,
@@ -1254,5 +1398,14 @@ mod tests {
         assert!(validate_purge_request(None, Some("ready"), None, None).is_err());
         // A purgeable status passes.
         assert!(validate_purge_request(None, Some("idea"), None, None).is_ok());
+    }
+
+    #[test]
+    fn decompose_insert_persists_repo_binding_columns() {
+        let sql = decomposed_work_item_insert_sql();
+        assert!(sql.contains("repo_id"));
+        assert!(sql.contains("repo_url"));
+        assert!(sql.contains("repo_path"));
+        assert!(sql.contains("$6, $7, $8"));
     }
 }
