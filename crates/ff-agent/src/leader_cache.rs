@@ -5,8 +5,8 @@
 //! ticks use the atomic bit here so a skip path is a local memory read instead
 //! of a Postgres query.
 
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
 use ff_db::leader_state::LeaderState;
@@ -75,9 +75,7 @@ impl LeaderCache {
     }
 
     pub fn global() -> SharedLeaderCache {
-        GLOBAL_LEADER_CACHE
-            .get_or_init(Self::shared)
-            .clone()
+        GLOBAL_LEADER_CACHE.get_or_init(Self::shared).clone()
     }
 
     pub async fn update_state(&self, is_current_leader: bool, info: LeaderInfo) {

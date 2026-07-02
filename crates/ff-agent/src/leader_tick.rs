@@ -474,11 +474,8 @@ impl LeaderTick {
                 .await?;
                 if claimed {
                     (self.on_became_leader)(None);
-                    self.update_leader_cache(
-                        true,
-                        self.self_leader_info(new_epoch, "initial"),
-                    )
-                    .await;
+                    self.update_leader_cache(true, self.self_leader_info(new_epoch, "initial"))
+                        .await;
                     Ok(TickOutcome::BecameLeader)
                 } else {
                     // Someone else won the race — we'll see them next tick.
@@ -572,7 +569,8 @@ impl LeaderTick {
                         .await;
                         Ok(TickOutcome::TookOver(displaced_name))
                     } else {
-                        self.update_leader_cache(false, LeaderInfo::from(&cur)).await;
+                        self.update_leader_cache(false, LeaderInfo::from(&cur))
+                            .await;
                         Ok(TickOutcome::NoOp)
                     }
                 } else if pulse_silent_long_enough && i_am_best && !stale {
@@ -610,11 +608,13 @@ impl LeaderTick {
                         .await;
                         Ok(TickOutcome::TookOver(displaced_name))
                     } else {
-                        self.update_leader_cache(false, LeaderInfo::from(&cur)).await;
+                        self.update_leader_cache(false, LeaderInfo::from(&cur))
+                            .await;
                         Ok(TickOutcome::NoOp)
                     }
                 } else {
-                    self.update_leader_cache(false, LeaderInfo::from(&cur)).await;
+                    self.update_leader_cache(false, LeaderInfo::from(&cur))
+                        .await;
                     Ok(TickOutcome::NoOp)
                 }
             }
@@ -622,7 +622,8 @@ impl LeaderTick {
             // Someone else is leader and no peer is alive in Pulse —
             // without evidence that we are the right taker, do nothing.
             (Some(cur), None) => {
-                self.update_leader_cache(false, LeaderInfo::from(&cur)).await;
+                self.update_leader_cache(false, LeaderInfo::from(&cur))
+                    .await;
                 Ok(TickOutcome::NoOp)
             }
         }
