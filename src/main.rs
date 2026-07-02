@@ -1122,7 +1122,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
             "disk-sampler",
             std::time::Duration::from_secs(300),
             shutdown_rx.clone(),
-            move || {
+            move |_run| {
                 let pg_pool = pg_pool.clone();
                 async move {
                     match ff_agent::disk_sampler::sample_local_disk(&pg_pool).await {
