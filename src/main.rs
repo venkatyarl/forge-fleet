@@ -1136,7 +1136,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                         Err(e) => warn!(error = %e, "disk sampler failed"),
                     }
                 }
-            }
+            },
         ));
     }
 
