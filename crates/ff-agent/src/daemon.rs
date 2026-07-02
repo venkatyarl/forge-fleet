@@ -124,7 +124,10 @@ impl PanicIsolatingWrapper {
         pg: PgPool,
         worker_name: String,
     ) {
-        match AssertUnwindSafe(runner(pg, worker_name)).catch_unwind().await {
+        match AssertUnwindSafe(runner(pg, worker_name))
+            .catch_unwind()
+            .await
+        {
             Ok(Ok(())) => {}
             Ok(Err(err)) => warn!(tick = name, error = %err, "daemon tick failed"),
             Err(panic) => {
@@ -151,7 +154,11 @@ fn run_work_item_scheduler_tick(
     pg: PgPool,
     _worker_name: String,
 ) -> BoxFuture<'static, Result<()>> {
-    Box::pin(async move { crate::work_item_scheduler::evaluate_work_items(&pg).await.map(|_| ()) })
+    Box::pin(async move {
+        crate::work_item_scheduler::evaluate_work_items(&pg)
+            .await
+            .map(|_| ())
+    })
 }
 
 pub fn start_tick_scheduler(
