@@ -1664,6 +1664,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_tokens_used_with_spaces_and_large_comma_number() {
+        assert_eq!(parse_cli_tokens("tokens used  1,234,567"), 1234567);
+    }
+
+    #[test]
+    fn parses_uppercase_tokens_used_followed_by_zero() {
+        assert_eq!(parse_cli_tokens("TOKENS USED\n0"), 0);
+    }
+
+    #[test]
+    fn prefers_tokens_used_marker_over_earlier_used_number() {
+        assert_eq!(parse_cli_tokens("used 5 tokens then tokens used\n99"), 99);
+    }
+
+    #[test]
     fn parses_inline_tokens_variants() {
         assert_eq!(parse_cli_tokens("Total tokens: 1234"), 1234);
         assert_eq!(parse_cli_tokens("done. tokens: 42"), 42);
