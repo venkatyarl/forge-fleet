@@ -548,6 +548,18 @@ mod tests {
     }
 
     #[test]
+    fn gemini_overloaded_is_overloaded() {
+        let c = classify("gemini", None, "503 UNAVAILABLE: overloaded");
+        assert_eq!(c, CloudErrorClass::Overloaded);
+    }
+
+    #[test]
+    fn gemini_requests_per_day_is_quota() {
+        let c = classify("gemini", None, "429 RESOURCE_EXHAUSTED requests per day");
+        assert_eq!(c, CloudErrorClass::QuotaExhausted);
+    }
+
+    #[test]
     fn openai_429_quota_is_quota_not_ratelimit() {
         let c = classify(
             "codex",
@@ -611,6 +623,12 @@ mod tests {
     }
 
     #[test]
+    fn grok_invalid_api_key_is_auth() {
+        let c = classify("grok", Some(1), "401 invalid_api_key");
+        assert_eq!(c, CloudErrorClass::Unauthenticated);
+    }
+
+    #[test]
     fn gemini_504_is_timeout() {
         let c = classify(
             "gemini",
@@ -658,6 +676,12 @@ mod tests {
             Some(1),
             "404 model not found: grok-2 is deprecated, migrate to grok-4.3",
         );
+        assert_eq!(c, CloudErrorClass::ModelNotFound);
+    }
+
+    #[test]
+    fn grok_deprecated_model_is_not_found() {
+        let c = classify("grok", Some(1), "404 model not found grok-2 deprecated");
         assert_eq!(c, CloudErrorClass::ModelNotFound);
     }
 
