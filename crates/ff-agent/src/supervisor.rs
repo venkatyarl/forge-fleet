@@ -329,6 +329,9 @@ fn print_event_stderr(ev: &AgentEvent) {
         AgentEvent::Status { message, .. } => {
             eprintln!("    {DIM}· {message}{RESET}");
         }
+        AgentEvent::System { message, .. } => {
+            eprintln!("    {YELLOW}note:{RESET} {message}");
+        }
         AgentEvent::AssistantText { text, .. } => {
             let preview = truncate_chars(text.trim(), 200);
             if !preview.is_empty() {

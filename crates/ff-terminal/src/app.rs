@@ -407,6 +407,10 @@ impl App {
                 tab.status = message.clone();
                 tab.last_activity = message.clone();
             }
+            AgentEvent::System { message, .. } => {
+                tab.status = message.clone();
+                tab.last_activity = message.clone();
+            }
             AgentEvent::ToolStart { tool_name, .. } => {
                 tab.last_activity = format!("Running tool: {tool_name}");
             }

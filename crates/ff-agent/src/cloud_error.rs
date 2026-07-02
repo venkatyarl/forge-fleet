@@ -76,6 +76,37 @@ pub enum ErrorAction {
     Terminal,
 }
 
+/// Raw cloud-provider failure details suitable for classification.
+#[derive(Debug, Clone)]
+pub struct CloudError {
+    pub provider: String,
+    pub exit_code: Option<i32>,
+    pub output: String,
+}
+
+impl std::fmt::Display for CloudError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.exit_code {
+            Some(code) => write!(
+                f,
+                "{} cloud error (exit {code}): {}",
+                self.provider, self.output
+            ),
+            None => write!(f, "{} cloud error: {}", self.provider, self.output),
+        }
+    }
+}
+
+impl std::error::Error for CloudError {}
+
+/// Operator-facing classification summary for a cloud-provider failure.
+#[derive(Debug, Clone)]
+pub struct ClassifiedCloudError {
+    pub class: CloudErrorClass,
+    pub action: ErrorAction,
+    pub friendly_message: String,
+}
+
 impl CloudErrorClass {
     /// Whether this class is worth retrying on the *same* backend before
     /// considering a provider switch.
@@ -131,6 +162,95 @@ impl CloudErrorClass {
             Self::Network => "network",
             Self::Unknown => "unknown",
         }
+    }
+}
+
+/// Classify a cloud-provider failure and return an operator-friendly status.
+pub fn classify_cloud_error(err: &CloudError) -> ClassifiedCloudError {
+    let class = classify(&err.provider, err.exit_code, &err.output);
+    let action = class.action();
+    let friendly_message = match class {
+        CloudErrorClass::Overloaded => {
+            format!(
+                "{} is temporarily overloaded. ForgeFleet will retry or switch providers.",
+                err.provider
+            )
+        }
+        CloudErrorClass::RateLimited => {
+            format!(
+                "{} is rate-limiting requests. ForgeFleet will back off before continuing.",
+                err.provider
+            )
+        }
+        CloudErrorClass::QuotaExhausted => {
+            format!(
+                "{} quota or credits are exhausted. Switch providers or update billing.",
+                err.provider
+            )
+        }
+        CloudErrorClass::Unauthenticated => {
+            format!(
+                "{} is not authenticated. Re-authenticate that CLI before using this backend.",
+                err.provider
+            )
+        }
+        CloudErrorClass::Forbidden => {
+            format!(
+                "{} rejected the request due to permissions or account policy.",
+                err.provider
+            )
+        }
+        CloudErrorClass::ContextTooLong => {
+            format!(
+                "The prompt is too large for {}. Compact or reduce context before retrying.",
+                err.provider
+            )
+        }
+        CloudErrorClass::Timeout => {
+            format!(
+                "{} timed out. ForgeFleet will retry or switch providers if it persists.",
+                err.provider
+            )
+        }
+        CloudErrorClass::Transient5xx => {
+            format!(
+                "{} returned a temporary server error. Retry or switch providers if it persists.",
+                err.provider
+            )
+        }
+        CloudErrorClass::ModelNotFound => {
+            format!(
+                "{} could not find or access the requested model. Pick another model/backend.",
+                err.provider
+            )
+        }
+        CloudErrorClass::BadRequest => {
+            format!(
+                "{} rejected the request as invalid. Check the generated prompt or backend arguments.",
+                err.provider
+            )
+        }
+        CloudErrorClass::ContentFiltered => {
+            format!(
+                "{} blocked the response with a content filter.",
+                err.provider
+            )
+        }
+        CloudErrorClass::Network => {
+            format!(
+                "Network connectivity to {} failed. Check connectivity or retry.",
+                err.provider
+            )
+        }
+        CloudErrorClass::Unknown => {
+            format!("{} failed with an unclassified cloud error.", err.provider)
+        }
+    };
+
+    ClassifiedCloudError {
+        class,
+        action,
+        friendly_message,
     }
 }
 
