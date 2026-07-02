@@ -4451,6 +4451,31 @@ fn clean_version_line(out: &str) -> String {
 /// `ff model free-for-build` first and a 45-min timeout. After restart we read
 /// each host's RUNNING forgefleetd SHA and report per-host ok/fail + SHA +
 /// duration, then a convergence summary.
+/// Stamp/clear the presence-alert mute window
+/// (`fleet_secrets.alert_mute_until`, epoch seconds). While `NOW()` is inside
+/// the stamp, the leader's alert evaluator skips beat-age/heartbeat/status
+/// policies, so a deploy's daemon restarts don't fire a member_stale_beat per
+/// host. Best-effort: a failed stamp only means alerts stay live (the old
+/// behaviour), never a blocked deploy.
+async fn set_alert_mute(pool: &sqlx::PgPool, secs_from_now: i64) {
+    if let Err(e) = sqlx::query(
+        "INSERT INTO fleet_secrets (key, value, updated_by, updated_at)
+         VALUES ('alert_mute_until',
+                 (EXTRACT(EPOCH FROM NOW())::BIGINT + $1)::TEXT,
+                 'ff fleet deploy', NOW())
+         ON CONFLICT (key) DO UPDATE
+            SET value = EXCLUDED.value,
+                updated_by = EXCLUDED.updated_by,
+                updated_at = NOW()",
+    )
+    .bind(secs_from_now)
+    .execute(pool)
+    .await
+    {
+        eprintln!("{YELLOW}⚠ alert-mute stamp failed (alerts stay live): {e}{RESET}");
+    }
+}
+
 async fn handle_fleet_deploy(
     pool: &sqlx::PgPool,
     all: bool,
@@ -4607,6 +4632,14 @@ async fn handle_fleet_deploy(
         report_skipped_hosts(&skipped);
     }
 
+    // Mute presence alerts for the deploy window: every target's forgefleetd
+    // restarts during the rollout, so beat ages legitimately exceed the stale
+    // threshold and the evaluator would spam one member_stale_beat per host
+    // (operator-reported 2026-07-01). 50min covers the worst case (45min
+    // memory-tight build timeout); cleared on completion below, auto-expires
+    // if this process dies mid-deploy.
+    set_alert_mute(pool, 50 * 60).await;
+
     // Drive the deploys with bounded concurrency: keep at most `concurrency`
     // hosts building at once, refilling as each completes.
     let mut iter = targets.into_iter();
@@ -4635,6 +4668,10 @@ async fn handle_fleet_deploy(
         }
     }
     results.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Deploys done (daemons restarted + beating again) — lift the presence-
+    // alert mute rather than letting the 50min stamp ride out.
+    set_alert_mute(pool, 0).await;
 
     // Convergence target = the most-common SHA among successful hosts.
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();

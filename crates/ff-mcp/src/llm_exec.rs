@@ -86,10 +86,7 @@ impl GatewayLlmExec {
             // stable leader, not a node whose per-slot config drifts: the old
             // value (lily:55001 deepseek) went dead when lily's config changed
             // and caused "single dispatch failed: POST …:55001".
-            2 => (
-                "http://192.168.5.100:55001".into(),
-                "qwen36-35b-a3b".into(),
-            ),
+            2 => ("http://192.168.5.100:55001".into(), "qwen36-35b-a3b".into()),
             _ => (
                 "http://192.168.5.100:55001".into(),
                 "/Users/venkat/models/qwen36-35b-a3b".into(),
@@ -365,8 +362,9 @@ mod tests {
 
     #[test]
     fn tier_1_prefers_code() {
+        // Leads with the catalog's real code tag (`code-gen`), not legacy `code`.
         let tags = GatewayLlmExec::workload_tags_for_tier(1);
-        assert_eq!(tags[0], "code");
+        assert_eq!(tags[0], "code-gen");
     }
 
     #[test]
