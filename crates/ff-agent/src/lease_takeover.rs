@@ -12,13 +12,19 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 const STALE_HEARTBEAT_SECS: i64 = 5 * 60;
+/// Failure-convergence ceiling — must match `work_item_scheduler::MAX_BUILD_ATTEMPTS`.
+/// After this many reaped attempts the reaper marks the item `failed` instead of
+/// re-queuing it forever (the escalation ladder takes over from there).
+const MAX_BUILD_ATTEMPTS: i32 = 3;
 
 pub async fn evaluate_lease_takeover(pg: &PgPool, _worker_name: &str) -> Result<usize> {
     if !crate::leader_cache::is_current_leader() {
         return Ok(0);
     }
 
-    let reclaimed = ff_db::pg_reap_stale_work_item_leases(pg, STALE_HEARTBEAT_SECS).await? as usize;
+    let reclaimed =
+        ff_db::pg_reap_stale_work_item_leases(pg, STALE_HEARTBEAT_SECS, MAX_BUILD_ATTEMPTS).await?
+            as usize;
     if reclaimed > 0 {
         warn!(
             reclaimed,

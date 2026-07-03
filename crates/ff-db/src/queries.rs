@@ -7064,7 +7064,11 @@ pub async fn pg_rank_computers_by_capacity(pool: &PgPool) -> Result<Vec<HostCapa
 /// free its slot, mark any in-flight worktree stale/failed, and return the
 /// work_item to 'ready' (bumping attempts).
 /// Returns the number of leases successfully reaped.
-pub async fn pg_reap_stale_work_item_leases(pool: &PgPool, stale_secs: i64) -> Result<u64> {
+pub async fn pg_reap_stale_work_item_leases(
+    pool: &PgPool,
+    stale_secs: i64,
+    max_attempts: i32,
+) -> Result<u64> {
     let rows = sqlx::query(
         "SELECT id, work_item_id, sub_agent_id
            FROM work_item_leases
@@ -7129,15 +7133,29 @@ pub async fn pg_reap_stale_work_item_leases(pool: &PgPool, stale_secs: i64) -> R
             .execute(&mut *tx)
             .await?;
 
+            // Failure convergence: re-queue for another attempt ONLY while under
+            // the cap; once `attempts` would reach `max_attempts`, mark the item
+            // `failed` (with context) instead of `ready`. Without this ceiling a
+            // task the swarm can't build gets reaped→re-claimed→stalled forever
+            // (observed: 17 re-claims / 65 min / 0 PRs, holding a slot the whole
+            // time). Failing cleanly frees the slot and surfaces the task for a
+            // human or a retry-with-error-context.
             sqlx::query(
                 "UPDATE work_items
-                    SET status = 'ready',
+                    SET status = CASE WHEN attempts + 1 >= $2 THEN 'failed'
+                                      ELSE 'ready' END,
                         attempts = attempts + 1,
                         assigned_computer = NULL,
-                        last_error = 'stale-heartbeat takeover'
+                        last_error = CASE
+                            WHEN attempts + 1 >= $2
+                              THEN 'failed after ' || (attempts + 1)
+                                   || ' stalled attempts (max ' || $2 || ' reached)'
+                            ELSE 'stale-heartbeat takeover (attempt ' || (attempts + 1) || ')'
+                          END
                   WHERE id = $1",
             )
             .bind(wi)
+            .bind(max_attempts)
             .execute(&mut *tx)
             .await?;
 
