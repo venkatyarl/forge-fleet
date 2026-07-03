@@ -49,6 +49,11 @@ pub fn same_commit(a: &str, b: &str) -> bool {
     if a.len() < 7 || b.len() < 7 {
         return false;
     }
+    // Both must be pure hex (git SHAs) — never prefix-match arbitrary version
+    // strings (e.g. `gh version 2.89.0` vs `2.89.0.1`). Safe to reuse anywhere.
+    if !a.bytes().all(|c| c.is_ascii_hexdigit()) || !b.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
     let (short, long) = if a.len() <= b.len() {
         (&a, &b)
     } else {
