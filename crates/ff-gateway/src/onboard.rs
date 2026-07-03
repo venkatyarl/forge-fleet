@@ -557,7 +557,7 @@ pub async fn self_enroll(
     let default_source_tree_path = if node_row.role.eq_ignore_ascii_case("leader") {
         "~/projects/forge-fleet"
     } else {
-        "~/.forgefleet/sub-agent-0/forge-fleet"
+        "~/.forgefleet/sub-agents/sub-agent-0/forge-fleet"
     };
     let has_gpu = payload.has_nvidia.unwrap_or(false);
     let _ = sqlx::query(

@@ -508,7 +508,7 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// Ensure at least `desired_count` sub_agent rows exist for the given
 /// computer. Creates missing slots `0..desired_count` with workspace dirs
-/// of the form `~/.forgefleet/sub-agent-{slot}/`. Existing rows (by
+/// of the form `~/.forgefleet/sub-agents/sub-agent-{slot}/`. Existing rows (by
 /// computer_id, slot) are left untouched.
 pub async fn ensure_sub_agent_rows(
     pool: &PgPool,
@@ -518,7 +518,7 @@ pub async fn ensure_sub_agent_rows(
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let mut created = 0u32;
     for slot in 0..desired_count as i32 {
-        let workspace = format!("{home}/.forgefleet/sub-agent-{slot}");
+        let workspace = format!("{home}/.forgefleet/sub-agents/sub-agent-{slot}");
         let result = sqlx::query(
             "INSERT INTO sub_agents (computer_id, slot, status, workspace_dir) \
              VALUES ($1, $2, 'idle', $3) \

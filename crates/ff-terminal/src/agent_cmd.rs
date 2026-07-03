@@ -174,7 +174,7 @@ pub async fn handle_agent_fanout(
     // the member's fleet forge-fleet checkout.
     let run_cwd = cwd
         .clone()
-        .unwrap_or_else(|| "~/.forgefleet/sub-agent-0/forge-fleet".to_string());
+        .unwrap_or_else(|| "~/.forgefleet/sub-agents/sub-agent-0/forge-fleet".to_string());
     let git_policy = resolve_agent_git_policy(pool, project.as_deref()).await?;
     // Pass --timeout to the dispatched run (bounds the CLI subprocess) AND give
     // the fleet task a matching max_duration_secs (worker cap) with a small
@@ -278,7 +278,7 @@ pub async fn handle_agent_dispatch_each(
     let shell_safe_prompt = prompt.replace('\'', "'\\''");
     let run_cwd = cwd
         .clone()
-        .unwrap_or_else(|| "~/.forgefleet/sub-agent-0/forge-fleet".to_string());
+        .unwrap_or_else(|| "~/.forgefleet/sub-agents/sub-agent-0/forge-fleet".to_string());
     let git_policy = resolve_agent_git_policy(pool, project.as_deref()).await?;
     // See handle_agent_fanout: --timeout bounds the CLI, task max_duration_secs
     // bounds the worker; both raised above the 600s default for build runs.
@@ -326,7 +326,7 @@ pub async fn handle_agent_dispatch_each(
 //      latest row. Extract `produced_on_computer`, `modified_files`, title.
 //   2. Resolve the worker's ssh_user + primary_ip from `fleet_workers`.
 //      Resolve the canonical source-tree path via `software_registry.install_path`
-//      (falls back to `~/.forgefleet/sub-agent-0/forge-fleet` per convention).
+//      (falls back to `~/.forgefleet/sub-agents/sub-agent-0/forge-fleet` per convention).
 //   3. SSH into the worker and run git checkout -b / add / commit / (push / gh pr create).
 //   4. Persist the resulting branch + PR URL back into `work_items.pr_url`
 //      (via the work_item linked to the work_output).
@@ -419,7 +419,7 @@ pub async fn handle_agent_commit_back(
             if worker.eq_ignore_ascii_case("taylor") {
                 "~/projects/forge-fleet".to_string()
             } else {
-                "~/.forgefleet/sub-agent-0/forge-fleet".to_string()
+                "~/.forgefleet/sub-agents/sub-agent-0/forge-fleet".to_string()
             }
         });
 

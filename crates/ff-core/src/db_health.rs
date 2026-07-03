@@ -185,7 +185,7 @@ fn locate_compose_file() -> Option<PathBuf> {
     let candidates: Vec<PathBuf> = [
         std::env::var("FORGEFLEET_REPO").ok().map(PathBuf::from),
         dirs_home().map(|h| h.join("projects/forge-fleet")),
-        dirs_home().map(|h| h.join(".forgefleet/sub-agent-0/forge-fleet")),
+        dirs_home().map(|h| h.join(".forgefleet/sub-agents/sub-agent-0/forge-fleet")),
         Some(PathBuf::from(".")),
     ]
     .into_iter()

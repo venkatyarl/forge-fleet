@@ -748,6 +748,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "retire_v75_work_stealing",
         sql: schema::SCHEMA_V153_RETIRE_V75_WORK_STEALING,
     },
+    PgMigration {
+        version: 154,
+        name: "nested_subagent_workspace",
+        sql: schema::SCHEMA_V154_NESTED_SUBAGENT_WORKSPACE,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

@@ -181,8 +181,8 @@ pub fn resolve_ports_path() -> PathBuf {
         if explicit.exists() {
             return explicit;
         }
-        let worker =
-            PathBuf::from(&home).join(".forgefleet/sub-agent-0/forge-fleet/config/ports.toml");
+        let worker = PathBuf::from(&home)
+            .join(".forgefleet/sub-agents/sub-agent-0/forge-fleet/config/ports.toml");
         if worker.exists() {
             return worker;
         }

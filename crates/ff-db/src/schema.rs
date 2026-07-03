@@ -9430,3 +9430,19 @@ pub const SCHEMA_V153_RETIRE_V75_WORK_STEALING: &str = r#"
 DROP TABLE IF EXISTS fleet_work_items  CASCADE;
 DROP TABLE IF EXISTS fleet_work_batches CASCADE;
 "#;
+
+// V154 — canonicalize the sub-agent slot workspace to the NESTED layout
+// `~/.forgefleet/sub-agents/sub-agent-N/`. The provisioner (sub_agents.rs) and
+// all docs already use nested, but the scheduler (agent_coordinator) recorded
+// FLAT `~/.forgefleet/sub-agent-N/` on existing rows via ON CONFLICT DO NOTHING.
+// Rewrite those rows to nested so the scheduler points slots at the same dirs
+// the provisioner actually creates. Idempotent: the nested form contains
+// `sub-agents/` so the guard skips already-migrated rows.
+pub const SCHEMA_V154_NESTED_SUBAGENT_WORKSPACE: &str = r#"
+UPDATE sub_agents
+   SET workspace_dir = replace(workspace_dir,
+                               '/.forgefleet/sub-agent-',
+                               '/.forgefleet/sub-agents/sub-agent-')
+ WHERE workspace_dir LIKE '%/.forgefleet/sub-agent-%'
+   AND workspace_dir NOT LIKE '%/.forgefleet/sub-agents/%';
+"#;
