@@ -1795,7 +1795,7 @@ pub async fn handle_fleet_migrate_source_trees(
     }
     let rows = sqlx::query(
         "SELECT n.name, n.ip, n.ssh_user,
-                COALESCE(c.source_tree_path, '~/.forgefleet/sub-agent-0/forge-fleet') AS canonical
+                COALESCE(c.source_tree_path, '~/.forgefleet/sub-agents/sub-agent-0/forge-fleet') AS canonical
            FROM fleet_workers n
            LEFT JOIN computers c ON c.name = n.name
           WHERE LOWER(n.name) <> 'taylor'
@@ -1836,7 +1836,7 @@ pub async fn handle_fleet_migrate_source_trees(
         // One SSH call returns both flags, separated by "|".
         let script = "legacy=0; canonical=0; \
              [ -d ~/taylorProjects/forge-fleet ] && legacy=1; \
-             [ -d ~/.forgefleet/sub-agent-0/forge-fleet/.git ] && canonical=1; \
+             [ -d ~/.forgefleet/sub-agents/sub-agent-0/forge-fleet/.git ] && canonical=1; \
              echo \"$legacy|$canonical\"";
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(6),

@@ -1001,7 +1001,7 @@ impl LeaderTick {
         };
 
         let home = std::env::var("HOME").unwrap_or_default();
-        let checkout = format!("{home}/.forgefleet/sub-agent-0/open-design");
+        let checkout = format!("{home}/.forgefleet/sub-agents/sub-agent-0/open-design");
         // `skills/` presence is the sentinel that the checkout is materialized.
         if !std::path::Path::new(&checkout).join("skills").exists() {
             return Ok(());

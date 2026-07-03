@@ -68,7 +68,7 @@ pub struct PulseBeatV2 {
     pub build_sha: Option<String>,
     /// Ground-truth absolute path of this node's ForgeFleet source tree —
     /// the dir the daemon builds/self-upgrades from (Taylor: `~/projects/
-    /// forge-fleet`; workers: `~/.forgefleet/sub-agent-0/forge-fleet`).
+    /// forge-fleet`; workers: `~/.forgefleet/sub-agents/sub-agent-0/forge-fleet`).
     /// The leader's auto-upgrade reads `computers.source_tree_path` to know
     /// what to `cd` into; if it's NULL the leader self-upgrade silently skips
     /// (surfaced 2026-06-08 — only Taylor had it set, so leadership moving to

@@ -598,7 +598,7 @@ fn detect_source_tree_path() -> Option<String> {
         std::env::var("FORGEFLEET_REPO").ok().map(PathBuf::from),
         home.as_ref().map(|h| h.join("projects/forge-fleet")),
         home.as_ref()
-            .map(|h| h.join(".forgefleet/sub-agent-0/forge-fleet")),
+            .map(|h| h.join(".forgefleet/sub-agents/sub-agent-0/forge-fleet")),
     ]
     .into_iter()
     .flatten()

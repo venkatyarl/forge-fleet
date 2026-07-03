@@ -57,7 +57,7 @@ pub async fn verify_computer(pool: &PgPool, worker_name: &str) -> Result<VerifyR
     let subcmd = if is_windows {
         r#"powershell -NoProfile -Command "(Get-ChildItem -Directory \"$env:USERPROFILE\.forgefleet\sub-agent-*\" -ErrorAction SilentlyContinue).Count""#.to_string()
     } else {
-        "ls -d ~/.forgefleet/sub-agent-* 2>/dev/null | wc -l | tr -d ' '".to_string()
+        "ls -d ~/.forgefleet/sub-agents/sub-agent-* 2>/dev/null | wc -l | tr -d ' '".to_string()
     };
     let sub_res = ssh_capture(&ssh_dest, &subcmd).await;
     details.push(match sub_res {

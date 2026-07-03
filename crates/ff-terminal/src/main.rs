@@ -1208,7 +1208,7 @@ enum AgentCommand {
         /// Working dir for the dispatched `ff run` on each member — the repo
         /// checkout it edits, so the run records it and `ff agent commit-back`
         /// lifts from there. Default: the member's fleet checkout
-        /// `~/.forgefleet/sub-agent-0/forge-fleet`. (Named `--run-cwd` to avoid
+        /// `~/.forgefleet/sub-agents/sub-agent-0/forge-fleet`. (Named `--run-cwd` to avoid
         /// the global `--cwd`.)
         #[arg(long = "run-cwd")]
         run_cwd: Option<String>,
@@ -1752,7 +1752,7 @@ enum FleetCommand {
     },
     /// Plan 14 source-tree migration: move `~/taylorProjects/forge-fleet`
     /// to the canonical path (`computers.source_tree_path`, default
-    /// `~/.forgefleet/sub-agent-0/forge-fleet`) on every non-Taylor node.
+    /// `~/.forgefleet/sub-agents/sub-agent-0/forge-fleet`) on every non-Taylor node.
     ///
     /// Inspects each node over SSH, prints a plan (legacy present / canonical
     /// present / needs clone), and with --yes enqueues one deferred shell task
@@ -7042,7 +7042,7 @@ fn should_show_result_preview(tool_name: &str) -> bool {
 ///
 /// 1) **Skill catalog** (V68) — walks `<cwd>/.claude/skills/`,
 ///    `<cwd>/skills/`, `~/.claude/skills/`, and the fleet-installed
-///    `~/.forgefleet/sub-agent-0/open-design/skills/`. Each `SKILL.md`'s
+///    `~/.forgefleet/sub-agents/sub-agent-0/open-design/skills/`. Each `SKILL.md`'s
 ///    YAML frontmatter (name, description, triggers) is summarized into a
 ///    catalog the agent reads at decision time. The agent picks a skill
 ///    based on prompt match and uses the Read tool to load the full

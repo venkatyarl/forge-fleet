@@ -31,7 +31,7 @@
 //!   1. `<cwd>/.claude/skills/*/SKILL.md`     — project-private
 //!   2. `<cwd>/skills/*/SKILL.md`             — project-declared
 //!   3. `~/.claude/skills/*/SKILL.md`         — user-global
-//!   4. `~/.forgefleet/sub-agent-0/open-design/skills/*/SKILL.md` — fleet-installed (V65)
+//!   4. `~/.forgefleet/sub-agents/sub-agent-0/open-design/skills/*/SKILL.md` — fleet-installed (V65)
 //!
 //! Bounded breadth: at most 256 skills loaded; each skill's body is
 //! NOT included in the prompt (just frontmatter), so 256 entries cap
@@ -103,7 +103,7 @@ fn legacy_default_sources() -> Vec<SkillSource> {
         SkillSource {
             id: "fleet-open-design".into(),
             label: "fleet-installed open-design skills".into(),
-            path_template: "$HOME/.forgefleet/sub-agent-0/open-design/skills".into(),
+            path_template: "$HOME/.forgefleet/sub-agents/sub-agent-0/open-design/skills".into(),
             priority: 30,
         },
     ]

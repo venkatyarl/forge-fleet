@@ -190,7 +190,7 @@ pub fn resolve_config_path() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         for rel in [
             "projects/forge-fleet/config/cloud_llm_providers.toml",
-            ".forgefleet/sub-agent-0/forge-fleet/config/cloud_llm_providers.toml",
+            ".forgefleet/sub-agents/sub-agent-0/forge-fleet/config/cloud_llm_providers.toml",
         ] {
             let p = PathBuf::from(&home).join(rel);
             if p.exists() {
