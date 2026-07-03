@@ -106,9 +106,105 @@ pub fn display_version_short(s: &str) -> String {
     trimmed.chars().take(10).collect()
 }
 
+/// Two git SHAs name the same commit even at different prefix lengths
+/// (`7dc2a6b37d` vs `7dc2a6b37dfd`). Both must be ≥7 chars and pure hex, so a
+/// non-SHA version string can never accidentally prefix-match. This is the low
+/// level primitive under [`is_same_version`].
+pub fn same_commit(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim().to_ascii_lowercase(), b.trim().to_ascii_lowercase());
+    if a.len() < 7 || b.len() < 7 {
+        return false;
+    }
+    if !a.bytes().all(|c| c.is_ascii_hexdigit()) || !b.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    let (short, long) = if a.len() <= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    long.starts_with(short.as_str())
+}
+
+/// Extract a dotted numeric version (semver-ish) from a vendor `--version`
+/// string, e.g. `gh version 2.89.0 (2024-…)` → `2.89.0`.
+fn extract_semver(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                i += 1;
+            }
+            let slice = &s[start..i];
+            if slice.contains('.') {
+                return Some(slice.trim_end_matches('.').to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// THE canonical "are these two version strings the same underlying release?"
+/// predicate — the SINGLE source of truth for drift detection across every
+/// upgrade-dispatch path (auto_upgrade, version_check, upgrade wave). Order:
+///   1. ff `BuildVersion` (`<date>_<n> (pushed <sha>)`) → same pushed SHA,
+///      prefix-aware (build count/date/state ignored — per-host, not identity);
+///   2. semver extraction for vendor tools (`gh version 2.89.0` == `v2.89.0`);
+///   3. bare git SHAs at different prefix lengths (`7dc2a6b37d` == `7dc2a6b37dfd`);
+///   4. raw string equality.
+///
+/// Consolidated 2026-07-03 after the phantom-drift restart loop had to be fixed
+/// TWICE (#724 auto_upgrade, #731 version_check) because the comparison was
+/// duplicated. LLM council (codex+kimi) unanimous: one predicate, all paths.
+///
+/// NOTE: this answers only "same code?" — NOT "should an upgrade be dispatched?"
+/// (that adds the auto_upgrade_enabled gate, leader exclusion, reservation
+/// state, and playbook resolution, which stay in the dispatch layer).
+pub fn is_same_version(a: &str, b: &str) -> bool {
+    if let (Some(va), Some(vb)) = (BuildVersion::parse(a), BuildVersion::parse(b)) {
+        return va.sha == vb.sha || same_commit(&va.sha, &vb.sha);
+    }
+    match (extract_semver(a), extract_semver(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b || same_commit(a, b),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_same_version_covers_every_path() {
+        // BuildVersion: same SHA, different build counter → same.
+        assert!(is_same_version(
+            "2026.4.27_12 (pushed db1a950e4c)",
+            "2026.4.27_64 (pushed db1a950e4c)"
+        ));
+        // BuildVersion: different SHA → drift.
+        assert!(!is_same_version(
+            "2026.4.27_12 (pushed db1a950e4c)",
+            "2026.4.27_12 (pushed 33e05f9beb)"
+        ));
+        // Bare SHA prefix (the phantom-drift shape) → same.
+        assert!(is_same_version("7dc2a6b37d", "7dc2a6b37dfd"));
+        assert!(!is_same_version("7dc2a6b37d", "4130b332aa"));
+        // Vendor semver.
+        assert!(is_same_version("gh version 2.89.0 (2024)", "v2.89.0"));
+        assert!(!is_same_version("gh version 2.89.0", "gh version 2.90.0"));
+    }
+
+    #[test]
+    fn same_commit_is_hex_guarded_and_prefix_agnostic() {
+        assert!(same_commit("3b644697cb", "3b644697cb71"));
+        assert!(same_commit("3B644697CB", "3b644697cb71")); // case-insensitive
+        assert!(!same_commit("3b6", "3b644697cb71")); // too short
+        assert!(!same_commit("gh 2.89.0", "gh 2.89.0.1")); // non-hex never matches
+    }
 
     #[test]
     fn parses_pushed_form() {

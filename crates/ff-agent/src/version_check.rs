@@ -305,40 +305,14 @@ fn is_source_build_tool(tool: &str) -> bool {
 /// handles that path; for anything else we fall back to the dotted-numeric
 /// extraction.
 fn versions_equivalent(a: &str, b: &str) -> bool {
-    use ff_core::build_version::BuildVersion;
-    if let (Some(va), Some(vb)) = (BuildVersion::parse(a), BuildVersion::parse(b)) {
-        return va.is_same_code(&vb);
-    }
-    match (extract_semver(a), extract_semver(b)) {
-        (Some(x), Some(y)) => x == y,
-        // Bare git SHAs (e.g. `7dc2a6b37d` vs `7dc2a6b37dfd`) are the same commit
-        // at different prefix lengths — NOT drift. Without this, this tick's
-        // enqueue path re-dispatches a phantom no-op upgrade every cycle, which
-        // restarts forgefleetd and kills in-flight builds. `same_commit` is
-        // hex-guarded so non-SHA strings fall through to plain equality.
-        // (Sibling of the auto_upgrade fix in PR #724, which missed THIS path.)
-        _ => a == b || crate::auto_upgrade::same_commit(a, b),
-    }
-}
-
-fn extract_semver(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() {
-            let start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
-                i += 1;
-            }
-            let slice = &s[start..i];
-            if slice.contains('.') {
-                return Some(slice.trim_end_matches('.').to_string());
-            }
-        } else {
-            i += 1;
-        }
-    }
-    None
+    // Route through the ONE canonical drift predicate in ff_core, shared with
+    // auto_upgrade + the upgrade wave. Consolidated 2026-07-03 (LLM council:
+    // codex+kimi) after the phantom-drift restart loop had to be fixed in TWO
+    // places (#724 auto_upgrade, #731 here) because the comparison was
+    // duplicated. This tick keeps its DETECTION/reporting role; the equality
+    // logic now has a single home so a SHA edge case can't revive the loop
+    // through a forgotten path.
+    ff_core::build_version::is_same_version(a, b)
 }
 
 // ── helpers ──────────────────────────────────────────────────────

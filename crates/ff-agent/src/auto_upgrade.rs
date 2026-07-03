@@ -38,29 +38,10 @@ const AUTO_UPGRADE_ENABLED_KEY: &str = "auto_upgrade_enabled";
 /// daemon restart. Permanent default OFF so shipping this is harmless.
 const LEADER_SELF_UPGRADE_KEY: &str = "leader_self_upgrade";
 
-/// True when two git SHAs name the same commit even at different prefix lengths
-/// (e.g. `3b644697cb` vs `3b644697cb71`). Both must be non-empty and ≥7 hex
-/// chars; they match when the shorter is a case-insensitive prefix of the
-/// longer. This defeats the phantom-drift loop where a follower's short-SHA
-/// install compares unequal (`<>`) to the leader's longer-SHA target, causing
-/// an endless no-op git-reset + rebuild + daemon RESTART every upgrade cycle.
-pub fn same_commit(a: &str, b: &str) -> bool {
-    let (a, b) = (a.trim().to_ascii_lowercase(), b.trim().to_ascii_lowercase());
-    if a.len() < 7 || b.len() < 7 {
-        return false;
-    }
-    // Both must be pure hex (git SHAs) — never prefix-match arbitrary version
-    // strings (e.g. `gh version 2.89.0` vs `2.89.0.1`). Safe to reuse anywhere.
-    if !a.bytes().all(|c| c.is_ascii_hexdigit()) || !b.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return false;
-    }
-    let (short, long) = if a.len() <= b.len() {
-        (&a, &b)
-    } else {
-        (&b, &a)
-    };
-    long.starts_with(short.as_str())
-}
+// The same-commit / drift predicate now lives in ONE place:
+// `ff_core::build_version::{same_commit, is_same_version}`. Consolidated
+// 2026-07-03 (LLM council codex+kimi) so a SHA edge case can't revive the
+// phantom-drift restart loop through a forgotten duplicate.
 
 /// One target computer + the resolved playbook command for it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,16 +186,18 @@ pub async fn resolve_upgrade_plans_with_suffix(
         let installed_version: Option<String> = row.get("installed_version");
 
         // Skip a no-op self-upgrade: if the install is already the target
-        // commit (same SHA at a different prefix length, e.g. `3b644697cb`
-        // vs `3b644697cb71`), dispatching would git-reset + rebuild + RESTART
-        // forgefleetd for nothing — killing any in-flight build. This phantom
-        // drift was the root cause of the follower daemon restart loop that
-        // prevented the fleet from ever self-building (2026-07-03).
+        // version (same commit, incl. a different SHA prefix length like
+        // `3b644697cb` vs `3b644697cb71`), dispatching would git-reset +
+        // rebuild + RESTART forgefleetd for nothing — killing any in-flight
+        // build. This phantom drift was the root cause of the follower daemon
+        // restart loop that prevented the fleet from ever self-building
+        // (2026-07-03). Uses the ONE canonical predicate shared with
+        // version_check + the wave (ff_core::build_version::is_same_version).
         if let (Some(inst), Some(latest)) =
             (installed_version.as_deref(), latest_version.as_deref())
         {
-            if same_commit(inst, latest) {
-                skipped.push((name, format!("already on target commit {latest}")));
+            if ff_core::build_version::is_same_version(inst, latest) {
+                skipped.push((name, format!("already on target version {latest}")));
                 continue;
             }
         }
@@ -1528,26 +1511,9 @@ where
 mod tests {
     use super::*;
 
-    /// The 2026-07-03 restart-loop regression guard: same commit at different
-    /// prefix lengths must NOT read as drift (that dispatched endless no-op
-    /// upgrade+restart tasks that killed every fleet build).
-    #[test]
-    fn same_commit_is_prefix_length_agnostic() {
-        // Same commit, leader stores 12 chars, follower stores 10 — the exact
-        // shape that caused the loop.
-        assert!(same_commit("3b644697cb", "3b644697cb71"));
-        assert!(same_commit("3b644697cb71", "3b644697cb"));
-        // Identical.
-        assert!(same_commit("3b644697cb71", "3b644697cb71"));
-        // Case-insensitive (git short SHAs are lowercase, but be safe).
-        assert!(same_commit("3B644697CB", "3b644697cb71"));
-        // Genuinely different commits must still be treated as drift.
-        assert!(!same_commit("3b644697cb", "a1b2c3d4e5"));
-        // Too-short / empty inputs are never "same" (avoid a 1-char prefix
-        // matching everything).
-        assert!(!same_commit("", "3b644697cb71"));
-        assert!(!same_commit("3b6", "3b644697cb71"));
-    }
+    // The same-commit / prefix-length regression guard moved to
+    // ff_core::build_version::tests (same_commit_is_hex_guarded_and_prefix_agnostic
+    // + is_same_version_covers_every_path) when the predicate was consolidated.
 
     #[test]
     fn daemon_self_software_matches_the_family_const() {
