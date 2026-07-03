@@ -9446,3 +9446,7 @@ UPDATE sub_agents
  WHERE workspace_dir LIKE '%/.forgefleet/sub-agent-%'
    AND workspace_dir NOT LIKE '%/.forgefleet/sub-agents/%';
 "#;
+
+pub const SCHEMA_V155_DROP_DEAD_BRIDGE: &str = r#"
+DROP TABLE IF EXISTS work_item_fleet_tasks CASCADE;
+"#;
