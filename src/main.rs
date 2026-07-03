@@ -3651,102 +3651,6 @@ async fn start_pulse_v2_subsystems(
         });
     }
 
-    // (9b) Work-item processor — every daemon claims and runs individual
-    // work_items from decomposed tasks. Works alongside the fleet_tasks
-    // runner; claims via SKIP LOCKED so they race safely.
-    info!("starting subsystem: work-item processor (every 5s)");
-    {
-        let pool = pg_pool.clone();
-        let name = worker_name.clone();
-        let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
-            let row: Option<uuid::Uuid> =
-                sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
-                    .bind(&name)
-                    .fetch_optional(&pool)
-                    .await
-                    .ok()
-                    .flatten();
-            let Some(my_id) = row else {
-                warn!(node = %name, "work-item processor: no computers row, disabled");
-                return;
-            };
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() { break; }
-                    }
-                }
-                match ff_agent::batch_manager::claim_work_item(&pool, my_id, None).await {
-                    Ok(Some(item)) => {
-                        tracing::info!(item = %item.id, item_type = %item.item_type, "work item claimed");
-                        // Mark as in_progress before executing
-                        let _ = sqlx::query(
-                            "UPDATE work_items SET status = 'in_progress' WHERE id = $1",
-                        )
-                        .bind(item.id)
-                        .execute(&pool)
-                        .await;
-                        let result = match item.item_type.as_str() {
-                            "shell" => {
-                                let mut cmd = tokio::process::Command::new("/bin/bash");
-                                cmd.arg("-lc").arg(&item.item_key);
-                                cmd.kill_on_drop(true);
-                                match cmd.output().await {
-                                    Ok(out) => {
-                                        let stdout = String::from_utf8_lossy(&out.stdout);
-                                        let stderr = String::from_utf8_lossy(&out.stderr);
-                                        let exit = out.status.code().unwrap_or(-1);
-                                        if exit == 0 {
-                                            Ok(format!(
-                                                "ok: {}",
-                                                stdout.chars().take(500).collect::<String>()
-                                            ))
-                                        } else {
-                                            Err(format!(
-                                                "exit {}: {}",
-                                                exit,
-                                                stderr.chars().take(500).collect::<String>()
-                                            ))
-                                        }
-                                    }
-                                    Err(e) => Err(format!("spawn error: {e}")),
-                                }
-                            }
-                            _ => Ok(format!(
-                                "unhandled item_type '{}' — marking complete",
-                                item.item_type
-                            )),
-                        };
-                        match result {
-                            Ok(summary) => {
-                                let _ = ff_agent::batch_manager::complete_work_item(
-                                    &pool, item.id, &summary, 0, 0,
-                                )
-                                .await;
-                                let _ = ff_agent::batch_manager::update_batch_progress(
-                                    &pool,
-                                    item.parent_task_id,
-                                    item.batch_id,
-                                )
-                                .await;
-                            }
-                            Err(err) => {
-                                let _ =
-                                    ff_agent::batch_manager::fail_work_item(&pool, item.id, &err)
-                                        .await;
-                            }
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => tracing::debug!(error = %e, "work item claim failed"),
-                }
-            }
-        });
-    }
-
     // (10) fleet_tasks watchdog — every daemon runs the distributed
     // handoff sweep. Re-queues stalled `running` tasks whose worker has
     // gone quiet for >120s.
@@ -3757,49 +3661,10 @@ async fn start_pulse_v2_subsystems(
         shutdown_rx.clone(),
     ));
 
-    // (10b) Work-item watchdog + steal loop — distributed handoff for
-    // work_items, plus proactive stealing from overloaded peers.
-    info!("starting subsystem: work-item watchdog + steal loop");
-    handles.push(ff_agent::work_stealer::spawn_work_item_watchdog(
-        pg_pool.clone(),
-        worker_name.clone(),
-        shutdown_rx.clone(),
-    ));
-    {
-        let pool = pg_pool.clone();
-        let name = worker_name.clone();
-        let shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
-            let row: Option<uuid::Uuid> =
-                sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
-                    .bind(&name)
-                    .fetch_optional(&pool)
-                    .await
-                    .ok()
-                    .flatten();
-            let Some(my_id) = row else {
-                return;
-            };
-            let _ =
-                ff_agent::work_stealer::spawn_steal_loop(pool, my_id, None, name, shutdown).await;
-        });
-    }
-
-    // (10c) Parent completion watcher — marks decomposed fleet_tasks as
-    // completed when all their work_items are done.
-    info!("starting subsystem: parent completion watcher (every 30s)");
-    handles.push(ff_agent::batch_manager::spawn_completion_watcher(
-        pg_pool.clone(),
-        30,
-        shutdown_rx.clone(),
-    ));
-
     // (10d) Wave-reaper — rolls up fleet-upgrade-wave parent rows whose
     // children have all reached a terminal state. Without this, every
-    // wave leaves a zombie parent row in 'pending' forever. Different
-    // from (10c): (10c) watches `task_type='decomposed'` parents and
-    // their `fleet_work_items` children. (10d) watches any pending
-    // parent whose children sit in `fleet_tasks` linked via
+    // wave leaves a zombie parent row in 'pending' forever. Watches any
+    // pending parent whose children sit in `fleet_tasks` linked via
     // parent_task_id — the actual fan-out pattern used by
     // `compose_fleet_upgrade_wave`.
     info!("starting subsystem: wave reaper (every 10min, leader-only)");

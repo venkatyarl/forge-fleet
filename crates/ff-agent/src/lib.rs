@@ -30,7 +30,8 @@ pub mod alert_evaluator;
 pub mod alert_policy_seed;
 pub mod audit_logger;
 pub mod bash_security;
-pub mod batch_manager;
+// batch_manager (V75 work-stealing) retired 2026-07-03 — superseded by Pillar-4
+// work_items + lease scheduler; its fleet_work_items table was 0-row dead (V153).
 pub mod brain;
 pub mod brain_mirror;
 pub mod capability_synthesis;
@@ -158,7 +159,7 @@ pub mod version_check;
 pub mod work_item_dispatch;
 pub mod work_item_merge_drain;
 pub mod work_item_scheduler;
-pub mod work_stealer;
+// work_stealer (V75) retired 2026-07-03 with batch_manager (dead fleet_work_items).
 
 pub use alert_policy_seed::{AlertSeedReport, seed_from_toml as seed_alert_policies_from_toml};
 pub use model_catalog_seed::{ModelSeedReport, seed_from_toml as seed_model_catalog_from_toml};

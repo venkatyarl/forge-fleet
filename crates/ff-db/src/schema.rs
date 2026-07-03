@@ -9415,3 +9415,18 @@ ALTER TABLE work_items
 CREATE INDEX IF NOT EXISTS idx_work_items_repo_id ON work_items (repo_id);
 CREATE INDEX IF NOT EXISTS idx_work_items_repo_url ON work_items (repo_url);
 "#;
+
+// V153 — retire the V75 work-stealing engine. `fleet_work_items` /
+// `fleet_work_batches` were the batch/work-stealing tables driven by
+// `batch_manager` + `work_stealer` (fed only by a `fleet_tasks` row with
+// task_type='decomposed'). That decompose-enqueue path was never wired
+// (`pg_enqueue_decomposed_task` had zero callers; zero 'decomposed' rows ever
+// existed), so both tables sat permanently at 0 rows while three daemon
+// subsystems spun against them every 5s. Superseded by Pillar-4
+// (`work_items` + `work_item_leases` + the lease scheduler). Modules + daemon
+// wiring removed in the same change; drop the dead tables here. CASCADE clears
+// their indexes/constraints. Forward-only; a fresh rebuild creates then drops.
+pub const SCHEMA_V153_RETIRE_V75_WORK_STEALING: &str = r#"
+DROP TABLE IF EXISTS fleet_work_items  CASCADE;
+DROP TABLE IF EXISTS fleet_work_batches CASCADE;
+"#;

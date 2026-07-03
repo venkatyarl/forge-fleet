@@ -136,8 +136,7 @@ pub async fn reap_pending_parents(pool: &PgPool) -> Result<ReaperReport, sqlx::E
     })
 }
 
-/// Spawn the wave-reaper as a leader-gated background tick. Mirrors
-/// the shape of `batch_manager::spawn_completion_watcher`. Self-
+/// Spawn the wave-reaper as a leader-gated background tick. Self-
 /// contained so `src/main.rs` only needs one call.
 pub fn spawn_reaper(
     pg: PgPool,

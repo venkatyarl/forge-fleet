@@ -312,7 +312,7 @@ impl TaskRunner {
              WHERE id = (
                SELECT id FROM fleet_tasks t
                 WHERE t.status = 'pending'
-                  AND t.task_type IN ('shell', 'decomposed')
+                  AND t.task_type = 'shell'
                   AND (t.preferred_computer_id IS NULL
                        OR t.preferred_computer_id = $1)
                   AND t.requires_capability <@ to_jsonb($2::text[])
@@ -432,7 +432,7 @@ impl TaskRunner {
                     OR NOT EXISTS (
                       SELECT 1 FROM fleet_tasks other
                        WHERE other.status = 'pending'
-                         AND other.task_type IN ('shell', 'decomposed')
+                         AND other.task_type = 'shell'
                          AND COALESCE(other.parent_task_id, other.id)
                              != COALESCE(t.parent_task_id, t.id)
                     )
@@ -474,95 +474,6 @@ impl TaskRunner {
         let timeout_secs: Option<i32> = row.get("timeout_secs");
 
         info!(task_id = %task_id, summary = %summary, task_type = %task_type, "task claimed");
-
-        // ── Decomposed task: create work items and return ──────────────────
-        if task_type == "decomposed" {
-            let items: Vec<Value> = payload
-                .get("items")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let num_batches = payload
-                .get("num_batches")
-                .and_then(Value::as_u64)
-                .unwrap_or(1) as usize;
-
-            let mut weighted_items = Vec::new();
-            for item in &items {
-                let key = item
-                    .get("key")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let item_type = item
-                    .get("item_type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("shell")
-                    .to_string();
-                let weight = crate::batch_manager::ItemWeight {
-                    base: item
-                        .get("base_weight")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(1.0),
-                    pages: item.get("pages").and_then(Value::as_f64).unwrap_or(0.0),
-                    words: item.get("words").and_then(Value::as_f64).unwrap_or(0.0),
-                    has_images: item
-                        .get("has_images")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0),
-                    has_code: item.get("has_code").and_then(Value::as_f64).unwrap_or(0.0),
-                };
-                weighted_items.push((key, item_type, weight));
-            }
-
-            if weighted_items.is_empty() {
-                warn!(task_id = %task_id, "decomposed task has no items — failing immediately");
-                sqlx::query(
-                    "UPDATE fleet_tasks SET status = 'failed', completed_at = NOW(), error = $1 WHERE id = $2"
-                )
-                .bind("decomposed task payload has no items")
-                .bind(task_id)
-                .execute(&self.pg)
-                .await?;
-                return Ok(Some(task_id));
-            }
-
-            match crate::batch_manager::create_work_items(
-                &self.pg,
-                task_id,
-                &weighted_items,
-                num_batches,
-            )
-            .await
-            {
-                Ok(batches) => {
-                    info!(task_id = %task_id, batches = batches.len(), "decomposed task into work items");
-                }
-                Err(e) => {
-                    warn!(task_id = %task_id, error = %e, "failed to create work items");
-                    sqlx::query(
-                        "UPDATE fleet_tasks SET status = 'failed', completed_at = NOW(), error = $1 WHERE id = $2"
-                    )
-                    .bind(format!("decomposition failed: {e}"))
-                    .bind(task_id)
-                    .execute(&self.pg)
-                    .await?;
-                    return Ok(Some(task_id));
-                }
-            }
-
-            // Keep task in running state; completion watcher will mark it
-            // done when all work_items finish. Heartbeat is bumped by the
-            // watcher every 30s so the watchdog doesn't re-queue us.
-            sqlx::query(
-                "UPDATE fleet_tasks SET progress_message = 'waiting for work items', progress_pct = 0.0 WHERE id = $1"
-            )
-            .bind(task_id)
-            .execute(&self.pg)
-            .await?;
-
-            return Ok(Some(task_id));
-        }
 
         // 2. Spawn a heartbeat ticker for the duration of the run.
         let pg_hb = self.pg.clone();
