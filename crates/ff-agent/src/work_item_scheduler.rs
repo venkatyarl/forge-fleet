@@ -28,10 +28,16 @@ const MAX_ASSIGN_PER_TICK: i64 = 64;
 /// considered orphaned and cancelled. Far above the lease/heartbeat windows so
 /// a legitimately-leased item is never swept mid-assignment.
 const ORPHAN_MIN_AGE_SECS: i64 = 3600;
+/// Failure-convergence ceiling: after this many stalled/reaped attempts a
+/// work_item is marked `failed` (with context) instead of re-queued forever.
+/// A task the swarm genuinely can't build must STOP thrashing and surface for a
+/// human or a retry-with-error-context — 3 tries is enough signal.
+const MAX_BUILD_ATTEMPTS: i32 = 3;
 
 /// One scheduler pass. Returns the number of work_items assigned this tick.
 pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
-    let reaped = ff_db::pg_reap_stale_work_item_leases(pg, LEASE_STALE_SECS).await?;
+    let reaped =
+        ff_db::pg_reap_stale_work_item_leases(pg, LEASE_STALE_SECS, MAX_BUILD_ATTEMPTS).await?;
     if reaped > 0 {
         warn!(
             reaped,

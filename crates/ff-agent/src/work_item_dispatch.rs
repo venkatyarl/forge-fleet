@@ -76,6 +76,12 @@ struct AssignedWorkItem {
     sub_agent_id: Uuid,
     computer_id: Uuid,
     slot: i32,
+    /// Prior failed attempts (escalation ladder). Drives backend escalation
+    /// (local → cloud) and prompt context injection.
+    attempts: i32,
+    /// The error from the previous attempt, fed back into this attempt's prompt
+    /// so the model doesn't repeat the same mistake (retry-with-context).
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -236,6 +242,8 @@ async fn assigned_work_items(
             w.description,
             w.base_branch,
             w.repo_id,
+            COALESCE(w.attempts, 0) AS attempts,
+            w.last_error,
             COALESCE(NULLIF(w.repo_url, ''), NULLIF(wr.github_url, '')) AS repo_url,
             NULLIF(w.repo_path, '') AS bound_repo_path,
             NULLIF(w.metadata->>'repo_path', '') AS metadata_repo_path,
@@ -325,6 +333,8 @@ async fn assigned_work_items(
                 sub_agent_id: r.get("sub_agent_id"),
                 computer_id: r.get("computer_id"),
                 slot: r.get("slot"),
+                attempts: r.try_get("attempts").unwrap_or(0),
+                last_error: r.try_get("last_error").ok().flatten(),
             })
         })
         .collect()
@@ -709,6 +719,11 @@ async fn mark_completed_without_pr(pg: &PgPool, item: &AssignedWorkItem) -> Resu
 /// error appended to the item's `last_error` so the next attempt has context.
 const MAX_DISPATCH_ATTEMPTS: i32 = 3;
 
+/// Escalation ladder stage 2: after this many prior attempts, SKIP the local
+/// codegen lane (it has already failed the same way) and go straight to the
+/// cloud/CLI backstop, which is more capable. Below this, try cheap-local-first.
+const ESCALATE_TO_CLOUD_AT: i32 = 2;
+
 /// Deterministic execution-contract outcome of a dispatch (roadmap item #3).
 /// Formalizes what previously was ad-hoc: a dispatch either succeeds, fails with
 /// no diff (retryable), fails but left a real diff (salvageable — treat as a
@@ -839,7 +854,65 @@ async fn mark_failed_and_release(pg: &PgPool, item: &AssignedWorkItem, error: &s
     .await?;
     release_slot_and_lease_tx(&mut tx, item, "dispatch failed").await?;
     tx.commit().await?;
+    // Escalation ladder stage 3: the fleet (local + cloud) couldn't build this
+    // after the full retry budget — tell the operator. Best-effort; a notify
+    // failure never fails the dispatch.
+    notify_operator_task_failed(pg, item.work_item_id, &item.title, error).await;
     Ok(())
+}
+
+/// Best-effort Telegram notification when a work_item exhausts its retry budget
+/// and lands on terminal `failed` — "Jarvis tells you when it's genuinely
+/// stuck." Reads the same `openclaw.telegram_*` secrets the alert evaluator
+/// uses. NEVER returns an error or panics: any failure is logged and swallowed.
+async fn notify_operator_task_failed(pg: &PgPool, work_item_id: Uuid, title: &str, error: &str) {
+    let token = match ff_db::pg_get_secret(pg, "openclaw.telegram_bot_token").await {
+        Ok(Some(t)) if !t.trim().is_empty() => t,
+        _ => {
+            tracing::debug!("notify_operator_task_failed: no telegram bot token; skipping");
+            return;
+        }
+    };
+    let chat_id = match ff_db::pg_get_secret(pg, "openclaw.telegram_chat_id").await {
+        Ok(Some(c)) if !c.trim().is_empty() => c,
+        _ => {
+            tracing::debug!("notify_operator_task_failed: no telegram chat id; skipping");
+            return;
+        }
+    };
+    let err_clip: String = error.chars().take(800).collect();
+    let text = format!(
+        "🛑 ForgeFleet task FAILED after max retries\n\n{title}\n\nwork_item: {work_item_id}\n\nlast error:\n{err_clip}"
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "notify_operator_task_failed: client build failed");
+            return;
+        }
+    };
+    let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+    match client
+        .post(&url)
+        .json(&serde_json::json!({ "chat_id": chat_id, "text": text }))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::info!(%work_item_id, "notify_operator_task_failed: telegram sent");
+        }
+        Ok(resp) => tracing::warn!(
+            status = %resp.status(),
+            %work_item_id,
+            "notify_operator_task_failed: telegram non-2xx"
+        ),
+        Err(e) => {
+            tracing::warn!(error = %e, %work_item_id, "notify_operator_task_failed: telegram send failed")
+        }
+    }
 }
 
 async fn release_slot_and_lease_tx(
@@ -921,12 +994,25 @@ fn dispatch_prompt(item: &AssignedWorkItem) -> String {
         Some(desc) if !desc.trim().is_empty() => format!("{}\n\n{}", item.title, desc.trim()),
         _ => item.title.clone(),
     };
+    // Retry-with-context (escalation ladder, stage 1): on a retry, feed the prior
+    // failure back into the prompt so the model doesn't repeat the same mistake.
+    // Previously last_error was stored but NEVER injected — a no-op. This closes it.
+    let retry_context = match (item.attempts, item.last_error.as_deref()) {
+        (n, Some(err)) if n > 0 && !err.trim().is_empty() => format!(
+            "\n\n⚠ This is retry attempt {}. The previous attempt(s) FAILED with:\n{}\n\
+             Diagnose why it failed and fix THAT root cause — do not repeat the same approach.\n",
+            n + 1,
+            err.trim()
+        ),
+        _ => String::new(),
+    };
     format!(
-        "Target repo:\n- project_id: {}\n- repo_url: {}\n- checkout: {}\n\n{}",
+        "Target repo:\n- project_id: {}\n- repo_url: {}\n- checkout: {}\n\n{}{}",
         item.project_id,
         item.repo_url.as_deref().unwrap_or("unknown"),
         item.repo_path.display(),
-        task
+        task,
+        retry_context,
     )
 }
 
@@ -1017,31 +1103,43 @@ async fn run_ff_dispatch(
 ) -> Result<(String, Output)> {
     let prompt = dispatch_prompt(item);
 
-    // Lane 1: local codegen harness.
-    match crate::codegen_apply::codegen_apply(pg, &worktree.worktree_path, &prompt, None, 4).await {
-        Ok(outcome) if outcome.applied => {
-            info!(
+    // Lane 1: local codegen harness — but skip it once we've escalated to cloud
+    // (stage 2): after ESCALATE_TO_CLOUD_AT local failures it has failed the same
+    // way, so don't waste another local round — fall straight through to Lane 2.
+    if item.attempts < ESCALATE_TO_CLOUD_AT {
+        match crate::codegen_apply::codegen_apply(pg, &worktree.worktree_path, &prompt, None, 4)
+            .await
+        {
+            Ok(outcome) if outcome.applied => {
+                info!(
+                    work_item_id = %item.work_item_id,
+                    rounds = outcome.rounds,
+                    "work_item_dispatch: local codegen harness landed the change"
+                );
+                return Ok((
+                    "local".to_string(),
+                    synthetic_output(&outcome.final_diff.unwrap_or_else(|| "applied".into())),
+                ));
+            }
+            Ok(outcome) => info!(
                 work_item_id = %item.work_item_id,
-                rounds = outcome.rounds,
-                "work_item_dispatch: local codegen harness landed the change"
-            );
-            return Ok((
-                "local".to_string(),
-                synthetic_output(&outcome.final_diff.unwrap_or_else(|| "applied".into())),
-            ));
+                error = ?outcome.error,
+                "work_item_dispatch: local codegen didn't land; backstop to codex"
+            ),
+            Err(e) => warn!(
+                work_item_id = %item.work_item_id,
+                // Full anyhow chain so the REAL cause surfaces (e.g. the underlying
+                // fleet_oneshot failure), not just the "fleet_oneshot round 1" wrapper.
+                error = format!("{e:#}"),
+                "work_item_dispatch: local codegen errored; backstop to codex"
+            ),
         }
-        Ok(outcome) => info!(
+    } else {
+        info!(
             work_item_id = %item.work_item_id,
-            error = ?outcome.error,
-            "work_item_dispatch: local codegen didn't land; backstop to codex"
-        ),
-        Err(e) => warn!(
-            work_item_id = %item.work_item_id,
-            // Full anyhow chain so the REAL cause surfaces (e.g. the underlying
-            // fleet_oneshot failure), not just the "fleet_oneshot round 1" wrapper.
-            error = format!("{e:#}"),
-            "work_item_dispatch: local codegen errored; backstop to codex"
-        ),
+            attempts = item.attempts,
+            "work_item_dispatch: escalated (stage 2) — skipping local lane, straight to cloud backstop"
+        );
     }
 
     // Lane 2: dispatch to an AVAILABLE backend (capability A4/A5) with the full
