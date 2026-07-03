@@ -4384,6 +4384,25 @@ mod tests {
     fn offload_workload_none_input_is_none() {
         assert_eq!(offload_workload_for_kind(None), None);
     }
+
+    #[test]
+    fn stale_lease_attempt_decision_fails_at_max_attempts_boundary() {
+        let decision = stale_lease_attempt_decision(2, 3);
+
+        assert_eq!(decision.status, "failed");
+        assert_eq!(
+            decision.last_error,
+            "failed after 3 stalled attempts (max 3 reached)"
+        );
+    }
+
+    #[test]
+    fn stale_lease_attempt_decision_requeues_while_under_max_attempts() {
+        let decision = stale_lease_attempt_decision(1, 3);
+
+        assert_eq!(decision.status, "ready");
+        assert_eq!(decision.last_error, "stale-heartbeat takeover (attempt 2)");
+    }
 }
 
 // ─── Task Provenance ─────────────────────────────────────────────────────────
@@ -7006,6 +7025,29 @@ pub struct HostCapacity {
     pub score: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaleLeaseAttemptDecision {
+    status: &'static str,
+    last_error: String,
+}
+
+fn stale_lease_attempt_decision(attempts: i32, max_attempts: i32) -> StaleLeaseAttemptDecision {
+    let next_attempts = attempts + 1;
+    if next_attempts >= max_attempts {
+        StaleLeaseAttemptDecision {
+            status: "failed",
+            last_error: format!(
+                "failed after {next_attempts} stalled attempts (max {max_attempts} reached)"
+            ),
+        }
+    } else {
+        StaleLeaseAttemptDecision {
+            status: "ready",
+            last_error: format!("stale-heartbeat takeover (attempt {next_attempts})"),
+        }
+    }
+}
+
 /// Fleet-global capacity ranking for work dispatch. Active leases are counted
 /// across all work_items/projects so dispatch spreads away from busy computers.
 pub async fn pg_rank_computers_by_capacity(pool: &PgPool) -> Result<Vec<HostCapacity>> {
@@ -7061,8 +7103,8 @@ pub async fn pg_rank_computers_by_capacity(pool: &PgPool) -> Result<Vec<HostCapa
 }
 
 /// Reap leases whose heartbeat is older than `stale_secs`: release the lease,
-/// free its slot, mark any in-flight worktree stale/failed, and return the
-/// work_item to 'ready' (bumping attempts).
+/// free its slot, mark any in-flight worktree stale/failed, and either return
+/// the work_item to 'ready' or fail it once the next attempt reaches the cap.
 /// Returns the number of leases successfully reaped.
 pub async fn pg_reap_stale_work_item_leases(
     pool: &PgPool,
@@ -7140,22 +7182,28 @@ pub async fn pg_reap_stale_work_item_leases(
             // (observed: 17 re-claims / 65 min / 0 PRs, holding a slot the whole
             // time). Failing cleanly frees the slot and surfaces the task for a
             // human or a retry-with-error-context.
+            let attempts: i32 = sqlx::query_scalar(
+                "SELECT attempts
+                   FROM work_items
+                  WHERE id = $1
+                  FOR UPDATE",
+            )
+            .bind(wi)
+            .fetch_one(&mut *tx)
+            .await?;
+            let decision = stale_lease_attempt_decision(attempts, max_attempts);
+
             sqlx::query(
                 "UPDATE work_items
-                    SET status = CASE WHEN attempts + 1 >= $2 THEN 'failed'
-                                      ELSE 'ready' END,
+                    SET status = $2,
                         attempts = attempts + 1,
                         assigned_computer = NULL,
-                        last_error = CASE
-                            WHEN attempts + 1 >= $2
-                              THEN 'failed after ' || (attempts + 1)
-                                   || ' stalled attempts (max ' || $2 || ' reached)'
-                            ELSE 'stale-heartbeat takeover (attempt ' || (attempts + 1) || ')'
-                          END
+                        last_error = $3
                   WHERE id = $1",
             )
             .bind(wi)
-            .bind(max_attempts)
+            .bind(decision.status)
+            .bind(decision.last_error)
             .execute(&mut *tx)
             .await?;
 
