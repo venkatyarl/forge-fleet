@@ -848,7 +848,7 @@ pub async fn list_work_items(
                labels, status, priority, assigned_to, assigned_computer,
                branch_name, pr_url, created_at, created_by, started_at,
                completed_at, due_date, estimated_hours
-        FROM fleet_work_items
+        FROM work_items
         WHERE 1=1
         "#,
     );

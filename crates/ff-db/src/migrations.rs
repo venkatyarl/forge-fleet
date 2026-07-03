@@ -743,6 +743,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "work_item_repo_binding",
         sql: schema::SCHEMA_V152_WORK_ITEM_REPO_BINDING,
     },
+    PgMigration {
+        version: 153,
+        name: "retire_v75_work_stealing",
+        sql: schema::SCHEMA_V153_RETIRE_V75_WORK_STEALING,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
