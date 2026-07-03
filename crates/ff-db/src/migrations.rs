@@ -758,6 +758,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "drop_dead_bridge",
         sql: schema::SCHEMA_V155_DROP_DEAD_BRIDGE,
     },
+    PgMigration {
+        version: 156,
+        name: "fleet_tasks_fold_columns",
+        sql: schema::SCHEMA_V156_FLEET_TASKS_FOLD_COLUMNS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

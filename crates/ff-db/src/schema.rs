@@ -9450,3 +9450,14 @@ UPDATE sub_agents
 pub const SCHEMA_V155_DROP_DEAD_BRIDGE: &str = r#"
 DROP TABLE IF EXISTS work_item_fleet_tasks CASCADE;
 "#;
+
+pub const SCHEMA_V156_FLEET_TASKS_FOLD_COLUMNS: &str = r#"
+ALTER TABLE fleet_tasks
+    ADD COLUMN IF NOT EXISTS task_class          TEXT,
+    ADD COLUMN IF NOT EXISTS not_before          TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS dedup_signature     TEXT,
+    ADD COLUMN IF NOT EXISTS parent_work_item_id UUID;
+CREATE INDEX IF NOT EXISTS idx_fleet_tasks_task_class ON fleet_tasks (task_class);
+CREATE INDEX IF NOT EXISTS idx_fleet_tasks_not_before ON fleet_tasks (not_before) WHERE not_before IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_tasks_dedup_signature ON fleet_tasks (dedup_signature) WHERE dedup_signature IS NOT NULL;
+"#;
