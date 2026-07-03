@@ -753,6 +753,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "nested_subagent_workspace",
         sql: schema::SCHEMA_V154_NESTED_SUBAGENT_WORKSPACE,
     },
+    PgMigration {
+        version: 155,
+        name: "drop_dead_bridge",
+        sql: schema::SCHEMA_V155_DROP_DEAD_BRIDGE,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
