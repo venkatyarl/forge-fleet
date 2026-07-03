@@ -178,12 +178,20 @@ impl UpstreamChecker {
                         .await?;
 
                         // … then mark any out-of-date installs as upgrade_available.
+                        // SHA-prefix aware: a follower may store the same commit
+                        // at a shorter prefix (`3b644697cb`) than the leader's
+                        // target (`3b644697cb71`). A plain `<>` treats those as
+                        // drift and triggers an endless no-op upgrade+restart
+                        // loop (the 2026-07-03 follower restart-loop root cause),
+                        // so only flag when neither is a prefix of the other.
                         sqlx::query(
                             "UPDATE computer_software
                                 SET status = 'upgrade_available'
                               WHERE software_id = $1
                                 AND installed_version IS NOT NULL
-                                AND installed_version <> $2
+                                AND length(installed_version) >= 7
+                                AND NOT (lower($2) LIKE lower(installed_version) || '%'
+                                      OR lower(installed_version) LIKE lower($2) || '%')
                                 AND status <> 'upgrade_available'",
                         )
                         .bind(&id)
