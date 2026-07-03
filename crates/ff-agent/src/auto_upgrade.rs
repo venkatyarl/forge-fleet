@@ -38,6 +38,25 @@ const AUTO_UPGRADE_ENABLED_KEY: &str = "auto_upgrade_enabled";
 /// daemon restart. Permanent default OFF so shipping this is harmless.
 const LEADER_SELF_UPGRADE_KEY: &str = "leader_self_upgrade";
 
+/// True when two git SHAs name the same commit even at different prefix lengths
+/// (e.g. `3b644697cb` vs `3b644697cb71`). Both must be non-empty and ≥7 hex
+/// chars; they match when the shorter is a case-insensitive prefix of the
+/// longer. This defeats the phantom-drift loop where a follower's short-SHA
+/// install compares unequal (`<>`) to the leader's longer-SHA target, causing
+/// an endless no-op git-reset + rebuild + daemon RESTART every upgrade cycle.
+pub fn same_commit(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim().to_ascii_lowercase(), b.trim().to_ascii_lowercase());
+    if a.len() < 7 || b.len() < 7 {
+        return false;
+    }
+    let (short, long) = if a.len() <= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    long.starts_with(short.as_str())
+}
+
 /// One target computer + the resolved playbook command for it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpgradePlan {
@@ -179,6 +198,21 @@ pub async fn resolve_upgrade_plans_with_suffix(
         let source_tree_path: Option<String> = row.get("source_tree_path");
         let install_source: Option<String> = row.get("install_source");
         let installed_version: Option<String> = row.get("installed_version");
+
+        // Skip a no-op self-upgrade: if the install is already the target
+        // commit (same SHA at a different prefix length, e.g. `3b644697cb`
+        // vs `3b644697cb71`), dispatching would git-reset + rebuild + RESTART
+        // forgefleetd for nothing — killing any in-flight build. This phantom
+        // drift was the root cause of the follower daemon restart loop that
+        // prevented the fleet from ever self-building (2026-07-03).
+        if let (Some(inst), Some(latest)) =
+            (installed_version.as_deref(), latest_version.as_deref())
+        {
+            if same_commit(inst, latest) {
+                skipped.push((name, format!("already on target commit {latest}")));
+                continue;
+            }
+        }
 
         let candidates: Vec<String> = {
             let mut v = Vec::new();
@@ -1488,6 +1522,27 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 2026-07-03 restart-loop regression guard: same commit at different
+    /// prefix lengths must NOT read as drift (that dispatched endless no-op
+    /// upgrade+restart tasks that killed every fleet build).
+    #[test]
+    fn same_commit_is_prefix_length_agnostic() {
+        // Same commit, leader stores 12 chars, follower stores 10 — the exact
+        // shape that caused the loop.
+        assert!(same_commit("3b644697cb", "3b644697cb71"));
+        assert!(same_commit("3b644697cb71", "3b644697cb"));
+        // Identical.
+        assert!(same_commit("3b644697cb71", "3b644697cb71"));
+        // Case-insensitive (git short SHAs are lowercase, but be safe).
+        assert!(same_commit("3B644697CB", "3b644697cb71"));
+        // Genuinely different commits must still be treated as drift.
+        assert!(!same_commit("3b644697cb", "a1b2c3d4e5"));
+        // Too-short / empty inputs are never "same" (avoid a 1-char prefix
+        // matching everything).
+        assert!(!same_commit("", "3b644697cb71"));
+        assert!(!same_commit("3b6", "3b644697cb71"));
+    }
 
     #[test]
     fn daemon_self_software_matches_the_family_const() {
