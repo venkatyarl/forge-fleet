@@ -79,6 +79,7 @@ mod pm_cmd;
 mod ports_cmd;
 mod power_cmd;
 mod project_cmd;
+mod queue_cmd;
 mod repo_context;
 mod research_cmd;
 mod secrets_cmd;
@@ -693,6 +694,8 @@ enum Command {
         #[command(subcommand)]
         command: PmCommand,
     },
+    /// Show queue counts for fleet tasks, work items, and active leases.
+    Queue,
     /// Project metadata — repos, environments, CI.
     Project {
         #[command(subcommand)]
@@ -4118,6 +4121,9 @@ async fn main() -> Result<()> {
         Some(Command::Pm { command }) => {
             return pm_cmd::handle_pm(command.clone(), cli.cwd.clone()).await;
         }
+        Some(Command::Queue) => {
+            return queue_cmd::handle_queue().await;
+        }
         Some(Command::Build {
             goal,
             project,
@@ -4452,6 +4458,7 @@ async fn main() -> Result<()> {
         Some(Command::Cortex(args)) => top_cortex_cmd::handle_top_cortex(args).await,
         Some(Command::Openclaw { command }) => openclaw_cmd::handle_openclaw(command).await,
         Some(Command::Pm { command }) => pm_cmd::handle_pm(command, cli.cwd.clone()).await,
+        Some(Command::Queue) => queue_cmd::handle_queue().await,
         Some(Command::Agent { command }) => agent_cmd::handle_agent(command).await,
         Some(Command::Project { command }) => project_cmd::handle_project(command).await,
         // V119 resource arbiter (backlog #7). Handlers open the pool via
