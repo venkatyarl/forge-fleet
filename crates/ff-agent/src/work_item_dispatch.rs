@@ -1163,6 +1163,8 @@ async fn run_ff_dispatch(
         routed
     };
     let computer_id = item.computer_id;
+    let forced_backend = primary_or_default_backend(&backends);
+    let mut attempted_backend = false;
     let mut last_output: Option<(String, Output)> = None;
 
     for backend in &backends {
@@ -1173,6 +1175,7 @@ async fn run_ff_dispatch(
             info!(backend = %backend, "run_ff_dispatch: skipping breaker-open backend");
             continue;
         }
+        attempted_backend = true;
         let mut attempt: u32 = 0;
         loop {
             let out = match run_backend_cli(backend, &worktree.worktree_path, &prompt).await {
@@ -1264,9 +1267,41 @@ async fn run_ff_dispatch(
             break; // exhausted / terminal-for-this-backend → try the next one
         }
     }
+    if !attempted_backend {
+        warn!(
+            backend = %forced_backend,
+            "run_ff_dispatch: all routed backends were skipped before launch; forcing one direct attempt"
+        );
+        match run_backend_cli(&forced_backend, &worktree.worktree_path, &prompt).await {
+            Ok(out) => return Ok((forced_backend, out)),
+            Err(e) => {
+                if worktree_has_diff(&worktree.worktree_path) {
+                    warn!(backend = %forced_backend, error = %e, "run_ff_dispatch: forced backend timed out but wrote a real diff — salvaging");
+                    let _ = crate::circuit_breaker::record_provider_success(
+                        pg,
+                        computer_id,
+                        &forced_backend,
+                    )
+                    .await;
+                    return Ok((
+                        forced_backend,
+                        synthetic_output("salvaged diff after forced backend timeout"),
+                    ));
+                }
+                return Err(e);
+            }
+        }
+    }
     last_output
         .map(Ok)
         .unwrap_or_else(|| bail!("run_ff_dispatch: no dispatchable backend on this node"))
+}
+
+fn primary_or_default_backend(backends: &[String]) -> String {
+    backends
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "codex".to_string())
 }
 
 /// The backend name for interaction attribution when a dispatch errored before
@@ -1276,7 +1311,7 @@ async fn primary_dispatch_backend(pg: &PgPool, computer_id: Uuid) -> String {
     ff_db::pg_routed_backends(pg, computer_id, 5400)
         .await
         .ok()
-        .and_then(|b| b.into_iter().next())
+        .map(|b| primary_or_default_backend(&b))
         .unwrap_or_else(|| "codex".to_string())
 }
 
@@ -1750,6 +1785,7 @@ pub fn spawn_worktree_reaper(
 mod tests {
     use super::{
         DispatchOutcome, classify_dispatch_outcome, dispatch_budget_for_host, parse_cli_tokens,
+        primary_or_default_backend,
     };
     use anyhow::anyhow;
     use std::os::unix::process::ExitStatusExt;
@@ -1864,5 +1900,18 @@ mod tests {
     fn returns_zero_when_absent() {
         assert_eq!(parse_cli_tokens("no counts here, just output"), 0);
         assert_eq!(parse_cli_tokens(""), 0);
+    }
+
+    #[test]
+    fn forced_fallback_prefers_first_routed_backend() {
+        assert_eq!(
+            primary_or_default_backend(&["kimi".to_string(), "codex".to_string()]),
+            "kimi"
+        );
+    }
+
+    #[test]
+    fn forced_fallback_defaults_to_codex_when_unrouted() {
+        assert_eq!(primary_or_default_backend(&[]), "codex");
     }
 }
