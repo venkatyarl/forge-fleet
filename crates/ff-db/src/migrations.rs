@@ -763,6 +763,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "fleet_tasks_fold_columns",
         sql: schema::SCHEMA_V156_FLEET_TASKS_FOLD_COLUMNS,
     },
+    PgMigration {
+        version: 157,
+        name: "fold_research_subtasks",
+        sql: schema::SCHEMA_V157_FOLD_RESEARCH_SUBTASKS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
