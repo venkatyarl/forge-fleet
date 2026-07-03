@@ -311,7 +311,13 @@ fn versions_equivalent(a: &str, b: &str) -> bool {
     }
     match (extract_semver(a), extract_semver(b)) {
         (Some(x), Some(y)) => x == y,
-        _ => a == b,
+        // Bare git SHAs (e.g. `7dc2a6b37d` vs `7dc2a6b37dfd`) are the same commit
+        // at different prefix lengths — NOT drift. Without this, this tick's
+        // enqueue path re-dispatches a phantom no-op upgrade every cycle, which
+        // restarts forgefleetd and kills in-flight builds. `same_commit` is
+        // hex-guarded so non-SHA strings fall through to plain equality.
+        // (Sibling of the auto_upgrade fix in PR #724, which missed THIS path.)
+        _ => a == b || crate::auto_upgrade::same_commit(a, b),
     }
 }
 
@@ -563,6 +569,18 @@ mod tests {
         let a = "2026.4.27_12 (pushed db1a950e4c)";
         let b = "2026.4.27_12 (pushed 33e05f9beb)";
         assert!(!versions_equivalent(a, b));
+    }
+
+    #[test]
+    fn versions_equivalent_bare_sha_prefix_is_not_drift() {
+        // forgefleetd_git often reports a BARE git SHA (no BuildVersion wrapper)
+        // at inconsistent prefix lengths across hosts. Same commit, different
+        // prefix must NOT read as drift — else this tick re-enqueues a phantom
+        // no-op upgrade every cycle (the 2026-07-03 restart-loop, path #2).
+        assert!(versions_equivalent("7dc2a6b37d", "7dc2a6b37dfd"));
+        assert!(versions_equivalent("7dc2a6b37dfd", "7dc2a6b37d"));
+        // Genuinely different bare SHAs are still drift.
+        assert!(!versions_equivalent("7dc2a6b37d", "4130b332aa"));
     }
 
     #[test]
