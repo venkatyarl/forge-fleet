@@ -9461,3 +9461,303 @@ CREATE INDEX IF NOT EXISTS idx_fleet_tasks_task_class ON fleet_tasks (task_class
 CREATE INDEX IF NOT EXISTS idx_fleet_tasks_not_before ON fleet_tasks (not_before) WHERE not_before IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_tasks_dedup_signature ON fleet_tasks (dedup_signature) WHERE dedup_signature IS NOT NULL;
 "#;
+
+pub const SCHEMA_V157_FOLD_RESEARCH_SUBTASKS: &str = r#"
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '60s';
+
+INSERT INTO fleet_tasks (
+    id,
+    task_type,
+    summary,
+    payload,
+    priority,
+    preferred_computer_id,
+    status,
+    claimed_by_computer_id,
+    started_at,
+    completed_at,
+    result,
+    error,
+    created_at,
+    created_by_computer_id,
+    original_computer_id,
+    task_class
+)
+SELECT
+    st.id,
+    'research_subtask',
+    st.sub_question,
+    jsonb_build_object(
+        'research_session_id', st.session_id,
+        'ordinal', st.ordinal,
+        'sub_question', st.sub_question,
+        'assigned_computer', st.assigned_computer,
+        'assigned_endpoint', st.assigned_endpoint,
+        'assigned_model', st.assigned_model,
+        'agent_session_id', st.agent_session_id,
+        'legacy_status', st.status,
+        'metadata', COALESCE(st.metadata, '{}'::jsonb)
+    ),
+    50,
+    c.id,
+    CASE st.status
+        WHEN 'pending' THEN 'pending'
+        WHEN 'running' THEN 'running'
+        WHEN 'done' THEN 'completed'
+        WHEN 'max_turns' THEN 'completed'
+        WHEN 'failed' THEN 'failed'
+        WHEN 'cancelled' THEN 'cancelled'
+        ELSE 'failed'
+    END,
+    CASE
+        WHEN st.status IN ('running', 'done', 'max_turns', 'failed', 'cancelled') THEN c.id
+        ELSE NULL
+    END,
+    st.started_at,
+    st.completed_at,
+    jsonb_build_object(
+        'output_markdown', st.output_markdown,
+        'turn_count', st.turn_count,
+        'duration_ms', st.duration_ms,
+        'tokens_in', st.tokens_in,
+        'tokens_out', st.tokens_out
+    ),
+    st.error,
+    COALESCE(rs.created_at, st.started_at, st.completed_at, NOW()),
+    c.id,
+    CASE
+        WHEN st.status IN ('running', 'done', 'max_turns', 'failed', 'cancelled') THEN c.id
+        ELSE NULL
+    END,
+    'research'
+FROM research_subtasks st
+LEFT JOIN research_sessions rs ON rs.id = st.session_id
+LEFT JOIN computers c ON c.name = st.assigned_computer
+ON CONFLICT (id) DO NOTHING;
+
+ALTER TABLE research_subtasks RENAME TO research_subtasks_legacy;
+
+CREATE OR REPLACE VIEW research_subtasks AS
+SELECT
+    t.id,
+    (t.payload->>'research_session_id')::uuid AS session_id,
+    COALESCE((t.payload->>'ordinal')::int, 0) AS ordinal,
+    COALESCE(t.payload->>'sub_question', t.summary) AS sub_question,
+    t.payload->>'assigned_computer' AS assigned_computer,
+    t.payload->>'assigned_endpoint' AS assigned_endpoint,
+    t.payload->>'assigned_model' AS assigned_model,
+    t.payload->>'agent_session_id' AS agent_session_id,
+    CASE
+        WHEN t.status = 'completed' THEN
+            CASE
+                WHEN COALESCE(t.payload->>'legacy_status', '') IN ('done', 'max_turns')
+                    THEN t.payload->>'legacy_status'
+                ELSE 'done'
+            END
+        WHEN t.status IN ('pending', 'running', 'failed', 'cancelled') THEN t.status
+        ELSE COALESCE(NULLIF(t.payload->>'legacy_status', ''), t.status)
+    END AS status,
+    t.result->>'output_markdown' AS output_markdown,
+    (t.result->>'turn_count')::int AS turn_count,
+    t.started_at,
+    t.completed_at,
+    (t.result->>'duration_ms')::bigint AS duration_ms,
+    (t.result->>'tokens_in')::bigint AS tokens_in,
+    (t.result->>'tokens_out')::bigint AS tokens_out,
+    t.error,
+    COALESCE(t.payload->'metadata', '{}'::jsonb) AS metadata
+FROM fleet_tasks t
+WHERE t.task_class = 'research';
+
+CREATE OR REPLACE FUNCTION research_subtasks_view_write()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    effective_id uuid;
+    assigned_computer_id uuid;
+    existing_created_at timestamptz;
+    fleet_status text;
+    legacy_status text;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        DELETE FROM research_subtasks_legacy WHERE id = OLD.id;
+        DELETE FROM fleet_tasks WHERE id = OLD.id AND task_class = 'research';
+        RETURN OLD;
+    END IF;
+
+    IF TG_OP = 'INSERT' THEN
+        effective_id := COALESCE(NEW.id, gen_random_uuid());
+        legacy_status := COALESCE(NEW.status, 'pending');
+    ELSE
+        effective_id := COALESCE(NEW.id, OLD.id);
+        legacy_status := COALESCE(NEW.status, OLD.status, 'pending');
+    END IF;
+
+    SELECT c.id
+      INTO assigned_computer_id
+      FROM computers c
+     WHERE c.name = NEW.assigned_computer
+     LIMIT 1;
+
+    SELECT t.created_at
+      INTO existing_created_at
+      FROM fleet_tasks t
+     WHERE t.id = effective_id
+       AND t.task_class = 'research';
+
+    fleet_status := CASE legacy_status
+        WHEN 'pending' THEN 'pending'
+        WHEN 'running' THEN 'running'
+        WHEN 'done' THEN 'completed'
+        WHEN 'max_turns' THEN 'completed'
+        WHEN 'failed' THEN 'failed'
+        WHEN 'cancelled' THEN 'cancelled'
+        ELSE 'failed'
+    END;
+
+    INSERT INTO research_subtasks_legacy (
+        id,
+        session_id,
+        ordinal,
+        sub_question,
+        assigned_computer,
+        assigned_endpoint,
+        assigned_model,
+        agent_session_id,
+        status,
+        output_markdown,
+        turn_count,
+        started_at,
+        completed_at,
+        duration_ms,
+        tokens_in,
+        tokens_out,
+        error,
+        metadata
+    )
+    VALUES (
+        effective_id,
+        NEW.session_id,
+        NEW.ordinal,
+        NEW.sub_question,
+        NEW.assigned_computer,
+        NEW.assigned_endpoint,
+        NEW.assigned_model,
+        NEW.agent_session_id,
+        legacy_status,
+        NEW.output_markdown,
+        NEW.turn_count,
+        NEW.started_at,
+        NEW.completed_at,
+        NEW.duration_ms,
+        COALESCE(NEW.tokens_in, 0),
+        COALESCE(NEW.tokens_out, 0),
+        NEW.error,
+        COALESCE(NEW.metadata, '{}'::jsonb)
+    )
+    ON CONFLICT (id) DO UPDATE
+    SET session_id = EXCLUDED.session_id,
+        ordinal = EXCLUDED.ordinal,
+        sub_question = EXCLUDED.sub_question,
+        assigned_computer = EXCLUDED.assigned_computer,
+        assigned_endpoint = EXCLUDED.assigned_endpoint,
+        assigned_model = EXCLUDED.assigned_model,
+        agent_session_id = EXCLUDED.agent_session_id,
+        status = EXCLUDED.status,
+        output_markdown = EXCLUDED.output_markdown,
+        turn_count = EXCLUDED.turn_count,
+        started_at = EXCLUDED.started_at,
+        completed_at = EXCLUDED.completed_at,
+        duration_ms = EXCLUDED.duration_ms,
+        tokens_in = EXCLUDED.tokens_in,
+        tokens_out = EXCLUDED.tokens_out,
+        error = EXCLUDED.error,
+        metadata = EXCLUDED.metadata;
+
+    INSERT INTO fleet_tasks (
+        id,
+        task_type,
+        summary,
+        payload,
+        priority,
+        preferred_computer_id,
+        status,
+        claimed_by_computer_id,
+        started_at,
+        completed_at,
+        result,
+        error,
+        created_at,
+        created_by_computer_id,
+        original_computer_id,
+        task_class
+    )
+    VALUES (
+        effective_id,
+        'research_subtask',
+        NEW.sub_question,
+        jsonb_build_object(
+            'research_session_id', NEW.session_id,
+            'ordinal', NEW.ordinal,
+            'sub_question', NEW.sub_question,
+            'assigned_computer', NEW.assigned_computer,
+            'assigned_endpoint', NEW.assigned_endpoint,
+            'assigned_model', NEW.assigned_model,
+            'agent_session_id', NEW.agent_session_id,
+            'legacy_status', legacy_status,
+            'metadata', COALESCE(NEW.metadata, '{}'::jsonb)
+        ),
+        50,
+        assigned_computer_id,
+        fleet_status,
+        CASE
+            WHEN legacy_status IN ('running', 'done', 'max_turns', 'failed', 'cancelled')
+                THEN assigned_computer_id
+            ELSE NULL
+        END,
+        NEW.started_at,
+        NEW.completed_at,
+        jsonb_build_object(
+            'output_markdown', NEW.output_markdown,
+            'turn_count', NEW.turn_count,
+            'duration_ms', NEW.duration_ms,
+            'tokens_in', COALESCE(NEW.tokens_in, 0),
+            'tokens_out', COALESCE(NEW.tokens_out, 0)
+        ),
+        NEW.error,
+        COALESCE(existing_created_at, NEW.started_at, NEW.completed_at, NOW()),
+        assigned_computer_id,
+        CASE
+            WHEN legacy_status IN ('running', 'done', 'max_turns', 'failed', 'cancelled')
+                THEN assigned_computer_id
+            ELSE NULL
+        END,
+        'research'
+    )
+    ON CONFLICT (id) DO UPDATE
+    SET summary = EXCLUDED.summary,
+        payload = EXCLUDED.payload,
+        preferred_computer_id = EXCLUDED.preferred_computer_id,
+        status = EXCLUDED.status,
+        claimed_by_computer_id = EXCLUDED.claimed_by_computer_id,
+        started_at = EXCLUDED.started_at,
+        completed_at = EXCLUDED.completed_at,
+        result = EXCLUDED.result,
+        error = EXCLUDED.error,
+        created_by_computer_id = EXCLUDED.created_by_computer_id,
+        original_computer_id = EXCLUDED.original_computer_id,
+        task_class = EXCLUDED.task_class;
+
+    NEW.id := effective_id;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS research_subtasks_view_write_trg ON research_subtasks;
+CREATE TRIGGER research_subtasks_view_write_trg
+INSTEAD OF INSERT OR UPDATE OR DELETE ON research_subtasks
+FOR EACH ROW
+EXECUTE FUNCTION research_subtasks_view_write();
+"#;
