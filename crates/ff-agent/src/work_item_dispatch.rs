@@ -997,6 +997,20 @@ async fn mark_worktree_cleaned(pg: &PgPool, work_item_id: Uuid) -> Result<()> {
 }
 
 /// The prompt the dispatch sends to the agent for a work_item.
+/// Repo-wide build conventions injected into EVERY dispatch prompt so a sub-agent
+/// doesn't rediscover them per task. Distilled from recurring fleet-build failures
+/// (2026-07-04): DB tests panicking in CI's DB-less job, redundant second
+/// migrations + endless iteration, and edits to historical migration consts.
+const DISPATCH_HOUSE_RULES: &str = "\n\n--- ForgeFleet build rules (apply to EVERY change) ---\n\
+- DB TESTS: any test that needs Postgres MUST early-return when neither \
+FORGEFLEET_POSTGRES_URL nor FORGEFLEET_DATABASE_URL is set (CI's `cargo test --lib` \
+has NO database and will PANIC otherwise). Never let a DB test panic in CI.\n\
+- MIGRATIONS are forward-only: add ONE new const + register the next integer version; \
+NEVER edit an existing migration const, and never add a second/redundant migration.\n\
+- STOP when done: once `cargo +1.88.0 fmt --check` + `cargo +1.88.0 check` + your \
+targeted test pass, open ONE PR and STOP — do not keep iterating or push more commits.\n\
+- Keep the diff minimal and scoped strictly to the task.\n";
+
 fn dispatch_prompt(item: &AssignedWorkItem) -> String {
     let task = match item.description.as_deref() {
         Some(desc) if !desc.trim().is_empty() => format!("{}\n\n{}", item.title, desc.trim()),
@@ -1015,12 +1029,13 @@ fn dispatch_prompt(item: &AssignedWorkItem) -> String {
         _ => String::new(),
     };
     format!(
-        "Target repo:\n- project_id: {}\n- repo_url: {}\n- checkout: {}\n\n{}{}",
+        "Target repo:\n- project_id: {}\n- repo_url: {}\n- checkout: {}\n\n{}{}{}",
         item.project_id,
         item.repo_url.as_deref().unwrap_or("unknown"),
         item.repo_path.display(),
         task,
         retry_context,
+        DISPATCH_HOUSE_RULES,
     )
 }
 
