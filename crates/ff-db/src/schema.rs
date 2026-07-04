@@ -9859,7 +9859,7 @@ FROM fleet_tasks t
 WHERE t.task_class = 'self_heal';
 "#;
 
-pub const SCHEMA_V159_SELF_HEAL_WRITER_MIGRATION: &str = r#"
+pub const SCHEMA_V159_FOLD_DEFERRED_TASKS: &str = r#"
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '60s';
 
@@ -9869,139 +9869,70 @@ INSERT INTO fleet_tasks (
     summary,
     payload,
     priority,
+    requires_capability,
     status,
+    claimed_at,
+    completed_at,
+    result,
+    error,
     created_at,
     task_class,
-    dedup_signature
+    not_before
 )
 SELECT
-    gen_random_uuid(),
-    'self_heal_writer',
-    format('self_heal_writer: %s', q.bug_signature),
-    jsonb_build_object(
-        'bug_signature', q.bug_signature,
-        'tier', q.tier,
-        'status', q.status,
-        'writer_computer_id', q.writer_computer_id,
-        'writer_model', q.writer_model,
-        'reviewer_computer_id', q.reviewer_computer_id,
-        'reviewer_model', q.reviewer_model,
-        'reviewer_confidence', q.reviewer_confidence,
-        'pr_number', q.pr_number,
-        'branch_name', q.branch_name,
-        'fix_commit_sha', q.fix_commit_sha,
-        'fixed_tag', q.fixed_tag,
-        'attempts', q.attempts,
-        'last_attempt_at', q.last_attempt_at,
-        'escalated_to_operator_at', q.escalated_to_operator_at,
-        'report_count', q.report_count
+    d.id,
+    d.kind,
+    d.title,
+    jsonb_strip_nulls(
+        jsonb_build_object(
+            'deferred_payload', COALESCE(d.payload, '{}'::jsonb),
+            'created_by', d.created_by,
+            'kind', d.kind,
+            'trigger_type', d.trigger_type,
+            'trigger_spec', COALESCE(d.trigger_spec, '{}'::jsonb),
+            'preferred_node', d.preferred_node,
+            'required_caps', COALESCE(d.required_caps, '[]'::jsonb),
+            'attempts', d.attempts,
+            'max_attempts', d.max_attempts,
+            'claimed_by', d.claimed_by
+        )
     ),
-    CASE q.tier
-        WHEN 'T1' THEN 100
-        WHEN 'T0' THEN 90
-        WHEN 'T2' THEN 80
-        ELSE 70
-    END,
-    CASE q.status
-        WHEN 'detected' THEN 'pending'
-        WHEN 'fixing' THEN 'running'
-        WHEN 'reviewing' THEN 'running'
-        WHEN 'pr_open' THEN 'running'
-        WHEN 'merged' THEN 'running'
-        WHEN 'rolled_out' THEN 'running'
-        WHEN 'verified' THEN 'completed'
-        WHEN 'paused' THEN 'paused'
-        WHEN 'reverted' THEN 'cancelled'
-        ELSE 'failed'
-    END,
-    q.created_at,
-    'self_heal',
-    q.bug_signature
-FROM fleet_self_heal_queue_legacy q
-ON CONFLICT (dedup_signature) WHERE dedup_signature IS NOT NULL DO UPDATE
-SET summary = EXCLUDED.summary,
-    priority = EXCLUDED.priority,
-    status = EXCLUDED.status,
-    created_at = LEAST(fleet_tasks.created_at, EXCLUDED.created_at),
-    payload = fleet_tasks.payload
-        || jsonb_strip_nulls(
-            jsonb_build_object(
-                'bug_signature', EXCLUDED.payload->>'bug_signature',
-                'tier', EXCLUDED.payload->>'tier',
-                'status', EXCLUDED.payload->>'status',
-                'writer_computer_id', EXCLUDED.payload->>'writer_computer_id',
-                'writer_model', EXCLUDED.payload->>'writer_model',
-                'reviewer_computer_id', EXCLUDED.payload->>'reviewer_computer_id',
-                'reviewer_model', EXCLUDED.payload->>'reviewer_model',
-                'reviewer_confidence', EXCLUDED.payload->>'reviewer_confidence',
-                'pr_number', EXCLUDED.payload->>'pr_number',
-                'branch_name', EXCLUDED.payload->>'branch_name',
-                'fix_commit_sha', EXCLUDED.payload->>'fix_commit_sha',
-                'fixed_tag', EXCLUDED.payload->>'fixed_tag',
-                'attempts', EXCLUDED.payload->>'attempts',
-                'last_attempt_at', EXCLUDED.payload->>'last_attempt_at',
-                'escalated_to_operator_at', EXCLUDED.payload->>'escalated_to_operator_at',
-                'report_count', EXCLUDED.payload->>'report_count'
-            )
-        );
+    50,
+    COALESCE(d.required_caps, '[]'::jsonb),
+    d.status,
+    d.claimed_at,
+    d.completed_at,
+    d.result,
+    d.last_error,
+    d.created_at,
+    'deferred',
+    d.next_attempt_at
+FROM deferred_tasks d
+ON CONFLICT (id) DO NOTHING;
 
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = current_schema()
-          AND c.relname = 'fleet_self_heal_queue'
-          AND c.relkind = 'r'
-    ) THEN
-        EXECUTE 'ALTER TABLE fleet_self_heal_queue RENAME TO fleet_self_heal_queue_legacy';
-    ELSIF EXISTS (
-        SELECT 1
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = current_schema()
-          AND c.relname = 'fleet_self_heal_queue'
-          AND c.relkind = 'v'
-    ) THEN
-        EXECUTE 'DROP VIEW fleet_self_heal_queue';
-    END IF;
-END
-$$;
+ALTER TABLE deferred_tasks RENAME TO deferred_tasks_legacy;
 
-CREATE VIEW fleet_self_heal_queue AS
+CREATE VIEW deferred_tasks AS
 SELECT
-    t.dedup_signature AS bug_signature,
-    COALESCE(t.payload->>'tier', 'T2') AS tier,
-    COALESCE(
-        NULLIF(t.payload->>'status', ''),
-        CASE t.status
-            WHEN 'pending' THEN 'detected'
-            WHEN 'claimed' THEN 'fixing'
-            WHEN 'running' THEN 'fixing'
-            WHEN 'completed' THEN 'verified'
-            WHEN 'paused' THEN 'paused'
-            WHEN 'cancelled' THEN 'reverted'
-            ELSE 'failed'
-        END
-    ) AS status,
-    NULLIF(t.payload->>'writer_computer_id', '')::uuid AS writer_computer_id,
-    t.payload->>'writer_model' AS writer_model,
-    NULLIF(t.payload->>'reviewer_computer_id', '')::uuid AS reviewer_computer_id,
-    t.payload->>'reviewer_model' AS reviewer_model,
-    (t.payload->>'reviewer_confidence')::double precision AS reviewer_confidence,
-    (t.payload->>'pr_number')::int AS pr_number,
-    t.payload->>'branch_name' AS branch_name,
-    t.payload->>'fix_commit_sha' AS fix_commit_sha,
-    t.payload->>'fixed_tag' AS fixed_tag,
+    t.id,
+    t.created_at,
+    NULLIF(t.payload->>'created_by', '') AS created_by,
+    t.summary AS title,
+    COALESCE(NULLIF(t.payload->>'kind', ''), t.task_type) AS kind,
+    COALESCE(t.payload->'deferred_payload', '{}'::jsonb) AS payload,
+    COALESCE(t.payload->>'trigger_type', 'now') AS trigger_type,
+    COALESCE(t.payload->'trigger_spec', '{}'::jsonb) AS trigger_spec,
+    NULLIF(t.payload->>'preferred_node', '') AS preferred_node,
+    COALESCE(t.payload->'required_caps', '[]'::jsonb) AS required_caps,
+    t.status,
     COALESCE((t.payload->>'attempts')::int, 0) AS attempts,
-    NULLIF(t.payload->>'last_attempt_at', '')::timestamptz AS last_attempt_at,
-    NULLIF(t.payload->>'escalated_to_operator_at', '')::timestamptz AS escalated_to_operator_at,
-    COALESCE((t.payload->>'report_count')::int, 0) AS report_count,
-    t.created_at
+    COALESCE((t.payload->>'max_attempts')::int, 5) AS max_attempts,
+    t.not_before AS next_attempt_at,
+    NULLIF(t.payload->>'claimed_by', '') AS claimed_by,
+    t.claimed_at,
+    t.error AS last_error,
+    t.result,
+    t.completed_at
 FROM fleet_tasks t
-WHERE t.task_class = 'self_heal';
-
-ALTER TABLE IF EXISTS self_heal_rollouts
-    DROP CONSTRAINT IF EXISTS self_heal_rollouts_bug_signature_fkey;
+WHERE t.task_class = 'deferred';
 "#;

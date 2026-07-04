@@ -775,8 +775,8 @@ static PG_MIGRATIONS: &[PgMigration] = &[
     },
     PgMigration {
         version: 159,
-        name: "self_heal_writer_migration",
-        sql: schema::SCHEMA_V159_SELF_HEAL_WRITER_MIGRATION,
+        name: "fold_deferred_tasks",
+        sql: schema::SCHEMA_V159_FOLD_DEFERRED_TASKS,
     },
 ];
 

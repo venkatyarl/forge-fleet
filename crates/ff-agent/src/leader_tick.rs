@@ -1516,6 +1516,11 @@ mod tests {
 
     #[tokio::test]
     async fn self_heal_same_signature_stays_single_flight_in_fleet_tasks() {
+        if env::var("FORGEFLEET_POSTGRES_URL").is_err()
+            && env::var("FORGEFLEET_DATABASE_URL").is_err()
+        {
+            return;
+        }
         let (admin, pool, db_name) = create_temp_db().await;
 
         let first_id = upsert_self_heal_task(&pool, "sig-same-bug", "T2", 1).await;
