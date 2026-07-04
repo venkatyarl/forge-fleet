@@ -1389,10 +1389,12 @@ async fn run_ff_dispatch(
     let forced_backend = primary_or_default_backend(&backends);
     let mut attempted_backend = false;
     let mut last_output: Option<(String, Output)> = None;
-    // Capture the real per-backend error so a total failure surfaces WHY (spawn
-    // ENOENT, gh auth, timeout) in the DB `last_error`, instead of the opaque
-    // "no dispatchable backend" that forces log-diving on the node to diagnose.
-    let mut last_err: Option<String> = None;
+    // Capture EVERY backend's error so a total failure surfaces WHY for ALL of
+    // them (codex + claude + kimi) in the DB `last_error` — not just the last —
+    // ending the SSH-into-node log-diving needed to see codex/claude when only
+    // kimi (the last tried) was recorded. Each error is tail-trimmed since the
+    // full command echoes the huge prompt; the status/stderr lives at the end.
+    let mut backend_errors: Vec<String> = Vec::new();
 
     for backend in &backends {
         if crate::circuit_breaker::is_provider_open(pg, computer_id, backend)
@@ -1433,7 +1435,7 @@ async fn run_ff_dispatch(
                     // backend rather than `?`-propagating out (which would abort
                     // failover — the "codex hangs → whole dispatch dies" bug).
                     warn!(backend = %backend, error = %e, "run_ff_dispatch: backend run errored (timeout/spawn), no diff — switching");
-                    last_err = Some(format!("{backend}: {e:#}"));
+                    backend_errors.push(format!("{backend}: {}", err_tail(&format!("{e:#}"))));
                     let _ = crate::circuit_breaker::record_provider_failure(
                         pg,
                         computer_id,
@@ -1520,14 +1522,20 @@ async fn run_ff_dispatch(
             }
         }
     }
-    last_output.map(Ok).unwrap_or_else(|| match last_err {
-        // Every backend errored before producing output — surface the actual last
-        // cause (the classifier in dispatch_prompt still treats infra errors as
-        // non-actionable on retry; this is for the operator + DB, not the agent).
-        Some(e) => bail!("run_ff_dispatch: all backends failed on this node; last backend error: {e}"),
-        // Genuinely nothing to run: every backend was breaker-open / skipped.
-        None => {
-            bail!("run_ff_dispatch: no dispatchable backend on this node (all backends breaker-open or skipped)")
+    last_output.map(Ok).unwrap_or_else(|| {
+        if backend_errors.is_empty() {
+            // Genuinely nothing to run: every backend was breaker-open / skipped.
+            bail!(
+                "run_ff_dispatch: no dispatchable backend on this node (all backends breaker-open or skipped)"
+            )
+        } else {
+            // Every attempted backend errored — surface ALL of their causes (the
+            // dispatch_prompt classifier still treats infra errors as
+            // non-actionable on retry; this is for the operator + DB).
+            bail!(
+                "run_ff_dispatch: all backends failed on this node:\n{}",
+                backend_errors.join("\n")
+            )
         }
     })
 }
@@ -1978,6 +1986,20 @@ fn truncate_for_log(s: &str) -> String {
     format!("{}...", &trimmed[..end])
 }
 
+/// The TAIL of a long backend-run error. `run_backend_cli`'s error leads with the
+/// full command (which echoes the entire prompt), so the useful part —
+/// `status: … stderr: …` — sits at the END. Keep the last ~280 chars so each
+/// per-backend line in `last_error` shows the real failure, not the prompt.
+fn err_tail(s: &str) -> String {
+    const KEEP: usize = 280;
+    let count = s.chars().count();
+    if count <= KEEP {
+        return s.trim().to_string();
+    }
+    let tail: String = s.chars().skip(count - KEEP).collect();
+    format!("…{}", tail.trim())
+}
+
 // ── Pillar 4 worktree reaper (per-host) ──────────────────────────────────
 // Removes on-disk git worktrees whose work_item reached a terminal state
 // (cancelled/merged/failed/done) but whose worktree row isn't 'cleaned' yet.
@@ -2090,6 +2112,23 @@ mod tests {
     use anyhow::anyhow;
     use std::os::unix::process::ExitStatusExt;
     use std::process::{Command, Output};
+
+    #[test]
+    fn err_tail_keeps_the_end_where_status_and_stderr_live() {
+        let short = "codex: exit status: 4 stderr: gh auth login";
+        assert_eq!(super::err_tail(short), short);
+        // A long error (command echoes the prompt up front) keeps the END.
+        let long = format!(
+            "{}\nstatus: exit status: 1\nstderr: LLM not set",
+            "x".repeat(1000)
+        );
+        let tail = super::err_tail(&long);
+        assert!(
+            tail.contains("LLM not set"),
+            "tail must retain stderr: {tail}"
+        );
+        assert!(tail.len() < 320);
+    }
 
     #[test]
     fn command_display_never_leaks_env_secrets() {
