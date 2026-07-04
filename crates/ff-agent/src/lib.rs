@@ -11,6 +11,7 @@ pub mod backend_detect;
 pub mod circuit_breaker;
 pub mod deadlines;
 pub mod defer_worker;
+pub mod dispatch_context;
 pub mod dispatcher;
 pub mod notification;
 pub mod research;

@@ -1268,7 +1268,22 @@ async fn run_ff_dispatch(
     item: &AssignedWorkItem,
     worktree: &WorktreeRecord,
 ) -> Result<(String, Output)> {
-    let prompt = dispatch_prompt(item);
+    let mut prompt = dispatch_prompt(item);
+    // Prepend a Cortex context pack: the exact existing symbols this task touches,
+    // pulled from the shared code graph, so the agent starts there instead of
+    // grep-storming the whole repo cold (wasted context + the cold-compile explore
+    // phase). Fail-open — empty pack ⇒ unchanged behaviour.
+    let pack = crate::dispatch_context::cortex_context_pack_async(
+        item.title.clone(),
+        item.description.clone().unwrap_or_default(),
+        item.repo_path.clone(),
+        6,
+    )
+    .await;
+    if !pack.is_empty() {
+        info!(work_item_id = %item.work_item_id, pack_bytes = pack.len(), "run_ff_dispatch: prepended Cortex context pack");
+        prompt = format!("{pack}\n{prompt}");
+    }
 
     // Lane-1 health gate: the local codegen harness needs a local agent-capable
     // model; on nodes where none is viable it hangs and only fails over after
