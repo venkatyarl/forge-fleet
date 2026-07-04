@@ -9858,3 +9858,81 @@ SELECT
 FROM fleet_tasks t
 WHERE t.task_class = 'self_heal';
 "#;
+
+pub const SCHEMA_V159_FOLD_DEFERRED_TASKS: &str = r#"
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '60s';
+
+INSERT INTO fleet_tasks (
+    id,
+    task_type,
+    summary,
+    payload,
+    priority,
+    requires_capability,
+    status,
+    claimed_at,
+    completed_at,
+    result,
+    error,
+    created_at,
+    task_class,
+    not_before
+)
+SELECT
+    d.id,
+    d.kind,
+    d.title,
+    jsonb_strip_nulls(
+        jsonb_build_object(
+            'deferred_payload', COALESCE(d.payload, '{}'::jsonb),
+            'created_by', d.created_by,
+            'kind', d.kind,
+            'trigger_type', d.trigger_type,
+            'trigger_spec', COALESCE(d.trigger_spec, '{}'::jsonb),
+            'preferred_node', d.preferred_node,
+            'required_caps', COALESCE(d.required_caps, '[]'::jsonb),
+            'attempts', d.attempts,
+            'max_attempts', d.max_attempts,
+            'claimed_by', d.claimed_by
+        )
+    ),
+    50,
+    COALESCE(d.required_caps, '[]'::jsonb),
+    d.status,
+    d.claimed_at,
+    d.completed_at,
+    d.result,
+    d.last_error,
+    d.created_at,
+    'deferred',
+    d.next_attempt_at
+FROM deferred_tasks d
+ON CONFLICT (id) DO NOTHING;
+
+ALTER TABLE deferred_tasks RENAME TO deferred_tasks_legacy;
+
+CREATE VIEW deferred_tasks AS
+SELECT
+    t.id,
+    t.created_at,
+    NULLIF(t.payload->>'created_by', '') AS created_by,
+    t.summary AS title,
+    COALESCE(NULLIF(t.payload->>'kind', ''), t.task_type) AS kind,
+    COALESCE(t.payload->'deferred_payload', '{}'::jsonb) AS payload,
+    COALESCE(t.payload->>'trigger_type', 'now') AS trigger_type,
+    COALESCE(t.payload->'trigger_spec', '{}'::jsonb) AS trigger_spec,
+    NULLIF(t.payload->>'preferred_node', '') AS preferred_node,
+    COALESCE(t.payload->'required_caps', '[]'::jsonb) AS required_caps,
+    t.status,
+    COALESCE((t.payload->>'attempts')::int, 0) AS attempts,
+    COALESCE((t.payload->>'max_attempts')::int, 5) AS max_attempts,
+    t.not_before AS next_attempt_at,
+    NULLIF(t.payload->>'claimed_by', '') AS claimed_by,
+    t.claimed_at,
+    t.error AS last_error,
+    t.result,
+    t.completed_at
+FROM fleet_tasks t
+WHERE t.task_class = 'deferred';
+"#;
