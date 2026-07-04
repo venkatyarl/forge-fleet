@@ -773,6 +773,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "fold_self_heal_queue",
         sql: schema::SCHEMA_V158_FOLD_SELF_HEAL_QUEUE,
     },
+    PgMigration {
+        version: 159,
+        name: "self_heal_writer_migration",
+        sql: schema::SCHEMA_V159_SELF_HEAL_WRITER_MIGRATION,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
