@@ -305,6 +305,78 @@ async fn gh_pr_comment(pr_url: &str, body: &str) -> Result<()> {
     );
 }
 
+/// Reconcile work_items stranded in `in_review` whose PR was merged or closed
+/// out-of-band — hand-merged by the operator, or merged by any path other than
+/// [`evaluate_merge_queue`] (e.g. a plain `gh pr merge` in a terminal, which
+/// touches GitHub but never the DB). Without this, such items sit in `in_review`
+/// forever and the queue/ETA never reflects that they actually shipped.
+///
+/// Bounded (25 rows/pass) and leader-gated by the caller. Best-effort: a `gh`
+/// failure for one PR is logged and skipped — it never aborts the pass. Only
+/// rows that are still `in_review` at UPDATE time are flipped (guards against a
+/// racing drain that already claimed the row).
+async fn reconcile_orphaned_reviews(pg: &PgPool) -> Result<usize> {
+    let rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+        "SELECT id, pr_url FROM work_items \
+         WHERE status = 'in_review' AND pr_url IS NOT NULL AND pr_url LIKE '%github.com%' \
+         ORDER BY COALESCE(started_at, created_at) ASC LIMIT 25",
+    )
+    .fetch_all(pg)
+    .await
+    .context("query in_review work_items for reconcile")?;
+
+    let mut reconciled = 0usize;
+    for (id, pr_url) in rows {
+        let out = match tokio::process::Command::new("gh")
+            .args(["pr", "view", &pr_url, "--json", "state,mergedAt"])
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => o,
+            Ok(o) => {
+                warn!(pr = %pr_url, stderr = %String::from_utf8_lossy(&o.stderr).trim(), "reconcile: gh pr view failed — leaving row");
+                continue;
+            }
+            Err(e) => {
+                warn!(pr = %pr_url, error = %e, "reconcile: gh spawn failed");
+                continue;
+            }
+        };
+        let v: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(pr = %pr_url, error = %e, "reconcile: gh json parse failed");
+                continue;
+            }
+        };
+        let merged = v.get("mergedAt").and_then(|m| m.as_str()).is_some();
+        let state = v.get("state").and_then(|s| s.as_str()).unwrap_or("");
+        let new_status = if merged {
+            "merged"
+        } else if state.eq_ignore_ascii_case("CLOSED") {
+            "cancelled"
+        } else {
+            continue; // still OPEN — nothing to reconcile
+        };
+        let affected = sqlx::query(
+            "UPDATE work_items SET status = $2, \
+             completed_at = COALESCE(completed_at, NOW()), last_error = NULL \
+             WHERE id = $1 AND status = 'in_review'",
+        )
+        .bind(id)
+        .bind(new_status)
+        .execute(pg)
+        .await
+        .context("reconcile update work_item status")?
+        .rows_affected();
+        if affected > 0 {
+            info!(work_item = %id, pr = %pr_url, status = new_status, "reconcile: flipped orphaned in_review");
+            reconciled += 1;
+        }
+    }
+    Ok(reconciled)
+}
+
 /// Spawn the leader-gated drain loop. Mirrors the scheduler's leader check.
 pub fn spawn_work_item_merge_drain(
     pg: PgPool,
@@ -314,6 +386,7 @@ pub fn spawn_work_item_merge_drain(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+        let mut tick_n: u64 = 0;
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -322,6 +395,16 @@ pub fn spawn_work_item_merge_drain(
                     }
                     if let Err(e) = evaluate_merge_queue(&pg).await {
                         warn!(error = %e, "work_item_merge_drain tick failed");
+                    }
+                    // Every ~20th tick, sweep for PRs merged/closed out-of-band
+                    // (hand-merges) so their work_items don't rot in `in_review`.
+                    tick_n = tick_n.wrapping_add(1);
+                    if tick_n % 20 == 1 {
+                        match reconcile_orphaned_reviews(&pg).await {
+                            Ok(n) if n > 0 => info!(count = n, "work_item_merge_drain: reconciled orphaned in_review items"),
+                            Ok(_) => {}
+                            Err(e) => warn!(error = %e, "work_item_merge_drain reconcile failed"),
+                        }
                     }
                 }
                 changed = shutdown_rx.changed() => {
