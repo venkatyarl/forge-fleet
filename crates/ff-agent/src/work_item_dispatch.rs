@@ -1043,6 +1043,49 @@ NEVER edit an existing migration const, and never add a second/redundant migrati
 targeted test pass, open ONE PR and STOP — do not keep iterating or push more commits.\n\
 - Keep the diff minimal and scoped strictly to the task.\n";
 
+/// Whether a stored `last_error` is a TASK-level failure the coding agent can
+/// act on (compile error, test failure, lint, missing file, type/assert error)
+/// versus an INFRASTRUCTURE failure (backend spawn, heartbeat/lease lifecycle,
+/// DB pool, provider/network, host-resource exhaustion) it cannot fix.
+///
+/// Only actionable errors belong in the retry prompt; injecting infra errors
+/// with "diagnose the root cause" makes the agent waste the attempt trying to
+/// fix e.g. "no dispatchable backend on this node". Signatures are consolidated
+/// from live errors seen in dispatch + an `ff council` (codex+kimi) pass; kept
+/// deliberately unambiguous so a real Rust compile/test error is never matched.
+fn retry_error_is_actionable(err: &str) -> bool {
+    const INFRA_ERROR_SIGNATURES: &[&str] = &[
+        // dispatch / backend spawn + routing
+        "no dispatchable backend",
+        "spawn \"",
+        "command timed out",
+        "timed out after",
+        // heartbeat / lease lifecycle
+        "stale-heartbeat",
+        "heartbeat takeover",
+        // datastore / pool
+        "pool timed out",
+        "pool timeout",
+        "route deployments",
+        // auth / provider / network (LLM endpoint or gh)
+        "gh auth login",
+        "bad credentials",
+        "rate limit",
+        "service unavailable",
+        "internal server error",
+        "connection refused",
+        "network is unreachable",
+        // host resource exhaustion
+        "no space left",
+        "cannot allocate memory",
+        "too many open files",
+        "resource temporarily unavailable",
+        "worker died",
+    ];
+    let lower = err.to_ascii_lowercase();
+    !INFRA_ERROR_SIGNATURES.iter().any(|sig| lower.contains(sig))
+}
+
 fn dispatch_prompt(item: &AssignedWorkItem) -> String {
     let task = match item.description.as_deref() {
         Some(desc) if !desc.trim().is_empty() => format!("{}\n\n{}", item.title, desc.trim()),
@@ -1052,11 +1095,24 @@ fn dispatch_prompt(item: &AssignedWorkItem) -> String {
     // failure back into the prompt so the model doesn't repeat the same mistake.
     // Previously last_error was stored but NEVER injected — a no-op. This closes it.
     let retry_context = match (item.attempts, item.last_error.as_deref()) {
-        (n, Some(err)) if n > 0 && !err.trim().is_empty() => format!(
-            "\n\n⚠ This is retry attempt {}. The previous attempt(s) FAILED with:\n{}\n\
-             Diagnose why it failed and fix THAT root cause — do not repeat the same approach.\n",
-            n + 1,
-            err.trim()
+        (n, Some(err)) if n > 0 && !err.trim().is_empty() && retry_error_is_actionable(err) => {
+            format!(
+                "\n\n⚠ This is retry attempt {}. The previous attempt(s) FAILED with:\n{}\n\
+                 Diagnose why it failed and fix THAT root cause — do not repeat the same approach.\n",
+                n + 1,
+                err.trim()
+            )
+        }
+        // Retry after an INFRASTRUCTURE failure (spawn / heartbeat / backend /
+        // pool / timeout) the coding agent cannot fix. Injecting that error plus
+        // "diagnose the root cause" actively sabotages the retry — the agent
+        // burns the attempt trying to "fix" e.g. "no dispatchable backend".
+        // Acknowledge the retry without the unactionable error so it simply
+        // re-approaches the task fresh.
+        (n, Some(_)) if n > 0 => format!(
+            "\n\n⚠ This is retry attempt {}. A prior attempt did not complete due to an \
+             infrastructure issue (not your code) — approach the task fresh.\n",
+            n + 1
         ),
         _ => String::new(),
     };
@@ -1281,6 +1337,10 @@ async fn run_ff_dispatch(
     let forced_backend = primary_or_default_backend(&backends);
     let mut attempted_backend = false;
     let mut last_output: Option<(String, Output)> = None;
+    // Capture the real per-backend error so a total failure surfaces WHY (spawn
+    // ENOENT, gh auth, timeout) in the DB `last_error`, instead of the opaque
+    // "no dispatchable backend" that forces log-diving on the node to diagnose.
+    let mut last_err: Option<String> = None;
 
     for backend in &backends {
         if crate::circuit_breaker::is_provider_open(pg, computer_id, backend)
@@ -1321,6 +1381,7 @@ async fn run_ff_dispatch(
                     // backend rather than `?`-propagating out (which would abort
                     // failover — the "codex hangs → whole dispatch dies" bug).
                     warn!(backend = %backend, error = %e, "run_ff_dispatch: backend run errored (timeout/spawn), no diff — switching");
+                    last_err = Some(format!("{backend}: {e:#}"));
                     let _ = crate::circuit_breaker::record_provider_failure(
                         pg,
                         computer_id,
@@ -1407,9 +1468,16 @@ async fn run_ff_dispatch(
             }
         }
     }
-    last_output
-        .map(Ok)
-        .unwrap_or_else(|| bail!("run_ff_dispatch: no dispatchable backend on this node"))
+    last_output.map(Ok).unwrap_or_else(|| match last_err {
+        // Every backend errored before producing output — surface the actual last
+        // cause (the classifier in dispatch_prompt still treats infra errors as
+        // non-actionable on retry; this is for the operator + DB, not the agent).
+        Some(e) => bail!("run_ff_dispatch: all backends failed on this node; last backend error: {e}"),
+        // Genuinely nothing to run: every backend was breaker-open / skipped.
+        None => {
+            bail!("run_ff_dispatch: no dispatchable backend on this node (all backends breaker-open or skipped)")
+        }
+    })
 }
 
 fn primary_or_default_backend(backends: &[String]) -> String {
@@ -1935,8 +2003,38 @@ pub fn spawn_worktree_reaper(
 mod tests {
     use super::{
         DispatchOutcome, classify_dispatch_outcome, command_display, dispatch_budget_for_host,
-        parse_cli_tokens, primary_or_default_backend,
+        parse_cli_tokens, primary_or_default_backend, retry_error_is_actionable,
     };
+
+    #[test]
+    fn retry_error_is_actionable_suppresses_infra_injects_task_errors() {
+        // Infra failures the coding agent can't fix → must NOT be injected.
+        for infra in [
+            "run_ff_dispatch: no dispatchable backend on this node",
+            "spawn \"ff\" \"cli\" \"codex\"",
+            "stale-heartbeat takeover (attempt 2)",
+            "fleet_oneshot round 3: route deployments: Postgres error: pool timed out",
+            "command timed out after 1080s",
+            "To get started with GitHub CLI, please run:  gh auth login",
+        ] {
+            assert!(
+                !retry_error_is_actionable(infra),
+                "infra error should be suppressed: {infra}"
+            );
+        }
+        // Real task-level failures the agent CAN act on → must be injected.
+        for task in [
+            "error[E0433]: failed to resolve: use of undeclared crate or module `foo`",
+            "test result: FAILED. 1 passed; 1 failed",
+            "cannot find function `backend_rank` in this scope",
+            "assertion `left == right` failed",
+        ] {
+            assert!(
+                retry_error_is_actionable(task),
+                "task error should be injected: {task}"
+            );
+        }
+    }
     use anyhow::anyhow;
     use std::os::unix::process::ExitStatusExt;
     use std::process::{Command, Output};
