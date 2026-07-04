@@ -20,14 +20,13 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Record a usage-headroom signal for a (computer, provider) into
-/// `fleet_provider_usage`, which the headroom router (`pg_routed_backends`)
-/// reads. `remaining_pct` is the best estimate from the most recent call
-/// outcome: 100 on a clean success, low on a rate-limit/overload, 0 on quota
-/// exhaustion. A single `live` row per (computer, provider) is overwritten each
-/// call so the latest outcome wins — self-correcting (a later success lifts a
-/// provider back above the router's headroom floor). The dispatch path has no
-/// HTTP headers to read, so the call OUTCOME is the signal.
+/// Upserts a live `fleet_provider_usage` row (one per computer+provider,
+/// window_kind='live') that the headroom router reads. `remaining_pct` is
+/// outcome-derived (100 on success, low on limit errors). A single `live` row
+/// per (computer, provider) is overwritten each call so the latest outcome
+/// wins — self-correcting (a later success lifts a provider back above the
+/// router's headroom floor). The dispatch path has no HTTP headers to read,
+/// so the call OUTCOME is the signal.
 pub async fn record_usage_signal(
     pool: &PgPool,
     computer_id: Uuid,
