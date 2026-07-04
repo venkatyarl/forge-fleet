@@ -768,6 +768,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "fold_research_subtasks",
         sql: schema::SCHEMA_V157_FOLD_RESEARCH_SUBTASKS,
     },
+    PgMigration {
+        version: 158,
+        name: "fold_self_heal",
+        sql: schema::SCHEMA_V158_FOLD_SELF_HEAL,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
