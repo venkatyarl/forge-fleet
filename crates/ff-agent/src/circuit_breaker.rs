@@ -67,6 +67,12 @@ pub fn headroom_hint_for_category(category: &str) -> Option<f64> {
 fn provider_cooldown_minutes(category: &str) -> i64 {
     match category {
         "rate_limited" | "quota_exhausted" => 10,
+        // The local codegen harness fails structurally (no agent-capable local
+        // model on this node), not transiently — a 2-min re-probe would just
+        // re-burn the full Lane-1 timeout. Hold it open longer so builds skip
+        // straight to the cloud backstop, while still re-probing periodically in
+        // case a capable local model later comes online.
+        "local_codegen_unavailable" => 20,
         _ => 2,
     }
 }
@@ -79,6 +85,7 @@ mod tests {
     fn provider_cooldown_minutes_maps_provider_categories() {
         assert_eq!(provider_cooldown_minutes("rate_limited"), 10);
         assert_eq!(provider_cooldown_minutes("quota_exhausted"), 10);
+        assert_eq!(provider_cooldown_minutes("local_codegen_unavailable"), 20);
         assert_eq!(provider_cooldown_minutes("overloaded"), 2);
         assert_eq!(provider_cooldown_minutes("transient_5xx"), 2);
     }
