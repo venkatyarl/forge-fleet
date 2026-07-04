@@ -1406,12 +1406,38 @@ fn git_worktree_add(
     task_branch: &str,
 ) -> Result<()> {
     let base_ref = format!("origin/{base_branch}");
-    let _ = run_git(
-        repo_path,
-        ["fetch", "origin", base_branch],
-        Duration::from_secs(120),
-    );
+    // Fetch origin/<base> so the worktree starts from the TRUE latest main, not a
+    // stale local ref. A SILENT fetch failure + the old stale-local fallback below
+    // were the #1 cause of entangled/unmergeable fleet PRs (2026-07-04: builds
+    // branched from an old base and re-added an already-merged fold). Retry, and
+    // FAIL rather than branch from a possibly-stale base — a failed build retries
+    // cleanly; a stale-base build produces a garbage PR.
+    let mut fetched = false;
+    for attempt in 0..3 {
+        match run_git(
+            repo_path,
+            ["fetch", "origin", base_branch],
+            Duration::from_secs(120),
+        ) {
+            Ok(_) => {
+                fetched = true;
+                break;
+            }
+            Err(e) => {
+                warn!(base_branch, attempt, error = %e, "git_worktree_add: fetch origin failed; retrying")
+            }
+        }
+    }
+    if !fetched {
+        bail!(
+            "git_worktree_add: could not fetch origin/{base_branch} in 3 tries — \
+             refusing to branch the worktree from a possibly-stale base"
+        );
+    }
 
+    // Branch STRICTLY from the freshly-fetched origin/<base>. No stale-local
+    // fallback: if this fails (e.g. a leftover worktree/branch), bail so the build
+    // retries from a clean slate rather than silently building on the local ref.
     run_git(
         repo_path,
         [
@@ -1423,21 +1449,7 @@ fn git_worktree_add(
             OsStr::new(&base_ref),
         ],
         Duration::from_secs(120),
-    )
-    .or_else(|_| {
-        run_git(
-            repo_path,
-            [
-                OsStr::new("worktree"),
-                OsStr::new("add"),
-                OsStr::new("-B"),
-                OsStr::new(task_branch),
-                worktree_path.as_os_str(),
-                OsStr::new(base_branch),
-            ],
-            Duration::from_secs(120),
-        )
-    })?;
+    )?;
     Ok(())
 }
 
