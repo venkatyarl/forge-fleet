@@ -3886,9 +3886,14 @@ pub enum SecretsCommand {
     /// Set (or update) a secret.
     Set {
         key: String,
-        value: String,
+        /// The secret value. Omit it (or pass --stdin) to read the value from
+        /// stdin so it never lands in shell history or the process arg list.
+        value: Option<String>,
         #[arg(long)]
         description: Option<String>,
+        /// Read the value from stdin instead of the positional argument.
+        #[arg(long)]
+        stdin: bool,
     },
     /// Delete a secret by key.
     #[command(alias = "rm")]
