@@ -9761,3 +9761,303 @@ INSTEAD OF INSERT OR UPDATE OR DELETE ON research_subtasks
 FOR EACH ROW
 EXECUTE FUNCTION research_subtasks_view_write();
 "#;
+
+pub const SCHEMA_V158_FOLD_SELF_HEAL: &str = r#"
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '60s';
+
+INSERT INTO fleet_tasks (
+    id,
+    task_type,
+    summary,
+    payload,
+    priority,
+    preferred_computer_id,
+    status,
+    claimed_by_computer_id,
+    started_at,
+    created_at,
+    created_by_computer_id,
+    original_computer_id,
+    task_class,
+    dedup_signature
+)
+SELECT
+    gen_random_uuid(),
+    'self_heal',
+    'self_heal: ' || q.bug_signature,
+    jsonb_build_object(
+        'bug_signature', q.bug_signature,
+        'tier', q.tier,
+        'writer_model', q.writer_model,
+        'reviewer_computer_id', q.reviewer_computer_id,
+        'reviewer_model', q.reviewer_model,
+        'reviewer_confidence', q.reviewer_confidence,
+        'pr_number', q.pr_number,
+        'branch_name', q.branch_name,
+        'fix_commit_sha', q.fix_commit_sha,
+        'fixed_tag', q.fixed_tag,
+        'attempts', q.attempts,
+        'last_attempt_at', q.last_attempt_at,
+        'escalated_to_operator_at', q.escalated_to_operator_at,
+        'report_count', q.report_count
+    ),
+    CASE q.tier
+        WHEN 'T1' THEN 90
+        WHEN 'T0' THEN 80
+        WHEN 'T2' THEN 60
+        ELSE 50
+    END,
+    q.writer_computer_id,
+    q.status,
+    CASE
+        WHEN q.status IN ('fixing', 'reviewing', 'pr_open') THEN q.writer_computer_id
+        ELSE NULL
+    END,
+    q.last_attempt_at,
+    q.created_at,
+    q.writer_computer_id,
+    q.writer_computer_id,
+    'self_heal',
+    q.bug_signature
+FROM fleet_self_heal_queue q
+WHERE NOT EXISTS (
+    SELECT 1
+      FROM fleet_tasks t
+     WHERE t.task_class = 'self_heal'
+       AND t.dedup_signature = q.bug_signature
+)
+ON CONFLICT (id) DO NOTHING;
+
+ALTER TABLE fleet_self_heal_queue RENAME TO fleet_self_heal_queue_legacy;
+
+CREATE TABLE fleet_self_heal_queue (
+    bug_signature            TEXT PRIMARY KEY,
+    tier                     TEXT NOT NULL,
+    status                   TEXT NOT NULL,
+    writer_computer_id       UUID REFERENCES computers(id) ON DELETE SET NULL,
+    writer_model             TEXT,
+    reviewer_computer_id     UUID REFERENCES computers(id) ON DELETE SET NULL,
+    reviewer_model           TEXT,
+    reviewer_confidence      DOUBLE PRECISION,
+    pr_number                INT,
+    branch_name              TEXT,
+    fix_commit_sha           TEXT,
+    fixed_tag                TEXT,
+    attempts                 INT NOT NULL DEFAULT 0,
+    last_attempt_at          TIMESTAMPTZ,
+    escalated_to_operator_at TIMESTAMPTZ,
+    report_count             INT NOT NULL DEFAULT 0,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_self_heal_queue_by_status
+    ON fleet_self_heal_queue(status, tier, created_at);
+
+INSERT INTO fleet_self_heal_queue (
+    bug_signature,
+    tier,
+    status,
+    writer_computer_id,
+    writer_model,
+    reviewer_computer_id,
+    reviewer_model,
+    reviewer_confidence,
+    pr_number,
+    branch_name,
+    fix_commit_sha,
+    fixed_tag,
+    attempts,
+    last_attempt_at,
+    escalated_to_operator_at,
+    report_count,
+    created_at
+)
+SELECT
+    bug_signature,
+    tier,
+    status,
+    writer_computer_id,
+    writer_model,
+    reviewer_computer_id,
+    reviewer_model,
+    reviewer_confidence,
+    pr_number,
+    branch_name,
+    fix_commit_sha,
+    fixed_tag,
+    attempts,
+    last_attempt_at,
+    escalated_to_operator_at,
+    report_count,
+    created_at
+FROM fleet_self_heal_queue_legacy
+ON CONFLICT (bug_signature) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION fleet_self_heal_queue_sync_to_fleet_tasks()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    effective_id uuid;
+    effective_signature text;
+    existing_created_at timestamptz;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        DELETE FROM fleet_self_heal_queue_legacy WHERE bug_signature = OLD.bug_signature;
+        DELETE FROM fleet_tasks
+         WHERE task_class = 'self_heal'
+           AND dedup_signature = OLD.bug_signature;
+        RETURN OLD;
+    END IF;
+
+    effective_signature := NEW.bug_signature;
+
+    SELECT t.id, t.created_at
+      INTO effective_id, existing_created_at
+      FROM fleet_tasks t
+     WHERE t.task_class = 'self_heal'
+       AND t.dedup_signature = COALESCE(OLD.bug_signature, effective_signature)
+     LIMIT 1;
+
+    effective_id := COALESCE(effective_id, gen_random_uuid());
+
+    IF TG_OP = 'UPDATE' AND OLD.bug_signature IS DISTINCT FROM effective_signature THEN
+        DELETE FROM fleet_self_heal_queue_legacy WHERE bug_signature = OLD.bug_signature;
+    END IF;
+
+    INSERT INTO fleet_self_heal_queue_legacy (
+        bug_signature,
+        tier,
+        status,
+        writer_computer_id,
+        writer_model,
+        reviewer_computer_id,
+        reviewer_model,
+        reviewer_confidence,
+        pr_number,
+        branch_name,
+        fix_commit_sha,
+        fixed_tag,
+        attempts,
+        last_attempt_at,
+        escalated_to_operator_at,
+        report_count,
+        created_at
+    )
+    VALUES (
+        effective_signature,
+        COALESCE(NEW.tier, 'T3'),
+        COALESCE(NEW.status, 'detected'),
+        NEW.writer_computer_id,
+        NEW.writer_model,
+        NEW.reviewer_computer_id,
+        NEW.reviewer_model,
+        NEW.reviewer_confidence,
+        NEW.pr_number,
+        NEW.branch_name,
+        NEW.fix_commit_sha,
+        NEW.fixed_tag,
+        COALESCE(NEW.attempts, 0),
+        NEW.last_attempt_at,
+        NEW.escalated_to_operator_at,
+        COALESCE(NEW.report_count, 0),
+        COALESCE(existing_created_at, NEW.created_at, NOW())
+    )
+    ON CONFLICT (bug_signature) DO UPDATE
+    SET tier = EXCLUDED.tier,
+        status = EXCLUDED.status,
+        writer_computer_id = EXCLUDED.writer_computer_id,
+        writer_model = EXCLUDED.writer_model,
+        reviewer_computer_id = EXCLUDED.reviewer_computer_id,
+        reviewer_model = EXCLUDED.reviewer_model,
+        reviewer_confidence = EXCLUDED.reviewer_confidence,
+        pr_number = EXCLUDED.pr_number,
+        branch_name = EXCLUDED.branch_name,
+        fix_commit_sha = EXCLUDED.fix_commit_sha,
+        fixed_tag = EXCLUDED.fixed_tag,
+        attempts = EXCLUDED.attempts,
+        last_attempt_at = EXCLUDED.last_attempt_at,
+        escalated_to_operator_at = EXCLUDED.escalated_to_operator_at,
+        report_count = EXCLUDED.report_count,
+        created_at = EXCLUDED.created_at;
+
+    INSERT INTO fleet_tasks (
+        id,
+        task_type,
+        summary,
+        payload,
+        priority,
+        preferred_computer_id,
+        status,
+        claimed_by_computer_id,
+        started_at,
+        created_at,
+        created_by_computer_id,
+        original_computer_id,
+        task_class,
+        dedup_signature
+    )
+    VALUES (
+        effective_id,
+        'self_heal',
+        'self_heal: ' || effective_signature,
+        jsonb_build_object(
+            'bug_signature', effective_signature,
+            'tier', COALESCE(NEW.tier, 'T3'),
+            'writer_model', NEW.writer_model,
+            'reviewer_computer_id', NEW.reviewer_computer_id,
+            'reviewer_model', NEW.reviewer_model,
+            'reviewer_confidence', NEW.reviewer_confidence,
+            'pr_number', NEW.pr_number,
+            'branch_name', NEW.branch_name,
+            'fix_commit_sha', NEW.fix_commit_sha,
+            'fixed_tag', NEW.fixed_tag,
+            'attempts', COALESCE(NEW.attempts, 0),
+            'last_attempt_at', NEW.last_attempt_at,
+            'escalated_to_operator_at', NEW.escalated_to_operator_at,
+            'report_count', COALESCE(NEW.report_count, 0)
+        ),
+        CASE COALESCE(NEW.tier, 'T3')
+            WHEN 'T1' THEN 90
+            WHEN 'T0' THEN 80
+            WHEN 'T2' THEN 60
+            ELSE 50
+        END,
+        NEW.writer_computer_id,
+        COALESCE(NEW.status, 'detected'),
+        CASE
+            WHEN COALESCE(NEW.status, 'detected') IN ('fixing', 'reviewing', 'pr_open')
+                THEN NEW.writer_computer_id
+            ELSE NULL
+        END,
+        NEW.last_attempt_at,
+        COALESCE(existing_created_at, NEW.created_at, NOW()),
+        NEW.writer_computer_id,
+        NEW.writer_computer_id,
+        'self_heal',
+        effective_signature
+    )
+    ON CONFLICT (id) DO UPDATE
+    SET summary = EXCLUDED.summary,
+        payload = EXCLUDED.payload,
+        priority = EXCLUDED.priority,
+        preferred_computer_id = EXCLUDED.preferred_computer_id,
+        status = EXCLUDED.status,
+        claimed_by_computer_id = EXCLUDED.claimed_by_computer_id,
+        started_at = EXCLUDED.started_at,
+        created_by_computer_id = EXCLUDED.created_by_computer_id,
+        original_computer_id = EXCLUDED.original_computer_id,
+        task_class = EXCLUDED.task_class,
+        dedup_signature = EXCLUDED.dedup_signature;
+
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS fleet_self_heal_queue_sync_to_fleet_tasks_trg ON fleet_self_heal_queue;
+CREATE TRIGGER fleet_self_heal_queue_sync_to_fleet_tasks_trg
+AFTER INSERT OR UPDATE OR DELETE ON fleet_self_heal_queue
+FOR EACH ROW
+EXECUTE FUNCTION fleet_self_heal_queue_sync_to_fleet_tasks();
+"#;
