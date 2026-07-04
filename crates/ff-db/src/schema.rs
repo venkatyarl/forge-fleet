@@ -9761,3 +9761,100 @@ INSTEAD OF INSERT OR UPDATE OR DELETE ON research_subtasks
 FOR EACH ROW
 EXECUTE FUNCTION research_subtasks_view_write();
 "#;
+
+pub const SCHEMA_V158_FOLD_SELF_HEAL_QUEUE: &str = r#"
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '60s';
+
+INSERT INTO fleet_tasks (
+    id,
+    task_type,
+    summary,
+    payload,
+    priority,
+    status,
+    created_at,
+    task_class,
+    dedup_signature
+)
+SELECT
+    gen_random_uuid(),
+    'self_heal_writer',
+    format('self_heal_writer: %s', q.bug_signature),
+    jsonb_build_object(
+        'bug_signature', q.bug_signature,
+        'tier', q.tier,
+        'status', q.status,
+        'writer_computer_id', q.writer_computer_id,
+        'writer_model', q.writer_model,
+        'reviewer_computer_id', q.reviewer_computer_id,
+        'reviewer_model', q.reviewer_model,
+        'reviewer_confidence', q.reviewer_confidence,
+        'pr_number', q.pr_number,
+        'branch_name', q.branch_name,
+        'fix_commit_sha', q.fix_commit_sha,
+        'fixed_tag', q.fixed_tag,
+        'attempts', q.attempts,
+        'last_attempt_at', q.last_attempt_at,
+        'escalated_to_operator_at', q.escalated_to_operator_at,
+        'report_count', q.report_count
+    ),
+    CASE q.tier
+        WHEN 'T1' THEN 100
+        WHEN 'T0' THEN 90
+        WHEN 'T2' THEN 80
+        ELSE 70
+    END,
+    CASE q.status
+        WHEN 'detected' THEN 'pending'
+        WHEN 'fixing' THEN 'running'
+        WHEN 'reviewing' THEN 'running'
+        WHEN 'pr_open' THEN 'running'
+        WHEN 'merged' THEN 'running'
+        WHEN 'rolled_out' THEN 'running'
+        WHEN 'verified' THEN 'completed'
+        WHEN 'paused' THEN 'paused'
+        WHEN 'reverted' THEN 'cancelled'
+        ELSE 'failed'
+    END,
+    q.created_at,
+    'self_heal',
+    q.bug_signature
+FROM fleet_self_heal_queue q
+ON CONFLICT (id) DO NOTHING;
+
+ALTER TABLE fleet_self_heal_queue RENAME TO fleet_self_heal_queue_legacy;
+
+CREATE OR REPLACE VIEW fleet_self_heal_queue AS
+SELECT
+    t.dedup_signature AS bug_signature,
+    COALESCE(t.payload->>'tier', 'T2') AS tier,
+    COALESCE(
+        NULLIF(t.payload->>'status', ''),
+        CASE t.status
+            WHEN 'pending' THEN 'detected'
+            WHEN 'claimed' THEN 'fixing'
+            WHEN 'running' THEN 'fixing'
+            WHEN 'completed' THEN 'verified'
+            WHEN 'paused' THEN 'paused'
+            WHEN 'cancelled' THEN 'reverted'
+            ELSE 'failed'
+        END
+    ) AS status,
+    NULLIF(t.payload->>'writer_computer_id', '')::uuid AS writer_computer_id,
+    t.payload->>'writer_model' AS writer_model,
+    NULLIF(t.payload->>'reviewer_computer_id', '')::uuid AS reviewer_computer_id,
+    t.payload->>'reviewer_model' AS reviewer_model,
+    (t.payload->>'reviewer_confidence')::double precision AS reviewer_confidence,
+    (t.payload->>'pr_number')::int AS pr_number,
+    t.payload->>'branch_name' AS branch_name,
+    t.payload->>'fix_commit_sha' AS fix_commit_sha,
+    t.payload->>'fixed_tag' AS fixed_tag,
+    COALESCE((t.payload->>'attempts')::int, 0) AS attempts,
+    NULLIF(t.payload->>'last_attempt_at', '')::timestamptz AS last_attempt_at,
+    NULLIF(t.payload->>'escalated_to_operator_at', '')::timestamptz AS escalated_to_operator_at,
+    COALESCE((t.payload->>'report_count')::int, 0) AS report_count,
+    t.created_at
+FROM fleet_tasks t
+WHERE t.task_class = 'self_heal';
+"#;

@@ -73,8 +73,11 @@ pub async fn handle_status(pg: &PgPool) -> Result<()> {
 
 pub async fn handle_pause(pg: &PgPool) -> Result<()> {
     sqlx::query(
-        "UPDATE fleet_self_heal_queue SET status = 'paused' \
-         WHERE status IN ('detected', 'fixing', 'reviewing')",
+        "UPDATE fleet_tasks \
+         SET status = 'paused', \
+             payload = payload || jsonb_build_object('status', 'paused') \
+         WHERE task_class = 'self_heal' \
+           AND COALESCE(payload->>'status', '') IN ('detected', 'fixing', 'reviewing')",
     )
     .execute(pg)
     .await?;
@@ -98,8 +101,12 @@ pub async fn handle_freeze_tier(pg: &PgPool, tier: &str, hours: u32) -> Result<(
 
 pub async fn handle_revert(pg: &PgPool, bug_sig: &str) -> Result<()> {
     let row = sqlx::query(
-        "SELECT id, bug_signature, tier, status, rollback_playbook, computer_id \
-         FROM fleet_self_heal_queue WHERE bug_signature = $1",
+        "SELECT id, dedup_signature AS bug_signature, payload->>'tier' AS tier, \
+                COALESCE(payload->>'status', status) AS status, \
+                payload->'rollback_playbook' AS rollback_playbook, \
+                payload->>'computer_id' AS computer_id \
+         FROM fleet_tasks \
+         WHERE task_class = 'self_heal' AND dedup_signature = $1",
     )
     .bind(bug_sig)
     .fetch_optional(pg)
@@ -110,9 +117,11 @@ pub async fn handle_revert(pg: &PgPool, bug_sig: &str) -> Result<()> {
         return Ok(());
     };
 
-    let id: i64 = row.try_get("id")?;
+    let id: uuid::Uuid = row.try_get("id")?;
     let status: String = row.try_get("status")?;
-    let rollback: serde_json::Value = row.try_get("rollback_playbook")?;
+    let rollback: serde_json::Value = row
+        .try_get::<Option<serde_json::Value>, _>("rollback_playbook")?
+        .unwrap_or(serde_json::json!({}));
 
     if status == "reverted" {
         println!("Fix {} is already reverted.", bug_sig);
@@ -149,8 +158,9 @@ pub async fn handle_revert(pg: &PgPool, bug_sig: &str) -> Result<()> {
     }
 
     sqlx::query(
-        "UPDATE fleet_self_heal_queue \
-         SET status = 'reverted', updated_at = NOW() \
+        "UPDATE fleet_tasks \
+         SET status = 'cancelled', \
+             payload = payload || jsonb_build_object('status', 'reverted') \
          WHERE id = $1",
     )
     .bind(id)
@@ -248,9 +258,9 @@ pub async fn handle_run_writer(pg: &PgPool, bug_sig: &str) -> Result<()> {
     // immediately. The leader sets status='fixing' on enqueue; we keep it
     // as 'fixing' until a real writer produces a branch/PR.
     sqlx::query(
-        "UPDATE fleet_self_heal_queue \
-         SET last_attempt_at = NOW() \
-         WHERE bug_signature = $1",
+        "UPDATE fleet_tasks \
+         SET payload = payload || jsonb_build_object('last_attempt_at', NOW()) \
+         WHERE task_class = 'self_heal' AND dedup_signature = $1",
     )
     .bind(bug_sig)
     .execute(pg)

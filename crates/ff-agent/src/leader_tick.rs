@@ -153,6 +153,28 @@ fn parse_yield_request(raw: &str) -> Option<(String, chrono::DateTime<Utc>)> {
     Some((member.to_string(), until))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn self_heal_priority_for_tier(tier: &str) -> i32 {
+    match tier {
+        "T1" => 100,
+        "T0" => 90,
+        "T2" => 80,
+        _ => 70,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn self_heal_task_status(queue_status: &str) -> &'static str {
+    match queue_status {
+        "detected" => "pending",
+        "fixing" | "reviewing" | "pr_open" | "merged" | "rolled_out" => "running",
+        "verified" => "completed",
+        "paused" => "paused",
+        "reverted" => "cancelled",
+        _ => "failed",
+    }
+}
+
 impl LeaderTick {
     /// Build a new tick with no-op hooks.
     pub fn new(
@@ -751,35 +773,76 @@ impl LeaderTick {
     pub async fn self_heal_scan(&self) -> Result<(), LeaderError> {
         // ── 1. Aggregate bug reports into the queue ──────────────────────────
         sqlx::query(
-            "INSERT INTO fleet_self_heal_queue \
-                (bug_signature, tier, status, report_count, created_at) \
-             SELECT bug_signature, MAX(tier), 'detected', COUNT(*), NOW() \
+            "INSERT INTO fleet_tasks \
+                (id, task_type, summary, payload, priority, status, created_at, task_class, dedup_signature) \
+             SELECT \
+                gen_random_uuid(), \
+                'self_heal_writer', \
+                format('self_heal_writer: %s', bug_signature), \
+                jsonb_build_object( \
+                    'bug_signature', bug_signature, \
+                    'tier', MAX(tier), \
+                    'status', 'detected', \
+                    'report_count', COUNT(*), \
+                    'attempts', 0 \
+                ), \
+                CASE MAX(tier) \
+                    WHEN 'T1' THEN 100 \
+                    WHEN 'T0' THEN 90 \
+                    WHEN 'T2' THEN 80 \
+                    ELSE 70 \
+                END, \
+                'pending', \
+                NOW(), \
+                'self_heal', \
+                bug_signature \
              FROM fleet_bug_reports \
              WHERE reported_at > NOW() - INTERVAL '5 minutes' \
              GROUP BY bug_signature \
-             ON CONFLICT (bug_signature) DO UPDATE SET \
-                 report_count = fleet_self_heal_queue.report_count \
-                     + EXCLUDED.report_count,
-                 tier = EXCLUDED.tier",
+             ON CONFLICT (dedup_signature) WHERE dedup_signature IS NOT NULL DO UPDATE SET \
+                summary = EXCLUDED.summary, \
+                priority = EXCLUDED.priority, \
+                payload = fleet_tasks.payload || jsonb_build_object( \
+                    'bug_signature', COALESCE(fleet_tasks.payload->>'bug_signature', EXCLUDED.payload->>'bug_signature'), \
+                    'tier', EXCLUDED.payload->>'tier', \
+                    'report_count', COALESCE((fleet_tasks.payload->>'report_count')::int, 0) \
+                        + COALESCE((EXCLUDED.payload->>'report_count')::int, 0) \
+                )",
         )
         .execute(&self.pg)
         .await?;
 
         // ── 2. Stale-claim recovery ─────────────────────────────────────────
         let stale_rows = sqlx::query(
-            "UPDATE fleet_self_heal_queue \
-             SET status = CASE \
-                 WHEN attempts >= 2 THEN 'escalated' \
-                 ELSE 'detected' \
-             END, \
-                 attempts = attempts + 1, \
-                 escalated_to_operator_at = CASE \
-                     WHEN attempts >= 2 THEN NOW() \
-                     ELSE escalated_to_operator_at \
-                 END \
-             WHERE status = 'fixing' \
-               AND (last_attempt_at IS NULL OR last_attempt_at < NOW() - INTERVAL '5 minutes') \
-             RETURNING bug_signature, status",
+            "WITH stale AS ( \
+                SELECT id, COALESCE((payload->>'attempts')::int, 0) AS attempts \
+                  FROM fleet_tasks \
+                 WHERE task_class = 'self_heal' \
+                   AND COALESCE(payload->>'status', '') = 'fixing' \
+                   AND ( \
+                        payload->>'last_attempt_at' IS NULL \
+                        OR (payload->>'last_attempt_at')::timestamptz < NOW() - INTERVAL '5 minutes' \
+                   ) \
+             ) \
+             UPDATE fleet_tasks t \
+                SET status = CASE \
+                    WHEN stale.attempts >= 2 THEN 'failed' \
+                    ELSE 'pending' \
+                END, \
+                    payload = t.payload || jsonb_build_object( \
+                        'status', CASE \
+                            WHEN stale.attempts >= 2 THEN 'escalated' \
+                            ELSE 'detected' \
+                        END, \
+                        'attempts', stale.attempts + 1, \
+                        'escalated_to_operator_at', CASE \
+                            WHEN stale.attempts >= 2 THEN NOW() \
+                            ELSE t.payload->>'escalated_to_operator_at' \
+                        END \
+                    ) \
+               FROM stale \
+              WHERE t.id = stale.id \
+              RETURNING t.dedup_signature AS bug_signature, t.payload->>'status' AS status",
         )
         .fetch_all(&self.pg)
         .await?;
@@ -861,10 +924,16 @@ impl LeaderTick {
                     );
                     // Mark as fixing so we don't re-dispatch next tick.
                     sqlx::query(
-                        "UPDATE fleet_self_heal_queue \
-                         SET status = 'fixing', attempts = attempts + 1, \
-                             last_attempt_at = NOW(), writer_computer_id = $2 \
-                         WHERE bug_signature = $1",
+                        "UPDATE fleet_tasks \
+                         SET status = 'running', \
+                             payload = payload || jsonb_build_object( \
+                                 'status', 'fixing', \
+                                 'attempts', COALESCE((payload->>'attempts')::int, 0) + 1, \
+                                 'last_attempt_at', NOW(), \
+                                 'writer_computer_id', $2::text \
+                             ) \
+                         WHERE task_class = 'self_heal' \
+                           AND dedup_signature = $1",
                     )
                     .bind(&sig)
                     .bind(self.my_computer_id)
@@ -894,8 +963,8 @@ impl LeaderTick {
     /// claude-code/kimi/codex/local self-heal writers.
     ///
     /// Single-flight is enforced two ways: the marker file caps the SELECT to
-    /// ~once per 30 min per leader, and `ON CONFLICT (bug_signature) DO NOTHING`
-    /// means a signature already in the queue (in any status) is never reset.
+    /// ~once per 30 min per leader, and `ON CONFLICT (dedup_signature) DO NOTHING`
+    /// means a signature already tracked in `fleet_tasks` is never reset.
     /// We classify interaction errors as tier `T2` — runtime/interaction-layer
     /// failures, distinct from the `T0/T1` build/test bugs that
     /// `fleet_bug_reports` feeds.
@@ -935,10 +1004,26 @@ impl LeaderTick {
             // Insert only if this signature is not already tracked. DO NOTHING
             // leaves any in-flight/fixed row untouched (no status reset).
             let inserted = sqlx::query(
-                "INSERT INTO fleet_self_heal_queue \
-                    (bug_signature, tier, status, report_count, created_at) \
-                 VALUES ($1, 'T2', 'detected', $2, NOW()) \
-                 ON CONFLICT (bug_signature) DO NOTHING",
+                "INSERT INTO fleet_tasks \
+                    (id, task_type, summary, payload, priority, status, created_at, task_class, dedup_signature) \
+                 VALUES ( \
+                    gen_random_uuid(), \
+                    'self_heal_writer', \
+                    format('self_heal_writer: %s', $1), \
+                    jsonb_build_object( \
+                        'bug_signature', $1, \
+                        'tier', 'T2', \
+                        'status', 'detected', \
+                        'report_count', $2, \
+                        'attempts', 0 \
+                    ), \
+                    80, \
+                    'pending', \
+                    NOW(), \
+                    'self_heal', \
+                    $1 \
+                 ) \
+                 ON CONFLICT (dedup_signature) WHERE dedup_signature IS NOT NULL DO NOTHING",
             )
             .bind(&sig)
             .bind(report_count as i32)
@@ -1159,6 +1244,8 @@ fn pick_best_candidate<'a>(
 mod tests {
     use super::*;
     use chrono::Duration as ChronoDuration;
+    use sqlx::postgres::PgPoolOptions;
+    use std::env;
 
     fn fake_leader(name: &str, heartbeat_age_secs: i64, epoch: i64) -> LeaderState {
         LeaderState {
@@ -1304,5 +1391,176 @@ mod tests {
         let (member, until) = parse_yield_request(&raw).expect("past deadline still parses");
         assert_eq!(member, "taylor");
         assert!(until < Utc::now());
+    }
+
+    fn temp_db_urls() -> (String, String, String) {
+        let base_url = env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
+            .expect("FORGEFLEET_POSTGRES_URL or FORGEFLEET_DATABASE_URL must be set for DB tests");
+        let (prefix, _) = base_url
+            .rsplit_once('/')
+            .expect("database URL must end with /<db>");
+        let db_name = format!("ff_self_heal_{}", Uuid::new_v4().simple());
+        (
+            format!("{prefix}/postgres"),
+            format!("{prefix}/{db_name}"),
+            db_name,
+        )
+    }
+
+    async fn create_temp_db() -> (PgPool, PgPool, String) {
+        let (admin_url, db_url, db_name) = temp_db_urls();
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("connect admin db");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create temp db");
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&db_url)
+            .await
+            .expect("connect temp db");
+        sqlx::raw_sql(
+            "CREATE EXTENSION IF NOT EXISTS pgcrypto;
+             CREATE TABLE fleet_tasks (
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 task_type TEXT NOT NULL,
+                 summary TEXT NOT NULL,
+                 payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                 priority INT NOT NULL DEFAULT 50,
+                 status TEXT NOT NULL DEFAULT 'pending',
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 task_class TEXT,
+                 dedup_signature TEXT
+             );
+             CREATE UNIQUE INDEX idx_fleet_tasks_dedup_signature
+                 ON fleet_tasks (dedup_signature)
+                 WHERE dedup_signature IS NOT NULL;",
+        )
+        .execute(&pool)
+        .await
+        .expect("create minimal fleet_tasks schema");
+        (admin, pool, db_name)
+    }
+
+    async fn drop_temp_db(admin: PgPool, pool: PgPool, db_name: &str) {
+        pool.close().await;
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid) \
+               FROM pg_stat_activity \
+              WHERE datname = $1 \
+                AND pid <> pg_backend_pid()",
+        )
+        .bind(db_name)
+        .execute(&admin)
+        .await
+        .expect("terminate temp db sessions");
+        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("drop temp db");
+        admin.close().await;
+    }
+
+    async fn upsert_self_heal_task(
+        pg: &PgPool,
+        bug_signature: &str,
+        tier: &str,
+        report_count: i32,
+    ) -> Uuid {
+        let row = sqlx::query(
+            "INSERT INTO fleet_tasks \
+                (id, task_type, summary, payload, priority, status, created_at, task_class, dedup_signature) \
+             VALUES ( \
+                gen_random_uuid(), \
+                'self_heal_writer', \
+                format('self_heal_writer: %s', $1), \
+                jsonb_build_object( \
+                    'bug_signature', $1, \
+                    'tier', $2, \
+                    'status', 'detected', \
+                    'report_count', $3, \
+                    'attempts', 0 \
+                ), \
+                $4, \
+                $5, \
+                NOW(), \
+                'self_heal', \
+                $1 \
+             ) \
+             ON CONFLICT (dedup_signature) WHERE dedup_signature IS NOT NULL DO UPDATE SET \
+                summary = EXCLUDED.summary, \
+                priority = EXCLUDED.priority, \
+                payload = fleet_tasks.payload || jsonb_build_object( \
+                    'bug_signature', COALESCE(fleet_tasks.payload->>'bug_signature', EXCLUDED.payload->>'bug_signature'), \
+                    'tier', EXCLUDED.payload->>'tier', \
+                    'report_count', COALESCE((fleet_tasks.payload->>'report_count')::int, 0) \
+                        + COALESCE((EXCLUDED.payload->>'report_count')::int, 0) \
+                ) \
+             RETURNING id",
+        )
+        .bind(bug_signature)
+        .bind(tier)
+        .bind(report_count)
+        .bind(self_heal_priority_for_tier(tier))
+        .bind(self_heal_task_status("detected"))
+        .fetch_one(pg)
+        .await
+        .expect("upsert self-heal task");
+        row.get("id")
+    }
+
+    #[tokio::test]
+    async fn self_heal_same_signature_stays_single_flight_in_fleet_tasks() {
+        // DB-backed: skip gracefully when no Postgres is configured (e.g. the
+        // `cargo test --workspace --lib` CI job has no DB) instead of panicking.
+        // Run it locally / in a DB-enabled job with FORGEFLEET_POSTGRES_URL set.
+        if env::var("FORGEFLEET_POSTGRES_URL").is_err()
+            && env::var("FORGEFLEET_DATABASE_URL").is_err()
+        {
+            eprintln!(
+                "skipping self_heal single-flight DB test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL"
+            );
+            return;
+        }
+        let (admin, pool, db_name) = create_temp_db().await;
+
+        let first_id = upsert_self_heal_task(&pool, "sig-same-bug", "T2", 1).await;
+        let second_id = upsert_self_heal_task(&pool, "sig-same-bug", "T1", 3).await;
+
+        let active_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) \
+               FROM fleet_tasks \
+              WHERE task_class = 'self_heal' \
+                AND dedup_signature = $1 \
+                AND status IN ('pending', 'claimed', 'running', 'paused')",
+        )
+        .bind("sig-same-bug")
+        .fetch_one(&pool)
+        .await
+        .expect("count active self-heal rows");
+
+        let row = sqlx::query(
+            "SELECT id, status, (payload->>'report_count')::int AS report_count, payload->>'tier' AS tier \
+               FROM fleet_tasks \
+              WHERE task_class = 'self_heal' AND dedup_signature = $1",
+        )
+        .bind("sig-same-bug")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch self-heal task");
+
+        assert_eq!(active_count, 1);
+        assert_eq!(first_id, second_id);
+        assert_eq!(row.get::<Uuid, _>("id"), first_id);
+        assert_eq!(row.get::<String, _>("status"), "pending");
+        assert_eq!(row.get::<i32, _>("report_count"), 4);
+        assert_eq!(row.get::<String, _>("tier"), "T1");
+
+        drop_temp_db(admin, pool, &db_name).await;
     }
 }
