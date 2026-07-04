@@ -321,12 +321,15 @@ async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Ve
         && let Ok(config) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str)
     {
         let db_url = config.database.url.trim().to_string();
+        // Reuse the shared, cached fleet pool rather than building a fresh
+        // max_connections(1) Postgres pool + TCP/auth handshake on EVERY router
+        // invocation. That per-call churn piled up connections against the same
+        // central Postgres and was part of the pressure that made concurrent
+        // dispatch hit "route deployments: pool timed out"
+        // (feedback_pool_per_call_antipattern). The db_url gate is kept so remote
+        // endpoints are still only attached when a database is configured.
         if !db_url.is_empty()
-            && let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(1)
-                .acquire_timeout(Duration::from_secs(3))
-                .connect(&db_url)
-                .await
+            && let Ok(pool) = crate::fleet_info::get_fleet_pool().await
         {
             let nodes = ff_db::pg_list_nodes(&pool).await.unwrap_or_default();
             let models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
