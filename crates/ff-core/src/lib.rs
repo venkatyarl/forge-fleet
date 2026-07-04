@@ -33,6 +33,7 @@ pub mod run_limits;
 pub mod synthetic;
 pub mod task;
 pub mod task_error;
+pub mod tool_path;
 pub mod types;
 pub mod url;
 pub mod verifier;
