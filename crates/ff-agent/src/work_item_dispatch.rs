@@ -1439,6 +1439,13 @@ async fn run_backend_cli(backend: &str, cwd: &Path, prompt: &str) -> Result<Outp
     let backend = backend.to_string();
     let cwd = cwd.to_path_buf();
     let prompt = prompt.to_string();
+    // Fetch the GitHub token HERE (async) and inject it into the backend's env so
+    // the agent has an authenticated `gh` for the ENTIRE build — not only the
+    // final `gh pr create` step. Without it, a codex/claude/kimi run that shells
+    // out to `gh` mid-build hits "To get started with GitHub CLI, run gh auth
+    // login" and exits non-zero on any node lacking ambient gh auth (i.e. all of
+    // them — the fleet authenticates gh purely via this secret, not `gh auth login`).
+    let gh_token = crate::fleet_info::fetch_secret("github_gh_token").await;
     tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new("ff");
         cmd.arg("cli")
@@ -1451,6 +1458,9 @@ async fn run_backend_cli(backend: &str, cwd: &Path, prompt: &str) -> Result<Outp
             // a failed work_item, not a silent 'done' (catches stdin-pipe no-ops).
             .arg("--require-change")
             .arg(&prompt);
+        if let Some(token) = gh_token {
+            cmd.env("GH_TOKEN", token);
+        }
         run_command_timeout(cmd, Duration::from_secs(FF_TIMEOUT_SECS + 30))
     })
     .await
