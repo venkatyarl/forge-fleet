@@ -1,5 +1,31 @@
 use crate::{RESET, YELLOW, whoami_tag};
-use anyhow::Result;
+use anyhow::{Context, Result};
+
+/// Resolve the value for `ff secrets set`: from the positional arg, or from
+/// stdin when `--stdin` is passed or no value arg was given. Reading from stdin
+/// keeps the secret out of shell history AND the process argument list (`ps`) —
+/// the safe way to set a token. Trailing newline(s) from an `echo`/paste are
+/// trimmed; interior content is preserved verbatim.
+fn resolve_secret_value(value: Option<String>, stdin: bool) -> Result<String> {
+    match (value, stdin) {
+        (Some(_), true) => {
+            anyhow::bail!("pass the value as an argument OR --stdin, not both")
+        }
+        (Some(v), false) => Ok(v),
+        (None, _) => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("read secret value from stdin")?;
+            let v = buf.trim_end_matches(['\n', '\r']).to_string();
+            if v.is_empty() {
+                anyhow::bail!("no secret value provided on stdin");
+            }
+            Ok(v)
+        }
+    }
+}
 
 /// Lossless JSON projection of one `fleet_secrets` metadata row for
 /// `ff secrets list --json`. Pure (no DB/clock). The secret VALUE is
@@ -79,7 +105,9 @@ pub async fn handle_secrets(cmd: crate::SecretsCommand) -> Result<()> {
             key,
             value,
             description,
+            stdin,
         } => {
+            let value = resolve_secret_value(value, stdin)?;
             let who = whoami_tag();
             ff_db::pg_set_secret(&pool, &key, &value, description.as_deref(), Some(&who)).await?;
             println!("Secret '{key}' stored ({} bytes) by {who}", value.len());
