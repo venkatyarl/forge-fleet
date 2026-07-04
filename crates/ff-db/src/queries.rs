@@ -7752,6 +7752,10 @@ pub fn backend_score(backend: &str, remaining_pct: Option<f64>, breaker_state: &
 /// `fleet_provider_usage` rows exist yet, every backend scores at full
 /// headroom and the order collapses to [`backend_rank`] — so this is always
 /// safe to use in place of [`pg_dispatchable_backends`].
+/// Returns dispatchable backends ordered by `backend_score` (headroom + rank).
+///
+/// Excludes breaker-open providers and backends under the 15% headroom floor.
+/// Degrades to `backend_rank` ordering when no usage rows exist.
 pub async fn pg_routed_backends(
     pool: &PgPool,
     computer_id: uuid::Uuid,
