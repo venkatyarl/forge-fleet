@@ -104,6 +104,29 @@ pub fn classify_auth(timed_out: bool, exit_ok: bool, stdout: &str, stderr: &str)
     (false, "probe returned no output".to_string())
 }
 
+/// Whether an auth-probe failure reason indicates the CLI BINARY ITSELF is
+/// broken (crashes on run) — a missing native/optional dependency from a
+/// half-finished npm install, a bad module load — rather than an auth failure
+/// or a transient network blip. Such a backend must fail CLOSED regardless of
+/// cred presence: it's on PATH and creds may exist, but it cannot execute a
+/// dispatch, so `cred_present` must not "rescue" it. PURE, so it's testable.
+pub fn probe_indicates_broken_binary(reason: &str) -> bool {
+    const BROKEN_SIGNATURES: &[&str] = &[
+        "missing optional dependency",
+        "cannot find module",
+        "module_not_found",
+        "err_module_not_found",
+        "err_dlopen",
+        "reinstall",
+        "npm install -g",
+        "undefined symbol",
+        "not a function",
+        "cannot find package",
+    ];
+    let lower = reason.to_ascii_lowercase();
+    BROKEN_SIGNATURES.iter().any(|s| lower.contains(s))
+}
+
 /// Detect every backend's availability on THIS node. When `probe_auth` is true,
 /// each installed backend additionally gets a tiny non-interactive request to
 /// verify it's authenticated (slower — a real CLI invocation per backend).
@@ -131,6 +154,16 @@ pub async fn detect_backends(probe_auth: bool, timeout: Duration) -> Vec<Backend
             let (ok, reason) = probe_auth_once(cfg.name, timeout).await;
             if ok {
                 (Some(true), reason)
+            } else if probe_indicates_broken_binary(&reason) {
+                // The probe didn't just fail auth — the CLI CRASHED on run (e.g.
+                // a missing native/optional npm dep from a half-finished install:
+                // "Missing optional dependency @openai/codex-linux-x64"). The
+                // binary is on PATH and creds may exist, but it CANNOT execute a
+                // dispatch. Fail closed regardless of cred presence (the
+                // cred-file fallback below must NOT mask a broken install — that
+                // is exactly how a dead codex read as "authenticated" and every
+                // dispatch to it failed with the opaque "no dispatchable backend").
+                (Some(false), format!("installed but NOT runnable: {reason}"))
             } else if cred_present(cfg.name) {
                 // The live probe can be flaky on the fleet (slow cold-start,
                 // sandbox quirks, transient 5xx) and would leave a genuinely
@@ -331,6 +364,24 @@ async fn probe_auth_once(backend: &str, timeout: Duration) -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broken_binary_detected_and_does_not_match_auth_or_transient() {
+        // The exact codex crash seen on lily/veronica — must be flagged broken.
+        assert!(probe_indicates_broken_binary(
+            "probe failed: Error: Missing optional dependency @openai/codex-linux-x64. Reinstall Codex: npm install -g @openai/codex@latest"
+        ));
+        assert!(probe_indicates_broken_binary(
+            "Cannot find module '/usr/lib/node_modules/@openai/codex/foo'"
+        ));
+        // Auth failures and transient blips are NOT broken-binary → cred fallback
+        // may still apply; don't over-match them.
+        assert!(!probe_indicates_broken_binary("401 Unauthorized"));
+        assert!(!probe_indicates_broken_binary(
+            "probe timed out (likely waiting on an interactive login prompt)"
+        ));
+        assert!(!probe_indicates_broken_binary("503 service unavailable"));
+    }
 
     #[test]
     fn auth_classify_fails_closed_on_timeout() {
