@@ -1785,9 +1785,22 @@ where
     run_command_timeout(cmd, timeout)
 }
 
+/// Render a command for logs as `program arg1 arg2 …`, deliberately EXCLUDING
+/// the environment. `{Command:?}` prints env vars too, so it would leak any
+/// secret injected via `.env()` (e.g. the `GH_TOKEN` the dispatch sets for the
+/// backend build) into the daemon log on every failed/timed-out command.
+fn command_display(cmd: &Command) -> String {
+    let mut s = cmd.get_program().to_string_lossy().into_owned();
+    for arg in cmd.get_args() {
+        s.push(' ');
+        s.push_str(&arg.to_string_lossy());
+    }
+    truncate_for_log(&s)
+}
+
 fn run_command_timeout(mut cmd: Command, timeout: Duration) -> Result<Output> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let program = format!("{cmd:?}");
+    let program = command_display(&cmd);
     let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
     let start = Instant::now();
 
@@ -1921,12 +1934,29 @@ pub fn spawn_worktree_reaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        DispatchOutcome, classify_dispatch_outcome, dispatch_budget_for_host, parse_cli_tokens,
-        primary_or_default_backend,
+        DispatchOutcome, classify_dispatch_outcome, command_display, dispatch_budget_for_host,
+        parse_cli_tokens, primary_or_default_backend,
     };
     use anyhow::anyhow;
     use std::os::unix::process::ExitStatusExt;
-    use std::process::Output;
+    use std::process::{Command, Output};
+
+    #[test]
+    fn command_display_never_leaks_env_secrets() {
+        // Regression guard: a secret injected via .env() (e.g. GH_TOKEN) must
+        // NEVER appear in the command's log rendering. `{Command:?}` would leak
+        // it; command_display renders program + args only.
+        let mut cmd = Command::new("ff");
+        cmd.args(["cli", "codex", "--cwd", "/tmp/wt"])
+            .env("GH_TOKEN", "gho_supersecretvalue_should_never_be_logged");
+        let shown = command_display(&cmd);
+        assert!(shown.contains("ff cli codex"));
+        assert!(
+            !shown.contains("gho_supersecretvalue_should_never_be_logged"),
+            "command_display leaked an env secret: {shown}"
+        );
+        assert!(!shown.contains("GH_TOKEN"), "env var name leaked: {shown}");
+    }
 
     fn ok_output() -> anyhow::Result<Output> {
         Ok(Output {
