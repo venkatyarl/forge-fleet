@@ -724,6 +724,14 @@ const MAX_DISPATCH_ATTEMPTS: i32 = 3;
 /// cloud/CLI backstop, which is more capable. Below this, try cheap-local-first.
 const ESCALATE_TO_CLOUD_AT: i32 = 2;
 
+/// Hard ceiling on the Lane-1 LOCAL codegen harness. It can HANG on a complex
+/// prompt (observed 2026-07-04 on the fleet_self_heal fold: empty worktree, no
+/// progress, live heartbeat for 30+ min — the dispatch's OUTER heartbeat loop
+/// keeps the lease fresh, so the lease reaper never reclaims it and the slot
+/// stalls forever). A hung local lane must FAIL OVER to the cloud backstop, not
+/// wedge the slot. 7 min is well above a real local codegen pass, but bounded.
+const LANE1_TIMEOUT_SECS: u64 = 420;
+
 /// Deterministic execution-contract outcome of a dispatch (roadmap item #3).
 /// Formalizes what previously was ad-hoc: a dispatch either succeeds, fails with
 /// no diff (retryable), fails but left a real diff (salvageable — treat as a
@@ -1107,10 +1115,17 @@ async fn run_ff_dispatch(
     // (stage 2): after ESCALATE_TO_CLOUD_AT local failures it has failed the same
     // way, so don't waste another local round — fall straight through to Lane 2.
     if item.attempts < ESCALATE_TO_CLOUD_AT {
-        match crate::codegen_apply::codegen_apply(pg, &worktree.worktree_path, &prompt, None, 4)
-            .await
-        {
-            Ok(outcome) if outcome.applied => {
+        // Bound Lane 1 with a hard timeout so a hung local codegen harness fails
+        // OVER to the cloud backstop instead of wedging the slot forever (see
+        // LANE1_TIMEOUT_SECS). Without this, a hang here stalls the build while
+        // the outer heartbeat keeps the lease alive — unrecoverable.
+        let lane1 = tokio::time::timeout(
+            Duration::from_secs(LANE1_TIMEOUT_SECS),
+            crate::codegen_apply::codegen_apply(pg, &worktree.worktree_path, &prompt, None, 4),
+        )
+        .await;
+        match lane1 {
+            Ok(Ok(outcome)) if outcome.applied => {
                 info!(
                     work_item_id = %item.work_item_id,
                     rounds = outcome.rounds,
@@ -1121,17 +1136,22 @@ async fn run_ff_dispatch(
                     synthetic_output(&outcome.final_diff.unwrap_or_else(|| "applied".into())),
                 ));
             }
-            Ok(outcome) => info!(
+            Ok(Ok(outcome)) => info!(
                 work_item_id = %item.work_item_id,
                 error = ?outcome.error,
                 "work_item_dispatch: local codegen didn't land; backstop to codex"
             ),
-            Err(e) => warn!(
+            Ok(Err(e)) => warn!(
                 work_item_id = %item.work_item_id,
                 // Full anyhow chain so the REAL cause surfaces (e.g. the underlying
                 // fleet_oneshot failure), not just the "fleet_oneshot round 1" wrapper.
                 error = format!("{e:#}"),
                 "work_item_dispatch: local codegen errored; backstop to codex"
+            ),
+            Err(_) => warn!(
+                work_item_id = %item.work_item_id,
+                timeout_secs = LANE1_TIMEOUT_SECS,
+                "work_item_dispatch: local codegen TIMED OUT (hung) — backstop to codex"
             ),
         }
     } else {
