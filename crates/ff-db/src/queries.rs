@@ -3202,6 +3202,31 @@ pub struct DeferredTaskRow {
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+const DEFERRED_TASK_SELECT: &str = r#"
+SELECT
+    t.id,
+    t.created_at,
+    NULLIF(t.payload->>'created_by', '') AS created_by,
+    t.summary AS title,
+    COALESCE(NULLIF(t.payload->>'kind', ''), t.task_type) AS kind,
+    COALESCE(t.payload->'deferred_payload', '{}'::jsonb) AS payload,
+    COALESCE(t.payload->>'trigger_type', 'now') AS trigger_type,
+    COALESCE(t.payload->'trigger_spec', '{}'::jsonb) AS trigger_spec,
+    NULLIF(t.payload->>'preferred_node', '') AS preferred_node,
+    COALESCE(t.payload->'required_caps', '[]'::jsonb) AS required_caps,
+    t.status,
+    COALESCE((t.payload->>'attempts')::int, 0) AS attempts,
+    COALESCE((t.payload->>'max_attempts')::int, 5) AS max_attempts,
+    t.not_before AS next_attempt_at,
+    NULLIF(t.payload->>'claimed_by', '') AS claimed_by,
+    t.claimed_at,
+    t.error AS last_error,
+    t.result,
+    t.completed_at
+FROM fleet_tasks t
+WHERE t.task_class = 'deferred'
+"#;
+
 /// Insert a new deferred task. Returns the generated UUID.
 #[allow(clippy::too_many_arguments)]
 pub async fn pg_enqueue_deferred(
@@ -3256,11 +3281,32 @@ pub async fn pg_enqueue_deferred_delayed(
     delay_secs: i64,
 ) -> Result<String> {
     let row = sqlx::query(
-        "INSERT INTO deferred_tasks
-            (title, kind, payload, trigger_type, trigger_spec, preferred_node,
-             required_caps, created_by, max_attempts, next_attempt_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 5),
-                 CASE WHEN $10 > 0 THEN NOW() + make_interval(secs => $10) ELSE NULL END)
+        "INSERT INTO fleet_tasks
+            (task_type, summary, payload, priority, requires_capability, status,
+             created_at, task_class, not_before)
+         VALUES (
+             $2,
+             $1,
+             jsonb_strip_nulls(
+                 jsonb_build_object(
+                     'deferred_payload', $3,
+                     'created_by', $8,
+                     'kind', $2,
+                     'trigger_type', $4,
+                     'trigger_spec', $5,
+                     'preferred_node', $6,
+                     'required_caps', $7,
+                     'attempts', 0,
+                     'max_attempts', COALESCE($9, 5)
+                 )
+             ),
+             50,
+             $7,
+             'pending',
+             NOW(),
+             'deferred',
+             CASE WHEN $10 > 0 THEN NOW() + make_interval(secs => $10) ELSE NULL END
+         )
          RETURNING id",
     )
     .bind(title)
@@ -3286,18 +3332,20 @@ pub async fn pg_list_deferred(
     limit: i64,
 ) -> Result<Vec<DeferredTaskRow>> {
     let rows = if let Some(s) = status {
-        sqlx::query(
-            "SELECT * FROM deferred_tasks WHERE status = $1 ORDER BY created_at DESC LIMIT $2",
-        )
+        sqlx::query(&format!(
+            "{DEFERRED_TASK_SELECT} AND t.status = $1 ORDER BY t.created_at DESC LIMIT $2"
+        ))
         .bind(s)
         .bind(limit)
         .fetch_all(pool)
         .await?
     } else {
-        sqlx::query("SELECT * FROM deferred_tasks ORDER BY created_at DESC LIMIT $1")
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
+        sqlx::query(&format!(
+            "{DEFERRED_TASK_SELECT} ORDER BY t.created_at DESC LIMIT $1"
+        ))
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
     };
     Ok(rows.iter().map(row_to_deferred).collect())
 }
@@ -3326,8 +3374,11 @@ pub struct DeferredStats {
 /// Compute a [`DeferredStats`] over a trailing `window_hours` window.
 pub async fn pg_deferred_stats(pool: &PgPool, window_hours: i64) -> Result<DeferredStats> {
     let by_status = sqlx::query(
-        "SELECT status AS label, COUNT(*) AS count FROM deferred_tasks
-         GROUP BY status ORDER BY COUNT(*) DESC",
+        "SELECT status AS label, COUNT(*) AS count
+           FROM fleet_tasks
+          WHERE task_class = 'deferred'
+          GROUP BY status
+          ORDER BY COUNT(*) DESC",
     )
     .fetch_all(pool)
     .await?
@@ -3339,9 +3390,10 @@ pub async fn pg_deferred_stats(pool: &PgPool, window_hours: i64) -> Result<Defer
     .collect();
 
     let recent_failures = sqlx::query(
-        "SELECT LEFT(COALESCE(last_error, '(no error text)'), 60) AS label, COUNT(*) AS count
-           FROM deferred_tasks
-          WHERE status = 'failed'
+        "SELECT LEFT(COALESCE(error, '(no error text)'), 60) AS label, COUNT(*) AS count
+           FROM fleet_tasks
+          WHERE task_class = 'deferred'
+            AND status = 'failed'
             AND created_at > now() - make_interval(hours => $1::int)
           GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 10",
     )
@@ -3357,10 +3409,11 @@ pub async fn pg_deferred_stats(pool: &PgPool, window_hours: i64) -> Result<Defer
 
     // Flood detector: tasks created per (first two title words) in the window.
     let recent_created = sqlx::query(
-        "SELECT split_part(title, ' ', 1) || ' ' || split_part(title, ' ', 2) AS label,
+        "SELECT split_part(summary, ' ', 1) || ' ' || split_part(summary, ' ', 2) AS label,
                 COUNT(*) AS count
-           FROM deferred_tasks
-          WHERE created_at > now() - make_interval(hours => $1::int)
+           FROM fleet_tasks
+          WHERE task_class = 'deferred'
+            AND created_at > now() - make_interval(hours => $1::int)
           GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 10",
     )
     .bind(window_hours as i32)
@@ -3376,8 +3429,9 @@ pub async fn pg_deferred_stats(pool: &PgPool, window_hours: i64) -> Result<Defer
     let oldest = sqlx::query(
         "SELECT id::text AS id,
                 EXTRACT(EPOCH FROM (now() - created_at))::bigint AS age_secs
-           FROM deferred_tasks
-          WHERE status = 'pending'
+           FROM fleet_tasks
+          WHERE task_class = 'deferred'
+            AND status = 'pending'
           ORDER BY created_at ASC LIMIT 1",
     )
     .fetch_optional(pool)
@@ -3405,7 +3459,7 @@ pub async fn pg_deferred_stats(pool: &PgPool, window_hours: i64) -> Result<Defer
 pub async fn pg_get_deferred(pool: &PgPool, id: &str) -> Result<Option<DeferredTaskRow>> {
     let uuid = sqlx::types::Uuid::parse_str(id)
         .map_err(|e| crate::error::DbError::NotFound(format!("bad uuid {id}: {e}")))?;
-    let row = sqlx::query("SELECT * FROM deferred_tasks WHERE id = $1")
+    let row = sqlx::query(&format!("{DEFERRED_TASK_SELECT} AND t.id = $1"))
         .bind(uuid)
         .fetch_optional(pool)
         .await?;
@@ -3418,9 +3472,11 @@ pub async fn pg_cancel_deferred(pool: &PgPool, id: &str) -> Result<bool> {
     let uuid = sqlx::types::Uuid::parse_str(id)
         .map_err(|e| crate::error::DbError::NotFound(format!("bad uuid {id}: {e}")))?;
     let r = sqlx::query(
-        "UPDATE deferred_tasks
-            SET status = 'cancelled', completed_at = NOW()
+        "UPDATE fleet_tasks
+            SET status = 'cancelled',
+                completed_at = NOW()
           WHERE id = $1
+            AND task_class = 'deferred'
             AND status IN ('pending', 'dispatchable', 'failed')",
     )
     .bind(uuid)
@@ -3437,10 +3493,12 @@ pub async fn pg_force_cancel_deferred(pool: &PgPool, id: &str) -> Result<bool> {
     let uuid = sqlx::types::Uuid::parse_str(id)
         .map_err(|e| crate::error::DbError::NotFound(format!("bad uuid {id}: {e}")))?;
     let r = sqlx::query(
-        "UPDATE deferred_tasks
-            SET status = 'cancelled', completed_at = NOW(),
-                last_error = LEFT(COALESCE(last_error, '') || ' [force-cancelled by operator]', 500)
+        "UPDATE fleet_tasks
+            SET status = 'cancelled',
+                completed_at = NOW(),
+                error = LEFT(COALESCE(error, '') || ' [force-cancelled by operator]', 500)
           WHERE id = $1
+            AND task_class = 'deferred'
             AND status IN ('pending', 'dispatchable', 'failed', 'running')",
     )
     .bind(uuid)
@@ -3461,16 +3519,31 @@ pub async fn pg_force_cancel_deferred(pool: &PgPool, id: &str) -> Result<bool> {
 /// `failed`. Returns the number of tasks reaped.
 pub async fn pg_reap_stale_running(pool: &PgPool, max_age_secs: i64) -> Result<u64> {
     let r = sqlx::query(
-        "UPDATE deferred_tasks
-            SET attempts = attempts + 1,
-                status = CASE WHEN attempts + 1 >= max_attempts THEN 'failed' ELSE 'pending' END,
-                claimed_by = NULL,
+        "UPDATE fleet_tasks
+            SET payload = jsonb_set(
+                    payload - 'claimed_by',
+                    '{attempts}',
+                    to_jsonb(COALESCE((payload->>'attempts')::int, 0) + 1),
+                    true
+                ),
+                status = CASE
+                    WHEN COALESCE((payload->>'attempts')::int, 0) + 1
+                        >= COALESCE((payload->>'max_attempts')::int, 5)
+                        THEN 'failed'
+                    ELSE 'pending'
+                END,
                 claimed_at = NULL,
-                next_attempt_at = NOW(),
-                completed_at = CASE WHEN attempts + 1 >= max_attempts THEN NOW() ELSE completed_at END,
-                last_error = LEFT(COALESCE(last_error, '') ||
+                not_before = NOW(),
+                completed_at = CASE
+                    WHEN COALESCE((payload->>'attempts')::int, 0) + 1
+                        >= COALESCE((payload->>'max_attempts')::int, 5)
+                        THEN NOW()
+                    ELSE completed_at
+                END,
+                error = LEFT(COALESCE(error, '') ||
                     ' [reaped: orphaned in running > ' || $1::text || 's, worker presumed dead]', 500)
-          WHERE status = 'running'
+          WHERE task_class = 'deferred'
+            AND status = 'running'
             AND claimed_at IS NOT NULL
             AND claimed_at < NOW() - ($1 * INTERVAL '1 second')",
     )
@@ -3486,18 +3559,20 @@ pub async fn pg_retry_deferred(pool: &PgPool, id: &str) -> Result<bool> {
     let uuid = sqlx::types::Uuid::parse_str(id)
         .map_err(|e| crate::error::DbError::NotFound(format!("bad uuid {id}: {e}")))?;
     let r = sqlx::query(
-        "UPDATE deferred_tasks
+        "UPDATE fleet_tasks
             SET status = 'pending',
-                claimed_by = NULL,
+                payload = payload - 'claimed_by',
                 claimed_at = NULL,
-                next_attempt_at = NOW(),
-                last_error = NULL,
+                not_before = NOW(),
+                error = NULL,
                 -- Clear the prior failure's captured output too. Since
                 -- pg_finish_deferred now persists result on failure, a retry
                 -- that only cleared last_error would leave a stale stderr that
                 -- `ff defer get` renders as the (now full) output stream.
                 result = NULL
-          WHERE id = $1 AND status IN ('failed', 'cancelled')",
+          WHERE id = $1
+            AND task_class = 'deferred'
+            AND status IN ('failed', 'cancelled')",
     )
     .bind(uuid)
     .execute(pool)
@@ -3525,12 +3600,13 @@ pub async fn pg_scheduler_pass(
             // stomping it to NOW(): GREATEST(NOW(), NULL) = NOW(), so the
             // common case (no scheduled delay) is unchanged, while a
             // deliberately-delayed task stays gated by `pg_claim_deferred`.
-            "UPDATE deferred_tasks
+            "UPDATE fleet_tasks
                 SET status = 'dispatchable',
-                    next_attempt_at = GREATEST(NOW(), next_attempt_at)
-              WHERE status = 'pending'
-                AND trigger_type = 'node_online'
-                AND (trigger_spec->>'node') = ANY($1)",
+                    not_before = GREATEST(NOW(), not_before)
+              WHERE task_class = 'deferred'
+                AND status = 'pending'
+                AND payload->>'trigger_type' = 'node_online'
+                AND (payload->'trigger_spec'->>'node') = ANY($1)",
         )
         .bind(online_nodes)
         .execute(pool)
@@ -3540,12 +3616,13 @@ pub async fn pg_scheduler_pass(
 
     // at_time: promote if trigger_spec.at <= now.
     let at_time_promoted = sqlx::query(
-        "UPDATE deferred_tasks
+        "UPDATE fleet_tasks
             SET status = 'dispatchable',
-                next_attempt_at = NOW()
-          WHERE status = 'pending'
-            AND trigger_type = 'at_time'
-            AND (trigger_spec->>'at')::timestamptz <= $1",
+                not_before = NOW()
+          WHERE task_class = 'deferred'
+            AND status = 'pending'
+            AND payload->>'trigger_type' = 'at_time'
+            AND (payload->'trigger_spec'->>'at')::timestamptz <= $1",
     )
     .bind(now)
     .execute(pool)
@@ -3559,12 +3636,13 @@ pub async fn pg_scheduler_pass(
     // enqueues sat at status='pending' forever — discovered 2026-05-16
     // with 38 operator-triggered tasks accumulated indefinitely.
     let immediate_promoted = sqlx::query(
-        "UPDATE deferred_tasks
+        "UPDATE fleet_tasks
             SET status = 'dispatchable',
-                next_attempt_at = NOW()
-          WHERE status = 'pending'
-            AND trigger_type IN ('manual', 'now', 'operator')
-            AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())",
+                not_before = NOW()
+          WHERE task_class = 'deferred'
+            AND status = 'pending'
+            AND payload->>'trigger_type' IN ('manual', 'now', 'operator')
+            AND (not_before IS NULL OR not_before <= NOW())",
     )
     .execute(pool)
     .await?
@@ -3587,22 +3665,22 @@ pub async fn pg_claim_deferred(
     worker_node: &str,
 ) -> Result<Option<DeferredTaskRow>> {
     let mut tx = pool.begin().await?;
-    let row = sqlx::query(
-        "SELECT * FROM deferred_tasks
-          WHERE status = 'dispatchable'
+    let row = sqlx::query(&format!(
+        "{DEFERRED_TASK_SELECT}
+          AND t.status = 'dispatchable'
             AND (
-                 preferred_node IS NULL
-              OR preferred_node = $1
-              OR next_attempt_at <= NOW() - INTERVAL '2 minutes'
+                 (t.payload->>'preferred_node') IS NULL
+              OR t.payload->>'preferred_node' = $1
+              OR t.not_before <= NOW() - INTERVAL '2 minutes'
             )
-            AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+            AND (t.not_before IS NULL OR t.not_before <= NOW())
           ORDER BY
-            (preferred_node = $1) DESC NULLS LAST,
-            (preferred_node IS NULL) DESC,
-            created_at ASC
+            ((t.payload->>'preferred_node') = $1) DESC NULLS LAST,
+            ((t.payload->>'preferred_node') IS NULL) DESC,
+            t.created_at ASC
           FOR UPDATE SKIP LOCKED
-          LIMIT 1",
-    )
+          LIMIT 1"
+    ))
     .bind(worker_node)
     .fetch_optional(&mut *tx)
     .await?;
@@ -3614,11 +3692,12 @@ pub async fn pg_claim_deferred(
         // means "max N failures", not "max N claims" — a worker crash
         // mid-task no longer burns a retry slot.
         sqlx::query(
-            "UPDATE deferred_tasks
+            "UPDATE fleet_tasks
                 SET status = 'running',
-                    claimed_by = $1,
+                    payload = jsonb_set(payload, '{claimed_by}', to_jsonb($1::text), true),
                     claimed_at = NOW()
-              WHERE id = $2",
+              WHERE id = $2
+                AND task_class = 'deferred'",
         )
         .bind(worker_node)
         .bind(id)
@@ -3640,9 +3719,12 @@ pub async fn pg_promote_deferred(pool: &PgPool, id: &str) -> Result<bool> {
     let uuid = sqlx::types::Uuid::parse_str(id)
         .map_err(|e| crate::error::DbError::NotFound(format!("bad uuid {id}: {e}")))?;
     let affected = sqlx::query(
-        "UPDATE deferred_tasks
-            SET status = 'dispatchable', next_attempt_at = NOW()
-          WHERE id = $1 AND status = 'pending'",
+        "UPDATE fleet_tasks
+            SET status = 'dispatchable',
+                not_before = NOW()
+          WHERE id = $1
+            AND task_class = 'deferred'
+            AND status = 'pending'",
     )
     .bind(uuid)
     .execute(pool)
@@ -3664,11 +3746,12 @@ pub async fn pg_finish_deferred(
         .map_err(|e| crate::error::DbError::NotFound(format!("bad uuid {id}: {e}")))?;
     if success {
         sqlx::query(
-            "UPDATE deferred_tasks
+            "UPDATE fleet_tasks
                 SET status = 'completed',
                     result = $1,
                     completed_at = NOW()
-              WHERE id = $2",
+              WHERE id = $2
+                AND task_class = 'deferred'",
         )
         .bind(result)
         .bind(uuid)
@@ -3679,22 +3762,34 @@ pub async fn pg_finish_deferred(
         // tracks actual failures, not claim/restart noise. Retry while
         // (attempts + 1) < max_attempts; else terminal fail.
         sqlx::query(
-            "UPDATE deferred_tasks
-                SET attempts = attempts + 1,
+            "UPDATE fleet_tasks
+                SET payload = jsonb_set(
+                        payload - 'claimed_by',
+                        '{attempts}',
+                        to_jsonb(COALESCE((payload->>'attempts')::int, 0) + 1),
+                        true
+                    ),
                     status = CASE
-                        WHEN attempts + 1 >= max_attempts THEN 'failed'
+                        WHEN COALESCE((payload->>'attempts')::int, 0) + 1
+                            >= COALESCE((payload->>'max_attempts')::int, 5)
+                            THEN 'failed'
                         ELSE 'pending'
                     END,
-                    last_error = $1,
+                    error = $1,
                     -- Keep the full execution output (stdout/stderr) on failure
                     -- too, so `ff defer get` can surface the complete stderr
                     -- instead of only the truncated last_error summary.
                     result = COALESCE($3, result),
-                    claimed_by = NULL,
                     claimed_at = NULL,
                     -- Exponential backoff capped at 4h: 1m, 5m, 30m, 1h, 4h
-                    next_attempt_at = NOW() + (LEAST(240, GREATEST(1, POWER(5, attempts + 1)::int)) * INTERVAL '1 minute')
-              WHERE id = $2",
+                    not_before = NOW() + (
+                        LEAST(
+                            240,
+                            GREATEST(1, POWER(5, COALESCE((payload->>'attempts')::int, 0) + 1)::int)
+                        ) * INTERVAL '1 minute'
+                    )
+              WHERE id = $2
+                AND task_class = 'deferred'",
         )
         .bind(error)
         .bind(uuid)
@@ -4011,6 +4106,9 @@ pub async fn load_fleet_config_from_postgres(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+
+    use sqlx::postgres::PgPoolOptions;
 
     #[test]
     fn backend_rank_orders_cheapest_capable_first() {
@@ -4402,6 +4500,197 @@ mod tests {
 
         assert_eq!(decision.status, "ready");
         assert_eq!(decision.last_error, "stale-heartbeat takeover (attempt 2)");
+    }
+
+    fn temp_db_urls() -> Option<(String, String, String)> {
+        let base_url = env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()?;
+        let (prefix, _) = base_url.rsplit_once('/')?;
+        let db_name = format!("ff_deferred_fold_{}", uuid::Uuid::new_v4().simple());
+        Some((
+            format!("{prefix}/postgres"),
+            format!("{prefix}/{db_name}"),
+            db_name,
+        ))
+    }
+
+    async fn create_temp_db() -> Option<(PgPool, PgPool, String)> {
+        let (admin_url, db_url, db_name) = temp_db_urls()?;
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("connect admin db");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create temp db");
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&db_url)
+            .await
+            .expect("connect temp db");
+        sqlx::raw_sql(
+            "CREATE EXTENSION IF NOT EXISTS pgcrypto;
+             CREATE TABLE fleet_tasks (
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 parent_task_id UUID,
+                 task_type TEXT NOT NULL,
+                 summary TEXT NOT NULL,
+                 payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                 priority INT NOT NULL DEFAULT 50,
+                 requires_capability JSONB NOT NULL DEFAULT '[]'::jsonb,
+                 preferred_computer_id UUID,
+                 status TEXT NOT NULL DEFAULT 'pending',
+                 claimed_by_computer_id UUID,
+                 claimed_at TIMESTAMPTZ,
+                 started_at TIMESTAMPTZ,
+                 completed_at TIMESTAMPTZ,
+                 last_heartbeat_at TIMESTAMPTZ,
+                 progress_pct REAL,
+                 progress_message TEXT,
+                 result JSONB,
+                 error TEXT,
+                 handoff_reason TEXT,
+                 handoff_state JSONB,
+                 original_computer_id UUID,
+                 handoff_count INT NOT NULL DEFAULT 0,
+                 deadline_at TIMESTAMPTZ,
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 created_by_computer_id UUID,
+                 task_class TEXT,
+                 not_before TIMESTAMPTZ,
+                 dedup_signature TEXT,
+                 parent_work_item_id UUID
+             );
+             CREATE TABLE deferred_tasks (
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 created_by TEXT,
+                 title TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                 trigger_type TEXT NOT NULL,
+                 trigger_spec JSONB NOT NULL DEFAULT '{}'::jsonb,
+                 preferred_node TEXT,
+                 required_caps JSONB NOT NULL DEFAULT '[]'::jsonb,
+                 status TEXT NOT NULL DEFAULT 'pending',
+                 attempts INT NOT NULL DEFAULT 0,
+                 max_attempts INT NOT NULL DEFAULT 5,
+                 next_attempt_at TIMESTAMPTZ,
+                 claimed_by TEXT,
+                 claimed_at TIMESTAMPTZ,
+                 last_error TEXT,
+                 result JSONB,
+                 completed_at TIMESTAMPTZ
+             );",
+        )
+        .execute(&pool)
+        .await
+        .expect("create minimal deferred fold schema");
+        Some((admin, pool, db_name))
+    }
+
+    async fn drop_temp_db(admin: PgPool, pool: PgPool, db_name: &str) {
+        pool.close().await;
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid)
+               FROM pg_stat_activity
+              WHERE datname = $1
+                AND pid <> pg_backend_pid()",
+        )
+        .bind(db_name)
+        .execute(&admin)
+        .await
+        .expect("terminate temp db sessions");
+        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("drop temp db");
+        admin.close().await;
+    }
+
+    #[tokio::test]
+    async fn deferred_fold_backfills_view_and_claims_from_fleet_tasks() {
+        let Some((admin, pool, db_name)) = create_temp_db().await else {
+            return;
+        };
+
+        let task_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO deferred_tasks
+                (id, created_at, created_by, title, kind, payload, trigger_type,
+                 trigger_spec, preferred_node, required_caps, status, attempts,
+                 max_attempts, next_attempt_at)
+             VALUES
+                ($1, NOW() - INTERVAL '10 minutes', 'leader:atlas', 'sample deferred task',
+                 'shell', '{\"command\":\"echo hi\"}'::jsonb, 'now', '{}'::jsonb,
+                 'atlas', '[\"ssh\"]'::jsonb, 'dispatchable', 2, 7, NOW() - INTERVAL '5 minutes')",
+        )
+        .bind(task_id)
+        .execute(&pool)
+        .await
+        .expect("insert legacy deferred row");
+
+        sqlx::raw_sql(crate::schema::SCHEMA_V159_FOLD_DEFERRED_TASKS)
+            .execute(&pool)
+            .await
+            .expect("run deferred fold migration");
+
+        let row = sqlx::query(
+            "SELECT created_by, title, kind, payload, trigger_type, preferred_node,
+                    required_caps, status, attempts, max_attempts, next_attempt_at
+               FROM deferred_tasks
+              WHERE id = $1",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read deferred compat view");
+
+        assert_eq!(
+            row.get::<Option<String>, _>("created_by").as_deref(),
+            Some("leader:atlas")
+        );
+        assert_eq!(row.get::<String, _>("title"), "sample deferred task");
+        assert_eq!(row.get::<String, _>("kind"), "shell");
+        assert_eq!(
+            row.get::<serde_json::Value, _>("payload"),
+            serde_json::json!({ "command": "echo hi" })
+        );
+        assert_eq!(row.get::<String, _>("trigger_type"), "now");
+        assert_eq!(
+            row.get::<Option<String>, _>("preferred_node").as_deref(),
+            Some("atlas")
+        );
+        assert_eq!(row.get::<String, _>("status"), "dispatchable");
+        assert_eq!(row.get::<i32, _>("attempts"), 2);
+        assert_eq!(row.get::<i32, _>("max_attempts"), 7);
+        assert_eq!(
+            row.get::<serde_json::Value, _>("required_caps"),
+            serde_json::json!(["ssh"])
+        );
+
+        let claimed = pg_claim_deferred(&pool, "atlas")
+            .await
+            .expect("claim deferred task")
+            .expect("one deferred task claimed");
+        assert_eq!(claimed.id, task_id.to_string());
+        assert_eq!(claimed.preferred_node.as_deref(), Some("atlas"));
+
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+               FROM fleet_tasks
+              WHERE task_class = 'deferred'
+                AND status = 'dispatchable'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count remaining dispatchable deferred tasks");
+        assert_eq!(remaining, 0);
+
+        drop_temp_db(admin, pool, &db_name).await;
     }
 }
 

@@ -773,6 +773,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "fold_self_heal_queue",
         sql: schema::SCHEMA_V158_FOLD_SELF_HEAL_QUEUE,
     },
+    PgMigration {
+        version: 159,
+        name: "fold_deferred_tasks",
+        sql: schema::SCHEMA_V159_FOLD_DEFERRED_TASKS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

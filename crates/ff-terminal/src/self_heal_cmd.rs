@@ -135,13 +135,35 @@ pub async fn handle_revert(pg: &PgPool, bug_sig: &str) -> Result<()> {
         .and_then(|c| c.as_str())
     {
         let task_id = uuid::Uuid::new_v4();
+        let title = format!("self_heal_revert: {bug_sig}");
         sqlx::query(
-            "INSERT INTO deferred_tasks (id, kind, payload, status, priority, created_at, meta) \
-             VALUES ($1, 'shell', $2, 'queued', 100, NOW(), $3)",
+            "INSERT INTO fleet_tasks
+                (id, task_type, summary, payload, priority, requires_capability, status, created_at, task_class)
+             VALUES (
+                $1,
+                'shell',
+                $2,
+                jsonb_build_object(
+                    'deferred_payload', $3,
+                    'created_by', 'ff self-heal revert',
+                    'kind', 'shell',
+                    'trigger_type', 'operator',
+                    'trigger_spec', '{}'::jsonb,
+                    'required_caps', '[]'::jsonb,
+                    'attempts', 0,
+                    'max_attempts', 3
+                ),
+                100,
+                '[]'::jsonb,
+                'pending',
+                NOW(),
+                'deferred'
+             )",
         )
         .bind(task_id)
-        .bind(serde_json::json!({ "command": cmd }))
+        .bind(&title)
         .bind(serde_json::json!({
+            "command": cmd,
             "self_heal_revert": { "queue_id": id, "bug_signature": bug_sig }
         }))
         .execute(pg)
