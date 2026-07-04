@@ -9936,3 +9936,15 @@ SELECT
 FROM fleet_tasks t
 WHERE t.task_class = 'deferred';
 "#;
+
+// V160 — operator failure-alert dedup/throttle. `notify_operator_task_failed`
+// fired a Telegram alert on EVERY terminal work_item failure; during an incident
+// (e.g. the 2026-07-04 restart loop that failed dozens of builds with the same
+// "no dispatchable backend" error) this floods the operator. This tiny table lets
+// the notifier collapse a burst of same-signature failures into one alert/hour.
+pub const SCHEMA_V160_NOTIFY_DEDUP: &str = r#"
+CREATE TABLE IF NOT EXISTS operator_notify_dedup (
+    signature  TEXT PRIMARY KEY,
+    last_sent  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"#;

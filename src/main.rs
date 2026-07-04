@@ -990,7 +990,11 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                         }
 
                         let running: std::result::Result<Vec<RunningTaskRow>, _> = sqlx::query_as(
-                            "SELECT t.id, t.kind
+                            // fleet_tasks has `task_type`, not `kind` — alias it to
+                            // match RunningTaskRow.kind. The bad `t.kind` broke this
+                            // liveness watchdog every 60s once the deferred fold moved
+                            // ~23k rows (incl. `running`) into fleet_tasks (2026-07-04).
+                            "SELECT t.id, t.task_type AS kind
                                FROM fleet_tasks t
                                JOIN computers c ON c.id = t.claimed_by_computer_id
                               WHERE c.name = $1

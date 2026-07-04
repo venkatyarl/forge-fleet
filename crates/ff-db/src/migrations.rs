@@ -778,6 +778,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "fold_deferred_tasks",
         sql: schema::SCHEMA_V159_FOLD_DEFERRED_TASKS,
     },
+    PgMigration {
+        version: 160,
+        name: "notify_dedup",
+        sql: schema::SCHEMA_V160_NOTIFY_DEDUP,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
