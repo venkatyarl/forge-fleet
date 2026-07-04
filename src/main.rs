@@ -109,6 +109,13 @@ async fn main() -> Result<()> {
 }
 
 async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
+    // A systemd/launchd unit hands us a bare system PATH that omits ~/.local/bin
+    // and ~/.cargo/bin, so the daemon's bare-name child spawns (`ff cli codex`,
+    // `cargo check`, `kimi`) fail with ENOENT and dispatch reports the misleading
+    // "no dispatchable backend". Restore the per-user tool dirs before anything
+    // spawns so every child inherits a usable PATH.
+    ff_core::tool_path::ensure_user_tool_path();
+
     let config_path = resolve_config_path(cli.config.clone())?;
     let config = load_or_default_config(&config_path)?;
 
