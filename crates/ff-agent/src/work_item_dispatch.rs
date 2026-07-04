@@ -888,6 +888,38 @@ async fn notify_operator_task_failed(pg: &PgPool, work_item_id: Uuid, title: &st
             return;
         }
     };
+    // Throttle: collapse a burst of same-signature failures into ONE alert/hour so
+    // an incident (e.g. the 2026-07-04 restart loop, dozens of identical "no
+    // dispatchable backend" failures) doesn't flood the operator. The dedup key is
+    // the error class (first line). Cross-node via the DB (failures fire on
+    // whichever node built). FAIL-OPEN: any dedup error → send anyway.
+    let signature: String = error
+        .lines()
+        .next()
+        .unwrap_or(error)
+        .trim()
+        .chars()
+        .take(200)
+        .collect();
+    match sqlx::query_scalar::<_, String>(
+        "INSERT INTO operator_notify_dedup (signature, last_sent) VALUES ($1, NOW()) \
+         ON CONFLICT (signature) DO UPDATE SET last_sent = NOW() \
+           WHERE operator_notify_dedup.last_sent < NOW() - INTERVAL '1 hour' \
+         RETURNING signature",
+    )
+    .bind(&signature)
+    .fetch_optional(pg)
+    .await
+    {
+        Ok(None) => {
+            tracing::info!(%work_item_id, signature = %signature, "notify_operator_task_failed: throttled (same-signature alert already sent within the hour)");
+            return;
+        }
+        Ok(Some(_)) => {} // first in the window (or window expired) — send
+        Err(e) => {
+            tracing::warn!(error = %e, "notify_operator_task_failed: dedup check failed; sending anyway (fail-open)")
+        }
+    }
     let err_clip: String = error.chars().take(800).collect();
     let text = format!(
         "🛑 ForgeFleet task FAILED after max retries\n\n{title}\n\nwork_item: {work_item_id}\n\nlast error:\n{err_clip}"
