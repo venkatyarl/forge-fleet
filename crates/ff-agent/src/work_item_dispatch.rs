@@ -1158,10 +1158,23 @@ async fn run_ff_dispatch(
 ) -> Result<(String, Output)> {
     let prompt = dispatch_prompt(item);
 
+    // Lane-1 health gate: the local codegen harness needs a local agent-capable
+    // model; on nodes where none is viable it hangs and only fails over after
+    // LANE1_TIMEOUT_SECS (~7min) — burned on EVERY build. Reuse the provider
+    // circuit breaker under a synthetic provider so that once Lane 1 has failed
+    // repeatedly ON THIS NODE the breaker opens and builds skip straight to the
+    // cloud backstop; the breaker half-opens after a cooldown so a single probe
+    // re-checks whether a capable local model has since come online.
+    const LOCAL_CODEGEN_PROVIDER: &str = "local-codegen";
+    let lane1_breaker_open =
+        crate::circuit_breaker::is_provider_open(pg, item.computer_id, LOCAL_CODEGEN_PROVIDER)
+            .await
+            .unwrap_or(false);
+
     // Lane 1: local codegen harness — but skip it once we've escalated to cloud
-    // (stage 2): after ESCALATE_TO_CLOUD_AT local failures it has failed the same
-    // way, so don't waste another local round — fall straight through to Lane 2.
-    if item.attempts < ESCALATE_TO_CLOUD_AT {
+    // (stage 2, after ESCALATE_TO_CLOUD_AT local failures it has failed the same
+    // way) OR when this node's local-codegen breaker is open (it's been failing).
+    if item.attempts < ESCALATE_TO_CLOUD_AT && !lane1_breaker_open {
         // Bound Lane 1 with a hard timeout so a hung local codegen harness fails
         // OVER to the cloud backstop instead of wedging the slot forever (see
         // LANE1_TIMEOUT_SECS). Without this, a hang here stalls the build while
@@ -1171,8 +1184,29 @@ async fn run_ff_dispatch(
             crate::codegen_apply::codegen_apply(pg, &worktree.worktree_path, &prompt, None, 4),
         )
         .await;
+        // Feed every Lane-1 outcome back into the breaker so it opens after a run
+        // of failures on this node and closes again once it lands.
+        let lane1_failed = |cat: &'static str| {
+            let pg = pg.clone();
+            let cid = item.computer_id;
+            async move {
+                let _ = crate::circuit_breaker::record_provider_failure(
+                    &pg,
+                    cid,
+                    LOCAL_CODEGEN_PROVIDER,
+                    cat,
+                )
+                .await;
+            }
+        };
         match lane1 {
             Ok(Ok(outcome)) if outcome.applied => {
+                let _ = crate::circuit_breaker::record_provider_success(
+                    pg,
+                    item.computer_id,
+                    LOCAL_CODEGEN_PROVIDER,
+                )
+                .await;
                 info!(
                     work_item_id = %item.work_item_id,
                     rounds = outcome.rounds,
@@ -1183,24 +1217,38 @@ async fn run_ff_dispatch(
                     synthetic_output(&outcome.final_diff.unwrap_or_else(|| "applied".into())),
                 ));
             }
-            Ok(Ok(outcome)) => info!(
-                work_item_id = %item.work_item_id,
-                error = ?outcome.error,
-                "work_item_dispatch: local codegen didn't land; backstop to codex"
-            ),
-            Ok(Err(e)) => warn!(
-                work_item_id = %item.work_item_id,
-                // Full anyhow chain so the REAL cause surfaces (e.g. the underlying
-                // fleet_oneshot failure), not just the "fleet_oneshot round 1" wrapper.
-                error = format!("{e:#}"),
-                "work_item_dispatch: local codegen errored; backstop to codex"
-            ),
-            Err(_) => warn!(
-                work_item_id = %item.work_item_id,
-                timeout_secs = LANE1_TIMEOUT_SECS,
-                "work_item_dispatch: local codegen TIMED OUT (hung) — backstop to codex"
-            ),
+            Ok(Ok(outcome)) => {
+                lane1_failed("local_codegen_unavailable").await;
+                info!(
+                    work_item_id = %item.work_item_id,
+                    error = ?outcome.error,
+                    "work_item_dispatch: local codegen didn't land; backstop to codex"
+                );
+            }
+            Ok(Err(e)) => {
+                lane1_failed("local_codegen_unavailable").await;
+                warn!(
+                    work_item_id = %item.work_item_id,
+                    // Full anyhow chain so the REAL cause surfaces (e.g. the underlying
+                    // fleet_oneshot failure), not just the "fleet_oneshot round 1" wrapper.
+                    error = format!("{e:#}"),
+                    "work_item_dispatch: local codegen errored; backstop to codex"
+                );
+            }
+            Err(_) => {
+                lane1_failed("local_codegen_unavailable").await;
+                warn!(
+                    work_item_id = %item.work_item_id,
+                    timeout_secs = LANE1_TIMEOUT_SECS,
+                    "work_item_dispatch: local codegen TIMED OUT (hung) — backstop to codex"
+                );
+            }
         }
+    } else if lane1_breaker_open {
+        info!(
+            work_item_id = %item.work_item_id,
+            "work_item_dispatch: local-codegen breaker OPEN on this node — skipping Lane 1, straight to cloud backstop"
+        );
     } else {
         info!(
             work_item_id = %item.work_item_id,
