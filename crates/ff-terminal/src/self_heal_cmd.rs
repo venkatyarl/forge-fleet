@@ -134,17 +134,21 @@ pub async fn handle_revert(pg: &PgPool, bug_sig: &str) -> Result<()> {
         .and_then(|o| o.get("command"))
         .and_then(|c| c.as_str())
     {
-        let task_id = uuid::Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO deferred_tasks (id, kind, payload, status, priority, created_at, meta) \
-             VALUES ($1, 'shell', $2, 'queued', 100, NOW(), $3)",
+        let task_id = ff_db::queries::pg_enqueue_deferred(
+            pg,
+            &format!("self_heal_revert: {bug_sig}"),
+            "shell",
+            &serde_json::json!({
+                "command": cmd,
+                "self_heal_revert": { "queue_id": id, "bug_signature": bug_sig }
+            }),
+            "now",
+            &serde_json::json!({}),
+            None,
+            &serde_json::json!([]),
+            Some("ff self-heal revert"),
+            Some(1),
         )
-        .bind(task_id)
-        .bind(serde_json::json!({ "command": cmd }))
-        .bind(serde_json::json!({
-            "self_heal_revert": { "queue_id": id, "bug_signature": bug_sig }
-        }))
-        .execute(pg)
         .await?;
         println!(
             "Enqueued rollback task {} for bug_signature={}",

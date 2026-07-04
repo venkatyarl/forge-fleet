@@ -154,8 +154,14 @@ pub async fn sweep_stale(
     // old, something crashed — reset to pending or mark failed (depending on attempts).
     let def_cutoff = now - policy.deferred_stale_after;
     let stuck_deferred = sqlx::query(
-        "SELECT id, attempts, max_attempts, claimed_at FROM deferred_tasks
-          WHERE status = 'running' AND claimed_at < $1
+        "SELECT id,
+                COALESCE((payload->>'attempts')::int, 0) AS attempts,
+                COALESCE((payload->>'max_attempts')::int, 5) AS max_attempts,
+                claimed_at
+           FROM fleet_tasks
+          WHERE task_class = 'deferred'
+            AND status = 'running'
+            AND claimed_at < $1
           LIMIT 500",
     )
     .bind(def_cutoff)
@@ -174,13 +180,14 @@ pub async fn sweep_stale(
             "pending"
         };
         let update = sqlx::query(
-            "UPDATE deferred_tasks
+            "UPDATE fleet_tasks
                 SET status = $1,
-                    last_error = $2,
-                    claimed_by = NULL,
+                    error = $2,
+                    claimed_by_computer_id = NULL,
                     claimed_at = NULL,
-                    next_attempt_at = NOW() + INTERVAL '2 minutes'
-              WHERE id = $3",
+                    not_before = NOW() + INTERVAL '2 minutes'
+              WHERE id = $3
+                AND task_class = 'deferred'",
         )
         .bind(new_status)
         .bind(error_msg)
@@ -202,9 +209,10 @@ pub async fn sweep_stale(
     // (every row has it; completed_at can be NULL for sweeper-failed rows).
     let prune_cutoff = now - policy.terminal_retention;
     match sqlx::query(
-        "DELETE FROM deferred_tasks WHERE ctid IN (
-             SELECT ctid FROM deferred_tasks
+        "DELETE FROM fleet_tasks WHERE ctid IN (
+             SELECT ctid FROM fleet_tasks
               WHERE status IN ('completed', 'cancelled', 'failed')
+                AND task_class = 'deferred'
                 AND created_at < $1
               LIMIT $2)",
     )

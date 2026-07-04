@@ -9858,3 +9858,96 @@ SELECT
 FROM fleet_tasks t
 WHERE t.task_class = 'self_heal';
 "#;
+
+pub const SCHEMA_V159_FOLD_DEFERRED_TASKS: &str = r#"
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '60s';
+
+INSERT INTO fleet_tasks (
+    id,
+    task_type,
+    summary,
+    payload,
+    priority,
+    requires_capability,
+    preferred_computer_id,
+    status,
+    claimed_by_computer_id,
+    claimed_at,
+    started_at,
+    completed_at,
+    result,
+    error,
+    created_at,
+    task_class,
+    not_before
+)
+SELECT
+    d.id,
+    d.kind,
+    d.title,
+    jsonb_build_object(
+        'deferred_payload', COALESCE(d.payload, '{}'::jsonb),
+        'trigger_type', d.trigger_type,
+        'trigger_spec', COALESCE(d.trigger_spec, '{}'::jsonb),
+        'kind', d.kind,
+        'required_caps', COALESCE(d.required_caps, '[]'::jsonb),
+        'created_by', d.created_by,
+        'preferred_node', d.preferred_node,
+        'attempts', d.attempts,
+        'max_attempts', d.max_attempts
+    ),
+    50,
+    COALESCE(d.required_caps, '[]'::jsonb),
+    pref.id,
+    d.status,
+    claimer.id,
+    d.claimed_at,
+    d.claimed_at,
+    d.completed_at,
+    d.result,
+    d.last_error,
+    d.created_at,
+    'deferred',
+    d.next_attempt_at
+FROM deferred_tasks d
+LEFT JOIN computers pref
+       ON pref.name = d.preferred_node
+LEFT JOIN computers claimer
+       ON claimer.name = d.claimed_by
+ON CONFLICT (id) DO NOTHING;
+
+CREATE INDEX IF NOT EXISTS idx_fleet_tasks_deferred_status_not_before
+    ON fleet_tasks (status, not_before, created_at)
+    WHERE task_class = 'deferred';
+
+ALTER TABLE deferred_tasks RENAME TO deferred_tasks_legacy;
+
+CREATE OR REPLACE VIEW deferred_tasks AS
+SELECT
+    t.id,
+    t.created_at,
+    t.payload->>'created_by' AS created_by,
+    t.summary AS title,
+    COALESCE(NULLIF(t.payload->>'kind', ''), t.task_type) AS kind,
+    COALESCE(t.payload->'deferred_payload', '{}'::jsonb) AS payload,
+    COALESCE(t.payload->>'trigger_type', 'now') AS trigger_type,
+    COALESCE(t.payload->'trigger_spec', '{}'::jsonb) AS trigger_spec,
+    COALESCE(pref.name, NULLIF(t.payload->>'preferred_node', '')) AS preferred_node,
+    COALESCE(t.payload->'required_caps', t.requires_capability, '[]'::jsonb) AS required_caps,
+    t.status,
+    COALESCE((t.payload->>'attempts')::int, 0) AS attempts,
+    COALESCE((t.payload->>'max_attempts')::int, 5) AS max_attempts,
+    t.not_before AS next_attempt_at,
+    claimed.name AS claimed_by,
+    t.claimed_at,
+    t.error AS last_error,
+    t.result,
+    t.completed_at
+FROM fleet_tasks t
+LEFT JOIN computers pref
+       ON pref.id = t.preferred_computer_id
+LEFT JOIN computers claimed
+       ON claimed.id = t.claimed_by_computer_id
+WHERE t.task_class = 'deferred';
+"#;

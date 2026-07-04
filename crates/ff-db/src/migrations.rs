@@ -773,6 +773,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "fold_self_heal_queue",
         sql: schema::SCHEMA_V158_FOLD_SELF_HEAL_QUEUE,
     },
+    PgMigration {
+        version: 159,
+        name: "fold_deferred_tasks",
+        sql: schema::SCHEMA_V159_FOLD_DEFERRED_TASKS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -915,6 +920,11 @@ async fn run_postgres_migrations_locked(conn: &mut sqlx::PgConnection) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+
+    use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+    use uuid::Uuid;
+
     #[test]
     fn migration_advisory_lock_key_is_stable() {
         // The key must be identical across every binary version that runs
@@ -923,5 +933,276 @@ mod tests {
         // silently change it. (positive i64, fits pg's bigint advisory key.)
         assert_eq!(MIGRATION_ADVISORY_LOCK_KEY, 0x46464D4947525438);
         assert!(MIGRATION_ADVISORY_LOCK_KEY > 0);
+    }
+
+    fn temp_db_urls() -> Option<(String, String, String)> {
+        let base_url = env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()?;
+        let (prefix, _) = base_url.rsplit_once('/')?;
+        let db_name = format!("ff_deferred_fold_{}", Uuid::new_v4().simple());
+        Some((
+            format!("{prefix}/postgres"),
+            format!("{prefix}/{db_name}"),
+            db_name,
+        ))
+    }
+
+    async fn create_temp_db() -> Option<(PgPool, PgPool, String)> {
+        let Some((admin_url, db_url, db_name)) = temp_db_urls() else {
+            eprintln!(
+                "skipping deferred_tasks fold DB test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL"
+            );
+            return None;
+        };
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("connect admin db");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create temp db");
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&db_url)
+            .await
+            .expect("connect temp db");
+        Some((admin, pool, db_name))
+    }
+
+    async fn drop_temp_db(admin: PgPool, pool: PgPool, db_name: &str) {
+        pool.close().await;
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid)
+               FROM pg_stat_activity
+              WHERE datname = $1
+                AND pid <> pg_backend_pid()",
+        )
+        .bind(db_name)
+        .execute(&admin)
+        .await
+        .expect("terminate temp db sessions");
+        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("drop temp db");
+        admin.close().await;
+    }
+
+    #[tokio::test]
+    async fn v159_backfills_deferred_tasks_view_and_claim_path() {
+        let Some((admin, pool, db_name)) = create_temp_db().await else {
+            return;
+        };
+
+        sqlx::raw_sql(
+            r#"
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE TABLE computers (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL UNIQUE
+);
+CREATE TABLE fleet_tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    parent_task_id UUID REFERENCES fleet_tasks(id) ON DELETE CASCADE,
+    task_type TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    priority INT NOT NULL DEFAULT 50,
+    requires_capability JSONB NOT NULL DEFAULT '[]'::jsonb,
+    preferred_computer_id UUID REFERENCES computers(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    claimed_by_computer_id UUID REFERENCES computers(id) ON DELETE SET NULL,
+    claimed_at TIMESTAMPTZ,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    last_heartbeat_at TIMESTAMPTZ,
+    progress_pct REAL,
+    progress_message TEXT,
+    result JSONB,
+    error TEXT,
+    handoff_reason TEXT,
+    handoff_state JSONB,
+    original_computer_id UUID REFERENCES computers(id) ON DELETE SET NULL,
+    handoff_count INT NOT NULL DEFAULT 0,
+    deadline_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by_computer_id UUID REFERENCES computers(id) ON DELETE SET NULL,
+    task_class TEXT,
+    not_before TIMESTAMPTZ,
+    dedup_signature TEXT,
+    parent_work_item_id UUID
+);
+CREATE TABLE deferred_tasks (
+    id UUID PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by TEXT,
+    title TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    trigger_type TEXT NOT NULL,
+    trigger_spec JSONB NOT NULL DEFAULT '{}'::jsonb,
+    preferred_node TEXT,
+    required_caps JSONB NOT NULL DEFAULT '[]'::jsonb,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INT NOT NULL DEFAULT 0,
+    max_attempts INT NOT NULL DEFAULT 5,
+    next_attempt_at TIMESTAMPTZ,
+    claimed_by TEXT,
+    claimed_at TIMESTAMPTZ,
+    last_error TEXT,
+    result JSONB,
+    completed_at TIMESTAMPTZ
+);
+CREATE TABLE _migrations (
+    version INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+INSERT INTO _migrations (version, name) VALUES (158, 'fold_self_heal_queue');
+INSERT INTO computers (id, name) VALUES
+    ('00000000-0000-0000-0000-000000000001', 'worker-a'),
+    ('00000000-0000-0000-0000-000000000002', 'worker-b');
+INSERT INTO deferred_tasks (
+    id,
+    created_at,
+    created_by,
+    title,
+    kind,
+    payload,
+    trigger_type,
+    trigger_spec,
+    preferred_node,
+    required_caps,
+    status,
+    attempts,
+    max_attempts,
+    next_attempt_at
+) VALUES (
+    '11111111-1111-1111-1111-111111111111',
+    NOW() - INTERVAL '10 minutes',
+    'leader:worker-a',
+    'sample deferred task',
+    'shell',
+    '{"command":"echo hi"}'::jsonb,
+    'now',
+    '{}'::jsonb,
+    'worker-a',
+    '["shell"]'::jsonb,
+    'dispatchable',
+    1,
+    4,
+    NOW() - INTERVAL '5 minutes'
+);
+"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed pre-v159 schema");
+
+        let mut conn = pool.acquire().await.expect("acquire temp db conn");
+        let version = run_postgres_migrations_locked(&mut conn)
+            .await
+            .expect("run v159");
+        assert_eq!(version, 159);
+        drop(conn);
+
+        let backfilled = sqlx::query(
+            "SELECT
+                task_type,
+                summary,
+                payload->'deferred_payload' AS deferred_payload,
+                payload->>'trigger_type' AS trigger_type,
+                payload->'trigger_spec' AS trigger_spec,
+                payload->'required_caps' AS required_caps,
+                payload->>'created_by' AS created_by,
+                preferred_computer_id,
+                status,
+                not_before
+             FROM fleet_tasks
+             WHERE id = $1
+               AND task_class = 'deferred'",
+        )
+        .bind(Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("valid uuid"))
+        .fetch_one(&pool)
+        .await
+        .expect("fetch backfilled task");
+        assert_eq!(backfilled.get::<String, _>("task_type"), "shell");
+        assert_eq!(
+            backfilled.get::<String, _>("summary"),
+            "sample deferred task"
+        );
+        assert_eq!(
+            backfilled.get::<serde_json::Value, _>("deferred_payload"),
+            serde_json::json!({ "command": "echo hi" })
+        );
+        assert_eq!(backfilled.get::<String, _>("trigger_type"), "now");
+        assert_eq!(
+            backfilled.get::<serde_json::Value, _>("trigger_spec"),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            backfilled.get::<serde_json::Value, _>("required_caps"),
+            serde_json::json!(["shell"])
+        );
+        assert_eq!(
+            backfilled.get::<Option<String>, _>("created_by"),
+            Some("leader:worker-a".to_string())
+        );
+        assert_eq!(
+            backfilled.get::<Option<Uuid>, _>("preferred_computer_id"),
+            Some(Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("valid uuid"))
+        );
+        assert_eq!(backfilled.get::<String, _>("status"), "dispatchable");
+        assert!(
+            backfilled
+                .get::<Option<chrono::DateTime<chrono::Utc>>, _>("not_before")
+                .is_some()
+        );
+
+        let view_row = sqlx::query(
+            "SELECT title, kind, payload, trigger_type, preferred_node, status, attempts, max_attempts
+               FROM deferred_tasks
+              WHERE id = $1",
+        )
+        .bind(Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("valid uuid"))
+        .fetch_one(&pool)
+        .await
+        .expect("read compat view");
+        assert_eq!(view_row.get::<String, _>("title"), "sample deferred task");
+        assert_eq!(view_row.get::<String, _>("kind"), "shell");
+        assert_eq!(
+            view_row.get::<serde_json::Value, _>("payload"),
+            serde_json::json!({ "command": "echo hi" })
+        );
+        assert_eq!(view_row.get::<String, _>("trigger_type"), "now");
+        assert_eq!(
+            view_row.get::<Option<String>, _>("preferred_node"),
+            Some("worker-a".to_string())
+        );
+        assert_eq!(view_row.get::<String, _>("status"), "dispatchable");
+        assert_eq!(view_row.get::<i32, _>("attempts"), 1);
+        assert_eq!(view_row.get::<i32, _>("max_attempts"), 4);
+
+        let claimed = crate::queries::pg_claim_deferred(&pool, "worker-a")
+            .await
+            .expect("claim deferred task")
+            .expect("one task claimed");
+        assert_eq!(claimed.id, "11111111-1111-1111-1111-111111111111");
+
+        let claimed_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+               FROM fleet_tasks
+              WHERE task_class = 'deferred'
+                AND status = 'running'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count claimed rows");
+        assert_eq!(claimed_count, 1);
+
+        drop_temp_db(admin, pool, &db_name).await;
     }
 }
