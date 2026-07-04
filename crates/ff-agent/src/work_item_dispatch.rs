@@ -1109,6 +1109,10 @@ fn retry_error_is_actionable(err: &str) -> bool {
     const INFRA_ERROR_SIGNATURES: &[&str] = &[
         // dispatch / backend spawn + routing
         "no dispatchable backend",
+        // the surfaced-error bail — suppress it too, else it's re-injected into
+        // the retry prompt AND recursively accumulates the prior attempt's
+        // context, exploding the prompt with nested "diagnose it" garbage.
+        "all backends failed on this node",
         "spawn \"",
         "command timed out",
         "timed out after",
@@ -1389,10 +1393,12 @@ async fn run_ff_dispatch(
     let forced_backend = primary_or_default_backend(&backends);
     let mut attempted_backend = false;
     let mut last_output: Option<(String, Output)> = None;
-    // Capture the real per-backend error so a total failure surfaces WHY (spawn
-    // ENOENT, gh auth, timeout) in the DB `last_error`, instead of the opaque
-    // "no dispatchable backend" that forces log-diving on the node to diagnose.
-    let mut last_err: Option<String> = None;
+    // Capture EVERY backend's error so a total failure surfaces WHY for ALL of
+    // them (codex + claude + kimi) in the DB `last_error` — not just the last —
+    // ending the SSH-into-node log-diving needed to see codex/claude when only
+    // kimi (the last tried) was recorded. Each error is tail-trimmed since the
+    // full command echoes the huge prompt; the status/stderr lives at the end.
+    let mut backend_errors: Vec<String> = Vec::new();
 
     for backend in &backends {
         if crate::circuit_breaker::is_provider_open(pg, computer_id, backend)
@@ -1433,7 +1439,7 @@ async fn run_ff_dispatch(
                     // backend rather than `?`-propagating out (which would abort
                     // failover — the "codex hangs → whole dispatch dies" bug).
                     warn!(backend = %backend, error = %e, "run_ff_dispatch: backend run errored (timeout/spawn), no diff — switching");
-                    last_err = Some(format!("{backend}: {e:#}"));
+                    backend_errors.push(format!("{backend}: {}", err_tail(&format!("{e:#}"))));
                     let _ = crate::circuit_breaker::record_provider_failure(
                         pg,
                         computer_id,
@@ -1520,14 +1526,20 @@ async fn run_ff_dispatch(
             }
         }
     }
-    last_output.map(Ok).unwrap_or_else(|| match last_err {
-        // Every backend errored before producing output — surface the actual last
-        // cause (the classifier in dispatch_prompt still treats infra errors as
-        // non-actionable on retry; this is for the operator + DB, not the agent).
-        Some(e) => bail!("run_ff_dispatch: all backends failed on this node; last backend error: {e}"),
-        // Genuinely nothing to run: every backend was breaker-open / skipped.
-        None => {
-            bail!("run_ff_dispatch: no dispatchable backend on this node (all backends breaker-open or skipped)")
+    last_output.map(Ok).unwrap_or_else(|| {
+        if backend_errors.is_empty() {
+            // Genuinely nothing to run: every backend was breaker-open / skipped.
+            bail!(
+                "run_ff_dispatch: no dispatchable backend on this node (all backends breaker-open or skipped)"
+            )
+        } else {
+            // Every attempted backend errored — surface ALL of their causes (the
+            // dispatch_prompt classifier still treats infra errors as
+            // non-actionable on retry; this is for the operator + DB).
+            bail!(
+                "run_ff_dispatch: all backends failed on this node:\n{}",
+                backend_errors.join("\n")
+            )
         }
     })
 }
@@ -1555,6 +1567,29 @@ async fn primary_dispatch_backend(pg: &PgPool, computer_id: Uuid) -> String {
 const AUTO_CONTINUE_MAX: u32 = 2;
 
 /// Run `ff cli <backend>` against the worktree once and capture its Output.
+/// A persistent cargo target dir for the sub-agent SLOT that owns `worktree_cwd`
+/// (`.../sub-agents/sub-agent-N/worktrees/wi/XXX` → `.../sub-agent-N/cargo-target`).
+/// Keeps the compile cache warm across a slot's tasks so verification builds are
+/// incremental, while staying per-slot so concurrent slots don't fight over one
+/// cargo lock. Falls back to a single shared node cache if the path doesn't match
+/// the sub-agent layout (e.g. a differently-rooted checkout).
+fn slot_cargo_target(worktree_cwd: &Path) -> PathBuf {
+    for anc in worktree_cwd.ancestors() {
+        if anc
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("sub-agent"))
+            .unwrap_or(false)
+        {
+            return anc.join("cargo-target");
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".forgefleet")
+        .join("cargo-shared-target")
+}
+
 async fn run_backend_cli(backend: &str, cwd: &Path, prompt: &str) -> Result<Output> {
     let backend = backend.to_string();
     let cwd = cwd.to_path_buf();
@@ -1581,6 +1616,15 @@ async fn run_backend_cli(backend: &str, cwd: &Path, prompt: &str) -> Result<Outp
         if let Some(token) = gh_token {
             cmd.env("GH_TOKEN", token);
         }
+        // Point cargo at a PERSISTENT per-slot target dir so a `cargo check` the
+        // agent runs to verify its change is INCREMENTAL (seconds) instead of a
+        // cold from-scratch compile of the whole workspace (many minutes) — each
+        // sub-agent worktree is a fresh checkout with an EMPTY target/, which made
+        // compile-heavy feature tasks blow past the dispatch timeout (the "codex
+        // hangs, 0 PRs" symptom — the 8 stuck procs were rustc/cargo). Per-slot
+        // (not one shared dir) keeps concurrent slots from serializing on cargo's
+        // target lock; it warms up on the slot's first build and stays warm after.
+        cmd.env("CARGO_TARGET_DIR", slot_cargo_target(&cwd));
         run_command_timeout(cmd, Duration::from_secs(FF_TIMEOUT_SECS + 30))
     })
     .await
@@ -1978,6 +2022,20 @@ fn truncate_for_log(s: &str) -> String {
     format!("{}...", &trimmed[..end])
 }
 
+/// The TAIL of a long backend-run error. `run_backend_cli`'s error leads with the
+/// full command (which echoes the entire prompt), so the useful part —
+/// `status: … stderr: …` — sits at the END. Keep the last ~280 chars so each
+/// per-backend line in `last_error` shows the real failure, not the prompt.
+fn err_tail(s: &str) -> String {
+    const KEEP: usize = 280;
+    let count = s.chars().count();
+    if count <= KEEP {
+        return s.trim().to_string();
+    }
+    let tail: String = s.chars().skip(count - KEEP).collect();
+    format!("…{}", tail.trim())
+}
+
 // ── Pillar 4 worktree reaper (per-host) ──────────────────────────────────
 // Removes on-disk git worktrees whose work_item reached a terminal state
 // (cancelled/merged/failed/done) but whose worktree row isn't 'cleaned' yet.
@@ -2023,6 +2081,64 @@ pub async fn evaluate_worktree_reaper(pg: &PgPool, worker_name: &str) -> Result<
     Ok(reaped)
 }
 
+/// `(available_gb, used_pct)` for the filesystem holding `path`, via `df -Pk`
+/// (POSIX one-line-per-fs, portable across macOS/Linux). None on any parse error.
+fn disk_free_for(path: &Path) -> Option<(f64, f64)> {
+    let out = Command::new("df").arg("-Pk").arg(path).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let cols: Vec<&str> = text.lines().nth(1)?.split_whitespace().collect();
+    // Filesystem 1024-blocks Used Available Capacity Mounted-on
+    let avail_kb: f64 = cols.get(3)?.parse().ok()?;
+    let pct: f64 = cols.get(4)?.trim_end_matches('%').parse().ok()?;
+    Some((avail_kb / 1024.0 / 1024.0, pct))
+}
+
+/// Prune the persistent per-slot cargo caches (see [`slot_cargo_target`]) when
+/// the disk is getting TIGHT, so warm build caches can't silently fill it. Only
+/// reaps under pressure (>90% used or <15 GB free) — otherwise the caches stay
+/// warm. Removes least-recently-modified caches first until back under a comfort
+/// margin. Best-effort + sync (run under spawn_blocking): fs walk + `rm -rf`.
+fn reap_cargo_targets() {
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let sub_agents = home.join(".forgefleet").join("sub-agents");
+    match disk_free_for(&sub_agents) {
+        Some((avail_gb, use_pct)) if use_pct >= 90.0 || avail_gb <= 15.0 => {}
+        _ => return, // healthy or unknown → leave the warm caches alone
+    }
+
+    let mut caches: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&sub_agents) {
+        for slot in rd.flatten() {
+            let ct = slot.path().join("cargo-target");
+            if ct.is_dir() {
+                let mtime = ct
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                caches.push((ct, mtime));
+            }
+        }
+    }
+    caches.sort_by_key(|(_, t)| *t); // least-recently-modified first
+
+    for (ct, _) in caches {
+        // Stop once there's a comfortable margin again.
+        if let Some((avail_gb, use_pct)) = disk_free_for(&sub_agents)
+            && use_pct < 85.0
+            && avail_gb > 25.0
+        {
+            break;
+        }
+        warn!(dir = %ct.display(), "cargo_target_reaper: disk tight — removing a warm cargo cache to free space");
+        let _ = std::fs::remove_dir_all(&ct);
+    }
+}
+
 /// Spawn the per-host worktree-reaper loop (not leader-gated — each host cleans
 /// its own worktrees).
 pub fn spawn_worktree_reaper(
@@ -2039,6 +2155,9 @@ pub fn spawn_worktree_reaper(
                     if let Err(e) = evaluate_worktree_reaper(&pg, &worker_name).await {
                         warn!(error = %e, "worktree_reaper tick failed");
                     }
+                    // Keep the persistent per-slot cargo caches from filling the
+                    // disk — prunes only under disk pressure, else leaves them warm.
+                    let _ = tokio::task::spawn_blocking(reap_cargo_targets).await;
                 }
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow() {
@@ -2063,6 +2182,7 @@ mod tests {
         // Infra failures the coding agent can't fix → must NOT be injected.
         for infra in [
             "run_ff_dispatch: no dispatchable backend on this node",
+            "run_ff_dispatch: all backends failed on this node:\ncodex: exit status: 1",
             "spawn \"ff\" \"cli\" \"codex\"",
             "stale-heartbeat takeover (attempt 2)",
             "fleet_oneshot round 3: route deployments: Postgres error: pool timed out",
@@ -2090,6 +2210,38 @@ mod tests {
     use anyhow::anyhow;
     use std::os::unix::process::ExitStatusExt;
     use std::process::{Command, Output};
+
+    #[test]
+    fn slot_cargo_target_is_per_slot_with_shared_fallback() {
+        let cwd =
+            std::path::Path::new("/home/x/.forgefleet/sub-agents/sub-agent-2/worktrees/wi/abc123");
+        assert_eq!(
+            super::slot_cargo_target(cwd),
+            std::path::Path::new("/home/x/.forgefleet/sub-agents/sub-agent-2/cargo-target")
+        );
+        // A path that doesn't match the sub-agent layout → shared node cache.
+        assert!(
+            super::slot_cargo_target(std::path::Path::new("/tmp/random/dir"))
+                .ends_with("cargo-shared-target")
+        );
+    }
+
+    #[test]
+    fn err_tail_keeps_the_end_where_status_and_stderr_live() {
+        let short = "codex: exit status: 4 stderr: gh auth login";
+        assert_eq!(super::err_tail(short), short);
+        // A long error (command echoes the prompt up front) keeps the END.
+        let long = format!(
+            "{}\nstatus: exit status: 1\nstderr: LLM not set",
+            "x".repeat(1000)
+        );
+        let tail = super::err_tail(&long);
+        assert!(
+            tail.contains("LLM not set"),
+            "tail must retain stderr: {tail}"
+        );
+        assert!(tail.len() < 320);
+    }
 
     #[test]
     fn command_display_never_leaks_env_secrets() {
