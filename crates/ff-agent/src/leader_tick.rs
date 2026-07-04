@@ -1516,6 +1516,17 @@ mod tests {
 
     #[tokio::test]
     async fn self_heal_same_signature_stays_single_flight_in_fleet_tasks() {
+        // DB-backed: skip gracefully when no Postgres is configured (e.g. the
+        // `cargo test --workspace --lib` CI job has no DB) instead of panicking.
+        // Run it locally / in a DB-enabled job with FORGEFLEET_POSTGRES_URL set.
+        if env::var("FORGEFLEET_POSTGRES_URL").is_err()
+            && env::var("FORGEFLEET_DATABASE_URL").is_err()
+        {
+            eprintln!(
+                "skipping self_heal single-flight DB test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL"
+            );
+            return;
+        }
         let (admin, pool, db_name) = create_temp_db().await;
 
         let first_id = upsert_self_heal_task(&pool, "sig-same-bug", "T2", 1).await;
