@@ -2085,6 +2085,7 @@ mod tests {
         // Infra failures the coding agent can't fix → must NOT be injected.
         for infra in [
             "run_ff_dispatch: no dispatchable backend on this node",
+            "run_ff_dispatch: all backends failed on this node:\ncodex: exit status: 1",
             "spawn \"ff\" \"cli\" \"codex\"",
             "stale-heartbeat takeover (attempt 2)",
             "fleet_oneshot round 3: route deployments: Postgres error: pool timed out",
