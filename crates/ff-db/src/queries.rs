@@ -4113,6 +4113,13 @@ mod tests {
     #[test]
     fn backend_rank_orders_cheapest_capable_first() {
         // codex is the proven build backend → leads; unknowns sink to the back.
+        assert_eq!(backend_rank("codex"), 0);
+        assert_eq!(backend_rank("claude"), 1);
+        assert_eq!(backend_rank("kimi"), 2);
+        assert_eq!(backend_rank("gemini"), 3);
+        assert_eq!(backend_rank("grok"), 4);
+        assert_eq!(backend_rank("totally-unknown"), 9);
+
         assert!(backend_rank("codex") < backend_rank("claude"));
         assert!(backend_rank("claude") < backend_rank("kimi"));
         assert!(backend_rank("kimi") < backend_rank("gemini"));
