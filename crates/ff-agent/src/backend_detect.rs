@@ -127,6 +127,26 @@ pub fn probe_indicates_broken_binary(reason: &str) -> bool {
     BROKEN_SIGNATURES.iter().any(|s| lower.contains(s))
 }
 
+/// Whether an auth-probe failure reason indicates the CLI runs but is
+/// MISCONFIGURED — it has no usable model/LLM selected — so it can't serve a
+/// dispatch even though the binary + creds are fine. Like a broken binary, this
+/// must fail CLOSED regardless of cred presence, else the router keeps picking a
+/// backend that fails every dispatch. Observed live: kimi exiting code 1 with
+/// "LLM not set" on a fleet node. PURE, so it's testable.
+pub fn probe_indicates_config_error(reason: &str) -> bool {
+    const CONFIG_SIGNATURES: &[&str] = &[
+        "llm not set",
+        "no model configured",
+        "model not configured",
+        "no llm configured",
+        "no model selected",
+        "select a model",
+        "configure a model",
+    ];
+    let lower = reason.to_ascii_lowercase();
+    CONFIG_SIGNATURES.iter().any(|s| lower.contains(s))
+}
+
 /// Detect every backend's availability on THIS node. When `probe_auth` is true,
 /// each installed backend additionally gets a tiny non-interactive request to
 /// verify it's authenticated (slower — a real CLI invocation per backend).
@@ -164,6 +184,15 @@ pub async fn detect_backends(probe_auth: bool, timeout: Duration) -> Vec<Backend
                 // is exactly how a dead codex read as "authenticated" and every
                 // dispatch to it failed with the opaque "no dispatchable backend").
                 (Some(false), format!("installed but NOT runnable: {reason}"))
+            } else if probe_indicates_config_error(&reason) {
+                // The CLI runs but has no usable model configured (e.g. kimi exits
+                // "LLM not set"). It can't serve a dispatch; fail closed regardless
+                // of creds so the router stops picking a backend that fails every
+                // time — same rationale as the broken-binary case.
+                (
+                    Some(false),
+                    format!("installed but MISCONFIGURED: {reason}"),
+                )
             } else if cred_present(cfg.name) {
                 // The live probe can be flaky on the fleet (slow cold-start,
                 // sandbox quirks, transient 5xx) and would leave a genuinely
@@ -381,6 +410,21 @@ mod tests {
             "probe timed out (likely waiting on an interactive login prompt)"
         ));
         assert!(!probe_indicates_broken_binary("503 service unavailable"));
+    }
+
+    #[test]
+    fn config_error_detected_and_disjoint_from_auth_and_broken() {
+        // The exact kimi failure seen live — runs but no model configured.
+        assert!(probe_indicates_config_error(
+            "exit status: 1 stdout: LLM not set"
+        ));
+        assert!(probe_indicates_config_error("Error: no model configured"));
+        // Not a config error: auth failure, transient, or a genuine crash.
+        assert!(!probe_indicates_config_error("401 Unauthorized"));
+        assert!(!probe_indicates_config_error("503 service unavailable"));
+        assert!(!probe_indicates_config_error(
+            "Missing optional dependency @openai/codex-linux-x64"
+        ));
     }
 
     #[test]
