@@ -6,6 +6,7 @@ use sqlx::Row;
 use crate::{CYAN, RESET, truncate_for_col};
 
 const FLEET_TASK_STATUSES: &[&str] = &["pending", "running", "completed", "failed"];
+const FLEET_TASK_CLASSES: &[&str] = &["build", "deferred", "research", "self_heal", "-"];
 const WORK_ITEM_STATUSES: &[&str] = &["idea", "ready", "building", "in_review", "done", "failed"];
 
 pub async fn handle_queue() -> Result<()> {
@@ -29,6 +30,29 @@ pub async fn handle_queue() -> Result<()> {
         let status: String = row.try_get("status")?;
         let count: i64 = row.try_get("count")?;
         fleet_counts.insert(status, count);
+    }
+
+    let fleet_task_class_rows = sqlx::query(
+        "SELECT COALESCE(task_class, '-') AS task_class,
+                status,
+                count(*)::bigint AS count
+           FROM fleet_tasks
+          GROUP BY task_class, status",
+    )
+    .fetch_all(&pool)
+    .await
+    .context("query fleet_tasks task_class queue counts")?;
+
+    let mut fleet_task_class_counts =
+        std::collections::BTreeMap::<String, std::collections::HashMap<String, i64>>::new();
+    for row in fleet_task_class_rows {
+        let task_class: String = row.try_get("task_class")?;
+        let status: String = row.try_get("status")?;
+        let count: i64 = row.try_get("count")?;
+        fleet_task_class_counts
+            .entry(task_class)
+            .or_default()
+            .insert(status, count);
     }
 
     let work_item_rows = sqlx::query(
@@ -82,6 +106,35 @@ pub async fn handle_queue() -> Result<()> {
     for status in FLEET_TASK_STATUSES {
         let count = fleet_counts.get(*status).copied().unwrap_or(0);
         println!("{:<12} {:>8}", status, count);
+    }
+
+    println!("\n{CYAN}fleet_tasks by task_class{RESET}");
+    println!(
+        "{:<12} {:>8} {:>8} {:>10} {:>8}",
+        "TASK_CLASS", "PENDING", "RUNNING", "COMPLETED", "FAILED"
+    );
+    for task_class in FLEET_TASK_CLASSES {
+        let counts = fleet_task_class_counts.get(*task_class);
+        println!(
+            "{:<12} {:>8} {:>8} {:>10} {:>8}",
+            task_class,
+            counts
+                .and_then(|row| row.get("pending"))
+                .copied()
+                .unwrap_or(0),
+            counts
+                .and_then(|row| row.get("running"))
+                .copied()
+                .unwrap_or(0),
+            counts
+                .and_then(|row| row.get("completed"))
+                .copied()
+                .unwrap_or(0),
+            counts
+                .and_then(|row| row.get("failed"))
+                .copied()
+                .unwrap_or(0)
+        );
     }
 
     println!("\n{CYAN}work_items by project{RESET}");
