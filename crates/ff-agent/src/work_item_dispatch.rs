@@ -421,13 +421,16 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     let worktree = create_worktree_for_item(&pg, &item).await?;
     mark_building(&pg, &item).await?;
 
-    let (stop_heartbeat_tx, stop_heartbeat_rx) = watch::channel(false);
-    let heartbeat = spawn_heartbeat(pg.clone(), item.work_item_id, stop_heartbeat_rx);
+    // Keep the lease heartbeat alive for the ENTIRE dispatch — the backend build
+    // AND the commit/push/PR tail — via an RAII guard that stops it when
+    // dispatch_one returns on ANY path. Previously the heartbeat stopped the
+    // instant the backend CLI returned, so a slow `git push` / `gh pr create` on
+    // a big diff ran with a frozen lease and the watchdog could reap it
+    // mid-finalize as a "stale-heartbeat takeover".
+    let _heartbeat_guard = HeartbeatGuard::spawn(pg.clone(), item.work_item_id);
 
     let started = std::time::Instant::now();
     let dispatch_full = run_ff_dispatch(&pg, &item, &worktree).await;
-    let _ = stop_heartbeat_tx.send(true);
-    let _ = heartbeat.await;
 
     // Split (backend, output) into the backend used + a plain Result<Output> for
     // the existing consumers. On error, no backend is carried, so use the
@@ -495,6 +498,31 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
 
     mark_ready_for_review(&pg, &item, &worktree, &head_sha, &pr_url).await?;
     Ok(())
+}
+
+/// RAII guard that keeps a work_item lease's heartbeat fresh while alive and
+/// signals the heartbeat task to stop on drop — i.e. when `dispatch_one` returns
+/// on ANY path (success, no-commit early return, or error). This holds the lease
+/// for the whole dispatch (build → commit → push → PR) so the leader watchdog
+/// can't reap it mid-finalize.
+struct HeartbeatGuard {
+    stop_tx: watch::Sender<bool>,
+}
+
+impl HeartbeatGuard {
+    fn spawn(pg: PgPool, work_item_id: Uuid) -> Self {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        // Detached: the task loops on its own timer and exits promptly when the
+        // guard's drop sends `true` on stop_tx.
+        let _ = spawn_heartbeat(pg, work_item_id, stop_rx);
+        Self { stop_tx }
+    }
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(true);
+    }
 }
 
 fn spawn_heartbeat(
