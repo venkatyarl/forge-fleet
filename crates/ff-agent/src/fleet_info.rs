@@ -36,6 +36,18 @@ static FLEET_SNAPSHOT: OnceCell<FleetSnapshot> = OnceCell::const_new();
 /// `EADDRNOTAVAIL` on macOS once 16K source ports were TIME_WAIT.
 static FLEET_POOL: OnceCell<PgPool> = OnceCell::const_new();
 
+/// A TINY dedicated Postgres pool used ONLY for the work_item lease heartbeat —
+/// a "liveness lane" that must reach Postgres even when the node's main
+/// [`FLEET_POOL`] is saturated by concurrent dispatch/tick queries. Sharing the
+/// main pool meant the 45s heartbeat competed for connections with the very load
+/// it exists to prove the node survives; under ~4 concurrent builds the acquire
+/// timed out, the heartbeat UPDATE silently failed, and the leader watchdog
+/// reaped a still-running build as a "stale-heartbeat takeover". Keep it 1-2
+/// connections (15 nodes × 2 is trivial against the server's headroom) and NEVER
+/// route other queries through it — that reintroduces the contention it avoids.
+/// (ff council codex+kimi 2026-07-04: dedicated pool + retry, not a bigger main pool.)
+static HEARTBEAT_POOL: OnceCell<PgPool> = OnceCell::const_new();
+
 /// A full fleet snapshot loaded from Postgres.
 #[derive(Debug, Clone, Default)]
 pub struct FleetSnapshot {
@@ -53,7 +65,9 @@ pub async fn get_fleet_pool() -> Result<PgPool, String> {
     Ok(FLEET_POOL.get_or_init(|| async { pool }).await.clone())
 }
 
-async fn build_fleet_pool() -> Result<PgPool, String> {
+/// Resolve the Postgres URL from `~/.forgefleet/fleet.toml` (shared by both the
+/// main pool and the dedicated heartbeat pool).
+fn read_db_url() -> Result<String, String> {
     let home = std::env::var("FORGEFLEET_HOME")
         .ok()
         .map(std::path::PathBuf::from)
@@ -64,16 +78,44 @@ async fn build_fleet_pool() -> Result<PgPool, String> {
         std::fs::read_to_string(&config_path).map_err(|e| format!("read fleet.toml: {e}"))?;
     let config: ff_core::config::FleetConfig =
         toml::from_str(&toml_str).map_err(|e| format!("parse fleet.toml: {e}"))?;
+    Ok(config.database.url)
+}
 
+async fn build_fleet_pool() -> Result<PgPool, String> {
+    let db_url = read_db_url()?;
     PgPoolOptions::new()
         .max_connections(10)
         .min_connections(0)
         .acquire_timeout(Duration::from_secs(5))
         .idle_timeout(Some(Duration::from_secs(60)))
         .max_lifetime(Some(Duration::from_secs(30 * 60)))
-        .connect(&config.database.url)
+        .connect(&db_url)
         .await
         .map_err(|e| format!("connect Postgres: {e}"))
+}
+
+/// The dedicated lease-heartbeat pool (see [`HEARTBEAT_POOL`]). Initialized on
+/// first use. 2 connections with one kept warm so a beat never pays cold-connect
+/// latency; a short acquire timeout so a hiccup fails fast enough to retry within
+/// the 45s beat interval instead of silently skipping the refresh.
+pub async fn get_heartbeat_pool() -> Result<PgPool, String> {
+    if let Some(p) = HEARTBEAT_POOL.get() {
+        return Ok(p.clone());
+    }
+    let pool = build_heartbeat_pool().await?;
+    Ok(HEARTBEAT_POOL.get_or_init(|| async { pool }).await.clone())
+}
+
+async fn build_heartbeat_pool() -> Result<PgPool, String> {
+    let db_url = read_db_url()?;
+    PgPoolOptions::new()
+        .max_connections(2)
+        .min_connections(1)
+        .acquire_timeout(Duration::from_secs(3))
+        .max_lifetime(Some(Duration::from_secs(30 * 60)))
+        .connect(&db_url)
+        .await
+        .map_err(|e| format!("connect Postgres (heartbeat pool): {e}"))
 }
 
 /// Fetch all fleet nodes from Postgres.

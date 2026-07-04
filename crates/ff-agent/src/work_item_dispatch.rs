@@ -427,7 +427,7 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     // instant the backend CLI returned, so a slow `git push` / `gh pr create` on
     // a big diff ran with a frozen lease and the watchdog could reap it
     // mid-finalize as a "stale-heartbeat takeover".
-    let _heartbeat_guard = HeartbeatGuard::spawn(pg.clone(), item.work_item_id);
+    let _heartbeat_guard = HeartbeatGuard::spawn(item.work_item_id);
 
     let started = std::time::Instant::now();
     let dispatch_full = run_ff_dispatch(&pg, &item, &worktree).await;
@@ -510,11 +510,11 @@ struct HeartbeatGuard {
 }
 
 impl HeartbeatGuard {
-    fn spawn(pg: PgPool, work_item_id: Uuid) -> Self {
+    fn spawn(work_item_id: Uuid) -> Self {
         let (stop_tx, stop_rx) = watch::channel(false);
         // Detached: the task loops on its own timer and exits promptly when the
         // guard's drop sends `true` on stop_tx.
-        let _ = spawn_heartbeat(pg, work_item_id, stop_rx);
+        let _ = spawn_heartbeat(work_item_id, stop_rx);
         Self { stop_tx }
     }
 }
@@ -526,7 +526,6 @@ impl Drop for HeartbeatGuard {
 }
 
 fn spawn_heartbeat(
-    pg: PgPool,
     work_item_id: Uuid,
     mut stop_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -535,13 +534,7 @@ fn spawn_heartbeat(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if let Err(e) = ff_db::pg_heartbeat_work_item_lease(&pg, work_item_id).await {
-                        warn!(
-                            work_item_id = %work_item_id,
-                            error = %e,
-                            "work_item_dispatch: lease heartbeat failed"
-                        );
-                    }
+                    heartbeat_lease_once(work_item_id).await;
                 }
                 changed = stop_rx.changed() => {
                     if changed.is_err() || *stop_rx.borrow() {
@@ -551,6 +544,37 @@ fn spawn_heartbeat(
             }
         }
     })
+}
+
+/// Refresh a lease heartbeat via the DEDICATED heartbeat pool, with bounded
+/// retry + LOUD logging. The old path shared the node's main pool and swallowed
+/// the error, so under concurrent dispatch a transient acquire-timeout silently
+/// skipped the beat — `heartbeat_at` went stale and the watchdog reaped a live
+/// build ("stale-heartbeat takeover"). The dedicated pool isolates the beat from
+/// dispatch/tick contention; the retry rides out a genuine DB hiccup within the
+/// beat interval; a final failure is logged loudly instead of vanishing.
+/// (ff council codex+kimi 2026-07-04.)
+async fn heartbeat_lease_once(work_item_id: Uuid) {
+    for attempt in 0..3u32 {
+        match crate::fleet_info::get_heartbeat_pool().await {
+            Ok(pool) => match ff_db::pg_heartbeat_work_item_lease(&pool, work_item_id).await {
+                Ok(()) => return,
+                Err(e) => warn!(
+                    work_item_id = %work_item_id, attempt, error = %e,
+                    "work_item_dispatch: lease heartbeat UPDATE failed; retrying on dedicated pool"
+                ),
+            },
+            Err(e) => warn!(
+                work_item_id = %work_item_id, attempt, error = %e,
+                "work_item_dispatch: heartbeat pool unavailable; retrying"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt + 1))).await;
+    }
+    warn!(
+        work_item_id = %work_item_id,
+        "work_item_dispatch: lease heartbeat FAILED after 3 tries — lease may go stale (watchdog could reap a LIVE build)"
+    );
 }
 
 async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Result<WorktreeRecord> {
