@@ -80,6 +80,54 @@ async fn collect_payloads(files: &[ConfigFile]) -> Result<Vec<(ConfigFile, Strin
     Ok(out)
 }
 
+/// Render the per-host distribute shell command. Pure (no I/O) so it's unit-
+/// testable. The task is enqueued with `preferred_computer = target`, so it
+/// almost always runs ON the target already: in that case write LOCALLY and
+/// skip the SSH entirely — a self-SSH to one's own IP is pure fragility (priya's
+/// loopback SSH wedges with exit 255, failing an otherwise-fine sync). Only when
+/// a DIFFERENT worker claimed the task do we SSH to the real target (preferred is
+/// a preference, not a guarantee — so correctness is preserved either way).
+/// On-target detection is portable: this host's IPv4s from `hostname -I` (Linux)
+/// + `ifconfig` (macOS), tested for the target IP.
+fn render_distribute_command(
+    label: &str,
+    target: &str,
+    ssh_user: &str,
+    primary_ip: &str,
+    payloads: &[(ConfigFile, String)],
+) -> String {
+    // The write-block: one mkdir+base64-decode per file. The b64 blobs are
+    // single-quoted so `$` is never shell-expanded. Config is non-secret →
+    // mode 0644. `stat` differs macOS/Linux, hence the `||` fallback.
+    let mut writes = String::new();
+    for (f, b64) in payloads {
+        writes.push_str(&format!(
+            "mkdir -p \"$(dirname {dest})\"\n\
+             printf '%s' '{b64}' | base64 -d > {dest}\n\
+             chmod 644 {dest}\n\
+             echo wrote: {dest} \\($(stat -c %s {dest} 2>/dev/null || stat -f %z {dest}) bytes\\)\n",
+            dest = f.dest,
+            b64 = b64,
+        ));
+    }
+    format!(
+        "set -e\n\
+         echo \"== distributing {label} config to {target} ==\"\n\
+         __ff_local_ips() {{ (hostname -I 2>/dev/null; \
+             ifconfig 2>/dev/null | awk '/inet /{{print $2}}') | tr ' ' '\\n'; }}\n\
+         if __ff_local_ips | grep -Fxq {primary_ip}; then\n\
+         echo '(on target — local write, no SSH)'\n\
+         {writes}\
+         else\n\
+         ssh -T {ssh_bypass} -o StrictHostKeyChecking=accept-new \
+             {ssh_user}@{primary_ip} bash -l <<'FF_CFG_EOF'\n\
+         {writes}\
+         FF_CFG_EOF\n\
+         fi\n",
+        ssh_bypass = crate::ssh_opts::SSH_AGENT_BYPASS,
+    )
+}
+
 /// Distribute `files` from the leader to every online fleet member except the
 /// leader. Returns the number of per-host distribute tasks enqueued. Each host
 /// gets ONE task that writes all present files (mode 0644) via an SSH heredoc,
@@ -119,35 +167,7 @@ pub async fn distribute_config_files(
         let ssh_user: String = row.get("ssh_user");
         let primary_ip: String = row.get("primary_ip");
 
-        // Build the remote write-block: one mkdir+base64-decode per file. The
-        // b64 blobs are single-quoted inside the heredoc so `$` is never
-        // shell-expanded. Config is non-secret → mode 0644.
-        let mut writes = String::new();
-        for (f, b64) in &payloads {
-            writes.push_str(&format!(
-                "mkdir -p \"$(dirname {dest})\"\n\
-                 printf '%s' '{b64}' | base64 -d > {dest}\n\
-                 chmod 644 {dest}\n\
-                 echo wrote: {dest} \\($(stat -c %s {dest} 2>/dev/null || stat -f %z {dest}) bytes\\)\n",
-                dest = f.dest,
-                b64 = b64,
-            ));
-        }
-
-        let cmd = format!(
-            "set -e\n\
-             echo \"== distributing {label} config to {target} ==\"\n\
-             ssh -T {ssh_bypass} -o StrictHostKeyChecking=accept-new \
-                 {ssh_user}@{primary_ip} bash -l <<'FF_CFG_EOF'\n\
-             {writes}\
-             FF_CFG_EOF\n",
-            label = label,
-            target = name,
-            ssh_user = ssh_user,
-            primary_ip = primary_ip,
-            writes = writes,
-            ssh_bypass = crate::ssh_opts::SSH_AGENT_BYPASS,
-        );
+        let cmd = render_distribute_command(label, &name, &ssh_user, &primary_ip, &payloads);
 
         pg_enqueue_shell_task(
             pool,
@@ -193,5 +213,27 @@ mod tests {
         let dests: Vec<&str> = KIMI_CONFIG_FILES.iter().map(|f| f.dest).collect();
         assert!(dests.contains(&"~/.kimi/config.toml"));
         assert!(dests.contains(&"~/.kimi/config.json"));
+    }
+
+    #[test]
+    fn rendered_command_has_local_and_ssh_branches() {
+        let payloads = vec![(
+            ConfigFile {
+                source: "~/.kimi/config.toml",
+                dest: "~/.kimi/config.toml",
+            },
+            "YWJj".to_string(), // base64("abc")
+        )];
+        let cmd = render_distribute_command("kimi", "priya", "priya", "192.168.5.104", &payloads);
+        // On-target fast path avoids the fragile self-SSH.
+        assert!(cmd.contains("__ff_local_ips | grep -Fxq 192.168.5.104"));
+        assert!(cmd.contains("on target — local write, no SSH"));
+        // Fallback still SSHes when a different worker claimed the task.
+        assert!(cmd.contains("ssh -T"));
+        assert!(cmd.contains("priya@192.168.5.104"));
+        // The write-block appears in BOTH branches (local + heredoc).
+        assert_eq!(cmd.matches("base64 -d > ~/.kimi/config.toml").count(), 2);
+        // Non-secret perms.
+        assert!(cmd.contains("chmod 644"));
     }
 }
