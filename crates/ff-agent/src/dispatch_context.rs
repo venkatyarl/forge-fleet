@@ -71,10 +71,27 @@ fn cortex_json(repo_path: &Path, args: &[&str]) -> Option<serde_json::Value> {
     serde_json::from_slice(&out.stdout).ok()
 }
 
-/// Build the context pack: substring-find each task identifier in the graph,
-/// rank the unique hits by fan-in, and `show` the top `max_symbols` bodies.
-/// Returns an empty string when Cortex has nothing (or is unavailable) — the
-/// caller prepends it, so empty == unchanged behaviour. Bounded + best-effort.
+/// Make a corpus file path node-independent: the graph stores the LEADER's
+/// absolute paths (`/Users/venkat/projects/forge-fleet/crates/...`), which don't
+/// exist on a follower. Strip to a repo-relative form so the pointer is valid on
+/// any node. Falls back to the basename for non-`crates/` layouts.
+fn relativize(file: &str) -> &str {
+    if let Some(i) = file.find("/crates/") {
+        return &file[i + 1..];
+    }
+    if let Some(i) = file.find("/src/") {
+        return &file[i + 1..];
+    }
+    file.rsplit('/').next().unwrap_or(file)
+}
+
+/// Build the context pack: `--all` substring-find each task identifier across
+/// EVERY indexed corpus (cwd-independent — a fresh worktree has no corpus of its
+/// own), rank unique hits by fan-in, and emit them as SYMBOL POINTERS
+/// (`qualified_name — kind at file:line`). Pointers alone kill the grep-storm:
+/// the agent opens the exact symbol directly instead of hunting for it. Returns
+/// empty when Cortex has nothing (or is unavailable) — caller prepends it, so
+/// empty == unchanged behaviour. Bounded + best-effort.
 pub fn build_cortex_context_pack(
     title: &str,
     description: &str,
@@ -86,62 +103,54 @@ pub fn build_cortex_context_pack(
         return String::new();
     }
 
-    // Collect unique (qualified_name, fan_in) hits across the identifiers.
-    let mut ranked: Vec<(String, i64)> = Vec::new();
+    // Unique hits: (qualified_name, kind, relfile, line, fan_in).
+    let mut ranked: Vec<(String, String, String, i64, i64)> = Vec::new();
     let mut seen = BTreeSet::new();
-    for id in idents.iter().take(12) {
-        let Some(serde_json::Value::Array(hits)) = cortex_json(repo_path, &["find", id]) else {
+    for id in idents.iter().take(8) {
+        let Some(serde_json::Value::Array(hits)) =
+            cortex_json(repo_path, &["find", id, "--all-corpora"])
+        else {
             continue;
         };
-        for h in hits.iter().take(4) {
+        for h in hits.iter().take(3) {
             let Some(qn) = h.get("qualified_name").and_then(|v| v.as_str()) else {
                 continue;
             };
-            if seen.insert(qn.to_string()) {
-                let fan = h.get("fan_in").and_then(|v| v.as_i64()).unwrap_or(0);
-                ranked.push((qn.to_string(), fan));
+            if !seen.insert(qn.to_string()) {
+                continue;
             }
+            let kind = h
+                .get("node_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("symbol")
+                .trim_start_matches("code:")
+                .to_string();
+            let file = h.get("file").and_then(|v| v.as_str()).unwrap_or("?");
+            let line = h.get("start_line").and_then(|v| v.as_i64()).unwrap_or(0);
+            let fan = h.get("fan_in").and_then(|v| v.as_i64()).unwrap_or(0);
+            ranked.push((
+                qn.to_string(),
+                kind,
+                relativize(file).to_string(),
+                line,
+                fan,
+            ));
         }
     }
     if ranked.is_empty() {
         return String::new();
     }
-    // Highest fan-in first — the load-bearing symbols the change orbits.
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.sort_by(|a, b| b.4.cmp(&a.4)); // highest fan-in first
 
     let mut pack = String::from(
         "## Relevant existing code (from the Cortex code graph)\n\
-         Start from these exact symbols instead of grepping the whole repo — they \
-         are what this task touches or sits next to:\n\n",
+         These are the exact symbols this task touches — open them directly \
+         instead of grepping the repo to find them:\n\n",
     );
-    let mut included = 0usize;
-    for (qn, _) in ranked {
-        if included >= max_symbols {
-            break;
-        }
-        let Some(obj) = cortex_json(repo_path, &["show", &qn, "--max-lines", "45"]) else {
-            continue;
-        };
-        let source = obj.get("source").and_then(|v| v.as_str()).unwrap_or("");
-        if source.trim().is_empty() {
-            continue;
-        }
-        let file = obj.get("file").and_then(|v| v.as_str()).unwrap_or("?");
-        let start = obj.get("start_line").and_then(|v| v.as_i64()).unwrap_or(0);
-        let truncated = obj
-            .get("truncated")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        pack.push_str(&format!(
-            "### {qn}  ({file}:{start})\n```\n{}\n```{}\n\n",
-            source.trim_end(),
-            if truncated { " (truncated)" } else { "" }
-        ));
-        included += 1;
+    for (qn, kind, file, line, _) in ranked.into_iter().take(max_symbols) {
+        pack.push_str(&format!("- `{qn}` — {kind} at {file}:{line}\n"));
     }
-    if included == 0 {
-        return String::new();
-    }
+    pack.push('\n');
     pack
 }
 
