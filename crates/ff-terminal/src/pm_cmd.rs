@@ -1,6 +1,6 @@
 use crate::{CYAN, GREEN, RED, RESET, YELLOW};
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
@@ -805,6 +805,18 @@ async fn handle_pm_decompose(
         .unwrap_or_else(|| {
             "Target repository context:\n- unknown; infer cautiously from the goal and do not assume forge-fleet.\n\n".to_string()
         });
+    // Give the LLM the repo's REAL source directories so its `files` point at a
+    // layout that exists. Without this it invents a plausible-but-wrong tree
+    // (observed: `crates/forge-fleet/src/commands/pm.rs`, which doesn't exist —
+    // the real path is `crates/ff-terminal/src/pm_cmd.rs`). Directory-level (not
+    // a full file dump) keeps it context-frugal. Fail-open: no local repo / not
+    // a git tree → empty, prompt behaves as before.
+    let dir_block = repo_context
+        .as_ref()
+        .and_then(|ctx| ctx.repo_path.as_deref())
+        .and_then(|p| source_dir_summary(&git_ls_files(p)?, 120))
+        .map(|s| format!("{s}\n"))
+        .unwrap_or_default();
     let prompt = format!(
         "You are a senior engineer breaking a goal into independent, well-scoped \
          LEAF coding tasks for the target repository. Plan against the target \
@@ -817,6 +829,7 @@ async fn handle_pm_decompose(
          make each self-contained (a per-file task that compiles/passes on its \
          own is far better than one big task that a small model half-finishes).\n\n\
          {repo_block}\
+         {dir_block}\
          Output ONLY a JSON array (no prose, no markdown fence) of at most {max} \
          objects, each: {{\"title\": \"<imperative, <70 chars>\", \"description\": \
          \"<precise instructions: which file, what to add/change, mirror an \
@@ -943,6 +956,61 @@ fn repo_context_from_binding(
         ctx.repo_path = repo_path;
     }
     Some(ctx)
+}
+
+/// Best-effort `git ls-files` for the target repo (newline-joined). Returns
+/// None when there's no local path or it isn't a git tree — fail-open, the
+/// caller just omits the directory hint.
+fn git_ls_files(repo_path: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("ls-files")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Summarize a `git ls-files` listing into the repo's real SOURCE directories
+/// (deduped, sorted, with a per-dir file count), so the decompose LLM anchors
+/// its predicted paths to a layout that EXISTS instead of inventing one.
+/// Directory-level (not a full file dump) keeps the prompt context-frugal.
+/// Returns None if no source files are present.
+fn source_dir_summary(ls_files: &str, max_dirs: usize) -> Option<String> {
+    use std::collections::BTreeMap;
+    const SRC_EXT: &[&str] = &[
+        ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".rb", ".sh", ".toml", ".sql",
+    ];
+    let mut dirs: BTreeMap<&str, usize> = BTreeMap::new();
+    for line in ls_files.lines() {
+        if line.contains("/target/") || line.contains("node_modules/") {
+            continue;
+        }
+        if !SRC_EXT.iter().any(|e| line.ends_with(e)) {
+            continue;
+        }
+        let dir = line.rsplit_once('/').map(|(d, _)| d).unwrap_or(".");
+        *dirs.entry(dir).or_default() += 1;
+    }
+    if dirs.is_empty() {
+        return None;
+    }
+    let total = dirs.len();
+    let mut s = String::from(
+        "Real source directories in the target repo (predicted `files` MUST live \
+         under one of these — do NOT invent a layout):\n",
+    );
+    for (i, (dir, count)) in dirs.iter().enumerate() {
+        if i >= max_dirs {
+            s.push_str(&format!("- … ({} more directories)\n", total - max_dirs));
+            break;
+        }
+        s.push_str(&format!("- {dir}/ ({count} files)\n"));
+    }
+    Some(s)
 }
 
 /// Normalize an LLM-supplied complexity into the work_items vocabulary
@@ -1482,6 +1550,32 @@ mod tests {
         assert!(sql.contains("complexity"));
         // 12 bound columns now (was 10) → placeholders through $10.
         assert!(sql.contains("$9, $10"));
+    }
+
+    #[test]
+    fn source_dir_summary_dedups_dirs_filters_noise() {
+        let ls = "crates/ff-terminal/src/pm_cmd.rs\n\
+                  crates/ff-terminal/src/main.rs\n\
+                  crates/ff-agent/src/lib.rs\n\
+                  crates/ff-agent/target/debug/junk.rs\n\
+                  node_modules/pkg/index.js\n\
+                  README.md\n\
+                  Cargo.toml";
+        let out = source_dir_summary(ls, 120).expect("has source dirs");
+        // Deduped dir with count.
+        assert!(out.contains("- crates/ff-terminal/src/ (2 files)"));
+        assert!(out.contains("- crates/ff-agent/src/ (1 files)"));
+        // target/ and node_modules/ filtered out; .md not a source ext.
+        assert!(!out.contains("target/debug"));
+        assert!(!out.contains("node_modules"));
+        assert!(!out.contains("README.md"));
+        // Root-level Cargo.toml → "." dir.
+        assert!(out.contains("- ./ (1 files)"));
+    }
+
+    #[test]
+    fn source_dir_summary_none_when_no_source() {
+        assert!(source_dir_summary("README.md\nLICENSE\n", 120).is_none());
     }
 
     #[test]
