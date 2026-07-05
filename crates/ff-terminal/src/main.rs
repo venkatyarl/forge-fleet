@@ -825,6 +825,14 @@ enum Command {
         #[command(subcommand)]
         command: OauthCommand,
     },
+    /// Kimi backend config — distribute the leader's tuned `~/.kimi/config.toml`
+    /// (model routing + MCP wiring) fleet-wide so a Lane-2 `ff cli kimi`
+    /// dispatch behaves the same on every node. Complements `ff oauth
+    /// distribute kimi` (which fans out the *credential*).
+    Kimi {
+        #[command(subcommand)]
+        command: KimiCommand,
+    },
     /// V43: self-heal coordination (operator escape-hatches).
     SelfHeal {
         #[command(subcommand)]
@@ -1459,6 +1467,15 @@ enum SessionCommand {
     /// marks pending steps `cancelled`, and cancels still-running
     /// fleet_tasks via the existing pg_cancel_task helper.
     Cancel { id: String },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum KimiCommand {
+    /// Distribute the leader's `~/.kimi/config.toml` + `config.json` (model
+    /// routing + forgefleet MCP wiring) to every other fleet member (mode
+    /// 0644, via the `fleet_tasks` shell dispatcher). Non-secret config, so no
+    /// TOS gate. Follow with `ff tasks list` to watch the per-host tasks.
+    SyncConfig,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -5095,6 +5112,31 @@ async fn main() -> Result<()> {
                         }
                     }
                     Ok(())
+                }
+            }
+        }
+        Some(Command::Kimi { command }) => {
+            let pool = ff_agent::fleet_info::get_fleet_pool()
+                .await
+                .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+            match command {
+                KimiCommand::SyncConfig => {
+                    use ff_agent::config_distributor::{
+                        KIMI_CONFIG_FILES, distribute_config_files,
+                    };
+                    match distribute_config_files(&pool, "kimi", KIMI_CONFIG_FILES).await {
+                        Ok(n) => {
+                            println!(
+                                "{GREEN}✓{RESET} kimi: enqueued {n} config-distribute task(s); \
+                                 follow with `ff tasks list`"
+                            );
+                            Ok(())
+                        }
+                        Err(e) => {
+                            println!("{RED}✗{RESET} kimi sync-config: {e}");
+                            Err(e)
+                        }
+                    }
                 }
             }
         }

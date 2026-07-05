@@ -44,6 +44,7 @@ pub mod codegen_apply;
 pub mod commands;
 pub mod commands_extended;
 pub mod compaction;
+pub mod config_distributor;
 pub mod conformance;
 pub mod consensus;
 pub mod coverage_guard;
