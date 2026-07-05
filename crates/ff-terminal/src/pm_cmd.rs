@@ -807,16 +807,24 @@ async fn handle_pm_decompose(
         });
     let prompt = format!(
         "You are a senior engineer breaking a goal into independent, well-scoped \
-         LEAF coding tasks for the target repository. Each task must be doable \
-         on its own by a coding agent and touch a small, specific set of files. \
-         Plan against the target repository context below. Do not use the \
-         project's primary repository unless it is the target repository.\n\n\
+         LEAF coding tasks for the target repository. Plan against the target \
+         repository context below. Do not use the project's primary repository \
+         unless it is the target repository.\n\n\
+         GRANULARITY (critical — the agents that build these are small local \
+         models that fumble sprawling changes): make each task as SMALL as \
+         possible — ideally touching exactly ONE file. If a change spans several \
+         files, emit ONE task PER FILE rather than a single multi-file task, and \
+         make each self-contained (a per-file task that compiles/passes on its \
+         own is far better than one big task that a small model half-finishes).\n\n\
          {repo_block}\
          Output ONLY a JSON array (no prose, no markdown fence) of at most {max} \
          objects, each: {{\"title\": \"<imperative, <70 chars>\", \"description\": \
-         \"<precise instructions: which file(s), what to add/change, mirror an \
+         \"<precise instructions: which file, what to add/change, mirror an \
          existing pattern; name the correct test/build command for this repo \
-         when useful>\"}}. \
+         when useful>\", \"files\": [\"<repo-relative path(s) this task edits — \
+         prefer exactly one>\"], \"complexity\": \"<mechanical|moderate|complex>\"}}. \
+         `complexity` = mechanical for a one-file localized edit, complex for a \
+         cross-cutting change. \
          GOAL:\n{goal_text}"
     );
 
@@ -844,6 +852,12 @@ async fn handle_pm_decompose(
     struct LeafTask {
         title: String,
         description: String,
+        // Optional so an older-shape response (title+description only) still
+        // parses — fail-open, the columns just stay at their defaults.
+        #[serde(default)]
+        files: Vec<String>,
+        #[serde(default)]
+        complexity: Option<String>,
     }
     let tasks: Vec<LeafTask> = serde_json::from_str(json_slice)
         .map_err(|e| anyhow::anyhow!("parse decomposed tasks JSON: {e}"))?;
@@ -859,6 +873,7 @@ async fn handle_pm_decompose(
     );
     let mut ids = Vec::new();
     for t in tasks.into_iter().take(max) {
+        let complexity = normalize_complexity(t.complexity.as_deref());
         let row = insert_decomposed_work_item(
             pool,
             &project,
@@ -867,10 +882,17 @@ async fn handle_pm_decompose(
             &created_by,
             parent_id,
             repo_context.as_ref(),
+            &t.files,
+            complexity,
         )
         .await?;
         ids.push(row.0);
-        println!("  + {} {}", row.0, t.title);
+        let scope = match t.files.len() {
+            0 => "unscoped".to_string(),
+            1 => t.files[0].clone(),
+            n => format!("{n} files"),
+        };
+        println!("  + {} [{complexity}] {} ({scope})", row.0, t.title);
     }
 
     if ready {
@@ -923,6 +945,18 @@ fn repo_context_from_binding(
     Some(ctx)
 }
 
+/// Normalize an LLM-supplied complexity into the work_items vocabulary
+/// (`mechanical` | `moderate` | `complex`). Unknown/absent → `mechanical`
+/// (matches the column default; the safe assumption for a well-scoped leaf).
+fn normalize_complexity(raw: Option<&str>) -> &'static str {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("complex") => "complex",
+        Some("moderate") => "moderate",
+        _ => "mechanical",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn insert_decomposed_work_item(
     pool: &sqlx::PgPool,
     project: &str,
@@ -931,6 +965,8 @@ async fn insert_decomposed_work_item(
     created_by: &str,
     parent_id: Option<uuid::Uuid>,
     repo_context: Option<&crate::repo_context::RepoContext>,
+    predicted_paths: &[String],
+    complexity: &str,
 ) -> Result<(uuid::Uuid,)> {
     sqlx::query_as(decomposed_work_item_insert_sql())
         .bind(project)
@@ -945,6 +981,8 @@ async fn insert_decomposed_work_item(
                 .and_then(|ctx| ctx.repo_path.as_ref())
                 .map(|p| p.to_string_lossy().to_string()),
         )
+        .bind(serde_json::json!(predicted_paths))
+        .bind(complexity)
         .fetch_one(pool)
         .await
         .map_err(|e| anyhow::anyhow!("insert child task: {e}"))
@@ -952,8 +990,8 @@ async fn insert_decomposed_work_item(
 
 fn decomposed_work_item_insert_sql() -> &'static str {
     "INSERT INTO work_items \
-        (project_id, kind, title, description, priority, created_by, parent_id, repo_id, repo_url, repo_path) \
-     VALUES ($1, 'task', $2, $3, 'normal', $4, $5, $6, $7, $8) RETURNING id"
+        (project_id, kind, title, description, priority, created_by, parent_id, repo_id, repo_url, repo_path, predicted_paths, complexity) \
+     VALUES ($1, 'task', $2, $3, 'normal', $4, $5, $6, $7, $8, $9, $10) RETURNING id"
 }
 
 pub async fn handle_pm_import_claude_tasks(
@@ -1435,6 +1473,25 @@ mod tests {
         assert!(sql.contains("repo_url"));
         assert!(sql.contains("repo_path"));
         assert!(sql.contains("$6, $7, $8"));
+    }
+
+    #[test]
+    fn decomposed_work_item_insert_persists_scope_and_complexity() {
+        let sql = decomposed_work_item_insert_sql();
+        assert!(sql.contains("predicted_paths"));
+        assert!(sql.contains("complexity"));
+        // 12 bound columns now (was 10) → placeholders through $10.
+        assert!(sql.contains("$9, $10"));
+    }
+
+    #[test]
+    fn normalize_complexity_maps_to_vocabulary() {
+        assert_eq!(normalize_complexity(Some("COMPLEX")), "complex");
+        assert_eq!(normalize_complexity(Some(" moderate ")), "moderate");
+        assert_eq!(normalize_complexity(Some("mechanical")), "mechanical");
+        // Unknown / absent / junk → the safe default.
+        assert_eq!(normalize_complexity(Some("epic")), "mechanical");
+        assert_eq!(normalize_complexity(None), "mechanical");
     }
 
     fn sample() -> PmStats {
