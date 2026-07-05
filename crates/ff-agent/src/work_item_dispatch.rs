@@ -1276,8 +1276,8 @@ async fn run_ff_dispatch(
     let pack = crate::dispatch_context::cortex_context_pack_async(
         item.title.clone(),
         item.description.clone().unwrap_or_default(),
-        item.repo_path.clone(),
-        6,
+        worktree.worktree_path.clone(),
+        8,
     )
     .await;
     if !pack.is_empty() {
