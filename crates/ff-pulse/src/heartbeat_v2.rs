@@ -263,7 +263,7 @@ impl HeartbeatV2Publisher {
                 // to take the GB10/DGX unified-memory fallback path.
                 beat.os = detect_os_info();
                 beat.build_sha = build_sha.clone();
-                beat.source_tree_path = detect_source_tree_path();
+                beat.source_tree_path = detect_source_tree_path(beat.role_claimed == "leader");
 
                 // ── Capabilities ─────────────────────────────────────────────
                 let gpu_kind = detect_gpu_kind();
@@ -591,21 +591,40 @@ pub(crate) fn aggregate_disk_bytes(disks: impl IntoIterator<Item = (u64, u64)>) 
 /// `ff_core::db_health::locate_compose_file`, picking the first that exists,
 /// and returns the canonicalized absolute path. `None` when no tree is found
 /// (e.g. binary-only install) — the materializer then leaves the column alone.
-fn detect_source_tree_path() -> Option<String> {
-    use std::path::PathBuf;
-    let home = std::env::var("HOME").ok().map(PathBuf::from);
-    let candidates: Vec<PathBuf> = [
-        std::env::var("FORGEFLEET_REPO").ok().map(PathBuf::from),
-        home.as_ref().map(|h| h.join("projects/forge-fleet")),
-        home.as_ref()
-            .map(|h| h.join(".forgefleet/sub-agents/sub-agent-0/forge-fleet")),
-    ]
+/// Ordered source-tree probe locations, most-preferred first. Pure (no I/O) so
+/// the role precedence is unit-testable. `FORGEFLEET_REPO` always wins (explicit
+/// override). Then by ROLE:
+///   • LEADER (taylor) is the operator's dev box — it keeps ~/projects/forge-fleet
+///     (alongside all their personal projects), so ~/projects is probed FIRST.
+///   • WORKERS must hold NOTHING at ~/projects — the fleet-managed checkout under
+///     ~/.forgefleet is probed FIRST so `source_tree_path` converges there. Before
+///     `ff fleet migrate-source-trees` a worker only has ~/projects, so it still
+///     falls back to it (nothing breaks); after the move, a leftover
+///     ~/projects/forge-fleet is ignored until Phase-2 cleanup removes it.
+fn source_tree_candidates(
+    is_leader: bool,
+    home: Option<&std::path::Path>,
+    explicit: Option<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    let projects = home.map(|h| h.join("projects/forge-fleet"));
+    let forgefleet = home.map(|h| h.join(".forgefleet/sub-agents/sub-agent-0/forge-fleet"));
+    if is_leader {
+        [explicit, projects, forgefleet]
+    } else {
+        [explicit, forgefleet, projects]
+    }
     .into_iter()
     .flatten()
-    .collect();
+    .collect()
+}
+
+fn detect_source_tree_path(is_leader: bool) -> Option<String> {
+    use std::path::PathBuf;
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
+    let explicit = std::env::var("FORGEFLEET_REPO").ok().map(PathBuf::from);
     // A real tree has the deploy compose file (and a .git dir); require the
     // compose file so we don't latch onto an empty placeholder directory.
-    candidates
+    source_tree_candidates(is_leader, home.as_deref(), explicit)
         .into_iter()
         .find(|root| root.join("deploy/docker-compose.yml").exists())
         .map(|root| {
@@ -1230,6 +1249,28 @@ fn classify_iface(iface: &str, ip: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_tree_precedence_is_role_aware() {
+        let home = std::path::Path::new("/home/x");
+        let projects = std::path::PathBuf::from("/home/x/projects/forge-fleet");
+        let forgefleet =
+            std::path::PathBuf::from("/home/x/.forgefleet/sub-agents/sub-agent-0/forge-fleet");
+
+        // Leader: ~/projects is probed before ~/.forgefleet.
+        let leader = source_tree_candidates(true, Some(home), None);
+        assert_eq!(leader, vec![projects.clone(), forgefleet.clone()]);
+
+        // Worker: ~/.forgefleet is probed before ~/projects (so it converges off
+        // ~/projects and a leftover pre-relocation tree is ignored once moved).
+        let worker = source_tree_candidates(false, Some(home), None);
+        assert_eq!(worker, vec![forgefleet.clone(), projects.clone()]);
+
+        // FORGEFLEET_REPO override always wins, regardless of role.
+        let explicit = std::path::PathBuf::from("/opt/repo");
+        let ovr = source_tree_candidates(false, Some(home), Some(explicit.clone()));
+        assert_eq!(ovr.first(), Some(&explicit));
+    }
 
     #[test]
     fn aggregate_disk_bytes_sums_normal_mounts() {
