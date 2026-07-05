@@ -173,7 +173,7 @@ pub async fn cortex_context_pack_async(
 
 #[cfg(test)]
 mod tests {
-    use super::extract_task_identifiers;
+    use super::{extract_task_identifiers, relativize};
 
     #[test]
     fn extracts_camel_and_snake_idents_skips_plain_words() {
@@ -205,14 +205,8 @@ mod tests {
             "crates/ff-agent/src/foo.rs"
         );
         // 2. /src/ found (but not /crates/) -> strips to src-relative
-        assert_eq!(
-            relativize("/home/x/repo/src/bar.rs"),
-            "src/bar.rs"
-        );
+        assert_eq!(relativize("/home/x/repo/src/bar.rs"), "src/bar.rs");
         // 3. neither found -> returns basename
-        assert_eq!(
-            relativize("/var/log/system/thing.log"),
-            "thing.log"
-        );
+        assert_eq!(relativize("/var/log/system/thing.log"), "thing.log");
     }
 }
