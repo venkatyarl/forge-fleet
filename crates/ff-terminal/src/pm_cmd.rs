@@ -841,10 +841,27 @@ async fn handle_pm_decompose(
          GOAL:\n{goal_text}"
     );
 
+    // Decomposition is a PLANNING task — it benefits from the strongest model,
+    // but fleet_oneshot orders candidates `tier ASC` (cheapest first), so with no
+    // hint it lands on a weak model that half-follows the instructions and
+    // hallucinates paths (observed: veronica emitting a fabricated layout). When
+    // the caller didn't pin `--llm`, steer to the strongest tool-calling model
+    // that has a healthy deployment (data-driven, no hardcoded names). An
+    // explicit `--llm` still wins; a fleet with nothing qualifying falls back to
+    // the default router (hint = None).
+    let effective_hint: Option<String> = match &llm {
+        Some(explicit) => Some(explicit.clone()),
+        None => strongest_planner_hint(pool).await,
+    };
+    if llm.is_none() {
+        if let Some(h) = &effective_hint {
+            println!("  planner: {h} (strongest tool-calling deployment)");
+        }
+    }
     let resp = ff_agent::fleet_oneshot::fleet_oneshot(
         pool,
         &prompt,
-        llm.as_deref(),
+        effective_hint.as_deref(),
         Some(std::time::Duration::from_secs(180)),
     )
     .await
@@ -956,6 +973,32 @@ fn repo_context_from_binding(
         ctx.repo_path = repo_path;
     }
     Some(ctx)
+}
+
+/// The strongest tool-calling model with a healthy deployment, as a routing
+/// hint for the decompose PLANNING call. `fleet_oneshot` orders `tier ASC`
+/// (cheapest first) — great for cheap one-shots, wrong for planning, which wants
+/// the LARGEST capable model. We pick the highest-tier `tool_calling` model that
+/// currently has a healthy deployment (tool-calling excludes the weak non-agent
+/// models like gemma; tier DESC = biggest first). Passed as `model_hint`, which
+/// `fleet_oneshot` prefers then fails over from. Data-driven (no hardcoded
+/// names); `None` when nothing qualifies → caller keeps default routing.
+async fn strongest_planner_hint(pool: &sqlx::PgPool) -> Option<String> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT cat.name \
+           FROM fleet_model_deployments d \
+           JOIN fleet_model_catalog cat ON cat.id = d.catalog_id \
+          WHERE d.health_status = 'healthy' \
+            AND cat.tool_calling = TRUE \
+            AND cat.name IS NOT NULL AND cat.name <> '' \
+          ORDER BY cat.tier DESC, d.last_health_at DESC NULLS LAST \
+          LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    row.map(|(name,)| name)
 }
 
 /// Best-effort `git ls-files` for the target repo (newline-joined). Returns
