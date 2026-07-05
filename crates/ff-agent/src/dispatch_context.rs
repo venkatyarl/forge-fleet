@@ -196,4 +196,23 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), ids.len());
     }
+
+    #[test]
+    fn relativize_strips_absolute_paths_to_repo_relative() {
+        // 1. /crates/ found -> strips to repo-relative
+        assert_eq!(
+            relativize("/Users/venkat/projects/forge-fleet/crates/ff-agent/src/foo.rs"),
+            "crates/ff-agent/src/foo.rs"
+        );
+        // 2. /src/ found (but not /crates/) -> strips to src-relative
+        assert_eq!(
+            relativize("/home/x/repo/src/bar.rs"),
+            "src/bar.rs"
+        );
+        // 3. neither found -> returns basename
+        assert_eq!(
+            relativize("/var/log/system/thing.log"),
+            "thing.log"
+        );
+    }
 }
