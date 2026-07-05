@@ -150,6 +150,18 @@ pub async fn resolve_upgrade_plans_with_suffix(
                 -- V114: never auto-upgrade a reserved/drained host (P3 / operator
                 -- claimed it; the wave must not build there).
                 AND COALESCE(c.reservation_state, 'available') = 'available'
+                -- Drain-before-restart: never upgrade (= rebuild + restart
+                -- forgefleetd on) a host with an IN-FLIGHT work_item build lease,
+                -- or the restart orphans the build → stale-heartbeat reap → wasted
+                -- attempt. That is exactly why long feature-task builds kept
+                -- failing while short ones landed: a 20-40min build gets caught by
+                -- the hourly upgrade wave. The host upgrades on a later tick once
+                -- it is idle between builds (a perpetually-busy host correctly
+                -- keeps its builds instead of being restarted out from under them).
+                AND NOT EXISTS (
+                    SELECT 1 FROM work_item_leases l
+                     WHERE l.computer_id = c.id AND l.released_at IS NULL
+                )
               ORDER BY c.name",
         )
         .bind(software_id)
@@ -167,6 +179,18 @@ pub async fn resolve_upgrade_plans_with_suffix(
                JOIN computers c ON c.id = cs.computer_id
               WHERE cs.software_id = $1
                 AND COALESCE(c.reservation_state, 'available') = 'available'
+                -- Drain-before-restart: never upgrade (= rebuild + restart
+                -- forgefleetd on) a host with an IN-FLIGHT work_item build lease,
+                -- or the restart orphans the build → stale-heartbeat reap → wasted
+                -- attempt. That is exactly why long feature-task builds kept
+                -- failing while short ones landed: a 20-40min build gets caught by
+                -- the hourly upgrade wave. The host upgrades on a later tick once
+                -- it is idle between builds (a perpetually-busy host correctly
+                -- keeps its builds instead of being restarted out from under them).
+                AND NOT EXISTS (
+                    SELECT 1 FROM work_item_leases l
+                     WHERE l.computer_id = c.id AND l.released_at IS NULL
+                )
               ORDER BY c.name",
         )
         .bind(software_id)
