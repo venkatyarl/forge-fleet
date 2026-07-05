@@ -1482,6 +1482,20 @@ async fn run_ff_dispatch(
             if out.status.code() == Some(3) {
                 return Ok((backend.clone(), out));
             }
+            // A non-zero exit that STILL wrote a real diff (the backend edited
+            // files, then its own final verify/exit step failed) is salvageable
+            // work, not a discard — commit it and let CI judge, exactly like the
+            // timeout-salvage path above. Without this, switching to run_command_capture
+            // (so exit-3 no-ops surface) would silently drop these diffs.
+            if worktree_has_diff(&worktree.worktree_path) {
+                warn!(backend = %backend, code = ?out.status.code(), "run_ff_dispatch: backend exited non-zero but wrote a real diff — salvaging");
+                let _ =
+                    crate::circuit_breaker::record_provider_success(pg, computer_id, backend).await;
+                return Ok((
+                    backend.clone(),
+                    synthetic_output("salvaged diff after non-zero backend exit"),
+                ));
+            }
             let combined = format!(
                 "{}\n{}",
                 String::from_utf8_lossy(&out.stdout),
@@ -1624,8 +1638,10 @@ async fn run_backend_cli(backend: &str, cwd: &Path, prompt: &str) -> Result<Outp
             .arg(&cwd)
             .arg("--timeout")
             .arg(FF_TIMEOUT_SECS.to_string())
-            // Fail (exit 3) if the CLI exits 0 but changes nothing — a no-op run is
-            // a failed work_item, not a silent 'done' (catches stdin-pipe no-ops).
+            // Exit 3 (not 0) if the CLI exits 0 but changes nothing, so run_ff_dispatch
+            // can DISTINGUISH a real no-op from a silent stdin-pipe failure. A genuine
+            // no-op (the change already exists on main) is treated as "already done" →
+            // completed-without-PR, NOT a failure to requeue-to-death.
             .arg("--require-change")
             .arg(&prompt);
         if let Some(token) = gh_token {
@@ -1640,7 +1656,10 @@ async fn run_backend_cli(backend: &str, cwd: &Path, prompt: &str) -> Result<Outp
         // (not one shared dir) keeps concurrent slots from serializing on cargo's
         // target lock; it warms up on the slot's first build and stays warm after.
         cmd.env("CARGO_TARGET_DIR", slot_cargo_target(&cwd));
-        run_command_timeout(cmd, Duration::from_secs(FF_TIMEOUT_SECS + 30))
+        // capture (not _timeout): keep the Output for ANY exit so run_ff_dispatch
+        // can distinguish exit-3 (require-change no-op = already done) from a real
+        // failure. Only spawn/timeout become Err here.
+        run_command_capture(cmd, Duration::from_secs(FF_TIMEOUT_SECS + 30))
     })
     .await
     .context("join ff dispatch task")?
@@ -1977,6 +1996,33 @@ fn command_display(cmd: &Command) -> String {
     truncate_for_log(&s)
 }
 
+/// Like [`run_command_timeout`] but returns the `Output` for ANY exit code —
+/// it only errors on spawn failure or timeout. Used for the backend CLI, whose
+/// non-zero exits must be INSPECTED by the caller, not collapsed into a generic
+/// "command failed": in particular `ff cli --require-change` exits 3 on a no-op
+/// (the change already exists), which `run_ff_dispatch` must treat as "already
+/// done", NOT as a backend failure to retry/fail. (Bailing on exit 3 here made
+/// that handler dead code — an already-built feature task requeued to death.)
+fn run_command_capture(mut cmd: Command, timeout: Duration) -> Result<Output> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let program = command_display(&cmd);
+    let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
+    let start = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child
+                .wait_with_output()
+                .with_context(|| format!("collect output for {program}"));
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("command timed out after {:?}: {program}", timeout);
+        }
+        std::thread::sleep(Duration::from_millis(COMMAND_POLL_MS));
+    }
+}
+
 fn run_command_timeout(mut cmd: Command, timeout: Duration) -> Result<Output> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let program = command_display(&cmd);
@@ -2222,9 +2268,30 @@ mod tests {
             );
         }
     }
+    use super::run_command_capture;
     use anyhow::anyhow;
     use std::os::unix::process::ExitStatusExt;
     use std::process::{Command, Output};
+
+    #[test]
+    fn run_command_capture_returns_output_for_nonzero_exit() {
+        // The whole point of `capture` vs `timeout`: a `--require-change` no-op
+        // exits 3, and the caller must SEE that exit code — not receive an Err.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf hi; exit 3");
+        let out = run_command_capture(cmd, std::time::Duration::from_secs(10))
+            .expect("non-zero exit must be Ok, not Err");
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.stdout, b"hi");
+    }
+
+    #[test]
+    fn run_command_capture_returns_output_for_zero_exit() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("exit 0");
+        let out = run_command_capture(cmd, std::time::Duration::from_secs(10)).expect("clean run");
+        assert!(out.status.success());
+    }
 
     #[test]
     fn slot_cargo_target_is_per_slot_with_shared_fallback() {
