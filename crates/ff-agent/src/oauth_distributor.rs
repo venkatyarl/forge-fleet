@@ -331,6 +331,16 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
         let cmd = format!(
             "set -e\n\
              echo \"== distributing {provider} cred file to {target} ==\"\n\
+             __ff_local_ips() {{ (hostname -I 2>/dev/null; \
+                 ifconfig 2>/dev/null | awk '/inet /{{print $2}}') | tr ' ' '\\n'; }}\n\
+             if __ff_local_ips | grep -Fxq {primary_ip}; then\n\
+             echo '(on target — local write, no SSH)'\n\
+             mkdir -p \"$(dirname {cred_path})\"\n\
+             umask 077\n\
+             printf '%s' '{b64}' | base64 -d > {cred_path}\n\
+             chmod 600 {cred_path}\n\
+             echo distributed: $(stat -c %y {cred_path} 2>/dev/null || stat -f %Sm {cred_path})\n\
+             else\n\
              ssh -T {ssh_bypass} -o StrictHostKeyChecking=accept-new \
                  {ssh_user}@{primary_ip} bash -l <<'FF_OAUTH_EOF'\n\
              mkdir -p \"$(dirname {cred_path})\"\n\
@@ -338,7 +348,8 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
              printf '%s' '{b64}' | base64 -d > {cred_path}\n\
              chmod 600 {cred_path}\n\
              echo distributed: $(stat -c %y {cred_path} 2>/dev/null || stat -f %Sm {cred_path})\n\
-             FF_OAUTH_EOF\n",
+             FF_OAUTH_EOF\n\
+             fi\n",
             provider = provider.name,
             target = name,
             ssh_user = ssh_user,
