@@ -41,6 +41,7 @@ const mainSections: NavSection[] = [
     icon: '📋',
     items: [
       { to: '/my-tasks', label: 'My Tasks', icon: '✅' },
+      { to: '/build-pipeline', label: 'Build Pipeline', icon: '⚡' },
       { to: '/projects', label: 'Projects', icon: '📁' },
       { to: '/planning', label: 'Planning Hub', icon: '🗓️' },
       { to: '/workflow', label: 'Workflows', icon: '🔄' },
