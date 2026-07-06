@@ -18,6 +18,7 @@ import { lazyNamed } from './lib/lazy'
 
 const MissionControl = lazyNamed(() => import('./pages/MissionControl'), 'MissionControl')
 const MyTasks = lazyNamed(() => import('./pages/MyTasks'), 'MyTasks')
+const BuildPipeline = lazyNamed(() => import('./pages/BuildPipeline'), 'BuildPipeline')
 const Projects = lazyNamed(() => import('./pages/Projects'), 'Projects')
 const PlanningHub = lazyNamed(() => import('./pages/PlanningHub'), 'PlanningHub')
 const WorkflowWorkbench = lazyNamed(() => import('./pages/WorkflowWorkbench'), 'WorkflowWorkbench')
@@ -106,6 +107,7 @@ function Shell() {
 const ROUTE_TITLES: Record<string, string> = {
   '/': 'Mission Control',
   '/my-tasks': 'My Tasks',
+  '/build-pipeline': 'Build Pipeline',
   '/projects': 'Projects',
   '/planning': 'Planning Hub',
   '/workflow': 'Workflows',
@@ -161,6 +163,7 @@ export default function App() {
         <Route path="chats" element={<Navigate to="/brain" replace />} />
         {/* Project Management */}
         <Route path="my-tasks" element={page(MyTasks)} handle={{ title: 'My Tasks' }} />
+        <Route path="build-pipeline" element={page(BuildPipeline)} handle={{ title: 'Build Pipeline' }} />
         <Route path="projects" element={page(Projects)} handle={{ title: 'Projects' }} />
         <Route path="planning" element={page(PlanningHub)} handle={{ title: 'Planning Hub' }} />
         <Route path="workflow" element={page(WorkflowWorkbench)} handle={{ title: 'Workflows' }} />
