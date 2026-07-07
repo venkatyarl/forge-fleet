@@ -793,12 +793,12 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     // `fleet_secrets.cortex_index_mode=off`.
     if let Some(pg_pool) = operational_store.pg_pool().cloned() {
         info!(
-            "starting subsystem: cortex reindex tick (hourly, leader-gated, gate=fleet_secrets.cortex_index_mode default on)"
+            "starting subsystem: cortex reindex tick (every 10min, leader-gated, corpora=fleet_secrets.cortex_reindex_corpora default 'forge-fleet', gate=fleet_secrets.cortex_index_mode default on)"
         );
         subsystem_tasks.push(ff_brain::spawn_reindex_loop(
             pg_pool,
             worker_name.clone(),
-            3600,
+            600,
             shutdown_rx.clone(),
         ));
     }
