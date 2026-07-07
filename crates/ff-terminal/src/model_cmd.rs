@@ -1826,6 +1826,7 @@ async fn handle_model_catalog_add(
     Ok(())
 }
 
+/// Lists running inference servers across the fleet.
 /// `ff model deployments` handler — extracted verbatim from the
 /// `handle_model` dispatch arm. `pool` by value (cheap Arc clone) so the body's
 /// `&pool` / `pool.clone()` uses are unchanged.
