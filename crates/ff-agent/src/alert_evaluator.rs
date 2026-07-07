@@ -589,6 +589,13 @@ async fn evaluate_current(
         }
         "disk_free_gb" => {
             let v = beat.map(|b| b.load.disk_free_gb).unwrap_or(0.0);
+            // A live beat reporting exactly 0.0 free disk is a sampling
+            // artifact from failed disk-stat collection, not a real full disk
+            // (Taylor false-paged at 2:48 AM with 2.2 TB actually free). Real
+            // near-full disks still report a small non-zero value and fire.
+            if v == 0.0 {
+                return Ok((false, None, None));
+            }
             Ok((eval_numeric(cond, v), Some(v), None))
         }
         "gpu_pct" => {
@@ -972,6 +979,34 @@ mod tests {
                 "metric {metric} misclassified",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn disk_free_zero_sample_does_not_fire_low_disk() {
+        let pg = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://forgefleet:forgefleet@localhost/forgefleet")
+            .expect("valid lazy postgres URL");
+        let cond = parse_condition("< 20");
+
+        let mut zero_sample = ff_pulse::beat_v2::PulseBeatV2::skeleton("taylor");
+        zero_sample.load.disk_free_gb = 0.0;
+        let (matches, numeric_value, string_value) =
+            evaluate_current("disk_free_gb", &cond, "taylor", &[zero_sample], &pg)
+                .await
+                .expect("disk_free_gb evaluation should not hit the DB");
+        assert!(!matches);
+        assert_eq!(numeric_value, None);
+        assert_eq!(string_value, None);
+
+        let mut low_nonzero = ff_pulse::beat_v2::PulseBeatV2::skeleton("taylor");
+        low_nonzero.load.disk_free_gb = 5.0;
+        let (matches, numeric_value, string_value) =
+            evaluate_current("disk_free_gb", &cond, "taylor", &[low_nonzero], &pg)
+                .await
+                .expect("disk_free_gb evaluation should not hit the DB");
+        assert!(matches);
+        assert_eq!(numeric_value, Some(5.0));
+        assert_eq!(string_value, None);
     }
 
     #[test]
