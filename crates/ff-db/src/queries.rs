@@ -7689,6 +7689,26 @@ pub async fn pg_agent_viable_computer_ids(pool: &PgPool) -> Result<Vec<uuid::Uui
     Ok(rows)
 }
 
+/// The canonical GitHub SSH alias for `github.com` — `(alias_name, identity_file)`
+/// — used to clone project repos with an authorized identity fleet-wide. The bare
+/// `git@github.com:` host resolves (per node) to a default key that is
+/// unauthorized on most fleet nodes, so the dispatcher must clone via this
+/// canonical alias instead (flagged in `github_ssh_aliases.is_canonical`, seeded
+/// by migration V161). Returns `None` when no alias is flagged canonical (e.g. an
+/// older DB) so callers fall back to the URL as-is — never worse than before.
+pub async fn pg_canonical_github_alias(pool: &PgPool) -> Result<Option<(String, String)>> {
+    let row = sqlx::query_as::<_, (String, String)>(
+        "SELECT alias_name, identity_file
+           FROM github_ssh_aliases
+          WHERE hostname = 'github.com' AND is_canonical
+          ORDER BY alias_name
+          LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 /// Upsert one node's availability for an LLM-CLI backend (capability A2). Called
 /// by the per-node detector tick from `backend_detect::detect_backends`.
 /// `last_auth_ok_at` advances only on a passing auth probe; `last_checked_at`

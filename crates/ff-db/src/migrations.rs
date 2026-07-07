@@ -783,6 +783,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "notify_dedup",
         sql: schema::SCHEMA_V160_NOTIFY_DEDUP,
     },
+    PgMigration {
+        version: 161,
+        name: "canonical_github_alias",
+        sql: schema::SCHEMA_V161_CANONICAL_GITHUB_ALIAS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
