@@ -691,6 +691,23 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 15b.0b) Task-history retention — every 6h, leader-gated.
+    // Prunes terminal rows older than `fleet_secrets.task_retention_days` (default
+    // 7) from the ephemeral fleet_tasks/deferred_tasks tables so they can't grow
+    // unbounded (they hit ~45k/~18k before this existed). Opt out with
+    // `fleet_secrets.task_retention_mode=off`. Never touches PM work_items.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!(
+            "starting subsystem: task-history retention (6h, leader-gated, gate=fleet_secrets.task_retention_mode default on)"
+        );
+        subsystem_tasks.push(ff_agent::task_retention::spawn_retention_loop(
+            pg_pool,
+            worker_name.clone(),
+            21_600,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 15b.1) Pillar 4 lease takeover — every 60s, leader-gated.
     // Reclaims active work_item leases whose builder host stopped heartbeating,
     // freeing the slot and returning the item to ready for another fleet slot.

@@ -7596,6 +7596,38 @@ pub async fn pg_reap_orphaned_work_items(pool: &PgPool, min_age_secs: i64) -> Re
     Ok(res.rows_affected())
 }
 
+/// Prune terminal (`completed`/`failed`/`cancelled`) rows older than
+/// `retention_days` from the EPHEMERAL task-history tables (`fleet_tasks`,
+/// `deferred_tasks`) so they can't accumulate unbounded (observed 2026-07-07:
+/// ~45k fleet_tasks + ~18k deferred_tasks with no pruning). Returns
+/// `(fleet_tasks_deleted, deferred_tasks_deleted)`. Deliberately does NOT touch
+/// the PM `work_items` table — those rows are operator-meaningful, not execution
+/// history.
+pub async fn pg_prune_terminal_task_history(
+    pool: &PgPool,
+    retention_days: i32,
+) -> Result<(u64, u64)> {
+    let fleet = sqlx::query(
+        "DELETE FROM fleet_tasks
+          WHERE status IN ('completed','failed','cancelled')
+            AND created_at < NOW() - make_interval(days => $1)",
+    )
+    .bind(retention_days)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    let deferred = sqlx::query(
+        "DELETE FROM deferred_tasks
+          WHERE status IN ('completed','failed','cancelled')
+            AND created_at < NOW() - make_interval(days => $1)",
+    )
+    .bind(retention_days)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok((fleet, deferred))
+}
+
 /// Work_items ready to schedule: explicitly status='ready', leaf kind='task',
 /// no active lease, and every blocking dependency (work_item_relations
 /// relation_type='blocks', from_id blocks to_id) is 'merged'. The dep clause is
