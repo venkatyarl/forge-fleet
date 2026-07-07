@@ -836,7 +836,7 @@ impl LeaderTick {
                         END, \
                         'attempts', stale.attempts + 1, \
                         'escalated_to_operator_at', CASE \
-                            WHEN stale.attempts >= 2 THEN NOW() \
+                            WHEN stale.attempts >= 2 THEN NOW()::text \
                             ELSE t.payload->>'escalated_to_operator_at' \
                         END \
                     ) \
