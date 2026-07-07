@@ -12,6 +12,12 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 const STALE_HEARTBEAT_SECS: i64 = 5 * 60;
+/// Hard ceiling on how long a single lease may be HELD regardless of heartbeat.
+/// The stale-heartbeat reaper cannot reclaim a wedged dispatch whose daemon keeps
+/// the heartbeat fresh (the "building forever with a live heartbeat" wedge —
+/// observed 2026-07-06: 24 min, 0 output). This age cap reclaims it so the slot
+/// self-heals. Set well above a real build (Lane-2 dispatch caps at ~18.5 min).
+const MAX_LEASE_DURATION_SECS: i64 = 25 * 60;
 /// Failure-convergence ceiling — must match `work_item_scheduler::MAX_BUILD_ATTEMPTS`.
 /// After this many reaped attempts the reaper marks the item `failed` instead of
 /// re-queuing it forever (the escalation ladder takes over from there).
@@ -22,13 +28,17 @@ pub async fn evaluate_lease_takeover(pg: &PgPool, _worker_name: &str) -> Result<
         return Ok(0);
     }
 
-    let reclaimed =
-        ff_db::pg_reap_stale_work_item_leases(pg, STALE_HEARTBEAT_SECS, MAX_BUILD_ATTEMPTS).await?
-            as usize;
+    let reclaimed = ff_db::pg_reap_stale_work_item_leases(
+        pg,
+        STALE_HEARTBEAT_SECS,
+        MAX_LEASE_DURATION_SECS,
+        MAX_BUILD_ATTEMPTS,
+    )
+    .await? as usize;
     if reclaimed > 0 {
         warn!(
             reclaimed,
-            "lease_takeover: reclaimed stale work_item leases"
+            "lease_takeover: reclaimed stale/overlong work_item leases"
         );
     }
     Ok(reclaimed)
