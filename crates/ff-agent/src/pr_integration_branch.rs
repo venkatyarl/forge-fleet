@@ -23,7 +23,10 @@ use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow};
+use ff_db::DbClient;
+use regex::Regex;
 use tokio::process::Command;
+use uuid::Uuid;
 
 use crate::pr_integration::IntegrationPlan;
 
@@ -97,6 +100,47 @@ pub fn integration_branch_name(plan: &IntegrationPlan) -> String {
     // `integration/<base>` with any slashes in the base flattened so the ref is
     // a single path segment (avoids `integration/feature/x` nesting surprises).
     format!("integration/{}", plan.target_branch.replace('/', "-"))
+}
+
+pub async fn create_integration_plan(parent_uuid: Uuid, db: &DbClient) -> Result<IntegrationPlan> {
+    let children = db
+        .get_children(parent_uuid)
+        .await
+        .with_context(|| format!("load children for parent work item {parent_uuid}"))?;
+    Ok(create_integration_plan_from_branches(
+        parent_uuid,
+        children.into_iter().filter_map(|child| child.branch_name),
+    ))
+}
+
+fn create_integration_plan_from_branches(
+    parent_uuid: Uuid,
+    branches: impl IntoIterator<Item = String>,
+) -> IntegrationPlan {
+    let pr_re = Regex::new(r"wi/[^-]+-(\d+)").expect("valid PR number regex");
+    let mut child_branches = Vec::new();
+    let mut pr_numbers = Vec::new();
+
+    for branch in branches {
+        if !branch.starts_with("wi/") {
+            continue;
+        }
+
+        if let Some(pr_number) = pr_re
+            .captures(&branch)
+            .and_then(|captures| captures.get(1))
+            .and_then(|m| m.as_str().parse::<u32>().ok())
+        {
+            pr_numbers.push(pr_number);
+        }
+        child_branches.push(branch);
+    }
+
+    IntegrationPlan {
+        child_branches,
+        pr_numbers,
+        target_branch: format!("integrate/{parent_uuid}"),
+    }
 }
 
 /// Build an integration branch by merging every child of `plan` onto a fresh
@@ -232,6 +276,13 @@ mod tests {
         }
     }
 
+    fn plan_from_mocked_child_branches(parent_uuid: Uuid, branches: &[&str]) -> IntegrationPlan {
+        create_integration_plan_from_branches(
+            parent_uuid,
+            branches.iter().map(|branch| branch.to_string()),
+        )
+    }
+
     #[test]
     fn branch_name_flattens_base_slashes() {
         assert_eq!(
@@ -242,6 +293,46 @@ mod tests {
             integration_branch_name(&plan("feature/x", &[])),
             "integration/feature-x"
         );
+    }
+
+    #[test]
+    fn create_integration_plan_filters_to_work_item_branches() {
+        let parent_uuid = Uuid::parse_str("730793b0-0b3c-4c69-9c76-000000000001").unwrap();
+        let plan = plan_from_mocked_child_branches(
+            parent_uuid,
+            &[
+                "wi/730793b00b3c-42",
+                "feature/unrelated",
+                "wi/abc-7",
+                "main",
+            ],
+        );
+
+        assert_eq!(
+            plan.child_branches,
+            vec!["wi/730793b00b3c-42", "wi/abc-7"]
+        );
+        assert_eq!(plan.target_branch, format!("integrate/{parent_uuid}"));
+    }
+
+    #[test]
+    fn create_integration_plan_extracts_pr_numbers_from_work_item_branches() {
+        let parent_uuid = Uuid::parse_str("730793b0-0b3c-4c69-9c76-000000000002").unwrap();
+        let plan = plan_from_mocked_child_branches(
+            parent_uuid,
+            &[
+                "wi/alpha-123",
+                "wi/no-pr-number",
+                "release/wi/not-a-child-999",
+                "wi/beta-456-extra",
+            ],
+        );
+
+        assert_eq!(
+            plan.child_branches,
+            vec!["wi/alpha-123", "wi/no-pr-number", "wi/beta-456-extra"]
+        );
+        assert_eq!(plan.pr_numbers, vec![123, 456]);
     }
 
     #[test]
