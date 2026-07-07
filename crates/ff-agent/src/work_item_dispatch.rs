@@ -577,8 +577,25 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         &worktree.task_branch,
     )?;
     if !has_commits {
-        mark_completed_without_pr(&pg, &item).await?;
-        mark_worktree_cleaned(&pg, item.work_item_id).await?;
+        // NO-OP IS NOT SUCCESS. A build work_item that produced no diff means the
+        // required change was never applied — the backend stalled, refused, or
+        // claimed "done" without editing (observed 2026-07-07: codex ran to a
+        // clean exit on a moderate task but left the worktree clean, and the item
+        // was silently marked `done` with no PR — a phantom success). Route it
+        // through the failure-aware retry ladder instead: requeue with context so
+        // the next attempt (or the cloud lane) can try, converging to terminal
+        // `failed` after MAX_DISPATCH_ATTEMPTS so a genuinely-unbuildable task
+        // surfaces to a human rather than masquerading as completed.
+        warn!(
+            work_item_id = %item.work_item_id,
+            "work_item_dispatch: backend produced no diff (no commits) — treating as failed no-op, not done"
+        );
+        requeue_or_fail(
+            &pg,
+            &item,
+            "backend produced no diff (no commits) — required change not applied",
+        )
+        .await?;
         remove_worktree(&item.repo_path, &worktree.worktree_path)?;
         return Ok(());
     }
@@ -836,23 +853,6 @@ async fn mark_ready_for_review(
     .await?;
 
     release_slot_and_lease_tx(&mut tx, item, "ready for review").await?;
-    tx.commit().await?;
-    Ok(())
-}
-
-async fn mark_completed_without_pr(pg: &PgPool, item: &AssignedWorkItem) -> Result<()> {
-    let mut tx = pg.begin().await?;
-    sqlx::query(
-        "UPDATE work_items
-            SET status = 'done',
-                completed_at = NOW(),
-                last_error = NULL
-          WHERE id = $1",
-    )
-    .bind(item.work_item_id)
-    .execute(&mut *tx)
-    .await?;
-    release_slot_and_lease_tx(&mut tx, item, "no commits produced").await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1152,20 +1152,6 @@ async fn mark_worktree_failed(pg: &PgPool, work_item_id: Uuid, error: &str) -> R
     )
     .bind(work_item_id)
     .bind(truncate_for_db(error))
-    .execute(pg)
-    .await?;
-    Ok(())
-}
-
-async fn mark_worktree_cleaned(pg: &PgPool, work_item_id: Uuid) -> Result<()> {
-    sqlx::query(
-        "UPDATE work_item_worktrees
-            SET status = 'cleaned',
-                cleaned_at = NOW()
-          WHERE work_item_id = $1
-            AND status IN ('active', 'failed')",
-    )
-    .bind(work_item_id)
     .execute(pg)
     .await?;
     Ok(())
