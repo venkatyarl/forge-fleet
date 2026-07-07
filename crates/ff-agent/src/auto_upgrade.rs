@@ -273,9 +273,13 @@ pub async fn resolve_upgrade_plans_with_suffix(
                 // does not happen inside double-quoted shell strings, so
                 // convert leading `~/` → `$HOME/` here. The playbook can then
                 // safely use `cd "{{source_tree_path}}"` on every platform.
+                // Fallback ONLY when source_tree_path is NULL (unmaterialized node).
+                // Auto-upgrade targets workers (the leader self-upgrades via its own
+                // path), so default to the canonical per-slot worker location — never
+                // regress a new worker to ~/projects (2026-07-07 layout migration).
                 let raw_path = source_tree_path
                     .as_deref()
-                    .unwrap_or("~/projects/forge-fleet");
+                    .unwrap_or("~/.forgefleet/sub-agents/sub-agent-0/forge-fleet");
                 let expanded_path = if let Some(rest) = raw_path.strip_prefix("~/") {
                     format!("$HOME/{rest}")
                 } else {

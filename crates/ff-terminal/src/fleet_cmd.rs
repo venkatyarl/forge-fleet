@@ -4087,6 +4087,15 @@ fn expand_home(raw: &str) -> String {
 /// `os_family` is taken from the `computers` row — never hardcoded per host.
 /// DGX (`linux-dgx`) builds with `-j 2` to keep LLVM RAM pressure manageable
 /// on the 4-core GB10 boxes.
+/// Source-tree fallbacks used ONLY when a node's `computers.source_tree_path` is
+/// NULL (a freshly-enrolled node not yet materialized by a heartbeat). The LEADER
+/// builds from the operator's dev tree; every WORKER builds from the canonical
+/// per-slot location so a new worker never regresses back to `~/projects`
+/// (post-2026-07-07 migration — workers hold ff work only under `~/.forgefleet`).
+/// In practice the leader's row is always set, so it never hits the worker default.
+const LEADER_SOURCE_TREE: &str = "~/projects/forge-fleet";
+const CANONICAL_WORKER_SOURCE_TREE: &str = "~/.forgefleet/sub-agents/sub-agent-0/forge-fleet";
+
 fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
     let src = expand_home(source_tree_path);
     // -p forge-fleet builds the forgefleetd daemon bin; -p ff-terminal builds
@@ -4263,7 +4272,7 @@ async fn refresh_local_leader_if_self(pool: &sqlx::PgPool) -> Option<(bool, Stri
         // Leader is a different host — --all can't restart a remote leader safely.
         return None;
     }
-    let src = expand_home(&stp.unwrap_or_else(|| "~/projects/forge-fleet".into()));
+    let src = expand_home(&stp.unwrap_or_else(|| LEADER_SOURCE_TREE.into()));
     // Guard: only act on a CLEAN tree already at origin/main HEAD. A plain build
     // then equals the merged/deployed state; we never touch a dirty dev tree.
     let clean = run_local_shell(
@@ -4545,7 +4554,7 @@ async fn handle_fleet_deploy(
                 ssh_port,
                 os_family,
                 total_ram_gb,
-                source_tree_path: stp.unwrap_or_else(|| "~/projects/forge-fleet".into()),
+                source_tree_path: stp.unwrap_or_else(|| CANONICAL_WORKER_SOURCE_TREE.into()),
             },
         )
         .collect()
@@ -4577,7 +4586,7 @@ async fn handle_fleet_deploy(
                     ssh_port,
                     os_family,
                     total_ram_gb,
-                    source_tree_path: stp.unwrap_or_else(|| "~/projects/forge-fleet".into()),
+                    source_tree_path: stp.unwrap_or_else(|| CANONICAL_WORKER_SOURCE_TREE.into()),
                 }]
             }
             None => anyhow::bail!(
@@ -5252,6 +5261,22 @@ mod route_tests {
         let p = super::deploy_playbook("linux", "~/projects/forge-fleet");
         assert!(p.contains("systemctl --user"));
         assert!(!p.contains("launchctl"));
+    }
+
+    /// Layout invariant (2026-07-07 migration): a NULL-source-tree WORKER must
+    /// default under ~/.forgefleet (never ~/projects), while the leader keeps its
+    /// dev tree. Guards against a regression that would rebuild a fresh worker's
+    /// source back into ~/projects.
+    #[test]
+    fn source_tree_defaults_keep_worker_under_forgefleet() {
+        assert_eq!(super::LEADER_SOURCE_TREE, "~/projects/forge-fleet");
+        assert!(
+            super::CANONICAL_WORKER_SOURCE_TREE
+                .starts_with("~/.forgefleet/sub-agents/sub-agent-0/"),
+            "worker default must live under ~/.forgefleet, got {}",
+            super::CANONICAL_WORKER_SOURCE_TREE
+        );
+        assert!(!super::CANONICAL_WORKER_SOURCE_TREE.contains("/projects/"));
     }
 }
 
