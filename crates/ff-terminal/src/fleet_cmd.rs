@@ -4273,10 +4273,16 @@ async fn refresh_local_leader_if_self(pool: &sqlx::PgPool) -> Option<(bool, Stri
         return None;
     }
     let src = expand_home(&stp.unwrap_or_else(|| LEADER_SOURCE_TREE.into()));
-    // Guard: only act on a CLEAN tree already at origin/main HEAD. A plain build
-    // then equals the merged/deployed state; we never touch a dirty dev tree.
+    // Guard: only act on a tree with no TRACKED modifications, already at
+    // origin/main HEAD. A plain build then equals the merged/deployed state; we
+    // never touch a dirty dev tree. `--untracked-files=no` deliberately IGNORES
+    // untracked files (operator artifacts like `research/`, `graphify-out`): the
+    // leader-refresh playbook only `cargo build`s from tracked HEAD and never
+    // resets/cleans, so an untracked dir can't change the build and must NOT block
+    // the auto-refresh — an untracked `research/` silently forced a manual Taylor
+    // rebuild on every deploy this session.
     let clean = run_local_shell(
-        &format!("cd \"{src}\" && [ -z \"$(git status --porcelain)\" ] && \
+        &format!("cd \"{src}\" && [ -z \"$(git status --porcelain --untracked-files=no)\" ] && \
                   git fetch origin -q && [ \"$(git rev-parse HEAD)\" = \"$(git rev-parse origin/main)\" ]"),
         120,
     )
