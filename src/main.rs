@@ -1198,54 +1198,48 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     // collector finds ff/forgefleetd even when PATH omits ~/.local/bin.)
     if let Some(pg_pool) = operational_store.pg_pool().cloned() {
         info!("starting subsystem: version-check tick (6h, per-node)");
-        let mut shutdown_rx_ver = shutdown_rx.clone();
         let ver_worker = worker_name.clone();
-        subsystem_tasks.push(tokio::spawn(async move {
-            // Settle briefly after startup, then run an initial pass + every 6h.
-            tokio::time::sleep(std::time::Duration::from_secs(45)).await;
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = shutdown_rx_ver.changed() => break,
-                    _ = tick.tick() => {
-                        match ff_agent::version_check::version_check_pass(&pg_pool).await {
-                            Ok(s) => info!(
-                                node = %ver_worker,
-                                tools = s.total_keys,
-                                drift = s.drifted_keys.len(),
-                                "version-check pass complete"
-                            ),
-                            Err(e) => warn!(node = %ver_worker, error = %e, "version-check pass failed"),
-                        }
-                        // Self-built LATEST refresh — UN-GATED (version CHECK is
-                        // not the auto-UPGRADE; otherwise `ff fleet versions`
-                        // shows a frozen phantom LATEST whenever auto-upgrade is
-                        // paused). Leader-only: it git-resolves the leader's tree.
-                        let is_leader: bool = sqlx::query_scalar::<_, bool>(
-                            "SELECT EXISTS(SELECT 1 FROM fleet_leader_state \
-                              WHERE member_name = $1 \
-                                AND heartbeat_at > NOW() - INTERVAL '60 seconds')",
-                        )
-                        .bind(&ver_worker)
-                        .fetch_one(&pg_pool)
-                        .await
-                        .unwrap_or(false);
-                        if is_leader {
-                            match ff_agent::auto_upgrade::refresh_self_built_latest_versions(
-                                &pg_pool,
-                            )
-                            .await
-                            {
-                                Ok(n) => info!(updated = n, "self-built LATEST refreshed (un-gated)"),
-                                Err(e) => warn!(error = %e, "self-built LATEST refresh failed"),
-                            }
-                        }
+        let version_check_tick = move |_run| {
+            let pg_pool = pg_pool.clone();
+            let ver_worker = ver_worker.clone();
+            async move {
+                match ff_agent::version_check::version_check_pass(&pg_pool).await {
+                    Ok(s) => info!(
+                        node = %ver_worker,
+                        tools = s.total_keys,
+                        drift = s.drifted_keys.len(),
+                        "version-check pass complete"
+                    ),
+                    Err(e) => warn!(node = %ver_worker, error = %e, "version-check pass failed"),
+                }
+                // Self-built LATEST refresh — UN-GATED (version CHECK is
+                // not the auto-UPGRADE; otherwise `ff fleet versions`
+                // shows a frozen phantom LATEST whenever auto-upgrade is
+                // paused). Leader-only: it git-resolves the leader's tree.
+                let is_leader: bool = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM fleet_leader_state \
+                      WHERE member_name = $1 \
+                        AND heartbeat_at > NOW() - INTERVAL '60 seconds')",
+                )
+                .bind(&ver_worker)
+                .fetch_one(&pg_pool)
+                .await
+                .unwrap_or(false);
+                if is_leader {
+                    match ff_agent::auto_upgrade::refresh_self_built_latest_versions(&pg_pool).await
+                    {
+                        Ok(n) => info!(updated = n, "self-built LATEST refreshed (un-gated)"),
+                        Err(e) => warn!(error = %e, "self-built LATEST refresh failed"),
                     }
                 }
             }
-        }));
+        };
+        subsystem_tasks.push(ff_agent::tick_registry::TickRegistry::register(
+            "version-check",
+            std::time::Duration::from_secs(6 * 3600),
+            shutdown_rx.clone(),
+            version_check_tick,
+        ));
     }
 
     // 20b1) DSN-of-record cache-mirror tick — per-node, ONLY when the operator
