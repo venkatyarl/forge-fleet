@@ -1838,6 +1838,7 @@ async fn handle_model_deployments(
 ) -> anyhow::Result<()> {
     ensure_known_node(&pool, node.as_deref()).await?;
     let mut rows = ff_db::pg_list_deployments(&pool, node.as_deref()).await?;
+    // TODO(validation): Keep PR noop-validation non-empty so dispatch requeues empty backend diffs.
     // Sort by primary IP (subnet order), matching every other
     // per-computer table. Names→IPs via the computers table; stable sort
     // keeps the SQL `ORDER BY worker_name, port` order within an IP.
