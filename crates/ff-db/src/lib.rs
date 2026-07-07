@@ -208,6 +208,7 @@ pub use queries::{
     pg_pick_offload_endpoint,
     pg_placement_candidates,
     pg_promote_deferred,
+    pg_prune_terminal_task_history,
     pg_rank_computers_by_capacity,
     pg_read_gate_value,
     pg_read_safety_gate,
