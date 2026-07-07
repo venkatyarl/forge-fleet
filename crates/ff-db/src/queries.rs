@@ -7405,16 +7405,26 @@ pub async fn pg_rank_computers_by_capacity(pool: &PgPool) -> Result<Vec<HostCapa
 pub async fn pg_reap_stale_work_item_leases(
     pool: &PgPool,
     stale_secs: i64,
+    max_lease_age_secs: i64,
     max_attempts: i32,
 ) -> Result<u64> {
+    // Reap a lease when EITHER: its heartbeat went stale (builder crashed), OR the
+    // lease has simply been held too long regardless of heartbeat (`created_at`
+    // age). The age branch catches the wedge the stale branch can't: a dispatch
+    // hangs but the daemon's OUTER heartbeat loop keeps `heartbeat_at` fresh, so
+    // the work_item sits `building` forever (observed 2026-07-06: a fleet build
+    // wedged 24 min with a 12s-fresh heartbeat, 0 output). A hard age cap reclaims
+    // it so the slot self-heals and the item requeues/fails.
     let rows = sqlx::query(
         "SELECT id, work_item_id, sub_agent_id
            FROM work_item_leases
           WHERE released_at IS NULL
-            AND heartbeat_at < NOW() - make_interval(secs => $1)
+            AND (heartbeat_at < NOW() - make_interval(secs => $1)
+                 OR created_at   < NOW() - make_interval(secs => $2))
           ORDER BY heartbeat_at ASC",
     )
     .bind(stale_secs as f64)
+    .bind(max_lease_age_secs as f64)
     .fetch_all(pool)
     .await?;
 
@@ -7430,13 +7440,18 @@ pub async fn pg_reap_stale_work_item_leases(
                 "UPDATE work_item_leases
                     SET lease_state = 'stale',
                         released_at = NOW(),
-                        release_reason = 'stale-heartbeat takeover'
+                        release_reason = CASE
+                            WHEN heartbeat_at < NOW() - make_interval(secs => $2)
+                              THEN 'stale-heartbeat takeover'
+                            ELSE 'max-build-duration exceeded' END
                   WHERE id = $1
                     AND released_at IS NULL
-                    AND heartbeat_at < NOW() - make_interval(secs => $2)",
+                    AND (heartbeat_at < NOW() - make_interval(secs => $2)
+                         OR created_at   < NOW() - make_interval(secs => $3))",
             )
             .bind(lease_id)
             .bind(stale_secs as f64)
+            .bind(max_lease_age_secs as f64)
             .execute(&mut *tx)
             .await?;
 

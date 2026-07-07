@@ -20,6 +20,11 @@ use tracing::{info, warn};
 /// Lease heartbeat deadline: a slot must heartbeat within this window or its
 /// lease is reaped and the work_item re-queued.
 const LEASE_STALE_SECS: i64 = 180;
+/// Hard ceiling on lease HOLD time regardless of heartbeat — reclaims a wedged
+/// dispatch that keeps its heartbeat fresh but makes no progress (the
+/// "building forever, live heartbeat" wedge). Above a real build's Lane-2 cap
+/// (~18.5 min).
+const MAX_LEASE_DURATION_SECS: i64 = 25 * 60;
 /// Lease lifetime granted at assignment (refreshed by heartbeats).
 const LEASE_GRANT_SECS: i64 = 600;
 /// Max assignments per tick (back-pressure; the rest wait for the next tick).
@@ -36,8 +41,13 @@ const MAX_BUILD_ATTEMPTS: i32 = 3;
 
 /// One scheduler pass. Returns the number of work_items assigned this tick.
 pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
-    let reaped =
-        ff_db::pg_reap_stale_work_item_leases(pg, LEASE_STALE_SECS, MAX_BUILD_ATTEMPTS).await?;
+    let reaped = ff_db::pg_reap_stale_work_item_leases(
+        pg,
+        LEASE_STALE_SECS,
+        MAX_LEASE_DURATION_SECS,
+        MAX_BUILD_ATTEMPTS,
+    )
+    .await?;
     if reaped > 0 {
         warn!(
             reaped,
