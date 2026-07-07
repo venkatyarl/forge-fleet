@@ -109,11 +109,21 @@ pub async fn codegen_apply(
             .collect::<Vec<_>>();
         if let Some((program, args)) = verify_command(repo_path, &changed_packages) {
             let check_name = format_command(&program, &args);
-            let check = Command::new(&program)
-                .args(&args)
-                .current_dir(repo_path)
-                .output()
-                .with_context(|| format!("run {check_name} in {}", repo_path.display()))?;
+            // Run the verify subprocess OFF the async runtime. It can take MINUTES
+            // (cargo check/build on the changed crates); a blocking
+            // Command::output() here runs on the tokio worker thread and starves
+            // the dispatch HeartbeatGuard task (same runtime), freezing the lease
+            // heartbeat. The scheduler's stale-heartbeat reaper (180s) then
+            // reclaims the ACTIVE build as "stalled", burning all 3 attempts on
+            // mechanical tasks that never reach a clean cloud lane — the root
+            // cause of #62 (observed on 00adb7e7 + 767afcc6, each reaped ~190s).
+            let rp = repo_path.to_path_buf();
+            let check = tokio::task::spawn_blocking(move || {
+                Command::new(&program).args(&args).current_dir(&rp).output()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("verify subprocess task panicked: {e}"))?
+            .with_context(|| format!("run {check_name} in {}", repo_path.display()))?;
 
             if !check.status.success() {
                 let err = command_error(&check_name, &check);
