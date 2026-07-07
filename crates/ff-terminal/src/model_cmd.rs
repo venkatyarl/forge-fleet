@@ -2933,6 +2933,7 @@ enum DistributeSelectError {
 /// runtime)` — distributing to one of them is a redundant rsync that just
 /// overwrites the existing copy, so they're never auto-picked. A pinned
 /// host is honored only when it's eligible and not already a holder.
+// TODO(validation): keep model deployment validation wired to a real diff.
 fn select_distribute_target<'a>(
     candidates: &'a [DistributeCandidate],
     excludes: &std::collections::HashSet<String>,
