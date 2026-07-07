@@ -103,6 +103,7 @@ pub use queries::{
     pg_attach_training_deferred_task,
     pg_bump_vault_node_hits,
     pg_cancel_deferred,
+    pg_canonical_github_alias,
     pg_claim_deferred,
     pg_cortex_resolution_stats,
     pg_cortex_suspicious_externs,

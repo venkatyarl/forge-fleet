@@ -9948,3 +9948,31 @@ CREATE TABLE IF NOT EXISTS operator_notify_dedup (
     last_sent  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 "#;
+
+// ─── V161: mark the canonical GitHub SSH alias ──────────────────────────────
+//
+// The Pillar-4 dispatcher clones project repos with the BARE `git@github.com:`
+// URL, which resolves (via each node's ~/.ssh/config) to a per-node default
+// key — `id_rsa` — that is NOT authorized on the venkatyarl account on most
+// fleet nodes. Measured 2026-07-06: bare `git@github.com:` fails with
+// "Permission denied (publickey)" on 9 of 14 worker nodes (aura, logan, lily,
+// veronica, duncan, sia, adele, rihanna, beyonce), so EVERY dispatch on those
+// nodes dies at the clone step before any build runs. The canonical alias
+// `github.com-venkat` (→ `id_venkat`, synced fleet-wide by `ff github sync` at
+// enrollment) authenticates on 14/14.
+//
+// Flag the canonical alias in the DB so the dispatcher can look it up and clone
+// via the authorized identity instead of hardcoding an account name. A future
+// account migration just moves the flag; no code change.
+pub const SCHEMA_V161_CANONICAL_GITHUB_ALIAS: &str = r#"
+ALTER TABLE github_ssh_aliases
+    ADD COLUMN IF NOT EXISTS is_canonical boolean NOT NULL DEFAULT false;
+
+-- venkatyarl is the canonical account post-migration (taylor-oclaw retired).
+UPDATE github_ssh_aliases SET is_canonical = true  WHERE alias_name = 'github.com-venkat';
+UPDATE github_ssh_aliases SET is_canonical = false WHERE alias_name <> 'github.com-venkat';
+
+-- At most one canonical alias per hostname.
+CREATE UNIQUE INDEX IF NOT EXISTS github_ssh_aliases_one_canonical_per_host
+    ON github_ssh_aliases (hostname) WHERE is_canonical;
+"#;

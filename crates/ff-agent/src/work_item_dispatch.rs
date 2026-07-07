@@ -428,18 +428,50 @@ async fn ensure_repo_checked_out(pg: &PgPool, item: &AssignedWorkItem) -> Result
             .with_context(|| format!("create repo parent {}", parent.display()))?;
     }
 
+    // Clone via the CANONICAL GitHub identity, not the bare `git@github.com:`
+    // host. The bare host resolves (per node's ~/.ssh/config) to a default key
+    // that is UNAUTHORIZED on the venkatyarl account on most fleet nodes —
+    // measured 2026-07-06: bare `git@github.com:` gets "Permission denied
+    // (publickey)" on 9 of 14 workers, so every dispatch there died at clone
+    // before any build ran. The canonical alias (`github.com-venkat` →
+    // `id_venkat`, flagged in `github_ssh_aliases.is_canonical` by V161)
+    // authenticates fleet-wide. We rewrite the URL host (so the persisted
+    // `origin` remote — and every later fetch/push from worktrees — also uses
+    // the authorized identity) AND force the identity via GIT_SSH_COMMAND so it
+    // works even on a node whose ~/.ssh/config lacks the alias Host block.
+    let (clone_url, ssh_identity) = match ff_db::pg_canonical_github_alias(pg).await {
+        Ok(Some((alias, identity_file))) => (
+            rewrite_github_host_alias(&github_url, &alias),
+            Some(identity_file),
+        ),
+        Ok(None) => (github_url.clone(), None),
+        Err(e) => {
+            warn!(error = %e, "canonical github alias lookup failed; cloning with bare URL");
+            (github_url.clone(), None)
+        }
+    };
+
     info!(
         work_item_id = %item.work_item_id,
         project_id = %item.project_id,
         repo_path = %item.repo_path.display(),
-        github_url = %github_url,
+        clone_url = %clone_url,
         "work_item_dispatch: cloning project repo"
     );
 
     let repo_path = item.repo_path.clone();
     tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new("git");
-        cmd.arg("clone").arg(&github_url).arg(&repo_path);
+        cmd.arg("clone").arg(&clone_url).arg(&repo_path);
+        if let Some(identity) = &ssh_identity {
+            cmd.env(
+                "GIT_SSH_COMMAND",
+                format!(
+                    "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
+                    expand_home(identity)
+                ),
+            );
+        }
         run_command_timeout(cmd, Duration::from_secs(600))
     })
     .await
@@ -447,6 +479,32 @@ async fn ensure_repo_checked_out(pg: &PgPool, item: &AssignedWorkItem) -> Result
     .with_context(|| format!("clone project repo into {}", item.repo_path.display()))?;
 
     Ok(())
+}
+
+/// Rewrite an scp-style `git@github.com:owner/repo` clone URL to use a specific
+/// SSH host alias (e.g. `github.com-venkat`), so the clone authenticates with the
+/// canonical identity instead of the bare-host default key (unauthorized on most
+/// fleet nodes). Only the `git@github.com:` form is rewritten; any other shape
+/// (https, an already-aliased host, a non-github remote) is returned unchanged.
+fn rewrite_github_host_alias(url: &str, alias: &str) -> String {
+    const BARE: &str = "git@github.com:";
+    match url.strip_prefix(BARE) {
+        Some(rest) => format!("git@{alias}:{rest}"),
+        None => url.to_string(),
+    }
+}
+
+/// Expand a leading `~/` in an identity-file path to `$HOME` so it can be passed
+/// to `ssh -i` (which does not do tilde expansion itself). A bare `~` or any
+/// non-tilde path is returned unchanged.
+fn expand_home(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => match std::env::var("HOME") {
+            Ok(home) => format!("{home}/{rest}"),
+            Err(_) => path.to_string(),
+        },
+        None => path.to_string(),
+    }
 }
 
 async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -> Result<()> {
@@ -2272,9 +2330,56 @@ pub fn spawn_worktree_reaper(
 mod tests {
     use super::{
         DispatchOutcome, classify_dispatch_outcome, command_display, dispatch_budget_for_host,
-        parse_cli_tokens, primary_or_default_backend, retry_error_is_actionable,
-        task_prefers_cloud_lane,
+        expand_home, parse_cli_tokens, primary_or_default_backend, retry_error_is_actionable,
+        rewrite_github_host_alias, task_prefers_cloud_lane,
     };
+
+    #[test]
+    fn rewrite_github_host_alias_only_touches_bare_github() {
+        // Bare scp-style github URL → rewritten to the canonical alias so the
+        // clone (and the persisted origin) authenticates fleet-wide.
+        assert_eq!(
+            rewrite_github_host_alias(
+                "git@github.com:venkatyarl/forge-fleet.git",
+                "github.com-venkat"
+            ),
+            "git@github.com-venkat:venkatyarl/forge-fleet.git"
+        );
+        // Already-aliased host is left alone (idempotent — no double rewrite).
+        assert_eq!(
+            rewrite_github_host_alias(
+                "git@github.com-venkat:venkatyarl/forge-fleet.git",
+                "github.com-venkat"
+            ),
+            "git@github.com-venkat:venkatyarl/forge-fleet.git"
+        );
+        // https and non-github remotes are untouched.
+        assert_eq!(
+            rewrite_github_host_alias(
+                "https://github.com/venkatyarl/forge-fleet.git",
+                "github.com-venkat"
+            ),
+            "https://github.com/venkatyarl/forge-fleet.git"
+        );
+        assert_eq!(
+            rewrite_github_host_alias("git@gitlab.com:acme/x.git", "github.com-venkat"),
+            "git@gitlab.com:acme/x.git"
+        );
+    }
+
+    #[test]
+    fn expand_home_expands_leading_tilde_slash() {
+        // SAFETY: this test only reads HOME; it does not mutate process env.
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(
+                expand_home("~/.ssh/id_venkat"),
+                format!("{home}/.ssh/id_venkat")
+            );
+        }
+        // Absolute + bare paths are returned unchanged.
+        assert_eq!(expand_home("/abs/id_key"), "/abs/id_key");
+        assert_eq!(expand_home("id_key"), "id_key");
+    }
 
     #[test]
     fn complexity_routes_hard_tasks_straight_to_cloud() {
