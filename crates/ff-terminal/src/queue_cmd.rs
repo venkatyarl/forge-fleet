@@ -33,11 +33,7 @@ pub async fn handle_queue() -> Result<()> {
     }
 
     let fleet_task_class_rows = sqlx::query(
-        "SELECT COALESCE(task_class, '-') AS task_class,
-                status,
-                count(*)::bigint AS count
-           FROM fleet_tasks
-          GROUP BY task_class, status",
+        "SELECT COALESCE(task_class,'-') AS task_class, status, count(*) FROM fleet_tasks GROUP BY task_class, status",
     )
     .fetch_all(&pool)
     .await
