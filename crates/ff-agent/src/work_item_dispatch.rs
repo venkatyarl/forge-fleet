@@ -1914,6 +1914,17 @@ fn reclaim_build_artifacts(path: &Path) -> u64 {
 /// commit was created, false if the worktree was clean (agent made no change).
 /// Provides a deterministic author so the daemon's git env needn't be configured.
 fn commit_worktree_changes(worktree_path: &Path, title: &str) -> Result<bool> {
+    // Auto-format BEFORE staging so a fleet-produced Rust PR passes CI
+    // `cargo fmt --check` — LLM backends routinely emit un-formatted Rust, which
+    // fails the fmt gate and blocks the PR (observed on PR #787). Best-effort +
+    // Rust-only: skip quietly when there's no Cargo.toml, and treat any fmt error
+    // as non-fatal (commit as-is) so a missing toolchain / non-Rust repo never
+    // breaks dispatch — it just falls back to the prior behavior.
+    if worktree_path.join("Cargo.toml").exists() {
+        if let Err(e) = run_cargo_fmt(worktree_path) {
+            warn!(error = %e, "commit_worktree_changes: cargo fmt failed (best-effort) — committing as-is");
+        }
+    }
     run_git(worktree_path, ["add", "-A"], Duration::from_secs(60))?;
     let status = run_git(
         worktree_path,
@@ -1941,6 +1952,21 @@ fn commit_worktree_changes(worktree_path: &Path, title: &str) -> Result<bool> {
         Duration::from_secs(60),
     )?;
     Ok(true)
+}
+
+/// Run `cargo fmt` over the worktree so committed Rust is CI-fmt-clean. Uses a
+/// login-ish shell that sources `~/.cargo/env` first (the daemon's own PATH may
+/// omit `~/.cargo/bin` — the same reason the deploy playbook sources it), tries
+/// the CI-pinned toolchain, then falls back to the default. The base tree is
+/// already fmt-clean (it's origin/main), so this only reformats the agent's own
+/// additions. Bounded; errors bubble up for the best-effort caller to log.
+fn run_cargo_fmt(worktree_path: &Path) -> Result<()> {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(". \"$HOME/.cargo/env\" 2>/dev/null || true; cargo +1.88.0 fmt 2>/dev/null || cargo fmt")
+        .current_dir(worktree_path);
+    run_command_timeout(cmd, Duration::from_secs(120))?;
+    Ok(())
 }
 
 fn branch_has_commits(repo_path: &Path, base_branch: &str, task_branch: &str) -> Result<bool> {
