@@ -3413,23 +3413,7 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
             handle_fleet_computers(format, os, role).await?;
         }
         FleetCommand::SetSlots { count, worker } => {
-            let rows = if let Some(worker) = worker {
-                sqlx::query("UPDATE fleet_workers SET sub_agent_count = $1 WHERE name = $2")
-                    .bind(count)
-                    .bind(&worker)
-                    .execute(&pool)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("update fleet_workers: {e}"))?
-                    .rows_affected()
-            } else {
-                sqlx::query("UPDATE fleet_workers SET sub_agent_count = $1")
-                    .bind(count)
-                    .execute(&pool)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("update fleet_workers: {e}"))?
-                    .rows_affected()
-            };
-            println!("Updated {rows} fleet worker(s).");
+            handle_fleet_set_slots(&pool, count, worker).await?;
         }
         FleetCommand::Exec { node, json, cmd } => {
             handle_fleet_exec(&pool, &node, json, &cmd).await?;
@@ -3449,6 +3433,31 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
             handle_fleet_rollout(&pool, command).await?;
         }
     }
+    Ok(())
+}
+
+async fn handle_fleet_set_slots(
+    pool: &sqlx::PgPool,
+    count: i32,
+    worker: Option<String>,
+) -> Result<()> {
+    let rows = if let Some(worker) = worker {
+        sqlx::query("UPDATE fleet_workers SET sub_agent_count = $1 WHERE name = $2")
+            .bind(count)
+            .bind(&worker)
+            .execute(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("update fleet_workers: {e}"))?
+            .rows_affected()
+    } else {
+        sqlx::query("UPDATE fleet_workers SET sub_agent_count = $1")
+            .bind(count)
+            .execute(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("update fleet_workers: {e}"))?
+            .rows_affected()
+    };
+    println!("Updated {rows} fleet worker(s).");
     Ok(())
 }
 
