@@ -341,14 +341,24 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
         // even if the DB value ever contained one (POSIX: close-quote, escaped
         // literal quote, reopen-quote). primary_ip is validated IP data today,
         // but this write path handles a secret — belt and suspenders.
-        let primary_ip_sh = primary_ip.replace('\'', "'\\''");
+        // Every DB-sourced value that reaches the shell is bound to a var via a
+        // single-quote-escaped assignment (POSIX close/escaped-quote/reopen) and
+        // referenced QUOTED — so no metacharacter in primary_ip / ssh_user /
+        // name can inject into this secret-write command. Const/base64 values
+        // (provider, cred_path, b64) are not attacker-influenced.
+        let sh_squote = |s: &str| s.replace('\'', "'\\''");
+        let primary_ip_sh = sh_squote(&primary_ip);
+        let ssh_user_sh = sh_squote(&ssh_user);
+        let target_sh = sh_squote(&name);
         // The remote payload: write the cred file with a heredoc (no
         // shell expansion of `$` inside the b64 blob), chmod 0600.
         let cmd = format!(
             "set -e\n\
              IP='{primary_ip_sh}'\n\
+             SSH_USER='{ssh_user_sh}'\n\
+             TARGET='{target_sh}'\n\
              CRED_PATH=\"{cred_path_sh}\"\n\
-             echo \"== distributing {provider} cred file to {target} ==\"\n\
+             echo \"== distributing {provider} cred file to $TARGET ==\"\n\
              __ff_local_ips() {{ (hostname -I 2>/dev/null; \
                  ifconfig 2>/dev/null | awk '/inet /{{print $2}}') | tr ' ' '\\n'; }}\n\
              if __ff_local_ips | grep -Fxq -- \"$IP\"; then\n\
@@ -360,7 +370,7 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
              echo distributed: $(stat -c %y \"$CRED_PATH\" 2>/dev/null || stat -f %Sm \"$CRED_PATH\")\n\
              else\n\
              ssh -T {ssh_bypass} -o StrictHostKeyChecking=accept-new \
-                 {ssh_user}@\"$IP\" bash -l <<'FF_OAUTH_EOF'\n\
+                 \"$SSH_USER@$IP\" bash -l <<'FF_OAUTH_EOF'\n\
              mkdir -p \"$(dirname {cred_path})\"\n\
              umask 077\n\
              printf '%s' '{b64}' | base64 -d > {cred_path}\n\
@@ -369,9 +379,9 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
              FF_OAUTH_EOF\n\
              fi\n",
             provider = provider.name,
-            target = name,
-            ssh_user = ssh_user,
             primary_ip_sh = primary_ip_sh,
+            ssh_user_sh = ssh_user_sh,
+            target_sh = target_sh,
             cred_path = provider.cred_path,
             cred_path_sh = cred_path_sh,
             b64 = b64,
