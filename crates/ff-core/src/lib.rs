@@ -80,6 +80,35 @@ pub fn is_blank(s: &str) -> bool {
     s.is_empty() || s.chars().all(char::is_whitespace)
 }
 
+/// Truncates `s` in the middle so the returned string is at most `max` chars.
+///
+/// If `s` is already `max` chars or shorter it is returned unchanged.
+/// Otherwise the head and tail of `s` are preserved and joined by a single
+/// Unicode ellipsis (`…`). The split is character-based, so multi-byte input
+/// never panics.
+pub fn truncate_middle(s: &str, max: usize) -> String {
+    let len = s.chars().count();
+    if len <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let keep = max - 1;
+    let head = keep / 2 + keep % 2;
+    let tail = keep - head;
+    let left: String = s.chars().take(head).collect();
+    let right: String = s
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{left}…{right}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +126,27 @@ mod tests {
     #[test]
     fn test_is_blank_non_blank() {
         assert!(!is_blank("hello"));
+    }
+
+    #[test]
+    fn test_truncate_middle_short_unchanged() {
+        assert_eq!(truncate_middle("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_middle_long_ascii_exact_max() {
+        let s = "abcdefghijklmnopqrstuvwxyz";
+        let max = 10;
+        let result = truncate_middle(s, max);
+        assert_eq!(result.chars().count(), max);
+        assert!(result.contains('…'));
+    }
+
+    #[test]
+    fn test_truncate_middle_multibyte_no_panic() {
+        let s = "🙂a🙂b🙂c🙂d🙂e🙂f🙂";
+        let result = truncate_middle(s, 6);
+        assert!(result.chars().count() <= 6);
+        assert!(result.contains('…'));
     }
 }
