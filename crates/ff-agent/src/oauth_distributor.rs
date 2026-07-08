@@ -326,23 +326,36 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
         let name: String = row.get("name");
         let ssh_user: String = row.get("ssh_user");
         let primary_ip: String = row.get("primary_ip");
+        // Bind the DB-sourced target IP + the (const) cred path to shell vars
+        // ONCE, then reference them QUOTED. This branch gates a local secret
+        // WRITE on an identity check, so `primary_ip` must not be able to
+        // misparse as grep options/pattern (hence `-- "$IP"`), and the path
+        // must survive spaces/metachars. `~` is pre-expanded to `$HOME` here so
+        // the quoted var still resolves (a quoted `~` would stay literal).
+        let cred_path_sh = provider
+            .cred_path
+            .strip_prefix("~/")
+            .map(|rest| format!("$HOME/{rest}"))
+            .unwrap_or_else(|| provider.cred_path.to_string());
         // The remote payload: write the cred file with a heredoc (no
         // shell expansion of `$` inside the b64 blob), chmod 0600.
         let cmd = format!(
             "set -e\n\
+             IP='{primary_ip}'\n\
+             CRED_PATH=\"{cred_path_sh}\"\n\
              echo \"== distributing {provider} cred file to {target} ==\"\n\
              __ff_local_ips() {{ (hostname -I 2>/dev/null; \
                  ifconfig 2>/dev/null | awk '/inet /{{print $2}}') | tr ' ' '\\n'; }}\n\
-             if __ff_local_ips | grep -Fxq {primary_ip}; then\n\
+             if __ff_local_ips | grep -Fxq -- \"$IP\"; then\n\
              echo '(on target — local write, no SSH)'\n\
-             mkdir -p \"$(dirname {cred_path})\"\n\
+             mkdir -p \"$(dirname \"$CRED_PATH\")\"\n\
              umask 077\n\
-             printf '%s' '{b64}' | base64 -d > {cred_path}\n\
-             chmod 600 {cred_path}\n\
-             echo distributed: $(stat -c %y {cred_path} 2>/dev/null || stat -f %Sm {cred_path})\n\
+             printf '%s' '{b64}' | base64 -d > \"$CRED_PATH\"\n\
+             chmod 600 \"$CRED_PATH\"\n\
+             echo distributed: $(stat -c %y \"$CRED_PATH\" 2>/dev/null || stat -f %Sm \"$CRED_PATH\")\n\
              else\n\
              ssh -T {ssh_bypass} -o StrictHostKeyChecking=accept-new \
-                 {ssh_user}@{primary_ip} bash -l <<'FF_OAUTH_EOF'\n\
+                 {ssh_user}@\"$IP\" bash -l <<'FF_OAUTH_EOF'\n\
              mkdir -p \"$(dirname {cred_path})\"\n\
              umask 077\n\
              printf '%s' '{b64}' | base64 -d > {cred_path}\n\
@@ -355,6 +368,7 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
             ssh_user = ssh_user,
             primary_ip = primary_ip,
             cred_path = provider.cred_path,
+            cred_path_sh = cred_path_sh,
             b64 = b64,
             ssh_bypass = crate::ssh_opts::SSH_AGENT_BYPASS,
         );
