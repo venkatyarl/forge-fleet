@@ -227,7 +227,13 @@ fn expand_tilde(p: &str) -> String {
     p.to_string()
 }
 
-fn default_clone_path(project_id: &str, repo_url: &str) -> PathBuf {
+/// Clone location for a work_item's repo: INSIDE the assigned sub-agent slot, so
+/// each slot holds its OWN full checkout (build-path option A, 2026-07-07) — e.g.
+/// `~/.forgefleet/sub-agents/sub-agent-3/forge-fleet`. Replaces the old shared
+/// top-level `~/.forgefleet/project-repos/{project}/{repo}`. `slot` is clamped to
+/// ≥0. Stage 1 of the refactor: worktrees still branch off this clone (under the
+/// same slot) until Stage 2 works in the clone directly.
+fn default_clone_path(slot: i32, repo_url: &str) -> PathBuf {
     let slug_source = repo_url
         .trim_end_matches('/')
         .trim_end_matches(".git")
@@ -248,8 +254,8 @@ fn default_clone_path(project_id: &str, repo_url: &str) -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".forgefleet")
-        .join("project-repos")
-        .join(project_id)
+        .join("sub-agents")
+        .join(format!("sub-agent-{}", slot.max(0)))
         .join(if slug.is_empty() { "repo" } else { slug })
 }
 
@@ -346,7 +352,7 @@ async fn assigned_work_items(
                 .or_else(|| {
                     repo_url
                         .as_deref()
-                        .map(|url| default_clone_path(&r.get::<String, _>("project_id"), url))
+                        .map(|url| default_clone_path(r.get::<i32, _>("slot"), url))
                 })
                 .or(bound_repo_path)
                 .unwrap_or_else(|| PathBuf::from(fallback_repo_path));
@@ -2341,10 +2347,33 @@ pub fn spawn_worktree_reaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        DispatchOutcome, classify_dispatch_outcome, command_display, dispatch_budget_for_host,
-        expand_home, parse_cli_tokens, primary_or_default_backend, retry_error_is_actionable,
-        rewrite_github_host_alias, task_prefers_cloud_lane,
+        DispatchOutcome, classify_dispatch_outcome, command_display, default_clone_path,
+        dispatch_budget_for_host, expand_home, parse_cli_tokens, primary_or_default_backend,
+        retry_error_is_actionable, rewrite_github_host_alias, task_prefers_cloud_lane,
     };
+
+    #[test]
+    fn default_clone_path_lives_inside_the_slot() {
+        // Build-path option A: the clone goes INSIDE the assigned sub-agent slot,
+        // named by the repo — never the old shared top-level project-repos/.
+        let p = default_clone_path(3, "git@github.com:venkatyarl/forge-fleet.git");
+        let s = p.to_string_lossy();
+        assert!(
+            s.ends_with(".forgefleet/sub-agents/sub-agent-3/forge-fleet"),
+            "expected sub-agent-3/forge-fleet, got {s}"
+        );
+        assert!(
+            !s.contains("project-repos"),
+            "must not use the old shared path: {s}"
+        );
+        // Different slots → different clones (per-slot isolation).
+        let p5 = default_clone_path(5, "git@github.com:venkatyarl/forge-fleet.git");
+        assert_ne!(p, p5);
+        assert!(p5.to_string_lossy().contains("sub-agent-5/forge-fleet"));
+        // Negative slot is clamped to 0 (never sub-agent--1).
+        let pneg = default_clone_path(-1, "https://x/y/repo.git");
+        assert!(pneg.to_string_lossy().contains("sub-agent-0/repo"));
+    }
 
     #[test]
     fn rewrite_github_host_alias_only_touches_bare_github() {
