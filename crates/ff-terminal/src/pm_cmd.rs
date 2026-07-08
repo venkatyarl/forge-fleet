@@ -158,6 +158,48 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
                 }
             }
         }
+        crate::PmCommand::Retry { id, on } => {
+            let uid = uuid::Uuid::parse_str(&id)
+                .map_err(|e| anyhow::anyhow!("invalid work item id '{id}': {e}"))?;
+            // Gate on terminal-but-retryable states so a LIVE item's attempts
+            // are never reset mid-flight (that would defeat the failure ceiling).
+            let row: Option<(String,)> = sqlx::query_as(
+                "UPDATE work_items \
+                    SET status = 'ready', \
+                        attempts = 0, \
+                        last_error = NULL, \
+                        assigned_computer = COALESCE($2, assigned_computer) \
+                  WHERE id = $1 \
+                    AND status IN ('failed', 'cancelled', 'blocked') \
+                 RETURNING kind",
+            )
+            .bind(uid)
+            .bind(on.as_deref())
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("retry: {e}"))?;
+            match row {
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "no retryable work item with id {id} — it must be failed/cancelled/blocked \
+                         (use `ff pm ready` for a fresh/idea item; a live item can't be reset)"
+                    ));
+                }
+                Some((kind,)) => {
+                    println!(
+                        "{GREEN}✓ work item {id} reset (attempts=0, error cleared) and flagged ready for retry{RESET}"
+                    );
+                    if let Some(host) = &on {
+                        println!("  pinned to: {host}");
+                    }
+                    if kind != "task" {
+                        println!(
+                            "  note: kind='{kind}' — only kind='task' (leaf) items are scheduled."
+                        );
+                    }
+                }
+            }
+        }
         crate::PmCommand::Board { limit } => {
             // Fleet-wide rollup first — the at-a-glance state of distributed
             // concurrent dev (Pillar 4) across all computers, before the detail.
