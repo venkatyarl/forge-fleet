@@ -1210,7 +1210,11 @@ has NO database and will PANIC otherwise). Never let a DB test panic in CI.\n\
 - MIGRATIONS are forward-only: add ONE new const + register the next integer version; \
 NEVER edit an existing migration const, and never add a second/redundant migration.\n\
 - STOP when done: once `cargo +1.88.0 fmt --check` + `cargo +1.88.0 check` + your \
-targeted test pass, open ONE PR and STOP — do not keep iterating or push more commits.\n\
+targeted test pass, STOP. LEAVE YOUR EDITS UNCOMMITTED in the working tree — do NOT \
+run `git add`, `git commit`, `git push`, or open a PR. The dispatch harness commits \
+your working-tree changes and opens the PR itself; if you commit them yourself it sees \
+a CLEAN tree and DISCARDS your work as a no-op (your task then fails despite the code \
+being correct).\n\
 - Keep the diff minimal and scoped strictly to the task.\n";
 
 /// Whether a stored `last_error` is a TASK-level failure the coding agent can
@@ -2382,11 +2386,33 @@ pub fn spawn_worktree_reaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        DispatchOutcome, classify_dispatch_outcome, command_display, default_clone_path,
-        dispatch_budget_for_host, expand_home, parse_cli_tokens, primary_or_default_backend,
-        retry_error_is_actionable, rewrite_github_host_alias, task_prefers_cloud_lane,
-        use_local_lane,
+        DISPATCH_HOUSE_RULES, DispatchOutcome, classify_dispatch_outcome, command_display,
+        default_clone_path, dispatch_budget_for_host, expand_home, parse_cli_tokens,
+        primary_or_default_backend, retry_error_is_actionable, rewrite_github_host_alias,
+        task_prefers_cloud_lane, use_local_lane,
     };
+
+    #[test]
+    fn house_rules_forbid_the_agent_from_committing_or_opening_a_pr() {
+        // #69 root cause: the old rule "open ONE PR and STOP" made codex
+        // self-COMMIT its edits, leaving a CLEAN worktree — so the dispatch's
+        // commit_worktree_changes saw dirty=false and DISCARDED the work as a
+        // no-op (confirmed live on beyonce: codex committed d28c671, tree clean).
+        // The harness commits + opens the PR; the agent must leave edits
+        // UNCOMMITTED. Guard against a reword that reintroduces the trigger.
+        assert!(
+            !DISPATCH_HOUSE_RULES.contains("open ONE PR"),
+            "house rules must NOT instruct the agent to open a PR (causes self-commit → discarded no-op)"
+        );
+        assert!(
+            DISPATCH_HOUSE_RULES.contains("do NOT") && DISPATCH_HOUSE_RULES.contains("git commit"),
+            "house rules must explicitly forbid the agent from running git commit"
+        );
+        assert!(
+            DISPATCH_HOUSE_RULES.contains("UNCOMMITTED"),
+            "house rules must tell the agent to leave edits UNCOMMITTED for the harness"
+        );
+    }
 
     #[test]
     fn lane1_timeout_is_strictly_below_the_lease_stale_window() {
