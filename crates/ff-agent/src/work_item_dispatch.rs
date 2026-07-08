@@ -552,7 +552,10 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     )
     .await;
 
-    match dispatch_result {
+    // Preserve a tail of the agent's OWN output so a no-diff outcome below is
+    // diagnosable (froze? errored? hung on a tool call? claimed done without
+    // editing?) straight from the daemon log — no host repro needed (#69).
+    let agent_output_tail = match dispatch_result {
         Ok(output) => {
             info!(
                 work_item_id = %item.work_item_id,
@@ -560,13 +563,14 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
                 stderr_len = output.stderr.len(),
                 "work_item_dispatch: ff dispatch completed"
             );
+            agent_output_tail(&output, 1500)
         }
         Err(e) => {
             mark_worktree_failed(&pg, item.work_item_id, &e.to_string()).await?;
             remove_worktree(&item.repo_path, &worktree.worktree_path)?;
             return Err(e);
         }
-    }
+    };
 
     // codex (and most CLI agents) EDIT files but don't `git commit`. Commit any
     // changes it made in the worktree so they can become a PR. A clean worktree
@@ -594,6 +598,8 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         // surfaces to a human rather than masquerading as completed.
         warn!(
             work_item_id = %item.work_item_id,
+            backend = %backend_used,
+            agent_output_tail = %agent_output_tail,
             "work_item_dispatch: backend produced no diff (no commits) — treating as failed no-op, not done"
         );
         requeue_or_fail(
@@ -1958,6 +1964,26 @@ fn reclaim_build_artifacts(path: &Path) -> u64 {
 /// Stage + commit any agent-made changes in the worktree. Returns true if a
 /// commit was created, false if the worktree was clean (agent made no change).
 /// Provides a deterministic author so the daemon's git env needn't be configured.
+/// Last `max_chars` characters of an agent CLI's combined stdout+stderr, for
+/// logging a no-diff outcome so it is diagnosable from the daemon log without a
+/// host repro (#69: codex ran minutes on a DGX host and produced nothing — froze?
+/// errored? claimed done without editing? — invisible in the summary-only log).
+/// Char-safe (never splits a multi-byte boundary); a leading `…` marks truncation.
+/// PURE + testable.
+fn agent_output_tail(output: &std::process::Output, max_chars: usize) -> String {
+    let combined = format!(
+        "[stdout]\n{}\n[stderr]\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let total = combined.chars().count();
+    if total <= max_chars {
+        return combined;
+    }
+    let tail: String = combined.chars().skip(total - max_chars).collect();
+    format!("…{tail}")
+}
+
 fn commit_worktree_changes(worktree_path: &Path, title: &str) -> Result<bool> {
     // Auto-format BEFORE staging so a fleet-produced Rust PR passes CI
     // `cargo fmt --check` — LLM backends routinely emit un-formatted Rust, which
@@ -2386,11 +2412,33 @@ pub fn spawn_worktree_reaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        DISPATCH_HOUSE_RULES, DispatchOutcome, classify_dispatch_outcome, command_display,
-        default_clone_path, dispatch_budget_for_host, expand_home, parse_cli_tokens,
-        primary_or_default_backend, retry_error_is_actionable, rewrite_github_host_alias,
-        task_prefers_cloud_lane, use_local_lane,
+        DISPATCH_HOUSE_RULES, DispatchOutcome, agent_output_tail, classify_dispatch_outcome,
+        command_display, default_clone_path, dispatch_budget_for_host, expand_home,
+        parse_cli_tokens, primary_or_default_backend, retry_error_is_actionable,
+        rewrite_github_host_alias, task_prefers_cloud_lane, use_local_lane,
     };
+
+    #[test]
+    fn agent_output_tail_keeps_the_end_and_is_char_safe() {
+        use std::os::unix::process::ExitStatusExt;
+        let mk = |out: &str, err: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: out.as_bytes().to_vec(),
+            stderr: err.as_bytes().to_vec(),
+        };
+        // Short output is returned whole (labelled).
+        let whole = agent_output_tail(&mk("hello", "world"), 1500);
+        assert!(whole.contains("[stdout]") && whole.contains("hello"));
+        assert!(whole.contains("[stderr]") && whole.contains("world"));
+        // Long output keeps the TAIL (where the final state/error lives) and
+        // marks truncation, never panicking on a multi-byte boundary. The tail
+        // comes from stderr (the trailing stream in the combined layout).
+        let big = "é".repeat(5000); // multi-byte; 5000 chars, 10000 bytes
+        let tail = agent_output_tail(&mk("", &big), 100);
+        assert!(tail.starts_with('…'));
+        assert_eq!(tail.chars().count(), 101); // 100 + the ellipsis
+        assert!(tail.chars().all(|c| c == '…' || c == 'é'));
+    }
 
     #[test]
     fn house_rules_forbid_the_agent_from_committing_or_opening_a_pr() {
