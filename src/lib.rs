@@ -1,3 +1,5 @@
+pub mod fleet_secrets;
+
 pub mod styles {
     pub const TOKENS_CSS: &str = include_str!("styles/tokens.css");
 
