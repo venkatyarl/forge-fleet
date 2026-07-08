@@ -571,6 +571,12 @@ mod tests {
     }
 
     #[test]
+    fn gemini_503_unavailable_model_overloaded() {
+        let c = classify("gemini", None, "503 UNAVAILABLE: The model is overloaded");
+        assert_eq!(c, CloudErrorClass::Overloaded);
+    }
+
+    #[test]
     fn gemini_overloaded_is_overloaded() {
         let c = classify("gemini", None, "503 UNAVAILABLE: overloaded");
         assert_eq!(c, CloudErrorClass::Overloaded);
@@ -579,6 +585,16 @@ mod tests {
     #[test]
     fn gemini_requests_per_day_is_quota() {
         let c = classify("gemini", None, "429 RESOURCE_EXHAUSTED requests per day");
+        assert_eq!(c, CloudErrorClass::QuotaExhausted);
+    }
+
+    #[test]
+    fn gemini_429_resource_exhausted_per_day_is_quota() {
+        let c = classify(
+            "gemini",
+            None,
+            "429 RESOURCE_EXHAUSTED: quota exceeded for free-tier requests per day",
+        );
         assert_eq!(c, CloudErrorClass::QuotaExhausted);
     }
 
@@ -649,6 +665,18 @@ mod tests {
     fn grok_invalid_api_key_is_auth() {
         let c = classify("grok", Some(1), "401 invalid_api_key");
         assert_eq!(c, CloudErrorClass::Unauthenticated);
+    }
+
+    #[test]
+    fn grok_401_invalid_api_key_is_unauthenticated() {
+        let c = classify("grok", Some(1), "401 invalid_api_key");
+        assert_eq!(c, CloudErrorClass::Unauthenticated);
+    }
+
+    #[test]
+    fn grok_404_model_not_found_deprecated_is_not_found() {
+        let c = classify("grok", Some(1), "404 model not found: grok-2 is deprecated");
+        assert_eq!(c, CloudErrorClass::ModelNotFound);
     }
 
     #[test]
