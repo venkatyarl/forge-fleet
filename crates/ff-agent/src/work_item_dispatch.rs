@@ -581,11 +581,39 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         "work_item_dispatch: committed agent changes (dirty={dirty})"
     );
 
-    let has_commits = branch_has_commits(
+    let mut has_commits = branch_has_commits(
         &item.repo_path,
         &worktree.base_branch,
         &worktree.task_branch,
     )?;
+    // SALVAGE an agent that committed its OWN work to a detached / self-made HEAD
+    // instead of leaving it on the task branch (some codex runs do this despite
+    // the house rule — see #801/#69). branch_has_commits only sees the task
+    // branch, so it misses that; but if the WORKTREE HEAD is ahead of base the
+    // real work IS there. Adopt it onto the task branch rather than discarding it
+    // as a no-op. Safe: only reached when the task branch has no commits (so it's
+    // not the checked-out branch), and it's a no-op when the agent left nothing.
+    if !has_commits
+        && worktree_head_ahead_of_base(&worktree.worktree_path, &worktree.base_branch)
+            .unwrap_or(false)
+        // Only adopt when HEAD is a proper continuation of base — never a diverged
+        // or unrelated branch (council guard: ahead-count alone isn't ancestry).
+        && base_is_ancestor_of_head(&worktree.worktree_path, &worktree.base_branch)
+    {
+        match adopt_worktree_head_onto_branch(&worktree.worktree_path, &worktree.task_branch) {
+            Ok(()) => {
+                warn!(
+                    work_item_id = %item.work_item_id,
+                    "work_item_dispatch: agent committed to its own HEAD (not the task branch) — salvaged onto the task branch instead of discarding as a no-op"
+                );
+                has_commits = true;
+            }
+            Err(e) => warn!(
+                work_item_id = %item.work_item_id, error = %e,
+                "work_item_dispatch: agent-committed HEAD detected but salvage-onto-task-branch failed; treating as no-op"
+            ),
+        }
+    }
     if !has_commits {
         // NO-OP IS NOT SUCCESS. A build work_item that produced no diff means the
         // required change was never applied — the backend stalled, refused, or
@@ -2068,6 +2096,85 @@ fn branch_has_commits(repo_path: &Path, base_branch: &str, task_branch: &str) ->
         .parse::<u64>()
         .unwrap_or(0);
     Ok(count > 0)
+}
+
+/// Whether the worktree's HEAD has commits ahead of `origin/<base>` — i.e. the
+/// agent COMMITTED work (possibly on a detached / self-made HEAD) even though the
+/// task branch shows none. Lets the no-diff path SALVAGE that work (#71/#69).
+/// Falls back to the local base ref when `origin/<base>` isn't present.
+fn worktree_head_ahead_of_base(worktree_path: &Path, base_branch: &str) -> Result<bool> {
+    let range = format!("origin/{base_branch}..HEAD");
+    let out = run_git(
+        worktree_path,
+        [
+            OsStr::new("rev-list"),
+            OsStr::new("--count"),
+            OsStr::new(&range),
+        ],
+        Duration::from_secs(30),
+    )
+    .or_else(|_| {
+        let range = format!("{base_branch}..HEAD");
+        run_git(
+            worktree_path,
+            [
+                OsStr::new("rev-list"),
+                OsStr::new("--count"),
+                OsStr::new(&range),
+            ],
+            Duration::from_secs(30),
+        )
+    })?;
+    let count = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    Ok(count > 0)
+}
+
+/// Whether `origin/<base>` (or the local base ref) is an ANCESTOR of the worktree
+/// HEAD — i.e. HEAD is a proper CONTINUATION of base, not a diverged / unrelated
+/// branch the agent happened to check out. Guards the salvage adoption so
+/// `git branch -f` can never publish unrelated history (#71 council guard): a
+/// positive `origin/base..HEAD` count alone only proves HEAD has commits base
+/// lacks, NOT that HEAD descends from base. Uses the EXIT CODE of
+/// `git merge-base --is-ancestor` (0=ancestor, 1=not); fails CLOSED (no salvage)
+/// on any spawn/other error.
+fn base_is_ancestor_of_head(worktree_path: &Path, base_branch: &str) -> bool {
+    let run = |base_ref: String| {
+        Command::new("git")
+            .current_dir(worktree_path)
+            .args(["merge-base", "--is-ancestor", &base_ref, "HEAD"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()
+            .and_then(|s| s.code())
+    };
+    match run(format!("origin/{base_branch}")) {
+        Some(0) => true,
+        Some(1) => false,
+        // origin/<base> missing or errored — fall back to the local base ref.
+        _ => matches!(run(base_branch.to_string()), Some(0)),
+    }
+}
+
+/// Force `task_branch` to point at the worktree's current HEAD, adopting an
+/// agent's self-made commit onto the branch the harness pushes (#71). Only called
+/// when `task_branch` has no commits of its own, so it's not the checked-out
+/// branch and `git branch -f` won't be refused.
+fn adopt_worktree_head_onto_branch(worktree_path: &Path, task_branch: &str) -> Result<()> {
+    run_git(
+        worktree_path,
+        [
+            OsStr::new("branch"),
+            OsStr::new("-f"),
+            OsStr::new(task_branch),
+            OsStr::new("HEAD"),
+        ],
+        Duration::from_secs(30),
+    )?;
+    Ok(())
 }
 
 fn git_head_sha(worktree_path: &Path) -> Result<String> {
