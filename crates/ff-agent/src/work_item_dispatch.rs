@@ -868,10 +868,29 @@ async fn mark_ready_for_review(
 /// error appended to the item's `last_error` so the next attempt has context.
 const MAX_DISPATCH_ATTEMPTS: i32 = 3;
 
-/// Escalation ladder stage 2: after this many prior attempts, SKIP the local
-/// codegen lane (it has already failed the same way) and go straight to the
-/// cloud/CLI backstop, which is more capable. Below this, try cheap-local-first.
-const ESCALATE_TO_CLOUD_AT: i32 = 2;
+/// Escalation ladder: after this many prior attempts, SKIP the local codegen lane
+/// and go straight to the cloud/CLI backstop, which is more capable. Below this,
+/// try cheap-local-first.
+///
+/// Set to 1 (was 2) because the LOCAL lane starves the dispatch heartbeat and gets
+/// reaped at ~190s (#62 — codegen_apply blocks the async runtime), so a SECOND
+/// local attempt just burns another ~190s + slot cycle for a task that keeps
+/// hanging the same way, before finally reaching cloud. The CLOUD lane does NOT
+/// starve the heartbeat (verified: cloud attempts run 900s+ with no stale-reap).
+/// Only MECHANICAL tasks use the local lane (moderate/complex already
+/// `prefers_cloud_lane`), so this narrows the local exposure to ONE cheap try then
+/// the reliable cloud lane — unblocking the mechanical backlog with no heartbeat
+/// rearchitecture.
+const ESCALATE_TO_CLOUD_AT: i32 = 1;
+
+/// Whether to try the cheap LOCAL codegen lane for this dispatch: only while UNDER
+/// the cloud-escalation threshold, the node's local-codegen breaker is closed, and
+/// the task isn't complexity-routed to cloud. Pure so the routing is testable —
+/// the `ESCALATE_TO_CLOUD_AT = 1` value means a mechanical task gets ONE local try
+/// then goes cloud (#62: the local lane starves the heartbeat; cloud does not).
+fn use_local_lane(attempts: i32, breaker_open: bool, prefers_cloud: bool) -> bool {
+    attempts < ESCALATE_TO_CLOUD_AT && !breaker_open && !prefers_cloud
+}
 
 /// Hard ceiling on the Lane-1 LOCAL codegen harness. It can HANG on a complex
 /// prompt (observed 2026-07-04 on the fleet_self_heal fold: empty worktree, no
@@ -1388,7 +1407,7 @@ async fn run_ff_dispatch(
     // multi-file) — the local lane wedges/half-finishes on those, so we send
     // them straight to the capable cloud CLI from attempt 0 instead of burning a
     // wedge-prone local attempt first.
-    if item.attempts < ESCALATE_TO_CLOUD_AT && !lane1_breaker_open && !item.prefers_cloud_lane() {
+    if use_local_lane(item.attempts, lane1_breaker_open, item.prefers_cloud_lane()) {
         // Bound Lane 1 with a hard timeout so a hung local codegen harness fails
         // OVER to the cloud backstop instead of wedging the slot forever (see
         // LANE1_TIMEOUT_SECS). Without this, a hang here stalls the build while
@@ -2350,7 +2369,28 @@ mod tests {
         DispatchOutcome, classify_dispatch_outcome, command_display, default_clone_path,
         dispatch_budget_for_host, expand_home, parse_cli_tokens, primary_or_default_backend,
         retry_error_is_actionable, rewrite_github_host_alias, task_prefers_cloud_lane,
+        use_local_lane,
     };
+
+    #[test]
+    fn use_local_lane_gives_mechanical_one_try_then_cloud() {
+        // Mechanical (prefers_cloud=false), breaker closed: local ONLY on attempt 0;
+        // attempt 1+ escalates to cloud (#62 — the local lane starves the heartbeat,
+        // a 2nd local try just burns another ~190s reap).
+        assert!(
+            use_local_lane(0, false, false),
+            "first attempt tries cheap local"
+        );
+        assert!(
+            !use_local_lane(1, false, false),
+            "#62: 2nd attempt goes cloud"
+        );
+        assert!(!use_local_lane(2, false, false));
+        // A complexity-routed (moderate/complex) task never touches the local lane.
+        assert!(!use_local_lane(0, false, true));
+        // Open local-codegen breaker → skip local even on attempt 0.
+        assert!(!use_local_lane(0, true, false));
+    }
 
     #[test]
     fn default_clone_path_lives_inside_the_slot() {
