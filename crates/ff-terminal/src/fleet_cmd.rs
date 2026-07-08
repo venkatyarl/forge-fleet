@@ -4248,6 +4248,26 @@ async fn run_local_shell(cmd: &str, timeout_secs: u64) -> (i32, String, String) 
     }
 }
 
+fn leader_refresh_result(code: i32, stderr: &str) -> (bool, String) {
+    if code == 0 {
+        return (true, "leader daemon rebuilt + restarted".into());
+    }
+
+    (
+        false,
+        format!(
+            "leader refresh exit {code}: {}",
+            stderr
+                .lines()
+                .last()
+                .unwrap_or("")
+                .chars()
+                .take(140)
+                .collect::<String>()
+        ),
+    )
+}
+
 /// Refresh the leader's OWN forgefleetd/ff after an `--all` deploy. `--all`
 /// excludes the leader (the host running this command can't SSH-restart itself),
 /// which silently left the leader's daemon lagging source after every deploy —
@@ -4297,22 +4317,7 @@ async fn refresh_local_leader_if_self(pool: &sqlx::PgPool) -> Option<(bool, Stri
         "{CYAN}▶ refreshing leader '{leader_name}' forgefleetd locally (tree clean @ HEAD)…{RESET}"
     );
     let (code, _out, err) = run_local_shell(&leader_refresh_playbook(&os_family, &src), 2700).await;
-    if code == 0 {
-        Some((true, "leader daemon rebuilt + restarted".into()))
-    } else {
-        Some((
-            false,
-            format!(
-                "leader refresh exit {code}: {}",
-                err.lines()
-                    .last()
-                    .unwrap_or("")
-                    .chars()
-                    .take(140)
-                    .collect::<String>()
-            ),
-        ))
-    }
+    Some(leader_refresh_result(code, &err))
 }
 
 /// Run one shell command on a target over SSH with a deadline, capturing
@@ -5267,6 +5272,15 @@ mod route_tests {
         let p = super::deploy_playbook("linux", "~/projects/forge-fleet");
         assert!(p.contains("systemctl --user"));
         assert!(!p.contains("launchctl"));
+    }
+
+    #[test]
+    fn leader_refresh_success_ignores_codesign_stderr() {
+        let (ok, detail) =
+            super::leader_refresh_result(0, "replacing existing signature\nsigned ok\n");
+
+        assert!(ok);
+        assert_eq!(detail, "leader daemon rebuilt + restarted");
     }
 
     /// Layout invariant (2026-07-07 migration): a NULL-source-tree WORKER must
