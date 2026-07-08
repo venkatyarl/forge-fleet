@@ -1,11 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { NodeCard } from '../components/NodeCard'
 import { PanelHeader, RefreshButton } from '../components/PanelHeader'
 import { StatusBadge } from '../components/StatusBadge'
 import { Badge } from '../components/ui/badge'
 import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
 import { getJson } from '../lib/api'
-import type { FleetComputer } from '../types'
 
 type BuildStatus = 'idea' | 'ready' | 'building' | 'in_review' | 'done' | 'failed'
 
@@ -34,7 +32,7 @@ const STATUS_LABEL: Record<BuildStatus, string> = {
 const BUILDING_STATUSES = new Set(['building', 'claimed', 'in_progress'])
 
 function normalizedStatus(status: string | null | undefined): BuildStatus {
-  const value = (status ?? '').toLowerCase()
+  const value = (status ?? '').trim().toLowerCase()
   if (BUILDING_STATUSES.has(value)) return 'building'
   if (value === 'idea' || value === 'ready' || value === 'in_review' || value === 'done' || value === 'failed') {
     return value
@@ -54,28 +52,6 @@ function priorityRank(priority: WorkItem['priority']): number {
   if (['medium', 'normal', 'p3', '3'].includes(value)) return 2
   if (['low', 'p4', '4'].includes(value)) return 3
   return 4
-}
-
-function nodeForItem(item: WorkItem): FleetComputer {
-  const name = item.assigned_computer ?? 'unassigned'
-  return {
-    id: `${item.id}-${name}`,
-    name,
-    ip: 'assigned builder',
-    role: 'pillar-4',
-    status: 'healthy',
-    health: 'healthy',
-    leader_state: 'follower',
-    cpu: 'unreported',
-    ram: 'unreported',
-    gpu: 'unreported',
-    current_workload: {
-      status: 'building',
-      active_tasks: 1,
-      task_ids: [item.id],
-    },
-    models_loaded: [],
-  }
 }
 
 export function BuildPipeline() {
@@ -127,7 +103,13 @@ export function BuildPipeline() {
   }, [items])
 
   const liveBuilds = useMemo(
-    () => grouped.building.filter((item) => Boolean(item.assigned_computer)),
+    () =>
+      grouped.building
+        .filter((item) => Boolean(item.assigned_computer?.trim()))
+        .sort((a, b) =>
+          (a.assigned_computer ?? '').localeCompare(b.assigned_computer ?? '') ||
+          a.title.localeCompare(b.title),
+        ),
     [grouped],
   )
 
@@ -150,7 +132,7 @@ export function BuildPipeline() {
 
       <Card className="bg-surface">
         <PanelHeader
-          title="Live Fleet Build"
+          title="Active Builds"
           subtitle={`${liveBuilds.length} assigned build${liveBuilds.length === 1 ? '' : 's'}`}
           rightSlot={<RefreshButton onClick={() => void load()} loading={loading} />}
         />
@@ -162,16 +144,24 @@ export function BuildPipeline() {
             No assigned builds are running.
           </div>
         ) : (
-          <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+          <div className="mt-4 flex gap-3 overflow-x-auto pb-1">
             {liveBuilds.map((item) => (
-              <div key={item.id} className="space-y-2">
-                <div className="rounded-lg border border-border bg-panel px-3 py-2 text-sm text-muted">
-                  <span className="font-medium text-foreground">{item.assigned_computer}</span>
-                  <span className="px-2 text-dim">-&gt;</span>
-                  <span>{item.title}</span>
+              <article
+                key={item.id}
+                className="min-w-64 max-w-80 rounded-lg border border-border bg-panel px-3 py-2"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <h3 className="truncate text-sm font-semibold text-foreground">
+                      {item.assigned_computer}
+                    </h3>
+                    <p className="mt-1 line-clamp-2 text-xs leading-5 text-muted">{item.title}</p>
+                  </div>
+                  <StatusBadge status="building" tone="warn">
+                    Building
+                  </StatusBadge>
                 </div>
-                <NodeCard node={nodeForItem(item)} />
-              </div>
+              </article>
             ))}
           </div>
         )}
