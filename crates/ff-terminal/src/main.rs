@@ -3034,6 +3034,18 @@ pub enum PmCommand {
     /// Cancel a work item (terminal status='cancelled'): releases any active
     /// lease and frees its slot so the scheduler stops touching it.
     Cancel { id: String },
+    /// Retry a FAILED/cancelled/blocked work item: reset its attempt counter
+    /// to 0, clear the stale error, and flag it `ready` for a FULL fresh
+    /// attempt budget. Unlike `ready` (which preserves attempts — so a task at
+    /// the max-attempts cap re-fails after a single try), this re-drives a
+    /// failed task from scratch: the verb for draining the failed backlog.
+    Retry {
+        /// Work item UUID.
+        id: String,
+        /// Optionally pin execution to one computer (sets assigned_computer).
+        #[arg(long)]
+        on: Option<String>,
+    },
     /// Live Pillar-4 pipeline board: active/recent work_items with their host,
     /// lease/worktree state, merge-queue status, and PR — the autonomous build
     /// pipeline at a glance.
