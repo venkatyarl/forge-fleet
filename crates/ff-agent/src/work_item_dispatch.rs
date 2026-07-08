@@ -158,18 +158,27 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
     let max_slot = assigned.iter().map(|w| w.slot).max().unwrap_or(0).max(0) as u32;
     ensure_workspaces(max_slot + 1).map_err(|e| anyhow!("ensure sub-agent workspaces: {e}"))?;
 
-    let mut started = 0usize;
+    // SPAWN each dispatch so a multi-minute build doesn't BLOCK this tick — the
+    // handler awaits evaluate_work_item_dispatch, so a serial `.await` per item
+    // froze the whole dispatch loop for the FIRST build's duration while every
+    // OTHER assigned lease on this host stale-reaped at LEASE_STALE_SECS (#72:
+    // duncan got 3 leases, ran 1, the other 2 reaped). Each spawned dispatch
+    // claims 'building' first (see dispatch_one), so the next tick's
+    // assigned_work_items excludes in-flight items → no double-dispatch; the
+    // budget above already caps how many start per tick to this host's free slots.
+    let started = assigned.len();
     for item in assigned {
-        match dispatch_one(pg.clone(), item.clone(), worker_name.to_string()).await {
-            Ok(()) => started += 1,
-            Err(e) => {
+        let pg = pg.clone();
+        let worker_name = worker_name.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = dispatch_one(pg.clone(), item.clone(), worker_name).await {
                 warn!(
                     work_item_id = %item.work_item_id,
                     sub_agent_id = %item.sub_agent_id,
                     error = %e,
                     "work_item_dispatch: dispatch failed"
                 );
-                if let Err(cleanup) = requeue_or_fail(pg, &item, &e.to_string()).await {
+                if let Err(cleanup) = requeue_or_fail(&pg, &item, &e.to_string()).await {
                     warn!(
                         work_item_id = %item.work_item_id,
                         error = %cleanup,
@@ -177,11 +186,14 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
                     );
                 }
             }
-        }
+        });
     }
 
     if started > 0 {
-        info!(started, "work_item_dispatch: started assigned work_items");
+        info!(
+            started,
+            "work_item_dispatch: started assigned work_items (concurrent)"
+        );
     }
     Ok(started)
 }
@@ -514,9 +526,24 @@ fn expand_home(path: &str) -> String {
 }
 
 async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -> Result<()> {
-    ensure_repo_checked_out(&pg, &item).await?;
-    let worktree = create_worktree_for_item(&pg, &item).await?;
-    mark_building(&pg, &item).await?;
+    // CLAIM + heartbeat FIRST, before the (possibly slow cold-clone) checkout.
+    // dispatch_one now runs CONCURRENTLY with this host's other assigned leases
+    // (spawned by evaluate_work_item_dispatch — a serial `.await` here blocked the
+    // whole dispatch tick, so batch-assigned leases stale-reaped before their turn
+    // #72). Because the tick re-fires while this build runs, marking 'building'
+    // immediately excludes this item from the next tick's assigned_work_items
+    // (its `w.status = 'claimed'` filter) → no double-dispatch. Starting the
+    // heartbeat guard now also keeps the lease fresh THROUGH the checkout, so a
+    // multi-minute clone can't stale-reap the lease before the build even starts.
+    if !mark_building(&pg, &item).await? {
+        // A concurrent dispatch already claimed this item (status was no longer
+        // 'claimed') — skip cleanly rather than double-dispatch or clobber it.
+        info!(
+            work_item_id = %item.work_item_id,
+            "work_item_dispatch: already claimed by a concurrent dispatch — skipping"
+        );
+        return Ok(());
+    }
 
     // Keep the lease heartbeat alive for the ENTIRE dispatch — the backend build
     // AND the commit/push/PR tail — via an RAII guard that stops it when
@@ -525,6 +552,9 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     // a big diff ran with a frozen lease and the watchdog could reap it
     // mid-finalize as a "stale-heartbeat takeover".
     let _heartbeat_guard = HeartbeatGuard::spawn(item.work_item_id);
+
+    ensure_repo_checked_out(&pg, &item).await?;
+    let worktree = create_worktree_for_item(&pg, &item).await?;
 
     let started = std::time::Instant::now();
     let dispatch_full = run_ff_dispatch(&pg, &item, &worktree).await;
@@ -815,12 +845,27 @@ async fn insert_worktree_creating(
     Ok(())
 }
 
-async fn mark_building(pg: &PgPool, item: &AssignedWorkItem) -> Result<()> {
+/// Atomically CLAIM the item for THIS dispatch: flip `claimed` → `building`, but
+/// ONLY if it's still `claimed`. Returns `false` when 0 rows change — another
+/// concurrent dispatch already claimed it (dispatches now run spawned/concurrent,
+/// #72), so the caller skips instead of double-dispatching. The `WHERE
+/// status = 'claimed'` guard is the compare-and-set (council guard): "probably
+/// before the next tick" is not a concurrency guarantee, the DB predicate is. On
+/// a win, also flip the lease to `building` and refresh its heartbeat.
+async fn mark_building(pg: &PgPool, item: &AssignedWorkItem) -> Result<bool> {
     let mut tx = pg.begin().await?;
-    sqlx::query("UPDATE work_items SET status = 'building' WHERE id = $1")
-        .bind(item.work_item_id)
-        .execute(&mut *tx)
-        .await?;
+    let claimed = sqlx::query(
+        "UPDATE work_items SET status = 'building' WHERE id = $1 AND status = 'claimed'",
+    )
+    .bind(item.work_item_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if claimed == 0 {
+        // Lost the race (already building/in_review/done) — don't touch the lease.
+        tx.rollback().await?;
+        return Ok(false);
+    }
     sqlx::query(
         "UPDATE work_item_leases
             SET lease_state = 'building', heartbeat_at = NOW()
@@ -833,7 +878,7 @@ async fn mark_building(pg: &PgPool, item: &AssignedWorkItem) -> Result<()> {
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 async fn mark_ready_for_review(
