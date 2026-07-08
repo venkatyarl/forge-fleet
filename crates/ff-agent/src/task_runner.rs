@@ -469,6 +469,18 @@ impl TaskRunner {
 
         let task_id: uuid::Uuid = row.get("id");
         let payload: Value = row.get("payload");
+        // Deferred tasks (`pg_enqueue_deferred`) fold into `fleet_tasks` with the
+        // caller's REAL payload nested under a `deferred_payload` key (V153-158
+        // queue consolidation). Unwrap it so the shell fields (command / shell /
+        // max_duration_secs) are read from the original payload — otherwise every
+        // cross-node deferred shell task (notably `ff model download --node`)
+        // fails "task payload missing required field: command". Non-deferred
+        // fleet_tasks (command at the top level) pass straight through.
+        let payload: Value = payload
+            .get("deferred_payload")
+            .filter(|v| v.is_object())
+            .cloned()
+            .unwrap_or(payload);
         let summary: String = row.get("summary");
         let task_type: String = row.get("task_type");
         let timeout_secs: Option<i32> = row.get("timeout_secs");
