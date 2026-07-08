@@ -18,8 +18,11 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 
 /// Lease heartbeat deadline: a slot must heartbeat within this window or its
-/// lease is reaped and the work_item re-queued.
-const LEASE_STALE_SECS: i64 = 180;
+/// lease is reaped and the work_item re-queued. `pub(crate)` so the dispatch
+/// path can keep the Lane-1 local-codegen timeout STRICTLY BELOW it (see
+/// `work_item_dispatch::LANE1_TIMEOUT_SECS`) — a slow local lane must fail over
+/// to the cloud backstop before this reaper can reclaim the lease.
+pub(crate) const LEASE_STALE_SECS: i64 = 180;
 /// Hard ceiling on lease HOLD time regardless of heartbeat — reclaims a wedged
 /// dispatch that keeps its heartbeat fresh but makes no progress (the
 /// "building forever, live heartbeat" wedge). Above a real build's Lane-2 cap
