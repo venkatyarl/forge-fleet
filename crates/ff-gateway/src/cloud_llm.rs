@@ -422,6 +422,21 @@ fn upstream_error_message(v: &Value, fallback: &str) -> String {
         .to_string()
 }
 
+fn upstream_error_message_from_text(body_text: &str, fallback: &str) -> String {
+    serde_json::from_str::<Value>(body_text)
+        .ok()
+        .map(|v| upstream_error_message(&v, fallback))
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| {
+            let trimmed = body_text.trim();
+            if trimmed.is_empty() {
+                fallback.to_string()
+            } else {
+                trimmed.to_string()
+            }
+        })
+}
+
 // ─── openai_chat ─────────────────────────────────────────────────────────────
 
 async fn call_openai_chat(
@@ -474,18 +489,24 @@ async fn call_openai_chat(
         return Ok(CallOutcome::Stream(axum_resp));
     }
 
-    let value: Value = resp
-        .json()
+    let body_text = resp
+        .text()
         .await
-        .map_err(|e| CloudCallError::Local(format!("parse upstream json: {e}")))?;
+        .map_err(|e| CloudCallError::Local(format!("read upstream body: {e}")))?;
 
     if !status.is_success() {
         return Err(CloudCallError::Http {
             status,
-            message: upstream_error_message(&value, "cloud provider returned an error"),
-            body_text: value.to_string(),
+            message: upstream_error_message_from_text(
+                &body_text,
+                "cloud provider returned an error",
+            ),
+            body_text,
         });
     }
+
+    let value: Value = serde_json::from_str(&body_text)
+        .map_err(|e| CloudCallError::Local(format!("parse upstream json: {e}")))?;
 
     let (tokens_in, tokens_out) = extract_openai_usage(&value);
     Ok(CallOutcome::Json {
@@ -539,18 +560,21 @@ async fn call_anthropic_messages(
         .map_err(|e| CloudCallError::Local(format!("upstream request failed: {e}")))?;
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let value: Value = resp
-        .json()
+    let body_text = resp
+        .text()
         .await
-        .map_err(|e| CloudCallError::Local(format!("parse upstream json: {e}")))?;
+        .map_err(|e| CloudCallError::Local(format!("read upstream body: {e}")))?;
 
     if !status.is_success() {
         return Err(CloudCallError::Http {
             status,
-            message: upstream_error_message(&value, "anthropic returned an error"),
-            body_text: value.to_string(),
+            message: upstream_error_message_from_text(&body_text, "anthropic returned an error"),
+            body_text,
         });
     }
+
+    let value: Value = serde_json::from_str(&body_text)
+        .map_err(|e| CloudCallError::Local(format!("parse upstream json: {e}")))?;
 
     let openai_shape = anthropic_to_openai_response(&value);
     let tokens_in = value
@@ -759,18 +783,21 @@ async fn call_google_generate_content(
         .map_err(|e| CloudCallError::Local(format!("upstream request failed: {e}")))?;
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let value: Value = resp
-        .json()
+    let body_text = resp
+        .text()
         .await
-        .map_err(|e| CloudCallError::Local(format!("parse upstream json: {e}")))?;
+        .map_err(|e| CloudCallError::Local(format!("read upstream body: {e}")))?;
 
     if !status.is_success() {
         return Err(CloudCallError::Http {
             status,
-            message: upstream_error_message(&value, "google returned an error"),
-            body_text: value.to_string(),
+            message: upstream_error_message_from_text(&body_text, "google returned an error"),
+            body_text,
         });
     }
+
+    let value: Value = serde_json::from_str(&body_text)
+        .map_err(|e| CloudCallError::Local(format!("parse upstream json: {e}")))?;
 
     let openai_shape = google_to_openai_response(&value, bare_model);
     let tokens_in = value
