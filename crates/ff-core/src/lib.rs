@@ -74,3 +74,35 @@ pub use verifier::{
 
 /// Crate version from Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub fn truncate_tail(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+
+    s.chars()
+        .take(max.saturating_sub(1))
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_tail;
+
+    #[test]
+    fn truncate_tail_returns_short_strings_unchanged() {
+        assert_eq!(truncate_tail("fleet", 5), "fleet");
+    }
+
+    #[test]
+    fn truncate_tail_replaces_tail_with_ellipsis() {
+        assert_eq!(truncate_tail("forgefleet", 6), "forge…");
+    }
+
+    #[test]
+    fn truncate_tail_counts_chars_not_bytes() {
+        assert_eq!(truncate_tail("aé日b", 4), "aé日b");
+        assert_eq!(truncate_tail("aé日bc", 4), "aé日…");
+    }
+}
