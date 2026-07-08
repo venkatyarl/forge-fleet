@@ -147,6 +147,37 @@ pub fn probe_indicates_config_error(reason: &str) -> bool {
     CONFIG_SIGNATURES.iter().any(|s| lower.contains(s))
 }
 
+/// Whether an auth-probe failure reason indicates a DEFINITIVE authentication
+/// failure — the CLI itself reported an expired / revoked / absent credential
+/// (not a flaky probe: timeout, transient 5xx, cold-start). Such a backend must
+/// fail CLOSED regardless of cred-FILE presence: the token is stale, so every
+/// dispatch to it 401s. Without this, `cred_present` masks it — the backend
+/// reads "authenticated" while the router burns every attempt on a 401 (observed
+/// live: claude + kimi green in `computer_backends` yet 401ing each dispatch).
+///
+/// Kept as a TIGHT subset: it keys off `classify_auth`'s own definitive verdict
+/// ("not authenticated (matched …)") plus a few unambiguous vendor phrases, and
+/// deliberately omits bare "403" / "api key" (which can appear in rate-limit or
+/// help text) so a genuinely-authenticated backend with a transient blip still
+/// gets the cred-file benefit of the doubt. PURE, so the policy is testable.
+pub fn probe_indicates_unauthenticated(reason: &str) -> bool {
+    const UNAUTH_SIGNATURES: &[&str] = &[
+        "not authenticated (matched", // classify_auth's definitive auth verdict
+        "401 invalid authentication",
+        "invalid authentication credentials",
+        "invalid api key",
+        "invalid credentials",
+        "credentials expired",
+        "token expired",
+        "session expired",
+        "please log in",
+        "please login",
+        "not logged in",
+    ];
+    let lower = reason.to_ascii_lowercase();
+    UNAUTH_SIGNATURES.iter().any(|s| lower.contains(s))
+}
+
 /// Detect every backend's availability on THIS node. When `probe_auth` is true,
 /// each installed backend additionally gets a tiny non-interactive request to
 /// verify it's authenticated (slower — a real CLI invocation per backend).
@@ -193,15 +224,33 @@ pub async fn detect_backends(probe_auth: bool, timeout: Duration) -> Vec<Backend
                     Some(false),
                     format!("installed but MISCONFIGURED: {reason}"),
                 )
+            } else if probe_indicates_unauthenticated(&reason) {
+                // A DEFINITIVE auth failure — the CLI itself reported an
+                // expired/revoked/absent credential (e.g. claude "401 Invalid
+                // authentication credentials", kimi "not logged in"). Unlike a
+                // flaky probe (timeout, transient 5xx) this 401s on EVERY
+                // dispatch, so fail CLOSED regardless of cred-FILE presence. The
+                // cred_present fallback below used to MASK this: a stale token
+                // left the backend marked "authenticated", so the dispatch
+                // picker kept routing to it and burned every attempt on a 401
+                // (observed live on duncan — claude+kimi green in the DB, both
+                // 401ing each dispatch). Marking it unauthenticated makes the
+                // picker skip it (→ codex, the working backend) and surfaces in
+                // `ff` that this node needs a fresh `ff oauth` / re-distribution.
+                (
+                    Some(false),
+                    format!("installed but UNAUTHENTICATED: {reason}"),
+                )
             } else if cred_present(cfg.name) {
                 // The live probe can be flaky on the fleet (slow cold-start,
                 // sandbox quirks, transient 5xx) and would leave a genuinely
                 // authenticated backend marked unusable — so the router never
                 // routes to it and dispatch has no fail-over target. If the
                 // vendor cred FILE is present, treat the backend as
-                // authenticated (cred-based). Safe: the dispatch path now
-                // classifies a real 401 as Unauthenticated and switches, so a
-                // cred that's actually expired self-corrects rather than wedging.
+                // authenticated (cred-based). Safe: a DEFINITIVE 401 is caught
+                // by the unauthenticated branch above and fails closed; only a
+                // non-definitive probe blip reaches here and gets the benefit of
+                // the doubt.
                 (
                     Some(true),
                     format!("authenticated (cred file present; probe: {reason})"),
@@ -424,6 +473,40 @@ mod tests {
         assert!(!probe_indicates_config_error("503 service unavailable"));
         assert!(!probe_indicates_config_error(
             "Missing optional dependency @openai/codex-linux-x64"
+        ));
+    }
+
+    #[test]
+    fn unauthenticated_detected_and_disjoint_from_transient_and_broken() {
+        // classify_auth's definitive verdict (the detect path always routes a
+        // real auth failure through this) must fail closed.
+        assert!(probe_indicates_unauthenticated(
+            "not authenticated (matched '401')"
+        ));
+        // The exact live dispatch surface from claude on duncan.
+        assert!(probe_indicates_unauthenticated(
+            "Failed to authenticate. API Error: 401 Invalid authentication credentials"
+        ));
+        assert!(probe_indicates_unauthenticated("not logged in"));
+        assert!(probe_indicates_unauthenticated("Your token expired"));
+        // Transient / flaky probes must NOT match — they keep the cred-file
+        // benefit of the doubt (a genuinely-authenticated backend blipping).
+        assert!(!probe_indicates_unauthenticated("503 service unavailable"));
+        assert!(!probe_indicates_unauthenticated(
+            "probe timed out (likely waiting on an interactive login prompt)"
+        ));
+        assert!(!probe_indicates_unauthenticated(
+            "probe failed: 502 bad gateway"
+        ));
+        // Disjoint from the broken-binary and config-error verdicts.
+        assert!(!probe_indicates_unauthenticated(
+            "Missing optional dependency @openai/codex-linux-x64"
+        ));
+        assert!(!probe_indicates_broken_binary(
+            "not authenticated (matched '401')"
+        ));
+        assert!(!probe_indicates_config_error(
+            "not authenticated (matched '401')"
         ));
     }
 
