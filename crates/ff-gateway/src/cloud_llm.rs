@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use ff_agent::cloud_llm_registry::{self, Provider};
+use ff_agent::{circuit_breaker, cloud_error, fleet_info};
 use ff_db::pg_get_secret;
 
 /// Max attempts when the upstream returns 429. Counts the initial call,
@@ -96,6 +97,64 @@ fn ok_response(mut body: Value, provider: &Provider, status: StatusCode) -> Resp
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+async fn record_provider_success_best_effort(pool: &PgPool, provider: &str) {
+    let computer_id = match resolve_this_computer_id(pool).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(provider = %provider, error = %e,
+                "cloud_llm: could not resolve local computer_id for provider success");
+            return;
+        }
+    };
+
+    if let Err(e) = circuit_breaker::record_provider_success(pool, computer_id, provider).await {
+        tracing::warn!(provider = %provider, computer_id = %computer_id, error = %e,
+            "cloud_llm: provider success breaker record failed");
+    }
+}
+
+async fn record_provider_failure_best_effort(
+    pool: &PgPool,
+    provider: &str,
+    status: StatusCode,
+    body_text: &str,
+) {
+    let class = cloud_error::classify(provider, Some(i32::from(status.as_u16())), body_text);
+    let computer_id = match resolve_this_computer_id(pool).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(provider = %provider, status = status.as_u16(), class = %class.as_str(), error = %e,
+                "cloud_llm: could not resolve local computer_id for provider failure");
+            return;
+        }
+    };
+
+    match circuit_breaker::record_provider_failure(pool, computer_id, provider, class.as_str())
+        .await
+    {
+        Ok(tripped) => {
+            if tripped {
+                tracing::warn!(provider = %provider, computer_id = %computer_id, class = %class.as_str(),
+                    "cloud_llm: provider breaker tripped from gateway HTTP failure");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(provider = %provider, computer_id = %computer_id, class = %class.as_str(), error = %e,
+                "cloud_llm: provider failure breaker record failed");
+        }
+    }
+}
+
+async fn resolve_this_computer_id(pool: &PgPool) -> Result<uuid::Uuid, String> {
+    let worker_name = fleet_info::resolve_this_worker_name().await;
+    sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM computers WHERE LOWER(name) = LOWER($1)")
+        .bind(&worker_name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("lookup computers.id for {worker_name}: {e}"))?
+        .ok_or_else(|| format!("no computers row for {worker_name}"))
 }
 
 /// Attempt to route `body` to a cloud provider. See module docs for the
@@ -297,6 +356,7 @@ pub async fn try_route_to_cloud(
             tokens_in,
             tokens_out,
         }) => {
+            record_provider_success_best_effort(pool, &provider.id).await;
             if let Err(e) = record_usage(
                 pool,
                 &provider.id,
@@ -313,8 +373,16 @@ pub async fn try_route_to_cloud(
             }
             Some(Ok(ok_response(rb, &provider, status)))
         }
-        Ok(CallOutcome::Stream(resp)) => Some(Ok(resp)),
-        Err(CloudCallError::Http { status, message }) => {
+        Ok(CallOutcome::Stream(resp)) => {
+            record_provider_success_best_effort(pool, &provider.id).await;
+            Some(Ok(resp))
+        }
+        Err(CloudCallError::Http {
+            status,
+            message,
+            body_text,
+        }) => {
+            record_provider_failure_best_effort(pool, &provider.id, status, &body_text).await;
             Some(Err(error_response(status, message, "cloud_upstream_error")))
         }
         Err(CloudCallError::Local(msg)) => Some(Err(error_response(
@@ -337,7 +405,11 @@ enum CallOutcome {
 
 #[derive(Debug)]
 enum CloudCallError {
-    Http { status: StatusCode, message: String },
+    Http {
+        status: StatusCode,
+        message: String,
+        body_text: String,
+    },
     Local(String),
 }
 
@@ -348,6 +420,21 @@ fn upstream_error_message(v: &Value, fallback: &str) -> String {
         .and_then(|m| m.as_str())
         .unwrap_or(fallback)
         .to_string()
+}
+
+fn upstream_error_message_from_text(body_text: &str, fallback: &str) -> String {
+    serde_json::from_str::<Value>(body_text)
+        .ok()
+        .map(|v| upstream_error_message(&v, fallback))
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| {
+            let trimmed = body_text.trim();
+            if trimmed.is_empty() {
+                fallback.to_string()
+            } else {
+                trimmed.to_string()
+            }
+        })
 }
 
 // ─── openai_chat ─────────────────────────────────────────────────────────────
@@ -402,17 +489,24 @@ async fn call_openai_chat(
         return Ok(CallOutcome::Stream(axum_resp));
     }
 
-    let value: Value = resp
-        .json()
+    let body_text = resp
+        .text()
         .await
-        .map_err(|e| CloudCallError::Local(format!("parse upstream json: {e}")))?;
+        .map_err(|e| CloudCallError::Local(format!("read upstream body: {e}")))?;
 
     if !status.is_success() {
         return Err(CloudCallError::Http {
             status,
-            message: upstream_error_message(&value, "cloud provider returned an error"),
+            message: upstream_error_message_from_text(
+                &body_text,
+                "cloud provider returned an error",
+            ),
+            body_text,
         });
     }
+
+    let value: Value = serde_json::from_str(&body_text)
+        .map_err(|e| CloudCallError::Local(format!("parse upstream json: {e}")))?;
 
     let (tokens_in, tokens_out) = extract_openai_usage(&value);
     Ok(CallOutcome::Json {
@@ -466,17 +560,21 @@ async fn call_anthropic_messages(
         .map_err(|e| CloudCallError::Local(format!("upstream request failed: {e}")))?;
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let value: Value = resp
-        .json()
+    let body_text = resp
+        .text()
         .await
-        .map_err(|e| CloudCallError::Local(format!("parse upstream json: {e}")))?;
+        .map_err(|e| CloudCallError::Local(format!("read upstream body: {e}")))?;
 
     if !status.is_success() {
         return Err(CloudCallError::Http {
             status,
-            message: upstream_error_message(&value, "anthropic returned an error"),
+            message: upstream_error_message_from_text(&body_text, "anthropic returned an error"),
+            body_text,
         });
     }
+
+    let value: Value = serde_json::from_str(&body_text)
+        .map_err(|e| CloudCallError::Local(format!("parse upstream json: {e}")))?;
 
     let openai_shape = anthropic_to_openai_response(&value);
     let tokens_in = value
@@ -685,17 +783,21 @@ async fn call_google_generate_content(
         .map_err(|e| CloudCallError::Local(format!("upstream request failed: {e}")))?;
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let value: Value = resp
-        .json()
+    let body_text = resp
+        .text()
         .await
-        .map_err(|e| CloudCallError::Local(format!("parse upstream json: {e}")))?;
+        .map_err(|e| CloudCallError::Local(format!("read upstream body: {e}")))?;
 
     if !status.is_success() {
         return Err(CloudCallError::Http {
             status,
-            message: upstream_error_message(&value, "google returned an error"),
+            message: upstream_error_message_from_text(&body_text, "google returned an error"),
+            body_text,
         });
     }
+
+    let value: Value = serde_json::from_str(&body_text)
+        .map_err(|e| CloudCallError::Local(format!("parse upstream json: {e}")))?;
 
     let openai_shape = google_to_openai_response(&value, bare_model);
     let tokens_in = value
@@ -842,9 +944,6 @@ async fn record_usage(
 
 #[cfg(test)]
 mod tests {
-    use ff_agent::circuit_breaker::{record_provider_failure, record_provider_success};
-    use ff_agent::cloud_error::classify;
-
     use super::*;
 
     #[test]
