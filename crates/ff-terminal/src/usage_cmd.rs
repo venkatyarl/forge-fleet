@@ -1,11 +1,12 @@
 use anyhow::Result;
+use serde::Serialize;
 
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 struct UsageRow {
     computer: String,
     provider: String,
@@ -58,20 +59,7 @@ pub async fn handle_usage(json: bool) -> Result<()> {
     .collect();
 
     if json {
-        let arr: Vec<_> = rows
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "computer": &r.computer,
-                    "provider": &r.provider,
-                    "remaining_pct": r.remaining_pct,
-                    "window_kind": &r.window_kind,
-                    "source": &r.source,
-                    "sampled_at": r.sampled_at.to_rfc3339(),
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&arr)?);
+        println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
 
