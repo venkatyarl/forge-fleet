@@ -337,11 +337,16 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
             .strip_prefix("~/")
             .map(|rest| format!("$HOME/{rest}"))
             .unwrap_or_else(|| provider.cred_path.to_string());
+        // Escape single quotes so the `IP='…'` assignment is injection-proof
+        // even if the DB value ever contained one (POSIX: close-quote, escaped
+        // literal quote, reopen-quote). primary_ip is validated IP data today,
+        // but this write path handles a secret — belt and suspenders.
+        let primary_ip_sh = primary_ip.replace('\'', "'\\''");
         // The remote payload: write the cred file with a heredoc (no
         // shell expansion of `$` inside the b64 blob), chmod 0600.
         let cmd = format!(
             "set -e\n\
-             IP='{primary_ip}'\n\
+             IP='{primary_ip_sh}'\n\
              CRED_PATH=\"{cred_path_sh}\"\n\
              echo \"== distributing {provider} cred file to {target} ==\"\n\
              __ff_local_ips() {{ (hostname -I 2>/dev/null; \
@@ -366,7 +371,7 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
             provider = provider.name,
             target = name,
             ssh_user = ssh_user,
-            primary_ip = primary_ip,
+            primary_ip_sh = primary_ip_sh,
             cred_path = provider.cred_path,
             cred_path_sh = cred_path_sh,
             b64 = b64,
