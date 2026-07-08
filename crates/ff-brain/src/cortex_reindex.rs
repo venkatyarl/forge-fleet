@@ -143,47 +143,76 @@ pub fn detect_index_langs(root: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-/// Re-scan + incrementally re-index ONE corpus by slug, auto-detecting its
-/// languages from its registered root. Returns `None` when the corpus isn't
-/// registered, its source checkout isn't on this host, or it has no
-/// Cortex-supported source — a quiet skip, not an error.
+/// Re-scan + incrementally re-index ONE corpus by slug. Auto-detects languages
+/// across ALL of the corpus's registered source roots that exist on THIS host —
+/// a corpus can have several (e.g. hireflow360 = a 50-file docs root at
+/// ~/Business/HireFlow360 PLUS the 10k-file code root at ~/projects/HireFlow360);
+/// picking one arbitrarily (the old `ORDER BY id LIMIT 1`) grabbed the docs root,
+/// found no code, and silently left the corpus stale. Returns `None` when the
+/// corpus isn't registered, none of its checkouts are on this host, or none has
+/// Cortex-supported source — a quiet skip, not an error. The index pass is
+/// retried on a transient Postgres deadlock (it races the hourly embed/summary
+/// ticks writing the same graph tables).
 pub async fn reindex_corpus(
     pool: &PgPool,
     slug: &str,
 ) -> Result<Option<cortex::IncrementalReport>> {
-    let root: Option<String> = sqlx::query_scalar(
+    // Every source root for this corpus, code-heaviest first so a small docs root
+    // can never shadow the real code root.
+    let roots: Vec<String> = sqlx::query_scalar(
         "SELECT bs.root_path FROM brain_sources bs \
            JOIN brain_corpora bc ON bc.id = bs.corpus_id \
-          WHERE bc.slug = $1 ORDER BY bs.id LIMIT 1",
+          WHERE bc.slug = $1 \
+          ORDER BY bs.file_count DESC NULLS LAST, bs.id",
     )
     .bind(slug)
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await?;
-    let Some(root) = root else {
+
+    // Union the detected languages across every root that actually exists here.
+    let mut langs: Vec<String> = Vec::new();
+    let mut any_root_here = false;
+    for root in &roots {
+        let p = std::path::Path::new(root);
+        if !p.exists() {
+            continue; // this source's checkout lives on another host
+        }
+        any_root_here = true;
+        for l in detect_index_langs(p) {
+            if !langs.contains(&l) {
+                langs.push(l);
+            }
+        }
+    }
+    if !any_root_here || langs.is_empty() {
+        return Ok(None); // no checkout on this host, or no Cortex-supported code
+    }
+
+    // Re-scan the corpus's content:file nodes from disk (the incremental indexer
+    // diffs against these), then incrementally re-index. Use get_corpus (NOT
+    // add_corpus) so we never clobber a multi-source corpus's registered roots.
+    let Some(c) = corpus::get_corpus(pool, slug).await? else {
         return Ok(None);
     };
-    let root_path = std::path::Path::new(&root);
-    if !root_path.exists() {
-        // The checkout lives on another host — quiet skip (leader-gated tick).
-        return Ok(None);
-    }
-    let langs = detect_index_langs(root_path);
-    if langs.is_empty() {
-        return Ok(None);
-    }
-    // Create-or-reuse the corpus + re-scan its content:file nodes from disk (the
-    // incremental indexer diffs against these — without a re-scan it never sees
-    // new files), then incrementally re-index the detected languages.
-    let c = corpus::add_corpus(
-        pool,
-        slug,
-        slug,
-        &[(root.clone(), Some("code".to_string()))],
-    )
-    .await?;
     corpus::scan(pool, &c, None, 12).await?;
-    let report = cortex::index_langs_incremental(pool, slug, &langs).await?;
-    Ok(Some(report))
+
+    // Retry the index pass on a transient Postgres deadlock (races embed/summary).
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match cortex::index_langs_incremental(pool, slug, &langs).await {
+            Ok(report) => return Ok(Some(report)),
+            Err(e) if attempt < 3 && e.to_string().contains("deadlock detected") => {
+                tracing::warn!(
+                    corpus = slug,
+                    attempt,
+                    "cortex reindex: deadlock — retrying index pass"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Back-compat wrapper: re-index just the self corpus. Retained for the lib
