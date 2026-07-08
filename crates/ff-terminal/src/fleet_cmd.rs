@@ -4248,11 +4248,12 @@ async fn run_local_shell(cmd: &str, timeout_secs: u64) -> (i32, String, String) 
     }
 }
 
-fn leader_refresh_result(code: i32, stderr: &str) -> (bool, String) {
+fn leader_refresh_result(code: i32, failure_stderr: Option<&str>) -> (bool, String) {
     if code == 0 {
         return (true, "leader daemon rebuilt + restarted".into());
     }
 
+    let stderr = failure_stderr.unwrap_or("");
     (
         false,
         format!(
@@ -4317,7 +4318,10 @@ async fn refresh_local_leader_if_self(pool: &sqlx::PgPool) -> Option<(bool, Stri
         "{CYAN}▶ refreshing leader '{leader_name}' forgefleetd locally (tree clean @ HEAD)…{RESET}"
     );
     let (code, _out, err) = run_local_shell(&leader_refresh_playbook(&os_family, &src), 2700).await;
-    Some(leader_refresh_result(code, &err))
+    Some(leader_refresh_result(
+        code,
+        (code != 0).then_some(err.as_str()),
+    ))
 }
 
 /// Run one shell command on a target over SSH with a deadline, capturing
@@ -5276,11 +5280,19 @@ mod route_tests {
 
     #[test]
     fn leader_refresh_success_ignores_codesign_stderr() {
-        let (ok, detail) =
-            super::leader_refresh_result(0, "replacing existing signature\nsigned ok\n");
+        let (ok, detail) = super::leader_refresh_result(0, None);
 
         assert!(ok);
         assert_eq!(detail, "leader daemon rebuilt + restarted");
+    }
+
+    #[test]
+    fn leader_refresh_failure_reports_stderr_tail() {
+        let (ok, detail) =
+            super::leader_refresh_result(1, Some("replacing existing signature\nactual failure\n"));
+
+        assert!(!ok);
+        assert_eq!(detail, "leader refresh exit 1: actual failure");
     }
 
     /// Layout invariant (2026-07-07 migration): a NULL-source-tree WORKER must
