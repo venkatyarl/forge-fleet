@@ -74,3 +74,28 @@ pub use verifier::{
 
 /// Crate version from Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Returns true if `s` is empty or contains only whitespace characters.
+pub fn is_blank(s: &str) -> bool {
+    s.is_empty() || s.chars().all(char::is_whitespace)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_blank_empty() {
+        assert!(is_blank(""));
+    }
+
+    #[test]
+    fn test_is_blank_whitespace() {
+        assert!(is_blank(" \t"));
+    }
+
+    #[test]
+    fn test_is_blank_non_blank() {
+        assert!(!is_blank("hello"));
+    }
+}
