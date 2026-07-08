@@ -147,14 +147,28 @@ async fn record_provider_failure_best_effort(
     }
 }
 
+/// This node's `computers.id` is STATIC for the process lifetime, but the
+/// breaker-recording path resolves it on EVERY cloud call (success + failure).
+/// Cache the first successful lookup so those calls add no per-request DB
+/// round-trip. `get_or_try_init` only caches an Ok — a transient DB error (or a
+/// not-yet-enrolled node) is NOT cached, so it self-heals on a later call.
+static COMPUTER_ID: tokio::sync::OnceCell<uuid::Uuid> = tokio::sync::OnceCell::const_new();
+
 async fn resolve_this_computer_id(pool: &PgPool) -> Result<uuid::Uuid, String> {
-    let worker_name = fleet_info::resolve_this_worker_name().await;
-    sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM computers WHERE LOWER(name) = LOWER($1)")
-        .bind(&worker_name)
-        .fetch_optional(pool)
+    COMPUTER_ID
+        .get_or_try_init(|| async {
+            let worker_name = fleet_info::resolve_this_worker_name().await;
+            sqlx::query_scalar::<_, uuid::Uuid>(
+                "SELECT id FROM computers WHERE LOWER(name) = LOWER($1)",
+            )
+            .bind(&worker_name)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("lookup computers.id for {worker_name}: {e}"))?
+            .ok_or_else(|| format!("no computers row for {worker_name}"))
+        })
         .await
-        .map_err(|e| format!("lookup computers.id for {worker_name}: {e}"))?
-        .ok_or_else(|| format!("no computers row for {worker_name}"))
+        .copied()
 }
 
 /// Attempt to route `body` to a cloud provider. See module docs for the
