@@ -102,8 +102,23 @@ services:
       - "56379:6379"
     volumes:
       - redis_data:/data
+    # Auto-repair a corrupt append-only file before starting. A hard power-off
+    # (e.g. the macOS auto-restart that hit us 2026-07-08) can leave a partial
+    # AOF write that makes redis crash-loop on boot; redis-check-aof --fix
+    # truncates the torn tail so the next boot self-heals instead of needing a
+    # manual repair. Safe here: this redis is coordination/cache (Pulse + LRU),
+    # not a source of truth — Postgres is.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        if [ -f /data/appendonlydir/appendonly.aof.manifest ]; then
+          echo "[redis-autorepair] verifying AOF before start"
+          printf 'y\n' | redis-check-aof --fix /data/appendonlydir/appendonly.aof.manifest || true
+        fi
+        exec redis-server "$@"
+      - redis-server
     command:
-      - "redis-server"
       - "--save"
       - "60"
       - "1"
