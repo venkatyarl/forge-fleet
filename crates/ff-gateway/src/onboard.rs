@@ -675,8 +675,14 @@ pub async fn self_enroll(
     Ok(Json(SelfEnrollResponse {
         assigned_name: name,
         peer_ssh_identities: peers,
-        postgres_url: std::env::var("FORGEFLEET_POSTGRES_URL").ok(),
-        redis_url: std::env::var("FORGEFLEET_REDIS_URL").ok(),
+        // #44: never hand out this gateway's own DSN env — it pins the
+        // enrolling node to the CURRENT primary's IP outside fleet.toml (the
+        // taylor-death time bomb: 12 nodes carried a dead .100 DSN in their
+        // units). Nodes derive the DSN from fleet.toml + dsn_failover; the
+        // fields stay for response-shape compatibility but are always None.
+        // No client-side consumer reads them (verified 2026-07-17).
+        postgres_url: None,
+        redis_url: None,
     }))
 }
 

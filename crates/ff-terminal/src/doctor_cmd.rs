@@ -252,6 +252,18 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
         detail: format!("{stuck_sessions} running/pending >{STUCK_SESSION_HOURS}h"),
     });
 
+    // 5b) Unit DSN-env lint (#44): a forgefleetd unit carrying a hardcoded
+    //     FORGEFLEET_*_URL Environment= line re-arms the stale-DSN time bomb
+    //     on the next reboot/upgrade (the July taylor-death class: 12 nodes
+    //     silently pinned to a dead primary). Nodes must read the DSN from
+    //     ~/.forgefleet/fleet.toml only.
+    let (dsn_status, dsn_detail) = unit_dsn_env_lint();
+    checks.push(DoctorCheck {
+        name: "unit DSN env".into(),
+        status: dsn_status,
+        detail: dsn_detail,
+    });
+
     // 6) Disk quota: latest sample per worker vs its disk_quota_pct. Stale
     //    samples (offline nodes) excluded via sampled_at.
     let (disk_over, disk_near): (i64, i64) = sqlx::query_as(
@@ -352,6 +364,57 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
     Ok(())
 }
 
+/// Whether service-unit text carries a hardcoded fleet DSN env line — the #44
+/// pattern (`Environment=FORGEFLEET_POSTGRES_URL=…` etc.) that pins a node to
+/// one primary's IP outside fleet.toml. Matches any FORGEFLEET_*_URL variable
+/// on an Environment= line so future DSN vars are covered too. Pure for tests.
+fn unit_text_has_dsn_env(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("Environment=")
+            && line.contains("FORGEFLEET_")
+            && line.contains("_URL=")
+    })
+}
+
+/// Scan the local forgefleetd unit definitions (systemd user + system unit and
+/// their drop-in dirs; the launchd plist on macOS) for hardcoded DSN env lines.
+/// FAIL with the offending path(s) + a strip hint; PASS when clean or when no
+/// unit exists at all (not-yet-onboarded box).
+fn unit_dsn_env_lint() -> (Health, String) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut candidates: Vec<std::path::PathBuf> = vec![
+        format!("{home}/.config/systemd/user/forgefleetd.service").into(),
+        "/etc/systemd/system/forgefleetd.service".into(),
+        format!("{home}/Library/LaunchAgents/com.forgefleet.daemon.plist").into(),
+    ];
+    for dropin_dir in [
+        format!("{home}/.config/systemd/user/forgefleetd.service.d"),
+        "/etc/systemd/system/forgefleetd.service.d".to_string(),
+    ] {
+        if let Ok(entries) = std::fs::read_dir(&dropin_dir) {
+            candidates.extend(entries.flatten().map(|e| e.path()));
+        }
+    }
+    let offenders: Vec<String> = candidates
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok().map(|t| (p, t)))
+        .filter(|(_, text)| unit_text_has_dsn_env(text))
+        .map(|(p, _)| p.display().to_string())
+        .collect();
+    if offenders.is_empty() {
+        (Health::Pass, "no hardcoded FORGEFLEET_*_URL env".into())
+    } else {
+        (
+            Health::Fail,
+            format!(
+                "hardcoded DSN env in {} — strip the FORGEFLEET_*_URL Environment= line(s) and `systemctl daemon-reload`; the DSN belongs in ~/.forgefleet/fleet.toml",
+                offenders.join(", ")
+            ),
+        )
+    }
+}
+
 /// Process exit code for an overall verdict: FAIL always fails; WARN fails only
 /// under `--strict`; PASS always succeeds. Pure, so the gating is unit-tested.
 fn doctor_exit_code(overall: Health, strict: bool) -> i32 {
@@ -376,6 +439,29 @@ mod tests {
         assert_eq!(doctor_exit_code(Health::Pass, true), 0);
         assert_eq!(doctor_exit_code(Health::Warn, true), 1);
         assert_eq!(doctor_exit_code(Health::Fail, true), 1);
+    }
+
+    #[test]
+    fn unit_dsn_env_lint_matches_only_dsn_env_lines() {
+        // The #44 pattern: hardcoded primary IP baked into the unit.
+        assert!(unit_text_has_dsn_env(
+            "[Service]\nEnvironment=FORGEFLEET_POSTGRES_URL=postgresql://ff@192.168.5.100:55432/ff\n"
+        ));
+        assert!(unit_text_has_dsn_env(
+            "  Environment=FORGEFLEET_REDIS_URL=redis://192.168.5.100:56379\n"
+        ));
+        // Benign env the units legitimately carry must NOT trip the lint.
+        assert!(!unit_text_has_dsn_env(
+            "[Service]\nEnvironment=RUST_LOG=info\nEnvironment=FORGEFLEET_HOME=%h/.forgefleet\n"
+        ));
+        // Non-URL FORGEFLEET vars (e.g. FORGEFLEET_LEADER_HOST) are allowed.
+        assert!(!unit_text_has_dsn_env(
+            "Environment=FORGEFLEET_LEADER_HOST=192.168.5.104\n"
+        ));
+        // A DSN mentioned outside an Environment= line (comment) is fine.
+        assert!(!unit_text_has_dsn_env(
+            "# used to carry FORGEFLEET_POSTGRES_URL=… before #44\n"
+        ));
     }
 
     #[test]
