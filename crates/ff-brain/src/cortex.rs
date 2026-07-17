@@ -116,6 +116,8 @@ pub mod routes;
 pub mod security;
 #[path = "cortex/spi.rs"]
 pub mod spi;
+#[path = "cortex/storage.rs"]
+pub mod storage;
 #[path = "cortex/extractors/types.rs"]
 pub mod types;
 

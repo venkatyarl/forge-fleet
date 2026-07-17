@@ -11,6 +11,8 @@
 # Ports exposed on the host (all 5-digit per the canonical-ports convention):
 #   Postgres:  55432  (connect: psql -h 192.168.5.100 -p 55432 -U forgefleet)
 #   Redis:     56379  (connect: redis-cli -h 192.168.5.100 -p 56379)
+#   FalkorDB:  63379  (connect: redis-cli -h 192.168.5.100 -p 63379)
+#   Falkor UI: 63000  (browser UI)
 #   Sentinel:  26380  (connect: redis-cli -h 192.168.5.100 -p 26380) [DEPRECATED]
 #   NATS:      54222  (client); 56222 (cluster); 58222 (monitoring, LAN only)
 #
@@ -128,6 +130,36 @@ services:
     networks:
       - forgefleet
 
+  # ─── FalkorDB (Cortex graph backend candidate) ─────────────────────────
+  #
+  # Design/scaffold only: Cortex still reads/writes Postgres by default.
+  # FalkorDB gives the code graph a native graph store with OpenCypher plus
+  # vector indexes for the existing bge-m3 embeddings.
+  falkordb:
+    image: falkordb/falkordb:latest
+    container_name: forgefleet-falkordb
+    ports:
+      # Host 63379 -> container 6379. Keep host ports 5-digit and outside the
+      # existing Redis/Postgres/NATS ranges.
+      - "63379:6379"
+      # The combined FalkorDB image includes FalkorDB Browser on port 3000.
+      - "63000:3000"
+    volumes:
+      - falkordb_data:/data
+    environment:
+      REDIS_ARGS: "--save 60 1 --appendonly yes --appendfsync everysec"
+      FALKORDB_ARGS: "THREAD_COUNT 4 CACHE_SIZE 256"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    mem_limit: 1g
+    restart: unless-stopped
+    networks:
+      - forgefleet
+
   # ─── Redis Sentinel (REMOVED — replaced by Pulse P2P) ─────────────────
   #
   # Per Plan 14 Phase 2/6: ff's own Pulse P2P layer (TCP on :51100, inside
@@ -171,6 +203,8 @@ volumes:
     name: forgefleet-postgres-data
   redis_data:
     name: forgefleet-redis-data
+  falkordb_data:
+    name: forgefleet-falkordb-data
   # sentinel_data volume removed — see the Sentinel service block above.
   nats_data:
     name: forgefleet-nats-data
