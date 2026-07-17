@@ -3979,12 +3979,26 @@ async fn proxy_chat_completions(
                 }
             }
         } else {
+            let started = std::time::Instant::now();
             match pulse
                 .route_completion_cached(&raw_payload, cache_ref, pg_ref)
                 .await
             {
                 Ok(value) => {
                     record_pulse_usage(&state, &value).await;
+                    // Interaction-log capture (V121 ff_interactions): the
+                    // Pulse router is the primary path for every routed
+                    // /v1/chat/completions turn, so without this hook the
+                    // training corpus records nothing from gateway traffic.
+                    if let Some(pool) = pg_ref {
+                        let latency_ms = started.elapsed().as_millis().min(i32::MAX as u128) as i32;
+                        let rec = build_router_interaction(
+                            last_user_message_text(&raw_payload),
+                            &value,
+                            latency_ms,
+                        );
+                        spawn_interaction_capture(pool.clone(), rec);
+                    }
                     return Ok(Json(value).into_response());
                 }
                 Err(llm_routing::LlmRoutingError::NoMatch { .. }) => {
@@ -4327,7 +4341,7 @@ async fn proxy_chat_completions(
 async fn record_usage_from_response(
     state: &GatewayState,
     backend: &ff_api::registry::BackendEndpoint,
-    _payload: &ChatCompletionRequest,
+    payload: &ChatCompletionRequest,
     upstream_body: bytes::Bytes,
     latency_ms: u64,
 ) -> bytes::Bytes {
@@ -4373,6 +4387,37 @@ async fn record_usage_from_response(
         ff_observability::metrics::LLM_COST_USD_TOTAL
             .with_label_values(&[&model, if backend.is_local { "true" } else { "false" }])
             .add(cost);
+
+        // Interaction-log capture (V121 ff_interactions) for the legacy
+        // tier/model-router fallback. Pulse-routed turns are captured in
+        // proxy_chat_completions; the `choices` gate skips upstream error
+        // bodies that flow through here on the 4xx passthrough path.
+        if resp_json.get("choices").is_some()
+            && let Some(pool) = state.operational_store.as_ref().and_then(|s| s.pg_pool())
+        {
+            let request_text = payload
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map(|m| match &m.content {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
+            let mut rec = build_router_interaction(
+                request_text,
+                &resp_json,
+                latency_ms.min(i32::MAX as u64) as i32,
+            );
+            if rec.worker_name.is_none() {
+                rec.worker_name = Some(backend.node.clone());
+            }
+            if rec.endpoint.is_none() {
+                rec.endpoint = Some(backend.base_url());
+            }
+            spawn_interaction_capture(pool.clone(), rec);
+        }
     }
     upstream_body
 }
@@ -4418,6 +4463,86 @@ async fn record_pulse_usage(state: &GatewayState, value: &Value) {
     ff_observability::metrics::LLM_COST_USD_TOTAL
         .with_label_values(&[&model, "true"])
         .add(0.0);
+}
+
+/// Last `role == "user"` message content from a raw OpenAI-style chat body.
+/// String content is returned as-is; structured (array) content is serialized
+/// so multimodal turns still land in the corpus.
+fn last_user_message_text(body: &Value) -> String {
+    body.get("messages")
+        .and_then(|v| v.as_array())
+        .and_then(|msgs| {
+            msgs.iter()
+                .rev()
+                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        })
+        .and_then(|m| m.get("content"))
+        .map(|c| match c {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default()
+}
+
+/// Build the `ff_interactions` row (V121/V138) for one routed
+/// /v1/chat/completions turn. Pure extraction — no I/O — so the mapping is
+/// unit-testable without a database. `_forgefleet_route` (attached by the
+/// Pulse router) supplies worker/endpoint attribution when present.
+fn build_router_interaction(
+    request_text: String,
+    response: &Value,
+    latency_ms: i32,
+) -> ff_db::InteractionRecord {
+    let usage = response.get("usage");
+    let route = response.get("_forgefleet_route");
+    ff_db::InteractionRecord {
+        channel: "gateway-router".to_string(),
+        request_text,
+        route_decision: route.cloned().unwrap_or_else(|| json!({})),
+        engine: response
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        response_text: response
+            .get("choices")
+            .and_then(|v| v.as_array())
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        tokens_in: usage
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32,
+        tokens_out: usage
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32,
+        latency_ms: Some(latency_ms),
+        outcome: "ok".to_string(),
+        worker_name: route
+            .and_then(|r| r.get("computer"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        endpoint: route
+            .and_then(|r| r.get("endpoint"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        ..Default::default()
+    }
+}
+
+/// Fire-and-forget insert into `ff_interactions`. Never blocks the HTTP
+/// response. Failures log at warn (not debug): a silent capture failure is
+/// exactly how the corpus went dark for a month without anyone noticing.
+fn spawn_interaction_capture(pool: sqlx::PgPool, rec: ff_db::InteractionRecord) {
+    tokio::spawn(async move {
+        if let Err(e) = ff_db::pg_record_interaction(&pool, &rec).await {
+            warn!(error = %e, "gateway-router interaction capture failed");
+        }
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -6297,5 +6422,120 @@ mod node_status_tests {
         assert!(parse_heartbeat_timestamp("   ").is_none());
         assert!(parse_heartbeat_timestamp("UNKNOWN").is_none());
         assert!(parse_heartbeat_timestamp("nonsense").is_none());
+    }
+}
+
+#[cfg(test)]
+mod router_interaction_capture_tests {
+    use super::{build_router_interaction, last_user_message_text};
+    use serde_json::json;
+
+    #[test]
+    fn last_user_message_prefers_final_user_turn() {
+        let body = json!({
+            "model": "qwen3-30b",
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "first answer"},
+                {"role": "user", "content": "second question"}
+            ]
+        });
+        assert_eq!(last_user_message_text(&body), "second question");
+        // No messages at all → empty, never panics.
+        assert_eq!(last_user_message_text(&json!({"model": "x"})), "");
+    }
+
+    #[test]
+    fn build_router_interaction_maps_pulse_response() {
+        let response = json!({
+            "model": "qwen3-30b-a3b",
+            "choices": [{"message": {"role": "assistant", "content": "42"}}],
+            "usage": {"prompt_tokens": 17, "completion_tokens": 5},
+            "_forgefleet_route": {
+                "computer": "forge-01",
+                "endpoint": "http://10.0.0.5:51001",
+                "runtime": "llama-server"
+            }
+        });
+        let rec = build_router_interaction("meaning of life?".to_string(), &response, 321);
+        assert_eq!(rec.channel, "gateway-router");
+        assert_eq!(rec.request_text, "meaning of life?");
+        assert_eq!(rec.response_text, "42");
+        assert_eq!(rec.engine.as_deref(), Some("qwen3-30b-a3b"));
+        assert_eq!(rec.tokens_in, 17);
+        assert_eq!(rec.tokens_out, 5);
+        assert_eq!(rec.latency_ms, Some(321));
+        assert_eq!(rec.outcome, "ok");
+        assert_eq!(rec.worker_name.as_deref(), Some("forge-01"));
+        assert_eq!(rec.endpoint.as_deref(), Some("http://10.0.0.5:51001"));
+        assert_eq!(rec.route_decision["computer"], "forge-01");
+    }
+
+    #[test]
+    fn build_router_interaction_defaults_without_route_metadata() {
+        // Legacy tier-router responses have no `_forgefleet_route`; the
+        // caller backfills worker/endpoint from the backend registry entry.
+        let response = json!({
+            "choices": [{"message": {"content": "ok"}}],
+        });
+        let rec = build_router_interaction("hi".to_string(), &response, 5);
+        assert_eq!(rec.engine, None);
+        assert_eq!(rec.worker_name, None);
+        assert_eq!(rec.endpoint, None);
+        assert_eq!(rec.tokens_in, 0);
+        assert_eq!(rec.tokens_out, 0);
+        assert_eq!(rec.route_decision, json!({}));
+    }
+
+    /// DB round-trip: insert one captured row through the same
+    /// `pg_record_interaction` call the router uses, proving the INSERT
+    /// column list matches the LIVE `ff_interactions` schema, then delete it.
+    /// Early-returns when no Postgres is configured (`cargo test --lib` in CI
+    /// has no database and must never panic).
+    #[tokio::test]
+    async fn router_interaction_round_trips_against_live_schema() {
+        let url = match std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+        {
+            Ok(u) => u,
+            Err(_) => {
+                eprintln!(
+                    "skipping router interaction DB test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL"
+                );
+                return;
+            }
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("connect to Postgres");
+
+        let response = json!({
+            "model": "test-model",
+            "choices": [{"message": {"content": "router capture round-trip"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4},
+            "_forgefleet_route": {"computer": "test-node", "endpoint": "http://test:1"}
+        });
+        let rec = build_router_interaction("router capture test".to_string(), &response, 42);
+        let id = ff_db::pg_record_interaction(&pool, &rec)
+            .await
+            .expect("insert into live ff_interactions");
+
+        let (channel, worker): (String, Option<String>) =
+            sqlx::query_as("SELECT channel, worker_name FROM ff_interactions WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read back inserted row");
+        assert_eq!(channel, "gateway-router");
+        assert_eq!(worker.as_deref(), Some("test-node"));
+
+        sqlx::query("DELETE FROM ff_interactions WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("clean up test row");
     }
 }
