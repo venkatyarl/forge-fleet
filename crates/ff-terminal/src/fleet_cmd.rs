@@ -3054,10 +3054,75 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         FleetCommand::SshMeshCheck {
             node,
             json,
+            from_here,
             since,
             repair,
             yes,
         } => {
+            if from_here {
+                if repair || since.is_some() {
+                    anyhow::bail!(
+                        "--from-here is a direct probe from this node; it can't be combined with --repair or --since"
+                    );
+                }
+                println!(
+                    "{CYAN}▶ Probing ping + SSH from this node to every fleet worker...{RESET}"
+                );
+                let probes = ff_agent::mesh_check::local_reach_check(&pool, node.as_deref())
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                if probes.is_empty() {
+                    println!("{YELLOW}no matching fleet_workers rows to probe{RESET}");
+                    return Ok(());
+                }
+                if json {
+                    let arr: Vec<_> = probes
+                        .iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "src": p.src, "dst": p.dst, "ip": p.ip,
+                                "ping_ok": p.ping_ok, "ssh_ok": p.ssh_ok,
+                                "status": p.status, "detail": p.detail,
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+                    return Ok(());
+                }
+                println!(
+                    "\n  {:<14} {:<16} {:<6} {:<6} detail",
+                    "node", "ip", "ping", "ssh"
+                );
+                let mut ok = 0;
+                let mut fail = 0;
+                for p in &probes {
+                    if p.ssh_ok {
+                        ok += 1;
+                    } else {
+                        fail += 1;
+                    }
+                    println!(
+                        "  {:<14} {:<16} {:<6} {:<6} {}",
+                        p.dst,
+                        p.ip,
+                        if p.ping_ok { "ok" } else { "down" },
+                        if p.ssh_ok { "ok" } else { "down" },
+                        p.detail.as_deref().unwrap_or(""),
+                    );
+                }
+                println!(
+                    "\n{ok} ok, {fail} failed — probed {} node(s) from {}",
+                    probes.len(),
+                    probes[0].src,
+                );
+                if fail > 0 {
+                    println!(
+                        "  failures recorded in fleet_mesh_status — full pair history: \
+                         {CYAN}ff fleet ssh-mesh-check --node <name>{RESET}"
+                    );
+                }
+                return Ok(());
+            }
             if repair && !yes {
                 anyhow::bail!(
                     "--repair rewrites authorized_keys / known_hosts on every failed peer — pass --yes to proceed"

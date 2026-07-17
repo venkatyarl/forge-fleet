@@ -1576,12 +1576,20 @@ enum LeaderAction {
 
 #[derive(Debug, Clone, Subcommand)]
 enum FleetCommand {
-    /// Pairwise SSH reachability check across the fleet (N×(N-1) probes).
+    /// Pairwise SSH reachability check across the fleet (N×(N-1) probes),
+    /// or a direct ping+SSH fan-out from this node with --from-here.
     SshMeshCheck {
         #[arg(long)]
         node: Option<String>,
         #[arg(long)]
         json: bool,
+        /// Probe directly FROM this node (ICMP ping + single-hop SSH,
+        /// BatchMode, ConnectTimeout=5) to every fleet_workers row instead of
+        /// the pairwise N×N mesh. Works even when peers can't reach each
+        /// other; failures are written to fleet_mesh_status as
+        /// (this node → dst) rows.
+        #[arg(long, default_value_t = false)]
+        from_here: bool,
         /// Only re-probe pairs whose last_checked in fleet_mesh_status is
         /// older than the given ISO-8601 duration prefix (e.g. "1h", "30m", "2d").
         #[arg(long)]
