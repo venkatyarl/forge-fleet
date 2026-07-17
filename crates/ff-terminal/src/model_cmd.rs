@@ -550,7 +550,9 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                     escaped_id, target_runtime
                 );
                 let title = format!("Download {} ({} variant) on {}", id, target_runtime, node);
-                let payload = serde_json::json!({ "command": command });
+                // Tens of GB per model — override the 10-min default duration so a
+                // slow pull isn't SIGKILLed mid-stream (see single-download note).
+                let payload = serde_json::json!({ "command": command, "max_duration_secs": 14400 });
                 let trigger_spec = serde_json::json!({});
                 let defer_id = ff_db::pg_enqueue_deferred(
                     &pool,
@@ -2434,7 +2436,11 @@ async fn handle_model_download(
             "Download {} ({} variant) on {}",
             id, target_runtime, worker_name
         );
-        let payload = serde_json::json!({ "command": command });
+        // Model files are tens of GB, so a HuggingFace pull runs far longer than
+        // the task runner's 10-min MAX_TASK_DURATION default — without this
+        // override the download is SIGKILLed mid-stream ("task exceeded max
+        // duration of 600s"). 4h covers even a slow ~200GB pull.
+        let payload = serde_json::json!({ "command": command, "max_duration_secs": 14400 });
         let trigger_spec = serde_json::json!({});
         let defer_id = ff_db::pg_enqueue_deferred(
             &pool,
