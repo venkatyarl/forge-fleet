@@ -184,6 +184,149 @@ async fn probe_pair(
     }
 }
 
+/// One direct (this node → dst) reachability probe: ICMP ping + single-hop SSH.
+#[derive(Debug, Clone)]
+pub struct LocalProbe {
+    pub src: String,
+    pub dst: String,
+    pub ip: String,
+    pub ping_ok: bool,
+    pub ssh_ok: bool,
+    /// "ok" | "failed" — what gets stored in fleet_mesh_status.
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+/// Direct reachability fan-out FROM this node: ping + single-hop SSH
+/// (BatchMode, ConnectTimeout=5) to every other `fleet_workers` row. Unlike
+/// the pairwise N×N check this needs no intermediate hop, so it still answers
+/// "who went dark?" when this node is the only reachable one, and the ping
+/// column separates host-down / stale-IP from host-up-but-SSH-broken.
+/// Results are upserted into fleet_mesh_status as (this node → dst) rows so
+/// failures land on the same alert path the integrity sweep reads.
+pub async fn local_reach_check(
+    pool: &PgPool,
+    only_node: Option<&str>,
+) -> Result<Vec<LocalProbe>, String> {
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    let me = crate::fleet_info::resolve_this_worker_name().await;
+    let nodes = ff_db::pg_list_nodes(pool)
+        .await
+        .map_err(|e| format!("pg_list_nodes: {e}"))?;
+
+    let mut futs = FuturesUnordered::new();
+    let mut probes = Vec::new();
+    for n in nodes.iter().filter(|n| n.name != me) {
+        if let Some(o) = only_node
+            && n.name != o
+        {
+            continue;
+        }
+        futs.push(probe_direct(
+            me.clone(),
+            n.name.clone(),
+            n.ssh_user.clone(),
+            n.ip.clone(),
+        ));
+        if futs.len() >= 8
+            && let Some(p) = futs.next().await
+        {
+            let _ =
+                ff_db::pg_upsert_mesh_status(pool, &p.src, &p.dst, &p.status, p.detail.as_deref())
+                    .await;
+            probes.push(p);
+        }
+    }
+    while let Some(p) = futs.next().await {
+        let _ = ff_db::pg_upsert_mesh_status(pool, &p.src, &p.dst, &p.status, p.detail.as_deref())
+            .await;
+        probes.push(p);
+    }
+    probes.sort_by(|a, b| a.dst.cmp(&b.dst));
+    Ok(probes)
+}
+
+async fn probe_direct(src: String, dst: String, dst_user: String, dst_ip: String) -> LocalProbe {
+    // macOS ping -W is milliseconds; Linux is seconds.
+    let ping_wait: &str = if cfg!(target_os = "macos") {
+        "2000"
+    } else {
+        "2"
+    };
+    let ping_ok = matches!(
+        timeout(
+            Duration::from_secs(4),
+            Command::new("ping")
+                .args(["-c", "1", "-W", ping_wait, &dst_ip])
+                .output(),
+        )
+        .await,
+        Ok(Ok(o)) if o.status.success()
+    );
+
+    let ssh_res = timeout(
+        Duration::from_secs(8),
+        Command::new("ssh")
+            .args(crate::ssh_opts::ssh_bypass_args())
+            .args([
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                &format!("{dst_user}@{dst_ip}"),
+                "true",
+            ])
+            .output(),
+    )
+    .await;
+    let ssh_err = match ssh_res {
+        Ok(Ok(out)) if out.status.success() => None,
+        Ok(Ok(out)) => Some(format!(
+            "exit {}: {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr)
+                .trim()
+                .chars()
+                .take(120)
+                .collect::<String>()
+        )),
+        Ok(Err(e)) => Some(format!("spawn: {e}")),
+        Err(_) => Some("timeout".into()),
+    };
+    let ssh_ok = ssh_err.is_none();
+    let (status, detail) = classify_direct_probe(ping_ok, ssh_err);
+    LocalProbe {
+        src,
+        dst,
+        ip: dst_ip,
+        ping_ok,
+        ssh_ok,
+        status,
+        detail,
+    }
+}
+
+/// Fold a ping result + optional SSH failure into the (status, last_error)
+/// pair stored in fleet_mesh_status. SSH decides ok/failed — ping is
+/// diagnostic (ICMP can be blocked while SSH works, and vice versa).
+fn classify_direct_probe(ping_ok: bool, ssh_err: Option<String>) -> (String, Option<String>) {
+    match (ping_ok, ssh_err) {
+        (true, None) => ("ok".into(), None),
+        (false, None) => (
+            "ok".into(),
+            Some("ssh ok; ping failed (icmp blocked or lossy path)".into()),
+        ),
+        (ping_ok, Some(e)) => (
+            "failed".into(),
+            Some(format!(
+                "ping {}; ssh {e}",
+                if ping_ok { "ok" } else { "failed" }
+            )),
+        ),
+    }
+}
+
 pub async fn mesh_propagate(
     pool: &PgPool,
     params: &serde_json::Value,
@@ -477,4 +620,32 @@ pub fn spawn_mesh_refresh_tick(
         }
         tracing::info!("mesh-refresh tick loop stopped");
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_both_ok_is_clean_ok() {
+        assert_eq!(classify_direct_probe(true, None), ("ok".into(), None));
+    }
+
+    #[test]
+    fn classify_ssh_ok_ping_failed_stays_ok_with_detail() {
+        let (status, detail) = classify_direct_probe(false, None);
+        assert_eq!(status, "ok");
+        assert!(detail.unwrap().contains("ping failed"));
+    }
+
+    #[test]
+    fn classify_ssh_failed_is_failed_and_keeps_ping_verdict() {
+        let (status, detail) = classify_direct_probe(false, Some("timeout".into()));
+        assert_eq!(status, "failed");
+        assert_eq!(detail.as_deref(), Some("ping failed; ssh timeout"));
+
+        let (status, detail) = classify_direct_probe(true, Some("exit 255: refused".into()));
+        assert_eq!(status, "failed");
+        assert_eq!(detail.as_deref(), Some("ping ok; ssh exit 255: refused"));
+    }
 }
