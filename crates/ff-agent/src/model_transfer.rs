@@ -219,6 +219,15 @@ pub async fn transfer_model(
     }
 
     // 6. Run rsync on the target, pulling from the source.
+    //
+    // Dir-models (MLX / safetensors repos) need a trailing slash on the rsync
+    // source, otherwise the directory nests (`<models_dir>/<name>/<name>/…`)
+    // while the library row records the outer dir — and `ff model load` then
+    // can't find the files.
+    let test_cmd = format!("test -d {}", shell_quote(&src_lib.file_path));
+    let (tc, _, _) = ssh_exec(&src_node.ssh_user, &src_node.ip, &test_cmd).await?;
+    let src_is_dir = tc == 0;
+
     println!(
         "Transferring {} ({}) from {} to {} …",
         basename,
@@ -226,11 +235,11 @@ pub async fn transfer_model(
         src_node.name,
         dst_node.name,
     );
-    let remote_src = format!(
-        "{}@{}:{}",
-        src_node.ssh_user,
-        src_node.ip,
-        shell_quote(&src_lib.file_path),
+    let remote_src = rsync_source_spec(
+        &src_node.ssh_user,
+        &src_node.ip,
+        &src_lib.file_path,
+        src_is_dir,
     );
     let rsync_cmd = format!(
         "rsync -av --partial -e 'ssh -o StrictHostKeyChecking=accept-new {}' {} {}",
@@ -246,19 +255,36 @@ pub async fn transfer_model(
     }
 
     // 7. Verify size on target (best effort — also serves as existence check).
-    let stat_cmd = format!(
-        "stat -c %s {} 2>/dev/null || stat -f %z {}",
-        shell_quote(&dst_path),
-        shell_quote(&dst_path),
-    );
-    let (sc, sstdout, _sstderr) = ssh_exec(&dst_node.ssh_user, &dst_node.ip, &stat_cmd).await?;
-    let bytes_transferred = if sc == 0 {
-        sstdout
-            .trim()
-            .parse::<u64>()
-            .unwrap_or(src_lib.size_bytes.max(0) as u64)
+    // `stat` on a directory returns the inode size (4096), not the payload,
+    // so dir-models sum the tree with `du` instead.
+    let bytes_transferred = if src_is_dir {
+        let du_cmd = format!("du -sk {}", shell_quote(&dst_path));
+        let (dc, dstdout, _dstderr) = ssh_exec(&dst_node.ssh_user, &dst_node.ip, &du_cmd).await?;
+        if dc == 0 {
+            dstdout
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|k| k.saturating_mul(1024))
+                .unwrap_or(src_lib.size_bytes.max(0) as u64)
+        } else {
+            src_lib.size_bytes.max(0) as u64
+        }
     } else {
-        src_lib.size_bytes.max(0) as u64
+        let stat_cmd = format!(
+            "stat -c %s {} 2>/dev/null || stat -f %z {}",
+            shell_quote(&dst_path),
+            shell_quote(&dst_path),
+        );
+        let (sc, sstdout, _sstderr) = ssh_exec(&dst_node.ssh_user, &dst_node.ip, &stat_cmd).await?;
+        if sc == 0 {
+            sstdout
+                .trim()
+                .parse::<u64>()
+                .unwrap_or(src_lib.size_bytes.max(0) as u64)
+        } else {
+            src_lib.size_bytes.max(0) as u64
+        }
     };
 
     // 8. Register new library row on target.
@@ -280,6 +306,18 @@ pub async fn transfer_model(
         target_library_id: new_id,
         bytes_transferred,
     })
+}
+
+/// Build the `user@host:path` rsync source spec. Directory sources get a
+/// trailing slash so rsync copies the directory's *contents* into the
+/// destination path instead of nesting the directory inside it.
+fn rsync_source_spec(ssh_user: &str, ip: &str, file_path: &str, is_dir: bool) -> String {
+    let quoted = if is_dir {
+        shell_quote(&format!("{}/", file_path.trim_end_matches('/')))
+    } else {
+        shell_quote(file_path)
+    };
+    format!("{ssh_user}@{ip}:{quoted}")
 }
 
 /// Conservative single-quote shell quoting for paths.
@@ -329,5 +367,26 @@ mod tests {
     fn shell_quote_handles_apostrophes() {
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn rsync_source_spec_file_has_no_trailing_slash() {
+        assert_eq!(
+            rsync_source_spec("bob", "10.0.0.2", "/home/bob/models/model.gguf", false),
+            "bob@10.0.0.2:'/home/bob/models/model.gguf'"
+        );
+    }
+
+    #[test]
+    fn rsync_source_spec_dir_gets_trailing_slash() {
+        assert_eq!(
+            rsync_source_spec("bob", "10.0.0.2", "/home/bob/models/qwen3-coder-30b", true),
+            "bob@10.0.0.2:'/home/bob/models/qwen3-coder-30b/'"
+        );
+        // Already-trailing slash is not doubled.
+        assert_eq!(
+            rsync_source_spec("bob", "10.0.0.2", "/home/bob/models/qwen3-coder-30b/", true),
+            "bob@10.0.0.2:'/home/bob/models/qwen3-coder-30b/'"
+        );
     }
 }
