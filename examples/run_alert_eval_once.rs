@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
         "postgres://forgefleet:forgefleet@localhost:55432/forgefleet".to_string()
     });
     let redis_url = std::env::var("FORGEFLEET_REDIS_URL")
-        .unwrap_or_else(|_| "redis://localhost:6380".to_string());
+        .unwrap_or_else(|_| "redis://localhost:56379".to_string());
 
     let pool = PgPoolOptions::new()
         .max_connections(4)
