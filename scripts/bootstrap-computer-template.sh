@@ -492,7 +492,7 @@ password = \"forgefleet\"
 url = \"postgresql://forgefleet:forgefleet@{{LEADER_HOST}}:55432/forgefleet\"
 
 [redis]
-url = \"redis://{{LEADER_HOST}}:6380\"
+url = \"redis://{{LEADER_HOST}}:56379\"
 prefix = \"pulse\"
 
 [loops.self_heal]
