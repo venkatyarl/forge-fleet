@@ -49,4 +49,4 @@ fi
 
 # Hand off to the real postgres entrypoint. Because PG_VERSION now
 # exists, the entrypoint will skip initdb and go straight to `exec postgres`.
-exec docker-entrypoint.sh postgres
+exec docker-entrypoint.sh postgres -c max_connections=500

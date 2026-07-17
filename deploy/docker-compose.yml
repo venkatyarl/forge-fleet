@@ -53,9 +53,11 @@ services:
       - "-c"
       - "effective_cache_size=512MB"
       - "-c"
-      # 15 daemons × ~4 pools each ≈ 60 baseline; 300 leaves headroom
-      # for psql shells, gateway bursts, and admin queries.
-      - "max_connections=300"
+      # 15 daemons × ~4 pools each ≈ 60 baseline; 500 leaves headroom
+      # for psql shells, gateway bursts, and admin queries. Replicas MUST
+      # pin max_connections >= this (the April-23 marcus lesson: a lower
+      # replica setting aborts recovery).
+      - "max_connections=500"
       - "-c"
       - "log_min_duration_statement=1000"
       # ─── Streaming-replication knobs (Phase 6 HA) ─────────────────────

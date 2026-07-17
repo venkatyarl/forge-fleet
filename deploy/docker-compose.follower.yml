@@ -17,7 +17,7 @@ name: forgefleet-follower
 
 services:
   postgres-replica:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     container_name: forgefleet-postgres-replica
     # Host networking so the replica's outbound pg_basebackup /
     # streaming connection sources from the node's LAN IP
