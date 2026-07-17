@@ -1340,7 +1340,7 @@ async fn pids_listening_on_port(port: u16) -> Vec<u32> {
 ///
 /// Never uses `pkill -f` — every signal targets a numeric PID resolved from
 /// the kernel, so this command can never match and kill itself.
-async fn stop_listener_on_port(port: u16, fallback_pid: Option<u32>) -> Vec<u32> {
+pub(crate) async fn stop_listener_on_port(port: u16, fallback_pid: Option<u32>) -> Vec<u32> {
     let mut targets = pids_listening_on_port(port).await;
     if targets.is_empty() {
         if let Some(fp) = fallback_pid
@@ -1429,7 +1429,7 @@ async fn stop_listener_on_port(port: u16, fallback_pid: Option<u32>) -> Vec<u32>
 /// rewrites + re-enables the unit. Failures (no systemd, no such unit,
 /// no user session) are logged and ignored.
 #[cfg(target_os = "linux")]
-async fn stop_systemd_unit(port: u16) {
+pub(crate) async fn stop_systemd_unit(port: u16) {
     use tokio::process::Command as TokCmd;
     let unit = format!("llama-{port}.service");
     for verb in ["stop", "disable"] {

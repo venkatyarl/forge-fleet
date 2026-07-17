@@ -59,6 +59,15 @@ fn ram_headroom_ok(free_ram_gb: f64, floor_gb: f64) -> bool {
     free_ram_gb >= floor_gb
 }
 
+/// Whether a local `unload_model` error means the UUID has no row in THIS
+/// node's deployment list ("no deployment '<uuid>' on this node") — the case
+/// where we fall back to a fleet-wide DB-row evict — as opposed to a real
+/// unload failure, which must still bail. Matches the error string built in
+/// `ff_agent::model_runtime::unload_model`. Pure for unit testing.
+fn unload_err_is_missing_row(err: &str) -> bool {
+    err.contains("no deployment '")
+}
+
 /// Reprofile a running deployment into the agent-capable serving profile
 /// (`--parallel 1 --ctx >= 32768`) so it becomes agent-router-visible. Runs on
 /// the host that owns the deployment, SSHing there if it lives elsewhere.
@@ -692,6 +701,34 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             }
             match ff_agent::model_runtime::unload_model(&pool, &id).await {
                 Ok(()) => println!("Unloaded deployment {id}"),
+                // "no deployment '<uuid>' on this node": the server process died
+                // and the reconciler re-created the row (possibly under a new
+                // UUID), or the row lives under another worker_name — either
+                // way the local by-UUID lookup can't see it. Fall back to
+                // evicting the DB row and clearing desired_state so the
+                // reconciler stops resurrecting the endpoint, instead of
+                // leaving the operator stuck in the desired_state='active'
+                // respawn loop (observed on sia 2026-07-17).
+                Err(e) if unload_err_is_missing_row(&e) => {
+                    println!(
+                        "{YELLOW}▶ No deployment {id} on this node — falling back to DB-row evict{RESET}"
+                    );
+                    match ff_agent::deployment_reconciler::evict_deployment_row(&pool, &id).await {
+                        Ok(ev) if ev.deleted => println!(
+                            "{CYAN}✓ Evicted{RESET} deployment {id} ({}:{}) — row deleted, desired_state cleared; reconciler will not resurrect it",
+                            ev.worker_name, ev.port
+                        ),
+                        Ok(ev) => println!(
+                            "{CYAN}✓ Retired{RESET} deployment {id} ({}:{}) — row belongs to {}; its reconciler will kill any survivor and drop the row within a tick",
+                            ev.worker_name, ev.port, ev.worker_name
+                        ),
+                        Err(e2) => {
+                            anyhow::bail!(
+                                "unload failed: {e}; DB-row evict fallback also failed: {e2}"
+                            )
+                        }
+                    }
+                }
                 Err(e) => anyhow::bail!("unload failed: {e}"),
             }
         }
@@ -3425,6 +3462,19 @@ mod tests {
     fn unknown_ctx_is_not_ready() {
         // NULL usable_agent_ctx (pre-backfill / unknown) must not be trusted.
         assert!(!is_agent_ready(None, AGENT_MIN_CTX as i32));
+    }
+
+    #[test]
+    fn unload_missing_row_error_triggers_evict_fallback() {
+        // The exact error unload_model builds when the UUID isn't in this
+        // node's deployment list → fall back to the DB-row evict.
+        assert!(unload_err_is_missing_row(
+            "no deployment '9d8d3fb8-e413-434d-af95-99a92bf55dba' on this node"
+        ));
+        // Real unload failures must still bail, not evict.
+        assert!(!unload_err_is_missing_row("pg_list_deployments: timeout"));
+        assert!(!unload_err_is_missing_row("mark retired: connection reset"));
+        assert!(!unload_err_is_missing_row("pg_delete_deployment: gone"));
     }
 
     fn cand(name: &str, free_gb: i64, models: i64) -> DistributeCandidate {

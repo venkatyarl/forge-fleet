@@ -443,6 +443,117 @@ async fn respawn_dead_deployment(
     Ok(true)
 }
 
+/// Outcome of [`evict_deployment_row`].
+#[derive(Debug, Clone)]
+pub struct EvictOutcome {
+    /// Worker the evicted row belonged to.
+    pub worker_name: String,
+    /// Port the evicted row claimed.
+    pub port: i32,
+    /// True when the row was deleted immediately (it belonged to this node, so
+    /// the systemd unit was stopped and any surviving listener killed first).
+    /// False when the row belongs to another worker: it was only flipped to
+    /// desired_state='retired' and that node's reconciler finishes the evict
+    /// (Pass A kills a surviving process, Pass B removes the row).
+    pub deleted: bool,
+}
+
+/// Evict a deployment row by UUID when `unload_model` can't — i.e. the row is
+/// not in this node's deployment list, typically because the server process
+/// died and this reconciler re-created the row (or the row lives under another
+/// worker_name). Clears desired_state FIRST so the respawn loop stops, then
+/// deletes the row (local) or leaves the delete to the owning node's reconciler
+/// (remote). Without this fallback a dead-but-desired='active' endpoint could
+/// only be stopped via the `--node`/`--port` form (observed on sia 2026-07-17:
+/// the reconciler kept re-enabling a broken unit under fresh UUIDs while every
+/// by-UUID unload bounced with "no deployment on this node").
+pub async fn evict_deployment_row(
+    pool: &sqlx::PgPool,
+    deployment_id: &str,
+) -> Result<EvictOutcome, String> {
+    let uuid = sqlx::types::Uuid::parse_str(deployment_id)
+        .map_err(|e| format!("bad deployment uuid '{deployment_id}': {e}"))?;
+
+    // Fleet-wide lookup — deliberately NOT filtered by worker_name, unlike
+    // unload_model's pg_list_deployments(Some(worker)) path that got us here.
+    let row = sqlx::query_as::<_, (String, i32, Option<i32>, Option<String>)>(
+        "SELECT worker_name, port, pid, library_id::text
+           FROM fleet_model_deployments WHERE id = $1",
+    )
+    .bind(uuid)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("lookup deployment {deployment_id}: {e}"))?;
+    let Some((worker_name, port, pid, library_id)) = row else {
+        return Err(format!(
+            "deployment '{deployment_id}' not found anywhere in fleet_model_deployments — \
+             the reconciler may have re-created it under a new UUID; list current rows with \
+             `ff model deployments`, or unload by endpoint: \
+             `ff model unload --node <name> --port <port>`"
+        ));
+    };
+
+    // Mark retired BEFORE any kill/delete so a racing reconciler tick doesn't
+    // see a missing process for an 'active' row and respawn it mid-evict.
+    sqlx::query("UPDATE fleet_model_deployments SET desired_state = 'retired' WHERE id = $1")
+        .bind(uuid)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("mark retired: {e}"))?;
+
+    let this_node = crate::fleet_info::resolve_this_worker_name().await;
+    if !evict_deletes_row(&worker_name, &this_node) {
+        return Ok(EvictOutcome {
+            worker_name,
+            port,
+            deleted: false,
+        });
+    }
+
+    // Local row: finish what unload_model would have done. Stop the systemd
+    // unit first so Restart=on-failure can't respawn the server, then reap
+    // whatever still listens on the port (usually nothing — the process being
+    // gone is why the by-UUID unload missed).
+    #[cfg(target_os = "linux")]
+    crate::model_runtime::stop_systemd_unit(port as u16).await;
+    let _ = crate::model_runtime::stop_listener_on_port(port as u16, pid.map(|p| p as u32)).await;
+
+    ff_db::pg_delete_deployment(pool, deployment_id)
+        .await
+        .map_err(|e| format!("pg_delete_deployment: {e}"))?;
+
+    // Same library cool-down as unload_model: back to cold unless another
+    // active deployment still serves this library row.
+    if let Some(lid) = library_id {
+        let _ = sqlx::query(
+            "UPDATE fleet_model_library SET state = 'cold' WHERE id = $1::uuid \
+             AND NOT EXISTS ( \
+               SELECT 1 FROM fleet_model_deployments dep2 \
+                WHERE dep2.library_id = $1::uuid \
+                  AND dep2.desired_state = 'active' \
+             )",
+        )
+        .bind(&lid)
+        .execute(pool)
+        .await;
+    }
+    Ok(EvictOutcome {
+        worker_name,
+        port,
+        deleted: true,
+    })
+}
+
+/// Whether the fleet-wide evict fallback may delete the row itself: only on the
+/// owning node, where we can also stop the systemd unit / kill a survivor
+/// first. Deleting a REMOTE row here would let that node's reconciler re-adopt
+/// a still-running process as a fresh 'active' row; retiring it instead makes
+/// that reconciler kill the process and drop the row. Case-insensitive to match
+/// the `--node` comparison in the CLI. Pure so the decision is unit-testable.
+fn evict_deletes_row(row_worker: &str, this_worker: &str) -> bool {
+    row_worker.eq_ignore_ascii_case(this_worker)
+}
+
 /// Minimal deployment row for the reconciler — pulls just what we need plus
 /// the new V90 `desired_state` column.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -618,6 +729,17 @@ mod tests {
         );
         assert_eq!(lib_id.as_deref(), Some("id-b"));
         assert_eq!(cat.as_deref(), Some("qwen3-coder-30b"));
+    }
+
+    #[test]
+    fn evict_deletes_row_only_on_owning_node() {
+        // Owning node (case-insensitive, like the CLI --node comparison) may
+        // delete the row after stopping the unit/listener.
+        assert!(evict_deletes_row("sia", "sia"));
+        assert!(evict_deletes_row("Sia", "sia"));
+        // A remote row is only retired — its own reconciler completes the
+        // evict, so a still-running process is never re-adopted as 'active'.
+        assert!(!evict_deletes_row("sia", "duncan"));
     }
 
     #[test]
