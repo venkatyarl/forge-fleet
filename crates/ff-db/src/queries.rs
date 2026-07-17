@@ -1614,9 +1614,21 @@ pub async fn pg_route_deployments(
            -- least-loaded picker would otherwise select them. Exclude a
            -- deployment only when its model is embedding/reranking-oriented AND
            -- has no chat-capable workload (a hybrid model still passes).
-           AND NOT (
-                cat.preferred_workloads ?| ARRAY['embedding','embeddings','reranking','rerank','retrieval']
-                AND NOT cat.preferred_workloads ?| ARRAY['chat','code','codegen','code-gen','instruct','reasoning','general','agentic','tool_calling']
+           --
+           -- BUT honor an EXPLICIT embedding/reranking request: cortex_search /
+           -- ff brain search route with workload=embedding|rerank and MUST reach
+           -- a pure embedder. The guard is ANDed with the workload filter below,
+           -- so without this escape it would zero out every embedder even when
+           -- one was explicitly asked for (→ silent fallback to hash-stub
+           -- vectors). Skip the guard when the requested synonyms ($1) overlap
+           -- the embedding/rerank tag set. $1 is empty for workload=None, so
+           -- chat/codegen routing keeps excluding embedders exactly as before.
+           AND (
+                $1::text[] && ARRAY['embedding','embeddings','reranking','rerank','retrieval']
+                OR NOT (
+                     cat.preferred_workloads ?| ARRAY['embedding','embeddings','reranking','rerank','retrieval']
+                     AND NOT cat.preferred_workloads ?| ARRAY['chat','code','codegen','code-gen','instruct','reasoning','general','agentic','tool_calling']
+                )
            )
            -- workload filter ($2 = true disables it). `?|` = any synonym present.
            AND ($2 OR cat.preferred_workloads ?| $1)
