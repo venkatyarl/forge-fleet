@@ -225,8 +225,21 @@ pub async fn transfer_model(
     // while the library row records the outer dir — and `ff model load` then
     // can't find the files.
     let test_cmd = format!("test -d {}", shell_quote(&src_lib.file_path));
-    let (tc, _, _) = ssh_exec(&src_node.ssh_user, &src_node.ip, &test_cmd).await?;
-    let src_is_dir = tc == 0;
+    let (tc, _, tstderr) = ssh_exec(&src_node.ssh_user, &src_node.ip, &test_cmd).await?;
+    // `test -d` exits 0 (dir) or 1 (not a dir); anything else is ssh itself
+    // failing — bail rather than misclassify a dir-model and nest it again.
+    let src_is_dir = match tc {
+        0 => true,
+        1 => false,
+        _ => {
+            return Err(format!(
+                "cannot probe source path type: ssh {}@{} exited {tc}: {}",
+                src_node.ssh_user,
+                src_node.ip,
+                tstderr.trim()
+            ));
+        }
+    };
 
     println!(
         "Transferring {} ({}) from {} to {} …",
