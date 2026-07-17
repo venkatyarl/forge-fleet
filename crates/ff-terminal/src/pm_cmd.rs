@@ -1147,6 +1147,199 @@ fn decomposed_work_item_insert_sql() -> &'static str {
      VALUES ($1, 'task', $2, $3, 'normal', $4, $5, $6, $7, $8, $9, $10) RETURNING id"
 }
 
+/// One task reconstructed from a Claude Code session transcript.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct ClaudeTask {
+    status: String,
+    subject: String,
+    description: String,
+}
+
+/// Encode a project cwd the way Claude Code names its
+/// `~/.claude/projects/<slug>` dir: EVERY non-alphanumeric char becomes `-`
+/// (so `/home/x/.forgefleet` → `-home-x--forgefleet`). The old
+/// `replace('/', "-")` missed dots and produced `-.forgefleet`-style slugs
+/// that match no real dir.
+fn claude_project_slug(path: &str) -> String {
+    path.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Parse a Claude Code session `.jsonl` into `task_id → ClaudeTask`.
+///
+/// Modern sessions persist tasks as structured tool calls, replayed in order:
+/// - `TaskCreate` tool_use carries subject/description; the ASSIGNED id only
+///   arrives in the paired tool_result (`toolUseResult.task.id`, or the
+///   "Task #N created" text as fallback).
+/// - `TaskUpdate` tool_use mutates status/subject/description by `taskId`;
+///   `status: "deleted"` drops the task.
+///
+/// Transcripts that predate structured tasks fall back to the legacy
+/// TodoWrite-era `#N. [status] subject` text scan.
+fn parse_claude_session_tasks(content: &str) -> std::collections::BTreeMap<String, ClaudeTask> {
+    let mut tasks: std::collections::BTreeMap<String, ClaudeTask> = Default::default();
+    // tool_use_id → (subject, description) awaiting the tool_result that
+    // carries the assigned task id.
+    let mut pending_creates: std::collections::HashMap<String, (String, String)> =
+        Default::default();
+    let created_re = regex::Regex::new(r"Task #(\d+) created").expect("static regex");
+
+    for line in content.lines() {
+        // Cheap pre-filter; real matching below is on PARSED structure, so a
+        // Bash tool_result whose stdout merely embeds a transcript can't
+        // fabricate tasks.
+        if !line.contains("TaskCreate")
+            && !line.contains("TaskUpdate")
+            && !line.contains("tool_result")
+        {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(items) = v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        for item in items {
+            match item.get("type").and_then(|t| t.as_str()) {
+                Some("tool_use") => {
+                    let Some(input) = item.get("input") else {
+                        continue;
+                    };
+                    let str_field = |k: &str| {
+                        input
+                            .get(k)
+                            .and_then(|s| s.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                    };
+                    match item.get("name").and_then(|n| n.as_str()) {
+                        Some("TaskCreate") => {
+                            if let (Some(use_id), Some(subject)) = (
+                                item.get("id").and_then(|i| i.as_str()),
+                                str_field("subject"),
+                            ) {
+                                pending_creates.insert(
+                                    use_id.to_string(),
+                                    (
+                                        subject.to_string(),
+                                        str_field("description").unwrap_or_default().to_string(),
+                                    ),
+                                );
+                            }
+                        }
+                        Some("TaskUpdate") => {
+                            let Some(task_id) = str_field("taskId") else {
+                                continue;
+                            };
+                            if str_field("status") == Some("deleted") {
+                                tasks.remove(task_id);
+                                continue;
+                            }
+                            let t = tasks.entry(task_id.to_string()).or_default();
+                            if let Some(s) = str_field("status") {
+                                t.status = s.to_string();
+                            }
+                            if let Some(s) = str_field("subject") {
+                                t.subject = s.to_string();
+                            }
+                            if let Some(s) = str_field("description") {
+                                t.description = s.to_string();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some("tool_result") => {
+                    let Some((subject, description)) = item
+                        .get("tool_use_id")
+                        .and_then(|i| i.as_str())
+                        .and_then(|id| pending_creates.remove(id))
+                    else {
+                        continue;
+                    };
+                    let task_id = v
+                        .pointer("/toolUseResult/task/id")
+                        .and_then(|i| i.as_str())
+                        .map(str::to_string)
+                        .or_else(|| {
+                            let text = match item.get("content") {
+                                Some(serde_json::Value::String(s)) => s.clone(),
+                                Some(serde_json::Value::Array(parts)) => parts
+                                    .iter()
+                                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                                _ => String::new(),
+                            };
+                            created_re.captures(&text).map(|c| c[1].to_string())
+                        });
+                    if let Some(task_id) = task_id {
+                        let t = tasks.entry(task_id).or_default();
+                        if t.subject.is_empty() {
+                            t.subject = subject;
+                        }
+                        if t.description.is_empty() {
+                            t.description = description;
+                        }
+                        if t.status.is_empty() {
+                            t.status = "pending".to_string();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !tasks.is_empty() {
+        return tasks;
+    }
+
+    // Legacy fallback: TodoWrite-era transcripts render tasks as
+    // `#<N> [<status>] <subject>` inside tool_result content strings.
+    let task_line_re =
+        regex::Regex::new(r"#(\d+)\s*(?:\.\s*)?\[(pending|in_progress|completed|deleted)\]\s+(.+)")
+            .expect("static regex");
+    for line in content.lines() {
+        if !line.contains("[pending]")
+            && !line.contains("[completed]")
+            && !line.contains("[in_progress]")
+        {
+            continue;
+        }
+        for cap in task_line_re.captures_iter(line) {
+            let id = cap[1].to_string();
+            let status = cap[2].to_string();
+            let mut subject = cap[3].trim().to_string();
+            // Subject ends at the end of the match; may have trailing JSON
+            // escape chars. Trim at the first of a few known terminators.
+            for term in ["\\n", "\"", "\n"] {
+                if let Some(pos) = subject.find(term) {
+                    subject.truncate(pos);
+                }
+            }
+            let subject = subject.trim_end().to_string();
+            if !subject.is_empty() {
+                tasks.insert(
+                    id,
+                    ClaudeTask {
+                        status,
+                        subject,
+                        description: String::new(),
+                    },
+                );
+            }
+        }
+    }
+    tasks
+}
+
 pub async fn handle_pm_import_claude_tasks(
     pool: &sqlx::PgPool,
     session: Option<PathBuf>,
@@ -1161,7 +1354,7 @@ pub async fn handle_pm_import_claude_tasks(
         p
     } else {
         let cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("cwd: {e}"))?;
-        let slug = cwd.to_string_lossy().replace('/', "-");
+        let slug = claude_project_slug(&cwd.to_string_lossy());
         let home = std::env::var("HOME").unwrap_or_default();
         let project_dir = PathBuf::from(format!("{home}/.claude/projects/{slug}"));
         let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
@@ -1189,43 +1382,12 @@ pub async fn handle_pm_import_claude_tasks(
         resolved.display()
     );
 
-    // Stream the JSONL, tracking the LAST task-list snapshot. Each line
-    // we care about has content like `#<N> [<status>] <subject>` — we
-    // find them inside tool_result `content` strings.
+    // Replay the session's structured TaskCreate/TaskUpdate tool calls
+    // (legacy `#N [status] subject` text scan as fallback).
     let content = tokio::fs::read_to_string(&resolved)
         .await
         .map_err(|e| anyhow::anyhow!("read {}: {e}", resolved.display()))?;
-    let task_line_re =
-        regex::Regex::new(r"#(\d+)\s*(?:\.\s*)?\[(pending|in_progress|completed|deleted)\]\s+(.+)")
-            .map_err(|e| anyhow::anyhow!("regex: {e}"))?;
-
-    // Group by task_id — later occurrences overwrite earlier ones.
-    let mut snapshot: std::collections::BTreeMap<String, (String, String)> = Default::default();
-    for line in content.lines() {
-        // Only look inside lines that mention system-reminder OR TaskList-shaped content.
-        if !line.contains("[pending]")
-            && !line.contains("[completed]")
-            && !line.contains("[in_progress]")
-        {
-            continue;
-        }
-        for cap in task_line_re.captures_iter(line) {
-            let id = cap[1].to_string();
-            let status = cap[2].to_string();
-            let mut subject = cap[3].trim().to_string();
-            // Subject ends at the end of the match; may have trailing JSON
-            // escape chars. Trim at the first of a few known terminators.
-            for term in ["\\n", "\"", "\n"] {
-                if let Some(pos) = subject.find(term) {
-                    subject.truncate(pos);
-                }
-            }
-            let subject = subject.trim_end().to_string();
-            if !subject.is_empty() {
-                snapshot.insert(id, (status, subject));
-            }
-        }
-    }
+    let snapshot = parse_claude_session_tasks(&content);
 
     if snapshot.is_empty() {
         println!("  (no task lines recognized in transcript)");
@@ -1249,20 +1411,25 @@ pub async fn handle_pm_import_claude_tasks(
 
     if dry_run {
         println!("\n{YELLOW}Dry run — not writing.{RESET}");
-        for (id, (status, subject)) in &snapshot {
-            let clip = if subject.chars().count() > 60 {
-                format!("{}…", subject.chars().take(59).collect::<String>())
+        for (id, task) in &snapshot {
+            let clip = if task.subject.chars().count() > 60 {
+                format!("{}…", task.subject.chars().take(59).collect::<String>())
             } else {
-                subject.clone()
+                task.subject.clone()
             };
-            println!("  would upsert #{id:<3} [{status:<11}] {clip}");
+            println!("  would upsert #{id:<3} [{:<11}] {clip}", task.status);
         }
         return Ok(());
     }
 
     let mut inserted = 0usize;
     let mut updated = 0usize;
-    for (id, (status, subject)) in &snapshot {
+    for (id, task) in &snapshot {
+        // A TaskUpdate-only trail (task created in an earlier session) can
+        // leave the subject unknown — nothing meaningful to import.
+        if task.subject.is_empty() {
+            continue;
+        }
         // Upsert by (project_id, claude_task_id). work_items has no
         // unique constraint on that pair so we check-then-insert/update.
         let existing: Option<uuid::Uuid> = sqlx::query_scalar(
@@ -1277,22 +1444,27 @@ pub async fn handle_pm_import_claude_tasks(
         .await
         .map_err(|e| anyhow::anyhow!("lookup existing: {e}"))?;
 
-        let wi_status = match status.as_str() {
+        let wi_status = match task.status.as_str() {
             "pending" => "backlog",
             "in_progress" => "in_progress",
             "completed" => "done",
             _ => "backlog",
         };
+        // Legacy-parsed tasks have no description — don't clobber one an
+        // earlier structured import wrote.
+        let description = Some(task.description.as_str()).filter(|d| !d.is_empty());
 
         if let Some(wi_id) = existing {
             sqlx::query(
                 "UPDATE work_items
                     SET status = $1,
-                        title  = $2
-                  WHERE id = $3",
+                        title  = $2,
+                        description = COALESCE($3, description)
+                  WHERE id = $4",
             )
             .bind(wi_status)
-            .bind(subject)
+            .bind(&task.subject)
+            .bind(description)
             .bind(wi_id)
             .execute(pool)
             .await
@@ -1301,13 +1473,14 @@ pub async fn handle_pm_import_claude_tasks(
         } else {
             sqlx::query(
                 "INSERT INTO work_items
-                    (project_id, kind, title, status, priority, created_by, metadata)
-                 VALUES ($1, 'code', $2, $3, 'normal', 'claude_code',
-                         jsonb_build_object('claude_task_id', $4::text,
+                    (project_id, kind, title, description, status, priority, created_by, metadata)
+                 VALUES ($1, 'code', $2, $3, $4, 'normal', 'claude_code',
+                         jsonb_build_object('claude_task_id', $5::text,
                                             'imported_at', NOW()::text))",
             )
             .bind(project)
-            .bind(subject)
+            .bind(&task.subject)
+            .bind(description)
             .bind(wi_status)
             .bind(id)
             .execute(pool)
@@ -1618,6 +1791,82 @@ async fn handle_pm_purge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_project_slug_encodes_every_non_alphanumeric() {
+        // Dots become '-' too — the old '/'-only replace produced
+        // `-home-adele-.forgefleet` which matches no real projects dir.
+        assert_eq!(
+            claude_project_slug("/home/adele/.forgefleet/sub-agents/sub-agent-0/forge-fleet"),
+            "-home-adele--forgefleet-sub-agents-sub-agent-0-forge-fleet"
+        );
+        assert_eq!(claude_project_slug("/tmp/my_app v2"), "-tmp-my-app-v2");
+    }
+
+    /// Fixture mirroring a real session .jsonl: TaskCreate tool_use →
+    /// tool_result with the assigned id, TaskUpdate transitions, a deleted
+    /// task, and a Bash tool_result whose stdout EMBEDS a transcript (must
+    /// not fabricate tasks).
+    fn task_fixture_jsonl() -> String {
+        [
+            // Task 1: created, then pending → in_progress → completed.
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"TaskCreate","input":{"subject":"Ship structured parser","description":"Replay TaskCreate/TaskUpdate JSON","activeForm":"Shipping parser"}}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"Task #1 created successfully: Ship structured parser"}]},"toolUseResult":{"task":{"id":"1","subject":"Ship structured parser"}}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"TaskUpdate","input":{"taskId":"1","status":"in_progress"}}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_3","name":"TaskUpdate","input":{"taskId":"1","status":"completed"}}]}}"#,
+            // Task 2: id only recoverable from the result TEXT (no
+            // toolUseResult), then a description edit.
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_4","name":"TaskCreate","input":{"subject":"Fix session slug","description":"orig"}}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_4","type":"tool_result","content":[{"type":"text","text":"Task #2 created successfully: Fix session slug"}]}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_5","name":"TaskUpdate","input":{"taskId":"2","description":"updated desc"}}]}}"#,
+            // Task 3: created then deleted — must not survive.
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_6","name":"TaskCreate","input":{"subject":"Doomed task"}}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_6","type":"tool_result","content":"Task #3 created successfully: Doomed task"}]},"toolUseResult":{"task":{"id":"3","subject":"Doomed task"}}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_7","name":"TaskUpdate","input":{"taskId":"3","status":"deleted"}}]}}"#,
+            // Bash result embedding a transcript as a STRING — a text-level
+            // scan would see "name":"TaskCreate" here; structured parse must not.
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_bash","type":"tool_result","content":"{\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"TaskCreate\",\"input\":{\"subject\":\"Phantom task\"}}]}}"}]},"toolUseResult":{"stdout":"..."}}"#,
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn parse_claude_session_tasks_replays_structured_tool_calls() {
+        let tasks = parse_claude_session_tasks(&task_fixture_jsonl());
+        assert_eq!(
+            tasks.len(),
+            2,
+            "deleted + phantom tasks excluded: {tasks:?}"
+        );
+
+        let t1 = &tasks["1"];
+        assert_eq!(t1.status, "completed");
+        assert_eq!(t1.subject, "Ship structured parser");
+        assert_eq!(t1.description, "Replay TaskCreate/TaskUpdate JSON");
+
+        let t2 = &tasks["2"];
+        assert_eq!(t2.status, "pending");
+        assert_eq!(t2.subject, "Fix session slug");
+        assert_eq!(
+            t2.description, "updated desc",
+            "TaskUpdate overrides create"
+        );
+    }
+
+    #[test]
+    fn parse_claude_session_tasks_falls_back_to_legacy_text_scan() {
+        let legacy = [
+            r##"{"type":"user","message":{"content":[{"type":"tool_result","content":"#1. [completed] Old-era task"}]}}"##,
+            r##"{"type":"user","message":{"content":[{"type":"tool_result","content":"#2. [in_progress] Another one"}]}}"##,
+        ]
+        .join("\n");
+        let tasks = parse_claude_session_tasks(&legacy);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks["1"].status, "completed");
+        assert_eq!(tasks["1"].subject, "Old-era task");
+        assert_eq!(tasks["2"].status, "in_progress");
+        assert_eq!(tasks["2"].subject, "Another one");
+    }
 
     #[test]
     fn decomposed_work_item_insert_persists_repo_binding() {
