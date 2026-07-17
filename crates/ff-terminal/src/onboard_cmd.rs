@@ -21,8 +21,22 @@ pub async fn handle_onboard(cmd: crate::OnboardCommand) -> Result<()> {
                 .await
                 .or_else(|| std::env::var("FORGEFLEET_ENROLLMENT_TOKEN").ok())
                 .unwrap_or_else(|| "<SET-TOKEN-FIRST>".into());
-            let leader =
-                std::env::var("FORGEFLEET_LEADER_HOST").unwrap_or_else(|_| "192.168.5.100".into());
+            // Leader host: env override → live DB (elected leader's roster IP)
+            // → legacy taylor fallback only if both fail. Keeps the printed
+            // curl correct across failovers instead of pinning dead .100.
+            let db_leader: Option<(String,)> = sqlx::query_as(
+                "SELECT w.ip FROM fleet_leader_state ls
+                 JOIN fleet_workers w ON w.name = ls.member_name
+                 LIMIT 1",
+            )
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten();
+            let leader = std::env::var("FORGEFLEET_LEADER_HOST")
+                .ok()
+                .or(db_leader.map(|(ip,)| ip))
+                .unwrap_or_else(|| "192.168.5.100".into());
             let ssh_user = ssh_user.unwrap_or_else(|| name.clone());
             let ip_q = ip.unwrap_or_else(|| "auto".into());
             println!("{CYAN}▶ On the new computer, paste:{RESET}\n");

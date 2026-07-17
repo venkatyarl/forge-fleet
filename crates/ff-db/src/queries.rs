@@ -7968,12 +7968,27 @@ pub async fn pg_assign_work_item(
 
 /// Refresh a work_item lease heartbeat so the stale-lease reaper doesn't reclaim
 /// it mid-execution. Called periodically by the dispatch loop while the slot runs.
-pub async fn pg_heartbeat_work_item_lease(pool: &PgPool, work_item_id: uuid::Uuid) -> Result<()> {
+///
+/// Also extends `lease_expires_at` by `extend_secs`: a lease that is actively
+/// heartbeating must never read as expired, or every consumer keyed on
+/// `lease_expires_at` (pm doctor stale count, board "building" rollup, expired-
+/// lease release) declares a live build dead at the original grant TTL and
+/// re-dispatches it mid-run (observed 2026-07-17: 18-min CLI builds killed at
+/// the 600s grant, "retry attempt 2 — infrastructure issue"). Twin of the
+/// stale-heartbeat reaper bug class (#589/#590) on the expiry axis.
+pub async fn pg_heartbeat_work_item_lease(
+    pool: &PgPool,
+    work_item_id: uuid::Uuid,
+    extend_secs: i64,
+) -> Result<()> {
     sqlx::query(
-        "UPDATE work_item_leases SET heartbeat_at = NOW() \
+        "UPDATE work_item_leases \
+            SET heartbeat_at = NOW(), \
+                lease_expires_at = GREATEST(lease_expires_at, NOW() + make_interval(secs => $2)) \
           WHERE work_item_id = $1 AND released_at IS NULL",
     )
     .bind(work_item_id)
+    .bind(extend_secs as f64)
     .execute(pool)
     .await?;
     Ok(())

@@ -735,7 +735,13 @@ fn spawn_heartbeat(
 async fn heartbeat_lease_once(work_item_id: Uuid) {
     for attempt in 0..3u32 {
         match crate::fleet_info::get_heartbeat_pool().await {
-            Ok(pool) => match ff_db::pg_heartbeat_work_item_lease(&pool, work_item_id).await {
+            Ok(pool) => match ff_db::pg_heartbeat_work_item_lease(
+                &pool,
+                work_item_id,
+                crate::work_item_scheduler::LEASE_GRANT_SECS,
+            )
+            .await
+            {
                 Ok(()) => return,
                 Err(e) => warn!(
                     work_item_id = %work_item_id, attempt, error = %e,
@@ -868,13 +874,15 @@ async fn mark_building(pg: &PgPool, item: &AssignedWorkItem) -> Result<bool> {
     }
     sqlx::query(
         "UPDATE work_item_leases
-            SET lease_state = 'building', heartbeat_at = NOW()
+            SET lease_state = 'building', heartbeat_at = NOW(),
+                lease_expires_at = GREATEST(lease_expires_at, NOW() + make_interval(secs => $3))
           WHERE work_item_id = $1
             AND sub_agent_id = $2
             AND released_at IS NULL",
     )
     .bind(item.work_item_id)
     .bind(item.sub_agent_id)
+    .bind(crate::work_item_scheduler::LEASE_GRANT_SECS as f64)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;

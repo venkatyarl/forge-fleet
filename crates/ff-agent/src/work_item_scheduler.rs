@@ -29,7 +29,7 @@ pub(crate) const LEASE_STALE_SECS: i64 = 180;
 /// (~18.5 min).
 const MAX_LEASE_DURATION_SECS: i64 = 25 * 60;
 /// Lease lifetime granted at assignment (refreshed by heartbeats).
-const LEASE_GRANT_SECS: i64 = 600;
+pub(crate) const LEASE_GRANT_SECS: i64 = 600;
 /// Max assignments per tick (back-pressure; the rest wait for the next tick).
 const MAX_ASSIGN_PER_TICK: i64 = 64;
 /// Minimum age before an `in_progress` work_item with NO active lease is
