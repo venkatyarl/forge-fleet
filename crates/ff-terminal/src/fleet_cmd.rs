@@ -3054,10 +3054,63 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         FleetCommand::SshMeshCheck {
             node,
             json,
+            from_here,
             since,
             repair,
             yes,
         } => {
+            if from_here {
+                if repair || since.is_some() {
+                    anyhow::bail!(
+                        "--from-here is a direct probe from this node; it can't be combined with --repair or --since"
+                    );
+                }
+                println!(
+                    "{CYAN}▶ Probing ping + SSH from this node to every fleet worker...{RESET}"
+                );
+                let probes = ff_agent::mesh_check::local_reach_check(&pool, node.as_deref())
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                if probes.is_empty() {
+                    println!("{YELLOW}no matching fleet_workers rows to probe{RESET}");
+                    return Ok(());
+                }
+                if json {
+                    let arr: Vec<_> = probes
+                        .iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "src": p.src, "dst": p.dst, "ip": p.ip,
+                                "ping_ok": p.ping_ok, "ssh_ok": p.ssh_ok,
+                                "status": p.status, "detail": p.detail,
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+                    return Ok(());
+                }
+                println!(
+                    "\n  {:<14} {:<16} {:<6} {:<6} detail",
+                    "node", "ip", "ping", "ssh"
+                );
+                let ok = probes.iter().filter(|p| p.ssh_ok).count();
+                let fail = probes.len() - ok;
+                for p in &probes {
+                    println!("{}", fmt_from_here_probe_row(p));
+                }
+                println!(
+                    "\n{ok} ok, {fail} failed — probed {} node(s) from {}",
+                    probes.len(),
+                    probes[0].src,
+                );
+                if fail > 0 {
+                    println!(
+                        "  failures recorded in fleet_mesh_status — full pair history: \
+                         {CYAN}ff fleet ssh-mesh-check --node <name>{RESET}"
+                    );
+                }
+                return Ok(());
+            }
             if repair && !yes {
                 anyhow::bail!(
                     "--repair rewrites authorized_keys / known_hosts on every failed peer — pass --yes to proceed"
@@ -3705,6 +3758,60 @@ fn route_candidate_json(r: &ff_db::RouteCandidate) -> serde_json::Value {
 /// `computer_metrics_history` row) shows `"-"` rather than a fake `0%/0`, so the
 /// operator can tell "idle" from "no data". Either half falls back to `?` if
 /// only one of the two metrics is present. Pure — unit-tested.
+/// One text row of the `--from-here` direct-probe table. SSH decides the row's
+/// verdict (mirrors `fleet_mesh_status`); ping is a separate diagnostic column
+/// so host-down / stale-IP reads differently from host-up-but-SSH-broken.
+fn fmt_from_here_probe_row(p: &ff_agent::mesh_check::LocalProbe) -> String {
+    format!(
+        "  {:<14} {:<16} {:<6} {:<6} {}",
+        p.dst,
+        p.ip,
+        if p.ping_ok { "ok" } else { "down" },
+        if p.ssh_ok { "ok" } else { "down" },
+        p.detail.as_deref().unwrap_or(""),
+    )
+}
+
+#[cfg(test)]
+mod from_here_probe_row_tests {
+    use super::*;
+    use ff_agent::mesh_check::LocalProbe;
+
+    fn probe(ping_ok: bool, ssh_ok: bool, detail: Option<&str>) -> LocalProbe {
+        LocalProbe {
+            src: "adele".into(),
+            dst: "james".into(),
+            ip: "192.168.1.77".into(),
+            ping_ok,
+            ssh_ok,
+            status: if ssh_ok { "ok" } else { "failed" }.into(),
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn healthy_row_shows_ok_ok_and_no_detail() {
+        let row = fmt_from_here_probe_row(&probe(true, true, None));
+        assert_eq!(
+            row.trim_end(),
+            "  james          192.168.1.77     ok     ok"
+        );
+    }
+
+    #[test]
+    fn dark_node_shows_down_down_with_detail() {
+        let row = fmt_from_here_probe_row(&probe(false, false, Some("ping failed; ssh timeout")));
+        assert!(row.contains("down   down"));
+        assert!(row.ends_with("ping failed; ssh timeout"));
+    }
+
+    #[test]
+    fn icmp_blocked_keeps_ssh_ok_but_flags_ping() {
+        let row = fmt_from_here_probe_row(&probe(false, true, None));
+        assert!(row.contains("down   ok"));
+    }
+}
+
 fn fmt_route_load(cpu_pct: Option<f64>, active_requests: Option<i32>) -> String {
     match (cpu_pct, active_requests) {
         (None, None) => "-".to_string(),
