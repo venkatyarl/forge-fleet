@@ -359,13 +359,16 @@ async fn assigned_work_items(
                 .map(|p| PathBuf::from(expand_tilde(&p)));
             let fallback_repo_path: String = r.get("fallback_repo_path");
             let local_bound_path = bound_repo_path.as_ref().filter(|p| p.exists()).cloned();
-            let repo_path = local_bound_path
+            // Clone-per-slot ALWAYS (operator decision 2026-07-17): when the
+            // item has a repo_url, the workspace is the slot's own clone — the
+            // ensure-clone step creates it on first dispatch. Bound/metadata
+            // paths are only honored for repo-url-less items (nothing to clone
+            // from), where the single shared path is all we have.
+            let repo_path = repo_url
+                .as_deref()
+                .map(|url| default_clone_path(r.get::<i32, _>("slot"), url))
+                .or(local_bound_path)
                 .or(metadata_repo_path)
-                .or_else(|| {
-                    repo_url
-                        .as_deref()
-                        .map(|url| default_clone_path(r.get::<i32, _>("slot"), url))
-                })
                 .or(bound_repo_path)
                 .unwrap_or_else(|| PathBuf::from(fallback_repo_path));
             Ok(AssignedWorkItem {
@@ -776,58 +779,17 @@ async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Resul
         .cloned()
         .ok_or_else(|| anyhow!("missing workspace for slot {}", item.slot))?;
 
-    // Stage 2 (operator decision 2026-07-17): NO git worktrees. When the item's
-    // repo is this slot's OWN clone (the default_clone_path case), build
-    // directly in the clone: fetch + full clean + `checkout -B` from
-    // origin/<base>. Kills the whole stale-worktree/branch-registration retry
-    // bug class ("already used by worktree", non-fast-forward re-push of a
-    // half-dead attempt). The worktree path below survives ONLY for repos
-    // bound OUTSIDE the slot (a shared clone — direct checkout there would
-    // collide across slots).
-    if item.repo_path.starts_with(&slot_ws) {
-        let worktree_path = item.repo_path.clone();
-        insert_worktree_creating(pg, item, &worktree_path, &base_branch, &task_branch).await?;
-        match checkout_clone_for_build(&item.repo_path, &base_branch, &task_branch) {
-            Ok(()) => {
-                sqlx::query(
-                    "UPDATE work_item_worktrees
-                        SET status = 'active'
-                      WHERE work_item_id = $1
-                        AND worktree_path = $2",
-                )
-                .bind(item.work_item_id)
-                .bind(worktree_path.to_string_lossy().to_string())
-                .execute(pg)
-                .await?;
-            }
-            Err(e) => {
-                mark_worktree_failed(pg, item.work_item_id, &e.to_string()).await?;
-                return Err(e);
-            }
-        }
-        return Ok(WorktreeRecord {
-            worktree_path,
-            base_branch,
-            task_branch,
-        });
-    }
-
-    let worktree_path = slot_ws.join("worktrees").join(&task_branch);
-    std::fs::create_dir_all(
-        worktree_path
-            .parent()
-            .ok_or_else(|| anyhow!("worktree path has no parent: {}", worktree_path.display()))?,
-    )
-    .with_context(|| format!("create worktree parent for {}", worktree_path.display()))?;
-
+    // NO git worktrees (operator decision 2026-07-17): every build runs
+    // directly in the slot's own clone — fetch + full clean + `checkout -B`
+    // from origin/<base>. `-B` resets any leftover task branch, so retries are
+    // collision-free with zero worktree bookkeeping. Repo resolution
+    // guarantees repo_path is the slot clone whenever the item has a repo_url;
+    // a repo-url-less item bound outside the slot uses that path the same way
+    // (it is the only workspace that exists for it).
+    let _ = slot_ws; // workspace dirs ensured above; the clone lives inside.
+    let worktree_path = item.repo_path.clone();
     insert_worktree_creating(pg, item, &worktree_path, &base_branch, &task_branch).await?;
-
-    if worktree_path.exists() {
-        remove_worktree(&item.repo_path, &worktree_path)
-            .with_context(|| format!("remove stale worktree {}", worktree_path.display()))?;
-    }
-
-    match git_worktree_add(&item.repo_path, &worktree_path, &base_branch, &task_branch) {
+    match checkout_clone_for_build(&item.repo_path, &base_branch, &task_branch) {
         Ok(()) => {
             sqlx::query(
                 "UPDATE work_item_worktrees
@@ -845,7 +807,6 @@ async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Resul
             return Err(e);
         }
     }
-
     Ok(WorktreeRecord {
         worktree_path,
         base_branch,
@@ -1940,67 +1901,13 @@ fn synthetic_output(summary: &str) -> Output {
     }
 }
 
-fn git_worktree_add(
-    repo_path: &Path,
-    worktree_path: &Path,
-    base_branch: &str,
-    task_branch: &str,
-) -> Result<()> {
-    let base_ref = format!("origin/{base_branch}");
-    // Fetch origin/<base> so the worktree starts from the TRUE latest main, not a
-    // stale local ref. A SILENT fetch failure + the old stale-local fallback below
-    // were the #1 cause of entangled/unmergeable fleet PRs (2026-07-04: builds
-    // branched from an old base and re-added an already-merged fold). Retry, and
-    // FAIL rather than branch from a possibly-stale base — a failed build retries
-    // cleanly; a stale-base build produces a garbage PR.
-    let mut fetched = false;
-    for attempt in 0..3 {
-        match run_git(
-            repo_path,
-            ["fetch", "origin", base_branch],
-            Duration::from_secs(120),
-        ) {
-            Ok(_) => {
-                fetched = true;
-                break;
-            }
-            Err(e) => {
-                warn!(base_branch, attempt, error = %e, "git_worktree_add: fetch origin failed; retrying")
-            }
-        }
-    }
-    if !fetched {
-        bail!(
-            "git_worktree_add: could not fetch origin/{base_branch} in 3 tries — \
-             refusing to branch the worktree from a possibly-stale base"
-        );
-    }
-
-    // Branch STRICTLY from the freshly-fetched origin/<base>. No stale-local
-    // fallback: if this fails (e.g. a leftover worktree/branch), bail so the build
-    // retries from a clean slate rather than silently building on the local ref.
-    run_git(
-        repo_path,
-        [
-            OsStr::new("worktree"),
-            OsStr::new("add"),
-            OsStr::new("-B"),
-            OsStr::new(task_branch),
-            worktree_path.as_os_str(),
-            OsStr::new(&base_ref),
-        ],
-        Duration::from_secs(120),
-    )?;
-    Ok(())
-}
-
-/// Stage-2 build checkout: prepare the slot's OWN clone for a fresh attempt.
-/// Fetch origin/<base> (same no-stale-base contract as the old worktree path:
-/// fail rather than branch from a stale ref), then a FULL clean —
-/// `reset --hard` + `clean -fd` — so leftovers from a dead prior attempt can
-/// never leak into this build, then `checkout -B wi/<id> origin/<base>`.
-/// `-B` resets the task branch even if a prior attempt left it behind, which
-/// is what makes retries collision-free without any worktree bookkeeping.
+/// Prepare the slot's clone for a fresh build attempt. Fetch origin/<base>
+/// (same no-stale-base contract as ever: fail rather than branch from a stale
+/// ref), then a FULL clean — `reset --hard` + `clean -fd` — so leftovers from
+/// a dead prior attempt can never leak into this build, then
+/// `checkout -B wi/<id> origin/<base>`. `-B` resets the task branch even if a
+/// prior attempt left it behind, which is what makes retries collision-free
+/// without any worktree bookkeeping.
 fn checkout_clone_for_build(repo_path: &Path, base_branch: &str, task_branch: &str) -> Result<()> {
     let base_ref = format!("origin/{base_branch}");
     let mut fetched = false;
@@ -2055,17 +1962,11 @@ fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
         let _ = run_git(repo_path, ["clean", "-fd"], Duration::from_secs(120));
         return Ok(());
     }
+    // Legacy row from the pre-clone-direct era: the detached worktree dirs
+    // were bulk-deleted fleet-wide on 2026-07-17, so all that's left is to
+    // drop any straggler dir and let git forget the registration.
     if worktree_path.exists() {
-        run_git(
-            repo_path,
-            [
-                OsStr::new("worktree"),
-                OsStr::new("remove"),
-                OsStr::new("--force"),
-                worktree_path.as_os_str(),
-            ],
-            Duration::from_secs(120),
-        )?;
+        let _ = std::fs::remove_dir_all(worktree_path);
     }
     let _ = run_git(repo_path, ["worktree", "prune"], Duration::from_secs(60));
     Ok(())
