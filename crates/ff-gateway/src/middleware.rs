@@ -178,6 +178,14 @@ const PUBLIC_ROUTES: &[&str] = &[
     "/api/github/webhook",
     "/metrics",
     "/ws",
+    // Enrollment endpoints: an enrolling node has no fleet credentials YET by
+    // definition, and each of these enforces its own shared-secret policy
+    // (EnrollmentConfig / onboard.rs) — gating them behind fleet auth made
+    // onboarding impossible (found live 2026-07-18: shakira's self-enroll
+    // POST 401'd at this middleware before the token check ever ran).
+    "/onboard",
+    "/api/fleet/self-enroll",
+    "/api/fleet/enrollment-progress",
 ];
 
 fn is_public_route(path: &str) -> bool {
