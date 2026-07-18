@@ -183,8 +183,7 @@ async fn send_telegram(bot_token: &str, chat_id: &str, notification: &Notificati
     let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
     let payload = serde_json::json!({
         "chat_id": chat_id,
-        "text": format!("*{}*\n{}", notification.title, notification.message),
-        "parse_mode": "Markdown",
+        "text": format!("{}\n{}", notification.title, notification.message),
     });
     if let Err(e) = SHARED_HTTP
         .post(&url)

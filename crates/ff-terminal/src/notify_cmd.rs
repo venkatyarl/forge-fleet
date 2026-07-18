@@ -33,7 +33,7 @@ pub async fn handle_notify(cmd: NotifyCommand) -> Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
 
-            // send_telegram_from_secrets formats as `*<title>*\n<body>`; when
+            // send_telegram_from_secrets formats as `<title>\n<body>`; when
             // there's no explicit title we send the message as the title with an
             // empty body so it renders as a single plain line.
             let (t, b) = match title {
@@ -47,7 +47,12 @@ pub async fn handle_notify(cmd: NotifyCommand) -> Result<()> {
                 .await
                 .ok()
                 .flatten()
-                .is_some();
+                .is_some()
+                || ff_db::pg_get_secret(&pool, "telegram_bot_token")
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some();
 
             ff_agent::telegram::send_telegram_from_secrets(&pool, &t, &b).await?;
             if configured {

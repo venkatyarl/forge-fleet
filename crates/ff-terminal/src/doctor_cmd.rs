@@ -371,9 +371,7 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
 fn unit_text_has_dsn_env(text: &str) -> bool {
     text.lines().any(|line| {
         let line = line.trim_start();
-        line.starts_with("Environment=")
-            && line.contains("FORGEFLEET_")
-            && line.contains("_URL=")
+        line.starts_with("Environment=") && line.contains("FORGEFLEET_") && line.contains("_URL=")
     })
 }
 
