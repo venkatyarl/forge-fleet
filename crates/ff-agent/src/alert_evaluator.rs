@@ -746,8 +746,15 @@ pub async fn dispatch_alert(pg: &PgPool, channel: &str, severity: &str, message:
                 .await
                 .ok()
                 .flatten();
+            let chat_id = match chat_id {
+                Some(chat_id) => Some(chat_id),
+                None => ff_db::pg_get_secret(pg, "telegram_chat_id")
+                    .await
+                    .ok()
+                    .flatten(),
+            };
             let Some(chat_id) = chat_id else {
-                return "failed: no openclaw.telegram_chat_id secret".into();
+                return "failed: no telegram chat id secret".into();
             };
 
             // Prefer direct Telegram Bot API when a bot token is configured —
@@ -758,6 +765,13 @@ pub async fn dispatch_alert(pg: &PgPool, channel: &str, severity: &str, message:
                 .await
                 .ok()
                 .flatten();
+            let bot_token = match bot_token {
+                Some(token) => Some(token),
+                None => ff_db::pg_get_secret(pg, "telegram_bot_token")
+                    .await
+                    .ok()
+                    .flatten(),
+            };
 
             if let Some(token) = bot_token {
                 let url = format!("https://api.telegram.org/bot{token}/sendMessage");
