@@ -2238,11 +2238,18 @@ fn git_head_sha(worktree_path: &Path) -> Result<String> {
 }
 
 fn push_branch(repo_path: &Path, task_branch: &str) -> Result<()> {
+    // --force-with-lease: the harness OWNS wi/* branches. When a prior attempt
+    // pushed and then died (daemon restart, timeout), the retry rebuilds fresh
+    // history from origin/<base> and a plain push is rejected non-fast-forward
+    // — the retry then fails despite correct code (observed twice 2026-07-17).
+    // with-lease (not plain --force) still refuses to clobber a push we haven't
+    // fetched, so a genuinely concurrent build on the same id can't be lost.
     run_git(
         repo_path,
         [
             OsStr::new("push"),
             OsStr::new("-u"),
+            OsStr::new("--force-with-lease"),
             OsStr::new("origin"),
             OsStr::new(task_branch),
         ],
