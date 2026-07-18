@@ -775,6 +775,43 @@ async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Resul
         .get(item.slot.max(0) as usize)
         .cloned()
         .ok_or_else(|| anyhow!("missing workspace for slot {}", item.slot))?;
+
+    // Stage 2 (operator decision 2026-07-17): NO git worktrees. When the item's
+    // repo is this slot's OWN clone (the default_clone_path case), build
+    // directly in the clone: fetch + full clean + `checkout -B` from
+    // origin/<base>. Kills the whole stale-worktree/branch-registration retry
+    // bug class ("already used by worktree", non-fast-forward re-push of a
+    // half-dead attempt). The worktree path below survives ONLY for repos
+    // bound OUTSIDE the slot (a shared clone — direct checkout there would
+    // collide across slots).
+    if item.repo_path.starts_with(&slot_ws) {
+        let worktree_path = item.repo_path.clone();
+        insert_worktree_creating(pg, item, &worktree_path, &base_branch, &task_branch).await?;
+        match checkout_clone_for_build(&item.repo_path, &base_branch, &task_branch) {
+            Ok(()) => {
+                sqlx::query(
+                    "UPDATE work_item_worktrees
+                        SET status = 'active'
+                      WHERE work_item_id = $1
+                        AND worktree_path = $2",
+                )
+                .bind(item.work_item_id)
+                .bind(worktree_path.to_string_lossy().to_string())
+                .execute(pg)
+                .await?;
+            }
+            Err(e) => {
+                mark_worktree_failed(pg, item.work_item_id, &e.to_string()).await?;
+                return Err(e);
+            }
+        }
+        return Ok(WorktreeRecord {
+            worktree_path,
+            base_branch,
+            task_branch,
+        });
+    }
+
     let worktree_path = slot_ws.join("worktrees").join(&task_branch);
     std::fs::create_dir_all(
         worktree_path
@@ -1957,7 +1994,67 @@ fn git_worktree_add(
     Ok(())
 }
 
+/// Stage-2 build checkout: prepare the slot's OWN clone for a fresh attempt.
+/// Fetch origin/<base> (same no-stale-base contract as the old worktree path:
+/// fail rather than branch from a stale ref), then a FULL clean —
+/// `reset --hard` + `clean -fd` — so leftovers from a dead prior attempt can
+/// never leak into this build, then `checkout -B wi/<id> origin/<base>`.
+/// `-B` resets the task branch even if a prior attempt left it behind, which
+/// is what makes retries collision-free without any worktree bookkeeping.
+fn checkout_clone_for_build(repo_path: &Path, base_branch: &str, task_branch: &str) -> Result<()> {
+    let base_ref = format!("origin/{base_branch}");
+    let mut fetched = false;
+    for attempt in 0..3 {
+        match run_git(
+            repo_path,
+            ["fetch", "origin", base_branch],
+            Duration::from_secs(120),
+        ) {
+            Ok(_) => {
+                fetched = true;
+                break;
+            }
+            Err(e) => {
+                warn!(base_branch, attempt, error = %e, "checkout_clone_for_build: fetch origin failed; retrying")
+            }
+        }
+    }
+    if !fetched {
+        bail!(
+            "checkout_clone_for_build: could not fetch origin/{base_branch} in 3 tries — \
+             refusing to build from a possibly-stale base"
+        );
+    }
+    run_git(repo_path, ["reset", "--hard"], Duration::from_secs(120))?;
+    run_git(repo_path, ["clean", "-fd"], Duration::from_secs(120))?;
+    run_git(
+        repo_path,
+        [
+            OsStr::new("checkout"),
+            OsStr::new("-B"),
+            OsStr::new(task_branch),
+            OsStr::new(&base_ref),
+        ],
+        Duration::from_secs(120),
+    )?;
+    Ok(())
+}
+
 fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
+    // Stage-2 clone-direct workspace: the "worktree" IS the clone. Never
+    // remove the directory — park HEAD on detached origin HEAD and full-clean
+    // so the next dispatch starts pristine. (`checkout -B` on the next attempt
+    // resets the task branch, so leaving it behind here is harmless.)
+    if worktree_path == repo_path {
+        let _ = run_git(
+            repo_path,
+            ["checkout", "--detach", "HEAD"],
+            Duration::from_secs(60),
+        );
+        let _ = run_git(repo_path, ["reset", "--hard"], Duration::from_secs(120));
+        let _ = run_git(repo_path, ["clean", "-fd"], Duration::from_secs(120));
+        return Ok(());
+    }
     if worktree_path.exists() {
         run_git(
             repo_path,
@@ -2452,7 +2549,12 @@ pub async fn evaluate_worktree_reaper(pg: &PgPool, worker_name: &str) -> Result<
         let tree = PathBuf::from(&wt.worktree_path);
         // Best-effort filesystem cleanup; the DB mark below is the source of truth.
         let _ = remove_worktree(&repo, &tree);
-        reclaimed_bytes = reclaimed_bytes.saturating_add(reclaim_build_artifacts(&tree));
+        // Clone-direct rows: the "worktree" is the slot's long-lived clone —
+        // reclaiming would delete its target/node_modules out from under the
+        // next build. Only legacy detached worktree dirs are reclaimed.
+        if tree != repo {
+            reclaimed_bytes = reclaimed_bytes.saturating_add(reclaim_build_artifacts(&tree));
+        }
         let _ = run_git(
             &repo,
             [
