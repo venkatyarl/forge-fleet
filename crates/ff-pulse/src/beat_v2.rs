@@ -697,4 +697,25 @@ mod tests {
             serde_json::from_value(json).expect("beat with unknown future field must deserialize");
         assert_eq!(parsed.pulse_protocol_version, 2);
     }
+
+    /// Pre-#870 daemons still send `capabilities.can_serve_openclaw_gateway`,
+    /// a key since removed from `Capabilities`. Unknown-key tolerance must hold
+    /// inside nested objects too — the top-level check in
+    /// `beat_deserializes_across_schema_generations` would not catch a
+    /// `deny_unknown_fields` added to `Capabilities` alone.
+    #[test]
+    fn beat_with_removed_openclaw_capability_field_deserializes() {
+        let beat = PulseBeatV2::skeleton("orin");
+        let mut json = serde_json::to_value(&beat).expect("to_value");
+        json.as_object_mut()
+            .expect("beat serializes to an object")
+            .get_mut("capabilities")
+            .expect("capabilities present")
+            .as_object_mut()
+            .expect("capabilities is an object")
+            .insert("can_serve_openclaw_gateway".into(), serde_json::json!(true));
+        let parsed: PulseBeatV2 = serde_json::from_value(json)
+            .expect("beat carrying the removed capability key must deserialize");
+        assert_eq!(parsed.computer_name, "orin");
+    }
 }
