@@ -817,6 +817,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "telegram_reply_routing",
         sql: schema::SCHEMA_V167_TELEGRAM_REPLY_ROUTING,
     },
+    PgMigration {
+        version: 168,
+        name: "work_item_context",
+        sql: schema::SCHEMA_V168_WORK_ITEM_CONTEXT,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

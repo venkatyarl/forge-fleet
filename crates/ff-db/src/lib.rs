@@ -341,6 +341,7 @@ pub struct WorkItem {
     pub reviewer_required: bool,
     pub attempts: i32,
     pub last_error: Option<String>,
+    pub context: JsonValue,
 }
 
 /// Lightweight Postgres client for `work_items` access patterns.

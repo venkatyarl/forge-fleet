@@ -10188,3 +10188,14 @@ CREATE TABLE IF NOT EXISTS telegram_poll_state (
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 "#;
+
+/// V168 — Add free-form structured `context` to canonical work_items.
+///
+/// The `context` JSONB holds task-specific metadata (e.g. source-system
+/// identifiers, dispatch hints, or precomputed Cortex packs) without requiring
+/// a new column for every ad-hoc key. It defaults to an empty object so
+/// existing rows remain valid and fresh rebuilds get the column too.
+pub const SCHEMA_V168_WORK_ITEM_CONTEXT: &str = r#"
+ALTER TABLE work_items
+    ADD COLUMN IF NOT EXISTS context JSONB NOT NULL DEFAULT '{}';
+"#;
