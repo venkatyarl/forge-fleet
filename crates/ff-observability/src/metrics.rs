@@ -516,6 +516,7 @@ pub fn init_prometheus_metrics() {
             .unwrap();
         r.register(Box::new(ORCHESTRATE_DURATION_SECONDS.clone()))
             .unwrap();
+        crate::work_queue::init_work_queue_metrics();
     });
 }
 
