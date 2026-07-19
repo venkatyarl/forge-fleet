@@ -30,6 +30,7 @@ pub mod notifications;
 pub mod obsidian_export;
 pub mod panic_hook;
 pub mod quarantine;
+pub mod queue;
 pub mod run_limits;
 pub mod schema;
 pub mod synthetic;
