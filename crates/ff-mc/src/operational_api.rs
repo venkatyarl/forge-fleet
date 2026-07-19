@@ -711,6 +711,10 @@ async fn create_work_item_in_store(
         task_group_id: params.task_group_id,
         sequence_order: params.sequence_order,
         labels: params.labels,
+        eisenhower_quadrant: None,
+        numeric_priority: None,
+        pick_score: None,
+        capability_tags: Vec::new(),
         created_at: now,
         updated_at: now,
     };
