@@ -50,6 +50,10 @@ pub use community_summary::{
 pub use context::{BrainMessage, ContextBundle, ResolvedNode, select_context};
 pub use cortex::ingest_decisions;
 pub use cortex::ingest_pm;
+pub use cortex::work_item_context::{
+    CodeSnippet, RelatedWorkItem, RelevantFile, WorkItemContext, WorkItemContextExtractor,
+    precompute_context, related_work_items, relevant_code_snippets, relevant_files, write_context,
+};
 pub use cortex::{
     CommunityExplanation, CommunityMember, CortexAlerts, CortexStats, FileOutline, GraphExport,
     OutlineEntry, SymbolHit, SymbolRef, SymbolSource, TestHit, call_path, callees,
