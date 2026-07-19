@@ -840,6 +840,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "artifact_index",
         sql: schema::SCHEMA_V171_ARTIFACT_INDEX,
     },
+    PgMigration {
+        version: 172,
+        name: "computers_primary_ip_ram_atomic",
+        sql: schema::SCHEMA_V172_COMPUTERS_PRIMARY_IP_RAM_ATOMIC,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1019,7 +1024,7 @@ async fn run_postgres_migrations_locked(conn: &mut sqlx::PgConnection) -> Result
 mod tests {
     use std::env;
 
-    use sqlx::postgres::PgPoolOptions;
+    use sqlx::{Connection, postgres::PgPoolOptions};
 
     use super::*;
 
@@ -1152,5 +1157,86 @@ mod tests {
         assert_eq!(row.0 as u32, BOOTSTRAP_BASELINE_VERSION);
 
         drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn computers_primary_ip_and_ram_must_change_together() {
+        let Some(url) = db_url() else {
+            return;
+        };
+
+        let mut conn = sqlx::PgConnection::connect(&url)
+            .await
+            .expect("connect to test database");
+        let mut tx = Connection::begin(&mut conn)
+            .await
+            .expect("begin test transaction");
+        sqlx::raw_sql(
+            "CREATE TEMP TABLE computers (
+                id INT PRIMARY KEY,
+                primary_ip TEXT NOT NULL,
+                total_ram_gb INT
+            );",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("create temporary computers table");
+        sqlx::raw_sql(schema::SCHEMA_V172_COMPUTERS_PRIMARY_IP_RAM_ATOMIC)
+            .execute(&mut *tx)
+            .await
+            .expect("apply computers atomic-update migration");
+        sqlx::query(
+            "INSERT INTO computers (id, primary_ip, total_ram_gb) VALUES (1, '10.0.0.1', 16)",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("insert test computer");
+
+        sqlx::query("SAVEPOINT reject_ip_only")
+            .execute(&mut *tx)
+            .await
+            .expect("create savepoint");
+        let ip_only = sqlx::query("UPDATE computers SET primary_ip = '10.0.0.2' WHERE id = 1")
+            .execute(&mut *tx)
+            .await
+            .expect_err("primary_ip-only update must be rejected");
+        assert_eq!(
+            ip_only
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("23514")
+        );
+        sqlx::query("ROLLBACK TO SAVEPOINT reject_ip_only")
+            .execute(&mut *tx)
+            .await
+            .expect("recover from expected rejection");
+
+        sqlx::query("SAVEPOINT reject_ram_only")
+            .execute(&mut *tx)
+            .await
+            .expect("create savepoint");
+        let ram_only = sqlx::query("UPDATE computers SET total_ram_gb = 32 WHERE id = 1")
+            .execute(&mut *tx)
+            .await
+            .expect_err("RAM-only update must be rejected");
+        assert_eq!(
+            ram_only
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("23514")
+        );
+        sqlx::query("ROLLBACK TO SAVEPOINT reject_ram_only")
+            .execute(&mut *tx)
+            .await
+            .expect("recover from expected rejection");
+
+        sqlx::query("UPDATE computers SET primary_ip = '10.0.0.2', total_ram_gb = 32 WHERE id = 1")
+            .execute(&mut *tx)
+            .await
+            .expect("paired update must succeed");
+
+        tx.rollback().await.expect("roll back test transaction");
     }
 }
