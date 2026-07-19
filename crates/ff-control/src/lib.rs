@@ -14,6 +14,7 @@ pub mod control_plane;
 pub mod errors;
 pub mod ha_coordinator;
 pub mod health;
+pub mod timeout;
 
 pub use bootstrap::{
     BootstrapOptions, BootstrapPlan, BootstrapValidation, StartupSubsystem, build_bootstrap_plan,
