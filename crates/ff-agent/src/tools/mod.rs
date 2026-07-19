@@ -7,6 +7,7 @@ pub mod agent_tool;
 pub mod agentic;
 pub mod analytics;
 pub mod bash;
+pub mod build_pipeline;
 pub mod code_quality;
 pub mod computer;
 pub mod content;
@@ -261,6 +262,7 @@ pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(grep_tool::GrepTool),
         // Agent & coordination tools
         Box::new(agent_tool::SubAgentTool),
+        Box::new(build_pipeline::BuildPipelineTool),
         Box::new(send_message::SendMessageTool::default()),
         // Task management tools
         Box::new(task_tools::TaskCreateTool),
