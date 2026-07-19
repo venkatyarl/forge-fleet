@@ -1,0 +1,53 @@
+# ForgeFleet unified daemon (forgefleetd) — canonical systemd USER unit.
+#
+# Installed by `scripts/bootstrap-computer-template.sh` on Linux hosts. The
+# `__COMPUTER_NAME__` token is substituted at install time via sed; the
+# rendered file lives at ~/.config/systemd/user/forgefleetd.service and is
+# activated with:
+#   loginctl enable-linger <user>          # user manager (+ daemon) at boot
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now forgefleetd.service
+#
+# Status:  systemctl --user status forgefleetd.service
+# Logs:    tail -f ~/.forgefleet/logs/forgefleetd.log
+#
+# Replaces the legacy system-scope `forgefleet-daemon@.service` (`ff daemon`):
+# forgefleetd bundles those loops (defer-worker, disk sampler, reconciler)
+# plus pulse publishing, discovery, and the gateway. Everything that manages
+# the daemon (`ff fleet deploy`, revive, panic-stop, self-update playbooks)
+# targets `systemctl --user … forgefleetd.service` — this unit is that target.
+
+[Unit]
+Description=ForgeFleet daemon
+After=network-online.target
+Wants=network-online.target
+# Always-up restart policy (pairs with Restart=always below). systemd's tight
+# default start limit (5 in 10s) tripped during the 2026-04-22 DGX migration —
+# a SIGTERM storm made systemd give up permanently for 9+ hours. 100 restarts/
+# hour ≈ "never give up" for a daemon that is supposed to be always running.
+# These two keys MUST live in [Unit]: in [Service] modern systemd ignores them
+# (the earlier field units carried them there, silently keeping the default).
+StartLimitIntervalSec=3600
+StartLimitBurst=100
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/forgefleetd start
+WorkingDirectory=%h
+
+# Env fix: a user unit does NOT inherit a login-shell PATH, and forgefleetd
+# shells out to `ff`, cargo, and cloud CLIs living under ~/.local/bin and
+# ~/.cargo/bin (plus CUDA tools for GPU probes). FORGEFLEET_NODE_NAME pins
+# the fleet_workers identity so it never falls back to a hostname guess.
+Environment=RUST_LOG=info
+Environment=FORGEFLEET_NODE_NAME=__COMPUTER_NAME__
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/cuda/bin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+
+Restart=always
+RestartSec=5
+
+StandardOutput=append:%h/.forgefleet/logs/forgefleetd.log
+StandardError=append:%h/.forgefleet/logs/forgefleetd.log
+
+[Install]
+WantedBy=default.target
