@@ -804,6 +804,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "server_policy",
         sql: schema::SCHEMA_V165_SERVER_POLICY,
     },
+    PgMigration {
+        version: 166,
+        name: "remove_openclaw",
+        sql: schema::SCHEMA_V166_REMOVE_OPENCLAW,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
