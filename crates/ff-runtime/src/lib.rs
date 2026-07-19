@@ -42,6 +42,7 @@
 //! # }
 //! ```
 
+pub mod build_runner;
 pub mod detector;
 pub mod engine;
 pub mod error;
@@ -53,6 +54,7 @@ pub mod process_manager;
 pub mod vllm;
 
 // Re-export key types at crate root.
+pub use build_runner::{BuildRunner, BuildRunnerConfig, BuildStatus, TrackedBuild};
 pub use engine::{EngineConfig, EngineStatus, InferenceEngine};
 pub use error::{Result, RuntimeError};
 pub use process_manager::{DetectedProcess, ManagedModel, ProcessManager, ProcessManagerConfig};
