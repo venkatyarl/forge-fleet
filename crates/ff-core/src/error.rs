@@ -65,6 +65,10 @@ pub enum ForgeFleetError {
     // ── Internal ─────────────────────────────────────────────────────
     #[error("internal error: {0}")]
     Internal(String),
+
+    // ── Queue ────────────────────────────────────────────────────────
+    #[error("priority queue is empty")]
+    QueueEmpty,
 }
 
 /// Convenience alias used throughout ff-core.
