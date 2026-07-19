@@ -13,16 +13,34 @@ pub struct NodeInfo {
     pub has_npu: bool,
     /// Whether an integrated GPU is present.
     pub has_igpu: bool,
+    /// Whether the node uses unified/shared CPU-GPU memory.
+    ///
+    /// True for Apple Silicon and for Linux APUs whose GPU reports no
+    /// dedicated VRAM pool (e.g., AMD Strix Halo when `gpu_total_vram_gb` is
+    /// `None` or `0`).
+    pub has_unified_memory: bool,
 }
 
 impl NodeInfo {
-    /// Detect NPU/iGPU presence on the current node.
+    /// Detect NPU/iGPU presence and unified-memory architecture on the current node.
     pub fn detect() -> Self {
+        let has_igpu = detect_igpu();
         Self {
             has_npu: detect_npu(),
-            has_igpu: detect_igpu(),
+            has_igpu,
+            has_unified_memory: detect_unified_memory(has_igpu),
         }
     }
+}
+
+/// Pure predicate: a node is treated as unified-memory when a GPU is present
+/// but reports no dedicated VRAM (`gpu_total_vram_gb` is `None`/`0.0`).
+///
+/// This catches AMD Strix Halo APUs whose ROCm stack exposes a GPU with no
+/// discrete carve-out, while leaving discrete GPUs (which report a positive
+/// VRAM value) classified as non-unified.
+pub fn is_unified_memory(gpu_total_vram_gb: Option<f64>, has_gpu: bool) -> bool {
+    has_gpu && gpu_total_vram_gb.map_or(true, |v| v == 0.0)
 }
 
 fn detect_npu() -> bool {
@@ -62,6 +80,27 @@ fn detect_igpu() -> bool {
             return detect_igpu_linux(&out);
         }
         false
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+fn detect_unified_memory(has_igpu: bool) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // Apple Silicon is always unified-memory.
+        return has_igpu;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if !has_igpu {
+            return false;
+        }
+        is_unified_memory(probe_gpu_total_vram_gb(), true)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -134,6 +173,45 @@ fn detect_igpu_linux(lspci: &str) -> bool {
     false
 }
 
+/// Best-effort probe of the total GPU-addressable VRAM pool in GB.
+///
+/// Returns `None` when no GPU stack is available or the tool reports no
+/// usable value. On APUs this `None` is interpreted as unified memory.
+#[cfg(target_os = "linux")]
+fn probe_gpu_total_vram_gb() -> Option<f64> {
+    // AMD ROCm — rocm-smi CSV: card0,<total_bytes>,<used_bytes>,...
+    if let Some(out) = run_command("rocm-smi", &["--showmeminfo", "vram", "--csv"]) {
+        let bytes = out
+            .lines()
+            .flat_map(|l| l.split(','))
+            .filter_map(|f| f.trim().parse::<u64>().ok())
+            .filter(|&b| b > 1_000_000)
+            .fold(0_u64, u64::max);
+        if bytes > 0 {
+            return Some((bytes as f64) / 1e9);
+        }
+        return Some(0.0);
+    }
+
+    // NVIDIA CUDA — nvidia-smi memory.total in MiB.
+    if let Some(out) = run_command(
+        "nvidia-smi",
+        &["--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+    ) {
+        let first = out.lines().map(str::trim).find(|l| !l.is_empty());
+        if let Some(mib) = first
+            .and_then(|l| l.parse::<u64>().ok())
+            .filter(|&mib| mib > 0)
+        {
+            return Some((mib as f64) / 1024.0);
+        }
+        // "N/A" or "[N/A]" is treated as no discrete VRAM.
+        return Some(0.0);
+    }
+
+    None
+}
+
 fn run_command(cmd: &str, args: &[&str]) -> Option<String> {
     std::process::Command::new(cmd)
         .args(args)
@@ -153,6 +231,20 @@ mod tests {
         let info = NodeInfo::detect();
         let _ = info.has_npu;
         let _ = info.has_igpu;
+        let _ = info.has_unified_memory;
+    }
+
+    #[test]
+    fn unified_memory_when_gpu_has_no_vram() {
+        assert!(is_unified_memory(None, true));
+        assert!(is_unified_memory(Some(0.0), true));
+    }
+
+    #[test]
+    fn not_unified_when_no_gpu_or_discrete_vram() {
+        assert!(!is_unified_memory(None, false));
+        assert!(!is_unified_memory(Some(0.0), false));
+        assert!(!is_unified_memory(Some(8.0), true));
     }
 
     #[test]
