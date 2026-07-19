@@ -10,6 +10,7 @@ description = "ForgeFleet MCP (Model Context Protocol) server — JSON-RPC 2.0 o
 ff-core = { path = "../ff-core" }
 ff-db = { path = "../ff-db" }
 ff-agent = { path = "../ff-agent" }
+ff-mc = { path = "../ff-mc" }
 ff-brain = { path = "../ff-brain" }
 ff-api = { path = "../ff-api" }
 ff-discovery = { path = "../ff-discovery" }
