@@ -2179,7 +2179,7 @@ pub enum FleetDbCommand {
     /// momentarily flaky. Use it to verify the HA backup path on demand
     /// instead of waiting for the next scheduled tick.
     Backup {
-        /// Which datastore to back up: `postgres`, `redis`, or `all`.
+        /// Which datastore to back up: `postgres`, `redis`, `falkordb`, or `all`.
         #[arg(long, default_value = "all")]
         kind: String,
         /// Force the run even if this host isn't detected as leader. On by

@@ -132,10 +132,7 @@ async fn run_pr_review(
 ) -> anyhow::Result<(bool, String)> {
     let mut diff_cmd = gh_cmd().await;
     diff_cmd.args(["pr", "diff", pr_url]);
-    let diff_out = diff_cmd
-        .output()
-        .await
-        .context("spawn gh pr diff")?;
+    let diff_out = diff_cmd.output().await.context("spawn gh pr diff")?;
     if !diff_out.status.success() {
         anyhow::bail!(
             "gh pr diff failed: {}",

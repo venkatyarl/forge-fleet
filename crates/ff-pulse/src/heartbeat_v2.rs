@@ -657,6 +657,7 @@ fn detect_os_info() -> crate::beat_v2::OsInfo {
             distribution: "macOS".to_string(),
             version,
             kernel,
+            arch: std::env::consts::ARCH.to_string(),
         };
     }
     if cfg!(target_os = "windows") {
@@ -665,6 +666,7 @@ fn detect_os_info() -> crate::beat_v2::OsInfo {
             distribution: "Windows".to_string(),
             version: String::new(),
             kernel: String::new(),
+            arch: std::env::consts::ARCH.to_string(),
         };
     }
     if cfg!(target_os = "linux") {
@@ -702,10 +704,12 @@ fn detect_os_info() -> crate::beat_v2::OsInfo {
             distribution,
             version,
             kernel,
+            arch: std::env::consts::ARCH.to_string(),
         };
     }
     OsInfo {
         family: "unknown".to_string(),
+        arch: std::env::consts::ARCH.to_string(),
         ..Default::default()
     }
 }

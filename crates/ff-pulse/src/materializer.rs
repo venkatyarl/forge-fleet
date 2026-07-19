@@ -686,6 +686,13 @@ impl Materializer {
             .await;
         }
 
+        // V165: resolve the hardware→inference-server decision table
+        // (fleet_server_policies, kind='server_policy') against this beat's
+        // detected hardware and self-heal fleet_workers.runtime; on a real
+        // (re)classification it also seeds the policy's model downloads.
+        // Best-effort: a missing table/row must never fail the beat.
+        self.apply_server_policy(beat).await;
+
         // build_sha auto-refresh moved earlier in this function so it
         // runs before the fast-path exit; see V89 note above.
 
@@ -1215,6 +1222,201 @@ impl Materializer {
         }
         Ok(count)
     }
+
+    /// V165: resolve the DB-persisted hardware→inference-server decision
+    /// table (`fleet_server_policies`, kind='server_policy', keyed on
+    /// arch/gpu_kind/has_discrete_vram/ram_tier with 'any' wildcards) and
+    /// self-heal `fleet_workers.runtime` to the matched row's runtime.
+    ///
+    /// When the UPDATE actually flips the value — first beat after
+    /// enrollment, or a hardware/policy change — the node was just
+    /// (re)classified, and we additionally enqueue the row's
+    /// `seed_model_ids` as `ff model download <id>` deferred tasks on that
+    /// node (dedup'd against its model library and still-open seed tasks).
+    /// Best-effort throughout: any failure logs and leaves the beat alone.
+    async fn apply_server_policy(&self, beat: &PulseBeatV2) {
+        let gpu_kind = beat.capabilities.gpu_kind.as_str();
+        // Skeleton/degenerate beats carry no hardware — don't classify.
+        if beat.hardware.ram_gb <= 0 || gpu_kind.is_empty() {
+            return;
+        }
+        let arch = resolve_arch(&beat.os.arch, &beat.os.family, gpu_kind);
+        let discrete = if has_discrete_vram(
+            gpu_kind,
+            &beat.os.family,
+            beat.capabilities.gpu_total_vram_gb,
+        ) {
+            "yes"
+        } else {
+            "no"
+        };
+        let tier = ram_tier(beat.hardware.ram_gb);
+
+        // Most-specific matching row wins: each concrete key column match
+        // scores 1, wildcards 0; `id` breaks ties deterministically.
+        let policy = match sqlx::query(
+            "SELECT runtime, primary_server, seed_model_ids::text AS seed_ids \
+             FROM fleet_server_policies \
+             WHERE kind = 'server_policy' \
+               AND arch IN ($1, 'any') \
+               AND gpu_kind IN ($2, 'any') \
+               AND has_discrete_vram IN ($3, 'any') \
+               AND ram_tier IN ($4, 'any') \
+             ORDER BY ((arch = $1)::int + (gpu_kind = $2)::int \
+                     + (has_discrete_vram = $3)::int + (ram_tier = $4)::int) DESC, \
+                      id \
+             LIMIT 1",
+        )
+        .bind(&arch)
+        .bind(gpu_kind)
+        .bind(discrete)
+        .bind(tier)
+        .fetch_optional(&self.pg)
+        .await
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                debug!(
+                    computer = %beat.computer_name,
+                    arch, gpu_kind, discrete, tier,
+                    "server policy: no matching fleet_server_policies row"
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    computer = %beat.computer_name,
+                    error = %e,
+                    "server policy: fleet_server_policies lookup failed"
+                );
+                return;
+            }
+        };
+
+        let runtime: String = policy.try_get("runtime").unwrap_or_default();
+        if runtime.is_empty() {
+            return;
+        }
+        let primary_server: String = policy.try_get("primary_server").unwrap_or_default();
+
+        let updated = sqlx::query(
+            "UPDATE fleet_workers SET runtime = $1, updated_at = NOW() \
+             WHERE name = $2 AND runtime IS DISTINCT FROM $1",
+        )
+        .bind(&runtime)
+        .bind(&beat.computer_name)
+        .execute(&self.pg)
+        .await;
+        match updated {
+            Ok(r) if r.rows_affected() > 0 => {
+                info!(
+                    computer = %beat.computer_name,
+                    arch, gpu_kind, discrete, tier,
+                    runtime = %runtime,
+                    server = %primary_server,
+                    "server policy: classified node; fleet_workers.runtime set"
+                );
+            }
+            Ok(_) => return, // already conformant — nothing to seed
+            Err(e) => {
+                warn!(
+                    computer = %beat.computer_name,
+                    error = %e,
+                    "server policy: fleet_workers.runtime self-heal failed"
+                );
+                return;
+            }
+        }
+
+        // Seed model downloads for the freshly classified node.
+        let seed_json: String = policy.try_get("seed_ids").unwrap_or_default();
+        let seed_ids: Vec<String> = serde_json::from_str(&seed_json).unwrap_or_default();
+        for id in seed_ids {
+            // The id is interpolated into a shell command run by the node's
+            // defer-worker — refuse anything but plain catalog-id characters.
+            if id.is_empty()
+                || !id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            {
+                warn!(model = %id, "server policy: refusing non-catalog-id seed value");
+                continue;
+            }
+            self.seed_model_download(&beat.computer_name, &id).await;
+        }
+    }
+
+    /// Enqueue `ff model download <catalog_id>` on `node` through the
+    /// deferred task queue (same fleet_tasks row shape as
+    /// `ff_db::pg_enqueue_deferred`, which ff-pulse can't call directly —
+    /// no ff-db dependency). Skips silently if the node's library already
+    /// has the model or an open seed task for it exists.
+    async fn seed_model_download(&self, node: &str, catalog_id: &str) {
+        let in_library = sqlx::query(
+            "SELECT 1 AS one FROM fleet_model_library \
+             WHERE worker_name = $1 AND catalog_id = $2 LIMIT 1",
+        )
+        .bind(node)
+        .bind(catalog_id)
+        .fetch_optional(&self.pg)
+        .await;
+        if !matches!(in_library, Ok(None)) {
+            return; // present already, or lookup failed — don't enqueue blind
+        }
+
+        let title = format!("Seed model {catalog_id} on {node}");
+        let open_task = sqlx::query(
+            "SELECT 1 AS one FROM fleet_tasks \
+             WHERE task_class = 'deferred' AND summary = $1 \
+               AND status NOT IN ('completed', 'failed', 'cancelled') \
+             LIMIT 1",
+        )
+        .bind(&title)
+        .fetch_optional(&self.pg)
+        .await;
+        if !matches!(open_task, Ok(None)) {
+            return;
+        }
+
+        let command = format!("ff model download {catalog_id}");
+        let inserted = sqlx::query(
+            "INSERT INTO fleet_tasks \
+                (task_type, summary, payload, priority, requires_capability, \
+                 status, created_at, task_class) \
+             VALUES ( \
+                 'shell', $1, \
+                 jsonb_build_object( \
+                     'deferred_payload', jsonb_build_object('command', $2), \
+                     'created_by', 'pulse-materializer', \
+                     'kind', 'shell', \
+                     'trigger_type', 'now', \
+                     'trigger_spec', '{}'::jsonb, \
+                     'preferred_node', $3, \
+                     'required_caps', '[]'::jsonb, \
+                     'attempts', 0, \
+                     'max_attempts', 3 \
+                 ), \
+                 50, '[]'::jsonb, 'pending', NOW(), 'deferred')",
+        )
+        .bind(&title)
+        .bind(&command)
+        .bind(node)
+        .execute(&self.pg)
+        .await;
+        match inserted {
+            Ok(_) => info!(
+                computer = %node,
+                model = %catalog_id,
+                "server policy: seeded model download via deferred task"
+            ),
+            Err(e) => warn!(
+                computer = %node,
+                model = %catalog_id,
+                error = %e,
+                "server policy: model download seed enqueue failed"
+            ),
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1245,6 +1447,41 @@ fn persistent_fields_changed(
     primary_ip_differ: bool,
 ) -> bool {
     ips_differ || hw_differ || cap_differ || primary_ip_differ
+}
+
+/// RAM tier key for server-policy resolution: <=8GB is `tiny` (CPU-only
+/// llama-server, no model seed), everything else `standard`. Callers must
+/// gate out non-positive ram_gb (degenerate beats) before classifying.
+fn ram_tier(ram_gb: i32) -> &'static str {
+    if ram_gb <= 8 { "tiny" } else { "standard" }
+}
+
+/// Whether the GPU owns a discrete VRAM pool, vs sharing system RAM.
+/// Mirrors the autoscaler's memory-pool classifier: GB10 DGX Sparks
+/// (os_family `linux-dgx`) and Apple Silicon are unified; AMD ROCm
+/// reporting only a tiny (<8GB) VRAM carve-out is GTT-unified (Strix Halo,
+/// where the 2GB "VRAM" is a carve-out of the 123GB RAM pool).
+fn has_discrete_vram(gpu_kind: &str, os_family: &str, gpu_total_vram_gb: Option<f64>) -> bool {
+    match gpu_kind {
+        "nvidia_cuda" => os_family != "linux-dgx",
+        "amd_rocm" => gpu_total_vram_gb.unwrap_or(0.0) >= 8.0,
+        _ => false, // apple_silicon = unified; none/integrated = no VRAM
+    }
+}
+
+/// Arch key for server-policy resolution. Prefers the beat's self-reported
+/// `os.arch` (V165+ daemons); beats from older daemons fall back to a
+/// derivation — the only aarch64 hosts in the fleet without the field are
+/// DGX Sparks (linux-dgx) and Apple Silicon Macs.
+fn resolve_arch(os_arch: &str, os_family: &str, gpu_kind: &str) -> String {
+    if !os_arch.is_empty() {
+        return os_arch.to_string();
+    }
+    if os_family == "linux-dgx" || gpu_kind == "apple_silicon" {
+        "aarch64".to_string()
+    } else {
+        "x86_64".to_string()
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1575,5 +1812,43 @@ mod tests {
         assert!(snapshots_match);
         assert!(!status_changed);
         // Expected behavior: exactly one write: UPDATE computers SET last_seen_at.
+    }
+
+    #[test]
+    fn ram_tier_splits_at_8gb() {
+        assert_eq!(ram_tier(3), "tiny");
+        assert_eq!(ram_tier(8), "tiny");
+        assert_eq!(ram_tier(9), "standard");
+        assert_eq!(ram_tier(123), "standard");
+    }
+
+    #[test]
+    fn discrete_vram_classification_matches_fleet_hardware() {
+        // DGX Spark GB10: CUDA but unified memory.
+        assert!(!has_discrete_vram("nvidia_cuda", "linux-dgx", Some(122.0)));
+        // Generic x86 NVIDIA box: discrete VRAM.
+        assert!(has_discrete_vram("nvidia_cuda", "linux-ubuntu", Some(24.0)));
+        // Strix Halo (duncan/lily/logan/veronica): 2.1GB carve-out → GTT-unified.
+        assert!(!has_discrete_vram(
+            "amd_rocm",
+            "linux-ubuntu",
+            Some(2.147483648)
+        ));
+        assert!(!has_discrete_vram("amd_rocm", "linux-ubuntu", None));
+        // AMD with a real discrete card.
+        assert!(has_discrete_vram("amd_rocm", "linux-ubuntu", Some(24.0)));
+        // Apple Silicon and CPU-only hosts never have discrete VRAM.
+        assert!(!has_discrete_vram("apple_silicon", "macos", Some(96.0)));
+        assert!(!has_discrete_vram("none", "linux-ubuntu", None));
+    }
+
+    #[test]
+    fn arch_prefers_beat_field_then_derives_from_family() {
+        assert_eq!(resolve_arch("aarch64", "linux-ubuntu", "none"), "aarch64");
+        assert_eq!(resolve_arch("x86_64", "linux-dgx", "nvidia_cuda"), "x86_64");
+        // Pre-V165 daemons: no arch in the beat — derive.
+        assert_eq!(resolve_arch("", "linux-dgx", "nvidia_cuda"), "aarch64");
+        assert_eq!(resolve_arch("", "macos", "apple_silicon"), "aarch64");
+        assert_eq!(resolve_arch("", "linux-ubuntu", "amd_rocm"), "x86_64");
     }
 }

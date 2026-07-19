@@ -3437,7 +3437,7 @@ async fn start_pulse_v2_subsystems(
     info!(
         node = %worker_name,
         computer_id = %computer_id,
-        "starting subsystem: backup orchestrator (pg=4h, redis=2h)"
+        "starting subsystem: backup orchestrator (cadence/policy from fleet_backup_config)"
     );
     let backup = ff_agent::ha::backup::BackupOrchestrator::new(
         pg_pool.clone(),
