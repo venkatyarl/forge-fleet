@@ -11,6 +11,7 @@
 //! - **task** — Agent task and result types
 
 pub mod activity;
+pub mod artifact_cache;
 pub mod audit;
 pub mod build_version;
 pub mod chaos;
@@ -43,6 +44,9 @@ pub mod verifier;
 
 // Re-export the most commonly used items at crate root.
 pub use activity::{ActivitySignals, ActivityState, YieldMode};
+pub use artifact_cache::{
+    ArtifactEvictionPolicy, evaluate_artifact_eviction, spawn_artifact_eviction_loop,
+};
 pub use chaos::{
     ChaosConfig, ChaosEngine, ChaosHooks, Simulation, SimulationId, SimulationState, SimulationType,
 };
