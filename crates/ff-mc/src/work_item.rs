@@ -5,6 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::{McError, McResult};
 
@@ -135,6 +136,10 @@ pub struct WorkItem {
     /// Capabilities a slot must have to pick this item up (e.g. `gpu`, `macos`).
     #[serde(default)]
     pub capability_tags: Vec<String>,
+    /// Free-form structured context attached to the work item (e.g. task
+    /// metadata, source-system identifiers, or dispatch hints).
+    #[serde(default)]
+    pub context: Option<Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -161,6 +166,8 @@ pub struct CreateWorkItem {
     pub sequence_order: Option<i32>,
     #[serde(default)]
     pub labels: Vec<String>,
+    #[serde(default)]
+    pub context: Option<Value>,
 }
 
 /// Parameters for updating a work item. All fields optional.
@@ -176,6 +183,7 @@ pub struct UpdateWorkItem {
     pub task_group_id: Option<Option<String>>,
     pub sequence_order: Option<Option<i32>>,
     pub labels: Option<Vec<String>>,
+    pub context: Option<Option<Value>>,
 }
 
 // ─── CRUD ────────────────────────────────────────────────────────────────────

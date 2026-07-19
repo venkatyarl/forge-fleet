@@ -716,6 +716,7 @@ async fn create_work_item_in_store(
         numeric_priority: None,
         pick_score: None,
         capability_tags: Vec::new(),
+        context: params.context,
         created_at: now,
         updated_at: now,
     };
@@ -760,6 +761,9 @@ async fn update_work_item_in_store(
     }
     if let Some(labels) = params.labels {
         item.labels = labels;
+    }
+    if let Some(context) = params.context {
+        item.context = context;
     }
 
     item.updated_at = Utc::now();
