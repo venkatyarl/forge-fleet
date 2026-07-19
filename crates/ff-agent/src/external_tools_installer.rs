@@ -19,11 +19,11 @@
 //!
 //! When `external_tools.metadata.artifact_cache` carries an entry for the
 //! target's playbook key (same key precedence as `upgrade_playbook`), the
-//! enqueued command is wrapped cache-first: rsync the artifact from the
-//! fleet cache into `~/.forgefleet/artifact-cache/<tool_id>/`, validate
-//! its SHA256, and run the entry's `install_cmd` (which sees the local
-//! path as `$FF_ARTIFACT`). On rsync failure or checksum mismatch the
-//! wrapper falls back to the original playbook command (WAN download).
+//! enqueued command is wrapped cache-first: check the node-local artifact,
+//! then rsync it from the fleet cache on a miss, validate its SHA256, and run
+//! the entry's `install_cmd` (which sees the local path as `$FF_ARTIFACT`). On
+//! cache/rsync failure or checksum mismatch the wrapper falls back to the
+//! original playbook command (WAN download).
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -387,11 +387,11 @@ fn resolve_artifact_cache(
 }
 
 /// Wrap a playbook command cache-first. POSIX sh (the defer worker runs
-/// commands via `sh -c`, dash on Ubuntu): rsync the artifact into the
-/// node-local cache dir, validate SHA256 (`sha256sum` with `shasum -a
-/// 256` fallback for macOS), then run `install_cmd` with `$FF_ARTIFACT`
-/// exported. Any failure — rsync unreachable, checksum mismatch — drops
-/// the fetched file and falls back to the original WAN command.
+/// commands via `sh -c`, dash on Ubuntu): validate an existing node-local
+/// artifact first, rsync only on a miss, validate SHA256 (`sha256sum` with
+/// `shasum -a 256` fallback for macOS), then run `install_cmd` with
+/// `$FF_ARTIFACT` exported. Any failure — rsync unreachable, checksum mismatch
+/// — drops the fetched file and falls back to the original WAN command.
 fn wrap_with_artifact_cache(tool_id: &str, spec: &ArtifactCacheSpec, wan_command: &str) -> String {
     // Basename of the rsync source ("user@host:/a/b/tool.tar.gz" → "tool.tar.gz").
     let file_name = spec
@@ -416,9 +416,13 @@ fn wrap_with_artifact_cache(tool_id: &str, spec: &ArtifactCacheSpec, wan_command
         "FF_CACHE_DIR=\"${{FORGEFLEET_ARTIFACT_CACHE:-$HOME/.forgefleet/artifact-cache}}\"/{q_tool}\n\
          FF_ARTIFACT=\"$FF_CACHE_DIR\"/{q_file}\n\
          export FF_ARTIFACT\n\
-         if mkdir -p \"$FF_CACHE_DIR\" \\\n\
-            && rsync -a --partial {q_src} \"$FF_ARTIFACT\" \\\n\
-            && [ \"$({{ command -v sha256sum >/dev/null 2>&1 && sha256sum \"$FF_ARTIFACT\" || shasum -a 256 \"$FF_ARTIFACT\"; }} | awk '{{print $1}}')\" = \"{sha}\" ]; then\n\
+         ff_artifact_valid() {{\n\
+           [ -f \"$FF_ARTIFACT\" ] && [ \"$({{ command -v sha256sum >/dev/null 2>&1 && sha256sum \"$FF_ARTIFACT\" || shasum -a 256 \"$FF_ARTIFACT\"; }} | awk '{{print $1}}')\" = \"{sha}\" ]\n\
+         }}\n\
+         if ff_artifact_valid \\\n\
+            || {{ mkdir -p \"$FF_CACHE_DIR\" \\\n\
+                 && rsync -a --partial {q_src} \"$FF_ARTIFACT\" \\\n\
+                 && ff_artifact_valid; }}; then\n\
            echo {hit_msg}\n\
            {install_cmd}\n\
          else\n\
@@ -533,6 +537,7 @@ mod tests {
     #[test]
     fn wrapped_command_embeds_cache_check_and_wan_fallback() {
         let wrapped = wrap_with_artifact_cache("crg", &spec(), "cargo install crg");
+        assert!(wrapped.contains("if ff_artifact_valid"));
         assert!(wrapped.contains("rsync -a --partial"));
         assert!(wrapped.contains("'ff@sophie:/srv/ff-artifacts/crg/crg-linux-x86_64'"));
         assert!(wrapped.contains(&"a".repeat(64)));
@@ -542,6 +547,44 @@ mod tests {
         // Artifact lands under the per-tool cache dir, named after the source.
         assert!(wrapped.contains("/'crg'"));
         assert!(wrapped.contains("/'crg-linux-x86_64'"));
+    }
+
+    #[test]
+    fn wrapped_command_uses_existing_local_artifact_before_rsync() {
+        if !(have_cmd("sha256sum") || have_cmd("shasum")) {
+            return;
+        }
+        let cache = tempfile::tempdir().expect("tempdir");
+        let local_dir = cache.path().join("crg");
+        std::fs::create_dir_all(&local_dir).expect("create local cache");
+        std::fs::write(local_dir.join("tool-bin"), b"artifact-payload")
+            .expect("seed local artifact");
+        let installed = cache.path().join("installed-bin");
+
+        let mut s = spec();
+        // If the wrapper invokes rsync this source fails, proving a successful
+        // install came from the node-local artifact.
+        s.source = cache
+            .path()
+            .join("missing")
+            .join("tool-bin")
+            .display()
+            .to_string();
+        s.sha256 = "5c6fd60a6ad0ce3fffdf2f2c61fbf1e9677f780c64a1ee33563bb2a40f29ef80".into();
+        s.install_cmd = format!(
+            "cp \"$FF_ARTIFACT\" {}",
+            shell_quote(&installed.display().to_string())
+        );
+
+        let wrapped = wrap_with_artifact_cache("crg", &s, "echo WAN_INSTALL_RAN");
+        let out = run_sh(&wrapped, cache.path());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "wrapper exited nonzero: {out:?}");
+        assert!(!stdout.contains("WAN_INSTALL_RAN"), "stdout: {stdout}");
+        assert_eq!(
+            std::fs::read(&installed).expect("installed artifact"),
+            b"artifact-payload"
+        );
     }
 
     #[test]
