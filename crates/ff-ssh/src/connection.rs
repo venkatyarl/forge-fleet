@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -39,6 +41,11 @@ pub struct SshConnectionOptions {
     pub known_hosts_path: Option<PathBuf>,
     #[serde(default)]
     pub extra_args: Vec<String>,
+    /// Optional name → IP roster. When `host` is a node name/alias rather than a
+    /// literal IP, the connection logic resolves it to the roster IP before
+    /// invoking ssh, ensuring fleet SSH checks always target the canonical IP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster: Option<HashMap<String, String>>,
 }
 
 fn default_batch_mode() -> bool {
@@ -68,6 +75,7 @@ impl SshConnectionOptions {
             strict_host_key_checking: true,
             known_hosts_path: node.known_hosts_path.clone(),
             extra_args: Vec::new(),
+            roster: None,
         }
     }
 }
@@ -113,6 +121,10 @@ impl SshConnection {
     }
 
     /// Verify remote reachability/auth by running `echo connected`.
+    ///
+    /// The connection always targets the roster IP when `host` resolves to a
+    /// name/alias present in `options.roster`, falling back to the literal host
+    /// string only when it is already an IP or absent from the roster.
     pub fn connect(&self) -> Result<SshCommandOutput, SshConnectionError> {
         self.execute("echo connected")
     }
@@ -123,12 +135,10 @@ impl SshConnection {
         let started = Instant::now();
         let mut cmd = self.build_command(remote_command)?;
         let output = self.run_command(&mut cmd)?;
+        let host = self.resolve_host();
 
         Ok(SshCommandOutput {
-            target: format!(
-                "{}@{}:{}",
-                self.options.username, self.options.host, self.options.port
-            ),
+            target: format!("{}@{}:{}", self.options.username, host, self.options.port),
             command: remote_command.to_string(),
             started_at,
             duration_ms: started.elapsed().as_millis(),
@@ -137,6 +147,21 @@ impl SshConnection {
             stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         })
+    }
+
+    /// Resolve `options.host` to the roster IP when the host is a node
+    /// name/alias, or return it unchanged when it is already an IP address.
+    fn resolve_host(&self) -> String {
+        let host = &self.options.host;
+        if host.parse::<IpAddr>().is_ok() {
+            return host.clone();
+        }
+        if let Some(roster) = &self.options.roster {
+            if let Some(ip) = roster.get(host) {
+                return ip.clone();
+            }
+        }
+        host.clone()
     }
 
     fn build_command(&self, remote_command: &str) -> Result<Command, SshConnectionError> {
@@ -179,7 +204,7 @@ impl SshConnection {
             cmd.arg(arg);
         }
 
-        cmd.arg(format!("{}@{}", self.options.username, self.options.host));
+        cmd.arg(format!("{}@{}", self.options.username, self.resolve_host()));
         cmd.arg(remote_command);
 
         Ok(cmd)
@@ -231,4 +256,58 @@ fn command_exists(binary: &str) -> bool {
 
 fn yes_no(enabled: bool) -> &'static str {
     if enabled { "yes" } else { "no" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn opts_with_host(host: impl Into<String>) -> SshConnectionOptions {
+        SshConnectionOptions {
+            host: host.into(),
+            username: "user".into(),
+            port: 22,
+            auth: SshAuth::Agent,
+            batch_mode: true,
+            connect_timeout_secs: None,
+            command_timeout_secs: None,
+            strict_host_key_checking: true,
+            known_hosts_path: None,
+            extra_args: Vec::new(),
+            roster: None,
+        }
+    }
+
+    #[test]
+    fn resolve_host_uses_literal_ip_unchanged() {
+        let conn = SshConnection::new(opts_with_host("192.168.5.100"));
+        assert_eq!(conn.resolve_host(), "192.168.5.100");
+    }
+
+    #[test]
+    fn resolve_host_maps_alias_to_roster_ip() {
+        let mut roster = HashMap::new();
+        roster.insert("taylor".into(), "192.168.5.100".into());
+        let mut opts = opts_with_host("taylor");
+        opts.roster = Some(roster);
+        let conn = SshConnection::new(opts);
+        assert_eq!(conn.resolve_host(), "192.168.5.100");
+    }
+
+    #[test]
+    fn resolve_host_falls_back_when_alias_not_in_roster() {
+        let mut roster = HashMap::new();
+        roster.insert("other".into(), "192.168.5.101".into());
+        let mut opts = opts_with_host("unknown-alias");
+        opts.roster = Some(roster);
+        let conn = SshConnection::new(opts);
+        assert_eq!(conn.resolve_host(), "unknown-alias");
+    }
+
+    #[test]
+    fn resolve_host_falls_back_when_roster_is_none() {
+        let conn = SshConnection::new(opts_with_host("some-host"));
+        assert_eq!(conn.resolve_host(), "some-host");
+    }
 }

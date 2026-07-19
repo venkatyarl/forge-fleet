@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
@@ -70,14 +71,24 @@ impl ConnectivityChecker {
     }
 
     /// Check connectivity for all nodes in parallel.
+    ///
+    /// Builds a name → primary host roster from the supplied nodes so that SSH
+    /// probes resolve node aliases to the canonical IP configured for the fleet.
     pub async fn check_all(&self, nodes: &[SshNodeConfig]) -> ConnectivityMatrix {
         let checked_at = Utc::now();
+        let roster: HashMap<String, String> = nodes
+            .iter()
+            .map(|n| (n.name.clone(), n.host.clone()))
+            .collect();
         let mut handles = Vec::with_capacity(nodes.len());
 
         for node in nodes {
             let checker = self.clone();
             let node = node.clone();
-            handles.push(tokio::spawn(async move { checker.check_node(&node).await }));
+            let roster = roster.clone();
+            handles.push(tokio::spawn(async move {
+                checker.check_node_with_roster(&node, &roster).await
+            }));
         }
 
         let mut results = Vec::with_capacity(nodes.len());
@@ -95,6 +106,14 @@ impl ConnectivityChecker {
 
     /// Check one node, trying primary host and then alternates.
     pub async fn check_node(&self, node: &SshNodeConfig) -> NodeConnectivityResult {
+        self.check_node_with_roster(node, &HashMap::new()).await
+    }
+
+    async fn check_node_with_roster(
+        &self,
+        node: &SshNodeConfig,
+        roster: &HashMap<String, String>,
+    ) -> NodeConnectivityResult {
         let mut last_failure = None;
 
         for candidate_host in node.candidate_hosts() {
@@ -107,7 +126,8 @@ impl ConnectivityChecker {
             match tokio::task::spawn_blocking({
                 let checker = self.clone();
                 let candidate = candidate.clone();
-                move || checker.probe_candidate(&candidate)
+                let roster = roster.clone();
+                move || checker.probe_candidate(&candidate, &roster)
             })
             .await
             {
@@ -154,10 +174,15 @@ impl ConnectivityChecker {
         })
     }
 
-    fn probe_candidate(&self, node: &SshNodeConfig) -> Result<(), (ConnectivityStatus, String)> {
+    fn probe_candidate(
+        &self,
+        node: &SshNodeConfig,
+        roster: &HashMap<String, String>,
+    ) -> Result<(), (ConnectivityStatus, String)> {
         let mut options = SshConnectionOptions::from_node(node);
         options.command_timeout_secs = Some(self.timeout_secs);
         options.connect_timeout_secs = Some(self.timeout_secs);
+        options.roster = Some(roster.clone());
 
         let connection = SshConnection::new(options);
         match connection.execute(&self.probe_command) {
