@@ -2314,6 +2314,20 @@ fn push_branch(repo_path: &Path, task_branch: &str) -> Result<()> {
         ["fetch", "--prune", "origin"],
         Duration::from_secs(120),
     );
+    // Some slot clones were provisioned single-branch (fetch refspec covering
+    // only main — observed on the ring nodes 2026-07-19), so the plain fetch
+    // above never learns the task branch's remote state and the lease check
+    // below fails with "stale info" forever. Fetch the task branch explicitly
+    // (tolerating absence: a first push has nothing to fetch).
+    let _ = run_git(
+        repo_path,
+        [
+            "fetch",
+            "origin",
+            &format!("+refs/heads/{task_branch}:refs/remotes/origin/{task_branch}"),
+        ],
+        Duration::from_secs(60),
+    );
     // --force-with-lease: the harness OWNS wi/* branches. When a prior attempt
     // pushed and then died (daemon restart, timeout), the retry rebuilds fresh
     // history from origin/<base> and a plain push is rejected non-fast-forward
