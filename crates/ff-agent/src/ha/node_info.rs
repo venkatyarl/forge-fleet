@@ -19,6 +19,12 @@ pub struct NodeInfo {
     /// (Apple Silicon, NVIDIA GB10/DGX Spark reporting `N/A`, AMD APUs) whose
     /// pool is system RAM rather than dedicated VRAM.
     pub gpu_total_vram_gb: Option<f64>,
+    /// Whether the GPU runs on unified memory shared with the CPU: a GPU is
+    /// present but reports no dedicated VRAM pool (Apple Silicon, AMD Strix
+    /// Halo APUs, NVIDIA GB10/DGX Spark). Defaults to `false` when
+    /// deserializing snapshots recorded before this field existed.
+    #[serde(default)]
+    pub unified_memory: bool,
     /// CPU feature flags relevant to ML inference routing, normalized to
     /// lowercase (e.g. `avx2`, `avx512f`, `avx512vnni`). Empty on platforms
     /// where flag probing is not implemented.
@@ -28,13 +34,23 @@ pub struct NodeInfo {
 impl NodeInfo {
     /// Detect NPU/iGPU presence, total GPU VRAM, and CPU flags on the current node.
     pub fn detect() -> Self {
+        let has_igpu = detect_igpu();
+        let gpu_total_vram_gb = detect_gpu_total_vram_gb();
         Self {
             has_npu: detect_npu(),
-            has_igpu: detect_igpu(),
-            gpu_total_vram_gb: detect_gpu_total_vram_gb(),
+            has_igpu,
+            gpu_total_vram_gb,
+            unified_memory: is_unified_memory(has_igpu, gpu_total_vram_gb),
             cpu_flags: detect_cpu_flags(),
         }
     }
+}
+
+/// A node is unified-memory when a GPU is present but the discrete VRAM probe
+/// found no dedicated pool (`None` or 0 GB): the GPU's pool is carved from
+/// system RAM (AMD Strix Halo APUs, Apple Silicon).
+fn is_unified_memory(gpu_present: bool, gpu_total_vram_gb: Option<f64>) -> bool {
+    gpu_present && gpu_total_vram_gb.map_or(true, |gb| gb <= 0.0)
 }
 
 fn detect_npu() -> bool {
@@ -323,6 +339,19 @@ mod tests {
             vec!["avx2", "avx512f", "avx512vnni", "de", "fpu", "pse", "vme"]
         );
         assert!(parse_linux_cpu_flags("").is_empty());
+    }
+
+    #[test]
+    fn unified_memory_requires_gpu_with_no_discrete_vram() {
+        // AMD Strix Halo APU / Apple Silicon: GPU present, VRAM probe found nothing.
+        assert!(is_unified_memory(true, None));
+        // Driver reports a 0-sized pool: still unified.
+        assert!(is_unified_memory(true, Some(0.0)));
+        // Discrete GPU with a real VRAM pool.
+        assert!(!is_unified_memory(true, Some(24.0)));
+        // No GPU at all: nothing to mark unified.
+        assert!(!is_unified_memory(false, None));
+        assert!(!is_unified_memory(false, Some(0.0)));
     }
 
     #[test]
