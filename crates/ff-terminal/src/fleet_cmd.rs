@@ -4198,8 +4198,7 @@ fn deploy_install_restart_playbook(os_family: &str) -> String {
         // reports the node unreachable (ace had a 2-day-old orphan, 2026-06-25).
         // After the pre-kill, launchd brings up exactly ONE daemon on the fresh
         // binary; RESTART_DUP flags it loudly if somehow >1 survive.
-        "macos" => format!(
-            "install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
+        "macos" => "install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
              install -m 755 target/release/ff ~/.local/bin/ff && \
              codesign --force --sign - ~/.local/bin/forgefleetd && \
              codesign --force --sign - ~/.local/bin/ff && \
@@ -4207,26 +4206,24 @@ fn deploy_install_restart_playbook(os_family: &str) -> String {
              USER_ID=$(stat -f %u \"$HOME\" 2>/dev/null || id -u); \
              for p in $(pgrep -x forgefleetd); do kill -TERM \"$p\" 2>/dev/null; done; sleep 2; \
              for p in $(pgrep -x forgefleetd); do kill -KILL \"$p\" 2>/dev/null; done; \
-             launchctl kickstart -k \"gui/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
-               || launchctl kickstart -k \"user/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
+             launchctl kickstart -k \"gui/${USER_ID}/com.forgefleet.forgefleetd\" 2>/dev/null \
+               || launchctl kickstart -k \"user/${USER_ID}/com.forgefleet.forgefleetd\" 2>/dev/null \
                || ( nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
                     </dev/null >/tmp/forgefleetd.log 2>&1 & disown ); \
              sleep 4; ~/.local/bin/ff model resume-from-build 2>/dev/null || true; \
              RN=$(pgrep -x forgefleetd 2>/dev/null | wc -l | tr -d ' '); \
              echo \"RESTART_VERIFY count=$RN (macos: launchd-managed, orphans cleared)\"; \
-             [ \"$RN\" -le 1 ] || echo \"RESTART_DUP: $RN forgefleetd running — orphan not cleared\" >&2"
-        ),
+             [ \"$RN\" -le 1 ] || echo \"RESTART_DUP: $RN forgefleetd running — orphan not cleared\" >&2".to_string(),
         // linux + linux-dgx share the same restart idiom; only -j differs
         // (folded into cargo_build in the build playbook). Prefer the systemd
         // user unit; the fallback kills the running daemon by PID *excluding
         // this shell* ($$) — a `pkill -f forgefleetd...` would also match (and
         // kill) THIS deploy command's own SSH shell, which exited it 255 before
         // the restart ran.
-        _ => format!(
-            "install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
+        _ => "install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
              install -m 755 target/release/ff ~/.local/bin/ff && \
              install -m 755 target/release/ff ~/.cargo/bin/ff 2>/dev/null || true; \
-             export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
+             export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; \
              systemctl --user stop forgefleetd.service 2>/dev/null; \
              for p in $(pgrep -x forgefleetd); do kill -TERM \"$p\" 2>/dev/null; done; sleep 2; \
              for p in $(pgrep -x forgefleetd); do kill -KILL \"$p\" 2>/dev/null; done; \
@@ -4239,8 +4236,7 @@ fn deploy_install_restart_playbook(os_family: &str) -> String {
              RE=$(readlink /proc/$RP/exe 2>/dev/null); \
              echo \"RESTART_VERIFY count=$RN exe=$RE\"; \
              case \"$RE\" in *'(deleted)'*) echo 'RESTART_STALE: running deleted inode' >&2; exit 7;; esac; \
-             [ \"$RN\" -ge 1 ] || {{ echo 'RESTART_DOWN: no forgefleetd running' >&2; exit 8; }}"
-        ),
+             [ \"$RN\" -ge 1 ] || { echo 'RESTART_DOWN: no forgefleetd running' >&2; exit 8; }".to_string(),
     }
 }
 
@@ -4552,7 +4548,7 @@ async fn scp_binaries_from_builder(
 
     // Ensure the receiver's target/release directory exists.
     let mkdir_remote = format!("{}@{}", receiver.ssh_user, receiver_ip);
-    let mkdir_cmd = format!("mkdir -p {}/target/release", receiver_dst);
+    let mkdir_cmd = format!("mkdir -p {receiver_dst}/target/release");
     let mut mkdir = tokio::process::Command::new("ssh");
     mkdir
         .arg("-o")

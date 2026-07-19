@@ -366,19 +366,38 @@ async fn pr_merge_state(pr_url: &str) -> PrMergeState {
     }
 }
 
-/// `gh pr update-branch <url>` — merges current base into the PR branch via the
-/// GitHub API so CI re-runs against what the squash-merge will actually contain.
+/// Merge current base into the PR branch so CI re-runs against what the
+/// squash-merge will actually contain. Uses the REST endpoint directly
+/// (`PUT /repos/{owner}/{repo}/pulls/{n}/update-branch`) because the
+/// `gh pr update-branch` subcommand only exists in gh >= 2.57 and older
+/// fleet nodes silently lack it.
 async fn gh_update_pr_branch(pr_url: &str) -> Result<()> {
+    let api_path =
+        update_branch_api_path(pr_url).with_context(|| format!("unrecognized PR url: {pr_url}"))?;
     let mut cmd = gh_cmd().await;
-    cmd.args(["pr", "update-branch", pr_url]);
-    let out = cmd.output().await.context("spawn gh pr update-branch")?;
+    cmd.args(["api", "-X", "PUT", &api_path]);
+    let out = cmd.output().await.context("spawn gh api update-branch")?;
     if out.status.success() {
         return Ok(());
     }
     anyhow::bail!(
-        "gh pr update-branch failed: {}",
+        "gh api update-branch failed: {}",
         String::from_utf8_lossy(&out.stderr).trim()
     )
+}
+
+/// `https://github.com/{owner}/{repo}/pull/{n}` → REST path for update-branch.
+fn update_branch_api_path(pr_url: &str) -> Option<String> {
+    let rest = pr_url.strip_prefix("https://github.com/")?;
+    let mut it = rest.splitn(4, '/');
+    match (it.next(), it.next(), it.next(), it.next()) {
+        (Some(owner), Some(repo), Some("pull"), Some(num))
+            if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            Some(format!("repos/{owner}/{repo}/pulls/{num}/update-branch"))
+        }
+        _ => None,
+    }
 }
 
 /// Inspect a PR's checks via `gh pr checks <url> --json state`. No checks yet
@@ -567,4 +586,30 @@ pub fn spawn_work_item_merge_drain(
         }
         info!("work_item_merge_drain loop stopped");
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::update_branch_api_path;
+
+    #[test]
+    fn pr_url_maps_to_update_branch_api_path() {
+        assert_eq!(
+            update_branch_api_path("https://github.com/venkatyarl/forge-fleet/pull/930").as_deref(),
+            Some("repos/venkatyarl/forge-fleet/pulls/930/update-branch")
+        );
+    }
+
+    #[test]
+    fn malformed_pr_urls_are_rejected() {
+        for bad in [
+            "https://github.com/venkatyarl/forge-fleet",
+            "https://github.com/venkatyarl/forge-fleet/issues/930",
+            "https://github.com/venkatyarl/forge-fleet/pull/",
+            "https://github.com/venkatyarl/forge-fleet/pull/93x",
+            "http://github.com/venkatyarl/forge-fleet/pull/930",
+        ] {
+            assert!(update_branch_api_path(bad).is_none(), "{bad}");
+        }
+    }
 }

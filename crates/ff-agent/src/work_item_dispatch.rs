@@ -560,7 +560,7 @@ async fn ensure_repo_checked_out(pg: &PgPool, item: &AssignedWorkItem) -> Result
                 ["remote", "set-url", "origin", &clone_url_for_remote],
                 Duration::from_secs(60),
             )
-            .with_context(|| format!("set origin to {}", clone_url_for_remote))?;
+            .with_context(|| format!("set origin to {clone_url_for_remote}"))?;
 
             Ok::<(), anyhow::Error>(())
         })
@@ -659,7 +659,7 @@ async fn seed_repo_cache(repo_path: &Path, cache_path: &Path, clone_url: &str) -
             ["remote", "set-url", "origin", &clone_url],
             Duration::from_secs(60),
         )
-        .with_context(|| format!("set cache origin to {}", clone_url))?;
+        .with_context(|| format!("set cache origin to {clone_url}"))?;
 
         Ok::<(), anyhow::Error>(())
     })
