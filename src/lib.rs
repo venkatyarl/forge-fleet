@@ -1,3 +1,5 @@
+pub mod pm;
+
 pub mod styles {
     pub const TOKENS_CSS: &str = include_str!("styles/tokens.css");
 
