@@ -102,6 +102,10 @@ pub struct FleetConfig {
     #[serde(default)]
     pub redis: RedisConfig,
 
+    /// Obsidian export daemon settings — `[obsidian_export]`.
+    #[serde(default)]
+    pub obsidian_export: ObsidianExportConfig,
+
     /// Pending nodes awaiting bootstrap — `[[bootstrap_targets]]`.
     #[serde(default)]
     pub bootstrap_targets: Vec<BootstrapTarget>,
@@ -139,6 +143,7 @@ impl Default for FleetConfig {
             enrollment: EnrollmentConfig::default(),
             database: DatabaseConfig::default(),
             redis: RedisConfig::default(),
+            obsidian_export: ObsidianExportConfig::default(),
             bootstrap_targets: vec![],
             leader: LeaderConfig::default(),
             discovery: DiscoveryConfig::default(),
@@ -1239,6 +1244,44 @@ fn default_redis_prefix() -> String {
     "pulse".into()
 }
 
+// ── Obsidian Export Config ───────────────────────────────────────────────────
+
+/// Obsidian export daemon configuration — `[obsidian_export]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObsidianExportConfig {
+    /// Enable the Obsidian export daemon.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Target directory path for exported Obsidian content.
+    #[serde(default)]
+    pub target_dir: Option<String>,
+
+    /// Model identifier used for export generation.
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// Sampling temperature for the export model.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+
+    /// Maximum tokens for the export model.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+}
+
+impl Default for ObsidianExportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target_dir: None,
+            model: None,
+            temperature: None,
+            max_tokens: None,
+        }
+    }
+}
+
 // ── Bootstrap Targets ────────────────────────────────────────────────────────
 
 /// A pending node awaiting bootstrap — `[[bootstrap_targets]]`.
@@ -1361,6 +1404,11 @@ fn default_ctx_size() -> u32 {
 /// - `FORGEFLEET_TELEGRAM_MEDIA_DOWNLOAD_DIR` → transport.telegram.media_download_dir
 /// - `FORGEFLEET_TELEGRAM_MEDIA_MAX_FILE_SIZE_BYTES` → transport.telegram.media_max_file_size_bytes
 /// - `FORGEFLEET_TELEGRAM_MEDIA_ALLOWED_MIME_TYPES` → transport.telegram.media_allowed_mime_types (CSV)
+/// - `FORGEFLEET_OBSIDIAN_EXPORT_ENABLED` → obsidian_export.enabled
+/// - `FORGEFLEET_OBSIDIAN_EXPORT_TARGET_DIR` → obsidian_export.target_dir
+/// - `FORGEFLEET_OBSIDIAN_EXPORT_MODEL` → obsidian_export.model
+/// - `FORGEFLEET_OBSIDIAN_EXPORT_TEMPERATURE` → obsidian_export.temperature
+/// - `FORGEFLEET_OBSIDIAN_EXPORT_MAX_TOKENS` → obsidian_export.max_tokens
 pub fn apply_env_overrides(config: &mut FleetConfig) {
     if let Ok(v) = std::env::var("FORGEFLEET_FLEET_NAME") {
         info!(name = %v, "env override: fleet name");
@@ -1490,6 +1538,38 @@ pub fn apply_env_overrides(config: &mut FleetConfig) {
                 .get_or_insert_with(TelegramTransportConfig::default);
             telegram.media_allowed_mime_types = parsed;
         }
+    }
+
+    if let Ok(v) = std::env::var("FORGEFLEET_OBSIDIAN_EXPORT_ENABLED") {
+        let enabled = matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+        config.obsidian_export.enabled = enabled;
+    }
+
+    if let Ok(v) = std::env::var("FORGEFLEET_OBSIDIAN_EXPORT_TARGET_DIR")
+        && !v.trim().is_empty()
+    {
+        config.obsidian_export.target_dir = Some(v.trim().to_string());
+    }
+
+    if let Ok(v) = std::env::var("FORGEFLEET_OBSIDIAN_EXPORT_MODEL")
+        && !v.trim().is_empty()
+    {
+        config.obsidian_export.model = Some(v.trim().to_string());
+    }
+
+    if let Ok(v) = std::env::var("FORGEFLEET_OBSIDIAN_EXPORT_TEMPERATURE")
+        && let Ok(temp) = v.trim().parse::<f32>()
+    {
+        config.obsidian_export.temperature = Some(temp);
+    }
+
+    if let Ok(v) = std::env::var("FORGEFLEET_OBSIDIAN_EXPORT_MAX_TOKENS")
+        && let Ok(n) = v.trim().parse::<u32>()
+    {
+        config.obsidian_export.max_tokens = Some(n);
     }
 }
 
@@ -1871,6 +1951,13 @@ url = "postgresql://forgefleet:forgefleet@127.0.0.1:55432/forgefleet"
 preferred = "taylor"
 fallback_order = ["marcus"]
 
+[obsidian_export]
+enabled = true
+target_dir = "/tmp/forgefleet-obsidian"
+model = "gpt-4o"
+temperature = 0.2
+max_tokens = 4096
+
 [[bootstrap_targets]]
 name = "logan"
 status = "in_progress"
@@ -2006,6 +2093,16 @@ notes = "Setup started."
         // Check leader.
         assert_eq!(config.leader.preferred, "taylor");
 
+        // Check obsidian export daemon config.
+        assert!(config.obsidian_export.enabled);
+        assert_eq!(
+            config.obsidian_export.target_dir.as_deref(),
+            Some("/tmp/forgefleet-obsidian")
+        );
+        assert_eq!(config.obsidian_export.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(config.obsidian_export.temperature, Some(0.2));
+        assert_eq!(config.obsidian_export.max_tokens, Some(4096));
+
         // Check bootstrap_targets.
         assert_eq!(config.bootstrap_targets.len(), 1);
         assert_eq!(config.bootstrap_targets[0].name, "logan");
@@ -2049,6 +2146,9 @@ notes = "Setup started."
         assert!(config.nodes.is_empty());
         assert!(config.models.is_empty());
         assert!(config.transport.telegram.is_none());
+        assert!(!config.obsidian_export.enabled);
+        assert!(config.obsidian_export.target_dir.is_none());
+        assert!(config.obsidian_export.model.is_none());
     }
 
     #[test]
