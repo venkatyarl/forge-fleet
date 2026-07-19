@@ -79,6 +79,33 @@ run_as_user mkdir -p "$USER_HOME/.local/bin" "$USER_HOME/.forgefleet/logs"
 say "ForgeFleet onboarding for $NAME ($IP) — runtime hint: $RUNTIME_HINT"
 report "start" running
 
+# ─── 0. Non-interactive PATH header in ~/.bashrc ─────────────────────────
+#
+# Ubuntu's stock ~/.bashrc opens with a `case $- in *i*)` guard that
+# `return`s for non-interactive shells, so the distro's own ~/.local/bin
+# PATH setup further down never runs for `ssh <host> 'ff ...'` or the
+# dispatch harness's `bash -c` invocations — they can't resolve
+# ~/.local/bin/ff or ~/.cargo/bin/cargo. The export must be PREPENDED
+# above that guard; appending would land after the early `return` and
+# never execute. Idempotent via the marker line.
+report "path_header" running
+BASHRC="$USER_HOME/.bashrc"
+PATH_MARKER="# forgefleet: non-interactive PATH (must stay above the interactive-only guard)"
+if grep -qFx "$PATH_MARKER" "$BASHRC" 2>/dev/null; then
+  report "path_header" ok "already present"
+else
+  run_as_user bash -c "
+    tmp='$BASHRC.ffpath.tmp'
+    {
+      printf '%s\n' '$PATH_MARKER'
+      printf 'export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH\"\n\n'
+      cat '$BASHRC' 2>/dev/null || true
+    } > \"\$tmp\"
+    mv \"\$tmp\" '$BASHRC'
+  "
+  report "path_header" ok "prepended"
+fi
+
 # ─── 1. OS detection ──────────────────────────────────────────────────────
 
 OS_FULL="unknown"
