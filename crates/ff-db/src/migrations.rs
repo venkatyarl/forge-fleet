@@ -835,6 +835,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "work_queue",
         sql: schema::SCHEMA_V170_WORK_QUEUE,
     },
+    PgMigration {
+        version: 171,
+        name: "artifact_index",
+        sql: schema::SCHEMA_V171_ARTIFACT_INDEX,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

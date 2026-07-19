@@ -12,6 +12,7 @@ pub mod config;
 pub mod daemon;
 pub mod deployer;
 pub mod health_gate;
+pub mod node;
 pub mod release;
 pub mod resolution;
 pub mod rollback;
@@ -23,6 +24,9 @@ pub use daemon::{ActiveLease, RestartReport, restart_with_lease_drain};
 pub use deployer::{DeploymentAdapter, DeploymentOrchestrator, DeploymentReport, StepOutcome};
 pub use health_gate::{
     HealthGate, HealthGateConfig, HealthGateEvaluation, HealthGateStatus, HealthSnapshot,
+};
+pub use node::{
+    forgefleetd_restart_command, restart_forgefleetd_local, restart_forgefleetd_with_drain,
 };
 pub use release::{ReleaseChannel, ReleaseManifest, ReleaseRecord, ReleaseState};
 pub use resolution::{ResolutionError, ResolutionRetryPolicy, ResolvedTarget, resolve_with_retry};

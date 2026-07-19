@@ -48,7 +48,7 @@ pub use activity::{ActivitySignals, ActivityState, YieldMode};
 pub use artifact_cache::{
     ArtifactEvictionPolicy, evaluate_artifact_eviction, spawn_artifact_eviction_loop,
 };
-pub use artifact_fetch::{ArtifactCacheManager, FetchSource, LanPeer};
+pub use artifact_fetch::{ArtifactCacheManager, FetchSource, LanPeer, default_artifact_cache_root};
 pub use chaos::{
     ChaosConfig, ChaosEngine, ChaosHooks, Simulation, SimulationId, SimulationState, SimulationType,
 };
