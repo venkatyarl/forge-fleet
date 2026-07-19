@@ -390,7 +390,7 @@ impl Materializer {
     ///   Q1  SELECT_COMPUTER_BY_NAME
     ///   Q2  GET_PERSISTED_SNAPSHOT (redis)
     ///   Q3  UPDATE_COMPUTER_LAST_SEEN_ONLY              (fast-path, snapshot match)
-    ///   Q4  UPDATE_COMPUTER_PERSISTENT_FIELDS           (delta-path)
+    ///   Q4  UPSERT_COMPUTER_PERSISTENT_FIELDS           (delta-path, single atomic statement)
     ///   Q5  UPDATE_COMPUTER_STATUS_TRANSITION           (on status change)
     ///   Q6  INSERT_DOWNTIME_EVENT                       (going_offline)
     ///   Q7  CLOSE_DOWNTIME_EVENT                        (return online)
@@ -432,7 +432,9 @@ impl Materializer {
         let prev_gpu_count: Option<i32> = row.try_get("gpu_count").ok();
         let prev_gpu_total_vram_gb: Option<f64> = row.try_get("gpu_total_vram_gb").ok();
 
-        if computer_row_has_empty_node_attributes(prev_primary_ip.as_deref(), prev_ram_gb) {
+        let row_needs_heal =
+            computer_row_has_empty_node_attributes(prev_primary_ip.as_deref(), prev_ram_gb);
+        if row_needs_heal {
             error!(
                 computer = %beat.computer_name,
                 primary_ip = ?prev_primary_ip,
@@ -516,13 +518,16 @@ impl Materializer {
         }
 
         // Fast path: if the snapshot matches exactly AND no status transition,
-        // only update last_seen_at.
+        // only update last_seen_at. A row with empty node attributes
+        // (primary_ip / RAM) is excluded: it must fall through to the atomic
+        // Q4 upsert below so it self-heals instead of staying empty for as
+        // long as the Redis snapshot keeps matching.
         let snapshots_match = prior_snapshot
             .as_ref()
             .map(|ps| ps == &new_snapshot)
             .unwrap_or(false);
 
-        if snapshots_match && !status_changed {
+        if fast_path_allowed(snapshots_match, status_changed, row_needs_heal) {
             // Q3: UPDATE_COMPUTER_LAST_SEEN_ONLY
             sqlx::query("UPDATE computers SET last_seen_at = NOW() WHERE id = $1")
                 .bind(computer_id)
@@ -572,41 +577,55 @@ impl Materializer {
         let primary_ip_differ =
             prev_primary_ip.as_deref() != Some(beat.network.primary_ip.as_str());
 
-        // Q4: UPDATE_COMPUTER_PERSISTENT_FIELDS
-        if persistent_fields_changed(ips_differ, hw_differ, cap_differ, primary_ip_differ) {
-            sqlx::query(
-                "UPDATE computers SET \
-                    last_seen_at = NOW(), \
-                    primary_ip = $9, \
-                    all_ips = $2::jsonb, \
-                    cpu_cores = $3, \
-                    total_ram_gb = $4, \
-                    total_disk_gb = $5, \
-                    gpu_kind = $6, \
-                    gpu_count = $7, \
-                    gpu_total_vram_gb = $8, \
-                    has_gpu = ($7 > 0) \
-                 WHERE id = $1",
-            )
-            .bind(computer_id)
-            .bind(new_ips_json)
-            .bind(beat.hardware.cpu_cores)
-            .bind(beat.hardware.ram_gb)
-            .bind(beat.hardware.disk_gb)
-            .bind(&beat.capabilities.gpu_kind)
-            .bind(beat.capabilities.gpu_count)
-            .bind(beat.capabilities.gpu_total_vram_gb)
-            .bind(&beat.network.primary_ip)
-            .execute(&self.pg)
-            .await?;
-            report.wrote_computer_row = true;
-        } else {
-            // At minimum refresh last_seen_at.
-            sqlx::query("UPDATE computers SET last_seen_at = NOW() WHERE id = $1")
-                .bind(computer_id)
-                .execute(&self.pg)
-                .await?;
-        }
+        // Q4: UPSERT_COMPUTER_PERSISTENT_FIELDS — one atomic statement.
+        //
+        // The old shape here was a conditional partial UPDATE: full-field
+        // rewrite when the Q1 read said something differed, else a
+        // last_seen_at-only touch. That decision was made against a stale
+        // read — a concurrent writer (enrollment re-run, overlapping leader
+        // during failover, operator UPDATE) could empty primary_ip/RAM
+        // between Q1 and here, and the "nothing changed" branch would then
+        // leave the row empty until some future beat happened to differ.
+        // Writing the whole persistent field set in a single UPDATE removes
+        // that window: readers see either the complete old row or the
+        // complete new row, never a partially-written one.
+        //
+        // Degenerate-beat guards (same idiom as the fleet_workers self-heal
+        // below): a skeleton beat carrying an empty primary_ip / `[]` IPs /
+        // zeroed hardware must never blank a good row — each of those
+        // columns keeps its current value unless the beat has a real one.
+        // A true INSERT ... ON CONFLICT (name) is deliberately NOT used:
+        // `computers` rows are created at enrollment with columns a beat
+        // doesn't carry (ssh_user NOT NULL), and unknown computers are
+        // rejected at Q1 — so the row is guaranteed to exist here.
+        sqlx::query(
+            "UPDATE computers SET \
+                last_seen_at = NOW(), \
+                primary_ip = COALESCE(NULLIF($9, ''), primary_ip), \
+                all_ips = CASE WHEN $2::jsonb = '[]'::jsonb \
+                    THEN all_ips ELSE $2::jsonb END, \
+                cpu_cores = CASE WHEN $3 > 0 THEN $3 ELSE cpu_cores END, \
+                total_ram_gb = CASE WHEN $4 > 0 THEN $4 ELSE total_ram_gb END, \
+                total_disk_gb = CASE WHEN $5 > 0 THEN $5 ELSE total_disk_gb END, \
+                gpu_kind = $6, \
+                gpu_count = $7, \
+                gpu_total_vram_gb = $8, \
+                has_gpu = ($7 > 0) \
+             WHERE id = $1",
+        )
+        .bind(computer_id)
+        .bind(new_ips_json)
+        .bind(beat.hardware.cpu_cores)
+        .bind(beat.hardware.ram_gb)
+        .bind(beat.hardware.disk_gb)
+        .bind(&beat.capabilities.gpu_kind)
+        .bind(beat.capabilities.gpu_count)
+        .bind(beat.capabilities.gpu_total_vram_gb)
+        .bind(&beat.network.primary_ip)
+        .execute(&self.pg)
+        .await?;
+        report.wrote_computer_row = row_needs_heal
+            || persistent_fields_changed(ips_differ, hw_differ, cap_differ, primary_ip_differ);
 
         // Always keep fleet_workers.ip in sync with the heartbeat's
         // primary_ip — this is the worker-role registry (V83 rename from
@@ -1520,6 +1539,14 @@ fn computer_row_has_empty_node_attributes(primary_ip: Option<&str>, ram_gb: Opti
     primary_ip.is_none_or(str::is_empty) || ram_gb.is_none_or(|ram| ram <= 0)
 }
 
+/// Whether the last_seen_at-only fast path may be taken. A row with empty
+/// node attributes (primary_ip / RAM) must NOT take it even when the Redis
+/// snapshot matches — the fast path would keep skipping the atomic Q4
+/// upsert forever and the row would never self-heal.
+fn fast_path_allowed(snapshots_match: bool, status_changed: bool, row_needs_heal: bool) -> bool {
+    snapshots_match && !status_changed && !row_needs_heal
+}
+
 /// RAM tier key for server-policy resolution: <=8GB is `tiny` (CPU-only
 /// llama-server, no model seed), everything else `standard`. Callers must
 /// gate out non-positive ram_gb (degenerate beats) before classifying.
@@ -1857,6 +1884,17 @@ mod tests {
     #[test]
     fn no_rewrite_when_nothing_changed() {
         assert!(!persistent_fields_changed(false, false, false, false));
+    }
+
+    #[test]
+    fn fast_path_requires_match_no_transition_and_healthy_row() {
+        assert!(fast_path_allowed(true, false, false));
+        // Snapshot mismatch or a status transition forces the delta path.
+        assert!(!fast_path_allowed(false, false, false));
+        assert!(!fast_path_allowed(true, true, false));
+        // An empty primary_ip/RAM row must fall through to the atomic Q4
+        // upsert even when the snapshot matches, so it self-heals.
+        assert!(!fast_path_allowed(true, false, true));
     }
 
     #[test]
