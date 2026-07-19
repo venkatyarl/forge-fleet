@@ -10282,6 +10282,32 @@ CREATE INDEX IF NOT EXISTS idx_artifact_index_sha256
     ON artifact_index (sha256);
 "#;
 
+/// V172 — Keep computer network identity and capacity snapshots coherent.
+///
+/// These values are discovered together. Rejecting a change to only one of
+/// them prevents readers from observing a partially refreshed computer row.
+pub const SCHEMA_V172_COMPUTERS_PRIMARY_IP_RAM_ATOMIC: &str = r#"
+CREATE OR REPLACE FUNCTION enforce_computers_primary_ip_ram_atomic()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF (NEW.primary_ip IS DISTINCT FROM OLD.primary_ip)
+       <> (NEW.total_ram_gb IS DISTINCT FROM OLD.total_ram_gb) THEN
+        RAISE EXCEPTION
+            'computers.primary_ip and total_ram_gb must be updated together'
+            USING ERRCODE = '23514';
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_computers_primary_ip_ram_atomic ON computers;
+CREATE TRIGGER trg_computers_primary_ip_ram_atomic
+    BEFORE UPDATE OF primary_ip, total_ram_gb ON computers
+    FOR EACH ROW
+    EXECUTE FUNCTION enforce_computers_primary_ip_ram_atomic();
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
