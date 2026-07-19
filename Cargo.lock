@@ -1325,10 +1325,12 @@ dependencies = [
  "ff-discovery",
  "ff-orchestrator",
  "ff-runtime",
+ "libc",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -1348,6 +1350,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",
@@ -1400,7 +1403,9 @@ dependencies = [
  "chrono",
  "ff-core",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "uuid",
 ]
@@ -1642,8 +1647,10 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "uuid",
 ]

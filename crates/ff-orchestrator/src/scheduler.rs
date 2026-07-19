@@ -142,6 +142,9 @@ pub struct NodeCapacity {
     pub has_gpu: bool,
     /// Whether the node is online and accepting work.
     pub online: bool,
+    /// Last time the node's work-item dispatch loop ticked, as reported by Pulse.
+    /// Hosts whose tick is stale are not safe assignment targets.
+    pub dispatch_tick_at: Option<DateTime<Utc>>,
     /// IDs of tasks currently running on this node.
     pub running_tasks: Vec<RunningTask>,
 }
@@ -162,6 +165,7 @@ impl NodeCapacity {
             available_memory_gib: memory_gib,
             has_gpu,
             online: true,
+            dispatch_tick_at: Some(Utc::now()),
             running_tasks: Vec::new(),
         }
     }
@@ -169,6 +173,12 @@ impl NodeCapacity {
     /// Check if this node can satisfy the given requirements.
     pub fn can_fit(&self, req: &ResourceRequirements) -> bool {
         if !self.online {
+            return false;
+        }
+        if self
+            .dispatch_tick_at
+            .is_some_and(|tick| tick < Utc::now() - chrono::Duration::minutes(3))
+        {
             return false;
         }
         if req.gpu_required && !self.has_gpu {
@@ -539,7 +549,11 @@ impl Scheduler {
         let mut preempt_candidates: Vec<(String, Uuid, f64)> = Vec::new();
 
         for (name, cap) in &self.nodes {
-            if !cap.online {
+            if !cap.online
+                || cap
+                    .dispatch_tick_at
+                    .is_some_and(|tick| tick < Utc::now() - chrono::Duration::minutes(3))
+            {
                 continue;
             }
             // GPU check
@@ -801,6 +815,19 @@ mod tests {
             }
             other => panic!("Expected Queue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_stale_dispatch_tick_node_excluded() {
+        let mut scheduler = Scheduler::new(PlacementPolicy::BinPack);
+        let mut stale = make_node("james", 16, 64, false);
+        stale.dispatch_tick_at = Some(Utc::now() - chrono::Duration::minutes(4));
+        scheduler.add_node(stale);
+        scheduler.add_node(make_node("marcus", 16, 64, false));
+
+        let decision = scheduler.schedule_task(&make_task("build", 4, 8, false));
+
+        assert_eq!(decision.target_node(), Some("marcus"));
     }
 
     #[test]

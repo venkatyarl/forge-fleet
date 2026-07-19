@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -60,6 +61,13 @@ pub struct Alert {
     pub resolved_at: Option<DateTime<Utc>>,
     /// Whether this alert has been acknowledged by an operator.
     pub acknowledged: bool,
+    /// Number of occurrences aggregated into this alert.
+    #[serde(default = "default_alert_count")]
+    pub count: u64,
+}
+
+const fn default_alert_count() -> u64 {
+    1
 }
 
 impl Alert {
@@ -196,18 +204,34 @@ pub struct AlertEngine {
     /// Configured alert rules.
     rules: Vec<AlertRule>,
     /// Currently active (unfired or unresolved) alerts, keyed by a dedup key.
-    active_alerts: Arc<DashMap<String, Alert>>,
+    active_alerts: Arc<DashMap<String, ActiveAlert>>,
     /// History of all alerts (bounded).
     history: Arc<DashMap<Uuid, Alert>>,
+    /// How long repeated alerts are aggregated.
+    dedup_window: chrono::Duration,
 }
+
+#[derive(Debug, Clone)]
+struct ActiveAlert {
+    alert: Alert,
+    last_seen_at: DateTime<Utc>,
+}
+
+const DEFAULT_DEDUP_WINDOW_SECS: i64 = 300;
 
 impl AlertEngine {
     /// Create a new alert engine with the given rules.
     pub fn new(rules: Vec<AlertRule>) -> Self {
+        Self::with_dedup_window(rules, chrono::Duration::seconds(DEFAULT_DEDUP_WINDOW_SECS))
+    }
+
+    /// Create an alert engine with a custom deduplication window.
+    pub fn with_dedup_window(rules: Vec<AlertRule>, dedup_window: chrono::Duration) -> Self {
         Self {
             rules,
             active_alerts: Arc::new(DashMap::new()),
             history: Arc::new(DashMap::new()),
+            dedup_window,
         }
     }
 
@@ -262,23 +286,23 @@ impl AlertEngine {
                         }
                         if nm.cpu_percent >= *threshold_percent {
                             let dedup_key = format!("{}:{}", rule.id, nm.worker_name);
-                            if !self.active_alerts.contains_key(&dedup_key) {
-                                let alert = Alert {
-                                    id: Uuid::new_v4(),
-                                    rule_id: rule.id.clone(),
-                                    severity: rule.severity,
-                                    message: format!(
-                                        "{}: CPU at {:.1}% on {}",
-                                        rule.name, nm.cpu_percent, nm.worker_name
-                                    ),
-                                    node: Some(nm.worker_name.clone()),
-                                    model_id: None,
-                                    fired_at: Utc::now(),
-                                    resolved_at: None,
-                                    acknowledged: false,
-                                };
-                                self.active_alerts.insert(dedup_key, alert.clone());
-                                self.history.insert(alert.id, alert.clone());
+                            let alert = Alert {
+                                id: Uuid::new_v4(),
+                                rule_id: rule.id.clone(),
+                                severity: rule.severity,
+                                message: format!(
+                                    "{}: CPU at {:.1}% on {}",
+                                    rule.name, nm.cpu_percent, nm.worker_name
+                                ),
+                                node: Some(nm.worker_name.clone()),
+                                model_id: None,
+                                fired_at: Utc::now(),
+                                resolved_at: None,
+                                acknowledged: false,
+                                count: 1,
+                            };
+                            let (alert, is_new) = self.record_alert(dedup_key, alert);
+                            if is_new {
                                 new_alerts.push(alert);
                             }
                         }
@@ -295,25 +319,25 @@ impl AlertEngine {
                         let util = nm.memory_utilization();
                         if util >= *threshold_ratio {
                             let dedup_key = format!("{}:{}", rule.id, nm.worker_name);
-                            if !self.active_alerts.contains_key(&dedup_key) {
-                                let alert = Alert {
-                                    id: Uuid::new_v4(),
-                                    rule_id: rule.id.clone(),
-                                    severity: rule.severity,
-                                    message: format!(
-                                        "{}: memory at {:.0}% on {}",
-                                        rule.name,
-                                        util * 100.0,
-                                        nm.worker_name
-                                    ),
-                                    node: Some(nm.worker_name.clone()),
-                                    model_id: None,
-                                    fired_at: Utc::now(),
-                                    resolved_at: None,
-                                    acknowledged: false,
-                                };
-                                self.active_alerts.insert(dedup_key, alert.clone());
-                                self.history.insert(alert.id, alert.clone());
+                            let alert = Alert {
+                                id: Uuid::new_v4(),
+                                rule_id: rule.id.clone(),
+                                severity: rule.severity,
+                                message: format!(
+                                    "{}: memory at {:.0}% on {}",
+                                    rule.name,
+                                    util * 100.0,
+                                    nm.worker_name
+                                ),
+                                node: Some(nm.worker_name.clone()),
+                                model_id: None,
+                                fired_at: Utc::now(),
+                                resolved_at: None,
+                                acknowledged: false,
+                                count: 1,
+                            };
+                            let (alert, is_new) = self.record_alert(dedup_key, alert);
+                            if is_new {
                                 new_alerts.push(alert);
                             }
                         }
@@ -330,26 +354,26 @@ impl AlertEngine {
                         if mm.error_rate() >= *threshold_ratio {
                             let dedup_key =
                                 format!("{}:{}@{}", rule.id, mm.model_id, mm.worker_name);
-                            if !self.active_alerts.contains_key(&dedup_key) {
-                                let alert = Alert {
-                                    id: Uuid::new_v4(),
-                                    rule_id: rule.id.clone(),
-                                    severity: rule.severity,
-                                    message: format!(
-                                        "{}: error rate {:.1}% for {} on {}",
-                                        rule.name,
-                                        mm.error_rate() * 100.0,
-                                        mm.model_id,
-                                        mm.worker_name
-                                    ),
-                                    node: Some(mm.worker_name.clone()),
-                                    model_id: Some(mm.model_id.clone()),
-                                    fired_at: Utc::now(),
-                                    resolved_at: None,
-                                    acknowledged: false,
-                                };
-                                self.active_alerts.insert(dedup_key, alert.clone());
-                                self.history.insert(alert.id, alert.clone());
+                            let alert = Alert {
+                                id: Uuid::new_v4(),
+                                rule_id: rule.id.clone(),
+                                severity: rule.severity,
+                                message: format!(
+                                    "{}: error rate {:.1}% for {} on {}",
+                                    rule.name,
+                                    mm.error_rate() * 100.0,
+                                    mm.model_id,
+                                    mm.worker_name
+                                ),
+                                node: Some(mm.worker_name.clone()),
+                                model_id: Some(mm.model_id.clone()),
+                                fired_at: Utc::now(),
+                                resolved_at: None,
+                                acknowledged: false,
+                                count: 1,
+                            };
+                            let (alert, is_new) = self.record_alert(dedup_key, alert);
+                            if is_new {
                                 new_alerts.push(alert);
                             }
                         }
@@ -392,10 +416,39 @@ impl AlertEngine {
             fired_at: Utc::now(),
             resolved_at: None,
             acknowledged: false,
+            count: 1,
         };
-        self.active_alerts.insert(dedup_key, alert.clone());
-        self.history.insert(alert.id, alert.clone());
-        alert
+        self.record_alert(dedup_key, alert).0
+    }
+
+    fn record_alert(&self, dedup_key: String, alert: Alert) -> (Alert, bool) {
+        let now = Utc::now();
+        match self.active_alerts.entry(dedup_key) {
+            Entry::Occupied(mut entry) if now - entry.get().last_seen_at <= self.dedup_window => {
+                let active = entry.get_mut();
+                active.alert.count = active.alert.count.saturating_add(1);
+                active.last_seen_at = now;
+                self.history.insert(active.alert.id, active.alert.clone());
+                (active.alert.clone(), false)
+            }
+            Entry::Occupied(mut entry) => {
+                let active = ActiveAlert {
+                    alert: alert.clone(),
+                    last_seen_at: now,
+                };
+                entry.insert(active);
+                self.history.insert(alert.id, alert.clone());
+                (alert, true)
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(ActiveAlert {
+                    alert: alert.clone(),
+                    last_seen_at: now,
+                });
+                self.history.insert(alert.id, alert.clone());
+                (alert, true)
+            }
+        }
     }
 
     /// Resolve all active alerts matching a dedup key prefix.
@@ -408,9 +461,9 @@ impl AlertEngine {
             .collect();
 
         for key in keys {
-            if let Some((_, mut alert)) = self.active_alerts.remove(&key) {
-                alert.resolve();
-                self.history.insert(alert.id, alert);
+            if let Some((_, mut active)) = self.active_alerts.remove(&key) {
+                active.alert.resolve();
+                self.history.insert(active.alert.id, active.alert);
             }
         }
     }
@@ -419,7 +472,7 @@ impl AlertEngine {
     pub fn active_alerts(&self) -> Vec<Alert> {
         self.active_alerts
             .iter()
-            .map(|e| e.value().clone())
+            .map(|e| e.value().alert.clone())
             .collect()
     }
 
@@ -427,8 +480,8 @@ impl AlertEngine {
     pub fn active_alerts_min_severity(&self, min: AlertSeverity) -> Vec<Alert> {
         self.active_alerts
             .iter()
-            .filter(|e| e.value().severity >= min)
-            .map(|e| e.value().clone())
+            .filter(|e| e.value().alert.severity >= min)
+            .map(|e| e.value().alert.clone())
             .collect()
     }
 
@@ -562,6 +615,7 @@ mod tests {
         let alerts2 = engine.evaluate(&metrics);
         assert_eq!(alerts2.len(), 0);
         assert_eq!(engine.active_count(), 1);
+        assert_eq!(engine.active_alerts()[0].count, 2);
     }
 
     #[test]
@@ -589,5 +643,68 @@ mod tests {
         );
         assert!(alert.is_active());
         assert_eq!(engine.active_count(), 1);
+    }
+
+    #[test]
+    fn test_repeated_manual_alerts_are_aggregated_by_metric_and_node() {
+        let engine = AlertEngine::new(Vec::new());
+
+        let first = engine.fire_alert(
+            "node_down",
+            AlertSeverity::Critical,
+            "Node james is unreachable".into(),
+            Some("james".into()),
+            None,
+        );
+        let repeated = engine.fire_alert(
+            "node_down",
+            AlertSeverity::Critical,
+            "Node james is still unreachable".into(),
+            Some("james".into()),
+            None,
+        );
+        engine.fire_alert(
+            "node_down",
+            AlertSeverity::Critical,
+            "Node taylor is unreachable".into(),
+            Some("taylor".into()),
+            None,
+        );
+        engine.fire_alert(
+            "high_cpu",
+            AlertSeverity::Warning,
+            "CPU is high on james".into(),
+            Some("james".into()),
+            None,
+        );
+
+        assert_eq!(repeated.id, first.id);
+        assert_eq!(repeated.count, 2);
+        assert_eq!(engine.active_count(), 3);
+    }
+
+    #[test]
+    fn test_alert_after_dedup_window_is_new() {
+        let engine = AlertEngine::with_dedup_window(Vec::new(), chrono::Duration::zero());
+        let first = engine.fire_alert(
+            "node_down",
+            AlertSeverity::Critical,
+            "Node james is unreachable".into(),
+            Some("james".into()),
+            None,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let second = engine.fire_alert(
+            "node_down",
+            AlertSeverity::Critical,
+            "Node james is unreachable".into(),
+            Some("james".into()),
+            None,
+        );
+
+        assert_ne!(second.id, first.id);
+        assert_eq!(second.count, 1);
+        assert_eq!(engine.active_count(), 1);
+        assert_eq!(engine.alert_history().len(), 2);
     }
 }

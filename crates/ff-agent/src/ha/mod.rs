@@ -12,6 +12,61 @@ pub mod node_info;
 pub mod pg_failover;
 pub mod repair;
 pub mod restore_drill;
+pub mod self_heal;
+
+/// Gracefully release this computer's active work-item leases before an agent
+/// restart.
+///
+/// Unlike stale-lease recovery, draining is an orderly handoff and therefore
+/// does not consume an attempt. The lease release, slot cleanup, worktree
+/// cleanup, and requeue are committed atomically so another agent can resume
+/// the work immediately.
+pub async fn drain_work_item_leases(
+    pool: &sqlx::PgPool,
+    computer_id: uuid::Uuid,
+) -> Result<u64, sqlx::Error> {
+    let drained: i64 = sqlx::query_scalar(
+        "WITH drained AS (
+             UPDATE work_item_leases
+                SET lease_state = 'released',
+                    released_at = NOW(),
+                    release_reason = 'agent restart drain'
+              WHERE computer_id = $1
+                AND released_at IS NULL
+          RETURNING work_item_id, sub_agent_id
+         ), freed_slots AS (
+             UPDATE sub_agents AS sa
+                SET current_work_item_id = NULL,
+                    status = 'idle',
+                    started_at = NULL,
+                    last_heartbeat_at = NOW()
+              WHERE EXISTS (
+                    SELECT 1
+                      FROM drained AS d
+                     WHERE d.sub_agent_id = sa.id
+                       AND d.work_item_id = sa.current_work_item_id)
+         ), retired_worktrees AS (
+             UPDATE work_item_worktrees AS wt
+                SET status = 'failed'
+              WHERE wt.status IN ('creating', 'active')
+                AND EXISTS (
+                    SELECT 1 FROM drained AS d WHERE d.work_item_id = wt.work_item_id)
+         ), requeued AS (
+             UPDATE work_items AS wi
+                SET status = 'ready',
+                    assigned_computer = NULL
+              WHERE wi.status IN ('claimed', 'building')
+                AND EXISTS (
+                    SELECT 1 FROM drained AS d WHERE d.work_item_id = wi.id)
+         )
+         SELECT COUNT(*) FROM drained",
+    )
+    .bind(computer_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(drained as u64)
+}
 
 // ─── Pure HA topology model (used by tests + planners) ───────────────────────
 
@@ -119,6 +174,22 @@ pub fn evaluate_failover(replicas: &[ReplicaNode], max_lag_bytes: i64) -> Failov
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_drain_is_attempt_neutral() {
+        let source = include_str!("mod.rs");
+        let drain = source
+            .split("pub async fn drain_work_item_leases")
+            .nth(1)
+            .expect("lease drain function")
+            .split("// ─── Pure HA topology model")
+            .next()
+            .expect("lease drain function body");
+
+        assert!(!drain.contains("attempts = attempts + 1"));
+        assert!(drain.contains("status = 'ready'"));
+        assert!(drain.contains("released_at = NOW()"));
+    }
 
     fn primary(name: &str) -> ReplicaNode {
         ReplicaNode::new(name, ReplicaRole::Primary, 0, true)

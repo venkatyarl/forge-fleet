@@ -42,6 +42,7 @@ use ff_db::leader_state::{
 use ff_pulse::reader::{PulseError, PulseReader};
 
 use crate::ha::pg_failover::{FailoverOutcome, PostgresFailoverManager};
+use crate::ha::self_heal::rearm_self_heal_task;
 use crate::leader_cache::{LeaderCache, LeaderInfo};
 
 /// Max revive attempts per computer per [`REVIVE_BACKOFF_WINDOW_MIN`] minutes.
@@ -771,6 +772,12 @@ impl LeaderTick {
     /// 3. Recover stale claims (`fixing` older than 5 min) — retry or escalate.
     pub async fn self_heal_scan(&self) -> Result<(), LeaderError> {
         // ── 1. Aggregate bug reports into the queue ──────────────────────────
+        // On conflict, keep a single row per bug signature. Active/queued rows
+        // just have their report_count/priority updated. If the same signature
+        // reappears after the previous self-heal reached a terminal status
+        // (completed/cancelled/failed), re-arm it so the fleet tries to fix the
+        // recurring bug again.
+        let terminal_statuses = ["completed", "cancelled", "failed"];
         sqlx::query(
             "INSERT INTO fleet_tasks \
                 (id, task_type, summary, payload, priority, status, created_at, task_class, dedup_signature) \
@@ -801,13 +808,42 @@ impl LeaderTick {
              ON CONFLICT (dedup_signature) WHERE dedup_signature IS NOT NULL DO UPDATE SET \
                 summary = EXCLUDED.summary, \
                 priority = EXCLUDED.priority, \
+                status = CASE \
+                    WHEN fleet_tasks.status = ANY($1) THEN 'pending' \
+                    ELSE fleet_tasks.status \
+                END, \
+                created_at = CASE \
+                    WHEN fleet_tasks.status = ANY($1) THEN NOW() \
+                    ELSE fleet_tasks.created_at \
+                END, \
                 payload = fleet_tasks.payload || jsonb_build_object( \
                     'bug_signature', COALESCE(fleet_tasks.payload->>'bug_signature', EXCLUDED.payload->>'bug_signature'), \
                     'tier', EXCLUDED.payload->>'tier', \
                     'report_count', COALESCE((fleet_tasks.payload->>'report_count')::int, 0) \
-                        + COALESCE((EXCLUDED.payload->>'report_count')::int, 0) \
+                        + COALESCE((EXCLUDED.payload->>'report_count')::int, 0), \
+                    'status', CASE \
+                        WHEN fleet_tasks.status = ANY($1) THEN 'detected' \
+                        ELSE COALESCE(fleet_tasks.payload->>'status', 'detected') \
+                    END, \
+                    'attempts', CASE \
+                        WHEN fleet_tasks.status = ANY($1) THEN 0 \
+                        ELSE COALESCE((fleet_tasks.payload->>'attempts')::int, 0) \
+                    END, \
+                    'last_attempt_at', CASE \
+                        WHEN fleet_tasks.status = ANY($1) THEN NULL \
+                        ELSE fleet_tasks.payload->>'last_attempt_at' \
+                    END, \
+                    'writer_computer_id', CASE \
+                        WHEN fleet_tasks.status = ANY($1) THEN NULL \
+                        ELSE fleet_tasks.payload->>'writer_computer_id' \
+                    END, \
+                    'escalated_to_operator_at', CASE \
+                        WHEN fleet_tasks.status = ANY($1) THEN NULL \
+                        ELSE fleet_tasks.payload->>'escalated_to_operator_at' \
+                    END \
                 )",
         )
+        .bind(&terminal_statuses[..])
         .execute(&self.pg)
         .await?;
 
@@ -963,7 +999,10 @@ impl LeaderTick {
     ///
     /// Single-flight is enforced two ways: the marker file caps the SELECT to
     /// ~once per 30 min per leader, and `ON CONFLICT (dedup_signature) DO NOTHING`
-    /// means a signature already tracked in `fleet_tasks` is never reset.
+    /// means an in-flight signature in `fleet_tasks` is not duplicated. If a
+    /// previously processed signature (completed/failed/cancelled) recurs after
+    /// the re-arm cooldown, it is reset to `detected` so recurring runtime
+    /// errors are not lost.
     /// We classify interaction errors as tier `T2` — runtime/interaction-layer
     /// failures, distinct from the `T0/T1` build/test bugs that
     /// `fleet_bug_reports` feeds.
@@ -1039,10 +1078,35 @@ impl LeaderTick {
                     "scan_interaction_errors: enqueued novel error signature for self-heal"
                 );
             } else {
-                tracing::debug!(
-                    error_signature = %sig,
-                    "scan_interaction_errors: signature already in self-heal queue; skipping"
-                );
+                // Signature already exists. If it has been processed to a
+                // terminal state and cooled down, re-arm it so recurring
+                // runtime errors are not permanently suppressed.
+                match rearm_self_heal_task(&self.pg, &sig, "T2", report_count as i32, None).await {
+                    Ok(true) => {
+                        novel += 1;
+                        tracing::info!(
+                            node = %self.my_name,
+                            error_signature = %sig,
+                            report_count,
+                            error_text = error_text.as_deref().unwrap_or(""),
+                            "scan_interaction_errors: re-armed recurring error signature for self-heal"
+                        );
+                    }
+                    Ok(false) => {
+                        tracing::debug!(
+                            error_signature = %sig,
+                            "scan_interaction_errors: signature already in self-heal queue; skipping"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            node = %self.my_name,
+                            error_signature = %sig,
+                            error = %err,
+                            "scan_interaction_errors: failed to re-arm self-heal signature"
+                        );
+                    }
+                }
             }
         }
 
@@ -1433,6 +1497,7 @@ mod tests {
                  priority INT NOT NULL DEFAULT 50,
                  status TEXT NOT NULL DEFAULT 'pending',
                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 completed_at TIMESTAMPTZ,
                  task_class TEXT,
                  dedup_signature TEXT
              );
@@ -1471,6 +1536,7 @@ mod tests {
         tier: &str,
         report_count: i32,
     ) -> Uuid {
+        let terminal_statuses = ["completed", "cancelled", "failed"];
         let row = sqlx::query(
             "INSERT INTO fleet_tasks \
                 (id, task_type, summary, payload, priority, status, created_at, task_class, dedup_signature) \
@@ -1494,11 +1560,39 @@ mod tests {
              ON CONFLICT (dedup_signature) WHERE dedup_signature IS NOT NULL DO UPDATE SET \
                 summary = EXCLUDED.summary, \
                 priority = EXCLUDED.priority, \
+                status = CASE \
+                    WHEN fleet_tasks.status = ANY($6) THEN 'pending' \
+                    ELSE fleet_tasks.status \
+                END, \
+                created_at = CASE \
+                    WHEN fleet_tasks.status = ANY($6) THEN NOW() \
+                    ELSE fleet_tasks.created_at \
+                END, \
                 payload = fleet_tasks.payload || jsonb_build_object( \
                     'bug_signature', COALESCE(fleet_tasks.payload->>'bug_signature', EXCLUDED.payload->>'bug_signature'), \
                     'tier', EXCLUDED.payload->>'tier', \
                     'report_count', COALESCE((fleet_tasks.payload->>'report_count')::int, 0) \
-                        + COALESCE((EXCLUDED.payload->>'report_count')::int, 0) \
+                        + COALESCE((EXCLUDED.payload->>'report_count')::int, 0), \
+                    'status', CASE \
+                        WHEN fleet_tasks.status = ANY($6) THEN 'detected' \
+                        ELSE COALESCE(fleet_tasks.payload->>'status', 'detected') \
+                    END, \
+                    'attempts', CASE \
+                        WHEN fleet_tasks.status = ANY($6) THEN 0 \
+                        ELSE COALESCE((fleet_tasks.payload->>'attempts')::int, 0) \
+                    END, \
+                    'last_attempt_at', CASE \
+                        WHEN fleet_tasks.status = ANY($6) THEN NULL \
+                        ELSE fleet_tasks.payload->>'last_attempt_at' \
+                    END, \
+                    'writer_computer_id', CASE \
+                        WHEN fleet_tasks.status = ANY($6) THEN NULL \
+                        ELSE fleet_tasks.payload->>'writer_computer_id' \
+                    END, \
+                    'escalated_to_operator_at', CASE \
+                        WHEN fleet_tasks.status = ANY($6) THEN NULL \
+                        ELSE fleet_tasks.payload->>'escalated_to_operator_at' \
+                    END \
                 ) \
              RETURNING id",
         )
@@ -1507,6 +1601,7 @@ mod tests {
         .bind(report_count)
         .bind(self_heal_priority_for_tier(tier))
         .bind(self_heal_task_status("detected"))
+        .bind(&terminal_statuses[..])
         .fetch_one(pg)
         .await
         .expect("upsert self-heal task");
@@ -1559,6 +1654,84 @@ mod tests {
         assert_eq!(row.get::<String, _>("status"), "pending");
         assert_eq!(row.get::<i32, _>("report_count"), 4);
         assert_eq!(row.get::<String, _>("tier"), "T1");
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn self_heal_recurring_signature_rearms_terminal_task() {
+        // DB-backed: skip gracefully when no Postgres is configured.
+        if env::var("FORGEFLEET_POSTGRES_URL").is_err()
+            && env::var("FORGEFLEET_DATABASE_URL").is_err()
+        {
+            eprintln!("skipping self_heal re-arm DB test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL");
+            return;
+        }
+        let (admin, pool, db_name) = create_temp_db().await;
+
+        let id = upsert_self_heal_task(&pool, "sig-recur", "T2", 1).await;
+
+        // Simulate a previous self-heal attempt that exhausted its retries.
+        sqlx::query(
+            "UPDATE fleet_tasks \
+             SET status = 'failed', \
+                 payload = payload || jsonb_build_object( \
+                     'status', 'failed', \
+                     'attempts', 2, \
+                     'last_attempt_at', NOW(), \
+                     'writer_computer_id', $2::text, \
+                     'escalated_to_operator_at', NOW() \
+                 ) \
+             WHERE task_class = 'self_heal' AND dedup_signature = $1",
+        )
+        .bind("sig-recur")
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .expect("mark self-heal task terminal");
+
+        let rearmed_id = upsert_self_heal_task(&pool, "sig-recur", "T1", 3).await;
+
+        let row = sqlx::query(
+            "SELECT id, status, payload->>'status' AS payload_status, \
+                    (payload->>'report_count')::int AS report_count, \
+                    payload->>'tier' AS tier, \
+                    (payload->>'attempts')::int AS attempts, \
+                    payload->>'last_attempt_at' AS last_attempt_at, \
+                    payload->>'writer_computer_id' AS writer_computer_id, \
+                    payload->>'escalated_to_operator_at' AS escalated_to_operator_at \
+               FROM fleet_tasks \
+              WHERE task_class = 'self_heal' AND dedup_signature = $1",
+        )
+        .bind("sig-recur")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch rearmed self-heal task");
+
+        assert_eq!(rearmed_id, id);
+        assert_eq!(row.get::<String, _>("status"), "pending");
+        assert_eq!(row.get::<String, _>("payload_status"), "detected");
+        assert_eq!(row.get::<i32, _>("report_count"), 4);
+        assert_eq!(row.get::<String, _>("tier"), "T1");
+        assert_eq!(row.get::<i32, _>("attempts"), 0);
+        assert!(
+            row.try_get::<Option<String>, _>("last_attempt_at")
+                .ok()
+                .flatten()
+                .is_none()
+        );
+        assert!(
+            row.try_get::<Option<String>, _>("writer_computer_id")
+                .ok()
+                .flatten()
+                .is_none()
+        );
+        assert!(
+            row.try_get::<Option<String>, _>("escalated_to_operator_at")
+                .ok()
+                .flatten()
+                .is_none()
+        );
 
         drop_temp_db(admin, pool, &db_name).await;
     }

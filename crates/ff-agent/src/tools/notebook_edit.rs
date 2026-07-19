@@ -64,6 +64,10 @@ impl AgentTool for NotebookEditTool {
             ctx.working_dir.join(file_path)
         };
 
+        // Hold the per-session edit lock across the read-modify-write so a
+        // concurrent edit in the same turn can't lose this update.
+        let _edit_guard = ctx.edit_lock.lock().await;
+
         // Read notebook
         let content = match fs::read_to_string(&path).await {
             Ok(c) => c,

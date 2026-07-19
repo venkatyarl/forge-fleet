@@ -10,10 +10,13 @@
 
 pub mod bootstrap;
 pub mod commands;
+pub mod config;
 pub mod control_plane;
+pub mod dispatcher;
 pub mod errors;
 pub mod ha_coordinator;
 pub mod health;
+pub mod timeout;
 
 pub use bootstrap::{
     BootstrapOptions, BootstrapPlan, BootstrapValidation, StartupSubsystem, build_bootstrap_plan,
@@ -24,11 +27,13 @@ pub use commands::{
     DiscoverMode, DiscoverRequest, DiscoverResult, RunTaskRequest, RunTaskResult, ScheduleRequest,
     ScheduleResult, StartAgentRequest, StartAgentResult,
 };
+pub use config::{AlertConfig, ControlConfig, DeduplicationConfig};
 pub use control_plane::{
     ControlPlane, ControlPlaneHandles, DeploySubsystemHandle, DiscoverySubsystemHandle,
     OrchestratorSubsystemHandle, RuntimeSubsystemHandle, SchedulerSubsystemHandle, StartupEvent,
     StartupStepStatus,
 };
+pub use dispatcher::{DEFAULT_LEASE_DURATION, DEFAULT_MAX_BUILD_DURATION, WorkItemDispatch};
 pub use errors::{ControlError, Result};
 pub use ha_coordinator::{
     DEFAULT_MAX_REPLICATION_LAG_BYTES, HaAction, HaClusterEvent, HaCoordinator,

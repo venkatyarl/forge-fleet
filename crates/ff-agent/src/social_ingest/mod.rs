@@ -15,10 +15,12 @@ pub mod analyzer;
 pub mod fetcher;
 pub mod platform;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -27,7 +29,7 @@ use uuid::Uuid;
 static INGEST_SEM: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
 
 use self::analyzer::Analysis;
-use self::fetcher::FetchedPost;
+use self::fetcher::{FetchedPost, MediaItem};
 use self::platform::detect_platform;
 
 /// Vision model preference (matches IDs in `config/model_catalog.toml`).
@@ -101,7 +103,17 @@ async fn run_pipeline(pool: PgPool, post_id: Uuid, url: String) -> Result<()> {
     tokio::fs::create_dir_all(&out_dir)
         .await
         .with_context(|| format!("mkdir {}", out_dir.display()))?;
-    let fetched: FetchedPost = fetcher::fetch(&url, &out_dir).await?;
+
+    let fetched: FetchedPost = if let Some(cached) = try_load_from_cache(&url, &out_dir).await {
+        tracing::info!(post_id = %post_id, url = %url, "social_ingest: using cached artifacts");
+        cached
+    } else {
+        let fetched = fetcher::fetch(&url, &out_dir).await?;
+        if let Err(e) = save_to_cache(&url, &fetched).await {
+            tracing::warn!(post_id = %post_id, error = %e, "social_ingest: failed to populate cache");
+        }
+        fetched
+    };
 
     // Persist media + caption + author before analysis so partial rows
     // are useful even if analysis later fails.
@@ -201,6 +213,168 @@ fn post_workdir(post_id: Uuid) -> PathBuf {
         .join(post_id.to_string())
 }
 
+/// Cache directory for a given URL (SHA256 of the URL).
+fn cache_dir_for(url: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let url_hash = sha256_bytes(url.as_bytes());
+    PathBuf::from(home)
+        .join(".forgefleet")
+        .join("social_ingest")
+        .join("cache")
+        .join(url_hash)
+}
+
+/// Compute SHA256 of a byte slice, returning a lowercase hex string.
+fn sha256_bytes(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Compute SHA256 of a file, returning a lowercase hex string.
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(sha256_bytes(&bytes))
+}
+
+/// On-disk manifest describing a cached ingest result.
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedManifest {
+    url: String,
+    platform: String,
+    author: Option<String>,
+    caption: Option<String>,
+    media_items: Vec<CachedMediaItem>,
+    raw_metadata: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedMediaItem {
+    kind: String,
+    file_name: String,
+    mime: String,
+    bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frame_count: Option<usize>,
+    sha256: String,
+}
+
+/// Try to restore a previously fetched post from the local artifact cache.
+/// Every file is SHA256-verified before use so LAN-copied cache entries cannot
+/// silently corrupt the pipeline.
+async fn try_load_from_cache(url: &str, out_dir: &Path) -> Option<FetchedPost> {
+    let cache_dir = cache_dir_for(url);
+    let manifest_path = cache_dir.join("manifest.json");
+    let manifest_bytes = tokio::fs::read(&manifest_path).await.ok()?;
+    let manifest: CachedManifest = serde_json::from_slice(&manifest_bytes).ok()?;
+
+    let mut media_items = Vec::with_capacity(manifest.media_items.len());
+    for item in &manifest.media_items {
+        let src = cache_dir.join(&item.file_name);
+        if !src.exists() {
+            tracing::debug!(url = %url, file = %item.file_name, "social_ingest: cached artifact missing");
+            return None;
+        }
+
+        let actual_hash = tokio::task::spawn_blocking({
+            let src = src.clone();
+            move || sha256_file(&src)
+        })
+        .await
+        .ok()?
+        .ok()?;
+        if actual_hash != item.sha256 {
+            tracing::warn!(url = %url, file = %item.file_name, "social_ingest: cached artifact SHA256 mismatch");
+            return None;
+        }
+
+        let dst = out_dir.join(&item.file_name);
+        tokio::fs::copy(&src, &dst).await.ok()?;
+        media_items.push(MediaItem {
+            kind: item.kind.clone(),
+            local_path: dst.to_string_lossy().into_owned(),
+            mime: item.mime.clone(),
+            bytes: item.bytes,
+            frame_count: item.frame_count,
+        });
+    }
+
+    Some(FetchedPost {
+        platform: manifest.platform,
+        author: manifest.author,
+        caption: manifest.caption,
+        media_items,
+        raw_metadata: manifest.raw_metadata,
+    })
+}
+
+/// Persist a successful fetch into the local artifact cache for future reuse.
+/// Writes a manifest with per-file SHA256 hashes so that LAN-copied cache
+/// entries can be verified on later loads.
+async fn save_to_cache(url: &str, fetched: &FetchedPost) -> Result<()> {
+    let cache_dir = cache_dir_for(url);
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .with_context(|| format!("create cache dir {}", cache_dir.display()))?;
+
+    let mut cached_items = Vec::with_capacity(fetched.media_items.len());
+    for item in &fetched.media_items {
+        let src = PathBuf::from(&item.local_path);
+        let file_name = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow!("invalid media path: {}", item.local_path))?
+            .to_string();
+        let dst = cache_dir.join(&file_name);
+
+        tokio::fs::copy(&src, &dst)
+            .await
+            .with_context(|| format!("copy {} to cache", src.display()))?;
+
+        let hash = tokio::task::spawn_blocking({
+            let dst = dst.clone();
+            move || sha256_file(&dst)
+        })
+        .await
+        .context("spawn sha256")?
+        .with_context(|| format!("sha256 cache file {}", dst.display()))?;
+
+        cached_items.push(CachedMediaItem {
+            kind: item.kind.clone(),
+            file_name,
+            mime: item.mime.clone(),
+            bytes: item.bytes,
+            frame_count: item.frame_count,
+            sha256: hash,
+        });
+    }
+
+    let manifest = CachedManifest {
+        url: url.to_string(),
+        platform: fetched.platform.clone(),
+        author: fetched.author.clone(),
+        caption: fetched.caption.clone(),
+        media_items: cached_items,
+        raw_metadata: fetched.raw_metadata.clone(),
+    };
+
+    let manifest_path = cache_dir.join("manifest.json");
+    let tmp_path = cache_dir.join("manifest.json.tmp");
+    let bytes = serde_json::to_vec_pretty(&manifest).context("serialize cache manifest")?;
+    tokio::fs::write(&tmp_path, bytes)
+        .await
+        .with_context(|| format!("write cache manifest {}", tmp_path.display()))?;
+    tokio::fs::rename(&tmp_path, &manifest_path)
+        .await
+        .with_context(|| format!("finalize cache manifest {}", manifest_path.display()))?;
+
+    Ok(())
+}
+
 /// Pick a healthy vision LLM via the shared DB router ([`ff_db::pg_route_deployments`]).
 ///
 /// This replaces the old Pulse/Redis scan. `pg_route_deployments` is the single
@@ -281,5 +455,63 @@ mod tests {
         assert!(!model_matches(Some("llama32-vision-11b"), "qwen2-vl-7b"));
         // None never matches
         assert!(!model_matches(None, "qwen3-vl-30b-a3b"));
+    }
+
+    #[test]
+    fn cache_lookup_uses_artifacts_and_rejects_corrupted_lan_copies() {
+        use std::sync::Mutex;
+        static HOME_LOCK: Mutex<()> = Mutex::new(());
+
+        let _guard = HOME_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by HOME_LOCK so this process-global env mutation
+        // does not race with other HOME-dependent tests.
+        unsafe { std::env::set_var("HOME", tmp.path()) };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let url = "https://example.com/cache-test";
+            let out_dir = tmp.path().join("out");
+            tokio::fs::create_dir_all(&out_dir).await.unwrap();
+
+            let fetched = FetchedPost {
+                platform: "twitter".into(),
+                author: Some("author".into()),
+                caption: Some("caption".into()),
+                media_items: vec![MediaItem {
+                    kind: "image".into(),
+                    local_path: out_dir.join("img.jpg").to_string_lossy().into_owned(),
+                    mime: "image/jpeg".into(),
+                    bytes: 4,
+                    frame_count: None,
+                }],
+                raw_metadata: serde_json::json!({"id": "abc"}),
+            };
+            tokio::fs::write(&fetched.media_items[0].local_path, b"data")
+                .await
+                .unwrap();
+
+            save_to_cache(url, &fetched).await.unwrap();
+
+            // Cache hit returns the post and copies artifacts to out_dir.
+            let cached = try_load_from_cache(url, &out_dir).await.unwrap();
+            assert_eq!(cached.platform, "twitter");
+            assert_eq!(cached.media_items.len(), 1);
+            assert_eq!(cached.author, Some("author".into()));
+            assert!(
+                tokio::fs::metadata(&cached.media_items[0].local_path)
+                    .await
+                    .is_ok()
+            );
+
+            // Simulate a LAN-copied corrupted cache entry.
+            let cache_dir = cache_dir_for(url);
+            tokio::fs::write(cache_dir.join("img.jpg"), b"bad!")
+                .await
+                .unwrap();
+
+            // Corrupted artifact must be rejected by SHA256 verification.
+            assert!(try_load_from_cache(url, &out_dir).await.is_none());
+        });
     }
 }

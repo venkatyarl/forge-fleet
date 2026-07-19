@@ -7812,6 +7812,10 @@ pub async fn pg_free_slots(
            FROM sub_agents sa
            JOIN computers c ON c.id = sa.computer_id
           WHERE sa.current_work_item_id IS NULL
+            -- Operator quarantine: a 'disabled' slot must never claim work
+            -- (2026-07-19: sarah, a 3GB traveler, kept claiming builds it
+            -- cannot run because this filter was missing).
+            AND COALESCE(sa.status, '') <> 'disabled'
             AND NOT EXISTS (
                 SELECT 1 FROM work_item_leases l
                  WHERE l.sub_agent_id = sa.id AND l.released_at IS NULL)

@@ -246,13 +246,10 @@ fn expand_tilde(p: &str) -> String {
     p.to_string()
 }
 
-/// Clone location for a work_item's repo: INSIDE the assigned sub-agent slot, so
-/// each slot holds its OWN full checkout (build-path option A, 2026-07-07) — e.g.
-/// `~/.forgefleet/sub-agents/sub-agent-3/forge-fleet`. Replaces the old shared
-/// top-level `~/.forgefleet/project-repos/{project}/{repo}`. `slot` is clamped to
-/// ≥0. Stage 1 of the refactor: worktrees still branch off this clone (under the
-/// same slot) until Stage 2 works in the clone directly.
-fn default_clone_path(slot: i32, repo_url: &str) -> PathBuf {
+/// Sanitized repo name derived from a clone URL. Shared by the per-slot clone
+/// path and the fleet artifact cache so a cache lookup uses the same key as
+/// the destination clone.
+fn repo_slug(repo_url: &str) -> String {
     let slug_source = repo_url
         .trim_end_matches('/')
         .trim_end_matches(".git")
@@ -270,12 +267,41 @@ fn default_clone_path(slot: i32, repo_url: &str) -> PathBuf {
         })
         .collect();
     let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "repo".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+/// Clone location for a work_item's repo: INSIDE the assigned sub-agent slot, so
+/// each slot holds its OWN full checkout (build-path option A, 2026-07-07) — e.g.
+/// `~/.forgefleet/sub-agents/sub-agent-3/forge-fleet`. Replaces the old shared
+/// top-level `~/.forgefleet/project-repos/{project}/{repo}`. `slot` is clamped to
+/// ≥0. Stage 1 of the refactor: worktrees still branch off this clone (under the
+/// same slot) until Stage 2 works in the clone directly.
+fn default_clone_path(slot: i32, repo_url: &str) -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".forgefleet")
         .join("sub-agents")
         .join(format!("sub-agent-{}", slot.max(0)))
-        .join(if slug.is_empty() { "repo" } else { slug })
+        .join(repo_slug(repo_url))
+}
+
+/// Shared fleet artifact cache root for project repos.
+fn artifact_cache_root() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".forgefleet")
+        .join("cache")
+        .join("repos")
+}
+
+/// Cache directory for a repo URL. This is a single, shared mirror that each
+/// per-slot clone can copy from instead of hitting the WAN.
+fn repo_cache_path(repo_url: &str) -> PathBuf {
+    artifact_cache_root().join(repo_slug(repo_url))
 }
 
 async fn assigned_work_items(
@@ -472,15 +498,6 @@ async fn ensure_repo_checked_out(pg: &PgPool, item: &AssignedWorkItem) -> Result
         )
     })?;
 
-    if let Some(parent) = item
-        .repo_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create repo parent {}", parent.display()))?;
-    }
-
     // Clone via the CANONICAL GitHub identity, not the bare `git@github.com:`
     // host. The bare host resolves (per node's ~/.ssh/config) to a default key
     // that is UNAUTHORIZED on the venkatyarl account on most fleet nodes —
@@ -504,18 +521,78 @@ async fn ensure_repo_checked_out(pg: &PgPool, item: &AssignedWorkItem) -> Result
         }
     };
 
+    let repo_path = item.repo_path.clone();
+    let cache_path = repo_cache_path(&github_url);
+
+    // Try the fleet artifact cache first to avoid a WAN clone.
+    if cache_path.join(".git").exists() {
+        info!(
+            work_item_id = %item.work_item_id,
+            project_id = %item.project_id,
+            repo_path = %repo_path.display(),
+            cache_path = %cache_path.display(),
+            "work_item_dispatch: staging repo from local artifact cache"
+        );
+
+        let clone_url_for_remote = clone_url.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = repo_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create repo parent {}", parent.display()))?;
+            }
+
+            let mut cmd = Command::new("git");
+            cmd.arg("clone")
+                .arg("--local")
+                .arg("--no-hardlinks")
+                .arg(&cache_path)
+                .arg(&repo_path);
+            run_command_timeout(cmd, Duration::from_secs(300)).with_context(|| {
+                format!(
+                    "clone from cache {} into {}",
+                    cache_path.display(),
+                    repo_path.display()
+                )
+            })?;
+
+            run_git(
+                &repo_path,
+                ["remote", "set-url", "origin", &clone_url_for_remote],
+                Duration::from_secs(60),
+            )
+            .with_context(|| format!("set origin to {}", clone_url_for_remote))?;
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("join cache-clone task")??;
+
+        return Ok(());
+    }
+
     info!(
         work_item_id = %item.work_item_id,
         project_id = %item.project_id,
-        repo_path = %item.repo_path.display(),
+        repo_path = %repo_path.display(),
         clone_url = %clone_url,
-        "work_item_dispatch: cloning project repo"
+        "work_item_dispatch: cache miss — cloning project repo from WAN"
     );
 
-    let repo_path = item.repo_path.clone();
+    let repo_path_for_clone = repo_path.clone();
+    let clone_url_for_clone = clone_url.clone();
     tokio::task::spawn_blocking(move || {
+        if let Some(parent) = repo_path_for_clone
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create repo parent {}", parent.display()))?;
+        }
+
         let mut cmd = Command::new("git");
-        cmd.arg("clone").arg(&clone_url).arg(&repo_path);
+        cmd.arg("clone")
+            .arg(&clone_url_for_clone)
+            .arg(&repo_path_for_clone);
         if let Some(identity) = &ssh_identity {
             cmd.env(
                 "GIT_SSH_COMMAND",
@@ -529,9 +606,65 @@ async fn ensure_repo_checked_out(pg: &PgPool, item: &AssignedWorkItem) -> Result
     })
     .await
     .context("join git clone task")?
-    .with_context(|| format!("clone project repo into {}", item.repo_path.display()))?;
+    .with_context(|| format!("clone project repo into {}", repo_path.display()))?;
+
+    // Seed the artifact cache for the next dispatch, but don't fail the task if
+    // the mirror update itself fails.
+    if let Err(e) = seed_repo_cache(&repo_path, &cache_path, &clone_url).await {
+        warn!(
+            work_item_id = %item.work_item_id,
+            project_id = %item.project_id,
+            error = %e,
+            "work_item_dispatch: failed to seed artifact cache"
+        );
+    }
 
     Ok(())
+}
+
+/// Seed the shared repo artifact cache from a freshly cloned slot checkout.
+/// Failures are surfaced to the caller but intentionally do NOT fail the
+/// dispatch — the cache is an optimization, not a hard requirement.
+async fn seed_repo_cache(repo_path: &Path, cache_path: &Path, clone_url: &str) -> Result<()> {
+    if cache_path.join(".git").exists() {
+        return Ok(());
+    }
+
+    let repo_path = repo_path.to_path_buf();
+    let cache_path = cache_path.to_path_buf();
+    let clone_url = clone_url.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        if let Some(parent) = cache_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create cache parent {}", parent.display()))?;
+        }
+
+        let mut cmd = Command::new("git");
+        cmd.arg("clone")
+            .arg("--local")
+            .arg("--no-hardlinks")
+            .arg(&repo_path)
+            .arg(&cache_path);
+        run_command_timeout(cmd, Duration::from_secs(300)).with_context(|| {
+            format!(
+                "seed cache from {} into {}",
+                repo_path.display(),
+                cache_path.display()
+            )
+        })?;
+
+        run_git(
+            &cache_path,
+            ["remote", "set-url", "origin", &clone_url],
+            Duration::from_secs(60),
+        )
+        .with_context(|| format!("set cache origin to {}", clone_url))?;
+
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("join cache-seed task")?
 }
 
 /// Rewrite an scp-style `git@github.com:owner/repo` clone URL to use a specific
@@ -2713,8 +2846,9 @@ mod tests {
     use super::{
         DISPATCH_HOUSE_RULES, DispatchOutcome, agent_output_tail, classify_dispatch_outcome,
         command_display, default_clone_path, dispatch_budget_for_host, expand_home,
-        parse_cli_tokens, primary_or_default_backend, retry_error_is_actionable,
-        rewrite_github_host_alias, task_prefers_cloud_lane, use_local_lane,
+        parse_cli_tokens, primary_or_default_backend, repo_cache_path, repo_slug,
+        retry_error_is_actionable, rewrite_github_host_alias, task_prefers_cloud_lane,
+        use_local_lane,
     };
 
     #[test]
@@ -2817,6 +2951,42 @@ mod tests {
         // Negative slot is clamped to 0 (never sub-agent--1).
         let pneg = default_clone_path(-1, "https://x/y/repo.git");
         assert!(pneg.to_string_lossy().contains("sub-agent-0/repo"));
+    }
+
+    #[test]
+    fn repo_slug_derives_from_url_tail() {
+        assert_eq!(
+            repo_slug("git@github.com:venkatyarl/forge-fleet.git"),
+            "forge-fleet"
+        );
+        assert_eq!(
+            repo_slug("https://github.com/venkatyarl/forge-fleet.git"),
+            "forge-fleet"
+        );
+        assert_eq!(repo_slug("https://x/y/repo.git"), "repo");
+        // Unsafe characters become dashes and edge dashes are trimmed.
+        assert_eq!(repo_slug("https://x/y/foo--bar.git"), "foo--bar");
+        assert_eq!(repo_slug("https://x/y/-weird-.git"), "weird");
+    }
+
+    #[test]
+    fn repo_cache_path_is_shared_and_slug_keyed() {
+        let cache = repo_cache_path("git@github.com:venkatyarl/forge-fleet.git");
+        let s = cache.to_string_lossy();
+        assert!(
+            s.ends_with(".forgefleet/cache/repos/forge-fleet"),
+            "expected shared cache path, got {s}"
+        );
+        assert!(
+            !s.contains("sub-agent"),
+            "artifact cache must not be per-slot: {s}"
+        );
+
+        // The cache key must match the per-slot clone's repo slug so a cache hit
+        // copies into the right destination.
+        let slot = default_clone_path(2, "git@github.com:venkatyarl/forge-fleet.git");
+        assert_eq!(slot.file_name(), cache.file_name());
+        assert_ne!(slot, cache);
     }
 
     #[test]

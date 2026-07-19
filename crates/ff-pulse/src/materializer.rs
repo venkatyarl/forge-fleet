@@ -458,16 +458,12 @@ impl Materializer {
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok());
 
-        // Determine new status from beat.
-        let new_status = if beat.going_offline {
-            "offline".to_string()
-        } else {
-            "online".to_string()
-        };
-        let status_changed = prev_status != new_status;
+        // Determine whether this beat flips the row status (online/offline).
+        let transition_plan = plan_status_transition(&prev_status, beat.going_offline);
+        let status_changed = transition_plan.is_some();
 
-        if status_changed {
-            report.status_transition = Some((prev_status.clone(), new_status.clone()));
+        if let Some(plan) = &transition_plan {
+            report.status_transition = Some((prev_status.clone(), plan.new_status.to_string()));
         }
 
         // V89: build_sha auto-refresh — must run BEFORE the fast-path exit
@@ -696,45 +692,53 @@ impl Materializer {
         // build_sha auto-refresh moved earlier in this function so it
         // runs before the fast-path exit; see V89 note above.
 
-        // Status transition handling.
-        if status_changed {
-            report.wrote_computer_row = true;
-            if beat.going_offline {
-                // Q5/Q6: transition to offline.
-                sqlx::query(
-                    "UPDATE computers SET \
-                        status = 'offline', \
-                        status_changed_at = NOW(), \
-                        offline_since = COALESCE(offline_since, NOW()) \
-                     WHERE id = $1",
-                )
-                .bind(computer_id)
-                .execute(&self.pg)
-                .await?;
+        // Status transition handling (Q5–Q7).
+        //
+        // Race-safety: `status` was read at Q1, but another writer — an
+        // overlapping leader during failover, a duplicate beat for the same
+        // computer, an operator UPDATE — may have moved the row since. The
+        // old unconditional UPDATE + separate event INSERT let both racers
+        // record the same transition (duplicate downtime events, clobbered
+        // offline_since, phantom node_online publishes). The flip is now a
+        // compare-and-set (`WHERE status = $prev`) and its downtime-event
+        // bookkeeping runs in the SAME transaction, gated on the CAS
+        // affecting a row: the racer that loses sees rows_affected == 0 and
+        // skips both the event write and the publish.
+        if let Some(plan) = &transition_plan {
+            let mut tx = self.pg.begin().await?;
 
-                sqlx::query(
-                    "INSERT INTO computer_downtime_events \
-                        (computer_id, offline_at, cause) \
-                     VALUES ($1, NOW(), 'graceful_shutdown')",
-                )
-                .bind(computer_id)
-                .execute(&self.pg)
-                .await?;
-            } else {
-                // Q5: transition to online.
-                sqlx::query(
-                    "UPDATE computers SET \
-                        status = 'online', \
-                        status_changed_at = NOW(), \
-                        offline_since = NULL \
-                     WHERE id = $1",
-                )
-                .bind(computer_id)
-                .execute(&self.pg)
-                .await?;
+            // Q5: atomic compare-and-set of the status flip.
+            let flipped = sqlx::query(
+                "UPDATE computers SET \
+                    status = $2, \
+                    status_changed_at = NOW(), \
+                    offline_since = CASE WHEN $2 = 'offline' \
+                        THEN COALESCE(offline_since, NOW()) \
+                        ELSE NULL END \
+                 WHERE id = $1 AND status = $3",
+            )
+            .bind(computer_id)
+            .bind(plan.new_status)
+            .bind(&prev_status)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+                > 0;
 
-                // Q7: close the most recent open downtime event, if any.
-                if matches!(prev_status.as_str(), "offline" | "sdown" | "odown") {
+            if flipped {
+                if plan.insert_downtime {
+                    // Q6: open a downtime event for the offline transition.
+                    sqlx::query(
+                        "INSERT INTO computer_downtime_events \
+                            (computer_id, offline_at, cause) \
+                         VALUES ($1, NOW(), 'graceful_shutdown')",
+                    )
+                    .bind(computer_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                if plan.close_downtime {
+                    // Q7: close the most recent open downtime event, if any.
                     sqlx::query(
                         "UPDATE computer_downtime_events \
                          SET online_at = NOW(), \
@@ -743,9 +747,16 @@ impl Materializer {
                          WHERE computer_id = $1 AND online_at IS NULL",
                     )
                     .bind(computer_id)
-                    .execute(&self.pg)
+                    .execute(&mut *tx)
                     .await?;
+                }
+            }
 
+            tx.commit().await?;
+
+            if flipped {
+                report.wrote_computer_row = true;
+                if plan.publish_node_online {
                     // Wake the deferred-task scheduler: any task with
                     // trigger=node_online targeting this computer is
                     // queued waiting on this exact event. Without this
@@ -765,6 +776,11 @@ impl Materializer {
                         "materializer: published fleet:node_online for sdown→online transition"
                     );
                 }
+            } else {
+                // Lost the race: another writer already moved the row off
+                // `prev_status`. Clear the transition so the NATS mirror in
+                // the subscribe loop doesn't announce a phantom flip.
+                report.status_transition = None;
             }
         }
 
@@ -1423,6 +1439,48 @@ impl Materializer {
 // Small helpers
 // -----------------------------------------------------------------------------
 
+/// What a status transition must write, decided once from the Q1 read.
+/// The actual flip is executed as a compare-and-set on `prev_status`, so
+/// a plan is only ever applied if the row still holds the status it was
+/// planned against.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StatusTransitionPlan {
+    /// Status the row moves to ("online" / "offline").
+    pub new_status: &'static str,
+    /// Open a computer_downtime_events row (offline transition).
+    pub insert_downtime: bool,
+    /// Close the open downtime event (return from a down state).
+    pub close_downtime: bool,
+    /// Publish `fleet:node_online` to wake the deferred-task scheduler.
+    pub publish_node_online: bool,
+}
+
+/// Pure transition planner: returns None when the beat doesn't change the
+/// row status. Extracted so the transition decision table is unit-testable
+/// without a database.
+fn plan_status_transition(prev_status: &str, going_offline: bool) -> Option<StatusTransitionPlan> {
+    let new_status = if going_offline { "offline" } else { "online" };
+    if prev_status == new_status {
+        return None;
+    }
+    if going_offline {
+        Some(StatusTransitionPlan {
+            new_status,
+            insert_downtime: true,
+            close_downtime: false,
+            publish_node_online: false,
+        })
+    } else {
+        let was_down = matches!(prev_status, "offline" | "sdown" | "odown");
+        Some(StatusTransitionPlan {
+            new_status,
+            insert_downtime: false,
+            close_downtime: was_down,
+            publish_node_online: was_down,
+        })
+    }
+}
+
 /// Whitespace-normalize a JSON string so two logically-equal JSON values
 /// compare equal even if Postgres reformatted its copy.
 fn normalize_json(s: &str) -> String {
@@ -1796,6 +1854,44 @@ mod tests {
             prev_status.as_str(),
             "offline" | "sdown" | "odown"
         ));
+    }
+
+    #[test]
+    fn transition_plan_none_when_status_unchanged() {
+        assert!(plan_status_transition("online", false).is_none());
+        assert!(plan_status_transition("offline", true).is_none());
+    }
+
+    #[test]
+    fn transition_plan_offline_opens_downtime_event_only() {
+        let plan = plan_status_transition("online", true).expect("transition");
+        assert_eq!(plan.new_status, "offline");
+        assert!(plan.insert_downtime);
+        assert!(!plan.close_downtime);
+        assert!(!plan.publish_node_online);
+    }
+
+    #[test]
+    fn transition_plan_return_from_down_states_closes_downtime_and_publishes() {
+        for prev in ["offline", "sdown", "odown"] {
+            let plan = plan_status_transition(prev, false).expect("transition");
+            assert_eq!(plan.new_status, "online");
+            assert!(!plan.insert_downtime);
+            assert!(plan.close_downtime, "prev={prev} must close downtime");
+            assert!(plan.publish_node_online, "prev={prev} must publish");
+        }
+    }
+
+    #[test]
+    fn transition_plan_online_from_non_down_state_skips_downtime_close() {
+        // e.g. an enrolling/unknown row coming online for the first time:
+        // flip the status, but there is no open downtime event to close and
+        // no node_online wake to publish.
+        let plan = plan_status_transition("enrolling", false).expect("transition");
+        assert_eq!(plan.new_status, "online");
+        assert!(!plan.insert_downtime);
+        assert!(!plan.close_downtime);
+        assert!(!plan.publish_node_online);
     }
 
     #[test]

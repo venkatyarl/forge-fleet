@@ -32,6 +32,7 @@ pub mod intelligence;
 pub mod json_query;
 pub mod lint_fix;
 pub mod media;
+pub mod mlx_degraded;
 pub mod model_discovery;
 pub mod model_mgmt;
 pub mod multimodal;
@@ -126,6 +127,10 @@ pub struct AgentToolContext {
     pub session_id: String,
     /// Persistent shell state (cwd + env vars) across Bash invocations.
     pub shell_state: Arc<Mutex<ShellState>>,
+    /// Serializes file mutations (Edit/Write/NotebookEdit) within this agent
+    /// session. The agent loop executes a turn's tool calls in parallel, so
+    /// unsynchronized read-modify-write edits can lose each other's updates.
+    pub edit_lock: Arc<Mutex<()>>,
     /// Optional Postgres pool for audit logging and security checks.
     pub pg_pool: Option<sqlx::PgPool>,
 }
@@ -196,9 +201,24 @@ pub fn session_shell_state(session_id: &str) -> Arc<Mutex<ShellState>> {
         .clone()
 }
 
-/// Clear the shell state for a session (on session end).
+/// Clear the shell state (and edit lock) for a session (on session end).
 pub fn clear_session_shell_state(session_id: &str) {
     SHELL_STATES.remove(session_id);
+    EDIT_LOCKS.remove(session_id);
+}
+
+/// Global registry of per-session edit locks, so file-mutating tools
+/// (Edit/Write/NotebookEdit) in the same session serialize their
+/// read-modify-write even though tool calls execute in parallel.
+static EDIT_LOCKS: std::sync::LazyLock<DashMap<String, Arc<Mutex<()>>>> =
+    std::sync::LazyLock::new(DashMap::new);
+
+/// Get or create the edit-serialization lock for the given session.
+pub fn session_edit_lock(session_id: &str) -> Arc<Mutex<()>> {
+    EDIT_LOCKS
+        .entry(session_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +338,7 @@ pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(fleet_ops::ModelDeployTool),
         Box::new(fleet_ops::FleetInventoryTool::default()),
         Box::new(fleet_ops::NodeHealthCheckTool::default()),
+        Box::new(mlx_degraded::MlxDegradedTool),
         Box::new(fleet_ops::BinaryDeployTool),
         // Intelligence & self-improvement tools
         Box::new(intelligence::PatternLearnerTool),

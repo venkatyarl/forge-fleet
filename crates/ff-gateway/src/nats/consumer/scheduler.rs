@@ -40,6 +40,10 @@ pub const DURABLE_NAME: &str = "ff-gateway-scheduler";
 /// task is dead-lettered.
 pub const MAX_DELIVERIES: i64 = 5;
 
+/// Maximum number of messages to process before returning, to prevent
+/// over-processing in long-running consumers.
+const MAX_ITERATIONS: usize = 100;
+
 /// How long the server waits for an ack before redelivering.
 const ACK_WAIT: Duration = Duration::from_secs(30);
 /// Delay requested on NAK so a failing task is not retried in a hot loop.
@@ -144,10 +148,19 @@ where
     );
 
     let mut messages = consumer.messages().await?;
+    let mut processed = 0;
     while let Some(next) = messages.next().await {
         match next {
             Ok(msg) => process_message(&js, msg, &handler).await,
             Err(e) => warn!(error = %e, "scheduler consumer pull error"),
+        }
+        processed += 1;
+        if processed >= MAX_ITERATIONS {
+            warn!(
+                max_iterations = MAX_ITERATIONS,
+                "scheduler iteration cap reached; stopping consumer"
+            );
+            break;
         }
     }
     Ok(())

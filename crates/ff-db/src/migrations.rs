@@ -9,6 +9,9 @@ use tracing::{debug, info, warn};
 use crate::error::{DbError, Result};
 use crate::schema;
 
+/// The highest migration version baked into the squashed fresh-DB bootstrap.
+const BOOTSTRAP_BASELINE_VERSION: u32 = 161;
+
 // ─── Postgres Migrations ─────────────────────────────────────────────────────
 
 /// A single Postgres migration step.
@@ -832,6 +835,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "work_queue",
         sql: schema::SCHEMA_V170_WORK_QUEUE,
     },
+    PgMigration {
+        version: 171,
+        name: "artifact_index",
+        sql: schema::SCHEMA_V171_ARTIFACT_INDEX,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -912,7 +920,43 @@ pub async fn run_postgres_migrations(pool: &PgPool) -> Result<u32> {
 /// it exactly once in [`run_postgres_migrations`].
 async fn run_postgres_migrations_locked(conn: &mut sqlx::PgConnection) -> Result<u32> {
     ensure_pg_migrations_table(&mut *conn).await?;
-    let current = pg_current_version(&mut *conn).await?;
+    let mut current = pg_current_version(&mut *conn).await?;
+
+    // Fresh DB: apply the squashed v161 baseline instead of replaying the
+    // legacy 7→161 migration chain, which has accumulated rename/renumber
+    // drift and fails on a clean Postgres.
+    if current == 0 {
+        info!(
+            baseline = BOOTSTRAP_BASELINE_VERSION,
+            "fresh postgres database detected; applying bootstrap baseline"
+        );
+
+        let mut tx = conn.begin().await?;
+        match sqlx::raw_sql(schema::BOOTSTRAP_V161_SQL)
+            .execute(&mut *tx)
+            .await
+        {
+            Ok(_) => {
+                tx.commit().await?;
+                info!(
+                    baseline = BOOTSTRAP_BASELINE_VERSION,
+                    "postgres bootstrap baseline applied successfully"
+                );
+            }
+            Err(e) => {
+                return Err(DbError::Migration(format!(
+                    "postgres bootstrap baseline (through v{BOOTSTRAP_BASELINE_VERSION}) failed: {e}"
+                )));
+            }
+        }
+
+        current = pg_current_version(&mut *conn).await?;
+        if current < BOOTSTRAP_BASELINE_VERSION {
+            return Err(DbError::Migration(format!(
+                "postgres bootstrap baseline did not advance version to v{BOOTSTRAP_BASELINE_VERSION}; got v{current}"
+            )));
+        }
+    }
 
     let pending: Vec<&PgMigration> = PG_MIGRATIONS
         .iter()
@@ -973,7 +1017,12 @@ async fn run_postgres_migrations_locked(conn: &mut sqlx::PgConnection) -> Result
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+
+    use sqlx::postgres::PgPoolOptions;
+
     use super::*;
+
     #[test]
     fn migration_advisory_lock_key_is_stable() {
         // The key must be identical across every binary version that runs
@@ -1003,5 +1052,105 @@ mod tests {
                 pair[1].name,
             );
         }
+    }
+
+    fn db_url() -> Option<String> {
+        env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()
+    }
+
+    async fn create_fresh_temp_db() -> Option<(PgPool, PgPool, String)> {
+        let base_url = db_url()?;
+        let (prefix, _) = base_url.rsplit_once('/')?;
+        let db_name = format!("ff_bootstrap_v161_{}", uuid::Uuid::new_v4().simple());
+        let admin_url = format!("{prefix}/postgres");
+        let db_url = format!("{prefix}/{db_name}");
+
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .ok()?;
+
+        // The bootstrap baseline requires pgcrypto, pgvector, and amcheck.
+        // Skip the test if the server doesn't have them available.
+        let extensions_ready: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pgcrypto')
+                AND EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'vector')
+                AND EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'amcheck')",
+        )
+        .fetch_one(&admin)
+        .await
+        .ok()?;
+        if !extensions_ready {
+            admin.close().await;
+            return None;
+        }
+
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .ok()?;
+
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&db_url)
+            .await
+            .ok()?;
+
+        Some((admin, pool, db_name))
+    }
+
+    async fn drop_temp_db(admin: PgPool, pool: PgPool, db_name: &str) {
+        pool.close().await;
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid)
+               FROM pg_stat_activity
+              WHERE datname = $1
+                AND pid <> pg_backend_pid()",
+        )
+        .bind(db_name)
+        .execute(&admin)
+        .await
+        .expect("terminate temp db sessions");
+        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("drop temp db");
+        admin.close().await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_fresh_db_starts_at_v161() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        let final_version = run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        let expected_version = PG_MIGRATIONS
+            .last()
+            .map(|m| m.version)
+            .unwrap_or(BOOTSTRAP_BASELINE_VERSION);
+        assert!(
+            final_version >= BOOTSTRAP_BASELINE_VERSION,
+            "expected at least v{BOOTSTRAP_BASELINE_VERSION}, got v{final_version}"
+        );
+        assert_eq!(
+            final_version, expected_version,
+            "expected final version v{expected_version}, got v{final_version}"
+        );
+
+        let row: (i32,) = sqlx::query_as("SELECT version FROM _migrations WHERE version = $1")
+            .bind(BOOTSTRAP_BASELINE_VERSION as i32)
+            .fetch_one(&pool)
+            .await
+            .expect("v161 bootstrap should be recorded in _migrations");
+        assert_eq!(row.0 as u32, BOOTSTRAP_BASELINE_VERSION);
+
+        drop_temp_db(admin, pool, &db_name).await;
     }
 }
