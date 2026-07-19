@@ -1049,6 +1049,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn baseline_version_is_present_in_migration_sequence() {
+        // The fresh-DB bootstrap squashes the schema through
+        // BOOTSTRAP_BASELINE_VERSION and seeds _migrations so the runner only
+        // applies later versions. The baseline number must therefore match an
+        // actual migration entry; otherwise the boundary between "already
+        // applied by the baseline" and "apply incrementally" is undefined.
+        assert!(
+            PG_MIGRATIONS
+                .iter()
+                .any(|m| m.version == BOOTSTRAP_BASELINE_VERSION),
+            "BOOTSTRAP_BASELINE_VERSION ({}) must exist in PG_MIGRATIONS",
+            BOOTSTRAP_BASELINE_VERSION
+        );
+    }
+
     fn db_url() -> Option<String> {
         env::var("FORGEFLEET_POSTGRES_URL")
             .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
