@@ -29,7 +29,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use sqlx::postgres::PgListener;
 use sqlx::{PgPool, Row};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -588,9 +587,12 @@ impl TaskRunner {
     /// Spawn the worker tick loop. Tries to claim one task every
     /// `interval_secs`. Exits when `shutdown` flips to true.
     ///
-    /// Phase 3 (V77): Uses PostgreSQL LISTEN/NOTIFY to wake immediately
-    /// when a new task is inserted.  A 10s fallback interval remains for
-    /// resilience if NOTIFY is lost or the DB connection drops.
+    /// Phase 3 (V77): Consumes the NATS `FF_TASKS` stream to wake
+    /// immediately when a new task is inserted.  A 10s fallback interval
+    /// remains for resilience if the NATS notification is lost or the
+    /// NATS connection drops.  During rollout the PostgreSQL
+    /// `fleet_task_inserted` NOTIFY remains active (dual-emission), so
+    /// mixed-version workers still wake.
     pub fn spawn(self, interval_secs: u64, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
         let interval = Duration::from_secs(interval_secs.max(2));
         tokio::spawn(async move {
@@ -599,11 +601,11 @@ impl TaskRunner {
                     debug!(error = %e, computer = %self.my_name, "task tick error");
                 }
                 tokio::select! {
-                    result = listen_for_tasks(&self.pg) => {
+                    result = crate::ha::agent::listen_for_tasks() => {
                         if let Err(e) = result {
-                            debug!(error = %e, "task listener error, falling back to interval");
+                            debug!(error = %e, "task NATS listener error, falling back to interval");
                         } else {
-                            debug!("woken by fleet_task_inserted notification");
+                            debug!("woken by NATS FF_TASKS notification");
                         }
                     }
                     _ = tokio::time::sleep(interval) => {}
@@ -614,17 +616,6 @@ impl TaskRunner {
             }
         })
     }
-}
-
-/// Wait for a `fleet_task_inserted` NOTIFY on a dedicated connection.
-/// Returns when a notification is received so the caller can call
-/// `tick_once` immediately.
-async fn listen_for_tasks(pg: &PgPool) -> Result<(), sqlx::Error> {
-    let mut listener = PgListener::connect_with(pg).await?;
-    listener.listen("fleet_task_inserted").await?;
-    // Block until at least one notification arrives.
-    let _ = listener.recv().await?;
-    Ok(())
 }
 
 /// Leader-only watchdog: detect `running` tasks whose worker has gone
@@ -908,6 +899,10 @@ pub async fn pg_enqueue_shell_task_full(
     .fetch_one(pg)
     .await?;
 
+    // Dual-emission: notify NATS FF_TASKS stream in addition to the
+    // PostgreSQL fleet_task_inserted NOTIFY during rollout.
+    crate::nats_jetstream::publish_task_inserted(id).await;
+
     Ok(id)
 }
 
@@ -975,6 +970,10 @@ pub async fn pg_enqueue_shell_task_routed(
     .bind(routing_mode)
     .fetch_one(pg)
     .await?;
+
+    // Dual-emission: notify NATS FF_TASKS stream in addition to the
+    // PostgreSQL fleet_task_inserted NOTIFY during rollout.
+    crate::nats_jetstream::publish_task_inserted(id).await;
 
     Ok(id)
 }

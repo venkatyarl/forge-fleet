@@ -5,6 +5,7 @@
 //! queue). Future additions: replica-lag monitor, promote/demote
 //! coordinator, failover state machine.
 
+pub mod agent;
 pub mod backup;
 pub mod handoff;
 pub mod node_info;
