@@ -157,7 +157,7 @@ where
 {
     let beat = reader.latest_beat(src_node).await?;
     let src_online = source_beat_alive(beat.as_ref());
-    dispatch_if_source_online(src_online, dispatch).await
+    dispatch_if_source_online(src_online, src_node, dispatch).await
 }
 
 async fn dispatch_if_source_online<F, Fut, T>(
