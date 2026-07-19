@@ -56,7 +56,25 @@ pub async fn handle_notify(cmd: NotifyCommand) -> Result<()> {
             // --unrouted lists messages the poller could not attribute to any
             // session (session_id IS NULL); otherwise filter by the session.
             let session_filter = session.filter(|_| !unrouted);
-            let rows: Vec<(i64, Option<String>, String, chrono::DateTime<chrono::Utc>)> =
+            // With --claim, claim atomically in ONE statement (UPDATE…RETURNING
+            // over the unclaimed set): two concurrent `--claim` calls can never
+            // print the same reply — the second sees zero rows. A read-only
+            // listing stays a plain SELECT.
+            let rows: Vec<(i64, Option<String>, String, chrono::DateTime<chrono::Utc>)> = if claim {
+                sqlx::query_as(
+                    "UPDATE telegram_replies SET claimed_at = NOW() \
+                      WHERE id IN ( \
+                            SELECT id FROM telegram_replies \
+                             WHERE claimed_at IS NULL \
+                               AND (($1::text IS NOT NULL AND session_id = $1) \
+                                    OR ($1::text IS NULL AND session_id IS NULL)) \
+                             FOR UPDATE SKIP LOCKED) \
+                      RETURNING id, from_name, body, received_at",
+                )
+                .bind(&session_filter)
+                .fetch_all(&pool)
+                .await?
+            } else {
                 sqlx::query_as(
                     "SELECT id, from_name, body, received_at FROM telegram_replies \
                       WHERE claimed_at IS NULL \
@@ -66,13 +84,15 @@ pub async fn handle_notify(cmd: NotifyCommand) -> Result<()> {
                 )
                 .bind(&session_filter)
                 .fetch_all(&pool)
-                .await?;
-            let rows: Vec<(i64, String, String, chrono::DateTime<chrono::Utc>)> = rows
+                .await?
+            };
+            let mut rows: Vec<(i64, String, String, chrono::DateTime<chrono::Utc>)> = rows
                 .into_iter()
                 .map(|(id, from, body, at)| {
                     (id, from.unwrap_or_else(|| "operator".into()), body, at)
                 })
                 .collect();
+            rows.sort_by_key(|r| r.0);
             if rows.is_empty() {
                 println!("no unclaimed replies");
                 return Ok(());
@@ -81,12 +101,7 @@ pub async fn handle_notify(cmd: NotifyCommand) -> Result<()> {
                 println!("[{id}] {at} {from}: {body}");
             }
             if claim {
-                let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
-                sqlx::query("UPDATE telegram_replies SET claimed_at = NOW() WHERE id = ANY($1)")
-                    .bind(&ids)
-                    .execute(&pool)
-                    .await?;
-                println!("claimed {} replies", ids.len());
+                println!("claimed {} replies", rows.len());
             }
             Ok(())
         }

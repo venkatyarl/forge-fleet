@@ -52,13 +52,29 @@ pub async fn poll_telegram_replies_once(pool: &PgPool) -> Result<usize> {
         "https://api.telegram.org/bot{token}/getUpdates?offset={}&timeout=0",
         offset + 1
     );
+    // `reqwest::Error` Display includes the request URL — which embeds the bot
+    // token. Strip the URL before the error can reach logs.
     let resp = SHARED_HTTP
         .get(&url)
         .timeout(Duration::from_secs(10))
         .send()
         .await
-        .context("GET telegram getUpdates")?;
-    let json: serde_json::Value = resp.json().await.context("parse getUpdates response")?;
+        .map_err(|e| anyhow::anyhow!("GET telegram getUpdates: {}", e.without_url()))?;
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("parse getUpdates response: {}", e.without_url()))?;
+    // Telegram reports failures in-band (`ok:false`, e.g. 409 Conflict when a
+    // second consumer holds getUpdates — the exact misconfiguration the gate
+    // guards against). Treating that as "no updates" would fail silently
+    // forever, so surface it.
+    if json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let desc = json
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("<no description>");
+        anyhow::bail!("telegram getUpdates not ok: {desc}");
+    }
     let Some(updates) = json.get("result").and_then(|r| r.as_array()) else {
         return Ok(0);
     };
@@ -134,6 +150,21 @@ pub async fn poll_telegram_replies_once(pool: &PgPool) -> Result<usize> {
         }
     }
 
+    // Heal the send→record window: a reply can arrive between sendMessage and
+    // the telegram_messages INSERT and get filed unrouted. Re-resolve unclaimed
+    // unrouted replies against the (by now recorded) message map each tick.
+    sqlx::query(
+        "UPDATE telegram_replies r SET session_id = m.session_id \
+           FROM telegram_messages m \
+          WHERE r.session_id IS NULL AND r.claimed_at IS NULL \
+            AND r.reply_to_tg_message_id IS NOT NULL \
+            AND m.chat_id = r.chat_id \
+            AND m.tg_message_id = r.reply_to_tg_message_id \
+            AND m.session_id IS NOT NULL",
+    )
+    .execute(pool)
+    .await?;
+
     if max_update_id > offset {
         sqlx::query(
             "INSERT INTO telegram_poll_state (singleton, last_update_id, updated_at) \
@@ -189,6 +220,7 @@ async fn send_bot_response(token: &str, chat_id: &str, text: &str) {
         .send()
         .await
     {
-        tracing::warn!(error = %e, "telegram_reply_poller: bot response send failed");
+        // without_url: the URL embeds the bot token — keep it out of logs.
+        tracing::warn!(error = %e.without_url(), "telegram_reply_poller: bot response send failed");
     }
 }
