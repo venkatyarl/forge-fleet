@@ -18,6 +18,7 @@ pub mod leader_state;
 pub mod migrations;
 pub mod operational_store;
 pub mod pm;
+pub mod postgres;
 pub mod queries;
 pub mod runtime_registry;
 pub mod schema;
