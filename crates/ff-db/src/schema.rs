@@ -1735,13 +1735,6 @@ VALUES
    true, false),
 
 -- Agent platforms -------------------------------------------------------
-  ('openclaw',
-   'OpenClaw Agent',
-   'binary',
-   NULL,
-   '{"method":"cmd","args":["openclaw","--version"],"regex":"OpenClaw (\\S+)"}'::jsonb,
-   '{"all":"curl -fsSL https://openclaw.ai/install.sh | bash"}'::jsonb,
-   true, false),
 
 -- Developer tools -------------------------------------------------------
   ('gh',
@@ -10091,4 +10084,34 @@ VALUES
      'llama.cpp', 'llama-server (CPU)',                NULL,
      '[]'::jsonb,            'catch-all fallback')
 ON CONFLICT (kind, arch, gpu_kind, has_discrete_vram, ram_tier) DO NOTHING;
+"#;
+
+// ─── V166: remove OpenClaw subsystem ───────────────────────────────────────
+//
+// OpenClaw was retired in July 2026. This migration tears down the remaining
+// DB artifacts so fresh and existing fleets are clean. It is intentionally
+// idempotent: rows/tables may or may not exist depending on whether earlier
+// migrations seeded them before they were excised from the codebase.
+pub const SCHEMA_V166_REMOVE_OPENCLAW: &str = r#"
+-- Durable state table for the retired gateway role reconciler.
+DROP TABLE IF EXISTS openclaw_installations;
+
+-- Remove OpenClaw from the software / external-tools catalogs so the
+-- auto-upgrade and `ff ext` ticks no longer try to install or version-check it.
+DELETE FROM computer_software WHERE software_id = 'openclaw';
+DELETE FROM software_registry WHERE id = 'openclaw';
+DELETE FROM external_tools WHERE id = 'openclaw';
+
+-- Canonical port assignments and runtime secrets for the gateway.
+DELETE FROM port_registry WHERE service = 'openclaw_gateway';
+DELETE FROM fleet_secrets WHERE key IN (
+    'port.openclaw',
+    'openclaw.gateway_url',
+    'openclaw.device_pairings_export',
+    'openclaw.telegram_bot_token',
+    'openclaw.telegram_chat_id'
+);
+
+-- Any alert policy still wired to the retired channel falls back to telegram.
+UPDATE alert_policies SET channel = 'telegram' WHERE channel = 'openclaw';
 "#;

@@ -587,19 +587,9 @@ CREATE TABLE IF NOT EXISTS fleet_leader_state (
     CHECK (singleton_key = 'current')
 );
 
--- ─── OpenClaw install record ────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS openclaw_installations (
-    computer_id          UUID PRIMARY KEY REFERENCES computers(id) ON DELETE CASCADE,
-    mode                 TEXT NOT NULL DEFAULT 'node',   -- gateway|node
-    gateway_url          TEXT,
-    last_reconfigured_at TIMESTAMPTZ,
-    config_path          TEXT NOT NULL DEFAULT '~/.openclaw/openclaw.json',
-    metadata             JSONB NOT NULL DEFAULT '{}'
-);
-
 -- ─── Software registry + per-computer install record ────────────────────
 CREATE TABLE IF NOT EXISTS software_registry (
-    id                     TEXT PRIMARY KEY,         -- "ff", "openclaw", "os-macos", ...
+    id                     TEXT PRIMARY KEY,         -- "ff", "codex", "os-macos", ...
     display_name           TEXT NOT NULL,
     kind                   TEXT NOT NULL,            -- binary|runtime|service|os
     applies_to_os_family   TEXT,                      -- NULL = applies everywhere
@@ -1359,13 +1349,6 @@ VALUES
    true, false),
 
 -- Agent platforms -------------------------------------------------------
-  ('openclaw',
-   'OpenClaw Agent',
-   'binary',
-   NULL,
-   '{"method":"cmd","args":["openclaw","--version"],"regex":"OpenClaw (\\S+)"}'::jsonb,
-   '{"all":"curl -fsSL https://openclaw.ai/install.sh | bash"}'::jsonb,
-   true, false),
 
 -- Developer tools -------------------------------------------------------
   ('gh',
