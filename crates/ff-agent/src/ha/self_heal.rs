@@ -152,11 +152,11 @@ pub async fn rearm_self_heal_task(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_helpers {
     use super::*;
     use std::env;
 
-    fn temp_db_urls() -> (String, String, String) {
+    pub fn temp_db_urls() -> (String, String, String) {
         let base_url = env::var("FORGEFLEET_POSTGRES_URL")
             .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
             .expect("FORGEFLEET_POSTGRES_URL or FORGEFLEET_DATABASE_URL must be set for DB tests");
@@ -171,7 +171,7 @@ mod tests {
         )
     }
 
-    async fn create_temp_db() -> (sqlx::PgPool, sqlx::PgPool, String) {
+    pub async fn create_temp_db() -> (sqlx::PgPool, sqlx::PgPool, String) {
         let (admin_url, db_url, db_name) = temp_db_urls();
         let admin = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
@@ -211,7 +211,7 @@ mod tests {
         (admin, pool, db_name)
     }
 
-    async fn drop_temp_db(admin: sqlx::PgPool, pool: sqlx::PgPool, db_name: &str) {
+    pub async fn drop_temp_db(admin: sqlx::PgPool, pool: sqlx::PgPool, db_name: &str) {
         pool.close().await;
         sqlx::query(
             "SELECT pg_terminate_backend(pid)
@@ -230,7 +230,7 @@ mod tests {
         admin.close().await;
     }
 
-    async fn insert_self_heal_task(
+    pub async fn insert_self_heal_task(
         pg: &sqlx::PgPool,
         bug_signature: &str,
         status: &str,
@@ -261,6 +261,13 @@ mod tests {
         .expect("insert self-heal task");
         row.get("id")
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_helpers::*;
+    use super::*;
+    use std::env;
 
     #[tokio::test]
     async fn missing_signature_never_rearms() {
