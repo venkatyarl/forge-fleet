@@ -4122,6 +4122,7 @@ struct DeployTarget {
     ssh_user: String,
     ssh_port: i32,
     os_family: String,
+    arch: String,
     total_ram_gb: i32,
     source_tree_path: String,
 }
@@ -4183,6 +4184,66 @@ fn expand_home(raw: &str) -> String {
 const LEADER_SOURCE_TREE: &str = "~/projects/forge-fleet";
 const CANONICAL_WORKER_SOURCE_TREE: &str = "~/.forgefleet/sub-agents/sub-agent-0/forge-fleet";
 
+/// Install + restart commands used by both the full build playbook and the
+/// binary-ship receiver path. Assumes `target/release/forgefleetd` and
+/// `target/release/ff` are already present in the source tree.
+fn deploy_install_restart_playbook(os_family: &str) -> String {
+    match os_family {
+        // macOS: install + codesign, then restart via launchd. CRITICAL: kill
+        // ALL forgefleetd FIRST, including non-launchd ORPHANS. `launchctl
+        // kickstart -k` only restarts the *managed* job, so a stray bare
+        // `forgefleetd` (e.g. from an old nohup fallback) survives every deploy
+        // and squats the gateway port (:51002) — the managed daemon then runs
+        // but can't bind, so /health is dead and `ff fleet versions --live`
+        // reports the node unreachable (ace had a 2-day-old orphan, 2026-06-25).
+        // After the pre-kill, launchd brings up exactly ONE daemon on the fresh
+        // binary; RESTART_DUP flags it loudly if somehow >1 survive.
+        "macos" => format!(
+            "install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
+             install -m 755 target/release/ff ~/.local/bin/ff && \
+             codesign --force --sign - ~/.local/bin/forgefleetd && \
+             codesign --force --sign - ~/.local/bin/ff && \
+             ( install -m 755 target/release/ff ~/.cargo/bin/ff 2>/dev/null && codesign --force --sign - ~/.cargo/bin/ff 2>/dev/null ) || true; \
+             USER_ID=$(stat -f %u \"$HOME\" 2>/dev/null || id -u); \
+             for p in $(pgrep -x forgefleetd); do kill -TERM \"$p\" 2>/dev/null; done; sleep 2; \
+             for p in $(pgrep -x forgefleetd); do kill -KILL \"$p\" 2>/dev/null; done; \
+             launchctl kickstart -k \"gui/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
+               || launchctl kickstart -k \"user/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
+               || ( nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
+                    </dev/null >/tmp/forgefleetd.log 2>&1 & disown ); \
+             sleep 4; ~/.local/bin/ff model resume-from-build 2>/dev/null || true; \
+             RN=$(pgrep -x forgefleetd 2>/dev/null | wc -l | tr -d ' '); \
+             echo \"RESTART_VERIFY count=$RN (macos: launchd-managed, orphans cleared)\"; \
+             [ \"$RN\" -le 1 ] || echo \"RESTART_DUP: $RN forgefleetd running — orphan not cleared\" >&2"
+        ),
+        // linux + linux-dgx share the same restart idiom; only -j differs
+        // (folded into cargo_build in the build playbook). Prefer the systemd
+        // user unit; the fallback kills the running daemon by PID *excluding
+        // this shell* ($$) — a `pkill -f forgefleetd...` would also match (and
+        // kill) THIS deploy command's own SSH shell, which exited it 255 before
+        // the restart ran.
+        _ => format!(
+            "install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
+             install -m 755 target/release/ff ~/.local/bin/ff && \
+             install -m 755 target/release/ff ~/.cargo/bin/ff 2>/dev/null || true; \
+             export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
+             systemctl --user stop forgefleetd.service 2>/dev/null; \
+             for p in $(pgrep -x forgefleetd); do kill -TERM \"$p\" 2>/dev/null; done; sleep 2; \
+             for p in $(pgrep -x forgefleetd); do kill -KILL \"$p\" 2>/dev/null; done; \
+             ( systemctl --user reset-failed forgefleetd.service 2>/dev/null; \
+               systemctl --user start forgefleetd.service 2>/dev/null ) \
+               || ( nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
+                    </dev/null >/tmp/forgefleetd.log 2>&1 & disown ); \
+             sleep 4; ~/.local/bin/ff model resume-from-build 2>/dev/null || true; \
+             RP=$(pgrep -x forgefleetd | head -1); RN=$(pgrep -x forgefleetd 2>/dev/null | wc -l | tr -d ' '); \
+             RE=$(readlink /proc/$RP/exe 2>/dev/null); \
+             echo \"RESTART_VERIFY count=$RN exe=$RE\"; \
+             case \"$RE\" in *'(deleted)'*) echo 'RESTART_STALE: running deleted inode' >&2; exit 7;; esac; \
+             [ \"$RN\" -ge 1 ] || {{ echo 'RESTART_DOWN: no forgefleetd running' >&2; exit 8; }}"
+        ),
+    }
+}
+
 fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
     let src = expand_home(source_tree_path);
     // -p forge-fleet builds the forgefleetd daemon bin; -p ff-terminal builds
@@ -4205,65 +4266,27 @@ fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
         )
     };
 
-    match os_family {
-        // macOS: install + codesign, then restart via launchd. CRITICAL: kill
-        // ALL forgefleetd FIRST, including non-launchd ORPHANS. `launchctl
-        // kickstart -k` only restarts the *managed* job, so a stray bare
-        // `forgefleetd` (e.g. from an old nohup fallback) survives every deploy
-        // and squats the gateway port (:51002) — the managed daemon then runs
-        // but can't bind, so /health is dead and `ff fleet versions --live`
-        // reports the node unreachable (ace had a 2-day-old orphan, 2026-06-25).
-        // After the pre-kill, launchd brings up exactly ONE daemon on the fresh
-        // binary; RESTART_DUP flags it loudly if somehow >1 survive.
-        "macos" => format!(
-            ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
-             {git_sync} && \
-             {cargo_build} && \
-             install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
-             install -m 755 target/release/ff ~/.local/bin/ff && \
-             codesign --force --sign - ~/.local/bin/forgefleetd && \
-             codesign --force --sign - ~/.local/bin/ff && \
-             ( install -m 755 target/release/ff ~/.cargo/bin/ff 2>/dev/null && codesign --force --sign - ~/.cargo/bin/ff 2>/dev/null ) || true; \
-             USER_ID=$(stat -f %u \"$HOME\" 2>/dev/null || id -u); \
-             for p in $(pgrep -x forgefleetd); do kill -TERM \"$p\" 2>/dev/null; done; sleep 2; \
-             for p in $(pgrep -x forgefleetd); do kill -KILL \"$p\" 2>/dev/null; done; \
-             launchctl kickstart -k \"gui/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
-               || launchctl kickstart -k \"user/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
-               || ( nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
-                    </dev/null >/tmp/forgefleetd.log 2>&1 & disown ); \
-             sleep 4; ~/.local/bin/ff model resume-from-build 2>/dev/null || true; \
-             RN=$(pgrep -x forgefleetd 2>/dev/null | wc -l | tr -d ' '); \
-             echo \"RESTART_VERIFY count=$RN (macos: launchd-managed, orphans cleared)\"; \
-             [ \"$RN\" -le 1 ] || echo \"RESTART_DUP: $RN forgefleetd running — orphan not cleared\" >&2"
-        ),
-        // linux + linux-dgx share the same restart idiom; only -j differs
-        // (folded into cargo_build above). Prefer the systemd user unit; the
-        // fallback kills the running daemon by PID *excluding this shell* ($$)
-        // — a `pkill -f forgefleetd...` would also match (and kill) THIS deploy
-        // command's own SSH shell, which exited it 255 before the restart ran.
-        _ => format!(
-            ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
-             {git_sync} && \
-             {cargo_build} && \
-             install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
-             install -m 755 target/release/ff ~/.local/bin/ff && \
-             install -m 755 target/release/ff ~/.cargo/bin/ff 2>/dev/null || true; \
-             export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
-             systemctl --user stop forgefleetd.service 2>/dev/null; \
-             for p in $(pgrep -x forgefleetd); do kill -TERM \"$p\" 2>/dev/null; done; sleep 2; \
-             for p in $(pgrep -x forgefleetd); do kill -KILL \"$p\" 2>/dev/null; done; \
-             ( systemctl --user reset-failed forgefleetd.service 2>/dev/null; \
-               systemctl --user start forgefleetd.service 2>/dev/null ) \
-               || ( nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
-                    </dev/null >/tmp/forgefleetd.log 2>&1 & disown ); \
-             sleep 4; ~/.local/bin/ff model resume-from-build 2>/dev/null || true; \
-             RP=$(pgrep -x forgefleetd | head -1); RN=$(pgrep -x forgefleetd 2>/dev/null | wc -l | tr -d ' '); \
-             RE=$(readlink /proc/$RP/exe 2>/dev/null); \
-             echo \"RESTART_VERIFY count=$RN exe=$RE\"; \
-             case \"$RE\" in *'(deleted)'*) echo 'RESTART_STALE: running deleted inode' >&2; exit 7;; esac; \
-             [ \"$RN\" -ge 1 ] || {{ echo 'RESTART_DOWN: no forgefleetd running' >&2; exit 8; }}"
-        ),
-    }
+    let install_restart = deploy_install_restart_playbook(os_family);
+    format!(
+        ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
+         cd \"{src}\" && \
+         {git_sync} && \
+         {cargo_build} && \
+         {install_restart}"
+    )
+}
+
+/// Receiver-side playbook: install + restart only. The caller must have already
+/// copied `target/release/forgefleetd` and `target/release/ff` into the
+/// receiver's source tree (or any directory we can `cd` into).
+fn deploy_receiver_playbook(os_family: &str, source_tree_path: &str) -> String {
+    let src = expand_home(source_tree_path);
+    let install_restart = deploy_install_restart_playbook(os_family);
+    format!(
+        ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
+         cd \"{src}\" && \
+         {install_restart}"
+    )
 }
 
 /// Build + install + restart forgefleetd/ff for the LEADER, run LOCALLY on the
@@ -4446,11 +4469,140 @@ async fn deploy_ssh(
     }
 }
 
+/// Probe a target's CPU architecture over SSH. `uname -m` is accurate across
+/// the supported fleet (x86_64 Linux/Mac, aarch64 Linux/Mac/GB10) and avoids
+/// adding a DB column just for deploy grouping.
+async fn detect_target_arch(t: &DeployTarget) -> Option<String> {
+    let (code, stdout, _stderr) = deploy_ssh(t, "uname -m", 30).await;
+    if code == 0 {
+        let arch = stdout.lines().next().unwrap_or("").trim();
+        if !arch.is_empty() {
+            return Some(arch.to_string());
+        }
+    }
+    None
+}
+
+/// Copy the two release binaries from `builder`'s source tree to `receiver`'s
+/// source tree, routing through the local leader. Returns (0, _, _) on success.
+async fn scp_binaries_from_builder(
+    builder: &DeployTarget,
+    receiver: &DeployTarget,
+) -> (i32, String, String) {
+    let builder_ip = match ff_agent::fleet_info::resolve_best_ip(&builder.name).await {
+        Some((ip, _)) => ip,
+        None => builder.primary_ip.clone(),
+    };
+    let receiver_ip = match ff_agent::fleet_info::resolve_best_ip(&receiver.name).await {
+        Some((ip, _)) => ip,
+        None => receiver.primary_ip.clone(),
+    };
+    let builder_src = expand_home(&builder.source_tree_path);
+    let receiver_dst = expand_home(&receiver.source_tree_path);
+
+    let temp_dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => return (-1, String::new(), format!("tempdir: {e}")),
+    };
+    let local_forgefleetd = temp_dir.path().join("forgefleetd");
+    let local_ff = temp_dir.path().join("ff");
+
+    let run_scp = |args: Vec<String>| async move {
+        let mut cmd = tokio::process::Command::new("scp");
+        cmd.arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=accept-new")
+            .arg("-o")
+            .arg("ConnectTimeout=10");
+        for a in args {
+            cmd.arg(a);
+        }
+        match cmd.output().await {
+            Ok(out) if out.status.success() => (0, String::new(), String::new()),
+            Ok(out) => (
+                out.status.code().unwrap_or(-1),
+                String::new(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            ),
+            Err(e) => (-1, String::new(), format!("spawn: {e}")),
+        }
+    };
+
+    // Pull builder's freshly-built binaries to a local temp dir.
+    let builder_addr = format!(
+        "{}@{}:{}/target/release/",
+        builder.ssh_user, builder_ip, builder_src
+    );
+    let (code, _, err) = run_scp(vec![
+        "-P".to_string(),
+        builder.ssh_port.to_string(),
+        format!("{}forgefleetd", builder_addr),
+        format!("{}ff", builder_addr),
+        local_forgefleetd
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .to_string(),
+    ])
+    .await;
+    if code != 0 {
+        return (code, String::new(), format!("scp pull from builder: {err}"));
+    }
+
+    // Ensure the receiver's target/release directory exists.
+    let mkdir_remote = format!("{}@{}", receiver.ssh_user, receiver_ip);
+    let mkdir_cmd = format!("mkdir -p {}/target/release", receiver_dst);
+    let mut mkdir = tokio::process::Command::new("ssh");
+    mkdir
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-p")
+        .arg(receiver.ssh_port.to_string())
+        .arg(&mkdir_remote)
+        .arg(&mkdir_cmd);
+    match mkdir.output().await {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            return (
+                out.status.code().unwrap_or(-1),
+                String::new(),
+                format!(
+                    "mkdir receiver target dir: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            );
+        }
+        Err(e) => return (-1, String::new(), format!("mkdir receiver target dir: {e}")),
+    }
+
+    // Push binaries into the receiver's source tree.
+    let (code, _, err) = run_scp(vec![
+        "-P".to_string(),
+        receiver.ssh_port.to_string(),
+        local_forgefleetd.to_string_lossy().to_string(),
+        local_ff.to_string_lossy().to_string(),
+        format!(
+            "{}@{}:{}/target/release/",
+            receiver.ssh_user, receiver_ip, receiver_dst
+        ),
+    ])
+    .await;
+    if code != 0 {
+        return (code, String::new(), format!("scp push to receiver: {err}"));
+    }
+
+    (0, String::new(), String::new())
+}
+
 /// Deploy the full forgefleetd + ff playbook to one target, then verify
 /// convergence by reading the RUNNING binary SHA. Never panics — every
 /// failure mode collapses into a `DeployResult { ok: false, .. }`.
 async fn deploy_one_host(t: DeployTarget) -> DeployResult {
-    use ff_core::build_version::BuildVersion;
     let start = std::time::Instant::now();
     let tight = t.total_ram_gb > 0 && t.total_ram_gb <= MEMORY_TIGHT_RAM_GB;
     let timeout_secs = if tight {
@@ -4491,15 +4643,64 @@ async fn deploy_one_host(t: DeployTarget) -> DeployResult {
         };
     }
 
-    // 3) Convergence = RUNNING binary. Give the freshly-restarted daemon a
-    //    moment, then read its version SHA. We read forgefleetd (the daemon
-    //    we just bounced) so the SHA reflects the running process, not just
-    //    the on-disk binary.
-    // The version-probe over SSH can transiently fail (exit 255 — a host-key
-    // "Warning: Permanently added …" on first connect, or a flaky link), which
-    // would mark a SUCCESSFUL build+restart as a scary ✗ "version unparsable".
-    // Retry a few times and strip SSH warning noise before parsing. `tail -3`
-    // (not `head -1`) so a leading warning line doesn't hide the version.
+    verify_deploy_convergence(t, start).await
+}
+
+/// Receiver path: ship the builder's binaries over and run only the
+/// install+restart portion of the playbook. If the ship or the receiver
+/// install fails, fall back to a full self-build on this node.
+async fn deploy_receiver(receiver: DeployTarget, builder: DeployTarget) -> DeployResult {
+    let start = std::time::Instant::now();
+    let timeout_secs = DEPLOY_TIMEOUT_ROOMY_SECS;
+
+    let (scp_code, _scp_out, scp_err) = scp_binaries_from_builder(&builder, &receiver).await;
+    let mut ship_ok = scp_code == 0;
+    let mut fallback_reason = String::new();
+
+    if ship_ok {
+        let playbook = deploy_receiver_playbook(&receiver.os_family, &receiver.source_tree_path);
+        let (code, _stdout, stderr) = deploy_ssh(&receiver, &playbook, timeout_secs).await;
+        if code != 0 {
+            ship_ok = false;
+            let snippet: String = stderr
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect();
+            fallback_reason = format!("receiver install exit {code}: {snippet}");
+        }
+    } else {
+        fallback_reason = format!("binary ship failed: {scp_err}");
+    }
+
+    if ship_ok {
+        return verify_deploy_convergence(receiver, start).await;
+    }
+
+    // Fall back to a full self-build.
+    let fb = deploy_one_host(receiver).await;
+    DeployResult {
+        name: fb.name,
+        ok: fb.ok,
+        sha: fb.sha,
+        secs: start.elapsed().as_secs_f64(),
+        detail: format!("{}; fallback: {}", fallback_reason, fb.detail),
+    }
+}
+
+/// Convergence = RUNNING binary. Give the freshly-restarted daemon a moment,
+/// then read its version SHA. We read forgefleetd (the daemon we just bounced)
+/// so the SHA reflects the running process, not just the on-disk binary.
+/// The version-probe over SSH can transiently fail (exit 255 — a host-key
+/// "Warning: Permanently added …" on first connect, or a flaky link), which
+/// would mark a SUCCESSFUL build+restart as a scary ✗ "version unparsable".
+/// Retry a few times and strip SSH warning noise before parsing. `tail -3`
+/// (not `head -1`) so a leading warning line doesn't hide the version.
+async fn verify_deploy_convergence(t: DeployTarget, start: std::time::Instant) -> DeployResult {
+    use ff_core::build_version::BuildVersion;
     let mut raw = String::new();
     for attempt in 0..3 {
         let (vcode, vout, verr) = deploy_ssh(
@@ -4544,6 +4745,75 @@ async fn deploy_one_host(t: DeployTarget) -> DeployResult {
     }
 }
 
+/// One (os_family, arch) group's deploy plan: a single builder compiles the
+/// release binaries; every other member receives them via scp.
+#[derive(Clone)]
+struct GroupPlan {
+    builder: DeployTarget,
+    receivers: Vec<DeployTarget>,
+}
+
+/// Execute one group's deploy: build once on the builder, then ship binaries to
+/// each receiver. If the builder fails, every receiver falls back to a full
+/// self-build. Concurrency is gated by `sem` so expensive builds contend for
+/// slots the same way the old per-host deploy did.
+async fn deploy_group(
+    plan: GroupPlan,
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
+) -> Vec<DeployResult> {
+    let builder_permit = sem.acquire().await.unwrap_or_else(|_| {
+        // The semaphore is never closed; this branch keeps the compiler happy.
+        std::process::exit(1)
+    });
+    let builder_res = deploy_one_host(plan.builder.clone()).await;
+    drop(builder_permit);
+
+    if !builder_res.ok {
+        // Builder failed: nothing safe to ship. Every receiver self-builds.
+        let mut results = vec![builder_res];
+        let mut handles: Vec<tokio::task::JoinHandle<DeployResult>> = Vec::new();
+        for r in plan.receivers {
+            let s = sem.clone();
+            handles.push(tokio::spawn(async move {
+                let _p = s.acquire().await.unwrap();
+                deploy_one_host(r).await
+            }));
+        }
+        for h in handles {
+            results.push(h.await.unwrap_or_else(|e| DeployResult {
+                name: "?".into(),
+                ok: false,
+                sha: "-".into(),
+                secs: 0.0,
+                detail: format!("fallback task join error: {e}"),
+            }));
+        }
+        return results;
+    }
+
+    // Builder succeeded: distribute its binaries to receivers.
+    let mut results = vec![builder_res];
+    let mut handles: Vec<tokio::task::JoinHandle<DeployResult>> = Vec::new();
+    for r in plan.receivers {
+        let s = sem.clone();
+        let b = plan.builder.clone();
+        handles.push(tokio::spawn(async move {
+            let _p = s.acquire().await.unwrap();
+            deploy_receiver(r, b).await
+        }));
+    }
+    for h in handles {
+        results.push(h.await.unwrap_or_else(|e| DeployResult {
+            name: "?".into(),
+            ok: false,
+            sha: "-".into(),
+            secs: 0.0,
+            detail: format!("receiver task join error: {e}"),
+        }));
+    }
+    results
+}
+
 /// Pick the version-looking line out of an SSH probe's output, dropping the
 /// host-key / pseudo-terminal warnings SSH emits to the same stream. Returns the
 /// first non-warning, non-empty line (BuildVersion::parse is the real validator,
@@ -4562,16 +4832,19 @@ fn clean_version_line(out: &str) -> String {
         .to_string()
 }
 
-/// `ff fleet deploy --all | --node <name>` — fast PARALLEL self-built deploy.
+/// `ff fleet deploy --all | --node <name>` — grouped build-once, ship-many deploy.
 ///
 /// Additive alternative to the `ff tasks compose-fleet-upgrade` wave. Targets
 /// resolve from Postgres (`computers` ⋈ `fleet_workers`); `--all` selects every
 /// ONLINE non-leader computer (the leader is excluded — it restarts itself
-/// badly). Each target runs the deploy playbook over SSH concurrently (bounded
-/// by --concurrency, default 6); memory-tight hosts (total_ram_gb ≤ 40) get a
-/// `ff model free-for-build` first and a 45-min timeout. After restart we read
-/// each host's RUNNING forgefleetd SHA and report per-host ok/fail + SHA +
-/// duration, then a convergence summary.
+/// badly). Targets are grouped by (os_family, arch); each group builds ONCE on
+/// a designated builder, then scp's `target/release/forgefleetd` and `ff` to the
+/// remaining receivers and runs only the install+restart portion there. If the
+/// ship fails or no same-arch builder exists, the receiver falls back to a full
+/// self-build. Concurrency is bounded by `--concurrency` (default 6); memory-
+/// tight hosts (total_ram_gb ≤ 40) get a `ff model free-for-build` first and a
+/// 45-min timeout. After restart we read each host's RUNNING forgefleetd SHA
+/// and report per-host ok/fail + SHA + duration, then a convergence summary.
 /// Stamp/clear the presence-alert mute window
 /// (`fleet_secrets.alert_mute_until`, epoch seconds). While `NOW()` is inside
 /// the stamp, the leader's alert evaluator skips beat-age/heartbeat/status
@@ -4604,8 +4877,6 @@ async fn handle_fleet_deploy(
     concurrency: usize,
     json: bool,
 ) -> Result<()> {
-    use futures::stream::{FuturesUnordered, StreamExt};
-
     if !all && node.is_none() {
         anyhow::bail!("pass --all or --node <name> to pick targets");
     }
@@ -4617,7 +4888,7 @@ async fn handle_fleet_deploy(
     // Resolve targets. Both shapes pull the same columns; --all filters to
     // online non-leader, --node matches one host by name or IP (leader
     // allowed — the only way to deploy the leader).
-    let targets: Vec<DeployTarget> = if all {
+    let mut targets: Vec<DeployTarget> = if all {
         sqlx::query_as::<_, (String, String, String, i32, String, i32, Option<String>)>(
             "SELECT c.name,
                     c.primary_ip,
@@ -4646,6 +4917,7 @@ async fn handle_fleet_deploy(
                 ssh_user,
                 ssh_port,
                 os_family,
+                arch: String::new(),
                 total_ram_gb,
                 source_tree_path: stp.unwrap_or_else(|| CANONICAL_WORKER_SOURCE_TREE.into()),
             },
@@ -4678,6 +4950,7 @@ async fn handle_fleet_deploy(
                     ssh_user,
                     ssh_port,
                     os_family,
+                    arch: String::new(),
                     total_ram_gb,
                     source_tree_path: stp.unwrap_or_else(|| CANONICAL_WORKER_SOURCE_TREE.into()),
                 }]
@@ -4730,24 +5003,68 @@ async fn handle_fleet_deploy(
         return Ok(());
     }
 
+    // Detect CPU architecture for each target so we can group by
+    // (os_family, arch) and build once per group. Missing detection is
+    // non-fatal: the host lands in an "unknown" group and self-builds.
+    let arch_by_name: std::collections::HashMap<String, String> =
+        futures::future::join_all(targets.iter().map(|t| async {
+            let arch = detect_target_arch(t)
+                .await
+                .unwrap_or_else(|| "unknown".to_string());
+            (t.name.clone(), arch)
+        }))
+        .await
+        .into_iter()
+        .collect();
+    for t in &mut targets {
+        if let Some(a) = arch_by_name.get(&t.name) {
+            t.arch.clone_from(a);
+        }
+    }
+
+    // Group targets by (os_family, arch). One build per group is executed on a
+    // designated builder; binaries are then scp'd to the remaining receivers.
+    let mut groups: std::collections::HashMap<(String, String), Vec<DeployTarget>> =
+        std::collections::HashMap::new();
+    for t in targets {
+        groups
+            .entry((t.os_family.clone(), t.arch.clone()))
+            .or_default()
+            .push(t);
+    }
+    let mut plans: Vec<GroupPlan> = groups
+        .into_values()
+        .map(|mut hosts| {
+            // Prefer a roomy builder so memory-tight boxes stay available as
+            // receivers (they only run the cheap install+restart path).
+            let builder_idx = hosts
+                .iter()
+                .position(|t| !(t.total_ram_gb > 0 && t.total_ram_gb <= MEMORY_TIGHT_RAM_GB))
+                .unwrap_or(0);
+            let builder = hosts.swap_remove(builder_idx);
+            GroupPlan {
+                builder,
+                receivers: hosts,
+            }
+        })
+        .collect();
+    plans.sort_by(|a, b| a.builder.name.cmp(&b.builder.name));
+
     if !json {
+        let total_targets = plans.iter().map(|p| 1 + p.receivers.len()).sum::<usize>();
         eprintln!(
-            "{CYAN}▶ ff fleet deploy{RESET}: {} target(s), up to {} building in parallel",
-            targets.len(),
-            concurrency.min(targets.len())
+            "{CYAN}▶ ff fleet deploy{RESET}: {} target(s) across {} group(s), up to {} in parallel",
+            total_targets,
+            plans.len(),
+            concurrency
         );
-        for t in &targets {
-            let tight = t.total_ram_gb > 0 && t.total_ram_gb <= MEMORY_TIGHT_RAM_GB;
+        for p in &plans {
+            let label = format!("{}+{}", p.builder.os_family, p.builder.arch);
             eprintln!(
-                "  {:<12} {:<10} {:>3}GB{}",
-                t.name,
-                t.os_family,
-                t.total_ram_gb,
-                if tight {
-                    " (memory-tight: free-for-build + 45m timeout)"
-                } else {
-                    ""
-                }
+                "  group {:<18} builder={:<12} receivers={}",
+                label,
+                p.builder.name,
+                p.receivers.len()
             );
         }
         report_skipped_hosts(&skipped);
@@ -4761,34 +5078,49 @@ async fn handle_fleet_deploy(
     // if this process dies mid-deploy.
     set_alert_mute(pool, 50 * 60).await;
 
-    // Drive the deploys with bounded concurrency: keep at most `concurrency`
-    // hosts building at once, refilling as each completes.
-    let mut iter = targets.into_iter();
-    let mut inflight = FuturesUnordered::new();
-    for _ in 0..concurrency {
-        if let Some(t) = iter.next() {
-            inflight.push(deploy_one_host(t));
-        }
+    // Drive deploys with bounded global concurrency. Each group builds once on
+    // its builder, then ships binaries to receivers. Builder failures cause
+    // receivers to fall back to self-build.
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut handles: Vec<tokio::task::JoinHandle<Vec<DeployResult>>> = Vec::new();
+    for plan in plans {
+        let s = sem.clone();
+        handles.push(tokio::spawn(async move { deploy_group(plan, s).await }));
     }
     let mut results: Vec<DeployResult> = Vec::new();
-    while let Some(res) = inflight.next().await {
-        if !json {
-            let mark = if res.ok {
+    for h in handles {
+        match h.await {
+            Ok(group_results) => {
+                results.extend(group_results);
+            }
+            Err(e) => {
+                eprintln!("{YELLOW}⚠ deploy group task failed: {e}{RESET}");
+                results.push(DeployResult {
+                    name: "?".into(),
+                    ok: false,
+                    sha: "-".into(),
+                    secs: 0.0,
+                    detail: format!("task join error: {e}"),
+                });
+            }
+        }
+    }
+    results.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Replay per-host completion lines now that all groups are done.
+    if !json {
+        for r in &results {
+            let mark = if r.ok {
                 format!("{GREEN}✓{RESET}")
             } else {
                 format!("{RED}✗{RESET}")
             };
             eprintln!(
                 "  {mark} {:<12} {:<10} {:>6.0}s  {}",
-                res.name, res.sha, res.secs, res.detail
+                r.name, r.sha, r.secs, r.detail
             );
         }
-        results.push(res);
-        if let Some(t) = iter.next() {
-            inflight.push(deploy_one_host(t));
-        }
     }
-    results.sort_by(|a, b| a.name.cmp(&b.name));
 
     // Deploys done (daemons restarted + beating again) — lift the presence-
     // alert mute rather than letting the 50min stamp ride out.
