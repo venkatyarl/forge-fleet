@@ -654,4 +654,47 @@ mod tests {
         let parsed: PulseBeatV2 = serde_json::from_str(&json).expect("deserialize older beat");
         assert!(parsed.receivers.is_empty());
     }
+
+    /// Cross-generation compat contract (the 2026-07-19 mixed-fleet incident:
+    /// receivers on an older binary must parse beats from newer senders and
+    /// vice versa during a rolling deploy).
+    ///
+    /// Backward: a beat JSON written by an OLDER daemon — i.e. with every
+    /// `#[serde(default)]`-guarded later-generation field absent — must still
+    /// deserialize. Forward: a beat carrying an unknown future field must also
+    /// deserialize (serde ignores unknown keys by default; this pins that no
+    /// `deny_unknown_fields` ever sneaks onto the struct).
+    #[test]
+    fn beat_deserializes_across_schema_generations() {
+        let beat = PulseBeatV2::skeleton("sia");
+        let mut json: serde_json::Value = serde_json::to_value(&beat).expect("to_value");
+        let obj = json.as_object_mut().expect("beat serializes to an object");
+
+        // Older-generation sender: later added-with-default fields absent.
+        for later_field in [
+            "os",
+            "build_sha",
+            "source_tree_path",
+            "multi_host_participation",
+            "encountered_bugs",
+            "local_tasks",
+            "receivers",
+        ] {
+            obj.remove(later_field);
+        }
+        let parsed: PulseBeatV2 =
+            serde_json::from_value(json.clone()).expect("older-format beat must deserialize");
+        assert_eq!(parsed.computer_name, "sia");
+        assert!(parsed.encountered_bugs.is_empty());
+        assert!(parsed.build_sha.is_none());
+
+        // Newer-generation sender: an unknown field must be ignored, not fatal.
+        json.as_object_mut().unwrap().insert(
+            "field_from_the_future".into(),
+            serde_json::json!({"nested": true}),
+        );
+        let parsed: PulseBeatV2 =
+            serde_json::from_value(json).expect("beat with unknown future field must deserialize");
+        assert_eq!(parsed.pulse_protocol_version, 2);
+    }
 }
