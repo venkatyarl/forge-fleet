@@ -1,13 +1,14 @@
 //! Node hardware capability flags for HA decision tables.
 //!
 //! Provides a small, serializable snapshot of accelerator presence (NPU / iGPU)
-//! that HA orchestration and decision-table routing can query without
-//! depending on the full ff-core hardware profile.
+//! and CPU feature flags (AVX2, AVX-512, etc.) that HA orchestration and
+//! decision-table routing can query without depending on the full ff-core
+//! hardware profile.
 
 use serde::{Deserialize, Serialize};
 
 /// Detected node hardware capability flags.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeInfo {
     /// Whether a Neural Processing Unit (discrete or integrated) is present.
     pub has_npu: bool,
@@ -18,15 +19,20 @@ pub struct NodeInfo {
     /// (Apple Silicon, NVIDIA GB10/DGX Spark reporting `N/A`, AMD APUs) whose
     /// pool is system RAM rather than dedicated VRAM.
     pub gpu_total_vram_gb: Option<f64>,
+    /// CPU feature flags relevant to ML inference routing, normalized to
+    /// lowercase (e.g. `avx2`, `avx512f`, `avx512vnni`). Empty on platforms
+    /// where flag probing is not implemented.
+    pub cpu_flags: Vec<String>,
 }
 
 impl NodeInfo {
-    /// Detect NPU/iGPU presence and total GPU VRAM on the current node.
+    /// Detect NPU/iGPU presence, total GPU VRAM, and CPU flags on the current node.
     pub fn detect() -> Self {
         Self {
             has_npu: detect_npu(),
             has_igpu: detect_igpu(),
             gpu_total_vram_gb: detect_gpu_total_vram_gb(),
+            cpu_flags: detect_cpu_flags(),
         }
     }
 }
@@ -53,6 +59,59 @@ fn detect_npu() -> bool {
     {
         false
     }
+}
+
+/// Detect CPU feature flags relevant to ML inference routing.
+fn detect_cpu_flags() -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        return std::fs::read_to_string("/proc/cpuinfo")
+            .map(|content| parse_linux_cpu_flags(&content))
+            .unwrap_or_default();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut flags = Vec::new();
+        if let Some(out) = run_command("sysctl", &["-n", "machdep.cpu.features"]) {
+            flags.extend(normalize_cpu_flags(&out));
+        }
+        if let Some(out) = run_command("sysctl", &["-n", "machdep.cpu.leaf7_features"]) {
+            flags.extend(normalize_cpu_flags(&out));
+        }
+        return flags;
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Vec::new()
+    }
+}
+
+/// Parse the `flags` line from `/proc/cpuinfo` output.
+#[cfg(target_os = "linux")]
+fn parse_linux_cpu_flags(cpuinfo: &str) -> Vec<String> {
+    cpuinfo
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .starts_with("flags")
+                .then(|| trimmed.split(':').nth(1).map(|s| s.to_string()))
+                .flatten()
+        })
+        .map(|flags| normalize_cpu_flags(&flags))
+        .unwrap_or_default()
+}
+
+/// Normalize raw CPU feature strings to lowercase, deduplicate, and sort.
+fn normalize_cpu_flags(raw: &str) -> Vec<String> {
+    let set: std::collections::BTreeSet<String> = raw
+        .split_whitespace()
+        .map(|s| s.to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    set.into_iter().collect()
 }
 
 fn detect_igpu() -> bool {
@@ -252,6 +311,27 @@ mod tests {
         let _ = info.has_npu;
         let _ = info.has_igpu;
         let _ = info.gpu_total_vram_gb;
+        let _ = info.cpu_flags;
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn parse_linux_cpu_flags_extracts_flags() {
+        let cpuinfo = "processor\t: 0\nflags\t\t: fpu vme de pse avx2 avx512f avx512vnni\n";
+        assert_eq!(
+            parse_linux_cpu_flags(cpuinfo),
+            vec!["avx2", "avx512f", "avx512vnni", "de", "fpu", "pse", "vme"]
+        );
+        assert!(parse_linux_cpu_flags("").is_empty());
+    }
+
+    #[test]
+    fn normalize_cpu_flags_lowercases_dedups_and_sorts() {
+        assert_eq!(
+            normalize_cpu_flags("AVX2 avx2 FMA fma AVX512F"),
+            vec!["avx2", "avx512f", "fma"]
+        );
+        assert!(normalize_cpu_flags("  ").is_empty());
     }
 
     #[test]
@@ -330,5 +410,13 @@ Agent 2
         assert!(!detect_igpu_linux(
             "01:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 33 [Radeon RX 7600M XT]"
         ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn detect_cpu_flags_does_not_panic_on_linux() {
+        let flags = detect_cpu_flags();
+        // Result is host-dependent; just ensure it is well-formed.
+        let _ = flags.len();
     }
 }
