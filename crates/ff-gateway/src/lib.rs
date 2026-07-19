@@ -23,6 +23,7 @@ pub mod nats;
 pub mod onboard;
 pub mod orchestrate;
 pub mod orchestrator_adapter;
+pub mod pgcat_config;
 pub mod pulse_api;
 pub mod router;
 pub mod screen_ctrl;
@@ -45,6 +46,7 @@ pub use message::{
     Channel, IncomingMessage, MessageButton, MessageMedia, MessageMediaKind, OutgoingMessage,
     ParsedCommand, Reaction, ReactionAction,
 };
+pub use pgcat_config::{PgcatConfig, PgcatConfigError, ServerRole, parse_postgres_url};
 pub use router::{MessageRouter, RouteTarget, RoutedMessage, ToolExecutionIntent};
 pub use server::{GatewayConfig, GatewayServer, GatewayState, build_router, run};
 pub use telegram::{TelegramClient, TelegramError};
