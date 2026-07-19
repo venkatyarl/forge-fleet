@@ -1,9 +1,12 @@
 //! Repair status tracking for HA sources.
 //!
 //! Tracks the lifecycle of repair actions, including the `src-offline` edge
-//! status used when a source becomes unavailable while a repair is in flight.
+//! status used when a source becomes unavailable while a repair is in flight,
+//! and operator-facing alerts ([`RepairAlert`]) that attach distinct
+//! remediation instructions to a repair's status display.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
 
 /// Lifecycle status of a repair action.
@@ -31,6 +34,21 @@ pub struct InvalidRepairTransition {
 }
 
 impl RepairStatus {
+    /// Stable display identifier, matching the serde wire form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RepairStatus::Proposed => "proposed",
+            RepairStatus::Approved => "approved",
+            RepairStatus::Applying => "applying",
+            RepairStatus::Applied => "applied",
+            RepairStatus::Verified => "verified",
+            RepairStatus::Failed => "failed",
+            RepairStatus::RolledBack => "rolled_back",
+            RepairStatus::Suppressed => "suppressed",
+            RepairStatus::SrcOffline => "src-offline",
+        }
+    }
+
     /// Returns true if `self` can transition to `next`.
     pub fn can_transition_to(self, next: RepairStatus) -> bool {
         matches!(
@@ -61,6 +79,59 @@ impl RepairStatus {
                 to: next,
             })
         }
+    }
+}
+
+impl fmt::Display for RepairStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Operator-facing alert attached to a repair that needs manual attention.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RepairAlert {
+    /// The remote host's SSH key no longer matches the recorded known_hosts
+    /// entry — repairs cannot proceed until the stale entry is replaced.
+    KeyChanged { host: String },
+}
+
+impl RepairAlert {
+    /// Classify raw SSH output for `host`, returning a `KeyChanged` alert
+    /// when it carries the distinct changed-key signature. A bare
+    /// "Host key verification failed." is NOT enough: that also fires for a
+    /// merely unknown host, so we require the identification-changed banner
+    /// or the "Offending ... key" known_hosts pointer.
+    pub fn from_ssh_output(host: &str, output: &str) -> Option<Self> {
+        let text = output.to_ascii_lowercase();
+        let changed = text.contains("remote host identification has changed")
+            || (text.contains("offending") && text.contains("key"));
+        changed.then(|| RepairAlert::KeyChanged {
+            host: host.to_string(),
+        })
+    }
+
+    /// Remediation instructions for this alert.
+    pub fn remediation(&self) -> String {
+        match self {
+            RepairAlert::KeyChanged { host } => format!(
+                "host key for {host} has changed — verify the change is expected \
+                 (reinstall/re-image?), then refresh known_hosts:\n  \
+                 ssh-keygen -R {host}\n  \
+                 ssh-keyscan -H {host} >> ~/.ssh/known_hosts"
+            ),
+        }
+    }
+}
+
+/// Render an operator-facing status line for a repair. With no alert the
+/// line is the bare status; a `KeyChanged` alert appends its distinct
+/// SSH-keygen remediation instructions.
+pub fn display_status(status: RepairStatus, alert: Option<&RepairAlert>) -> String {
+    match alert {
+        Some(alert) => format!("{status} — {}", alert.remediation()),
+        None => status.to_string(),
     }
 }
 
@@ -98,5 +169,79 @@ mod tests {
     fn deserializes_src_offline() {
         let status: RepairStatus = serde_json::from_str("\"src-offline\"").unwrap();
         assert_eq!(status, RepairStatus::SrcOffline);
+    }
+
+    #[test]
+    fn key_changed_detected_from_ssh_banner() {
+        let banner = "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+                      @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!    @\n\
+                      Offending ECDSA key in /home/op/.ssh/known_hosts:12\n\
+                      Host key verification failed.";
+        assert_eq!(
+            RepairAlert::from_ssh_output("node-7", banner),
+            Some(RepairAlert::KeyChanged {
+                host: "node-7".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn key_changed_detected_from_offending_key_line() {
+        let out = "Offending RSA key in /root/.ssh/known_hosts:3";
+        assert!(RepairAlert::from_ssh_output("node-7", out).is_some());
+    }
+
+    #[test]
+    fn plain_verification_failure_is_not_key_changed() {
+        // Fires for an unknown host too — must not classify as key-changed.
+        assert_eq!(
+            RepairAlert::from_ssh_output("node-7", "Host key verification failed."),
+            None
+        );
+        assert_eq!(
+            RepairAlert::from_ssh_output(
+                "node-7",
+                "ssh: connect to host node-7: Connection refused"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn key_changed_remediation_has_keygen_commands() {
+        let alert = RepairAlert::KeyChanged {
+            host: "192.168.5.108".to_string(),
+        };
+        let r = alert.remediation();
+        assert!(r.contains("ssh-keygen -R 192.168.5.108"));
+        assert!(r.contains("ssh-keyscan -H 192.168.5.108"));
+    }
+
+    #[test]
+    fn display_status_is_distinct_for_key_changed() {
+        let plain = display_status(RepairStatus::Failed, None);
+        assert_eq!(plain, "failed");
+
+        let alert = RepairAlert::KeyChanged {
+            host: "node-7".to_string(),
+        };
+        let with_alert = display_status(RepairStatus::Failed, Some(&alert));
+        assert_ne!(with_alert, plain);
+        assert!(with_alert.starts_with("failed — "));
+        assert!(with_alert.contains("ssh-keygen -R node-7"));
+    }
+
+    #[test]
+    fn key_changed_alert_serde_round_trip() {
+        let alert = RepairAlert::KeyChanged {
+            host: "node-7".to_string(),
+        };
+        let json = serde_json::to_value(&alert).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "key_changed", "host": "node-7"})
+        );
+        let back: RepairAlert = serde_json::from_value(json).unwrap();
+        assert_eq!(back, alert);
     }
 }
