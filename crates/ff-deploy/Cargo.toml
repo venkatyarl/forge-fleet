@@ -11,6 +11,7 @@ ff-core = { path = "../ff-core" }
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 uuid.workspace = true

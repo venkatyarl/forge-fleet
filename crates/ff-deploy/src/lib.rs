@@ -8,6 +8,7 @@
 //! - deployment orchestration interfaces (`deployer`)
 
 pub mod config;
+pub mod daemon;
 pub mod deployer;
 pub mod health_gate;
 pub mod release;
@@ -16,6 +17,7 @@ pub mod rollout;
 pub mod strategy;
 
 pub use config::DeployConfig;
+pub use daemon::{ActiveLease, RestartReport, restart_with_lease_drain};
 pub use deployer::{DeploymentAdapter, DeploymentOrchestrator, DeploymentReport, StepOutcome};
 pub use health_gate::{
     HealthGate, HealthGateConfig, HealthGateEvaluation, HealthGateStatus, HealthSnapshot,
