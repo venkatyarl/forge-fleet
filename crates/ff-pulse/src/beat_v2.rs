@@ -109,6 +109,12 @@ pub struct PulseBeatV2 {
     /// `fleet_tasks` table (forthcoming V44); this field is a liveness hint.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_tasks: Vec<LocalTaskSnapshot>,
+    /// Intended recipient computer names for targeted pulse routing. Empty
+    /// means no specific target (broadcast to all consumers). Older beats do
+    /// not include this field, so it defaults to empty for backward
+    /// compatibility during mixed-generation deployments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receivers: Vec<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -512,6 +518,7 @@ impl PulseBeatV2 {
             multi_host_participation: None,
             encountered_bugs: Vec::new(),
             local_tasks: Vec::new(),
+            receivers: Vec::new(),
         }
     }
 }
@@ -635,5 +642,16 @@ mod tests {
         assert!(parsed.multi_host_participation.is_none());
         assert!(parsed.encountered_bugs.is_empty());
         assert!(parsed.local_tasks.is_empty());
+    }
+
+    #[test]
+    fn beat_without_receivers_field_defaults_to_empty() {
+        let mut beat = PulseBeatV2::skeleton("marcus");
+        beat.receivers = vec!["node-a".to_string(), "node-b".to_string()];
+        let mut value = serde_json::to_value(&beat).expect("serialize");
+        value.as_object_mut().expect("object").remove("receivers");
+        let json = serde_json::to_string(&value).expect("re-serialize");
+        let parsed: PulseBeatV2 = serde_json::from_str(&json).expect("deserialize older beat");
+        assert!(parsed.receivers.is_empty());
     }
 }
