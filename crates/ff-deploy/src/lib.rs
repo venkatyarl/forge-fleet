@@ -26,7 +26,8 @@ pub use health_gate::{
     HealthGate, HealthGateConfig, HealthGateEvaluation, HealthGateStatus, HealthSnapshot,
 };
 pub use node::{
-    forgefleetd_restart_command, restart_forgefleetd_local, restart_forgefleetd_with_drain,
+    forgefleetd_restart_command, requeue_claimed_items, restart_forgefleetd_local,
+    restart_forgefleetd_with_drain,
 };
 pub use release::{ReleaseChannel, ReleaseManifest, ReleaseRecord, ReleaseState};
 pub use resolution::{ResolutionError, ResolutionRetryPolicy, ResolvedTarget, resolve_with_retry};

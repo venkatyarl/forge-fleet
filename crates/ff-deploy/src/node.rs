@@ -14,6 +14,74 @@ use tracing::{info, warn};
 use crate::config::DeployConfig;
 use crate::daemon::{ActiveLease, RestartReport, restart_with_lease_drain};
 
+const REQUEUE_CLAIMED_ITEMS_SQL: &str = r#"
+WITH released AS (
+    UPDATE work_item_leases
+       SET lease_state = 'released',
+           released_at = NOW(),
+           release_reason = 'deploy restart drain'
+     WHERE work_item_id = ANY($1)
+       AND released_at IS NULL
+ RETURNING work_item_id, sub_agent_id
+), freed_slots AS (
+    UPDATE sub_agents AS sa
+       SET current_work_item_id = NULL,
+           status = 'idle',
+           started_at = NULL,
+           last_heartbeat_at = NOW()
+     WHERE EXISTS (
+           SELECT 1
+             FROM released AS r
+            WHERE r.sub_agent_id = sa.id
+              AND r.work_item_id = sa.current_work_item_id)
+), retired_worktrees AS (
+    UPDATE work_item_worktrees AS wt
+       SET status = 'failed'
+     WHERE wt.status IN ('creating', 'active')
+       AND EXISTS (
+           SELECT 1 FROM released AS r WHERE r.work_item_id = wt.work_item_id)
+), requeued AS (
+    UPDATE work_items AS wi
+       SET status = 'ready',
+           assigned_computer = NULL
+     WHERE wi.status IN ('claimed', 'building')
+       AND EXISTS (
+           SELECT 1 FROM released AS r WHERE r.work_item_id = wi.id)
+ RETURNING wi.id
+)
+SELECT COUNT(*) FROM requeued
+"#;
+
+/// Requeue work held by active leases because a deploy is restarting the node.
+///
+/// This is intentionally attempt-neutral: unlike stale-lease recovery, the
+/// query does not modify either the work item's `attempts` counter or the
+/// lease's `attempt` counter. Lease release, slot cleanup, worktree retirement,
+/// and requeue are performed in one statement so no item can be reclaimed
+/// between those transitions.
+pub async fn requeue_claimed_items(pool: &sqlx::PgPool, leases: Vec<ActiveLease>) -> Result<u64> {
+    let work_item_ids = leases
+        .into_iter()
+        .flat_map(|lease| lease.work_item_ids)
+        .map(|id| {
+            id.parse::<uuid::Uuid>()
+                .with_context(|| format!("invalid work item id in active lease: {id}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if work_item_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let requeued: i64 = sqlx::query_scalar(REQUEUE_CLAIMED_ITEMS_SQL)
+        .bind(&work_item_ids)
+        .fetch_one(pool)
+        .await
+        .context("failed to requeue claimed items for deploy restart")?;
+
+    Ok(requeued as u64)
+}
+
 /// Drain active leases, then restart `forgefleetd`.
 ///
 /// The drain phase reuses [`restart_with_lease_drain`]: it polls
@@ -202,5 +270,13 @@ mod tests {
         assert!(cmd.contains("systemctl --user restart --no-block forgefleetd.service"));
         assert!(cmd.contains("setsid"));
         assert!(cmd.contains("XDG_RUNTIME_DIR"));
+    }
+
+    #[test]
+    fn deploy_requeue_sql_is_attempt_neutral() {
+        assert!(REQUEUE_CLAIMED_ITEMS_SQL.contains("wi.status IN ('claimed', 'building')"));
+        assert!(REQUEUE_CLAIMED_ITEMS_SQL.contains("SET status = 'ready'"));
+        assert!(!REQUEUE_CLAIMED_ITEMS_SQL.contains("attempts ="));
+        assert!(!REQUEUE_CLAIMED_ITEMS_SQL.contains("attempt ="));
     }
 }
