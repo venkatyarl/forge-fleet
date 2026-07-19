@@ -428,7 +428,7 @@ async fn resolve_fabric_endpoints(
     }
     bail!(
         "no shared fabric subnet found between {a} and {b}; are both ends configured? \
-           (run `ff openclaw status` and verify all_ips on each computer)"
+           (run `ff fleet status` and verify all_ips on each computer)"
     )
 }
 

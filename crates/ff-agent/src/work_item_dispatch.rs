@@ -1202,17 +1202,17 @@ async fn mark_failed_and_release(pg: &PgPool, item: &AssignedWorkItem, error: &s
 
 /// Best-effort Telegram notification when a work_item exhausts its retry budget
 /// and lands on terminal `failed` — "Jarvis tells you when it's genuinely
-/// stuck." Reads the same `openclaw.telegram_*` secrets the alert evaluator
-/// uses. NEVER returns an error or panics: any failure is logged and swallowed.
+/// stuck." Reads the same `telegram_bot_token` / `telegram_chat_id` secrets
+/// the alert evaluator uses. NEVER returns an error or panics: any failure is logged and swallowed.
 async fn notify_operator_task_failed(pg: &PgPool, work_item_id: Uuid, title: &str, error: &str) {
-    let token = match ff_db::pg_get_secret(pg, "openclaw.telegram_bot_token").await {
+    let token = match ff_db::pg_get_secret(pg, "telegram_bot_token").await {
         Ok(Some(t)) if !t.trim().is_empty() => t,
         _ => {
             tracing::debug!("notify_operator_task_failed: no telegram bot token; skipping");
             return;
         }
     };
-    let chat_id = match ff_db::pg_get_secret(pg, "openclaw.telegram_chat_id").await {
+    let chat_id = match ff_db::pg_get_secret(pg, "telegram_chat_id").await {
         Ok(Some(c)) if !c.trim().is_empty() => c,
         _ => {
             tracing::debug!("notify_operator_task_failed: no telegram chat id; skipping");

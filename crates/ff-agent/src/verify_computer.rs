@@ -90,9 +90,9 @@ pub async fn verify_computer(pool: &PgPool, worker_name: &str) -> Result<VerifyR
     });
     // 5. tooling_installed
     let tool_cmd = if is_windows {
-        r#"powershell -NoProfile -Command "$c = 0; foreach ($t in 'gh','git','codex','claude','openclaw') { if (Get-Command $t -ErrorAction SilentlyContinue) { $c++ } }; if ($c -ge 3) { exit 0 } else { exit 1 }""#
+        r#"powershell -NoProfile -Command "$c = 0; foreach ($t in 'gh','git','codex','claude') { if (Get-Command $t -ErrorAction SilentlyContinue) { $c++ } }; if ($c -ge 3) { exit 0 } else { exit 1 }""#
     } else {
-        "[ $(which gh op codex claude openclaw 2>/dev/null | wc -l) -ge 3 ]"
+        "[ $(which gh op codex claude 2>/dev/null | wc -l) -ge 3 ]"
     };
     details.push(check_ssh_cmd(&ssh_dest, "tooling_installed", tool_cmd).await);
     // 6. tool_versions_reported
@@ -121,13 +121,6 @@ pub async fn verify_computer(pool: &PgPool, worker_name: &str) -> Result<VerifyR
             message: Some(format!("{} models indexed", libs.len())),
             retry_task_id: None,
         }
-    });
-    // 8. openclaw_registered — skip for now
-    details.push(CheckResult {
-        check: "openclaw_registered".into(),
-        status: "skip".into(),
-        message: Some("openclaw api not yet wired".into()),
-        retry_task_id: None,
     });
     // 9. sudo_passwordless (N/A on Windows — UAC is the equivalent and is
     //    always interactive; Windows daemons run as services, so skip.)

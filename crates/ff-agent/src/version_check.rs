@@ -70,7 +70,6 @@ pub async fn collect_current() -> BTreeMap<String, String> {
         out.insert("forgefleetd_git".into(), sha);
     }
     for (key, bin, args) in [
-        ("openclaw", "openclaw", vec!["--version"]),
         ("gh", "gh", vec!["--version"]),
         ("op", "op", vec!["--version"]),
         ("codex", "codex", vec!["--version"]),
@@ -116,7 +115,6 @@ pub async fn fetch_latest(client: &reqwest::Client, keys: &[&str]) -> BTreeMap<S
                 "op" => gh_release(&client, "1Password/cli-releases").await,
                 "codex" => gh_release(&client, "microsoft/codex-cli").await,
                 "claude" => gh_release(&client, "anthropics/claude-code").await,
-                "openclaw" => gh_release(&client, "openclaw-ai/openclaw").await,
                 "llama.cpp" => gh_release(&client, "ggerganov/llama.cpp").await,
                 "mlx_lm" => pypi_version(&client, "mlx-lm").await,
                 "vllm" => pypi_version(&client, "vllm").await,
@@ -297,7 +295,7 @@ fn is_source_build_tool(tool: &str) -> bool {
 
 /// Best-effort version equivalence. Tool `--version` output and upstream
 /// release tags are almost never byte-identical: "gh version 2.89.0 (date)"
-/// vs "v2.89.0", "2.32.1" vs "v2.32.1", "OpenClaw 2.4.0" vs "2.4.0", etc.
+/// vs "v2.89.0", "2.32.1" vs "v2.32.1", etc.
 ///
 /// For `ff` / `ff_git` / `forgefleetd_git` rows the inputs follow the
 /// `<date>_<n> (pushed <sha>)` shape — those should compare on SHA only,
@@ -496,7 +494,7 @@ mod tests {
             assert!(is_source_build_tool(t), "{t} should be source-build");
         }
         // Package-manager tools don't touch the dev tree → safe on the leader.
-        for t in ["gh", "op", "openclaw", "mlx_lm", "vllm", "llama.cpp", "os"] {
+        for t in ["gh", "op", "mlx_lm", "vllm", "llama.cpp", "os"] {
             assert!(!is_source_build_tool(t), "{t} should NOT be source-build");
         }
     }

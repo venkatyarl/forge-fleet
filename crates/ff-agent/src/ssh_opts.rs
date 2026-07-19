@@ -15,8 +15,8 @@
 //! pipeline that ships fixes strangled by the agent it inherited. Those two
 //! sites were patched inline; this module generalizes the fix to the ~10 other
 //! daemon SSH/rsync call sites (mesh_check, revive, model_transfer, oauth
-//! distribution, pg_failover, conformance, ssh_key_manager, openclaw,
-//! verify_computer, panic_stop) that were latent on the same hosts.
+//! distribution, pg_failover, conformance, ssh_key_manager, verify_computer,
+//! panic_stop) that were latent on the same hosts.
 //!
 //! ## The fix
 //!

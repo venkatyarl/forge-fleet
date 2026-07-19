@@ -153,9 +153,6 @@ pub async fn handle_fleet_quarantine(pool: &sqlx::PgPool, computer: &str, yes: b
         );
     }
     println!("  {GREEN}✓{RESET} status='maintenance' in computers table");
-    println!(
-        "  {GREEN}✓{RESET} openclaw_installations.mode='node', gateway_url cleared (if present)"
-    );
     println!("  {GREEN}✓{RESET} published fleet.events.quarantine on NATS");
     println!();
     println!("Implications while '{}' is quarantined:", result.name);
@@ -1528,7 +1525,7 @@ async fn remove_computer_core(pool: &sqlx::PgPool, name: &str) -> Result<RemoveC
 
     // computers cascades: computer_software, computer_models,
     // computer_model_deployments, computer_downtime_events, computer_trust,
-    // fleet_workers, openclaw_installations, computer_docker_containers.
+    // fleet_workers, computer_docker_containers.
     let r = sqlx::query("DELETE FROM computers WHERE name = $1")
         .bind(name)
         .execute(&mut *tx)
@@ -1593,7 +1590,7 @@ async fn remove_computer_core(pool: &sqlx::PgPool, name: &str) -> Result<RemoveC
 ///
 /// Strategy: ask the local DB on Taylor for every peer's primary_ip, then
 /// for each peer run a grep -v filter on `authorized_keys` that drops any
-/// line ending with `@<name>` (the canonical comment suffix OpenClaw
+/// line ending with `@<name>` (the canonical comment suffix ForgeFleet
 /// writes during onboarding).
 fn build_remove_computer_ssh_script(name: &str) -> String {
     let name = name.replace('\'', "'\\''");
@@ -1660,7 +1657,7 @@ pub async fn handle_fleet_remove_computer(
     println!("                    computer_software, computer_models,");
     println!("                    computer_model_deployments, computer_trust,");
     println!("                    computer_downtime_events, fleet_workers,");
-    println!("                    openclaw_installations, computer_docker_containers");
+    println!("                    computer_docker_containers");
     println!("  explicit deletes: fleet_models (no cascade),");
     println!("                    fleet_leader_state WHERE member_name=<name>");
     println!("  side-effect:      1 deferred SSH-revocation task on taylor");

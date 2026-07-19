@@ -74,7 +74,6 @@ mod model_serve_cmd;
 mod notify_cmd;
 mod offload_cmd;
 mod onboard_cmd;
-mod openclaw_cmd;
 mod pm_cmd;
 mod ports_cmd;
 mod power_cmd;
@@ -684,11 +683,6 @@ enum Command {
     /// cortex index`: derives the corpus slug from the directory, auto-detects
     /// the language(s), and indexes in one shot. `ff brain cortex` still works.
     Cortex(top_cortex_cmd::TopCortexArgs),
-    /// OpenClaw gateway/node visibility across the fleet.
-    Openclaw {
-        #[command(subcommand)]
-        command: OpenclawCommand,
-    },
     /// Project management — projects, work items, branches.
     Pm {
         #[command(subcommand)]
@@ -2911,46 +2905,6 @@ pub enum CorpusCommand {
 }
 
 #[derive(Debug, Clone, Subcommand)]
-pub enum OpenclawCommand {
-    /// Show OpenClaw mode across all fleet members (gateway vs node + version).
-    Status {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Paired-device migration helpers (phone/IoT/browser pairings that
-    /// otherwise break on a leader change).
-    Devices {
-        #[command(subcommand)]
-        command: OpenclawDevicesCommand,
-    },
-}
-
-#[derive(Debug, Clone, Subcommand)]
-pub enum OpenclawDevicesCommand {
-    /// Export paired devices from the local OpenClaw gateway to stdout.
-    /// Equivalent to `openclaw devices export --format json`, but routed
-    /// through the ForgeFleet OpenClawManager so we can also stash the
-    /// result into `fleet_secrets.openclaw.device_pairings_export` for
-    /// the next leader to pick up.
-    Export {
-        /// Also write the export into fleet_secrets (same key the
-        /// automatic demotion flow uses).
-        #[arg(long, default_value_t = false)]
-        stash: bool,
-    },
-    /// Import paired devices into the local OpenClaw gateway. Reads
-    /// JSON from stdin (or --from-secret) and pipes into
-    /// `openclaw devices import --format json`.
-    Import {
-        /// Instead of reading stdin, read the stashed secret
-        /// `openclaw.device_pairings_export` from fleet_secrets. Clears
-        /// the secret after a successful import.
-        #[arg(long, default_value_t = false)]
-        from_secret: bool,
-    },
-}
-
-#[derive(Debug, Clone, Subcommand)]
 pub enum OnboardCommand {
     /// Print the copy-paste curl command for onboarding a new computer.
     Show {
@@ -4157,9 +4111,6 @@ async fn main() -> Result<()> {
         Some(Command::VirtualBrain { command }) => {
             return brain_cmd::handle_brain(command.clone()).await;
         }
-        Some(Command::Openclaw { command }) => {
-            return openclaw_cmd::handle_openclaw(command.clone()).await;
-        }
         Some(Command::Pm { command }) => {
             return pm_cmd::handle_pm(command.clone(), cli.cwd.clone()).await;
         }
@@ -4498,7 +4449,6 @@ async fn main() -> Result<()> {
         Some(Command::VirtualBrain { command }) => brain_cmd::handle_brain(command).await,
         Some(Command::Memory { command }) => memory_cmd::handle_memory(command).await,
         Some(Command::Cortex(args)) => top_cortex_cmd::handle_top_cortex(args).await,
-        Some(Command::Openclaw { command }) => openclaw_cmd::handle_openclaw(command).await,
         Some(Command::Pm { command }) => pm_cmd::handle_pm(command, cli.cwd.clone()).await,
         Some(Command::Queue) => queue_cmd::handle_queue().await,
         Some(Command::Agent { command }) => agent_cmd::handle_agent(command).await,

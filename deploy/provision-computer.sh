@@ -8,7 +8,6 @@
 #   - Node.js + npm (if missing)
 #   - Python3 + pip (if missing)
 #   - Claude Code (@anthropic-ai/claude-code)
-#   - OpenClaw
 #   - Codex (OpenAI)
 #   - code-review-graph (MCP server)
 #   - Docker (if missing)
@@ -62,19 +61,6 @@ else
         log "Claude Code: installed ✓"
     else
         warn "Claude Code: install failed (may need manual setup)"
-    fi
-fi
-
-# ─── OpenClaw ─────────────────────────────────────────────
-if command -v openclaw &>/dev/null; then
-    log "OpenClaw: $(openclaw --version 2>/dev/null || echo 'installed') ✓"
-else
-    log "Installing OpenClaw..."
-    sudo npm install -g openclaw 2>/dev/null || npm install -g openclaw 2>/dev/null || true
-    if command -v openclaw &>/dev/null; then
-        log "OpenClaw: installed ✓"
-    else
-        warn "OpenClaw: install failed (may need manual setup)"
     fi
 fi
 

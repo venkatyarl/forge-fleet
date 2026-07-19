@@ -16,23 +16,8 @@ use sqlx::PgPool;
 
 use crate::notifications::SHARED_HTTP;
 
-const TELEGRAM_BOT_TOKEN_KEY: &str = "openclaw.telegram_bot_token";
-const TELEGRAM_CHAT_ID_KEY: &str = "openclaw.telegram_chat_id";
-const LEGACY_TELEGRAM_BOT_TOKEN_KEY: &str = "telegram_bot_token";
-const LEGACY_TELEGRAM_CHAT_ID_KEY: &str = "telegram_chat_id";
-
-async fn get_secret_with_legacy_fallback(
-    pool: &PgPool,
-    primary_key: &str,
-    legacy_key: &str,
-) -> Result<Option<String>> {
-    match ff_db::pg_get_secret(pool, primary_key).await? {
-        Some(value) => Ok(Some(value)),
-        None => ff_db::pg_get_secret(pool, legacy_key)
-            .await
-            .map_err(Into::into),
-    }
-}
+const TELEGRAM_BOT_TOKEN_KEY: &str = "telegram_bot_token";
+const TELEGRAM_CHAT_ID_KEY: &str = "telegram_chat_id";
 
 fn telegram_payload(chat_id: &str, title: &str, body: &str) -> serde_json::Value {
     let text = if body.is_empty() {
@@ -93,17 +78,12 @@ async fn send_returning_id(
     title: &str,
     body: &str,
 ) -> Result<Option<(String, i64)>> {
-    let token = get_secret_with_legacy_fallback(
-        pool,
-        TELEGRAM_BOT_TOKEN_KEY,
-        LEGACY_TELEGRAM_BOT_TOKEN_KEY,
-    )
-    .await
-    .context("lookup telegram bot token")?;
-    let chat_id =
-        get_secret_with_legacy_fallback(pool, TELEGRAM_CHAT_ID_KEY, LEGACY_TELEGRAM_CHAT_ID_KEY)
-            .await
-            .context("lookup telegram chat id")?;
+    let token = ff_db::pg_get_secret(pool, TELEGRAM_BOT_TOKEN_KEY)
+        .await
+        .context("lookup telegram bot token")?;
+    let chat_id = ff_db::pg_get_secret(pool, TELEGRAM_CHAT_ID_KEY)
+        .await
+        .context("lookup telegram chat id")?;
 
     let has_token = token.is_some();
     let has_chat = chat_id.is_some();

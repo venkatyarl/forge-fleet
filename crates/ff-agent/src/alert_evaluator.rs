@@ -741,86 +741,43 @@ pub async fn dispatch_alert(pg: &PgPool, channel: &str, severity: &str, message:
             }
             "sent".to_string()
         }
-        "telegram" | "openclaw" => {
-            let chat_id = ff_db::pg_get_secret(pg, "openclaw.telegram_chat_id")
+        "telegram" => {
+            let chat_id = ff_db::pg_get_secret(pg, "telegram_chat_id")
                 .await
                 .ok()
                 .flatten();
-            let chat_id = match chat_id {
-                Some(chat_id) => Some(chat_id),
-                None => ff_db::pg_get_secret(pg, "telegram_chat_id")
-                    .await
-                    .ok()
-                    .flatten(),
-            };
             let Some(chat_id) = chat_id else {
                 return "failed: no telegram chat id secret".into();
             };
 
-            // Prefer direct Telegram Bot API when a bot token is configured —
-            // no shell-out, works without openclaw installed, and gives us a
-            // clean place to extend (parse_mode, silent, etc). Fall back to
-            // `openclaw agent` otherwise (legacy path).
-            let bot_token = ff_db::pg_get_secret(pg, "openclaw.telegram_bot_token")
+            let bot_token = ff_db::pg_get_secret(pg, "telegram_bot_token")
                 .await
                 .ok()
                 .flatten();
-            let bot_token = match bot_token {
-                Some(token) => Some(token),
-                None => ff_db::pg_get_secret(pg, "telegram_bot_token")
-                    .await
-                    .ok()
-                    .flatten(),
+            let Some(token) = bot_token else {
+                return "failed: no bot token configured".into();
             };
 
-            if let Some(token) = bot_token {
-                let url = format!("https://api.telegram.org/bot{token}/sendMessage");
-                let payload = serde_json::json!({
-                    "chat_id": chat_id,
-                    "text": format!("[{severity}] {message}"),
-                    "disable_web_page_preview": true,
-                });
-                return match SHARED_HTTP
-                    .post(&url)
-                    .json(&payload)
-                    .timeout(Duration::from_secs(10))
-                    .send()
-                    .await
-                {
-                    Ok(resp) if resp.status().is_success() => "sent".into(),
-                    Ok(resp) => {
-                        let status = resp.status();
-                        let body = resp.text().await.unwrap_or_default();
-                        format!("failed: telegram HTTP {status}: {}", body.trim())
-                    }
-                    Err(e) => format!("failed: telegram: {e}"),
-                };
-            }
-
-            // No bot token → try openclaw as a fallback. If openclaw is not
-            // installed either, we record that rather than crashing.
-            if channel == "telegram" {
-                return "failed: no bot token configured".into();
-            }
-            let output = tokio::process::Command::new("openclaw")
-                .args([
-                    "agent",
-                    "--channel",
-                    "telegram",
-                    "--to",
-                    &chat_id,
-                    &format!("ALERT: {message}"),
-                ])
-                .output()
-                .await;
-            match output {
-                Ok(out) if out.status.success() => "sent".into(),
-                Ok(out) => format!(
-                    "failed: openclaw exit {:?}: {}",
-                    out.status.code(),
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
-                Err(e) => format!("failed: spawn openclaw: {e}"),
+            let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+            let payload = serde_json::json!({
+                "chat_id": chat_id,
+                "text": format!("[{severity}] {message}"),
+                "disable_web_page_preview": true,
+            });
+            match SHARED_HTTP
+                .post(&url)
+                .json(&payload)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => "sent".into(),
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    format!("failed: telegram HTTP {status}: {}", body.trim())
+                }
+                Err(e) => format!("failed: telegram: {e}"),
             }
         }
         "webhook" => {
