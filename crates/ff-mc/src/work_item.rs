@@ -103,6 +103,10 @@ impl Default for Priority {
 // ─── Work Item ───────────────────────────────────────────────────────────────
 
 /// A single work item (ticket / task / issue).
+///
+/// The work-queue priority fields (`eisenhower_quadrant`, `numeric_priority`,
+/// `pick_score`, `capability_tags`) all carry `#[serde(default)]` — records
+/// persisted before these fields existed must still deserialize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItem {
     pub id: String,
@@ -116,6 +120,21 @@ pub struct WorkItem {
     pub task_group_id: Option<String>,
     pub sequence_order: Option<i32>,
     pub labels: Vec<String>,
+    /// Eisenhower matrix quadrant: `urgent_important`, `not_urgent_important`,
+    /// `urgent_not_important`, or `not_urgent_not_important`.
+    #[serde(default)]
+    pub eisenhower_quadrant: Option<String>,
+    /// Fine-grained numeric priority for work-queue ordering (higher = sooner);
+    /// complements the coarse 1–5 [`Priority`] band.
+    #[serde(default)]
+    pub numeric_priority: Option<i32>,
+    /// Computed scheduler pick score; recalculated by the work queue, not set
+    /// by operators.
+    #[serde(default)]
+    pub pick_score: Option<f64>,
+    /// Capabilities a slot must have to pick this item up (e.g. `gpu`, `macos`).
+    #[serde(default)]
+    pub capability_tags: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
