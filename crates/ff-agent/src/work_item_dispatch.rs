@@ -2302,7 +2302,45 @@ async fn create_pr(
             "work_item_dispatch: github_gh_token secret missing; falling back to ambient gh auth"
         );
     }
-    let out = run_command_timeout(cmd, Duration::from_secs(120))?;
+    let out = match run_command_timeout(cmd, Duration::from_secs(120)) {
+        Ok(o) => o,
+        Err(e) if e.to_string().contains("already exists") => {
+            // A retry force-pushes onto the SAME wi/ branch, so a PR opened by
+            // a prior attempt is still there and now carries the new commits —
+            // `gh pr create` then exits 1 with "a pull request … already
+            // exists". That IS the desired end state; failing the item here
+            // sheds finished work (observed 2026-07-19: PRs #840/#846 died
+            // this way). Adopt the existing PR instead.
+            let mut view = Command::new("gh");
+            view.current_dir(worktree_path).args([
+                "pr",
+                "view",
+                &worktree.task_branch,
+                "--json",
+                "url",
+                "--jq",
+                ".url",
+            ]);
+            if let Some(token) = crate::fleet_info::fetch_secret("github_gh_token").await {
+                view.env("GH_TOKEN", token);
+            }
+            let vout = run_command_timeout(view, Duration::from_secs(60))?;
+            let url = String::from_utf8_lossy(&vout.stdout).trim().to_string();
+            if url.is_empty() {
+                bail!(
+                    "PR for {} already exists but its URL could not be resolved",
+                    worktree.task_branch
+                );
+            }
+            info!(
+                work_item_id = %item.work_item_id,
+                pr = %url,
+                "work_item_dispatch: PR already exists for branch — adopting it"
+            );
+            return Ok(url);
+        }
+        Err(e) => return Err(e),
+    };
     let pr_url = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if pr_url.is_empty() {
         bail!("gh pr create returned an empty PR URL");
