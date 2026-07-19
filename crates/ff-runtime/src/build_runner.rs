@@ -239,7 +239,7 @@ impl BuildRunner {
     /// against `max_build_duration` and kill any build that exceeded it.
     ///
     /// Returns the IDs of the builds that were killed.
-    pub async fn check_timeouts(&self) -> Vec<u64> {
+    pub async fn check_and_kill_stuck_builds(&self) -> Vec<u64> {
         let max = self.config.max_build_duration();
 
         let expired: Vec<u64> = {
@@ -265,6 +265,11 @@ impl BuildRunner {
         killed
     }
 
+    /// Compatibility alias for [`BuildRunner::check_and_kill_stuck_builds`].
+    pub async fn check_timeouts(&self) -> Vec<u64> {
+        self.check_and_kill_stuck_builds().await
+    }
+
     /// Spawn the background timeout watcher.
     ///
     /// Sweeps every `watch_interval_secs`, monitoring each running build's
@@ -278,7 +283,7 @@ impl BuildRunner {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                let killed = runner.check_timeouts().await;
+                let killed = runner.check_and_kill_stuck_builds().await;
                 if !killed.is_empty() {
                     warn!(count = killed.len(), "timeout watcher killed hung builds");
                 }
@@ -342,9 +347,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_timeouts_empty_returns_empty() {
+    async fn check_and_kill_stuck_builds_empty_returns_empty() {
         let runner = BuildRunner::new();
-        assert!(runner.check_timeouts().await.is_empty());
+        assert!(runner.check_and_kill_stuck_builds().await.is_empty());
     }
 
     #[cfg(unix)]
@@ -392,7 +397,7 @@ mod tests {
         // Ensure some (non-zero) duration has elapsed past max_build_duration.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let killed = runner.check_timeouts().await;
+        let killed = runner.check_and_kill_stuck_builds().await;
         assert_eq!(killed, vec![id]);
 
         let build = runner.get_build(id).await.expect("build should exist");
@@ -403,14 +408,14 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn check_timeouts_ignores_builds_within_limit() {
+    async fn check_and_kill_stuck_builds_ignores_builds_within_limit() {
         let runner = BuildRunner::new(); // default max is 1800s
         let id = runner
             .start_build("sleep", &["30".into()], None)
             .await
             .expect("spawn should succeed");
 
-        assert!(runner.check_timeouts().await.is_empty());
+        assert!(runner.check_and_kill_stuck_builds().await.is_empty());
         let build = runner.get_build(id).await.expect("build should exist");
         assert_eq!(build.status, BuildStatus::Running);
 
