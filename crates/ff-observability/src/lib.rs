@@ -17,6 +17,7 @@ pub mod log_ingest;
 pub mod metrics;
 pub mod telemetry;
 pub mod tracing_ext;
+pub mod work_queue;
 
 // Re-export the most commonly used items at crate root.
 pub use alerting::{Alert, AlertEngine, AlertRule, AlertSeverity};
@@ -58,6 +59,10 @@ pub use tracing_ext::{
     SpanExt, TraceStore, TraceSummary, extract_or_generate_trace_id, extract_trace_header,
     global_trace_store, inject_trace_header, new_trace_id, trace_discovery, trace_llm_call,
     trace_replication, trace_request,
+};
+pub use work_queue::{
+    WORK_QUEUE_PROCESSING_SECONDS, WORK_QUEUE_SIZE, WORK_QUEUE_SIZE_BY_PRIORITY,
+    init_work_queue_metrics, observe_processing_time, set_priority_distribution, set_queue_size,
 };
 
 /// Crate version from Cargo.toml.
