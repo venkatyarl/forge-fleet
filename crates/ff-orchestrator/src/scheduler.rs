@@ -409,6 +409,17 @@ impl Scheduler {
         }
     }
 
+    /// Update the last dispatch-tick timestamp for a node.
+    ///
+    /// Called when the agent reports a dispatch tick (or a heartbeat that
+    /// implies the dispatch loop is still running). Keeps the scheduler's
+    /// dispatch-tick liveness window fresh.
+    pub fn update_dispatch_tick(&mut self, worker_name: &str, tick_at: Option<DateTime<Utc>>) {
+        if let Some(node) = self.nodes.get_mut(worker_name) {
+            node.dispatch_tick_at = tick_at;
+        }
+    }
+
     /// Release resources for a completed task.
     pub fn release_task(&mut self, worker_name: &str, task_id: Uuid) -> Option<RunningTask> {
         self.nodes
