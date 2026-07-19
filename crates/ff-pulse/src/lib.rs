@@ -21,6 +21,7 @@ pub mod heartbeat_v2;
 pub mod llm_probe;
 pub mod materializer;
 pub mod metrics;
+pub mod mlx_adapter;
 pub mod nats;
 pub mod peer_map;
 pub mod pulse_hmac;
