@@ -3030,6 +3030,10 @@ pub enum PmCommand {
     },
     /// Work_item backlog + throughput rollup.
     Summary(PmSummary),
+    /// Velocity KPI digest: 7d throughput vs prior week, avg cycle time,
+    /// WIP by status, 4-week completion trend, and top projects — the same
+    /// text the Telegram daemon digest sends.
+    Velocity,
     /// Bulk-delete NON-LIVE work_items (e.g. clear a one-time audit run's
     /// stale `idea` rows). DRY-RUN by default — prints what would be deleted;
     /// pass `--yes` to actually delete. Only ever touches terminal/never-started

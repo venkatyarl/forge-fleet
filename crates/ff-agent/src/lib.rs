@@ -110,6 +110,7 @@ pub mod orphan_reaper;
 pub mod panic_stop;
 pub mod permissions;
 pub mod plugins;
+pub mod pm_velocity;
 pub mod portfolio_maintenance;
 pub mod ports_registry;
 pub mod power_scheduler;

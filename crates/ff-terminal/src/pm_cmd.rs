@@ -310,6 +310,9 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
                 print!("{}", render_pm_stats(&stats));
             }
         }
+        crate::PmCommand::Velocity => {
+            print!("{}", ff_agent::pm_velocity::velocity_digest(&pool).await?);
+        }
         crate::PmCommand::Purge {
             kind,
             status,
