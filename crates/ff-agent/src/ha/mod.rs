@@ -69,6 +69,44 @@ pub async fn drain_work_item_leases(
     Ok(drained as u64)
 }
 
+// ─── Git mirror rewrite configuration ────────────────────────────────────────
+
+/// Register Git `url.<mirror>.insteadOf` rewrite rules so that clones and
+/// fetches against `github.com` are redirected to the LAN mirror.
+///
+/// Both common GitHub URL forms are rewritten:
+///
+/// * `https://github.com/<owner>/<repo>`
+/// * `git@github.com:<owner>/<repo>`
+///
+/// The `mirror` argument must be the replacement URL prefix in the form Git
+/// expects for `url.<base>.insteadOf`, e.g. `https://git-mirror.local/` or
+/// `git@git-mirror.local:`.
+pub async fn register_github_mirror_rewrite(mirror: &str) -> anyhow::Result<()> {
+    if mirror.is_empty() {
+        return Err(anyhow::anyhow!("mirror URL must not be empty"));
+    }
+
+    const GITHUB_PREFIXES: &[&str] = &["https://github.com/", "git@github.com:"];
+
+    for original in GITHUB_PREFIXES {
+        let key = format!("url.{mirror}.insteadOf");
+        let status = tokio::process::Command::new("git")
+            .args(["config", "--global", &key, original])
+            .status()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to spawn git config for {original}: {e}"))?;
+
+        if !status.success() {
+            return Err(anyhow::anyhow!(
+                "git config --global url.{mirror}.insteadOf {original} failed ({status})"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 // ─── Pure HA topology model (used by tests + planners) ───────────────────────
 
 /// Role of a database node in a fleet HA topology.
