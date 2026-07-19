@@ -81,6 +81,15 @@ impl ArtifactCacheManager {
         Self { root }
     }
 
+    /// Create a manager for the canonical `~/.forgefleet/cache/artifacts`
+    /// tree, creating the cache root when it does not exist.
+    pub fn from_default_root() -> Result<Self> {
+        let root = default_artifact_cache_root();
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("create artifact cache root {}", root.display()))?;
+        Ok(Self::new(root))
+    }
+
     /// Cache root directory.
     pub fn root(&self) -> &Path {
         &self.root
@@ -280,6 +289,15 @@ impl ArtifactCacheManager {
     }
 }
 
+/// Canonical local artifact-cache root.
+pub fn default_artifact_cache_root() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".forgefleet")
+        .join("cache")
+        .join("artifacts")
+}
+
 /// Temp-file path used while a fetch is in flight (`<file>.part` alongside
 /// the destination, so the rename is atomic on the same filesystem).
 fn part_path(dest: &Path) -> PathBuf {
@@ -369,6 +387,12 @@ mod tests {
                 .join("v1.2.3")
                 .join("ff-agent.bin")
         );
+    }
+
+    #[test]
+    fn default_cache_root_uses_forgefleet_cache_tree() {
+        let root = default_artifact_cache_root();
+        assert!(root.ends_with(".forgefleet/cache/artifacts"));
     }
 
     #[test]

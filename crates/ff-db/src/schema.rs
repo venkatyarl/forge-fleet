@@ -10265,6 +10265,23 @@ CREATE INDEX IF NOT EXISTS idx_work_queue_status_created
     ON work_queue (status, created_at DESC);
 "#;
 
+/// V171 — Fleet artifact cache index.
+///
+/// Tracks each immutable artifact version by digest and the fleet nodes that
+/// currently hold it in their local cache.
+pub const SCHEMA_V171_ARTIFACT_INDEX: &str = r#"
+CREATE TABLE IF NOT EXISTS artifact_index (
+    artifact        TEXT NOT NULL,
+    version         TEXT NOT NULL,
+    sha256          TEXT NOT NULL,
+    holder_nodes    TEXT[] NOT NULL DEFAULT '{}',
+    PRIMARY KEY (artifact, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifact_index_sha256
+    ON artifact_index (sha256);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
