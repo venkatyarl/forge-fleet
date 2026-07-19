@@ -708,6 +708,8 @@ async fn run_agent_loop(
     http_client: &reqwest::Client,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
 ) -> AgentOutcome {
+    const MAX_AGENT_ITERATIONS: u32 = 100;
+
     let session_id = session.id.to_string();
     let openai_tools = openai_bridge::tools_to_openai_arc(&session.tools);
 
@@ -719,8 +721,14 @@ async fn run_agent_loop(
     // retries before the model finally fits.
     const MAX_COMPACTION_RETRIES: u32 = 5;
     let mut compaction_retries: u32 = 0;
+    let mut iteration_count: u32 = 0;
 
     for turn in 1..=session.config.max_turns {
+        if iteration_count >= MAX_AGENT_ITERATIONS {
+            break;
+        }
+        iteration_count += 1;
+
         session.turn_count = turn;
         let mut llm_retry_count = 0u32;
 
