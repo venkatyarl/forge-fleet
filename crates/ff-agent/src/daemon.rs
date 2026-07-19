@@ -64,6 +64,12 @@ impl TickRegistry {
                 scope: TickScope::LeaderOnly,
                 runner: run_telegram_reply_poller_tick,
             },
+            TickDefinition {
+                name: "log_analysis_worker",
+                interval: crate::log_analysis_worker::DEFAULT_INTERVAL,
+                scope: TickScope::LeaderOnly,
+                runner: run_log_analysis_tick,
+            },
         ]
         .into_iter()
         .map(|definition| RegisteredTick {
@@ -180,6 +186,14 @@ fn run_telegram_reply_poller_tick(
 ) -> BoxFuture<'static, Result<()>> {
     Box::pin(async move {
         crate::telegram_reply_poller::poll_telegram_replies_once(&pg)
+            .await
+            .map(|_| ())
+    })
+}
+
+fn run_log_analysis_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::log_analysis_worker::run_log_analysis_tick(&pg, &worker_name)
             .await
             .map(|_| ())
     })
