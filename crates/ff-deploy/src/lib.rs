@@ -101,7 +101,8 @@ pub fn git_stash_dirty_tree(repo_path: &Path) -> Result<String> {
 /// is checked before `git reset --hard` runs. If it is dirty, changes are
 /// preserved in a labeled stash rather than discarded.
 pub fn git_fetch_and_reset_hard(repo_path: &Path, remote_ref: &str) -> Result<()> {
-    if git_tree_is_dirty(repo_path)? {
+    let tree_was_dirty = git_tree_is_dirty(repo_path)?;
+    if tree_was_dirty {
         let label = git_stash_dirty_tree(repo_path)
             .context("working tree is dirty and could not be stashed before reset --hard")?;
         tracing::warn!(
@@ -113,8 +114,13 @@ pub fn git_fetch_and_reset_hard(repo_path: &Path, remote_ref: &str) -> Result<()
 
     git_run(repo_path, &["fetch", "origin"])
         .context("failed to fetch origin before reset --hard")?;
-    git_run(repo_path, &["reset", "--hard", remote_ref])
-        .with_context(|| format!("failed to reset --hard to {remote_ref}"))?;
+    git_run(repo_path, &["reset", "--hard", remote_ref]).with_context(|| {
+        if tree_was_dirty {
+            format!("source tree was dirty and could not be reset --hard to {remote_ref}")
+        } else {
+            format!("failed to reset --hard to {remote_ref}")
+        }
+    })?;
 
     Ok(())
 }
@@ -135,4 +141,34 @@ fn git_run(repo_path: &Path, args: &[&str]) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn dirty_tree_reset_failure_has_clear_error() {
+        let temp = tempfile::tempdir().expect("create temporary repository");
+        let repo = temp.path();
+
+        git_run(repo, &["init"]).expect("initialize repository");
+        git_run(repo, &["config", "user.email", "test@example.com"]).expect("configure git email");
+        git_run(repo, &["config", "user.name", "ForgeFleet Test"]).expect("configure git name");
+        fs::write(repo.join("tracked.txt"), "clean\n").expect("write tracked file");
+        git_run(repo, &["add", "tracked.txt"]).expect("stage tracked file");
+        git_run(repo, &["commit", "-m", "initial"]).expect("commit tracked file");
+        git_run(repo, &["remote", "add", "origin", "."]).expect("add local origin");
+
+        fs::write(repo.join("tracked.txt"), "dirty\n").expect("dirty tracked file");
+        let error = git_fetch_and_reset_hard(repo, "origin/missing")
+            .expect_err("reset to a missing ref should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "source tree was dirty and could not be reset --hard to origin/missing"
+        );
+    }
 }
