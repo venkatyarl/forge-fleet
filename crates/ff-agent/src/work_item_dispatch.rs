@@ -179,12 +179,22 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
         let worker_name = worker_name.to_string();
         tokio::spawn(async move {
             if let Err(e) = dispatch_one(pg.clone(), item.clone(), worker_name).await {
-                warn!(
-                    work_item_id = %item.work_item_id,
-                    sub_agent_id = %item.sub_agent_id,
-                    error = %e,
-                    "work_item_dispatch: dispatch failed"
-                );
+                if is_build_timeout(&e) {
+                    warn!(
+                        work_item_id = %item.work_item_id,
+                        sub_agent_id = %item.sub_agent_id,
+                        attempts = item.attempts + 1,
+                        error = %e,
+                        "work_item_dispatch: build timed out; requeueing for retry"
+                    );
+                } else {
+                    warn!(
+                        work_item_id = %item.work_item_id,
+                        sub_agent_id = %item.sub_agent_id,
+                        error = %e,
+                        "work_item_dispatch: dispatch failed"
+                    );
+                }
                 if let Err(cleanup) = requeue_or_fail(&pg, &item, &e.to_string()).await {
                     warn!(
                         work_item_id = %item.work_item_id,
@@ -203,6 +213,16 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
         );
     }
     Ok(started)
+}
+
+/// Whether a dispatch error was caused by a build command exceeding its time
+/// budget. Inspect the full anyhow chain because callers add context while the
+/// timeout itself is normally the innermost error.
+fn is_build_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("timed out") || message.contains("timeout")
+    })
 }
 
 /// Spawn the dispatch loop. PER-HOST (not leader-gated): the scheduler (leader)
@@ -2846,7 +2866,7 @@ mod tests {
     use super::{
         DISPATCH_HOUSE_RULES, DispatchOutcome, agent_output_tail, classify_dispatch_outcome,
         command_display, default_clone_path, dispatch_budget_for_host, expand_home,
-        parse_cli_tokens, primary_or_default_backend, repo_cache_path, repo_slug,
+        is_build_timeout, parse_cli_tokens, primary_or_default_backend, repo_cache_path, repo_slug,
         retry_error_is_actionable, rewrite_github_host_alias, task_prefers_cloud_lane,
         use_local_lane,
     };
@@ -3206,6 +3226,13 @@ mod tests {
             classify_dispatch_outcome(&r2, false),
             DispatchOutcome::FailedNoDiff
         );
+    }
+
+    #[test]
+    fn detects_build_timeout_through_error_context() {
+        let timeout = anyhow!("command timed out after 300s").context("run cargo build");
+        assert!(is_build_timeout(&timeout));
+        assert!(!is_build_timeout(&anyhow!("cargo build exited 1")));
     }
 
     #[test]
