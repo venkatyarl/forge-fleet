@@ -955,4 +955,25 @@ mod tests {
         assert_eq!(MIGRATION_ADVISORY_LOCK_KEY, 0x46464D4947525438);
         assert!(MIGRATION_ADVISORY_LOCK_KEY > 0);
     }
+
+    #[test]
+    fn migration_versions_are_strictly_increasing() {
+        // Many builds land migrations concurrently; two branches claiming the
+        // same version number both compile and both pass CI in isolation, so
+        // the FIRST place a collision can be caught is here, at merge time,
+        // when both entries are in the list. A duplicate (or out-of-order)
+        // version would make the runner's applied-version bookkeeping skip or
+        // double-apply SQL. Gaps are fine (versions get reserved by in-flight
+        // branches); duplicates and regressions are not.
+        for pair in PG_MIGRATIONS.windows(2) {
+            assert!(
+                pair[0].version < pair[1].version,
+                "PG_MIGRATIONS out of order or duplicated: {} ({}) then {} ({})",
+                pair[0].version,
+                pair[0].name,
+                pair[1].version,
+                pair[1].name,
+            );
+        }
+    }
 }
