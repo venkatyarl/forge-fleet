@@ -20,10 +20,14 @@ pub mod cascade_strategy;
 pub mod confidence;
 pub mod crew;
 pub mod decomposer;
+pub mod leader;
 pub mod parallel;
+pub mod placement;
 pub mod planner;
 pub mod project_policy;
+pub mod queue;
 pub mod router;
+pub mod scheduler;
 pub mod task_decomposer;
 
 // Re-export primary types at crate root for ergonomic use.
@@ -34,7 +38,12 @@ pub use confidence::{
 };
 pub use crew::{AgentRole, CrewAssignment, CrewDefinition};
 pub use decomposer::{SubTask, SubTaskType, TaskDecomposition};
+pub use leader::{
+    AgentHeartbeatResult, AgentTask, LeaderCoordinator, Preemption, SubmissionAction,
+    SubmissionResult, TickResult,
+};
 pub use parallel::{ExecutionResult, ParallelExecutor, SubTaskResult};
+pub use placement::{AntiAffinityRule, NodeWorkloadPreference, PlacementEngine, PlacementPolicy};
 pub use planner::{ExecutionPlan, PlanNode, PlanStage};
 pub use project_policy::{
     ApprovalTrigger, ComplianceFlag, DataSensitivity, DeploymentTarget, ExecutionPolicy,
@@ -42,7 +51,12 @@ pub use project_policy::{
     ReviewRequirements, ReviewStrictness, RolloutPolicy, RolloutStrategy, RoutingPolicy,
     TestRequirements, TierAccessPolicy,
 };
+pub use queue::{PriorityQueue, QueuedTask};
 pub use router::{ModelScore, RouteDecision, TaskRouter};
+pub use scheduler::{
+    NodeCapacity, ResourceRequirements, RunningTask, ScheduleDecision, ScheduledTask, Scheduler,
+    TaskPriority,
+};
 pub use task_decomposer::{
     DecomposedSubTask, DecompositionStrategy, TaskPattern, TemplateDecomposer,
 };

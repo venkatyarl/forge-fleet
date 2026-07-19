@@ -87,6 +87,7 @@ impl QueuedTask {
 /// Backed by a `BTreeMap<TaskPriority, VecDeque<QueuedTask>>` so that
 /// iteration naturally yields highest-priority tasks first (Critical has
 /// the smallest discriminant and comes first in BTreeMap order).
+#[derive(Debug)]
 pub struct PriorityQueue {
     /// Priority → FIFO queue of tasks at that level.
     buckets: BTreeMap<TaskPriority, VecDeque<QueuedTask>>,
@@ -337,10 +338,7 @@ impl PriorityQueue {
 
     /// Get counts per priority level.
     pub fn counts_by_priority(&self) -> BTreeMap<TaskPriority, usize> {
-        self.buckets
-            .iter()
-            .map(|(&p, d)| (p, d.len()))
-            .collect()
+        self.buckets.iter().map(|(&p, d)| (p, d.len())).collect()
     }
 
     /// Iterate over all tasks (immutable, in priority order).
@@ -367,11 +365,7 @@ mod tests {
     use super::*;
 
     fn make_queued_task(desc: &str, priority: TaskPriority) -> QueuedTask {
-        QueuedTask::new(
-            desc,
-            ResourceRequirements::default(),
-            priority,
-        )
+        QueuedTask::new(desc, ResourceRequirements::default(), priority)
     }
 
     #[test]
@@ -437,9 +431,18 @@ mod tests {
     fn test_drain_by_priority() {
         let mut q = PriorityQueue::with_default_timeout();
 
-        q.enqueue(make_queued_task("n1", TaskPriority::Normal), TaskPriority::Normal);
-        q.enqueue(make_queued_task("n2", TaskPriority::Normal), TaskPriority::Normal);
-        q.enqueue(make_queued_task("h1", TaskPriority::High), TaskPriority::High);
+        q.enqueue(
+            make_queued_task("n1", TaskPriority::Normal),
+            TaskPriority::Normal,
+        );
+        q.enqueue(
+            make_queued_task("n2", TaskPriority::Normal),
+            TaskPriority::Normal,
+        );
+        q.enqueue(
+            make_queued_task("h1", TaskPriority::High),
+            TaskPriority::High,
+        );
 
         let drained = q.drain_by_priority(TaskPriority::Normal);
         assert_eq!(drained.len(), 2);
@@ -537,10 +540,22 @@ mod tests {
 
     #[test]
     fn test_boost_priority_ladder() {
-        assert_eq!(boost_priority(TaskPriority::Background), Some(TaskPriority::Low));
-        assert_eq!(boost_priority(TaskPriority::Low), Some(TaskPriority::Normal));
-        assert_eq!(boost_priority(TaskPriority::Normal), Some(TaskPriority::High));
-        assert_eq!(boost_priority(TaskPriority::High), Some(TaskPriority::Critical));
+        assert_eq!(
+            boost_priority(TaskPriority::Background),
+            Some(TaskPriority::Low)
+        );
+        assert_eq!(
+            boost_priority(TaskPriority::Low),
+            Some(TaskPriority::Normal)
+        );
+        assert_eq!(
+            boost_priority(TaskPriority::Normal),
+            Some(TaskPriority::High)
+        );
+        assert_eq!(
+            boost_priority(TaskPriority::High),
+            Some(TaskPriority::Critical)
+        );
         assert_eq!(boost_priority(TaskPriority::Critical), None);
     }
 
@@ -548,10 +563,22 @@ mod tests {
     fn test_counts_by_priority() {
         let mut q = PriorityQueue::with_default_timeout();
 
-        q.enqueue(make_queued_task("h1", TaskPriority::High), TaskPriority::High);
-        q.enqueue(make_queued_task("h2", TaskPriority::High), TaskPriority::High);
-        q.enqueue(make_queued_task("n1", TaskPriority::Normal), TaskPriority::Normal);
-        q.enqueue(make_queued_task("b1", TaskPriority::Background), TaskPriority::Background);
+        q.enqueue(
+            make_queued_task("h1", TaskPriority::High),
+            TaskPriority::High,
+        );
+        q.enqueue(
+            make_queued_task("h2", TaskPriority::High),
+            TaskPriority::High,
+        );
+        q.enqueue(
+            make_queued_task("n1", TaskPriority::Normal),
+            TaskPriority::Normal,
+        );
+        q.enqueue(
+            make_queued_task("b1", TaskPriority::Background),
+            TaskPriority::Background,
+        );
 
         let counts = q.counts_by_priority();
         assert_eq!(counts[&TaskPriority::High], 2);
@@ -563,9 +590,18 @@ mod tests {
     fn test_iter() {
         let mut q = PriorityQueue::with_default_timeout();
 
-        q.enqueue(make_queued_task("bg", TaskPriority::Background), TaskPriority::Background);
-        q.enqueue(make_queued_task("crit", TaskPriority::Critical), TaskPriority::Critical);
-        q.enqueue(make_queued_task("norm", TaskPriority::Normal), TaskPriority::Normal);
+        q.enqueue(
+            make_queued_task("bg", TaskPriority::Background),
+            TaskPriority::Background,
+        );
+        q.enqueue(
+            make_queued_task("crit", TaskPriority::Critical),
+            TaskPriority::Critical,
+        );
+        q.enqueue(
+            make_queued_task("norm", TaskPriority::Normal),
+            TaskPriority::Normal,
+        );
 
         let descriptions: Vec<&str> = q.iter().map(|t| t.description.as_str()).collect();
         // Should iterate in priority order: Critical, Normal, Background
