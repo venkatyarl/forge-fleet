@@ -11,6 +11,10 @@ use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
@@ -216,10 +220,20 @@ pub fn spawn_work_item_dispatch(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let start = Instant::now();
+        let last_tick_at = Arc::new(AtomicU64::new(start.elapsed().as_secs()));
+        let watchdog_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(crate::daemon::dispatch_tick_watchdog(
+            start,
+            last_tick_at.clone(),
+            watchdog_shutdown_rx,
+        ));
+
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    last_tick_at.store(start.elapsed().as_secs(), Ordering::Relaxed);
                     if let Err(e) = evaluate_work_item_dispatch(&pg, &worker_name).await {
                         warn!(error = %e, "work_item_dispatch tick failed");
                     }
