@@ -12,6 +12,7 @@
 
 pub mod activity;
 pub mod artifact_cache;
+pub mod artifact_fetch;
 pub mod audit;
 pub mod build_version;
 pub mod chaos;
@@ -47,6 +48,7 @@ pub use activity::{ActivitySignals, ActivityState, YieldMode};
 pub use artifact_cache::{
     ArtifactEvictionPolicy, evaluate_artifact_eviction, spawn_artifact_eviction_loop,
 };
+pub use artifact_fetch::{ArtifactCacheManager, FetchSource, LanPeer};
 pub use chaos::{
     ChaosConfig, ChaosEngine, ChaosHooks, Simulation, SimulationId, SimulationState, SimulationType,
 };
