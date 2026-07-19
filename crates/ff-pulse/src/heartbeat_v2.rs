@@ -44,6 +44,11 @@ pub struct HeartbeatV2Publisher {
     /// the next-preferred follower takes over (a clean, operator-driven handoff
     /// without waiting 45s for a stale-heartbeat takeover).
     is_yielding: Arc<AtomicBool>,
+    /// Unix-seconds timestamp of the last work-item dispatch tick, shared
+    /// with the daemon's dispatch loop (0 = no tick recorded yet). Read on
+    /// every beat to populate `PulseBeatV2::dispatch_tick_at` so the
+    /// scheduler can exclude nodes whose dispatch loop has stalled.
+    dispatch_tick_at_unix: Arc<AtomicU64>,
     /// Cached election priority from fleet_workers (set at startup).
     election_priority: i32,
     /// 10-char git SHA of the binary, captured at compile time and
@@ -71,6 +76,7 @@ impl HeartbeatV2Publisher {
             epoch: Arc::new(AtomicU64::new(0)),
             role: Arc::new(parking_lot_compat::RwLock::new("member".to_string())),
             is_yielding: Arc::new(AtomicBool::new(false)),
+            dispatch_tick_at_unix: Arc::new(AtomicU64::new(0)),
             election_priority,
             build_sha: None,
         }
@@ -113,6 +119,13 @@ impl HeartbeatV2Publisher {
     /// from the `leader_yield_request` fleet_secret (HA Phase 1).
     pub fn yielding_handle(&self) -> Arc<AtomicBool> {
         self.is_yielding.clone()
+    }
+
+    /// Share the dispatch-tick timestamp with the daemon's work-item
+    /// dispatch loop, which stores `Utc::now().timestamp()` (unix seconds)
+    /// on every tick. While it stays 0, beats carry `dispatch_tick_at: None`.
+    pub fn dispatch_tick_handle(&self) -> Arc<AtomicU64> {
+        self.dispatch_tick_at_unix.clone()
     }
 
     /// Build a single beat from local system state.
@@ -347,6 +360,14 @@ impl HeartbeatV2Publisher {
                 (skeleton, false)
             }
         };
+
+        // Dispatch-tick liveness: read the shared timestamp on every beat
+        // (including fallback skeleton beats) so the scheduler always sees
+        // the freshest tick this daemon recorded.
+        let tick_unix = self.dispatch_tick_at_unix.load(Ordering::Relaxed);
+        beat.dispatch_tick_at = (tick_unix > 0)
+            .then(|| chrono::DateTime::from_timestamp(tick_unix as i64, 0))
+            .flatten();
 
         // Phase B: async probes — safe to .await because blocking work above
         // is now on a separate thread.
@@ -1319,10 +1340,24 @@ mod tests {
         assert_eq!(beat.pulse_protocol_version, 2);
         assert_eq!(beat.computer_name, "test-computer");
         assert!(beat.hardware.cpu_cores > 0);
+        // No dispatch tick recorded → the beat must not claim one.
+        assert!(beat.dispatch_tick_at.is_none());
         let json = serde_json::to_string(&beat).expect("serialize");
         let decoded: PulseBeatV2 = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.computer_name, "test-computer");
         assert_eq!(decoded.hardware.cpu_cores, beat.hardware.cpu_cores);
+    }
+
+    #[tokio::test]
+    async fn build_beat_carries_recorded_dispatch_tick() {
+        let client = redis::Client::open("redis://localhost:56379").unwrap();
+        let pub_ =
+            HeartbeatV2Publisher::new(client, "test-computer".into(), Duration::from_secs(15), 100);
+        let now = Utc::now().timestamp();
+        pub_.dispatch_tick_handle()
+            .store(now as u64, Ordering::Relaxed);
+        let beat = pub_.build_beat().await;
+        assert_eq!(beat.dispatch_tick_at.map(|t| t.timestamp()), Some(now));
     }
 
     #[test]

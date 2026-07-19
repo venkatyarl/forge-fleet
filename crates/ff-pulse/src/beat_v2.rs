@@ -61,6 +61,13 @@ pub struct PulseBeatV2 {
     /// Last-Will-and-Testament flag: set true when publishing a graceful-exit beat.
     pub going_offline: bool,
     pub maintenance_mode: bool,
+    /// Last time this node's work-item dispatch loop ticked. The scheduler
+    /// treats a stale tick as "not a safe assignment target"
+    /// (`NodeCapacity::dispatch_tick_at` in ff-orchestrator). `None` on beats
+    /// from daemons running pre-this-field code or nodes whose dispatch loop
+    /// hasn't ticked yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_tick_at: Option<DateTime<Utc>>,
     pub network: NetworkInfo,
     /// V87+: OS family + distribution. Default-empty for backward compat with
     /// daemons that publish beats before this field was added.
@@ -451,6 +458,7 @@ impl PulseBeatV2 {
             is_yielding: false,
             going_offline: false,
             maintenance_mode: false,
+            dispatch_tick_at: None,
             network: NetworkInfo {
                 primary_ip: String::new(),
                 all_ips: Vec::new(),
@@ -639,6 +647,7 @@ mod tests {
         assert!(parsed.os.arch.is_empty());
         assert!(parsed.build_sha.is_none());
         assert!(parsed.source_tree_path.is_none());
+        assert!(parsed.dispatch_tick_at.is_none());
         assert!(parsed.multi_host_participation.is_none());
         assert!(parsed.encountered_bugs.is_empty());
         assert!(parsed.local_tasks.is_empty());
