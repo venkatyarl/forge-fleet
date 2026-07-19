@@ -531,16 +531,38 @@ if [ "$OS_ID" != "macos" ]; then
     run_as_user systemctl --user daemon-reload 2>/dev/null || true
   fi
 
+  # Legacy system-scope `ff daemon` unit: stop + remove so it can't
+  # double-run alongside the canonical forgefleetd user unit below.
+  if [ -f /etc/systemd/system/forgefleet-daemon@.service ]; then
+    systemctl disable --now "forgefleet-daemon@${SUDO_INVOKER}.service" >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/forgefleet-daemon@.service
+    systemctl daemon-reload
+    report "legacy_unit_swept" ok "forgefleet-daemon@.service"
+  fi
+
   report "service" running
-  UNIT=/etc/systemd/system/forgefleet-daemon@.service
-  cp "$REPO_DIR/deploy/systemd/forgefleet-daemon.service" "$UNIT"
-  systemctl daemon-reload
-  systemctl enable --now "forgefleet-daemon@${SUDO_INVOKER}.service" >/dev/null 2>&1 || true
+  # Canonical forgefleetd USER unit (deploy/systemd/forgefleetd.service).
+  # enable-linger starts the user manager at boot (and creates
+  # /run/user/<uid>, which `systemctl --user` from a sudo context needs).
+  USER_UID="$(run_as_user id -u)"
+  loginctl enable-linger "$SUDO_INVOKER" 2>/dev/null || true
+  user_systemctl() {
+    run_as_user env XDG_RUNTIME_DIR="/run/user/$USER_UID" \
+      DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" \
+      systemctl --user "$@"
+  }
+  run_as_user mkdir -p "$USER_SYSTEMD_DIR" "$USER_HOME/.forgefleet/logs"
+  run_as_user bash -c "sed 's|__COMPUTER_NAME__|$NAME|g' '$REPO_DIR/deploy/systemd/forgefleetd.service' > '$USER_SYSTEMD_DIR/forgefleetd.service'"
+  user_systemctl daemon-reload >/dev/null 2>&1 || true
+  user_systemctl enable forgefleetd.service >/dev/null 2>&1 || true
+  # restart (not just enable --now): an idempotent re-run must pick up the
+  # freshly built binary, not keep the old process.
+  user_systemctl restart forgefleetd.service >/dev/null 2>&1 || true
   sleep 2
-  if systemctl is-active "forgefleet-daemon@${SUDO_INVOKER}.service" >/dev/null 2>&1; then
+  if user_systemctl is-active forgefleetd.service >/dev/null 2>&1; then
     report "service" ok
   else
-    report "service" failed "systemctl reports inactive"
+    report "service" failed "systemctl --user reports forgefleetd inactive"
   fi
 else
   # macOS: install LaunchAgent plist so `launchctl kickstart -k` works
