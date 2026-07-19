@@ -1,12 +1,21 @@
-//! Backup orchestrator — runs on the leader, snapshots Postgres +
-//! Redis on a cadence, and distributes each snapshot across the
-//! fleet via the deferred-task queue (rsync fan-out).
+//! Backup orchestrator — snapshots Postgres + Redis (on the leader) and
+//! FalkorDB (on its pinned source host) on a cadence, and distributes each
+//! snapshot to offsite peers via the deferred-task queue (rsync fan-out).
 //!
-//! ## Cadence
-//! - Postgres: every `postgres_interval_hours` (default 4h) via
-//!   `pg_basebackup -Ft -z` streamed to a local `.tar.gz`.
-//! - Redis:    every `redis_interval_hours` (default 2h) via
-//!   `BGSAVE` + copy of `dump.rdb` + `zstd` compression.
+//! ## Policy lives in the DB (`fleet_backup_config`, schema V163)
+//! Per kind: `source_host` (NULL = leader), `dest_hosts[]` (empty =
+//! auto-pick 2 recently-seen peers — the offsite-2-nodes rule),
+//! `interval_secs`, `retention_count`, `retention_days`, `encrypt`,
+//! `enabled`. Built-in defaults only apply when the row/table is missing.
+//! On-disk layout on every node: `~/.forgefleet/backups/<KIND>/`
+//! (postgres/, redis/, FalkorDB/, brain/, obsidian/).
+//!
+//! ## Cadence (seeded defaults)
+//! - Postgres: every 4h via `pg_basebackup -Ft -z` streamed to a local
+//!   `.tar.gz`.
+//! - Redis:    every 2h via `BGSAVE` + copy of `dump.rdb` + `zstd`.
+//! - FalkorDB: every 6h via `BGSAVE` + tar of `dump.rdb` + the AOF dir
+//!   out of the `forgefleet-falkordb` container + `zstd`.
 //!
 //! Both flows share the same post-processing:
 //!   1. Compute SHA256 of the final artifact.
