@@ -5,10 +5,37 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
+use std::collections::HashSet;
 
 /// Default cooldown before a processed self-heal signature is eligible for
 /// re-arming. Prevents thrashing on a bug that flaps every few minutes.
 pub const DEFAULT_REARM_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// In-memory state used while coordinating self-heal tasks.
+///
+/// Detected signatures are kept as a set so repeated reports remain
+/// single-flight and a signature can be consumed when its task is re-armed.
+#[derive(Debug, Default)]
+pub struct SelfHealTaskState {
+    detected_bug_signatures: HashSet<String>,
+}
+
+impl SelfHealTaskState {
+    /// Record a detected signature, returning `true` only for a novel one.
+    pub fn record_bug_signature(&mut self, bug_signature: impl Into<String>) -> bool {
+        self.detected_bug_signatures.insert(bug_signature.into())
+    }
+
+    /// Check whether a signature has already been detected.
+    pub fn has_bug_signature(&self, bug_signature: &str) -> bool {
+        self.detected_bug_signatures.contains(bug_signature)
+    }
+
+    /// Consume a detected signature when its self-heal task is re-armed.
+    pub fn take_bug_signature_for_rearm(&mut self, bug_signature: &str) -> bool {
+        self.detected_bug_signatures.remove(bug_signature)
+    }
+}
 
 /// Map a self-heal tier to a `fleet_tasks` priority.
 pub fn self_heal_priority_for_tier(tier: &str) -> i32 {
@@ -155,6 +182,20 @@ pub async fn rearm_self_heal_task(
 mod tests {
     use super::*;
     use std::env;
+
+    #[test]
+    fn self_heal_task_state_tracks_signatures_for_rearm() {
+        let mut state = SelfHealTaskState::default();
+
+        assert!(state.record_bug_signature("sig-a"));
+        assert!(!state.record_bug_signature("sig-a"));
+        assert!(state.has_bug_signature("sig-a"));
+        assert!(!state.has_bug_signature("sig-b"));
+
+        assert!(state.take_bug_signature_for_rearm("sig-a"));
+        assert!(!state.has_bug_signature("sig-a"));
+        assert!(!state.take_bug_signature_for_rearm("sig-a"));
+    }
 
     fn temp_db_urls() -> (String, String, String) {
         let base_url = env::var("FORGEFLEET_POSTGRES_URL")
