@@ -51,6 +51,10 @@ impl AgentTool for FileWriteTool {
             Err(e) => return AgentToolResult::err(e),
         };
 
+        // Hold the per-session edit lock so this write can't interleave with
+        // a concurrent Edit's read-modify-write on the same file.
+        let _edit_guard = ctx.edit_lock.lock().await;
+
         // Create parent directories
         if let Some(parent) = path.parent()
             && let Err(e) = fs::create_dir_all(parent).await
