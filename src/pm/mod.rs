@@ -119,12 +119,52 @@ pub fn compute_pick_score(item: &WorkItem, now: DateTime<Utc>) -> f64 {
         - (item.blocked_by_count as f64 * BLOCKER_PENALTY)
 }
 
+// ─── Capability matching ─────────────────────────────────────────────────────
+
+/// Returns `true` when `slot` provides every capability required by `item`.
+///
+/// A work item with no required capabilities matches any slot; a slot matches
+/// only when its capability set is a superset of the item's required tags.
+pub fn slot_can_handle(item: &WorkItem, slot: &Slot) -> bool {
+    item.required_capabilities.is_subset(&slot.capabilities)
+}
+
+/// Estimated job size for the WSJF denominator.
+///
+/// Sized by the number of distinct capabilities the item requires.  Items with
+/// no required capabilities default to a size of 1.0 so the WSJF ratio is
+/// well-defined and capability-agnostic work is not infinitely preferred.
+const MIN_JOB_SIZE: f64 = 1.0;
+
+pub fn job_size(item: &WorkItem) -> f64 {
+    (item.required_capabilities.len() as f64).max(MIN_JOB_SIZE)
+}
+
+/// Cost of Delay for the WSJF numerator.
+///
+/// Reuses the existing pick score, which already weights urgency (quadrant +
+/// priority), ageing, and blocker penalties.
+pub fn cost_of_delay(item: &WorkItem, now: DateTime<Utc>) -> f64 {
+    compute_pick_score(item, now)
+}
+
+/// WSJF capability-match score for assigning `item` to `slot`.
+///
+/// Returns `Some(cost_of_delay / job_size)` when the slot can handle the item,
+/// otherwise `None`.  Higher scores schedule first.
+pub fn wsjf_match_score(item: &WorkItem, slot: &Slot, now: DateTime<Utc>) -> Option<f64> {
+    if !slot_can_handle(item, slot) {
+        return None;
+    }
+    Some(cost_of_delay(item, now) / job_size(item))
+}
+
 // ─── Tick ────────────────────────────────────────────────────────────────────
 
 /// One scheduler pass.
 ///
 /// 1. Filters to [`Status::Ready`] items.
-/// 2. Computes a `pick_score` for each using [`compute_pick_score`].
+/// 2. Computes a WSJF match score for each using [`wsjf_match_score`].
 /// 3. Sorts by score descending (ties broken by item id for determinism).
 /// 4. Greedily assigns each ready item to the first capable, unused slot.
 ///
@@ -134,7 +174,15 @@ pub fn scheduler_tick(items: &[WorkItem], slots: &[Slot], now: DateTime<Utc>) ->
     let mut ready: Vec<(f64, &WorkItem)> = items
         .iter()
         .filter(|i| i.status == Status::Ready)
-        .map(|i| (compute_pick_score(i, now), i))
+        .map(|i| {
+            // Score each item by its best WSJF match across all slots; items
+            // that no slot can handle receive a score of 0.0 and are skipped.
+            let best_score = slots
+                .iter()
+                .filter_map(|slot| wsjf_match_score(i, slot, now))
+                .fold(0.0, f64::max);
+            (best_score, i)
+        })
         .collect();
 
     // Higher score first; tie-break by id so the output is deterministic.
@@ -151,13 +199,13 @@ pub fn scheduler_tick(items: &[WorkItem], slots: &[Slot], now: DateTime<Utc>) ->
     for (_, item) in ready {
         if let Some(idx) = available
             .iter()
-            .position(|slot| item.required_capabilities.is_subset(&slot.capabilities))
+            .position(|slot| slot_can_handle(item, slot))
         {
             let slot = available.swap_remove(idx);
             assignments.push(Assignment {
                 item_id: item.id.clone(),
                 slot_id: slot.id.clone(),
-                pick_score: compute_pick_score(item, now),
+                pick_score: wsjf_match_score(item, slot, now).unwrap_or(0.0),
             });
         }
     }
@@ -266,5 +314,43 @@ mod tests {
         let slots = [slot("s1", &[])];
         let assignments = scheduler_tick(&items, &slots, now);
         assert_eq!(assignments.len(), 1);
+    }
+
+    #[test]
+    fn slot_can_handle_allows_superset() {
+        let item = item("a", Quadrant::Q2, 3, 0, 0, &["cpu"]);
+        let slot = slot("s1", &["cpu", "gpu"]);
+        assert!(slot_can_handle(&item, &slot));
+    }
+
+    #[test]
+    fn slot_can_handle_rejects_missing_capability() {
+        let item = item("a", Quadrant::Q2, 3, 0, 0, &["gpu"]);
+        let slot = slot("s1", &["cpu"]);
+        assert!(!slot_can_handle(&item, &slot));
+    }
+
+    #[test]
+    fn wsjf_match_score_none_when_slot_cannot_handle() {
+        let now = Utc::now();
+        let item = item("a", Quadrant::Q1, 1, 0, 0, &["gpu"]);
+        let slot = slot("s1", &["cpu"]);
+        assert!(wsjf_match_score(&item, &slot, now).is_none());
+    }
+
+    #[test]
+    fn wsjf_prefers_shorter_job_at_same_cost_of_delay() {
+        let now = Utc::now();
+        let simple = item("simple", Quadrant::Q1, 1, 0, 0, &["cpu"]);
+        let complex = item("complex", Quadrant::Q1, 1, 0, 0, &["cpu", "gpu", "ram"]);
+        let slot = slot("s1", &["cpu", "gpu", "ram", "disk"]);
+
+        let simple_score = wsjf_match_score(&simple, &slot, now).unwrap();
+        let complex_score = wsjf_match_score(&complex, &slot, now).unwrap();
+
+        // Same quadrant, priority, age and blockers => same cost of delay.
+        // The item requiring fewer capabilities has a smaller job size, so its
+        // WSJF score is higher.
+        assert!(simple_score > complex_score);
     }
 }
