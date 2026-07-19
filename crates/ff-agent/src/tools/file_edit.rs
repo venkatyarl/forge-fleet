@@ -73,6 +73,10 @@ impl AgentTool for FileEditTool {
             Err(e) => return AgentToolResult::err(e),
         };
 
+        // Hold the per-session edit lock across the read-modify-write so a
+        // concurrent Edit/Write in the same turn can't lose this update.
+        let _edit_guard = ctx.edit_lock.lock().await;
+
         let content = match fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => {
@@ -151,4 +155,68 @@ fn resolve_path(
     };
 
     Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn test_ctx(dir: &std::path::Path) -> AgentToolContext {
+        AgentToolContext {
+            working_dir: dir.to_path_buf(),
+            session_id: "test-session".to_string(),
+            shell_state: Arc::new(Mutex::new(Default::default())),
+            edit_lock: Arc::new(Mutex::new(())),
+            pg_pool: None,
+        }
+    }
+
+    /// Concurrent Edit calls in the same session must not lose updates: each
+    /// read-modify-write holds the session edit lock, so every replacement
+    /// survives even when the agent loop runs the calls in parallel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_edits_are_serialized() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("target.txt");
+        let n = 16usize;
+        // Zero-padded tokens so no old_string is a substring of another.
+        let initial: String = (0..n).map(|i| format!("old{i:02}\n")).collect();
+        fs::write(&file, &initial).await.expect("seed file");
+
+        let ctx = test_ctx(dir.path());
+        let tool = Arc::new(FileEditTool);
+
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let tool = Arc::clone(&tool);
+            let ctx = ctx.clone();
+            let path = file.display().to_string();
+            handles.push(tokio::spawn(async move {
+                tool.execute(
+                    json!({
+                        "file_path": path,
+                        "old_string": format!("old{i:02}"),
+                        "new_string": format!("new{i:02}"),
+                    }),
+                    &ctx,
+                )
+                .await
+            }));
+        }
+
+        for handle in handles {
+            let result = handle.await.expect("join edit task");
+            assert!(!result.is_error, "edit failed: {}", result.content);
+        }
+
+        let final_content = fs::read_to_string(&file).await.expect("read back");
+        for i in 0..n {
+            assert!(
+                final_content.contains(&format!("new{i:02}")),
+                "lost update: new{i:02} missing from {final_content:?}"
+            );
+        }
+    }
 }

@@ -320,6 +320,7 @@ impl AgentSession {
             working_dir: config.working_dir.clone(),
             session_id: session_id.to_string(),
             shell_state: tools::session_shell_state(&session_id.to_string()),
+            edit_lock: tools::session_edit_lock(&session_id.to_string()),
             pg_pool: config.pg_pool.clone(),
         };
 
@@ -384,6 +385,7 @@ impl AgentSession {
             working_dir: config.working_dir.clone(),
             session_id: session_id.to_string(),
             shell_state: tools::session_shell_state(&session_id.to_string()),
+            edit_lock: tools::session_edit_lock(&session_id.to_string()),
             pg_pool: config.pg_pool.clone(),
         };
 
