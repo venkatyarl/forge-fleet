@@ -3,7 +3,7 @@ use super::{
     dataflow::DataflowExtractor, db_schema::DbSchemaExtractor, deps::DepsExtractor,
     events::EventsExtractor, lookup_code_node, observ::ObservExtractor, owners::OwnersExtractor,
     product::ProductExtractor, routes::RoutesExtractor, security::SecurityExtractor,
-    types::TypesExtractor, upsert_code_node,
+    types::TypesExtractor, upsert_code_node, work_item_context::WorkItemContextExtractor,
 };
 use anyhow::Result;
 use serde_json::Value;
@@ -66,6 +66,7 @@ pub fn registry() -> Vec<Box<dyn Extractor>> {
         Box::new(SecurityExtractor),
         Box::new(TypesExtractor),
         Box::new(ApiExtractor),
+        Box::new(WorkItemContextExtractor),
     ]
 }
 

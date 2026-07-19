@@ -120,6 +120,8 @@ pub mod spi;
 pub mod storage;
 #[path = "cortex/extractors/types.rs"]
 pub mod types;
+#[path = "cortex/extractors/work_item_context.rs"]
+pub mod work_item_context;
 
 /// Summary of a Cortex indexing run.
 #[derive(Debug, Default, Clone)]
