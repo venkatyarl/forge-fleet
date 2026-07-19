@@ -8,6 +8,7 @@
 //! - Per-session working memory with promotion to long-term memory
 //! - Workspace-level memory isolation and cross-workspace search
 
+pub mod cache;
 pub mod capture;
 pub mod rag;
 pub mod retrieval;
@@ -15,6 +16,7 @@ pub mod session;
 pub mod store;
 pub mod workspace;
 
+pub use cache::{ContextCache, WorkItemContextCache};
 pub use capture::{AutoCaptureEngine, CaptureCandidate, CaptureKind, TranscriptTurn};
 pub use rag::{DocumentKind, IngestReport, RagChunk, RagEngine, RagQuery, RagResult};
 pub use retrieval::{MemoryRetrievalEngine, RetrievalQuery, RetrievalResult};
