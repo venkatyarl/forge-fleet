@@ -10,7 +10,9 @@ use std::fmt;
 use std::future::Future;
 use thiserror::Error;
 
+use ff_pulse::beat_v2::PulseBeatV2;
 use ff_pulse::client::PulseClient;
+use ff_pulse::reader::PulseReader;
 
 /// Lifecycle status of a repair action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -126,6 +128,36 @@ where
 {
     let src_online = pulse.is_node_alive(src_node).await?;
     dispatch_if_source_online(src_online, src_node, dispatch).await
+}
+
+/// Classify a source node's latest Pulse v2 beat as alive or not.
+///
+/// A source counts as alive only when a beat is present (the 45s beat key
+/// TTL has not expired) and the beat is not a graceful-exit (LWT) beat —
+/// the same definition `is_odown` and the election use for a healthy peer.
+pub fn source_beat_alive(beat: Option<&PulseBeatV2>) -> bool {
+    beat.is_some_and(|b| !b.going_offline)
+}
+
+/// Dispatch a repair only while its source node's Pulse v2 beat status
+/// shows it alive.
+///
+/// Checks the source's latest beat via [`source_beat_alive`] and returns
+/// early with a parked `src-offline` edge when the node has stopped
+/// beating (or published its going-offline beat); the dispatch closure is
+/// never called in that case.
+pub async fn dispatch_repair_by_beat<F, Fut, T>(
+    reader: &PulseReader,
+    src_node: &str,
+    dispatch: F,
+) -> anyhow::Result<RepairDispatch<T>>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    let beat = reader.latest_beat(src_node).await?;
+    let src_online = source_beat_alive(beat.as_ref());
+    dispatch_if_source_online(src_online, dispatch).await
 }
 
 async fn dispatch_if_source_online<F, Fut, T>(
@@ -316,6 +348,24 @@ mod tests {
         );
         let back: RepairAlert = serde_json::from_value(json).unwrap();
         assert_eq!(back, alert);
+    }
+
+    #[test]
+    fn missing_beat_is_not_alive() {
+        assert!(!source_beat_alive(None));
+    }
+
+    #[test]
+    fn live_beat_is_alive() {
+        let beat = PulseBeatV2::skeleton("node-7");
+        assert!(source_beat_alive(Some(&beat)));
+    }
+
+    #[test]
+    fn going_offline_beat_is_not_alive() {
+        let mut beat = PulseBeatV2::skeleton("node-7");
+        beat.going_offline = true;
+        assert!(!source_beat_alive(Some(&beat)));
     }
 
     #[tokio::test]
