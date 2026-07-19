@@ -94,6 +94,7 @@ impl NodeWorkloadPreference {
 // ─── Placement Engine ────────────────────────────────────────────────────────
 
 /// Scores nodes for task placement using the configured policy.
+#[derive(Debug)]
 pub struct PlacementEngine {
     /// Active placement policy.
     policy: PlacementPolicy,
@@ -405,11 +406,7 @@ mod tests {
         offline.online = false;
 
         let score = engine.score_node(&task, &offline);
-        assert!(
-            score == 0.0,
-            "Offline node should score 0.0, got {}",
-            score
-        );
+        assert!(score == 0.0, "Offline node should score 0.0, got {}", score);
     }
 
     #[test]

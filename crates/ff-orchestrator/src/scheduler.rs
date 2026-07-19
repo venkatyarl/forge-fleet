@@ -178,7 +178,12 @@ impl NodeCapacity {
     }
 
     /// Allocate resources for a task. Returns `false` if insufficient capacity.
-    pub fn allocate(&mut self, task_id: Uuid, req: &ResourceRequirements, priority: TaskPriority) -> bool {
+    pub fn allocate(
+        &mut self,
+        task_id: Uuid,
+        req: &ResourceRequirements,
+        priority: TaskPriority,
+    ) -> bool {
         if !self.can_fit(req) {
             return false;
         }
@@ -247,14 +252,9 @@ pub struct RunningTask {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ScheduleDecision {
     /// Assign the task to the named node.
-    Assign {
-        worker_name: String,
-        score: f64,
-    },
+    Assign { worker_name: String, score: f64 },
     /// No capacity — task should be queued.
-    Queue {
-        reason: String,
-    },
+    Queue { reason: String },
     /// Preempt a lower-priority task to make room.
     Preempt {
         /// Node where preemption will happen.
@@ -351,6 +351,7 @@ impl ScheduledTask {
 ///
 /// Maintains runtime node capacities and makes scheduling decisions
 /// using configurable placement policies.
+#[derive(Debug)]
 pub struct Scheduler {
     /// Per-node capacity tracking.
     nodes: HashMap<String, NodeCapacity>,
@@ -400,7 +401,9 @@ impl Scheduler {
 
     /// Release resources for a completed task.
     pub fn release_task(&mut self, worker_name: &str, task_id: Uuid) -> Option<RunningTask> {
-        self.nodes.get_mut(worker_name).and_then(|n| n.release(task_id))
+        self.nodes
+            .get_mut(worker_name)
+            .and_then(|n| n.release(task_id))
     }
 
     /// Number of registered nodes.
@@ -446,8 +449,8 @@ impl Scheduler {
         }
 
         // Step 4: Pick best candidate
-        if let Some((ref best_node, score)) = candidates.first().cloned() {
-            let worker_name = best_node.to_string();
+        if let Some((best_node, score)) = candidates.first().cloned() {
+            let worker_name = best_node;
 
             // Allocate resources
             if let Some(cap) = self.nodes.get_mut(&worker_name) {
@@ -494,7 +497,11 @@ impl Scheduler {
     ///
     /// When multiple candidates have similar scores (within 5%), rotate
     /// among them to distribute work from the same project across nodes.
-    fn apply_fairness_tiebreak(&mut self, candidates: &mut Vec<(String, f64)>, task: &ScheduledTask) {
+    fn apply_fairness_tiebreak(
+        &mut self,
+        candidates: &mut Vec<(String, f64)>,
+        task: &ScheduledTask,
+    ) {
         if candidates.is_empty() {
             return;
         }
@@ -509,10 +516,7 @@ impl Scheduler {
         }
 
         // Rotate the round-robin index
-        let idx = self
-            .round_robin_index
-            .entry(task.priority)
-            .or_insert(0);
+        let idx = self.round_robin_index.entry(task.priority).or_insert(0);
         let pick = *idx % tied_count;
         *idx = idx.wrapping_add(1);
 
@@ -565,9 +569,8 @@ impl Scheduler {
         }
 
         // Pick the best preemption candidate
-        preempt_candidates.sort_by(|a, b| {
-            b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        preempt_candidates
+            .sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
         if let Some((worker_name, evict_task_id, score)) = preempt_candidates.into_iter().next() {
             // Release the evicted task's resources
@@ -731,14 +734,14 @@ mod tests {
         scheduler.add_node(make_node("james", 8, 32, false));
 
         // Fill the node with a background task
-        let bg_task = make_task("background work", 6, 24, false)
-            .with_priority(TaskPriority::Background);
+        let bg_task =
+            make_task("background work", 6, 24, false).with_priority(TaskPriority::Background);
         let bg_decision = scheduler.schedule_task(&bg_task);
         assert!(bg_decision.is_assigned());
 
         // Now a critical task arrives that needs the same resources
-        let critical_task = make_task("urgent fix", 6, 24, false)
-            .with_priority(TaskPriority::Critical);
+        let critical_task =
+            make_task("urgent fix", 6, 24, false).with_priority(TaskPriority::Critical);
         let decision = scheduler.schedule_task(&critical_task);
 
         match &decision {
@@ -760,13 +763,12 @@ mod tests {
         scheduler.add_node(make_node("james", 8, 32, false));
 
         // Fill the node with a background task
-        let bg_task = make_task("background work", 6, 24, false)
-            .with_priority(TaskPriority::Background);
+        let bg_task =
+            make_task("background work", 6, 24, false).with_priority(TaskPriority::Background);
         scheduler.schedule_task(&bg_task);
 
         // High priority (not Critical) cannot preempt
-        let high_task = make_task("high priority", 6, 24, false)
-            .with_priority(TaskPriority::High);
+        let high_task = make_task("high priority", 6, 24, false).with_priority(TaskPriority::High);
         let decision = scheduler.schedule_task(&high_task);
 
         assert!(matches!(decision, ScheduleDecision::Queue { .. }));
