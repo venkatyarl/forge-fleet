@@ -15,6 +15,9 @@ pub mod errors;
 pub mod ha_coordinator;
 pub mod health;
 
+#[cfg(test)]
+mod tests;
+
 pub use bootstrap::{
     BootstrapOptions, BootstrapPlan, BootstrapValidation, StartupSubsystem, build_bootstrap_plan,
     validate_fleet_config, validate_startup_order,
