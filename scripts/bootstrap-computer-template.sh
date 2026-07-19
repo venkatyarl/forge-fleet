@@ -112,6 +112,42 @@ fi
 say "Runtime resolved: $RUNTIME"
 report "detect_os" ok "$OS_FULL / $RUNTIME"
 
+# ─── 1b. /etc/hosts hostname entry ─────────────────────────────────────────
+# Debian/Ubuntu convention: 127.0.1.1 must map to this computer's hostname.
+# Fleet images are sometimes renamed after imaging, leaving the old entry (or
+# none at all), which breaks `sudo` and hostname-sensitive daemons. Make the
+# bootstrap idempotent: rewrite the 127.0.1.1 line to NAME, or append one.
+if [ "$OS_ID" != "macos" ]; then
+  report "hosts" running
+  HOSTS_BACKUP="/etc/hosts.forgefleet-before-$(date +%s)"
+  cp /etc/hosts "$HOSTS_BACKUP"
+
+  if ! awk -v name="$NAME" '
+    BEGIN { found=0 }
+    {
+      if ($1 == "127.0.1.1") {
+        $2 = name
+        found=1
+      }
+      print
+    }
+    END { if (!found) print "127.0.1.1 " name }
+  ' /etc/hosts > /tmp/forgefleet-hosts.new; then
+    rm -f /tmp/forgefleet-hosts.new "$HOSTS_BACKUP"
+    die "failed to stage /etc/hosts update"
+  fi
+
+  if ! awk -v name="$NAME" '$1 == "127.0.1.1" && $2 == name { found=1 } END { exit !found }' /tmp/forgefleet-hosts.new; then
+    cp "$HOSTS_BACKUP" /etc/hosts
+    rm -f /tmp/forgefleet-hosts.new "$HOSTS_BACKUP"
+    die "failed to ensure 127.0.1.1 $NAME in /etc/hosts"
+  fi
+
+  mv /tmp/forgefleet-hosts.new /etc/hosts
+  rm -f "$HOSTS_BACKUP"
+  report "hosts" ok
+fi
+
 # ─── 2. Prerequisites ─────────────────────────────────────────────────────
 
 report "prereqs" running
