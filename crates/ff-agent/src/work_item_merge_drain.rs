@@ -45,6 +45,56 @@ pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
         return Ok(0);
     };
 
+    // Conflict-cascade guard: when several sibling PRs land near-simultaneously,
+    // each squash-merge advances main and stales the rest — `gh pr merge` then
+    // fails with conflicts and the item is shed (2026-07-18: 20 of 38 wave PRs
+    // died this way). DIRTY → close this queue row and reset the item for a
+    // fresh rebuild against current main; BEHIND → update the PR branch and let
+    // CI re-run before merging, so we never squash a stale head.
+    match pr_merge_state(&pr_url).await {
+        PrMergeState::Dirty => {
+            warn!(
+                pr = %pr_url,
+                work_item = %item.work_item_id,
+                "merge_drain: PR conflicts with advanced main — resetting item for rebuild"
+            );
+            ff_db::pg_mark_merge_failed(
+                pg,
+                item.id,
+                item.work_item_id,
+                "PR conflicted with advanced main — auto-reset for rebuild",
+            )
+            .await?;
+            sqlx::query(
+                "UPDATE work_items \
+                    SET status = 'ready', attempts = 0, last_error = NULL, \
+                        assigned_computer = NULL \
+                  WHERE id = $1",
+            )
+            .bind(item.work_item_id)
+            .execute(pg)
+            .await?;
+            return Ok(0);
+        }
+        PrMergeState::Behind => match gh_update_pr_branch(&pr_url).await {
+            Ok(()) => {
+                info!(
+                    pr = %pr_url,
+                    "merge_drain: PR behind main — branch updated, waiting for fresh CI"
+                );
+                return Ok(0);
+            }
+            Err(e) => {
+                warn!(
+                    pr = %pr_url,
+                    error = %e,
+                    "merge_drain: update-branch failed — continuing with stale head"
+                );
+            }
+        },
+        PrMergeState::Other => {}
+    }
+
     // Mark that we're watching this PR's CI (idempotent).
     ff_db::pg_mark_merge_ci_running(pg, item.id).await?;
 
@@ -236,6 +286,56 @@ enum CiState {
     Pending,
     Success,
     Failed(String),
+}
+
+/// GitHub's view of how the PR head relates to its base branch.
+enum PrMergeState {
+    /// Merge-conflicting with the base (GitHub `DIRTY`).
+    Dirty,
+    /// No conflicts but behind the base (GitHub `BEHIND`).
+    Behind,
+    /// Everything else (CLEAN/BLOCKED/UNSTABLE/UNKNOWN or a gh/API error) —
+    /// take no special action; the normal CI→review→merge path decides.
+    Other,
+}
+
+/// `gh pr view <url> --json mergeStateStatus`. Any error maps to `Other` so a
+/// gh hiccup can never reset a healthy item or block the drain.
+async fn pr_merge_state(pr_url: &str) -> PrMergeState {
+    let mut cmd = gh_cmd().await;
+    cmd.args(["pr", "view", pr_url, "--json", "mergeStateStatus"]);
+    let out = match cmd.output().await {
+        Ok(o) if o.status.success() => o,
+        _ => return PrMergeState::Other,
+    };
+    let status = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .ok()
+        .and_then(|v| {
+            v.get("mergeStateStatus")
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    match status.as_str() {
+        "DIRTY" => PrMergeState::Dirty,
+        "BEHIND" => PrMergeState::Behind,
+        _ => PrMergeState::Other,
+    }
+}
+
+/// `gh pr update-branch <url>` — merges current base into the PR branch via the
+/// GitHub API so CI re-runs against what the squash-merge will actually contain.
+async fn gh_update_pr_branch(pr_url: &str) -> Result<()> {
+    let mut cmd = gh_cmd().await;
+    cmd.args(["pr", "update-branch", pr_url]);
+    let out = cmd.output().await.context("spawn gh pr update-branch")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "gh pr update-branch failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    )
 }
 
 /// Inspect a PR's checks via `gh pr checks <url> --json state`. No checks yet

@@ -2239,6 +2239,19 @@ fn git_head_sha(worktree_path: &Path) -> Result<String> {
 }
 
 fn push_branch(repo_path: &Path, task_branch: &str) -> Result<()> {
+    // Prune-fetch first: the lease below is checked against this clone's
+    // remote-tracking ref, and merged wi/* branches are DELETED on origin
+    // (merge policy: --delete-branch). A slot that once built any wi/ item
+    // keeps a stale refs/remotes/origin/wi/* forever, and every later
+    // force-with-lease push from that slot dies with "stale info" (observed
+    // 2026-07-19: duncan wi/812dbdffc9df + three same-tick failures). Pruning
+    // makes the lease reflect what origin actually has. Best-effort: if the
+    // fetch fails the push may still succeed against an accurate ref.
+    let _ = run_git(
+        repo_path,
+        ["fetch", "--prune", "origin"],
+        Duration::from_secs(120),
+    );
     // --force-with-lease: the harness OWNS wi/* branches. When a prior attempt
     // pushed and then died (daemon restart, timeout), the retry rebuilds fresh
     // history from origin/<base> and a plain push is rejected non-fast-forward
