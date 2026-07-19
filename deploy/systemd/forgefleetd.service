@@ -21,10 +21,8 @@
 Description=ForgeFleet daemon
 After=network-online.target
 Wants=network-online.target
-# Always-up restart policy (pairs with Restart=always below). systemd's tight
-# default start limit (5 in 10s) tripped during the 2026-04-22 DGX migration —
-# a SIGTERM storm made systemd give up permanently for 9+ hours. 100 restarts/
-# hour ≈ "never give up" for a daemon that is supposed to be always running.
+# Restart unexpected failures while allowing intentional stops. Relax systemd's
+# tight default start limit so a rapid failure loop does not disable recovery.
 # These two keys MUST live in [Unit]: in [Service] modern systemd ignores them
 # (the earlier field units carried them there, silently keeping the default).
 StartLimitIntervalSec=3600
@@ -43,7 +41,7 @@ Environment=RUST_LOG=info
 Environment=FORGEFLEET_NODE_NAME=__COMPUTER_NAME__
 Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/cuda/bin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 
-Restart=always
+Restart=on-failure
 RestartSec=5
 
 StandardOutput=append:%h/.forgefleet/logs/forgefleetd.log
