@@ -7,7 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::future::Future;
 use thiserror::Error;
+
+use ff_pulse::client::PulseClient;
 
 /// Lifecycle status of a repair action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -88,6 +91,48 @@ impl fmt::Display for RepairStatus {
     }
 }
 
+/// Result of attempting to dispatch a repair edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepairDispatch<T> {
+    /// The source was online and the repair was dispatched.
+    Dispatched(T),
+    /// The edge was parked without running the repair.
+    Parked(RepairStatus),
+}
+
+/// Dispatch a repair only while its source node has a live Pulse beat.
+///
+/// Pulse metrics keys expire when a node stops beating, so this check prevents
+/// stale repair edges from being sent to an unavailable source. The dispatch
+/// closure is intentionally lazy and is never called for a parked edge.
+pub async fn dispatch_repair<F, Fut, T>(
+    pulse: &mut PulseClient,
+    src_node: &str,
+    dispatch: F,
+) -> anyhow::Result<RepairDispatch<T>>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    let src_online = pulse.is_node_alive(src_node).await?;
+    dispatch_if_source_online(src_online, dispatch).await
+}
+
+async fn dispatch_if_source_online<F, Fut, T>(
+    src_online: bool,
+    dispatch: F,
+) -> anyhow::Result<RepairDispatch<T>>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    if !src_online {
+        return Ok(RepairDispatch::Parked(RepairStatus::SrcOffline));
+    }
+
+    dispatch().await.map(RepairDispatch::Dispatched)
+}
+
 /// Operator-facing alert attached to a repair that needs manual attention.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -138,6 +183,7 @@ pub fn display_status(status: RepairStatus, alert: Option<&RepairAlert>) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn src_offline_is_reachable_from_proposed_and_applying() {
@@ -243,5 +289,29 @@ mod tests {
         );
         let back: RepairAlert = serde_json::from_value(json).unwrap();
         assert_eq!(back, alert);
+    }
+
+    #[tokio::test]
+    async fn offline_source_parks_edge_without_dispatching() {
+        let called = AtomicBool::new(false);
+
+        let result = dispatch_if_source_online(false, || async {
+            called.store(true, Ordering::SeqCst);
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result, RepairDispatch::Parked(RepairStatus::SrcOffline));
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn online_source_dispatches_repair() {
+        let result = dispatch_if_source_online(true, || async { Ok::<_, anyhow::Error>(42) })
+            .await
+            .unwrap();
+
+        assert_eq!(result, RepairDispatch::Dispatched(42));
     }
 }
