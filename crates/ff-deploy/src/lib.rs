@@ -29,7 +29,10 @@ pub use node::{
     forgefleetd_restart_command, restart_forgefleetd_local, restart_forgefleetd_with_drain,
 };
 pub use release::{ReleaseChannel, ReleaseManifest, ReleaseRecord, ReleaseState};
-pub use resolution::{ResolutionError, ResolutionRetryPolicy, ResolvedTarget, resolve_with_retry};
+pub use resolution::{
+    ResolutionError, ResolutionRetryPolicy, ResolvedTarget, TargetLike,
+    resolve_all_with_retry_async, resolve_with_retry, resolve_with_retry_async,
+};
 pub use rollback::{
     RollbackAction, RollbackCause, RollbackContext, RollbackDecider, RollbackDecision,
     RollbackPlan, RollbackPlanner, RollbackSeverity, RollbackStep,
