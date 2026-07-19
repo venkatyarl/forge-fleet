@@ -538,4 +538,101 @@ mod tests {
         assert_eq!(parsed.computer_name, "marcus");
         assert_eq!(parsed.pulse_protocol_version, 2);
     }
+
+    /// Backward-compatibility guard: a beat serialized by an older daemon
+    /// (before newer optional fields were added) must still deserialize into
+    /// the current schema. This protects rolling deployments where the fleet
+    /// runs mixed versions and older beats may still be in Redis/Postgres.
+    #[test]
+    fn legacy_beat_schema_deserializes_with_defaults() {
+        let legacy_json = r#"{
+            "pulse_protocol_version": 2,
+            "computer_id": null,
+            "computer_name": "legacy-node",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "epoch": 1,
+            "role_claimed": "member",
+            "election_priority": 0,
+            "is_yielding": false,
+            "going_offline": false,
+            "maintenance_mode": false,
+            "network": {
+                "primary_ip": "10.0.0.1",
+                "all_ips": [
+                    { "iface": "eth0", "ip": "10.0.0.1", "kind": "lan" }
+                ]
+            },
+            "hardware": { "cpu_cores": 8, "ram_gb": 32, "disk_gb": 500, "gpu": null },
+            "load": {
+                "cpu_pct": 12.5,
+                "ram_pct": 34.0,
+                "disk_free_gb": 123.4,
+                "gpu_pct": 0.0,
+                "active_inference_requests": 0,
+                "active_agent_sessions": 0
+            },
+            "memory": {
+                "ram_total_gb": 32.0,
+                "ram_used_gb": 10.0,
+                "ram_free_gb": 22.0,
+                "llm_ram_allocated_gb": 0.0,
+                "ram_available_for_new_llm_gb": 19.0,
+                "vram_total_gb": null,
+                "vram_used_gb": null,
+                "vram_free_gb": null,
+                "llm_vram_allocated_gb": null
+            },
+            "capabilities": {
+                "can_serve_ff_gateway": true,
+                "can_host_postgres_replica": false,
+                "can_host_redis_replica": false,
+                "gpu_kind": "none",
+                "gpu_count": 0,
+                "gpu_vram_gb": null,
+                "gpu_total_vram_gb": null,
+                "can_run_cuda": false,
+                "can_run_metal": false,
+                "can_run_rocm": false,
+                "recommended_runtimes": [],
+                "max_runnable_model_gb": null
+            },
+            "llm_servers": [],
+            "available_models": [],
+            "installed_software": [],
+            "docker": {
+                "daemon_running": false,
+                "total_cpu_pct": 0.0,
+                "total_memory_mb": 0.0,
+                "memory_limit_mb": 0.0,
+                "projects": []
+            },
+            "peers_seen": [],
+            "db_topology": {
+                "postgres_primary": null,
+                "postgres_replicas": [],
+                "redis_primary": null,
+                "redis_replicas": []
+            },
+            "config_version": null
+        }"#;
+
+        let parsed: PulseBeatV2 = serde_json::from_str(legacy_json)
+            .expect("legacy beat schema must deserialize into current struct");
+
+        assert_eq!(parsed.computer_name, "legacy-node");
+        assert_eq!(parsed.pulse_protocol_version, 2);
+        assert_eq!(parsed.network.primary_ip, "10.0.0.1");
+
+        // Fields added after the original schema must default safely.
+        assert!(parsed.os.family.is_empty());
+        assert!(parsed.os.distribution.is_empty());
+        assert!(parsed.os.version.is_empty());
+        assert!(parsed.os.kernel.is_empty());
+        assert!(parsed.os.arch.is_empty());
+        assert!(parsed.build_sha.is_none());
+        assert!(parsed.source_tree_path.is_none());
+        assert!(parsed.multi_host_participation.is_none());
+        assert!(parsed.encountered_bugs.is_empty());
+        assert!(parsed.local_tasks.is_empty());
+    }
 }
