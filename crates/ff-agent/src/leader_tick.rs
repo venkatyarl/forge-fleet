@@ -119,6 +119,9 @@ pub struct LeaderTick {
     /// primary and promote the local replica if we host one.
     pg_failover_manager: Option<Arc<PostgresFailoverManager>>,
 
+    /// In-process deduplication for novel error Telegram alerts.
+    error_tracker: crate::ha::error_tracker::ErrorTracker,
+
     /// First wall-clock instant at which we observed the current leader
     /// as ODOWN on the Pulse channel despite a fresh Postgres heartbeat.
     /// Reset to `None` whenever the leader becomes pulse-alive again OR
@@ -193,6 +196,7 @@ impl LeaderTick {
             on_became_leader: Arc::new(|_| {}),
             on_lost_leader: Arc::new(|_| {}),
             pg_failover_manager: None,
+            error_tracker: crate::ha::error_tracker::ErrorTracker::default(),
             leader_pulse_silent_since: tokio::sync::Mutex::new(None),
             yield_flag: None,
         }
@@ -1038,6 +1042,9 @@ impl LeaderTick {
                     error_text = error_text.as_deref().unwrap_or(""),
                     "scan_interaction_errors: enqueued novel error signature for self-heal"
                 );
+                self.error_tracker
+                    .alert(&self.pg, &sig, error_text.as_deref())
+                    .await;
             } else {
                 tracing::debug!(
                     error_signature = %sig,
