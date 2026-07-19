@@ -4711,6 +4711,58 @@ mod tests {
 
         drop_temp_db(admin, pool, &db_name).await;
     }
+
+    #[tokio::test]
+    async fn prune_terminal_history_retains_self_heal_bug_signatures() {
+        let Some((admin, pool, db_name)) = create_temp_db().await else {
+            return;
+        };
+
+        // Old terminal self-heal row WITH a bug signature → must survive so
+        // signature_should_rearm can still find it for the re-arm cooldown.
+        sqlx::query(
+            "INSERT INTO fleet_tasks
+                (task_type, summary, status, task_class, dedup_signature, created_at, completed_at)
+             VALUES
+                ('self_heal', 'heal panic in pulse', 'completed', 'self_heal', 'sig-keep',
+                 NOW() - INTERVAL '30 days', NOW() - INTERVAL '30 days'),
+                ('self_heal', 'heal without signature', 'failed', 'self_heal', NULL,
+                 NOW() - INTERVAL '30 days', NOW() - INTERVAL '30 days'),
+                ('build', 'ordinary old task', 'completed', NULL, NULL,
+                 NOW() - INTERVAL '30 days', NOW() - INTERVAL '30 days'),
+                ('self_heal', 'recent heal', 'completed', 'self_heal', 'sig-recent',
+                 NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert fleet_tasks history rows");
+
+        sqlx::query(
+            "INSERT INTO deferred_tasks (title, kind, trigger_type, status, created_at)
+             VALUES ('old deferred', 'shell', 'now', 'completed', NOW() - INTERVAL '30 days')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert deferred_tasks history row");
+
+        let (fleet, deferred) = pg_prune_terminal_task_history(&pool, 7)
+            .await
+            .expect("prune terminal task history");
+        // Only the signature-less self-heal row and the ordinary old row go.
+        assert_eq!(fleet, 2);
+        assert_eq!(deferred, 1);
+
+        let kept: Vec<String> = sqlx::query_scalar(
+            "SELECT dedup_signature FROM fleet_tasks
+              WHERE dedup_signature IS NOT NULL ORDER BY dedup_signature",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read surviving signatures");
+        assert_eq!(kept, ["sig-keep", "sig-recent"]);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
 }
 
 // ─── Task Provenance ─────────────────────────────────────────────────────────
@@ -7742,6 +7794,13 @@ pub async fn pg_reap_orphaned_work_items(pool: &PgPool, min_age_secs: i64) -> Re
 /// `(fleet_tasks_deleted, deferred_tasks_deleted)`. Deliberately does NOT touch
 /// the PM `work_items` table — those rows are operator-meaningful, not execution
 /// history.
+///
+/// Self-heal rows with a `dedup_signature` (the bug signature) are also
+/// retained: `signature_should_rearm` in ff-agent looks the signature up in
+/// `fleet_tasks` to enforce the re-arm cooldown, and pruning the row would let
+/// a recurring bug bypass the cooldown and lose its report history. These rows
+/// stay bounded on their own — the unique `dedup_signature` index keeps one row
+/// per bug, and re-arming resets `created_at` instead of inserting.
 pub async fn pg_prune_terminal_task_history(
     pool: &PgPool,
     retention_days: i32,
@@ -7749,7 +7808,8 @@ pub async fn pg_prune_terminal_task_history(
     let fleet = sqlx::query(
         "DELETE FROM fleet_tasks
           WHERE status IN ('completed','failed','cancelled')
-            AND created_at < NOW() - make_interval(days => $1)",
+            AND created_at < NOW() - make_interval(days => $1)
+            AND NOT (task_class = 'self_heal' AND dedup_signature IS NOT NULL)",
     )
     .bind(retention_days)
     .execute(pool)
