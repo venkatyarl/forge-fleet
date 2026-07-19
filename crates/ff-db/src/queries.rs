@@ -6081,6 +6081,133 @@ pub async fn pg_list_shared_volume_mounts(
         .collect())
 }
 
+// ─── node_peer_mounts (autofs / manual NFS peer mounts) ─────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct NodePeerMountRow {
+    pub id: sqlx::types::Uuid,
+    pub computer_id: sqlx::types::Uuid,
+    pub computer_name: Option<String>,
+    pub peer_name: String,
+    pub source: String,
+    pub mount_path: String,
+    pub fs_type: String,
+    pub mount_options: Option<String>,
+    pub detected_at: chrono::DateTime<chrono::Utc>,
+    pub last_check_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Upsert a discovered peer mount for a computer.  The unique key is
+/// `(computer_id, mount_path)` so repeated inventories update the same row.
+pub async fn pg_upsert_node_peer_mount(
+    pool: &PgPool,
+    computer_id: sqlx::types::Uuid,
+    peer_name: &str,
+    source: &str,
+    mount_path: &str,
+    fs_type: &str,
+    mount_options: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO node_peer_mounts
+            (computer_id, peer_name, source, mount_path, fs_type, mount_options, detected_at, last_check_at)
+         VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+         ON CONFLICT (computer_id, mount_path) DO UPDATE SET
+             peer_name = EXCLUDED.peer_name,
+             source = EXCLUDED.source,
+             fs_type = EXCLUDED.fs_type,
+             mount_options = EXCLUDED.mount_options,
+             last_check_at = NOW()",
+    )
+    .bind(computer_id)
+    .bind(peer_name)
+    .bind(source)
+    .bind(mount_path)
+    .bind(fs_type)
+    .bind(mount_options)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// List discovered peer mounts, optionally filtered by computer or peer name.
+pub async fn pg_list_node_peer_mounts(
+    pool: &PgPool,
+    computer_id: Option<sqlx::types::Uuid>,
+    peer_name: Option<&str>,
+) -> Result<Vec<NodePeerMountRow>> {
+    let rows = if let Some(cid) = computer_id {
+        if let Some(peer) = peer_name {
+            sqlx::query_as::<_, NodePeerMountRow>(
+                "SELECT m.*, c.name as computer_name
+                 FROM node_peer_mounts m
+                 LEFT JOIN computers c ON c.id = m.computer_id
+                 WHERE m.computer_id = $1 AND m.peer_name = $2
+                 ORDER BY m.last_check_at DESC
+                 LIMIT 500",
+            )
+            .bind(cid)
+            .bind(peer)
+            .fetch_all(pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, NodePeerMountRow>(
+                "SELECT m.*, c.name as computer_name
+                 FROM node_peer_mounts m
+                 LEFT JOIN computers c ON c.id = m.computer_id
+                 WHERE m.computer_id = $1
+                 ORDER BY m.last_check_at DESC
+                 LIMIT 500",
+            )
+            .bind(cid)
+            .fetch_all(pool)
+            .await?
+        }
+    } else if let Some(peer) = peer_name {
+        sqlx::query_as::<_, NodePeerMountRow>(
+            "SELECT m.*, c.name as computer_name
+             FROM node_peer_mounts m
+             LEFT JOIN computers c ON c.id = m.computer_id
+             WHERE m.peer_name = $1
+             ORDER BY m.last_check_at DESC
+             LIMIT 500",
+        )
+        .bind(peer)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, NodePeerMountRow>(
+            "SELECT m.*, c.name as computer_name
+             FROM node_peer_mounts m
+             LEFT JOIN computers c ON c.id = m.computer_id
+             ORDER BY m.last_check_at DESC
+             LIMIT 500",
+        )
+        .fetch_all(pool)
+        .await?
+    };
+    Ok(rows)
+}
+
+/// Count peer mounts whose direct mesh edge to the peer is currently failed
+/// and recent.  This is the correlation that turns a dead peer into a
+/// concrete list of affected client mounts.
+pub async fn pg_count_peer_mounts_on_failed_mesh(pool: &PgPool) -> Result<i64> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+           FROM node_peer_mounts m
+           JOIN computers c ON c.id = m.computer_id
+           JOIN fleet_mesh_status s
+             ON s.src_node = c.name
+            AND s.dst_node = m.peer_name
+          WHERE s.status = 'failed'
+            AND s.last_checked > NOW() - INTERVAL '1 hour'",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
 // ─── computer_schedules ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Serialize)]

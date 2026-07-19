@@ -35,7 +35,7 @@ cat <<'NEXT'
 ----
 On James, run:
   sudo mkdir -p /Volumes/taylor-models
-  sudo mount -t nfs -o resvport,ro,nolocks 10.44.0.1:/Users/venkat/models /Volumes/taylor-models
+  sudo mount -t nfs -o resvport,ro,nolocks,soft,intr,timeo=50,retrans=3 10.44.0.1:/Users/venkat/models /Volumes/taylor-models
   ls /Volumes/taylor-models
 
 Then on Taylor:

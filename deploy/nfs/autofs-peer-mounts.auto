@@ -1,0 +1,16 @@
+# ForgeFleet peer automount map sample.
+#
+# Drop this file as /etc/auto.forgefleet-peer-mounts and reference it from
+# /etc/auto.master.d/forgefleet-peer-mounts.autofs (or /etc/auto.master):
+#
+#   /mnt /etc/auto.forgefleet-peer-mounts --timeout=60
+#
+# Then reload autofs:
+#   sudo systemctl reload autofs
+#
+# The options below are the important part: soft,intr plus short timeo/retrans
+# so a dead peer fails fast instead of pinning the client in uninterruptible
+# D-state and inflating load.
+#
+# key      [-options]                                    location
+james      -fstype=nfs4,soft,intr,timeo=50,retrans=3,rw james:/mnt/james

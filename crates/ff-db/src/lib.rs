@@ -69,6 +69,7 @@ pub use queries::{
     ModelDeploymentRow,
     ModelJobRow,
     ModelLibraryRow,
+    NodePeerMountRow,
     // Orchestrator P3 — adaptive serving-mix autoscaler
     PlacementCandidate,
     ProjectGitPolicy,
@@ -184,6 +185,7 @@ pub use queries::{
     pg_list_mesh_status,
     pg_list_models,
     pg_list_models_for_node,
+    pg_list_node_peer_mounts,
     pg_list_node_ssh_keys,
     pg_list_nodes,
     pg_list_reserved_hosts,
@@ -259,6 +261,7 @@ pub use queries::{
     pg_upsert_mesh_status,
     pg_upsert_model,
     pg_upsert_node,
+    pg_upsert_node_peer_mount,
     pg_upsert_shared_volume_mount,
     // Orchestrator P2 — demand sensing emission (V116)
     record_session_work_signal,

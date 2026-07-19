@@ -10199,3 +10199,28 @@ pub const SCHEMA_V168_WORK_ITEM_CONTEXT: &str = r#"
 ALTER TABLE work_items
     ADD COLUMN IF NOT EXISTS context JSONB NOT NULL DEFAULT '{}';
 "#;
+
+/// V169 — Peer-mount inventory.
+///
+/// Records which fleet computers mount which peers (autofs or manual NFS
+/// mounts).  The mesh check and `ff doctor` correlate these rows with
+/// `fleet_mesh_status` to flag stale mounts while a peer is unreachable.
+pub const SCHEMA_V169_PEER_MOUNT_INVENTORY: &str = r#"
+CREATE TABLE IF NOT EXISTS node_peer_mounts (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    computer_id     UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    peer_name       TEXT NOT NULL,
+    source          TEXT NOT NULL,
+    mount_path      TEXT NOT NULL,
+    fs_type         TEXT NOT NULL,
+    mount_options   TEXT,
+    detected_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_check_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (computer_id, mount_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_peer_mounts_peer
+    ON node_peer_mounts(peer_name);
+CREATE INDEX IF NOT EXISTS idx_node_peer_mounts_computer
+    ON node_peer_mounts(computer_id);
+"#;

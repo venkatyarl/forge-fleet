@@ -822,6 +822,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "work_item_context",
         sql: schema::SCHEMA_V168_WORK_ITEM_CONTEXT,
     },
+    PgMigration {
+        version: 169,
+        name: "peer_mount_inventory",
+        sql: schema::SCHEMA_V169_PEER_MOUNT_INVENTORY,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

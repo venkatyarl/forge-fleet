@@ -1,4 +1,4 @@
-use crate::{GREEN, RED, RESET, truncate_str};
+use crate::{GREEN, RED, RESET, YELLOW, truncate_str};
 use anyhow::Result;
 
 pub async fn handle_storage(cmd: crate::StorageCommand) -> Result<()> {
@@ -12,6 +12,47 @@ pub async fn handle_storage(cmd: crate::StorageCommand) -> Result<()> {
     let mgr = ff_agent::shared_storage::SharedStorageManager::new(pool.clone());
 
     match cmd {
+        crate::StorageCommand::PeerMounts { command } => match command {
+            crate::PeerMountCommand::Inventory => {
+                let (recorded, failed) = mgr
+                    .inventory_peer_mounts()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("{GREEN}✓ Inventoried peer mounts{RESET}");
+                println!("  recorded: {recorded}");
+                println!("  failed_nodes: {failed}");
+                if failed > 0 {
+                    eprintln!("{YELLOW}⚠ {failed} node(s) could not be scanned{RESET}");
+                }
+                Ok(())
+            }
+            crate::PeerMountCommand::List => {
+                let rows = ff_db::pg_list_node_peer_mounts(&pool, None, None)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                if rows.is_empty() {
+                    println!(
+                        "(no peer mounts inventoried; run `ff storage peer-mounts inventory`)"
+                    );
+                    return Ok(());
+                }
+                println!(
+                    "{:<14} {:<14} {:<24} {:<10} {}",
+                    "COMPUTER", "PEER", "MOUNT", "FS", "OPTIONS"
+                );
+                for r in rows {
+                    println!(
+                        "{:<14} {:<14} {:<24} {:<10} {}",
+                        truncate_str(r.computer_name.as_deref().unwrap_or("?"), 14),
+                        truncate_str(&r.peer_name, 14),
+                        truncate_str(&r.mount_path, 24),
+                        truncate_str(&r.fs_type, 10),
+                        r.mount_options.as_deref().unwrap_or("-"),
+                    );
+                }
+                Ok(())
+            }
+        },
         crate::StorageCommand::Share { command } => match command {
             crate::StorageShareCommand::Create {
                 name,

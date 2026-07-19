@@ -3691,6 +3691,20 @@ pub enum StorageCommand {
         #[command(subcommand)]
         command: StorageShareCommand,
     },
+    /// Discovered NFS peer mounts (autofs/manual) per computer.
+    PeerMounts {
+        #[command(subcommand)]
+        command: PeerMountCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum PeerMountCommand {
+    /// Scan fleet nodes and record their NFS peer mounts in `node_peer_mounts`.
+    Inventory,
+    /// List recorded peer mounts.
+    #[command(alias = "ls")]
+    List,
 }
 
 #[derive(Debug, Clone, Subcommand)]
