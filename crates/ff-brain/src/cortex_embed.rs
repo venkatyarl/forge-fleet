@@ -36,6 +36,10 @@ const CORTEX_PREFIXES: &[&str] = &["code:", "doc:", "data:", "image:"];
 /// eviction) but not so many that a genuinely-down endpoint spins for long.
 const MAX_CONSECUTIVE_BATCH_FAILURES: u32 = 5;
 
+/// Maximum number of batches to process before returning, to prevent
+/// over-processing in long-running embed passes.
+const MAX_ITERATIONS: usize = 50;
+
 /// Seconds to wait before retrying after the Nth consecutive batch failure:
 /// linear `2·n` so a one-off blip pauses briefly while a persistent outage
 /// still trips the bail threshold quickly (2+4+6+8 = 20s across 4 retries).
@@ -142,7 +146,17 @@ where
     // the deferred failures.
     let initial_remaining = remaining_unembedded(pool, corpus).await.unwrap_or(i64::MAX);
 
+    let mut iterations = 0;
     loop {
+        iterations += 1;
+        if iterations > MAX_ITERATIONS {
+            tracing::warn!(
+                max_iterations = MAX_ITERATIONS,
+                "cortex embed iteration cap reached; stopping pass"
+            );
+            break;
+        }
+
         if stats.embedded + stats.failed >= initial_remaining as usize {
             break;
         }
