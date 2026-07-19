@@ -147,6 +147,12 @@ async fn recent_host_failures(pg: &PgPool, worker_name: &str) -> Result<usize> {
 pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Result<usize> {
     let repo_path = std::env::current_dir().context("resolve current repo path")?;
 
+    // Bump the dispatch tick for every active lease on this host. The stale-lease
+    // reaper watches `dispatch_tick_at` independently of `heartbeat_at` so it can
+    // reclaim a lease whose host dispatch loop wedged even though the in-build
+    // process keeps heartbeating.
+    bump_dispatch_tick_at(pg, worker_name).await;
+
     // Capacity-aware budget: dispatch up to this host's free-slot count, capped
     // at MAX_DISPATCH_PER_TICK, throttled to 1 under recent-failure backpressure.
     // Replaces the old hard 1/tick that left the fleet mostly idle.
@@ -928,6 +934,28 @@ async fn heartbeat_lease_once(work_item_id: Uuid) {
         work_item_id = %work_item_id,
         "work_item_dispatch: lease heartbeat FAILED after 3 tries — lease may go stale (watchdog could reap a LIVE build)"
     );
+}
+
+/// Bump `dispatch_tick_at` for every active lease on this host. Best-effort:
+/// if the update fails (e.g. the host has no computers row yet), the next tick
+/// retries. A missed tick eventually triggers the stale-dispatch-tick reaper.
+async fn bump_dispatch_tick_at(pg: &PgPool, worker_name: &str) {
+    if let Err(e) = sqlx::query(
+        "UPDATE work_item_leases
+            SET dispatch_tick_at = NOW()
+          WHERE computer_id = (SELECT id FROM computers WHERE name = $1)
+            AND released_at IS NULL",
+    )
+    .bind(worker_name)
+    .execute(pg)
+    .await
+    {
+        warn!(
+            worker_name = %worker_name,
+            error = %e,
+            "work_item_dispatch: failed to bump dispatch_tick_at"
+        );
+    }
 }
 
 /// Human-readable task branch: `feature/<title-slug>-<id4>` (operator

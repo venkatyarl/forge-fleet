@@ -10331,6 +10331,20 @@ CREATE TRIGGER trg_computers_ip_ram_paired_update
     EXECUTE FUNCTION computers_ip_ram_paired_update_guard();
 "#;
 
+/// V174 — Dispatch tick tracking for active work_item leases.
+///
+/// `heartbeat_at` tracks the in-build process, but a host's dispatch loop can
+/// stall while the build keeps heartbeating (e.g. the outer tokio task wedges).
+/// `dispatch_tick_at` is bumped by the host's dispatch loop every tick so the
+/// stale-lease reaper can also reclaim leases whose host stopped dispatching.
+pub const SCHEMA_V174_DISPATCH_TICK_AT: &str = r#"
+ALTER TABLE work_item_leases
+    ADD COLUMN IF NOT EXISTS dispatch_tick_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+CREATE INDEX IF NOT EXISTS idx_work_item_leases_dispatch_tick
+    ON work_item_leases (lease_state, dispatch_tick_at) WHERE released_at IS NULL;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
