@@ -10,6 +10,28 @@ use sqlx::{PgPool, Row};
 /// re-arming. Prevents thrashing on a bug that flaps every few minutes.
 pub const DEFAULT_REARM_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+/// Map a self-heal tier to a `fleet_tasks` priority.
+pub fn self_heal_priority_for_tier(tier: &str) -> i32 {
+    match tier {
+        "T1" => 100,
+        "T0" => 90,
+        "T2" => 80,
+        _ => 70,
+    }
+}
+
+/// Map a self-heal queue status to a `fleet_tasks` status.
+pub fn self_heal_task_status(queue_status: &str) -> &'static str {
+    match queue_status {
+        "detected" => "pending",
+        "fixing" | "reviewing" | "pr_open" | "merged" | "rolled_out" => "running",
+        "verified" => "completed",
+        "paused" => "paused",
+        "reverted" => "cancelled",
+        _ => "failed",
+    }
+}
+
 /// Outcome of checking whether a bug signature should re-arm a self-heal task.
 #[derive(Debug, Clone)]
 pub struct RearmCheck {
@@ -96,33 +118,33 @@ pub async fn rearm_self_heal_task(
         return Ok(false);
     }
 
-    let priority = match tier {
-        "T1" => 100,
-        "T0" => 90,
-        "T2" => 80,
-        _ => 70,
-    };
-
+    let terminal_statuses = ["completed", "failed", "cancelled"];
     let updated = sqlx::query(
         "UPDATE fleet_tasks
-            SET status = 'pending',
+            SET status = $4,
                 priority = $3,
                 completed_at = NULL,
+                created_at = NOW(),
                 payload = payload || jsonb_build_object(
                     'status', 'detected',
                     'attempts', 0,
                     'report_count', COALESCE((payload->>'report_count')::int, 0) + $2,
-                    'tier', $4,
-                    'rearmed_at', NOW()::text
+                    'tier', $5,
+                    'rearmed_at', NOW()::text,
+                    'last_attempt_at', NULL,
+                    'writer_computer_id', NULL,
+                    'escalated_to_operator_at', NULL
                 )
           WHERE task_class = 'self_heal'
             AND dedup_signature = $1
-            AND status IN ('completed', 'failed', 'cancelled')",
+            AND status = ANY($6)",
     )
     .bind(bug_signature)
     .bind(report_count)
-    .bind(priority)
+    .bind(self_heal_priority_for_tier(tier))
+    .bind(self_heal_task_status("detected"))
     .bind(tier)
+    .bind(&terminal_statuses[..])
     .execute(pg)
     .await?;
 
@@ -345,14 +367,44 @@ mod tests {
         let completed = Utc::now() - chrono::Duration::hours(1);
         let id = insert_self_heal_task(&pool, "sig-rearm", "completed", Some(completed)).await;
 
+        // Populate fields that should be cleared on rearm.
+        sqlx::query(
+            "UPDATE fleet_tasks
+             SET payload = payload || jsonb_build_object(
+                 'last_attempt_at', NOW()::text,
+                 'writer_computer_id', $2::text,
+                 'escalated_to_operator_at', NOW()::text
+             )
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(uuid::Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .expect("seed rearm test fields");
+
+        let before_rearm: DateTime<Utc> =
+            sqlx::query_scalar("SELECT created_at FROM fleet_tasks WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch pre-rearm created_at");
+
         let rearmed = rearm_self_heal_task(&pool, "sig-rearm", "T2", 3, None)
             .await
             .expect("rearm task");
         assert!(rearmed);
 
         let row = sqlx::query(
-            "SELECT status, (payload->>'report_count')::int AS report_count,
-                    (payload->>'status')::text AS payload_status
+            "SELECT status,
+                    created_at,
+                    completed_at,
+                    (payload->>'report_count')::int AS report_count,
+                    (payload->>'status')::text AS payload_status,
+                    (payload->>'attempts')::int AS attempts,
+                    payload->>'last_attempt_at' AS last_attempt_at,
+                    payload->>'writer_computer_id' AS writer_computer_id,
+                    payload->>'escalated_to_operator_at' AS escalated_to_operator_at
                FROM fleet_tasks
               WHERE id = $1",
         )
@@ -363,6 +415,32 @@ mod tests {
         assert_eq!(row.get::<String, _>("status"), "pending");
         assert_eq!(row.get::<String, _>("payload_status"), "detected");
         assert_eq!(row.get::<i32, _>("report_count"), 3);
+        assert_eq!(row.get::<i32, _>("attempts"), 0);
+        assert!(
+            row.try_get::<Option<DateTime<Utc>>, _>("completed_at")
+                .ok()
+                .flatten()
+                .is_none()
+        );
+        assert!(row.get::<DateTime<Utc>, _>("created_at") > before_rearm);
+        assert!(
+            row.try_get::<Option<String>, _>("last_attempt_at")
+                .ok()
+                .flatten()
+                .is_none()
+        );
+        assert!(
+            row.try_get::<Option<String>, _>("writer_computer_id")
+                .ok()
+                .flatten()
+                .is_none()
+        );
+        assert!(
+            row.try_get::<Option<String>, _>("escalated_to_operator_at")
+                .ok()
+                .flatten()
+                .is_none()
+        );
 
         drop_temp_db(admin, pool, &db_name).await;
     }
