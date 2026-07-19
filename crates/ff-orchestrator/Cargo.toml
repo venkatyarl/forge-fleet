@@ -8,6 +8,7 @@ description = "ForgeFleet task decomposition, multi-model routing, and parallel 
 
 [dependencies]
 ff-core = { path = "../ff-core" }
+ff-observability = { path = "../ff-observability" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

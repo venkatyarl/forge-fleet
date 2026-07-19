@@ -1589,6 +1589,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "ff-core",
+ "ff-observability",
  "futures",
  "reqwest",
  "serde",

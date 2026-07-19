@@ -16,6 +16,7 @@
 //! - [`confidence`] — Confidence-based escalation and trend tracking
 
 pub mod agent_team;
+pub mod alerts;
 pub mod cascade_strategy;
 pub mod confidence;
 pub mod crew;
@@ -32,6 +33,7 @@ pub mod task_decomposer;
 
 // Re-export primary types at crate root for ergonomic use.
 pub use agent_team::{AgentAssignment, ModelPreference, TeamConfig, TeamTemplates};
+pub use alerts::{AlertForwarder, AlertSink};
 pub use confidence::{
     ConfidenceAssessment, ConfidenceExtractor, ConfidenceScore, ConfidenceTracker,
     EscalationConfig, EscalationDecision,
