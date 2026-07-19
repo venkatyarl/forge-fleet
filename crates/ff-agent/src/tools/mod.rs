@@ -32,6 +32,7 @@ pub mod intelligence;
 pub mod json_query;
 pub mod lint_fix;
 pub mod media;
+pub mod mlx_degraded;
 pub mod model_discovery;
 pub mod model_mgmt;
 pub mod multimodal;
@@ -337,6 +338,7 @@ pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(fleet_ops::ModelDeployTool),
         Box::new(fleet_ops::FleetInventoryTool::default()),
         Box::new(fleet_ops::NodeHealthCheckTool::default()),
+        Box::new(mlx_degraded::MlxDegradedTool),
         Box::new(fleet_ops::BinaryDeployTool),
         // Intelligence & self-improvement tools
         Box::new(intelligence::PatternLearnerTool),

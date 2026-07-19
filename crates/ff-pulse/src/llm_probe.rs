@@ -128,7 +128,7 @@ impl LlmProbe {
                 continue;
             }
 
-            let (tokens_per_sec, queue_depth, metrics_runtime_hint) =
+            let (mut tokens_per_sec, mut queue_depth, metrics_runtime_hint) =
                 fetch_metrics(client, port).await;
             let runtime = identify_runtime(
                 port,
@@ -141,8 +141,30 @@ impl LlmProbe {
             let display_name = model_id.rsplit('/').next().unwrap_or(&model_id).to_string();
 
             // If we got this far, the server advertised at least one model → active.
-            let status = "active";
-            let health_ok = true;
+            let mut status = "active";
+            let mut health_ok = true;
+
+            // MLX-specific degraded adapter: health-ping + derived throughput.
+            if runtime == "mlx_lm" {
+                let mlx = crate::mlx_adapter::MlxDegradedAdapter::default();
+                let endpoint = format!("http://127.0.0.1:{port}");
+                match mlx.check_endpoint(&endpoint).await {
+                    Ok(state) => {
+                        tokens_per_sec = state.tokens_per_sec;
+                        queue_depth = state.queue_depth;
+                        health_ok =
+                            state.health_status != crate::mlx_adapter::MlxHealthStatus::Unhealthy;
+                        if state.degraded {
+                            status = "degraded";
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(port, err = %e, "MLX degraded adapter check failed");
+                        health_ok = false;
+                        status = "error";
+                    }
+                }
+            }
 
             servers.push(LlmServer {
                 deployment_id: Uuid::new_v4(),
