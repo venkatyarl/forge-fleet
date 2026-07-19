@@ -48,6 +48,8 @@ enum Command {
     Health,
     Tools(ToolsArgs),
     Config(ConfigArgs),
+    /// Export data to external systems
+    Export(ExportArgs),
     Version,
 }
 
@@ -151,6 +153,18 @@ struct ConfigArgs {
     command: ConfigCommand,
 }
 
+#[derive(Debug, Args)]
+struct ExportArgs {
+    #[command(subcommand)]
+    command: ExportCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ExportCommand {
+    /// Trigger the Obsidian export daemon.
+    Obsidian,
+}
+
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
     Show,
@@ -192,6 +206,7 @@ async fn main() -> Result<()> {
         Command::Health => handle_health(&config_path),
         Command::Tools(args) => handle_tools(args, &config_path).await,
         Command::Config(args) => handle_config(args, &config_path),
+        Command::Export(args) => handle_export(args).await,
         Command::Version => {
             println!("forgefleet {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -200,7 +215,9 @@ async fn main() -> Result<()> {
 }
 
 async fn handle_chat(args: ChatArgs) -> Result<()> {
-    let working_dir = args.cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+    let working_dir = args
+        .cwd
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
 
     println!("{CYAN}ForgeFleet Agent Chat{RESET}");
     println!("  LLM: {}", args.llm);
@@ -254,13 +271,29 @@ async fn handle_chat(args: ChatArgs) -> Result<()> {
         let printer = tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 match event {
-                    AgentEvent::ToolStart { tool_name, input_json, .. } => {
-                        println!("{YELLOW}⚡ {tool_name}{RESET} {}", truncate_display(&input_json, 80));
+                    AgentEvent::ToolStart {
+                        tool_name,
+                        input_json,
+                        ..
+                    } => {
+                        println!(
+                            "{YELLOW}⚡ {tool_name}{RESET} {}",
+                            truncate_display(&input_json, 80)
+                        );
                     }
-                    AgentEvent::ToolEnd { tool_name, result, is_error, duration_ms, .. } => {
+                    AgentEvent::ToolEnd {
+                        tool_name,
+                        result,
+                        is_error,
+                        duration_ms,
+                        ..
+                    } => {
                         let icon = if is_error { RED } else { GREEN };
                         let status = if is_error { "✗" } else { "✓" };
-                        println!("{icon}{status} {tool_name}{RESET} ({duration_ms}ms) {}", truncate_display(&result, 200));
+                        println!(
+                            "{icon}{status} {tool_name}{RESET} ({duration_ms}ms) {}",
+                            truncate_display(&result, 200)
+                        );
                     }
                     AgentEvent::AssistantText { text, .. } => {
                         println!("\n{CYAN}{text}{RESET}\n");
@@ -271,8 +304,14 @@ async fn handle_chat(args: ChatArgs) -> Result<()> {
                     AgentEvent::Error { message, .. } => {
                         println!("{RED}Error: {message}{RESET}");
                     }
-                    AgentEvent::Compaction { messages_before, messages_after, .. } => {
-                        println!("{YELLOW}  Compacted: {messages_before} → {messages_after} messages{RESET}");
+                    AgentEvent::Compaction {
+                        messages_before,
+                        messages_after,
+                        ..
+                    } => {
+                        println!(
+                            "{YELLOW}  Compacted: {messages_before} → {messages_after} messages{RESET}"
+                        );
                     }
                     AgentEvent::TokenWarning { usage_pct, .. } => {
                         println!("{YELLOW}  ⚠ Context window at {usage_pct:.0}%{RESET}");
@@ -286,7 +325,7 @@ async fn handle_chat(args: ChatArgs) -> Result<()> {
         printer.abort();
 
         match outcome {
-            ff_agent::agent_loop::AgentOutcome::EndTurn { .. } => {},
+            ff_agent::agent_loop::AgentOutcome::EndTurn { .. } => {}
             ff_agent::agent_loop::AgentOutcome::MaxTurns { .. } => {
                 println!("{YELLOW}(hit max turn limit){RESET}");
             }
@@ -303,7 +342,9 @@ async fn handle_chat(args: ChatArgs) -> Result<()> {
 }
 
 async fn handle_run(args: RunArgs) -> Result<()> {
-    let working_dir = args.cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+    let working_dir = args
+        .cwd
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
 
     let config = AgentSessionConfig {
         model: args.model,
@@ -351,7 +392,9 @@ async fn handle_run(args: RunArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         match &outcome {
-            ff_agent::agent_loop::AgentOutcome::EndTurn { final_message } => println!("{final_message}"),
+            ff_agent::agent_loop::AgentOutcome::EndTurn { final_message } => {
+                println!("{final_message}")
+            }
             ff_agent::agent_loop::AgentOutcome::Error(e) => eprintln!("Error: {e}"),
             _ => {}
         }
@@ -494,7 +537,11 @@ async fn handle_tools(args: ToolsArgs, _config_path: &Path) -> Result<()> {
     let client = &*SHARED_HTTP;
 
     match args.command {
-        ToolsCommand::List { node, name, unhealthy } => {
+        ToolsCommand::List {
+            node,
+            name,
+            unhealthy,
+        } => {
             let mut url = format!("{}/api/tools", gateway);
             let mut params = vec![];
             if let Some(n) = node {
@@ -515,7 +562,8 @@ async fn handle_tools(args: ToolsArgs, _config_path: &Path) -> Result<()> {
                 anyhow::bail!("Gateway returned {}", resp.status());
             }
             let body: serde_json::Value = resp.json().await?;
-            let tools = body["tools"].as_array().unwrap_or(&vec![]);
+            let empty_tools = vec![];
+            let tools = body["tools"].as_array().unwrap_or(&empty_tools);
 
             println!("{GREEN}✓ Fleet Tools{RESET} ({} total)", tools.len());
             for tool in tools {
@@ -544,7 +592,11 @@ async fn handle_tools(args: ToolsArgs, _config_path: &Path) -> Result<()> {
 
             println!("{GREEN}✓ Tool Registry Health{RESET}");
             println!("  total:     {}", total);
-            println!("  healthy:   {}{GREEN}{}{RESET}", if healthy == total { "" } else { "  " }, healthy);
+            println!(
+                "  healthy:   {}{GREEN}{}{RESET}",
+                if healthy == total { "" } else { "  " },
+                healthy
+            );
             if unhealthy > 0 {
                 println!("  unhealthy: {RED}{}{RESET}", unhealthy);
             }
@@ -577,6 +629,30 @@ async fn handle_tools(args: ToolsArgs, _config_path: &Path) -> Result<()> {
             println!("   This command is for manual re-registration if needed.)");
         }
     }
+    Ok(())
+}
+
+async fn handle_export(args: ExportArgs) -> Result<()> {
+    match args.command {
+        ExportCommand::Obsidian => handle_export_obsidian().await,
+    }
+}
+
+async fn handle_export_obsidian() -> Result<()> {
+    let gateway = std::env::var("FF_GATEWAY_URL")
+        .unwrap_or_else(|_| "http://192.168.5.100:51002".to_string());
+    let client = reqwest::Client::new();
+    let url = format!("{gateway}/api/export/obsidian");
+
+    println!("{CYAN}▶ Triggering Obsidian export daemon{RESET}");
+    println!("  endpoint: {url}");
+
+    let resp = client.post(&url).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Obsidian export daemon returned {}", resp.status());
+    }
+
+    println!("{GREEN}✓ Obsidian export daemon triggered{RESET}");
     Ok(())
 }
 

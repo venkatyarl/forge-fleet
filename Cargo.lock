@@ -1285,6 +1285,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ff-cli"
+version = "2026.4.7"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "ff-agent",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "ff-code-intel"
 version = "2026.4.7"
 dependencies = [
