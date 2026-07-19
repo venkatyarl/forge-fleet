@@ -7,9 +7,11 @@
 //! - **events** — Structured fleet event model with pluggable sinks
 //! - **log_ingest** — Ingest and buffer structured logs from nodes and agents
 //! - **alerting** — Rule-based alerts (node down, model unavailable, high load)
+//! - **alerts** — TTL-based deduplication state for alert delivery
 //! - **dashboard** — Aggregate status snapshots and axum API routes
 
 pub mod alerting;
+pub mod alerts;
 pub mod dashboard;
 pub mod events;
 pub mod file_logger;
@@ -21,6 +23,7 @@ pub mod work_queue;
 
 // Re-export the most commonly used items at crate root.
 pub use alerting::{Alert, AlertEngine, AlertRule, AlertSeverity};
+pub use alerts::{AlertDedupState, AlertDeduplicationState};
 pub use dashboard::{DashboardState, FleetSnapshot, ModelSummary, NodeSummary};
 pub use events::{EventRecord, EventSink, FleetEvent, InMemoryEventSink};
 pub use file_logger::FileLogConfig;
