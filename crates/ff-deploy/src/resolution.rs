@@ -72,14 +72,14 @@ pub enum ResolutionError {
         /// Last lookup error.
         source: anyhow::Error,
     },
-    /// Lookups succeeded but the target remained incomplete because
-    /// `primary_ip` or `ram_gb` were empty/zero. This is a retryable condition:
-    /// the host may report the missing values on a subsequent attempt.
+    /// The retry budget was exhausted while the target remained incomplete.
+    /// The circuit is open and the deployment must fail rather than retrying
+    /// indefinitely.
     #[error(
-        "target '{name}' still incomplete after {attempts} attempt(s) \
+        "target resolution circuit opened for '{name}' after {attempts} attempt(s) \
          (primary_ip='{primary_ip}', ram_gb={ram_gb}); missing: {missing}"
     )]
-    Retryable {
+    CircuitOpen {
         /// Attempts performed.
         attempts: u32,
         /// Host name from the last lookup.
@@ -94,10 +94,12 @@ pub enum ResolutionError {
 }
 
 impl ResolutionError {
-    /// Returns `true` for transient/incomplete-target errors that may resolve
-    /// themselves on retry (empty `primary_ip` or zero `ram_gb`).
+    /// Returns whether the caller may safely retry this error.
+    ///
+    /// Errors returned by `resolve_with_retry` are terminal because the
+    /// configured attempt budget has already been exhausted.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, ResolutionError::Retryable { .. })
+        false
     }
 }
 
@@ -146,7 +148,7 @@ where
             if target.ram_gb <= 0 {
                 missing.push("ram");
             }
-            Err(ResolutionError::Retryable {
+            Err(ResolutionError::CircuitOpen {
                 attempts: max_attempts,
                 name: target.name,
                 primary_ip: target.primary_ip,
@@ -245,17 +247,17 @@ mod tests {
         assert_eq!(calls, 5);
         assert!(matches!(
             err,
-            ResolutionError::Retryable { attempts: 5, .. }
+            ResolutionError::CircuitOpen { attempts: 5, .. }
         ));
-        assert!(err.is_retryable());
+        assert!(!err.is_retryable());
     }
 
     #[test]
-    fn retryable_error_lists_empty_primary_ip() {
+    fn circuit_open_error_lists_empty_primary_ip() {
         let err = resolve_with_retry(&instant_policy(), || Ok(target("", 64)))
             .expect_err("empty ip never completes");
         match err {
-            ResolutionError::Retryable { missing, .. } => {
+            ResolutionError::CircuitOpen { missing, .. } => {
                 assert_eq!(missing, "primary_ip");
             }
             other => panic!("unexpected error: {other}"),
@@ -263,11 +265,11 @@ mod tests {
     }
 
     #[test]
-    fn retryable_error_lists_zero_ram() {
+    fn circuit_open_error_lists_zero_ram() {
         let err = resolve_with_retry(&instant_policy(), || Ok(target("192.168.1.20", 0)))
             .expect_err("zero ram never completes");
         match err {
-            ResolutionError::Retryable { missing, .. } => {
+            ResolutionError::CircuitOpen { missing, .. } => {
                 assert_eq!(missing, "ram");
             }
             other => panic!("unexpected error: {other}"),
@@ -275,11 +277,11 @@ mod tests {
     }
 
     #[test]
-    fn retryable_error_lists_both_missing_fields() {
+    fn circuit_open_error_lists_both_missing_fields() {
         let err = resolve_with_retry(&instant_policy(), || Ok(target("", 0)))
             .expect_err("both missing never completes");
         match err {
-            ResolutionError::Retryable { missing, .. } => {
+            ResolutionError::CircuitOpen { missing, .. } => {
                 assert_eq!(missing, "primary_ip, ram");
             }
             other => panic!("unexpected error: {other}"),
