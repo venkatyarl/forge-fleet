@@ -30,6 +30,7 @@ pub mod notifications;
 pub mod panic_hook;
 pub mod quarantine;
 pub mod run_limits;
+pub mod schema;
 pub mod synthetic;
 pub mod task;
 pub mod task_error;
