@@ -15,8 +15,10 @@ ff-cron = { path = "../ff-cron" }
 ff-deploy = { path = "../ff-deploy" }
 
 chrono.workspace = true
+libc = "0.2"
 serde.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

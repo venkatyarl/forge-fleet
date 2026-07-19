@@ -1325,10 +1325,12 @@ dependencies = [
  "ff-discovery",
  "ff-orchestrator",
  "ff-runtime",
+ "libc",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
