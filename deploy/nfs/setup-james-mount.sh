@@ -23,7 +23,7 @@ if mount | grep -qF " on $MOUNT "; then
     exit 0
 fi
 
-mount -t nfs -o resvport,ro,nolocks "${SERVER}:${EXPORT}" "$MOUNT"
+mount -t nfs -o resvport,ro,nolocks,soft,timeo=600,retrans=3 "${SERVER}:${EXPORT}" "$MOUNT"
 
 echo
 echo "Mounted:"

@@ -10,7 +10,7 @@
         <string>-t</string>
         <string>nfs</string>
         <string>-o</string>
-        <string>resvport,ro,nolocks</string>
+        <string>resvport,ro,nolocks,soft,timeo=600,retrans=3</string>
         <string>10.44.0.1:/Users/venkat/models</string>
         <string>/Volumes/taylor-models</string>
     </array>
