@@ -1,7 +1,7 @@
 //! Grounded Telegram answers (roadmap E1).
 //!
 //! The Telegram conversation used to be owned by an UNGROUNDED LLM agent
-//! (OpenClaw, with its `nodes`/`gateway` tools stripped) that hallucinated
+//! (with its `nodes`/`gateway` tools stripped) that hallucinated
 //! fake computer names, fake work items, and shifting ETAs whenever the
 //! operator asked "show me my work items" or "what computers are you using".
 //!
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn classifies_the_operators_real_questions() {
-        // Exactly the phrasings Vinny sent that OpenClaw hallucinated answers to.
+        // Exactly the phrasings Vinny sent that the old bot hallucinated answers to.
         assert_eq!(
             classify_intent("Show me all the items you are working on and what's planned next"),
             TelegramIntent::WorkStatus

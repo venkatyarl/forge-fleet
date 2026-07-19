@@ -246,12 +246,12 @@ pub async fn resolve_upgrade_plans_with_suffix(
                 v.push(format!("{os_family}-{src}"));
             }
             v.push(os_family.clone());
-            // Base-family fallback: openclaw/claude-code/codex ship a
-            // `linux` key that pre-dates the linux-ubuntu / linux-dgx
-            // split. Try the bare base family before falling back to
-            // `all`. Surfaced 2026-04-30 — drift was stuck on every
-            // Linux host because the dispatcher only tried `linux-ubuntu`
-            // and `all`, both missing from openclaw's playbook.
+            // Base-family fallback: claude-code/codex ship a `linux` key
+            // that pre-dates the linux-ubuntu / linux-dgx split. Try the
+            // bare base family before falling back to `all`. Surfaced
+            // 2026-04-30 — drift was stuck on every Linux host because the
+            // dispatcher only tried `linux-ubuntu` and `all`, both missing
+            // from the npm CLI playbooks.
             if let Some(base) = crate::upgrade_playbooks::base_family(&os_family) {
                 v.push(base.to_string());
             }
@@ -783,7 +783,7 @@ impl AutoUpgradeTick {
         // auto-upgrade tick — one SQL UPDATE per row. If leader's row just flipped,
         // the next line (drift check) will see upgrade_available immediately.
         let _ = refresh_self_built_latest_versions(&self.pool).await;
-        // npm-distributed tools (openclaw, codex, context-mode, …): query
+        // npm-distributed tools (codex, context-mode, …): query
         // registry.npmjs.org/<pkg>/latest. Same-tick refresh for parity with
         // self_built — without this, npm releases sit unnoticed indefinitely.
         let _ = refresh_npm_registry_latest_versions(&self.client, &self.pool).await;
@@ -1487,7 +1487,7 @@ where
         };
         // Dual-write: software_registry is the auto-upgrade catalog,
         // external_tools is the `ff ext` catalog. They overlap for tools
-        // that live in both (openclaw, codex, claude-code, …). Update
+        // that live in both (codex, claude-code, …). Update
         // both so `ff ext drift` and `ff software drift` agree.
         let res = sqlx::query(
             r#"
@@ -1567,17 +1567,9 @@ mod tests {
 
     #[test]
     fn non_daemon_software_is_not_self() {
-        // Tool upgrades (openclaw/claude/codex/gh) do NOT restart forgefleetd, so
+        // Tool upgrades (claude/codex/gh) do NOT restart forgefleetd, so
         // they must NOT be serialized as daemon-self or gated out of the leader.
-        for id in [
-            "openclaw",
-            "claude-code",
-            "codex_git",
-            "gh",
-            "ff",
-            "forgefleetd",
-            "",
-        ] {
+        for id in ["claude-code", "codex_git", "gh", "ff", "forgefleetd", ""] {
             assert!(
                 !is_daemon_self_software(id),
                 "{id} wrongly flagged daemon-self"

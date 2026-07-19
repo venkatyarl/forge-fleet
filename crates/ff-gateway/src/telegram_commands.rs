@@ -6,8 +6,8 @@
 //!     so that typing `/` actually shows the commands.
 //!
 //! WHY this exists: the ForgeFleet bot previously registered NO commands (its
-//! `getMyCommands` was empty), so `/` showed nothing — unlike the OpenClaw bot,
-//! which had called `setMyCommands`. Listing commands here + syncing on startup
+//! `getMyCommands` was empty), so `/` showed nothing. Listing commands here +
+//! syncing on startup
 //! fixes that.
 //!
 //! KEEP IN SYNC with the command match arms in

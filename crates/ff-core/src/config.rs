@@ -86,7 +86,7 @@ pub struct FleetConfig {
     #[serde(default)]
     pub loops: LoopSettings,
 
-    /// MCP service configuration — `[mcp.openclaw]`, `[mcp.forgefleet]`, etc.
+    /// MCP service configuration — `[mcp.forgefleet]`, etc.
     #[serde(default)]
     pub mcp: HashMap<String, McpConfig>,
 
@@ -622,8 +622,6 @@ pub struct LlmTimeouts {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PortsConfig {
     #[serde(default)]
-    pub openclaw: Option<u16>,
-    #[serde(default)]
     pub forgefleet: Option<u16>,
     #[serde(default)]
     pub model_start: Option<u16>,
@@ -964,7 +962,7 @@ pub struct EnrollmentConfig {
     /// Engine used for bootstrapping (e.g. "forgefleet").
     #[serde(default)]
     pub bootstrap_engine: Option<String>,
-    /// Interface used for bootstrapping (e.g. "openclaw").
+    /// Interface used for bootstrapping (e.g. "forgefleet").
     #[serde(default)]
     pub bootstrap_interface: Option<String>,
     /// Whether SSH access is required before bootstrapping.
@@ -1802,7 +1800,6 @@ tier3 = 600
 tier4 = 900
 
 [ports]
-openclaw = 50000
 forgefleet = 50001
 model_start = 55000
 model_end = 55010
@@ -1812,16 +1809,16 @@ canonical_writer = "taylor"
 degraded_coordinator_mode = true
 max_handoffs_per_task = 2
 
-[mcp.openclaw]
+[mcp.forgefleet]
 server = true
 client = true
-port = 50000
-endpoint = "http://127.0.0.1:50000/mcp"
+port = 50001
+endpoint = "http://127.0.0.1:50001/mcp"
 required = true
 required_tools = ["fleet_status"]
 optional_tools = ["model_stats"]
-depends_on = ["forgefleet"]
-optional_depends_on = ["openclaw"]
+depends_on = []
+optional_depends_on = []
 request_timeout_secs = 3
 
 [loops.evolution]
@@ -1853,7 +1850,7 @@ request_timeout_secs = 4
 
 [enrollment]
 bootstrap_engine = "forgefleet"
-bootstrap_interface = "openclaw"
+bootstrap_interface = "forgefleet"
 require_ssh_before_bootstrap = true
 auto_enroll_after_healthcheck = true
 
@@ -1959,7 +1956,7 @@ notes = "Setup started."
         assert_eq!(config.llm.timeouts.tier1, Some(120));
 
         // Check ports.
-        assert_eq!(config.ports.openclaw, Some(50000));
+        assert_eq!(config.ports.forgefleet, Some(50001));
 
         // Check scheduling.
         assert_eq!(
@@ -1968,15 +1965,15 @@ notes = "Setup started."
         );
 
         // Check MCP.
-        let mcp_openclaw = config.mcp.get("openclaw").unwrap();
-        assert_eq!(mcp_openclaw.port, Some(50000));
+        let mcp_forgefleet = config.mcp.get("forgefleet").unwrap();
+        assert_eq!(mcp_forgefleet.port, Some(50001));
         assert_eq!(
-            mcp_openclaw.endpoint.as_deref(),
-            Some("http://127.0.0.1:50000/mcp")
+            mcp_forgefleet.endpoint.as_deref(),
+            Some("http://127.0.0.1:50001/mcp")
         );
-        assert_eq!(mcp_openclaw.required, Some(true));
+        assert_eq!(mcp_forgefleet.required, Some(true));
         assert_eq!(
-            mcp_openclaw.required_tools,
+            mcp_forgefleet.required_tools,
             vec!["fleet_status".to_string()]
         );
 

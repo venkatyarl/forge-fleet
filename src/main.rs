@@ -502,14 +502,13 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
             && tg.resolve_bot_token().is_none()
             && let Some(pg_pool) = operational_store.pg_pool()
         {
-            // Canonical key is `openclaw.telegram_bot_token` (what `ff secrets
-            // set` writes and what the gateway reads); `telegram.bot_token` is
+            // Canonical key is `telegram_bot_token`; `telegram.bot_token` is
             // tried second for back-compat. Using the wrong key here meant the
             // fleet_secrets path silently failed, forcing the token to live in
             // the launchd plist as a plaintext env var — defeating the whole
             // "secrets out of plists" point of this block.
             let mut loaded = false;
-            for secret_key in ["openclaw.telegram_bot_token", "telegram.bot_token"] {
+            for secret_key in ["telegram_bot_token", "telegram.bot_token"] {
                 match ff_db::pg_get_secret(pg_pool, secret_key).await {
                     Ok(Some(token)) if !token.trim().is_empty() => {
                         let key = if tg.bot_token_env.trim().is_empty() {
@@ -530,7 +529,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
             }
             if !loaded {
                 info!(
-                    "telegram bot token absent in fleet_secrets (tried openclaw.telegram_bot_token, telegram.bot_token)"
+                    "telegram bot token absent in fleet_secrets (tried telegram_bot_token, telegram.bot_token)"
                 );
             }
         }
@@ -1703,7 +1702,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     // (or launchd `StandardOutPath`) redirects our stdout/stderr into it, so
     // there's no tracing rolling-appender bounding its size. Left alone it grows
     // without limit (1.87 GiB observed on rihanna 2026-06-13 — a recurring
-    // disk-pressure root cause; #212 stopped the openclaw restart-spam SOURCE
+    // disk-pressure root cause; #212 stopped a retired subsystem's restart-spam SOURCE
     // but the file still grows from normal logging and never shrinks). The
     // redirect opens the file in append mode, so truncating it in place reclaims
     // space and the next write lands at the fresh EOF. This copytruncates any
@@ -3050,36 +3049,6 @@ async fn start_pulse_v2_subsystems(
         ff_pulse::materializer::Materializer::new(pg_pool.clone(), redis_client.clone());
     handles.push(materializer.spawn(shutdown_rx.clone()));
 
-    // OpenClawManager — built BEFORE the fleet_members gate so the
-    // reconciler runs on every daemon, including unenrolled workers.
-    // Election callbacks (promote/demote) are wired only inside the
-    // LeaderTick branch since they fire on transitions, but the
-    // periodic reconcile_role on every node closes the gap for nodes
-    // that never saw a transition.
-    let my_primary_ip: String =
-        sqlx::query_scalar("SELECT primary_ip FROM computers WHERE id = $1")
-            .bind(computer_id)
-            .fetch_one(&pg_pool)
-            .await
-            .unwrap_or_else(|_| "127.0.0.1".to_string());
-
-    let openclaw = std::sync::Arc::new(ff_agent::openclaw::OpenClawManager::new(
-        pg_pool.clone(),
-        computer_id,
-        my_primary_ip,
-    ));
-
-    // Reconciler — runs on EVERY daemon, every 60s. Reads
-    // fleet_leader_state and ensures local OpenClaw role matches.
-    // Idempotent. Doesn't depend on fleet_members enrollment.
-    let oc_reconciler = openclaw.clone();
-    let oc_reconciler_shutdown = shutdown_rx.clone();
-    handles.push(tokio::spawn(async move {
-        oc_reconciler
-            .run_reconciler(oc_reconciler_shutdown, std::time::Duration::from_secs(60))
-            .await;
-    }));
-
     // Deployment reconciler — drives fleet_model_deployments desired_state
     // toward live process reality, every 60s. Without this tick, a dead
     // llama-server child stays dead until an operator manually re-runs
@@ -3223,97 +3192,26 @@ async fn start_pulse_v2_subsystems(
         let pulse_reader = ff_pulse::reader::PulseReader::new(&redis_url)
             .context("pulse v2: failed to build PulseReader for leader_tick")?;
 
-        let oc_promote = openclaw.clone();
-        let oc_demote = openclaw.clone();
-        let pool_for_url = pg_pool.clone();
-        let pool_for_promote = pg_pool.clone();
-        let pool_for_demote = pg_pool.clone();
+        let worker_name_for_became = worker_name.clone();
+        let worker_name_for_lost = worker_name.clone();
 
-        let my_name_for_promote = worker_name.clone();
-        let my_name_for_demote = worker_name.clone();
-
-        let on_became: ff_agent::leader_tick::OnBecameLeader = std::sync::Arc::new(
-            move |prev: Option<String>| {
-                let oc = oc_promote.clone();
-                let my_name = my_name_for_promote.clone();
-                let pool = pool_for_promote.clone();
+        let on_became: ff_agent::leader_tick::OnBecameLeader =
+            std::sync::Arc::new(move |prev: Option<String>| {
+                let my_name = worker_name_for_became.clone();
                 tokio::spawn(async move {
-                    // Publish leader-change event to NATS (best-effort).
                     ff_agent::fleet_events_nats::FleetEventBus::publish_leader_change(
                         prev.as_deref(),
                         &my_name,
                         0,
                     )
                     .await;
-
-                    if let Err(e) = oc.promote_to_gateway(prev.as_deref()).await {
-                        tracing::error!(error = %e, "openclaw: promote_to_gateway failed");
-                    } else {
-                        // Surface promotion as a deployment.started event for the openclaw-gateway.
-                        ff_agent::fleet_events_nats::FleetEventBus::publish_deployment_change(
-                            &my_name,
-                            uuid::Uuid::nil(),
-                            "started",
-                            "openclaw-gateway",
-                        )
-                        .await;
-
-                        // Re-import paired devices stashed by the previous
-                        // leader on its way out (if any). Best-effort: if
-                        // the secret is missing or the import fails, just
-                        // log — phones/IoT will need to re-pair but the
-                        // gateway is still functional.
-                        match ff_agent::openclaw::lookup_device_pairings_export(&pool).await {
-                            Ok(Some(export)) if !export.trim().is_empty() => {
-                                match oc.import_devices(&export).await {
-                                    Ok(n) => {
-                                        tracing::info!(
-                                            count = n,
-                                            "openclaw: imported paired devices from previous leader"
-                                        );
-                                        if let Err(e) =
-                                            ff_agent::openclaw::clear_device_pairings_export(&pool)
-                                                .await
-                                        {
-                                            tracing::warn!(
-                                                error = %e,
-                                                "openclaw: failed to clear device pairings secret"
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            error = %e,
-                                            "openclaw: import_devices failed — devices may need to re-pair"
-                                        );
-                                    }
-                                }
-                            }
-                            Ok(_) => {
-                                tracing::debug!(
-                                    "openclaw: no device pairings stashed (cold start or previous leader crashed before export)"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "openclaw: could not read device pairings secret"
-                                );
-                            }
-                        }
-                    }
                 });
-            },
-        );
+            });
 
-        let on_lost: ff_agent::leader_tick::OnLostLeader = std::sync::Arc::new(
-            move |new_leader_name: String| {
-                let oc = oc_demote.clone();
-                let pool = pool_for_url.clone();
-                let pool_export = pool_for_demote.clone();
-                let my_name = my_name_for_demote.clone();
+        let on_lost: ff_agent::leader_tick::OnLostLeader =
+            std::sync::Arc::new(move |new_leader_name: String| {
+                let my_name = worker_name_for_lost.clone();
                 tokio::spawn(async move {
-                    // Publish leader-change event to NATS (best-effort).
                     let new_name = if new_leader_name.is_empty() {
                         "unknown"
                     } else {
@@ -3325,66 +3223,8 @@ async fn start_pulse_v2_subsystems(
                         0,
                     )
                     .await;
-
-                    // Export paired devices BEFORE demoting so the new
-                    // leader can re-import them. Best-effort: a failure
-                    // here degrades to "devices must re-pair", not a
-                    // gateway outage.
-                    match oc.export_devices().await {
-                        Ok(export) => {
-                            if let Err(e) = sqlx::query(
-                                "INSERT INTO fleet_secrets (key, value, updated_by, updated_at) \
-                                 VALUES ($1, $2, 'openclaw-manager', NOW()) \
-                                 ON CONFLICT (key) DO UPDATE \
-                                 SET value = $2, updated_at = NOW()",
-                            )
-                            .bind(ff_agent::openclaw::DEVICE_PAIRINGS_SECRET_KEY)
-                            .bind(&export)
-                            .execute(&pool_export)
-                            .await
-                            {
-                                tracing::warn!(
-                                    error = %e,
-                                    "openclaw: failed to stash device pairings to fleet_secrets"
-                                );
-                            } else {
-                                tracing::info!(
-                                    bytes = export.len(),
-                                    "openclaw: stashed paired-device export for new leader"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "openclaw: export_devices failed during demotion — devices will lose pairing"
-                            );
-                        }
-                    }
-
-                    let url = ff_agent::openclaw::lookup_gateway_url(&pool)
-                        .await
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default();
-                    if url.is_empty() {
-                        tracing::warn!("openclaw: lost leader but no gateway URL published yet");
-                        return;
-                    }
-                    if let Err(e) = oc.demote_to_node(&url).await {
-                        tracing::error!(error = %e, "openclaw: demote_to_node failed");
-                    } else {
-                        ff_agent::fleet_events_nats::FleetEventBus::publish_deployment_change(
-                            &my_name,
-                            uuid::Uuid::nil(),
-                            "stopped",
-                            "openclaw-gateway",
-                        )
-                        .await;
-                    }
                 });
-            },
-        );
+            });
 
         // Phase 6 HA — auto Postgres failover manager. Runs inside every
         // leader tick (only when we are the current fleet leader). The

@@ -309,7 +309,7 @@ report "build" running
 run_as_user bash -lc "cd '$REPO_DIR' && cargo build -p ff-terminal --release 2>&1 | tail -2" \
   || die "cargo build failed"
 run_as_user install -m 755 "$REPO_DIR/target/release/ff" "$USER_HOME/.local/bin/ff"
-# CLI aliases so external agents (Codex, Claude Code, OpenClaw, third-party
+# CLI aliases so external agents (Codex, Claude Code, third-party
 # tools) can resolve the binary by project name without hardcoding "ff".
 run_as_user ln -sf "$USER_HOME/.local/bin/ff" "$USER_HOME/.local/bin/forgefleet"
 run_as_user ln -sf "$USER_HOME/.local/bin/ff" "$USER_HOME/.local/bin/ForgeFleet"
@@ -360,23 +360,6 @@ run_as_user bash -lc "cd '$REPO_DIR' && cargo build -p forge-fleet --release 2>&
   || die "forgefleetd cargo build failed"
 run_as_user install -m 755 "$REPO_DIR/target/release/forgefleetd" "$USER_HOME/.local/bin/forgefleetd"
 report "forgefleetd_build" ok
-
-# ─── 6b. OpenClaw ────────────────────────────────────────────────────────
-# Installs OpenClaw via npm (matches deploy/provision-computer.sh). Failure here
-# does NOT abort enrollment — the computer can still work as a ForgeFleet member
-# and a deferred task is available to retry later.
-report "openclaw" running
-if command -v npm >/dev/null 2>&1; then
-  run_as_user bash -lc 'command -v openclaw >/dev/null || npm install -g openclaw' >/dev/null 2>&1 \
-    || npm install -g openclaw >/dev/null 2>&1 || true
-  if run_as_user bash -lc 'command -v openclaw >/dev/null'; then
-    report "openclaw" ok "$(run_as_user bash -lc 'openclaw --version 2>&1 | head -1')"
-  else
-    report "openclaw" failed "install failed — retry later"
-  fi
-else
-  report "openclaw" failed "npm not present — install node/npm and rerun"
-fi
 
 # ─── 6c. vLLM venv (GPU nodes only) ──────────────────────────────────────
 if [ "$RUNTIME" = "vllm" ]; then

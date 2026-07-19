@@ -1512,7 +1512,6 @@ mod tests {
         };
         b.capabilities = Capabilities {
             can_serve_ff_gateway: true,
-            can_serve_openclaw_gateway: true,
             can_host_postgres_replica: false,
             can_host_redis_replica: false,
             gpu_kind: "apple_silicon".to_string(),

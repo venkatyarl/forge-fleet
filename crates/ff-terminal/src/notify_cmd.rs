@@ -1,8 +1,8 @@
 //! `ff notify` — send fleet notifications through the configured channel.
 //!
 //! Today this is the operator's Telegram DM (bot token + chat id in
-//! `fleet_secrets`, keys `openclaw.telegram_bot_token` /
-//! `openclaw.telegram_chat_id`). Reuses the same sender the daemon's
+//! `fleet_secrets`, keys `telegram_bot_token` / `telegram_chat_id`). Reuses
+//! the same sender the daemon's
 //! alert/upgrade ticks use (`ff_agent::telegram::send_telegram_from_secrets`)
 //! so there is ONE notification path, not a fork. If Telegram isn't
 //! configured the send is a no-op (the underlying fn skips), and we say so
@@ -127,16 +127,11 @@ pub async fn handle_notify(cmd: NotifyCommand) -> Result<()> {
 
             // Detect configured-ness for an honest report (the sender itself
             // silently skips when unconfigured).
-            let configured = ff_db::pg_get_secret(&pool, "openclaw.telegram_bot_token")
+            let configured = ff_db::pg_get_secret(&pool, "telegram_bot_token")
                 .await
                 .ok()
                 .flatten()
-                .is_some()
-                || ff_db::pg_get_secret(&pool, "telegram_bot_token")
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some();
+                .is_some();
 
             match session.as_deref() {
                 Some(sid) => {
@@ -150,7 +145,7 @@ pub async fn handle_notify(cmd: NotifyCommand) -> Result<()> {
                 println!("notification sent");
             } else {
                 println!(
-                    "notification skipped — Telegram not configured (set openclaw.telegram_bot_token / openclaw.telegram_chat_id)"
+                    "notification skipped — Telegram not configured (set telegram_bot_token / telegram_chat_id)"
                 );
             }
             Ok(())

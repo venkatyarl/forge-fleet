@@ -333,8 +333,8 @@ fn classify_install_source(rule: &DetectionRule, path: &str) -> Option<String> {
         "auto" => {
             // npm-global CLIs symlink from a package-manager bin dir
             // (/opt/homebrew/bin, /usr/bin, /usr/local/bin) INTO a
-            // node_modules tree, e.g. openclaw:
-            //   /opt/homebrew/bin/openclaw -> ../lib/node_modules/openclaw/openclaw.mjs
+            // node_modules tree, e.g. codex:
+            //   /opt/homebrew/bin/codex -> ../lib/node_modules/@openai/codex/bin/codex
             // The bare symlink path matches classify_pkg_source's brew/apt
             // prefixes, so it would mislabel npm-global tools brew (macOS) or
             // apt (Linux). Resolve the symlink first and surface npm when the

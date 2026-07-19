@@ -957,7 +957,7 @@ async fn health(State(state): State<Arc<GatewayState>>) -> Json<HealthResponse> 
 
 /// Discovery document at the standard RFC 8615 well-known path.
 ///
-/// External agents (Codex, Claude Code, OpenClaw, third-party CLIs) probe
+/// External agents (Codex, Claude Code, third-party CLIs) probe
 /// `http://<host>:51002/.well-known/forgefleet.json` to confirm a ForgeFleet
 /// leader is running and to auto-discover capabilities + endpoints without
 /// operator configuration. Designed for the "any computer on the LAN can

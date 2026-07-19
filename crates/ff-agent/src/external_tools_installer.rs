@@ -140,8 +140,8 @@ pub async fn resolve_install_plans(
             // ("linux"/"macos") rather than the specific os_family
             // ("linux-ubuntu"/"linux-dgx"). Without this, `ff ext install`
             // SKIPS every linux node whose playbook uses the broad "linux" key
-            // — which is the kimi-cli (V150) AND the existing codex/claude/
-            // openclaw (V46) rows. Try the class before falling to "all".
+            // — which is the kimi-cli (V150) AND the existing codex/claude
+            // (V46) rows. Try the class before falling to "all".
             let os_class = if os_family.starts_with("linux") {
                 "linux"
             } else if os_family.starts_with("macos") || os_family.starts_with("darwin") {

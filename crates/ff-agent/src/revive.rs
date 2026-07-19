@@ -14,13 +14,13 @@
 //! 2. **Wake-on-LAN** — if SSH is unreachable and we have MAC addresses on
 //!    record, fire a magic packet to the local broadcast on UDP/9.
 //! 3. **Failure** — no SSH + no MAC ⇒ record `Failed` so the caller can raise
-//!    an alert via OpenClaw channels.
+//!    an alert via Telegram channels.
 //!
 //! This module is safe to invoke from any node but is only **scheduled** by
 //! the current leader (see `leader_tick::revive_scan`).
 //!
 //! ### Not (yet) implemented
-//! - OpenClaw alert fan-out lives outside this module; the deferred task that
+//! - Telegram alert fan-out lives outside this module; the deferred task that
 //!   wraps a revive attempt records `Failed` and the leader escalates from
 //!   there. This keeps the revive manager free of Slack/webhook dependencies.
 

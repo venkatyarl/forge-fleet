@@ -89,8 +89,7 @@ pub enum TickOutcome {
 
 /// Callback fired once, on the tick that transitions us to leader.
 /// Argument: name of the previous leader we displaced (`None` on cold
-/// claim of the empty singleton). Used by OpenClaw gateway promotion
-/// to rsync paired-device state from the outgoing gateway.
+/// claim of the empty singleton).
 pub type OnBecameLeader = Arc<dyn Fn(Option<String>) + Send + Sync>;
 /// Callback fired once, on the tick that we stop being leader.
 /// Argument: name of the new/expected leader (may be empty if unknown).
@@ -1168,7 +1167,7 @@ async fn load_candidates(pool: &PgPool) -> Result<Vec<Candidate>, sqlx::Error> {
     // Filter out computers explicitly marked `never_leader` (V49).
     // Laptops that travel off-LAN should never be promoted — if they
     // win and then drop wifi, the whole fleet's leader-gated subsystems
-    // (auto-upgrade, sub-agent reaper, openclaw reconciler, task
+    // (auto-upgrade, sub-agent reaper, task
     // watchdog) freeze until the laptop returns. Reads through
     // COALESCE so legacy rows (NULL eligibility) still count.
     // Read worker rows + their election_priority directly from

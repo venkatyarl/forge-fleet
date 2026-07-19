@@ -187,7 +187,6 @@ pub struct MemoryInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capabilities {
     pub can_serve_ff_gateway: bool,
-    pub can_serve_openclaw_gateway: bool,
     pub can_host_postgres_replica: bool,
     pub can_host_redis_replica: bool,
     /// `"none" | "integrated" | "apple_silicon" | "nvidia_cuda" | "amd_rocm"`.
@@ -479,7 +478,6 @@ impl PulseBeatV2 {
             },
             capabilities: Capabilities {
                 can_serve_ff_gateway: false,
-                can_serve_openclaw_gateway: false,
                 can_host_postgres_replica: false,
                 can_host_redis_replica: false,
                 gpu_kind: "none".to_string(),

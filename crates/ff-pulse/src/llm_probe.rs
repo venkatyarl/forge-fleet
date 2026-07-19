@@ -25,7 +25,6 @@ const LLM_SCAN_PORTS: &[u16] = &[
 /// Ports that belong to ForgeFleet infrastructure, NOT LLM servers.
 /// Never classify these as inference endpoints even if they respond to probes.
 const EXCLUDED_PORTS: &[u16] = &[
-    50000, // openclaw gateway
     50001, // MCP HTTP
     51002, // forgefleetd gateway (responds to /health + empty /v1/models)
     51100, // pulse P2P TCP (future)

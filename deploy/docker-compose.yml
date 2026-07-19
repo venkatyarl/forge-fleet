@@ -184,8 +184,8 @@ services:
   # as ForgeFleet leader election. Advantages over Sentinel:
   #   • Peer discovery uses Postgres (independently replicated), not a
   #     Redis pub/sub bootstrap channel that's dead when Redis is dead.
-  #   • One monitoring system for leader + Postgres + Redis + OpenClaw +
-  #     LLM servers, not N separate ones.
+  #   • One monitoring system for leader + Postgres + Redis + LLM servers,
+  #     not N separate ones.
   # See `project_ha_architecture.md` + `feedback_fleet_self_heals.md`.
 
   # ─── NATS JetStream (coordination + event bus + KV store) ─────────────

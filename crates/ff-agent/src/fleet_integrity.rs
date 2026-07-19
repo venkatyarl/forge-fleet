@@ -603,7 +603,6 @@ mod tests {
             "tool_versions_reported",
             "mesh_ssh_complete",
             "sudo_passwordless",
-            "openclaw_registered",
             "defer_end_to_end",
             "library_health",
             "verify_battery_ran",

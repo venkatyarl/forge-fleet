@@ -1217,7 +1217,7 @@ pub(crate) fn kill_process_group(_pid: u32) {}
 /// Every node-specific value (IPs, ssh user, role) and every fleet
 /// constant (gateway port) is read from the DB at compose time — no
 /// IPs, names, usernames, or port numbers in source. Ports come from
-/// `fleet_secrets` (seeded by V50: `port.gateway`, `port.openclaw`, …)
+/// `fleet_secrets` (seeded by V50: `port.gateway`, …)
 /// so an operator can change one row to change a port fleet-wide
 /// without a recompile.
 ///

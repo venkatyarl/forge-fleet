@@ -1,7 +1,7 @@
 //! `ff-mcp` — ForgeFleet MCP (Model Context Protocol) server.
 //!
 //! Implements the MCP specification over JSON-RPC 2.0, exposing ForgeFleet
-//! tools to AI assistants like OpenClaw, Claude, and others.
+//! tools to AI assistants like Claude, Codex, Kimi, and others.
 //!
 //! # Transports
 //!

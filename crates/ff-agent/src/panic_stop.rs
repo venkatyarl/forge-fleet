@@ -16,10 +16,7 @@
 //! 1. SSH to the named computer and stop both daemon services.
 //! 2. `UPDATE computers SET status='maintenance'` so leader election and
 //!    LLM routing skip the node on their next scan.
-//! 3. Flip `openclaw_installations.mode='node'` and clear `gateway_url`
-//!    (if a row exists) so the quarantined computer can't serve gateway
-//!    traffic while isolated.
-//! 4. Publish `fleet.events.quarantine` on NATS for dashboards/log sinks.
+//! 3. Publish `fleet.events.quarantine` on NATS for dashboards/log sinks.
 //!
 //! `unquarantine` is the symmetric reverse — SSH in, restart the services,
 //! bump status back to 'pending'. The next pulse flips it to 'online'.
@@ -402,18 +399,6 @@ pub async fn quarantine_computer(
     if res.rows_affected() == 0 {
         return Err(QuarantineError::NotFound(target.name));
     }
-
-    // Only rewrite openclaw row if it exists — computers without an
-    // OpenClaw install don't get a phantom row.
-    let _oc = sqlx::query(
-        "UPDATE openclaw_installations oi \
-            SET mode = 'node', gateway_url = NULL \
-           FROM computers c \
-          WHERE oi.computer_id = c.id AND LOWER(c.name) = LOWER($1)",
-    )
-    .bind(&target.name)
-    .execute(&mut *tx)
-    .await?;
 
     tx.commit().await?;
 
