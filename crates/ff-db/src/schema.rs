@@ -794,6 +794,13 @@ pub const TABLES: &[&str] = &[
     "config_kv",
 ];
 
+/// Postgres baseline migration version for newly created databases.
+///
+/// `deploy/sql/bootstrap-v161.sql` squashes the schema through this version
+/// and pre-seeds `_migrations` so the runner treats v161 as already applied
+/// on fresh databases.
+pub const PG_BASELINE_VERSION: u32 = 161;
+
 pub const SCHEMA_V14_COMPUTERS_AND_PORTFOLIO: &str = r#"
 -- ─── V14: Computers as first-class + software registry + model portfolio ──
 -- Adds the new data model layer described in
