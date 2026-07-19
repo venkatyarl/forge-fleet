@@ -229,6 +229,10 @@ pub fn start_tick_scheduler(
             tokio::select! {
                 _ = tokio::time::sleep(idle_interval) => {
                     last_tick_at.store(start.elapsed().as_secs(), Ordering::Relaxed);
+                    // Mirror the tick into Pulse so every heartbeat carries
+                    // `dispatch_tick_at` — the scheduler drops nodes whose
+                    // dispatch loop has gone quiet.
+                    ff_pulse::note_dispatch_tick();
 
                     let now = Instant::now();
                     for tick in &mut registry.ticks {
