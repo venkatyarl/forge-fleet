@@ -92,6 +92,13 @@ pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
                 );
             }
         },
+        PrMergeState::Unknown => {
+            info!(
+                pr = %pr_url,
+                "merge_drain: mergeability still computing (UNKNOWN) — deferring to next tick"
+            );
+            return Ok(0);
+        }
         PrMergeState::Other => {}
     }
 
@@ -165,6 +172,37 @@ pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
                     Ok(1)
                 }
                 Err(e) => {
+                    let msg = e.to_string();
+                    // GitHub computes mergeability ASYNCHRONOUSLY after each
+                    // sibling squash-merge; the DIRTY pre-check can race it
+                    // (state still UNKNOWN) and the conflict then surfaces
+                    // here as "not mergeable"/"cannot be cleanly created".
+                    // That is the same condition as DIRTY — recover the item
+                    // (rebuild on current main) instead of shedding it.
+                    if msg.contains("not mergeable") || msg.contains("cannot be cleanly created") {
+                        warn!(
+                            pr = %pr_url,
+                            work_item = %item.work_item_id,
+                            "merge_drain: merge hit late-detected conflict — resetting item for rebuild"
+                        );
+                        ff_db::pg_mark_merge_failed(
+                            pg,
+                            item.id,
+                            item.work_item_id,
+                            "PR conflicted at merge time (async mergeable race) — auto-reset for rebuild",
+                        )
+                        .await?;
+                        sqlx::query(
+                            "UPDATE work_items \
+                                SET status = 'ready', attempts = 0, last_error = NULL, \
+                                    assigned_computer = NULL \
+                              WHERE id = $1",
+                        )
+                        .bind(item.work_item_id)
+                        .execute(pg)
+                        .await?;
+                        return Ok(0);
+                    }
                     let reason = format!("gh pr merge failed: {e}");
                     warn!(pr = %pr_url, %reason, "merge_drain: merge failed");
                     ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &reason).await?;
@@ -294,8 +332,12 @@ enum PrMergeState {
     Dirty,
     /// No conflicts but behind the base (GitHub `BEHIND`).
     Behind,
-    /// Everything else (CLEAN/BLOCKED/UNSTABLE/UNKNOWN or a gh/API error) —
-    /// take no special action; the normal CI→review→merge path decides.
+    /// GitHub is still computing mergeability (`UNKNOWN`) — happens for a few
+    /// seconds after any sibling merges. Defer this tick rather than racing
+    /// past the guard into a doomed `gh pr merge`.
+    Unknown,
+    /// Everything else (CLEAN/BLOCKED/UNSTABLE or a gh/API error) — take no
+    /// special action; the normal CI→review→merge path decides.
     Other,
 }
 
@@ -319,6 +361,7 @@ async fn pr_merge_state(pr_url: &str) -> PrMergeState {
     match status.as_str() {
         "DIRTY" => PrMergeState::Dirty,
         "BEHIND" => PrMergeState::Behind,
+        "UNKNOWN" => PrMergeState::Unknown,
         _ => PrMergeState::Other,
     }
 }
