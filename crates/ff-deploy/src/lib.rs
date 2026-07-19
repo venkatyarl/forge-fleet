@@ -7,6 +7,7 @@
 //! - rollback decisioning and planning (`rollback`)
 //! - deployment orchestration interfaces (`deployer`)
 
+pub mod config;
 pub mod deployer;
 pub mod health_gate;
 pub mod release;
@@ -14,6 +15,7 @@ pub mod rollback;
 pub mod rollout;
 pub mod strategy;
 
+pub use config::DeployConfig;
 pub use deployer::{DeploymentAdapter, DeploymentOrchestrator, DeploymentReport, StepOutcome};
 pub use health_gate::{
     HealthGate, HealthGateConfig, HealthGateEvaluation, HealthGateStatus, HealthSnapshot,
