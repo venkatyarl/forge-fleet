@@ -10331,6 +10331,14 @@ CREATE TRIGGER trg_computers_ip_ram_paired_update
     EXECUTE FUNCTION computers_ip_ram_paired_update_guard();
 "#;
 
+/// V174: persist the daemon's dispatch-tick timestamp from PulseBeatV2 so the
+/// scheduler/reaper can detect a heartbeat-healthy node whose work dispatch loop
+/// has stalled.
+pub const SCHEMA_V174_DISPATCH_TICK_MONITORING: &str = r#"
+ALTER TABLE computers
+    ADD COLUMN IF NOT EXISTS dispatch_tick_at TIMESTAMPTZ;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

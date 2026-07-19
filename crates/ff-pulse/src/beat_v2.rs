@@ -109,6 +109,13 @@ pub struct PulseBeatV2 {
     /// `fleet_tasks` table (forthcoming V44); this field is a liveness hint.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_tasks: Vec<LocalTaskSnapshot>,
+    /// V174+: last time this daemon's work-item dispatch loop ticked, as
+    /// reported by the heartbeat publisher. The materializer persists it to
+    /// `computers.dispatch_tick_at` so the scheduler/reaper can detect a
+    /// heartbeat-healthy node whose dispatch loop has stalled. Older daemons
+    /// omit this field; it defaults to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_tick_at: Option<DateTime<Utc>>,
     /// Intended recipient computer names for targeted pulse routing. Empty
     /// means no specific target (broadcast to all consumers). Older beats do
     /// not include this field, so it defaults to empty for backward
@@ -518,6 +525,7 @@ impl PulseBeatV2 {
             multi_host_participation: None,
             encountered_bugs: Vec::new(),
             local_tasks: Vec::new(),
+            dispatch_tick_at: None,
             receivers: Vec::new(),
         }
     }
@@ -642,6 +650,7 @@ mod tests {
         assert!(parsed.multi_host_participation.is_none());
         assert!(parsed.encountered_bugs.is_empty());
         assert!(parsed.local_tasks.is_empty());
+        assert!(parsed.dispatch_tick_at.is_none());
     }
 
     #[test]
@@ -678,6 +687,7 @@ mod tests {
             "multi_host_participation",
             "encountered_bugs",
             "local_tasks",
+            "dispatch_tick_at",
             "receivers",
         ] {
             obj.remove(later_field);

@@ -523,11 +523,18 @@ impl Materializer {
             .unwrap_or(false);
 
         if snapshots_match && !status_changed {
-            // Q3: UPDATE_COMPUTER_LAST_SEEN_ONLY
-            sqlx::query("UPDATE computers SET last_seen_at = NOW() WHERE id = $1")
-                .bind(computer_id)
-                .execute(&self.pg)
-                .await?;
+            // Q3: refresh liveness timestamps only; the persistent snapshot
+            // hasn't changed so we skip the heavier persistent-field rewrite.
+            sqlx::query(
+                "UPDATE computers SET \
+                    last_seen_at = NOW(), \
+                    dispatch_tick_at = $2 \
+                 WHERE id = $1",
+            )
+            .bind(computer_id)
+            .bind(beat.dispatch_tick_at)
+            .execute(&self.pg)
+            .await?;
 
             // Refresh the TTL on the snapshot so it doesn't expire mid-stream.
             let _: Result<(), _> = redis_conn
@@ -585,6 +592,7 @@ impl Materializer {
                     gpu_kind = $6, \
                     gpu_count = $7, \
                     gpu_total_vram_gb = $8, \
+                    dispatch_tick_at = $10, \
                     has_gpu = ($7 > 0) \
                  WHERE id = $1",
             )
@@ -597,15 +605,22 @@ impl Materializer {
             .bind(beat.capabilities.gpu_count)
             .bind(beat.capabilities.gpu_total_vram_gb)
             .bind(&beat.network.primary_ip)
+            .bind(beat.dispatch_tick_at)
             .execute(&self.pg)
             .await?;
             report.wrote_computer_row = true;
         } else {
-            // At minimum refresh last_seen_at.
-            sqlx::query("UPDATE computers SET last_seen_at = NOW() WHERE id = $1")
-                .bind(computer_id)
-                .execute(&self.pg)
-                .await?;
+            // At minimum refresh last_seen_at and the dispatch tick.
+            sqlx::query(
+                "UPDATE computers SET \
+                    last_seen_at = NOW(), \
+                    dispatch_tick_at = $2 \
+                 WHERE id = $1",
+            )
+            .bind(computer_id)
+            .bind(beat.dispatch_tick_at)
+            .execute(&self.pg)
+            .await?;
         }
 
         // Always keep fleet_workers.ip in sync with the heartbeat's
