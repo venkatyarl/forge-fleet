@@ -52,6 +52,7 @@ pub mod mlx;
 pub mod model_manager;
 pub mod ollama;
 pub mod process_manager;
+pub mod scheduler;
 pub mod vllm;
 
 // Re-export key types at crate root.
