@@ -19,6 +19,9 @@ pub mod rollback;
 pub mod rollout;
 pub mod strategy;
 
+#[cfg(test)]
+mod deploy_tests;
+
 pub use config::DeployConfig;
 pub use daemon::{ActiveLease, RestartReport, restart_with_lease_drain};
 pub use deployer::{DeploymentAdapter, DeploymentOrchestrator, DeploymentReport, StepOutcome};
