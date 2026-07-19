@@ -19,6 +19,7 @@ pub mod jarvis_api;
 pub mod llm_routing;
 pub mod message;
 pub mod middleware;
+pub mod nats;
 pub mod onboard;
 pub mod orchestrate;
 pub mod orchestrator_adapter;
