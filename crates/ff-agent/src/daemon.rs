@@ -1,5 +1,9 @@
 use std::{
     panic::AssertUnwindSafe,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -181,10 +185,17 @@ fn run_telegram_reply_poller_tick(
     })
 }
 
+/// How often the dispatch-tick watchdog wakes up to check liveness.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Maximum allowed silence from the dispatch-tick scheduler loop before the
+/// watchdog considers the daemon stuck and triggers a restart.
+const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(300);
+
 pub fn start_tick_scheduler(
     pg: PgPool,
     worker_name: String,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     let registry = TickRegistry::new();
     let leader_cache = LeaderCache::new(worker_name.clone());
@@ -199,13 +210,26 @@ pub fn start_tick_scheduler(
         );
     }
 
+    let start = Instant::now();
+    let last_tick_at = Arc::new(AtomicU64::new(start.elapsed().as_secs()));
+    let watchdog_last_tick = last_tick_at.clone();
+    let watchdog_shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(dispatch_tick_watchdog(
+        start,
+        watchdog_last_tick,
+        watchdog_shutdown_rx,
+    ));
+
     tokio::spawn(async move {
+        let mut shutdown_rx = shutdown_rx;
         let mut registry = registry;
         let idle_interval = Duration::from_secs(1);
 
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(idle_interval) => {
+                    last_tick_at.store(start.elapsed().as_secs(), Ordering::Relaxed);
+
                     let now = Instant::now();
                     for tick in &mut registry.ticks {
                         if now < tick.state.next_run_at {
@@ -240,4 +264,115 @@ pub fn start_tick_scheduler(
 
         info!("daemon tick scheduler stopped");
     })
+}
+
+/// Self-watchdog for the dispatch-tick scheduler.
+///
+/// The scheduler loop bumps a monotonic heartbeat on every idle iteration.
+/// If the heartbeat goes stale, the daemon is assumed to be wedged and we
+/// trigger an out-of-process restart. Under systemd we ask systemd to restart
+/// the canonical unit; otherwise we fall back to `nohup`-re-executing the
+/// current binary and then exit.
+async fn dispatch_tick_watchdog(
+    start: Instant,
+    last_tick_at: Arc<AtomicU64>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(WATCHDOG_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let elapsed = start.elapsed().as_secs();
+                let last = last_tick_at.load(Ordering::Relaxed);
+                if elapsed.saturating_sub(last) > WATCHDOG_TIMEOUT.as_secs() {
+                    error!(
+                        stale_secs = elapsed.saturating_sub(last),
+                        "dispatch tick watchdog: scheduler loop appears stuck; triggering restart"
+                    );
+                    restart_agent().await;
+                    // If restart_agent returns without exiting, the process is in
+                    // an unrecoverable state; terminate hard so a wrapper can restart us.
+                    std::process::exit(1);
+                }
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+    info!("dispatch tick watchdog stopped");
+}
+
+/// Restart the agent process.
+///
+/// On Linux with systemd available, this asks systemd to restart the canonical
+/// `forgefleetd.service` unit. On failure, or on non-systemd platforms, it
+/// falls back to `nohup`-re-executing the current binary.
+async fn restart_agent() {
+    if try_systemd_restart().await {
+        info!("dispatch tick watchdog: systemd restart triggered; exiting");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        std::process::exit(0);
+    }
+
+    warn!("dispatch tick watchdog: systemd unavailable or restart failed; falling back to nohup");
+    if let Err(err) = try_nohup_restart() {
+        error!(error = %err, "dispatch tick watchdog: nohup restart failed");
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    std::process::exit(1);
+}
+
+/// Attempt to restart via systemd user units. Returns `true` if the systemctl
+/// command reported success. This matches the restart pattern used elsewhere
+/// in the fleet (`local_healer`, `revive`, `panic_stop`).
+async fn try_systemd_restart() -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    // Running under a systemd service manager sets INVOCATION_ID.
+    if std::env::var("INVOCATION_ID").is_err() {
+        return false;
+    }
+
+    let script = "\
+        export XDG_RUNTIME_DIR=/run/user/$(id -u); \
+        export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus; \
+        systemctl --user reset-failed forgefleetd.service forgefleet-node.service 2>/dev/null; \
+        systemctl --user restart --no-block forgefleetd.service \
+            || systemctl --user restart --no-block forgefleet-node.service";
+
+    match tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+    {
+        Ok(output) => output.status.success(),
+        Err(err) => {
+            warn!(error = %err, "dispatch tick watchdog: systemctl invocation failed");
+            false
+        }
+    }
+}
+
+/// Fall-back restart: re-execute the current binary with `nohup` so it
+/// survives this process exiting, then terminate.
+fn try_nohup_restart() -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    let _child = std::process::Command::new("nohup")
+        .arg(&exe)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    Ok(())
 }
