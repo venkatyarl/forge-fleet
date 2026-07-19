@@ -796,7 +796,7 @@ pub const TABLES: &[&str] = &[
 
 /// Postgres baseline migration version for newly created databases.
 ///
-/// `deploy/sql/bootstrap-v161.sql` squashes the schema through this version
+/// `crates/ff-db/src/migrations/v161_bootstrap_baseline.sql` squashes the schema through this version
 /// and pre-seeds `_migrations` so the runner treats v161 as already applied
 /// on fresh databases.
 pub const PG_BASELINE_VERSION: u32 = 161;
@@ -10271,4 +10271,4 @@ CREATE INDEX IF NOT EXISTS idx_work_queue_status_created
 /// Postgres due to accumulated rename/renumber drift. On a brand-new DB the
 /// migration runner applies this single idempotent baseline instead of the
 /// legacy chain, then continues with any migrations after v161.
-pub const BOOTSTRAP_V161_SQL: &str = include_str!("../../../deploy/sql/bootstrap-v161.sql");
+pub const BOOTSTRAP_V161_SQL: &str = include_str!("migrations/v161_bootstrap_baseline.sql");
