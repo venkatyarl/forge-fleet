@@ -797,13 +797,42 @@ async fn heartbeat_lease_once(work_item_id: Uuid) {
     );
 }
 
+/// Human-readable task branch: `feature/<title-slug>-<id4>` (operator
+/// directive 2026-07-19 — "name them feature/<work item name> instead of the
+/// id"). The 4-hex id tail keeps the name DETERMINISTIC per item (retries must
+/// regenerate the identical branch for `checkout -B` + force-with-lease to
+/// converge) and unique when two items share a title. Slug: lowercase
+/// alphanumerics, runs of everything else collapsed to `-`, capped at 40 chars.
+fn task_branch_name(title: &str, work_item_id: uuid::Uuid) -> String {
+    let mut slug = String::with_capacity(40);
+    let mut last_dash = true; // suppress a leading dash
+    for c in title.chars() {
+        if slug.len() >= 40 {
+            break;
+        }
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    let slug = slug.trim_end_matches('-');
+    let id4 = &work_item_id.simple().to_string()[..4];
+    if slug.is_empty() {
+        format!("feature/{id4}")
+    } else {
+        format!("feature/{slug}-{id4}")
+    }
+}
+
 async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Result<WorktreeRecord> {
     let base_branch = match item.base_branch.as_deref() {
         Some(branch) if !branch.trim().is_empty() => branch.trim().to_string(),
         _ => default_branch(&item.repo_path).unwrap_or_else(|_| "main".to_string()),
     };
-    let short_id = item.work_item_id.simple().to_string()[..12].to_string();
-    let task_branch = format!("wi/{short_id}");
+    let task_branch = task_branch_name(&item.title, item.work_item_id);
 
     let workspaces = ensure_workspaces((item.slot.max(0) as u32) + 1)
         .map_err(|e| anyhow!("ensure sub-agent workspaces: {e}"))?;

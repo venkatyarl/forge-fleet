@@ -123,7 +123,7 @@ pub async fn run_pr_merge_pass(_pool: &sqlx::PgPool) -> Result<PrMergeReport> {
     let prs: Vec<GhPr> = serde_json::from_slice(&list_out).unwrap_or_default();
     for pr in prs
         .into_iter()
-        .filter(|p| p.head_ref_name.starts_with("wi/"))
+        .filter(|p| p.head_ref_name.starts_with("wi/") || p.head_ref_name.starts_with("feature/"))
     {
         report.considered += 1;
         let n = pr.number;
