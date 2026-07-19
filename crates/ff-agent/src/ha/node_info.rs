@@ -62,7 +62,7 @@ impl NodeInfo {
 /// found no dedicated pool (`None` or 0 GB): the GPU's pool is carved from
 /// system RAM (AMD Strix Halo APUs, Apple Silicon).
 fn is_unified_memory(gpu_present: bool, gpu_total_vram_gb: Option<f64>) -> bool {
-    gpu_present && gpu_total_vram_gb.map_or(true, |gb| gb <= 0.0)
+    gpu_present && gpu_total_vram_gb.is_none_or(|gb| gb <= 0.0)
 }
 
 fn detect_npu() -> bool {
@@ -93,9 +93,9 @@ fn detect_npu() -> bool {
 fn detect_cpu_flags() -> Vec<String> {
     #[cfg(target_os = "linux")]
     {
-        return std::fs::read_to_string("/proc/cpuinfo")
+        std::fs::read_to_string("/proc/cpuinfo")
             .map(|content| parse_linux_cpu_flags(&content))
-            .unwrap_or_default();
+            .unwrap_or_default()
     }
 
     #[cfg(target_os = "macos")]
@@ -345,7 +345,7 @@ fn detect_gpu_kind() -> String {
         if run_command("rocm-smi", &["--version"]).is_some() {
             return "amd_rocm".to_string();
         }
-        return "none".to_string();
+        "none".to_string()
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

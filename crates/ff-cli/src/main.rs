@@ -531,7 +531,7 @@ fn handle_health(config_path: &Path) -> Result<()> {
 
 async fn handle_tools(args: ToolsArgs, _config_path: &Path) -> Result<()> {
     static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
-        std::sync::LazyLock::new(|| reqwest::Client::new());
+        std::sync::LazyLock::new(reqwest::Client::new);
     let gateway = std::env::var("FF_GATEWAY_URL")
         .unwrap_or_else(|_| "http://192.168.5.100:51002".to_string());
     let client = &*SHARED_HTTP;
@@ -542,13 +542,13 @@ async fn handle_tools(args: ToolsArgs, _config_path: &Path) -> Result<()> {
             name,
             unhealthy,
         } => {
-            let mut url = format!("{}/api/tools", gateway);
+            let mut url = format!("{gateway}/api/tools");
             let mut params = vec![];
             if let Some(n) = node {
-                params.push(format!("node={}", n));
+                params.push(format!("node={n}"));
             }
             if let Some(n) = name {
-                params.push(format!("name={}", n));
+                params.push(format!("name={n}"));
             }
             if unhealthy {
                 params.push("unhealthy=true".to_string());
@@ -579,7 +579,7 @@ async fn handle_tools(args: ToolsArgs, _config_path: &Path) -> Result<()> {
             }
         }
         ToolsCommand::Health => {
-            let url = format!("{}/api/tools/health", gateway);
+            let url = format!("{gateway}/api/tools/health");
             let resp = client.get(&url).send().await?;
             if !resp.status().is_success() {
                 anyhow::bail!("Gateway returned {}", resp.status());
@@ -591,14 +591,14 @@ async fn handle_tools(args: ToolsArgs, _config_path: &Path) -> Result<()> {
             let unhealthy = body["unhealthy_tools"].as_i64().unwrap_or(0);
 
             println!("{GREEN}✓ Tool Registry Health{RESET}");
-            println!("  total:     {}", total);
+            println!("  total:     {total}");
             println!(
                 "  healthy:   {}{GREEN}{}{RESET}",
                 if healthy == total { "" } else { "  " },
                 healthy
             );
             if unhealthy > 0 {
-                println!("  unhealthy: {RED}{}{RESET}", unhealthy);
+                println!("  unhealthy: {RED}{unhealthy}{RESET}");
             }
             if let Some(nodes) = body["nodes"].as_array() {
                 println!("\n  By node:");

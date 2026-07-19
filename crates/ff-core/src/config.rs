@@ -1245,7 +1245,7 @@ fn default_redis_prefix() -> String {
 // ── Obsidian Export Config ───────────────────────────────────────────────────
 
 /// Obsidian export daemon configuration — `[obsidian_export]`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ObsidianExportConfig {
     /// Enable the Obsidian export daemon.
     #[serde(default)]
@@ -1266,18 +1266,6 @@ pub struct ObsidianExportConfig {
     /// Maximum tokens for the export model.
     #[serde(default)]
     pub max_tokens: Option<u32>,
-}
-
-impl Default for ObsidianExportConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            target_dir: None,
-            model: None,
-            temperature: None,
-            max_tokens: None,
-        }
-    }
 }
 
 // ── Bootstrap Targets ────────────────────────────────────────────────────────
