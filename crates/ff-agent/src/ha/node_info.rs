@@ -193,7 +193,7 @@ fn parse_rocminfo_total_vram_gb(out: &str) -> Option<f64> {
     let mut agent_max_kib: u64 = 0;
     let mut in_global_pool = false;
 
-    let mut flush = |in_gpu: bool, is_apu: bool, agent_max_kib: u64, total: &mut u64| {
+    let flush = |in_gpu: bool, is_apu: bool, agent_max_kib: u64, total: &mut u64| {
         if in_gpu && !is_apu {
             *total += agent_max_kib;
         }

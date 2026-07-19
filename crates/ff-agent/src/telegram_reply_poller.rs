@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use sqlx::{PgPool, Row};
 
 use crate::notifications::SHARED_HTTP;

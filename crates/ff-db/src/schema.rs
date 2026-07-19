@@ -10146,6 +10146,7 @@ CREATE TRIGGER trg_task_notification_outbox
     AFTER INSERT OR UPDATE OF status ON fleet_tasks
     FOR EACH ROW
     EXECUTE FUNCTION enqueue_task_notification();
+"#;
 
 /// V167 — Telegram send/reply routing (operator request 2026-07-19: "if I
 /// reply to a Telegram message, ff routes the reply to the session that sent
