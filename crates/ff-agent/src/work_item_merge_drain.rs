@@ -13,9 +13,26 @@
 
 use anyhow::{Context, Result};
 use sqlx::PgPool;
-use std::process::Command;
 use std::time::Duration;
 use tracing::{info, warn};
+
+/// Build a `gh` invocation with the fleet GitHub token injected as `GH_TOKEN`.
+///
+/// The merge-drain runs on whichever node is currently leader, and that node's
+/// *ambient* `gh` auth (`~/.config/gh`) may be unset or point at a retired
+/// account (e.g. `taylor-oclaw`) — relying on it silently breaks every drain
+/// call with `gh ... failed: authenticate with gh auth login`, stranding
+/// CI-green PRs in the queue. Pulling `github_gh_token` from `fleet_secrets` at
+/// call time makes the drain authenticate on ANY leader with no per-node `gh
+/// auth` and without writing the token to disk. No secret → ambient-auth
+/// fallback (unchanged behaviour).
+async fn gh_cmd() -> tokio::process::Command {
+    let mut c = tokio::process::Command::new("gh");
+    if let Some(token) = crate::fleet_info::fetch_secret("github_gh_token").await {
+        c.env("GH_TOKEN", token);
+    }
+    c
+}
 
 /// One drain pass. Returns 1 if it merged something this tick, else 0.
 pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
@@ -113,9 +130,11 @@ async fn run_pr_review(
     pr_url: &str,
     work_item_id: uuid::Uuid,
 ) -> anyhow::Result<(bool, String)> {
-    let diff_out = Command::new("gh")
-        .args(["pr", "diff", pr_url])
+    let mut diff_cmd = gh_cmd().await;
+    diff_cmd.args(["pr", "diff", pr_url]);
+    let diff_out = diff_cmd
         .output()
+        .await
         .context("spawn gh pr diff")?;
     if !diff_out.status.success() {
         anyhow::bail!(
@@ -225,11 +244,9 @@ enum CiState {
 /// Inspect a PR's checks via `gh pr checks <url> --json state`. No checks yet
 /// (or gh transient error) is treated as Pending so we never merge prematurely.
 async fn pr_ci_state(pr_url: &str) -> CiState {
-    let out = match tokio::process::Command::new("gh")
-        .args(["pr", "checks", pr_url, "--json", "state"])
-        .output()
-        .await
-    {
+    let mut cmd = gh_cmd().await;
+    cmd.args(["pr", "checks", pr_url, "--json", "state"]);
+    let out = match cmd.output().await {
         Ok(o) => o,
         Err(e) => return CiState::Failed(format!("gh pr checks spawn: {e}")),
     };
@@ -268,11 +285,9 @@ async fn pr_ci_state(pr_url: &str) -> CiState {
 /// `gh pr merge <url> --squash --delete-branch` (the project policy — always
 /// delete the branch; see feedback_pr_merge_delete_branch.md).
 async fn gh_merge_squash(pr_url: &str) -> Result<()> {
-    let out = tokio::process::Command::new("gh")
-        .args(["pr", "merge", pr_url, "--squash", "--delete-branch"])
-        .output()
-        .await
-        .context("spawn gh pr merge")?;
+    let mut cmd = gh_cmd().await;
+    cmd.args(["pr", "merge", pr_url, "--squash", "--delete-branch"]);
+    let out = cmd.output().await.context("spawn gh pr merge")?;
     if out.status.success() {
         return Ok(());
     }
@@ -287,11 +302,9 @@ async fn gh_merge_squash(pr_url: &str) -> Result<()> {
 }
 
 async fn gh_pr_comment(pr_url: &str, body: &str) -> Result<()> {
-    let out = tokio::process::Command::new("gh")
-        .args(["pr", "comment", pr_url, "--body", body])
-        .output()
-        .await
-        .context("spawn gh pr comment")?;
+    let mut cmd = gh_cmd().await;
+    cmd.args(["pr", "comment", pr_url, "--body", body]);
+    let out = cmd.output().await.context("spawn gh pr comment")?;
     if out.status.success() {
         return Ok(());
     }
@@ -327,11 +340,9 @@ async fn reconcile_orphaned_reviews(pg: &PgPool) -> Result<usize> {
 
     let mut reconciled = 0usize;
     for (id, pr_url) in rows {
-        let out = match tokio::process::Command::new("gh")
-            .args(["pr", "view", &pr_url, "--json", "state,mergedAt"])
-            .output()
-            .await
-        {
+        let mut cmd = gh_cmd().await;
+        cmd.args(["pr", "view", &pr_url, "--json", "state,mergedAt"]);
+        let out = match cmd.output().await {
             Ok(o) if o.status.success() => o,
             Ok(o) => {
                 warn!(pr = %pr_url, stderr = %String::from_utf8_lossy(&o.stderr).trim(), "reconcile: gh pr view failed — leaving row");
