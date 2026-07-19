@@ -432,6 +432,15 @@ impl Materializer {
         let prev_gpu_count: Option<i32> = row.try_get("gpu_count").ok();
         let prev_gpu_total_vram_gb: Option<f64> = row.try_get("gpu_total_vram_gb").ok();
 
+        if computer_row_has_empty_node_attributes(prev_primary_ip.as_deref(), prev_ram_gb) {
+            error!(
+                computer = %beat.computer_name,
+                primary_ip = ?prev_primary_ip,
+                total_ram_gb = ?prev_ram_gb,
+                "materializer: computers row has empty primary_ip or RAM"
+            );
+        }
+
         report.computer_id = Some(computer_id);
 
         // V43+: persist encountered bugs before the fast-path exit so panics
@@ -1449,6 +1458,10 @@ fn persistent_fields_changed(
     ips_differ || hw_differ || cap_differ || primary_ip_differ
 }
 
+fn computer_row_has_empty_node_attributes(primary_ip: Option<&str>, ram_gb: Option<i32>) -> bool {
+    primary_ip.is_none_or(str::is_empty) || ram_gb.is_none_or(|ram| ram <= 0)
+}
+
 /// RAM tier key for server-policy resolution: <=8GB is `tiny` (CPU-only
 /// llama-server, no model seed), everything else `standard`. Callers must
 /// gate out non-positive ram_gb (degenerate beats) before classifying.
@@ -1763,6 +1776,24 @@ mod tests {
         // Regression guard for the aura wifi→ethernet freeze + the 9/15
         // fleet_workers.ip drift.
         assert!(persistent_fields_changed(false, false, false, true));
+    }
+
+    #[test]
+    fn detects_empty_computer_row_node_attributes() {
+        assert!(computer_row_has_empty_node_attributes(None, Some(32)));
+        assert!(computer_row_has_empty_node_attributes(Some(""), Some(32)));
+        assert!(computer_row_has_empty_node_attributes(
+            Some("10.0.0.1"),
+            None
+        ));
+        assert!(computer_row_has_empty_node_attributes(
+            Some("10.0.0.1"),
+            Some(0)
+        ));
+        assert!(!computer_row_has_empty_node_attributes(
+            Some("10.0.0.1"),
+            Some(32)
+        ));
     }
 
     #[test]
