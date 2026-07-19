@@ -538,4 +538,19 @@ mod tests {
         assert_eq!(parsed.computer_name, "marcus");
         assert_eq!(parsed.pulse_protocol_version, 2);
     }
+
+    #[test]
+    fn deserializes_legacy_beat_without_receivers_field() {
+        // Older-format beats may omit fields the current schema supports (for
+        // example, a `receivers` field). Their absence must not break deserialization.
+        let mut value = serde_json::to_value(PulseBeatV2::skeleton("legacy-node")).unwrap();
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.remove("receivers");
+        }
+        let json = serde_json::to_string(&value).unwrap();
+        let beat: PulseBeatV2 = serde_json::from_str(&json).expect("legacy beat deserializes");
+        assert_eq!(beat.computer_name, "legacy-node");
+        assert_eq!(beat.pulse_protocol_version, 2);
+        assert!(beat.llm_servers.is_empty());
+    }
 }
