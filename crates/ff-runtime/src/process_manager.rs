@@ -470,7 +470,7 @@ impl Default for ProcessManager {
 
 /// Send a Unix signal to a process by PID.
 #[cfg(unix)]
-fn send_signal(pid: u32, signal: &str) {
+pub(crate) fn send_signal(pid: u32, signal: &str) {
     let _ = Command::new("kill")
         .args([&format!("-{signal}"), &pid.to_string()])
         .stdout(Stdio::null())
@@ -479,12 +479,12 @@ fn send_signal(pid: u32, signal: &str) {
 }
 
 #[cfg(not(unix))]
-fn send_signal(pid: u32, signal: &str) {
+pub(crate) fn send_signal(pid: u32, signal: &str) {
     let _ = (pid, signal); // no-op on non-Unix
 }
 
 /// Check if a PID is still alive.
-fn is_pid_alive(pid: u32) -> bool {
+pub(crate) fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         // `kill -0` checks existence without actually signalling.
