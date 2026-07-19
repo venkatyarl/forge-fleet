@@ -784,11 +784,14 @@ fn detect_gpu_vram_gb(gpu_kind: &str, os_family: &str) -> (Option<f64>, Option<f
             .unwrap_or_default();
 
             // First non-empty line: MiB integer, or "[N/A]" / "N/A" on GB10.
+            // Parse as u64 first to avoid float-parse edge cases and keep the
+            // integer->double conversion explicit and bounded.
             let first = smi.lines().map(str::trim).find(|l| !l.is_empty());
-            if let Some(mib) = first.and_then(|l| l.parse::<f64>().ok())
-                && mib > 0.0
+            if let Some(mib) = first
+                .and_then(|l| l.parse::<u64>().ok())
+                .filter(|&mib| mib > 0)
             {
-                let gb = mib / 1024.0;
+                let gb = (mib as f64) / 1024.0;
                 return (Some(gb), Some(gb));
             }
 
@@ -819,15 +822,16 @@ fn detect_gpu_vram_gb(gpu_kind: &str, os_family: &str) -> (Option<f64>, Option<f
             .unwrap_or_default();
 
             // CSV rows look like: `card0,<total_bytes>,<used_bytes>`. Grab the
-            // largest plausible byte-count on any data line.
+            // largest plausible byte-count on any data line. Parse as u64 first
+            // to avoid float overflow/precision loss on large integer counts.
             let bytes = out
                 .lines()
                 .flat_map(|l| l.split(','))
-                .filter_map(|f| f.trim().parse::<f64>().ok())
-                .filter(|b| *b > 1_000_000.0) // ignore small ints (ids, used==0)
-                .fold(0.0_f64, f64::max);
-            if bytes > 0.0 {
-                let gb = bytes / 1e9;
+                .filter_map(|f| f.trim().parse::<u64>().ok())
+                .filter(|&b| b > 1_000_000) // ignore small ints (ids, used==0)
+                .fold(0_u64, u64::max);
+            if bytes > 0 {
+                let gb = (bytes as f64) / 1e9;
                 return (Some(gb), Some(gb));
             }
             (None, None)
@@ -859,14 +863,14 @@ fn local_total_ram_gb() -> Option<f64> {
             3,
         )
         .filter(|o| o.status.success())?;
-        let bytes: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
-        return Some(bytes / 1e9);
+        let bytes: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+        return Some((bytes as f64) / 1e9);
     }
     let txt = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in txt.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kb: f64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
-            return Some(kb / 1e6);
+            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            return Some((kb as f64) / 1e6);
         }
     }
     None
