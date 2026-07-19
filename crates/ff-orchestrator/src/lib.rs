@@ -29,6 +29,7 @@ pub mod queue;
 pub mod router;
 pub mod scheduler;
 pub mod task_decomposer;
+pub mod train_branch;
 
 // Re-export primary types at crate root for ergonomic use.
 pub use agent_team::{AgentAssignment, ModelPreference, TeamConfig, TeamTemplates};
@@ -60,3 +61,4 @@ pub use scheduler::{
 pub use task_decomposer::{
     DecomposedSubTask, DecompositionStrategy, TaskPattern, TemplateDecomposer,
 };
+pub use train_branch::{QueuedPr, TrainBranch, TrainBranchError, create_train_branch};
