@@ -206,7 +206,7 @@ fi
 # Canonical source-tree location (per reference_source_tree_locations.md +
 # the V31 `computers.source_tree_path` backfill):
 #   - Taylor (leader / dev workstation):      ~/projects/forge-fleet
-#   - Every other fleet member:               ~/.forgefleet/sub-agent-0/forge-fleet
+#   - Every other fleet member:               ~/.forgefleet/sub-agents/sub-agent-0/forge-fleet
 #
 # The sub-agent-0 path is the canonical workspace for dispatched fleet-LLM
 # work (`ff supervise` / `ff run`). Keeping the bootstrap clone there
@@ -221,7 +221,7 @@ if [ "$OS_ID" = "macos" ]; then
 elif [ "$ROLE" = "leader" ]; then
   REPO_DIR="/home/${SUDO_INVOKER}/projects/forge-fleet"
 else
-  REPO_DIR="/home/${SUDO_INVOKER}/.forgefleet/sub-agent-0/forge-fleet"
+  REPO_DIR="/home/${SUDO_INVOKER}/.forgefleet/sub-agents/sub-agent-0/forge-fleet"
 fi
 
 run_as_user mkdir -p "$(dirname "$REPO_DIR")"
@@ -375,7 +375,7 @@ FF_HOME="$USER_HOME/.forgefleet"
 run_as_user mkdir -p "$FF_HOME/logs"
 i=0
 while [ "$i" -lt "$SUB_AGENTS" ]; do
-  run_as_user mkdir -p "$FF_HOME/sub-agent-${i}/scratch" "$FF_HOME/sub-agent-${i}/checkpoints" "$FF_HOME/sub-agent-${i}/cache"
+  run_as_user mkdir -p "$FF_HOME/sub-agents/sub-agent-${i}/scratch" "$FF_HOME/sub-agents/sub-agent-${i}/checkpoints" "$FF_HOME/sub-agents/sub-agent-${i}/cache"
   i=$((i + 1))
 done
 report "sub_agents" ok "count=$SUB_AGENTS"
