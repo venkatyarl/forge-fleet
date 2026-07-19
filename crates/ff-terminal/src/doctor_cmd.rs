@@ -143,6 +143,27 @@ fn leader_health(fresh: bool) -> Health {
     if fresh { Health::Pass } else { Health::Fail }
 }
 
+/// Processes stuck in uninterruptible sleep (`D` state).  A small number is
+/// transient IO; a pileup (especially with idle CPU) is the classic signature
+/// of a hard-mounted NFS peer going dark.
+fn dstate_health(count: i64) -> Health {
+    match count {
+        0 => Health::Pass,
+        1..=5 => Health::Warn,
+        _ => Health::Fail,
+    }
+}
+
+/// Peer mounts whose source node is unreachable on the SSH mesh.  These are
+/// the mounts that will wedge in D-state if they are still hard-mounted.
+fn stale_peer_mount_health(count: i64) -> Health {
+    if count > 0 {
+        Health::Warn
+    } else {
+        Health::Pass
+    }
+}
+
 /// Render the report. Pure (no I/O / color in the assertions matter) so the
 /// layout is unit-testable.
 fn render_doctor(checks: &[DoctorCheck], overall: Health) -> String {
@@ -307,6 +328,42 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
         name: "mesh reachability".into(),
         status: mesh_health(mesh_failed),
         detail: format!("{mesh_failed} edges not ok (last 1h)"),
+    });
+
+    // 7c) Local D-state waiters.  Cheap /proc scan; non-Linux hosts report
+    //     "not available" and pass.
+    let dstate = ff_agent::shared_storage::local_dstate_waiter_count().unwrap_or(-1);
+    checks.push(DoctorCheck {
+        name: "D-state waiters".into(),
+        status: if dstate < 0 {
+            Health::Pass
+        } else {
+            dstate_health(dstate)
+        },
+        detail: if dstate < 0 {
+            "not available on this OS".into()
+        } else {
+            format!("{dstate} processes in D-state")
+        },
+    });
+
+    // 7d) Peer mounts whose source node has a recent failed mesh edge.  These
+    //     are the mounts that will hang (or are hanging) when the peer dies.
+    let stale_peer_mounts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM node_peer_mounts m
+          JOIN computers c ON c.id = m.computer_id
+          JOIN fleet_mesh_status s
+            ON s.src_node = c.name AND s.dst_node = m.peer_name
+         WHERE s.status = 'failed'
+           AND s.last_checked > NOW() - INTERVAL '1 hour'",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("stale peer-mount check: {e}"))?;
+    checks.push(DoctorCheck {
+        name: "stale peer mounts".into(),
+        status: stale_peer_mount_health(stale_peer_mounts),
+        detail: format!("{stale_peer_mounts} peer mounts on failed mesh edges (last 1h)"),
     });
 
     // 7b) Model deployments that should be serving but are unhealthy/stale.
@@ -520,6 +577,15 @@ mod tests {
         assert_eq!(deployment_health(1), Health::Warn);
         assert_eq!(leader_health(true), Health::Pass);
         assert_eq!(leader_health(false), Health::Fail);
+    }
+
+    #[test]
+    fn dstate_and_stale_peer_mount_thresholds() {
+        assert_eq!(dstate_health(0), Health::Pass);
+        assert_eq!(dstate_health(3), Health::Warn);
+        assert_eq!(dstate_health(10), Health::Fail);
+        assert_eq!(stale_peer_mount_health(0), Health::Pass);
+        assert_eq!(stale_peer_mount_health(1), Health::Warn);
     }
 
     #[test]

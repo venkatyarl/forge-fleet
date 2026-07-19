@@ -59,6 +59,12 @@ pub enum StorageError {
     UnsupportedOs(String),
 }
 
+/// NFS client mount options shared by every code path that performs a client
+/// mount.  `soft` causes NFS calls to return ETIMEDOUT instead of wedging the
+/// process in uninterruptible D-state; `timeo=50` (5s) + `retrans=3` fail fast
+/// enough that autofs can recover when the peer comes back.
+const NFS_CLIENT_OPTS: &str = "soft,intr,timeo=50,retrans=3";
+
 /// Info about a share + its mount fan-out.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ShareInfo {
@@ -405,9 +411,9 @@ async fn attempt_client_mount(
     // that macOS accepts `-o resvport` (required by macOS NFS v3 clients on
     // privileged ports); NFSv4 over TCP port 2049 works on both platforms.
     let extra_opts = if os.starts_with("macos") {
-        "-o nfsvers=4,resvport"
+        format!("-o nfsvers=4,resvport,{NFS_CLIENT_OPTS}")
     } else {
-        "-o nfsvers=4"
+        format!("-o nfsvers=4,{NFS_CLIENT_OPTS}")
     };
 
     let cmd = format!(
@@ -443,6 +449,203 @@ fn shell_quote(s: &str) -> String {
         }
     }
     out.push('\'');
+    out
+}
+
+// ─── Peer-mount inventory + D-state checks ──────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct ParsedPeerMount {
+    peer_name: String,
+    source: String,
+    mount_path: String,
+    fs_type: String,
+    mount_options: String,
+}
+
+impl SharedStorageManager {
+    /// Scan every fleet node for currently-mounted NFS peer mounts (autofs or
+    /// manual) and upsert them into `node_peer_mounts`.  Returns
+    /// `(recorded_mounts, failed_nodes)`.
+    pub async fn inventory_peer_mounts(&self) -> Result<(usize, usize), StorageError> {
+        let nodes = ff_db::pg_list_nodes(&self.pg).await?;
+        let mut recorded = 0usize;
+        let mut failed = 0usize;
+
+        for node in &nodes {
+            let Some(computer) = fetch_computer(&self.pg, &node.name).await? else {
+                continue;
+            };
+            let probe = "cat /proc/mounts 2>/dev/null || mount";
+            match ssh_exec(&node.ssh_user, &node.ip, probe).await {
+                Ok((0, stdout, _stderr)) => {
+                    for m in parse_mount_text(&stdout, &nodes) {
+                        ff_db::pg_upsert_node_peer_mount(
+                            &self.pg,
+                            computer.id,
+                            &m.peer_name,
+                            &m.source,
+                            &m.mount_path,
+                            &m.fs_type,
+                            Some(&m.mount_options),
+                        )
+                        .await?;
+                        recorded += 1;
+                    }
+                }
+                Ok((code, stdout, stderr)) => {
+                    failed += 1;
+                    warn!(
+                        node = %node.name,
+                        code,
+                        output = %format!("{}{}", stdout.trim_end(), stderr),
+                        "peer-mount inventory failed"
+                    );
+                }
+                Err(e) => {
+                    failed += 1;
+                    warn!(node = %node.name, error = %e, "peer-mount inventory ssh failed");
+                }
+            }
+        }
+
+        Ok((recorded, failed))
+    }
+}
+
+/// Count local processes in uninterruptible sleep (`D` state).  This is the
+/// symptom class that makes a node look runaway while CPU is idle — a pileup of
+/// NFS waiters on a hard-mounted dead peer.  Returns `None` on non-Linux
+/// platforms (no `/proc`).
+pub fn local_dstate_waiter_count() -> Option<i64> {
+    let mut count = 0i64;
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str() else { continue };
+        if !pid.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let stat_path = format!("/proc/{pid}/stat");
+        let Ok(content) = std::fs::read_to_string(&stat_path) else {
+            continue;
+        };
+        if let Some(state) = parse_proc_stat_state(&content) {
+            if state == 'D' {
+                count += 1;
+            }
+        }
+    }
+    Some(count)
+}
+
+/// Parse the one-character process state out of `/proc/<pid>/stat`.  The file
+/// format is `pid (comm) state ...`; `comm` may contain spaces, so we locate the
+/// first ')' and read the next non-whitespace character.
+fn parse_proc_stat_state(content: &str) -> Option<char> {
+    let close = content.find(')')?;
+    content[close + 1..].trim_start().chars().next()
+}
+
+/// Resolve a mount source hostname (e.g. `james` or `10.44.0.2`) to a fleet
+/// worker name.  Falls back to the raw source when the host is not a known
+/// fleet node.
+fn resolve_peer_name(source_host: &str, nodes: &[ff_db::FleetNodeRow]) -> String {
+    let host = source_host.to_lowercase();
+    for node in nodes {
+        if node.name.to_lowercase() == host {
+            return node.name.clone();
+        }
+        if node.ip.to_lowercase() == host {
+            return node.name.clone();
+        }
+        if let Some(arr) = node.alt_ips.as_array() {
+            for alt in arr {
+                if let Some(s) = alt.as_str() {
+                    if s.to_lowercase() == host {
+                        return node.name.clone();
+                    }
+                }
+            }
+        }
+    }
+    source_host.to_string()
+}
+
+/// Parse both Linux `/proc/mounts` text and macOS `mount` output, returning
+/// only NFS-family mounts whose source looks like `host:/path`.
+fn parse_mount_text(text: &str, nodes: &[ff_db::FleetNodeRow]) -> Vec<ParsedPeerMount> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Linux /proc/mounts: device mnt fs opts dump pass
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 4 && parts[0].contains(':') && parts[2].starts_with("nfs") {
+            let source = parts[0].to_string();
+            let host = source.split(':').next().unwrap_or(&source);
+            out.push(ParsedPeerMount {
+                peer_name: resolve_peer_name(host, nodes),
+                source,
+                mount_path: unescape_mount_path(parts[1]),
+                fs_type: parts[2].to_string(),
+                mount_options: parts[3].to_string(),
+            });
+            continue;
+        }
+
+        // macOS `mount` output: host:/path on /mnt (nfs4, read-only, ...)
+        if let Some((device, rest)) = line.split_once(" on ") {
+            if !device.contains(':') {
+                continue;
+            }
+            let (mount_path, opts) = rest.rsplit_once(" (").unwrap_or((rest, ""));
+            let fs_type = opts
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .split(',')
+                .next()
+                .unwrap_or("nfs")
+                .trim()
+                .to_string();
+            if fs_type.starts_with("nfs") {
+                let host = device.split(':').next().unwrap_or(device);
+                out.push(ParsedPeerMount {
+                    peer_name: resolve_peer_name(host, nodes),
+                    source: device.to_string(),
+                    mount_path: mount_path.to_string(),
+                    fs_type,
+                    mount_options: opts
+                        .trim_start_matches('(')
+                        .trim_end_matches(')')
+                        .to_string(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Undo the octal escapes used by the kernel in `/proc/mounts` (`\040` → space).
+fn unescape_mount_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'0') {
+            chars.next();
+            if chars.peek() == Some(&'4') {
+                chars.next();
+                if chars.peek() == Some(&'0') {
+                    chars.next();
+                    out.push(' ');
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+    }
     out
 }
 
@@ -490,5 +693,80 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
         // A single quote becomes close-quote, escaped-quote, reopen-quote.
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    fn test_node(name: &str, ip: &str, alt_ips: &[&str]) -> ff_db::FleetNodeRow {
+        ff_db::FleetNodeRow {
+            name: name.to_string(),
+            ip: ip.to_string(),
+            ssh_user: "root".to_string(),
+            ram_gb: 0,
+            cpu_cores: 0,
+            os: "linux".to_string(),
+            role: "worker".to_string(),
+            election_priority: 0,
+            hardware: String::new(),
+            alt_ips: serde_json::json!(alt_ips),
+            capabilities: serde_json::json!({}),
+            preferences: serde_json::json!({}),
+            resources: serde_json::json!({}),
+            status: "online".to_string(),
+            runtime: "unknown".to_string(),
+            models_dir: "~/models".to_string(),
+            disk_quota_pct: 80,
+            sub_agent_count: 1,
+            gh_account: None,
+            tooling: serde_json::json!({}),
+            gpu_kind: None,
+            gpu_model: None,
+            gpu_vram_gb: None,
+            gpu_total_vram_gb: None,
+            has_gpu: None,
+            computer_ram_gb: None,
+            computer_cpu_cores: None,
+        }
+    }
+
+    #[test]
+    fn parse_proc_mounts_linux() {
+        let nodes = vec![test_node("james", "10.44.0.2", &[])];
+        let text = "james:/mnt/james /mnt/james nfs4 rw,relatime,vers=4.2,hard,timeo=600,retrans=2 0 0\n/dev/sda1 / ext4 rw 0 0\n";
+        let mounts = parse_mount_text(text, &nodes);
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].peer_name, "james");
+        assert_eq!(mounts[0].mount_path, "/mnt/james");
+        assert_eq!(mounts[0].fs_type, "nfs4");
+        assert!(mounts[0].mount_options.contains("hard"));
+    }
+
+    #[test]
+    fn parse_mount_macos() {
+        let nodes = vec![test_node("taylor", "10.44.0.1", &[])];
+        let text =
+            "10.44.0.1:/Users/venkat/models on /Volumes/taylor-models (nfs4, read-only, ...)\n";
+        let mounts = parse_mount_text(text, &nodes);
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].peer_name, "taylor");
+        assert_eq!(mounts[0].mount_path, "/Volumes/taylor-models");
+        assert_eq!(mounts[0].fs_type, "nfs4");
+    }
+
+    #[test]
+    fn resolve_peer_name_matches_alt_ip() {
+        let nodes = vec![test_node("marcus", "10.44.0.3", &["192.168.5.33"])];
+        assert_eq!(resolve_peer_name("marcus", &nodes), "marcus");
+        assert_eq!(resolve_peer_name("10.44.0.3", &nodes), "marcus");
+        assert_eq!(resolve_peer_name("192.168.5.33", &nodes), "marcus");
+        assert_eq!(resolve_peer_name("sophie", &nodes), "sophie");
+    }
+
+    #[test]
+    fn parse_proc_stat_state_extracts_dstate() {
+        assert_eq!(parse_proc_stat_state("123 (bash) S 0 1 1 ..."), Some('S'));
+        assert_eq!(parse_proc_stat_state("456 (nfs-io) D 0 1 1 ..."), Some('D'));
+        assert_eq!(
+            parse_proc_stat_state("789 (comm with spaces) D 0"),
+            Some('D')
+        );
     }
 }
