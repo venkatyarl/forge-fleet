@@ -37,8 +37,8 @@ pub async fn handle_storage(cmd: crate::StorageCommand) -> Result<()> {
                     return Ok(());
                 }
                 println!(
-                    "{:<14} {:<14} {:<24} {:<10} {}",
-                    "COMPUTER", "PEER", "MOUNT", "FS", "OPTIONS"
+                    "{:<14} {:<14} {:<24} {:<10} OPTIONS",
+                    "COMPUTER", "PEER", "MOUNT", "FS"
                 );
                 for r in rows {
                     println!(

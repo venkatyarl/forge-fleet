@@ -117,7 +117,7 @@ impl WorkQueue {
         let mut entry = self
             .items
             .get_mut(id)
-            .ok_or_else(|| ApiError::BadRequest(format!("work item '{}' not found", id)))?;
+            .ok_or_else(|| ApiError::BadRequest(format!("work item '{id}' not found")))?;
         entry.status = status.to_string();
         entry.updated_at = Utc::now().timestamp();
         Ok(entry.to_response())
@@ -167,7 +167,7 @@ pub async fn get_work_item(
         .work_queue
         .get(&id)
         .map(Json)
-        .ok_or_else(|| ApiError::BadRequest(format!("work item '{}' not found", id)))
+        .ok_or_else(|| ApiError::BadRequest(format!("work item '{id}' not found")))
 }
 
 /// Retrieve the next pending work item.

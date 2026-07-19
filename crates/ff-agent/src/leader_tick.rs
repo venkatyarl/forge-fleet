@@ -43,6 +43,8 @@ use ff_pulse::reader::{PulseError, PulseReader};
 
 use crate::ha::pg_failover::{FailoverOutcome, PostgresFailoverManager};
 use crate::ha::self_heal::rearm_self_heal_task;
+#[cfg(test)]
+use crate::ha::self_heal::{self_heal_priority_for_tier, self_heal_task_status};
 use crate::leader_cache::{LeaderCache, LeaderInfo};
 
 /// Max revive attempts per computer per [`REVIVE_BACKOFF_WINDOW_MIN`] minutes.
@@ -151,28 +153,6 @@ fn parse_yield_request(raw: &str) -> Option<(String, chrono::DateTime<Utc>)> {
         .ok()?
         .with_timezone(&Utc);
     Some((member.to_string(), until))
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn self_heal_priority_for_tier(tier: &str) -> i32 {
-    match tier {
-        "T1" => 100,
-        "T0" => 90,
-        "T2" => 80,
-        _ => 70,
-    }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn self_heal_task_status(queue_status: &str) -> &'static str {
-    match queue_status {
-        "detected" => "pending",
-        "fixing" | "reviewing" | "pr_open" | "merged" | "rolled_out" => "running",
-        "verified" => "completed",
-        "paused" => "paused",
-        "reverted" => "cancelled",
-        _ => "failed",
-    }
 }
 
 impl LeaderTick {
