@@ -237,6 +237,14 @@ else
   report "gh_auth" ok "no PAT on fleet (public repo clone will still work)"
 fi
 
+# ─── 5c. Git identity ────────────────────────────────────────────────────
+# Commits made on this computer (sub-agent worktrees, dispatched builds) need
+# a consistent author identity. Configure it for the invoking user, not root.
+report "git_identity" running
+run_as_user git config --global user.name 'Venkat Yarlagadda'
+run_as_user git config --global user.email 'venkatyarl@users.noreply.github.com'
+report "git_identity" ok
+
 # ─── 6. Clone forge-fleet + build ff ─────────────────────────────────────
 #
 # Canonical source-tree location (per reference_source_tree_locations.md +
