@@ -487,6 +487,8 @@ mod tests {
             timestamp: Utc::now(),
             epoch: 1,
             role_claimed: "member".to_string(),
+            boot_id: None,
+            system_uptime_secs: None,
             election_priority: 0,
             is_yielding: false,
             going_offline: false,
