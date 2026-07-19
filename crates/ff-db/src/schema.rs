@@ -10282,6 +10282,55 @@ CREATE INDEX IF NOT EXISTS idx_artifact_index_sha256
     ON artifact_index (sha256);
 "#;
 
+/// V173 — Atomic `primary_ip` / `total_ram_gb` updates on `computers`.
+///
+/// Every legitimate writer of a computer's network identity carries its
+/// hardware profile in the SAME statement (materializer Q4, self-enroll
+/// upsert), so a row where one half moved without the other is always a
+/// partial update — e.g. an IP rewrite that leaves RAM from a different
+/// enrollment, which mis-sizes autoscaler placement. Postgres triggers can't
+/// see an UPDATE's SET list, so the enforceable invariant is value-level:
+/// a `primary_ip` change must leave `total_ram_gb` populated, and a
+/// `total_ram_gb` change must leave `primary_ip` non-blank. The trigger's
+/// WHEN clause keeps the hot last_seen_at-only heartbeat UPDATE from ever
+/// invoking the function.
+pub const SCHEMA_V173_COMPUTERS_IP_RAM_ATOMIC: &str = r#"
+CREATE OR REPLACE FUNCTION computers_ip_ram_paired_update_guard()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $guard$
+BEGIN
+    IF NEW.primary_ip IS DISTINCT FROM OLD.primary_ip
+       AND NEW.total_ram_gb IS NULL
+    THEN
+        RAISE EXCEPTION
+            'computers: partial update rejected — primary_ip changed (% -> %) with total_ram_gb NULL; update primary_ip and total_ram_gb together in one statement',
+            OLD.primary_ip, NEW.primary_ip
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    IF NEW.total_ram_gb IS DISTINCT FROM OLD.total_ram_gb
+       AND btrim(NEW.primary_ip) = ''
+    THEN
+        RAISE EXCEPTION
+            'computers: partial update rejected — total_ram_gb changed (% -> %) with primary_ip blank; update primary_ip and total_ram_gb together in one statement',
+            OLD.total_ram_gb, NEW.total_ram_gb
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    RETURN NEW;
+END;
+$guard$;
+
+DROP TRIGGER IF EXISTS trg_computers_ip_ram_paired_update ON computers;
+CREATE TRIGGER trg_computers_ip_ram_paired_update
+    BEFORE UPDATE ON computers
+    FOR EACH ROW
+    WHEN (OLD.primary_ip IS DISTINCT FROM NEW.primary_ip
+          OR OLD.total_ram_gb IS DISTINCT FROM NEW.total_ram_gb)
+    EXECUTE FUNCTION computers_ip_ram_paired_update_guard();
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
