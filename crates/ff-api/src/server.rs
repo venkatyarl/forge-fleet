@@ -22,6 +22,7 @@ use crate::{
     quality_tracker::QualityTracker,
     registry::BackendRegistry,
     router::{ModelRouter, TierRouter},
+    routes::work_queue::{self, WorkQueue},
     types::{
         ChatCompletionRequest, ChatMessage, CompletionRequest, HealthResponse, ModelInfo,
         ModelListResponse,
@@ -35,6 +36,7 @@ pub struct AppState {
     pub adaptive_router: Arc<AdaptiveRouter>,
     pub http_client: reqwest::Client,
     pub request_metrics: Arc<RequestMetrics>,
+    pub work_queue: Arc<WorkQueue>,
 }
 
 impl AppState {
@@ -60,6 +62,7 @@ impl AppState {
             adaptive_router,
             http_client,
             request_metrics: Arc::new(RequestMetrics::default()),
+            work_queue: Arc::new(WorkQueue::new()),
         })
     }
 }
@@ -91,6 +94,17 @@ pub fn build_http_router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .route("/v1/work-queue/items", post(work_queue::submit_work_item))
+        .route("/v1/work-queue/items", get(work_queue::list_work_items))
+        .route(
+            "/v1/work-queue/items/next",
+            get(work_queue::get_next_work_item),
+        )
+        .route("/v1/work-queue/items/{id}", get(work_queue::get_work_item))
+        .route(
+            "/v1/work-queue/items/{id}/status",
+            post(work_queue::update_work_item_status),
+        )
         .fallback(not_found)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
