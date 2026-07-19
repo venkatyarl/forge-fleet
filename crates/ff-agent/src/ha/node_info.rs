@@ -23,16 +23,28 @@ pub struct NodeInfo {
     /// lowercase (e.g. `avx2`, `avx512f`, `avx512vnni`). Empty on platforms
     /// where flag probing is not implemented.
     pub cpu_flags: Vec<String>,
+    /// Detected GPU accelerator family: `nvidia_cuda`, `amd_rocm`,
+    /// `apple_silicon`, or `none`.
+    #[serde(default)]
+    pub gpu_kind: String,
+    /// Machine architecture as reported by `uname -m` (e.g. `x86_64`,
+    /// `aarch64`, `arm64`). Falls back to `std::env::consts::ARCH` when
+    /// `uname` is unavailable.
+    #[serde(default)]
+    pub arch: String,
 }
 
 impl NodeInfo {
-    /// Detect NPU/iGPU presence, total GPU VRAM, and CPU flags on the current node.
+    /// Detect NPU/iGPU presence, total GPU VRAM, CPU flags, GPU kind, and
+    /// architecture on the current node.
     pub fn detect() -> Self {
         Self {
             has_npu: detect_npu(),
             has_igpu: detect_igpu(),
             gpu_total_vram_gb: detect_gpu_total_vram_gb(),
             cpu_flags: detect_cpu_flags(),
+            gpu_kind: detect_gpu_kind(),
+            arch: detect_arch(),
         }
     }
 }
@@ -291,6 +303,51 @@ fn parse_rocminfo_total_vram_gb(out: &str) -> Option<f64> {
     (total_kib > 0).then(|| total_kib as f64 / (1024.0 * 1024.0))
 }
 
+/// Detect the accelerator family present on this node.
+///
+/// * Linux: prefers NVIDIA CUDA (`nvidia-smi --version`), then AMD ROCm
+///   (`rocm-smi --version`).
+/// * macOS: Apple Silicon is reported as `apple_silicon`; Intel Macs report
+///   `none`.
+/// * Everything else: `none`.
+fn detect_gpu_kind() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let arch = detect_arch();
+        return if arch == "aarch64" || arch == "arm64" {
+            "apple_silicon".to_string()
+        } else {
+            "none".to_string()
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if run_command("nvidia-smi", &["--version"]).is_some() {
+            return "nvidia_cuda".to_string();
+        }
+        if run_command("rocm-smi", &["--version"]).is_some() {
+            return "amd_rocm".to_string();
+        }
+        return "none".to_string();
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "none".to_string()
+    }
+}
+
+/// Detect the machine architecture using `uname -m`.
+///
+/// Falls back to `std::env::consts::ARCH` when the command is unavailable.
+fn detect_arch() -> String {
+    run_command("uname", &["-m"])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| std::env::consts::ARCH.to_string())
+}
+
 fn run_command(cmd: &str, args: &[&str]) -> Option<String> {
     std::process::Command::new(cmd)
         .args(args)
@@ -312,6 +369,25 @@ mod tests {
         let _ = info.has_igpu;
         let _ = info.gpu_total_vram_gb;
         let _ = info.cpu_flags;
+        assert!(!info.arch.is_empty());
+        assert!(
+            matches!(
+                info.gpu_kind.as_str(),
+                "nvidia_cuda" | "amd_rocm" | "apple_silicon" | "none"
+            ),
+            "unexpected gpu_kind: {}",
+            info.gpu_kind
+        );
+    }
+
+    #[test]
+    fn deserializing_old_json_without_new_fields_uses_defaults() {
+        let info: NodeInfo = serde_json::from_str(
+            r#"{"has_npu":false,"has_igpu":false,"gpu_total_vram_gb":null,"cpu_flags":[]}"#,
+        )
+        .unwrap();
+        assert!(info.gpu_kind.is_empty());
+        assert!(info.arch.is_empty());
     }
 
     #[test]
