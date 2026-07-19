@@ -25,10 +25,7 @@ use async_nats::jetstream::{AckKind, Context, Message};
 use futures::StreamExt;
 use tracing::{error, info, warn};
 
-/// Stream the scheduler consumes from.
-pub const STREAM_FF_TASKS: &str = "FF_TASKS";
-/// Subject space captured by [`STREAM_FF_TASKS`].
-pub const FF_TASKS_SUBJECT_PREFIX: &str = "ff.tasks.";
+use crate::nats::stream_config::{self, FF_TASKS_SUBJECT_PREFIX, STREAM_FF_TASKS};
 
 /// Dead-letter stream. Lives on the distinct `ff.dlq.` prefix so DLQ
 /// traffic can never overlap the live stream's subject filter.
@@ -86,22 +83,24 @@ pub fn dlq_subject(subject: &str) -> String {
 /// Idempotently create the `FF_TASKS` and `FF_TASKS_DLQ` streams and
 /// return the task stream.
 pub async fn ensure_streams(js: &Context) -> Result<Stream, async_nats::Error> {
-    for (name, subject) in [
-        (STREAM_FF_TASKS_DLQ, format!("{DLQ_SUBJECT_PREFIX}>")),
-        (STREAM_FF_TASKS, format!("{FF_TASKS_SUBJECT_PREFIX}>")),
-    ] {
-        let cfg = StreamConfig {
-            name: name.to_string(),
-            subjects: vec![subject],
-            retention: RetentionPolicy::Limits,
-            max_age: DEFAULT_MAX_AGE,
-            max_messages: DEFAULT_MAX_MSGS,
-            storage: StorageType::File,
-            ..Default::default()
-        };
-        js.get_or_create_stream(cfg).await?;
-        info!(stream = name, "jetstream stream ready");
-    }
+    // DLQ uses limits retention so dead-lettered messages age out naturally.
+    let dlq_cfg = StreamConfig {
+        name: STREAM_FF_TASKS_DLQ.to_string(),
+        subjects: vec![format!("{DLQ_SUBJECT_PREFIX}>")],
+        retention: RetentionPolicy::Limits,
+        max_age: DEFAULT_MAX_AGE,
+        max_messages: DEFAULT_MAX_MSGS,
+        storage: StorageType::File,
+        ..Default::default()
+    };
+    js.get_or_create_stream(dlq_cfg).await?;
+    info!(stream = STREAM_FF_TASKS_DLQ, "jetstream stream ready");
+
+    // Task work queue uses the centralized stream config.
+    js.get_or_create_stream(stream_config::ff_tasks_stream_config())
+        .await?;
+    info!(stream = STREAM_FF_TASKS, "jetstream stream ready");
+
     Ok(js.get_stream(STREAM_FF_TASKS).await?)
 }
 
