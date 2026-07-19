@@ -477,6 +477,12 @@ lazy_static! {
         Opts::new("self_updates_total", "Self-update attempts"),
         &["status"],
     ).unwrap();
+
+    /// Total number of builds that timed out.
+    pub static ref BUILD_TIMEOUT_COUNT: IntCounter = IntCounter::new(
+        "build_timeout_count",
+        "Total number of builds that timed out",
+    ).unwrap();
 }
 
 static PROM_INIT: Once = Once::new();
@@ -504,6 +510,7 @@ pub fn init_prometheus_metrics() {
         r.register(Box::new(LEADER_ELECTIONS_TOTAL.clone()))
             .unwrap();
         r.register(Box::new(SELF_UPDATES_TOTAL.clone())).unwrap();
+        r.register(Box::new(BUILD_TIMEOUT_COUNT.clone())).unwrap();
         r.register(Box::new(LLM_TOKENS_TOTAL.clone())).unwrap();
         r.register(Box::new(LLM_COST_USD_TOTAL.clone())).unwrap();
         r.register(Box::new(LLM_BUDGET_REMAINING_USD.clone()))
@@ -632,5 +639,18 @@ mod tests {
         let agg = collector.fleet_aggregate();
         assert_eq!(agg.nodes_online, 2);
         assert!((agg.avg_cpu_percent - 65.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_build_timeout_count_metric() {
+        init_prometheus_metrics();
+        BUILD_TIMEOUT_COUNT.reset();
+        BUILD_TIMEOUT_COUNT.inc();
+        BUILD_TIMEOUT_COUNT.inc_by(2);
+        assert_eq!(BUILD_TIMEOUT_COUNT.get(), 3);
+
+        let output = metrics_handler();
+        assert!(output.contains("build_timeout_count"));
+        assert!(output.contains("build_timeout_count 3"));
     }
 }
