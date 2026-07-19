@@ -10147,3 +10147,17 @@ CREATE TRIGGER trg_task_notification_outbox
     FOR EACH ROW
     EXECUTE FUNCTION enqueue_task_notification();
 "#;
+
+// ─── V167: add JSONB `context` column to canonical work_items ───────────────
+//
+// Dispatcher and agent runners need a place to stash structured, task-specific
+// context (repo aliases, requested models, tool allow-lists, etc.) without
+// overloading the free-form `metadata` blob. JSONB keeps it queryable and
+// extensible; the default empty object preserves existing rows.
+pub const SCHEMA_V167_WORK_ITEM_CONTEXT: &str = r#"
+ALTER TABLE work_items
+    ADD COLUMN IF NOT EXISTS context JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+CREATE INDEX IF NOT EXISTS idx_work_items_context_gin
+    ON work_items USING GIN (context);
+"#;
