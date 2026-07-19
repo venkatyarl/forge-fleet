@@ -2,6 +2,7 @@ import { Link } from 'react-router-dom'
 import { Activity, MessageSquare, Rocket, LayoutGrid } from 'lucide-react'
 import { Card, CardHeader, CardTitle, CardDescription } from '../components/ui/card'
 import { StatusBadge } from '../components/ui/status-badge'
+import { WorkQueueMetrics } from '../components/work_queue_metrics'
 import { useFleetStatus, useWorkItems, useAgentSessions, useAuditRecent } from '../features/hooks/useDashboardQueries'
 import { formatElapsed } from '../lib/utils'
 
@@ -194,6 +195,8 @@ export function MissionControl() {
         </div>
 
         <div className="space-y-6">
+          <WorkQueueMetrics />
+
           <Card>
             <CardHeader>
               <CardTitle>Quick Actions</CardTitle>
