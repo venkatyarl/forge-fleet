@@ -84,6 +84,7 @@ pub mod lease_takeover;
 pub mod legacy_daemon_reaper;
 pub mod local_healer;
 pub mod log_rotate;
+pub mod log_signature;
 pub mod mcp_client;
 pub mod mcp_tools;
 pub mod memory;
