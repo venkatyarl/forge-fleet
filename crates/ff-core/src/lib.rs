@@ -64,7 +64,7 @@ pub use synthetic::{
     BackupFreshnessProbe, DbWriteReadProbe, DiskSpaceProbe, HttpHealthProbe, LlmSmokeProbe,
     ProbeCategory, ProbeRegistry, ProbeResult, ProbeStatus, ReplicationLagProbe, SyntheticProbe,
 };
-pub use task::{AgentTask, AgentTaskKind, TaskResult};
+pub use task::{AgentTask, AgentTaskKind, TaskResult, publish_task_notification};
 pub use task_error::{TaskErrorClass, classify_task_error};
 pub use types::*;
 pub use verifier::{
