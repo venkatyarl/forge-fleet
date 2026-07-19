@@ -27,6 +27,7 @@ pub mod maintenance;
 pub mod model_id;
 pub mod monitor;
 pub mod notifications;
+pub mod obsidian_export;
 pub mod panic_hook;
 pub mod quarantine;
 pub mod run_limits;
