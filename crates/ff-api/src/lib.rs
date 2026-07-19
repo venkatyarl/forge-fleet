@@ -8,6 +8,7 @@ pub mod openai_compat;
 pub mod quality_tracker;
 pub mod registry;
 pub mod router;
+pub mod routes;
 pub mod server;
 pub mod token_ledger;
 pub mod tool_calling;
