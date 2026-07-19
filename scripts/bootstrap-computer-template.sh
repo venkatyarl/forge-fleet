@@ -403,6 +403,8 @@ KEY_PATH="$USER_HOME/.ssh/id_ed25519"
 if [ ! -f "$KEY_PATH" ]; then
   run_as_user mkdir -p "$USER_HOME/.ssh"
   run_as_user chmod 700 "$USER_HOME/.ssh"
+  # Populate known_hosts for github.com so git over SSH works without prompts.
+  run_as_user bash -lc "ssh-keyscan github.com >> '$USER_HOME/.ssh/known_hosts'" 2>/dev/null || true
   run_as_user ssh-keygen -t ed25519 -N "" -f "$KEY_PATH" -C "${SUDO_INVOKER}@${NAME}" >/dev/null
 fi
 USER_PUBKEY="$(cat "${KEY_PATH}.pub")"
