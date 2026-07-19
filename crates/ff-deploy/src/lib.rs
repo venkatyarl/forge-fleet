@@ -2,6 +2,7 @@
 //!
 //! This crate provides:
 //! - release domain models (`release`)
+//! - deploy target resolution with retry (`resolution`)
 //! - rollout strategy + planning (`strategy`, `rollout`)
 //! - health gate evaluation (`health_gate`)
 //! - rollback decisioning and planning (`rollback`)
@@ -11,6 +12,7 @@ pub mod config;
 pub mod deployer;
 pub mod health_gate;
 pub mod release;
+pub mod resolution;
 pub mod rollback;
 pub mod rollout;
 pub mod strategy;
@@ -21,6 +23,7 @@ pub use health_gate::{
     HealthGate, HealthGateConfig, HealthGateEvaluation, HealthGateStatus, HealthSnapshot,
 };
 pub use release::{ReleaseChannel, ReleaseManifest, ReleaseRecord, ReleaseState};
+pub use resolution::{ResolutionError, ResolutionRetryPolicy, ResolvedTarget, resolve_with_retry};
 pub use rollback::{
     RollbackAction, RollbackCause, RollbackContext, RollbackDecider, RollbackDecision,
     RollbackPlan, RollbackPlanner, RollbackSeverity, RollbackStep,
