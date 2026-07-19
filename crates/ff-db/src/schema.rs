@@ -10224,3 +10224,36 @@ CREATE INDEX IF NOT EXISTS idx_node_peer_mounts_peer
 CREATE INDEX IF NOT EXISTS idx_node_peer_mounts_computer
     ON node_peer_mounts(computer_id);
 "#;
+
+/// V170 — Work queue persistence.
+///
+/// Generic durable work queue with priority and status. Items are claimed by
+/// workers, retried up to `max_attempts`, and completed with an optional result
+/// or failure reason. Indexed for the common "next pending by priority" claim
+/// pattern and for status scans.
+pub const SCHEMA_V170_WORK_QUEUE: &str = r#"
+CREATE TABLE IF NOT EXISTS work_queue (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    queue_name      TEXT NOT NULL DEFAULT 'default',
+    payload         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    priority        INT NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'pending', -- pending | claimed | running | completed | failed | cancelled
+    worker_id       TEXT,
+    attempts        INT NOT NULL DEFAULT 0,
+    max_attempts    INT NOT NULL DEFAULT 3,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    scheduled_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at      TIMESTAMPTZ,
+    completed_at    TIMESTAMPTZ,
+    last_error      TEXT,
+    result          JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_work_queue_claim
+    ON work_queue (queue_name, status, priority DESC, scheduled_at, id);
+CREATE INDEX IF NOT EXISTS idx_work_queue_worker
+    ON work_queue (worker_id) WHERE worker_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_work_queue_status_created
+    ON work_queue (status, created_at DESC);
+"#;

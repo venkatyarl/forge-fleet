@@ -22,6 +22,7 @@ pub mod postgres;
 pub mod queries;
 pub mod runtime_registry;
 pub mod schema;
+pub mod work_queue;
 
 pub use leader_state::*;
 
