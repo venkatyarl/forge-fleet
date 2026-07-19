@@ -3,12 +3,50 @@
 //! These functions live outside `leader_tick.rs` so they can be unit-tested
 //! without spinning the whole leader state machine.
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
 /// Default cooldown before a processed self-heal signature is eligible for
 /// re-arming. Prevents thrashing on a bug that flaps every few minutes.
 pub const DEFAULT_REARM_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// In-memory state kept by the leader tick for the self-heal subsystem.
+///
+/// Tracks bug signatures that have been observed so that a previously
+/// resolved bug can be recognised when it reappears.
+#[derive(Debug, Default, Clone)]
+pub struct SelfHealState {
+    /// Bug signatures currently tracked by the leader.
+    pub tracked_signatures: HashSet<String>,
+}
+
+impl SelfHealState {
+    /// Create an empty state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Start tracking a bug signature.
+    ///
+    /// Returns `true` if the signature was newly added, or `false` if it was
+    /// already tracked.
+    pub fn track(&mut self, signature: &str) -> bool {
+        self.tracked_signatures.insert(signature.to_owned())
+    }
+
+    /// Returns `true` if the signature is currently tracked.
+    pub fn is_tracked(&self, signature: &str) -> bool {
+        self.tracked_signatures.contains(signature)
+    }
+
+    /// Returns `true` when a tracked signature is reported again with status
+    /// `detected`, indicating a previously resolved bug has reappeared.
+    pub fn is_reappearing(&self, signature: &str, current_status: &str) -> bool {
+        self.is_tracked(signature) && current_status == "detected"
+    }
+}
 
 /// Map a self-heal tier to a `fleet_tasks` priority.
 pub fn self_heal_priority_for_tier(tier: &str) -> i32 {
@@ -465,5 +503,33 @@ mod tests {
         assert!(!rearmed);
 
         drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[test]
+    fn self_heal_state_starts_empty() {
+        let state = SelfHealState::new();
+        assert!(state.tracked_signatures.is_empty());
+        assert!(!state.is_tracked("sig"));
+    }
+
+    #[test]
+    fn self_heal_state_tracks_signatures() {
+        let mut state = SelfHealState::new();
+        assert!(state.track("sig-a"));
+        assert!(state.is_tracked("sig-a"));
+        assert!(!state.track("sig-a"));
+        assert!(state.track("sig-b"));
+        assert_eq!(state.tracked_signatures.len(), 2);
+    }
+
+    #[test]
+    fn self_heal_state_detects_reappearing_bug() {
+        let mut state = SelfHealState::new();
+        state.track("recurring-sig");
+
+        assert!(state.is_reappearing("recurring-sig", "detected"));
+        assert!(!state.is_reappearing("recurring-sig", "fixing"));
+        assert!(!state.is_reappearing("recurring-sig", "verified"));
+        assert!(!state.is_reappearing("unknown-sig", "detected"));
     }
 }
