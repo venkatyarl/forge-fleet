@@ -7,20 +7,26 @@
 use serde::{Deserialize, Serialize};
 
 /// Detected node hardware capability flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeInfo {
     /// Whether a Neural Processing Unit (discrete or integrated) is present.
     pub has_npu: bool,
     /// Whether an integrated GPU is present.
     pub has_igpu: bool,
+    /// Detected GPU kind: `nvidia_cuda`, `amd_rocm`, `apple_silicon`, or `none`.
+    pub gpu_kind: String,
+    /// Machine architecture as reported by `uname -m` (e.g. `aarch64`, `x86_64`).
+    pub arch: String,
 }
 
 impl NodeInfo {
-    /// Detect NPU/iGPU presence on the current node.
+    /// Detect NPU/iGPU presence, GPU kind, and architecture on the current node.
     pub fn detect() -> Self {
         Self {
             has_npu: detect_npu(),
             has_igpu: detect_igpu(),
+            gpu_kind: detect_gpu_kind(),
+            arch: detect_arch(),
         }
     }
 }
@@ -72,9 +78,50 @@ fn detect_igpu() -> bool {
 
 #[cfg(target_os = "macos")]
 fn is_apple_silicon() -> bool {
-    run_command("sysctl", &["-n", "machdep.cpu.brand_string"])
-        .map(|s| s.contains("Apple"))
-        .unwrap_or(false)
+    detect_arch() == "arm64"
+}
+
+/// Detect the GPU kind from system commands.
+///
+/// Probes `nvidia-smi` / `rocm-smi` on Linux and `uname -m` on macOS.
+/// Returns one of: `nvidia_cuda`, `amd_rocm`, `apple_silicon`, `none`.
+fn detect_gpu_kind() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return if is_apple_silicon() {
+            "apple_silicon".to_string()
+        } else {
+            "none".to_string()
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if command_succeeds("nvidia-smi", &["--version"]) {
+            return "nvidia_cuda".to_string();
+        }
+        if command_succeeds("rocm-smi", &["--version"]) {
+            return "amd_rocm".to_string();
+        }
+        return "none".to_string();
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "none".to_string()
+    }
+}
+
+/// Machine architecture as reported by `uname -m`.
+fn detect_arch() -> String {
+    run_command("uname", &["-m"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| std::env::consts::ARCH.to_string())
+}
+
+/// Check whether a command runs successfully.
+fn command_succeeds(cmd: &str, args: &[&str]) -> bool {
+    run_command(cmd, args).is_some()
 }
 
 /// Check for common Linux accelerator device nodes.
@@ -153,6 +200,26 @@ mod tests {
         let info = NodeInfo::detect();
         let _ = info.has_npu;
         let _ = info.has_igpu;
+        let _ = info.gpu_kind.as_str();
+        let _ = info.arch.as_str();
+    }
+
+    #[test]
+    fn detect_arch_returns_non_empty() {
+        let arch = detect_arch();
+        assert!(!arch.is_empty());
+    }
+
+    #[test]
+    fn detect_gpu_kind_returns_known_variant() {
+        let kind = detect_gpu_kind();
+        assert!(
+            matches!(
+                kind.as_str(),
+                "nvidia_cuda" | "amd_rocm" | "apple_silicon" | "none"
+            ),
+            "unexpected gpu_kind: {kind}"
+        );
     }
 
     #[test]
