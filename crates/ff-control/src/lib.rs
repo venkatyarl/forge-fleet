@@ -12,6 +12,7 @@ pub mod bootstrap;
 pub mod commands;
 pub mod control_plane;
 pub mod errors;
+pub mod ha_coordinator;
 pub mod health;
 
 pub use bootstrap::{
@@ -29,6 +30,10 @@ pub use control_plane::{
     StartupStepStatus,
 };
 pub use errors::{ControlError, Result};
+pub use ha_coordinator::{
+    DEFAULT_MAX_REPLICATION_LAG_BYTES, HaAction, HaClusterEvent, HaCoordinator,
+    PatroniClusterMember, PatroniClusterState, PatroniMemberRole,
+};
 pub use health::{
     AggregateHealthStatus, ControlPlaneHealthSnapshot, DiscoveryHealthAggregate,
     RuntimeHealthAggregate, SchedulerHealthAggregate, aggregate_health_snapshot,
