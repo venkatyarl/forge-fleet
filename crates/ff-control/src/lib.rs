@@ -10,6 +10,7 @@
 
 pub mod bootstrap;
 pub mod commands;
+pub mod config;
 pub mod control_plane;
 pub mod errors;
 pub mod ha_coordinator;
@@ -25,6 +26,7 @@ pub use commands::{
     DiscoverMode, DiscoverRequest, DiscoverResult, RunTaskRequest, RunTaskResult, ScheduleRequest,
     ScheduleResult, StartAgentRequest, StartAgentResult,
 };
+pub use config::{AlertConfig, ControlConfig, DeduplicationConfig};
 pub use control_plane::{
     ControlPlane, ControlPlaneHandles, DeploySubsystemHandle, DiscoverySubsystemHandle,
     OrchestratorSubsystemHandle, RuntimeSubsystemHandle, SchedulerSubsystemHandle, StartupEvent,
