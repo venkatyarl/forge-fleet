@@ -407,10 +407,15 @@ async fn attempt_client_mount(
     // Make sure mount point exists + mount. Commands differ per OS only in
     // that macOS accepts `-o resvport` (required by macOS NFS v3 clients on
     // privileged ports); NFSv4 over TCP port 2049 works on both platforms.
+    //
+    // soft + timeo/retrans tuned: a dead peer returns EIO instead of wedging
+    // callers in D-state and inflating load. (Modern Linux kernels make
+    // interruptibility the default for soft mounts; `intr` is therefore
+    // omitted to avoid mount.nfs warnings on kernels where it is deprecated.)
     let extra_opts = if os.starts_with("macos") {
-        "-o nfsvers=4,resvport"
+        "-o nfsvers=4,resvport,soft,timeo=600,retrans=3"
     } else {
-        "-o nfsvers=4"
+        "-o nfsvers=4,soft,timeo=600,retrans=3"
     };
 
     let cmd = format!(
@@ -495,3 +500,4 @@ mod tests {
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }
 }
+// test marker

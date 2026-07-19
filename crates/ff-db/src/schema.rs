@@ -10092,3 +10092,34 @@ VALUES
      '[]'::jsonb,            'catch-all fallback')
 ON CONFLICT (kind, arch, gpu_kind, has_discrete_vram, ram_tier) DO NOTHING;
 "#;
+
+// ─── V166: peer mount inventory + D-state health signals ────────────────────
+//
+// Operator req 2026-07-18: when a fleet node dies, hard-mounted NFS peers
+// leave processes in D-state and inflate load despite idle CPUs. We need an
+// inventory of which nodes mount which peers, the options they were mounted
+// with, and a per-node D-state count so `ff doctor` and the mesh-check can
+// correlate a dead peer with its client-side symptoms.
+pub const SCHEMA_V166_PEER_MOUNT_HEALTH: &str = r#"
+CREATE TABLE IF NOT EXISTS fleet_mount_inventory (
+    node_name     TEXT NOT NULL,
+    source_host   TEXT NOT NULL,
+    export_path   TEXT NOT NULL,
+    mount_path    TEXT NOT NULL,
+    fs_type       TEXT NOT NULL,
+    mount_options TEXT,
+    status        TEXT NOT NULL DEFAULT 'active',
+    checked_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (node_name, mount_path)
+);
+CREATE INDEX IF NOT EXISTS idx_fleet_mount_inventory_node
+    ON fleet_mount_inventory (node_name);
+CREATE INDEX IF NOT EXISTS idx_fleet_mount_inventory_source
+    ON fleet_mount_inventory (source_host);
+
+CREATE TABLE IF NOT EXISTS fleet_node_health_signals (
+    node_name      TEXT PRIMARY KEY,
+    d_state_count  INTEGER NOT NULL DEFAULT 0,
+    checked_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"#;

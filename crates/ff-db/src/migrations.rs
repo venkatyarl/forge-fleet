@@ -804,6 +804,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "server_policy",
         sql: schema::SCHEMA_V165_SERVER_POLICY,
     },
+    PgMigration {
+        version: 166,
+        name: "peer_mount_health",
+        sql: schema::SCHEMA_V166_PEER_MOUNT_HEALTH,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

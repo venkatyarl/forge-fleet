@@ -6081,6 +6081,88 @@ pub async fn pg_list_shared_volume_mounts(
         .collect())
 }
 
+// ─── peer mount inventory + D-state health signals ───────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct MountInventoryHealthSummary {
+    pub d_state_nodes: i64,
+    pub hard_mounts: i64,
+    pub stale_mounts: i64,
+}
+
+pub async fn pg_upsert_mount_inventory(
+    pool: &PgPool,
+    node_name: &str,
+    source_host: &str,
+    export_path: &str,
+    mount_path: &str,
+    fs_type: &str,
+    mount_options: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO fleet_mount_inventory
+            (node_name, source_host, export_path, mount_path, fs_type, mount_options, status, checked_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'active', NOW())
+         ON CONFLICT (node_name, mount_path) DO UPDATE SET
+             source_host = EXCLUDED.source_host,
+             export_path = EXCLUDED.export_path,
+             fs_type = EXCLUDED.fs_type,
+             mount_options = EXCLUDED.mount_options,
+             status = EXCLUDED.status,
+             checked_at = NOW()",
+    )
+    .bind(node_name)
+    .bind(source_host)
+    .bind(export_path)
+    .bind(mount_path)
+    .bind(fs_type)
+    .bind(mount_options)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn pg_upsert_node_health_signal(
+    pool: &PgPool,
+    node_name: &str,
+    d_state_count: i32,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO fleet_node_health_signals
+            (node_name, d_state_count, checked_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (node_name) DO UPDATE SET
+             d_state_count = EXCLUDED.d_state_count,
+             checked_at = NOW()",
+    )
+    .bind(node_name)
+    .bind(d_state_count)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn pg_mount_inventory_health_summary(
+    pool: &PgPool,
+) -> Result<MountInventoryHealthSummary> {
+    let row = sqlx::query_as::<_, MountInventoryHealthSummary>(
+        "SELECT
+             COALESCE((SELECT COUNT(DISTINCT node_name)
+                         FROM fleet_node_health_signals
+                        WHERE d_state_count > 0), 0) AS d_state_nodes,
+             COALESCE((SELECT COUNT(*)
+                         FROM fleet_mount_inventory
+                        WHERE mount_options IS NULL
+                           OR mount_options NOT LIKE '%soft%'), 0) AS hard_mounts,
+             COALESCE((SELECT COUNT(*)
+                         FROM shared_volume_mounts
+                        WHERE status = 'stale'), 0) AS stale_mounts",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
+}
+
 // ─── computer_schedules ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Serialize)]
