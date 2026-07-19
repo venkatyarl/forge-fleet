@@ -788,6 +788,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "canonical_github_alias",
         sql: schema::SCHEMA_V161_CANONICAL_GITHUB_ALIAS,
     },
+    PgMigration {
+        version: 162,
+        name: "drop_worktree_path_unique",
+        sql: schema::SCHEMA_V162_DROP_WORKTREE_PATH_UNIQUE,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

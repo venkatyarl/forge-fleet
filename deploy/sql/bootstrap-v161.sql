@@ -7094,7 +7094,8 @@ CREATE TABLE IF NOT EXISTS work_item_worktrees (
         CHECK (status IN ('creating','active','ready_for_review','merged','failed','cleaned')),
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     cleaned_at    TIMESTAMPTZ,
-    UNIQUE (computer_id, worktree_path),
+    -- NOTE: no UNIQUE (computer_id, worktree_path) — under clone-per-slot many
+    -- work_items share one slot clone path; task_branch is the real per-item key.
     UNIQUE (task_branch)
 );
 CREATE INDEX IF NOT EXISTS idx_work_item_worktrees_item ON work_item_worktrees (work_item_id);

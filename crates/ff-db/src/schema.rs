@@ -8979,7 +8979,8 @@ CREATE TABLE IF NOT EXISTS work_item_worktrees (
         CHECK (status IN ('creating','active','ready_for_review','merged','failed','cleaned')),
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     cleaned_at    TIMESTAMPTZ,
-    UNIQUE (computer_id, worktree_path),
+    -- NOTE: no UNIQUE (computer_id, worktree_path) — under clone-per-slot many
+    -- work_items share one slot clone path; task_branch is the real per-item key.
     UNIQUE (task_branch)
 );
 CREATE INDEX IF NOT EXISTS idx_work_item_worktrees_item ON work_item_worktrees (work_item_id);
@@ -9975,4 +9976,17 @@ UPDATE github_ssh_aliases SET is_canonical = false WHERE alias_name <> 'github.c
 -- At most one canonical alias per hostname.
 CREATE UNIQUE INDEX IF NOT EXISTS github_ssh_aliases_one_canonical_per_host
     ON github_ssh_aliases (hostname) WHERE is_canonical;
+"#;
+
+/// V162 — drop the stale `UNIQUE (computer_id, worktree_path)` on
+/// `work_item_worktrees`. Under clone-per-slot (operator decision 2026-07-17)
+/// every build for a given slot runs in that slot's ONE clone, so many
+/// work_items legitimately share the same `(computer_id, worktree_path)`. The
+/// real per-item key is `task_branch` (still UNIQUE), which the dispatch INSERT
+/// already conflicts on. The old pair-unique now spuriously rejects every
+/// second build on a slot with `duplicate key ... work_item_worktrees_
+/// computer_id_worktree_path_key`, failing the item. Forward-only drop.
+pub const SCHEMA_V162_DROP_WORKTREE_PATH_UNIQUE: &str = r#"
+ALTER TABLE work_item_worktrees
+    DROP CONSTRAINT IF EXISTS work_item_worktrees_computer_id_worktree_path_key;
 "#;
