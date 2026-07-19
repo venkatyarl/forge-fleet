@@ -1,6 +1,7 @@
 //! ForgeFleet hardware and node discovery.
 
 pub mod activity;
+pub mod etcd_client;
 pub mod hardware;
 pub mod health;
 pub mod models;
@@ -10,6 +11,9 @@ pub mod registry;
 pub mod scanner;
 
 pub use activity::{ActivitySignals, read_activity_signals};
+pub use etcd_client::{
+    EtcdClient, EtcdConfig, EtcdError, EtcdKeyValue, EtcdStatus, EtcdWatchEvent, EtcdWatcher,
+};
 pub use hardware::{
     CpuProfile, GpuType, HardwareProfile, InterconnectType, MemoryProfile, MemoryType,
     detect_hardware_profile,
