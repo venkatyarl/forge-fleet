@@ -471,7 +471,13 @@ async fn emit_findings_as_work_items(
 /// count instead, so the audit can't flood the PM board with hundreds of
 /// untriaged `idea` rows. Pure → unit-tested.
 fn finding_passes_emit_gate(severity: &str) -> bool {
-    severity_rank(severity) <= AUDIT_EMIT_MAX_RANK
+    // With the default max rank of 0 (high-only) this is `== 0`, which trips
+    // clippy's extreme-comparison lint — but `<=` is the intended contract so
+    // raising AUDIT_EMIT_MAX_RANK to 1 later admits medium without edits here.
+    #[allow(clippy::absurd_extreme_comparisons)]
+    {
+        severity_rank(severity) <= AUDIT_EMIT_MAX_RANK
+    }
 }
 
 /// Max `severity_rank` (0 = high) emitted as a work_item. high-only by default.

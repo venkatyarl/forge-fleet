@@ -143,10 +143,7 @@ pub fn elect_leader(config: &FleetConfig, node_health: &[(String, bool, bool)]) 
             elected: Some(name.clone()),
             candidates,
             timestamp: now,
-            reason: format!(
-                "{} elected (priority {}, healthy, not yielding)",
-                name, priority
-            ),
+            reason: format!("{name} elected (priority {priority}, healthy, not yielding)"),
         };
     }
 
@@ -161,8 +158,7 @@ pub fn elect_leader(config: &FleetConfig, node_health: &[(String, bool, bool)]) 
             candidates,
             timestamp: now,
             reason: format!(
-                "{} elected (priority {}, healthy but yielding — no better option)",
-                name, priority
+                "{name} elected (priority {priority}, healthy but yielding — no better option)"
             ),
         };
     }

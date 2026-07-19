@@ -726,8 +726,9 @@ impl HeartbeatGuard {
     fn spawn(work_item_id: Uuid) -> Self {
         let (stop_tx, stop_rx) = watch::channel(false);
         // Detached: the task loops on its own timer and exits promptly when the
-        // guard's drop sends `true` on stop_tx.
-        let _ = spawn_heartbeat(work_item_id, stop_rx);
+        // guard's drop sends `true` on stop_tx. (spawn_heartbeat already
+        // tokio::spawns; dropping the JoinHandle is the intentional detach.)
+        drop(spawn_heartbeat(work_item_id, stop_rx));
         Self { stop_tx }
     }
 }
@@ -2120,10 +2121,7 @@ fn commit_worktree_changes(worktree_path: &Path, title: &str) -> Result<bool> {
     if String::from_utf8_lossy(&status.stdout).trim().is_empty() {
         return Ok(false); // nothing to commit
     }
-    let msg = format!(
-        "{}\n\nAutomated work_item dispatch (ForgeFleet Pillar 4).",
-        title
-    );
+    let msg = format!("{title}\n\nAutomated work_item dispatch (ForgeFleet Pillar 4).");
     run_git(
         worktree_path,
         [
@@ -2448,7 +2446,7 @@ fn run_command_capture(mut cmd: Command, timeout: Duration) -> Result<Output> {
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("command timed out after {:?}: {program}", timeout);
+            bail!("command timed out after {timeout:?}: {program}");
         }
         std::thread::sleep(Duration::from_millis(COMMAND_POLL_MS));
     }
@@ -2482,7 +2480,7 @@ fn run_command_timeout(mut cmd: Command, timeout: Duration) -> Result<Output> {
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("command timed out after {:?}: {program}", timeout);
+            bail!("command timed out after {timeout:?}: {program}");
         }
 
         std::thread::sleep(Duration::from_millis(COMMAND_POLL_MS));

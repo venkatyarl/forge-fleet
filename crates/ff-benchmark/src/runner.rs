@@ -351,12 +351,12 @@ fn parse_queue_time_ms(headers: &reqwest::header::HeaderMap, body: Option<&Value
 fn format_status_error(status: StatusCode, body: &str) -> String {
     let body = body.trim();
     if body.is_empty() {
-        return format!("http status {}", status);
+        return format!("http status {status}");
     }
 
     let max = 240;
     if body.len() <= max {
-        format!("http status {}: {}", status, body)
+        format!("http status {status}: {body}")
     } else {
         format!("http status {}: {}…", status, &body[..max])
     }

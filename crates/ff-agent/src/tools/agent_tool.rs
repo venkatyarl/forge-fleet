@@ -157,8 +157,7 @@ impl AgentTool for SubAgentTool {
             }
             AgentOutcome::MaxTurns { partial_message } => {
                 let msg = format!(
-                    "Sub-agent hit max turn limit ({max_turns} turns). Partial result:\n{}",
-                    partial_message
+                    "Sub-agent hit max turn limit ({max_turns} turns). Partial result:\n{partial_message}"
                 );
                 AgentToolResult::ok(truncate_output(&msg, MAX_TOOL_RESULT_CHARS))
             }

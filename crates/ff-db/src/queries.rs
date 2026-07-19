@@ -5532,7 +5532,7 @@ pub async fn pg_search_brain_vault_nodes(
     query: &str,
     limit: i64,
 ) -> Result<Vec<BrainVaultNodeRow>> {
-    let pattern = format!("%{}%", query);
+    let pattern = format!("%{query}%");
     let rows = sqlx::query(
         "SELECT * FROM brain_vault_nodes
          WHERE valid_until IS NULL

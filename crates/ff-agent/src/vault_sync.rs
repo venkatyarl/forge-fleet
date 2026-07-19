@@ -90,7 +90,7 @@ pub async fn regenerate_index_md(
                 let last_str = last
                     .map(|d| d.format("%Y-%m-%d").to_string())
                     .unwrap_or_else(|| "—".to_string());
-                format!("| {} | {} | {} | {} |", id, name, status, last_str)
+                format!("| {id} | {name} | {status} | {last_str} |")
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -109,7 +109,7 @@ pub async fn regenerate_index_md(
             .map(|r| {
                 let summary: String = r.get("summary");
                 let status: String = r.get("status");
-                format!("- [{}] {}", status, summary)
+                format!("- [{status}] {summary}")
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -129,7 +129,7 @@ pub async fn regenerate_index_md(
                 let summary: String = r.get("summary");
                 let status: String = r.get("status");
                 let mark = if status == "completed" { "x" } else { " " };
-                format!("- [{}] {} ({})", mark, summary, status)
+                format!("- [{mark}] {summary} ({status})")
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -151,7 +151,7 @@ pub async fn regenerate_index_md(
                 let date = updated
                     .map(|d| d.format("%Y-%m-%d").to_string())
                     .unwrap_or_else(|| "—".to_string());
-                format!("- `{}` ({})", path, date)
+                format!("- `{path}` ({date})")
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -174,9 +174,9 @@ pub async fn regenerate_index_md(
                 let status: String = r.get("status");
                 let load: Option<f64> = r.get("cpu_percent");
                 let load_str = load
-                    .map(|l| format!("{:.1}%", l))
+                    .map(|l| format!("{l:.1}%"))
                     .unwrap_or_else(|| "—".to_string());
-                format!("| {} | {} | {} | {} |", name, role, status, load_str)
+                format!("| {name} | {role} | {status} | {load_str} |")
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -217,17 +217,17 @@ pub async fn append_daily_note(
     let daily_dir = vault_path.join("Daily Notes").join(&year).join(&month);
     fs::create_dir_all(&daily_dir).await?;
 
-    let note_path = daily_dir.join(format!("{}.md", day));
+    let note_path = daily_dir.join(format!("{day}.md"));
 
     let section = format!(
         r#"
 ## ForgeFleet Activity (auto-generated)
 
-**Session**: {session}
-**Tasks**: {completed} completed, {notes_created} notes created, {notes_modified} modified
+**Session**: {session_id}
+**Tasks**: {tasks_completed} completed, {notes_created} notes created, {notes_modified} modified
 
 ### Completed
-- ✅ Session {session}: {completed} tasks completed
+- ✅ Session {session_id}: {tasks_completed} tasks completed
 
 ### New Notes
 - {notes_created} notes created
@@ -237,10 +237,6 @@ pub async fn append_daily_note(
 
 ---
 "#,
-        session = session_id,
-        completed = tasks_completed,
-        notes_created = notes_created,
-        notes_modified = notes_modified,
     );
 
     if note_path.exists() {
@@ -250,10 +246,9 @@ pub async fn append_daily_note(
         }
     } else {
         let frontmatter = format!(
-            "---\nff_activity: true\nff_session: {}\nff_tasks_completed: {}\nff_notes_created: {}\n---\n\n# {}\n",
-            session_id, tasks_completed, notes_created, day
+            "---\nff_activity: true\nff_session: {session_id}\nff_tasks_completed: {tasks_completed}\nff_notes_created: {notes_created}\n---\n\n# {day}\n"
         );
-        fs::write(&note_path, format!("{}\n{}", frontmatter, section)).await?;
+        fs::write(&note_path, format!("{frontmatter}\n{section}")).await?;
     }
 
     info!(path = %note_path.display(), "daily note updated");

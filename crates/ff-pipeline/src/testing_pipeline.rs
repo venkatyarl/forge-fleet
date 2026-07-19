@@ -98,7 +98,7 @@ async fn run_t1_fast_checks(repo_path: &str) -> TierResult {
             Err(e) => {
                 all_pass = false;
                 warn!(check = name, error = %e, "T1 check error");
-                stderr_acc.push_str(&format!("{} error: {}\n", name, e));
+                stderr_acc.push_str(&format!("{name} error: {e}\n"));
             }
         }
     }

@@ -1016,7 +1016,7 @@ pub async fn pg_enqueue_pr_merge_task(
     priority: i32,
     created_by_computer_id: Option<uuid::Uuid>,
 ) -> Result<uuid::Uuid, sqlx::Error> {
-    let summary = format!("ff: merge PR #{pr_number} ({:?}) + delete branch", method);
+    let summary = format!("ff: merge PR #{pr_number} ({method:?}) + delete branch");
     let merge_flag = method.flag();
     let command = if ci_timeout_iters > 0 {
         format!(
@@ -1098,8 +1098,7 @@ async fn run_shell_payload(
     ];
     if !ALLOWED_SHELLS.contains(&shell.as_str()) {
         return Err(TaskRunnerError::BadPayload(format!(
-            "shell '{}' is not in the allowed list: {:?}",
-            shell, ALLOWED_SHELLS
+            "shell '{shell}' is not in the allowed list: {ALLOWED_SHELLS:?}"
         )));
     }
 
@@ -2152,20 +2151,13 @@ fn wave_build_ssh_command(
 ) -> String {
     format!(
         "set -e\n\
-         echo \"== upgrading {target} via ssh from $(hostname) ==\"\n\
-         ssh -T{port_arg} {ssh_bypass} -o ServerAliveInterval=15 \
-             -o ServerAliveCountMax={count_max} -o ConnectTimeout=30 \
+         echo \"== upgrading {target_name} via ssh from $(hostname) ==\"\n\
+         ssh -T{port_arg} {SSH_AGENT_BYPASS} -o ServerAliveInterval=15 \
+             -o ServerAliveCountMax={WAVE_BUILD_SSH_ALIVE_COUNT_MAX} -o ConnectTimeout=30 \
              -o StrictHostKeyChecking=accept-new \
              {ssh_user}@{primary_ip} bash -l <<'FF_PLAYBOOK_EOF'\n\
-         {playbook}\n\
+         {playbook_body}\n\
          FF_PLAYBOOK_EOF\n",
-        target = target_name,
-        port_arg = port_arg,
-        ssh_bypass = SSH_AGENT_BYPASS,
-        count_max = WAVE_BUILD_SSH_ALIVE_COUNT_MAX,
-        ssh_user = ssh_user,
-        primary_ip = primary_ip,
-        playbook = playbook_body,
     )
 }
 

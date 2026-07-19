@@ -249,7 +249,7 @@ impl AgentTool for TaskUpdateTool {
             });
         }
 
-        AgentToolResult::ok(format!("Task #{id} updated (status: {})", status_clone))
+        AgentToolResult::ok(format!("Task #{id} updated (status: {status_clone})"))
     }
 }
 

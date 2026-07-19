@@ -10146,4 +10146,44 @@ CREATE TRIGGER trg_task_notification_outbox
     AFTER INSERT OR UPDATE OF status ON fleet_tasks
     FOR EACH ROW
     EXECUTE FUNCTION enqueue_task_notification();
+
+/// V167 — Telegram send/reply routing (operator request 2026-07-19: "if I
+/// reply to a Telegram message, ff routes the reply to the session that sent
+/// it"). `telegram_messages` records every recorded outbound send with the
+/// originating session; the leader's reply poller matches incoming
+/// `reply_to_message` ids against it and files rows in `telegram_replies`,
+/// which sessions consume (claim) via `ff notify replies`. `telegram_poll_state`
+/// is the single-row getUpdates offset so updates are consumed exactly once
+/// even across leader failover.
+pub const SCHEMA_V167_TELEGRAM_REPLY_ROUTING: &str = r#"
+CREATE TABLE IF NOT EXISTS telegram_messages (
+    id            BIGSERIAL PRIMARY KEY,
+    chat_id       TEXT NOT NULL,
+    tg_message_id BIGINT NOT NULL,
+    session_id    TEXT,
+    title         TEXT,
+    sent_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (chat_id, tg_message_id)
+);
+
+CREATE TABLE IF NOT EXISTS telegram_replies (
+    id                     BIGSERIAL PRIMARY KEY,
+    tg_update_id           BIGINT NOT NULL UNIQUE,
+    chat_id                TEXT NOT NULL,
+    reply_to_tg_message_id BIGINT,
+    session_id             TEXT,
+    from_name              TEXT,
+    body                   TEXT NOT NULL,
+    received_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    claimed_at             TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_replies_unclaimed
+    ON telegram_replies (session_id) WHERE claimed_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS telegram_poll_state (
+    singleton      BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    last_update_id BIGINT NOT NULL DEFAULT 0,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 "#;

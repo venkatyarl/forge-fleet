@@ -396,11 +396,8 @@ fn is_common_token(token: &str) -> bool {
 
 fn token_regex(pattern: &str) -> Regex {
     let escaped = regex::escape(pattern);
-    Regex::new(&format!(
-        r"(?i)(^|[^A-Za-z0-9_]){}([^A-Za-z0-9_]|$)",
-        escaped
-    ))
-    .expect("valid text-match regex")
+    Regex::new(&format!(r"(?i)(^|[^A-Za-z0-9_]){escaped}([^A-Za-z0-9_]|$)"))
+        .expect("valid text-match regex")
 }
 
 async fn add_edge(pool: &PgPool, src: Uuid, dst: Uuid, evidence: &MatchEvidence) -> Result<()> {

@@ -142,8 +142,7 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
             CircuitState::HalfOpen => 2,
         };
         lines.push(format!(
-            "forgefleet_circuit_breaker_state{{node=\"{}\"}} {}",
-            node, state_num
+            "forgefleet_circuit_breaker_state{{node=\"{node}\"}} {state_num}"
         ));
     }
 

@@ -183,9 +183,11 @@ impl PgcatConfig {
                 .map(|r| (r.host.clone(), r.port, ServerRole::Replica)),
         );
 
-        let mut general = GeneralConfig::default();
         // Non-empty admin credential so pgcat's admin console isn't wide open.
-        general.admin_password = primary.password.clone();
+        let general = GeneralConfig {
+            admin_password: primary.password.clone(),
+            ..Default::default()
+        };
 
         let mut users = BTreeMap::new();
         users.insert(

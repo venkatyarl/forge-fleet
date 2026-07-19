@@ -248,7 +248,7 @@ impl MemoryStore {
         {
             query
                 .push(" AND content ILIKE ")
-                .push_bind(format!("%{}%", keyword));
+                .push_bind(format!("%{keyword}%"));
         }
 
         if !params.tags.is_empty() {

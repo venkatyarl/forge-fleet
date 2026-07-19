@@ -1245,7 +1245,7 @@ pub(crate) async fn file_metadata(path: &Path) -> Result<(i64, String), BackupEr
         hasher.update(&buf[..n]);
     }
     let digest = hasher.finalize();
-    Ok((size_bytes, format!("{:x}", digest)))
+    Ok((size_bytes, format!("{digest:x}")))
 }
 
 /// `LASTSAVE` of a Redis-protocol container (redis proper or FalkorDB,

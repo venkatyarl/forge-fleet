@@ -91,7 +91,7 @@ fn date_path(date: &DateTime<Utc>) -> PathBuf {
 fn chat_filename(sequence: u32, date: &DateTime<Utc>, name: &str) -> String {
     let date_str = format!("{:02}{:02}{}", date.month(), date.day(), date.year());
     let safe_name = sanitize_name(name);
-    format!("{:02}-{date_str}-{safe_name}.json", sequence)
+    format!("{sequence:02}-{date_str}-{safe_name}.json")
 }
 
 /// Sanitize a name for use in filenames.

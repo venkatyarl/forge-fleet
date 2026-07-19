@@ -231,9 +231,8 @@ pub async fn try_route_to_cloud(
                 return Some(Err(error_response(
                     StatusCode::PAYMENT_REQUIRED,
                     format!(
-                        "daily budget cap ${:.2} reached (today: ${:.2}); falling back to local LLM. \
-                             Adjust with `ff secrets set budget.daily_usd_cap <usd>` or wait for the 24h window.",
-                        cap, today_cost
+                        "daily budget cap ${cap:.2} reached (today: ${today_cost:.2}); falling back to local LLM. \
+                             Adjust with `ff secrets set budget.daily_usd_cap <usd>` or wait for the 24h window."
                     ),
                     "budget_cap_reached",
                 )));
@@ -614,6 +613,7 @@ async fn call_anthropic_messages(
 /// - `system` messages concatenated into top-level `system`
 /// - Remaining `user`/`assistant` messages become `messages`
 /// - `max_tokens` is REQUIRED by Anthropic; default 4096 when absent.
+///
 /// Flatten an OpenAI message `content` field into plain text. OpenAI allows
 /// `content` to be EITHER a string OR an array of content parts
 /// (`[{"type":"text","text":"…"}, {"type":"image_url",…}]`). The cloud

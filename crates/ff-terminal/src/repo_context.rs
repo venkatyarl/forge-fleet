@@ -102,7 +102,7 @@ pub async fn resolve_repo_context(
         return Ok(Some(ctx));
     }
 
-    Ok(primary_project_repo(pool, project).await?)
+    primary_project_repo(pool, project).await
 }
 
 pub fn detect_repo_from_cwd(cwd: &Path) -> Result<RepoContext> {

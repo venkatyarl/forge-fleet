@@ -48,9 +48,9 @@ impl From<&LeaderState> for LeaderInfo {
             computer_id: Some(state.computer_id),
             member_name: Some(state.member_name.clone()),
             epoch: Some(state.epoch),
-            elected_at: Some(state.elected_at.clone()),
+            elected_at: Some(state.elected_at),
             reason: state.reason.clone(),
-            heartbeat_at: Some(state.heartbeat_at.clone()),
+            heartbeat_at: Some(state.heartbeat_at),
             observed_at: Utc::now(),
         }
     }

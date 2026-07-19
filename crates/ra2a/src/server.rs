@@ -54,5 +54,5 @@ async fn handle_task_updates(Path(task_id): Path<Uuid>) -> Result<String, Status
         timestamp: chrono::Utc::now(),
     };
     let json = serde_json::to_string(&update).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(format!("data: {}\n\n", json))
+    Ok(format!("data: {json}\n\n"))
 }

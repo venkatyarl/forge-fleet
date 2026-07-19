@@ -84,7 +84,7 @@ pub fn classify_auth(timed_out: bool, exit_ok: bool, stdout: &str, stderr: &str)
             "probe timed out (likely waiting on an interactive login prompt)".to_string(),
         );
     }
-    let hay = format!("{}\n{}", stdout, stderr).to_lowercase();
+    let hay = format!("{stdout}\n{stderr}").to_lowercase();
     if let Some(marker) = AUTH_FAILURE_MARKERS.iter().find(|m| hay.contains(**m)) {
         return (false, format!("not authenticated (matched '{marker}')"));
     }

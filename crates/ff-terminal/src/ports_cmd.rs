@@ -226,7 +226,7 @@ pub async fn handle_ports_scan(pool: &sqlx::PgPool, computer: &str) -> Result<()
         match registered.get(p) {
             Some((svc, kind, _exposed, status)) => {
                 let color = if status == "deprecated" { RED } else { GREEN };
-                println!("  {color}✓ {:<6}{RESET} {svc}  ({kind}, {status})", p);
+                println!("  {color}✓ {p:<6}{RESET} {svc}  ({kind}, {status})");
             }
             None => unexpected.push(*p),
         }
@@ -234,7 +234,7 @@ pub async fn handle_ports_scan(pool: &sqlx::PgPool, computer: &str) -> Result<()
     if !unexpected.is_empty() {
         println!("\n{YELLOW}⚠ Unexpected listeners (not in port_registry):{RESET}");
         for p in unexpected {
-            println!("  {YELLOW}? {}{RESET}", p);
+            println!("  {YELLOW}? {p}{RESET}");
         }
     }
 
@@ -260,7 +260,7 @@ pub async fn handle_ports_scan(pool: &sqlx::PgPool, computer: &str) -> Result<()
     if !missing.is_empty() {
         println!("\n{YELLOW}⚠ Expected but not listening:{RESET}");
         for (port, svc, kind) in missing {
-            println!("  {YELLOW}∅ {:<6}{RESET} {svc}  ({kind})", port);
+            println!("  {YELLOW}∅ {port:<6}{RESET} {svc}  ({kind})");
         }
     } else {
         println!(

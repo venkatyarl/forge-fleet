@@ -191,7 +191,7 @@ const PUBLIC_ROUTES: &[&str] = &[
 fn is_public_route(path: &str) -> bool {
     PUBLIC_ROUTES
         .iter()
-        .any(|p| path == *p || path.starts_with(&format!("{}/", p)))
+        .any(|p| path == *p || path.starts_with(&format!("{p}/")))
 }
 
 /// Axum middleware that validates `Authorization: Bearer <token>`.

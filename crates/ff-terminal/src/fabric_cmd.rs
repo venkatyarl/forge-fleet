@@ -13,18 +13,18 @@ pub async fn handle_fabric_pair(pg: &PgPool, a: &str, b: &str, kind: &str) -> Re
         bail!("cannot pair a computer with itself");
     }
     let (a_name, b_name) = if a < b { (a, b) } else { (b, a) };
-    let pair_name = format!("{}-{}", a_name, b_name);
+    let pair_name = format!("{a_name}-{b_name}");
 
     let row_a = sqlx::query("SELECT id FROM computers WHERE name = $1")
         .bind(a_name)
         .fetch_optional(pg)
         .await?
-        .with_context(|| format!("computer '{}' not found", a_name))?;
+        .with_context(|| format!("computer '{a_name}' not found"))?;
     let row_b = sqlx::query("SELECT id FROM computers WHERE name = $1")
         .bind(b_name)
         .fetch_optional(pg)
         .await?
-        .with_context(|| format!("computer '{}' not found", b_name))?;
+        .with_context(|| format!("computer '{b_name}' not found"))?;
     let a_id: Uuid = row_a.try_get("id")?;
     let b_id: Uuid = row_b.try_get("id")?;
 
@@ -42,7 +42,7 @@ pub async fn handle_fabric_pair(pg: &PgPool, a: &str, b: &str, kind: &str) -> Re
     .execute(pg)
     .await?;
 
-    println!("Paired: {} (kind={})", pair_name, kind);
+    println!("Paired: {pair_name} (kind={kind})");
     println!(
         "Next: configure IPs via nmcli on both hosts, then beats will auto-populate iface/ip."
     );
@@ -81,28 +81,28 @@ pub async fn handle_fabric_benchmark(
         b_fabric_ip,
         fabric_kind,
         claimed_gbps
-            .map(|g| format!(", claimed={}Gbps", g))
+            .map(|g| format!(", claimed={g}Gbps"))
             .unwrap_or_default()
     );
 
     // 2. Look up SSH user for both nodes.
     let (a_ssh_user, _) = ff_agent::fleet_info::fetch_node_ip_user(a)
         .await
-        .with_context(|| format!("could not resolve SSH for {}", a))?;
+        .with_context(|| format!("could not resolve SSH for {a}"))?;
     let (_b_ssh_user, _) = ff_agent::fleet_info::fetch_node_ip_user(b)
         .await
-        .with_context(|| format!("could not resolve SSH for {}", b))?;
+        .with_context(|| format!("could not resolve SSH for {b}"))?;
     let a_lan_ip = a_ssh_user.clone();
     let _ = a_lan_ip;
     // fetch_node_ip_user returns (ip, ssh_user) tuple — re-fetch for clarity
     let a_meta = ff_agent::fleet_info::fetch_node_by_name(a)
         .await
         .map_err(|e| anyhow::anyhow!(e))?
-        .with_context(|| format!("computer '{}' not in fleet", a))?;
+        .with_context(|| format!("computer '{a}' not in fleet"))?;
     let b_meta = ff_agent::fleet_info::fetch_node_by_name(b)
         .await
         .map_err(|e| anyhow::anyhow!(e))?
-        .with_context(|| format!("computer '{}' not in fleet", b))?;
+        .with_context(|| format!("computer '{b}' not in fleet"))?;
 
     let a_target = format!("{}@{}", a_meta.ssh_user, a_meta.ip);
     let b_target = format!("{}@{}", b_meta.ssh_user, b_meta.ip);
@@ -125,7 +125,7 @@ pub async fn handle_fabric_benchmark(
         };
 
     // 3. Start iperf3 -s on b in background.
-    println!("Starting iperf3 server on {}...", b);
+    println!("Starting iperf3 server on {b}...");
     let _ = run_or_local(
         b_is_me,
         &b_target,
@@ -137,14 +137,8 @@ pub async fn handle_fabric_benchmark(
 
     // 4. Forward direction A → B (unless reverse_only).
     if !reverse_only {
-        println!(
-            "Running iperf3 client on {} → {} ({}s, {} streams)...",
-            a, b, duration, streams
-        );
-        let cmd = format!(
-            "iperf3 -c {} -t {} -P {} -J",
-            b_fabric_ip, duration, streams
-        );
+        println!("Running iperf3 client on {a} → {b} ({duration}s, {streams} streams)...");
+        let cmd = format!("iperf3 -c {b_fabric_ip} -t {duration} -P {streams} -J");
         let out = run_or_local(a_is_me, &a_target, &cmd).context("iperf3 forward failed")?;
         let body = String::from_utf8_lossy(&out.stdout);
         let (gbps, retr) = parse_iperf3_json(&body);
@@ -154,24 +148,18 @@ pub async fn handle_fabric_benchmark(
                 a,
                 b,
                 gbps,
-                retr.map(|r| format!(" ({} retransmits)", r))
+                retr.map(|r| format!(" ({r} retransmits)"))
                     .unwrap_or_default()
             );
             measurements.push(("a_to_b".to_string(), gbps, retr));
         } else {
-            println!("  {} → {}: failed (no parseable result)", a, b);
+            println!("  {a} → {b}: failed (no parseable result)");
         }
     }
 
     // 5. Reverse direction B → A.
-    println!(
-        "Running iperf3 client on {} → {} (reverse, {}s, {} streams)...",
-        b, a, duration, streams
-    );
-    let cmd = format!(
-        "iperf3 -c {} -t {} -P {} -R -J",
-        b_fabric_ip, duration, streams
-    );
+    println!("Running iperf3 client on {b} → {a} (reverse, {duration}s, {streams} streams)...");
+    let cmd = format!("iperf3 -c {b_fabric_ip} -t {duration} -P {streams} -R -J");
     let out = run_or_local(a_is_me, &a_target, &cmd).context("iperf3 reverse failed")?;
     let body = String::from_utf8_lossy(&out.stdout);
     let (gbps, retr) = parse_iperf3_json(&body);
@@ -181,12 +169,12 @@ pub async fn handle_fabric_benchmark(
             b,
             a,
             gbps,
-            retr.map(|r| format!(" ({} retransmits)", r))
+            retr.map(|r| format!(" ({r} retransmits)"))
                 .unwrap_or_default()
         );
         measurements.push(("b_to_a".to_string(), gbps, retr));
     } else {
-        println!("  {} → {}: failed", b, a);
+        println!("  {b} → {a}: failed");
     }
 
     // 6. Stop iperf3 server.
@@ -357,7 +345,7 @@ pub async fn handle_fabric_measurements(
             dir,
             gbps,
             claimed
-                .map(|c| format!("{}Gbps", c))
+                .map(|c| format!("{c}Gbps"))
                 .unwrap_or_else(|| "-".into()),
             retr.map(|r| r.to_string()).unwrap_or_else(|| "-".into())
         );
@@ -386,10 +374,10 @@ async fn resolve_fabric_endpoints(
             .await?;
 
     let a_ips = a_ips_raw
-        .with_context(|| format!("computer '{}' not in DB", a))?
+        .with_context(|| format!("computer '{a}' not in DB"))?
         .0;
     let b_ips = b_ips_raw
-        .with_context(|| format!("computer '{}' not in DB", b))?
+        .with_context(|| format!("computer '{b}' not in DB"))?
         .0;
 
     let parse = |v: &Value| -> Vec<(String, String, String, Option<u32>)> {
@@ -439,10 +427,8 @@ async fn resolve_fabric_endpoints(
         }
     }
     bail!(
-        "no shared fabric subnet found between {} and {}; are both ends configured? \
-           (run `ff openclaw status` and verify all_ips on each computer)",
-        a,
-        b
+        "no shared fabric subnet found between {a} and {b}; are both ends configured? \
+           (run `ff openclaw status` and verify all_ips on each computer)"
     )
 }
 

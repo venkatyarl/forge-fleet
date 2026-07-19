@@ -54,6 +54,45 @@ fn telegram_payload(chat_id: &str, title: &str, body: &str) -> serde_json::Value
 /// Silently returns `Ok(())` if either secret is missing — we don't
 /// consider that a runtime error, it's just "telegram not configured."
 pub async fn send_telegram_from_secrets(pool: &PgPool, title: &str, body: &str) -> Result<()> {
+    send_returning_id(pool, title, body).await.map(|_| ())
+}
+
+/// Like [`send_telegram_from_secrets`] but records the sent message in
+/// `telegram_messages` keyed to `session_id`, so an operator REPLY to this
+/// exact message can be routed back to the session that sent it (the reply
+/// poller resolves `reply_to_message.message_id` against this table).
+/// Returns the Telegram message id when the send happened and was recorded.
+pub async fn send_telegram_recorded(
+    pool: &PgPool,
+    title: &str,
+    body: &str,
+    session_id: &str,
+) -> Result<Option<i64>> {
+    let Some((chat_id, message_id)) = send_returning_id(pool, title, body).await? else {
+        return Ok(None);
+    };
+    sqlx::query(
+        "INSERT INTO telegram_messages (chat_id, tg_message_id, session_id, title) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (chat_id, tg_message_id) DO NOTHING",
+    )
+    .bind(&chat_id)
+    .bind(message_id)
+    .bind(session_id)
+    .bind(title)
+    .execute(pool)
+    .await
+    .context("record telegram_messages row")?;
+    Ok(Some(message_id))
+}
+
+/// Shared send path: returns `None` when telegram isn't configured, else
+/// `(chat_id, message_id)` of the delivered message.
+async fn send_returning_id(
+    pool: &PgPool,
+    title: &str,
+    body: &str,
+) -> Result<Option<(String, i64)>> {
     let token = get_secret_with_legacy_fallback(
         pool,
         TELEGRAM_BOT_TOKEN_KEY,
@@ -74,7 +113,7 @@ pub async fn send_telegram_from_secrets(pool: &PgPool, title: &str, body: &str) 
             has_chat,
             "telegram not fully configured; skipping send"
         );
-        return Ok(());
+        return Ok(None);
     };
 
     let url = format!("https://api.telegram.org/bot{token}/sendMessage");
@@ -93,7 +132,15 @@ pub async fn send_telegram_from_secrets(pool: &PgPool, title: &str, body: &str) 
         let body = resp.text().await.unwrap_or_default();
         return Err(anyhow!("telegram HTTP {status}: {}", body.trim()));
     }
-    Ok(())
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .context("parse telegram sendMessage response")?;
+    let message_id = json
+        .pointer("/result/message_id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow!("telegram response missing result.message_id"))?;
+    Ok(Some((chat_id, message_id)))
 }
 
 #[cfg(test)]

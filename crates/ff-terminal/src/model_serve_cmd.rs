@@ -26,12 +26,12 @@ pub async fn handle_model_serve_tp2(
         .bind(host_a)
         .fetch_optional(pg)
         .await?
-        .with_context(|| format!("host '{}' not found", host_a))?;
+        .with_context(|| format!("host '{host_a}' not found"))?;
     let row_b = sqlx::query("SELECT id, ssh_user, primary_ip FROM computers WHERE name = $1")
         .bind(host_b)
         .fetch_optional(pg)
         .await?
-        .with_context(|| format!("host '{}' not found", host_b))?;
+        .with_context(|| format!("host '{host_b}' not found"))?;
     let a_id: Uuid = row_a.try_get("id")?;
     let a_user: String = row_a.try_get("ssh_user")?;
     let a_ip: String = row_a.try_get("primary_ip")?;
@@ -40,9 +40,9 @@ pub async fn handle_model_serve_tp2(
     let b_ip: String = row_b.try_get("primary_ip")?;
 
     let pair_name = if host_a < host_b {
-        format!("{}-{}", host_a, host_b)
+        format!("{host_a}-{host_b}")
     } else {
-        format!("{}-{}", host_b, host_a)
+        format!("{host_b}-{host_a}")
     };
     let pr = sqlx::query(
         "SELECT a_ip, b_ip, computer_a_id, a_iface FROM fabric_pairs WHERE pair_name = $1",
@@ -50,7 +50,7 @@ pub async fn handle_model_serve_tp2(
     .bind(&pair_name)
     .fetch_optional(pg)
     .await?
-    .with_context(|| format!("fabric pair '{}' not found", pair_name))?;
+    .with_context(|| format!("fabric pair '{pair_name}' not found"))?;
     let pr_a_ip: String = pr.try_get("a_ip")?;
     let pr_b_ip: String = pr.try_get("b_ip")?;
     let pr_a_id: Uuid = pr.try_get("computer_a_id")?;
@@ -65,7 +65,7 @@ pub async fn handle_model_serve_tp2(
         bail!("fabric pair has no IPs yet");
     }
 
-    let cluster_id = format!("{}-tp2-{}-{}", model_id, host_a, host_b);
+    let cluster_id = format!("{model_id}-tp2-{host_a}-{host_b}");
 
     // Validate database-derived values to prevent shell injection.
     let validate_username = |u: &str| -> Result<()> {
@@ -75,7 +75,7 @@ pub async fn handle_model_serve_tp2(
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         {
-            bail!("invalid SSH username: {}", u);
+            bail!("invalid SSH username: {u}");
         }
         Ok(())
     };
@@ -86,7 +86,7 @@ pub async fn handle_model_serve_tp2(
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         {
-            bail!("invalid interface name: {}", i);
+            bail!("invalid interface name: {i}");
         }
         Ok(())
     };
@@ -94,10 +94,10 @@ pub async fn handle_model_serve_tp2(
     validate_username(&b_user)?;
     validate_iface(&iface)?;
     if a_fabric.parse::<std::net::IpAddr>().is_err() {
-        bail!("invalid fabric IP for host A: {}", a_fabric);
+        bail!("invalid fabric IP for host A: {a_fabric}");
     }
     if b_fabric.parse::<std::net::IpAddr>().is_err() {
-        bail!("invalid fabric IP for host B: {}", b_fabric);
+        bail!("invalid fabric IP for host B: {b_fabric}");
     }
 
     // Escape a string for safe use inside a single-quoted shell argument.
@@ -105,49 +105,36 @@ pub async fn handle_model_serve_tp2(
         s.replace('\'', "'\"'\"'")
     }
 
-    println!(
-        "[1/4] Starting ray-head on {} (fabric {})...",
-        host_a, a_fabric
-    );
+    println!("[1/4] Starting ray-head on {host_a} (fabric {a_fabric})...");
     let head_cmd = format!(
         "docker rm -f ff-ray-head 2>/dev/null; docker run -d --name ff-ray-head \
          --network host --ipc=host --gpus all --shm-size=64g \
-         -e VLLM_HOST_IP={fab} -e NCCL_SOCKET_IFNAME={ifc} -e GLOO_SOCKET_IFNAME={ifc} \
+         -e VLLM_HOST_IP={a_fabric} -e NCCL_SOCKET_IFNAME={iface} -e GLOO_SOCKET_IFNAME={iface} \
          -e RAY_memory_monitor_refresh_ms=0 -e RAY_memory_usage_threshold=0.99 \
-         -v /home/{u}/models:/models:ro \
+         -v /home/{a_user}/models:/models:ro \
          --entrypoint /bin/bash vllm/vllm-openai:latest \
          -c 'pip install \"ray[default]\" --quiet; ray start --head --port=6379 \
-             --node-ip-address={fab} --dashboard-host=0.0.0.0 --num-gpus=1; tail -f /dev/null'",
-        fab = a_fabric,
-        ifc = iface,
-        u = a_user
+             --node-ip-address={a_fabric} --dashboard-host=0.0.0.0 --num-gpus=1; tail -f /dev/null'"
     );
     run_ssh(&a_user, &a_ip, &head_cmd).await?;
 
-    println!(
-        "[2/4] Starting ray-worker on {} (fabric {})...",
-        host_b, b_fabric
-    );
+    println!("[2/4] Starting ray-worker on {host_b} (fabric {b_fabric})...");
     let worker_cmd = format!(
         "sudo docker rm -f ff-ray-worker 2>/dev/null; sudo docker run -d --name ff-ray-worker \
          --network host --ipc=host --gpus all --shm-size=64g \
-         -e VLLM_HOST_IP={fab_b} -e NCCL_SOCKET_IFNAME={ifc} -e GLOO_SOCKET_IFNAME={ifc} \
+         -e VLLM_HOST_IP={b_fabric} -e NCCL_SOCKET_IFNAME={iface} -e GLOO_SOCKET_IFNAME={iface} \
          -e RAY_memory_monitor_refresh_ms=0 -e RAY_memory_usage_threshold=0.99 \
-         -v /home/{u_a}/models:/models:ro \
+         -v /home/{a_user}/models:/models:ro \
          --entrypoint /bin/bash vllm/vllm-openai:latest \
-         -c 'pip install \"ray[default]\" --quiet; sleep 30; ray start --address={fab_a}:6379 \
-             --node-ip-address={fab_b} --num-gpus=1; tail -f /dev/null'",
-        fab_a = a_fabric,
-        fab_b = b_fabric,
-        ifc = iface,
-        u_a = a_user
+         -c 'pip install \"ray[default]\" --quiet; sleep 30; ray start --address={a_fabric}:6379 \
+             --node-ip-address={b_fabric} --num-gpus=1; tail -f /dev/null'"
     );
     run_ssh(&b_user, &b_ip, &worker_cmd).await?;
 
     println!("[3/4] Waiting for ray cluster to form (~90s)...");
     tokio::time::sleep(std::time::Duration::from_secs(90)).await;
 
-    println!("[4/4] Launching vllm serve TP=2 on {}...", host_a);
+    println!("[4/4] Launching vllm serve TP=2 on {host_a}...");
     let serve_cmd = format!(
         "docker exec -d ff-ray-head bash -c 'vllm serve {path} \
             --tensor-parallel-size 2 --distributed-executor-backend ray \
@@ -184,16 +171,13 @@ pub async fn handle_model_serve_tp2(
     .bind(model_id)
     .bind(a_id)
     .bind(json!([b_id.to_string()]))
-    .bind(format!("{}:6379", a_fabric))
-    .bind(format!("http://{}:{}", a_ip, port))
+    .bind(format!("{a_fabric}:6379"))
+    .bind(format!("http://{a_ip}:{port}"))
     .bind(&recipe)
     .execute(pg)
     .await?;
 
-    println!(
-        "Launched cluster {} — API at http://{}:{}/v1/models",
-        cluster_id, a_ip, port
-    );
+    println!("Launched cluster {cluster_id} — API at http://{a_ip}:{port}/v1/models");
     Ok(())
 }
 
@@ -205,12 +189,12 @@ async fn run_ssh(user: &str, ip: &str, cmd: &str) -> Result<()> {
             "-o",
             "StrictHostKeyChecking=accept-new",
         ])
-        .arg(format!("{}@{}", user, ip))
+        .arg(format!("{user}@{ip}"))
         .arg(cmd)
         .status()
         .await?;
     if !status.success() {
-        bail!("ssh failed on {}@{}", user, ip);
+        bail!("ssh failed on {user}@{ip}");
     }
     Ok(())
 }

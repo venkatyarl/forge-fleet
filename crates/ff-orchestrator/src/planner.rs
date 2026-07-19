@@ -376,7 +376,7 @@ mod tests {
         for i in 0..5 {
             decomp.add_subtask(SubTask::new(
                 i,
-                &format!("task {i}"),
+                format!("task {i}"),
                 "do stuff",
                 SubTaskType::FastLookup,
             ));

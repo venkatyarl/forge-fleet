@@ -515,7 +515,7 @@ impl AgentTool for ClusterInferenceTool {
                         plan.push_str(&format!("Controller: {} (runs llama-server)\n", nodes[0]));
                         plan.push_str("Workers:\n");
                         for node in nodes.iter().skip(1) {
-                            plan.push_str(&format!("  {}: rpc-server on port 50052\n", node));
+                            plan.push_str(&format!("  {node}: rpc-server on port 50052\n"));
                         }
                         plan.push_str("\nCommands:\n");
                         for node in nodes.iter().skip(1) {

@@ -203,7 +203,7 @@ pub async fn execute(
         // 1. Mark skippable steps.
         let skippable = graph.skippable_steps(&statuses);
         for id in skippable {
-            let reason = format!("dependency of '{}' failed", id);
+            let reason = format!("dependency of '{id}' failed");
             statuses.insert(id.clone(), StepStatus::Skipped);
             let result = StepResult::skipped(id.clone(), reason.clone());
             results.insert(id.clone(), result);

@@ -413,10 +413,7 @@ impl DbWriteReadProbe {
                     let val = json.get("value").and_then(|v| v.as_str());
                     if val != Some(test_value) {
                         return ProbeStatus::Fail {
-                            reason: format!(
-                                "read mismatch: expected '{test_value}', got {:?}",
-                                val
-                            ),
+                            reason: format!("read mismatch: expected '{test_value}', got {val:?}"),
                         };
                     }
                 }
@@ -1133,6 +1130,6 @@ mod tests {
         let pct = DiskSpaceProbe::check_local_disk();
         assert!(pct.is_some());
         let pct = pct.unwrap();
-        assert!(pct >= 0.0 && pct <= 100.0);
+        assert!((0.0..=100.0).contains(&pct));
     }
 }

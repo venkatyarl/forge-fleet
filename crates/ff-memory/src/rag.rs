@@ -223,7 +223,7 @@ impl RagEngine {
                 if idx > 0 {
                     sql.push(" OR ");
                 }
-                sql.push("content ILIKE ").push_bind(format!("%{}%", term));
+                sql.push("content ILIKE ").push_bind(format!("%{term}%"));
             }
             sql.push(")");
         }

@@ -120,8 +120,8 @@ pub async fn handle_versions(node_filter: Option<String>, json_out: bool) -> Res
                 Some(_) => "⚠",
                 None => " ",
             };
-            let disp = format!("{} {}", cur_short, marker);
-            print!(" {:<14}", disp);
+            let disp = format!("{cur_short} {marker}");
+            print!(" {disp:<14}");
         }
         println!();
     }

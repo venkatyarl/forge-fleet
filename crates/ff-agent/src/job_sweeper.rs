@@ -304,68 +304,6 @@ pub async fn sweep_stale(
 // Add the trait import that the raw query rows need.
 use sqlx::Row as _;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// These thresholds were proven in production for months under the legacy
-    /// `ff daemon` and are preserved verbatim by the relocation into
-    /// forgefleetd. The deferred threshold MUST stay generous enough not to
-    /// reap a legitimately long-running deferred task; the model-job threshold
-    /// covers multi-GB HF downloads. Pin them so a careless edit can't silently
-    /// weaken recovery (too short → kills live work; too long → orphans leak).
-    #[test]
-    fn default_policy_thresholds_are_stable() {
-        let p = SweepPolicy::default();
-        assert_eq!(p.job_stale_after, Duration::hours(2));
-        assert_eq!(p.deferred_stale_after, Duration::hours(2));
-        // INVARIANT (the fix): the deferred sweep window must be >= the
-        // defer-worker's own wall-clock cap, or it would reap a HEALTHY
-        // long-running task (e.g. a 45-min multi-GB model download) and let a
-        // second worker re-dispatch a racing duplicate. There is no mid-task
-        // heartbeat on deferred_tasks, so this coupling is the only guard.
-        assert!(
-            p.deferred_stale_after.num_seconds() as u64
-                >= crate::defer_worker::DEFAULT_DEFER_MAX_DURATION.as_secs(),
-            "deferred sweep must not fire before the worker's max-duration cap"
-        );
-        // Research sessions: generous enough not to reap a live `ff research`
-        // run, short enough that orphans (process killed) clear within the hour.
-        assert_eq!(p.research_stale_after, Duration::hours(1));
-        // Deployment health flip: must stay strictly LONGER than the live
-        // dispatch freshness floor (DISPATCH_HEALTH_MAX_AGE_SEC = 300s) so the
-        // cheap reversible router skip always fires before the persistent
-        // healthy→unhealthy write — otherwise a transient reconciler blip
-        // flaps the stored state.
-        assert_eq!(p.deployment_health_stale_after, Duration::minutes(10));
-        assert!(
-            p.deployment_health_stale_after.num_seconds()
-                > ff_db::queries::DISPATCH_HEALTH_MAX_AGE_SEC as i64
-        );
-        // Retention must be long enough to keep useful recent history but
-        // finite so the queue table can't grow unbounded.
-        assert_eq!(p.terminal_retention, Duration::days(14));
-    }
-
-    #[test]
-    fn only_terminal_statuses_are_prunable() {
-        // Live/recoverable states must NEVER be deleted by the retention prune —
-        // the sweeper recovers those, it doesn't drop them.
-        for s in ["completed", "cancelled", "failed"] {
-            assert!(is_prunable_terminal_status(s), "{s} should be prunable");
-        }
-        for s in ["pending", "running", "dispatchable", "claimed"] {
-            assert!(!is_prunable_terminal_status(s), "{s} must NOT be prunable");
-        }
-    }
-
-    #[test]
-    fn sweep_interval_and_leader_window_are_sane() {
-        assert_eq!(SWEEP_INTERVAL, std::time::Duration::from_secs(300));
-        assert_eq!(LEADER_FRESH_SECS, 60);
-    }
-}
-
 /// How often the sweeper runs in production. Mirrors the 5-minute cadence the
 /// legacy `ff daemon` used so orphaned `running` rows are recovered promptly.
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
@@ -378,6 +316,7 @@ const RESEARCH_AUTO_RECOVER_LIMIT: i64 = 3;
 /// The leader's Postgres `heartbeat_at` must be fresher than this for us to
 /// consider ourselves the live leader. Matches the 60s window the other
 /// leader-gated forgefleetd ticks (amcheck, summary-refresh) use.
+#[allow(dead_code)] // spec pin, asserted by tests; production inlines the window
 const LEADER_FRESH_SECS: i64 = 60;
 
 /// Production stale-job sweeper tick for `forgefleetd`.
@@ -481,5 +420,67 @@ impl StaleJobSweeperTick {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These thresholds were proven in production for months under the legacy
+    /// `ff daemon` and are preserved verbatim by the relocation into
+    /// forgefleetd. The deferred threshold MUST stay generous enough not to
+    /// reap a legitimately long-running deferred task; the model-job threshold
+    /// covers multi-GB HF downloads. Pin them so a careless edit can't silently
+    /// weaken recovery (too short → kills live work; too long → orphans leak).
+    #[test]
+    fn default_policy_thresholds_are_stable() {
+        let p = SweepPolicy::default();
+        assert_eq!(p.job_stale_after, Duration::hours(2));
+        assert_eq!(p.deferred_stale_after, Duration::hours(2));
+        // INVARIANT (the fix): the deferred sweep window must be >= the
+        // defer-worker's own wall-clock cap, or it would reap a HEALTHY
+        // long-running task (e.g. a 45-min multi-GB model download) and let a
+        // second worker re-dispatch a racing duplicate. There is no mid-task
+        // heartbeat on deferred_tasks, so this coupling is the only guard.
+        assert!(
+            p.deferred_stale_after.num_seconds() as u64
+                >= crate::defer_worker::DEFAULT_DEFER_MAX_DURATION.as_secs(),
+            "deferred sweep must not fire before the worker's max-duration cap"
+        );
+        // Research sessions: generous enough not to reap a live `ff research`
+        // run, short enough that orphans (process killed) clear within the hour.
+        assert_eq!(p.research_stale_after, Duration::hours(1));
+        // Deployment health flip: must stay strictly LONGER than the live
+        // dispatch freshness floor (DISPATCH_HEALTH_MAX_AGE_SEC = 300s) so the
+        // cheap reversible router skip always fires before the persistent
+        // healthy→unhealthy write — otherwise a transient reconciler blip
+        // flaps the stored state.
+        assert_eq!(p.deployment_health_stale_after, Duration::minutes(10));
+        assert!(
+            p.deployment_health_stale_after.num_seconds()
+                > ff_db::queries::DISPATCH_HEALTH_MAX_AGE_SEC as i64
+        );
+        // Retention must be long enough to keep useful recent history but
+        // finite so the queue table can't grow unbounded.
+        assert_eq!(p.terminal_retention, Duration::days(14));
+    }
+
+    #[test]
+    fn only_terminal_statuses_are_prunable() {
+        // Live/recoverable states must NEVER be deleted by the retention prune —
+        // the sweeper recovers those, it doesn't drop them.
+        for s in ["completed", "cancelled", "failed"] {
+            assert!(is_prunable_terminal_status(s), "{s} should be prunable");
+        }
+        for s in ["pending", "running", "dispatchable", "claimed"] {
+            assert!(!is_prunable_terminal_status(s), "{s} must NOT be prunable");
+        }
+    }
+
+    #[test]
+    fn sweep_interval_and_leader_window_are_sane() {
+        assert_eq!(SWEEP_INTERVAL, std::time::Duration::from_secs(300));
+        assert_eq!(LEADER_FRESH_SECS, 60);
     }
 }

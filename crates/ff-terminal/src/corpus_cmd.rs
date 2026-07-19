@@ -142,8 +142,8 @@ pub async fn handle_corpus(pool: &PgPool, cmd: crate::CorpusCommand) -> Result<(
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
                 println!(
-                    "{:<38} {:<16} {:<5} {:<14} {}",
-                    "ID", "KIND", "CONF", "HEURISTIC", "TITLE"
+                    "{:<38} {:<16} {:<5} {:<14} TITLE",
+                    "ID", "KIND", "CONF", "HEURISTIC"
                 );
                 for r in &rows {
                     println!(

@@ -236,7 +236,7 @@ fn parse_field(
             if start > end {
                 return Err(ScheduleError::InvalidField {
                     field: field_name.to_string(),
-                    reason: format!("range start {} > end {}", start, end),
+                    reason: format!("range start {start} > end {end}"),
                 });
             }
             (start, end)
@@ -299,7 +299,7 @@ fn parse_value(
     if !(min..=valid_upper).contains(&value) {
         return Err(ScheduleError::InvalidField {
             field: field_name.to_string(),
-            reason: format!("value {} outside {}..={}", value, min, valid_upper),
+            reason: format!("value {value} outside {min}..={valid_upper}"),
         });
     }
 

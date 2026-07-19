@@ -311,11 +311,8 @@ impl PostgresFailoverManager {
 
         // 5) Update fleet_secrets.postgres_primary_url.
         let my_ip = self.lookup_my_primary_ip().await?;
-        let new_url = format!(
-            "postgres://forgefleet:forgefleet@{host}:{port}/forgefleet",
-            host = my_ip,
-            port = POSTGRES_PORT
-        );
+        let new_url =
+            format!("postgres://forgefleet:forgefleet@{my_ip}:{POSTGRES_PORT}/forgefleet");
         pg_set_secret(
             &self.pg,
             "postgres_primary_url",

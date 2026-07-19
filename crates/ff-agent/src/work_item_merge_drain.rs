@@ -368,7 +368,7 @@ async fn pr_ci_state(pr_url: &str) -> CiState {
         .iter()
         .any(|s| matches!(s.as_str(), "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT"))
     {
-        return CiState::Failed(format!("a check is {:?}", states));
+        return CiState::Failed(format!("a check is {states:?}"));
     }
     if states
         .iter()

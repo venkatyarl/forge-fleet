@@ -376,7 +376,7 @@ impl ModelManager {
         } else if bytes >= 1_000_000 {
             format!("{:.1} MB", bytes as f64 / 1_000_000.0)
         } else {
-            format!("{} bytes", bytes)
+            format!("{bytes} bytes")
         }
     }
 }

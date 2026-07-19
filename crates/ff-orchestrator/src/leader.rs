@@ -484,7 +484,7 @@ impl LeaderCoordinator {
             // have the description/project here, so we use a minimal placeholder.
             // Callers that need richer retry semantics should submit a fresh task.
             let task = QueuedTask::new(
-                format!("retry of {}", task_id),
+                format!("retry of {task_id}"),
                 ResourceRequirements::default(),
                 TaskPriority::Normal,
             )
@@ -639,10 +639,7 @@ mod tests {
 
         let task = make_task("build feature", 4, 8);
         let submit_result = coordinator.submit_task(task);
-        assert!(matches!(
-            submit_result.action,
-            SubmissionAction::Queued { .. }
-        ));
+        assert!(matches!(submit_result.action, SubmissionAction::Queued));
 
         let tick = coordinator.tick();
         assert_eq!(tick.assignments.len(), 1);
@@ -735,7 +732,7 @@ mod tests {
 
         // Fill the node.
         for i in 0..2 {
-            let task = make_task(&format!("fill-{}", i), 4, 8);
+            let task = make_task(&format!("fill-{i}"), 4, 8);
             coordinator.submit_task(task);
         }
         coordinator.tick();

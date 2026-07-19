@@ -34,7 +34,7 @@ impl EpicStatus {
             "in_progress" | "inprogress" | "in progress" => Ok(Self::InProgress),
             "done" | "complete" | "completed" => Ok(Self::Done),
             "cancelled" | "canceled" => Ok(Self::Cancelled),
-            other => Err(format!("invalid epic status: {}", other)),
+            other => Err(format!("invalid epic status: {other}")),
         }
     }
 }

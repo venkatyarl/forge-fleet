@@ -92,10 +92,7 @@ pub async fn handle_freeze_tier(pg: &PgPool, tier: &str, hours: u32) -> Result<(
         .bind(tier)
         .execute(pg)
         .await?;
-    println!(
-        "Tier {} frozen until {} (human approval required)",
-        tier, until
-    );
+    println!("Tier {tier} frozen until {until} (human approval required)");
     Ok(())
 }
 
@@ -113,7 +110,7 @@ pub async fn handle_revert(pg: &PgPool, bug_sig: &str) -> Result<()> {
     .await?;
 
     let Some(row) = row else {
-        println!("No self-heal entry found for bug_signature={}", bug_sig);
+        println!("No self-heal entry found for bug_signature={bug_sig}");
         return Ok(());
     };
 
@@ -124,7 +121,7 @@ pub async fn handle_revert(pg: &PgPool, bug_sig: &str) -> Result<()> {
         .unwrap_or(serde_json::json!({}));
 
     if status == "reverted" {
-        println!("Fix {} is already reverted.", bug_sig);
+        println!("Fix {bug_sig} is already reverted.");
         return Ok(());
     }
 
@@ -168,14 +165,10 @@ pub async fn handle_revert(pg: &PgPool, bug_sig: &str) -> Result<()> {
         }))
         .execute(pg)
         .await?;
-        println!(
-            "Enqueued rollback task {} for bug_signature={}",
-            task_id, bug_sig
-        );
+        println!("Enqueued rollback task {task_id} for bug_signature={bug_sig}");
     } else {
         println!(
-            "No rollback playbook for bug_signature={}; marking reverted without action.",
-            bug_sig
+            "No rollback playbook for bug_signature={bug_sig}; marking reverted without action."
         );
     }
 
@@ -189,7 +182,7 @@ pub async fn handle_revert(pg: &PgPool, bug_sig: &str) -> Result<()> {
     .execute(pg)
     .await?;
 
-    println!("Marked bug_signature={} as reverted.", bug_sig);
+    println!("Marked bug_signature={bug_sig} as reverted.");
     Ok(())
 }
 
@@ -201,10 +194,7 @@ pub async fn handle_trust_reset(pg: &PgPool, computer: &str) -> Result<()> {
     .bind(computer)
     .execute(pg)
     .await?;
-    println!(
-        "Trust reset for {}: back to operator-approve probation",
-        computer
-    );
+    println!("Trust reset for {computer}: back to operator-approve probation");
     Ok(())
 }
 
@@ -222,10 +212,7 @@ pub async fn handle_run_writer(pg: &PgPool, bug_sig: &str) -> Result<()> {
     .await?;
 
     let Some(row) = row else {
-        println!(
-            "No self-heal queue entry found for bug_signature={}",
-            bug_sig
-        );
+        println!("No self-heal queue entry found for bug_signature={bug_sig}");
         return Ok(());
     };
 
@@ -245,11 +232,11 @@ pub async fn handle_run_writer(pg: &PgPool, bug_sig: &str) -> Result<()> {
     .await?;
 
     println!("── Self-heal writer run ────────────────────────────────");
-    println!("bug_signature : {}", sig);
-    println!("tier          : {}", tier);
-    println!("status        : {}", status);
-    println!("report_count  : {}", report_count);
-    println!("attempts      : {}", attempts);
+    println!("bug_signature : {sig}");
+    println!("tier          : {tier}");
+    println!("status        : {status}");
+    println!("report_count  : {report_count}");
+    println!("attempts      : {attempts}");
 
     if let Some(d) = detail {
         let file: Option<String> = d.try_get("file_path").ok();
@@ -262,12 +249,12 @@ pub async fn handle_run_writer(pg: &PgPool, bug_sig: &str) -> Result<()> {
             file.as_deref().unwrap_or("?"),
             line.map(|n| n.to_string()).unwrap_or_else(|| "?".into())
         );
-        println!("error_class   : {}", class);
+        println!("error_class   : {class}");
         if let Some(v) = version {
-            println!("binary_version: {}", v);
+            println!("binary_version: {v}");
         }
         if let Some(s) = stack {
-            println!("stack_excerpt : {}", s);
+            println!("stack_excerpt : {s}");
         }
     }
 

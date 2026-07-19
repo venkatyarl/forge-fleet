@@ -35,6 +35,12 @@ pub struct LlmProbe {
     client: reqwest::Client,
 }
 
+impl Default for LlmProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LlmProbe {
     pub fn new() -> Self {
         Self {
@@ -124,7 +130,7 @@ impl LlmProbe {
             }
 
             let (tokens_per_sec, queue_depth, metrics_runtime_hint) =
-                fetch_metrics(&client, port).await;
+                fetch_metrics(client, port).await;
             let runtime = identify_runtime(
                 port,
                 &raw_body,

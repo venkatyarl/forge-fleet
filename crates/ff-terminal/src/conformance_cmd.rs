@@ -302,7 +302,7 @@ pub async fn handle_profiles(pg: &PgPool) -> Result<()> {
                 let kind: String = ch.get("check_kind");
                 let sev: String = ch.get("severity");
                 let t: String = ch.get("title");
-                println!("      - [{}] {} ({}) — {}", sev, ck, kind, t);
+                println!("      - [{sev}] {ck} ({kind}) — {t}");
             }
         }
     }
@@ -514,7 +514,7 @@ pub async fn handle_report(pg: &PgPool, role: &str) -> Result<()> {
             host_blockers += 1;
         }
         let mark = if conformant { "ok  " } else { "FAIL" };
-        println!("  [{}] {:<12} ({:<8}) {}", mark, ck, sev, reason);
+        println!("  [{mark}] {ck:<12} ({sev:<8}) {reason}");
     }
     if !current.is_empty() {
         println!(

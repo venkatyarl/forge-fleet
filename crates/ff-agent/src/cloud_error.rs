@@ -287,7 +287,10 @@ fn has_code(text: &str, code: &str) -> bool {
 /// Order is deliberate: quota is checked before rate-limit (both can be 429),
 /// overload before generic 5xx, auth before everything 4xx.
 pub fn classify(provider: &str, _exit_code: Option<i32>, output: &str) -> CloudErrorClass {
-    let p = provider.to_ascii_lowercase();
+    // `provider` is currently unused in the match arms (the last provider-
+    // specific clause was dead code and removed); the parameter stays for the
+    // documented per-vendor contract.
+    let _ = provider;
     let t = output.to_ascii_lowercase();
 
     // 1. Auth — token expired / missing / invalid.
@@ -348,10 +351,10 @@ pub fn classify(provider: &str, _exit_code: Option<i32>, output: &str) -> CloudE
             "engine is currently overloaded",
         ],
     );
-    if has_code(&t, "529")
-        || overload_words
-        || (has_code(&t, "503") && !any(&t, &["bad gateway"]))
-        || (p == "kimi" && has_code(&t, "429") && overload_words)
+    // NOTE: a kimi-specific `429 && overload_words` clause used to sit here,
+    // but `|| overload_words` above already covers every overload_words case —
+    // the provider-specific term was dead code (clippy: overlapping bool expr).
+    if has_code(&t, "529") || overload_words || (has_code(&t, "503") && !any(&t, &["bad gateway"]))
     {
         return CloudErrorClass::Overloaded;
     }

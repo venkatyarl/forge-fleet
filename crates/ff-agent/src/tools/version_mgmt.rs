@@ -333,7 +333,7 @@ impl AgentTool for VersionManagerTool {
                     if existing_count == 0 {
                         base
                     } else {
-                        format!("{base}.{:02}", existing_count)
+                        format!("{base}.{existing_count:02}")
                     }
                 };
 

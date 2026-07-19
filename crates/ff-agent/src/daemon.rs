@@ -11,6 +11,9 @@ use tracing::{error, info, warn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TickScope {
+    /// Not yet used — every registered tick today is leader-gated; kept as
+    /// the documented shape for per-node ticks (disk sampler etc. migrate in).
+    #[allow(dead_code)]
     EveryNode,
     LeaderOnly,
 }
@@ -50,6 +53,12 @@ impl TickRegistry {
                 interval: Duration::from_secs(15),
                 scope: TickScope::LeaderOnly,
                 runner: run_work_item_scheduler_tick,
+            },
+            TickDefinition {
+                name: "telegram_reply_poller",
+                interval: Duration::from_secs(30),
+                scope: TickScope::LeaderOnly,
+                runner: run_telegram_reply_poller_tick,
             },
         ]
         .into_iter()
@@ -156,6 +165,17 @@ fn run_work_item_scheduler_tick(
 ) -> BoxFuture<'static, Result<()>> {
     Box::pin(async move {
         crate::work_item_scheduler::evaluate_work_items(&pg)
+            .await
+            .map(|_| ())
+    })
+}
+
+fn run_telegram_reply_poller_tick(
+    pg: PgPool,
+    _worker_name: String,
+) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::telegram_reply_poller::poll_telegram_replies_once(&pg)
             .await
             .map(|_| ())
     })

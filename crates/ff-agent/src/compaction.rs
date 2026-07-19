@@ -341,9 +341,9 @@ mod tests {
         let mut msgs = vec![
             ToolChatMessage::system("sys"),
             ToolChatMessage::user("do something"),
-            ToolChatMessage::tool_result("call_1", &"x".repeat(1000)),
-            ToolChatMessage::tool_result("call_2", &"y".repeat(1000)),
-            ToolChatMessage::tool_result("call_3", &"z".repeat(1000)),
+            ToolChatMessage::tool_result("call_1", "x".repeat(1000)),
+            ToolChatMessage::tool_result("call_2", "y".repeat(1000)),
+            ToolChatMessage::tool_result("call_3", "z".repeat(1000)),
         ];
 
         let truncated = apply_tool_result_budget(&mut msgs, 1500);

@@ -194,8 +194,7 @@ impl TelegramNotifier {
             self.batch_window.as_secs()
         ));
         lines.push(format!(
-            "Counts: 🔴{}  🟡{}  🟢{}  📊{}",
-            critical, warning, info, report
+            "Counts: 🔴{critical}  🟡{warning}  🟢{info}  📊{report}"
         ));
         lines.push(String::new());
 
@@ -239,8 +238,7 @@ impl TelegramNotifier {
                 .await
                 .unwrap_or_else(|_| "<failed to read error body>".to_string());
             return Err(ForgeFleetError::Runtime(format!(
-                "telegram API returned {}: {}",
-                status, body
+                "telegram API returned {status}: {body}"
             )));
         }
 

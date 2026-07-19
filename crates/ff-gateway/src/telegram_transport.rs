@@ -594,9 +594,9 @@ impl TelegramPollingTransport {
                 ""
             };
             let title = thread.title.as_deref().unwrap_or(&thread.slug);
-            text_lines.push(format!("- {}{marker}", title));
+            text_lines.push(format!("- {title}{marker}"));
             button_rows.push(vec![MessageButton::callback(
-                format!("{}{marker}", title),
+                format!("{title}{marker}"),
                 format!("switch:{}", thread.slug),
             )]);
         }
@@ -638,7 +638,7 @@ impl TelegramPollingTransport {
             slug,
             title
                 .as_ref()
-                .map(|t| format!(" ({})", t))
+                .map(|t| format!(" ({t})"))
                 .unwrap_or_default()
         );
         let mut outgoing =

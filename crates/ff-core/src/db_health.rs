@@ -82,7 +82,7 @@ pub async fn ensure_postgres_up(db_url: &str) -> Result<(), String> {
         .await
         .map_err(|e| format!("spawn docker: {e}"))?;
     if !status.success() {
-        return Err(format!("`docker compose up -d` exited {}", status));
+        return Err(format!("`docker compose up -d` exited {status}"));
     }
 
     // 4. Wait up to ~30s for the port to accept queries.

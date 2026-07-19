@@ -73,7 +73,7 @@ impl PanicIsolatingWrapper {
     {
         let started = Instant::now();
 
-        let future = match catch_unwind(AssertUnwindSafe(|| tick())) {
+        let future = match catch_unwind(AssertUnwindSafe(tick)) {
             Ok(future) => future,
             Err(payload) => {
                 return Err(TickOutcome::Panicked {

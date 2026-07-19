@@ -163,7 +163,7 @@ impl BinaryVerifier {
         for smoke_cmd in &self.config.smoke_tests {
             let result = self.run_smoke_test(binary_path, smoke_cmd);
             if !result.passed {
-                issues.push(format!("smoke test failed: {}", smoke_cmd));
+                issues.push(format!("smoke test failed: {smoke_cmd}"));
             }
             smoke_test_results.push(result);
         }

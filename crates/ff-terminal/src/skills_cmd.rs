@@ -197,8 +197,8 @@ async fn list_cmd(
     }
 
     println!(
-        "{:<22} {:<14} {:<14} {:<8} {:<8} {}",
-        "NAME", "SOURCE", "FAMILY", "VERSION", "RISK", "DESCRIPTION"
+        "{:<22} {:<14} {:<14} {:<8} {:<8} DESCRIPTION",
+        "NAME", "SOURCE", "FAMILY", "VERSION", "RISK"
     );
     for s in &filtered {
         let first_line = s
@@ -395,17 +395,17 @@ async fn stats_cmd(pool: &sqlx::PgPool, json: bool) -> Result<()> {
     println!();
     println!("by source:");
     for (k, v) in &by_source {
-        println!("  {:<20} {}", k, v);
+        println!("  {k:<20} {v}");
     }
     println!();
     println!("by family:");
     for (k, v) in &by_family {
-        println!("  {:<20} {}", k, v);
+        println!("  {k:<20} {v}");
     }
     println!();
     println!("by risk:");
     for (k, v) in &by_risk {
-        println!("  {:<20} {}", k, v);
+        println!("  {k:<20} {v}");
     }
     Ok(())
 }

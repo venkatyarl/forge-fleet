@@ -1046,7 +1046,7 @@ mod tests {
     #[test]
     fn unicode_attack_detected() {
         // Zero-width space
-        let cmd = format!("ls\u{200B}-la");
+        let cmd = "ls\u{200B}-la".to_string();
         let result = scan_command(&cmd);
         assert!(
             result

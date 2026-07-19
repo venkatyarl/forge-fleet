@@ -129,10 +129,7 @@ impl AgentTool for PasswordGenTool {
                     } else {
                         "a-zA-Z0-9!@#$%^&*()-_=+"
                     };
-                    format!(
-                        "LC_ALL=C tr -dc '{}' < /dev/urandom | head -c {}",
-                        charset, length
-                    )
+                    format!("LC_ALL=C tr -dc '{charset}' < /dev/urandom | head -c {length}")
                 }
             };
             if let Ok(o) = Command::new("bash").arg("-c").arg(&cmd).output().await {

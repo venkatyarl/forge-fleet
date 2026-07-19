@@ -68,7 +68,7 @@ pub async fn query_models_endpoint(
                     queried_at,
                     latency_ms: started.elapsed().as_millis(),
                     models: vec![],
-                    error: Some(format!("invalid JSON payload from {}: {}", url, err)),
+                    error: Some(format!("invalid JSON payload from {url}: {err}")),
                 },
             }
         }

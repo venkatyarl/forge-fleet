@@ -328,7 +328,7 @@ fn build_media_request_for_kind(
         .media
         .iter()
         .find(|media| media.kind == kind)
-        .ok_or_else(|| TelegramError::Parse(format!("no media item found for {:?}", kind)))?;
+        .ok_or_else(|| TelegramError::Parse(format!("no media item found for {kind:?}")))?;
 
     Ok(build_media_request(outgoing, media))
 }

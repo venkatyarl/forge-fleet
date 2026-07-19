@@ -554,5 +554,5 @@ fn to_rfc3339(value: DateTime<Utc>) -> String {
 fn parse_rfc3339(value: &str) -> Result<DateTime<Utc>, PersistenceError> {
     DateTime::parse_from_rfc3339(value)
         .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|err| PersistenceError::Decode(format!("invalid timestamp '{}': {err}", value)))
+        .map_err(|err| PersistenceError::Decode(format!("invalid timestamp '{value}': {err}")))
 }

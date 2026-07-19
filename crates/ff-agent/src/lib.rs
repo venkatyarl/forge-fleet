@@ -149,6 +149,7 @@ pub mod task_coverage_seed;
 pub mod task_retention;
 pub mod task_runner;
 pub mod telegram;
+pub mod telegram_reply_poller;
 pub mod template_registry;
 pub mod thinking;
 pub mod tick_registry;
@@ -999,7 +1000,7 @@ fn build_pipeline_graph(
             if let (Some(dep), Some(current)) = (step_ids.get(*dep_idx), step_ids.get(idx)) {
                 graph
                     .add_dependency(&current.clone().into(), &dep.clone().into())
-                    .with_context(|| format!("failed to add dependency {} -> {}", dep, current))?;
+                    .with_context(|| format!("failed to add dependency {dep} -> {current}"))?;
             }
         }
     }

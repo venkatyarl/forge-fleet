@@ -121,8 +121,7 @@ impl AgentTool for TimezoneConvertTool {
                     .and_then(Value::as_str)
                     .unwrap_or("US/Eastern");
                 let cmd = format!(
-                    "TZ='{}' date -d 'TZ=\"{}\" {}' '+%Y-%m-%d %H:%M %Z' 2>/dev/null || echo 'Use: TimezoneConvert now for current times'",
-                    to, from, time
+                    "TZ='{to}' date -d 'TZ=\"{from}\" {time}' '+%Y-%m-%d %H:%M %Z' 2>/dev/null || echo 'Use: TimezoneConvert now for current times'"
                 );
                 match Command::new("bash").arg("-c").arg(&cmd).output().await {
                     Ok(o) => AgentToolResult::ok(format!(

@@ -227,8 +227,7 @@ impl ElevenLabsClient {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(VoiceError::Tts(format!(
-                "elevenlabs list voices failed {}: {}",
-                status, body
+                "elevenlabs list voices failed {status}: {body}"
             )));
         }
 
@@ -266,8 +265,7 @@ impl ElevenLabsClient {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(VoiceError::Tts(format!(
-                "elevenlabs tts failed {}: {}",
-                status, body
+                "elevenlabs tts failed {status}: {body}"
             )));
         }
 

@@ -960,7 +960,7 @@ mod tests {
                 assert_eq!(tiers, vec![1, 2, 3]);
                 assert_eq!(validator, ValidatorKind::Json);
             }
-            other => panic!("expected Cascade, got {:?}", other),
+            other => panic!("expected Cascade, got {other:?}"),
         }
     }
 
@@ -974,7 +974,7 @@ mod tests {
             RouteStrategy::Cascade { validator, .. } => {
                 assert_eq!(validator, ValidatorKind::Yaml);
             }
-            other => panic!("expected Cascade, got {:?}", other),
+            other => panic!("expected Cascade, got {other:?}"),
         }
     }
 
@@ -990,7 +990,7 @@ mod tests {
             RouteStrategy::Cascade { validator, .. } => {
                 assert_eq!(validator, ValidatorKind::None);
             }
-            other => panic!("expected Cascade, got {:?}", other),
+            other => panic!("expected Cascade, got {other:?}"),
         }
     }
 
@@ -1010,7 +1010,7 @@ mod tests {
                 assert_eq!(max_tier, 4);
                 assert_eq!(threshold, 7);
             }
-            other => panic!("expected JudgeEscalate, got {:?}", other),
+            other => panic!("expected JudgeEscalate, got {other:?}"),
         }
     }
 
@@ -1025,7 +1025,7 @@ mod tests {
                 assert!(!tiers.contains(&1), "expert shouldn't start at tier-1");
                 assert_eq!(tiers, vec![2, 3, 4]);
             }
-            other => panic!("expected Cascade, got {:?}", other),
+            other => panic!("expected Cascade, got {other:?}"),
         }
     }
 

@@ -170,11 +170,13 @@ impl ApprovalManager {
             requests: Arc::new(DashMap::new()),
         };
         if tokio::runtime::Handle::try_current().is_ok() {
-            let _ = Self::spawn_reaper(
+            // spawn_reaper tokio::spawns internally; dropping the JoinHandle
+            // detaches the reaper on purpose (it runs for the daemon lifetime).
+            drop(Self::spawn_reaper(
                 mgr.requests_handle(),
                 std::time::Duration::from_secs(1800),
                 chrono::Duration::hours(2),
-            );
+            ));
         }
         mgr
     }

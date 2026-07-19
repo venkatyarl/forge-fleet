@@ -344,8 +344,7 @@ impl SkillExecutor {
     async fn execute_builtin(&self, handler: &str, args: &serde_json::Value) -> Result<String> {
         debug!(handler, "builtin tool delegated to external registry");
         Ok(format!(
-            "{{\"handler\": \"{handler}\", \"args\": {}, \"status\": \"external_registry_required\"}}",
-            args
+            "{{\"handler\": \"{handler}\", \"args\": {args}, \"status\": \"external_registry_required\"}}"
         ))
     }
 

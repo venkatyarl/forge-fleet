@@ -423,7 +423,7 @@ mod tests {
 
     #[test]
     fn secret_detection() {
-        assert!(!detect_secrets("normal output").is_empty() == false);
+        assert!(!(!detect_secrets("normal output").is_empty()));
         assert!(!detect_secrets("AKIAIOSFODNN7EXAMPLE").is_empty());
         assert!(!detect_secrets("ghp_xxxxxxxxxxxx").is_empty());
     }

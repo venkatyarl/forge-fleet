@@ -299,14 +299,14 @@ pub async fn execute_cli_in_dir(
     let timeout = timeout.unwrap_or(DEFAULT_TIMEOUT);
     let child = cmd
         .spawn()
-        .map_err(|e| anyhow!("spawn `{}` failed: {e}", bin_path))?;
+        .map_err(|e| anyhow!("spawn `{bin_path}` failed: {e}"))?;
     // Capture the pid before the wait future takes ownership — we need it to kill
     // the process group if the call times out.
     let child_pid = child.id();
     let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
-            return Err(anyhow!("wait `{}` failed: {e}", bin_path));
+            return Err(anyhow!("wait `{bin_path}` failed: {e}"));
         }
         Err(_) => {
             // Timed out. kill_on_drop reaps the direct child when the future

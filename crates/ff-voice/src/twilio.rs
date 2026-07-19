@@ -97,8 +97,7 @@ impl TwilioClient {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(VoiceError::Twilio(format!(
-                "twilio create_call failed {}: {}",
-                status, body
+                "twilio create_call failed {status}: {body}"
             )));
         }
 
@@ -168,7 +167,7 @@ impl TwimlBuilder {
 
     pub fn pause(mut self, length_seconds: u32) -> Self {
         self.verbs
-            .push(format!("<Pause length=\"{}\" />", length_seconds));
+            .push(format!("<Pause length=\"{length_seconds}\" />"));
         self
     }
 

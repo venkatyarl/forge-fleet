@@ -108,7 +108,7 @@ impl SubAgentWorkspace {
         let dst = self.artifacts_promoted_dir().join(name);
 
         if !src.exists() {
-            anyhow::bail!("Artifact not found in pending: {}", name);
+            anyhow::bail!("Artifact not found in pending: {name}");
         }
 
         fs::copy(&src, &dst).await?;

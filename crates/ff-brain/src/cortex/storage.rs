@@ -493,9 +493,7 @@ impl CortexGraphStore for FalkorCortexGraphStore {
         _semantic: bool,
     ) -> Result<Vec<SymbolHit>> {
         anyhow::bail!(
-            "FalkorDB result decoding is not wired yet. Query templates:\n{}\n{}",
-            FALKOR_FIND_SYMBOLS_CYPHER,
-            FALKOR_SEMANTIC_SEARCH_CYPHER
+            "FalkorDB result decoding is not wired yet. Query templates:\n{FALKOR_FIND_SYMBOLS_CYPHER}\n{FALKOR_SEMANTIC_SEARCH_CYPHER}"
         )
     }
 
@@ -506,8 +504,7 @@ impl CortexGraphStore for FalkorCortexGraphStore {
         _min_confidence: f32,
     ) -> Result<Vec<SymbolRef>> {
         anyhow::bail!(
-            "FalkorDB result decoding is not wired yet. Query template:\n{}",
-            FALKOR_CALLERS_CYPHER
+            "FalkorDB result decoding is not wired yet. Query template:\n{FALKOR_CALLERS_CYPHER}"
         )
     }
 
@@ -518,8 +515,7 @@ impl CortexGraphStore for FalkorCortexGraphStore {
         _min_confidence: f32,
     ) -> Result<Vec<SymbolRef>> {
         anyhow::bail!(
-            "FalkorDB result decoding is not wired yet. Query template:\n{}",
-            FALKOR_CALLEES_CYPHER
+            "FalkorDB result decoding is not wired yet. Query template:\n{FALKOR_CALLEES_CYPHER}"
         )
     }
 
@@ -531,8 +527,7 @@ impl CortexGraphStore for FalkorCortexGraphStore {
         _min_confidence: f32,
     ) -> Result<Vec<SymbolRef>> {
         anyhow::bail!(
-            "FalkorDB result decoding is not wired yet. Query template:\n{}",
-            FALKOR_IMPACT_CYPHER
+            "FalkorDB result decoding is not wired yet. Query template:\n{FALKOR_IMPACT_CYPHER}"
         )
     }
 
@@ -545,8 +540,7 @@ impl CortexGraphStore for FalkorCortexGraphStore {
         _min_confidence: f32,
     ) -> Result<Option<Vec<SymbolRef>>> {
         anyhow::bail!(
-            "FalkorDB result decoding is not wired yet. Query template:\n{}",
-            FALKOR_CALL_PATH_CYPHER
+            "FalkorDB result decoding is not wired yet. Query template:\n{FALKOR_CALL_PATH_CYPHER}"
         )
     }
 
@@ -579,8 +573,7 @@ impl CortexGraphStore for FalkorCortexGraphStore {
         _kind: Option<&str>,
     ) -> Result<Option<FileOutline>> {
         anyhow::bail!(
-            "FalkorDB result decoding is not wired yet. Query template:\n{}",
-            FALKOR_OUTLINE_FILE_CYPHER
+            "FalkorDB result decoding is not wired yet. Query template:\n{FALKOR_OUTLINE_FILE_CYPHER}"
         )
     }
 }

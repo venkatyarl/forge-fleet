@@ -82,14 +82,13 @@ impl AgentTool for ToolSearchTool {
 
         if matches.is_empty() {
             return AgentToolResult::ok(format!(
-                "No tools found matching '{}'. Try broader terms like 'git', 'file', 'web', 'fleet', 'docker', 'database', 'media'.",
-                query
+                "No tools found matching '{query}'. Try broader terms like 'git', 'file', 'web', 'fleet', 'docker', 'database', 'media'."
             ));
         }
 
         let mut result = format!("Found {} tool(s) matching '{}':\n\n", matches.len(), query);
         for (name, desc, schema) in &matches {
-            result.push_str(&format!("### {}\n{}\n", name, desc));
+            result.push_str(&format!("### {name}\n{desc}\n"));
             result.push_str(&format!(
                 "Parameters: {}\n\n",
                 serde_json::to_string_pretty(schema).unwrap_or_default()

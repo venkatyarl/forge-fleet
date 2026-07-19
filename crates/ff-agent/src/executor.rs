@@ -188,7 +188,7 @@ async fn execute_model_inference(
     let mut output = "runtime unreachable".to_string();
 
     for ep in endpoints {
-        let url = format!("{}{}", runtime_url, ep);
+        let url = format!("{runtime_url}{ep}");
         match client.post(&url).json(&body).send().await {
             Ok(resp) if resp.status().is_success() => {
                 let text = resp
@@ -203,7 +203,7 @@ async fn execute_model_inference(
                 output = format!("runtime error {} at {}", resp.status(), url);
             }
             Err(err) => {
-                output = format!("runtime request failed at {}: {}", url, err);
+                output = format!("runtime request failed at {url}: {err}");
             }
         }
     }

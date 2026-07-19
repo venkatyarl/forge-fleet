@@ -40,8 +40,7 @@ impl AgentTool for PhotoAnalysisTool {
             match *action {
                 "dimensions" => {
                     let cmd = format!(
-                        "identify -format '%wx%h %m %b' '{}' 2>/dev/null || sips -g pixelWidth -g pixelHeight '{}' 2>/dev/null",
-                        path, path
+                        "identify -format '%wx%h %m %b' '{path}' 2>/dev/null || sips -g pixelWidth -g pixelHeight '{path}' 2>/dev/null"
                     );
                     if let Ok(o) = Command::new("bash").arg("-c").arg(&cmd).output().await {
                         results.push(format!(
@@ -52,8 +51,7 @@ impl AgentTool for PhotoAnalysisTool {
                 }
                 "exif" => {
                     let cmd = format!(
-                        "exiftool '{}' 2>/dev/null | head -20 || identify -verbose '{}' 2>/dev/null | head -20",
-                        path, path
+                        "exiftool '{path}' 2>/dev/null | head -20 || identify -verbose '{path}' 2>/dev/null | head -20"
                     );
                     if let Ok(o) = Command::new("bash").arg("-c").arg(&cmd).output().await {
                         results.push(format!(
@@ -78,8 +76,7 @@ impl AgentTool for PhotoAnalysisTool {
                 }
                 "colors" => {
                     let cmd = format!(
-                        "convert '{}' -colors 5 -format '%c' histogram:info:- 2>/dev/null | head -5",
-                        path
+                        "convert '{path}' -colors 5 -format '%c' histogram:info:- 2>/dev/null | head -5"
                     );
                     if let Ok(o) = Command::new("bash").arg("-c").arg(&cmd).output().await {
                         results.push(format!(
@@ -138,8 +135,7 @@ impl AgentTool for VideoAnalysisTool {
         match action {
             "info" => {
                 let cmd = format!(
-                    "ffprobe -v quiet -print_format json -show_format -show_streams '{}' 2>/dev/null || echo 'ffprobe not installed (brew install ffmpeg)'",
-                    path
+                    "ffprobe -v quiet -print_format json -show_format -show_streams '{path}' 2>/dev/null || echo 'ffprobe not installed (brew install ffmpeg)'"
                 );
                 match Command::new("bash").arg("-c").arg(&cmd).output().await {
                     Ok(o) => AgentToolResult::ok(truncate_output(
@@ -182,7 +178,7 @@ impl AgentTool for VideoAnalysisTool {
                     .get("output_dir")
                     .and_then(Value::as_str)
                     .unwrap_or("./audio.mp3");
-                let cmd = format!("ffmpeg -i '{}' -vn -acodec mp3 '{}' 2>/dev/null", path, out);
+                let cmd = format!("ffmpeg -i '{path}' -vn -acodec mp3 '{out}' 2>/dev/null");
                 match Command::new("bash")
                     .arg("-c")
                     .arg(&cmd)
@@ -201,8 +197,7 @@ impl AgentTool for VideoAnalysisTool {
             "transcribe" => {
                 // Extract audio then transcribe with whisper
                 let cmd = format!(
-                    "ffmpeg -i '{}' -vn -acodec pcm_s16le -ar 16000 /tmp/ff_audio.wav 2>/dev/null && whisper /tmp/ff_audio.wav --model base --output_format txt 2>/dev/null && cat /tmp/ff_audio.txt",
-                    path
+                    "ffmpeg -i '{path}' -vn -acodec pcm_s16le -ar 16000 /tmp/ff_audio.wav 2>/dev/null && whisper /tmp/ff_audio.wav --model base --output_format txt 2>/dev/null && cat /tmp/ff_audio.txt"
                 );
                 match Command::new("bash").arg("-c").arg(&cmd).output().await {
                     Ok(o) if o.status.success() => AgentToolResult::ok(format!(
@@ -279,8 +274,7 @@ impl AgentTool for AudioAnalysisTool {
             }
             "info" => {
                 let cmd = format!(
-                    "ffprobe -v quiet -print_format json -show_format '{}' 2>/dev/null",
-                    path
+                    "ffprobe -v quiet -print_format json -show_format '{path}' 2>/dev/null"
                 );
                 match Command::new("bash").arg("-c").arg(&cmd).output().await {
                     Ok(o) => AgentToolResult::ok(truncate_output(
@@ -295,7 +289,7 @@ impl AgentTool for AudioAnalysisTool {
                     .get("output")
                     .and_then(Value::as_str)
                     .unwrap_or("output.mp3");
-                let cmd = format!("ffmpeg -i '{}' '{}' 2>/dev/null", path, output);
+                let cmd = format!("ffmpeg -i '{path}' '{output}' 2>/dev/null");
                 match Command::new("bash")
                     .arg("-c")
                     .arg(&cmd)
@@ -491,7 +485,7 @@ impl AgentTool for AutoFleetTool {
                 match Command::new("bash").arg("-c").arg(cmd).output().await {
                     Ok(o) => {
                         let alive = String::from_utf8_lossy(&o.stdout);
-                        AgentToolResult::ok(format!("Network Scan (192.168.5.100-130):\n{}\n\nNew nodes not in fleet.toml should be onboarded with NodeSetup + NodeEnroll.", alive))
+                        AgentToolResult::ok(format!("Network Scan (192.168.5.100-130):\n{alive}\n\nNew nodes not in fleet.toml should be onboarded with NodeSetup + NodeEnroll."))
                     }
                     Err(e) => AgentToolResult::err(format!("Scan failed: {e}")),
                 }

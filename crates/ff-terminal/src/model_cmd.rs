@@ -310,7 +310,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 Some(parts) => parts,
                 None => anyhow::bail!("--across requires `<hostA>+<hostB>` (e.g. `sia+adele`)"),
             };
-            let path_inside = container_path.unwrap_or_else(|| format!("/models/{}", model_id));
+            let path_inside = container_path.unwrap_or_else(|| format!("/models/{model_id}"));
             crate::model_serve_cmd::handle_model_serve_tp2(
                 &pool,
                 &model_id,
@@ -554,11 +554,8 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             let mut enqueued: Vec<(String, String)> = Vec::with_capacity(ids.len());
             for id in &ids {
                 let escaped_id = shell_escape_single(id);
-                let command = format!(
-                    "ff model download {} --runtime {}",
-                    escaped_id, target_runtime
-                );
-                let title = format!("Download {} ({} variant) on {}", id, target_runtime, node);
+                let command = format!("ff model download {escaped_id} --runtime {target_runtime}");
+                let title = format!("Download {id} ({target_runtime} variant) on {node}");
                 // Tens of GB per model — override the 10-min default duration so a
                 // slow pull isn't SIGKILLed mid-stream (see single-download note).
                 let payload = serde_json::json!({ "command": command, "max_duration_secs": 14400 });
@@ -615,7 +612,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                     ff_agent::model_runtime::AGENT_MIN_CTX
                 );
             } else {
-                println!("{CYAN}▶ Loading library {} on port {port}...{RESET}", id);
+                println!("{CYAN}▶ Loading library {id} on port {port}...{RESET}");
             }
             match ff_agent::model_runtime::load_model(&pool, opts).await {
                 Ok(res) => {
@@ -1342,7 +1339,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                                     .and_then(|v| v.as_f64())
                                     .unwrap_or(0.0);
                                 let ttft = run.get("ttft_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                                println!("{:<48} {:<12.2} {:<12}", key, tps, ttft);
+                                println!("{key:<48} {tps:<12.2} {ttft:<12}");
                             }
                         }
                     } else {
@@ -2147,7 +2144,6 @@ async fn handle_model_info(pool: sqlx::PgPool, id: String) -> anyhow::Result<()>
         return Ok(());
     }
     anyhow::bail!("'{id}' is not a known catalog id, library UUID, or deployment UUID");
-    Ok(())
 }
 
 /// `ff model approve` handler — extracted verbatim from the
@@ -2465,14 +2461,8 @@ async fn handle_model_download(
     let this_node = ff_agent::fleet_info::resolve_this_worker_name().await;
     if worker_name != this_node {
         let escaped_id = shell_escape_single(&id);
-        let command = format!(
-            "ff model download {} --runtime {}",
-            escaped_id, target_runtime
-        );
-        let title = format!(
-            "Download {} ({} variant) on {}",
-            id, target_runtime, worker_name
-        );
+        let command = format!("ff model download {escaped_id} --runtime {target_runtime}");
+        let title = format!("Download {id} ({target_runtime} variant) on {worker_name}");
         // Model files are tens of GB, so a HuggingFace pull runs far longer than
         // the task runner's 10-min MAX_TASK_DURATION default — without this
         // override the download is SIGKILLed mid-stream ("task exceeded max
@@ -2820,7 +2810,7 @@ fn job_json_row(r: &ff_db::ModelJobRow) -> serde_json::Value {
 fn human_size(size_bytes: i64) -> String {
     let gb = (size_bytes as f64) / 1024.0 / 1024.0 / 1024.0;
     if gb >= 1.0 {
-        format!("{:.1} GB", gb)
+        format!("{gb:.1} GB")
     } else {
         format!("{} MB", size_bytes / 1024 / 1024)
     }
@@ -2907,8 +2897,8 @@ async fn handle_model_where(pool: &sqlx::PgPool, query: &str, json: bool) -> any
         std::process::exit(1);
     }
     println!(
-        "{CYAN}{:<10} {:<28} {:<10} {:<8} {:<5} {:>9}  {}{RESET}",
-        "COMPUTER", "MODEL", "RUNTIME", "QUANT", "STATE", "SIZE", "PATH / last_used"
+        "{CYAN}{:<10} {:<28} {:<10} {:<8} {:<5} {:>9}  PATH / last_used{RESET}",
+        "COMPUTER", "MODEL", "RUNTIME", "QUANT", "STATE", "SIZE"
     );
     for (lib_id, worker, catalog, runtime, quant, size, path, last_used, state) in &rows {
         let size_s = human_size(*size);
@@ -2926,7 +2916,7 @@ async fn handle_model_where(pool: &sqlx::PgPool, query: &str, json: bool) -> any
             size_s,
             path
         );
-        println!("           id={}  last_used={}", lib_id, used);
+        println!("           id={lib_id}  last_used={used}");
     }
     Ok(())
 }
@@ -2943,6 +2933,7 @@ async fn handle_model_where(pool: &sqlx::PgPool, query: &str, json: bool) -> any
 ///   3. Rank candidates by (free_bytes desc, model_count asc) — prefer hosts
 ///      with most free disk that don't already hold many models.
 ///   4. Pick top candidate; print plan; transfer (unless --dry-run).
+///
 /// A disk-eligible distribution candidate host: online, enough free disk,
 /// not reserved. The slice handed to [`select_distribute_target`] is
 /// pre-sorted by free disk DESC then model_count ASC.
@@ -3056,8 +3047,7 @@ async fn handle_model_distribute(
 
     let source_gb = (size_bytes as f64) / 1024.0 / 1024.0 / 1024.0;
     println!(
-        "{CYAN}source{RESET}      {} on {} ({} runtime, {:.1} GB)",
-        catalog_id, source_worker, runtime, source_gb
+        "{CYAN}source{RESET}      {catalog_id} on {source_worker} ({runtime} runtime, {source_gb:.1} GB)"
     );
 
     // Step 2: build exclude set.
@@ -3140,9 +3130,7 @@ async fn handle_model_distribute(
     let pick = match select_distribute_target(&candidates, &excludes, &holders, pinned_to) {
         Ok(p) => p,
         Err(DistributeSelectError::NoCandidate) => anyhow::bail!(
-            "no candidate host with enough free disk (need {:.1} GB × 1.5; reserved hosts: taylor + DGX; excludes={:?})",
-            source_gb,
-            excludes
+            "no candidate host with enough free disk (need {source_gb:.1} GB × 1.5; reserved hosts: taylor + DGX; excludes={excludes:?})"
         ),
         Err(DistributeSelectError::AllAlreadyHold) => anyhow::bail!(
             "every disk-eligible host already holds a copy of '{catalog_id}' ({runtime} runtime) — nothing to distribute"
@@ -3233,8 +3221,8 @@ async fn handle_model_upgrade_available(pool: &sqlx::PgPool) -> anyhow::Result<(
     }
 
     println!(
-        "{CYAN}{:<24} {:<48} {:<14} {}{RESET}",
-        "MODEL", "UPSTREAM_REPO", "LATEST_REV", "LAST_CHECKED"
+        "{CYAN}{:<24} {:<48} {:<14} LAST_CHECKED{RESET}",
+        "MODEL", "UPSTREAM_REPO", "LATEST_REV"
     );
     for (id, upstream_id, rev, _statuses, last_checked) in &rows {
         let rev_short = rev

@@ -1780,8 +1780,8 @@ async fn run_doctor(pool: &PgPool, corpus: &str, limit: i64, format: &str) -> Re
              internal candidate):"
         );
         println!(
-            "  {:>6}  {:<40}  {}",
-            "FAN-IN", "EXTERN (resolved-to)", "INTERNAL CANDIDATE(S)"
+            "  {:>6}  {:<40}  INTERNAL CANDIDATE(S)",
+            "FAN-IN", "EXTERN (resolved-to)"
         );
         for s in suspicious {
             println!(
@@ -2033,7 +2033,7 @@ fn print_symbol_source(
                 let lineno = s.display_start as usize + i;
                 let in_span = lineno >= s.start_line as usize && lineno <= s.end_line as usize;
                 let gutter = if in_span { '\u{2502}' } else { '\u{250a}' };
-                println!("  {:>5} {} {}", lineno, gutter, line);
+                println!("  {lineno:>5} {gutter} {line}");
             }
             if s.truncated {
                 println!("{YELLOW}  \u{2026} (truncated; raise --max-lines to see more){RESET}");
@@ -2621,14 +2621,12 @@ async fn run_index(
 
     if verbose {
         println!(
-            "{CYAN}\u{2713} corpus '{}' indexed: {} file(s), {} node(s), {} edge(s){RESET}",
-            slug, total_files, total_symbols, total_edges
+            "{CYAN}\u{2713} corpus '{slug}' indexed: {total_files} file(s), {total_symbols} node(s), {total_edges} edge(s){RESET}"
         );
         println!("  try: ff cortex callers <symbol>   |   ff cortex status");
     } else {
         println!(
-            "{CYAN}\u{2713} re-indexed '{}': {} file(s), {} node(s), {} edge(s){RESET}",
-            slug, total_files, total_symbols, total_edges
+            "{CYAN}\u{2713} re-indexed '{slug}': {total_files} file(s), {total_symbols} node(s), {total_edges} edge(s){RESET}"
         );
     }
     // Surface wholesale lobe failures so a transient DB hiccup can't masquerade
@@ -3011,10 +3009,7 @@ async fn run_watch(
         .watch(root, RecursiveMode::Recursive)
         .map_err(|e| anyhow!("watch {}: {e}", root.display()))?;
 
-    println!(
-        "  watching for changes (debounce {}s) \u{2014} Ctrl-C to stop.",
-        debounce_secs
-    );
+    println!("  watching for changes (debounce {debounce_secs}s) \u{2014} Ctrl-C to stop.");
 
     let debounce = Duration::from_secs(debounce_secs.max(1));
     loop {
@@ -3024,12 +3019,8 @@ async fn run_watch(
         }
         // Debounce: drain any further events that land within the window so a
         // burst of edits collapses into a single re-index.
-        loop {
-            match rx.recv_timeout(debounce) {
-                Ok(()) => continue, // more changes — keep draining
-                Err(_) => break,    // quiet for `debounce` — go index
-            }
-        }
+        // more changes → keep draining; quiet for `debounce` → go index
+        while rx.recv_timeout(debounce).is_ok() {}
         println!(
             "{CYAN}\u{25b6} change detected \u{2014} re-indexing (incremental)\u{2026}{RESET}"
         );

@@ -881,7 +881,7 @@ async fn query_omni_endpoint() -> anyhow::Result<String> {
 
     let ip: String = row.try_get("ip")?;
     let port: i32 = row.try_get("port")?;
-    Ok(format!("http://{}:{}", ip, port))
+    Ok(format!("http://{ip}:{port}"))
 }
 
 // HTML parsing helpers
@@ -894,10 +894,10 @@ fn extract_meta(html: &str, start_tag: &str, end_tag: &str) -> Option<String> {
 fn extract_meta_attr(html: &str, property: &str) -> Option<String> {
     // Look for <meta property="og:title" content="..." /> or <meta name="description" content="..." />
     let patterns = [
-        format!("property=\"{}\" content=\"", property),
-        format!("property=\"{}\" content='", property),
-        format!("name=\"{}\" content=\"", property),
-        format!("name=\"{}\" content='", property),
+        format!("property=\"{property}\" content=\""),
+        format!("property=\"{property}\" content='"),
+        format!("name=\"{property}\" content=\""),
+        format!("name=\"{property}\" content='"),
     ];
     for pattern in &patterns {
         if let Some(start) = html.find(pattern.as_str()) {

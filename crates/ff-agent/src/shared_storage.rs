@@ -352,13 +352,10 @@ async fn configure_nfs_export(host: &ComputerInfo, export_path: &str) -> Result<
 
     let line = if os.starts_with("macos") {
         // macOS /etc/exports syntax: path -network <net> -mask <mask>
-        format!("{} -network 192.168.5.0 -mask 255.255.255.0", export_path)
+        format!("{export_path} -network 192.168.5.0 -mask 255.255.255.0")
     } else if os.starts_with("linux") {
         // Linux /etc/exports syntax: path client(options)
-        format!(
-            "{} {}(rw,sync,no_subtree_check,no_root_squash)",
-            export_path, subnet
-        )
+        format!("{export_path} {subnet}(rw,sync,no_subtree_check,no_root_squash)")
     } else {
         return Err(StorageError::UnsupportedOs(os));
     };

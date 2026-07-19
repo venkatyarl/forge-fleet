@@ -389,7 +389,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .current_project
         .as_ref()
         .map(|p| format!(" │ {} ({}) ", p.name, working_dir))
-        .unwrap_or_else(|| format!(" │ {} ", working_dir));
+        .unwrap_or_else(|| format!(" │ {working_dir} "));
 
     // Compact elapsed marker when an agent turn is in flight.
     let elapsed_marker = tab
@@ -488,7 +488,7 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("({})", stack_depth),
+            format!("({stack_depth})"),
             Style::default().fg(Color::Rgb(100, 116, 139)),
         ),
     ]));
@@ -545,7 +545,7 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("({})", backlog_count),
+            format!("({backlog_count})"),
             Style::default().fg(Color::Rgb(100, 116, 139)),
         ),
     ]));

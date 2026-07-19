@@ -68,7 +68,7 @@ impl BenchmarkReport {
             out.push_str("No endpoint samples available.\n");
         } else {
             for (endpoint, metrics) in &self.endpoint_summary {
-                out.push_str(&format!("### {}\n\n", endpoint));
+                out.push_str(&format!("### {endpoint}\n\n"));
                 out.push_str(&render_metrics(metrics));
                 out.push('\n');
             }

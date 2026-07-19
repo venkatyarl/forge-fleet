@@ -475,7 +475,7 @@ fn stable_digest(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
     let digest = hasher.finalize();
-    format!("{:x}", digest)[..16].to_string()
+    format!("{digest:x}")[..16].to_string()
 }
 
 #[cfg(test)]

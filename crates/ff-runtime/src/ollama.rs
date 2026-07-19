@@ -115,7 +115,7 @@ impl OllamaEngine {
 
     /// Wait for the health endpoint.
     async fn wait_for_health(&self, host: &str, port: u16, timeout: Duration) -> Result<()> {
-        let url = format!("http://{}:{}/api/tags", host, port);
+        let url = format!("http://{host}:{port}/api/tags");
         let start = Instant::now();
 
         loop {

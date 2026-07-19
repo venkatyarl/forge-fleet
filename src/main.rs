@@ -405,7 +405,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                 "tools": tools,
             });
             match tool_registry_client
-                .post(format!("{}/api/tools/register", gateway))
+                .post(format!("{gateway}/api/tools/register"))
                 .json(&register_body)
                 .send()
                 .await
@@ -422,7 +422,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        let _ = tool_registry_client.post(format!("{}/api/tools/heartbeat", gateway))
+                        let _ = tool_registry_client.post(format!("{gateway}/api/tools/heartbeat"))
                             .json(&serde_json::json!({"worker_name": name}))
                             .send().await;
                     }
@@ -1354,12 +1354,11 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                                     "dispatching ssh mesh auto-repair"
                                 );
                                 let command = format!(
-                                    "ff fleet ssh-mesh-check --node {} --repair --yes 2>&1 | tail -10",
-                                    dst
+                                    "ff fleet ssh-mesh-check --node {dst} --repair --yes 2>&1 | tail -10"
                                 );
                                 if let Err(e) = ff_agent::task_runner::pg_enqueue_shell_task(
                                     &pg_pool,
-                                    &format!("auto-mesh-repair: {} -> {}", src, dst),
+                                    &format!("auto-mesh-repair: {src} -> {dst}"),
                                     &command,
                                     &["ff".to_string()],
                                     Some(&name),
@@ -1379,7 +1378,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                                 let _ = ff_agent::telegram::send_telegram_from_secrets(
                                     &pg_pool,
                                     "SSH mesh auto-repair",
-                                    &format!("Repair dispatched: {} -> {} (attempts={})", src, dst, attempts),
+                                    &format!("Repair dispatched: {src} -> {dst} (attempts={attempts})"),
                                 )
                                 .await;
                             }
@@ -1524,14 +1523,12 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                                     .await;
 
                                     let command = format!(
-                                        "ff model download {} --force --node {}",
-                                        model_id, host
+                                        "ff model download {model_id} --force --node {host}"
                                     );
                                     if let Err(e) = ff_agent::task_runner::pg_enqueue_shell_task(
                                         &pg_pool,
                                         &format!(
-                                            "model-auto-upgrade: {} on {} -> rev {}",
-                                            model_id, host, revision_short
+                                            "model-auto-upgrade: {model_id} on {host} -> rev {revision_short}"
                                         ),
                                         &command,
                                         &["ff".to_string()],
@@ -1553,8 +1550,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                                         &pg_pool,
                                         "Model auto-upgrade",
                                         &format!(
-                                            "Re-downloading {} on {} (HF rev {})",
-                                            model_id, host, revision_short
+                                            "Re-downloading {model_id} on {host} (HF rev {revision_short})"
                                         ),
                                     )
                                     .await;
@@ -2526,9 +2522,7 @@ fn start_evolution_subsystem(
                     }
 
                     let summary = format!(
-                        "fleet health observation: {}/{} unhealthy nodes",
-                        unhealthy_count,
-                        total_nodes
+                        "fleet health observation: {unhealthy_count}/{total_nodes} unhealthy nodes"
                     );
 
                     let log = unhealthy_nodes
@@ -2871,7 +2865,7 @@ fn start_self_heal_subsystem(
                         .unwrap_or_default();
 
                     for (name, ip, restart_cmd) in &fleet_workers {
-                        let url = format!("http://{}:55000/health", ip);
+                        let url = format!("http://{ip}:55000/health");
                         match client.get(&url).send().await {
                             Ok(r) if r.status().is_success() => { fleet_healthy += 1; }
                             _ => {
@@ -2880,9 +2874,8 @@ fn start_self_heal_subsystem(
                                 // Attempt remote restart via SSH with node-specific command
                                 if loop_cfg.auto_adopt && !restart_cmd.is_empty() {
                                     let ssh_cmd = format!(
-                                        "ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no {}@{} \
-                                         'pgrep -f llama-server || ({})' 2>/dev/null",
-                                        name, ip, restart_cmd
+                                        "ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no {name}@{ip} \
+                                         'pgrep -f llama-server || ({restart_cmd})' 2>/dev/null"
                                     );
                                     let _ = tokio::process::Command::new("bash")
                                         .arg("-c")
@@ -3878,7 +3871,7 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
                 && !model_slug.starts_with("claude")
                 && !model_slug.starts_with("gemini");
             backends.push(BackendEndpoint {
-                id: format!("{}:{}:{}", worker_name, model_slug, port),
+                id: format!("{worker_name}:{model_slug}:{port}"),
                 node: worker_name.clone(),
                 host: node_cfg.ip.clone(),
                 port,

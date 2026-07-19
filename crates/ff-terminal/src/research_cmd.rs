@@ -120,7 +120,7 @@ pub async fn handle_research(
         config.planner_model,
         config.subagent_model
     );
-    eprintln!("\x1b[2m  Query: {}{RESET}\n", prompt);
+    eprintln!("\x1b[2m  Query: {prompt}{RESET}\n");
 
     let session = ff_agent::research::ResearchSession::new(pool, config)
         .await
@@ -168,23 +168,6 @@ pub async fn handle_research(
     eprintln!();
     println!("{}", report.markdown);
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_exclude_names;
-
-    #[test]
-    fn parse_exclude_names_trims_dedups_and_drops_empties() {
-        assert_eq!(parse_exclude_names(""), Vec::<String>::new());
-        assert_eq!(parse_exclude_names("  "), Vec::<String>::new());
-        assert_eq!(
-            parse_exclude_names("sia, adele ,rihanna"),
-            vec!["sia", "adele", "rihanna"]
-        );
-        assert_eq!(parse_exclude_names(",taylor,,"), vec!["taylor"]);
-        assert_eq!(parse_exclude_names("sia,sia,adele"), vec!["sia", "adele"]);
-    }
 }
 
 /// `ff research --show <session-id>` — read-only status + report for a session.
@@ -327,4 +310,21 @@ pub async fn handle_research_recover(session_id: &str, output: Option<PathBuf>) 
     eprintln!();
     println!("{}", report.markdown);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_exclude_names;
+
+    #[test]
+    fn parse_exclude_names_trims_dedups_and_drops_empties() {
+        assert_eq!(parse_exclude_names(""), Vec::<String>::new());
+        assert_eq!(parse_exclude_names("  "), Vec::<String>::new());
+        assert_eq!(
+            parse_exclude_names("sia, adele ,rihanna"),
+            vec!["sia", "adele", "rihanna"]
+        );
+        assert_eq!(parse_exclude_names(",taylor,,"), vec!["taylor"]);
+        assert_eq!(parse_exclude_names("sia,sia,adele"), vec!["sia", "adele"]);
+    }
 }

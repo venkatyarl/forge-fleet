@@ -540,7 +540,7 @@ async fn publish_beat(
     };
 
     // SET pulse:computer:{name} <json> EX 45
-    let key = format!("pulse:computer:{}", name);
+    let key = format!("pulse:computer:{name}");
     let _: () = conn.set_ex(&key, &signed, 45).await?;
 
     // PUBLISH pulse:events <json>
@@ -1334,8 +1334,7 @@ mod tests {
                 kind.as_str(),
                 "apple_silicon" | "nvidia_cuda" | "amd_rocm" | "none"
             ),
-            "unexpected gpu_kind: {}",
-            kind
+            "unexpected gpu_kind: {kind}"
         );
     }
 

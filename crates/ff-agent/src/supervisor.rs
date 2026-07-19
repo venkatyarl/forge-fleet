@@ -176,11 +176,10 @@ pub async fn supervise(
                     let reminder = format!(
                         "CRITICAL: the previous attempt did not create the required files. \
                          You MUST invoke the Write tool (or Edit if the file exists) to create \
-                         each of these files with the content described below:\n{}\n\n",
-                        paths_list
+                         each of these files with the content described below:\n{paths_list}\n\n"
                     );
                     let existing = agent_config.system_prompt.take().unwrap_or_default();
-                    agent_config.system_prompt = Some(format!("{}\n{}", reminder, existing));
+                    agent_config.system_prompt = Some(format!("{reminder}\n{existing}"));
                     let delay = sup_config.retry_delay_ms * (1u64 << attempt);
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     continue;
@@ -228,11 +227,10 @@ pub async fn supervise(
                             "CRITICAL: the previous attempt left placeholder strings in the \
                              deliverable files. You MUST use the Edit tool to replace EVERY \
                              occurrence of these placeholders with real content before stopping:\n\
-                             {}\n\nVerify with `grep -c` before declaring done.\n\n",
-                            hits_list
+                             {hits_list}\n\nVerify with `grep -c` before declaring done.\n\n"
                         );
                         let existing = agent_config.system_prompt.take().unwrap_or_default();
-                        agent_config.system_prompt = Some(format!("{}\n{}", reminder, existing));
+                        agent_config.system_prompt = Some(format!("{reminder}\n{existing}"));
                         let delay = sup_config.retry_delay_ms * (1u64 << attempt);
                         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                         continue;
@@ -515,15 +513,14 @@ fn diagnose_and_fix(
         },
         FailureType::ToolLoop { tool, count } => {
             let fix = format!(
-                "You previously called {} {} times in a row. This approach is NOT working. \
-                 Try a completely different strategy. Do not repeat the same tool call.",
-                tool, count
+                "You previously called {tool} {count} times in a row. This approach is NOT working. \
+                 Try a completely different strategy. Do not repeat the same tool call."
             );
             inject_system_addendum(config, &fix);
             FailureDiagnosis {
                 attempt,
-                failure_type: format!("tool_loop({}×{})", tool, count),
-                evidence: format!("{} called {} times with similar args", tool, count),
+                failure_type: format!("tool_loop({tool}×{count})"),
+                evidence: format!("{tool} called {count} times with similar args"),
                 fix_applied: "Injected anti-loop instruction into system prompt".into(),
             }
         }
@@ -534,7 +531,7 @@ fn diagnose_and_fix(
             inject_system_addendum(config, fix);
             FailureDiagnosis {
                 attempt,
-                failure_type: format!("early_stop({} tools)", tool_count),
+                failure_type: format!("early_stop({tool_count} tools)"),
                 evidence: "Agent stopped with only intent language, no tool calls".into(),
                 fix_applied: "Injected tool-use enforcement".into(),
             }
@@ -560,8 +557,8 @@ fn diagnose_and_fix(
             inject_system_addendum(config, fix);
             FailureDiagnosis {
                 attempt,
-                failure_type: format!("consecutive_errors({})", count),
-                evidence: format!("{} tool calls failed", count),
+                failure_type: format!("consecutive_errors({count})"),
+                evidence: format!("{count} tool calls failed"),
                 fix_applied: "Injected error-recovery guidance".into(),
             }
         }
@@ -699,8 +696,7 @@ pub fn extract_prompt_paths(prompt: &str) -> Vec<std::path::PathBuf> {
 fn inject_system_addendum(config: &mut AgentSessionConfig, instruction: &str) {
     let current = config.system_prompt.clone().unwrap_or_default();
     config.system_prompt = Some(format!(
-        "{}\n\n## IMPORTANT (Supervisor Recovery)\n{}",
-        current, instruction
+        "{current}\n\n## IMPORTANT (Supervisor Recovery)\n{instruction}"
     ));
 }
 
@@ -743,13 +739,13 @@ mod tests {
         let p = extract_prompt_paths(
             "Hit https://example.com/api on 192.168.5.100, version 2026.6.14, repo github.com mirror",
         );
-        assert!(p.is_empty(), "unexpected paths extracted: {:?}", p);
+        assert!(p.is_empty(), "unexpected paths extracted: {p:?}");
     }
 
     #[test]
     fn rejects_unknown_extensions() {
         let p = extract_prompt_paths("the value is 3.14159 and the ratio a.b are fine");
-        assert!(p.is_empty(), "unexpected paths extracted: {:?}", p);
+        assert!(p.is_empty(), "unexpected paths extracted: {p:?}");
     }
 
     #[test]

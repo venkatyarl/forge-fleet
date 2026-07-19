@@ -76,28 +76,6 @@ fn provider_cooldown_minutes(category: &str) -> i64 {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{headroom_hint_for_category, provider_cooldown_minutes};
-
-    #[test]
-    fn provider_cooldown_minutes_maps_provider_categories() {
-        assert_eq!(provider_cooldown_minutes("rate_limited"), 10);
-        assert_eq!(provider_cooldown_minutes("quota_exhausted"), 10);
-        assert_eq!(provider_cooldown_minutes("local_codegen_unavailable"), 20);
-        assert_eq!(provider_cooldown_minutes("overloaded"), 2);
-        assert_eq!(provider_cooldown_minutes("transient_5xx"), 2);
-    }
-
-    #[test]
-    fn headroom_hint_for_category_maps_usage_signals() {
-        assert_eq!(headroom_hint_for_category("quota_exhausted"), Some(0.0));
-        assert_eq!(headroom_hint_for_category("rate_limited"), Some(8.0));
-        assert_eq!(headroom_hint_for_category("overloaded"), Some(12.0));
-        assert_eq!(headroom_hint_for_category("bad_request"), None);
-    }
-}
-
 /// Record a provider-level failure against `fleet_backend_health`. Returns
 /// `true` if the breaker tripped open on this call. The 5-min rolling window
 /// resets when stale. Trip condition (council): ≥5 errors in the window, OR
@@ -277,4 +255,26 @@ pub async fn is_quarantined(pool: &PgPool, worker_name: &str) -> Result<bool, sq
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|c| c.0 > 0).unwrap_or(false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{headroom_hint_for_category, provider_cooldown_minutes};
+
+    #[test]
+    fn provider_cooldown_minutes_maps_provider_categories() {
+        assert_eq!(provider_cooldown_minutes("rate_limited"), 10);
+        assert_eq!(provider_cooldown_minutes("quota_exhausted"), 10);
+        assert_eq!(provider_cooldown_minutes("local_codegen_unavailable"), 20);
+        assert_eq!(provider_cooldown_minutes("overloaded"), 2);
+        assert_eq!(provider_cooldown_minutes("transient_5xx"), 2);
+    }
+
+    #[test]
+    fn headroom_hint_for_category_maps_usage_signals() {
+        assert_eq!(headroom_hint_for_category("quota_exhausted"), Some(0.0));
+        assert_eq!(headroom_hint_for_category("rate_limited"), Some(8.0));
+        assert_eq!(headroom_hint_for_category("overloaded"), Some(12.0));
+        assert_eq!(headroom_hint_for_category("bad_request"), None);
+    }
 }

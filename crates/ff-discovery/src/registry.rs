@@ -431,7 +431,7 @@ impl NodeRegistry {
                         http_ok: None,
                         http_status: None,
                         status: HealthStatus::Unreachable,
-                        error: Some(format!("stale: no heartbeat for {}s", elapsed)),
+                        error: Some(format!("stale: no heartbeat for {elapsed}s")),
                     });
                 }
 

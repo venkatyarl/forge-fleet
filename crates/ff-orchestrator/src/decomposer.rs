@@ -504,7 +504,7 @@ fn generate_title(prompt: &str, task_type: SubTaskType) -> String {
     if snippet.len() > 40 {
         format!("[{}] {}…", task_type, &snippet[..40])
     } else {
-        format!("[{}] {}", task_type, snippet)
+        format!("[{task_type}] {snippet}")
     }
 }
 

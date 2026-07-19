@@ -82,7 +82,7 @@ async fn handle_list(pool: &sqlx::PgPool, json: bool) -> Result<()> {
             a.hostname, a.ssh_user, a.identity_file
         );
         if let Some(d) = &a.description {
-            println!("    {}", d);
+            println!("    {d}");
         }
         let secret_base = secret_base_for(&a.identity_file);
         let priv_key = format!("{secret_base}_priv");
@@ -191,7 +191,7 @@ async fn handle_sync(pool: &sqlx::PgPool, dry_run: bool) -> Result<()> {
                 ssh_config.display()
             );
             for line in to_append.lines() {
-                println!("    {}", line);
+                println!("    {line}");
             }
         } else {
             let mut combined = existing_cfg;

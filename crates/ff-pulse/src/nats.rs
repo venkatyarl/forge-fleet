@@ -53,7 +53,7 @@ pub async fn publish_pulse_beat(computer_name: &str, beat: &PulseBeatV2) {
     let Some(client) = get_or_init_nats().await else {
         return;
     };
-    let subject = format!("fleet.pulse.{}", computer_name);
+    let subject = format!("fleet.pulse.{computer_name}");
     let bytes = match serde_json::to_vec(beat) {
         Ok(b) => b,
         Err(_) => return,

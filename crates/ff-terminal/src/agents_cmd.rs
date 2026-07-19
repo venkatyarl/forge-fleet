@@ -72,8 +72,8 @@ async fn list_cmd(pool: &sqlx::PgPool, all: bool, source: Option<String>) -> Res
         .collect();
 
     println!(
-        "{:<16} {:<18} {:<10} {:<8} {:<3} {}",
-        "NAME", "ROLE", "SOURCE", "MIN_CTX", "EN", "DESCRIPTION"
+        "{:<16} {:<18} {:<10} {:<8} {:<3} DESCRIPTION",
+        "NAME", "ROLE", "SOURCE", "MIN_CTX", "EN"
     );
     for a in &filtered {
         let desc = a.description.as_deref().unwrap_or("");

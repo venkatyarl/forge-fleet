@@ -183,8 +183,7 @@ impl WhisperApiClient {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(VoiceError::Stt(format!(
-                "whisper api error {}: {}",
-                status, body
+                "whisper api error {status}: {body}"
             )));
         }
 

@@ -176,8 +176,7 @@ pub async fn handle_status_inner(p: PathBuf) -> Result<()> {
                 };
                 let over = used_pct >= quota as f64;
                 let line = format!(
-                    "  {:<10} {:5.1}/{:5.1} GiB ({:4.1}%)  models {:5.1} GiB  quota {}%",
-                    name, used_gib, total_gib, used_pct, models_gib, quota
+                    "  {name:<10} {used_gib:5.1}/{total_gib:5.1} GiB ({used_pct:4.1}%)  models {models_gib:5.1} GiB  quota {quota}%"
                 );
                 if over {
                     println!("{RED}{line}{RESET}");
@@ -300,7 +299,7 @@ async fn render_fleet_section(pool: &sqlx::PgPool) {
     {
         Ok(r) => r,
         Err(e) => {
-            println!("{CYAN}Fleet{RESET}     : {RED}✗ query failed: {}{RESET}", e);
+            println!("{CYAN}Fleet{RESET}     : {RED}✗ query failed: {e}{RESET}");
             return;
         }
     };

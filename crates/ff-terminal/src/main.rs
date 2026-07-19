@@ -437,7 +437,7 @@ enum Command {
         /// Disable auto-detection of deliverable paths from the prompt. By
         /// default, when no explicit `--verify-files` are given, ff scans the
         /// prompt for file paths (e.g. `write foo.rs`) and verifies they exist
-        /// + are non-empty before declaring success — closing the silent
+        /// and are non-empty before declaring success — closing the silent
         /// false-positive gap. Pass this for tasks whose output isn't a file
         /// (analysis, fleet commands) so auto-detected paths don't cause
         /// spurious retries.
@@ -4255,7 +4255,7 @@ async fn main() -> Result<()> {
 
     // If model is "auto", query the LLM server for its actual model name
     static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
-        std::sync::LazyLock::new(|| reqwest::Client::new());
+        std::sync::LazyLock::new(reqwest::Client::new);
 
     if model == "auto" {
         let detect_url = format!("{}/v1/models", llm.trim_end_matches('/'));
@@ -4785,8 +4785,7 @@ async fn main() -> Result<()> {
                         let goal = r.get("goal").and_then(|v| v.as_str()).unwrap_or("");
                         let goal_short: String = goal.chars().take(60).collect();
                         println!(
-                            "{:<36} {:<10} {:<6} {:<6} {:<6} {}",
-                            id, status, done, failed, total, goal_short
+                            "{id:<36} {status:<10} {done:<6} {failed:<6} {total:<6} {goal_short}"
                         );
                     }
                     Ok(())
@@ -5262,8 +5261,7 @@ async fn main() -> Result<()> {
             // attempts (same logic as the local supervisor uses).
             if !backend.eq_ignore_ascii_case("local") {
                 eprintln!(
-                    "{CYAN}▶ ForgeFleet Supervisor{RESET} (backend={backend}, {} attempt(s) max)",
-                    max_attempts
+                    "{CYAN}▶ ForgeFleet Supervisor{RESET} (backend={backend}, {max_attempts} attempt(s) max)"
                 );
                 let mut last_err = String::new();
                 for attempt in 1..=max_attempts {
@@ -5340,7 +5338,7 @@ async fn main() -> Result<()> {
                 agent_config.model
             );
             let prompt_preview: String = prompt.chars().take(80).collect();
-            eprintln!("\x1b[2m  Task: {}{RESET}", prompt_preview);
+            eprintln!("\x1b[2m  Task: {prompt_preview}{RESET}");
             eprintln!("\x1b[2m  Max attempts: {max_attempts}{RESET}");
             if !verify_files.is_empty() {
                 eprintln!(
@@ -5400,7 +5398,7 @@ async fn main() -> Result<()> {
             // inside a multi-byte UTF-8 char (e.g. box-drawing '─' in cargo
             // output). See feedback_ff_supervise_utf8_panic.md.
             let preview: String = result.final_output.chars().take(500).collect();
-            println!("{}", preview);
+            println!("{preview}");
             Ok(())
         }
         Some(Command::Research {
@@ -5524,6 +5522,7 @@ fn is_prose_function_word(t: &str) -> bool {
 ///      token (`-c`, `--json`, …) appears later — i.e. `ff db psql -c "…"`;
 ///   4. it is a SHORT (2–3 token) sequence of all-command-shaped tokens with no
 ///      English function word — i.e. `ff db psql`, `ff modle ls`, `ff cortx indx`.
+///
 /// Shapes 3 & 4 are the dangerous cases the single-word guard missed: a typo'd
 /// multi-word subcommand used to fall through to the free-text agent dispatcher,
 /// which once HALLUCINATED a fake psql result AND once *attempted* `rm -rf` on a
@@ -5853,7 +5852,7 @@ async fn run_tui(config: AgentSessionConfig) -> Result<()> {
 /// Check fleet node health on startup.
 async fn check_fleet_health(app: &mut App) {
     static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
-        std::sync::LazyLock::new(|| reqwest::Client::new());
+        std::sync::LazyLock::new(reqwest::Client::new);
     for node in &mut app.fleet_workers {
         // Check daemon
         let daemon_url = format!(
@@ -6079,8 +6078,7 @@ async fn run_event_loop(
                             app.tab_mut()
                                 .messages
                                 .push(ff_terminal::messages::render_status(&format!(
-                                    "Queued: \"{}\" — will send when agent finishes.",
-                                    preview
+                                    "Queued: \"{preview}\" — will send when agent finishes."
                                 )));
                             app.tab_mut().input.text.clear();
                             app.tab_mut().input.cursor = 0;
@@ -6710,7 +6708,7 @@ pub fn kick_fleet_health_refresh(current_nodes: &[ff_terminal::app::FleetCompute
     let nodes_snapshot = current_nodes.to_vec();
 
     static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
-        std::sync::LazyLock::new(|| reqwest::Client::new());
+        std::sync::LazyLock::new(reqwest::Client::new);
 
     tokio::spawn(async move {
         let mut refreshed = nodes_snapshot;
@@ -7477,9 +7475,7 @@ async fn handle_stack_host_rank(
 
     if filtered.is_empty() {
         anyhow::bail!(
-            "no eligible host: need {} GB RAM, not Taylor, not DGX, not in excludes={:?}",
-            min_ram_gb,
-            excludes
+            "no eligible host: need {min_ram_gb} GB RAM, not Taylor, not DGX, not in excludes={excludes:?}"
         );
     }
 
@@ -7500,8 +7496,8 @@ async fn handle_stack_host_rank(
     }
 
     println!(
-        "{CYAN}{:<10} {:<6} {:<18} {:<6} {}{RESET}",
-        "HOST", "RAM_GB", "CLASS", "LLMS", "STATUS"
+        "{CYAN}{:<10} {:<6} {:<18} {:<6} STATUS{RESET}",
+        "HOST", "RAM_GB", "CLASS", "LLMS"
     );
     for (i, (name, os_family, gpu_kind, ram, load)) in filtered.iter().enumerate() {
         let marker = if i == 0 { "← pick" } else { "" };

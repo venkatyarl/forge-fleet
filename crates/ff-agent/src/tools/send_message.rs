@@ -99,7 +99,7 @@ impl AgentTool for SendMessageTool {
 async fn resolve_node_url(name: &str) -> String {
     // Try DB first
     if let Ok(ip) = lookup_node_ip_from_db(name).await {
-        return format!("http://{}:50002/agent/message", ip);
+        return format!("http://{ip}:50002/agent/message");
     }
     // Fallback to known-good table
     let known: std::collections::HashMap<&str, &str> = [
@@ -116,9 +116,9 @@ async fn resolve_node_url(name: &str) -> String {
     ]
     .into();
     if let Some(ip) = known.get(name.to_lowercase().as_str()) {
-        format!("http://{}:50002/agent/message", ip)
+        format!("http://{ip}:50002/agent/message")
     } else {
-        format!("http://{}:50002/agent/message", name)
+        format!("http://{name}:50002/agent/message")
     }
 }
 

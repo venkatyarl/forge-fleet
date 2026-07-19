@@ -89,8 +89,7 @@ fn parse_blame_porcelain(output: &str) -> String {
                 let author_preview: String = current_author.chars().take(20).collect();
                 let summary_preview: String = current_summary.chars().take(40).collect();
                 result.push_str(&format!(
-                    "{line_num:>4} | {:<20} | {:<40} | {code}\n",
-                    author_preview, summary_preview
+                    "{line_num:>4} | {author_preview:<20} | {summary_preview:<40} | {code}\n"
                 ));
             }
         }

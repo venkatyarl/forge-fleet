@@ -118,10 +118,7 @@ impl PriorityQueue {
     /// Enqueue a task at the given priority.
     pub fn enqueue(&mut self, task: QueuedTask, priority: TaskPriority) {
         let id = task.id;
-        self.buckets
-            .entry(priority)
-            .or_insert_with(VecDeque::new)
-            .push_back(task);
+        self.buckets.entry(priority).or_default().push_back(task);
         self.index.insert(id, priority);
 
         debug!(task_id = %id, priority = %priority, "task enqueued");
@@ -320,7 +317,7 @@ impl PriorityQueue {
                     self.index.insert(task_id, new_priority);
                     self.buckets
                         .entry(new_priority)
-                        .or_insert_with(VecDeque::new)
+                        .or_default()
                         .push_back(task);
 
                     info!(

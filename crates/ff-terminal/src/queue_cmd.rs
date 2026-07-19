@@ -105,7 +105,7 @@ pub async fn handle_queue() -> Result<()> {
     println!("{:<12} {:>8}", "STATUS", "COUNT");
     for status in FLEET_TASK_STATUSES {
         let count = fleet_counts.get(*status).copied().unwrap_or(0);
-        println!("{:<12} {:>8}", status, count);
+        println!("{status:<12} {count:>8}");
     }
 
     println!("\n{CYAN}fleet_tasks by task_class{RESET}");

@@ -163,7 +163,7 @@ impl DistillationPipeline {
 
             // Generate fresh data
             let prompts: Vec<String> = (0..self.config.dataset_size)
-                .map(|i| format!("Synthetic prompt {} (attempt {})", i, attempt))
+                .map(|i| format!("Synthetic prompt {i} (attempt {attempt})"))
                 .collect();
             self.generate_data(prompts).await;
 

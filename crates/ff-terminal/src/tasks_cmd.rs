@@ -251,7 +251,7 @@ pub async fn handle_tasks_list(
         let created_at: chrono::DateTime<chrono::Utc> = r.try_get("created_at")?;
         let age_secs = (chrono::Utc::now() - created_at).num_seconds().max(0) as u64;
         let age_str = if age_secs < 60 {
-            format!("{}s", age_secs)
+            format!("{age_secs}s")
         } else if age_secs < 3600 {
             format!("{}m", age_secs / 60)
         } else if age_secs < 86400 {
@@ -259,9 +259,7 @@ pub async fn handle_tasks_list(
         } else {
             format!("{}d", age_secs / 86400)
         };
-        let pct_str = pct
-            .map(|p| format!("{:.0}", p))
-            .unwrap_or_else(|| "-".into());
+        let pct_str = pct.map(|p| format!("{p:.0}")).unwrap_or_else(|| "-".into());
         let ty_short: String = ty.chars().take(20).collect();
         let status_short: String = status.chars().take(12).collect();
         let summary_short: String = summary.chars().take(60).collect();
@@ -454,7 +452,7 @@ pub async fn handle_tasks_get(pg: &PgPool, id: uuid::Uuid, json: bool, watch: bo
     println!("Summary:         {summary}");
     println!("Status:          {status}");
     println!("Priority:        {priority}");
-    println!("Capabilities:    {}", caps);
+    println!("Capabilities:    {caps}");
     println!("Claimed by:      {}", claimer.as_deref().unwrap_or("-"));
     if handoff_count > 0 {
         println!(

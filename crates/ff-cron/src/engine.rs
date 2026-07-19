@@ -189,7 +189,7 @@ impl CronEngine {
             }) => {
                 run.mark_success(output);
                 if let Some(existing) = run.output.clone() {
-                    run.output = Some(format!("{}\n(duration_ms={})", existing, duration_ms));
+                    run.output = Some(format!("{existing}\n(duration_ms={duration_ms})"));
                 }
 
                 job.note_success(now)?;
@@ -199,10 +199,7 @@ impl CronEngine {
                 task_id,
                 worker_hint,
             }) => {
-                run.mark_dispatched(
-                    worker_hint,
-                    format!("queued to ff-mesh task_id={}", task_id),
-                );
+                run.mark_dispatched(worker_hint, format!("queued to ff-mesh task_id={task_id}"));
 
                 // Treat dispatch as accepted; next recurrence follows cron schedule.
                 job.note_success(now)?;

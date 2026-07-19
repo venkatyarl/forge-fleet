@@ -78,7 +78,7 @@ impl AgentTool for ColorPaletteTool {
                         }
                     };
                     let (nr, ng, nb) = hsl_to_rgb(offset.0, offset.1, offset.2);
-                    palette.push(format!("#{:02x}{:02x}{:02x}", nr, ng, nb));
+                    palette.push(format!("#{nr:02x}{ng:02x}{nb:02x}"));
                 }
                 AgentToolResult::ok(format!(
                     "Color Palette ({style}):\n\n{}\n\nCSS variables:\n{}",
@@ -224,8 +224,7 @@ impl AgentTool for AccessibilityCheckTool {
         let label_count = lower.matches("<label").count();
         if input_count > label_count {
             issues.push(format!(
-                "⚠ Form inputs without labels: {} inputs but only {} labels",
-                input_count, label_count
+                "⚠ Form inputs without labels: {input_count} inputs but only {label_count} labels"
             ));
         }
 

@@ -81,7 +81,7 @@ pub async fn vector_search(query: &str, top_k: i64, pg: &PgPool) -> anyhow::Resu
 pub async fn hybrid_search(query: &str, top_k: i64, pg: &PgPool) -> anyhow::Result<Vec<VaultNode>> {
     let embedding = generate_embedding_with_pool(query, pg).await;
     let embedding_str = embedding_to_pgvector(&embedding);
-    let pattern = format!("%{}%", query);
+    let pattern = format!("%{query}%");
 
     // ── Vector candidates ──────────────────────────────────────────────
     // V78 only adds the `embedding` column when the pgvector extension is

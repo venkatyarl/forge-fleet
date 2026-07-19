@@ -228,7 +228,7 @@ fn try_parse_single_tool_call(parsed: &serde_json::Value, index: usize) -> Optio
     let arguments = find_args(obj).unwrap_or_else(|| "{}".to_string());
 
     Some(ToolCall {
-        id: format!("call_text_{}", index),
+        id: format!("call_text_{index}"),
         call_type: "function".to_string(),
         function: FunctionCall { name, arguments },
     })

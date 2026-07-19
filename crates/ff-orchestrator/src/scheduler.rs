@@ -497,11 +497,7 @@ impl Scheduler {
     ///
     /// When multiple candidates have similar scores (within 5%), rotate
     /// among them to distribute work from the same project across nodes.
-    fn apply_fairness_tiebreak(
-        &mut self,
-        candidates: &mut Vec<(String, f64)>,
-        task: &ScheduledTask,
-    ) {
+    fn apply_fairness_tiebreak(&mut self, candidates: &mut [(String, f64)], task: &ScheduledTask) {
         if candidates.is_empty() {
             return;
         }
@@ -708,7 +704,7 @@ mod tests {
             ScheduleDecision::Assign { worker_name, .. } => {
                 assert_eq!(worker_name, "taylor", "GPU task must go to GPU node");
             }
-            other => panic!("Expected Assign, got {:?}", other),
+            other => panic!("Expected Assign, got {other:?}"),
         }
     }
 
@@ -724,7 +720,7 @@ mod tests {
             ScheduleDecision::Queue { reason } => {
                 assert!(reason.contains("insufficient resources"));
             }
-            other => panic!("Expected Queue, got {:?}", other),
+            other => panic!("Expected Queue, got {other:?}"),
         }
     }
 
@@ -753,7 +749,7 @@ mod tests {
                 assert_eq!(worker_name, "james");
                 assert_eq!(*evict_task_id, bg_task.id);
             }
-            other => panic!("Expected Preempt, got {:?}", other),
+            other => panic!("Expected Preempt, got {other:?}"),
         }
     }
 
@@ -803,7 +799,7 @@ mod tests {
             ScheduleDecision::Queue { reason } => {
                 assert!(reason.contains("no nodes online"));
             }
-            other => panic!("Expected Queue, got {:?}", other),
+            other => panic!("Expected Queue, got {other:?}"),
         }
     }
 
@@ -814,9 +810,9 @@ mod tests {
 
         // Schedule 4 tasks, each using 4 CPU / 16 GiB
         for i in 0..4 {
-            let task = make_task(&format!("task-{}", i), 4, 16, false);
+            let task = make_task(&format!("task-{i}"), 4, 16, false);
             let decision = scheduler.schedule_task(&task);
-            assert!(decision.is_assigned(), "task {} should be assigned", i);
+            assert!(decision.is_assigned(), "task {i} should be assigned");
         }
 
         // 5th task should be queued (no capacity left)

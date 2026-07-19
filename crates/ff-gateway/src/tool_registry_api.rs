@@ -88,14 +88,11 @@ pub async fn list_tools(
     // into the SQL string itself.
     let mut next_param = 1;
     if query.node.is_some() {
-        sql.push_str(&format!(" AND worker_name = ${}", next_param));
+        sql.push_str(&format!(" AND worker_name = ${next_param}"));
         next_param += 1;
     }
     if query.name.is_some() {
-        sql.push_str(&format!(
-            " AND tool_name ILIKE '%' || ${} || '%'",
-            next_param
-        ));
+        sql.push_str(&format!(" AND tool_name ILIKE '%' || ${next_param} || '%'"));
         // next_param would be incremented here if more clauses followed.
     }
     if query.unhealthy == Some(true) {

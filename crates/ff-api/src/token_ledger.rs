@@ -717,8 +717,7 @@ mod tests {
         let cost = pricing.calculate_cost(1000, 500);
         assert!(
             (cost - 0.00750).abs() < 0.00001,
-            "cost should be ~0.00750, got {}",
-            cost
+            "cost should be ~0.00750, got {cost}"
         );
     }
 

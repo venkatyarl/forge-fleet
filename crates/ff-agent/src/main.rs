@@ -221,7 +221,7 @@ async fn run_tool_registry_reporter(
         "tools": tools,
     });
 
-    let register_url = format!("{}/api/tools/register", gateway);
+    let register_url = format!("{gateway}/api/tools/register");
     match client.post(&register_url).json(&register_body).send().await {
         Ok(resp) => {
             if resp.status().is_success() {
@@ -247,7 +247,7 @@ async fn run_tool_registry_reporter(
         }
 
         let heartbeat_body = serde_json::json!({"worker_name": node_id});
-        let heartbeat_url = format!("{}/api/tools/heartbeat", gateway);
+        let heartbeat_url = format!("{gateway}/api/tools/heartbeat");
         match client
             .post(&heartbeat_url)
             .json(&heartbeat_body)

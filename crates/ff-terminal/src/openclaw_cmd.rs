@@ -75,14 +75,11 @@ pub async fn handle_openclaw(cmd: crate::OpenclawCommand) -> Result<()> {
                     _ => mode_s.to_string(),
                 };
                 let mode_pad = if matches!(mode_s, "gateway" | "node") {
-                    format!("{:<8}", mode_colored)
+                    format!("{mode_colored:<8}")
                 } else {
-                    format!("{:<8}", mode_s)
+                    format!("{mode_s:<8}")
                 };
-                println!(
-                    "{:<14} {:<16} {} {:<34} {:<22} {}",
-                    name, ip, mode_pad, url_s, ts_s, ver_s
-                );
+                println!("{name:<14} {ip:<16} {mode_pad} {url_s:<34} {ts_s:<22} {ver_s}");
             }
         }
         crate::OpenclawCommand::Devices { command } => {

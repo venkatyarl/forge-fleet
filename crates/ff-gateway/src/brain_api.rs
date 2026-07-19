@@ -510,8 +510,7 @@ async fn generate_brain_reply(
     }
 
     Err(anyhow::anyhow!(
-        "no LLM backend available for model '{}'. Start a local model or configure a cloud provider.",
-        model
+        "no LLM backend available for model '{model}'. Start a local model or configure a cloud provider."
     ))
 }
 

@@ -685,7 +685,7 @@ impl OperationalStore {
         limit: u32,
     ) -> Result<Vec<(String, String)>, DbError> {
         let clamped = limit.clamp(1, 10_000) as i64;
-        let like_pattern = format!("{}%", prefix);
+        let like_pattern = format!("{prefix}%");
 
         match self {
             Self::Postgres(pool) => {

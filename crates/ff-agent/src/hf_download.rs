@@ -82,13 +82,13 @@ impl TreeEntry {
 pub fn compute_file_sha256(path: &Path) -> Result<String, String> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)
-        .map_err(|e| format!("failed to open {:?} for hashing: {e}", path))?;
+        .map_err(|e| format!("failed to open {path:?} for hashing: {e}"))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = f
             .read(&mut buf)
-            .map_err(|e| format!("read error while hashing {:?}: {e}", path))?;
+            .map_err(|e| format!("read error while hashing {path:?}: {e}"))?;
         if n == 0 {
             break;
         }
@@ -192,7 +192,7 @@ pub async fn download_repo(
         if let Some(parent) = dest_path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
-                .map_err(|e| format!("failed to create parent {:?}: {e}", parent))?;
+                .map_err(|e| format!("failed to create parent {parent:?}: {e}"))?;
         }
 
         // Resume: skip if already complete (and verified when possible).
@@ -264,7 +264,7 @@ pub async fn download_repo(
 
         let mut out = tokio::fs::File::create(&dest_path)
             .await
-            .map_err(|e| format!("failed to open {:?} for write: {e}", dest_path))?;
+            .map_err(|e| format!("failed to open {dest_path:?} for write: {e}"))?;
 
         let mut stream = resp.bytes_stream();
         let mut bytes_done: u64 = 0;
@@ -277,9 +277,9 @@ pub async fn download_repo(
                 if e.raw_os_error() == Some(28)
                 /* ENOSPC */
                 {
-                    format!("disk full writing {:?}: {msg}", dest_path)
+                    format!("disk full writing {dest_path:?}: {msg}")
                 } else {
-                    format!("write error on {:?}: {msg}", dest_path)
+                    format!("write error on {dest_path:?}: {msg}")
                 }
             })?;
             bytes_done += chunk.len() as u64;
@@ -303,7 +303,7 @@ pub async fn download_repo(
 
         out.flush()
             .await
-            .map_err(|e| format!("flush failed on {:?}: {e}", dest_path))?;
+            .map_err(|e| format!("flush failed on {dest_path:?}: {e}"))?;
         drop(out);
 
         // Final tick.

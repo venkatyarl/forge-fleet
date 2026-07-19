@@ -4,7 +4,7 @@ use ff_agent::agent_loop::AgentSessionConfig;
 
 pub async fn handle_health(c: &AgentSessionConfig) -> Result<()> {
     static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
-        std::sync::LazyLock::new(|| reqwest::Client::new());
+        std::sync::LazyLock::new(reqwest::Client::new);
 
     let nodes = load_fleet_nodes_for_health(c).await;
 

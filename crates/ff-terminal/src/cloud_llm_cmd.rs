@@ -170,10 +170,7 @@ pub async fn handle_cloud_llm_usage(pool: &sqlx::PgPool, since: &str) -> Result<
         let ti: i64 = sqlx::Row::get(r, "tokens_in");
         let to: i64 = sqlx::Row::get(r, "tokens_out");
         let avg_ms: f64 = sqlx::Row::get(r, "avg_ms");
-        println!(
-            "{:<12} {:>8} {:>12} {:>12} {:>10.1}",
-            id, calls, ti, to, avg_ms,
-        );
+        println!("{id:<12} {calls:>8} {ti:>12} {to:>12} {avg_ms:>10.1}",);
     }
     println!("\nWindow: last {since} ({secs}s).");
     Ok(())
@@ -235,7 +232,7 @@ pub async fn handle_cloud_llm_test(
     );
 
     static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
-        std::sync::LazyLock::new(|| reqwest::Client::new());
+        std::sync::LazyLock::new(reqwest::Client::new);
     let http = &*SHARED_HTTP;
 
     let wire_model = if provider.request_format == "google_generate_content" {

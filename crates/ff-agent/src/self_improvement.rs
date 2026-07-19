@@ -80,8 +80,7 @@ impl SelfImprovementLoop {
                     category: "recurring_error".to_string(),
                     frequency: samples.len(),
                     suggested_action: format!(
-                        "Consider retry logic or fallback model for error kind: {}",
-                        error_kind
+                        "Consider retry logic or fallback model for error kind: {error_kind}"
                     ),
                     confidence: (samples.len() as f32 / hist.len() as f32).min(1.0),
                 });
@@ -96,8 +95,7 @@ impl SelfImprovementLoop {
                     category: "slow_model".to_string(),
                     frequency: count,
                     suggested_action: format!(
-                        "Model {} averages {}ms per task; consider quantizing or routing to faster hardware",
-                        model, avg
+                        "Model {model} averages {avg}ms per task; consider quantizing or routing to faster hardware"
                     ),
                     confidence: 0.7,
                 });
@@ -114,8 +112,7 @@ impl SelfImprovementLoop {
                     category: "token_efficiency".to_string(),
                     frequency: total_tasks,
                     suggested_action: format!(
-                        "Average {} tokens/task; consider context-window pruning or smaller model for simple tasks",
-                        avg_tokens
+                        "Average {avg_tokens} tokens/task; consider context-window pruning or smaller model for simple tasks"
                     ),
                     confidence: 0.6,
                 });

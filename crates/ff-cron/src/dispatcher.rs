@@ -215,8 +215,7 @@ fn fleet_task_to_agent_task(kind: &str, payload: serde_json::Value) -> anyhow::R
         }
         other => {
             return Err(anyhow!(
-                "unsupported fleet task kind '{}'; expected shell_command or model_inference",
-                other
+                "unsupported fleet task kind '{other}'; expected shell_command or model_inference"
             ));
         }
     };
@@ -238,14 +237,14 @@ fn default_local_executor() -> LocalExecutor {
             let output = if let Some(timeout) = timeout_secs {
                 tokio::time::timeout(std::time::Duration::from_secs(timeout), child)
                     .await
-                    .map_err(|_| anyhow!("command timed out after {}s", timeout))??
+                    .map_err(|_| anyhow!("command timed out after {timeout}s"))??
             } else {
                 child.await?
             };
 
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let combined = format!("{}{}", stdout, stderr).trim().to_string();
+            let combined = format!("{stdout}{stderr}").trim().to_string();
 
             if output.status.success() {
                 Ok(combined)

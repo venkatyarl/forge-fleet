@@ -132,14 +132,12 @@ pub fn validate_fleet_config(
         }
         if node.ip.trim().is_empty() {
             return Err(ControlError::BootstrapValidation(format!(
-                "node '{}' has empty host/ip",
-                name
+                "node '{name}' has empty host/ip"
             )));
         }
         if !node_names.insert(name.clone()) {
             return Err(ControlError::BootstrapValidation(format!(
-                "duplicate node name '{}'",
-                name
+                "duplicate node name '{name}'"
             )));
         }
     }

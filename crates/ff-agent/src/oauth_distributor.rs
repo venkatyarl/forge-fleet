@@ -402,7 +402,7 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
             None,
         )
         .await
-        .with_context(|| format!("enqueue distribute task for {}", name))?;
+        .with_context(|| format!("enqueue distribute task for {name}"))?;
         enqueued += 1;
     }
 

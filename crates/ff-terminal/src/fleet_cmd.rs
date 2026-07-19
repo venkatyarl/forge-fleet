@@ -1616,7 +1616,6 @@ for P in $PEERS; do
 done
 echo "revocation fan-out complete for $NAME"
 "#,
-        name = name,
     )
 }
 
@@ -1953,7 +1952,7 @@ pub async fn handle_fleet_migrate_source_trees(
         enqueued.len()
     );
     for (name, id) in &enqueued {
-        println!("  {:<14} {id}", name);
+        println!("  {name:<14} {id}");
     }
     println!("\nTrack progress with: ff defer list");
     Ok(())
@@ -1986,7 +1985,6 @@ else
   echo "fresh clone into canonical"
 fi
 "#,
-        canonical = canonical,
     )
 }
 
@@ -2093,7 +2091,7 @@ pub async fn handle_fleet_task_coverage(
                 } else {
                     notes.unwrap_or_default()
                 };
-                println!("{:<32} {:<6} {:<14}  {}", task, min, pri, extra);
+                println!("{task:<32} {min:<6} {pri:<14}  {extra}");
             }
         }
     }
@@ -2162,7 +2160,7 @@ pub async fn handle_fleet_revive(
                 _ => None,
             },
         });
-        println!("{}", j);
+        println!("{j}");
     } else {
         match outcome {
             ff_agent::revive::ReviveOutcome::DaemonRestarted => {
@@ -2282,7 +2280,7 @@ pub async fn handle_fleet_leader(pool: &sqlx::PgPool, json: bool) -> Result<()> 
     }
 
     // HA Phase 2: surface an active maintenance lease (designated standby).
-    if let Some((standby, until)) = ff_db::pg_get_active_maintenance_lease(&pool)
+    if let Some((standby, until)) = ff_db::pg_get_active_maintenance_lease(pool)
         .await
         .unwrap_or(None)
     {
@@ -2303,8 +2301,7 @@ pub async fn handle_fleet_leader(pool: &sqlx::PgPool, json: bool) -> Result<()> 
                 _ => "",
             };
             println!(
-                "    {:<12} priority={:<5} alive={:<4} yielding={:<4}{}",
-                name, prio, alive_str, yield_str, marker
+                "    {name:<12} priority={prio:<5} alive={alive_str:<4} yielding={yield_str:<4}{marker}"
             );
         }
     } else {
@@ -2551,11 +2548,11 @@ pub async fn handle_fleet_health(pool: &sqlx::PgPool, json: bool) -> Result<()> 
             .unwrap_or_else(|| "-".into());
         let cpu = h
             .cpu_pct
-            .map(|v| format!("{:.1}", v))
+            .map(|v| format!("{v:.1}"))
             .unwrap_or_else(|| "-".into());
         let ram = h
             .ram_pct
-            .map(|v| format!("{:.1}", v))
+            .map(|v| format!("{v:.1}"))
             .unwrap_or_else(|| "-".into());
         let llms = h
             .llm_servers
@@ -2728,15 +2725,9 @@ pub async fn handle_fleet_versions(
                 .as_ref()
                 .map(|v| v.build_count.to_string())
                 .unwrap_or_else(|| "-".into());
-            println!(
-                "{:<12} {:<10} {:<10} {:<10} {:<8}",
-                name, inst_short, lat_short, state, count
-            );
+            println!("{name:<12} {inst_short:<10} {lat_short:<10} {state:<10} {count:<8}");
         } else {
-            println!(
-                "{:<12} {:<10} {:<10} {:<8}",
-                name, inst_short, lat_short, state
-            );
+            println!("{name:<12} {inst_short:<10} {lat_short:<10} {state:<8}");
         }
     }
 
@@ -3131,7 +3122,7 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                 let created = ff_agent::mesh_check::enqueue_retries(&pool)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
-                println!("  enqueued {} mesh_retry task(s)", created);
+                println!("  enqueued {created} mesh_retry task(s)");
             }
             if let Some(spec) = &since {
                 let age = parse_duration(spec).ok_or_else(|| {
@@ -3380,7 +3371,7 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                 enqueued.len()
             );
             for (node, id) in &enqueued {
-                println!("  {:<15} {id}", node);
+                println!("  {node:<15} {id}");
             }
             println!("\nTrack progress with: ff defer list");
         }
@@ -3959,16 +3950,8 @@ async fn handle_fleet_route(
     );
 
     println!(
-        "  {:<10} {:<30} {:<22} {:<4} {:<5} {:<14} {:<6} {:<11} {}",
-        "WORKER",
-        "ENDPOINT",
-        "MODEL",
-        "TIER",
-        "TOOLS",
-        "CTX(use/win)",
-        "SLOTS",
-        "LOAD(cpu/rq)",
-        "HEALTH"
+        "  {:<10} {:<30} {:<22} {:<4} {:<5} {:<14} {:<6} {:<11} HEALTH",
+        "WORKER", "ENDPOINT", "MODEL", "TIER", "TOOLS", "CTX(use/win)", "SLOTS", "LOAD(cpu/rq)"
     );
     for r in &rows {
         let ctx = format!(

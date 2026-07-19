@@ -131,7 +131,7 @@ async fn maybe_alert_over_quota(
     } else {
         used_bytes * 100 / total_bytes
     };
-    let title = format!("⚠ disk quota exceeded on {worker_name} ({}%)", used_pct);
+    let title = format!("⚠ disk quota exceeded on {worker_name} ({used_pct}%)");
     let payload = serde_json::json!({
         "note": format!(
             "Disk usage {}% exceeds quota {}% on {}. \

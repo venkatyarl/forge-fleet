@@ -63,8 +63,7 @@ impl AgentTool for TrainingTool {
             }
             "list_adapters" => execute_list_adapters().await,
             _ => AgentToolResult::err(format!(
-                "Unknown action: {}. Use: status, import, export, train, list_adapters",
-                action
+                "Unknown action: {action}. Use: status, import, export, train, list_adapters"
             )),
         }
     }
@@ -152,7 +151,7 @@ async fn execute_import() -> AgentToolResult {
             result.turns_extracted,
             result.errors,
         )),
-        Err(e) => AgentToolResult::err(format!("Import failed: {}", e)),
+        Err(e) => AgentToolResult::err(format!("Import failed: {e}")),
     }
 }
 
@@ -167,7 +166,7 @@ async fn execute_export() -> AgentToolResult {
         Ok((path, count)) => {
             AgentToolResult::ok(format!("Exported {} examples to {}", count, path.display()))
         }
-        Err(e) => AgentToolResult::err(format!("Export failed: {}", e)),
+        Err(e) => AgentToolResult::err(format!("Export failed: {e}")),
     }
 }
 
@@ -216,14 +215,13 @@ async fn execute_train(model: &str, ctx: &AgentToolContext) -> AgentToolResult {
                 let _ = child.wait().await;
             });
             AgentToolResult::ok(format!(
-                "LoRA training started in background (PID {})!\n\
-                 Model: {}\n\
+                "LoRA training started in background (PID {pid})!\n\
+                 Model: {model}\n\
                  Monitor with: tail -f /tmp/forgefleet-lora-training.log\n\
                  Use Training action='status' to check progress.",
-                pid, model,
             ))
         }
-        Err(e) => AgentToolResult::err(format!("Failed to start training: {}", e)),
+        Err(e) => AgentToolResult::err(format!("Failed to start training: {e}")),
     }
 }
 

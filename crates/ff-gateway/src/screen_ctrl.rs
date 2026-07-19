@@ -211,7 +211,7 @@ async fn run_click(x: i32, y: i32, double: bool) -> axum::response::Response {
     };
 
     #[cfg(target_os = "linux")]
-    let mut cmd = {
+    let cmd = {
         let mut c = tokio::process::Command::new("xdotool");
         c.arg("mousemove").arg(x.to_string()).arg(y.to_string());
         if double {

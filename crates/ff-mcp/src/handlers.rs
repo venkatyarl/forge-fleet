@@ -3284,14 +3284,10 @@ fn crew_summary_text(
     skipped: usize,
 ) -> String {
     if success {
-        format!(
-            "Crew completed task '{}' with {}/{} successful steps.",
-            task, succeeded, total_steps
-        )
+        format!("Crew completed task '{task}' with {succeeded}/{total_steps} successful steps.")
     } else {
         format!(
-            "Crew finished task '{}' with failures (succeeded: {}, failed: {}, skipped: {}).",
-            task, succeeded, failed, skipped
+            "Crew finished task '{task}' with failures (succeeded: {succeeded}, failed: {failed}, skipped: {skipped})."
         )
     }
 }
@@ -3423,7 +3419,7 @@ fn backends_from_config(config: &FleetConfig) -> Vec<BackendEndpoint> {
                 && !model_name.starts_with("claude")
                 && !model_name.starts_with("gemini");
             endpoints.push(BackendEndpoint {
-                id: format!("{}:{}:{}", worker_name, slug, port),
+                id: format!("{worker_name}:{slug}:{port}"),
                 node: worker_name.clone(),
                 host: node_cfg.ip.clone(),
                 port,
@@ -3911,7 +3907,7 @@ async fn open_operational_store() -> Result<OperationalStore, String> {
 }
 
 fn project_profile_storage_key(project_id: &str) -> String {
-    format!("{}{}", PROJECT_PROFILE_KEY_PREFIX, project_id)
+    format!("{PROJECT_PROFILE_KEY_PREFIX}{project_id}")
 }
 
 async fn upsert_project_profile_record(

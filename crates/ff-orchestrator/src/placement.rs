@@ -290,9 +290,7 @@ mod tests {
 
         assert!(
             busy_score > free_score,
-            "BinPack should prefer busy node ({} > {})",
-            busy_score,
-            free_score
+            "BinPack should prefer busy node ({busy_score} > {free_score})"
         );
     }
 
@@ -320,9 +318,7 @@ mod tests {
 
         assert!(
             free_score > busy_score,
-            "Spread should prefer free node ({} > {})",
-            free_score,
-            busy_score
+            "Spread should prefer free node ({free_score} > {busy_score})"
         );
     }
 
@@ -346,9 +342,7 @@ mod tests {
 
         assert!(
             james_score > marcus_score,
-            "Affinity should boost james for coding ({} > {})",
-            james_score,
-            marcus_score
+            "Affinity should boost james for coding ({james_score} > {marcus_score})"
         );
     }
 
@@ -370,9 +364,7 @@ mod tests {
 
         assert!(
             marcus_score > james_score,
-            "Anti-affinity should penalize james ({} < {})",
-            james_score,
-            marcus_score
+            "Anti-affinity should penalize james ({james_score} < {marcus_score})"
         );
     }
 
@@ -391,9 +383,7 @@ mod tests {
 
         assert!(
             james_score > marcus_score,
-            "Preferred node should get bonus ({} > {})",
-            james_score,
-            marcus_score
+            "Preferred node should get bonus ({james_score} > {marcus_score})"
         );
     }
 
@@ -406,7 +396,7 @@ mod tests {
         offline.online = false;
 
         let score = engine.score_node(&task, &offline);
-        assert!(score == 0.0, "Offline node should score 0.0, got {}", score);
+        assert!(score == 0.0, "Offline node should score 0.0, got {score}");
     }
 
     #[test]
@@ -425,8 +415,7 @@ mod tests {
         let score = engine.score_node(&task, &small_node);
         assert!(
             score == 0.0,
-            "Insufficient node should score 0.0, got {}",
-            score
+            "Insufficient node should score 0.0, got {score}"
         );
     }
 

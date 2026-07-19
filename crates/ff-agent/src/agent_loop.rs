@@ -60,7 +60,7 @@ fn log_tool_usage(tool_name: &str, session_id: &str, success: bool, duration_ms:
         "duration_ms": duration_ms as i64,
     });
     let name = tool_name.to_string();
-    let url = format!("{}/api/tools/usage", gateway);
+    let url = format!("{gateway}/api/tools/usage");
     if let Ok(permit) = TOOL_USAGE_SEM.try_acquire() {
         tokio::spawn(async move {
             let _permit = permit;
@@ -589,7 +589,7 @@ impl AgentSession {
                         tool_call_id: m.tool_call_id.clone(),
                     })
                     .collect(),
-                task_type: format!("{:?}", task_type),
+                task_type: format!("{task_type:?}"),
                 success,
                 collected_at: chrono::Utc::now().to_rfc3339(),
             };
@@ -1524,9 +1524,8 @@ async fn run_agent_loop(
 
                         if session.build_verify_retries > MAX_BUILD_VERIFY_RETRIES {
                             let msg = format!(
-                                "BuildStuckAfterNRetries: cargo check failed {} times in a row \
-                                 after Rust edits — aborting task so the supervisor can retry.",
-                                MAX_BUILD_VERIFY_RETRIES
+                                "BuildStuckAfterNRetries: cargo check failed {MAX_BUILD_VERIFY_RETRIES} times in a row \
+                                 after Rust edits — aborting task so the supervisor can retry."
                             );
                             emit(
                                 &event_tx,
@@ -1590,8 +1589,7 @@ async fn run_agent_loop(
                     AgentEvent::Status {
                         session_id: session_id.clone(),
                         message: format!(
-                            "Loop detected: same action repeated {} times. Injecting recovery...",
-                            repeat_count
+                            "Loop detected: same action repeated {repeat_count} times. Injecting recovery..."
                         ),
                     },
                 );

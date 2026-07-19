@@ -42,7 +42,7 @@ pub async fn upsert_fabric_pairs(
         } else {
             (peer_name, peer_id, my_name, computer_id)
         };
-        let pair_name = format!("{}-{}", a_name, b_name);
+        let pair_name = format!("{a_name}-{b_name}");
 
         let (a_iface, a_ip, b_iface, b_ip) = if my_name == a_name {
             (ip_entry.iface.as_str(), ip_entry.ip.as_str(), "", "")

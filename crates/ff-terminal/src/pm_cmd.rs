@@ -1158,7 +1158,7 @@ struct ClaudeTask {
 
 /// Extract content blocks from a JSONL record. Claude Code lines sometimes put
 /// the content array under `message.content` and sometimes at the root.
-fn extract_content_blocks<'v>(value: &'v serde_json::Value) -> Vec<&'v serde_json::Value> {
+fn extract_content_blocks(value: &serde_json::Value) -> Vec<&serde_json::Value> {
     if let Some(content) = value.get("message").and_then(|m| m.get("content")) {
         if let Some(arr) = content.as_array() {
             return arr.iter().collect();
@@ -1563,7 +1563,7 @@ pub async fn handle_pm_import_claude_tasks(
         }
         newest
             .map(|(p, _)| p)
-            .ok_or_else(|| anyhow::anyhow!("no session JSONL found under {:?}", project_dir))?
+            .ok_or_else(|| anyhow::anyhow!("no session JSONL found under {project_dir:?}"))?
     };
 
     println!(
@@ -2055,7 +2055,7 @@ mod tests {
 
     #[test]
     fn parse_claude_tasks_task_create_update() {
-        let lines = vec![
+        let lines = [
             serde_json::json!({
                 "type": "assistant",
                 "message": {
@@ -2149,7 +2149,7 @@ mod tests {
 
     #[test]
     fn parse_claude_tasks_task_create_returns_tasks_array() {
-        let lines = vec![
+        let lines = [
             serde_json::json!({
                 "type": "assistant",
                 "message": {
@@ -2215,7 +2215,7 @@ mod tests {
 
     #[test]
     fn parse_claude_tasks_task_update_with_id() {
-        let lines = vec![
+        let lines = [
             serde_json::json!({
                 "type": "assistant",
                 "message": {

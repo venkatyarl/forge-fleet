@@ -30,8 +30,8 @@ pub async fn handle_backends(
     }
 
     println!(
-        "{:<10} {:<10} {:<12} {}",
-        "backend", "installed", "authed", "detail"
+        "{:<10} {:<10} {:<12} detail",
+        "backend", "installed", "authed"
     );
     println!("{}", "─".repeat(64));
     let mut dispatchable = 0usize;

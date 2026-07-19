@@ -353,9 +353,8 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
             // embedder.
             if mode != ServingMode::Chat {
                 return Err(format!(
-                    "mlx runtime does not support {:?} mode (chat only); \
-                     use the llama.cpp variant instead",
-                    mode
+                    "mlx runtime does not support {mode:?} mode (chat only); \
+                     use the llama.cpp variant instead"
                 ));
             }
             // mlx_lm.server expects the MODEL to be either an HF repo id or a local dir
@@ -374,8 +373,7 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
             if mode != ServingMode::Chat {
                 return Err(format!(
                     "vllm runtime via this launcher does not yet support \
-                     {:?} mode; needs --task embedding wiring",
-                    mode
+                     {mode:?} mode; needs --task embedding wiring"
                 ));
             }
             let args = vec![
@@ -399,7 +397,7 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
     let log_dir = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
         .join(".forgefleet/logs");
     let _ = std::fs::create_dir_all(&log_dir);
-    let log_path = log_dir.join(format!("model-{}.log", port));
+    let log_path = log_dir.join(format!("model-{port}.log"));
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

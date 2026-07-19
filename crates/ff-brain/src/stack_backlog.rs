@@ -63,7 +63,7 @@ impl BrainStateClient {
     // ─── Stack operations (LIFO per thread) ──────────────────────────
 
     fn stack_key(&self, user_id: &Uuid, thread_id: &Uuid) -> String {
-        format!("brain:stack:{}:{}", user_id, thread_id)
+        format!("brain:stack:{user_id}:{thread_id}")
     }
 
     pub async fn stack_push(
@@ -214,7 +214,7 @@ impl BrainStateClient {
     // ─── Backlog operations (priority FIFO per project) ──────────────
 
     fn backlog_key(&self, user_id: &Uuid, project: &str) -> String {
-        format!("brain:backlog:{}:{}", user_id, project)
+        format!("brain:backlog:{user_id}:{project}")
     }
 
     pub async fn backlog_add(

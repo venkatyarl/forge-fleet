@@ -4,7 +4,7 @@ use std::path::Path;
 
 pub async fn handle_task(cmd: crate::TaskCommand, _config_path: &Path) -> Result<()> {
     static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
-        std::sync::LazyLock::new(|| reqwest::Client::new());
+        std::sync::LazyLock::new(reqwest::Client::new);
     let client = &*SHARED_HTTP;
     let base = "http://127.0.0.1:50002";
 

@@ -517,10 +517,10 @@ async fn resolve_live_model_id(client: &reqwest::Client, chat_endpoint: &str) ->
             if server.get("healthy").and_then(|h| h.as_bool()) != Some(true) {
                 return None;
             }
-            let status_ok = match server.get("status").and_then(|s| s.as_str()) {
-                Some("active") | None => true,
-                _ => false,
-            };
+            let status_ok = matches!(
+                server.get("status").and_then(|s| s.as_str()),
+                Some("active") | None
+            );
             if !status_ok {
                 return None;
             }
@@ -635,6 +635,7 @@ const MIN_AGENT_CTX: i64 = 16_384;
 
 /// Pure: can a node with this `usable_agent_ctx` run an agentic sub-task?
 /// `None` (no deployment) and anything below [`MIN_AGENT_CTX`] cannot.
+#[allow(dead_code)] // tested spec mirror of the swarm viability SQL filter
 fn node_is_agent_viable(usable_agent_ctx: Option<i64>) -> bool {
     usable_agent_ctx.unwrap_or(0) >= MIN_AGENT_CTX
 }

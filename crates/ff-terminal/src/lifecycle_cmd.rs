@@ -20,7 +20,7 @@ pub async fn handle_stop() -> Result<()> {
     // Verify
     tokio::time::sleep(Duration::from_secs(1)).await;
     static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
-        std::sync::LazyLock::new(|| reqwest::Client::new());
+        std::sync::LazyLock::new(reqwest::Client::new);
     let still_running = SHARED_HTTP
         .get(format!(
             "http://127.0.0.1:{}/health",
@@ -54,7 +54,7 @@ pub async fn handle_start(leader: bool, config_path: &Path, working_dir: &Path) 
 
     // Check if daemon is already running (check web UI port — only daemon serves this)
     static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
-        std::sync::LazyLock::new(|| reqwest::Client::new());
+        std::sync::LazyLock::new(reqwest::Client::new);
     let daemon_running = SHARED_HTTP
         .get(format!(
             "http://127.0.0.1:{}/health",
@@ -251,7 +251,7 @@ pub fn find_daemon_binary(working_dir: &Path) -> Option<PathBuf> {
 }
 pub async fn handle_models(c: &ff_agent::agent_loop::AgentSessionConfig) -> Result<()> {
     static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
-        std::sync::LazyLock::new(|| reqwest::Client::new());
+        std::sync::LazyLock::new(reqwest::Client::new);
     let url = format!("{}/v1/models", c.llm_base_url.trim_end_matches('/'));
     match SHARED_HTTP.get(&url).send().await {
         Ok(r) => println!("{}", r.text().await.unwrap_or_default()),

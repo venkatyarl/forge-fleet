@@ -164,10 +164,7 @@ impl ModelBenchmarker {
         let (bench_pass, bench_pass_reason) = if tokens_per_sec < BENCH_PASS_MIN_TPS {
             (
                 false,
-                format!(
-                    "tokens_per_sec {:.2} < threshold {:.2}",
-                    tokens_per_sec, BENCH_PASS_MIN_TPS
-                ),
+                format!("tokens_per_sec {tokens_per_sec:.2} < threshold {BENCH_PASS_MIN_TPS:.2}"),
             )
         } else if max_ctx == 0 && total_gen_tokens == 0 {
             (false, "no prompt produced a non-empty response".to_string())

@@ -141,7 +141,7 @@ async fn run_ssh_collect(user: &str, host: &str, port: i32, remote_cmd: &str) ->
             (out.status.success(), combined.trim().to_string())
         }
         Ok(Err(e)) => (false, format!("ssh spawn failed: {e}")),
-        Err(_) => (false, format!("ssh timed out after {:?}", SSH_TIMEOUT)),
+        Err(_) => (false, format!("ssh timed out after {SSH_TIMEOUT:?}")),
     }
 }
 

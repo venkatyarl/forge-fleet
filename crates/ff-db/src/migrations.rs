@@ -809,6 +809,14 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "task_notification_outbox",
         sql: schema::SCHEMA_V166_TASK_NOTIFICATION_OUTBOX,
     },
+    // V166 was claimed by task_notification_outbox on main first — telegram
+    // reply routing takes 167 (collision caught by the versions-strictly-
+    // increasing unit test).
+    PgMigration {
+        version: 167,
+        name: "telegram_reply_routing",
+        sql: schema::SCHEMA_V167_TELEGRAM_REPLY_ROUTING,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

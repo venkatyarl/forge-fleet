@@ -3193,16 +3193,16 @@ fn build_config_hints(
     for (name, node_cfg) in &config.nodes {
         let cpu = node_cfg
             .effective_cpu_cores()
-            .map(|cores| format!("{} cores (configured)", cores));
+            .map(|cores| format!("{cores} cores (configured)"));
         let ram = node_cfg
             .effective_ram_gb()
-            .map(|gb| format!("{} GB (configured)", gb));
+            .map(|gb| format!("{gb} GB (configured)"));
 
         let gpu = node_cfg
             .resources
             .as_ref()
             .and_then(|res| res.vram_gb)
-            .map(|vram| format!("{} GB VRAM (configured)", vram))
+            .map(|vram| format!("{vram} GB VRAM (configured)"))
             .or_else(|| {
                 if node_cfg.models.is_empty() {
                     None
@@ -5269,7 +5269,7 @@ async fn proxy_embeddings(
 
     // ── 5. Proxy to best candidate ──
     if let Some((_tier, _qd, _tps, slug, _name, endpoint)) = scored.first() {
-        let url = format!("{}/v1/embeddings", endpoint);
+        let url = format!("{endpoint}/v1/embeddings");
         debug!(model = %slug, %url, "proxying embeddings request");
 
         match state.http_client.post(&url).json(&raw_payload).send().await {

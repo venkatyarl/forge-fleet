@@ -262,7 +262,7 @@ async fn load_work_item(pool: &PgPool, work_item_id: Uuid) -> Result<Option<Work
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(parse_work_item_row).transpose()?)
+    row.map(parse_work_item_row).transpose()
 }
 
 async fn load_work_items_for_project(pool: &PgPool, project_id: &str) -> Result<Vec<WorkItemRow>> {

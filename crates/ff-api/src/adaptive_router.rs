@@ -333,7 +333,7 @@ impl AdaptiveRouter {
         // Register as an ad-hoc tier-2 backend so future requests route to it.
         let (host, port) = parse_host_port(&url).ok_or_else(|| format!("bad url: {url}"))?;
         let endpoint = BackendEndpoint {
-            id: format!("autoload-{}-{}", catalog_id, port),
+            id: format!("autoload-{catalog_id}-{port}"),
             node: "local".to_string(),
             host,
             port,

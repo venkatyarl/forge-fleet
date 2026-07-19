@@ -458,7 +458,7 @@ impl App {
 
     /// Get web UI URL.
     pub fn web_url(&self) -> String {
-        format!("http://localhost:{}", PORT_WEB)
+        format!("http://localhost:{PORT_WEB}")
     }
 
     /// Tab count.
@@ -563,7 +563,7 @@ async fn fleet_nodes_from_db() -> Vec<FleetComputer> {
         ];
         let raw = raw.trim();
         for rt in KNOWN_RUNTIMES {
-            let p = format!("{}:", rt);
+            let p = format!("{rt}:");
             if let Some(rest) = raw.strip_prefix(&p) {
                 return (Some(rt.to_string()), rest.trim().to_string());
             }
@@ -681,7 +681,7 @@ async fn fleet_nodes_from_db() -> Vec<FleetComputer> {
         // Defensive: if we have nothing meaningful (e.g. all digits like
         // "55000"), fall back to a marker.
         if s.is_empty() || s.chars().all(|c| c.is_ascii_digit()) {
-            return format!("port-{}", s);
+            return format!("port-{s}");
         }
         s
     }

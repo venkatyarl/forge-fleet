@@ -162,7 +162,7 @@ async fn render_tools(app: &App) -> String {
                     let health = if t.healthy { "ok" } else { "crit" };
                     let latency = t
                         .avg_latency_ms
-                        .map(|v| format!("{:.0} ms", v))
+                        .map(|v| format!("{v:.0} ms"))
                         .unwrap_or_else(|| "-".to_string());
                     lines.push(format!(
                         "{health:<7} {tool:<24} {node:<12} {calls:<8} {latency:<12}",

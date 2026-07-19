@@ -55,6 +55,7 @@ fn reap_threshold_mins(status: &str) -> i64 {
 /// slot is reaped when its status is reapable AND it either never meaningfully
 /// started (NULL `started_at`) or its `started_at` is older than the per-status
 /// threshold. `started_at_age_mins` is `None` for a NULL `started_at`.
+#[allow(dead_code)] // pure mirror of the reaper SQL — the tested spec, not the impl
 fn should_reap(status: &str, started_at_age_mins: Option<i64>) -> bool {
     if status != "error" && status != "busy" {
         return false;

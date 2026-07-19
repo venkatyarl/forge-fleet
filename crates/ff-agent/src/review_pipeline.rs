@@ -62,7 +62,7 @@ pub async fn scan_and_enqueue(
     let output = tokio::process::Command::new("git")
         .args([
             "log",
-            &format!("{}..HEAD", since),
+            &format!("{since}..HEAD"),
             "--pretty=format:%H|%s|%an",
         ])
         .current_dir(repo_path)

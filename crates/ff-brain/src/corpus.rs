@@ -1007,8 +1007,7 @@ pub async fn query(pg: &PgPool, corpus: &Corpus, q: &FacetQuery) -> anyhow::Resu
         sql.push_str(&format!(
             r#" AND EXISTS (SELECT 1 FROM brain_memberships m
                  WHERE m.member_id = n.id AND m.member_kind = 'content'
-                   AND m.entity_id = ANY(${idx}))"#,
-            idx = next_idx
+                   AND m.entity_id = ANY(${next_idx}))"#
         ));
         binds_uuid_lists.push(ids.clone());
         next_idx += 1;
@@ -1023,9 +1022,7 @@ pub async fn query(pg: &PgPool, corpus: &Corpus, q: &FacetQuery) -> anyhow::Resu
         sql.push_str(&format!(
             r#" AND EXISTS (SELECT 1 FROM brain_node_facets nf
                  JOIN brain_facets f ON f.id = nf.facet_id
-                 WHERE nf.node_id = n.id AND f.dimension = ${d} AND f.value = ANY(${v}))"#,
-            d = dim_idx,
-            v = val_idx
+                 WHERE nf.node_id = n.id AND f.dimension = ${dim_idx} AND f.value = ANY(${val_idx}))"#
         ));
         binds_dim.push(dim);
         binds_vals.push(vals);
