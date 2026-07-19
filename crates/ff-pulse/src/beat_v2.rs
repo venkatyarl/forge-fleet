@@ -51,6 +51,9 @@ pub struct PulseBeatV2 {
     pub computer_id: Option<Uuid>,
     pub computer_name: String,
     pub timestamp: DateTime<Utc>,
+    /// When the dispatch tick was last updated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_tick_at: Option<DateTime<Utc>>,
     /// Monotonic epoch counter, per-computer.
     pub epoch: u64,
     /// `"leader"` or `"member"`.
@@ -438,6 +441,7 @@ impl PulseBeatV2 {
             computer_id: None,
             computer_name: computer_name.into(),
             timestamp: now,
+            dispatch_tick_at: Some(now),
             epoch: 0,
             role_claimed: "member".to_string(),
             election_priority: 0,
@@ -526,6 +530,7 @@ mod tests {
         assert_eq!(beat.computer_name, "taylor");
         assert_eq!(beat.role_claimed, "member");
         assert!(beat.computer_id.is_none());
+        assert!(beat.dispatch_tick_at.is_some());
         assert!(beat.llm_servers.is_empty());
         assert!(!beat.docker.daemon_running);
     }
