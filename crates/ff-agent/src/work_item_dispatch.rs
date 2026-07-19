@@ -1394,7 +1394,8 @@ fn dispatch_prompt(item: &AssignedWorkItem) -> String {
 /// corpus captures token economics, not just content. codex prints
 /// `tokens used\n9,332`; kimi/others print variants like `Tokens: 1234` or
 /// `total tokens: 1234`. Best-effort — returns 0 when no count is found.
-fn parse_cli_tokens(output: &str) -> i32 {
+#[doc(hidden)]
+pub fn parse_cli_tokens(output: &str) -> i32 {
     let lower = output.to_ascii_lowercase();
     // Find a "tokens" marker, then the nearest number after it (strip commas).
     for marker in ["tokens used", "total tokens", "tokens:", "tokens"] {
@@ -2313,7 +2314,8 @@ fn default_branch(repo_path: &Path) -> Result<String> {
     Ok(branch)
 }
 
-fn run_git<I, S>(cwd: &Path, args: I, timeout: Duration) -> Result<Output>
+#[doc(hidden)]
+pub fn run_git<I, S>(cwd: &Path, args: I, timeout: Duration) -> Result<Output>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,

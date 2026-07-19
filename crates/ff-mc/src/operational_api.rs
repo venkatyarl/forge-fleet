@@ -655,7 +655,8 @@ fn work_item_matches_filter(item: &WorkItem, filter: &WorkItemFilter) -> bool {
     true
 }
 
-async fn get_work_item_from_store(store: &OperationalStore, id: &str) -> McResult<WorkItem> {
+/// Load a work item from the canonical operational store.
+pub async fn get_work_item_from_store(store: &OperationalStore, id: &str) -> McResult<WorkItem> {
     let key = work_item_storage_key(id);
     let Some(payload) = store
         .config_get(&key)

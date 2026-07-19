@@ -95,6 +95,7 @@ impl ToolRegistry {
         self.register(Self::fleet_models_deployments());
         self.register(Self::fleet_models_disk_usage());
         self.register(Self::fleet_agents());
+        self.register(Self::work_item_context());
 
         // ── Virtual Brain tools ─────────────────────────────────────────
         self.register(Self::brain_search());
@@ -139,6 +140,33 @@ impl ToolRegistry {
     }
 
     // ── Tool definitions ─────────────────────────────────────────────────
+
+    fn work_item_context() -> ToolDefinition {
+        ToolDefinition {
+            name: "work_item_context".to_string(),
+            description: "Retrieve bounded, ready-to-inject context for a Mission Control work item, optionally including repository state.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "work_item_id": {
+                        "type": "string",
+                        "description": "Mission Control work item id"
+                    },
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Optional local Git checkout to include"
+                    },
+                    "max_commits": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 50,
+                        "default": 10
+                    }
+                },
+                "required": ["work_item_id"]
+            }),
+        }
+    }
 
     fn fleet_status() -> ToolDefinition {
         ToolDefinition {
@@ -1743,6 +1771,7 @@ mod tests {
             "fleet_models_deployments",
             "fleet_models_disk_usage",
             "fleet_agents",
+            "work_item_context",
             // Virtual Brain
             "brain_search",
             "brain_vault_read",

@@ -29,6 +29,7 @@ pub mod server;
 pub mod strategy_dispatch;
 pub mod tools;
 pub mod transport;
+pub mod verbs;
 
 pub use protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use server::McpServer;
