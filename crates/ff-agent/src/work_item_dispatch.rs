@@ -1967,6 +1967,28 @@ fn synthetic_output(summary: &str) -> Output {
     }
 }
 
+/// Environment variable holding an optional LAN git mirror URL. When set, fetches
+/// are routed through this mirror while pushes continue to target the canonical
+/// GitHub origin (`git remote set-url --push`).
+const LAN_MIRROR_URL_ENV: &str = "FORGEFLEET_LAN_MIRROR_URL";
+
+/// Max attempts for each fetch phase (mirror and direct fallback).
+const FETCH_ATTEMPTS: usize = 3;
+
+/// Bounded exponential backoff base: 500ms → 1s → 2s before each retry.
+const FETCH_BACKOFF_BASE_MS: u64 = 500;
+
+/// Return a small non-cryptographic jitter (0..max_ms) derived from the current
+/// time so concurrent retries across slots don't stampede the same remote.
+fn fetch_jitter(max_ms: u64) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let jitter_ms = nanos % max_ms.max(1);
+    Duration::from_millis(jitter_ms)
+}
+
 /// Prepare the slot's clone for a fresh build attempt. Fetch origin/<base>
 /// (same no-stale-base contract as ever: fail rather than branch from a stale
 /// ref), then a FULL clean — `reset --hard` + `clean -fd` — so leftovers from
@@ -1974,27 +1996,136 @@ fn synthetic_output(summary: &str) -> Output {
 /// `checkout -B wi/<id> origin/<base>`. `-B` resets the task branch even if a
 /// prior attempt left it behind, which is what makes retries collision-free
 /// without any worktree bookkeeping.
+///
+/// LAN mirror: if `FORGEFLEET_LAN_MIRROR_URL` is set, origin's fetch URL is
+/// pointed at the mirror and `--push` is pointed at the canonical GitHub URL.
+/// Mirror fetches are retried with exponential backoff + jitter; if they all
+/// fail we transparently fall back to a direct GitHub fetch.
 fn checkout_clone_for_build(repo_path: &Path, base_branch: &str, task_branch: &str) -> Result<()> {
     let base_ref = format!("origin/{base_branch}");
+
+    // Remember the canonical GitHub origin so we can restore it on fallback
+    // and configure --push correctly when a mirror is in play.
+    let github_url = run_git(
+        repo_path,
+        ["remote", "get-url", "origin"],
+        Duration::from_secs(30),
+    )
+    .ok()
+    .and_then(|o| {
+        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    });
+
+    // Optionally configure the LAN mirror: fetch from mirror, push to GitHub.
+    let mirror_url = std::env::var(LAN_MIRROR_URL_ENV).ok();
+    let mirror_configured = match (&mirror_url, &github_url) {
+        (Some(mirror), Some(github)) if mirror != github => {
+            run_git(
+                repo_path,
+                ["remote", "set-url", "origin", mirror],
+                Duration::from_secs(30),
+            )
+            .with_context(|| format!("set origin fetch URL to LAN mirror {mirror}"))?;
+            run_git(
+                repo_path,
+                ["remote", "set-url", "--push", "origin", github],
+                Duration::from_secs(30),
+            )
+            .with_context(|| format!("set origin push URL to GitHub {github}"))?;
+            info!(
+                mirror_url = mirror,
+                push_url = github,
+                "checkout_clone_for_build: configured LAN mirror fetch with GitHub push"
+            );
+            true
+        }
+        _ => false,
+    };
+
     let mut fetched = false;
-    for attempt in 0..3 {
-        match run_git(
-            repo_path,
-            ["fetch", "origin", base_branch],
-            Duration::from_secs(120),
-        ) {
-            Ok(_) => {
-                fetched = true;
-                break;
+
+    // Phase 1: fetch from the LAN mirror (if configured) with backoff + jitter.
+    if mirror_configured {
+        for attempt in 0..FETCH_ATTEMPTS {
+            if attempt > 0 {
+                let backoff =
+                    Duration::from_millis(FETCH_BACKOFF_BASE_MS * (1u64 << (attempt - 1)));
+                std::thread::sleep(backoff + fetch_jitter(200));
             }
-            Err(e) => {
-                warn!(base_branch, attempt, error = %e, "checkout_clone_for_build: fetch origin failed; retrying")
+            match run_git(
+                repo_path,
+                ["fetch", "origin", base_branch],
+                Duration::from_secs(120),
+            ) {
+                Ok(_) => {
+                    fetched = true;
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        base_branch,
+                        attempt,
+                        error = %e,
+                        "checkout_clone_for_build: LAN mirror fetch failed; retrying"
+                    )
+                }
             }
         }
     }
+
+    // Phase 2: fallback to direct GitHub fetch, restoring the canonical origin.
+    if !fetched {
+        if mirror_configured {
+            if let Some(github) = &github_url {
+                run_git(
+                    repo_path,
+                    ["remote", "set-url", "origin", github],
+                    Duration::from_secs(30),
+                )
+                .with_context(|| format!("restore origin URL to GitHub {github}"))?;
+                // Push should also use GitHub now that we're not mirroring.
+                let _ = run_git(
+                    repo_path,
+                    ["remote", "set-url", "--push", "origin", github],
+                    Duration::from_secs(30),
+                );
+            }
+            warn!(
+                base_branch,
+                "checkout_clone_for_build: LAN mirror fetch failed; falling back to direct GitHub fetch"
+            );
+        }
+        for attempt in 0..FETCH_ATTEMPTS {
+            if attempt > 0 {
+                let backoff =
+                    Duration::from_millis(FETCH_BACKOFF_BASE_MS * (1u64 << (attempt - 1)));
+                std::thread::sleep(backoff + fetch_jitter(200));
+            }
+            match run_git(
+                repo_path,
+                ["fetch", "origin", base_branch],
+                Duration::from_secs(120),
+            ) {
+                Ok(_) => {
+                    fetched = true;
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        base_branch,
+                        attempt,
+                        error = %e,
+                        "checkout_clone_for_build: direct fetch failed; retrying"
+                    )
+                }
+            }
+        }
+    }
+
     if !fetched {
         bail!(
-            "checkout_clone_for_build: could not fetch origin/{base_branch} in 3 tries — \
+            "checkout_clone_for_build: could not fetch origin/{base_branch} in {FETCH_ATTEMPTS} tries — \
              refusing to build from a possibly-stale base"
         );
     }
