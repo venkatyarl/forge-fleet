@@ -7,6 +7,7 @@
 
 pub mod backup;
 pub mod handoff;
+pub mod node_info;
 pub mod pg_failover;
 pub mod repair;
 pub mod restore_drill;
