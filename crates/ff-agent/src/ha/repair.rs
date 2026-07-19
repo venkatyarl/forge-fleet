@@ -27,6 +27,10 @@ pub enum RepairStatus {
     /// Source went offline while the repair was being tracked.
     #[serde(rename = "src-offline")]
     SrcOffline,
+    /// The remote host's SSH key changed and the repair is blocked until the
+    /// stale known_hosts entry is refreshed.
+    #[serde(rename = "key-changed")]
+    KeyChanged,
 }
 
 #[derive(Debug, Error)]
@@ -49,6 +53,7 @@ impl RepairStatus {
             RepairStatus::RolledBack => "rolled_back",
             RepairStatus::Suppressed => "suppressed",
             RepairStatus::SrcOffline => "src-offline",
+            RepairStatus::KeyChanged => "key-changed",
         }
     }
 
@@ -64,11 +69,15 @@ impl RepairStatus {
                 | (RepairStatus::Applying, RepairStatus::Applied)
                 | (RepairStatus::Applying, RepairStatus::Failed)
                 | (RepairStatus::Applying, RepairStatus::SrcOffline)
+                | (RepairStatus::Applying, RepairStatus::KeyChanged)
                 | (RepairStatus::Applied, RepairStatus::Verified)
                 | (RepairStatus::Applied, RepairStatus::Failed)
                 | (RepairStatus::Applied, RepairStatus::RolledBack)
                 | (RepairStatus::SrcOffline, RepairStatus::Applying)
                 | (RepairStatus::SrcOffline, RepairStatus::Failed)
+                | (RepairStatus::SrcOffline, RepairStatus::KeyChanged)
+                | (RepairStatus::Proposed, RepairStatus::KeyChanged)
+                | (RepairStatus::Approved, RepairStatus::KeyChanged)
         )
     }
 
@@ -96,8 +105,9 @@ impl fmt::Display for RepairStatus {
 pub enum RepairDispatch<T> {
     /// The source was online and the repair was dispatched.
     Dispatched(T),
-    /// The edge was parked without running the repair.
-    Parked(RepairStatus),
+    /// The edge was parked without running the repair. An alert may be attached
+    /// so the status response can include remediation instructions.
+    Parked(RepairStatus, Option<RepairAlert>),
 }
 
 /// Dispatch a repair only while its source node has a live Pulse beat.
@@ -115,11 +125,12 @@ where
     Fut: Future<Output = anyhow::Result<T>>,
 {
     let src_online = pulse.is_node_alive(src_node).await?;
-    dispatch_if_source_online(src_online, dispatch).await
+    dispatch_if_source_online(src_online, src_node, dispatch).await
 }
 
 async fn dispatch_if_source_online<F, Fut, T>(
     src_online: bool,
+    src_node: &str,
     dispatch: F,
 ) -> anyhow::Result<RepairDispatch<T>>
 where
@@ -127,10 +138,26 @@ where
     Fut: Future<Output = anyhow::Result<T>>,
 {
     if !src_online {
-        return Ok(RepairDispatch::Parked(RepairStatus::SrcOffline));
+        return Ok(RepairDispatch::Parked(RepairStatus::SrcOffline, None));
     }
 
-    dispatch().await.map(RepairDispatch::Dispatched)
+    match dispatch().await {
+        Ok(v) => Ok(RepairDispatch::Dispatched(v)),
+        Err(e) => match classify_repair_error(src_node, &e) {
+            Some(alert) => Ok(RepairDispatch::Parked(
+                RepairStatus::KeyChanged,
+                Some(alert),
+            )),
+            None => Err(e),
+        },
+    }
+}
+
+/// Inspect a repair failure for a host-key-changed signature. When found,
+/// return a [`RepairAlert::KeyChanged`] so callers can surface a distinct
+/// `key-changed` status with remediation instructions instead of retrying.
+pub fn classify_repair_error(host: &str, err: &anyhow::Error) -> Option<RepairAlert> {
+    RepairAlert::from_ssh_output(host, &err.to_string())
 }
 
 /// Operator-facing alert attached to a repair that needs manual attention.
@@ -295,23 +322,84 @@ mod tests {
     async fn offline_source_parks_edge_without_dispatching() {
         let called = AtomicBool::new(false);
 
-        let result = dispatch_if_source_online(false, || async {
+        let result = dispatch_if_source_online(false, "node-7", || async {
             called.store(true, Ordering::SeqCst);
             Ok::<_, anyhow::Error>(())
         })
         .await
         .unwrap();
 
-        assert_eq!(result, RepairDispatch::Parked(RepairStatus::SrcOffline));
+        assert_eq!(
+            result,
+            RepairDispatch::Parked(RepairStatus::SrcOffline, None)
+        );
         assert!(!called.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
     async fn online_source_dispatches_repair() {
-        let result = dispatch_if_source_online(true, || async { Ok::<_, anyhow::Error>(42) })
-            .await
-            .unwrap();
+        let result =
+            dispatch_if_source_online(true, "node-7", || async { Ok::<_, anyhow::Error>(42) })
+                .await
+                .unwrap();
 
         assert_eq!(result, RepairDispatch::Dispatched(42));
+    }
+
+    #[tokio::test]
+    async fn host_key_changed_parks_with_key_changed_status_and_alert() {
+        let result = dispatch_if_source_online(true, "node-7", || async {
+            Err::<(), _>(anyhow::anyhow!(
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+                     @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!    @\n\
+                     Offending ECDSA key in /home/op/.ssh/known_hosts:12\n\
+                     Host key verification failed."
+            ))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            RepairDispatch::Parked(
+                RepairStatus::KeyChanged,
+                Some(RepairAlert::KeyChanged {
+                    host: "node-7".to_string(),
+                })
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn non_key_error_is_not_parked() {
+        let result = dispatch_if_source_online(true, "node-7", || async {
+            Err::<(), _>(anyhow::anyhow!("connection timed out"))
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "connection timed out");
+    }
+
+    #[test]
+    fn key_changed_status_serializes_as_key_changed() {
+        assert_eq!(
+            serde_json::to_value(RepairStatus::KeyChanged).unwrap(),
+            serde_json::json!("key-changed")
+        );
+        let status: RepairStatus = serde_json::from_str("\"key-changed\"").unwrap();
+        assert_eq!(status, RepairStatus::KeyChanged);
+    }
+
+    #[test]
+    fn key_changed_is_terminal() {
+        assert!(!RepairStatus::KeyChanged.can_transition_to(RepairStatus::Applying));
+        assert!(!RepairStatus::KeyChanged.can_transition_to(RepairStatus::Verified));
+    }
+
+    #[test]
+    fn applying_and_src_offline_can_transition_to_key_changed() {
+        assert!(RepairStatus::Applying.can_transition_to(RepairStatus::KeyChanged));
+        assert!(RepairStatus::SrcOffline.can_transition_to(RepairStatus::KeyChanged));
     }
 }
