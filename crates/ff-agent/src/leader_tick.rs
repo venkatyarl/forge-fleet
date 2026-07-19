@@ -42,6 +42,7 @@ use ff_db::leader_state::{
 use ff_pulse::reader::{PulseError, PulseReader};
 
 use crate::ha::pg_failover::{FailoverOutcome, PostgresFailoverManager};
+use crate::ha::self_heal::rearm_self_heal_task;
 use crate::leader_cache::{LeaderCache, LeaderInfo};
 
 /// Max revive attempts per computer per [`REVIVE_BACKOFF_WINDOW_MIN`] minutes.
@@ -963,7 +964,10 @@ impl LeaderTick {
     ///
     /// Single-flight is enforced two ways: the marker file caps the SELECT to
     /// ~once per 30 min per leader, and `ON CONFLICT (dedup_signature) DO NOTHING`
-    /// means a signature already tracked in `fleet_tasks` is never reset.
+    /// means an in-flight signature in `fleet_tasks` is not duplicated. If a
+    /// previously processed signature (completed/failed/cancelled) recurs after
+    /// the re-arm cooldown, it is reset to `detected` so recurring runtime
+    /// errors are not lost.
     /// We classify interaction errors as tier `T2` — runtime/interaction-layer
     /// failures, distinct from the `T0/T1` build/test bugs that
     /// `fleet_bug_reports` feeds.
@@ -1039,10 +1043,35 @@ impl LeaderTick {
                     "scan_interaction_errors: enqueued novel error signature for self-heal"
                 );
             } else {
-                tracing::debug!(
-                    error_signature = %sig,
-                    "scan_interaction_errors: signature already in self-heal queue; skipping"
-                );
+                // Signature already exists. If it has been processed to a
+                // terminal state and cooled down, re-arm it so recurring
+                // runtime errors are not permanently suppressed.
+                match rearm_self_heal_task(&self.pg, &sig, "T2", report_count as i32, None).await {
+                    Ok(true) => {
+                        novel += 1;
+                        tracing::info!(
+                            node = %self.my_name,
+                            error_signature = %sig,
+                            report_count,
+                            error_text = error_text.as_deref().unwrap_or(""),
+                            "scan_interaction_errors: re-armed recurring error signature for self-heal"
+                        );
+                    }
+                    Ok(false) => {
+                        tracing::debug!(
+                            error_signature = %sig,
+                            "scan_interaction_errors: signature already in self-heal queue; skipping"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            node = %self.my_name,
+                            error_signature = %sig,
+                            error = %err,
+                            "scan_interaction_errors: failed to re-arm self-heal signature"
+                        );
+                    }
+                }
             }
         }
 
@@ -1433,6 +1462,7 @@ mod tests {
                  priority INT NOT NULL DEFAULT 50,
                  status TEXT NOT NULL DEFAULT 'pending',
                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 completed_at TIMESTAMPTZ,
                  task_class TEXT,
                  dedup_signature TEXT
              );
