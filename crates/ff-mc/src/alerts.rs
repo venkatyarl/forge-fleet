@@ -165,6 +165,8 @@ mod tests {
             fired_at: Utc::now(),
             resolved_at: None,
             acknowledged: false,
+            count: 1,
+            last_sent: None,
         }
     }
 

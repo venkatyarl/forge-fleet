@@ -64,10 +64,17 @@ pub struct Alert {
     /// Number of occurrences aggregated into this alert.
     #[serde(default = "default_alert_count")]
     pub count: u64,
+    /// When this alert was last sent to notification channels.
+    #[serde(default = "default_alert_last_sent")]
+    pub last_sent: Option<DateTime<Utc>>,
 }
 
 const fn default_alert_count() -> u64 {
     1
+}
+
+const fn default_alert_last_sent() -> Option<DateTime<Utc>> {
+    None
 }
 
 impl Alert {
@@ -300,6 +307,7 @@ impl AlertEngine {
                                 resolved_at: None,
                                 acknowledged: false,
                                 count: 1,
+                                last_sent: None,
                             };
                             let (alert, is_new) = self.record_alert(dedup_key, alert);
                             if is_new {
@@ -335,6 +343,7 @@ impl AlertEngine {
                                 resolved_at: None,
                                 acknowledged: false,
                                 count: 1,
+                                last_sent: None,
                             };
                             let (alert, is_new) = self.record_alert(dedup_key, alert);
                             if is_new {
@@ -371,6 +380,7 @@ impl AlertEngine {
                                 resolved_at: None,
                                 acknowledged: false,
                                 count: 1,
+                                last_sent: None,
                             };
                             let (alert, is_new) = self.record_alert(dedup_key, alert);
                             if is_new {
@@ -417,6 +427,7 @@ impl AlertEngine {
             resolved_at: None,
             acknowledged: false,
             count: 1,
+            last_sent: None,
         };
         self.record_alert(dedup_key, alert).0
     }
@@ -432,6 +443,8 @@ impl AlertEngine {
                 (active.alert.clone(), false)
             }
             Entry::Occupied(mut entry) => {
+                let mut alert = alert.clone();
+                alert.last_sent = Some(now);
                 let active = ActiveAlert {
                     alert: alert.clone(),
                     last_seen_at: now,
@@ -441,6 +454,8 @@ impl AlertEngine {
                 (alert, true)
             }
             Entry::Vacant(entry) => {
+                let mut alert = alert.clone();
+                alert.last_sent = Some(now);
                 entry.insert(ActiveAlert {
                     alert: alert.clone(),
                     last_seen_at: now,
