@@ -8,9 +8,11 @@
 //! is the "many computers, many models" lever: every LLM on every node starts
 //! from the same precise, token-cheap context instead of re-deriving it.
 //!
-//! v1 uses SUBSTRING find on identifiers lifted from the task text (semantic
-//! search needs a loaded embedding endpoint, which isn't always up). Fail-OPEN:
-//! any Cortex hiccup yields an empty pack and dispatch proceeds exactly as before.
+//! v2 prefers loading the precomputed context (`brain_node_ids` and `touched_paths`)
+//! stored on the canonical `work_items` row. Those fields are populated by the
+//! `work_item_context` extractor during Cortex reindex, so dispatch no longer
+//! recomputes the symbol set on every build. If the row has no stored context,
+//! the legacy SUBSTRING path over `ff cortex find` is used as a fail-open fallback.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -32,7 +34,7 @@ pub fn extract_task_identifiers(title: &str, description: &str) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     let mut token = String::new();
-    let mut flush = |tok: &mut String, out: &mut Vec<String>, seen: &mut BTreeSet<String>| {
+    let flush = |tok: &mut String, out: &mut Vec<String>, seen: &mut BTreeSet<String>| {
         let t = std::mem::take(tok);
         if t.len() < 4 || STOPWORDS.contains(&t.as_str()) {
             return;
@@ -171,9 +173,103 @@ pub async fn cortex_context_pack_async(
     }
 }
 
+/// Build a context pack from the precomputed `brain_node_ids` and `touched_paths`
+/// stored on the `work_items` row. Deduplicates across the two sources and emits
+/// the same "symbol pointer" style as [`build_cortex_context_pack`] so the agent
+/// can open the relevant files/symbols directly.
+pub fn build_context_pack_from_store(
+    brain_node_ids: &[String],
+    touched_paths: &[String],
+    max_symbols: usize,
+) -> String {
+    #[derive(Debug)]
+    struct Entry {
+        name: String,
+        kind: String,
+    }
+
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for path in brain_node_ids.iter().filter(|p| !p.trim().is_empty()) {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let entry = if let Some(rest) = path.strip_prefix("code://") {
+            if let Some((file, symbol)) = rest.rsplit_once('/') {
+                Entry {
+                    name: symbol.to_string(),
+                    kind: format!("symbol at {file}"),
+                }
+            } else {
+                Entry {
+                    name: path.clone(),
+                    kind: "symbol".to_string(),
+                }
+            }
+        } else {
+            Entry {
+                name: path.clone(),
+                kind: "brain node".to_string(),
+            }
+        };
+        entries.push(entry);
+        if entries.len() >= max_symbols {
+            break;
+        }
+    }
+
+    for path in touched_paths.iter().filter(|p| !p.trim().is_empty()) {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        entries.push(Entry {
+            name: path.clone(),
+            kind: "file".to_string(),
+        });
+        if entries.len() >= max_symbols {
+            break;
+        }
+    }
+
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    let mut pack = String::from(
+        "## Relevant existing code (from the Cortex code graph)\n\
+         These are the exact symbols this task touches — open them directly \
+         instead of grepping the repo to find them:\n\n",
+    );
+    for entry in entries {
+        pack.push_str(&format!("- `{}` — {}\n", entry.name, entry.kind));
+    }
+    pack.push('\n');
+    pack
+}
+
+/// Build a context pack for dispatch, preferring the precomputed DB context and
+/// falling back to a live Cortex lookup only when nothing is stored. This keeps
+/// dispatch fast and consistent across the fleet while remaining compatible with
+/// work items that have not yet been indexed.
+pub async fn context_pack_for_dispatch(
+    brain_node_ids: Vec<String>,
+    touched_paths: Vec<String>,
+    title: String,
+    description: String,
+    repo_path: std::path::PathBuf,
+    max_symbols: usize,
+) -> String {
+    let store_pack = build_context_pack_from_store(&brain_node_ids, &touched_paths, max_symbols);
+    if !store_pack.is_empty() {
+        return store_pack;
+    }
+    cortex_context_pack_async(title, description, repo_path, max_symbols).await
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{extract_task_identifiers, relativize};
+    use super::{build_context_pack_from_store, extract_task_identifiers, relativize};
 
     #[test]
     fn extracts_camel_and_snake_idents_skips_plain_words() {
@@ -208,5 +304,44 @@ mod tests {
         assert_eq!(relativize("/home/x/repo/src/bar.rs"), "src/bar.rs");
         // 3. neither found -> returns basename
         assert_eq!(relativize("/var/log/system/thing.log"), "thing.log");
+    }
+
+    #[test]
+    fn build_context_pack_from_store_renders_symbols_and_files() {
+        let pack = build_context_pack_from_store(
+            &[
+                "code://crates/ff-agent/src/work_item_dispatch.rs/run_git".to_string(),
+                "pm://work_item/82cd7aa9-9942-4774-bdd1-5ac1b3d65c62".to_string(),
+            ],
+            &["crates/ff-agent/src/dispatch_context.rs".to_string()],
+            8,
+        );
+        assert!(pack.contains("run_git"));
+        assert!(pack.contains("crates/ff-agent/src/work_item_dispatch.rs"));
+        assert!(pack.contains("crates/ff-agent/src/dispatch_context.rs"));
+        assert!(pack.contains("pm://work_item/82cd7aa9-9942-4774-bdd1-5ac1b3d65c62"));
+    }
+
+    #[test]
+    fn build_context_pack_from_store_deduplicates_and_caps() {
+        let pack = build_context_pack_from_store(
+            &[
+                "code://crates/a.rs/foo".to_string(),
+                "code://crates/a.rs/foo".to_string(),
+            ],
+            &[],
+            1,
+        );
+        // Deduplication keeps one symbol; cap keeps only the first entry.
+        assert_eq!(pack.matches("`foo`").count(), 1);
+        assert!(!pack.contains("crates/b.rs"));
+    }
+
+    #[test]
+    fn build_context_pack_from_store_empty_when_no_context() {
+        assert!(build_context_pack_from_store(&[], &[], 8).is_empty());
+        assert!(
+            build_context_pack_from_store(&["".to_string()], &["  ".to_string()], 8).is_empty()
+        );
     }
 }
