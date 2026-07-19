@@ -90,6 +90,13 @@ struct AssignedWorkItem {
     /// change is beyond the local codegen harness's reliable range, so it too
     /// routes straight to cloud.
     predicted_paths_count: i32,
+    /// Precomputed Cortex context stored on the `work_items` row. Loaded at
+    /// dispatch time so the prompt can point the agent at the exact symbols to
+    /// touch without recomputing them via `ff cortex find`.
+    brain_node_ids: Vec<String>,
+    /// Precomputed file paths stored on the `work_items` row, companion to
+    /// `brain_node_ids`.
+    touched_paths: Vec<String>,
 }
 
 impl AssignedWorkItem {
@@ -291,6 +298,8 @@ async fn assigned_work_items(
             w.last_error,
             COALESCE(NULLIF(w.complexity, ''), 'mechanical') AS complexity,
             COALESCE(jsonb_array_length(w.predicted_paths), 0) AS predicted_paths_count,
+            COALESCE(w.brain_node_ids, '[]'::jsonb) AS brain_node_ids,
+            COALESCE(w.touched_paths, '[]'::jsonb) AS touched_paths,
             COALESCE(NULLIF(w.repo_url, ''), NULLIF(wr.github_url, '')) AS repo_url,
             NULLIF(w.repo_path, '') AS bound_repo_path,
             NULLIF(w.metadata->>'repo_path', '') AS metadata_repo_path,
@@ -389,9 +398,32 @@ async fn assigned_work_items(
                     .try_get("complexity")
                     .unwrap_or_else(|_| "mechanical".to_string()),
                 predicted_paths_count: r.try_get("predicted_paths_count").unwrap_or(0),
+                brain_node_ids: jsonb_string_array(&r, "brain_node_ids"),
+                touched_paths: jsonb_string_array(&r, "touched_paths"),
             })
         })
         .collect()
+}
+
+/// Parse a JSONB array column into a `Vec<String>`, skipping non-string values.
+/// Empty arrays and missing columns resolve to an empty vector so dispatch can
+/// fall back to the legacy Cortex lookup.
+fn jsonb_string_array(row: &sqlx::postgres::PgRow, column: &str) -> Vec<String> {
+    let value: serde_json::Value = match row.try_get(column) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    match value {
+        serde_json::Value::Array(arr) => arr
+            .into_iter()
+            .filter_map(|v| match v {
+                serde_json::Value::String(s) if !s.trim().is_empty() => Some(s),
+                _ => None,
+            })
+            .collect(),
+        serde_json::Value::String(s) if !s.trim().is_empty() => vec![s],
+        _ => Vec::new(),
+    }
 }
 
 async fn ensure_repo_checked_out(pg: &PgPool, item: &AssignedWorkItem) -> Result<()> {
@@ -1480,8 +1512,11 @@ async fn run_ff_dispatch(
     // Prepend a Cortex context pack: the exact existing symbols this task touches,
     // pulled from the shared code graph, so the agent starts there instead of
     // grep-storming the whole repo cold (wasted context + the cold-compile explore
-    // phase). Fail-open — empty pack ⇒ unchanged behaviour.
-    let pack = crate::dispatch_context::cortex_context_pack_async(
+    // phase). Prefer the precomputed context stored on the work_item row; fall back
+    // to a live `ff cortex find` lookup only when nothing is stored. Fail-open.
+    let pack = crate::dispatch_context::context_pack_for_dispatch(
+        item.brain_node_ids.clone(),
+        item.touched_paths.clone(),
         item.title.clone(),
         item.description.clone().unwrap_or_default(),
         worktree.worktree_path.clone(),
