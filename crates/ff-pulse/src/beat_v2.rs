@@ -45,7 +45,8 @@ pub struct OsInfo {
 /// Top-level Pulse v2 beat payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PulseBeatV2 {
-    /// Always `2` for this schema revision.
+    /// Always [`crate::PULSE_SCHEMA_VERSION`] for beats built by this crate;
+    /// readers gate on [`crate::is_schema_compatible`] (one-generation rule).
     pub pulse_protocol_version: u32,
     /// Populated after enrollment; `None` until the node is fully enrolled.
     pub computer_id: Option<Uuid>,
@@ -434,7 +435,7 @@ impl PulseBeatV2 {
     pub fn skeleton(computer_name: impl Into<String>) -> Self {
         let now = Utc::now();
         Self {
-            pulse_protocol_version: 2,
+            pulse_protocol_version: crate::PULSE_SCHEMA_VERSION,
             computer_id: None,
             computer_name: computer_name.into(),
             timestamp: now,
