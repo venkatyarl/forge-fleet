@@ -57,11 +57,28 @@ fn default_deduplication_ttl_secs() -> u64 {
 }
 
 /// Top-level control-plane configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlConfig {
+    /// Maximum build wall-clock duration in seconds.
+    #[serde(default = "default_max_build_duration_secs")]
+    pub max_build_duration_secs: u64,
+
     /// Alert deduplication settings — `[control.alerts.deduplication]`.
     #[serde(default)]
     pub alerts: AlertConfig,
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            max_build_duration_secs: default_max_build_duration_secs(),
+            alerts: AlertConfig::default(),
+        }
+    }
+}
+
+fn default_max_build_duration_secs() -> u64 {
+    300
 }
 
 /// Alert handling configuration.
@@ -94,5 +111,14 @@ mod tests {
         let parsed: DeduplicationConfig = serde_json::from_str(&json).unwrap();
         assert!(parsed.is_enabled());
         assert_eq!(parsed.ttl_secs, 60);
+    }
+
+    #[test]
+    fn control_config_defaults_max_build_duration() {
+        let cfg = ControlConfig::default();
+        assert_eq!(cfg.max_build_duration_secs, 300);
+
+        let parsed: ControlConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.max_build_duration_secs, 300);
     }
 }
