@@ -10257,3 +10257,11 @@ CREATE INDEX IF NOT EXISTS idx_work_queue_worker
 CREATE INDEX IF NOT EXISTS idx_work_queue_status_created
     ON work_queue (status, created_at DESC);
 "#;
+
+/// Squashed Postgres bootstrap through migration v161.
+///
+/// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
+/// Postgres due to accumulated rename/renumber drift. On a brand-new DB the
+/// migration runner applies this single idempotent baseline instead of the
+/// legacy chain, then continues with any migrations after v161.
+pub const BOOTSTRAP_V161_SQL: &str = include_str!("../../../deploy/sql/bootstrap-v161.sql");
