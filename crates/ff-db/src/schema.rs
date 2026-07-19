@@ -9990,3 +9990,105 @@ pub const SCHEMA_V162_DROP_WORKTREE_PATH_UNIQUE: &str = r#"
 ALTER TABLE work_item_worktrees
     DROP CONSTRAINT IF EXISTS work_item_worktrees_computer_id_worktree_path_key;
 "#;
+
+// ─── V163: fleet-wide backup policy table ───────────────────────────────────
+//
+// Operator req 2026-07-18: every backup setting (who produces a kind, where the
+// offsite copies go, cadence, retention, encryption) must live in the DATABASE
+// and be read by the code — not hardcoded. One row per backup kind; the
+// on-disk layout is `~/.forgefleet/backups/<KIND>/` on every node.
+//
+// `source_host` NULL means "the current fleet leader" (postgres/redis run on
+// the leader); a concrete name pins production to the host that actually runs
+// that datastore (FalkorDB's container lives on priya). Empty `dest_hosts`
+// means "auto-pick 2 recently-seen peers excluding the source" — the
+// offsite-2-nodes rule; a non-empty array pins the destinations.
+pub const SCHEMA_V163_FLEET_BACKUP_CONFIG: &str = r#"
+CREATE TABLE IF NOT EXISTS fleet_backup_config (
+    kind            TEXT PRIMARY KEY,          -- postgres|redis|falkordb|brain|obsidian
+    source_host     TEXT,                      -- NULL = current fleet leader
+    dest_hosts      TEXT[] NOT NULL DEFAULT '{}', -- empty = auto-pick 2 non-source peers
+    interval_secs   BIGINT NOT NULL DEFAULT 14400,
+    retention_count INT NOT NULL DEFAULT 14,   -- newest generations kept on the source
+    retention_days  INT,                       -- NULL = no age-based pruning
+    encrypt         BOOLEAN NOT NULL DEFAULT TRUE,
+    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Seed the kinds the fleet backs up today. postgres/redis mirror the previous
+-- hardcoded cadences/retention; falkordb is NEW (BGSAVE + AOF tar off priya —
+-- it had no offsite dump job before this); brain/obsidian are policy
+-- placeholders for their folders under ~/.forgefleet/backups/.
+INSERT INTO fleet_backup_config
+    (kind, source_host, interval_secs, retention_count, retention_days, encrypt)
+VALUES
+    ('postgres', NULL,    14400, 14, 30,   TRUE),
+    ('redis',    NULL,     7200, 60, 14,   TRUE),
+    ('falkordb', 'priya', 21600, 14, 30,   TRUE),
+    ('brain',    NULL,    86400, 14, 60,   TRUE),
+    ('obsidian', NULL,    86400, 14, 60,   TRUE)
+ON CONFLICT (kind) DO NOTHING;
+"#;
+
+// ─── V165: inference-server-per-hardware decision table ─────────────────────
+//
+// Operator req 2026-07-18: the hardware → inference-server mapping must live
+// in the DATABASE and be read by the code (onboarding hardware-detection),
+// not hardcoded in the bootstrap script / detector heuristics. Rows with
+// kind='server_policy' are keyed on (arch, gpu_kind, has_discrete_vram,
+// ram_tier), each key column accepting the literal 'any' as a wildcard. The
+// resolver (ff-pulse materializer) picks the row matching the most concrete
+// key columns and self-heals fleet_workers.runtime to the row's runtime,
+// then seeds the row's model downloads through the deferred task queue.
+//
+// Operator override baked into the seed: AMD GTT-unified boxes (Strix Halo:
+// duncan/lily/logan/veronica) serve via ROCm llama-server (Lemonade as the
+// fallback stack), NOT the Vulkan default the runtime detector recommends.
+pub const SCHEMA_V165_SERVER_POLICY: &str = r#"
+CREATE TABLE IF NOT EXISTS fleet_server_policies (
+    id                BIGSERIAL PRIMARY KEY,
+    kind              TEXT NOT NULL DEFAULT 'server_policy',
+    arch              TEXT NOT NULL DEFAULT 'any',   -- aarch64|x86_64|any
+    gpu_kind          TEXT NOT NULL DEFAULT 'any',   -- nvidia_cuda|amd_rocm|apple_silicon|none|any
+    has_discrete_vram TEXT NOT NULL DEFAULT 'any',   -- yes|no|any ('no' = unified/shared RAM)
+    ram_tier          TEXT NOT NULL DEFAULT 'any',   -- tiny (<=8GB)|standard|any
+    runtime           TEXT NOT NULL,                 -- fleet_workers.runtime value: vllm|llama.cpp|mlx
+    primary_server    TEXT NOT NULL,                 -- concrete server + backend to run
+    fallback_server   TEXT,
+    seed_model_ids    JSONB NOT NULL DEFAULT '[]'::jsonb, -- fleet_model_catalog ids to download on onboard
+    notes             TEXT,
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (kind, arch, gpu_kind, has_discrete_vram, ram_tier)
+);
+
+INSERT INTO fleet_server_policies
+    (kind, arch, gpu_kind, has_discrete_vram, ram_tier,
+     runtime, primary_server, fallback_server, seed_model_ids, notes)
+VALUES
+    ('server_policy', 'aarch64', 'nvidia_cuda',   'no',  'any',
+     'vllm',      'vllm (aarch64/sm_121)',             'llama-server (CUDA)',
+     '["qwen35-9b"]'::jsonb, 'DGX Spark GB10 — CUDA unified memory'),
+    ('server_policy', 'x86_64',  'nvidia_cuda',   'yes', 'any',
+     'vllm',      'vllm (CUDA)',                       'llama-server (CUDA)',
+     '["qwen35-9b"]'::jsonb, 'x86 NVIDIA with discrete VRAM'),
+    ('server_policy', 'x86_64',  'amd_rocm',      'yes', 'any',
+     'vllm',      'vllm (ROCm)',                       'llama-server (ROCm)',
+     '["qwen35-9b"]'::jsonb, 'x86 AMD with discrete VRAM'),
+    ('server_policy', 'x86_64',  'amd_rocm',      'no',  'any',
+     'llama.cpp', 'llama-server (ROCm)',               'lemonade (ROCm)',
+     '["qwen35-9b"]'::jsonb, 'AMD GTT-unified (Strix Halo: duncan/lily/logan/veronica) — operator 2026-07-18: ROCm, NOT Vulkan'),
+    ('server_policy', 'aarch64', 'apple_silicon', 'no',  'any',
+     'mlx',       'mlx_lm.server',                     'llama-server (Metal)',
+     '["qwen35-9b"]'::jsonb, 'Apple Silicon unified memory'),
+    ('server_policy', 'x86_64',  'none',          'any', 'standard',
+     'llama.cpp', 'llama-server (CPU: OpenVINO/AVX2)', NULL,
+     '["qwen35-9b"]'::jsonb, 'Intel/AMD CPU-only boxes'),
+    ('server_policy', 'any',     'any',           'any', 'tiny',
+     'llama.cpp', 'llama-server (CPU)',                NULL,
+     '[]'::jsonb,            '<=8GB RAM — CPU only, no model seed'),
+    ('server_policy', 'any',     'any',           'any', 'any',
+     'llama.cpp', 'llama-server (CPU)',                NULL,
+     '[]'::jsonb,            'catch-all fallback')
+ON CONFLICT (kind, arch, gpu_kind, has_discrete_vram, ram_tier) DO NOTHING;
+"#;

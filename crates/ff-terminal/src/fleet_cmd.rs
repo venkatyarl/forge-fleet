@@ -684,16 +684,16 @@ async fn enqueue_remote_drill(pool: &sqlx::PgPool, node: &str, me: &str) -> Resu
     }
 }
 
-/// `ff fleet db backup --kind <all|postgres|redis> [--now]` — force an
-/// immediate backup cycle through the real HA orchestrator.
+/// `ff fleet db backup --kind <all|postgres|redis|falkordb> [--now]` — force
+/// an immediate backup cycle through the real HA orchestrator.
 pub async fn handle_fleet_db_backup_now(
     pool: &sqlx::PgPool,
     kind: &str,
     force: bool,
 ) -> Result<()> {
     let kind = kind.to_lowercase();
-    if !matches!(kind.as_str(), "all" | "postgres" | "redis") {
-        anyhow::bail!("--kind must be one of: all | postgres | redis (got '{kind}')");
+    if !matches!(kind.as_str(), "all" | "postgres" | "redis" | "falkordb") {
+        anyhow::bail!("--kind must be one of: all | postgres | redis | falkordb (got '{kind}')");
     }
 
     // Resolve THIS host's identity the same way the daemon does.

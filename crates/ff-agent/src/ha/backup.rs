@@ -53,6 +53,13 @@ pub const BACKUP_ENC_PRIVKEY: &str = "backup_encryption_privkey";
 
 const DEFAULT_POSTGRES_INTERVAL_HOURS: u64 = 4;
 const DEFAULT_REDIS_INTERVAL_HOURS: u64 = 2;
+/// FalkorDB cadence fallback when `fleet_backup_config` has no row (6h).
+const DEFAULT_FALKORDB_INTERVAL_SECS: u64 = 21_600;
+/// Container name FalkorDB runs under (deploy/docker-compose.yml).
+const FALKORDB_CONTAINER: &str = "forgefleet-falkordb";
+/// Offsite fan-out width when `fleet_backup_config.dest_hosts` is empty:
+/// a kind's backups go to this many OTHER computers (never the source).
+const OFFSITE_DEST_COUNT: i64 = 2;
 /// Delay before the first tick after daemon startup (avoid racing
 /// Postgres/Redis containers still coming up).
 const STARTUP_DELAY_SECS: u64 = 300;
@@ -82,6 +89,12 @@ const LOCAL_KEEP_POSTGRES_LEADER: usize = 14;
 const LOCAL_KEEP_POSTGRES_PEER: usize = 4;
 const LOCAL_KEEP_REDIS_LEADER: usize = 60;
 const LOCAL_KEEP_REDIS_PEER: usize = 24;
+const LOCAL_KEEP_FALKORDB_PEER: usize = 4;
+/// Minimum generations the SOURCE host must retain regardless of the
+/// configured `retention_count` / `retention_days`: the DB `backups` catalog
+/// references at most `RECENT + DAILY + WEEKLY` (13) rows — always the
+/// most-recent generations — so pruning below this depth would orphan rows.
+const SOURCE_KEEP_FLOOR: usize = RECENT_RETENTION + DAILY_RETENTION + WEEKLY_RETENTION + 1;
 /// How often each node prunes its own backup directory.
 const PRUNE_INTERVAL_SECS: u64 = 3600;
 
@@ -119,6 +132,87 @@ pub enum BackupError {
     Uuid(#[from] uuid::Error),
     #[error("unknown backup kind: {0}")]
     UnknownKind(String),
+}
+
+/// Per-kind backup policy from the `fleet_backup_config` table (schema V163).
+/// Everything an operator can tune — who produces a kind, where the offsite
+/// copies go, cadence, retention, encryption — lives in the DB, not in code.
+#[derive(Debug, Clone)]
+pub struct BackupKindConfig {
+    pub kind: String,
+    /// Host that produces this kind's backups. `None` = the current fleet
+    /// leader (postgres/redis run on the leader; FalkorDB is pinned to the
+    /// host running its container, e.g. priya).
+    pub source_host: Option<String>,
+    /// Explicit offsite destinations. Empty = auto-pick
+    /// [`OFFSITE_DEST_COUNT`] recently-seen peers excluding the source.
+    pub dest_hosts: Vec<String>,
+    pub interval_secs: i64,
+    /// Newest generations kept on the source host's disk.
+    pub retention_count: i32,
+    /// Also unlink artifacts older than this many days (`None` = count-only).
+    pub retention_days: Option<i32>,
+    pub encrypt: bool,
+    pub enabled: bool,
+}
+
+impl BackupKindConfig {
+    /// Built-in fallback used when the `fleet_backup_config` row (or, on a
+    /// fleet mid-upgrade, the table itself) is missing. Mirrors the
+    /// pre-V163 hardcoded behavior: leader-produced, always encrypted,
+    /// offsite auto-pick.
+    fn default_for(kind: &str) -> Self {
+        let (interval_secs, retention_count) = match kind {
+            "postgres" => (
+                DEFAULT_POSTGRES_INTERVAL_HOURS * 3600,
+                LOCAL_KEEP_POSTGRES_LEADER,
+            ),
+            "redis" => (DEFAULT_REDIS_INTERVAL_HOURS * 3600, LOCAL_KEEP_REDIS_LEADER),
+            _ => (DEFAULT_FALKORDB_INTERVAL_SECS, LOCAL_KEEP_POSTGRES_LEADER),
+        };
+        Self {
+            kind: kind.to_string(),
+            source_host: None,
+            dest_hosts: Vec::new(),
+            interval_secs: interval_secs as i64,
+            retention_count: retention_count as i32,
+            retention_days: None,
+            encrypt: true,
+            enabled: true,
+        }
+    }
+}
+
+/// Load one kind's policy from `fleet_backup_config`. Returns `None` (callers
+/// fall back to [`BackupKindConfig::default_for`] or builder overrides) when
+/// the row is absent or the table doesn't exist yet, so a fleet whose DB
+/// predates V163 keeps its old cadence instead of erroring every tick.
+pub async fn load_backup_config(pool: &PgPool, kind: &str) -> Option<BackupKindConfig> {
+    let row = sqlx::query(
+        "SELECT source_host, dest_hosts, interval_secs, retention_count,
+                retention_days, encrypt, enabled
+           FROM fleet_backup_config WHERE kind = $1",
+    )
+    .bind(kind)
+    .fetch_optional(pool)
+    .await;
+    match row {
+        Ok(Some(r)) => Some(BackupKindConfig {
+            kind: kind.to_string(),
+            source_host: r.get("source_host"),
+            dest_hosts: r.get("dest_hosts"),
+            interval_secs: r.get("interval_secs"),
+            retention_count: r.get("retention_count"),
+            retention_days: r.get("retention_days"),
+            encrypt: r.get("encrypt"),
+            enabled: r.get("enabled"),
+        }),
+        Ok(None) => None,
+        Err(e) => {
+            debug!(kind, error = %e, "fleet_backup_config unavailable; using built-in defaults");
+            None
+        }
+    }
 }
 
 /// Result of a single [`BackupOrchestrator::run_once`] cycle.
@@ -199,40 +293,62 @@ impl BackupOrchestrator {
     }
 
     /// Run a single backup cycle for the given kind (`"postgres"`,
-    /// `"redis"`, or `"all"`). Silently short-circuits when we're not
-    /// the current fleet leader *unless* `force` is true.
+    /// `"redis"`, `"falkordb"`, or `"all"`). Each kind is gated on its
+    /// `fleet_backup_config.source_host` (a pinned host must match this
+    /// node; `NULL` falls back to the historical leader gate) and silently
+    /// short-circuits elsewhere *unless* `force` is true.
     pub async fn run_once(
         &self,
         kind: &str,
         force: bool,
     ) -> Result<Vec<BackupReport>, BackupError> {
-        if !force && !self.i_am_leader().await? {
-            debug!(node = %self.my_node_name, kind, "backup skipped — not leader");
-            return Ok(vec![BackupReport::not_leader(kind)]);
-        }
-
         let kinds: Vec<&str> = match kind {
-            "all" => vec!["postgres", "redis"],
-            "postgres" | "redis" => vec![kind],
+            "all" => vec!["postgres", "redis", "falkordb"],
+            "postgres" | "redis" | "falkordb" => vec![kind],
             other => return Err(BackupError::UnknownKind(other.to_string())),
         };
 
         let mut reports = Vec::new();
+        let mut produced_any = false;
         for k in kinds {
+            let cfg = load_backup_config(&self.pg, k)
+                .await
+                .unwrap_or_else(|| BackupKindConfig::default_for(k));
+            if !cfg.enabled {
+                debug!(kind = k, "backup skipped — disabled in fleet_backup_config");
+                reports.push(BackupReport::not_leader(k));
+                continue;
+            }
+            let am_source = match cfg.source_host.as_deref() {
+                Some(h) => h.eq_ignore_ascii_case(&self.my_node_name),
+                None => self.i_am_leader().await?,
+            };
+            if !force && !am_source {
+                debug!(node = %self.my_node_name, kind = k,
+                       "backup skipped — not this kind's source host");
+                reports.push(BackupReport::not_leader(k));
+                continue;
+            }
+
             let report = match k {
-                "postgres" => self.run_postgres().await?,
-                "redis" => self.run_redis().await?,
+                "postgres" => self.run_postgres(&cfg).await?,
+                "redis" => self.run_redis(&cfg).await?,
+                "falkordb" => self.run_falkordb(&cfg).await?,
                 _ => unreachable!(),
             };
             // Retention compaction is per-kind.
             if let Err(e) = self.run_retention(k).await {
                 warn!(kind = k, error = %e, "retention compaction failed");
             }
+            produced_any = true;
             reports.push(report);
         }
-        // Prune our own on-disk copies after producing/cataloguing. Runs
-        // on the leader here; peers prune via the spawn-loop ticker (they
-        // short-circuit above and never reach this point).
+        if !produced_any {
+            // Pure skip cycle (peer / non-source node) — prune runs via the
+            // spawn-loop ticker on those nodes, exactly as before.
+            return Ok(reports);
+        }
+        // Prune our own on-disk copies after producing/cataloguing.
         self.prune_all_local().await;
         // Leader-driven backup-replica reaper: prune OVER-QUOTA peers' excess
         // backup copies via an embedded shell script. The per-node prune above
@@ -244,8 +360,12 @@ impl BackupOrchestrator {
         // disk_reconcile actuates disk pressure but only evicts MODELS, so it's
         // blind to backup replicas. This reaper closes that gap: the prune
         // script is generated on the leader and SSH-executed on the peer, so it
-        // works regardless of the peer's binary version.
-        self.reap_over_quota_peers().await;
+        // works regardless of the peer's binary version. Leader-gated: a
+        // non-leader source host (e.g. priya producing falkordb) must not
+        // drive fleet-wide reaps.
+        if self.i_am_leader().await.unwrap_or(false) {
+            self.reap_over_quota_peers().await;
+        }
         Ok(reports)
     }
 
@@ -273,10 +393,27 @@ impl BackupOrchestrator {
                 }
             }
 
-            let pg_period = Duration::from_secs(self.postgres_interval_hours * 3600);
-            let redis_period = Duration::from_secs(self.redis_interval_hours * 3600);
-            let mut pg_ticker = tokio::time::interval(pg_period);
-            let mut redis_ticker = tokio::time::interval(redis_period);
+            // Cadence comes from `fleet_backup_config` (operator-tunable in
+            // the DB); builder overrides / built-in defaults only apply when
+            // the row (or the table, pre-V163) is missing. Read once at
+            // startup — interval changes need a daemon restart, everything
+            // else (destinations, retention, encrypt) is re-read every tick.
+            let pg_secs = load_backup_config(&self.pg, "postgres")
+                .await
+                .map(|c| c.interval_secs.max(60) as u64)
+                .unwrap_or(self.postgres_interval_hours * 3600);
+            let redis_secs = load_backup_config(&self.pg, "redis")
+                .await
+                .map(|c| c.interval_secs.max(60) as u64)
+                .unwrap_or(self.redis_interval_hours * 3600);
+            let falkor_secs = load_backup_config(&self.pg, "falkordb")
+                .await
+                .map(|c| c.interval_secs.max(60) as u64)
+                .unwrap_or(DEFAULT_FALKORDB_INTERVAL_SECS);
+            let mut pg_ticker = tokio::time::interval(Duration::from_secs(pg_secs));
+            let mut redis_ticker = tokio::time::interval(Duration::from_secs(redis_secs));
+            // Ticks on EVERY node; non-source hosts skip cheaply in run_once.
+            let mut falkor_ticker = tokio::time::interval(Duration::from_secs(falkor_secs));
             // Prune our OWN backup dir on a cadence regardless of leader
             // status — peers never produce backups but DO receive rsync'd
             // copies that would otherwise accumulate forever. First tick
@@ -286,6 +423,7 @@ impl BackupOrchestrator {
             // startup delay, then on cadence.
             pg_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             redis_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            falkor_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             prune_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
@@ -326,6 +464,24 @@ impl BackupOrchestrator {
                             Err(e) => error!(error = %e, "redis backup tick failed"),
                         }
                     }
+                    _ = falkor_ticker.tick() => {
+                        match self.run_once("falkordb", false).await {
+                            Ok(reports) => {
+                                for r in &reports {
+                                    if r.produced {
+                                        info!(
+                                            kind = %r.kind,
+                                            file = %r.file_name,
+                                            size = r.size_bytes,
+                                            targets = r.distributed_to.len(),
+                                            "backup produced"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => error!(error = %e, "falkordb backup tick failed"),
+                        }
+                    }
                     _ = prune_ticker.tick() => {
                         self.prune_all_local().await;
                     }
@@ -342,14 +498,19 @@ impl BackupOrchestrator {
 
     // ─── Postgres ─────────────────────────────────────────────────────
 
-    async fn run_postgres(&self) -> Result<BackupReport, BackupError> {
-        let out_dir = self.backup_dir.join("postgres");
+    async fn run_postgres(&self, cfg: &BackupKindConfig) -> Result<BackupReport, BackupError> {
+        let out_dir = self.backup_dir.join(kind_dir("postgres"));
         tokio::fs::create_dir_all(&out_dir).await?;
 
         // Ensure an age keypair is provisioned in fleet_secrets before we
         // try to encrypt. If the operator hasn't set one, we generate a
-        // fresh X25519 keypair and store it.
-        let recipient = ensure_backup_keypair(&self.pg).await?;
+        // fresh X25519 keypair and store it. Skipped entirely when the
+        // kind's policy disables encryption.
+        let recipient = if cfg.encrypt {
+            Some(ensure_backup_keypair(&self.pg).await?)
+        } else {
+            None
+        };
 
         // Ensure the `replicator` Postgres role exists before we shell
         // pg_basebackup -U replicator. On a fresh / post-wipe DB the role is
@@ -361,7 +522,7 @@ impl BackupOrchestrator {
         ensure_replication_role(&self.pg).await?;
 
         let ts = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let file_name = format!("pg-{ts}.tar.gz.age");
+        let file_name = format!("pg-{ts}.tar.gz{}", age_ext(cfg.encrypt));
         let path = out_dir.join(&file_name);
 
         // pg_basebackup -Ft -z writes a tar+gzip stream to stdout when
@@ -374,10 +535,10 @@ impl BackupOrchestrator {
         // we don't need to wire three tokio Commands together.
         let shell_cmd = format!(
             "docker exec -e PGPASSWORD={pw} forgefleet-postgres \
-                 pg_basebackup -h 127.0.0.1 -U replicator -D - -Ft -z -X fetch \
-                 | age -r {recipient} > {out}",
+                 pg_basebackup -h 127.0.0.1 -U replicator -D - -Ft -z -X fetch\
+                 {age} > {out}",
             pw = REPLICATOR_DEFAULT_PASSWORD,
-            recipient = shell_quote(&recipient),
+            age = age_stage(recipient.as_deref()),
             out = shell_quote(&path.to_string_lossy()),
         );
 
@@ -396,7 +557,9 @@ impl BackupOrchestrator {
             .insert_backup_row("postgres", &file_name, size_bytes, &sha256)
             .await?;
 
-        let targets = self.enqueue_distribution("postgres", &file_name).await?;
+        let targets = self
+            .enqueue_distribution("postgres", &file_name, cfg)
+            .await?;
 
         Ok(BackupReport {
             kind: "postgres".into(),
@@ -412,14 +575,18 @@ impl BackupOrchestrator {
 
     // ─── Redis ────────────────────────────────────────────────────────
 
-    async fn run_redis(&self) -> Result<BackupReport, BackupError> {
-        let out_dir = self.backup_dir.join("redis");
+    async fn run_redis(&self, cfg: &BackupKindConfig) -> Result<BackupReport, BackupError> {
+        let out_dir = self.backup_dir.join(kind_dir("redis"));
         tokio::fs::create_dir_all(&out_dir).await?;
 
-        let recipient = ensure_backup_keypair(&self.pg).await?;
+        let recipient = if cfg.encrypt {
+            Some(ensure_backup_keypair(&self.pg).await?)
+        } else {
+            None
+        };
 
         let ts = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let file_name = format!("redis-{ts}.rdb.zst.age");
+        let file_name = format!("redis-{ts}.rdb.zst{}", age_ext(cfg.encrypt));
         let path = out_dir.join(&file_name);
 
         // 1) Ask Redis to write an RDB snapshot. BGSAVE is async but
@@ -437,11 +604,11 @@ impl BackupOrchestrator {
         }
 
         // 2) Wait for LASTSAVE to advance (short poll — 60s max).
-        let before_ts = redis_lastsave().await.unwrap_or(0);
+        let before_ts = container_lastsave("forgefleet-redis").await.unwrap_or(0);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            if redis_lastsave().await.unwrap_or(0) > before_ts {
+            if container_lastsave("forgefleet-redis").await.unwrap_or(0) > before_ts {
                 break;
             }
         }
@@ -451,23 +618,21 @@ impl BackupOrchestrator {
         //    first; a pipe is smaller-on-disk and faster.
         let shell_cmd = format!(
             "docker exec forgefleet-redis cat /data/dump.rdb \
-                | zstd -q \
-                | age -r {recipient} > {out}",
-            recipient = shell_quote(&recipient),
+                | zstd -q{age} > {out}",
+            age = age_stage(recipient.as_deref()),
             out = shell_quote(&path.to_string_lossy()),
         );
         let status = run_pipeline(&shell_cmd).await?;
         if !status.success() {
             // Fallback: try plain gzip if zstd isn't on PATH. Still
-            // encrypt-at-rest via age.
+            // encrypt-at-rest via age (when the policy asks for it).
             warn!("zstd unavailable or failed; falling back to gzip");
-            let file_name_gz = format!("redis-{ts}.rdb.gz.age");
+            let file_name_gz = format!("redis-{ts}.rdb.gz{}", age_ext(cfg.encrypt));
             let path_gz = out_dir.join(&file_name_gz);
             let shell_cmd_gz = format!(
                 "docker exec forgefleet-redis cat /data/dump.rdb \
-                    | gzip \
-                    | age -r {recipient} > {out}",
-                recipient = shell_quote(&recipient),
+                    | gzip{age} > {out}",
+                age = age_stage(recipient.as_deref()),
                 out = shell_quote(&path_gz.to_string_lossy()),
             );
             let status_gz = run_pipeline(&shell_cmd_gz).await?;
@@ -481,7 +646,9 @@ impl BackupOrchestrator {
             let backup_id = self
                 .insert_backup_row("redis", &file_name_gz, size_bytes, &sha256)
                 .await?;
-            let targets = self.enqueue_distribution("redis", &file_name_gz).await?;
+            let targets = self
+                .enqueue_distribution("redis", &file_name_gz, cfg)
+                .await?;
             return Ok(BackupReport {
                 kind: "redis".into(),
                 file_name: file_name_gz,
@@ -499,10 +666,88 @@ impl BackupOrchestrator {
         let backup_id = self
             .insert_backup_row("redis", &file_name, size_bytes, &sha256)
             .await?;
-        let targets = self.enqueue_distribution("redis", &file_name).await?;
+        let targets = self.enqueue_distribution("redis", &file_name, cfg).await?;
 
         Ok(BackupReport {
             kind: "redis".into(),
+            file_name,
+            file_path: path,
+            size_bytes,
+            sha256,
+            backup_id,
+            distributed_to: targets,
+            produced: true,
+        })
+    }
+
+    // ─── FalkorDB ─────────────────────────────────────────────────────
+
+    /// FalkorDB is a Redis module, so the same BGSAVE/RDB/AOF machinery
+    /// applies — but unlike redis we also capture the multi-part AOF dir
+    /// (`/data/appendonlydir`), tar both out of the container, compress,
+    /// and encrypt per policy into
+    /// `~/.forgefleet/backups/FalkorDB/falkordb-<ts>.tar.zst[.age]`.
+    /// Runs only on the configured `source_host` (the node whose docker
+    /// runs the `forgefleet-falkordb` container, e.g. priya).
+    async fn run_falkordb(&self, cfg: &BackupKindConfig) -> Result<BackupReport, BackupError> {
+        let out_dir = self.backup_dir.join(kind_dir("falkordb"));
+        tokio::fs::create_dir_all(&out_dir).await?;
+
+        let recipient = if cfg.encrypt {
+            Some(ensure_backup_keypair(&self.pg).await?)
+        } else {
+            None
+        };
+
+        // 1) Ask FalkorDB to write an RDB snapshot.
+        let bgsave = Command::new("docker")
+            .args(["exec", FALKORDB_CONTAINER, "redis-cli", "BGSAVE"])
+            .output()
+            .await?;
+        if !bgsave.status.success() {
+            return Err(BackupError::Cmd(format!(
+                "falkordb BGSAVE failed (is the {FALKORDB_CONTAINER} container \
+                 running on this host?): {}",
+                String::from_utf8_lossy(&bgsave.stderr).trim()
+            )));
+        }
+
+        // 2) Wait for LASTSAVE to advance (short poll — 60s max).
+        let before_ts = container_lastsave(FALKORDB_CONTAINER).await.unwrap_or(0);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if container_lastsave(FALKORDB_CONTAINER).await.unwrap_or(0) > before_ts {
+                break;
+            }
+        }
+
+        let ts = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let file_name = format!("falkordb-{ts}.tar.zst{}", age_ext(cfg.encrypt));
+        let path = out_dir.join(&file_name);
+
+        // 3) tar dump.rdb + AOF dir out of the container, compress, encrypt.
+        let shell_cmd = falkordb_dump_cmd(recipient.as_deref(), &path.to_string_lossy());
+        info!(path = %path.display(), "running falkordb tar | zstd | age");
+        let status = run_pipeline(&shell_cmd).await?;
+        if !status.success() {
+            return Err(BackupError::Cmd(format!(
+                "falkordb dump export failed: {status}; \
+                 are the `zstd` and `age` CLIs installed on this host?"
+            )));
+        }
+
+        let (size_bytes, sha256) = file_metadata(&path).await?;
+        validate_backup_size("falkordb", &path, size_bytes).await?;
+        let backup_id = self
+            .insert_backup_row("falkordb", &file_name, size_bytes, &sha256)
+            .await?;
+        let targets = self
+            .enqueue_distribution("falkordb", &file_name, cfg)
+            .await?;
+
+        Ok(BackupReport {
+            kind: "falkordb".into(),
             file_name,
             file_path: path,
             size_bytes,
@@ -547,12 +792,19 @@ impl BackupOrchestrator {
         Ok(id)
     }
 
-    /// Enqueue one rsync deferred task per peer computer. The source
+    /// Enqueue one rsync deferred task per offsite destination. The source
     /// IP is our current primary IP from the `computers` table.
+    ///
+    /// Destination selection is policy-driven (`fleet_backup_config`, V163):
+    /// an explicit `dest_hosts` array wins; when it's empty we auto-pick the
+    /// [`OFFSITE_DEST_COUNT`] most-recently-seen peers — the operator's
+    /// offsite-2-nodes rule (a kind's backups always land on 2 computers
+    /// OTHER than the one running the datastore).
     async fn enqueue_distribution(
         &self,
         kind: &str,
         file_name: &str,
+        cfg: &BackupKindConfig,
     ) -> Result<Vec<String>, BackupError> {
         // Look up my own IP + SSH user so peers know where + as whom
         // to rsync from. REDIS.1 part 2 (2026-05-19): the original code
@@ -575,18 +827,30 @@ impl BackupOrchestrator {
             None => ("127.0.0.1".to_string(), "root".to_string()),
         };
 
-        // Target every computer except me that has a live `last_seen_at`
-        // within the last 24h. Fresh-on-disk peers are picked up by the
-        // deferred queue when they next come online.
-        let rows = sqlx::query(
-            "SELECT c.name
-               FROM computers c
-              WHERE c.id <> $1
-                AND (c.last_seen_at IS NULL OR c.last_seen_at > NOW() - INTERVAL '24 hours')",
-        )
-        .bind(self.my_computer_id)
-        .fetch_all(&self.pg)
-        .await?;
+        // Pinned destinations from the policy row, or auto-pick the
+        // OFFSITE_DEST_COUNT most-recently-seen peers (excluding me, with a
+        // name tie-break so the pick is deterministic). Peers picked here are
+        // served by the deferred queue when they next come online.
+        let names: Vec<String> = if !cfg.dest_hosts.is_empty() {
+            cfg.dest_hosts
+                .iter()
+                .filter(|h| !h.eq_ignore_ascii_case(&self.my_node_name))
+                .cloned()
+                .collect()
+        } else {
+            sqlx::query_scalar::<_, String>(
+                "SELECT c.name
+                   FROM computers c
+                  WHERE c.id <> $1
+                    AND (c.last_seen_at IS NULL OR c.last_seen_at > NOW() - INTERVAL '24 hours')
+                  ORDER BY c.last_seen_at DESC NULLS LAST, c.name
+                  LIMIT $2",
+            )
+            .bind(self.my_computer_id)
+            .bind(OFFSITE_DEST_COUNT)
+            .fetch_all(&self.pg)
+            .await?
+        };
 
         let mut enqueued = Vec::new();
         let source_path = format!(
@@ -594,20 +858,19 @@ impl BackupOrchestrator {
             my_user,
             my_ip,
             self.backup_dir.display(),
-            kind,
+            kind_dir(kind),
             file_name
         );
-        // kind is always an internal literal (redis/postgres/nats/...). Filter
-        // anyway so the unquoted interpolation below stays injection-safe.
-        let kind_safe: String = kind
+        // kind is always an internal literal (redis/postgres/falkordb/...).
+        // Filter anyway so the unquoted interpolation below stays
+        // injection-safe.
+        let kind_safe: String = kind_dir(kind)
             .chars()
             .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
             .collect();
 
         let who = format!("backup_orchestrator@{}", self.my_node_name);
-        for row in rows {
-            let name: String = row.get("name");
-
+        for name in names {
             // Coalesce the fan-out: skip a peer that still has a non-terminal
             // (pending/dispatchable/running) backup-rsync of this kind. Without this, every
             // snapshot enqueues a fresh ~1 GiB rsync to EVERY peer regardless of
@@ -751,43 +1014,64 @@ impl BackupOrchestrator {
         Ok(())
     }
 
-    /// Prune local backup files for every kind, choosing retention depth
-    /// by our current leader/peer role. Never fails the caller — this is
-    /// best-effort disk hygiene that must not perturb the backup cadence.
+    /// Prune local backup files for every kind, choosing retention depth by
+    /// our source/peer role for that kind per `fleet_backup_config`
+    /// (`retention_count` newest generations + optional `retention_days` age
+    /// cap). Never fails the caller — this is best-effort disk hygiene that
+    /// must not perturb the backup cadence.
     pub async fn prune_all_local(&self) {
-        // Fail-open to the LEADER (larger) depth on a lookup error so a
+        // Fail-open to the SOURCE (larger) depth on a lookup error so a
         // transient DB blip can never cause over-deletion of replicas.
         let leader = self.i_am_leader().await.unwrap_or(true);
-        let (pg_keep, redis_keep) = if leader {
-            (LOCAL_KEEP_POSTGRES_LEADER, LOCAL_KEEP_REDIS_LEADER)
-        } else {
-            (LOCAL_KEEP_POSTGRES_PEER, LOCAL_KEEP_REDIS_PEER)
-        };
-        if let Err(e) = self.prune_local_backups("postgres", pg_keep).await {
-            warn!(error = %e, "postgres local backup prune failed");
-        }
-        if let Err(e) = self.prune_local_backups("redis", redis_keep).await {
-            warn!(error = %e, "redis local backup prune failed");
+        for kind in ["postgres", "redis", "falkordb"] {
+            let cfg = load_backup_config(&self.pg, kind)
+                .await
+                .unwrap_or_else(|| BackupKindConfig::default_for(kind));
+            let am_source = match cfg.source_host.as_deref() {
+                Some(h) => h.eq_ignore_ascii_case(&self.my_node_name),
+                None => leader,
+            };
+            // The source keeps at least the DB-catalog depth so neither the
+            // count NOR the age prune can orphan a `backups` row; peers hold
+            // only a few disaster-recovery replicas (replica depth is disk
+            // hygiene, not operator policy — it stays in code).
+            let (keep, min_keep) = if am_source {
+                (
+                    (cfg.retention_count.max(1) as usize).max(SOURCE_KEEP_FLOOR),
+                    SOURCE_KEEP_FLOOR,
+                )
+            } else {
+                (local_peer_keep(kind), 1)
+            };
+            if let Err(e) = self
+                .prune_local_backups(kind, keep, min_keep, cfg.retention_days)
+                .await
+            {
+                warn!(kind, error = %e, "local backup prune failed");
+            }
         }
     }
 
-    /// Prune this node's OWN `<backup_dir>/<kind>/` directory, keeping the
-    /// `keep` most-recent files (by mtime) and unlinking the rest. Only
+    /// Prune this node's OWN `<backup_dir>/<kind-dir>/` directory: keep the
+    /// `keep` most-recent files (by mtime), and additionally unlink files
+    /// older than `retention_days` (never dipping below `min_keep`). Only
     /// touches files whose name carries the kind's backup prefix
-    /// (`pg-` / `redis-`), so an operator file dropped in the directory is
-    /// never deleted. Best-effort: logs and continues past individual
-    /// unlink errors. Returns `(files_removed, bytes_freed)`.
+    /// (`pg-` / `redis-` / `falkordb-`), so an operator file dropped in the
+    /// directory is never deleted. Best-effort: logs and continues past
+    /// individual unlink errors. Returns `(files_removed, bytes_freed)`.
     async fn prune_local_backups(
         &self,
         kind: &str,
         keep: usize,
+        min_keep: usize,
+        retention_days: Option<i32>,
     ) -> Result<(u64, u64), BackupError> {
         let keep = keep.max(1);
         let prefix = kind_prefix(kind);
         if prefix.is_empty() {
             return Ok((0, 0));
         }
-        let dir = self.backup_dir.join(kind);
+        let dir = self.backup_dir.join(kind_dir(kind));
         let mut rd = match tokio::fs::read_dir(&dir).await {
             Ok(rd) => rd,
             // No directory yet (node never received a backup) → nothing to do.
@@ -811,7 +1095,10 @@ impl BackupOrchestrator {
             let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
             files.push((entry.path(), mtime, meta.len()));
         }
-        let targets = prune_targets(files, keep);
+        let cutoff = retention_days.filter(|d| *d > 0).map(|d| {
+            std::time::SystemTime::now() - std::time::Duration::from_secs(d as u64 * 86_400)
+        });
+        let targets = prune_targets_with_policy(files, keep, min_keep, cutoff);
         let mut removed = 0u64;
         let mut freed = 0u64;
         for (path, size) in targets {
@@ -870,6 +1157,7 @@ impl BackupOrchestrator {
             for (kind, keep) in [
                 ("postgres", LOCAL_KEEP_POSTGRES_PEER),
                 ("redis", LOCAL_KEEP_REDIS_PEER),
+                ("falkordb", LOCAL_KEEP_FALKORDB_PEER),
             ] {
                 // Coalesce: skip a peer that still has a pending/running reap of
                 // this kind. Fail-open (a count error still enqueues).
@@ -951,9 +1239,11 @@ pub(crate) async fn file_metadata(path: &Path) -> Result<(i64, String), BackupEr
     Ok((size_bytes, format!("{:x}", digest)))
 }
 
-async fn redis_lastsave() -> Option<u64> {
+/// `LASTSAVE` of a Redis-protocol container (redis proper or FalkorDB,
+/// which is a Redis module and answers the same command).
+async fn container_lastsave(container: &str) -> Option<u64> {
     let out = Command::new("docker")
-        .args(["exec", "forgefleet-redis", "redis-cli", "LASTSAVE"])
+        .args(["exec", container, "redis-cli", "LASTSAVE"])
         .output()
         .await
         .ok()?;
@@ -964,15 +1254,65 @@ async fn redis_lastsave() -> Option<u64> {
 }
 
 /// Filename prefix the backup writer uses for a kind's artifacts
-/// (`pg-<ts>.tar.gz.age`, `redis-<ts>.rdb.zst.age`). Empty for an
-/// unknown kind so the prune becomes a no-op rather than matching
-/// everything.
+/// (`pg-<ts>.tar.gz.age`, `redis-<ts>.rdb.zst.age`,
+/// `falkordb-<ts>.tar.zst.age`). Empty for an unknown kind so the prune
+/// becomes a no-op rather than matching everything.
 fn kind_prefix(kind: &str) -> &'static str {
     match kind {
         "postgres" => "pg-",
         "redis" => "redis-",
+        "falkordb" => "falkordb-",
         _ => "",
     }
+}
+
+/// On-disk folder name for a kind under `~/.forgefleet/backups/`. The
+/// operator's layout uses `FalkorDB/` (product capitalization); every other
+/// kind's folder is its lowercase name (postgres/, redis/, brain/, obsidian/).
+fn kind_dir(kind: &str) -> &str {
+    match kind {
+        "falkordb" => "FalkorDB",
+        other => other,
+    }
+}
+
+/// Replica generations a NON-source node keeps of a kind (disaster-recovery
+/// depth — bounded so a small-disk peer never fills up with fan-out copies).
+fn local_peer_keep(kind: &str) -> usize {
+    match kind {
+        "postgres" => LOCAL_KEEP_POSTGRES_PEER,
+        "redis" => LOCAL_KEEP_REDIS_PEER,
+        _ => LOCAL_KEEP_FALKORDB_PEER,
+    }
+}
+
+/// `.age` filename suffix when a kind's policy enables encryption.
+fn age_ext(encrypt: bool) -> &'static str {
+    if encrypt { ".age" } else { "" }
+}
+
+/// The ` | age -r <recipient>` pipeline stage, or empty when the kind's
+/// policy disables encryption.
+fn age_stage(recipient: Option<&str>) -> String {
+    match recipient {
+        Some(r) => format!(" | age -r {}", shell_quote(r)),
+        None => String::new(),
+    }
+}
+
+/// Shell pipeline that streams `dump.rdb` plus the multi-part AOF dir (when
+/// present) out of the FalkorDB container as a tar, compresses with zstd, and
+/// optionally encrypts. The inner `sh -c` runs INSIDE the container; tar'ing
+/// only the two known paths means a stray file in /data is never captured.
+/// Pure — no IO — so the command shape is unit-testable.
+fn falkordb_dump_cmd(recipient: Option<&str>, out_path: &str) -> String {
+    format!(
+        "docker exec {FALKORDB_CONTAINER} sh -c \
+           'cd /data && tar cf - dump.rdb $(test -d appendonlydir && echo appendonlydir)' \
+         | zstd -q{age} > {out}",
+        age = age_stage(recipient),
+        out = shell_quote(out_path),
+    )
 }
 
 /// SQL `LIKE` pattern matching every backup-rsync task title for `kind`
@@ -1119,13 +1459,14 @@ fn peer_backup_reap_script(kind: &str, keep: usize) -> String {
         return String::new();
     }
     let keep = keep.max(1);
+    let dir = kind_dir(kind);
     // `ls -1t` lists newest-first (full paths, because the glob is anchored to
     // "$d"); `tail -n +<keep+1>` selects everything past the kept window. Glob
     // expansion + ls errors are swallowed so an empty/absent dir is a clean
     // no-op. `rm -f "$f"` operates on the full path ls emitted.
     let start = keep + 1;
     format!(
-        "d=\"$HOME/.forgefleet/backups/{kind}\"; \
+        "d=\"$HOME/.forgefleet/backups/{dir}\"; \
          if [ -d \"$d\" ]; then \
            ls -1t \"$d\"/{prefix}* 2>/dev/null | tail -n +{start} \
              | while IFS= read -r f; do rm -f \"$f\"; done; \
@@ -1135,19 +1476,29 @@ fn peer_backup_reap_script(kind: &str, keep: usize) -> String {
 }
 
 /// Given `(path, mtime, size)` tuples, return the `(path, size)` of files
-/// to delete: everything except the `keep` most-recent by mtime. The
-/// newest files (largest mtime) are retained. Pure — no IO — so the
-/// retention policy is unit-testable.
-fn prune_targets(
+/// to delete under the count+age policy: everything past the `keep`
+/// most-recent by mtime goes, and a file older than `cutoff` also goes —
+/// unless it sits within the newest `min_keep` (so the age prune can never
+/// orphan a catalogued row on the source, and a peer always retains at
+/// least one replica). Pure — no IO — so the retention policy is
+/// unit-testable.
+fn prune_targets_with_policy(
     mut files: Vec<(PathBuf, std::time::SystemTime, u64)>,
     keep: usize,
+    min_keep: usize,
+    cutoff: Option<std::time::SystemTime>,
 ) -> Vec<(PathBuf, u64)> {
     // Most-recent first; ties broken by path so the result is deterministic.
     files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let min_keep = min_keep.max(1);
     files
         .into_iter()
-        .skip(keep)
-        .map(|(p, _, s)| (p, s))
+        .enumerate()
+        .filter_map(|(rank, (p, mtime, s))| {
+            let over_count = rank >= keep;
+            let over_age = cutoff.is_some_and(|c| mtime < c) && rank >= min_keep;
+            (over_count || over_age).then_some((p, s))
+        })
         .collect()
 }
 
@@ -1498,6 +1849,10 @@ mod tests {
         let redis = peer_backup_reap_script("redis", 24);
         assert!(redis.contains("\"$d\"/redis-*"));
         assert!(redis.contains("tail -n +25"));
+        // falkordb: the reap must target the operator-layout FalkorDB/ dir.
+        let falkor = peer_backup_reap_script("falkordb", 4);
+        assert!(falkor.contains("backups/FalkorDB"), "script: {falkor}");
+        assert!(falkor.contains("\"$d\"/falkordb-*"), "script: {falkor}");
         // Unknown kind → empty (caller skips), never a match-all `rm`.
         assert!(peer_backup_reap_script("nats", 4).is_empty());
         // keep is floored at 1 so a 0 can never delete every generation.
@@ -1508,8 +1863,91 @@ mod tests {
     fn kind_prefix_maps_known_kinds() {
         assert_eq!(kind_prefix("postgres"), "pg-");
         assert_eq!(kind_prefix("redis"), "redis-");
+        assert_eq!(kind_prefix("falkordb"), "falkordb-");
         // Unknown kind → empty so the prune is a no-op, never a match-all.
         assert_eq!(kind_prefix("nats"), "");
+    }
+
+    #[test]
+    fn kind_dir_uses_operator_layout() {
+        // The operator's on-disk layout is ~/.forgefleet/backups/<KIND>/ with
+        // FalkorDB capitalized; everything else keeps its lowercase name.
+        assert_eq!(kind_dir("falkordb"), "FalkorDB");
+        assert_eq!(kind_dir("postgres"), "postgres");
+        assert_eq!(kind_dir("redis"), "redis");
+        assert_eq!(kind_dir("brain"), "brain");
+        // The rsync/reap scripts interpolate this after an alnum/_/- filter —
+        // "FalkorDB" must survive it unchanged.
+        let filtered: String = kind_dir("falkordb")
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        assert_eq!(filtered, "FalkorDB");
+    }
+
+    #[test]
+    fn falkordb_dump_cmd_captures_rdb_and_aof() {
+        let cmd = falkordb_dump_cmd(Some("age1abc"), "/tmp/falkordb-x.tar.zst.age");
+        assert!(
+            cmd.contains("docker exec forgefleet-falkordb"),
+            "cmd: {cmd}"
+        );
+        // Both the RDB snapshot and the multi-part AOF dir must be in the tar.
+        assert!(cmd.contains("dump.rdb"), "cmd: {cmd}");
+        assert!(cmd.contains("appendonlydir"), "cmd: {cmd}");
+        assert!(cmd.contains("| zstd -q"), "cmd: {cmd}");
+        assert!(cmd.contains("| age -r 'age1abc'"), "cmd: {cmd}");
+        assert!(
+            cmd.contains("> '/tmp/falkordb-x.tar.zst.age'"),
+            "cmd: {cmd}"
+        );
+
+        // encrypt=false policy → no age stage at all.
+        let plain = falkordb_dump_cmd(None, "/tmp/falkordb-x.tar.zst");
+        assert!(!plain.contains("age -r"), "cmd: {plain}");
+        assert!(plain.contains("| zstd -q > "), "cmd: {plain}");
+    }
+
+    #[test]
+    fn age_helpers_follow_encrypt_policy() {
+        assert_eq!(age_ext(true), ".age");
+        assert_eq!(age_ext(false), "");
+        assert_eq!(age_stage(Some("age1xyz")), " | age -r 'age1xyz'");
+        assert_eq!(age_stage(None), "");
+    }
+
+    #[test]
+    fn default_config_mirrors_pre_v163_behavior() {
+        // The fallback (row/table missing) must reproduce the old hardcoded
+        // cadence + retention so a fleet mid-upgrade never changes behavior.
+        let pg = BackupKindConfig::default_for("postgres");
+        assert_eq!(pg.interval_secs, 4 * 3600);
+        assert_eq!(pg.retention_count as usize, LOCAL_KEEP_POSTGRES_LEADER);
+        assert!(pg.encrypt && pg.enabled);
+        assert!(
+            pg.source_host.is_none(),
+            "postgres defaults to leader-gated"
+        );
+        assert!(pg.dest_hosts.is_empty(), "empty = offsite auto-pick");
+
+        let redis = BackupKindConfig::default_for("redis");
+        assert_eq!(redis.interval_secs, 2 * 3600);
+        assert_eq!(redis.retention_count as usize, LOCAL_KEEP_REDIS_LEADER);
+
+        // falkordb without a config row is leader-gated too — but the row
+        // seeded by V163 pins it to the FalkorDB host (priya).
+        let falkor = BackupKindConfig::default_for("falkordb");
+        assert_eq!(falkor.interval_secs as u64, DEFAULT_FALKORDB_INTERVAL_SECS);
+        assert!(falkor.encrypt && falkor.enabled);
+    }
+
+    #[test]
+    fn peer_keep_bounds_every_kind() {
+        assert_eq!(local_peer_keep("postgres"), LOCAL_KEEP_POSTGRES_PEER);
+        assert_eq!(local_peer_keep("redis"), LOCAL_KEEP_REDIS_PEER);
+        assert_eq!(local_peer_keep("falkordb"), LOCAL_KEEP_FALKORDB_PEER);
+        // Every peer depth is a thin DR replica set, well under source depth.
+        assert!(local_peer_keep("falkordb") < SOURCE_KEEP_FLOOR);
     }
 
     /// Build a `(path, mtime, size)` tuple `secs` seconds after the epoch.
@@ -1525,7 +1963,7 @@ mod tests {
     fn prune_targets_keeps_most_recent() {
         // newest → oldest: c(30), b(20), a(10)
         let files = vec![f("a", 10), f("b", 20), f("c", 30)];
-        let del = prune_targets(files, 2);
+        let del = prune_targets_with_policy(files, 2, 1, None);
         // Keep the 2 newest (c, b); delete the oldest (a).
         assert_eq!(del.len(), 1);
         assert_eq!(del[0].0, PathBuf::from("a"));
@@ -1534,16 +1972,16 @@ mod tests {
     #[test]
     fn prune_targets_noop_when_under_keep() {
         let files = vec![f("a", 10), f("b", 20)];
-        assert!(prune_targets(files, 5).is_empty());
+        assert!(prune_targets_with_policy(files, 5, 1, None).is_empty());
         // Exactly `keep` files → nothing deleted.
         let files = vec![f("a", 10), f("b", 20)];
-        assert!(prune_targets(files, 2).is_empty());
+        assert!(prune_targets_with_policy(files, 2, 1, None).is_empty());
     }
 
     #[test]
     fn prune_targets_deletes_all_oldest_in_order() {
         let files = vec![f("a", 10), f("b", 20), f("c", 30), f("d", 40)];
-        let del = prune_targets(files, 1);
+        let del = prune_targets_with_policy(files, 1, 1, None);
         // Keep only d(40); delete c, b, a.
         let names: Vec<_> = del.iter().map(|(p, _)| p.clone()).collect();
         assert_eq!(names.len(), 3);
@@ -1551,6 +1989,29 @@ mod tests {
         assert!(names.contains(&PathBuf::from("b")));
         assert!(names.contains(&PathBuf::from("c")));
         assert!(!names.contains(&PathBuf::from("d")));
+    }
+
+    #[test]
+    fn prune_policy_age_cutoff_respects_min_keep() {
+        // Files at t=10..40; cutoff at t=35 marks a, b, c "too old".
+        let cutoff = std::time::UNIX_EPOCH + Duration::from_secs(35);
+        let files = vec![f("a", 10), f("b", 20), f("c", 30), f("d", 40)];
+        // Generous count cap (10) — only the age rule bites, but the newest
+        // min_keep=2 (d, c) survive even though c is past the cutoff. This is
+        // what keeps `retention_days` from orphaning catalogued rows.
+        let del = prune_targets_with_policy(files, 10, 2, Some(cutoff));
+        let names: Vec<_> = del.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(names, vec![PathBuf::from("b"), PathBuf::from("a")]);
+
+        // No cutoff → pure count policy, min_keep irrelevant.
+        let files = vec![f("a", 10), f("b", 20)];
+        assert!(prune_targets_with_policy(files, 5, 2, None).is_empty());
+
+        // min_keep is floored at 1: even an all-ancient dir keeps its newest.
+        let files = vec![f("a", 10), f("b", 20)];
+        let del = prune_targets_with_policy(files, 10, 0, Some(cutoff));
+        let names: Vec<_> = del.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(names, vec![PathBuf::from("a")]);
     }
 
     #[test]

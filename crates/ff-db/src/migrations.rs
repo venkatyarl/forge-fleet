@@ -793,6 +793,17 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "drop_worktree_path_unique",
         sql: schema::SCHEMA_V162_DROP_WORKTREE_PATH_UNIQUE,
     },
+    PgMigration {
+        version: 163,
+        name: "fleet_backup_config",
+        sql: schema::SCHEMA_V163_FLEET_BACKUP_CONFIG,
+    },
+    // V164 is claimed by in-flight branch wi/a3ce533f6de1 — take 165.
+    PgMigration {
+        version: 165,
+        name: "server_policy",
+        sql: schema::SCHEMA_V165_SERVER_POLICY,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

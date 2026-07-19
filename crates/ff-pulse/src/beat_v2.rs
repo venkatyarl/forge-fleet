@@ -35,6 +35,11 @@ pub struct OsInfo {
     /// ending in `-nvidia`; see memory: dgx-spark-specs.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kernel: String,
+    /// CPU architecture from `std::env::consts::ARCH` ("aarch64", "x86_64").
+    /// Key column of the server-policy resolver; empty on beats from older
+    /// daemons — the materializer then derives it from os_family/gpu_kind.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub arch: String,
 }
 
 /// Top-level Pulse v2 beat payload.
