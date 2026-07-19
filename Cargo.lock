@@ -1502,6 +1502,7 @@ dependencies = [
  "dashmap",
  "ff-core",
  "ff-db",
+ "ff-observability",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
