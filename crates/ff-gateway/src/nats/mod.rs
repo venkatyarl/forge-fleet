@@ -2,3 +2,4 @@
 
 pub mod consumer;
 pub mod publisher;
+pub mod stream_config;
