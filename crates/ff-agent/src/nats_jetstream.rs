@@ -3,6 +3,7 @@
 //! Creates idempotent JetStream streams for audit, cost, alerts, and tasks.
 //! Call [`init_jetstream_streams`] once at daemon startup after [`init_nats`].
 
+use serde_json::json;
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -10,7 +11,7 @@ use tracing::{info, warn};
 pub const STREAM_AUDIT: &str = "AUDIT";
 pub const STREAM_COST: &str = "COST";
 pub const STREAM_ALERTS: &str = "ALERTS";
-pub const STREAM_TASKS: &str = "TASKS";
+pub const STREAM_FF_TASKS: &str = "FF_TASKS";
 pub const STREAM_LOGS: &str = "LOGS";
 
 /// Default retention: 30 days, max 10M messages per stream.
@@ -26,7 +27,7 @@ pub async fn init_jetstream_streams(client: &async_nats::Client) {
         (STREAM_AUDIT, vec!["fleet.audit.>"]),
         (STREAM_COST, vec!["fleet.cost.>"]),
         (STREAM_ALERTS, vec!["fleet.alerts.>"]),
-        (STREAM_TASKS, vec!["fleet.tasks.>"]),
+        (STREAM_FF_TASKS, vec!["fleet.tasks.>"]),
         (STREAM_LOGS, vec!["logs.>"]),
     ];
 
@@ -52,6 +53,24 @@ pub async fn init_jetstream_streams(client: &async_nats::Client) {
             }
         }
     }
+}
+
+/// Subject used for new fleet_task insert notifications on the NATS
+/// `FF_TASKS` stream.
+pub const FF_TASKS_INSERTED_SUBJECT: &str = "fleet.tasks.inserted";
+
+/// Best-effort NATS notification that a new `fleet_tasks` row was inserted.
+///
+/// This is the dual-emission counterpart to the PostgreSQL
+/// `fleet_task_inserted` NOTIFY used during the rollout from LISTEN/NOTIFY
+/// to NATS consumption.  Failures are swallowed so enqueue never fails
+/// because NATS is unreachable.
+pub async fn publish_task_inserted(task_id: uuid::Uuid) {
+    crate::nats_client::publish_json(
+        FF_TASKS_INSERTED_SUBJECT,
+        &json!({ "task_id": task_id, "event": "inserted" }),
+    )
+    .await;
 }
 
 /// Publish a message to a JetStream stream with durability guarantees.
