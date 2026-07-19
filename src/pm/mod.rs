@@ -82,6 +82,16 @@ pub struct WorkItem {
     pub created_at: DateTime<Utc>,
     pub blocked_by_count: usize,
     pub required_capabilities: HashSet<String>,
+    /// Self-improvement tracking: coarse project health/status bucket the item
+    /// belongs to (e.g. "green", "yellow", "red"). Optional so legacy items
+    /// without a status still deserialize.
+    pub project_status: Option<String>,
+    /// Self-improvement tracking: number of prior improvement iterations this
+    /// work item has undergone.
+    pub improvement_count: usize,
+    /// Self-improvement tracking: latest performance metric score associated
+    /// with the item (e.g. throughput, success rate). Higher is better.
+    pub performance_score: Option<f64>,
 }
 
 /// An available worker slot with a set of capabilities.
@@ -236,6 +246,9 @@ mod tests {
             created_at: Utc::now() - Duration::hours(age_hours),
             blocked_by_count: blockers,
             required_capabilities: caps.iter().map(|s| s.to_string()).collect(),
+            project_status: None,
+            improvement_count: 0,
+            performance_score: None,
         }
     }
 
