@@ -1393,6 +1393,7 @@ name = "ff-discovery"
 version = "2026.4.7"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "dashmap",
  "reqwest",
