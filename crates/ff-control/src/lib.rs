@@ -11,6 +11,7 @@
 pub mod bootstrap;
 pub mod commands;
 pub mod control_plane;
+pub mod dispatcher;
 pub mod errors;
 pub mod ha_coordinator;
 pub mod health;
@@ -29,6 +30,7 @@ pub use control_plane::{
     OrchestratorSubsystemHandle, RuntimeSubsystemHandle, SchedulerSubsystemHandle, StartupEvent,
     StartupStepStatus,
 };
+pub use dispatcher::{DEFAULT_LEASE_DURATION, DEFAULT_MAX_BUILD_DURATION, WorkItemDispatch};
 pub use errors::{ControlError, Result};
 pub use ha_coordinator::{
     DEFAULT_MAX_REPLICATION_LAG_BYTES, HaAction, HaClusterEvent, HaCoordinator,
