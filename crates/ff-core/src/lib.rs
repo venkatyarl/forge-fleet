@@ -16,6 +16,7 @@ pub mod artifact_cache_dir;
 pub mod artifact_fetch;
 pub mod audit;
 pub mod build_version;
+pub mod cache;
 pub mod chaos;
 pub mod ci_trigger;
 pub mod circuit_breaker;

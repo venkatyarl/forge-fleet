@@ -87,8 +87,10 @@ struct AssignedWorkItem {
     /// so the model doesn't repeat the same mistake (retry-with-context).
     last_error: Option<String>,
     /// Task complexity from the decomposer (`mechanical` | `moderate` | `complex`).
-    /// A non-mechanical task skips the weak local codegen lane and dispatches
-    /// straight to the cloud CLI backstop (see [`AssignedWorkItem::prefers_cloud_lane`]).
+    /// Mechanical and moderate tasks try the cheap local Lane-1 codegen harness
+    /// first; complex tasks and any task predicted to touch more than
+    /// [`PREDICTED_PATHS_CLOUD_THRESHOLD`] files skip straight to the cloud CLI
+    /// backstop (see [`AssignedWorkItem::prefers_cloud_lane`]).
     complexity: String,
     /// How many files the decomposer predicted this task touches. A multi-file
     /// change is beyond the local codegen harness's reliable range, so it too
@@ -106,20 +108,30 @@ struct AssignedWorkItem {
 impl AssignedWorkItem {
     /// Whether this task should SKIP the local Lane-1 codegen harness and go
     /// straight to the cloud CLI (codex/claude/kimi). The local lane is great for
-    /// small mechanical single-file edits but HANGS or half-finishes on complex
-    /// multi-file work (observed 2026-07-06: a 3-file React feature wedged a slot
-    /// for 24min producing nothing). Route those to the more capable cloud lane
-    /// from attempt 0 instead of burning a wedge-prone local attempt first.
+    /// small mechanical and moderate edits, but complex or multi-file-heavy work
+    /// (predicted to touch more than [`PREDICTED_PATHS_CLOUD_THRESHOLD`] files)
+    /// can hang or half-finish there (observed 2026-07-06: a 3-file React feature
+    /// wedged a slot for 24min producing nothing). Route those to the more capable
+    /// cloud lane from attempt 0 instead of burning a wedge-prone local attempt
+    /// first.
     fn prefers_cloud_lane(&self) -> bool {
         task_prefers_cloud_lane(&self.complexity, self.predicted_paths_count)
     }
 }
 
+/// Number of predicted touched paths above which a task is treated as
+/// "multi-file-heavy" and routed straight to the cloud CLI, even when its
+/// complexity is `mechanical` or `moderate`. Chosen so the local Lane-1 harness
+/// gets the majority of moderate single/double-file edits while avoiding the
+/// multi-file wedge class that local codegen fumbles.
+const PREDICTED_PATHS_CLOUD_THRESHOLD: i32 = 3;
+
 /// Pure routing predicate (unit-testable): a task skips the local Lane-1 codegen
-/// harness for the cloud CLI when it's `moderate`/`complex` OR touches more than
-/// one file. Mechanical single-file edits stay on the cheap local lane.
+/// harness for the cloud CLI when it's `complex` OR predicted to touch more than
+/// [`PREDICTED_PATHS_CLOUD_THRESHOLD`] files. Mechanical and moderate tasks that
+/// are not multi-file-heavy stay on the cheap local lane.
 fn task_prefers_cloud_lane(complexity: &str, predicted_paths_count: i32) -> bool {
-    matches!(complexity, "moderate" | "complex") || predicted_paths_count > 1
+    matches!(complexity, "complex") || predicted_paths_count > PREDICTED_PATHS_CLOUD_THRESHOLD
 }
 
 #[derive(Debug, Clone)]
@@ -858,6 +870,30 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         return Ok(());
     }
 
+    // SELF-VERIFY GATE — catch garbage at the source, before it costs a PR + CI
+    // + review cycle. "Has a diff" != "is good": empty stub files or
+    // non-compiling code must never reach the review drain (2026-07-20: an item
+    // committed three 0-byte files and the review drain was the FIRST place it
+    // was caught). On failure, requeue with the specific reason as context —
+    // the next attempt (warm or fresh) gets an actionable problem to fix —
+    // instead of opening a broken PR.
+    if let Err(reason) = self_verify_worktree(&worktree.worktree_path, &worktree.base_branch).await
+    {
+        warn!(
+            work_item_id = %item.work_item_id,
+            %reason,
+            "work_item_dispatch: self-verify gate rejected the build before PR — requeue with context"
+        );
+        requeue_or_fail(
+            &pg,
+            &item,
+            &format!("self-verify failed before opening PR: {reason}"),
+        )
+        .await?;
+        remove_worktree(&item.repo_path, &worktree.worktree_path)?;
+        return Ok(());
+    }
+
     let head_sha = git_head_sha(&worktree.worktree_path)?;
     push_branch(&item.repo_path, &worktree.task_branch)?;
     let pr_url = create_pr(&worktree.worktree_path, &item, &worktree).await?;
@@ -1199,10 +1235,10 @@ const MAX_DISPATCH_ATTEMPTS: i32 = 3;
 /// local attempt just burns another ~190s + slot cycle for a task that keeps
 /// hanging the same way, before finally reaching cloud. The CLOUD lane does NOT
 /// starve the heartbeat (verified: cloud attempts run 900s+ with no stale-reap).
-/// Only MECHANICAL tasks use the local lane (moderate/complex already
-/// `prefers_cloud_lane`), so this narrows the local exposure to ONE cheap try then
-/// the reliable cloud lane — unblocking the mechanical backlog with no heartbeat
-/// rearchitecture.
+/// Mechanical and moderate tasks use the local lane; complex or multi-file-heavy
+/// tasks already `prefers_cloud_lane`, so this narrows the local exposure to ONE
+/// cheap try then the reliable cloud lane — unblocking the backlog with no
+/// heartbeat rearchitecture.
 const ESCALATE_TO_CLOUD_AT: i32 = 1;
 
 /// Whether to try the cheap LOCAL codegen lane for this dispatch: only while UNDER
@@ -1485,13 +1521,49 @@ async fn release_slot_and_lease_tx(
     reason: &str,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE work_item_leases
-            SET lease_state = 'released',
-                released_at = NOW(),
-                release_reason = $3
-          WHERE work_item_id = $1
-            AND sub_agent_id = $2
-            AND released_at IS NULL",
+        "WITH releasing AS (
+             SELECT id, work_item_id, lease_state, endpoint, attempt, computer_id
+               FROM work_item_leases
+              WHERE work_item_id = $1
+                AND sub_agent_id = $2
+                AND released_at IS NULL
+              FOR UPDATE
+         ), released AS (
+             UPDATE work_item_leases l
+                SET lease_state = 'released',
+                    released_at = NOW(),
+                    release_reason = $3
+               FROM releasing r
+              WHERE l.id = r.id
+          RETURNING r.work_item_id,
+                    r.lease_state AS from_status,
+                    r.endpoint,
+                    r.attempt,
+                    l.release_reason,
+                    r.computer_id
+         )
+         INSERT INTO work_item_events
+             (work_item_id, from_status, to_status, computer, attempt, detail)
+         SELECT r.work_item_id,
+                r.from_status,
+                'lease_released',
+                c.name,
+                r.attempt,
+                jsonb_build_object(
+                    'event_type', 'lease_released',
+                    'endpoint', r.endpoint,
+                    'lane', CASE
+                        WHEN NULLIF(r.endpoint, '') IS NULL THEN NULL
+                        WHEN r.endpoint LIKE 'cloud:%'
+                          OR r.endpoint ~ '^(codex|claude|kimi|gemini|grok)(:|$)'
+                          THEN 'cloud'
+                        ELSE 'local'
+                    END,
+                    'attempt', r.attempt,
+                    'release_reason', r.release_reason
+                )
+           FROM released r
+           LEFT JOIN computers c ON c.id = r.computer_id",
     )
     .bind(item.work_item_id)
     .bind(item.sub_agent_id)
@@ -1780,9 +1852,9 @@ async fn run_ff_dispatch(
     // Lane 1: local codegen harness — but skip it once we've escalated to cloud
     // (stage 2, after ESCALATE_TO_CLOUD_AT local failures it has failed the same
     // way), when this node's local-codegen breaker is open (it's been failing),
-    // OR when the task is complexity-routed to cloud (moderate/complex or
-    // multi-file) — the local lane wedges/half-finishes on those, so we send
-    // them straight to the capable cloud CLI from attempt 0 instead of burning a
+    // OR when the task is complexity-routed to cloud (complex or multi-file-
+    // heavy) — the local lane wedges/half-finishes on those, so we send them
+    // straight to the capable cloud CLI from attempt 0 instead of burning a
     // wedge-prone local attempt first.
     if use_local_lane(item.attempts, lane1_breaker_open, item.prefers_cloud_lane()) {
         // Bound Lane 1 with a hard timeout so a hung local codegen harness fails
@@ -2735,6 +2807,71 @@ fn git_head_sha(worktree_path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Self-verify a built worktree BEFORE it becomes a PR — the cheap local checks
+/// a competent engineer runs before calling a change "done": no empty /
+/// whitespace-only added files, and (best-effort) the tree still compiles.
+/// Returns `Err(reason)` on the first problem so the retry gets actionable
+/// context. Catching garbage here saves a PR + CI + review cycle (2026-07-20:
+/// an item committed three 0-byte files and reached the review drain).
+async fn self_verify_worktree(
+    worktree_path: &Path,
+    base_branch: &str,
+) -> std::result::Result<(), String> {
+    // 1) Reject empty / whitespace-only ADDED files (instant, catches the
+    //    empty-stub failure mode directly).
+    let range = format!("{base_branch}...HEAD");
+    let out = run_git(
+        worktree_path,
+        ["diff", "--diff-filter=A", "--name-only", &range],
+        Duration::from_secs(30),
+    )
+    .map_err(|e| format!("git diff for self-verify failed: {e}"))?;
+    for f in String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
+        let full = worktree_path.join(f);
+        let empty = match std::fs::read(&full) {
+            Ok(bytes) => bytes.is_empty() || bytes.iter().all(u8::is_ascii_whitespace),
+            Err(_) => false, // unreadable/deleted — not this gate's concern
+        };
+        if empty {
+            return Err(format!("added file is empty or whitespace-only: {f}"));
+        }
+    }
+
+    // 2) Compile check — best-effort and bounded. Only an ACTUAL compile error
+    //    blocks the PR; a tooling error or timeout must not (never freeze the
+    //    pipeline on check infra). Skipped for a non-Rust repo.
+    if !worktree_path.join("Cargo.toml").exists() {
+        return Ok(());
+    }
+    let check = tokio::time::timeout(
+        Duration::from_secs(300),
+        tokio::process::Command::new("cargo")
+            .args(["check", "--quiet"])
+            .current_dir(worktree_path)
+            .output(),
+    )
+    .await;
+    if let Ok(Ok(o)) = check {
+        if !o.status.success() {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if let Some(err_line) = stderr
+                .lines()
+                .find(|l| l.contains("error[") || l.trim_start().starts_with("error:"))
+            {
+                return Err(format!(
+                    "cargo check failed: {}",
+                    err_line.trim().chars().take(200).collect::<String>()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn push_branch(repo_path: &Path, task_branch: &str) -> Result<()> {
     // Prune-fetch first: the lease below is checked against this clone's
     // remote-tracking ref, and merged wi/* branches are DELETED on origin
@@ -3226,7 +3363,7 @@ mod tests {
             "#62: 2nd attempt goes cloud"
         );
         assert!(!use_local_lane(2, false, false));
-        // A complexity-routed (moderate/complex) task never touches the local lane.
+        // A complexity-routed (complex or multi-file-heavy) task never touches the local lane.
         assert!(!use_local_lane(0, false, true));
         // Open local-codegen breaker → skip local even on attempt 0.
         assert!(!use_local_lane(0, true, false));
@@ -3356,11 +3493,13 @@ mod tests {
         // Mechanical single-file → cheap local lane.
         assert!(!task_prefers_cloud_lane("mechanical", 1));
         assert!(!task_prefers_cloud_lane("mechanical", 0));
-        // Non-mechanical complexity → cloud from attempt 0 (the wedge-avoidance).
-        assert!(task_prefers_cloud_lane("moderate", 1));
+        // Moderate tasks that are not multi-file-heavy try local first.
+        assert!(!task_prefers_cloud_lane("moderate", 1));
+        assert!(!task_prefers_cloud_lane("moderate", 3));
+        // Complex tasks bypass the local lane regardless of file count.
         assert!(task_prefers_cloud_lane("complex", 0));
-        // Multi-file even if labelled mechanical → cloud (local lane fumbles them).
-        assert!(task_prefers_cloud_lane("mechanical", 3));
+        // Multi-file-heavy tasks (above the threshold) go cloud even if mechanical.
+        assert!(task_prefers_cloud_lane("mechanical", 4));
         // Unknown/empty complexity is treated as mechanical (safe default).
         assert!(!task_prefers_cloud_lane("", 1));
     }

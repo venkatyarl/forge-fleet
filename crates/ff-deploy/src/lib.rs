@@ -23,14 +23,18 @@ pub mod strategy;
 
 pub use config::DeployConfig;
 pub use daemon::{ActiveLease, RestartReport, restart_with_lease_drain};
-pub use deploy::{LeaseSource, RestartCoordinator};
+pub use deploy::{
+    LeaseSource, RestartCoordinator, git_fetch_and_reset_hard, git_stash_dirty_tree,
+    git_tree_is_dirty,
+};
 pub use deployer::{DeploymentAdapter, DeploymentOrchestrator, DeploymentReport, StepOutcome};
-pub use git_utils::git_tree_is_dirty;
+
 pub use health_gate::{
     HealthGate, HealthGateConfig, HealthGateEvaluation, HealthGateStatus, HealthSnapshot,
 };
 pub use node::{
-    forgefleetd_restart_command, restart_forgefleetd_local, restart_forgefleetd_with_drain,
+    drain_active_work_item_leases, forgefleetd_restart_command, restart_forgefleetd_local,
+    restart_forgefleetd_local_with_drain, restart_forgefleetd_with_drain,
 };
 pub use release::{ReleaseChannel, ReleaseManifest, ReleaseRecord, ReleaseState};
 pub use resolution::{ResolutionError, ResolutionRetryPolicy, ResolvedTarget, resolve_with_retry};
