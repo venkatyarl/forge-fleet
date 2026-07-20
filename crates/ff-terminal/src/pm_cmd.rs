@@ -221,9 +221,11 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
                 Option<String>,
                 Option<String>,
                 Option<String>,
+                bool,
             )> = sqlx::query_as(
                 "SELECT w.kind, w.title, w.status, w.assigned_computer, lc.name AS live_host, \
-                        wt.status AS worktree, mq.status AS merge_q, w.pr_url, w.repo_url, w.repo_path \
+                        wt.status AS worktree, mq.status AS merge_q, w.pr_url, w.repo_url, w.repo_path, \
+                        EXISTS (SELECT 1 FROM work_items c WHERE c.parent_id = w.id) AS is_parent \
                    FROM work_items w \
                    LEFT JOIN work_item_worktrees wt \
                           ON wt.work_item_id = w.id AND wt.status <> 'cleaned' \
@@ -260,6 +262,7 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
                 pr,
                 repo_url,
                 repo_path,
+                is_parent,
             ) in rows
             {
                 let t: String = title.chars().take(33).collect();
@@ -279,9 +282,12 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
                     .or(repo_url.as_deref())
                     .and_then(|s| s.rsplit('/').next())
                     .unwrap_or("");
+                // Parent work_items are not schedulable leaves; mark them so the
+                // board doesn't look like starved ready work.
+                let kind_label = if is_parent { format!("{kind}*") } else { kind };
                 println!(
                     "{:<8} {:<34} {:<11} {:<8} {:<11} {:<18} {}",
-                    kind,
+                    kind_label,
                     t,
                     status,
                     host,

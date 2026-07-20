@@ -876,6 +876,16 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "error_events",
         sql: schema::SCHEMA_V178_ERROR_EVENTS,
     },
+    PgMigration {
+        version: 179,
+        name: "ssh_mesh_degraded_alert",
+        sql: schema::SCHEMA_V179_SSH_MESH_DEGRADED_ALERT,
+    },
+    PgMigration {
+        version: 180,
+        name: "align_subagent_paths_to_nested_full_clone",
+        sql: schema::SCHEMA_V180_ALIGN_SUBAGENT_PATHS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

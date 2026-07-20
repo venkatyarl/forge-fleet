@@ -1,12 +1,14 @@
 //! Fleet-wide SSH mesh verification + propagation.
 //! See plan: /Users/venkat/.claude/plans/gentle-questing-valley.md §3h.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use sqlx::PgPool;
 use tokio::process::Command;
 use tokio::time::timeout;
+use tracing::{error, warn};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct MeshCell {
@@ -26,14 +28,18 @@ pub async fn pairwise_ssh_check(pool: &PgPool) -> Result<MeshMatrix, String> {
     let nodes = ff_db::pg_list_nodes(pool)
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
-    pairwise_ssh_check_inner(pool, &nodes, None).await
+    let matrix = pairwise_ssh_check_inner(pool, &nodes, None).await?;
+    let _ = fire_mesh_alert(pool).await;
+    Ok(matrix)
 }
 
 pub async fn pairwise_ssh_check_node(pool: &PgPool, node: &str) -> Result<MeshMatrix, String> {
     let nodes = ff_db::pg_list_nodes(pool)
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
-    pairwise_ssh_check_inner(pool, &nodes, Some(node)).await
+    let matrix = pairwise_ssh_check_inner(pool, &nodes, Some(node)).await?;
+    let _ = fire_mesh_alert(pool).await;
+    Ok(matrix)
 }
 
 async fn pairwise_ssh_check_inner(
@@ -243,6 +249,7 @@ pub async fn local_reach_check(
             .await;
         probes.push(p);
     }
+    let _ = fire_mesh_alert(pool).await;
     probes.sort_by(|a, b| a.dst.cmp(&b.dst));
     Ok(probes)
 }
@@ -325,6 +332,177 @@ fn classify_direct_probe(ping_ok: bool, ssh_err: Option<String>) -> (String, Opt
             )),
         ),
     }
+}
+
+/// Alert policy seeded by migration V179.
+const MESH_ALERT_POLICY: &str = "ssh_mesh_degraded";
+const MESH_ALERT_RECENCY_HOURS: i64 = 24;
+
+#[derive(Debug, Default)]
+struct MeshAlertSnapshot {
+    failed_edges: Vec<(String, String, Option<String>)>,
+    asymmetric: Vec<(String, String, String, String)>,
+}
+
+async fn load_mesh_alert_snapshot(pg: &PgPool) -> Result<MeshAlertSnapshot, String> {
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(MESH_ALERT_RECENCY_HOURS);
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> = sqlx::query_as(
+        "SELECT src_node, dst_node, status, last_error, last_checked
+         FROM fleet_mesh_status
+         ORDER BY src_node, dst_node",
+    )
+    .fetch_all(pg)
+    .await
+    .map_err(|e| format!("load mesh status: {e}"))?;
+
+    let mut directed: BTreeMap<(String, String), (String, Option<String>)> = BTreeMap::new();
+    for (src, dst, status, last_error, last_checked) in rows {
+        if last_checked.map(|t| t < cutoff).unwrap_or(true) {
+            continue;
+        }
+        directed.insert((src, dst), (status, last_error));
+    }
+
+    let mut snapshot = MeshAlertSnapshot::default();
+    for ((src, dst), (status, last_error)) in &directed {
+        if status == "failed" {
+            snapshot
+                .failed_edges
+                .push((src.clone(), dst.clone(), last_error.clone()));
+        }
+    }
+
+    let mut names: Vec<String> = directed.keys().map(|(a, _)| a.clone()).collect();
+    names.sort();
+    names.dedup();
+    for i in 0..names.len() {
+        for j in (i + 1)..names.len() {
+            let a = &names[i];
+            let b = &names[j];
+            let Some((ab_status, _)) = directed.get(&(a.clone(), b.clone())) else {
+                continue;
+            };
+            let Some((ba_status, _)) = directed.get(&(b.clone(), a.clone())) else {
+                continue;
+            };
+            if ab_status != ba_status {
+                snapshot.asymmetric.push((
+                    a.clone(),
+                    b.clone(),
+                    ab_status.clone(),
+                    ba_status.clone(),
+                ));
+            }
+        }
+    }
+
+    Ok(snapshot)
+}
+
+/// Fire the `ssh_mesh_degraded` imperative alert if the recent mesh snapshot
+/// contains any failed directed pairs or asymmetric pairs. Called automatically
+/// after full pairwise checks and local reachability checks so both scheduled
+/// ticks and on-demand `ff fleet ssh-mesh-check` alert on problems.
+pub async fn fire_mesh_alert(pg: &PgPool) -> Result<(), String> {
+    let policy: Option<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT id, severity, channel FROM alert_policies WHERE name = $1 AND enabled = true",
+    )
+    .bind(MESH_ALERT_POLICY)
+    .fetch_optional(pg)
+    .await
+    .map_err(|e| format!("load {MESH_ALERT_POLICY} policy: {e}"))?;
+
+    let Some((policy_id, severity, channel)) = policy else {
+        error!(
+            policy = MESH_ALERT_POLICY,
+            "ssh-mesh: alert policy missing or disabled"
+        );
+        return Ok(());
+    };
+
+    let snapshot = load_mesh_alert_snapshot(pg).await?;
+    let total = snapshot.failed_edges.len() + snapshot.asymmetric.len();
+    if total == 0 {
+        return Ok(());
+    }
+
+    let mut parts = Vec::new();
+    if !snapshot.failed_edges.is_empty() {
+        let summary = snapshot
+            .failed_edges
+            .iter()
+            .take(12)
+            .map(|(a, b, e)| {
+                let extra = e.as_ref().map(|x| format!(" ({x})")).unwrap_or_default();
+                format!("{a}->{b}{extra}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ellipsis = if snapshot.failed_edges.len() > 12 {
+            ", ..."
+        } else {
+            ""
+        };
+        parts.push(format!("failed: {summary}{ellipsis}"));
+    }
+    if !snapshot.asymmetric.is_empty() {
+        let summary = snapshot
+            .asymmetric
+            .iter()
+            .take(12)
+            .map(|(a, b, ab, ba)| format!("{a}->{b}={ab}, {b}->{a}={ba}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ellipsis = if snapshot.asymmetric.len() > 12 {
+            ", ..."
+        } else {
+            ""
+        };
+        parts.push(format!("asymmetric: {summary}{ellipsis}"));
+    }
+
+    let message = format!(
+        "SSH mesh degraded: {} unhealthy pair(s). {}",
+        total,
+        parts.join("; ")
+    );
+
+    let channel_result =
+        crate::alert_evaluator::dispatch_alert(pg, &channel, &severity, &message).await;
+
+    if let Err(e) = sqlx::query(
+        r#"
+        INSERT INTO alert_events
+            (policy_id, computer_id, value, value_text, message, channel_result)
+        VALUES ($1, NULL, $2, NULL, $3, $4)
+        "#,
+    )
+    .bind(policy_id)
+    .bind(total as f64)
+    .bind(&message)
+    .bind(&channel_result)
+    .execute(pg)
+    .await
+    {
+        error!(error = %e, "ssh-mesh: failed to record alert_event");
+    }
+
+    warn!(
+        total,
+        failed = snapshot.failed_edges.len(),
+        asymmetric = snapshot.asymmetric.len(),
+        channel = %channel,
+        channel_result = %channel_result,
+        "ssh-mesh: degraded-pair alert fired"
+    );
+
+    Ok(())
 }
 
 pub async fn mesh_propagate(

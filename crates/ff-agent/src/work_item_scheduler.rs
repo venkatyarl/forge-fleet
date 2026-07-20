@@ -75,6 +75,17 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         );
     }
 
+    // Auto-complete decomposed parents (bug/feature) once all of their task
+    // children are terminal. This stops parent rows from lingering in `ready`
+    // and cluttering the board after their leaves finish.
+    let completed_parents = ff_db::pg_complete_parent_work_items(pg).await?;
+    if completed_parents > 0 {
+        info!(
+            completed_parents,
+            "work_item_scheduler: auto-completed parent work_items"
+        );
+    }
+
     let ready = ff_db::pg_ready_work_items(pg, MAX_ASSIGN_PER_TICK).await?;
     if ready.is_empty() {
         return Ok(0);

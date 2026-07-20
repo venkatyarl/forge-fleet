@@ -55,7 +55,7 @@ pub async fn verify_computer(pool: &PgPool, worker_name: &str) -> Result<VerifyR
     // 4. sub_agent_dirs_exist
     let want = node.sub_agent_count;
     let subcmd = if is_windows {
-        r#"powershell -NoProfile -Command "(Get-ChildItem -Directory \"$env:USERPROFILE\.forgefleet\sub-agent-*\" -ErrorAction SilentlyContinue).Count""#.to_string()
+        r#"powershell -NoProfile -Command "(Get-ChildItem -Directory \"$env:USERPROFILE\.forgefleet\sub-agents\sub-agent-*\" -ErrorAction SilentlyContinue).Count""#.to_string()
     } else {
         "ls -d ~/.forgefleet/sub-agents/sub-agent-* 2>/dev/null | wc -l | tr -d ' '".to_string()
     };

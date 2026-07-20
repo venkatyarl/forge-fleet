@@ -10515,6 +10515,67 @@ CREATE INDEX IF NOT EXISTS idx_error_events_deployment
     ON error_events (deployment_id, occurred_at DESC) WHERE deployment_id IS NOT NULL;
 "#;
 
+pub const SCHEMA_V179_SSH_MESH_DEGRADED_ALERT: &str = r#"
+-- V179: Seed the ssh_mesh_degraded alert policy for the SSH mesh check.
+INSERT INTO alert_policies
+    (name, description, metric, scope, condition,
+     duration_secs, severity, cooldown_secs, channel, enabled)
+VALUES
+  ('ssh_mesh_degraded',
+   'One or more SSH mesh pairs are failed or asymmetric',
+   'ssh_mesh_degraded', 'leader_only', '> 0',
+   0, 'warning', 21600, 'telegram', true)
+ON CONFLICT (name) DO NOTHING;
+"#;
+
+/// V180 — Align sub-agent paths to the consolidated nested full-clone-per-slot layout.
+///
+/// The runtime now keeps each sub-agent slot under
+/// `~/.forgefleet/sub-agents/sub-agent-{N}/` with a full clone at
+/// `~/.forgefleet/sub-agents/sub-agent-{N}/{repo-slug}/`. Historical seeds and
+/// backfills still used the old flat `~/.forgefleet/sub-agent-0/...` spelling,
+/// and the Phase-15e `fleet_workspaces` / `subagent_cleanup_log` tables tracked
+/// a workspace layout (`~/.forgefleet/agents/agent-{id}/...`) that was never
+/// adopted. This migration rewrites the paths and drops the orphaned tables.
+pub const SCHEMA_V180_ALIGN_SUBAGENT_PATHS: &str = r#"
+-- 1. Auto-upgrade playbooks for ForgeFleet's own repo now clone/build in the
+--    nested slot-0 directory that dispatch actually uses.
+UPDATE software_registry
+   SET upgrade_playbook = replace(
+       upgrade_playbook::text,
+       '$HOME/.forgefleet/sub-agent-0/forge-fleet',
+       '$HOME/.forgefleet/sub-agents/sub-agent-0/forge-fleet'
+   )::jsonb
+ WHERE id IN ('ff_git', 'forgefleetd_git')
+   AND upgrade_playbook::text LIKE '%$HOME/.forgefleet/sub-agent-0/forge-fleet%';
+
+-- 2. open-design skills repo now clones into the nested slot-0 directory.
+UPDATE software_registry
+   SET upgrade_playbook = replace(
+       upgrade_playbook::text,
+       '$HOME/.forgefleet/sub-agent-0/open-design',
+       '$HOME/.forgefleet/sub-agents/sub-agent-0/open-design'
+   )::jsonb
+ WHERE id = 'open_design_git'
+   AND upgrade_playbook::text LIKE '%$HOME/.forgefleet/sub-agent-0/open-design%';
+
+-- 3. Skill catalog root for fleet-installed open-design skills.
+UPDATE skill_sources
+   SET path = '$HOME/.forgefleet/sub-agents/sub-agent-0/open-design/skills'
+ WHERE id = 'fleet-open-design'
+   AND path = '$HOME/.forgefleet/sub-agent-0/open-design/skills';
+
+-- 4. Backfill worker source_tree_path from the old flat layout.
+UPDATE computers
+   SET source_tree_path = '~/.forgefleet/sub-agents/sub-agent-0/forge-fleet'
+ WHERE source_tree_path = '~/.forgefleet/sub-agent-0/forge-fleet';
+
+-- 5. Drop Phase-15e workspace tables that implemented a conflicting
+--    `~/.forgefleet/agents/agent-{id}/...` layout and are no longer referenced.
+DROP TABLE IF EXISTS subagent_cleanup_log;
+DROP TABLE IF EXISTS fleet_workspaces;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
