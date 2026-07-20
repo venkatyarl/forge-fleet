@@ -5,7 +5,11 @@
 //! Runs on the leader every 10 minutes. Resets any stuck `sub_agents` row back
 //! to `'idle'` so the dispatch queue can reuse the slot — when a worker crashes
 //! mid-task or flips to `'error'` without a later cleanup, the slot is
-//! effectively dead and would otherwise leak forever.
+//! effectively dead and would otherwise leak forever. Slots holding an ACTIVE
+//! `work_item_leases` row are exempt: the lease lifecycle owns those (the
+//! stale-lease reaper resets them when the lease dies), and each tick also
+//! runs [`ff_db::queries::pg_reconcile_sub_agent_slots`] to re-derive
+//! `status`/`current_work_item_id` from the lease table when they drift.
 //!
 //! ## Per-status staleness clock (the important part)
 //!
@@ -54,9 +58,17 @@ fn reap_threshold_mins(status: &str) -> i64 {
 /// Pure mirror of the reaper's SQL WHERE clause (for tests + as the spec). A
 /// slot is reaped when its status is reapable AND it either never meaningfully
 /// started (NULL `started_at`) or its `started_at` is older than the per-status
-/// threshold. `started_at_age_mins` is `None` for a NULL `started_at`.
+/// threshold — UNLESS it holds an ACTIVE work_item lease. A live lease means
+/// the lease lifecycle owns the slot: the stale-lease reaper
+/// (`pg_reap_stale_work_item_leases`) resets it when the lease actually dies,
+/// and wiping it here while a long build keeps heartbeating desyncs `busy`
+/// from the lease table (observed 2026-07-20: 1 busy slot / 36 active leases).
+/// `started_at_age_mins` is `None` for a NULL `started_at`.
 #[allow(dead_code)] // pure mirror of the reaper SQL — the tested spec, not the impl
-fn should_reap(status: &str, started_at_age_mins: Option<i64>) -> bool {
+fn should_reap(status: &str, started_at_age_mins: Option<i64>, has_active_lease: bool) -> bool {
+    if has_active_lease {
+        return false;
+    }
     if status != "error" && status != "busy" {
         return false;
     }
@@ -97,6 +109,9 @@ impl SubAgentReaper {
                     current_work_item_id = NULL
                FROM computers c
               WHERE s.computer_id = c.id
+                AND NOT EXISTS (
+                     SELECT 1 FROM work_item_leases l
+                      WHERE l.sub_agent_id = s.id AND l.released_at IS NULL)
                 AND (
                      (s.status = 'error'
                         AND (s.started_at IS NULL
@@ -124,7 +139,18 @@ impl SubAgentReaper {
                 "reaped stuck sub_agent slot"
             );
         }
-        Ok(rows.len())
+
+        // Reconcile the mutable slot columns from the lease source of truth:
+        // relink slots whose ACTIVE lease says busy, free slots whose lease was
+        // released without the matching slot update landing.
+        let (relinked, freed) = ff_db::queries::pg_reconcile_sub_agent_slots(&self.pool)
+            .await
+            .context("reconcile sub_agent slots from leases")?;
+        if relinked > 0 || freed > 0 {
+            tracing::info!(relinked, freed, "reconciled sub_agent slots from leases");
+        }
+
+        Ok(rows.len() + relinked as usize + freed as usize)
     }
 
     /// Spawn the 10-minute tick. First tick fires ~120s after spawn so the
@@ -167,26 +193,36 @@ mod tests {
         // THE BUG FIX: a live 'busy' slot running a 30-min task (well under the
         // 60-min ceiling) must NOT be reaped — reaping it mid-run would let the
         // scheduler oversubscribe the slot.
-        assert!(!should_reap("busy", Some(30)));
-        assert!(!should_reap("busy", Some(BUSY_STALE_MINS))); // exactly at ceiling: not yet
+        assert!(!should_reap("busy", Some(30), false));
+        assert!(!should_reap("busy", Some(BUSY_STALE_MINS), false)); // exactly at ceiling: not yet
         // A genuinely hung 'busy' slot past the ceiling IS reaped.
-        assert!(should_reap("busy", Some(BUSY_STALE_MINS + 5)));
+        assert!(should_reap("busy", Some(BUSY_STALE_MINS + 5), false));
         // A 'busy' slot that never recorded a start is dead → reaped.
-        assert!(should_reap("busy", None));
+        assert!(should_reap("busy", None, false));
+    }
+
+    #[test]
+    fn active_lease_exempts_slot_from_reaping() {
+        // A slot whose lease is still ACTIVE belongs to the lease lifecycle —
+        // wiping it here while the build heartbeats its lease desyncs 'busy'
+        // from work_item_leases (2026-07-20: 1 busy slot / 36 active leases).
+        assert!(!should_reap("busy", Some(BUSY_STALE_MINS + 500), true));
+        assert!(!should_reap("busy", None, true));
+        assert!(!should_reap("error", Some(ERROR_STALE_MINS + 500), true));
     }
 
     #[test]
     fn error_slots_freed_quickly() {
-        assert!(!should_reap("error", Some(5))); // within the short window
-        assert!(should_reap("error", Some(ERROR_STALE_MINS + 1)));
-        assert!(should_reap("error", None));
+        assert!(!should_reap("error", Some(5), false)); // within the short window
+        assert!(should_reap("error", Some(ERROR_STALE_MINS + 1), false));
+        assert!(should_reap("error", None, false));
     }
 
     #[test]
     fn non_reapable_status_never_reaped() {
-        assert!(!should_reap("idle", None));
-        assert!(!should_reap("idle", Some(999)));
-        assert!(!should_reap("planning", Some(999)));
+        assert!(!should_reap("idle", None, false));
+        assert!(!should_reap("idle", Some(999), false));
+        assert!(!should_reap("planning", Some(999), false));
     }
 
     #[test]

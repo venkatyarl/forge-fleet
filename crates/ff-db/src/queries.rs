@@ -4813,12 +4813,12 @@ mod tests {
         assert_eq!(decision.last_error, "stale-heartbeat takeover (attempt 2)");
     }
 
-    fn temp_db_urls() -> Option<(String, String, String)> {
+    fn temp_db_urls(name_prefix: &str) -> Option<(String, String, String)> {
         let base_url = env::var("FORGEFLEET_POSTGRES_URL")
             .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
             .ok()?;
         let (prefix, _) = base_url.rsplit_once('/')?;
-        let db_name = format!("ff_deferred_fold_{}", uuid::Uuid::new_v4().simple());
+        let db_name = format!("{name_prefix}_{}", uuid::Uuid::new_v4().simple());
         Some((
             format!("{prefix}/postgres"),
             format!("{prefix}/{db_name}"),
@@ -4827,7 +4827,7 @@ mod tests {
     }
 
     async fn create_temp_db() -> Option<(PgPool, PgPool, String)> {
-        let (admin_url, db_url, db_name) = temp_db_urls()?;
+        let (admin_url, db_url, db_name) = temp_db_urls("ff_deferred_fold")?;
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .connect(&admin_url)
@@ -4920,6 +4920,162 @@ mod tests {
             .await
             .expect("drop temp db");
         admin.close().await;
+    }
+
+    /// Minimal slot/lease schema for [`pg_reconcile_sub_agent_slots`] tests.
+    async fn create_slot_reconcile_db() -> Option<(PgPool, PgPool, String)> {
+        let (admin_url, db_url, db_name) = temp_db_urls("ff_slot_reconcile")?;
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("connect admin db");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create temp db");
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&db_url)
+            .await
+            .expect("connect temp db");
+        sqlx::raw_sql(
+            "CREATE EXTENSION IF NOT EXISTS pgcrypto;
+             CREATE TABLE computers (
+                 id   UUID PRIMARY KEY,
+                 name TEXT NOT NULL
+             );
+             CREATE TABLE work_items (
+                 id     UUID PRIMARY KEY,
+                 status TEXT NOT NULL DEFAULT 'ready'
+             );
+             CREATE TABLE sub_agents (
+                 id                   UUID PRIMARY KEY,
+                 computer_id          UUID NOT NULL REFERENCES computers(id),
+                 slot                 INT NOT NULL,
+                 status               TEXT NOT NULL DEFAULT 'idle',
+                 current_work_item_id UUID REFERENCES work_items(id),
+                 started_at           TIMESTAMPTZ,
+                 workspace_dir        TEXT NOT NULL DEFAULT '',
+                 last_heartbeat_at    TIMESTAMPTZ
+             );
+             CREATE TABLE work_item_leases (
+                 id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 work_item_id     UUID NOT NULL REFERENCES work_items(id),
+                 sub_agent_id     UUID REFERENCES sub_agents(id),
+                 computer_id      UUID NOT NULL REFERENCES computers(id),
+                 lease_state      TEXT NOT NULL DEFAULT 'claimed',
+                 lease_expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '1 hour',
+                 heartbeat_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 released_at      TIMESTAMPTZ,
+                 release_reason   TEXT
+             );",
+        )
+        .execute(&pool)
+        .await
+        .expect("create minimal slot/lease schema");
+        Some((admin, pool, db_name))
+    }
+
+    #[tokio::test]
+    async fn reconcile_sub_agent_slots_relinks_and_frees_from_leases() {
+        let Some((admin, pool, db_name)) = create_slot_reconcile_db().await else {
+            return;
+        };
+
+        let computer = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'testbox')")
+            .bind(computer)
+            .execute(&pool)
+            .await
+            .expect("insert computer");
+
+        let wi: Vec<uuid::Uuid> = (0..4).map(|_| uuid::Uuid::new_v4()).collect();
+        for id in &wi {
+            sqlx::query("INSERT INTO work_items (id, status) VALUES ($1, 'claimed')")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("insert work_item");
+        }
+
+        // slot 0: active lease but the slot reads idle (reaper wiped it) → relink.
+        // slot 1: busy with a RELEASED lease for its item (missed release) → free.
+        // slot 2: busy with NO lease rows at all (coordinator claim) → untouched.
+        // slot 3: 'disabled' quarantine with an active lease → untouched.
+        let slots: Vec<uuid::Uuid> = (0..4).map(|_| uuid::Uuid::new_v4()).collect();
+        for (i, (status, item)) in [
+            ("idle", None),
+            ("busy", Some(wi[1])),
+            ("busy", Some(wi[2])),
+            ("disabled", None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO sub_agents (id, computer_id, slot, status, current_work_item_id)
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(slots[i])
+            .bind(computer)
+            .bind(i as i32)
+            .bind(status)
+            .bind(item)
+            .execute(&pool)
+            .await
+            .expect("insert sub_agent");
+        }
+
+        for (item, slot, released) in [
+            (wi[0], slots[0], false),
+            (wi[1], slots[1], true),
+            (wi[3], slots[3], false),
+        ] {
+            sqlx::query(
+                "INSERT INTO work_item_leases
+                    (work_item_id, sub_agent_id, computer_id, released_at, release_reason)
+                 VALUES ($1, $2, $3,
+                         CASE WHEN $4 THEN NOW() ELSE NULL END,
+                         CASE WHEN $4 THEN 'done' ELSE NULL END)",
+            )
+            .bind(item)
+            .bind(slot)
+            .bind(computer)
+            .bind(released)
+            .execute(&pool)
+            .await
+            .expect("insert lease");
+        }
+
+        let (relinked, freed) = pg_reconcile_sub_agent_slots(&pool)
+            .await
+            .expect("reconcile slots");
+        assert_eq!(relinked, 1, "only the wiped-but-leased slot is relinked");
+        assert_eq!(freed, 1, "only the missed-release busy slot is freed");
+
+        let rows: Vec<(uuid::Uuid, String, Option<uuid::Uuid>)> =
+            sqlx::query_as("SELECT id, status, current_work_item_id FROM sub_agents ORDER BY slot")
+                .fetch_all(&pool)
+                .await
+                .expect("read slots back");
+        assert_eq!(rows[0].1, "busy");
+        assert_eq!(rows[0].2, Some(wi[0])); // relinked to its active lease
+        assert_eq!(rows[1].1, "idle");
+        assert_eq!(rows[1].2, None); // freed after the missed release
+        assert_eq!(rows[2].1, "busy");
+        assert_eq!(rows[2].2, Some(wi[2])); // coordinator claim untouched
+        assert_eq!(rows[3].1, "disabled");
+        assert_eq!(rows[3].2, None); // quarantine untouched
+
+        // Idempotent: a second pass finds nothing to fix.
+        let (relinked2, freed2) = pg_reconcile_sub_agent_slots(&pool)
+            .await
+            .expect("reconcile slots again");
+        assert_eq!((relinked2, freed2), (0, 0));
+
+        drop_temp_db(admin, pool, &db_name).await;
     }
 
     #[tokio::test]
@@ -8312,6 +8468,67 @@ pub async fn pg_free_slots(
         );
     }
     Ok(slots)
+}
+
+/// Reconcile `sub_agents.status` / `current_work_item_id` from the lease
+/// source of truth (`work_item_leases`). The mutable slot columns are written
+/// on the claim path but can drift from the lease lifecycle (observed
+/// 2026-07-20: 1 busy slot while 36 leases were active, and 51 busy while ~17
+/// were): the stuck-slot reaper used to wipe a busy slot whose long build was
+/// still heartbeating its lease, and several release paths (guarded
+/// `WHERE current_work_item_id = $2`, HA drain, cancel) can miss the slot
+/// update. Two directions, returns `(relinked, freed)`:
+///
+/// 1. relink — a slot holding an ACTIVE lease must read `busy` with that
+///    lease's work_item (newest lease wins if several). `'disabled'` slots are
+///    left alone: that status is an operator quarantine, not lifecycle state.
+/// 2. free — a `busy` slot with NO active lease whose recorded work_item's
+///    lease on this slot was RELEASED is a missed release; reset it to idle.
+///    The released-lease guard keeps this from clobbering the agent
+///    coordinator's non-lease claims (`fleet_run` dispatch never writes lease
+///    rows), which stay owned by the stuck-slot reaper's age ceiling.
+pub async fn pg_reconcile_sub_agent_slots(pool: &PgPool) -> Result<(u64, u64)> {
+    let relinked = sqlx::query(
+        "UPDATE sub_agents sa
+            SET status = 'busy',
+                current_work_item_id = l.work_item_id,
+                started_at = COALESCE(sa.started_at, l.created_at),
+                last_heartbeat_at = NOW()
+           FROM (SELECT DISTINCT ON (sub_agent_id) sub_agent_id, work_item_id, created_at
+                   FROM work_item_leases
+                  WHERE released_at IS NULL AND sub_agent_id IS NOT NULL
+                  ORDER BY sub_agent_id, created_at DESC) l
+          WHERE sa.id = l.sub_agent_id
+            AND sa.status <> 'disabled'
+            AND (sa.status <> 'busy'
+                 OR sa.current_work_item_id IS DISTINCT FROM l.work_item_id)",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    let freed = sqlx::query(
+        "UPDATE sub_agents sa
+            SET status = 'idle',
+                current_work_item_id = NULL,
+                started_at = NULL,
+                last_heartbeat_at = NOW()
+          WHERE sa.status = 'busy'
+            AND sa.current_work_item_id IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM work_item_leases l
+                 WHERE l.sub_agent_id = sa.id AND l.released_at IS NULL)
+            AND EXISTS (
+                SELECT 1 FROM work_item_leases l
+                 WHERE l.sub_agent_id = sa.id
+                   AND l.work_item_id = sa.current_work_item_id
+                   AND l.released_at IS NOT NULL)",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok((relinked, freed))
 }
 
 /// Computer ids that currently host a LIVE, agent-capable model deployment:
