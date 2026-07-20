@@ -7,13 +7,18 @@
 
 pub mod agent;
 pub mod backup;
+pub mod error_tracker;
 pub mod handoff;
+pub mod log_monitor;
 pub mod manager;
+pub mod mirror_service;
 pub mod node_info;
+pub mod periodic;
 pub mod pg_failover;
 pub mod repair;
 pub mod restore_drill;
 pub mod self_heal;
+pub mod slot_manager;
 
 #[cfg(test)]
 pub mod self_heal_tests;
@@ -30,14 +35,49 @@ pub async fn drain_work_item_leases(
     computer_id: uuid::Uuid,
 ) -> Result<u64, sqlx::Error> {
     let drained: i64 = sqlx::query_scalar(
-        "WITH drained AS (
-             UPDATE work_item_leases
+        "WITH draining AS (
+             SELECT id, work_item_id, sub_agent_id, lease_state, endpoint, attempt, computer_id
+               FROM work_item_leases
+              WHERE computer_id = $1
+                AND released_at IS NULL
+              FOR UPDATE
+         ), drained AS (
+             UPDATE work_item_leases l
                 SET lease_state = 'released',
                     released_at = NOW(),
                     release_reason = 'agent restart drain'
-              WHERE computer_id = $1
-                AND released_at IS NULL
-          RETURNING work_item_id, sub_agent_id
+               FROM draining d
+              WHERE l.id = d.id
+          RETURNING d.work_item_id,
+                    d.sub_agent_id,
+                    d.lease_state AS from_status,
+                    d.endpoint,
+                    d.attempt,
+                    l.release_reason,
+                    d.computer_id
+         ), lease_events AS (
+             INSERT INTO work_item_events
+                 (work_item_id, from_status, to_status, computer, attempt, detail)
+             SELECT d.work_item_id,
+                    d.from_status,
+                    'lease_released',
+                    c.name,
+                    d.attempt,
+                    jsonb_build_object(
+                        'event_type', 'lease_released',
+                        'endpoint', d.endpoint,
+                        'lane', CASE
+                            WHEN NULLIF(d.endpoint, '') IS NULL THEN NULL
+                            WHEN d.endpoint LIKE 'cloud:%'
+                              OR d.endpoint ~ '^(codex|claude|kimi|gemini|grok)(:|$)'
+                              THEN 'cloud'
+                            ELSE 'local'
+                        END,
+                        'attempt', d.attempt,
+                        'release_reason', d.release_reason
+                    )
+               FROM drained d
+               LEFT JOIN computers c ON c.id = d.computer_id
          ), freed_slots AS (
              UPDATE sub_agents AS sa
                 SET current_work_item_id = NULL,
@@ -70,6 +110,44 @@ pub async fn drain_work_item_leases(
     .await?;
 
     Ok(drained as u64)
+}
+
+// ─── Git mirror rewrite configuration ────────────────────────────────────────
+
+/// Register Git `url.<mirror>.insteadOf` rewrite rules so that clones and
+/// fetches against `github.com` are redirected to the LAN mirror.
+///
+/// Both common GitHub URL forms are rewritten:
+///
+/// * `https://github.com/<owner>/<repo>`
+/// * `git@github.com:<owner>/<repo>`
+///
+/// The `mirror` argument must be the replacement URL prefix in the form Git
+/// expects for `url.<base>.insteadOf`, e.g. `https://git-mirror.local/` or
+/// `git@git-mirror.local:`.
+pub async fn register_github_mirror_rewrite(mirror: &str) -> anyhow::Result<()> {
+    if mirror.is_empty() {
+        return Err(anyhow::anyhow!("mirror URL must not be empty"));
+    }
+
+    const GITHUB_PREFIXES: &[&str] = &["https://github.com/", "git@github.com:"];
+
+    for original in GITHUB_PREFIXES {
+        let key = format!("url.{mirror}.insteadOf");
+        let status = tokio::process::Command::new("git")
+            .args(["config", "--global", &key, original])
+            .status()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to spawn git config for {original}: {e}"))?;
+
+        if !status.success() {
+            return Err(anyhow::anyhow!(
+                "git config --global url.{mirror}.insteadOf {original} failed ({status})"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 // ─── Pure HA topology model (used by tests + planners) ───────────────────────
