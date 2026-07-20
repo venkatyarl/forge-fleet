@@ -201,12 +201,22 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
         let worker_name = worker_name.to_string();
         tokio::spawn(async move {
             if let Err(e) = dispatch_one(pg.clone(), item.clone(), worker_name).await {
-                warn!(
-                    work_item_id = %item.work_item_id,
-                    sub_agent_id = %item.sub_agent_id,
-                    error = %e,
-                    "work_item_dispatch: dispatch failed"
-                );
+                if is_build_timeout(&e) {
+                    warn!(
+                        work_item_id = %item.work_item_id,
+                        sub_agent_id = %item.sub_agent_id,
+                        attempts = item.attempts + 1,
+                        error = %e,
+                        "work_item_dispatch: build timed out; requeueing for retry"
+                    );
+                } else {
+                    warn!(
+                        work_item_id = %item.work_item_id,
+                        sub_agent_id = %item.sub_agent_id,
+                        error = %e,
+                        "work_item_dispatch: dispatch failed"
+                    );
+                }
                 if let Err(cleanup) = requeue_or_fail(&pg, &item, &e.to_string()).await {
                     warn!(
                         work_item_id = %item.work_item_id,
@@ -225,6 +235,16 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
         );
     }
     Ok(started)
+}
+
+/// Whether a dispatch error was caused by a build command exceeding its time
+/// budget. Inspect the full anyhow chain because callers add context while the
+/// timeout itself is normally the innermost error.
+fn is_build_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("timed out") || message.contains("timeout")
+    })
 }
 
 /// Spawn the dispatch loop. PER-HOST (not leader-gated): the scheduler (leader)
@@ -805,7 +825,9 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     // codex (and most CLI agents) EDIT files but don't `git commit`. Commit any
     // changes it made in the worktree so they can become a PR. A clean worktree
     // (agent made no change) commits nothing → handled as "no commits" below.
-    let dirty = commit_worktree_changes(&worktree.worktree_path, &item.title)?;
+    let (git_name, git_email) = resolve_git_identity(&pg, &item.project_id).await;
+    let dirty =
+        commit_worktree_changes(&worktree.worktree_path, &item.title, &git_name, &git_email)?;
     info!(
         work_item_id = %item.work_item_id, dirty,
         "work_item_dispatch: committed agent changes (dirty={dirty})"
@@ -2565,7 +2587,12 @@ fn agent_output_tail(output: &std::process::Output, max_chars: usize) -> String 
     format!("…{tail}")
 }
 
-fn commit_worktree_changes(worktree_path: &Path, title: &str) -> Result<bool> {
+fn commit_worktree_changes(
+    worktree_path: &Path,
+    title: &str,
+    author_name: &str,
+    author_email: &str,
+) -> Result<bool> {
     // Auto-format BEFORE staging so a fleet-produced Rust PR passes CI
     // `cargo fmt --check` — LLM backends routinely emit un-formatted Rust, which
     // fails the fmt gate and blocks the PR (observed on PR #787). Best-effort +
@@ -2587,13 +2614,21 @@ fn commit_worktree_changes(worktree_path: &Path, title: &str) -> Result<bool> {
         return Ok(false); // nothing to commit
     }
     let msg = format!("{title}\n\nAutomated work_item dispatch (ForgeFleet Pillar 4).");
+    // Author with the resolved per-project identity via `-c` so it WINS over any
+    // repo-local config a backend set during its run (codex writes
+    // user.email=codex@openai.com into the slot clone; other agents leave
+    // noreply). `-c` overrides both global and local config for this one
+    // command, so fleet-authored commits always carry the operator/project
+    // identity, not a bot. Identity is DB-driven (see resolve_git_identity).
+    let name_cfg = format!("user.name={author_name}");
+    let email_cfg = format!("user.email={author_email}");
     run_git(
         worktree_path,
         [
             OsStr::new("-c"),
-            OsStr::new("user.name=ForgeFleet"),
+            OsStr::new(&name_cfg),
             OsStr::new("-c"),
-            OsStr::new("user.email=fleet@forgefleet.local"),
+            OsStr::new(&email_cfg),
             OsStr::new("commit"),
             OsStr::new("-m"),
             OsStr::new(&msg),
@@ -2601,6 +2636,34 @@ fn commit_worktree_changes(worktree_path: &Path, title: &str) -> Result<bool> {
         Duration::from_secs(60),
     )?;
     Ok(true)
+}
+
+/// Resolve a project's git author identity, DB-driven and per-project:
+/// `projects.metadata` git_author_name/email first (so different projects can
+/// commit under different identities), then the fleet-wide
+/// `fleet_secrets` git.author_name/email default, then a final hardcoded
+/// fallback so a commit never fails for lack of an identity.
+async fn resolve_git_identity(pg: &PgPool, project_id: &str) -> (String, String) {
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT metadata->>'git_author_name', metadata->>'git_author_email' \
+           FROM projects WHERE id = $1",
+    )
+    .bind(project_id)
+    .fetch_optional(pg)
+    .await
+    .ok()
+    .flatten();
+    let (mut name, mut email) = row.unwrap_or((None, None));
+    if name.is_none() {
+        name = crate::fleet_info::fetch_secret("git.author_name").await;
+    }
+    if email.is_none() {
+        email = crate::fleet_info::fetch_secret("git.author_email").await;
+    }
+    (
+        name.unwrap_or_else(|| "Venkat Yarlagadda".to_string()),
+        email.unwrap_or_else(|| "venkat.yarl@gmail.com".to_string()),
+    )
 }
 
 /// Run `cargo fmt` over the worktree so committed Rust is CI-fmt-clean. Uses a
@@ -3295,7 +3358,7 @@ mod tests {
     use super::{
         DISPATCH_HOUSE_RULES, DispatchOutcome, agent_output_tail, classify_dispatch_outcome,
         command_display, default_clone_path, dispatch_budget_for_host, expand_home,
-        parse_cli_tokens, primary_or_default_backend, repo_cache_path, repo_slug,
+        is_build_timeout, parse_cli_tokens, primary_or_default_backend, repo_cache_path, repo_slug,
         retry_error_is_actionable, rewrite_github_host_alias, task_prefers_cloud_lane,
         use_local_lane,
     };
@@ -3657,6 +3720,13 @@ mod tests {
             classify_dispatch_outcome(&r2, false),
             DispatchOutcome::FailedNoDiff
         );
+    }
+
+    #[test]
+    fn detects_build_timeout_through_error_context() {
+        let timeout = anyhow!("command timed out after 300s").context("run cargo build");
+        assert!(is_build_timeout(&timeout));
+        assert!(!is_build_timeout(&anyhow!("cargo build exited 1")));
     }
 
     #[test]
