@@ -108,8 +108,13 @@ pub async fn scan_local_library(
                 }
             }
         } else if file_type.is_dir() {
-            match classify_dir(&path, &catalog) {
-                Some(d) => {
+            let classified = classify_top_level_dir(&path, &catalog);
+            if classified.is_empty() {
+                if verbose {
+                    eprintln!("[scan]  dir   skip: {}", path.display());
+                }
+            } else {
+                for d in classified {
                     if verbose {
                         eprintln!(
                             "[scan]  dir   → catalog={} runtime={} size={}",
@@ -117,11 +122,6 @@ pub async fn scan_local_library(
                         );
                     }
                     discovered.push(d);
-                }
-                None => {
-                    if verbose {
-                        eprintln!("[scan]  dir   skip: {}", path.display());
-                    }
                 }
             }
         } else if verbose {
@@ -188,6 +188,32 @@ pub async fn scan_local_library(
     }
 
     Ok(summary)
+}
+
+/// Classify a top-level directory, descending one level for known directories
+/// that group models by runtime/vendor rather than representing a model.
+fn classify_top_level_dir(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Vec<Discovered> {
+    let is_vendor_dir = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("llama-cpp"));
+
+    if !is_vendor_dir {
+        return classify_dir(path, catalog).into_iter().collect();
+    }
+
+    std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|file_type| file_type.is_dir())
+                .and_then(|_| classify_dir(&entry.path(), catalog))
+        })
+        .collect()
 }
 
 /// Classify a single top-level file. Returns `None` if unrecognised.
@@ -565,5 +591,22 @@ mod tests {
     fn match_catalog_no_match_returns_none() {
         let cat = vec![row("qwen3-coder-30b", "Qwen3 Coder 30B")];
         assert_eq!(match_catalog("mistral-7b-instruct", &cat), None);
+    }
+
+    #[test]
+    fn llama_cpp_vendor_dir_classifies_child_models_by_directory_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let vendor = temp.path().join("llama-cpp");
+        let model = vendor.join("qwen3-coder-480b");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(model.join("model.gguf"), b"gguf").unwrap();
+
+        let discovered =
+            classify_top_level_dir(&vendor, &[row("qwen3-coder-480b", "Qwen3 Coder 480B")]);
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].catalog_id, "qwen3-coder-480b");
+        assert_eq!(discovered[0].file_path, model.to_string_lossy());
+        assert_eq!(discovered[0].runtime, "llama.cpp");
     }
 }
