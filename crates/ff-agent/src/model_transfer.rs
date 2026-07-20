@@ -255,7 +255,7 @@ pub async fn transfer_model(
         src_is_dir,
     );
     let rsync_cmd = format!(
-        "rsync -av --partial -e 'ssh -o StrictHostKeyChecking=accept-new {}' {} {}",
+        "LC_ALL=C rsync -av --partial --stats --no-human-readable -e 'ssh -o StrictHostKeyChecking=accept-new {}' {} {}",
         crate::ssh_opts::SSH_AGENT_BYPASS,
         remote_src,
         shell_quote(&dst_path),
@@ -267,38 +267,13 @@ pub async fn transfer_model(
         ));
     }
 
-    // 7. Verify size on target (best effort — also serves as existence check).
-    // `stat` on a directory returns the inode size (4096), not the payload,
-    // so dir-models sum the tree with `du` instead.
-    let bytes_transferred = if src_is_dir {
-        let du_cmd = format!("du -sk {}", shell_quote(&dst_path));
-        let (dc, dstdout, _dstderr) = ssh_exec(&dst_node.ssh_user, &dst_node.ip, &du_cmd).await?;
-        if dc == 0 {
-            dstdout
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(|k| k.saturating_mul(1024))
-                .unwrap_or(src_lib.size_bytes.max(0) as u64)
-        } else {
-            src_lib.size_bytes.max(0) as u64
-        }
-    } else {
-        let stat_cmd = format!(
-            "stat -c %s {} 2>/dev/null || stat -f %z {}",
-            shell_quote(&dst_path),
-            shell_quote(&dst_path),
-        );
-        let (sc, sstdout, _sstderr) = ssh_exec(&dst_node.ssh_user, &dst_node.ip, &stat_cmd).await?;
-        if sc == 0 {
-            sstdout
-                .trim()
-                .parse::<u64>()
-                .unwrap_or(src_lib.size_bytes.max(0) as u64)
-        } else {
-            src_lib.size_bytes.max(0) as u64
-        }
-    };
+    // 7. Record the complete logical size reported by rsync. In particular,
+    // never `stat` a directory: that reports its inode size (commonly 4096),
+    // not the files copied into it. `Total file size` also avoids `du`'s block
+    // rounding and describes the complete model rather than only changed files.
+    let bytes_transferred = parse_rsync_total_file_size(&rstdout).ok_or_else(|| {
+        format!("rsync succeeded but did not report a valid total file size:\n{rstdout}")
+    })?;
 
     // 8. Register new library row on target.
     let new_id = ff_db::pg_upsert_library(
@@ -331,6 +306,19 @@ fn rsync_source_spec(ssh_user: &str, ip: &str, file_path: &str, is_dir: bool) ->
         shell_quote(file_path)
     };
     format!("{ssh_user}@{ip}:{quoted}")
+}
+
+fn parse_rsync_total_file_size(stdout: &str) -> Option<u64> {
+    stdout.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("Total file size:")?;
+        let digits: String = value
+            .split_whitespace()
+            .next()?
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
+        (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+    })
 }
 
 /// Conservative single-quote shell quoting for paths.
@@ -401,5 +389,18 @@ mod tests {
             rsync_source_spec("bob", "10.0.0.2", "/home/bob/models/qwen3-coder-30b/", true),
             "bob@10.0.0.2:'/home/bob/models/qwen3-coder-30b/'"
         );
+    }
+
+    #[test]
+    fn parses_rsync_total_file_size_for_directory_model() {
+        let stdout = "Number of files: 8\nTotal file size: 17,300,000,000 bytes\nTotal transferred file size: 17,300,000,000 bytes\n";
+        assert_eq!(parse_rsync_total_file_size(stdout), Some(17_300_000_000));
+    }
+
+    #[test]
+    fn ignores_directory_inode_and_incremental_transfer_sizes() {
+        let stdout = "sent 4,096 bytes\nTotal file size: 17,300,000,000 bytes\nTotal transferred file size: 0 bytes\n";
+        assert_eq!(parse_rsync_total_file_size(stdout), Some(17_300_000_000));
+        assert_eq!(parse_rsync_total_file_size("sent 4,096 bytes\n"), None);
     }
 }
