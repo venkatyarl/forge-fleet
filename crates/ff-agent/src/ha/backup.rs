@@ -13,6 +13,10 @@
 //! ## Cadence (seeded defaults)
 //! - Postgres: every 4h via `pg_basebackup -Ft -z` streamed to a local
 //!   `.tar.gz`.
+//! - Postgres WAL: Postgres `archive_command` writes completed WAL segments to
+//!   `~/.forgefleet/backups/postgres-wal/`; the backup tick rsyncs new segments
+//!   to the same offsite destinations as the base backup. WAL retention is 7d,
+//!   giving a 7d PITR window when paired with retained base backups.
 //! - Redis:    every 2h via `BGSAVE` + copy of `dump.rdb` + `zstd`.
 //! - FalkorDB: every 6h via `BGSAVE` + tar of `dump.rdb` + the AOF dir
 //!   out of the `forgefleet-falkordb` container + `zstd`.
@@ -61,6 +65,10 @@ pub const BACKUP_ENC_PUBKEY: &str = "backup_encryption_pubkey";
 pub const BACKUP_ENC_PRIVKEY: &str = "backup_encryption_privkey";
 
 const DEFAULT_POSTGRES_INTERVAL_HOURS: u64 = 4;
+const DEFAULT_POSTGRES_WAL_INTERVAL_SECS: u64 = 14_400;
+const DEFAULT_POSTGRES_WAL_RETENTION_DAYS: i32 = 7;
+const LOCAL_KEEP_POSTGRES_WAL_SOURCE: usize = 10_000;
+const LOCAL_KEEP_POSTGRES_WAL_PEER: usize = 10_000;
 const DEFAULT_REDIS_INTERVAL_HOURS: u64 = 2;
 /// FalkorDB cadence fallback when `fleet_backup_config` has no row (6h).
 const DEFAULT_FALKORDB_INTERVAL_SECS: u64 = 21_600;
@@ -106,6 +114,10 @@ const LOCAL_KEEP_FALKORDB_PEER: usize = 4;
 const SOURCE_KEEP_FLOOR: usize = RECENT_RETENTION + DAILY_RETENTION + WEEKLY_RETENTION + 1;
 /// How often each node prunes its own backup directory.
 const PRUNE_INTERVAL_SECS: u64 = 3600;
+/// How often each node checks its OWN backup directory for stale replicas.
+const FRESHNESS_CHECK_INTERVAL_SECS: u64 = 60;
+/// Alert policy seeded by DB migration V181.
+const STALE_LOCAL_BACKUP_POLICY_NAME: &str = "stale_local_backup";
 
 /// Backup-distribution fan-out staggering. A single snapshot is replicated to
 /// every peer; promoting all of those rsync pulls at once turns the leader into
@@ -176,6 +188,10 @@ impl BackupKindConfig {
                 DEFAULT_POSTGRES_INTERVAL_HOURS * 3600,
                 LOCAL_KEEP_POSTGRES_LEADER,
             ),
+            "postgres_wal" => (
+                DEFAULT_POSTGRES_WAL_INTERVAL_SECS,
+                LOCAL_KEEP_POSTGRES_WAL_SOURCE,
+            ),
             "redis" => (DEFAULT_REDIS_INTERVAL_HOURS * 3600, LOCAL_KEEP_REDIS_LEADER),
             _ => (DEFAULT_FALKORDB_INTERVAL_SECS, LOCAL_KEEP_POSTGRES_LEADER),
         };
@@ -185,7 +201,7 @@ impl BackupKindConfig {
             dest_hosts: Vec::new(),
             interval_secs: interval_secs as i64,
             retention_count: retention_count as i32,
-            retention_days: None,
+            retention_days: (kind == "postgres_wal").then_some(DEFAULT_POSTGRES_WAL_RETENTION_DAYS),
             encrypt: true,
             enabled: true,
         }
@@ -428,12 +444,15 @@ impl BackupOrchestrator {
             // copies that would otherwise accumulate forever. First tick
             // fires immediately after the startup delay.
             let mut prune_ticker = tokio::time::interval(Duration::from_secs(PRUNE_INTERVAL_SECS));
+            let mut freshness_ticker =
+                tokio::time::interval(Duration::from_secs(FRESHNESS_CHECK_INTERVAL_SECS));
             // Both start "due now" — fire once immediately after the
             // startup delay, then on cadence.
             pg_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             redis_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             falkor_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             prune_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            freshness_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
                 tokio::select! {
@@ -493,6 +512,9 @@ impl BackupOrchestrator {
                     }
                     _ = prune_ticker.tick() => {
                         self.prune_all_local().await;
+                    }
+                    _ = freshness_ticker.tick() => {
+                        self.check_local_backup_freshness().await;
                     }
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() {
@@ -569,6 +591,9 @@ impl BackupOrchestrator {
         let targets = self
             .enqueue_distribution("postgres", &file_name, cfg)
             .await?;
+        if let Err(e) = self.enqueue_wal_archive_distribution(cfg).await {
+            warn!(error = %e, "postgres WAL archive fan-out failed");
+        }
 
         Ok(BackupReport {
             kind: "postgres".into(),
@@ -955,6 +980,112 @@ impl BackupOrchestrator {
         Ok(enqueued)
     }
 
+    /// Enqueue rsync pulls for archived Postgres WAL segments. WAL files are
+    /// immutable once archived, so peers use `--ignore-existing` and only copy
+    /// segments they have not seen yet. Destination policy follows the
+    /// Postgres base-backup config for now; the off-fleet Tailscale/Neon work
+    /// can pin `dest_hosts` there without adding another control plane.
+    async fn enqueue_wal_archive_distribution(
+        &self,
+        cfg: &BackupKindConfig,
+    ) -> Result<Vec<String>, BackupError> {
+        let row =
+            sqlx::query("SELECT primary_ip, COALESCE(ssh_user, 'root') AS ssh_user FROM computers WHERE id = $1")
+                .bind(self.my_computer_id)
+                .fetch_optional(&self.pg)
+                .await?;
+        let (my_ip, my_user): (String, String) = match row {
+            Some(r) => (r.get("primary_ip"), r.get("ssh_user")),
+            None => ("127.0.0.1".to_string(), "root".to_string()),
+        };
+
+        let names: Vec<String> = if !cfg.dest_hosts.is_empty() {
+            cfg.dest_hosts
+                .iter()
+                .filter(|h| !h.eq_ignore_ascii_case(&self.my_node_name))
+                .cloned()
+                .collect()
+        } else {
+            sqlx::query_scalar::<_, String>(
+                "SELECT c.name
+                   FROM computers c
+                  WHERE c.id <> $1
+                    AND (c.last_seen_at IS NULL OR c.last_seen_at > NOW() - INTERVAL '24 hours')
+                  ORDER BY c.last_seen_at DESC NULLS LAST, c.name
+                  LIMIT $2",
+            )
+            .bind(self.my_computer_id)
+            .bind(OFFSITE_DEST_COUNT)
+            .fetch_all(&self.pg)
+            .await?
+        };
+
+        let source_path = format!(
+            "{}@{}:{}/{}/",
+            my_user,
+            my_ip,
+            self.backup_dir.display(),
+            kind_dir("postgres_wal")
+        );
+        let who = format!("backup_orchestrator@{}", self.my_node_name);
+        let mut enqueued = Vec::new();
+        for name in names {
+            let inflight: i64 = match sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM deferred_tasks \
+                  WHERE preferred_node = $1 \
+                    AND kind = 'shell' \
+                    AND status IN ('pending', 'dispatchable', 'running') \
+                    AND title LIKE $2",
+            )
+            .bind(&name)
+            .bind(wal_rsync_title_like())
+            .fetch_one(&self.pg)
+            .await
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(target_node = %name, error = %e,
+                          "WAL archive coalesce check failed; enqueueing anyway");
+                    0
+                }
+            };
+            if inflight > 0 {
+                debug!(target_node = %name, inflight,
+                       "skipping WAL archive fan-out — peer still draining prior transfer");
+                continue;
+            }
+
+            let title = format!("rsync postgres WAL archive → {name}");
+            let payload = serde_json::json!({
+                "command": wal_archive_rsync_script(&shell_quote(&source_path)),
+                "summary": title,
+            });
+            let trigger_spec = serde_json::json!({ "node": name });
+            let required_caps = serde_json::json!([]);
+            let delay_secs = distribution_stagger_secs(enqueued.len());
+            match pg_enqueue_deferred_delayed(
+                &self.pg,
+                &title,
+                "shell",
+                &payload,
+                "node_online",
+                &trigger_spec,
+                Some(&name),
+                &required_caps,
+                Some(&who),
+                Some(3),
+                delay_secs,
+            )
+            .await
+            {
+                Ok(_id) => enqueued.push(name),
+                Err(e) => warn!(target_node = %name, error = %e,
+                                "failed to enqueue WAL archive rsync task"),
+            }
+        }
+        Ok(enqueued)
+    }
+
     /// 4-tier retention: recent → daily → weekly → deleted.
     ///
     /// Rule of thumb per kind:
@@ -1059,6 +1190,252 @@ impl BackupOrchestrator {
                 warn!(kind, error = %e, "local backup prune failed");
             }
         }
+        let wal_cfg = load_backup_config(&self.pg, "postgres_wal")
+            .await
+            .unwrap_or_else(|| BackupKindConfig::default_for("postgres_wal"));
+        let wal_source = leader;
+        let wal_keep = if wal_source {
+            wal_cfg.retention_count.max(1) as usize
+        } else {
+            LOCAL_KEEP_POSTGRES_WAL_PEER
+        };
+        if let Err(e) = self
+            .prune_local_backups(
+                "postgres_wal",
+                wal_keep,
+                1,
+                wal_cfg
+                    .retention_days
+                    .or(Some(DEFAULT_POSTGRES_WAL_RETENTION_DAYS)),
+            )
+            .await
+        {
+            warn!(kind = "postgres_wal", error = %e, "local WAL archive prune failed");
+        }
+    }
+
+    /// Check this node's OWN backup directory and fire/resolve one durable alert
+    /// per stale `(node, kind)`. Runs on every daemon, not just the leader.
+    pub async fn check_local_backup_freshness(&self) {
+        let leader = self.i_am_leader().await.unwrap_or(false);
+        for kind in ["postgres", "postgres_wal", "redis", "falkordb"] {
+            let cfg = load_backup_config(&self.pg, kind)
+                .await
+                .unwrap_or_else(|| BackupKindConfig::default_for(kind));
+            if !cfg.enabled {
+                self.resolve_stale_local_backup_alert(kind).await;
+                continue;
+            }
+            match self.expected_to_hold_backup(kind, &cfg, leader).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.resolve_stale_local_backup_alert(kind).await;
+                    continue;
+                }
+                Err(e) => {
+                    warn!(kind, error = %e, "local backup freshness expectation lookup failed");
+                    continue;
+                }
+            }
+
+            let max_age = Duration::from_secs((cfg.interval_secs.max(60) as u64).saturating_mul(2));
+            match newest_local_backup_age(&self.backup_dir, kind).await {
+                Ok(newest) => match local_backup_freshness(now_system_time(), newest, max_age) {
+                    LocalBackupFreshness::Fresh { age } => {
+                        debug!(
+                            kind,
+                            node = %self.my_node_name,
+                            age_secs = age.as_secs(),
+                            max_age_secs = max_age.as_secs(),
+                            "local backup freshness OK"
+                        );
+                        self.resolve_stale_local_backup_alert(kind).await;
+                    }
+                    LocalBackupFreshness::Stale { age } => {
+                        self.fire_stale_local_backup_alert(kind, Some(age), max_age)
+                            .await;
+                    }
+                    LocalBackupFreshness::Missing => {
+                        self.fire_stale_local_backup_alert(kind, None, max_age)
+                            .await;
+                    }
+                },
+                Err(e) => {
+                    warn!(kind, error = %e, "local backup freshness scan failed");
+                }
+            }
+        }
+    }
+
+    async fn expected_to_hold_backup(
+        &self,
+        kind: &str,
+        cfg: &BackupKindConfig,
+        leader: bool,
+    ) -> Result<bool, BackupError> {
+        let am_source = match cfg.source_host.as_deref() {
+            Some(h) => h.eq_ignore_ascii_case(&self.my_node_name),
+            None => leader,
+        };
+        if am_source {
+            return Ok(true);
+        }
+        if !cfg.dest_hosts.is_empty() {
+            return Ok(cfg
+                .dest_hosts
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(&self.my_node_name)));
+        }
+
+        let expected: Vec<String> = if let Some(source_host) = cfg.source_host.as_deref() {
+            sqlx::query_scalar::<_, String>(
+                "SELECT c.name
+                   FROM computers c
+                  WHERE c.name <> $1
+                    AND (c.last_seen_at IS NULL OR c.last_seen_at > NOW() - INTERVAL '24 hours')
+                  ORDER BY c.last_seen_at DESC NULLS LAST, c.name
+                  LIMIT $2",
+            )
+            .bind(source_host)
+            .bind(OFFSITE_DEST_COUNT)
+            .fetch_all(&self.pg)
+            .await?
+        } else {
+            sqlx::query_scalar::<_, String>(
+                "SELECT c.name
+                   FROM computers c
+                  WHERE c.id <> (
+                        SELECT computer_id FROM fleet_leader_state LIMIT 1
+                    )
+                    AND (c.last_seen_at IS NULL OR c.last_seen_at > NOW() - INTERVAL '24 hours')
+                  ORDER BY c.last_seen_at DESC NULLS LAST, c.name
+                  LIMIT $1",
+            )
+            .bind(OFFSITE_DEST_COUNT)
+            .fetch_all(&self.pg)
+            .await?
+        };
+
+        debug!(
+            kind,
+            node = %self.my_node_name,
+            expected = ?expected,
+            "local backup freshness expected holders"
+        );
+        Ok(expected
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(&self.my_node_name)))
+    }
+
+    async fn fire_stale_local_backup_alert(
+        &self,
+        kind: &str,
+        age: Option<Duration>,
+        max_age: Duration,
+    ) {
+        let policy: Option<(Uuid, String, String)> = match sqlx::query_as(
+            "SELECT id, severity, channel FROM alert_policies WHERE name = $1 AND enabled = true",
+        )
+        .bind(STALE_LOCAL_BACKUP_POLICY_NAME)
+        .fetch_optional(&self.pg)
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "stale local backup alert policy lookup failed");
+                return;
+            }
+        };
+        let Some((policy_id, severity, channel)) = policy else {
+            warn!(
+                policy = STALE_LOCAL_BACKUP_POLICY_NAME,
+                "local backup is stale but alert policy is missing/disabled"
+            );
+            return;
+        };
+
+        let unresolved: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM alert_events
+              WHERE policy_id = $1
+                AND computer_id = $2
+                AND value_text = $3
+                AND resolved_at IS NULL
+              ORDER BY fired_at DESC
+              LIMIT 1",
+        )
+        .bind(policy_id)
+        .bind(self.my_computer_id)
+        .bind(kind)
+        .fetch_optional(&self.pg)
+        .await
+        .ok()
+        .flatten();
+        if unresolved.is_some() {
+            return;
+        }
+
+        let value = age.map(|d| d.as_secs_f64());
+        let detail = age
+            .map(|d| format!("{:.1}h old", d.as_secs_f64() / 3600.0))
+            .unwrap_or_else(|| "missing".to_string());
+        let message = format!(
+            "[{severity}] stale local {kind} backup on {}: newest backup is {detail}; \
+             max allowed age is {:.1}h (2x configured interval)",
+            self.my_node_name,
+            max_age.as_secs_f64() / 3600.0
+        );
+        let channel_result =
+            crate::alert_evaluator::dispatch_alert(&self.pg, &channel, &severity, &message).await;
+        if let Err(e) = sqlx::query(
+            "INSERT INTO alert_events
+                (policy_id, computer_id, value, value_text, message, channel_result)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(policy_id)
+        .bind(self.my_computer_id)
+        .bind(value)
+        .bind(kind)
+        .bind(&message)
+        .bind(&channel_result)
+        .execute(&self.pg)
+        .await
+        {
+            warn!(kind, error = %e, "failed to record stale local backup alert");
+        }
+    }
+
+    async fn resolve_stale_local_backup_alert(&self, kind: &str) {
+        let policy_id: Option<Uuid> =
+            match sqlx::query_scalar("SELECT id FROM alert_policies WHERE name = $1")
+                .bind(STALE_LOCAL_BACKUP_POLICY_NAME)
+                .fetch_optional(&self.pg)
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!(error = %e, "stale local backup alert policy lookup failed");
+                    return;
+                }
+            };
+        let Some(policy_id) = policy_id else {
+            return;
+        };
+        if let Err(e) = sqlx::query(
+            "UPDATE alert_events
+                SET resolved_at = NOW()
+              WHERE policy_id = $1
+                AND computer_id = $2
+                AND value_text = $3
+                AND resolved_at IS NULL",
+        )
+        .bind(policy_id)
+        .bind(self.my_computer_id)
+        .bind(kind)
+        .execute(&self.pg)
+        .await
+        {
+            warn!(kind, error = %e, "failed to resolve stale local backup alert");
+        }
     }
 
     /// Prune this node's OWN `<backup_dir>/<kind-dir>/` directory: keep the
@@ -1076,8 +1453,7 @@ impl BackupOrchestrator {
         retention_days: Option<i32>,
     ) -> Result<(u64, u64), BackupError> {
         let keep = keep.max(1);
-        let prefix = kind_prefix(kind);
-        if prefix.is_empty() {
+        if !is_known_backup_kind(kind) {
             return Ok((0, 0));
         }
         let dir = self.backup_dir.join(kind_dir(kind));
@@ -1091,7 +1467,7 @@ impl BackupOrchestrator {
         while let Some(entry) = rd.next_entry().await? {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if !name.starts_with(prefix) {
+            if !is_kind_backup_file(kind, &name) {
                 continue; // never touch non-backup files
             }
             let meta = match entry.metadata().await {
@@ -1275,12 +1651,32 @@ fn kind_prefix(kind: &str) -> &'static str {
     }
 }
 
+fn is_known_backup_kind(kind: &str) -> bool {
+    matches!(kind, "postgres" | "postgres_wal" | "redis" | "falkordb")
+}
+
+fn is_kind_backup_file(kind: &str, name: &str) -> bool {
+    match kind {
+        "postgres_wal" => is_postgres_wal_archive_name(name),
+        _ => name.starts_with(kind_prefix(kind)),
+    }
+}
+
+fn is_postgres_wal_archive_name(name: &str) -> bool {
+    if let Some(timeline) = name.strip_suffix(".history") {
+        return timeline.len() == 8 && timeline.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    let base = name.strip_suffix(".backup").unwrap_or(name);
+    (base.len() == 24 || base.len() == 40) && base.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// On-disk folder name for a kind under `~/.forgefleet/backups/`. The
 /// operator's layout uses `FalkorDB/` (product capitalization); every other
 /// kind's folder is its lowercase name (postgres/, redis/, brain/, obsidian/).
 fn kind_dir(kind: &str) -> &str {
     match kind {
         "falkordb" => "FalkorDB",
+        "postgres_wal" => "postgres-wal",
         other => other,
     }
 }
@@ -1290,9 +1686,67 @@ fn kind_dir(kind: &str) -> &str {
 fn local_peer_keep(kind: &str) -> usize {
     match kind {
         "postgres" => LOCAL_KEEP_POSTGRES_PEER,
+        "postgres_wal" => LOCAL_KEEP_POSTGRES_WAL_PEER,
         "redis" => LOCAL_KEEP_REDIS_PEER,
         _ => LOCAL_KEEP_FALKORDB_PEER,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalBackupFreshness {
+    Fresh { age: Duration },
+    Stale { age: Duration },
+    Missing,
+}
+
+fn now_system_time() -> std::time::SystemTime {
+    std::time::SystemTime::now()
+}
+
+fn local_backup_freshness(
+    now: std::time::SystemTime,
+    newest: Option<std::time::SystemTime>,
+    max_age: Duration,
+) -> LocalBackupFreshness {
+    let Some(newest) = newest else {
+        return LocalBackupFreshness::Missing;
+    };
+    let age = now.duration_since(newest).unwrap_or(Duration::ZERO);
+    if age > max_age {
+        LocalBackupFreshness::Stale { age }
+    } else {
+        LocalBackupFreshness::Fresh { age }
+    }
+}
+
+async fn newest_local_backup_age(
+    backup_dir: &Path,
+    kind: &str,
+) -> Result<Option<std::time::SystemTime>, BackupError> {
+    if !is_known_backup_kind(kind) {
+        return Ok(None);
+    }
+    let dir = backup_dir.join(kind_dir(kind));
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut newest = None;
+    while let Some(entry) = rd.next_entry().await? {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !is_kind_backup_file(kind, &name) {
+            continue;
+        }
+        let meta = match entry.metadata().await {
+            Ok(m) if m.is_file() => m,
+            _ => continue,
+        };
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        newest = Some(newest.map_or(mtime, |cur: std::time::SystemTime| cur.max(mtime)));
+    }
+    Ok(newest)
 }
 
 /// `.age` filename suffix when a kind's policy enables encryption.
@@ -1442,6 +1896,22 @@ fn backup_rsync_script(kind_safe: &str, source_quoted: &str) -> String {
            --partial \
            {source_quoted} \"$HOME/.forgefleet/backups/{kind_safe}/\""
     )
+}
+
+fn wal_archive_rsync_script(source_quoted: &str) -> String {
+    format!(
+        "mkdir -p \"$HOME/.forgefleet/backups/postgres-wal/\" && \
+         rsync -a \
+           -e 'ssh -o IdentityAgent=none -o BatchMode=yes -o ServerAliveInterval=60 -o ServerAliveCountMax=10 -o ConnectTimeout=30' \
+           --timeout=300 \
+           --partial \
+           --ignore-existing \
+           {source_quoted} \"$HOME/.forgefleet/backups/postgres-wal/\""
+    )
+}
+
+fn wal_rsync_title_like() -> &'static str {
+    "rsync postgres WAL archive %"
 }
 
 /// SQL `LIKE` pattern matching every over-quota backup-reap task title for
@@ -1822,6 +2292,24 @@ mod tests {
     }
 
     #[test]
+    fn wal_archive_rsync_script_copies_immutable_segments() {
+        let src = "'venkat@192.168.5.100:/Users/venkat/.forgefleet/backups/postgres-wal/'";
+        let script = wal_archive_rsync_script(src);
+
+        assert!(script.contains("rsync -a "), "script: {script}");
+        assert!(script.contains("--ignore-existing"), "script: {script}");
+        assert!(script.contains("--partial"), "script: {script}");
+        assert!(script.contains("--timeout=300"), "script: {script}");
+        assert!(script.contains("IdentityAgent=none"), "script: {script}");
+        assert!(script.contains(src), "source must be embedded: {script}");
+        assert!(
+            script.contains("\"$HOME/.forgefleet/backups/postgres-wal/\""),
+            "dest dir must be the WAL archive path: {script}"
+        );
+        assert_eq!(wal_rsync_title_like(), "rsync postgres WAL archive %");
+    }
+
+    #[test]
     fn reap_title_like_matches_real_reap_titles() {
         // The coalesce LIKE pattern's literal prefix must align with the title
         // built in reap_over_quota_peers, or the in-flight check silently matches
@@ -1873,8 +2361,25 @@ mod tests {
         assert_eq!(kind_prefix("postgres"), "pg-");
         assert_eq!(kind_prefix("redis"), "redis-");
         assert_eq!(kind_prefix("falkordb"), "falkordb-");
+        assert!(is_known_backup_kind("postgres_wal"));
         // Unknown kind → empty so the prune is a no-op, never a match-all.
         assert_eq!(kind_prefix("nats"), "");
+    }
+
+    #[test]
+    fn postgres_wal_archive_name_guard_is_narrow() {
+        assert!(is_postgres_wal_archive_name("0000000100000000000000A1"));
+        assert!(is_postgres_wal_archive_name(
+            "0000000100000000000000A1.backup"
+        ));
+        assert!(is_postgres_wal_archive_name("00000002.history"));
+        assert!(!is_postgres_wal_archive_name("README"));
+        assert!(!is_postgres_wal_archive_name(
+            "pg-20260720T000000Z.tar.gz.age"
+        ));
+        assert!(!is_postgres_wal_archive_name(
+            "0000000100000000000000A1.tmp"
+        ));
     }
 
     #[test]
@@ -1882,6 +2387,7 @@ mod tests {
         // The operator's on-disk layout is ~/.forgefleet/backups/<KIND>/ with
         // FalkorDB capitalized; everything else keeps its lowercase name.
         assert_eq!(kind_dir("falkordb"), "FalkorDB");
+        assert_eq!(kind_dir("postgres_wal"), "postgres-wal");
         assert_eq!(kind_dir("postgres"), "postgres");
         assert_eq!(kind_dir("redis"), "redis");
         assert_eq!(kind_dir("brain"), "brain");
@@ -1953,10 +2459,64 @@ mod tests {
     #[test]
     fn peer_keep_bounds_every_kind() {
         assert_eq!(local_peer_keep("postgres"), LOCAL_KEEP_POSTGRES_PEER);
+        assert_eq!(
+            local_peer_keep("postgres_wal"),
+            LOCAL_KEEP_POSTGRES_WAL_PEER
+        );
         assert_eq!(local_peer_keep("redis"), LOCAL_KEEP_REDIS_PEER);
         assert_eq!(local_peer_keep("falkordb"), LOCAL_KEEP_FALKORDB_PEER);
         // Every peer depth is a thin DR replica set, well under source depth.
         assert!(local_peer_keep("falkordb") < SOURCE_KEEP_FLOOR);
+    }
+
+    #[test]
+    fn local_backup_freshness_fires_only_past_2x_interval() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(10_000);
+        let max_age = Duration::from_secs(8 * 3600);
+
+        assert_eq!(
+            local_backup_freshness(now, None, max_age),
+            LocalBackupFreshness::Missing
+        );
+        assert_eq!(
+            local_backup_freshness(now, Some(now - max_age), max_age),
+            LocalBackupFreshness::Fresh { age: max_age }
+        );
+        assert_eq!(
+            local_backup_freshness(now, Some(now - max_age - Duration::from_secs(1)), max_age),
+            LocalBackupFreshness::Stale {
+                age: max_age + Duration::from_secs(1)
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn newest_local_backup_ignores_non_backup_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "ff-bk-freshness-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let pg_dir = dir.join("postgres");
+        tokio::fs::create_dir_all(&pg_dir).await.unwrap();
+        let old = pg_dir.join("pg-20260720T000000Z.tar.gz.age");
+        let ignored = pg_dir.join("README");
+        tokio::fs::write(&old, b"old").await.unwrap();
+        tokio::fs::write(&ignored, b"ignored").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let newest = pg_dir.join("pg-20260720T010000Z.tar.gz.age");
+        tokio::fs::write(&newest, b"new").await.unwrap();
+
+        let got = newest_local_backup_age(&dir, "postgres")
+            .await
+            .unwrap()
+            .expect("backup file");
+        let newest_mtime = std::fs::metadata(&newest).unwrap().modified().unwrap();
+        let old_mtime = std::fs::metadata(&old).unwrap().modified().unwrap();
+        assert!(got >= newest_mtime);
+        assert!(got > old_mtime);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     /// Build a `(path, mtime, size)` tuple `secs` seconds after the epoch.

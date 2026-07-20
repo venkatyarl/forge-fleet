@@ -42,6 +42,9 @@ services:
       POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=en_US.utf8 --lc-ctype=en_US.utf8"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # WAL archive for PITR. The daemon prunes and fans this directory out
+      # with the normal Postgres backup destinations.
+      - ${HOME}/.forgefleet/backups/postgres-wal:/wal_archive
     command:
       - "postgres"
       - "-c"
@@ -68,8 +71,17 @@ services:
       # synchronous_commit=off trades a small durability window for
       # throughput — replicas still catch up via WAL streaming and
       # periodic pg_basebackup snapshots cover the worst-case loss.
+      # archive_mode/archive_command keep completed WAL segments outside
+      # PGDATA for point-in-time recovery; archive_timeout bounds the
+      # low-traffic RPO to 5 minutes.
       - "-c"
       - "wal_level=replica"
+      - "-c"
+      - "archive_mode=on"
+      - "-c"
+      - "archive_timeout=300"
+      - "-c"
+      - "archive_command=test -f /wal_archive/%f || cp %p /wal_archive/%f"
       - "-c"
       - "max_wal_senders=4"
       - "-c"

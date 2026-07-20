@@ -881,6 +881,16 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "work_item_events",
         sql: schema::SCHEMA_V179_WORK_ITEM_EVENTS,
     },
+    PgMigration {
+        version: 180,
+        name: "postgres_wal_archiving_config",
+        sql: schema::SCHEMA_V180_POSTGRES_WAL_ARCHIVING_CONFIG,
+    },
+    PgMigration {
+        version: 181,
+        name: "stale_local_backup_alert",
+        sql: schema::SCHEMA_V181_STALE_LOCAL_BACKUP_ALERT,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
