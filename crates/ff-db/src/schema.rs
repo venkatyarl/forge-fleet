@@ -10486,6 +10486,35 @@ CREATE INDEX IF NOT EXISTS idx_fleet_metrics_hourly_metric_time
     ON fleet_metrics_hourly (metric, bucket_start DESC);
 "#;
 
+/// V178 — Classified model-server error events.
+///
+/// Persists startup/load/crash/OOM failures from ff-agent's model runtime so
+/// dashboards and the autoscaler can reason about failure patterns per model,
+/// node, and runtime without re-parsing server log files.
+pub const SCHEMA_V178_ERROR_EVENTS: &str = r#"
+CREATE TABLE IF NOT EXISTS error_events (
+    id              BIGSERIAL PRIMARY KEY,
+    occurred_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    worker_name     TEXT NOT NULL,
+    deployment_id   UUID REFERENCES fleet_model_deployments(id) ON DELETE SET NULL,
+    library_id      UUID REFERENCES fleet_model_library(id) ON DELETE SET NULL,
+    catalog_id      TEXT,
+    runtime         TEXT NOT NULL,
+    error_kind      TEXT NOT NULL CHECK (error_kind IN ('startup', 'load', 'crash', 'oom')),
+    summary         TEXT NOT NULL,
+    details         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    stderr_tail     TEXT,
+    resolved_at     TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_error_events_worker_time
+    ON error_events (worker_name, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_error_events_kind_time
+    ON error_events (error_kind, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_error_events_deployment
+    ON error_events (deployment_id, occurred_at DESC) WHERE deployment_id IS NOT NULL;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

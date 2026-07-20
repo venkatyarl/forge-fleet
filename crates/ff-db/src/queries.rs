@@ -1311,6 +1311,167 @@ pub async fn pg_upsert_deployment(
     Ok(id.to_string())
 }
 
+/// Insert payload for a classified model-server error event.
+#[derive(Debug, Clone)]
+pub struct ErrorEventInsert {
+    pub worker_name: String,
+    pub deployment_id: Option<String>,
+    pub library_id: Option<String>,
+    pub catalog_id: Option<String>,
+    pub runtime: String,
+    pub error_kind: String,
+    pub summary: String,
+    pub details: JsonValue,
+    pub stderr_tail: Option<String>,
+}
+
+/// A persisted model-server error event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorEventRow {
+    pub id: i64,
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    pub worker_name: String,
+    pub deployment_id: Option<String>,
+    pub library_id: Option<String>,
+    pub catalog_id: Option<String>,
+    pub runtime: String,
+    pub error_kind: String,
+    pub summary: String,
+    pub details: JsonValue,
+    pub stderr_tail: Option<String>,
+    pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Record a classified model-server error event.
+pub async fn pg_insert_error_event(pool: &PgPool, event: &ErrorEventInsert) -> Result<i64> {
+    let dep_uuid = event
+        .deployment_id
+        .as_deref()
+        .map(|s| {
+            sqlx::types::Uuid::parse_str(s).map_err(|e| {
+                crate::error::DbError::NotFound(format!("bad deployment uuid {s}: {e}"))
+            })
+        })
+        .transpose()?;
+    let lib_uuid = event
+        .library_id
+        .as_deref()
+        .map(|s| {
+            sqlx::types::Uuid::parse_str(s)
+                .map_err(|e| crate::error::DbError::NotFound(format!("bad library uuid {s}: {e}")))
+        })
+        .transpose()?;
+    let row = sqlx::query(
+        "INSERT INTO error_events
+            (worker_name, deployment_id, library_id, catalog_id, runtime,
+             error_kind, summary, details, stderr_tail)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id",
+    )
+    .bind(&event.worker_name)
+    .bind(dep_uuid)
+    .bind(lib_uuid)
+    .bind(&event.catalog_id)
+    .bind(&event.runtime)
+    .bind(&event.error_kind)
+    .bind(&event.summary)
+    .bind(&event.details)
+    .bind(&event.stderr_tail)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<i64, _>("id"))
+}
+
+fn parse_error_event_row(r: &sqlx::postgres::PgRow) -> ErrorEventRow {
+    let dep_id: Option<sqlx::types::Uuid> = r.get("deployment_id");
+    let lib_id: Option<sqlx::types::Uuid> = r.get("library_id");
+    ErrorEventRow {
+        id: r.get("id"),
+        occurred_at: r.get("occurred_at"),
+        worker_name: r.get("worker_name"),
+        deployment_id: dep_id.map(|u| u.to_string()),
+        library_id: lib_id.map(|u| u.to_string()),
+        catalog_id: r.get("catalog_id"),
+        runtime: r.get("runtime"),
+        error_kind: r.get("error_kind"),
+        summary: r.get("summary"),
+        details: r.get("details"),
+        stderr_tail: r.get("stderr_tail"),
+        resolved_at: r.get("resolved_at"),
+    }
+}
+
+/// List recent error events, optionally filtered by node and/or kind.
+pub async fn pg_list_error_events(
+    pool: &PgPool,
+    worker_name: Option<&str>,
+    error_kind: Option<&str>,
+    limit: i64,
+) -> Result<Vec<ErrorEventRow>> {
+    let rows = match (worker_name, error_kind) {
+        (Some(w), Some(k)) => {
+            sqlx::query(
+                "SELECT id, occurred_at, worker_name, deployment_id, library_id,
+                    catalog_id, runtime, error_kind, summary, details,
+                    stderr_tail, resolved_at
+               FROM error_events
+              WHERE worker_name = $1 AND error_kind = $2
+              ORDER BY occurred_at DESC
+              LIMIT $3",
+            )
+            .bind(w)
+            .bind(k)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+        (Some(w), None) => {
+            sqlx::query(
+                "SELECT id, occurred_at, worker_name, deployment_id, library_id,
+                    catalog_id, runtime, error_kind, summary, details,
+                    stderr_tail, resolved_at
+               FROM error_events
+              WHERE worker_name = $1
+              ORDER BY occurred_at DESC
+              LIMIT $2",
+            )
+            .bind(w)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+        (None, Some(k)) => {
+            sqlx::query(
+                "SELECT id, occurred_at, worker_name, deployment_id, library_id,
+                    catalog_id, runtime, error_kind, summary, details,
+                    stderr_tail, resolved_at
+               FROM error_events
+              WHERE error_kind = $1
+              ORDER BY occurred_at DESC
+              LIMIT $2",
+            )
+            .bind(k)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+        (None, None) => {
+            sqlx::query(
+                "SELECT id, occurred_at, worker_name, deployment_id, library_id,
+                    catalog_id, runtime, error_kind, summary, details,
+                    stderr_tail, resolved_at
+               FROM error_events
+              ORDER BY occurred_at DESC
+              LIMIT $1",
+            )
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+    Ok(rows.iter().map(parse_error_event_row).collect())
+}
+
 /// Filters for [`pg_route_deployments`] — the single scored selector that
 /// backs both the `fleet_route` MCP tool and the agent-capable router.
 ///
