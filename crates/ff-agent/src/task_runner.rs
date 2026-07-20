@@ -56,7 +56,7 @@ fn shell_task_capabilities(command: &str, capabilities: &[String]) -> Vec<String
         .next()
         .unwrap_or_default();
     if first == "ff" && !tags.iter().any(|tag| tag == "ff") {
-        tags.push("ff".to_string());
+        tags.push("ff".into());
     }
     tags.sort_unstable();
     tags.dedup();
