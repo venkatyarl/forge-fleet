@@ -2791,7 +2791,7 @@ fn commit_worktree_changes(
         ["status", "--porcelain"],
         Duration::from_secs(30),
     )?;
-    if String::from_utf8_lossy(&status.stdout).trim().is_empty() {
+    if status_output_is_clean(&status) {
         return Ok(false); // nothing to commit
     }
     let msg = format!("{title}\n\nAutomated work_item dispatch (ForgeFleet Pillar 4).");
@@ -2803,7 +2803,7 @@ fn commit_worktree_changes(
     // identity, not a bot. Identity is DB-driven (see resolve_git_identity).
     let name_cfg = format!("user.name={author_name}");
     let email_cfg = format!("user.email={author_email}");
-    run_git(
+    let commit = run_git(
         worktree_path,
         [
             OsStr::new("-c"),
@@ -2815,7 +2815,27 @@ fn commit_worktree_changes(
             OsStr::new(&msg),
         ],
         Duration::from_secs(60),
-    )?;
+    );
+    if let Err(commit_error) = commit {
+        // A pre-commit hook may normalize generated files back to their checked-in
+        // form. In that case `status` above was dirty, but `git commit` correctly
+        // exits 1 with "nothing to commit" and leaves a clean tree. Treat that as
+        // the same no-op as an initially-clean tree; otherwise the dispatcher
+        // reports a failed build and retries an item that produced no durable diff.
+        let post_hook_status = run_git(
+            worktree_path,
+            ["status", "--porcelain"],
+            Duration::from_secs(30),
+        )?;
+        if status_output_is_clean(&post_hook_status) {
+            warn!(
+                error = %commit_error,
+                "commit_worktree_changes: hook removed the staged diff; treating clean tree as no-op"
+            );
+            return Ok(false);
+        }
+        return Err(commit_error);
+    }
     Ok(true)
 }
 
@@ -2845,6 +2865,10 @@ async fn resolve_git_identity(pg: &PgPool, project_id: &str) -> (String, String)
         name.unwrap_or_else(|| "Venkat Yarlagadda".to_string()),
         email.unwrap_or_else(|| "venkat.yarl@gmail.com".to_string()),
     )
+}
+
+fn status_output_is_clean(status: &Output) -> bool {
+    String::from_utf8_lossy(&status.stdout).trim().is_empty()
 }
 
 /// Run `cargo fmt` over the worktree so committed Rust is CI-fmt-clean. Uses a
@@ -3541,7 +3565,7 @@ mod tests {
         classify_dispatch_outcome, command_display, default_clone_path, dispatch_budget_for_host,
         expand_home, is_build_timeout, parse_cli_tokens, primary_or_default_backend,
         repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
-        task_prefers_cloud_lane, use_local_lane,
+        status_output_is_clean, task_prefers_cloud_lane, use_local_lane,
     };
 
     #[test]
@@ -3564,6 +3588,19 @@ mod tests {
         assert!(tail.starts_with('…'));
         assert_eq!(tail.chars().count(), 101); // 100 + the ellipsis
         assert!(tail.chars().all(|c| c == '…' || c == 'é'));
+    }
+
+    #[test]
+    fn porcelain_status_cleanliness_ignores_only_whitespace() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = |stdout: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        };
+
+        assert!(status_output_is_clean(&output("\n")));
+        assert!(!status_output_is_clean(&output(" M generated.rs\n")));
     }
 
     #[test]
