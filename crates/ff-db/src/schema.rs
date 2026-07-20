@@ -11148,6 +11148,25 @@ VALUES (
 ON CONFLICT (key) DO NOTHING;
 "#;
 
+/// V201 — Make folder-owned, in-place review the merge-queue contract.
+pub const SCHEMA_V201_FOLDER_OWNED_PR_REVIEW: &str = r#"
+INSERT INTO fleet_secrets (key, value, description)
+VALUES (
+    'distributed_review_mode',
+    'on',
+    'Each build folder cross-model reviews its own warm tree before enqueue'
+)
+ON CONFLICT (key) DO UPDATE SET
+    value = EXCLUDED.value,
+    description = EXCLUDED.description,
+    updated_at = NOW();
+
+CREATE INDEX IF NOT EXISTS idx_work_item_merge_queue_approved
+    ON work_item_merge_queue (project_id, position)
+    WHERE status IN ('queued', 'ci_running', 'mergeable')
+      AND review_verdict = 'approve';
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

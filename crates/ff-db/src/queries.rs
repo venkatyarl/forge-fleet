@@ -8119,8 +8119,9 @@ pub async fn pg_reap_stale_work_item_leases(
     // age cap reclaims it so the slot self-heals and the item requeues/fails.
     let rows = sqlx::query(
         "SELECT id, work_item_id, sub_agent_id
-           FROM work_item_leases
+          FROM work_item_leases
           WHERE released_at IS NULL
+            AND lease_state <> 'reviewing'
             AND (heartbeat_at      < NOW() - make_interval(secs => $1)
                  OR dispatch_tick_at < NOW() - make_interval(secs => $1)
                  OR created_at       < NOW() - make_interval(secs => $2))
@@ -8149,6 +8150,7 @@ pub async fn pg_reap_stale_work_item_leases(
                        FROM work_item_leases
                       WHERE id = $1
                         AND released_at IS NULL
+                        AND lease_state <> 'reviewing'
                         AND (heartbeat_at      < NOW() - make_interval(secs => $2)
                              OR dispatch_tick_at < NOW() - make_interval(secs => $2)
                              OR created_at       < NOW() - make_interval(secs => $3))
@@ -9004,6 +9006,7 @@ pub async fn pg_next_merge_queue_item(pool: &PgPool) -> Result<Option<MergeQueue
         "SELECT id, work_item_id, project_id, pr_url, branch_name
            FROM work_item_merge_queue q
           WHERE q.status IN ('queued', 'ci_running', 'mergeable')
+            AND q.review_verdict = 'approve'
             AND NOT EXISTS (
                 SELECT 1 FROM work_item_merge_queue q2
                  WHERE q2.project_id = q.project_id
@@ -9070,7 +9073,8 @@ pub async fn pg_mark_merge_mergeable(pool: &PgPool, id: uuid::Uuid) -> Result<()
     Ok(())
 }
 
-/// Mark a merge as landed: queue→merged, the work_item→merged, its worktree→cleaned.
+/// Mark a merge as landed. The owning folder remains leased until that
+/// computer's reaper deletes the branch/tree and releases it for another item.
 pub async fn pg_mark_merge_merged(
     pool: &PgPool,
     id: uuid::Uuid,
@@ -9085,13 +9089,6 @@ pub async fn pg_mark_merge_merged(
     .await?;
     sqlx::query(
         "UPDATE work_items SET status = 'merged', completed_at = NOW(), last_error = NULL WHERE id = $1",
-    )
-    .bind(work_item_id)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "UPDATE work_item_worktrees SET status = 'cleaned', cleaned_at = NOW() \
-          WHERE work_item_id = $1 AND status <> 'cleaned'",
     )
     .bind(work_item_id)
     .execute(&mut *tx)

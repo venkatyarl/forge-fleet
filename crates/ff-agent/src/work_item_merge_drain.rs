@@ -205,93 +205,9 @@ pub async fn evaluate_merge_queue(
                 );
                 return Ok(0);
             }
-            // Honor an existing PR review verdict before spending an
-            // autonomous review: APPROVED (operator or external reviewer
-            // already signed off) skips the fleet's own review entirely, and
-            // CHANGES_REQUESTED rejects the item with the reviewer's reason
-            // written to `last_error` so a retry attempt sees why. No verdict
-            // (or a gh hiccup) falls through to the autonomous review path,
-            // unchanged.
-            match pr_review_verdict(&pr_url).await {
-                PrReviewVerdict::Approved => {
-                    info!(
-                        pr = %pr_url,
-                        work_item = %item.work_item_id,
-                        "merge_drain: PR already has an approved review verdict — skipping autonomous review"
-                    );
-                }
-                PrReviewVerdict::ChangesRequested(reason) => {
-                    let failure = format!("review verdict changes_requested: {reason}");
-                    warn!(
-                        pr = %pr_url,
-                        work_item = %item.work_item_id,
-                        reason = %failure,
-                        "merge_drain: PR has a rejecting review verdict — marking work_item failed"
-                    );
-                    ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &failure).await?;
-                    return Ok(0);
-                }
-                PrReviewVerdict::None => {
-                    match run_pr_review(pg, &pr_url, item.work_item_id).await {
-                        Ok((true, reason)) => {
-                            info!(
-                                pr = %pr_url,
-                                work_item = %item.work_item_id,
-                                %reason,
-                                "merge_drain: autonomous review approved"
-                            );
-                        }
-                        Ok((false, reason)) => {
-                            let failure = format!("review rejected: {reason}");
-                            warn!(
-                                pr = %pr_url,
-                                work_item = %item.work_item_id,
-                                reason = %failure,
-                                "merge_drain: autonomous review rejected PR"
-                            );
-                            ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &failure)
-                                .await?;
-                            if reason.starts_with("local fix budget exhausted") {
-                                sqlx::query(
-                                    "UPDATE work_items
-                                        SET status = 'ready',
-                                            attempts = COALESCE(attempts, 0) + 1,
-                                            last_error = $2,
-                                            assigned_computer = NULL
-                                      WHERE id = $1",
-                                )
-                                .bind(item.work_item_id)
-                                .bind(&failure)
-                                .execute(pg)
-                                .await?;
-                                info!(
-                                    pr = %pr_url,
-                                    work_item = %item.work_item_id,
-                                    "merge_drain: local fix budget exhausted — queued clean rebuild"
-                                );
-                            }
-                            if let Err(e) = gh_pr_comment(
-                                &pr_url,
-                                &format!("Autonomous review REJECTED: {reason}"),
-                            )
-                            .await
-                            {
-                                warn!(pr = %pr_url, error = %e, "merge_drain: failed to comment review rejection");
-                            }
-                            return Ok(0);
-                        }
-                        Err(e) => {
-                            warn!(
-                                pr = %pr_url,
-                                work_item = %item.work_item_id,
-                                error = %e,
-                                "merge_drain: review unavailable, deferring PR for manual review"
-                            );
-                            return Ok(0);
-                        }
-                    }
-                }
-            }
+            // The folder that built this PR already recorded an approval in
+            // the queue. pg_next_merge_queue_item filters out every other
+            // verdict, so the leader remains a pure serial train-merger.
             match gh_merge_squash(&pr_url).await {
                 Ok(()) => {
                     ff_db::pg_mark_merge_merged(pg, item.id, item.work_item_id).await?;

@@ -986,6 +986,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "review_ladder_mode",
         sql: schema::SCHEMA_V200_REVIEW_LADDER_MODE,
     },
+    PgMigration {
+        version: 201,
+        name: "folder_owned_pr_review",
+        sql: schema::SCHEMA_V201_FOLDER_OWNED_PR_REVIEW,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

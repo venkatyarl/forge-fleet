@@ -1034,26 +1034,18 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
 
     // In-place review (Pillar-4 v2): judge the change IN the still-warm build
     // workspace — diff vs base + item spec + a real `cargo test` run — before
-    // it enters the merge queue. Gated by the `distributed_review_mode` fleet
-    // secret. Fail-open on reviewer-infrastructure errors: with the PR already
-    // pushed, stranding a built change because every reviewer was unreachable
-    // is worse than enqueueing it unreviewed (the merge drain still gates it).
-    let review = if distributed_review_enabled(&pg).await {
-        match run_in_place_review(&pg, &item, &worktree, &backend_used).await {
-            Ok(r) => Some(r),
-            Err(e) => {
-                warn!(
-                    work_item_id = %item.work_item_id,
-                    error = format!("{e:#}"),
-                    "work_item_dispatch: in-place review unavailable — enqueueing unreviewed"
-                );
-                None
-            }
+    // it enters the merge queue. Review is fail-closed: the serial drain is a
+    // pure merger and only sees rows carrying an approval from this folder.
+    let review = match run_in_place_review(&pg, &item, &worktree, &backend_used).await {
+        Ok(r) => r,
+        Err(e) => {
+            requeue_or_fail(&pg, &item, &format!("in-place review unavailable: {e:#}")).await?;
+            remove_worktree(&item.repo_path, &worktree.worktree_path)?;
+            return Ok(());
         }
-    } else {
-        None
     };
-    if let Some(r) = review.as_ref().filter(|r| !r.approved) {
+    if !review.approved {
+        let r = &review;
         let reason = format!("in-place review rejected by {}: {}", r.reviewer, r.reason);
         warn!(
             work_item_id = %item.work_item_id,
@@ -1087,7 +1079,7 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         &head_sha,
         &pr_url,
         &backend_used,
-        review.as_ref(),
+        Some(&review),
     )
     .await?;
     Ok(())
@@ -1391,8 +1383,8 @@ async fn mark_ready_for_review(
         INSERT INTO work_item_merge_queue
             (work_item_id, project_id, status, branch_name, pr_url, head_sha,
              builder, reviewer, review_verdict, review_reason,
-             review_started_at, review_completed_at)
-        VALUES ($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             review_started_at, review_completed_at, reviewer_computer)
+        VALUES ($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         ON CONFLICT (work_item_id) DO UPDATE
             SET status = 'queued',
                 branch_name = EXCLUDED.branch_name,
@@ -1405,7 +1397,8 @@ async fn mark_ready_for_review(
                 review_verdict = EXCLUDED.review_verdict,
                 review_reason = EXCLUDED.review_reason,
                 review_started_at = EXCLUDED.review_started_at,
-                review_completed_at = EXCLUDED.review_completed_at
+                review_completed_at = EXCLUDED.review_completed_at,
+                reviewer_computer = EXCLUDED.reviewer_computer
         "#,
     )
     .bind(item.work_item_id)
@@ -1419,10 +1412,21 @@ async fn mark_ready_for_review(
     .bind(review.map(|r| truncate_for_db(&r.reason)))
     .bind(review.map(|r| r.started_at))
     .bind(review.map(|r| r.completed_at))
+    .bind(review.map(|_| item.computer_name.as_str()))
     .execute(&mut *tx)
     .await?;
 
-    release_slot_and_lease_tx(&mut tx, item, "ready for review").await?;
+    // Folder ownership spans build -> review -> merge. Keep the slot occupied
+    // until the serial drain reports the merged signal; the host reaper then
+    // deletes the branch/tree before this folder can claim another item.
+    sqlx::query(
+        "UPDATE work_item_leases SET lease_state = 'reviewing', heartbeat_at = NOW() \
+          WHERE work_item_id = $1 AND sub_agent_id = $2 AND released_at IS NULL",
+    )
+    .bind(item.work_item_id)
+    .bind(item.sub_agent_id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1467,23 +1471,20 @@ struct ReviewOutcome {
     completed_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Whether the operator has opted into the in-place dispatch review. Default
-/// OFF — flipped via `ff secrets set distributed_review_mode on`.
-async fn distributed_review_enabled(pg: &PgPool) -> bool {
-    matches!(
-        ff_db::pg_read_gate_value(pg, "distributed_review_mode", "off", "off")
-            .await
-            .as_deref(),
-        Ok("on") | Ok("true") | Ok("1")
-    )
-}
-
 /// A `local` build may have escalated to the 480B inside the codegen cascade,
 /// so any local builder conservatively excludes the 480B reviewer (rule 1:
 /// never the model that built the change). Pure for testability.
 fn builder_excludes_480b(builder: &str) -> bool {
     let b = builder.to_ascii_lowercase();
     b == "local" || b.starts_with("local:") || b.contains("480b")
+}
+
+fn same_model_family(builder: &str, reviewer: &str) -> bool {
+    let builder = builder.to_ascii_lowercase();
+    let reviewer = reviewer.to_ascii_lowercase();
+    builder == reviewer
+        || builder.ends_with(&format!(":{reviewer}"))
+        || builder.starts_with(&format!("{reviewer}:"))
 }
 
 /// Observed per-reviewer review history (recent window), read from the same
@@ -1531,7 +1532,7 @@ const DEFAULT_REVIEW_LATENCY_SECS: f64 = 180.0;
 fn order_cloud_reviewers(builder: &str, stats: &[ReviewerStat]) -> Vec<String> {
     let mut scored: Vec<(f64, String)> = CLOUD_REVIEWERS
         .iter()
-        .filter(|b| !b.eq_ignore_ascii_case(builder))
+        .filter(|b| !same_model_family(builder, b))
         .map(|b| {
             let score = stats
                 .iter()
@@ -1779,8 +1780,8 @@ async fn record_review_rejection(
             (work_item_id, project_id, status, branch_name, pr_url, head_sha,
              failed_at, failure_reason,
              builder, reviewer, review_verdict, review_reason,
-             review_started_at, review_completed_at)
-        VALUES ($1, $2, 'failed', $3, $4, $5, NOW(), $6, $7, $8, 'reject', $9, $10, $11)
+             review_started_at, review_completed_at, reviewer_computer)
+        VALUES ($1, $2, 'failed', $3, $4, $5, NOW(), $6, $7, $8, 'reject', $9, $10, $11, $12)
         ON CONFLICT (work_item_id) DO UPDATE
             SET status = 'failed',
                 branch_name = EXCLUDED.branch_name,
@@ -1793,7 +1794,8 @@ async fn record_review_rejection(
                 review_verdict = 'reject',
                 review_reason = EXCLUDED.review_reason,
                 review_started_at = EXCLUDED.review_started_at,
-                review_completed_at = EXCLUDED.review_completed_at
+                review_completed_at = EXCLUDED.review_completed_at,
+                reviewer_computer = EXCLUDED.reviewer_computer
         "#,
     )
     .bind(item.work_item_id)
@@ -1810,6 +1812,7 @@ async fn record_review_rejection(
     .bind(truncate_for_db(&review.reason))
     .bind(review.started_at)
     .bind(review.completed_at)
+    .bind(&item.computer_name)
     .execute(pg)
     .await?;
     Ok(())
@@ -4168,13 +4171,31 @@ pub async fn evaluate_worktree_reaper(pg: &PgPool, worker_name: &str) -> Result<
             ],
             Duration::from_secs(30),
         );
+        let mut tx = pg.begin().await?;
         sqlx::query(
             "UPDATE work_item_worktrees SET status = 'cleaned', cleaned_at = NOW() \
               WHERE work_item_id = $1",
         )
         .bind(wt.work_item_id)
-        .execute(pg)
+        .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "UPDATE work_item_leases SET lease_state = 'released', released_at = NOW(), \
+                    release_reason = 'workspace cleaned after terminal signal' \
+              WHERE work_item_id = $1 AND released_at IS NULL",
+        )
+        .bind(wt.work_item_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE sub_agents SET current_work_item_id = NULL, status = 'idle', \
+                    started_at = NULL, last_heartbeat_at = NOW() \
+              WHERE current_work_item_id = $1",
+        )
+        .bind(wt.work_item_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         reaped += 1;
     }
     if reaped > 0 {
@@ -4284,7 +4305,7 @@ mod tests {
         dispatch_budget_for_host, expand_home, is_build_timeout, order_cloud_reviewers,
         parse_cli_tokens, primary_or_default_backend, quick_empty_success_is_provider_failure,
         repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
-        status_output_is_clean, task_failed_alert_text, task_prefers_cloud_lane,
+        same_model_family, status_output_is_clean, task_failed_alert_text, task_prefers_cloud_lane,
         try_acquire_lane15_480b_permit, use_local_lane,
     };
     use std::path::PathBuf;
@@ -4316,6 +4337,8 @@ mod tests {
         // Rule 1: the builder never reviews its own change.
         let order = order_cloud_reviewers("codex", &[]);
         assert_eq!(order, vec!["claude".to_string(), "kimi".to_string()]);
+        assert!(same_model_family("cloud:codex", "codex"));
+        assert!(!order_cloud_reviewers("cloud:codex", &[]).contains(&"codex".to_string()));
         // A local builder excludes no cloud reviewer.
         let order = order_cloud_reviewers("local", &[]);
         assert_eq!(order.len(), 3);
