@@ -4277,6 +4277,129 @@ pub async fn load_fleet_config_from_postgres(
     Ok(config)
 }
 
+// ─── artifact_index (fleet artifact cache index) ────────────────────────────
+
+/// A row from the `artifact_index` cache index table.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ArtifactIndexRow {
+    pub artifact: String,
+    pub version: String,
+    pub sha256: String,
+    pub holder_nodes: Vec<String>,
+}
+
+/// Insert or update an artifact cache index entry.
+///
+/// The primary key is `(artifact, version)`. Passing a new `sha256` or
+/// `holder_nodes` list updates the existing row.
+pub async fn pg_upsert_artifact_index(
+    pool: &PgPool,
+    artifact: &str,
+    version: &str,
+    sha256: &str,
+    holder_nodes: &[String],
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO artifact_index (artifact, version, sha256, holder_nodes)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (artifact, version) DO UPDATE SET
+             sha256 = EXCLUDED.sha256,
+             holder_nodes = EXCLUDED.holder_nodes",
+    )
+    .bind(artifact)
+    .bind(version)
+    .bind(sha256)
+    .bind(holder_nodes)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Fetch a single artifact cache index entry by its primary key.
+pub async fn pg_get_artifact_index(
+    pool: &PgPool,
+    artifact: &str,
+    version: &str,
+) -> Result<Option<ArtifactIndexRow>> {
+    let row = sqlx::query_as::<_, ArtifactIndexRow>(
+        "SELECT *
+         FROM artifact_index
+         WHERE artifact = $1 AND version = $2",
+    )
+    .bind(artifact)
+    .bind(version)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// List artifact cache index entries, optionally filtered by artifact name.
+pub async fn pg_list_artifact_index(
+    pool: &PgPool,
+    artifact: Option<&str>,
+) -> Result<Vec<ArtifactIndexRow>> {
+    let rows = if let Some(artifact) = artifact {
+        sqlx::query_as::<_, ArtifactIndexRow>(
+            "SELECT *
+             FROM artifact_index
+             WHERE artifact = $1
+             ORDER BY artifact, version",
+        )
+        .bind(artifact)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, ArtifactIndexRow>(
+            "SELECT *
+             FROM artifact_index
+             ORDER BY artifact, version
+             LIMIT 1000",
+        )
+        .fetch_all(pool)
+        .await?
+    };
+    Ok(rows)
+}
+
+/// Replace the holder node list for an artifact cache index entry.
+///
+/// Returns `true` if a row was updated.
+pub async fn pg_update_artifact_index_holders(
+    pool: &PgPool,
+    artifact: &str,
+    version: &str,
+    holder_nodes: &[String],
+) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE artifact_index
+         SET holder_nodes = $3
+         WHERE artifact = $1 AND version = $2",
+    )
+    .bind(artifact)
+    .bind(version)
+    .bind(holder_nodes)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Delete an artifact cache index entry by its primary key.
+pub async fn pg_delete_artifact_index(
+    pool: &PgPool,
+    artifact: &str,
+    version: &str,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "DELETE FROM artifact_index
+         WHERE artifact = $1 AND version = $2",
+    )
+    .bind(artifact)
+    .bind(version)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4872,6 +4995,108 @@ mod tests {
         assert_eq!(remaining, 0);
 
         drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn artifact_index_crud_lifecycle() {
+        let Some(url) = env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()
+        else {
+            return;
+        };
+
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect to test database");
+
+        sqlx::raw_sql(crate::schema::SCHEMA_V171_ARTIFACT_INDEX)
+            .execute(&pool)
+            .await
+            .expect("apply artifact_index schema");
+
+        // Insert
+        pg_upsert_artifact_index(
+            &pool,
+            "model-qwen3-30b",
+            "v1.0",
+            "deadbeef",
+            &["taylor".to_string(), "james".to_string()],
+        )
+        .await
+        .unwrap();
+
+        // Query single
+        let row = pg_get_artifact_index(&pool, "model-qwen3-30b", "v1.0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.artifact, "model-qwen3-30b");
+        assert_eq!(row.version, "v1.0");
+        assert_eq!(row.sha256, "deadbeef");
+        assert_eq!(row.holder_nodes, vec!["taylor", "james"]);
+
+        // Update holders
+        let updated = pg_update_artifact_index_holders(
+            &pool,
+            "model-qwen3-30b",
+            "v1.0",
+            &["taylor".to_string()],
+        )
+        .await
+        .unwrap();
+        assert!(updated);
+        let row = pg_get_artifact_index(&pool, "model-qwen3-30b", "v1.0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.holder_nodes, vec!["taylor"]);
+
+        // List filtered
+        pg_upsert_artifact_index(
+            &pool,
+            "model-qwen3-30b",
+            "v2.0",
+            "cafebabe",
+            &["james".to_string()],
+        )
+        .await
+        .unwrap();
+        let rows = pg_list_artifact_index(&pool, Some("model-qwen3-30b"))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // Upsert updates sha256
+        pg_upsert_artifact_index(
+            &pool,
+            "model-qwen3-30b",
+            "v1.0",
+            "newhash",
+            &["taylor".to_string(), "james".to_string()],
+        )
+        .await
+        .unwrap();
+        let row = pg_get_artifact_index(&pool, "model-qwen3-30b", "v1.0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.sha256, "newhash");
+
+        // Delete
+        let deleted = pg_delete_artifact_index(&pool, "model-qwen3-30b", "v1.0")
+            .await
+            .unwrap();
+        assert!(deleted);
+        let gone = pg_get_artifact_index(&pool, "model-qwen3-30b", "v1.0")
+            .await
+            .unwrap();
+        assert!(gone.is_none());
+
+        // Cleanup remaining test row
+        let _ = pg_delete_artifact_index(&pool, "model-qwen3-30b", "v2.0").await;
     }
 }
 
@@ -7743,20 +7968,56 @@ pub async fn pg_reap_stale_work_item_leases(
         let outcome = async {
             let mut tx = pool.begin().await?;
             let released = sqlx::query(
-                "UPDATE work_item_leases
-                    SET lease_state = 'stale',
-                        released_at = NOW(),
-                        release_reason = CASE
-                            WHEN heartbeat_at < NOW() - make_interval(secs => $2)
-                              THEN 'stale-heartbeat takeover'
-                            WHEN dispatch_tick_at < NOW() - make_interval(secs => $2)
-                              THEN 'stale-dispatch-tick takeover'
-                            ELSE 'max-build-duration exceeded' END
-                  WHERE id = $1
-                    AND released_at IS NULL
-                    AND (heartbeat_at      < NOW() - make_interval(secs => $2)
-                         OR dispatch_tick_at < NOW() - make_interval(secs => $2)
-                         OR created_at       < NOW() - make_interval(secs => $3))",
+                "WITH releasing AS (
+                     SELECT id, work_item_id, lease_state, endpoint, attempt, computer_id
+                       FROM work_item_leases
+                      WHERE id = $1
+                        AND released_at IS NULL
+                        AND (heartbeat_at      < NOW() - make_interval(secs => $2)
+                             OR dispatch_tick_at < NOW() - make_interval(secs => $2)
+                             OR created_at       < NOW() - make_interval(secs => $3))
+                      FOR UPDATE
+                 ), released AS (
+                     UPDATE work_item_leases l
+                        SET lease_state = 'stale',
+                            released_at = NOW(),
+                            release_reason = CASE
+                                WHEN l.heartbeat_at < NOW() - make_interval(secs => $2)
+                                  THEN 'stale-heartbeat takeover'
+                                WHEN l.dispatch_tick_at < NOW() - make_interval(secs => $2)
+                                  THEN 'stale-dispatch-tick takeover'
+                                ELSE 'max-build-duration exceeded' END
+                       FROM releasing r
+                      WHERE l.id = r.id
+                  RETURNING r.work_item_id,
+                            r.lease_state AS from_status,
+                            r.endpoint,
+                            r.attempt,
+                            l.release_reason,
+                            r.computer_id
+                 )
+                 INSERT INTO work_item_events
+                     (work_item_id, from_status, to_status, computer, attempt, detail)
+                 SELECT r.work_item_id,
+                        r.from_status,
+                        'lease_released',
+                        c.name,
+                        r.attempt,
+                        jsonb_build_object(
+                            'event_type', 'lease_released',
+                            'endpoint', r.endpoint,
+                            'lane', CASE
+                                WHEN NULLIF(r.endpoint, '') IS NULL THEN NULL
+                                WHEN r.endpoint LIKE 'cloud:%'
+                                  OR r.endpoint ~ '^(codex|claude|kimi|gemini|grok)(:|$)'
+                                  THEN 'cloud'
+                                ELSE 'local'
+                            END,
+                            'attempt', r.attempt,
+                            'release_reason', r.release_reason
+                        )
+                   FROM released r
+                   LEFT JOIN computers c ON c.id = r.computer_id",
             )
             .bind(lease_id)
             .bind(stale_secs as f64)
