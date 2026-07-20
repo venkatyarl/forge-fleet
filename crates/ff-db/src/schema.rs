@@ -11327,6 +11327,17 @@ LEFT JOIN LATERAL (
 ) s ON TRUE;
 "#;
 
+/// V207 — Ensure merge-queue review ownership, outcome, and latency fields.
+pub const SCHEMA_V207_MERGE_QUEUE_REVIEW_TRACKING: &str = r#"
+ALTER TABLE work_item_merge_queue
+    ADD COLUMN IF NOT EXISTS reviewer_computer   TEXT,
+    ADD COLUMN IF NOT EXISTS review_claimed_at   TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS review_verdict      TEXT,
+    ADD COLUMN IF NOT EXISTS review_reason       TEXT,
+    ADD COLUMN IF NOT EXISTS review_started_at   TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS review_completed_at TIMESTAMPTZ;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

@@ -1016,6 +1016,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_endpoint_metrics",
         sql: schema::SCHEMA_V206_MODEL_ENDPOINT_METRICS,
     },
+    PgMigration {
+        version: 207,
+        name: "merge_queue_review_tracking",
+        sql: schema::SCHEMA_V207_MERGE_QUEUE_REVIEW_TRACKING,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
