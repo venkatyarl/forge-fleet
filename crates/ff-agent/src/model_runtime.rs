@@ -1473,6 +1473,14 @@ fn parse_flag_value(cmdline: &str, flag: &str) -> Option<String> {
 }
 
 fn pid_is_alive(pid: u32) -> bool {
+    // A real, live PID is a positive `pid_t` (i32). A value that doesn't fit in
+    // i32 (e.g. `u32::MAX`) is reinterpreted by `kill` as a NEGATIVE pid, which
+    // targets a whole process GROUP — `kill -0 -1` broadcasts signal 0 and
+    // succeeds, falsely reporting "alive". PID 0 broadcasts likewise. Reject
+    // both up front so a stale/garbage PID never aliases to a broadcast.
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
     // `kill -0 <pid>` returns 0 if the process exists and we can signal it.
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])

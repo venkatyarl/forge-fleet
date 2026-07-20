@@ -280,7 +280,10 @@ mod tests {
         );
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].summary, "Fleet, standup");
-        assert_eq!(events[0].starts_at, "2026-07-21T13:00:00Z".parse().unwrap());
+        assert_eq!(
+            events[0].starts_at,
+            "2026-07-21T13:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     #[test]

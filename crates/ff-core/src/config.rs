@@ -779,6 +779,47 @@ fn default_agent_poll_interval() -> u64 {
     8
 }
 
+// ── Offline autonomy ─────────────────────────────────────────────────────────
+
+/// Offline autonomy configuration — controls degraded, fully-local operation
+/// when the fleet loses connectivity to cloud LLMs / control plane.
+///
+/// Tuned for small (8 GB) nodes: `min_ram_mb` gates whether a node may run a
+/// local model at all, and `model_quantization` selects a memory-frugal quant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfflineAutonomyConfig {
+    /// Enable offline autonomy (local-only operation when disconnected).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Minimum free RAM (MB) required before a node runs a local model.
+    /// Defaults to 4096 (targets 8 GB nodes).
+    #[serde(default = "default_offline_min_ram_mb")]
+    pub min_ram_mb: u64,
+
+    /// Quantization used for locally-run models (e.g. "Q4_0").
+    #[serde(default = "default_offline_model_quantization")]
+    pub model_quantization: String,
+}
+
+impl Default for OfflineAutonomyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_ram_mb: default_offline_min_ram_mb(),
+            model_quantization: default_offline_model_quantization(),
+        }
+    }
+}
+
+fn default_offline_min_ram_mb() -> u64 {
+    4096
+}
+
+fn default_offline_model_quantization() -> String {
+    "Q4_0".to_string()
+}
+
 // ── Operational loops ───────────────────────────────────────────────────────
 
 /// Background loop configuration — `[loops]`.

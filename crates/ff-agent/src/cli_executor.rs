@@ -494,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_backend_keeps_hardened_headless_flags() {
+    fn codex_backend_headless_flags_contain_hardening() {
         let codex = backend_by_name("codex").expect("codex backend");
         assert_eq!(codex.default_flags[0], "exec");
         assert!(codex.default_flags.contains(&"--ignore-user-config"));

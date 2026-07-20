@@ -167,9 +167,6 @@ pub fn probe_indicates_unauthenticated(reason: &str) -> bool {
         "invalid authentication credentials",
         "invalid api key",
         "invalid credentials",
-        "credentials expired",
-        "token expired",
-        "session expired",
         "refresh token: access revoked",
         "access_terminated",
         "oauth session expired and could not be refreshed",
@@ -177,8 +174,18 @@ pub fn probe_indicates_unauthenticated(reason: &str) -> bool {
         "please login",
         "not logged in",
     ];
+    // Bare "<noun> expired" phrases are matched ONLY as the trailing clause of the
+    // reason. A message that merely DESCRIBES expiry ("context mentions token
+    // expired behavior") isn't a live-expiry verdict, so it must not fail closed;
+    // the definitive form ("Your token expired") ends with the phrase.
+    const EXPIRED_CLAUSES: &[&str] = &["credentials expired", "token expired", "session expired"];
+
     let lower = reason.to_ascii_lowercase();
-    UNAUTH_SIGNATURES.iter().any(|s| lower.contains(s))
+    if UNAUTH_SIGNATURES.iter().any(|s| lower.contains(s)) {
+        return true;
+    }
+    let clause_tail = lower.trim_end_matches(|c: char| !c.is_alphanumeric());
+    EXPIRED_CLAUSES.iter().any(|s| clause_tail.ends_with(s))
 }
 
 /// Detect every backend's availability on THIS node. When `probe_auth` is true,
