@@ -256,6 +256,9 @@ fn env_key_for_secret(key: &str) -> String {
         "huggingface.token" => "HF_TOKEN".to_string(),
         "openai.api_key" => "OPENAI_API_KEY".to_string(),
         "anthropic.api_key" => "ANTHROPIC_API_KEY".to_string(),
+        // Long-lived headless token minted by `claude setup-token`. Claude
+        // Code itself reads this exact env var name for non-interactive auth.
+        "claude.setup_token" => "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
         other => other.replace('.', "_").to_uppercase(),
     }
 }
