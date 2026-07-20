@@ -11137,6 +11137,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_upgrade_rollouts_one_auto_inflight
     WHERE automatic = TRUE AND status = 'in_progress';
 "#;
 
+/// V200 — Enable the cost-optimal local-first PR review ladder.
+pub const SCHEMA_V200_REVIEW_LADDER_MODE: &str = r#"
+INSERT INTO fleet_secrets (key, value, description)
+VALUES (
+    'review_ladder_mode',
+    'cost_optimal',
+    'Local review first; cloud only confirms weak local approvals; local coders repair rejects'
+)
+ON CONFLICT (key) DO NOTHING;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

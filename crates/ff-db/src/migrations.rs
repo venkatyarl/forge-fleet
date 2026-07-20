@@ -981,6 +981,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "continuous_rollout",
         sql: schema::SCHEMA_V199_CONTINUOUS_ROLLOUT,
     },
+    PgMigration {
+        version: 200,
+        name: "review_ladder_mode",
+        sql: schema::SCHEMA_V200_REVIEW_LADDER_MODE,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

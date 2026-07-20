@@ -25,6 +25,7 @@ use crate::project_github_sync::parse_owner_repo;
 const REVIEW_480B_TIMEOUT: Duration = Duration::from_secs(60);
 const REVIEW_LOCAL_POOL_TIMEOUT: Duration = Duration::from_secs(60);
 const REVIEW_CLOUD_TIMEOUT: Duration = Duration::from_secs(75);
+const REVIEW_LOCAL_FIX_ATTEMPTS: u32 = 2;
 
 /// Build a `gh` invocation with the fleet GitHub token injected as `GH_TOKEN`.
 ///
@@ -250,6 +251,25 @@ pub async fn evaluate_merge_queue(
                             );
                             ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &failure)
                                 .await?;
+                            if reason.starts_with("local fix budget exhausted") {
+                                sqlx::query(
+                                    "UPDATE work_items
+                                        SET status = 'ready',
+                                            attempts = COALESCE(attempts, 0) + 1,
+                                            last_error = $2,
+                                            assigned_computer = NULL
+                                      WHERE id = $1",
+                                )
+                                .bind(item.work_item_id)
+                                .bind(&failure)
+                                .execute(pg)
+                                .await?;
+                                info!(
+                                    pr = %pr_url,
+                                    work_item = %item.work_item_id,
+                                    "merge_drain: local fix budget exhausted — queued clean rebuild"
+                                );
+                            }
                             if let Err(e) = gh_pr_comment(
                                 &pr_url,
                                 &format!("Autonomous review REJECTED: {reason}"),
@@ -334,6 +354,25 @@ async fn run_pr_review(
         "run_pr_review: fleet_secrets.distributed_review_mode read"
     );
 
+    let (title, description): (String, Option<String>) =
+        sqlx::query_as("SELECT title, description FROM work_items WHERE id = $1")
+            .bind(work_item_id)
+            .fetch_one(pg)
+            .await
+            .context("fetch work_item intent for PR review")?;
+
+    if review_ladder_mode(pg).await != "cost_optimal" {
+        let prompt = build_pr_review_prompt(pr_url, &title, description.as_deref()).await?;
+        return legacy_review_ladder(pg, pr_url, &prompt).await;
+    }
+    review_ladder(pg, pr_url, &title, description.as_deref()).await
+}
+
+async fn build_pr_review_prompt(
+    pr_url: &str,
+    title: &str,
+    description: Option<&str>,
+) -> Result<String> {
     let mut diff_cmd = gh_cmd().await;
     diff_cmd.args(["pr", "diff", pr_url]);
     let diff_out = diff_cmd.output().await.context("spawn gh pr diff")?;
@@ -348,15 +387,7 @@ async fn run_pr_review(
         );
     }
     let diff = truncate_chars(&String::from_utf8_lossy(&diff_out.stdout), 40_000);
-
-    let (title, description): (String, Option<String>) =
-        sqlx::query_as("SELECT title, description FROM work_items WHERE id = $1")
-            .bind(work_item_id)
-            .fetch_one(pg)
-            .await
-            .context("fetch work_item intent for PR review")?;
-
-    let prompt = format!(
+    Ok(format!(
         "You are reviewing a pull request opened by an autonomous coding fleet.\n\
          Judge whether the change correctly and cleanly implements the requested work item.\n\n\
          Work item title:\n{title}\n\n\
@@ -373,9 +404,7 @@ async fn run_pr_review(
          next line.\n\n\
          Pull request diff (truncated to 40000 chars if needed):\n```diff\n{diff}\n```",
         description = description.unwrap_or_default(),
-    );
-
-    review_ladder(pg, pr_url, &prompt).await
+    ))
 }
 
 /// Review with the primary 480B ring, falling back to another working reviewer.
@@ -384,7 +413,7 @@ async fn run_pr_review(
 /// local 30B pool or a cloud CLI so one local misjudgement cannot fail a good
 /// PR. If the 480B ring is unavailable, the same local-to-cloud fallback keeps
 /// the drain moving; exhausting the ladder returns an error for manual review.
-async fn review_ladder(pg: &PgPool, pr_url: &str, prompt: &str) -> Result<(bool, String)> {
+async fn legacy_review_ladder(pg: &PgPool, pr_url: &str, prompt: &str) -> Result<(bool, String)> {
     match review_via_480b(pg, prompt).await {
         Ok((true, reason)) => Ok((true, format!("480b: {reason}"))),
         Ok((false, reason_480b)) => {
@@ -422,6 +451,228 @@ async fn review_ladder(pg: &PgPool, pr_url: &str, prompt: &str) -> Result<(bool,
     }
 }
 
+/// Cost-optimal ladder: a strong local approval is final; a weak local
+/// approval gets one cloud confirmation. Rejections never spend cloud money:
+/// a local coder repairs the PR head and the refreshed diff is reviewed again.
+async fn review_ladder(
+    pg: &PgPool,
+    pr_url: &str,
+    title: &str,
+    description: Option<&str>,
+) -> Result<(bool, String)> {
+    let mut fix_attempt = 0;
+    loop {
+        let prompt = build_pr_review_prompt(pr_url, title, description).await?;
+        let (approved, reason, reviewer, strong) = match review_via_480b(pg, &prompt).await {
+            Ok((approved, reason)) => (approved, reason, "480b".to_string(), true),
+            Err(e) => {
+                warn!(pr = %pr_url, error = %e, "merge_drain: 480b unavailable — reviewing with local 30b");
+                let (approved, reason, model) = local_pool_review(pg, &prompt).await?;
+                (approved, reason, format!("local:{model}"), false)
+            }
+        };
+
+        let rejection = if approved && strong {
+            return Ok((true, format!("{reviewer}: {reason}")));
+        } else if approved {
+            info!(pr = %pr_url, reviewer = %reviewer, "merge_drain: weak local approval — requesting one cloud confirmation");
+            let (confirmed, cloud_reason, backend) = cloud_cli_review(pg, &prompt, "cloud_confirm")
+                .await
+                .context("cloud confirmation of local approval")?;
+            if confirmed {
+                return Ok((
+                    true,
+                    format!("{reviewer}: {reason}; confirmed by {backend}: {cloud_reason}"),
+                ));
+            }
+            format!("{backend} overturned {reviewer} approval: {cloud_reason}")
+        } else {
+            format!("{reviewer}: {reason}")
+        };
+
+        if fix_attempt >= REVIEW_LOCAL_FIX_ATTEMPTS {
+            return Ok((
+                false,
+                format!("local fix budget exhausted after {fix_attempt} attempt(s): {rejection}"),
+            ));
+        }
+        fix_attempt += 1;
+        if let Err(e) = local_fix_pr(pg, pr_url, title, description, &rejection, fix_attempt).await
+        {
+            warn!(pr = %pr_url, attempt = fix_attempt, error = %e, "merge_drain: local PR fix attempt failed");
+            if fix_attempt >= REVIEW_LOCAL_FIX_ATTEMPTS {
+                return Ok((
+                    false,
+                    format!(
+                        "local fix budget exhausted after {fix_attempt} attempt(s): {rejection}; last fix error: {e}"
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+async fn review_ladder_mode(pg: &PgPool) -> String {
+    ff_db::pg_read_gate_value(pg, "review_ladder_mode", "cost_optimal", "cost_optimal")
+        .await
+        .ok()
+        .unwrap_or_else(|| "cost_optimal".to_string())
+}
+
+/// Repair the PR head in an isolated checkout. The original builder slot is
+/// released when the PR enters the queue and may already contain another
+/// task, so it is never safe for the merge drain to mutate that path.
+async fn local_fix_pr(
+    pg: &PgPool,
+    pr_url: &str,
+    title: &str,
+    description: Option<&str>,
+    rejection: &str,
+    attempt: u32,
+) -> Result<()> {
+    let (owner, repo) =
+        parse_owner_repo(pr_url).with_context(|| format!("unrecognized PR url: {pr_url}"))?;
+    let checkout = std::env::temp_dir().join(format!(
+        "forgefleet-review-fix-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let checkout_arg = checkout.to_string_lossy().to_string();
+    let repo_slug = format!("{owner}/{repo}");
+
+    let result = async {
+        run_fix_command(
+            "gh",
+            &[
+                "repo",
+                "clone",
+                &repo_slug,
+                &checkout_arg,
+                "--",
+                "--no-tags",
+            ],
+            None,
+        )
+        .await
+        .context("clone repository for local PR fix")?;
+        run_fix_command(
+            "gh",
+            &["pr", "checkout", pr_url, "--force"],
+            Some(&checkout),
+        )
+        .await
+        .context("checkout PR head for local fix")?;
+
+        let task = format!(
+            "Fix the current PR branch in place after a reviewer rejection.\n\
+             Preserve all correct existing work and make the smallest complete fix.\n\
+             Work item: {title}\n\
+             Description: {}\n\
+             Reviewer rejection: {rejection}",
+            description.unwrap_or_default()
+        );
+        let outcome =
+            crate::codegen_apply::codegen_apply(pg, &checkout, &task, Some("qwen3-coder"), 1)
+                .await
+                .context("local coder PR repair")?;
+        record_fix_interaction(pg, &task, &outcome, attempt).await;
+        if !outcome.applied {
+            anyhow::bail!(
+                "local coder did not produce a verified fix: {}",
+                outcome
+                    .error
+                    .unwrap_or_else(|| "no applicable edit".to_string())
+            );
+        }
+
+        run_fix_command(
+            "git",
+            &["config", "user.name", "ForgeFleet"],
+            Some(&checkout),
+        )
+        .await?;
+        run_fix_command(
+            "git",
+            &["config", "user.email", "fleet@forgefleet.local"],
+            Some(&checkout),
+        )
+        .await?;
+        run_fix_command("git", &["add", "-A"], Some(&checkout)).await?;
+        let message = format!("fix: address local review (attempt {attempt})");
+        run_fix_command("git", &["commit", "-m", &message], Some(&checkout)).await?;
+        run_fix_command("git", &["push", "origin", "HEAD"], Some(&checkout)).await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = std::fs::remove_dir_all(&checkout) {
+        warn!(path = %checkout.display(), error = %e, "merge_drain: failed to clean local-fix checkout");
+    }
+    result
+}
+
+async fn run_fix_command(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&std::path::Path>,
+) -> Result<()> {
+    let mut command = tokio::process::Command::new(program);
+    command.args(args);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    if program == "gh" {
+        if let Some(token) = crate::fleet_info::fetch_secret("github_gh_token").await {
+            command.env("GH_TOKEN", token);
+        }
+    }
+    let output = command
+        .output()
+        .await
+        .with_context(|| format!("spawn {program}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "{program} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .chars()
+                .take(500)
+                .collect::<String>()
+        );
+    }
+    Ok(())
+}
+
+async fn record_fix_interaction(
+    pg: &PgPool,
+    prompt: &str,
+    outcome: &crate::codegen_apply::CodegenOutcome,
+    attempt: u32,
+) {
+    let rec = ff_db::InteractionRecord {
+        channel: "merge_drain_review".to_string(),
+        request_text: prompt.chars().take(16000).collect(),
+        request_meta: serde_json::json!({ "stage": "local_fix", "attempt": attempt }),
+        engine: Some("local:qwen3-coder".to_string()),
+        response_text: format!(
+            "applied={} rounds={} error={}",
+            outcome.applied,
+            outcome.rounds,
+            outcome.error.as_deref().unwrap_or("")
+        ),
+        cost_usd: 0.0,
+        outcome: if outcome.applied {
+            "success"
+        } else {
+            "failure"
+        }
+        .to_string(),
+        ..Default::default()
+    };
+    if let Err(e) = ff_db::pg_record_interaction(pg, &rec).await {
+        warn!(error = %e, "merge_drain: failed to log local-fix interaction (non-fatal)");
+    }
+}
+
 /// Fallback review ladder after the primary 480B reviewer: try the local 30B
 /// pool first, then cloud CLIs. A working local review beats burning the whole
 /// tick on cloud backends while a healthy on-fleet coder sits idle.
@@ -435,7 +686,7 @@ async fn fallback_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, Str
             );
         }
     }
-    let (approved, reason, backend) = cloud_cli_review(pg, prompt).await?;
+    let (approved, reason, backend) = cloud_cli_review(pg, prompt, "legacy_cloud_review").await?;
     Ok((approved, reason, backend))
 }
 
@@ -453,6 +704,7 @@ async fn local_pool_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, S
     .context("local pool PR review")?;
     record_review_interaction(
         pg,
+        "local_review_30b",
         &resp.model,
         prompt,
         &resp.text,
@@ -505,6 +757,7 @@ async fn review_via_480b(pg: &PgPool, prompt: &str) -> Result<(bool, String)> {
     }
     record_review_interaction(
         pg,
+        "local_review_480b",
         &resp.model,
         prompt,
         &resp.text,
@@ -528,7 +781,11 @@ pub(crate) fn served_by_480b(model: &str) -> bool {
 /// One cloud CLI review pass — first backend that produces output wins, so a
 /// leader node missing one vendor CLI still gets a review. Returns
 /// `(approved, reason, backend)`.
-async fn cloud_cli_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, String)> {
+async fn cloud_cli_review(
+    pg: &PgPool,
+    prompt: &str,
+    stage: &str,
+) -> Result<(bool, String, String)> {
     let mut last_err: Option<anyhow::Error> = None;
     // claude first: it is the most reliable cloud reviewer here; codex has hung
     // and auth-expired fleet-wide in the past, so every backend gets a short
@@ -559,6 +816,7 @@ async fn cloud_cli_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, St
                 ));
                 record_review_interaction(
                     pg,
+                    stage,
                     backend,
                     prompt,
                     &res.stdout,
@@ -596,6 +854,7 @@ async fn cloud_cli_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, St
 #[allow(clippy::too_many_arguments)]
 async fn record_review_interaction(
     pg: &PgPool,
+    stage: &str,
     engine: &str,
     prompt: &str,
     response: &str,
@@ -614,7 +873,10 @@ async fn record_review_interaction(
     let rec = ff_db::InteractionRecord {
         channel: "merge_drain_review".to_string(),
         request_text: prompt.chars().take(16000).collect(),
-        request_meta: serde_json::json!({ "tokens_estimated": tokens_estimated }),
+        request_meta: serde_json::json!({
+            "stage": stage,
+            "tokens_estimated": tokens_estimated
+        }),
         engine: Some(engine),
         response_text: response.chars().take(16000).collect(),
         tokens_in,
