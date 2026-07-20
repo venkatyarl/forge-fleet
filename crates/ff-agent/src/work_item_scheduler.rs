@@ -35,7 +35,7 @@ pub(crate) const LEASE_STALE_SECS: i64 = 480;
 /// dispatch that keeps its heartbeat fresh but makes no progress (the
 /// "building forever, live heartbeat" wedge). Above a real build's Lane-2 cap
 /// (~18.5 min).
-const MAX_LEASE_DURATION_SECS: i64 = 25 * 60;
+pub(crate) const MAX_LEASE_DURATION_SECS: i64 = 25 * 60;
 /// Lease lifetime granted at assignment (refreshed by heartbeats).
 pub(crate) const LEASE_GRANT_SECS: i64 = 600;
 /// Max assignments per tick (back-pressure; the rest wait for the next tick).

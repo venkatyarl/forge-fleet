@@ -39,6 +39,13 @@ const COMMAND_POLL_MS: u64 = 250;
 // non-terminating process. A genuinely longer task simply salvages whatever diff
 // exists at 18 min (CI verifies it). Followers are 20-core/121GB.
 const FF_TIMEOUT_SECS: u64 = 1080;
+/// Dispatch-owned wall-clock ceiling. Unlike the heartbeat reaper, this fires
+/// even while a wedged build is successfully refreshing its lease. Keep the
+/// scheduler's max-lease-age sweep longer as a last-resort recovery path for a
+/// crashed dispatcher.
+const MAX_BUILD_DURATION_SECS: u64 = 20 * 60;
+const _: () =
+    assert!(MAX_BUILD_DURATION_SECS < crate::work_item_scheduler::MAX_LEASE_DURATION_SECS as u64);
 const MAX_SELF_FIX_ATTEMPTS: usize = 1;
 /// Ceiling on how many work_items a single host starts in one dispatch tick.
 /// The effective budget per tick is [`dispatch_budget_for_host`], which scales
@@ -240,7 +247,19 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
         let pg = pg.clone();
         let worker_name = worker_name.to_string();
         tokio::spawn(async move {
-            if let Err(e) = dispatch_one(pg.clone(), item.clone(), worker_name).await {
+            let result = match tokio::time::timeout(
+                Duration::from_secs(MAX_BUILD_DURATION_SECS),
+                dispatch_one(pg.clone(), item.clone(), worker_name),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!(
+                    "max-build-duration exceeded after {}s; build cancelled",
+                    MAX_BUILD_DURATION_SECS
+                )),
+            };
+            if let Err(e) = result {
                 if is_build_timeout(&e) {
                     warn!(
                         work_item_id = %item.work_item_id,
@@ -4862,7 +4881,18 @@ mod tests {
     fn detects_build_timeout_through_error_context() {
         let timeout = anyhow!("command timed out after 300s").context("run cargo build");
         assert!(is_build_timeout(&timeout));
+        assert!(is_build_timeout(&anyhow!(
+            "max-build-duration exceeded after 1200s; build cancelled"
+        )));
         assert!(!is_build_timeout(&anyhow!("cargo build exited 1")));
+    }
+
+    #[test]
+    fn build_timeout_precedes_max_lease_age_backstop() {
+        assert!(
+            super::MAX_BUILD_DURATION_SECS
+                < crate::work_item_scheduler::MAX_LEASE_DURATION_SECS as u64
+        );
     }
 
     #[test]
