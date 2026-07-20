@@ -292,6 +292,23 @@ impl LeaderTick {
             // Prevent a burst when several ticks are missed.
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+            // Warm the leader cache IMMEDIATELY on startup. After a daemon
+            // restart the in-memory `leader_cache` defaults to NOT-leader and
+            // stays cold until this loop's first election tick — during that
+            // window every leader-gated subsystem (merge-drain, reconcilers)
+            // silently no-ops even when this node is the durable DB leader
+            // (2026-07-20 freeze: merges stuck at 141 with ~99 green PRs
+            // waiting). Run one election tick up front so leadership is
+            // confirmed and the cache warmed before anything else runs.
+            // Idempotent with the loop's first tick (heartbeat refresh only).
+            if let Err(err) = self.tick().await {
+                tracing::warn!(
+                    node = %self.my_name,
+                    error = %err,
+                    "initial leader-cache warm tick failed"
+                );
+            }
+
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
