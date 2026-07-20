@@ -83,6 +83,7 @@ pub mod learning;
 pub mod lease_takeover;
 pub mod legacy_daemon_reaper;
 pub mod local_healer;
+pub mod log_analysis_worker;
 pub mod log_rotate;
 pub mod log_signature;
 pub mod mcp_client;
