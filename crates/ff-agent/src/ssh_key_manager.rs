@@ -7,11 +7,11 @@
 //!   Records a row per (revoked_node, target_node) in
 //!   `fleet_ssh_revocations` (schema V17).
 //!
-//! * [`SshKeyManager::rotate_computer_keypair`] — STUB. Full rotation
-//!   requires orchestrating `ssh-keygen` on the target host, distributing
-//!   the new pubkey to every peer, verifying reachability, and scrubbing
-//!   the old pubkey. That workflow is left for a follow-up phase;
-//!   calling it returns `NotImplemented` with a description of the steps.
+//! * [`SshKeyManager::rotate_computer_keypair`] — rotates a computer's SSH
+//!   user keypair by generating a new ed25519 key on the target, distributing
+//!   the new public key to every peer, verifying reachability with the new
+//!   key, swapping it to the primary identity on the target, and finally
+//!   scrubbing the old public key from peers.
 //!
 //! Revocation uses a simple SSH fan-out:
 //!   ```bash
@@ -23,6 +23,7 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use thiserror::Error;
 use tokio::process::Command;
@@ -41,6 +42,8 @@ pub enum SshError {
     Io(#[from] std::io::Error),
     #[error("operation not yet implemented: {0}")]
     NotImplemented(String),
+    #[error("rotation aborted: {0}")]
+    RotationAborted(String),
 }
 
 /// Per-target outcome of a single revocation attempt.
@@ -59,6 +62,27 @@ pub struct RevocationReport {
     pub targets: Vec<RevocationTarget>,
     pub succeeded: usize,
     pub failed: usize,
+}
+
+/// Per-target outcome of a rotation phase.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RotationTarget {
+    pub target: String,
+    pub primary_ip: Option<String>,
+    pub installed: bool,
+    pub verified: bool,
+    pub removed_old: bool,
+    pub messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RotationReport {
+    pub rotated_node: String,
+    pub new_fingerprint: String,
+    pub old_fingerprint: Option<String>,
+    pub targets: Vec<RotationTarget>,
+    pub peers_reached: usize,
+    pub peers_failed: usize,
 }
 
 /// SSH key manager. Holds a Postgres pool used to look up keys and record
@@ -199,23 +223,314 @@ impl SshKeyManager {
         Ok(report)
     }
 
-    /// Rotate the target computer's own SSH keypair.
+    /// Rotate `computer_name`'s user SSH keypair in-place.
     ///
-    /// Currently unimplemented — this phase only wires up revocation.
-    /// Full rotation requires:
-    ///   1. `ssh <target> "ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519.new"`
-    ///   2. Read new pubkey back, insert into `fleet_workers_ssh_keys`.
-    ///   3. Distribute pubkey to every peer's `authorized_keys`.
-    ///   4. Atomically swap `.new` → primary on the target.
-    ///   5. Verify new key works by probing each peer.
-    ///   6. Revoke the old pubkey from every peer (via
-    ///      `revoke_computer_trust` on the old fingerprint).
-    pub async fn rotate_computer_keypair(&self, computer_name: &str) -> Result<(), SshError> {
-        Err(SshError::NotImplemented(format!(
-            "SSH keypair rotation for '{computer_name}' is a multi-step workflow not yet wired. \
-             Use `ff fleet revoke-trust --computer {computer_name}` to revoke, then re-onboard \
-             with `ff onboard add` to distribute a fresh key."
-        )))
+    /// Steps:
+    /// 1. Generate a new ed25519 keypair on the target as `~/.ssh/id_ed25519.new`.
+    /// 2. Read the new public key back and persist it in `fleet_workers_ssh_keys`.
+    /// 3. Fan the new public key out to every peer's `authorized_keys`.
+    /// 4. Verify the target can reach each peer using the new private key.
+    /// 5. Atomically swap the `.new` key into the primary `id_ed25519` slot.
+    /// 6. Scrub the old public key from every peer.
+    /// 7. Clean up temporary `.new` / `.old` files on the target.
+    ///
+    /// Failures during fan-out are recorded per-target but do not abort the
+    /// whole rotation; however, if the new key cannot be generated or the
+    /// target is unreachable, the rotation aborts before any state is changed.
+    pub async fn rotate_computer_keypair(
+        &self,
+        computer_name: &str,
+    ) -> Result<RotationReport, SshError> {
+        // 1. Look up the target computer.
+        let computer_row = sqlx::query(
+            "SELECT name, primary_ip, ssh_user, ssh_port, COALESCE(os_family, '') AS os_family
+               FROM computers
+              WHERE name = $1",
+        )
+        .bind(computer_name)
+        .fetch_optional(&self.pg)
+        .await?;
+
+        let Some(row) = computer_row else {
+            return Err(SshError::UnknownComputer(computer_name.to_string()));
+        };
+
+        let target_name: String = row.get("name");
+        let target_ip: Option<String> = row.try_get("primary_ip").ok();
+        let target_ssh_user: String = row.get("ssh_user");
+        let target_ssh_port: i32 = row.try_get("ssh_port").unwrap_or(22);
+        let _target_os_family: String = row.try_get("os_family").unwrap_or_default();
+
+        let target_host = target_ip.as_deref().unwrap_or(&target_name);
+
+        // 2. Look up the current user key (the one we will replace).
+        let old_key_row = sqlx::query(
+            "SELECT public_key, fingerprint FROM fleet_workers_ssh_keys
+              WHERE worker_name = $1 AND key_purpose = 'user'
+              ORDER BY added_at DESC
+              LIMIT 1",
+        )
+        .bind(computer_name)
+        .fetch_optional(&self.pg)
+        .await?;
+
+        let old_key: Option<(String, String)> = old_key_row.map(|r| {
+            let pk: String = r.get("public_key");
+            let fp: String = r.get("fingerprint");
+            (pk, fp)
+        });
+
+        // 3. Generate a fresh ed25519 keypair on the target.
+        let gen_cmd = format!(
+            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
+             rm -f ~/.ssh/id_ed25519.new ~/.ssh/id_ed25519.new.pub && \
+             ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519.new -C '{user}@{name}-rotated' >/dev/null && \
+             cat ~/.ssh/id_ed25519.new.pub",
+            user = target_ssh_user,
+            name = target_name
+        );
+
+        let gen_output = self
+            .ssh_exec(
+                &target_ssh_user,
+                &target_host,
+                target_ssh_port,
+                &gen_cmd,
+                60,
+            )
+            .await?;
+        let new_pubkey = gen_output.trim().to_string();
+
+        if new_pubkey.is_empty() {
+            return Err(SshError::RotationAborted(
+                "target returned an empty new public key".into(),
+            ));
+        }
+
+        let (new_key_type, new_fingerprint) = parse_pubkey_meta(&new_pubkey);
+        if new_key_type != "ssh-ed25519" {
+            return Err(SshError::RotationAborted(format!(
+                "target generated unexpected key type '{new_key_type}'"
+            )));
+        }
+
+        // 4. Persist the new public key before we distribute it.
+        sqlx::query(
+            "INSERT INTO fleet_workers_ssh_keys
+                (worker_name, key_purpose, public_key, key_type, fingerprint)
+             VALUES ($1, 'user', $2, $3, $4)
+             ON CONFLICT (worker_name, fingerprint) DO UPDATE SET
+                public_key = EXCLUDED.public_key,
+                key_type = EXCLUDED.key_type,
+                key_purpose = EXCLUDED.key_purpose",
+        )
+        .bind(computer_name)
+        .bind(&new_pubkey)
+        .bind(&new_key_type)
+        .bind(&new_fingerprint)
+        .execute(&self.pg)
+        .await?;
+
+        // 5. Select peers: every other recently-seen computer.
+        let peers = sqlx::query(
+            "SELECT name, primary_ip, ssh_user, ssh_port, COALESCE(os_family, '') AS os_family
+               FROM computers
+              WHERE name <> $1
+                AND (last_seen_at IS NULL OR last_seen_at > NOW() - INTERVAL '24 hours')",
+        )
+        .bind(computer_name)
+        .fetch_all(&self.pg)
+        .await?;
+
+        let mut report = RotationReport {
+            rotated_node: computer_name.to_string(),
+            new_fingerprint: new_fingerprint.clone(),
+            old_fingerprint: old_key.as_ref().map(|(_, fp)| fp.clone()),
+            ..Default::default()
+        };
+
+        // 6. Distribute the new public key to every peer.
+        for row in &peers {
+            let peer_name: String = row.get("name");
+            let peer_ip: Option<String> = row.try_get("primary_ip").ok();
+            let peer_ssh_user: String = row.get("ssh_user");
+            let peer_ssh_port: i32 = row.try_get("ssh_port").unwrap_or(22);
+            let peer_os_family: String = row.try_get("os_family").unwrap_or_default();
+
+            let mut target_report = RotationTarget {
+                target: peer_name.clone(),
+                primary_ip: peer_ip.clone(),
+                ..Default::default()
+            };
+
+            match self
+                .install_key_on_target(
+                    &peer_name,
+                    peer_ip.as_deref(),
+                    &peer_ssh_user,
+                    peer_ssh_port,
+                    &peer_os_family,
+                    &new_pubkey,
+                )
+                .await
+            {
+                Ok(msg) => {
+                    target_report.installed = true;
+                    target_report.messages.push(msg);
+                    report.peers_reached += 1;
+                }
+                Err(e) => {
+                    let msg = format!("{e}");
+                    target_report.messages.push(msg.clone());
+                    report.peers_failed += 1;
+                    warn!(target = %peer_name, error = %msg, "failed to install new ssh key");
+                }
+            }
+
+            report.targets.push(target_report);
+        }
+
+        // 7. Verify the target can reach each peer using the new private key.
+        for row in &peers {
+            let peer_name: String = row.get("name");
+            let peer_ip: Option<String> = row.try_get("primary_ip").ok();
+            let peer_ssh_user: String = row.get("ssh_user");
+            let peer_ssh_port: i32 = row.try_get("ssh_port").unwrap_or(22);
+
+            let peer_host = peer_ip.as_deref().unwrap_or(&peer_name);
+            let peer_dest = ssh_dest(&peer_ssh_user, &peer_host);
+            let peer_port_args = ssh_port_args(peer_ssh_port);
+
+            let verify_cmd = format!(
+                "ssh -i ~/.ssh/id_ed25519.new {bypass} -o ConnectTimeout=5 \
+                 -o StrictHostKeyChecking=accept-new {port_args} {dest} true",
+                bypass = crate::ssh_opts::SSH_AGENT_BYPASS,
+                port_args = peer_port_args,
+                dest = shell_single_quote(&peer_dest)
+            );
+
+            if let Some(t) = report.targets.iter_mut().find(|t| t.target == peer_name) {
+                match self
+                    .ssh_exec(
+                        &target_ssh_user,
+                        &target_host,
+                        target_ssh_port,
+                        &verify_cmd,
+                        20,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        t.verified = true;
+                        t.messages.push("verified".into());
+                    }
+                    Err(e) => {
+                        let msg = format!("verify failed: {e}");
+                        t.messages.push(msg.clone());
+                        warn!(target = %peer_name, error = %msg, "new ssh key verification failed");
+                    }
+                }
+            }
+        }
+
+        // 8. Swap the new key into the primary slot on the target.
+        let swap_cmd = "cp ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.old && \
+                        cp ~/.ssh/id_ed25519.pub ~/.ssh/id_ed25519.old.pub && \
+                        mv ~/.ssh/id_ed25519.new ~/.ssh/id_ed25519 && \
+                        mv ~/.ssh/id_ed25519.new.pub ~/.ssh/id_ed25519.pub && \
+                        chmod 600 ~/.ssh/id_ed25519 && \
+                        chmod 644 ~/.ssh/id_ed25519.pub && \
+                        echo swapped";
+        self.ssh_exec(
+            &target_ssh_user,
+            &target_host,
+            target_ssh_port,
+            swap_cmd,
+            20,
+        )
+        .await
+        .map_err(|e| {
+            SshError::RotationAborted(format!(
+                "failed to swap new key into primary slot on {target_name}: {e}"
+            ))
+        })?;
+
+        // 9. Scrub the old public key from every peer.
+        if let Some((old_pubkey, old_fp)) = old_key {
+            for row in &peers {
+                let peer_name: String = row.get("name");
+                let peer_ip: Option<String> = row.try_get("primary_ip").ok();
+                let peer_ssh_user: String = row.get("ssh_user");
+                let peer_ssh_port: i32 = row.try_get("ssh_port").unwrap_or(22);
+                let peer_os_family: String = row.try_get("os_family").unwrap_or_default();
+
+                if let Some(t) = report.targets.iter_mut().find(|t| t.target == peer_name) {
+                    match self
+                        .remove_key_on_target(
+                            &peer_name,
+                            peer_ip.as_deref(),
+                            &peer_ssh_user,
+                            peer_ssh_port,
+                            &peer_os_family,
+                            &old_pubkey,
+                            &old_fp,
+                        )
+                        .await
+                    {
+                        Ok(msg) => {
+                            t.removed_old = true;
+                            t.messages.push(msg);
+                        }
+                        Err(e) => {
+                            let msg = format!("remove old key failed: {e}");
+                            t.messages.push(msg.clone());
+                            warn!(target = %peer_name, error = %msg, "failed to remove old ssh key");
+                        }
+                    }
+                }
+            }
+
+            // Record the overall rotation event in fleet_ssh_revocations for the old key.
+            let _ = sqlx::query(
+                "INSERT INTO fleet_ssh_revocations
+                    (revoked_node, key_fingerprint, target_node, revoked_by, success, last_error)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(computer_name)
+            .bind(&old_fp)
+            .bind("*")
+            .bind("rotate_computer_keypair")
+            .bind(true)
+            .bind::<Option<&str>>(None)
+            .execute(&self.pg)
+            .await;
+        }
+
+        // 10. Clean up temporary key files on the target.
+        let cleanup_cmd = "rm -f ~/.ssh/id_ed25519.new ~/.ssh/id_ed25519.new.pub \
+                           ~/.ssh/id_ed25519.old ~/.ssh/id_ed25519.old.pub && echo cleaned";
+        if let Err(e) = self
+            .ssh_exec(
+                &target_ssh_user,
+                &target_host,
+                target_ssh_port,
+                cleanup_cmd,
+                15,
+            )
+            .await
+        {
+            warn!(target = %target_name, error = %e, "failed to clean up temporary key files");
+        }
+
+        info!(
+            rotated = %computer_name,
+            new_fingerprint = %new_fingerprint,
+            peers_reached = report.peers_reached,
+            peers_failed = report.peers_failed,
+            "ssh key rotation complete",
+        );
+
+        Ok(report)
     }
 
     /// Run the sed on one target. Returns the stdout of the SSH command on success.
@@ -289,6 +604,106 @@ impl SshKeyManager {
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         Ok(stdout)
     }
+
+    /// Append `public_key` to `target`'s `authorized_keys` if not already present.
+    async fn install_key_on_target(
+        &self,
+        target: &str,
+        primary_ip: Option<&str>,
+        ssh_user: &str,
+        ssh_port: i32,
+        _os_family: &str,
+        public_key: &str,
+    ) -> Result<String, SshError> {
+        let host = primary_ip.unwrap_or(target);
+        let quoted = shell_single_quote(public_key);
+        let remote_cmd = format!(
+            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && \
+             chmod 600 ~/.ssh/authorized_keys && \
+             grep -qxF {quoted} ~/.ssh/authorized_keys || \
+             echo {quoted} >> ~/.ssh/authorized_keys && \
+             echo installed",
+        );
+
+        self.ssh_exec(ssh_user, host, ssh_port, &remote_cmd, 20)
+            .await
+    }
+
+    /// Remove `public_key` from `target`'s `authorized_keys`.
+    async fn remove_key_on_target(
+        &self,
+        target: &str,
+        primary_ip: Option<&str>,
+        ssh_user: &str,
+        ssh_port: i32,
+        _os_family: &str,
+        public_key: &str,
+        fingerprint: &str,
+    ) -> Result<String, SshError> {
+        let host = primary_ip.unwrap_or(target);
+        let body = extract_key_body(public_key).unwrap_or_else(|| fingerprint.to_string());
+        let remote_cmd = format!(
+            "mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && \
+             cp ~/.ssh/authorized_keys ~/.ssh/authorized_keys.bak && \
+             grep -v -F {body} ~/.ssh/authorized_keys.bak > ~/.ssh/authorized_keys && \
+             chmod 600 ~/.ssh/authorized_keys && \
+             echo removed:{safe_fp}",
+            body = shell_single_quote(&body),
+            safe_fp = fingerprint.replace(['\n', '\r'], ""),
+        );
+
+        self.ssh_exec(ssh_user, host, ssh_port, &remote_cmd, 20)
+            .await
+    }
+
+    /// Execute one SSH command and return stdout on success.
+    async fn ssh_exec(
+        &self,
+        user: &str,
+        host: &str,
+        port: i32,
+        remote_cmd: &str,
+        timeout_secs: u64,
+    ) -> Result<String, SshError> {
+        let dest = ssh_dest(user, host);
+        debug!(dest = %dest, port = %port, "ssh exec");
+        let mut args: Vec<String> = vec![
+            "-o".to_string(),
+            "ConnectTimeout=5".to_string(),
+            "-o".to_string(),
+            "StrictHostKeyChecking=accept-new".to_string(),
+        ];
+        if port != 22 {
+            args.push("-p".to_string());
+            args.push(port.to_string());
+        }
+        args.push(dest);
+        args.push(remote_cmd.to_string());
+
+        let output = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            Command::new("ssh")
+                .args(crate::ssh_opts::ssh_bypass_args())
+                .args(&args)
+                .output(),
+        )
+        .await
+        .map_err(|_| {
+            SshError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "ssh timeout",
+            ))
+        })??;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(SshError::Io(std::io::Error::other(format!(
+                "ssh on {user}@{host}:{port}: exit {:?}: {stderr}",
+                output.status.code()
+            ))));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
 }
 
 async fn lookup_computer_id(
@@ -302,6 +717,20 @@ async fn lookup_computer_id(
     Ok(row)
 }
 
+/// Build an SSH destination string (`user@host`).
+fn ssh_dest(user: &str, host: &str) -> String {
+    format!("{user}@{host}")
+}
+
+/// Shell-form port argument fragment for an embedded `ssh` command.
+fn ssh_port_args(port: i32) -> String {
+    if port == 22 {
+        String::new()
+    } else {
+        format!("-p {port}")
+    }
+}
+
 /// Extract the base64 body (middle field) of an OpenSSH-format public key line.
 /// Given: `ssh-ed25519 AAAA... user@host`, returns `Some("AAAA...")`.
 fn extract_key_body(line: &str) -> Option<String> {
@@ -311,6 +740,30 @@ fn extract_key_body(line: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Parse the type and fingerprint of an OpenSSH public-key string.
+/// Mirrors `ff-gateway/src/onboard.rs::parse_pubkey_meta` so rows written by
+/// rotation use the same fingerprint scheme as enrollment.
+fn parse_pubkey_meta(pubkey: &str) -> (String, String) {
+    let mut parts = pubkey.split_whitespace();
+    let key_type = parts.next().unwrap_or("unknown").to_string();
+    let key_body = parts.next().unwrap_or(pubkey);
+    let mut hasher = Sha256::new();
+    hasher.update(key_body.as_bytes());
+    let digest = hasher.finalize();
+    let fp = format!("SHA256:{}", hex_encode(&digest));
+    (key_type, fp)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xf) as usize] as char);
+    }
+    s
 }
 
 fn shell_single_quote(s: &str) -> String {
@@ -331,5 +784,25 @@ mod tests {
     fn shell_quote_escapes() {
         assert_eq!(shell_single_quote("abc"), "'abc'");
         assert_eq!(shell_single_quote("it's"), "'it'\"'\"'s'");
+    }
+
+    #[test]
+    fn parse_pubkey_meta_produces_ed25519_type() {
+        let line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3Q test@host";
+        let (kt, fp) = parse_pubkey_meta(line);
+        assert_eq!(kt, "ssh-ed25519");
+        assert!(fp.starts_with("SHA256:"));
+        assert!(!fp.is_empty());
+    }
+
+    #[test]
+    fn ssh_dest_builds_user_at_host() {
+        assert_eq!(ssh_dest("git", "host"), "git@host");
+    }
+
+    #[test]
+    fn ssh_port_args_omits_default() {
+        assert_eq!(ssh_port_args(22), "");
+        assert_eq!(ssh_port_args(2222), "-p 2222");
     }
 }

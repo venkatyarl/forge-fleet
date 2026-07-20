@@ -11048,7 +11048,18 @@ VALUES
         '{"source":"backup_orchestrator","imperative":true}'::jsonb
     )
 ON CONFLICT (name) DO NOTHING;
+"#;
 
+/// V194 — Add review tracking columns to the work-item merge queue.
+///
+/// These fields support a lightweight human/LLM review gate before an item is
+/// allowed to land: who claimed the review, when, and the verdict + rationale.
+pub const SCHEMA_V194_MERGE_QUEUE_REVIEW_FIELDS: &str = r#"
+ALTER TABLE work_item_merge_queue
+    ADD COLUMN IF NOT EXISTS reviewer_computer TEXT,
+    ADD COLUMN IF NOT EXISTS review_claimed_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS review_verdict    TEXT,
+    ADD COLUMN IF NOT EXISTS review_reason     TEXT;
 "#;
 
 /// Squashed Postgres bootstrap through migration v161.

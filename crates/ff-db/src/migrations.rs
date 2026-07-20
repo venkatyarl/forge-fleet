@@ -951,6 +951,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "stale_local_backup_alert",
         sql: schema::SCHEMA_V193_STALE_LOCAL_BACKUP_ALERT,
     },
+    PgMigration {
+        version: 194,
+        name: "merge_queue_review_fields",
+        sql: schema::SCHEMA_V194_MERGE_QUEUE_REVIEW_FIELDS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
