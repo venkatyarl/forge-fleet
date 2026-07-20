@@ -1177,14 +1177,14 @@ pub async fn health_check_deployment(
 // ─── helpers ──────────────────────────────────────────────────────────────
 
 /// Resolve `path` to a concrete `.gguf` file suitable for `llama-server --model`.
-/// If `path` already points at a `.gguf` file, return it unchanged. If it's a
-/// directory, pick the **largest** `.gguf` inside (sharded models put the
-/// real weights in the biggest shard; multi-quant directories typically
-/// have a single canonical gguf and the biggest is the right pick).
+/// If `path` already points at a `.gguf` file, use it directly (normalizing a
+/// split model to shard 00001). If it's a directory, pick the **largest**
+/// `.gguf` inside to select the model/quant, then normalize split models to
+/// their first shard.
 fn resolve_gguf_for_llamacpp(path: &str) -> std::io::Result<String> {
     let p = PathBuf::from(path);
     if p.is_file() && path.ends_with(".gguf") {
-        return Ok(path.to_string());
+        return Ok(first_gguf_shard(p).to_string_lossy().to_string());
     }
     if !p.is_dir() {
         return Err(std::io::Error::new(
@@ -1201,12 +1201,37 @@ fn resolve_gguf_for_llamacpp(path: &str) -> std::io::Result<String> {
     // (248 autoscaler autoload retries in 12h on veronica alone). Bounded depth
     // + no symlink-following keeps the walk cycle-safe.
     match largest_gguf_under(&p, 8)? {
-        Some(ep) => Ok(ep.to_string_lossy().to_string()),
+        Some(ep) => Ok(first_gguf_shard(ep).to_string_lossy().to_string()),
         None => Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("no .gguf files under {path} (searched recursively)"),
         )),
     }
+}
+
+/// llama.cpp expects the first file for a split GGUF; later shards are loaded
+/// from the split metadata. The largest shard is not necessarily shard 00001.
+fn first_gguf_shard(path: PathBuf) -> PathBuf {
+    let Some(stem) = path.file_stem().and_then(|name| name.to_str()) else {
+        return path;
+    };
+    let Some((before_total, total)) = stem.rsplit_once("-of-") else {
+        return path;
+    };
+    let Some((prefix, shard)) = before_total.rsplit_once('-') else {
+        return path;
+    };
+    if shard.len() != 5
+        || total.len() != 5
+        || !shard.bytes().all(|b| b.is_ascii_digit())
+        || !total.bytes().all(|b| b.is_ascii_digit())
+        || shard == "00001"
+    {
+        return path;
+    }
+
+    let first = path.with_file_name(format!("{prefix}-00001-of-{total}.gguf"));
+    if first.is_file() { first } else { path }
 }
 
 /// Recursively find the largest `.gguf` regular file under `dir`, descending at
@@ -1884,6 +1909,19 @@ mod tests {
         std::fs::write(&big, vec![0u8; 5000]).unwrap();
         let resolved = resolve_gguf_for_llamacpp(tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(resolved, big.to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_gguf_uses_first_split_shard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("MiniMax-M2.1-Q6_K-00001-of-00005.gguf");
+        let second = tmp.path().join("MiniMax-M2.1-Q6_K-00002-of-00005.gguf");
+        std::fs::write(&first, vec![0u8; 10]).unwrap();
+        std::fs::write(&second, vec![0u8; 20]).unwrap();
+
+        let resolved = resolve_gguf_for_llamacpp(tmp.path().to_str().unwrap()).unwrap();
+
+        assert_eq!(resolved, first.to_string_lossy());
     }
 
     #[test]
