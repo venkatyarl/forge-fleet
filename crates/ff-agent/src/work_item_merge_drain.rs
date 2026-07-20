@@ -26,6 +26,8 @@ const REVIEW_480B_TIMEOUT: Duration = Duration::from_secs(60);
 const REVIEW_LOCAL_POOL_TIMEOUT: Duration = Duration::from_secs(60);
 const REVIEW_CLOUD_TIMEOUT: Duration = Duration::from_secs(75);
 const REVIEW_LOCAL_FIX_ATTEMPTS: u32 = 2;
+const SEMANTIC_MERGE_RESET_MARKER: &str =
+    "semantic merge conflict (compile failure after clean merge) — auto-reset for rebuild";
 
 /// Build a `gh` invocation with the fleet GitHub token injected as `GH_TOKEN`.
 ///
@@ -172,6 +174,17 @@ pub async fn evaluate_merge_queue(
             Ok(0)
         }
         CiState::Failed { reason, run_ids } => {
+            let failed_log = failed_ci_logs(&pr_url, &run_ids).await;
+            if is_semantic_merge_compile_failure(&failed_log)
+                && reset_semantic_merge_failure_once(pg, item.id, item.work_item_id).await?
+            {
+                warn!(
+                    pr = %pr_url,
+                    work_item = %item.work_item_id,
+                    "merge_drain: CI found a semantic merge conflict — resetting item once for rebuild"
+                );
+                return Ok(0);
+            }
             if !run_ids.is_empty() && claim_ci_rerun(pg, item.id).await? {
                 if let Err(e) = rerun_failed_ci_jobs(&pr_url, &run_ids).await {
                     release_ci_rerun_claim(pg, item.id).await?;
@@ -1101,6 +1114,90 @@ fn github_actions_run_id(details_url: &str) -> Option<u64> {
     rest.split('/').next()?.parse().ok()
 }
 
+fn is_semantic_merge_compile_failure(log: &str) -> bool {
+    log.contains("error[E0063]") || log.contains("error[E0308]") || log.contains("missing field")
+}
+
+/// Fetch only failed-step output for each Actions run attached to the failed
+/// checks. A log-fetch failure is non-fatal: an empty/partial log simply falls
+/// through to the existing one-time CI rerun and terminal-failure behavior.
+async fn failed_ci_logs(pr_url: &str, run_ids: &[u64]) -> String {
+    let Some((owner, repo)) = parse_owner_repo(pr_url) else {
+        return String::new();
+    };
+    let repo = format!("{owner}/{repo}");
+    let mut logs = String::new();
+    for run_id in run_ids {
+        let mut cmd = gh_cmd().await;
+        cmd.args([
+            "run",
+            "view",
+            &run_id.to_string(),
+            "--log-failed",
+            "--repo",
+            &repo,
+        ]);
+        match cmd.output().await {
+            Ok(out) if out.status.success() => {
+                // Compile signatures are short; cap retained output so an
+                // unusually large CI log cannot grow the drain without bound.
+                logs.push_str(&truncate_chars(
+                    &String::from_utf8_lossy(&out.stdout),
+                    200_000,
+                ));
+            }
+            Ok(out) => warn!(
+                pr = %pr_url,
+                run_id,
+                error = %String::from_utf8_lossy(&out.stderr).trim(),
+                "merge_drain: could not fetch failed CI log"
+            ),
+            Err(e) => warn!(
+                pr = %pr_url,
+                run_id,
+                error = %e,
+                "merge_drain: could not spawn failed CI log fetch"
+            ),
+        }
+    }
+    logs
+}
+
+/// Close the current queue row and rebuild the item from current main at most
+/// once. `merge_attempts = 2` is retained by the queue upsert performed after
+/// the rebuild, making the bound durable without a schema change.
+async fn reset_semantic_merge_failure_once(
+    pg: &PgPool,
+    queue_id: uuid::Uuid,
+    work_item_id: uuid::Uuid,
+) -> Result<bool> {
+    let mut tx = pg.begin().await?;
+    let claimed = sqlx::query(
+        "UPDATE work_item_merge_queue \
+            SET status = 'failed', failed_at = NOW(), failure_reason = $2, merge_attempts = 2 \
+          WHERE id = $1 AND merge_attempts < 2",
+    )
+    .bind(queue_id)
+    .bind(SEMANTIC_MERGE_RESET_MARKER)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if claimed {
+        sqlx::query(
+            "UPDATE work_items \
+                SET status = 'ready', attempts = 0, last_error = $2, assigned_computer = NULL \
+              WHERE id = $1",
+        )
+        .bind(work_item_id)
+        .bind(SEMANTIC_MERGE_RESET_MARKER)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(claimed)
+}
+
 async fn claim_ci_rerun(pg: &PgPool, queue_id: uuid::Uuid) -> Result<bool> {
     Ok(sqlx::query(
         "UPDATE work_item_merge_queue SET merge_attempts = 1 \
@@ -1413,8 +1510,8 @@ async fn db_confirms_leader(pg: &PgPool, worker_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        PrReviewVerdict, github_actions_run_id, parse_review_response, parse_review_verdict,
-        served_by_480b, update_branch_api_path,
+        PrReviewVerdict, github_actions_run_id, is_semantic_merge_compile_failure,
+        parse_review_response, parse_review_verdict, served_by_480b, update_branch_api_path,
     };
 
     #[test]
@@ -1433,6 +1530,22 @@ mod tests {
             github_actions_run_id("https://github.com/org/repo/actions/runs/nope"),
             None
         );
+    }
+
+    #[test]
+    fn identifies_semantic_merge_compile_failures() {
+        assert!(is_semantic_merge_compile_failure(
+            "error[E0063]: missing field `kind` in initializer of `AssignedWorkItem`"
+        ));
+        assert!(is_semantic_merge_compile_failure(
+            "error[E0308]: mismatched types"
+        ));
+        assert!(is_semantic_merge_compile_failure(
+            "error: missing field `timeout` in initializer"
+        ));
+        assert!(!is_semantic_merge_compile_failure(
+            "test result: FAILED. 1 passed; 1 failed"
+        ));
     }
 
     #[test]
