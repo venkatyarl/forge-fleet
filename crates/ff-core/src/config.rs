@@ -476,11 +476,37 @@ pub struct NodePreferences {
 // ── Notifications ────────────────────────────────────────────────────────────
 
 /// Notification configuration — `[notifications]`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationsConfig {
+    /// Window in seconds during which repeated alerts may be collapsed.
+    #[serde(default = "default_alert_dedup_window_secs")]
+    pub alert_dedup_window_secs: u64,
+
+    /// Number of matching alerts required before they are collapsed.
+    #[serde(default = "default_alert_dedup_threshold")]
+    pub alert_dedup_threshold: u32,
+
     /// Telegram notifications — `[notifications.telegram]`.
     #[serde(default)]
     pub telegram: Option<TelegramNotification>,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            alert_dedup_window_secs: default_alert_dedup_window_secs(),
+            alert_dedup_threshold: default_alert_dedup_threshold(),
+            telegram: None,
+        }
+    }
+}
+
+fn default_alert_dedup_window_secs() -> u64 {
+    300
+}
+
+fn default_alert_dedup_threshold() -> u32 {
+    1
 }
 
 /// Telegram notification settings.
@@ -1880,6 +1906,10 @@ lifecycle = "production"
 mode = "always_on"
 preferred_workloads = ["coding", "review", "build"]
 
+[notifications]
+alert_dedup_window_secs = 600
+alert_dedup_threshold = 3
+
 [notifications.telegram]
 chat_id = "8496613333"
 channel = "telegram"
@@ -2046,6 +2076,8 @@ notes = "Setup started."
         assert_eq!(marcus.role, Role::Builder);
 
         // Check notifications.
+        assert_eq!(config.notifications.alert_dedup_window_secs, 600);
+        assert_eq!(config.notifications.alert_dedup_threshold, 3);
         let tg = config.notifications.telegram.as_ref().expect("telegram");
         assert_eq!(tg.chat_id, "8496613333");
 
@@ -2179,6 +2211,8 @@ notes = "Setup started."
         assert!(config.loops.self_heal.enabled);
         assert!(config.nodes.is_empty());
         assert!(config.models.is_empty());
+        assert_eq!(config.notifications.alert_dedup_window_secs, 300);
+        assert_eq!(config.notifications.alert_dedup_threshold, 1);
         assert!(config.transport.telegram.is_none());
         assert!(!config.obsidian_export.enabled);
         assert!(!config.fleet_secrets.distributed_review_mode);
