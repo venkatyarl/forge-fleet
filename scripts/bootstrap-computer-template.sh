@@ -587,13 +587,19 @@ if [ "$OS_ID" != "macos" ]; then
     run_as_user systemctl --user daemon-reload 2>/dev/null || true
   fi
 
-  # Legacy system-scope `ff daemon` unit: stop + remove so it can't
+  # Legacy system-scope `ff daemon` units: stop + remove so they can't
   # double-run alongside the canonical forgefleetd user unit below.
   if [ -f /etc/systemd/system/forgefleet-daemon@.service ]; then
     systemctl disable --now "forgefleet-daemon@${SUDO_INVOKER}.service" >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/forgefleet-daemon@.service
     systemctl daemon-reload
     report "legacy_unit_swept" ok "forgefleet-daemon@.service"
+  fi
+  if [ -f /etc/systemd/system/forgefleet-daemon.service ]; then
+    systemctl disable --now forgefleet-daemon.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/forgefleet-daemon.service
+    systemctl daemon-reload
+    report "legacy_unit_swept" ok "forgefleet-daemon.service"
   fi
 
   report "service" running
