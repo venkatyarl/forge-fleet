@@ -1667,6 +1667,18 @@ async fn record_dispatch_interaction(
             0,
         ),
     };
+
+    // Track the recurrence count for this error signature and populate the
+    // interaction-log column that the leader's self-heal tick aggregates.
+    let error_signature = error_text.as_deref().map(|err| {
+        let tracker = crate::log_signature::global_tracker();
+        let sig = tracker.signature_for(err);
+        // Also update the process-level tracker so recurrence counts are
+        // available for diagnostics even though the DB is the canonical store.
+        tracker.observe(err);
+        sig
+    });
+
     let rec = ff_db::InteractionRecord {
         channel: "work_item_dispatch".to_string(),
         request_text: dispatch_prompt(item),
@@ -1676,6 +1688,7 @@ async fn record_dispatch_interaction(
         latency_ms: i32::try_from(elapsed.as_millis()).ok(),
         outcome,
         error_text,
+        error_signature,
         worker_name: Some(worker_name.to_string()),
         endpoint: Some(format!("ff cli {backend}")),
         ..Default::default()
