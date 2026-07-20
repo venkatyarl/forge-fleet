@@ -140,6 +140,10 @@ where
     R: FnOnce() -> RFut,
     RFut: std::future::Future<Output = Result<()>>,
 {
+    // Drain active leases first — `restart_with_lease_drain` waits for
+    // in-flight items to complete, then requeues anything still claimed at
+    // the timeout deadline.  The requeue path sets status='ready' without
+    // touching `work_items.attempts`, so retry counters are preserved.
     let report = restart_with_lease_drain(config, active_leases, requeue_items)
         .await
         .context("lease drain failed; forgefleetd restart not dispatched")?;
@@ -153,6 +157,9 @@ where
         );
     }
 
+    // Only dispatch the actual daemon restart after the drain phase
+    // completes (success or timeout), never while leases are in an
+    // unknown state.
     restart_daemon()
         .await
         .context("failed to dispatch forgefleetd restart after drain")?;
