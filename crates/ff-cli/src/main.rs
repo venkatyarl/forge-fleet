@@ -50,7 +50,21 @@ enum Command {
     Config(ConfigArgs),
     /// Export data to external systems
     Export(ExportArgs),
+    /// Project management — KPI digests over work_items
+    Pm(PmArgs),
     Version,
+}
+
+#[derive(Debug, Args)]
+struct PmArgs {
+    #[command(subcommand)]
+    command: PmCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum PmCommand {
+    /// Print the PM velocity KPI digest (identical to the Telegram daemon digest)
+    Velocity,
 }
 
 #[derive(Debug, Args)]
@@ -207,6 +221,7 @@ async fn main() -> Result<()> {
         Command::Tools(args) => handle_tools(args, &config_path).await,
         Command::Config(args) => handle_config(args, &config_path),
         Command::Export(args) => handle_export(args).await,
+        Command::Pm(args) => handle_pm(args).await,
         Command::Version => {
             println!("forgefleet {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -630,6 +645,19 @@ async fn handle_tools(args: ToolsArgs, _config_path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn handle_pm(args: PmArgs) -> Result<()> {
+    match args.command {
+        PmCommand::Velocity => {
+            let pool = ff_agent::fleet_info::get_fleet_pool()
+                .await
+                .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+            let digest = ff_agent::pm_velocity::velocity_digest(&pool).await?;
+            print!("{digest}");
+            Ok(())
+        }
+    }
 }
 
 async fn handle_export(args: ExportArgs) -> Result<()> {
