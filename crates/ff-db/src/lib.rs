@@ -34,6 +34,7 @@ pub use queries::{
     AgentReadinessRow,
     // Resource arbiter (V119)
     ArbiterReservedHost,
+    ArtifactCacheHolderRow,
     // Fleet artifact cache index (V171)
     ArtifactIndexRow,
     BrainCandidateRow,
@@ -132,6 +133,7 @@ pub use queries::{
     pg_current_demand_vector,
     pg_defer_merge_queue_item_to_back,
     pg_deferred_stats,
+    pg_delete_artifact_cache_holder,
     pg_delete_artifact_index,
     pg_delete_deployment,
     pg_delete_library,
@@ -183,6 +185,7 @@ pub use queries::{
     pg_latest_demand_snapshot,
     pg_latest_disk_usage,
     pg_list_agents,
+    pg_list_artifact_cache_holders,
     pg_list_artifact_index,
     pg_list_brain_candidates_pending,
     pg_list_brain_communities,
@@ -268,6 +271,7 @@ pub use queries::{
     pg_update_job_progress,
     pg_update_training_job_status,
     pg_upsert_agent,
+    pg_upsert_artifact_cache_holder,
     pg_upsert_artifact_index,
     pg_upsert_brain_community,
     pg_upsert_brain_vault_edge,

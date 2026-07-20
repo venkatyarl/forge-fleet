@@ -4300,7 +4300,57 @@ pub async fn load_fleet_config_from_postgres(
 
 // ─── artifact_index (fleet artifact cache index) ────────────────────────────
 
-/// A row from the `artifact_index` cache index table.
+/// One verified local copy in the canonical per-holder cache index.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ArtifactCacheHolderRow {
+    pub artifact_key: String,
+    pub computer: String,
+    pub file_path: String,
+    pub size_bytes: i64,
+    pub checksum: String,
+}
+
+/// Record a verified local artifact without replacing other holder nodes.
+pub async fn pg_upsert_artifact_cache_holder(
+    pool: &PgPool,
+    artifact_key: &str,
+    computer: &str,
+    file_path: &str,
+    size_bytes: i64,
+    checksum: &str,
+) -> Result<()> {
+    sqlx::query("INSERT INTO artifact_cache_index (artifact_key, computer, file_path, size_bytes, checksum, last_used_at) VALUES ($1,$2,$3,$4,LOWER($5),NOW()) ON CONFLICT (artifact_key, computer) DO UPDATE SET file_path=EXCLUDED.file_path,size_bytes=EXCLUDED.size_bytes,checksum=EXCLUDED.checksum,last_used_at=NOW()")
+        .bind(artifact_key).bind(computer).bind(file_path).bind(size_bytes).bind(checksum).execute(pool).await?;
+    Ok(())
+}
+
+/// Find verified LAN sources for an immutable artifact, newest-used first.
+pub async fn pg_list_artifact_cache_holders(
+    pool: &PgPool,
+    artifact_key: &str,
+    checksum: &str,
+    exclude_computer: Option<&str>,
+) -> Result<Vec<ArtifactCacheHolderRow>> {
+    Ok(sqlx::query_as::<_, ArtifactCacheHolderRow>("SELECT artifact_key,computer,file_path,size_bytes,checksum FROM artifact_cache_index WHERE artifact_key=$1 AND checksum=LOWER($2) AND ($3::text IS NULL OR computer<>$3) ORDER BY last_used_at DESC NULLS LAST, created_at DESC")
+        .bind(artifact_key).bind(checksum).bind(exclude_computer).fetch_all(pool).await?)
+}
+
+/// Remove a holder after eviction or a failed LAN verification.
+pub async fn pg_delete_artifact_cache_holder(
+    pool: &PgPool,
+    artifact_key: &str,
+    computer: &str,
+) -> Result<bool> {
+    let result =
+        sqlx::query("DELETE FROM artifact_cache_index WHERE artifact_key=$1 AND computer=$2")
+            .bind(artifact_key)
+            .bind(computer)
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// A row from the legacy aggregate `artifact_index` table.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ArtifactIndexRow {
     pub artifact: String,
@@ -5274,6 +5324,56 @@ mod tests {
 
         // Cleanup remaining test row
         let _ = pg_delete_artifact_index(&pool, "model-qwen3-30b", "v2.0").await;
+    }
+
+    #[tokio::test]
+    async fn artifact_cache_holders_are_independent_and_checksum_scoped() {
+        let Some(url) = env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()
+        else {
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::raw_sql(crate::schema::SCHEMA_V183_ARTIFACT_CACHE_INDEX)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let key = format!("test/linux-x86_64/tool/v1/{}", uuid::Uuid::new_v4());
+        let sha = "a".repeat(64);
+        pg_upsert_artifact_cache_holder(&pool, &key, "node-a", "/cache/a", 10, &sha)
+            .await
+            .unwrap();
+        pg_upsert_artifact_cache_holder(&pool, &key, "node-b", "/cache/b", 10, &sha)
+            .await
+            .unwrap();
+
+        let rows = pg_list_artifact_cache_holders(&pool, &key, &sha, Some("node-b"))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].computer, "node-a");
+        assert!(
+            pg_list_artifact_cache_holders(&pool, &key, &"b".repeat(64), None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(
+            pg_delete_artifact_cache_holder(&pool, &key, "node-a")
+                .await
+                .unwrap()
+        );
+        assert!(
+            pg_delete_artifact_cache_holder(&pool, &key, "node-b")
+                .await
+                .unwrap()
+        );
     }
 }
 

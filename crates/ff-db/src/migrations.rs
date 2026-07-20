@@ -991,6 +991,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "folder_owned_pr_review",
         sql: schema::SCHEMA_V201_FOLDER_OWNED_PR_REVIEW,
     },
+    PgMigration {
+        version: 202,
+        name: "artifact_cache_holders",
+        sql: schema::SCHEMA_V202_ARTIFACT_CACHE_HOLDERS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

@@ -11167,6 +11167,16 @@ CREATE INDEX IF NOT EXISTS idx_work_item_merge_queue_approved
       AND review_verdict = 'approve';
 "#;
 
+/// V202 — Make the per-holder artifact cache index safe for verified LAN pulls.
+pub const SCHEMA_V202_ARTIFACT_CACHE_HOLDERS: &str = r#"
+ALTER TABLE artifact_cache_index ALTER COLUMN checksum SET NOT NULL;
+ALTER TABLE artifact_cache_index
+    ADD CONSTRAINT artifact_cache_index_sha256_check
+    CHECK (checksum ~ '^[0-9a-fA-F]{64}$') NOT VALID;
+CREATE INDEX IF NOT EXISTS idx_artifact_cache_index_lookup
+    ON artifact_cache_index (artifact_key, last_used_at DESC NULLS LAST, created_at DESC);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
