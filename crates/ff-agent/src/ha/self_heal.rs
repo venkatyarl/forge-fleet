@@ -743,6 +743,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recurring_failed_task_rearms_after_cooldown() {
+        if env::var("FORGEFLEET_POSTGRES_URL").is_err()
+            && env::var("FORGEFLEET_DATABASE_URL").is_err()
+        {
+            eprintln!(
+                "skipping rearm_self_heal_task DB test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL"
+            );
+            return;
+        }
+        let (admin, pool, db_name) = create_temp_db().await;
+
+        let failed_at = Utc::now() - chrono::Duration::hours(1);
+        let id =
+            insert_self_heal_task(&pool, "sig-recurring-failure", "failed", Some(failed_at)).await;
+
+        let rearmed = rearm_self_heal_task(&pool, "sig-recurring-failure", "T1", 2, None)
+            .await
+            .expect("rearm recurring failed task");
+        assert!(rearmed);
+
+        let row = sqlx::query(
+            "SELECT id, status, completed_at, payload->>'status' AS payload_status,
+                    (payload->>'attempts')::int AS attempts
+               FROM fleet_tasks
+              WHERE dedup_signature = $1",
+        )
+        .bind("sig-recurring-failure")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch recurring rearmed task");
+
+        assert_eq!(row.get::<uuid::Uuid, _>("id"), id);
+        assert_eq!(row.get::<String, _>("status"), "pending");
+        assert_eq!(row.get::<String, _>("payload_status"), "detected");
+        assert_eq!(row.get::<i32, _>("attempts"), 0);
+        assert!(
+            row.get::<Option<DateTime<Utc>>, _>("completed_at")
+                .is_none()
+        );
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
     async fn rearm_task_is_no_op_for_active_row() {
         if env::var("FORGEFLEET_POSTGRES_URL").is_err()
             && env::var("FORGEFLEET_DATABASE_URL").is_err()
