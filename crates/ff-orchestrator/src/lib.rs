@@ -21,6 +21,7 @@ pub mod confidence;
 pub mod crew;
 pub mod decomposer;
 pub mod leader;
+pub mod merge_train;
 pub mod parallel;
 pub mod placement;
 pub mod planner;
@@ -29,6 +30,7 @@ pub mod queue;
 pub mod router;
 pub mod scheduler;
 pub mod task_decomposer;
+pub mod train_branch;
 
 // Re-export primary types at crate root for ergonomic use.
 pub use agent_team::{AgentAssignment, ModelPreference, TeamConfig, TeamTemplates};
@@ -42,6 +44,7 @@ pub use leader::{
     AgentHeartbeatResult, AgentTask, LeaderCoordinator, Preemption, SubmissionAction,
     SubmissionResult, TickResult,
 };
+pub use merge_train::MergeTrainConfig;
 pub use parallel::{ExecutionResult, ParallelExecutor, SubTaskResult};
 pub use placement::{AntiAffinityRule, NodeWorkloadPreference, PlacementEngine, PlacementPolicy};
 pub use planner::{ExecutionPlan, PlanNode, PlanStage};
@@ -60,3 +63,4 @@ pub use scheduler::{
 pub use task_decomposer::{
     DecomposedSubTask, DecompositionStrategy, TaskPattern, TemplateDecomposer,
 };
+pub use train_branch::{QueuedPr, TrainBranch, TrainBranchError, create_train_branch};

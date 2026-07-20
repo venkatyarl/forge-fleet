@@ -707,6 +707,26 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 15b.0b2) Metrics partition maintenance — every 6h, leader-gated.
+    // Pre-creates upcoming child partitions for the tiered fleet_metrics_*
+    // tables (V177) and drops expired ones (raw > 7d, 1min rollups > 30d;
+    // hourly kept forever). Without this tick the partitioned parents have no
+    // children and reject inserts. Opt out with
+    // `fleet_secrets.metrics_partition_mode=off`.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!(
+            "starting subsystem: metrics partition maintenance (6h, leader-gated, gate=fleet_secrets.metrics_partition_mode default on)"
+        );
+        subsystem_tasks.push(
+            ff_agent::metrics_partition_maintenance::spawn_metrics_partition_loop(
+                pg_pool,
+                worker_name.clone(),
+                21_600,
+                shutdown_rx.clone(),
+            ),
+        );
+    }
+
     // 15b.0c) Target-cache cleanup — every 6h, PER-HOST.
     // Removes THIS host's stale `target/*/incremental` under its forge-fleet build
     // tree (the ~165 GB-class bloat from task #47) once untouched > 5 days. Safe:
