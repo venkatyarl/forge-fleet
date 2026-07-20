@@ -20,7 +20,7 @@ use chrono::Utc;
 use ff_db::OperationalStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::board::{BoardColumn, BoardFilter, BoardView};
@@ -287,8 +287,14 @@ async fn create_work_item(
     Json(params): Json<CreateWorkItem>,
 ) -> impl IntoResponse {
     match create_work_item_in_store(&state.store, params).await {
-        Ok(item) => (StatusCode::CREATED, Json(item)).into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(item) => {
+            info!(work_item_id = %item.id, title = %item.title, status = %item.status, "created work item");
+            (StatusCode::CREATED, Json(item)).into_response()
+        }
+        Err(err) => {
+            warn!(error = %err, "failed creating work item");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -297,8 +303,14 @@ async fn get_work_item(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match get_work_item_from_store(&state.store, &id).await {
-        Ok(item) => Json(item).into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(item) => {
+            info!(work_item_id = %id, status = %item.status, "got work item");
+            Json(item).into_response()
+        }
+        Err(err) => {
+            warn!(work_item_id = %id, error = %err, "failed getting work item");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -308,8 +320,14 @@ async fn update_work_item(
     Json(params): Json<UpdateWorkItem>,
 ) -> impl IntoResponse {
     match update_work_item_in_store(&state.store, &id, params).await {
-        Ok(item) => Json(item).into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(item) => {
+            info!(work_item_id = %id, status = %item.status, "updated work item");
+            Json(item).into_response()
+        }
+        Err(err) => {
+            warn!(work_item_id = %id, error = %err, "failed updating work item");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -318,8 +336,14 @@ async fn delete_work_item(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match delete_work_item_in_store(&state.store, &id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(()) => {
+            info!(work_item_id = %id, "deleted work item");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(err) => {
+            warn!(work_item_id = %id, error = %err, "failed deleting work item");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -335,8 +359,14 @@ async fn claim_work_item(
 ) -> impl IntoResponse {
     let assignee = body.and_then(|Json(v)| v.assignee);
     match claim_work_item_in_store(&state.store, &id, assignee).await {
-        Ok(item) => Json(item).into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(item) => {
+            info!(work_item_id = %id, status = %item.status, assignee = %item.assignee, "claimed work item");
+            Json(item).into_response()
+        }
+        Err(err) => {
+            warn!(work_item_id = %id, error = %err, "failed claiming work item");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -345,8 +375,14 @@ async fn complete_work_item(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match complete_work_item_in_store(&state.store, &id).await {
-        Ok(item) => Json(item).into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(item) => {
+            info!(work_item_id = %id, status = %item.status, "completed work item");
+            Json(item).into_response()
+        }
+        Err(err) => {
+            warn!(work_item_id = %id, error = %err, "failed completing work item");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -355,8 +391,14 @@ async fn fail_work_item(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match fail_work_item_in_store(&state.store, &id).await {
-        Ok(item) => Json(item).into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(item) => {
+            info!(work_item_id = %id, status = %item.status, "failed work item");
+            Json(item).into_response()
+        }
+        Err(err) => {
+            warn!(work_item_id = %id, error = %err, "failed marking work item failed");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -365,8 +407,14 @@ async fn escalate_work_item(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match escalate_work_item_in_store(&state.store, &id).await {
-        Ok(item) => Json(item).into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(item) => {
+            info!(work_item_id = %id, status = %item.status, priority = item.priority.0, "escalated work item");
+            Json(item).into_response()
+        }
+        Err(err) => {
+            warn!(work_item_id = %id, error = %err, "failed escalating work item");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -386,8 +434,14 @@ async fn submit_review(
     )
     .await
     {
-        Ok(item) => Json(item).into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(item) => {
+            info!(work_item_id = %id, status = %item.status, "submitted work item for review");
+            Json(item).into_response()
+        }
+        Err(err) => {
+            warn!(work_item_id = %id, error = %err, "failed submitting work item for review");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -405,18 +459,28 @@ async fn complete_review(
     match summary_for_work_item_review(&state.store, &id).await {
         Ok((total_items, all_approved)) => {
             if total_items > 0 && !all_approved {
+                warn!(work_item_id = %id, total_items, all_approved, "cannot complete review: checklist has non-approved items");
                 return handle_mc_err(McError::Other(anyhow!(
                     "cannot complete review: checklist has non-approved items"
                 )))
                 .into_response();
             }
         }
-        Err(err) => return handle_mc_err(err).into_response(),
+        Err(err) => {
+            warn!(work_item_id = %id, error = %err, "failed summarizing work item review");
+            return handle_mc_err(err).into_response();
+        }
     }
 
     match complete_work_item_in_store(&state.store, &id).await {
-        Ok(item) => Json(item).into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(item) => {
+            info!(work_item_id = %id, status = %item.status, "completed work item review");
+            Json(item).into_response()
+        }
+        Err(err) => {
+            warn!(work_item_id = %id, error = %err, "failed completing work item review");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -425,8 +489,14 @@ async fn list_review_items_for_work_item(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match list_review_items_for_work_item_store(&state.store, &id).await {
-        Ok(items) => Json(items).into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(items) => {
+            info!(work_item_id = %id, count = items.len(), "listed review items");
+            Json(items).into_response()
+        }
+        Err(err) => {
+            warn!(work_item_id = %id, error = %err, "failed listing review items");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -436,8 +506,14 @@ async fn create_review_item_for_work_item(
     Json(params): Json<CreateReviewItem>,
 ) -> impl IntoResponse {
     match create_review_item_for_work_item_store(&state.store, &id, params).await {
-        Ok(item) => (StatusCode::CREATED, Json(item)).into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(item) => {
+            info!(work_item_id = %id, review_item_id = %item.id, status = %item.status, "created review item");
+            (StatusCode::CREATED, Json(item)).into_response()
+        }
+        Err(err) => {
+            warn!(work_item_id = %id, error = %err, "failed creating review item");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -447,8 +523,14 @@ async fn update_review_item(
     Json(params): Json<UpdateReviewItem>,
 ) -> impl IntoResponse {
     match update_review_item_in_store(&state.store, &id, params).await {
-        Ok(item) => Json(item).into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(item) => {
+            info!(review_item_id = %id, work_item_id = %item.work_item_id, status = %item.status, "updated review item");
+            Json(item).into_response()
+        }
+        Err(err) => {
+            warn!(review_item_id = %id, error = %err, "failed updating review item");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -457,8 +539,14 @@ async fn delete_review_item(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match delete_review_item_in_store(&state.store, &id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(()) => {
+            info!(review_item_id = %id, "deleted review item");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(err) => {
+            warn!(review_item_id = %id, error = %err, "failed deleting review item");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -467,8 +555,14 @@ async fn reset_review_items_for_work_item(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match reset_review_items_for_work_item_store(&state.store, &id).await {
-        Ok(updated) => Json(serde_json::json!({"updated": updated})).into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(updated) => {
+            info!(work_item_id = %id, updated, "reset review items");
+            Json(serde_json::json!({"updated": updated})).into_response()
+        }
+        Err(err) => {
+            warn!(work_item_id = %id, error = %err, "failed resetting review items");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -484,8 +578,14 @@ async fn list_work_item_dependencies(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match list_dependencies_for_work_item_store(&state.store, &id).await {
-        Ok(deps) => Json(deps).into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(deps) => {
+            info!(work_item_id = %id, count = deps.len(), "listed work item dependencies");
+            Json(deps).into_response()
+        }
+        Err(err) => {
+            warn!(work_item_id = %id, error = %err, "failed listing work item dependencies");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -495,8 +595,14 @@ async fn add_work_item_dependency(
     Json(body): Json<AddDependencyRequest>,
 ) -> impl IntoResponse {
     match add_dependency_in_store(&state.store, &id, &body.depends_on_id).await {
-        Ok(dep) => (StatusCode::CREATED, Json(dep)).into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(dep) => {
+            info!(work_item_id = %id, depends_on_id = %dep.depends_on_id, "added work item dependency");
+            (StatusCode::CREATED, Json(dep)).into_response()
+        }
+        Err(err) => {
+            warn!(work_item_id = %id, depends_on_id = %body.depends_on_id, error = %err, "failed adding work item dependency");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -505,9 +611,18 @@ async fn remove_work_item_dependency(
     Path((id, depends_on_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     match remove_dependency_in_store(&state.store, &id, &depends_on_id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => mc_error(StatusCode::NOT_FOUND, "dependency not found").into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(true) => {
+            info!(work_item_id = %id, depends_on_id = %depends_on_id, "removed work item dependency");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => {
+            warn!(work_item_id = %id, depends_on_id = %depends_on_id, "dependency not found for removal");
+            mc_error(StatusCode::NOT_FOUND, "dependency not found").into_response()
+        }
+        Err(err) => {
+            warn!(work_item_id = %id, depends_on_id = %depends_on_id, error = %err, "failed removing work item dependency");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -516,8 +631,19 @@ async fn check_work_item_dependencies(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match check_dependencies_in_store(&state.store, &id).await {
-        Ok(result) => Json(result).into_response(),
-        Err(err) => handle_mc_err(err).into_response(),
+        Ok(result) => {
+            info!(
+                work_item_id = %id,
+                blocked_count = result.blocked_count,
+                can_start = result.can_start,
+                "checked work item dependencies"
+            );
+            Json(result).into_response()
+        }
+        Err(err) => {
+            warn!(work_item_id = %id, error = %err, "failed checking work item dependencies");
+            handle_mc_err(err).into_response()
+        }
     }
 }
 
@@ -663,6 +789,7 @@ pub async fn get_work_item_from_store(store: &OperationalStore, id: &str) -> McR
         .await
         .map_err(|e| to_other_error("failed loading work item", e))?
     else {
+        warn!(work_item_id = %id, "work item not found in store");
         return Err(McError::WorkItemNotFound { id: id.to_string() });
     };
 
@@ -683,7 +810,9 @@ async fn persist_work_item(store: &OperationalStore, item: &WorkItem) -> McResul
     store
         .config_set(&work_item_storage_key(&item.id), &payload)
         .await
-        .map_err(|e| to_other_error("failed saving work item", e))
+        .map_err(|e| to_other_error("failed saving work item", e))?;
+    info!(work_item_id = %item.id, status = %item.status, "persisted work item");
+    Ok(())
 }
 
 async fn create_work_item_in_store(
@@ -722,6 +851,7 @@ async fn create_work_item_in_store(
     };
 
     persist_work_item(store, &item).await?;
+    info!(work_item_id = %item.id, title = %item.title, status = %item.status, "created work item in store");
     Ok(item)
 }
 
@@ -731,6 +861,7 @@ async fn update_work_item_in_store(
     params: UpdateWorkItem,
 ) -> McResult<WorkItem> {
     let mut item = get_work_item_from_store(store, id).await?;
+    let old_status = item.status;
 
     if let Some(title) = params.title {
         item.title = title;
@@ -768,6 +899,16 @@ async fn update_work_item_in_store(
 
     item.updated_at = Utc::now();
     persist_work_item(store, &item).await?;
+    if item.status != old_status {
+        info!(
+            work_item_id = %id,
+            old_status = %old_status,
+            new_status = %item.status,
+            "work item status transitioned"
+        );
+    } else {
+        info!(work_item_id = %id, status = %item.status, "updated work item in store");
+    }
     Ok(item)
 }
 
@@ -778,6 +919,7 @@ async fn delete_work_item_in_store(store: &OperationalStore, id: &str) -> McResu
         .map_err(|e| to_other_error("failed deleting work item", e))?;
 
     if !deleted {
+        warn!(work_item_id = %id, "work item not found for deletion");
         return Err(McError::WorkItemNotFound { id: id.to_string() });
     }
 
@@ -785,6 +927,7 @@ async fn delete_work_item_in_store(store: &OperationalStore, id: &str) -> McResu
     delete_review_items_for_work_item_store(store, id).await?;
     delete_dependencies_for_work_item_store(store, id).await?;
 
+    info!(work_item_id = %id, "deleted work item from store");
     Ok(())
 }
 
@@ -794,8 +937,9 @@ async fn claim_work_item_in_store(
     assignee: Option<String>,
 ) -> McResult<WorkItem> {
     let item = get_work_item_from_store(store, id).await?;
+    let new_assignee = assignee.unwrap_or_else(|| "unassigned".to_string());
     let mut update = UpdateWorkItem {
-        assignee: Some(assignee.unwrap_or_else(|| "unassigned".to_string())),
+        assignee: Some(new_assignee.clone()),
         ..Default::default()
     };
 
@@ -803,10 +947,17 @@ async fn claim_work_item_in_store(
         update.status = Some("todo".to_string());
     }
 
+    info!(
+        work_item_id = %id,
+        old_status = %item.status,
+        assignee = %new_assignee,
+        "claiming work item"
+    );
     update_work_item_in_store(store, id, update).await
 }
 
 async fn complete_work_item_in_store(store: &OperationalStore, id: &str) -> McResult<WorkItem> {
+    info!(work_item_id = %id, "completing work item");
     update_work_item_in_store(
         store,
         id,
@@ -819,6 +970,7 @@ async fn complete_work_item_in_store(store: &OperationalStore, id: &str) -> McRe
 }
 
 async fn fail_work_item_in_store(store: &OperationalStore, id: &str) -> McResult<WorkItem> {
+    info!(work_item_id = %id, "failing work item");
     update_work_item_in_store(
         store,
         id,
@@ -839,6 +991,13 @@ async fn escalate_work_item_in_store(store: &OperationalStore, id: &str) -> McRe
         Some("blocked".to_string())
     };
 
+    info!(
+        work_item_id = %id,
+        old_priority = item.priority.0,
+        new_priority,
+        old_status = %item.status,
+        "escalating work item"
+    );
     update_work_item_in_store(
         store,
         id,
@@ -1102,6 +1261,12 @@ async fn create_review_item_for_work_item_store(
     };
 
     persist_review_item(store, &item).await?;
+    info!(
+        review_item_id = %item.id,
+        work_item_id = %item.work_item_id,
+        status = %item.status,
+        "created review item"
+    );
     Ok(item)
 }
 
@@ -1127,6 +1292,12 @@ async fn update_review_item_in_store(
 
     item.updated_at = Utc::now();
     persist_review_item(store, &item).await?;
+    info!(
+        review_item_id = %item.id,
+        work_item_id = %item.work_item_id,
+        status = %item.status,
+        "updated review item"
+    );
     Ok(item)
 }
 
@@ -1139,9 +1310,11 @@ async fn delete_review_item_in_store(store: &OperationalStore, id: &str) -> McRe
         .map_err(|e| to_other_error("failed deleting review item", e))?;
 
     if !deleted {
+        warn!(review_item_id = %id, "review item not found for deletion");
         return Err(McError::ReviewItemNotFound { id: id.to_string() });
     }
 
+    info!(review_item_id = %id, "deleted review item");
     Ok(())
 }
 
@@ -1161,6 +1334,9 @@ async fn reset_review_items_for_work_item_store(
         }
     }
 
+    if updated > 0 {
+        info!(work_item_id = %work_item_id, updated, "reset review items to pending");
+    }
     Ok(updated)
 }
 
@@ -1187,7 +1363,14 @@ async fn persist_review_item(store: &OperationalStore, item: &ReviewItem) -> McR
             &payload,
         )
         .await
-        .map_err(|e| to_other_error("failed saving review item", e))
+        .map_err(|e| to_other_error("failed saving review item", e))?;
+    info!(
+        review_item_id = %item.id,
+        work_item_id = %item.work_item_id,
+        status = %item.status,
+        "persisted review item"
+    );
+    Ok(())
 }
 
 async fn find_review_item_record(
@@ -1283,6 +1466,7 @@ async fn add_dependency_in_store(
         .await
         .map_err(|e| to_other_error("failed saving dependency", e))?;
 
+    info!(work_item_id = %work_item_id, depends_on_id = %depends_on_id, "added work item dependency");
     Ok(dep)
 }
 
@@ -1331,10 +1515,14 @@ async fn remove_dependency_in_store(
     work_item_id: &str,
     depends_on_id: &str,
 ) -> McResult<bool> {
-    store
+    let deleted = store
         .config_delete(&dependency_storage_key(work_item_id, depends_on_id))
         .await
-        .map_err(|e| to_other_error("failed deleting dependency", e))
+        .map_err(|e| to_other_error("failed deleting dependency", e))?;
+    if deleted {
+        info!(work_item_id = %work_item_id, depends_on_id = %depends_on_id, "removed dependency from store");
+    }
+    Ok(deleted)
 }
 
 async fn check_dependencies_in_store(
@@ -1354,6 +1542,13 @@ async fn check_dependencies_in_store(
     }
 
     let blocked_count = blocked_by_ids.len();
+
+    info!(
+        work_item_id = %work_item_id,
+        blocked_count,
+        can_start = blocked_count == 0,
+        "checked dependencies"
+    );
 
     Ok(DependencyCheck {
         work_item_id: work_item_id.to_string(),

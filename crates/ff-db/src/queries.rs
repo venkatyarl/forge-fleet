@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::{PgPool, Row};
+use tracing::{info, warn};
 
 use crate::error::Result;
 
@@ -7727,7 +7728,11 @@ pub async fn pg_reap_stale_work_item_leases(
     .bind(stale_secs as f64)
     .bind(max_lease_age_secs as f64)
     .fetch_all(pool)
-    .await?;
+    .await
+    .map_err(|e| {
+        warn!(stale_secs, max_lease_age_secs, error = %e, "pg_reap_stale_work_item_leases scan failed");
+        e
+    })?;
 
     let mut reaped = 0u64;
     for r in &rows {
@@ -7831,7 +7836,7 @@ pub async fn pg_reap_stale_work_item_leases(
             Ok(true) => reaped += 1,
             Ok(false) => {}
             Err(e) => {
-                tracing::warn!(
+                warn!(
                     lease_id = %lease_id,
                     work_item_id = %wi,
                     error = %e,
@@ -7839,6 +7844,9 @@ pub async fn pg_reap_stale_work_item_leases(
                 );
             }
         }
+    }
+    if reaped > 0 {
+        info!(reaped, stale_secs, "reaped stale work_item leases");
     }
     Ok(reaped)
 }
@@ -7866,7 +7874,11 @@ pub async fn pg_count_orphaned_work_items(pool: &PgPool, min_age_secs: i64) -> R
     )
     .bind(min_age_secs as f64)
     .fetch_one(pool)
-    .await?;
+    .await
+    .map_err(|e| {
+        warn!(min_age_secs, error = %e, "pg_count_orphaned_work_items query failed");
+        e
+    })?;
     Ok(n)
 }
 
@@ -7896,8 +7908,16 @@ pub async fn pg_reap_orphaned_work_items(pool: &PgPool, min_age_secs: i64) -> Re
     )
     .bind(min_age_secs as f64)
     .execute(pool)
-    .await?;
-    Ok(res.rows_affected())
+    .await
+    .map_err(|e| {
+        warn!(min_age_secs, error = %e, "pg_reap_orphaned_work_items query failed");
+        e
+    })?;
+    let rows = res.rows_affected();
+    if rows > 0 {
+        info!(rows, min_age_secs, "reaped orphaned work_items");
+    }
+    Ok(rows)
 }
 
 /// Prune terminal (`completed`/`failed`/`cancelled`) rows older than
@@ -7955,14 +7975,22 @@ pub async fn pg_ready_work_items(pool: &PgPool, limit: i64) -> Result<Vec<ReadyW
     )
     .bind(limit)
     .fetch_all(pool)
-    .await?;
-    Ok(rows
+    .await
+    .map_err(|e| {
+        warn!(limit, error = %e, "pg_ready_work_items query failed");
+        e
+    })?;
+    let items: Vec<ReadyWorkItem> = rows
         .iter()
         .map(|r| ReadyWorkItem {
             id: r.get("id"),
             assigned_computer: r.try_get("assigned_computer").ok().flatten(),
         })
-        .collect())
+        .collect();
+    if !items.is_empty() {
+        info!(count = items.len(), limit, "fetched ready work_items");
+    }
+    Ok(items)
 }
 
 /// Free fleet slots: sub_agents not currently running a work_item and with no
@@ -7991,14 +8019,31 @@ pub async fn pg_free_slots(
     .bind(computer_filter)
     .bind(limit)
     .fetch_all(pool)
-    .await?;
-    Ok(rows
+    .await
+    .map_err(|e| {
+        warn!(
+            computer_filter = computer_filter.unwrap_or("<any>"),
+            limit,
+            error = %e,
+            "pg_free_slots query failed"
+        );
+        e
+    })?;
+    let slots: Vec<FreeSlot> = rows
         .iter()
         .map(|r| FreeSlot {
             sub_agent_id: r.get("sub_agent_id"),
             computer_id: r.get("computer_id"),
         })
-        .collect())
+        .collect();
+    if !slots.is_empty() {
+        info!(
+            count = slots.len(),
+            computer_filter = computer_filter.unwrap_or("<any>"),
+            "fetched free fleet slots"
+        );
+    }
+    Ok(slots)
 }
 
 /// Computer ids that currently host a LIVE, agent-capable model deployment:
@@ -8025,7 +8070,14 @@ pub async fn pg_agent_viable_computer_ids(pool: &PgPool) -> Result<Vec<uuid::Uui
     .bind(MIN_AGENT_CTX)
     .bind(HEALTH_FRESH_SECS as f64)
     .fetch_all(pool)
-    .await?;
+    .await
+    .map_err(|e| {
+        warn!(error = %e, "pg_agent_viable_computer_ids query failed");
+        e
+    })?;
+    if rows.is_empty() {
+        warn!("no agent-viable computers found");
+    }
     Ok(rows)
 }
 
