@@ -10672,6 +10672,29 @@ CREATE INDEX IF NOT EXISTS idx_artifact_cache_index_artifact_key
     ON artifact_cache_index (artifact_key);
 "#;
 
+/// V184 — SSH-mesh asymmetric/failed-pair alert policy.
+///
+/// The pairwise mesh check (`ff fleet ssh-mesh-check`) already writes every
+/// (src → dst) probe to `fleet_mesh_status`, but nothing distinguished a
+/// *symmetric* failure (both directions dead → host genuinely unreachable) from
+/// an *asymmetric* one (A→B ok, B→A failed → a one-sided stale IP / stale key,
+/// NOT a down host). That gap is exactly what produced the "marcus unreachable"
+/// false alarm: one direction hit a stale IP while every other path reached the
+/// node fine. This seeds the imperative policy fired by the mesh-check verb and
+/// the leader-gated refresh tick when asymmetric or symmetric-failed pairs are
+/// present, so the drift surfaces instead of being silently overwritten.
+pub const SCHEMA_V184_SSH_MESH_ALERT_POLICY: &str = r#"
+INSERT INTO alert_policies
+    (name, description, metric, scope, condition,
+     duration_secs, severity, cooldown_secs, channel, enabled)
+VALUES
+  ('ssh_mesh_asymmetric',
+   'SSH mesh has asymmetric pairs (one direction ok, the other failed → stale IP / key, not a down host) or symmetric-failed pairs (both directions dead → unreachable host)',
+   'ssh_mesh_asymmetric', 'leader_only', '> 0',
+   0, 'warning', 21600, 'telegram', true)
+ON CONFLICT (name) DO NOTHING;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

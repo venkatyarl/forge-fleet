@@ -3222,6 +3222,20 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                     matrix.cells.len()
                 );
             }
+            // Classify the freshly-written matrix into asymmetric / symmetric-
+            // failed pairs and fire the ssh_mesh_asymmetric alert — the same
+            // path the scheduled refresh tick uses. Asymmetric pairs (one
+            // direction failed) are the stale-IP/key signature that would have
+            // caught the "marcus unreachable" false alarm instantly.
+            match ff_agent::mesh_check::evaluate_and_alert(&pool).await {
+                Ok(report) if !report.is_empty() => {
+                    if !json {
+                        print_mesh_alert_report(&report);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("{YELLOW}⚠ mesh alert evaluation failed: {e}{RESET}"),
+            }
         }
         FleetCommand::VerifyNode { name, json } => {
             println!("{CYAN}▶ Running verify-node battery for {name}...{RESET}");
@@ -3819,6 +3833,51 @@ fn fmt_from_here_probe_row(p: &ff_agent::mesh_check::LocalProbe) -> String {
         if p.ssh_ok { "ok" } else { "down" },
         p.detail.as_deref().unwrap_or(""),
     )
+}
+
+/// Render the asymmetric / symmetric-failed pair classification surfaced by the
+/// `ssh_mesh_asymmetric` alert path so an on-demand run shows the same verdict
+/// the scheduled tick alerts on.
+fn print_mesh_alert_report(report: &ff_agent::mesh_check::MeshAlertReport) {
+    if !report.asymmetric.is_empty() {
+        println!(
+            "\n{YELLOW}⚠ {} asymmetric pair(s) — one direction failed → likely a stale IP in \
+             fleet_workers or a missing key, NOT a downed host:{RESET}",
+            report.asymmetric.len()
+        );
+        for p in &report.asymmetric {
+            println!(
+                "  {RED}✗{RESET} {}↔{}   {}→{}={}  {}→{}={}  {}",
+                p.a,
+                p.b,
+                p.a,
+                p.b,
+                p.ab,
+                p.b,
+                p.a,
+                p.ba,
+                p.detail.as_deref().unwrap_or(""),
+            );
+        }
+    }
+    if !report.symmetric_failed.is_empty() {
+        println!(
+            "\n{YELLOW}⚠ {} unreachable pair(s) — both directions failed (host genuinely down):{RESET}",
+            report.symmetric_failed.len()
+        );
+        for p in &report.symmetric_failed {
+            println!(
+                "  {RED}✗{RESET} {}↔{}   {}",
+                p.a,
+                p.b,
+                p.detail.as_deref().unwrap_or(""),
+            );
+        }
+    }
+    println!(
+        "  Alert recorded (policy {CYAN}ssh_mesh_asymmetric{RESET}); \
+         repair a pair with {CYAN}ff fleet ssh-mesh-check --repair --yes{RESET}"
+    );
 }
 
 #[cfg(test)]
