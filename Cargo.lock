@@ -1287,6 +1287,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ff-capacity"
+version = "2026.4.7"
+dependencies = [
+ "arc-swap",
+ "chrono",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "ff-cli"
 version = "2026.4.7"
 dependencies = [
