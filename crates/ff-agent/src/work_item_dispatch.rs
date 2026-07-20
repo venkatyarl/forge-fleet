@@ -870,6 +870,30 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         return Ok(());
     }
 
+    // SELF-VERIFY GATE — catch garbage at the source, before it costs a PR + CI
+    // + review cycle. "Has a diff" != "is good": empty stub files or
+    // non-compiling code must never reach the review drain (2026-07-20: an item
+    // committed three 0-byte files and the review drain was the FIRST place it
+    // was caught). On failure, requeue with the specific reason as context —
+    // the next attempt (warm or fresh) gets an actionable problem to fix —
+    // instead of opening a broken PR.
+    if let Err(reason) = self_verify_worktree(&worktree.worktree_path, &worktree.base_branch).await
+    {
+        warn!(
+            work_item_id = %item.work_item_id,
+            %reason,
+            "work_item_dispatch: self-verify gate rejected the build before PR — requeue with context"
+        );
+        requeue_or_fail(
+            &pg,
+            &item,
+            &format!("self-verify failed before opening PR: {reason}"),
+        )
+        .await?;
+        remove_worktree(&item.repo_path, &worktree.worktree_path)?;
+        return Ok(());
+    }
+
     let head_sha = git_head_sha(&worktree.worktree_path)?;
     push_branch(&item.repo_path, &worktree.task_branch)?;
     let pr_url = create_pr(&worktree.worktree_path, &item, &worktree).await?;
@@ -1521,13 +1545,49 @@ async fn release_slot_and_lease_tx(
     reason: &str,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE work_item_leases
-            SET lease_state = 'released',
-                released_at = NOW(),
-                release_reason = $3
-          WHERE work_item_id = $1
-            AND sub_agent_id = $2
-            AND released_at IS NULL",
+        "WITH releasing AS (
+             SELECT id, work_item_id, lease_state, endpoint, attempt, computer_id
+               FROM work_item_leases
+              WHERE work_item_id = $1
+                AND sub_agent_id = $2
+                AND released_at IS NULL
+              FOR UPDATE
+         ), released AS (
+             UPDATE work_item_leases l
+                SET lease_state = 'released',
+                    released_at = NOW(),
+                    release_reason = $3
+               FROM releasing r
+              WHERE l.id = r.id
+          RETURNING r.work_item_id,
+                    r.lease_state AS from_status,
+                    r.endpoint,
+                    r.attempt,
+                    l.release_reason,
+                    r.computer_id
+         )
+         INSERT INTO work_item_events
+             (work_item_id, from_status, to_status, computer, attempt, detail)
+         SELECT r.work_item_id,
+                r.from_status,
+                'lease_released',
+                c.name,
+                r.attempt,
+                jsonb_build_object(
+                    'event_type', 'lease_released',
+                    'endpoint', r.endpoint,
+                    'lane', CASE
+                        WHEN NULLIF(r.endpoint, '') IS NULL THEN NULL
+                        WHEN r.endpoint LIKE 'cloud:%'
+                          OR r.endpoint ~ '^(codex|claude|kimi|gemini|grok)(:|$)'
+                          THEN 'cloud'
+                        ELSE 'local'
+                    END,
+                    'attempt', r.attempt,
+                    'release_reason', r.release_reason
+                )
+           FROM released r
+           LEFT JOIN computers c ON c.id = r.computer_id",
     )
     .bind(item.work_item_id)
     .bind(item.sub_agent_id)
@@ -2742,6 +2802,71 @@ fn git_head_sha(worktree_path: &Path) -> Result<String> {
         Duration::from_secs(30),
     )?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Self-verify a built worktree BEFORE it becomes a PR — the cheap local checks
+/// a competent engineer runs before calling a change "done": no empty /
+/// whitespace-only added files, and (best-effort) the tree still compiles.
+/// Returns `Err(reason)` on the first problem so the retry gets actionable
+/// context. Catching garbage here saves a PR + CI + review cycle (2026-07-20:
+/// an item committed three 0-byte files and reached the review drain).
+async fn self_verify_worktree(
+    worktree_path: &Path,
+    base_branch: &str,
+) -> std::result::Result<(), String> {
+    // 1) Reject empty / whitespace-only ADDED files (instant, catches the
+    //    empty-stub failure mode directly).
+    let range = format!("{base_branch}...HEAD");
+    let out = run_git(
+        worktree_path,
+        ["diff", "--diff-filter=A", "--name-only", &range],
+        Duration::from_secs(30),
+    )
+    .map_err(|e| format!("git diff for self-verify failed: {e}"))?;
+    for f in String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
+        let full = worktree_path.join(f);
+        let empty = match std::fs::read(&full) {
+            Ok(bytes) => bytes.is_empty() || bytes.iter().all(u8::is_ascii_whitespace),
+            Err(_) => false, // unreadable/deleted — not this gate's concern
+        };
+        if empty {
+            return Err(format!("added file is empty or whitespace-only: {f}"));
+        }
+    }
+
+    // 2) Compile check — best-effort and bounded. Only an ACTUAL compile error
+    //    blocks the PR; a tooling error or timeout must not (never freeze the
+    //    pipeline on check infra). Skipped for a non-Rust repo.
+    if !worktree_path.join("Cargo.toml").exists() {
+        return Ok(());
+    }
+    let check = tokio::time::timeout(
+        Duration::from_secs(300),
+        tokio::process::Command::new("cargo")
+            .args(["check", "--quiet"])
+            .current_dir(worktree_path)
+            .output(),
+    )
+    .await;
+    if let Ok(Ok(o)) = check {
+        if !o.status.success() {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if let Some(err_line) = stderr
+                .lines()
+                .find(|l| l.contains("error[") || l.trim_start().starts_with("error:"))
+            {
+                return Err(format!(
+                    "cargo check failed: {}",
+                    err_line.trim().chars().take(200).collect::<String>()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn push_branch(repo_path: &Path, task_branch: &str) -> Result<()> {
