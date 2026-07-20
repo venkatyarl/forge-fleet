@@ -119,7 +119,22 @@ pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
             // Still running — leave it; we'll re-check next tick.
             Ok(0)
         }
-        CiState::Failed(reason) => {
+        CiState::Failed { reason, run_ids } => {
+            if !run_ids.is_empty() && claim_ci_rerun(pg, item.id).await? {
+                if let Err(e) = rerun_failed_ci_jobs(&pr_url, &run_ids).await {
+                    release_ci_rerun_claim(pg, item.id).await?;
+                    return Err(e);
+                }
+                info!(
+                    pr = %pr_url,
+                    runs = ?run_ids,
+                    "merge_drain: requested one retry of failed CI jobs"
+                );
+                // GitHub updates the check rollup asynchronously. Re-evaluate
+                // next tick instead of treating this stale failed snapshot as
+                // the result of the rerun.
+                return Ok(0);
+            }
             warn!(pr = %pr_url, %reason, "merge_drain: PR CI failed — marking work_item failed");
             ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &reason).await?;
             Ok(0)
@@ -581,7 +596,7 @@ async fn automerge_enabled(pg: &PgPool) -> bool {
 enum CiState {
     Pending,
     Success,
-    Failed(String),
+    Failed { reason: String, run_ids: Vec<u64> },
 }
 
 /// GitHub's view of how the PR head relates to its base branch.
@@ -662,10 +677,15 @@ fn update_branch_api_path(pr_url: &str) -> Option<String> {
 /// (or gh transient error) is treated as Pending so we never merge prematurely.
 async fn pr_ci_state(pr_url: &str) -> CiState {
     let mut cmd = gh_cmd().await;
-    cmd.args(["pr", "checks", pr_url, "--json", "state"]);
+    cmd.args(["pr", "checks", pr_url, "--json", "state,detailsUrl"]);
     let out = match cmd.output().await {
         Ok(o) => o,
-        Err(e) => return CiState::Failed(format!("gh pr checks spawn: {e}")),
+        Err(e) => {
+            return CiState::Failed {
+                reason: format!("gh pr checks spawn: {e}"),
+                run_ids: Vec::new(),
+            };
+        }
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
     // gh exits non-zero when checks are failing OR still pending; rely on the
@@ -688,7 +708,28 @@ async fn pr_ci_state(pr_url: &str) -> CiState {
         .iter()
         .any(|s| matches!(s.as_str(), "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT"))
     {
-        return CiState::Failed(format!("a check is {states:?}"));
+        let value = serde_json::from_str::<serde_json::Value>(&stdout).unwrap_or_default();
+        let mut run_ids = value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|check| {
+                check
+                    .get("state")
+                    .and_then(|state| state.as_str())
+                    .is_some_and(|state| {
+                        matches!(state, "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT")
+                    })
+            })
+            .filter_map(|check| check.get("detailsUrl").and_then(|url| url.as_str()))
+            .filter_map(github_actions_run_id)
+            .collect::<Vec<_>>();
+        run_ids.sort_unstable();
+        run_ids.dedup();
+        return CiState::Failed {
+            reason: format!("a check is {states:?}"),
+            run_ids,
+        };
     }
     if states
         .iter()
@@ -697,6 +738,60 @@ async fn pr_ci_state(pr_url: &str) -> CiState {
         return CiState::Pending;
     }
     CiState::Success
+}
+
+fn github_actions_run_id(details_url: &str) -> Option<u64> {
+    let marker = "/actions/runs/";
+    let rest = details_url.split_once(marker)?.1;
+    rest.split('/').next()?.parse().ok()
+}
+
+async fn claim_ci_rerun(pg: &PgPool, queue_id: uuid::Uuid) -> Result<bool> {
+    Ok(sqlx::query(
+        "UPDATE work_item_merge_queue SET merge_attempts = 1 \
+         WHERE id = $1 AND merge_attempts = 0",
+    )
+    .bind(queue_id)
+    .execute(pg)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
+async fn release_ci_rerun_claim(pg: &PgPool, queue_id: uuid::Uuid) -> Result<()> {
+    sqlx::query(
+        "UPDATE work_item_merge_queue SET merge_attempts = 0 \
+         WHERE id = $1 AND merge_attempts = 1",
+    )
+    .bind(queue_id)
+    .execute(pg)
+    .await?;
+    Ok(())
+}
+
+async fn rerun_failed_ci_jobs(pr_url: &str, run_ids: &[u64]) -> Result<()> {
+    let (owner, repo) = parse_owner_repo(pr_url)
+        .with_context(|| format!("unrecognized GitHub PR url: {pr_url}"))?;
+    let repo = format!("{owner}/{repo}");
+    for run_id in run_ids {
+        let mut cmd = gh_cmd().await;
+        cmd.args([
+            "run",
+            "rerun",
+            &run_id.to_string(),
+            "--failed",
+            "--repo",
+            &repo,
+        ]);
+        let out = cmd.output().await.context("spawn gh run rerun --failed")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "gh run rerun {run_id} --failed failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `gh pr merge <url> --squash --delete-branch` (the project policy — always
@@ -918,7 +1013,27 @@ pub fn spawn_work_item_merge_drain(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_review_response, served_by_480b, update_branch_api_path};
+    use super::{
+        github_actions_run_id, parse_review_response, served_by_480b, update_branch_api_path,
+    };
+
+    #[test]
+    fn extracts_only_github_actions_run_ids() {
+        assert_eq!(
+            github_actions_run_id(
+                "https://github.com/venkatyarl/forge-fleet/actions/runs/123456/job/789"
+            ),
+            Some(123456)
+        );
+        assert_eq!(
+            github_actions_run_id("https://example.com/external/check/123456"),
+            None
+        );
+        assert_eq!(
+            github_actions_run_id("https://github.com/org/repo/actions/runs/nope"),
+            None
+        );
+    }
 
     #[test]
     fn pr_url_maps_to_update_branch_api_path() {
