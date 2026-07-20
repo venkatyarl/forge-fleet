@@ -3,7 +3,7 @@
 //!
 //! Unlike the fixed-interval ticks in [`crate::daemon`], the digest is pinned
 //! to a wall-clock time: once per day at [`DIGEST_HOUR_LOCAL`]:00 local time
-//! the leader summarizes the fleet's velocity views (V179:
+//! the leader summarizes the fleet's velocity views (V204:
 //! `v_throughput_hourly`, `v_lead_time_daily`, `v_computer_builds_daily`,
 //! `v_first_pass_rate_daily`) and sends the summary to the operator via
 //! [`crate::telegram::send_telegram_recorded`].
@@ -36,18 +36,14 @@ const DIGEST_SESSION_PREFIX: &str = "nightly-digest";
 /// without the V179 views (or with no events yet) still produces a digest.
 #[derive(Debug, Clone, Default)]
 pub struct DigestData {
-    /// (completed, failed) work items over the last 24h.
-    pub throughput_24h: Option<(i64, i64)>,
-    /// Completion-weighted average lead time in seconds since yesterday.
-    pub avg_lead_time_secs: Option<f64>,
-    /// (completed, first-pass) work items since yesterday.
-    pub first_pass: Option<(i64, i64)>,
-    /// Per-computer (name, started, succeeded, failed) builds since yesterday.
-    pub computer_builds: Vec<(String, i64, i64, i64)>,
-    /// Cached per-provider quota state from `cloud_budget_buckets`.
-    pub cloud_budgets: Vec<crate::cloud_budget::ProviderBudget>,
-    /// (records created, post-merge cleanups verified) over the last 24h.
-    pub provenance_24h: Option<(i64, i64)>,
+    /// Yesterday's merges and the preceding seven-day daily average.
+    pub throughput: Option<(f64, f64)>,
+    /// Yesterday's p50 lead time and the preceding seven-day average p50.
+    pub lead_time_p50: Option<(f64, f64)>,
+    /// Yesterday's first-pass rate and the preceding seven-day average rate.
+    pub first_pass_rate: Option<(f64, f64)>,
+    /// Per-computer (name, builds, average minutes) for yesterday.
+    pub computer_builds: Vec<(String, i64, f64)>,
 }
 
 /// Deterministic session id for one calendar day's digest. Doubles as the
@@ -79,63 +75,40 @@ pub fn format_digest(data: &DigestData) -> String {
     const NA: &str = "n/a (velocity views not populated)";
     let mut lines = Vec::new();
 
-    lines.push(match data.throughput_24h {
-        Some((completed, failed)) => {
-            format!("Throughput (24h): {completed} completed, {failed} failed")
+    lines.push(match data.throughput {
+        Some((yesterday, average)) => {
+            format!("Throughput: {yesterday:.0} merges yesterday vs {average:.1}/day (7d)")
         }
-        None => format!("Throughput (24h): {NA}"),
+        None => format!("Throughput: {NA}"),
     });
-    lines.push(match data.avg_lead_time_secs {
-        Some(secs) => format!("Avg lead time: {}", fmt_duration_secs(secs)),
-        None => format!("Avg lead time: {NA}"),
+    lines.push(match data.lead_time_p50 {
+        Some((yesterday, average)) => format!(
+            "Lead time p50: {} yesterday vs {} (7d)",
+            fmt_duration_secs(yesterday),
+            fmt_duration_secs(average)
+        ),
+        None => format!("Lead time p50: {NA}"),
     });
-    lines.push(match data.first_pass {
-        Some((completed, first_pass)) if completed > 0 => {
-            let pct = 100.0 * first_pass as f64 / completed as f64;
-            format!("First-pass rate: {pct:.0}% ({first_pass}/{completed})")
-        }
-        Some(_) => "First-pass rate: no completions".to_string(),
+    lines.push(match data.first_pass_rate {
+        Some((yesterday, average)) => format!(
+            "First-pass rate: {:.0}% yesterday vs {:.0}% (7d)",
+            yesterday * 100.0,
+            average * 100.0
+        ),
         None => format!("First-pass rate: {NA}"),
-    });
-    lines.push(match data.provenance_24h {
-        Some((records, cleaned)) => {
-            format!("Work-item provenance (24h): {records} recorded, {cleaned} cleanup verified")
-        }
-        None => "Work-item provenance (24h): unavailable".to_string(),
     });
     if data.computer_builds.is_empty() {
         lines.push("Builds by computer: none recorded".to_string());
     } else {
-        lines.push("Builds by computer:".to_string());
-        for (name, started, succeeded, failed) in &data.computer_builds {
-            lines.push(format!(
-                "  • {name}: {succeeded} ok / {failed} failed ({started} started)"
-            ));
+        let mut ranked = data.computer_builds.clone();
+        ranked.sort_by(|a, b| a.2.total_cmp(&b.2));
+        lines.push("Top computers (fastest avg build):".to_string());
+        for (name, builds, minutes) in ranked.iter().take(3) {
+            lines.push(format!("  • {name}: {minutes:.1}m ({builds} builds)"));
         }
-    }
-    if data.cloud_budgets.is_empty() {
-        lines.push("Cloud budgets: unavailable".to_string());
-    } else {
-        lines.push("Cloud budgets:".to_string());
-        let now = chrono::Utc::now();
-        for budget in &data.cloud_budgets {
-            let status = match budget.window_exhausted_until {
-                Some(until) if until > now => {
-                    format!(
-                        "exhausted until {}",
-                        until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-                    )
-                }
-                _ => "available".to_string(),
-            };
-            let weekly = budget
-                .weekly_pct
-                .map(|pct| format!("{pct}%"))
-                .unwrap_or_else(|| "n/a".to_string());
-            lines.push(format!(
-                "  • {}: {status}; weekly {weekly}",
-                budget.provider
-            ));
+        lines.push("Bottom computers (slowest avg build):".to_string());
+        for (name, builds, minutes) in ranked.iter().rev().take(3) {
+            lines.push(format!("  • {name}: {minutes:.1}m ({builds} builds)"));
         }
     }
     lines.join("\n")
@@ -147,57 +120,54 @@ pub fn format_digest(data: &DigestData) -> String {
 async fn collect_digest_data(pg: &PgPool) -> DigestData {
     let mut data = DigestData::default();
 
-    match sqlx::query_as::<_, (i64, i64)>(
-        "SELECT COALESCE(SUM(completed_count), 0)::BIGINT, \
-                COALESCE(SUM(failed_count), 0)::BIGINT \
-           FROM v_throughput_hourly \
-          WHERE hour_bucket >= NOW() - INTERVAL '24 hours'",
+    match sqlx::query_as::<_, (f64, f64)>(
+        "SELECT COALESCE(SUM(merge_count) FILTER (WHERE hour_bucket::date = CURRENT_DATE - 1), 0)::DOUBLE PRECISION, \
+                (COALESCE(SUM(merge_count) FILTER (WHERE hour_bucket::date BETWEEN CURRENT_DATE - 7 AND CURRENT_DATE - 1), 0) / 7.0)::DOUBLE PRECISION \
+           FROM v_throughput_hourly",
     )
     .fetch_one(pg)
     .await
     {
-        Ok(row) => data.throughput_24h = Some(row),
+        Ok(row) => data.throughput = Some(row),
         Err(e) => tracing::debug!(error = %e, "nightly digest: v_throughput_hourly unavailable"),
     }
 
-    match sqlx::query_scalar::<_, Option<f64>>(
-        "SELECT (SUM(avg_lead_time_seconds * completed_count) \
-                 / NULLIF(SUM(completed_count), 0))::DOUBLE PRECISION \
-           FROM v_lead_time_daily \
-          WHERE day_bucket >= date_trunc('day', NOW() - INTERVAL '1 day')",
+    match sqlx::query_as::<_, (Option<f64>, Option<f64>)>(
+        "SELECT MAX(p50_lead_time_seconds) FILTER (WHERE day_bucket::date = CURRENT_DATE - 1), \
+                AVG(p50_lead_time_seconds) FILTER (WHERE day_bucket::date BETWEEN CURRENT_DATE - 7 AND CURRENT_DATE - 1) \
+           FROM v_lead_time_daily",
     )
     .fetch_one(pg)
     .await
     {
-        Ok(avg) => data.avg_lead_time_secs = avg,
+        Ok((Some(yesterday), Some(average))) => data.lead_time_p50 = Some((yesterday, average)),
+        Ok(_) => {}
         Err(e) => tracing::debug!(error = %e, "nightly digest: v_lead_time_daily unavailable"),
     }
 
-    match sqlx::query_as::<_, (i64, i64)>(
-        "SELECT COALESCE(SUM(completed_count), 0)::BIGINT, \
-                COALESCE(SUM(first_pass_count), 0)::BIGINT \
-           FROM v_first_pass_rate_daily \
-          WHERE day_bucket >= date_trunc('day', NOW() - INTERVAL '1 day')",
+    match sqlx::query_as::<_, (Option<f64>, Option<f64>)>(
+        "SELECT MAX(first_pass_rate) FILTER (WHERE day_bucket::date = CURRENT_DATE - 1), \
+                AVG(first_pass_rate) FILTER (WHERE day_bucket::date BETWEEN CURRENT_DATE - 7 AND CURRENT_DATE - 1) \
+           FROM v_first_pass_rate_daily",
     )
     .fetch_one(pg)
     .await
     {
-        Ok(row) => data.first_pass = Some(row),
+        Ok((Some(yesterday), Some(average))) => data.first_pass_rate = Some((yesterday, average)),
+        Ok(_) => {}
         Err(e) => {
             tracing::debug!(error = %e, "nightly digest: v_first_pass_rate_daily unavailable")
         }
     }
 
-    match sqlx::query_as::<_, (String, i64, i64, i64)>(
+    match sqlx::query_as::<_, (String, i64, f64)>(
         "SELECT computer_name, \
-                COALESCE(SUM(builds_started), 0)::BIGINT, \
-                COALESCE(SUM(builds_succeeded), 0)::BIGINT, \
-                COALESCE(SUM(builds_failed), 0)::BIGINT \
+                SUM(build_count)::BIGINT, \
+                (SUM(avg_build_minutes * build_count) / NULLIF(SUM(build_count), 0))::DOUBLE PRECISION \
            FROM v_computer_builds_daily \
-          WHERE day_bucket >= date_trunc('day', NOW() - INTERVAL '1 day') \
+          WHERE day_bucket::date = CURRENT_DATE - 1 \
           GROUP BY computer_name \
-          ORDER BY 2 DESC \
-          LIMIT 8",
+          ORDER BY 3",
     )
     .fetch_all(pg)
     .await
@@ -206,21 +176,6 @@ async fn collect_digest_data(pg: &PgPool) -> DigestData {
         Err(e) => {
             tracing::debug!(error = %e, "nightly digest: v_computer_builds_daily unavailable")
         }
-    }
-
-    data.cloud_budgets = crate::cloud_budget::all_provider_budgets(pg).await;
-
-    match sqlx::query_as::<_, (i64, i64)>(
-        "SELECT COUNT(*)::bigint, \
-                COUNT(*) FILTER (WHERE cleanup_complete)::bigint \
-           FROM work_item_provenance \
-          WHERE updated_at >= NOW() - INTERVAL '24 hours'",
-    )
-    .fetch_one(pg)
-    .await
-    {
-        Ok(row) => data.provenance_24h = Some(row),
-        Err(e) => tracing::debug!(error = %e, "nightly digest: provenance unavailable"),
     }
 
     data
@@ -300,42 +255,35 @@ mod tests {
     #[test]
     fn format_digest_renders_all_sections() {
         let data = DigestData {
-            throughput_24h: Some((12, 3)),
-            avg_lead_time_secs: Some(4_320.0),
-            first_pass: Some((12, 10)),
-            provenance_24h: Some((12, 9)),
-            computer_builds: vec![("alpha".into(), 6, 5, 1)],
-            cloud_budgets: vec![crate::cloud_budget::ProviderBudget {
-                provider: "codex".into(),
-                window_exhausted_until: None,
-                weekly_pct: Some(12),
-            }],
+            throughput: Some((12.0, 9.5)),
+            lead_time_p50: Some((4_320.0, 3_600.0)),
+            first_pass_rate: Some((10.0 / 12.0, 0.75)),
+            computer_builds: vec![("alpha".into(), 6, 12.0), ("beta".into(), 4, 30.0)],
         };
         let body = format_digest(&data);
-        assert!(body.contains("Throughput (24h): 12 completed, 3 failed"));
-        assert!(body.contains("Avg lead time: 1h 12m"));
-        assert!(body.contains("First-pass rate: 83% (10/12)"));
-        assert!(body.contains("12 recorded, 9 cleanup verified"));
-        assert!(body.contains("• alpha: 5 ok / 1 failed (6 started)"));
-        assert!(body.contains("• codex: available; weekly 12%"));
+        assert!(body.contains("Throughput: 12 merges yesterday vs 9.5/day (7d)"));
+        assert!(body.contains("Lead time p50: 1h 12m yesterday vs 1h 0m (7d)"));
+        assert!(body.contains("First-pass rate: 83% yesterday vs 75% (7d)"));
+        assert!(body.contains("• alpha: 12.0m (6 builds)"));
+        assert!(body.contains("• beta: 30.0m (4 builds)"));
     }
 
     #[test]
     fn format_digest_degrades_when_views_missing() {
         let body = format_digest(&DigestData::default());
-        assert!(body.contains("Throughput (24h): n/a"));
-        assert!(body.contains("Avg lead time: n/a"));
+        assert!(body.contains("Throughput: n/a"));
+        assert!(body.contains("Lead time p50: n/a"));
         assert!(body.contains("First-pass rate: n/a"));
         assert!(body.contains("Builds by computer: none recorded"));
     }
 
     #[test]
-    fn format_digest_handles_zero_completions() {
+    fn format_digest_handles_zero_first_pass_rate() {
         let data = DigestData {
-            first_pass: Some((0, 0)),
+            first_pass_rate: Some((0.0, 0.25)),
             ..Default::default()
         };
-        assert!(format_digest(&data).contains("First-pass rate: no completions"));
+        assert!(format_digest(&data).contains("First-pass rate: 0% yesterday vs 25% (7d)"));
     }
 
     #[test]

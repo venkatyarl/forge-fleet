@@ -8281,19 +8281,13 @@ pub async fn pg_reap_stale_work_item_leases(
                         'lease_released',
                         c.name,
                         r.attempt,
-                        jsonb_build_object(
-                            'event_type', 'lease_released',
-                            'endpoint', r.endpoint,
-                            'lane', CASE
-                                WHEN NULLIF(r.endpoint, '') IS NULL THEN NULL
-                                WHEN r.endpoint LIKE 'cloud:%'
-                                  OR r.endpoint ~ '^(codex|claude|kimi|gemini|grok)(:|$)'
-                                  THEN 'cloud'
-                                ELSE 'local'
-                            END,
-                            'attempt', r.attempt,
-                            'release_reason', r.release_reason
-                        )
+                        NULLIF(concat_ws('/', NULLIF(r.endpoint, ''), CASE
+                            WHEN NULLIF(r.endpoint, '') IS NULL THEN NULL
+                            WHEN r.endpoint LIKE 'cloud:%'
+                              OR r.endpoint ~ '^(codex|claude|kimi|gemini|grok)(:|$)'
+                              THEN 'cloud'
+                            ELSE 'local'
+                        END), '')
                    FROM released r
                    LEFT JOIN computers c ON c.id = r.computer_id",
             )

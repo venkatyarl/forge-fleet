@@ -64,19 +64,13 @@ pub async fn drain_work_item_leases(
                     'lease_released',
                     c.name,
                     d.attempt,
-                    jsonb_build_object(
-                        'event_type', 'lease_released',
-                        'endpoint', d.endpoint,
-                        'lane', CASE
-                            WHEN NULLIF(d.endpoint, '') IS NULL THEN NULL
-                            WHEN d.endpoint LIKE 'cloud:%'
-                              OR d.endpoint ~ '^(codex|claude|kimi|gemini|grok)(:|$)'
-                              THEN 'cloud'
-                            ELSE 'local'
-                        END,
-                        'attempt', d.attempt,
-                        'release_reason', d.release_reason
-                    )
+                    NULLIF(concat_ws('/', NULLIF(d.endpoint, ''), CASE
+                        WHEN NULLIF(d.endpoint, '') IS NULL THEN NULL
+                        WHEN d.endpoint LIKE 'cloud:%'
+                          OR d.endpoint ~ '^(codex|claude|kimi|gemini|grok)(:|$)'
+                          THEN 'cloud'
+                        ELSE 'local'
+                    END), '')
                FROM drained d
                LEFT JOIN computers c ON c.id = d.computer_id
          ), freed_slots AS (

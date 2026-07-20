@@ -11204,6 +11204,84 @@ CREATE INDEX idx_work_item_provenance_merged_at
     ON work_item_provenance (merged_at DESC) WHERE merged_at IS NOT NULL;
 "#;
 
+/// V204 — Correct work-item velocity instrumentation to use the authoritative
+/// merge queue and lease lifecycle sources. V179–V182 introduced the event
+/// log and initial views; this forward-only migration aligns them with the
+/// operator-approved KPI definitions without rewriting those migrations.
+pub const SCHEMA_V204_WORK_ITEM_VELOCITY_INSTRUMENTATION: &str = r#"
+ALTER TABLE work_item_events
+    ALTER COLUMN detail DROP DEFAULT,
+    ALTER COLUMN detail DROP NOT NULL,
+    ALTER COLUMN detail TYPE TEXT USING detail::text;
+
+DROP VIEW IF EXISTS v_throughput_hourly;
+DROP VIEW IF EXISTS v_lead_time_daily;
+DROP VIEW IF EXISTS v_computer_builds_daily;
+DROP VIEW IF EXISTS v_first_pass_rate_daily;
+
+CREATE VIEW v_throughput_hourly AS
+SELECT
+    date_trunc('hour', merged_at) AS hour_bucket,
+    COUNT(*)::BIGINT AS merge_count
+FROM work_item_merge_queue
+WHERE merged_at IS NOT NULL
+GROUP BY 1;
+
+CREATE VIEW v_lead_time_daily AS
+SELECT
+    date_trunc('day', merged_at) AS day_bucket,
+    COUNT(*)::BIGINT AS merge_count,
+    AVG(EXTRACT(EPOCH FROM (merged_at - enqueued_at)))::DOUBLE PRECISION
+        AS avg_lead_time_seconds,
+    percentile_cont(0.5) WITHIN GROUP (
+        ORDER BY EXTRACT(EPOCH FROM (merged_at - enqueued_at))
+    )::DOUBLE PRECISION AS p50_lead_time_seconds,
+    percentile_cont(0.9) WITHIN GROUP (
+        ORDER BY EXTRACT(EPOCH FROM (merged_at - enqueued_at))
+    )::DOUBLE PRECISION AS p90_lead_time_seconds
+FROM work_item_merge_queue
+WHERE merged_at IS NOT NULL
+GROUP BY 1;
+
+CREATE VIEW v_computer_builds_daily AS
+SELECT
+    date_trunc('day', l.released_at) AS day_bucket,
+    COALESCE(c.name, 'unknown') AS computer_name,
+    COUNT(*)::BIGINT AS build_count,
+    AVG(EXTRACT(EPOCH FROM (l.released_at - l.created_at)) / 60.0)::DOUBLE PRECISION
+        AS avg_build_minutes
+FROM work_item_leases l
+LEFT JOIN computers c ON c.id = l.computer_id
+WHERE l.released_at IS NOT NULL
+GROUP BY 1, 2;
+
+CREATE VIEW v_first_pass_rate_daily AS
+SELECT
+    date_trunc('day', q.merged_at) AS day_bucket,
+    COUNT(*)::BIGINT AS merged_count,
+    COUNT(*) FILTER (WHERE NOT EXISTS (
+        SELECT 1
+        FROM work_item_events e
+        WHERE e.work_item_id = q.work_item_id
+          AND (
+              (e.to_status = 'ready' AND e.from_status NOT IN ('idea', 'ready'))
+              OR COALESCE(e.detail, '') ~* '(heal|reset)'
+          )
+    ))::BIGINT AS first_pass_count,
+    (COUNT(*) FILTER (WHERE NOT EXISTS (
+        SELECT 1
+        FROM work_item_events e
+        WHERE e.work_item_id = q.work_item_id
+          AND (
+              (e.to_status = 'ready' AND e.from_status NOT IN ('idea', 'ready'))
+              OR COALESCE(e.detail, '') ~* '(heal|reset)'
+          )
+    ))::DOUBLE PRECISION / NULLIF(COUNT(*), 0))::DOUBLE PRECISION AS first_pass_rate
+FROM work_item_merge_queue q
+WHERE q.merged_at IS NOT NULL
+GROUP BY 1;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

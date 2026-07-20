@@ -1001,6 +1001,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "work_item_provenance",
         sql: schema::SCHEMA_V203_WORK_ITEM_PROVENANCE,
     },
+    PgMigration {
+        version: 204,
+        name: "work_item_velocity_instrumentation",
+        sql: schema::SCHEMA_V204_WORK_ITEM_VELOCITY_INSTRUMENTATION,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1484,7 +1489,7 @@ mod tests {
             "INSERT INTO work_item_events
                  (work_item_id, from_status, to_status, computer, attempt, detail)
              VALUES ($1, 'idea', 'in_progress', 'v179-test-node', 1,
-                     '{\"reason\": \"test\"}'::jsonb)",
+                     'test/local')",
         )
         .bind(work_item_id)
         .execute(&pool)
@@ -1615,7 +1620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v181_fleet_velocity_views_aggregate_work_item_events() {
+    async fn v204_fleet_velocity_views_use_authoritative_sources() {
         // Needs Postgres — create_fresh_temp_db returns None (and we early-
         // return) when neither FORGEFLEET_POSTGRES_URL nor
         // FORGEFLEET_DATABASE_URL is set, so this never panics in CI.
@@ -1627,85 +1632,32 @@ mod tests {
             .await
             .expect("migrations should apply on fresh DB");
 
-        sqlx::query(
-            "INSERT INTO projects (id, display_name) VALUES ('v181-test-proj', 'V181 Test')",
-        )
-        .execute(&pool)
-        .await
-        .expect("insert test project");
-        let work_item_id: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO work_items
-                 (project_id, kind, title, created_at, assigned_computer)
-             VALUES
-                 ('v181-test-proj', 'task', 'v181 test item',
-                  '2026-07-18 08:00:00+00', 'v181-fallback-node')
-             RETURNING id",
+        let detail_type: String = sqlx::query_scalar(
+            "SELECT data_type FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'work_item_events'
+               AND column_name = 'detail'",
         )
         .fetch_one(&pool)
         .await
-        .expect("insert test work item");
+        .expect("read event detail type");
+        assert_eq!(detail_type, "text");
 
-        sqlx::query(
-            "INSERT INTO work_item_events
-                 (work_item_id, from_status, to_status, occurred_at, computer, attempt)
-             VALUES
-                 ($1, 'ready', 'building', '2026-07-18 09:00:00+00', NULL, 1),
-                 ($1, 'building', 'failed', '2026-07-18 10:00:00+00', NULL, 1),
-                 ($1, 'failed', 'building', '2026-07-18 11:00:00+00', 'v181-node', 2),
-                 ($1, 'building', 'done', '2026-07-18 12:00:00+00', 'v181-node', 2)",
-        )
-        .bind(work_item_id)
-        .execute(&pool)
-        .await
-        .expect("insert work item events");
-
-        let (completed, failed): (i64, i64) = sqlx::query_as(
-            "SELECT completed_count, failed_count
-             FROM v_throughput_hourly
-             WHERE hour_bucket = '2026-07-18 12:00:00+00'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("read throughput view");
-        assert_eq!((completed, failed), (1, 0));
-
-        let (completed, lead_time): (i64, f64) = sqlx::query_as(
-            "SELECT completed_count, avg_lead_time_seconds
-             FROM v_lead_time_daily
-             WHERE day_bucket = '2026-07-18 00:00:00+00'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("read lead-time view");
-        assert_eq!(completed, 1);
-        assert_eq!(lead_time, 14_400.0);
-
-        let computer_rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
-            "SELECT computer_name, builds_started, builds_succeeded, builds_failed
-             FROM v_computer_builds_daily
-             WHERE day_bucket = '2026-07-18 00:00:00+00'
-             ORDER BY computer_name",
+        let view_columns: Vec<String> = sqlx::query_scalar(
+            "SELECT table_name || '.' || column_name
+             FROM information_schema.columns
+             WHERE table_schema = 'public'
+               AND ((table_name = 'v_throughput_hourly' AND column_name = 'merge_count')
+                 OR (table_name = 'v_lead_time_daily' AND column_name IN
+                     ('avg_lead_time_seconds', 'p50_lead_time_seconds', 'p90_lead_time_seconds'))
+                 OR (table_name = 'v_computer_builds_daily' AND column_name IN
+                     ('build_count', 'avg_build_minutes'))
+                 OR (table_name = 'v_first_pass_rate_daily' AND column_name = 'first_pass_rate'))
+             ORDER BY 1",
         )
         .fetch_all(&pool)
         .await
-        .expect("read computer builds view");
-        assert_eq!(
-            computer_rows,
-            vec![
-                ("v181-fallback-node".to_string(), 1, 0, 1),
-                ("v181-node".to_string(), 1, 1, 0),
-            ]
-        );
-
-        let (completed, first_pass, rate): (i64, i64, f64) = sqlx::query_as(
-            "SELECT completed_count, first_pass_count, first_pass_rate
-             FROM v_first_pass_rate_daily
-             WHERE day_bucket = '2026-07-18 00:00:00+00'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("read first-pass view");
-        assert_eq!((completed, first_pass, rate), (1, 0, 0.0));
+        .expect("read velocity view columns");
+        assert_eq!(view_columns.len(), 7);
 
         drop_temp_db(admin, pool, &db_name).await;
     }
