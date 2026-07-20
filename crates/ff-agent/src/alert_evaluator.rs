@@ -196,6 +196,7 @@ pub const IMPERATIVE_METRICS: &[&str] = &[
     "backup_restore_drill_failed",
     "upgrade_rollout_halted",
     "secret_expiry_days_remaining",
+    "ssh_mesh_asymmetric",
 ];
 
 /// How (or whether) a policy can ever fire — the result of [`classify_policy_fireability`].
@@ -987,6 +988,7 @@ mod tests {
             "secret_expiry_days_remaining",
             "backup_restore_drill_failed",
             "upgrade_rollout_halted",
+            "ssh_mesh_asymmetric",
         ] {
             assert!(
                 classify_policy_fireability(metric, "> 0").can_fire(),

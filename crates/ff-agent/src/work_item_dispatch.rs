@@ -3528,6 +3528,8 @@ pub fn spawn_worktree_reaper(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         DISPATCH_HOUSE_RULES, DispatchOutcome, agent_output_tail, backend_failed_without_output,
         classify_dispatch_outcome, command_display, default_clone_path, dispatch_budget_for_host,

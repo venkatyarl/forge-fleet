@@ -704,6 +704,21 @@ pub fn spawn_mesh_refresh_tick(
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "mesh-refresh tick failed"),
                     }
+                    // After refreshing, classify the matrix and fire the
+                    // ssh_mesh_asymmetric alert on asymmetric / symmetric-failed
+                    // pairs so drift surfaces instead of sitting silently in
+                    // fleet_mesh_status.
+                    match evaluate_and_alert(&pg).await {
+                        Ok(r) if !r.is_empty() => tracing::info!(
+                            asymmetric = r.asymmetric.len(),
+                            symmetric_failed = r.symmetric_failed.len(),
+                            "mesh-refresh: fired ssh_mesh_asymmetric alert"
+                        ),
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "mesh-refresh: alert evaluation failed")
+                        }
+                    }
                 }
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow() {
@@ -716,9 +731,284 @@ pub fn spawn_mesh_refresh_tick(
     })
 }
 
+/// The alert policy fired on asymmetric / symmetric-failed mesh pairs.
+const MESH_ALERT_POLICY: &str = "ssh_mesh_asymmetric";
+
+/// One problem pair, canonicalized so `a <= b`. `ab` is the recorded status of
+/// the a→b probe, `ba` of b→a; `detail` folds both directions' last_error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshPair {
+    pub a: String,
+    pub b: String,
+    pub ab: String,
+    pub ba: String,
+    pub detail: Option<String>,
+}
+
+/// The two failure classes the alert distinguishes. Asymmetric (one direction
+/// ok, the other failed) is the stale-IP / stale-key signature — NOT a downed
+/// host — and is exactly what made the "marcus unreachable" alarm a false
+/// positive. Symmetric-failed (both directions dead) is a genuinely
+/// unreachable host.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MeshAlertReport {
+    pub asymmetric: Vec<MeshPair>,
+    pub symmetric_failed: Vec<MeshPair>,
+}
+
+impl MeshAlertReport {
+    pub fn is_empty(&self) -> bool {
+        self.asymmetric.is_empty() && self.symmetric_failed.is_empty()
+    }
+    pub fn total(&self) -> usize {
+        self.asymmetric.len() + self.symmetric_failed.len()
+    }
+}
+
+fn combine_detail(ab_err: Option<&str>, ba_err: Option<&str>) -> Option<String> {
+    match (ab_err, ba_err) {
+        (Some(x), Some(y)) => Some(format!("→ {x} | ← {y}")),
+        (Some(x), None) => Some(format!("→ {x}")),
+        (None, Some(y)) => Some(format!("← {y}")),
+        (None, None) => None,
+    }
+}
+
+/// Pure classifier over the current `fleet_mesh_status` rows: for every node
+/// pair whose BOTH directions were probed to a terminal status (`ok`/`failed`),
+/// bucket it as asymmetric (exactly one direction failed) or symmetric-failed
+/// (both failed). Pairs with a missing/`pending`/`skipped` direction are left
+/// out — asymmetry is only meaningful when both directions are known.
+pub fn classify_mesh_pairs(rows: &[ff_db::MeshStatusRow]) -> MeshAlertReport {
+    use std::collections::HashMap;
+    let by_pair: HashMap<(&str, &str), (&str, Option<&str>)> = rows
+        .iter()
+        .map(|r| {
+            (
+                (r.src_node.as_str(), r.dst_node.as_str()),
+                (r.status.as_str(), r.last_error.as_deref()),
+            )
+        })
+        .collect();
+
+    let terminal = |s: &str| s == "ok" || s == "failed";
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    let mut report = MeshAlertReport::default();
+    for r in rows {
+        let (a, b) = (r.src_node.as_str(), r.dst_node.as_str());
+        let (x, y) = if a <= b { (a, b) } else { (b, a) };
+        if !seen.insert((x, y)) {
+            continue;
+        }
+        let (Some(&(xy_status, xy_err)), Some(&(yx_status, yx_err))) =
+            (by_pair.get(&(x, y)), by_pair.get(&(y, x)))
+        else {
+            continue;
+        };
+        if !terminal(xy_status) || !terminal(yx_status) {
+            continue;
+        }
+        let pair = MeshPair {
+            a: x.to_string(),
+            b: y.to_string(),
+            ab: xy_status.to_string(),
+            ba: yx_status.to_string(),
+            detail: combine_detail(xy_err, yx_err),
+        };
+        match (xy_status == "failed", yx_status == "failed") {
+            (true, true) => report.symmetric_failed.push(pair),
+            (true, false) | (false, true) => report.asymmetric.push(pair),
+            (false, false) => {}
+        }
+    }
+    report
+        .asymmetric
+        .sort_by(|p, q| (&p.a, &p.b).cmp(&(&q.a, &q.b)));
+    report
+        .symmetric_failed
+        .sort_by(|p, q| (&p.a, &p.b).cmp(&(&q.a, &q.b)));
+    report
+}
+
+/// Human-readable alert body (pure, so it's unit-testable). Leads with the
+/// asymmetric interpretation because that's the diagnostic that would have
+/// short-circuited the stale-IP false alarm.
+pub fn mesh_alert_message(report: &MeshAlertReport) -> String {
+    let mut parts = Vec::new();
+    if !report.asymmetric.is_empty() {
+        let list: Vec<String> = report
+            .asymmetric
+            .iter()
+            .map(|p| format!("{}↔{}", p.a, p.b))
+            .collect();
+        parts.push(format!(
+            "{} asymmetric pair(s) [one direction failed → stale IP/key, NOT a down host]: {}",
+            report.asymmetric.len(),
+            list.join(", ")
+        ));
+    }
+    if !report.symmetric_failed.is_empty() {
+        let list: Vec<String> = report
+            .symmetric_failed
+            .iter()
+            .map(|p| format!("{}↔{}", p.a, p.b))
+            .collect();
+        parts.push(format!(
+            "{} unreachable pair(s) [both directions failed]: {}",
+            report.symmetric_failed.len(),
+            list.join(", ")
+        ));
+    }
+    format!(
+        "SSH mesh check: {}. Inspect a pair with `ff fleet ssh-mesh-check --node <name>`; \
+         asymmetric pairs usually mean a stale IP in fleet_workers or a missing key, not a downed host.",
+        parts.join("; ")
+    )
+}
+
+/// Read the current mesh matrix, classify it, and — if any asymmetric or
+/// symmetric-failed pairs exist — fire the `ssh_mesh_asymmetric` alert. Both
+/// the leader-gated refresh tick and the on-demand `ff fleet ssh-mesh-check`
+/// verb call this; it returns the report regardless so callers can render it.
+/// Alerting is best-effort and never fails the probe.
+pub async fn evaluate_and_alert(pool: &PgPool) -> Result<MeshAlertReport, String> {
+    let rows = ff_db::pg_list_mesh_status(pool, None)
+        .await
+        .map_err(|e| format!("pg_list_mesh_status: {e}"))?;
+    let report = classify_mesh_pairs(&rows);
+    if !report.is_empty() {
+        fire_mesh_alert(pool, &report).await;
+    }
+    Ok(report)
+}
+
+/// Load the seeded `ssh_mesh_asymmetric` policy, dispatch through its channel,
+/// then record the `alert_events` row — same shape as
+/// [`crate::fleet_integrity`]'s degraded-member alert. No-op if the policy is
+/// missing/disabled.
+async fn fire_mesh_alert(pool: &PgPool, report: &MeshAlertReport) {
+    let policy: Option<(uuid::Uuid, String, String)> = match sqlx::query_as(
+        "SELECT id, severity, channel FROM alert_policies WHERE name = $1 AND enabled = true",
+    )
+    .bind(MESH_ALERT_POLICY)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "ssh-mesh: failed to load {MESH_ALERT_POLICY} policy");
+            None
+        }
+    };
+    let Some((policy_id, severity, channel)) = policy else {
+        tracing::error!(
+            "ssh-mesh: {} problem pair(s) but alert policy '{}' missing/disabled — NOT alerting",
+            report.total(),
+            MESH_ALERT_POLICY
+        );
+        return;
+    };
+
+    let message = mesh_alert_message(report);
+    // Dispatch FIRST so the recorded channel_result reflects reality.
+    let channel_result =
+        crate::alert_evaluator::dispatch_alert(pool, &channel, &severity, &message).await;
+
+    if let Err(e) = sqlx::query(
+        r#"
+        INSERT INTO alert_events
+            (policy_id, computer_id, value, value_text, message, channel_result)
+        VALUES ($1, NULL, $2, NULL, $3, $4)
+        "#,
+    )
+    .bind(policy_id)
+    .bind(report.total() as f64)
+    .bind(&message)
+    .bind(&channel_result)
+    .execute(pool)
+    .await
+    {
+        tracing::error!(error = %e, "ssh-mesh: failed to record alert_event");
+    }
+
+    tracing::warn!(
+        asymmetric = report.asymmetric.len(),
+        symmetric_failed = report.symmetric_failed.len(),
+        channel = %channel,
+        channel_result = %channel_result,
+        "ssh-mesh: asymmetric/failed-pair alert fired"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(src: &str, dst: &str, status: &str, err: Option<&str>) -> ff_db::MeshStatusRow {
+        ff_db::MeshStatusRow {
+            src_node: src.to_string(),
+            dst_node: dst.to_string(),
+            status: status.to_string(),
+            last_checked: None,
+            last_error: err.map(str::to_string),
+            attempts: 1,
+        }
+    }
+
+    #[test]
+    fn asymmetric_pair_is_flagged_not_symmetric() {
+        let rows = vec![
+            row("marcus", "sia", "failed", Some("timeout")),
+            row("sia", "marcus", "ok", None),
+        ];
+        let r = classify_mesh_pairs(&rows);
+        assert_eq!(r.asymmetric.len(), 1);
+        assert!(r.symmetric_failed.is_empty());
+        let p = &r.asymmetric[0];
+        assert_eq!((p.a.as_str(), p.b.as_str()), ("marcus", "sia"));
+    }
+
+    #[test]
+    fn both_directions_failed_is_symmetric_unreachable() {
+        let rows = vec![
+            row("a", "b", "failed", Some("timeout")),
+            row("b", "a", "failed", Some("refused")),
+        ];
+        let r = classify_mesh_pairs(&rows);
+        assert!(r.asymmetric.is_empty());
+        assert_eq!(r.symmetric_failed.len(), 1);
+        assert_eq!(
+            r.symmetric_failed[0].detail.as_deref(),
+            Some("→ timeout | ← refused")
+        );
+    }
+
+    #[test]
+    fn both_ok_and_partial_pairs_are_ignored() {
+        let rows = vec![
+            row("a", "b", "ok", None),
+            row("b", "a", "ok", None),
+            // only one direction known → cannot judge asymmetry
+            row("c", "d", "failed", Some("x")),
+            // reverse direction still pending → not terminal
+            row("e", "f", "failed", Some("x")),
+            row("f", "e", "pending", None),
+        ];
+        let r = classify_mesh_pairs(&rows);
+        assert!(r.is_empty(), "clean/partial/pending pairs must not alert");
+    }
+
+    #[test]
+    fn message_leads_with_asymmetric_interpretation() {
+        let rows = vec![
+            row("marcus", "sia", "failed", Some("timeout")),
+            row("sia", "marcus", "ok", None),
+        ];
+        let msg = mesh_alert_message(&classify_mesh_pairs(&rows));
+        assert!(msg.contains("asymmetric"));
+        assert!(msg.contains("stale IP"));
+        assert!(msg.contains("marcus↔sia"));
+    }
 
     #[test]
     fn classify_both_ok_is_clean_ok() {

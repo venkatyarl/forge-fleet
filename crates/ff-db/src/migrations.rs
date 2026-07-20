@@ -901,6 +901,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "artifact_cache_index",
         sql: schema::SCHEMA_V183_ARTIFACT_CACHE_INDEX,
     },
+    PgMigration {
+        version: 184,
+        name: "ssh_mesh_alert_policy",
+        sql: schema::SCHEMA_V184_SSH_MESH_ALERT_POLICY,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
