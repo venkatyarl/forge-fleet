@@ -87,8 +87,10 @@ struct AssignedWorkItem {
     /// so the model doesn't repeat the same mistake (retry-with-context).
     last_error: Option<String>,
     /// Task complexity from the decomposer (`mechanical` | `moderate` | `complex`).
-    /// A non-mechanical task skips the weak local codegen lane and dispatches
-    /// straight to the cloud CLI backstop (see [`AssignedWorkItem::prefers_cloud_lane`]).
+    /// Mechanical and moderate tasks try the cheap local Lane-1 codegen harness
+    /// first; complex tasks and any task predicted to touch more than
+    /// [`PREDICTED_PATHS_CLOUD_THRESHOLD`] files skip straight to the cloud CLI
+    /// backstop (see [`AssignedWorkItem::prefers_cloud_lane`]).
     complexity: String,
     /// How many files the decomposer predicted this task touches. A multi-file
     /// change is beyond the local codegen harness's reliable range, so it too
@@ -106,20 +108,30 @@ struct AssignedWorkItem {
 impl AssignedWorkItem {
     /// Whether this task should SKIP the local Lane-1 codegen harness and go
     /// straight to the cloud CLI (codex/claude/kimi). The local lane is great for
-    /// small mechanical single-file edits but HANGS or half-finishes on complex
-    /// multi-file work (observed 2026-07-06: a 3-file React feature wedged a slot
-    /// for 24min producing nothing). Route those to the more capable cloud lane
-    /// from attempt 0 instead of burning a wedge-prone local attempt first.
+    /// small mechanical and moderate edits, but complex or multi-file-heavy work
+    /// (predicted to touch more than [`PREDICTED_PATHS_CLOUD_THRESHOLD`] files)
+    /// can hang or half-finish there (observed 2026-07-06: a 3-file React feature
+    /// wedged a slot for 24min producing nothing). Route those to the more capable
+    /// cloud lane from attempt 0 instead of burning a wedge-prone local attempt
+    /// first.
     fn prefers_cloud_lane(&self) -> bool {
         task_prefers_cloud_lane(&self.complexity, self.predicted_paths_count)
     }
 }
 
+/// Number of predicted touched paths above which a task is treated as
+/// "multi-file-heavy" and routed straight to the cloud CLI, even when its
+/// complexity is `mechanical` or `moderate`. Chosen so the local Lane-1 harness
+/// gets the majority of moderate single/double-file edits while avoiding the
+/// multi-file wedge class that local codegen fumbles.
+const PREDICTED_PATHS_CLOUD_THRESHOLD: i32 = 3;
+
 /// Pure routing predicate (unit-testable): a task skips the local Lane-1 codegen
-/// harness for the cloud CLI when it's `moderate`/`complex` OR touches more than
-/// one file. Mechanical single-file edits stay on the cheap local lane.
+/// harness for the cloud CLI when it's `complex` OR predicted to touch more than
+/// [`PREDICTED_PATHS_CLOUD_THRESHOLD`] files. Mechanical and moderate tasks that
+/// are not multi-file-heavy stay on the cheap local lane.
 fn task_prefers_cloud_lane(complexity: &str, predicted_paths_count: i32) -> bool {
-    matches!(complexity, "moderate" | "complex") || predicted_paths_count > 1
+    matches!(complexity, "complex") || predicted_paths_count > PREDICTED_PATHS_CLOUD_THRESHOLD
 }
 
 #[derive(Debug, Clone)]
@@ -1199,10 +1211,10 @@ const MAX_DISPATCH_ATTEMPTS: i32 = 3;
 /// local attempt just burns another ~190s + slot cycle for a task that keeps
 /// hanging the same way, before finally reaching cloud. The CLOUD lane does NOT
 /// starve the heartbeat (verified: cloud attempts run 900s+ with no stale-reap).
-/// Only MECHANICAL tasks use the local lane (moderate/complex already
-/// `prefers_cloud_lane`), so this narrows the local exposure to ONE cheap try then
-/// the reliable cloud lane — unblocking the mechanical backlog with no heartbeat
-/// rearchitecture.
+/// Mechanical and moderate tasks use the local lane; complex or multi-file-heavy
+/// tasks already `prefers_cloud_lane`, so this narrows the local exposure to ONE
+/// cheap try then the reliable cloud lane — unblocking the backlog with no
+/// heartbeat rearchitecture.
 const ESCALATE_TO_CLOUD_AT: i32 = 1;
 
 /// Whether to try the cheap LOCAL codegen lane for this dispatch: only while UNDER
@@ -1762,9 +1774,9 @@ async fn run_ff_dispatch(
     // Lane 1: local codegen harness — but skip it once we've escalated to cloud
     // (stage 2, after ESCALATE_TO_CLOUD_AT local failures it has failed the same
     // way), when this node's local-codegen breaker is open (it's been failing),
-    // OR when the task is complexity-routed to cloud (moderate/complex or
-    // multi-file) — the local lane wedges/half-finishes on those, so we send
-    // them straight to the capable cloud CLI from attempt 0 instead of burning a
+    // OR when the task is complexity-routed to cloud (complex or multi-file-
+    // heavy) — the local lane wedges/half-finishes on those, so we send them
+    // straight to the capable cloud CLI from attempt 0 instead of burning a
     // wedge-prone local attempt first.
     if use_local_lane(item.attempts, lane1_breaker_open, item.prefers_cloud_lane()) {
         // Bound Lane 1 with a hard timeout so a hung local codegen harness fails
@@ -3110,7 +3122,7 @@ mod tests {
             "#62: 2nd attempt goes cloud"
         );
         assert!(!use_local_lane(2, false, false));
-        // A complexity-routed (moderate/complex) task never touches the local lane.
+        // A complexity-routed (complex or multi-file-heavy) task never touches the local lane.
         assert!(!use_local_lane(0, false, true));
         // Open local-codegen breaker → skip local even on attempt 0.
         assert!(!use_local_lane(0, true, false));
@@ -3227,11 +3239,13 @@ mod tests {
         // Mechanical single-file → cheap local lane.
         assert!(!task_prefers_cloud_lane("mechanical", 1));
         assert!(!task_prefers_cloud_lane("mechanical", 0));
-        // Non-mechanical complexity → cloud from attempt 0 (the wedge-avoidance).
-        assert!(task_prefers_cloud_lane("moderate", 1));
+        // Moderate tasks that are not multi-file-heavy try local first.
+        assert!(!task_prefers_cloud_lane("moderate", 1));
+        assert!(!task_prefers_cloud_lane("moderate", 3));
+        // Complex tasks bypass the local lane regardless of file count.
         assert!(task_prefers_cloud_lane("complex", 0));
-        // Multi-file even if labelled mechanical → cloud (local lane fumbles them).
-        assert!(task_prefers_cloud_lane("mechanical", 3));
+        // Multi-file-heavy tasks (above the threshold) go cloud even if mechanical.
+        assert!(task_prefers_cloud_lane("mechanical", 4));
         // Unknown/empty complexity is treated as mechanical (safe default).
         assert!(!task_prefers_cloud_lane("", 1));
     }
