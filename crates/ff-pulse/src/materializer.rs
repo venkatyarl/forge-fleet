@@ -40,18 +40,21 @@ const PERSISTED_SNAPSHOT_TTL_SECS: u64 = 3600;
 /// beat, so a stale Q1 read can never decide to skip fields another writer
 /// changed underneath us. Idempotent: every assignment is a pure function
 /// of the bind values, so replaying the same beat converges to the same row.
-const UPSERT_COMPUTER_ROW_SQL: &str = "UPDATE computers SET \
-    last_seen_at = NOW(), \
-    primary_ip = $9, \
-    all_ips = $2::jsonb, \
-    cpu_cores = $3, \
-    total_ram_gb = $4, \
-    total_disk_gb = $5, \
-    gpu_kind = $6, \
-    gpu_count = $7, \
-    gpu_total_vram_gb = $8, \
-    has_gpu = ($7 > 0) \
- WHERE id = $1";
+const UPSERT_COMPUTER_ROW_SQL: &str = "INSERT INTO computers (\
+    id, name, primary_ip, all_ips, cpu_cores, total_ram_gb, total_disk_gb, \
+    gpu_kind, gpu_count, gpu_total_vram_gb, has_gpu, os_family, ssh_user, last_seen_at\
+) VALUES ($1, $2, $10, $3::jsonb, $4, $5, $6, $7, $8, $9, ($8 > 0), $11, $12, NOW()) \
+ON CONFLICT (id) DO UPDATE SET \
+    last_seen_at = EXCLUDED.last_seen_at, \
+    primary_ip = EXCLUDED.primary_ip, \
+    all_ips = EXCLUDED.all_ips, \
+    cpu_cores = EXCLUDED.cpu_cores, \
+    total_ram_gb = EXCLUDED.total_ram_gb, \
+    total_disk_gb = EXCLUDED.total_disk_gb, \
+    gpu_kind = EXCLUDED.gpu_kind, \
+    gpu_count = EXCLUDED.gpu_count, \
+    gpu_total_vram_gb = EXCLUDED.gpu_total_vram_gb, \
+    has_gpu = EXCLUDED.has_gpu";
 
 // -----------------------------------------------------------------------------
 // Errors
@@ -430,6 +433,7 @@ impl Materializer {
         let row = sqlx::query(
             "SELECT id, status, primary_ip, all_ips::text AS all_ips_text, cpu_cores, \
              total_ram_gb, total_disk_gb, gpu_kind, gpu_count, gpu_total_vram_gb \
+             , os_family, ssh_user \
              FROM computers WHERE name = $1",
         )
         .bind(&beat.computer_name)
@@ -449,6 +453,8 @@ impl Materializer {
         let prev_gpu_kind: Option<String> = row.try_get("gpu_kind").ok();
         let prev_gpu_count: Option<i32> = row.try_get("gpu_count").ok();
         let prev_gpu_total_vram_gb: Option<f64> = row.try_get("gpu_total_vram_gb").ok();
+        let os_family: String = row.try_get("os_family")?;
+        let ssh_user: String = row.try_get("ssh_user")?;
 
         if computer_row_has_empty_node_attributes(prev_primary_ip.as_deref(), prev_ram_gb) {
             error!(
@@ -617,13 +623,11 @@ impl Materializer {
         // computed from the stale Q1 read skipped the write and left the
         // beat's values unapplied until the next differing beat. The row is
         // rewritten on every delta-path beat anyway (last_seen_at), so one
-        // unconditional statement carrying every persistent field costs no
-        // extra tuple write, cannot interleave with other writers, and is
-        // idempotent — reapplying the same beat yields the same row. The
-        // row itself is created at enrollment (`ssh_user`/`os_family` are
-        // NOT NULL and absent from beats), which is why this is an UPDATE
-        // keyed on id rather than an INSERT .. ON CONFLICT: an unknown
-        // computer must stay an UnknownComputer error, not auto-enroll.
+        // unconditional UPSERT carrying every persistent field costs no extra
+        // tuple write, cannot interleave with other writers, and is idempotent
+        // — reapplying the same beat yields the same row. The preceding lookup
+        // preserves the UnknownComputer error and supplies the enrollment-only
+        // NOT NULL fields needed by the INSERT side of the statement.
         //
         // Guard: a skeleton/degenerate beat (empty primary_ip, or
         // ram_gb <= 0 — e.g. a daemon publishing before hardware probing
@@ -669,6 +673,7 @@ impl Materializer {
             }
             sqlx::query(UPSERT_COMPUTER_ROW_SQL)
                 .bind(computer_id)
+                .bind(&beat.computer_name)
                 .bind(new_ips_json)
                 .bind(beat.hardware.cpu_cores)
                 .bind(beat.hardware.ram_gb)
@@ -677,6 +682,8 @@ impl Materializer {
                 .bind(beat.capabilities.gpu_count)
                 .bind(beat.capabilities.gpu_total_vram_gb)
                 .bind(&beat.network.primary_ip)
+                .bind(&os_family)
+                .bind(&ssh_user)
                 .execute(&self.pg)
                 .await?;
             report.wrote_computer_row = persistent_row_differ;
@@ -2024,9 +2031,9 @@ mod tests {
         // writing it.
         let sql = UPSERT_COMPUTER_ROW_SQL;
         assert!(!sql.contains(';'), "must be a single statement");
-        assert!(sql.trim_start().starts_with("UPDATE computers SET"));
+        assert!(sql.trim_start().starts_with("INSERT INTO computers"));
+        assert!(sql.contains("ON CONFLICT (id) DO UPDATE SET"));
         assert!(!sql.contains("DELETE"), "must not delete-then-insert");
-        assert!(!sql.contains("INSERT"), "row creation is enrollment's job");
     }
 
     #[test]
