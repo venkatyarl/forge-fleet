@@ -316,18 +316,28 @@ impl LeaderCoordinator {
 
     /// Process a heartbeat from an agent.
     ///
-    /// Updates the node's online status and last heartbeat time. If the leader
-    /// has a pending assignment for this worker, the reservation is confirmed
-    /// and the task is returned so the agent can start execution.
+    /// Updates the node's online status, last heartbeat time, and dispatch-tick
+    /// timestamp. Logs the dispatch-tick activity so operators can verify the
+    /// agent's dispatch loop is being monitored. If the leader has a pending
+    /// assignment for this worker, the reservation is confirmed and the task is
+    /// returned so the agent can start execution.
     pub fn heartbeat_from_agent(&mut self, worker_name: impl Into<String>) -> AgentHeartbeatResult {
         let worker_name = worker_name.into();
         let is_leader = self.is_leader(&worker_name);
+        let now = Utc::now();
 
         if let Some(health) = self.node_health.get_mut(&worker_name) {
             health.online = true;
-            health.last_heartbeat = Utc::now();
+            health.last_heartbeat = now;
         }
         self.scheduler.set_node_online(&worker_name, true);
+        self.scheduler.update_dispatch_tick(&worker_name, Some(now));
+
+        info!(
+            node = %worker_name,
+            dispatch_tick_at = %now.to_rfc3339(),
+            "agent heartbeat refreshed dispatch tick"
+        );
 
         // Only the leader hands out assignments. If a non-leader heartbeat
         // arrives, still update health but don't return work.
@@ -807,5 +817,36 @@ mod tests {
 
         assert!(coordinator.fail_task("james", task_id, "disk full", true));
         assert_eq!(coordinator.queued_task_count(), 1);
+    }
+
+    #[test]
+    fn test_heartbeat_refreshes_dispatch_tick() {
+        let mut coordinator = make_leader("taylor");
+        coordinator.register_node(make_node("james", 16, 64, false));
+
+        // Age the dispatch tick so we can observe the refresh.
+        let stale = Utc::now() - chrono::Duration::minutes(5);
+        coordinator
+            .scheduler
+            .update_dispatch_tick("james", Some(stale));
+        assert_eq!(
+            coordinator
+                .scheduler
+                .get_node("james")
+                .unwrap()
+                .dispatch_tick_at,
+            Some(stale)
+        );
+
+        coordinator.heartbeat_from_agent("james");
+
+        let after = coordinator
+            .scheduler
+            .get_node("james")
+            .unwrap()
+            .dispatch_tick_at
+            .unwrap();
+        assert!(after > stale);
+        assert!(after <= Utc::now());
     }
 }

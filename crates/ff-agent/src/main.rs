@@ -1,5 +1,4 @@
 mod activity;
-mod config;
 mod executor;
 mod http;
 mod leader;
@@ -7,12 +6,12 @@ mod state;
 
 use crate::{
     activity::{decide_activity_level, should_yield_resources},
-    config::AgentConfig,
     executor::{run_task_executor, run_task_poller},
     http::{AppContext, build_router},
     leader::LeaderClient,
     state::{AgentState, SharedState},
 };
+use ff_agent::config::AgentConfig;
 use ff_discovery::{collect_health_snapshot, detect_hardware_profile, read_activity_signals};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::{RwLock, mpsc};

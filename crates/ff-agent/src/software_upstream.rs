@@ -467,7 +467,7 @@ fn github_status_is_transient(code: u16) -> bool {
 /// far faster than that, the converged fleet then read as `drift` against an
 /// older recorded LATEST in `ff fleet versions` — observed live when `ff_git`
 /// errored one pass and stuck a release behind while `forgefleetd_git` advanced.
-async fn github_get_json(
+pub async fn github_get_json(
     http: &reqwest::Client,
     url: &str,
     token: Option<&str>,

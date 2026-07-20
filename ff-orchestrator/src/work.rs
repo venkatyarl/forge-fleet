@@ -3,11 +3,13 @@ use std::collections::HashMap;
 
 /// Represents the current state of a work item.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum WorkItemStatus {
+pub enum WorkItemState {
     Pending,
     InProgress,
     Completed,
     Failed,
+    /// The item exceeded its build-time budget and should be requeued.
+    BuildTimeout,
 }
 
 /// Priority level for work items.
@@ -25,7 +27,7 @@ pub struct WorkItem {
     /// Unique identifier for this work item.
     pub id: String,
     /// Current status of the work item.
-    pub status: WorkItemStatus,
+    pub status: WorkItemState,
     /// Priority level.
     pub priority: Priority,
     /// Arbitrary metadata associated with the work item.
@@ -43,7 +45,7 @@ impl WorkItem {
     ) -> Self {
         Self {
             id: id.into(),
-            status: WorkItemStatus::Pending,
+            status: WorkItemState::Pending,
             priority,
             metadata,
             description: None,
@@ -53,8 +55,8 @@ impl WorkItem {
     /// Transitions the work item from Pending to InProgress.
     /// Returns true if the transition succeeded, false otherwise.
     pub fn start(&mut self) -> bool {
-        if matches!(self.status, WorkItemStatus::Pending) {
-            self.status = WorkItemStatus::InProgress;
+        if matches!(self.status, WorkItemState::Pending) {
+            self.status = WorkItemState::InProgress;
             true
         } else {
             false
@@ -64,8 +66,8 @@ impl WorkItem {
     /// Transitions the work item from InProgress to Completed.
     /// Returns true if the transition succeeded, false otherwise.
     pub fn complete(&mut self) -> bool {
-        if matches!(self.status, WorkItemStatus::InProgress) {
-            self.status = WorkItemStatus::Completed;
+        if matches!(self.status, WorkItemState::InProgress) {
+            self.status = WorkItemState::Completed;
             true
         } else {
             false
@@ -75,15 +77,41 @@ impl WorkItem {
     /// Transitions the work item to Failed state.
     /// Returns true if the transition succeeded, false otherwise.
     pub fn fail(&mut self) -> bool {
-        self.status = WorkItemStatus::Failed;
+        self.status = WorkItemState::Failed;
         true
     }
 
     /// Transitions the work item back to Pending from Failed state.
     /// Returns true if the transition succeeded, false otherwise.
     pub fn retry(&mut self) -> bool {
-        if matches!(self.status, WorkItemStatus::Failed) {
-            self.status = WorkItemStatus::Pending;
+        if matches!(self.status, WorkItemState::Failed) {
+            self.status = WorkItemState::Pending;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Records that the in-progress build timed out.
+    ///
+    /// Only allowed from [`WorkItemState::InProgress`]. Returns true if the
+    /// transition succeeded, false otherwise.
+    pub fn timeout(&mut self) -> bool {
+        if matches!(self.status, WorkItemState::InProgress) {
+            self.status = WorkItemState::BuildTimeout;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Requeues a timed-out work item so a worker can pick it up again.
+    ///
+    /// Only allowed from [`WorkItemState::BuildTimeout`]. Returns true if the
+    /// transition succeeded, false otherwise.
+    pub fn requeue(&mut self) -> bool {
+        if matches!(self.status, WorkItemState::BuildTimeout) {
+            self.status = WorkItemState::Pending;
             true
         } else {
             false
@@ -117,7 +145,7 @@ mod tests {
         let item = WorkItem::new("test-1", Priority::High, metadata.clone());
 
         assert_eq!(item.id, "test-1");
-        assert!(matches!(item.status, WorkItemStatus::Pending));
+        assert!(matches!(item.status, WorkItemState::Pending));
         assert_eq!(item.priority, Priority::High);
         assert_eq!(item.metadata, metadata);
         assert_eq!(item.description, None);
@@ -129,11 +157,11 @@ mod tests {
 
         // Pending -> InProgress
         assert!(item.start());
-        assert!(matches!(item.status, WorkItemStatus::InProgress));
+        assert!(matches!(item.status, WorkItemState::InProgress));
 
         // InProgress -> Completed
         assert!(item.complete());
-        assert!(matches!(item.status, WorkItemStatus::Completed));
+        assert!(matches!(item.status, WorkItemState::Completed));
 
         // Already completed, cannot start again
         assert!(!item.start());
@@ -141,9 +169,34 @@ mod tests {
         // Create new item, fail it, then retry
         let mut item2 = WorkItem::new("test-2", Priority::Low, HashMap::new());
         assert!(item2.fail());
-        assert!(matches!(item2.status, WorkItemStatus::Failed));
+        assert!(matches!(item2.status, WorkItemState::Failed));
         assert!(item2.retry());
-        assert!(matches!(item2.status, WorkItemStatus::Pending));
+        assert!(matches!(item2.status, WorkItemState::Pending));
+    }
+
+    #[test]
+    fn test_build_timeout_requeue() {
+        let mut item = WorkItem::new("test-3", Priority::High, HashMap::new());
+
+        // Timeouts can only happen while in progress.
+        assert!(!item.timeout());
+        assert!(item.start());
+        assert!(item.timeout());
+        assert!(matches!(item.status, WorkItemState::BuildTimeout));
+
+        // A timed-out item cannot complete directly.
+        assert!(!item.complete());
+
+        // Requeue returns it to Pending so another worker can pick it up.
+        assert!(item.requeue());
+        assert!(matches!(item.status, WorkItemState::Pending));
+        assert!(item.start());
+        assert!(item.complete());
+        assert!(matches!(item.status, WorkItemState::Completed));
+
+        // Requeue is a no-op for non-timeout states.
+        let mut item2 = WorkItem::new("test-4", Priority::Low, HashMap::new());
+        assert!(!item2.requeue());
     }
 
     #[test]
@@ -166,7 +219,10 @@ mod tests {
         let deserialized: WorkItem = serde_json::from_str(&json).unwrap();
 
         assert_eq!(deserialized.id, "test-1");
-        assert_eq!(deserialized.description, Some("A test work item".to_string()));
+        assert_eq!(
+            deserialized.description,
+            Some("A test work item".to_string())
+        );
         assert_eq!(deserialized.priority, Priority::High);
     }
 }
