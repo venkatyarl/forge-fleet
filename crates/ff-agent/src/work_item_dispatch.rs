@@ -39,6 +39,7 @@ const COMMAND_POLL_MS: u64 = 250;
 // non-terminating process. A genuinely longer task simply salvages whatever diff
 // exists at 18 min (CI verifies it). Followers are 20-core/121GB.
 const FF_TIMEOUT_SECS: u64 = 1080;
+const MAX_SELF_FIX_ATTEMPTS: usize = 1;
 /// Ceiling on how many work_items a single host starts in one dispatch tick.
 /// The effective budget per tick is [`dispatch_budget_for_host`], which scales
 /// with the host's free sub-agent slots up to this cap (and drops to 1 under
@@ -966,24 +967,65 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     // + review cycle. "Has a diff" != "is good": empty stub files or
     // non-compiling code must never reach the review drain (2026-07-20: an item
     // committed three 0-byte files and the review drain was the FIRST place it
-    // was caught). On failure, requeue with the specific reason as context —
-    // the next attempt (warm or fresh) gets an actionable problem to fix —
-    // instead of opening a broken PR.
-    if let Err(reason) = self_verify_worktree(&worktree.worktree_path, &worktree.base_branch).await
-    {
+    // was caught). On failure, give the same backend one repair turn in its warm
+    // worktree, then re-run the complete gate before considering a PR.
+    let mut self_fix_attempts = 0;
+    loop {
+        let Err(reason) =
+            self_verify_worktree(&worktree.worktree_path, &worktree.base_branch).await
+        else {
+            break;
+        };
         warn!(
             work_item_id = %item.work_item_id,
             %reason,
-            "work_item_dispatch: self-verify gate rejected the build before PR — requeue with context"
+            self_fix_attempts,
+            "work_item_dispatch: self-verify gate rejected the build before PR"
         );
-        requeue_or_fail(
-            &pg,
-            &item,
-            &format!("self-verify failed before opening PR: {reason}"),
+        if self_fix_attempts >= MAX_SELF_FIX_ATTEMPTS {
+            requeue_or_fail(
+                &pg,
+                &item,
+                &format!("self-verify failed before opening PR after {self_fix_attempts} self-fix attempt(s): {reason}"),
+            )
+            .await?;
+            remove_worktree(&item.repo_path, &worktree.worktree_path)?;
+            return Ok(());
+        }
+
+        self_fix_attempts += 1;
+        let prompt = format!(
+            "Your implementation failed the mandatory pre-PR verification gate:\n\n{reason}\n\nFix the failure in this same worktree now. Keep the change scoped to the original work item, run the relevant verification yourself, and leave all edits uncommitted. Do not open a PR."
+        );
+        let fix = crate::cli_executor::execute_cli_in_dir(
+            &backend_used,
+            &prompt,
+            &[],
+            Some(&worktree.worktree_path),
+            Some(Duration::from_secs(FF_TIMEOUT_SECS)),
         )
-        .await?;
-        remove_worktree(&item.repo_path, &worktree.worktree_path)?;
-        return Ok(());
+        .await;
+        match fix {
+            Ok(result) if result.exit_code == 0 => {}
+            Ok(result) => {
+                warn!(
+                    work_item_id = %item.work_item_id,
+                    backend = %backend_used,
+                    exit_code = result.exit_code,
+                    stderr = %err_tail(&result.stderr),
+                    "work_item_dispatch: same-agent self-fix turn failed"
+                );
+            }
+            Err(error) => warn!(
+                work_item_id = %item.work_item_id,
+                backend = %backend_used,
+                error = format!("{error:#}"),
+                "work_item_dispatch: same-agent self-fix turn could not run"
+            ),
+        }
+        // Preserve and verify any repair diff even if the backend exited
+        // non-zero after editing (commonly its own final test command failing).
+        commit_worktree_changes(&worktree.worktree_path, &item.title, &git_name, &git_email)?;
     }
 
     let head_sha = git_head_sha(&worktree.worktree_path)?;
@@ -3702,7 +3744,8 @@ fn git_head_sha(worktree_path: &Path) -> Result<String> {
 
 /// Self-verify a built worktree BEFORE it becomes a PR — the cheap local checks
 /// a competent engineer runs before calling a change "done": no empty /
-/// whitespace-only added files, and (best-effort) the tree still compiles.
+/// whitespace-only added files, the workspace still compiles, and cheap tests
+/// for directly affected crates pass.
 /// Returns `Err(reason)` on the first problem so the retry gets actionable
 /// context. Catching garbage here saves a PR + CI + review cycle (2026-07-20:
 /// an item committed three 0-byte files and reached the review drain).
@@ -3734,35 +3777,94 @@ async fn self_verify_worktree(
         }
     }
 
-    // 2) Compile check — best-effort and bounded. Only an ACTUAL compile error
-    //    blocks the PR; a tooling error or timeout must not (never freeze the
-    //    pipeline on check infra). Skipped for a non-Rust repo.
+    // 2) Compile check — mandatory and bounded. A tool error or timeout is a
+    //    failed verification too: inability to prove the diff builds must not
+    //    turn into a PR. Skipped only for a non-Rust repo.
     if !worktree_path.join("Cargo.toml").exists() {
         return Ok(());
     }
-    let check = tokio::time::timeout(
+    run_verification_command(
+        worktree_path,
+        &["check", "--workspace"],
+        "cargo check --workspace",
         Duration::from_secs(300),
+    )
+    .await?;
+
+    // 3) Test directly affected workspace crates when that is cheap. Limit the
+    //    fan-out so a broad mechanical change does not monopolize a worker; CI
+    //    remains responsible for the full workspace test matrix.
+    for manifest in affected_crate_manifests(worktree_path, base_branch)?
+        .into_iter()
+        .take(3)
+    {
+        let manifest_arg = manifest.to_string_lossy().into_owned();
+        run_verification_command(
+            worktree_path,
+            &["test", "--manifest-path", &manifest_arg, "--lib", "--quiet"],
+            &format!("cargo test --manifest-path {manifest_arg} --lib"),
+            Duration::from_secs(300),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn run_verification_command(
+    worktree_path: &Path,
+    args: &[&str],
+    label: &str,
+    timeout: Duration,
+) -> std::result::Result<(), String> {
+    let output = tokio::time::timeout(
+        timeout,
         tokio::process::Command::new("cargo")
-            .args(["check", "--quiet"])
+            .args(args)
             .current_dir(worktree_path)
             .output(),
     )
-    .await;
-    if let Ok(Ok(o)) = check {
-        if !o.status.success() {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            if let Some(err_line) = stderr
-                .lines()
-                .find(|l| l.contains("error[") || l.trim_start().starts_with("error:"))
-            {
-                return Err(format!(
-                    "cargo check failed: {}",
-                    err_line.trim().chars().take(200).collect::<String>()
-                ));
+    .await
+    .map_err(|_| format!("{label} timed out after {}s", timeout.as_secs()))?
+    .map_err(|e| format!("could not run {label}: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail: String = stderr
+            .chars()
+            .rev()
+            .take(1200)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        return Err(format!("{label} failed: {}", tail.trim()));
+    }
+    Ok(())
+}
+
+fn affected_crate_manifests(
+    worktree_path: &Path,
+    base_branch: &str,
+) -> std::result::Result<Vec<PathBuf>, String> {
+    let range = format!("{base_branch}...HEAD");
+    let out = run_git(
+        worktree_path,
+        ["diff", "--name-only", &range],
+        Duration::from_secs(30),
+    )
+    .map_err(|e| format!("git diff for affected tests failed: {e}"))?;
+    let mut manifests = Vec::new();
+    for path in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut parts = Path::new(path).components();
+        if parts.next().is_some_and(|p| p.as_os_str() == "crates") {
+            if let Some(crate_dir) = parts.next() {
+                let relative = PathBuf::from("crates").join(crate_dir).join("Cargo.toml");
+                if worktree_path.join(&relative).is_file() && !manifests.contains(&relative) {
+                    manifests.push(relative);
+                }
             }
         }
     }
-    Ok(())
+    Ok(manifests)
 }
 
 fn push_branch(repo_path: &Path, task_branch: &str) -> Result<()> {
@@ -4176,15 +4278,14 @@ pub fn spawn_worktree_reaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS,
-        ReviewerStat,
-        agent_output_tail, backend_failed_without_output, builder_excludes_480b,
-        classify_dispatch_outcome, command_display, default_clone_path, dispatch_budget_for_host,
-        expand_home, is_build_timeout, order_cloud_reviewers, parse_cli_tokens,
-        primary_or_default_backend, quick_empty_success_is_provider_failure, repo_cache_path,
-        repo_slug, retry_error_is_actionable, rewrite_github_host_alias, status_output_is_clean,
-        task_failed_alert_text, task_prefers_cloud_lane, try_acquire_lane15_480b_permit,
-        use_local_lane,
+        AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS, ReviewerStat,
+        affected_crate_manifests, agent_output_tail, backend_failed_without_output,
+        builder_excludes_480b, classify_dispatch_outcome, command_display, default_clone_path,
+        dispatch_budget_for_host, expand_home, is_build_timeout, order_cloud_reviewers,
+        parse_cli_tokens, primary_or_default_backend, quick_empty_success_is_provider_failure,
+        repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
+        status_output_is_clean, task_failed_alert_text, task_prefers_cloud_lane,
+        try_acquire_lane15_480b_permit, use_local_lane,
     };
     use std::path::PathBuf;
     use std::time::Duration;
@@ -4843,6 +4944,74 @@ mod tests {
     #[test]
     fn forced_fallback_defaults_to_claude_when_unrouted() {
         assert_eq!(primary_or_default_backend(&[]), "claude");
+    }
+
+    #[tokio::test]
+    async fn self_verify_rejects_whitespace_only_added_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        super::run_git(repo, ["init"], Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.name", "Test"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.email", "test@example.com"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        std::fs::write(repo.join("base.txt"), "base").unwrap();
+        super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["commit", "-m", "base"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["branch", "-M", "main"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["checkout", "-b", "task"], Duration::from_secs(10)).unwrap();
+        std::fs::write(repo.join("empty.txt"), " \n\t").unwrap();
+        super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["commit", "-m", "change"], Duration::from_secs(10)).unwrap();
+
+        let error = super::self_verify_worktree(repo, "main").await.unwrap_err();
+        assert!(error.contains("empty.txt"));
+    }
+
+    #[test]
+    fn affected_tests_select_unique_changed_crate_manifests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        super::run_git(repo, ["init"], Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.name", "Test"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.email", "test@example.com"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        std::fs::write(repo.join("README.md"), "base").unwrap();
+        super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["commit", "-m", "base"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["branch", "-M", "main"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["checkout", "-b", "task"], Duration::from_secs(10)).unwrap();
+        std::fs::create_dir_all(repo.join("crates/demo/src")).unwrap();
+        std::fs::write(
+            repo.join("crates/demo/Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("crates/demo/src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["commit", "-m", "change"], Duration::from_secs(10)).unwrap();
+
+        assert_eq!(
+            affected_crate_manifests(repo, "main").unwrap(),
+            vec![PathBuf::from("crates/demo/Cargo.toml")]
+        );
     }
 
     #[test]
