@@ -7,50 +7,117 @@ use std::time::Duration;
 use crate::graph::PipelineGraph;
 use crate::step::Step;
 
+/// Cargo environment variables that route dependency fetches through the
+/// ForgeFleet local mirror.
+///
+/// When a mirror URL is provided, crates.io is replaced with the
+/// `forgefleet-mirror` source so that every `cargo` fetch checks the mirror
+/// first.
+fn mirror_env(mirror_url: Option<&str>) -> Vec<(String, String)> {
+    mirror_url
+        .map(|url| {
+            vec![
+                (
+                    "CARGO_SOURCE_CRATES_IO_REPLACE_WITH".to_string(),
+                    "forgefleet-mirror".to_string(),
+                ),
+                (
+                    "CARGO_SOURCE_FORGEFLEET_MIRROR_REGISTRY".to_string(),
+                    url.to_string(),
+                ),
+            ]
+        })
+        .unwrap_or_default()
+}
+
 /// Create a Rust build pipeline: cargo check → cargo build → cargo test.
 ///
 /// Optionally scoped to a specific package with `package`.
 /// The `cwd` sets the working directory for all commands.
+///
+/// If `FORGEFLEET_MIRROR_URL` is set in the environment, a `mirror-fetch`
+/// step is inserted first and all cargo steps are configured to fetch
+/// dependencies through that mirror.
 pub fn build_pipeline(cwd: Option<&str>, package: Option<&str>) -> PipelineGraph {
+    let mirror_url = std::env::var("FORGEFLEET_MIRROR_URL").ok();
+    build_pipeline_with_mirror(cwd, package, mirror_url.as_deref())
+}
+
+/// Create a Rust build pipeline with an explicit mirror URL.
+///
+/// `mirror_url` takes precedence over `FORGEFLEET_MIRROR_URL`. Pass `None`
+/// to disable mirror fetching even when the environment variable is set.
+pub fn build_pipeline_with_mirror(
+    cwd: Option<&str>,
+    package: Option<&str>,
+    mirror_url: Option<&str>,
+) -> PipelineGraph {
     let pkg_flag = package.map(|p| format!(" -p {p}")).unwrap_or_default();
     let cwd_owned = cwd.map(|s| s.to_string());
 
-    let mut check = Step::shell(
-        "cargo-check",
-        "Cargo Check",
-        format!("cargo check{pkg_flag}"),
-    )
-    .with_timeout(Duration::from_secs(120));
-    if let Some(ref d) = cwd_owned
-        && let crate::step::StepKind::Shell { ref mut cwd, .. } = check.kind
-    {
-        *cwd = Some(d.clone());
-    }
+    let apply_cwd_and_mirror = |mut step: Step| -> Step {
+        if let crate::step::StepKind::Shell {
+            ref mut cwd,
+            ref mut env,
+            ..
+        } = step.kind
+        {
+            *cwd = cwd_owned.clone();
+            env.extend(mirror_env(mirror_url));
+        }
+        step
+    };
 
-    let mut build = Step::shell(
-        "cargo-build",
-        "Cargo Build",
-        format!("cargo build{pkg_flag}"),
-    )
-    .with_timeout(Duration::from_secs(300));
-    if let Some(ref d) = cwd_owned
-        && let crate::step::StepKind::Shell { ref mut cwd, .. } = build.kind
-    {
-        *cwd = Some(d.clone());
-    }
+    let check = apply_cwd_and_mirror(
+        Step::shell(
+            "cargo-check",
+            "Cargo Check",
+            format!("cargo check{pkg_flag}"),
+        )
+        .with_timeout(Duration::from_secs(120)),
+    );
 
-    let mut test = Step::shell("cargo-test", "Cargo Test", format!("cargo test{pkg_flag}"))
-        .with_timeout(Duration::from_secs(300));
-    if let Some(ref d) = cwd_owned
-        && let crate::step::StepKind::Shell { ref mut cwd, .. } = test.kind
-    {
-        *cwd = Some(d.clone());
-    }
+    let build = apply_cwd_and_mirror(
+        Step::shell(
+            "cargo-build",
+            "Cargo Build",
+            format!("cargo build{pkg_flag}"),
+        )
+        .with_timeout(Duration::from_secs(300)),
+    );
+
+    let test = apply_cwd_and_mirror(
+        Step::shell("cargo-test", "Cargo Test", format!("cargo test{pkg_flag}"))
+            .with_timeout(Duration::from_secs(300)),
+    );
 
     let mut g = PipelineGraph::new();
+
+    if mirror_url.is_some() {
+        let fetch = apply_cwd_and_mirror(
+            Step::shell(
+                "mirror-fetch",
+                "Mirror Fetch",
+                format!("cargo fetch{pkg_flag}"),
+            )
+            .with_timeout(Duration::from_secs(300)),
+        );
+        g.add_step(fetch).unwrap();
+    }
+
     g.add_step(check).unwrap();
     g.add_step(build).unwrap();
     g.add_step(test).unwrap();
+
+    if mirror_url.is_some() {
+        g.add_dependency(&"cargo-check".into(), &"mirror-fetch".into())
+            .unwrap();
+        g.add_dependency(&"cargo-build".into(), &"mirror-fetch".into())
+            .unwrap();
+        g.add_dependency(&"cargo-test".into(), &"mirror-fetch".into())
+            .unwrap();
+    }
+
     g.add_dependency(&"cargo-build".into(), &"cargo-check".into())
         .unwrap();
     g.add_dependency(&"cargo-test".into(), &"cargo-build".into())
@@ -197,6 +264,40 @@ mod tests {
         let step = g.get_step(&"cargo-check".into()).unwrap();
         if let crate::step::StepKind::Shell { command, .. } = &step.kind {
             assert!(command.contains("-p ff-core"));
+        } else {
+            panic!("expected shell step");
+        }
+    }
+
+    #[test]
+    fn build_pipeline_with_mirror_injects_fetch_step() {
+        let g = build_pipeline_with_mirror(Some("/tmp"), None, Some("http://localhost:8765"));
+        assert_eq!(g.len(), 4);
+        let sorted = g.topological_sort().unwrap();
+        let names: Vec<&str> = sorted.iter().map(|id| id.0.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["mirror-fetch", "cargo-check", "cargo-build", "cargo-test"]
+        );
+
+        let fetch = g.get_step(&"mirror-fetch".into()).unwrap();
+        if let crate::step::StepKind::Shell { env, .. } = &fetch.kind {
+            assert!(env.iter().any(|(k, v)| {
+                k == "CARGO_SOURCE_CRATES_IO_REPLACE_WITH" && v == "forgefleet-mirror"
+            }));
+            assert!(env.iter().any(|(k, v)| {
+                k == "CARGO_SOURCE_FORGEFLEET_MIRROR_REGISTRY" && v == "http://localhost:8765"
+            }));
+        } else {
+            panic!("expected shell step");
+        }
+
+        let check = g.get_step(&"cargo-check".into()).unwrap();
+        if let crate::step::StepKind::Shell { env, .. } = &check.kind {
+            assert!(
+                env.iter()
+                    .any(|(k, _)| k == "CARGO_SOURCE_CRATES_IO_REPLACE_WITH")
+            );
         } else {
             panic!("expected shell step");
         }
