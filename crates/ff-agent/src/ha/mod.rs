@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod backup;
+pub mod error_tracker;
 pub mod handoff;
 pub mod manager;
 pub mod node_info;
