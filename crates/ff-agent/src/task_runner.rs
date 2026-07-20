@@ -406,6 +406,30 @@ impl TaskRunner {
                                @> to_jsonb(ARRAY[b.claimed_by_computer_id])
                     )
                   )
+                  -- 2026-07-20 (drain-before-restart): a wave restart is not
+                  -- claimable while its TARGET holds an ACTIVE work_item
+                  -- build lease. The V114 no-active-lease gate only runs at
+                  -- COMPOSE time; builds take up to 45 min, and by restart
+                  -- time the target has claimed fresh leases — restarting
+                  -- then orphans the build → stale-heartbeat reap → wasted
+                  -- attempt (adele 01:14-01:35: 6 restarts in 21 min, item
+                  -- e10adbeb killed twice mid-build). The target is the
+                  -- single computer in excludes_computer_ids (V61). Bounded
+                  -- wait, no starvation: once this restart's build dep is
+                  -- completed, pg_free_slots stops granting the target NEW
+                  -- work_item leases (IMMINENT_DAEMON_RESTART_DRAIN_SQL),
+                  -- and existing leases are hard-ceilinged by the lease
+                  -- reaper (~25 min max) — so the gate always lifts and the
+                  -- restart then fires on an idle host.
+                  AND NOT (
+                    t.summary LIKE 'fleet-upgrade-wave/restart:%'
+                    AND EXISTS (
+                      SELECT 1 FROM work_item_leases wl
+                       WHERE wl.released_at IS NULL
+                         AND t.excludes_computer_ids
+                               @> to_jsonb(ARRAY[wl.computer_id])
+                    )
+                  )
                   -- GAP-C per-caller fair-share cap: one caller (a single
                   -- parent_task_id — a swarm/fanout/build invocation) may not
                   -- hold more than $3 'running' tasks fleet-wide WHILE a

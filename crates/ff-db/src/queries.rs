@@ -3838,6 +3838,7 @@ pub async fn pg_claim_deferred(
     worker_node: &str,
 ) -> Result<Option<DeferredTaskRow>> {
     let mut tx = pool.begin().await?;
+    let daemon_ids = DAEMON_RESTART_UPGRADE_IDS_SQL;
     let row = sqlx::query(&format!(
         "{DEFERRED_TASK_SELECT}
           AND t.status = 'dispatchable'
@@ -3847,6 +3848,32 @@ pub async fn pg_claim_deferred(
               OR t.not_before <= NOW() - INTERVAL '2 minutes'
             )
             AND (t.not_before IS NULL OR t.not_before <= NOW())
+            -- Drain-before-restart (2026-07-20 idle-gate race): a deferred
+            -- upgrade whose playbook restarts forgefleetd on its target must
+            -- NOT run while the target holds an ACTIVE work_item build lease —
+            -- the restart orphans the build (adele: 6 restarts in 21 min, item
+            -- e10adbeb killed twice mid-build; the V114 no-active-lease gate
+            -- only ran at ENQUEUE time). The task stays dispatchable and is
+            -- claimed once the target is idle. Bounded: pg_free_slots stops
+            -- granting the target NEW leases while this task is dispatchable
+            -- (IMMINENT_DAEMON_RESTART_DRAIN_SQL) and the lease reaper hard-
+            -- ceilings existing leases, so the wait converges within ~25 min.
+            -- Target = preferred_node, falling back to the claimer ($1).
+            AND NOT (
+                (
+                     (COALESCE(NULLIF(t.payload->>'kind',''), t.task_type) = 'upgrade'
+                      AND t.payload->'deferred_payload'->>'tool' IN {daemon_ids})
+                  OR t.payload->'deferred_payload'->'meta'->'auto_upgrade'->>'software_id'
+                         IN {daemon_ids}
+                )
+                AND EXISTS (
+                    SELECT 1 FROM work_item_leases wl
+                      JOIN computers wc ON wc.id = wl.computer_id
+                     WHERE wl.released_at IS NULL
+                       AND LOWER(wc.name)
+                           = LOWER(COALESCE(NULLIF(t.payload->>'preferred_node',''), $1))
+                )
+            )
           ORDER BY
             ((t.payload->>'preferred_node') = $1) DESC NULLS LAST,
             ((t.payload->>'preferred_node') IS NULL) DESC,
@@ -3883,6 +3910,39 @@ pub async fn pg_claim_deferred(
 
     tx.commit().await?;
     Ok(claimed)
+}
+
+/// Was an `upgrade`-kind deferred task for `(tool, node)` created within the
+/// last `window_secs` — in ANY status, including completed/failed? Drift
+/// coalescing (2026-07-20 idle-gate race): with main advancing ~15 merges/hr
+/// the version-check tick re-detected drift the moment an upgrade landed and
+/// re-enqueued another daemon restart within minutes (adele: 6 restarts in
+/// 21 min). Enqueue paths call this and skip the (node, tool) pair while a
+/// recent upgrade exists — the eventual next enqueue targets the newest SHA
+/// anyway, so intermediate drift is batched, not lost. A pending-only dedup
+/// cannot do this: it goes blind the instant the previous task completes.
+pub async fn pg_upgrade_recently_enqueued(
+    pool: &PgPool,
+    tool: &str,
+    node: &str,
+    window_secs: i64,
+) -> Result<bool> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM fleet_tasks t
+             WHERE t.task_class = 'deferred'
+               AND COALESCE(NULLIF(t.payload->>'kind',''), t.task_type) = 'upgrade'
+               AND t.payload->'deferred_payload'->>'tool' = $1
+               AND LOWER(COALESCE(t.payload->>'preferred_node','')) = LOWER($2)
+               AND t.created_at > NOW() - make_interval(secs => $3)
+        )",
+    )
+    .bind(tool)
+    .bind(node)
+    .bind(window_secs.max(0) as f64)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
 }
 
 /// Operator-initiated promotion: flip a pending task (any trigger_type) to
@@ -4282,6 +4342,44 @@ mod tests {
     use std::env;
 
     use sqlx::postgres::PgPoolOptions;
+
+    /// Drain-before-restart (2026-07-20 idle-gate race): the fragment that
+    /// makes a host unschedulable while a daemon restart is imminent must
+    /// cover BOTH restart paths (wave Phase-2 + deferred upgrade), stay
+    /// derived-state (keyed on live task status — nothing to clear after the
+    /// restart), and stay age-bounded so an abandoned task can't park a host.
+    #[test]
+    fn imminent_daemon_restart_drain_covers_both_restart_paths() {
+        let drain = IMMINENT_DAEMON_RESTART_DRAIN_SQL.replace(
+            "{DAEMON_RESTART_UPGRADE_IDS}",
+            DAEMON_RESTART_UPGRADE_IDS_SQL,
+        );
+        // Wave Phase-2 restart arm: only pending/running rows whose build dep
+        // already completed (a restart still waiting on its build is not
+        // imminent — draining then would idle hosts for the whole build).
+        assert!(drain.contains("fleet-upgrade-wave/restart:"));
+        assert!(drain.contains("t.status IN ('pending','running')"));
+        assert!(drain.contains("dep.status = 'completed'"));
+        // Deferred upgrade arm: dispatchable/running daemon-restarting tools,
+        // both the version-check `upgrade` kind and the shell+meta shape.
+        assert!(drain.contains("t.status IN ('dispatchable','running')"));
+        assert!(drain.contains("->>'tool'"));
+        assert!(drain.contains("'auto_upgrade'->>'software_id'"));
+        // The daemon-restart id list must name the forgefleetd family and must
+        // NOT include the ff CLI (its atomic binary swap kills no leases).
+        for id in ["'forgefleetd'", "'forgefleetd_git'", "'forgefleet'"] {
+            assert!(
+                DAEMON_RESTART_UPGRADE_IDS_SQL.contains(id),
+                "missing daemon id {id}"
+            );
+        }
+        assert!(!DAEMON_RESTART_UPGRADE_IDS_SQL.contains("'ff'"));
+        assert!(!DAEMON_RESTART_UPGRADE_IDS_SQL.contains("'ff_git'"));
+        // Age bound: an abandoned upgrade task must not drain a host forever.
+        assert!(drain.contains("INTERVAL '2 hours'"));
+        // The placeholder must be fully substituted before the SQL runs.
+        assert!(!drain.contains("{DAEMON_RESTART_UPGRADE_IDS}"));
+    }
 
     #[test]
     fn backend_rank_orders_cheapest_capable_first() {
@@ -7965,14 +8063,68 @@ pub async fn pg_ready_work_items(pool: &PgPool, limit: i64) -> Result<Vec<ReadyW
         .collect())
 }
 
+/// Registry / tool ids whose upgrade playbook RESTARTS forgefleetd on the
+/// target. Shared by the drain fragment below and the deferred-claim lease
+/// gate so the two can never disagree on what counts as "a daemon restart".
+/// Deliberately excludes `ff`/`ff_git`: replacing the CLI binary is an atomic
+/// rename that running processes survive — only a daemon bounce kills leases.
+pub const DAEMON_RESTART_UPGRADE_IDS_SQL: &str = "('forgefleetd','forgefleetd_git','forgefleet')";
+
+/// SQL fragment (correlated on the `sa`/`c` aliases of [`pg_free_slots`]) that
+/// is satisfied when the computer is the target of an IMMINENT daemon restart:
+///   - a fleet-upgrade-wave Phase-2 restart task that is pending-and-claimable
+///     (its build dependency already completed) or running, or
+///   - a deferred daemon-restarting upgrade task (version-check drift enqueue /
+///     `ff fleet upgrade` defer path) that is dispatchable or running.
+///
+/// This is the DRAIN half of the auto-upgrade idle-gate fix (2026-07-20 adele
+/// incident: 6 daemon restarts in 21 min killed active build leases — the V114
+/// no-active-lease gate only ran at enqueue time). While a restart is imminent
+/// the scheduler stops granting NEW work_item leases to the host, so the
+/// execution-time lease gates (tick_once / pg_claim_deferred) converge within
+/// the lease hard-ceiling (~25 min) instead of racing fresh leases forever.
+/// Derived state: the moment the upgrade task goes terminal the host is
+/// schedulable again — no flag to clear, nothing to leak. The 2h age bound
+/// stops an abandoned upgrade task from parking a host indefinitely.
+const IMMINENT_DAEMON_RESTART_DRAIN_SQL: &str = "
+    SELECT 1 FROM fleet_tasks t
+     WHERE t.created_at > NOW() - INTERVAL '2 hours'
+       AND (
+            (t.summary LIKE 'fleet-upgrade-wave/restart:%'
+             AND t.status IN ('pending','running')
+             AND t.excludes_computer_ids @> to_jsonb(ARRAY[sa.computer_id])
+             AND (t.depends_on_task_id IS NULL
+                  OR EXISTS (
+                      SELECT 1 FROM fleet_tasks dep
+                       WHERE dep.id = t.depends_on_task_id
+                         AND dep.status = 'completed')))
+         OR (t.task_class = 'deferred'
+             AND t.status IN ('dispatchable','running')
+             AND LOWER(COALESCE(t.payload->>'preferred_node','')) = LOWER(c.name)
+             AND (
+                  (COALESCE(NULLIF(t.payload->>'kind',''), t.task_type) = 'upgrade'
+                   AND t.payload->'deferred_payload'->>'tool'
+                       IN {DAEMON_RESTART_UPGRADE_IDS}
+                  )
+               OR t.payload->'deferred_payload'->'meta'->'auto_upgrade'->>'software_id'
+                      IN {DAEMON_RESTART_UPGRADE_IDS}
+             ))
+       )";
+
 /// Free fleet slots: sub_agents not currently running a work_item and with no
 /// active lease. `computer_filter` (computer name) optionally pins to one host.
+/// Excludes computers with an imminent daemon restart (drain-before-restart —
+/// see [`IMMINENT_DAEMON_RESTART_DRAIN_SQL`]).
 pub async fn pg_free_slots(
     pool: &PgPool,
     computer_filter: Option<&str>,
     limit: i64,
 ) -> Result<Vec<FreeSlot>> {
-    let rows = sqlx::query(
+    let drain = IMMINENT_DAEMON_RESTART_DRAIN_SQL.replace(
+        "{DAEMON_RESTART_UPGRADE_IDS}",
+        DAEMON_RESTART_UPGRADE_IDS_SQL,
+    );
+    let sql = format!(
         "SELECT sa.id AS sub_agent_id, sa.computer_id
            FROM sub_agents sa
            JOIN computers c ON c.id = sa.computer_id
@@ -7984,14 +8136,18 @@ pub async fn pg_free_slots(
             AND NOT EXISTS (
                 SELECT 1 FROM work_item_leases l
                  WHERE l.sub_agent_id = sa.id AND l.released_at IS NULL)
+            -- Drain-before-restart: no NEW lease on a host whose daemon is
+            -- about to be restarted by an upgrade (2026-07-20 idle-gate race).
+            AND NOT EXISTS ({drain})
             AND ($1::text IS NULL OR c.name = $1)
           ORDER BY sa.last_heartbeat_at DESC NULLS LAST
           LIMIT $2",
-    )
-    .bind(computer_filter)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+    );
+    let rows = sqlx::query(&sql)
+        .bind(computer_filter)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
     Ok(rows
         .iter()
         .map(|r| FreeSlot {
