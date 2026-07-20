@@ -48,5 +48,8 @@ pub use health::{
     AggregateHealthStatus, ControlPlaneHealthSnapshot, DiscoveryHealthAggregate,
     RuntimeHealthAggregate, SchedulerHealthAggregate, aggregate_health_snapshot,
 };
-pub use llm_480b_wrapper::{Llm480bError, Llm480bRequest, Llm480bResponse, Llm480bWrapper};
-pub use task_processor::{TaskComplexity, TaskProcessor};
+pub use llm_480b_wrapper::{
+    CodegenResult, Llm480bError, Llm480bHttpWrapper, Llm480bRequest, Llm480bResponse,
+    Llm480bWrapper,
+};
+pub use task_processor::{ComplexityFlag, TaskComplexity, TaskProcessor};

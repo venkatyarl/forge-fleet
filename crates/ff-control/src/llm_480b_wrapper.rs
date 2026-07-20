@@ -1,13 +1,98 @@
-//! Concurrency-limited client for the local 480B code-generation endpoint.
+//! Concurrency-limited adapters for the local 480B code-generation service.
 
+use std::path::Path;
+use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::process::Command;
 use tokio::sync::Semaphore;
+use tokio::time;
+use tracing::{info, warn};
 
-/// The 480B server is launched with `--parallel 2`.
-pub const LLM_480B_PARALLELISM: usize = 2;
+use crate::errors::{ControlError, Result};
 
+const DEFAULT_PARALLELISM: usize = 2;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodegenResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+}
+
+/// CLI adapter introduced by the codegen task-processing feature.
+#[derive(Debug)]
+pub struct Llm480bWrapper {
+    binary: String,
+    semaphore: Semaphore,
+    timeout: Duration,
+}
+
+impl Llm480bWrapper {
+    pub fn new(binary: impl Into<String>) -> Self {
+        Self {
+            binary: binary.into(),
+            semaphore: Semaphore::new(DEFAULT_PARALLELISM),
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
+
+    pub fn with_parallel(mut self, parallel: usize) -> Self {
+        self.semaphore = Semaphore::new(parallel.max(1));
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub async fn generate(&self, task: &str, repo: &Path) -> Result<CodegenResult> {
+        let _permit = self
+            .semaphore
+            .acquire()
+            .await
+            .map_err(|e| ControlError::Llm480b(format!("semaphore acquire failed: {e}")))?;
+
+        info!(binary = %self.binary, task, repo = %repo.display(), "480B codegen invocation start");
+        let output = time::timeout(
+            self.timeout,
+            Command::new(&self.binary)
+                .arg("--parallel")
+                .arg("2")
+                .arg("--task")
+                .arg(task)
+                .arg("--repo")
+                .arg(repo)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| ControlError::Llm480b("480B codegen timed out".to_string()))?
+        .map_err(|e| ControlError::Llm480b(format!("failed to spawn 480B codegen: {e}")))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let exit_code = output.status.code().unwrap_or(-1);
+        if output.status.success() {
+            info!(exit_code, "480B codegen invocation succeeded");
+        } else {
+            warn!(exit_code, stderr = %stderr, "480B codegen invocation failed");
+        }
+        Ok(CodegenResult {
+            stdout,
+            stderr,
+            exit_code,
+        })
+    }
+}
+
+/// Request accepted by the HTTP adapter.
 #[derive(Debug, Clone, Serialize)]
 pub struct Llm480bRequest {
     pub prompt: String,
@@ -18,6 +103,24 @@ pub struct Llm480bRequest {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Llm480bResponse {
     pub content: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Llm480bError {
+    #[error("480B dispatch semaphore is closed")]
+    SemaphoreClosed,
+    #[error("480B endpoint request failed: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error("480B endpoint returned no completion")]
+    EmptyResponse,
+}
+
+/// HTTP adapter retained for callers that submit OpenAI-compatible requests.
+#[derive(Debug, Clone)]
+pub struct Llm480bHttpWrapper {
+    endpoint: Arc<str>,
+    client: reqwest::Client,
+    semaphore: Arc<Semaphore>,
 }
 
 #[derive(Serialize)]
@@ -44,25 +147,7 @@ struct ChatChoice {
     message: Llm480bResponse,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum Llm480bError {
-    #[error("480B dispatch semaphore is closed")]
-    SemaphoreClosed,
-    #[error("480B endpoint request failed: {0}")]
-    Request(#[from] reqwest::Error),
-    #[error("480B endpoint returned no completion")]
-    EmptyResponse,
-}
-
-/// Wraps the local 480B endpoint and mirrors its two request slots.
-#[derive(Debug, Clone)]
-pub struct Llm480bWrapper {
-    endpoint: Arc<str>,
-    client: reqwest::Client,
-    semaphore: Arc<Semaphore>,
-}
-
-impl Llm480bWrapper {
+impl Llm480bHttpWrapper {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self::with_client(endpoint, reqwest::Client::new())
     }
@@ -71,26 +156,20 @@ impl Llm480bWrapper {
         Self {
             endpoint: Arc::from(endpoint.into()),
             client,
-            semaphore: Arc::new(Semaphore::new(LLM_480B_PARALLELISM)),
+            semaphore: Arc::new(Semaphore::new(DEFAULT_PARALLELISM)),
         }
     }
 
-    /// Submit one code-generation request.
-    ///
-    /// The owned permit is intentionally kept in scope until the request and
-    /// response body complete. Dropping it releases the slot on every exit
-    /// path, including cancellation and errors.
     pub async fn generate(
         &self,
         request: &Llm480bRequest,
-    ) -> Result<Llm480bResponse, Llm480bError> {
+    ) -> std::result::Result<Llm480bResponse, Llm480bError> {
         let _permit = self
             .semaphore
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| Llm480bError::SemaphoreClosed)?;
-
         let response: ChatResponse = self
             .client
             .post(ff_core::url::normalize_chat_completions_url(
@@ -109,7 +188,6 @@ impl Llm480bWrapper {
             .error_for_status()?
             .json()
             .await?;
-
         response
             .choices
             .into_iter()
@@ -127,26 +205,33 @@ impl Llm480bWrapper {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn wrapper_uses_two_shared_permits_and_releases_them() {
-        let wrapper = Llm480bWrapper::new("http://127.0.0.1:1/v1/completions");
-        assert_eq!(wrapper.available_permits(), 2);
-
-        let first = wrapper.semaphore.clone().acquire_owned().await.unwrap();
-        let second = wrapper.semaphore.clone().acquire_owned().await.unwrap();
-        assert_eq!(wrapper.available_permits(), 0);
-        assert!(wrapper.semaphore.clone().try_acquire_owned().is_err());
-
-        drop(first);
-        assert_eq!(wrapper.available_permits(), 1);
-        drop(second);
-        assert_eq!(wrapper.available_permits(), 2);
+    #[test]
+    fn default_parallelism_allows_two_concurrent_slots() {
+        let wrapper = Llm480bWrapper::new("dummy");
+        let _p1 = wrapper.semaphore.try_acquire().expect("first permit");
+        let _p2 = wrapper.semaphore.try_acquire().expect("second permit");
+        assert!(wrapper.semaphore.try_acquire().is_err());
     }
 
     #[test]
-    fn clones_share_the_same_dispatch_limit() {
-        let wrapper = Llm480bWrapper::new("http://127.0.0.1:1/v1/completions");
+    fn with_parallel_changes_capacity_and_clamps_to_one() {
+        let wrapper = Llm480bWrapper::new("dummy").with_parallel(4);
+        let permits: Vec<_> = (0..4)
+            .map(|_| wrapper.semaphore.try_acquire().expect("acquire permit"))
+            .collect();
+        assert!(wrapper.semaphore.try_acquire().is_err());
+        drop(permits);
+
+        let wrapper = Llm480bWrapper::new("dummy").with_parallel(0);
+        let _permit = wrapper.semaphore.try_acquire().expect("single permit");
+        assert!(wrapper.semaphore.try_acquire().is_err());
+    }
+
+    #[test]
+    fn http_clones_share_the_dispatch_limit() {
+        let wrapper = Llm480bHttpWrapper::new("http://127.0.0.1:1");
         let clone = wrapper.clone();
         assert!(Arc::ptr_eq(&wrapper.semaphore, &clone.semaphore));
+        assert_eq!(wrapper.available_permits(), 2);
     }
 }

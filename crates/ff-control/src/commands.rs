@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::control_plane::ControlPlane;
 use crate::errors::{ControlError, Result};
-use crate::task_processor::{TaskComplexity, TaskProcessor};
+use crate::task_processor::{ComplexityFlag, TaskProcessor};
 
 #[derive(Debug, Clone)]
 pub enum DiscoverMode {
@@ -50,7 +50,7 @@ pub struct RunTaskRequest {
 pub struct RunTaskResult {
     pub task: AgentTask,
     pub target_node: Option<String>,
-    pub complexity: TaskComplexity,
+    pub complexity: ComplexityFlag,
 }
 
 #[derive(Debug, Clone)]
@@ -168,12 +168,13 @@ impl ControlPlane {
             return Err(ControlError::UnknownNode(target_node.clone()));
         }
 
+        let complexity = TaskProcessor.assess_complexity(&req.kind);
+
         let task = AgentTask {
             id: Uuid::new_v4(),
             created_at: Utc::now(),
             kind: req.kind,
         };
-        let complexity = TaskProcessor::assess_complexity(&task);
 
         Ok(RunTaskResult {
             task,
