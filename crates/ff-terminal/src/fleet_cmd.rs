@@ -4601,6 +4601,114 @@ const DEPLOY_TIMEOUT_TIGHT_SECS: u64 = 45 * 60;
 /// new leases can race the final empty check.
 const DEPLOY_LEASE_DRAIN_TIMEOUT_SECS: u64 = 2 * 60;
 const DEPLOY_LEASE_DRAIN_POLL_SECS: u64 = 2;
+const DEPLOY_LEADER_HANDOFF_TIMEOUT_SECS: u64 = 45;
+const DEPLOY_LEADER_HANDOFF_POLL_SECS: u64 = 2;
+// Covers the longest (45 minute) memory-tight build plus install/restart and
+// verification, while remaining bounded for automatic fail-back.
+const DEPLOY_LEADER_YIELD_MINUTES: i64 = 120;
+
+/// If a deploy target is the current leader, explicitly hand leadership to the
+/// next-priority healthy node and wait for its fresh heartbeat before allowing
+/// the deploy to proceed. The yield lease remains active across the restart so
+/// the old leader cannot immediately pre-empt its successor when it comes back.
+async fn handoff_deploy_leader(
+    pool: &sqlx::PgPool,
+    target_names: &[String],
+) -> Result<Option<(String, String)>> {
+    let Some(current) = ff_db::pg_get_current_leader(pool).await? else {
+        return Ok(None);
+    };
+    if !target_names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(&current.member_name))
+    {
+        return Ok(None);
+    }
+
+    let successor: Option<String> = sqlx::query_scalar(
+        "SELECT fw.name
+           FROM fleet_workers fw
+           JOIN computers c ON c.name = fw.name
+          WHERE fw.name <> $1
+            AND COALESCE(c.election_eligibility, 'eligible') <> 'never_leader'
+            AND c.status = 'online'
+            AND c.last_seen_at >= now() - interval '45 seconds'
+          ORDER BY fw.election_priority ASC, fw.name ASC
+          LIMIT 1",
+    )
+    .bind(&current.member_name)
+    .fetch_optional(pool)
+    .await?;
+    let successor = successor.ok_or_else(|| {
+        anyhow::anyhow!(
+            "refusing to restart leader '{}': no healthy election successor",
+            current.member_name
+        )
+    })?;
+
+    let until = chrono::Utc::now() + chrono::Duration::minutes(DEPLOY_LEADER_YIELD_MINUTES);
+    let yield_value = format!("{}|{}", current.member_name, until.to_rfc3339());
+    if let Some(active) = ff_db::pg_get_secret(pool, "leader_yield_request").await?
+        && active != yield_value
+        && active
+            .split_once('|')
+            .and_then(|(_, expires)| chrono::DateTime::parse_from_rfc3339(expires.trim()).ok())
+            .is_some_and(|expires| expires.with_timezone(&chrono::Utc) > chrono::Utc::now())
+    {
+        anyhow::bail!("refusing to overwrite an active leader handoff request");
+    }
+    if let Err(error) = ff_db::pg_set_secret(
+        pool,
+        "leader_yield_request",
+        &yield_value,
+        Some("Temporary leader handoff for ff fleet deploy"),
+        Some("ff fleet deploy"),
+    )
+    .await
+    {
+        return Err(error.into());
+    }
+
+    eprintln!(
+        "{CYAN}▶ handing fleet leadership '{}' → '{}' before restart…{RESET}",
+        current.member_name, successor
+    );
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(DEPLOY_LEADER_HANDOFF_TIMEOUT_SECS);
+    loop {
+        if let Some(leader) = ff_db::pg_get_current_leader(pool).await?
+            && leader.member_name.eq_ignore_ascii_case(&successor)
+            && chrono::Utc::now()
+                .signed_duration_since(leader.heartbeat_at)
+                .num_seconds()
+                <= 45
+        {
+            eprintln!("{GREEN}✓ leadership transferred to '{}'{RESET}", successor);
+            return Ok(Some((current.member_name, successor)));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // Undo only the request values installed by this deploy. A newer
+            // operator handoff must not be cleared by our timeout cleanup.
+            sqlx::query(
+                "DELETE FROM fleet_secrets WHERE key = 'leader_yield_request' AND value = $1",
+            )
+            .bind(&yield_value)
+            .execute(pool)
+            .await
+            .ok();
+            anyhow::bail!(
+                "refusing to restart leader '{}': '{}' did not take over within {}s",
+                current.member_name,
+                successor,
+                DEPLOY_LEADER_HANDOFF_TIMEOUT_SECS
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(
+            DEPLOY_LEADER_HANDOFF_POLL_SECS,
+        ))
+        .await;
+    }
+}
 
 /// Prevent new work-item assignments to deploy targets and wait for their
 /// existing leases to finish. At the deadline, remaining leases are released
@@ -4965,6 +5073,9 @@ async fn refresh_local_leader_if_self(pool: &sqlx::PgPool) -> Option<(bool, Stri
     eprintln!(
         "{CYAN}▶ refreshing leader '{leader_name}' forgefleetd locally (tree clean @ HEAD)…{RESET}"
     );
+    if let Err(error) = handoff_deploy_leader(pool, std::slice::from_ref(&leader_name)).await {
+        return Some((false, format!("leader handoff failed: {error}")));
+    }
     let previous_reservation =
         match drain_deploy_targets(pool, std::slice::from_ref(&leader_name)).await {
             Ok(previous) => previous,
@@ -5667,6 +5778,7 @@ async fn handle_fleet_deploy(
     // finish before a restart can tear down its daemon. A bounded timeout
     // falls back to the attempt-neutral HA lease handoff.
     let target_names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
+    handoff_deploy_leader(pool, &target_names).await?;
     let previous_reservations = drain_deploy_targets(pool, &target_names).await?;
 
     // Group targets by (os_family, arch). One build per group is executed on a
@@ -6356,6 +6468,40 @@ mod route_tests {
             .find("leader_refresh_playbook")
             .expect("leader must restart");
         assert!(leader_drain < leader_restart, "leader must drain first");
+    }
+
+    #[test]
+    fn fleet_deploy_hands_off_leadership_before_drain_and_restart() {
+        let source = include_str!("fleet_cmd.rs");
+        let deploy = source
+            .split("async fn handle_fleet_deploy")
+            .nth(1)
+            .expect("fleet deploy handler");
+        let handoff = deploy
+            .find("handoff_deploy_leader(pool")
+            .expect("deploy must hand off a targeted leader");
+        let drain = deploy
+            .find("drain_deploy_targets(pool")
+            .expect("deploy must drain target leases");
+        let restart = deploy
+            .find("deploy_group(plan")
+            .expect("deploy must run grouped restarts");
+        assert!(handoff < drain && drain < restart);
+
+        let leader = source
+            .split("async fn refresh_local_leader_if_self")
+            .nth(1)
+            .expect("leader refresh handler");
+        let handoff = leader
+            .find("handoff_deploy_leader(pool")
+            .expect("leader refresh must transfer leadership");
+        let drain = leader
+            .find("drain_deploy_targets(pool")
+            .expect("leader refresh must drain leases");
+        let restart = leader
+            .find("leader_refresh_playbook")
+            .expect("leader refresh must restart");
+        assert!(handoff < drain && drain < restart);
     }
 
     #[test]
