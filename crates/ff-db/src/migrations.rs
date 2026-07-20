@@ -876,6 +876,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "error_events",
         sql: schema::SCHEMA_V178_ERROR_EVENTS,
     },
+    PgMigration {
+        version: 179,
+        name: "work_item_events",
+        sql: schema::SCHEMA_V179_WORK_ITEM_EVENTS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1324,6 +1329,79 @@ mod tests {
             .await
             .expect("list error events by kind oom");
         assert!(none.is_empty());
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v179_work_item_events_round_trip() {
+        // Needs Postgres — create_fresh_temp_db returns None (and we early-
+        // return) when neither FORGEFLEET_POSTGRES_URL nor
+        // FORGEFLEET_DATABASE_URL is set, so this never panics in CI.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        sqlx::query(
+            "INSERT INTO projects (id, display_name) VALUES ('v179-test-proj', 'V179 Test')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert test project");
+        let work_item_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO work_items (project_id, kind, title)
+             VALUES ('v179-test-proj', 'task', 'v179 test item') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert test work item");
+
+        sqlx::query(
+            "INSERT INTO work_item_events
+                 (work_item_id, from_status, to_status, computer, attempt, detail)
+             VALUES ($1, 'idea', 'in_progress', 'v179-test-node', 1,
+                     '{\"reason\": \"test\"}'::jsonb)",
+        )
+        .bind(work_item_id)
+        .execute(&pool)
+        .await
+        .expect("insert work item event");
+
+        let (from_status, to_status, computer, attempt): (
+            Option<String>,
+            String,
+            Option<String>,
+            Option<i32>,
+        ) = sqlx::query_as(
+            "SELECT from_status, to_status, computer, attempt
+             FROM work_item_events WHERE work_item_id = $1",
+        )
+        .bind(work_item_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read back work item event");
+        assert_eq!(from_status.as_deref(), Some("idea"));
+        assert_eq!(to_status, "in_progress");
+        assert_eq!(computer.as_deref(), Some("v179-test-node"));
+        assert_eq!(attempt, Some(1));
+
+        // Deleting the work item cascades to its events.
+        sqlx::query("DELETE FROM work_items WHERE id = $1")
+            .bind(work_item_id)
+            .execute(&pool)
+            .await
+            .expect("delete test work item");
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM work_item_events WHERE work_item_id = $1")
+                .bind(work_item_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count events after cascade");
+        assert_eq!(remaining, 0);
 
         drop_temp_db(admin, pool, &db_name).await;
     }

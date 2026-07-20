@@ -10515,6 +10515,28 @@ CREATE INDEX IF NOT EXISTS idx_error_events_deployment
     ON error_events (deployment_id, occurred_at DESC) WHERE deployment_id IS NOT NULL;
 "#;
 
+/// V179 — Work-item status-transition events.
+///
+/// Append-only audit trail of PM work-item status changes (from_status →
+/// to_status), recording which computer drove the transition and the attempt
+/// number, so dashboards can reconstruct a work item's lifecycle without
+/// parsing scheduler logs.
+pub const SCHEMA_V179_WORK_ITEM_EVENTS: &str = r#"
+CREATE TABLE IF NOT EXISTS work_item_events (
+    id            BIGSERIAL PRIMARY KEY,
+    work_item_id  UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    from_status   TEXT,
+    to_status     TEXT NOT NULL,
+    occurred_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    computer      TEXT,
+    attempt       INTEGER,
+    detail        JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_work_item_events_item_time
+    ON work_item_events (work_item_id, occurred_at DESC);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
