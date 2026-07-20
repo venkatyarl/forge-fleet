@@ -629,6 +629,26 @@ impl Materializer {
                 .execute(&self.pg)
                 .await?;
         } else {
+            // Track transient empty writes: primary_ip/ram are already gated
+            // above, but a partially-probed beat can still carry an empty
+            // all_ips / zero cpu_cores / zero disk / empty gpu_kind that this
+            // (non-rejected) write persists onto the row. Log the exact column
+            // set so the "computers row briefly went empty" drift is traceable
+            // to the beat that caused it.
+            let empty_fields = empty_persistent_beat_fields(beat, new_ips_json);
+            if !empty_fields.is_empty() {
+                warn!(
+                    computer = %beat.computer_name,
+                    empty_fields = ?empty_fields,
+                    primary_ip = %beat.network.primary_ip,
+                    all_ips = %new_ips_json,
+                    cpu_cores = beat.hardware.cpu_cores,
+                    ram_gb = beat.hardware.ram_gb,
+                    disk_gb = beat.hardware.disk_gb,
+                    gpu_kind = %beat.capabilities.gpu_kind,
+                    "materializer: updating computers row with empty persistent value(s)"
+                );
+            }
             sqlx::query(UPSERT_COMPUTER_ROW_SQL)
                 .bind(computer_id)
                 .bind(new_ips_json)
@@ -1561,6 +1581,38 @@ fn computer_row_has_empty_node_attributes(primary_ip: Option<&str>, ram_gb: Opti
     primary_ip.is_none_or(str::is_empty) || ram_gb.is_none_or(|ram| ram <= 0)
 }
 
+/// Names of the persistent `computers` columns whose incoming beat value is
+/// empty/zero. Used only for observability: a beat that fails
+/// `computer_row_has_empty_node_attributes` (empty primary_ip or non-positive
+/// ram) is rejected upstream, but the remaining persistent columns
+/// (`all_ips`, `cpu_cores`, `total_disk_gb`, `gpu_kind`) can still be written
+/// empty by a partially-probed beat — a daemon that finished IP+RAM probing
+/// but not disk/GPU enumeration. Those transient empty writes were previously
+/// invisible; logging the exact column set makes the "row briefly went empty"
+/// class of drift traceable to the beat that caused it.
+fn empty_persistent_beat_fields(beat: &PulseBeatV2, all_ips_json: &str) -> Vec<&'static str> {
+    let mut empty = Vec::new();
+    if beat.network.primary_ip.is_empty() {
+        empty.push("primary_ip");
+    }
+    if normalize_json(all_ips_json) == "[]" {
+        empty.push("all_ips");
+    }
+    if beat.hardware.cpu_cores <= 0 {
+        empty.push("cpu_cores");
+    }
+    if beat.hardware.ram_gb <= 0 {
+        empty.push("total_ram_gb");
+    }
+    if beat.hardware.disk_gb <= 0 {
+        empty.push("total_disk_gb");
+    }
+    if beat.capabilities.gpu_kind.is_empty() {
+        empty.push("gpu_kind");
+    }
+    empty
+}
+
 /// RAM tier key for server-policy resolution: <=8GB is `tiny` (CPU-only
 /// llama-server, no model seed), everything else `standard`. Callers must
 /// gate out non-positive ram_gb (degenerate beats) before classifying.
@@ -1893,6 +1945,38 @@ mod tests {
             Some("10.0.0.1"),
             Some(32)
         ));
+    }
+
+    #[test]
+    fn empty_persistent_beat_fields_flags_partial_probes() {
+        // A fully-probed online beat has no empty persistent columns.
+        let mut good = beat_online("marcus");
+        good.network.all_ips = vec![crate::beat_v2::Ip {
+            iface: "en0".to_string(),
+            ip: "10.0.0.1".to_string(),
+            kind: "v4".to_string(),
+            paired_with: None,
+            link_speed_gbps: None,
+            medium: None,
+        }];
+        let good_ips = serde_json::to_string(&good.network.all_ips).unwrap();
+        assert!(empty_persistent_beat_fields(&good, &good_ips).is_empty());
+
+        // A partially-probed beat: IP+RAM present (so it isn't rejected
+        // upstream) but disk/GPU enumeration hasn't finished. Those columns
+        // must be reported so the transient empty write is traceable.
+        let mut partial = beat_online("marcus");
+        partial.hardware.disk_gb = 0;
+        partial.capabilities.gpu_kind = String::new();
+        let partial_ips = serde_json::to_string(&partial.network.all_ips).unwrap();
+        let fields = empty_persistent_beat_fields(&partial, &partial_ips);
+        assert!(fields.contains(&"total_disk_gb"));
+        assert!(fields.contains(&"gpu_kind"));
+        assert!(!fields.contains(&"primary_ip"));
+        assert!(!fields.contains(&"total_ram_gb"));
+
+        // An empty all_ips array is flagged (`[]` normalizes to `[]`).
+        assert!(empty_persistent_beat_fields(&partial, "[]").contains(&"all_ips"));
     }
 
     #[test]
