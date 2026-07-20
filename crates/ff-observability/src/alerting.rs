@@ -659,7 +659,7 @@ mod tests {
         let repeated = engine.fire_alert(
             "node_down",
             AlertSeverity::Critical,
-            "Node james is still unreachable".into(),
+            "Node james is unreachable".into(),
             Some("james".into()),
             None,
         );
@@ -687,7 +687,16 @@ mod tests {
             .find(|alert| alert.id == first.id)
             .expect("the deduplicated alert should remain active");
         assert_eq!(james_node_down.count, 2);
-        assert_eq!(engine.alert_history().len(), 3);
+        let history = engine.alert_history();
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            history
+                .iter()
+                .find(|alert| alert.id == first.id)
+                .expect("history should update the collapsed alert")
+                .count,
+            2
+        );
     }
 
     #[test]
