@@ -21,6 +21,7 @@ pub mod confidence;
 pub mod crew;
 pub mod decomposer;
 pub mod leader;
+pub mod merge_train;
 pub mod parallel;
 pub mod placement;
 pub mod planner;
@@ -42,6 +43,7 @@ pub use leader::{
     AgentHeartbeatResult, AgentTask, LeaderCoordinator, Preemption, SubmissionAction,
     SubmissionResult, TickResult,
 };
+pub use merge_train::MergeTrainConfig;
 pub use parallel::{ExecutionResult, ParallelExecutor, SubTaskResult};
 pub use placement::{AntiAffinityRule, NodeWorkloadPreference, PlacementEngine, PlacementPolicy};
 pub use planner::{ExecutionPlan, PlanNode, PlanStage};
