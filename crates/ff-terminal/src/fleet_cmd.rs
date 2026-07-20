@@ -4709,12 +4709,12 @@ fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
     };
 
     // Dirty-tree guard: mirror the leader-local refresh and refuse to run
-    // `git reset --hard` on a tree with tracked modifications. Untracked files
-    // are ignored so operator artifacts (`research/`, `graphify-out/`, etc.)
-    // do not block a deploy that only builds from tracked sources.
+    // `git reset --hard` on a tree with tracked or untracked work. The Linux
+    // playbook also runs a targeted `git clean`, so ignoring untracked files
+    // here could still discard operator work.
     let dirty_guard = format!(
-        "if [ -n \"$(git status --porcelain --untracked-files=no)\" ]; then \
-         echo \"DEPLOY_DIRTY_TREE: refusing to reset --hard on dirty tree at {src}; commit or stash tracked changes first\" >&2; \
+        "if [ -n \"$(git status --porcelain)\" ]; then \
+         echo \"DEPLOY_DIRTY_TREE: refusing to reset --hard on dirty tree at {src}; commit or stash changes first\" >&2; \
          exit 1; \
          fi"
     );
@@ -6254,9 +6254,10 @@ mod route_tests {
             .expect("must reset --hard");
         assert!(dirty < reset, "dirty-tree guard must precede reset --hard");
         assert!(
-            p.contains("git status --porcelain --untracked-files=no"),
-            "must use tracked-only dirty check like leader-local guard"
+            p.contains("git status --porcelain"),
+            "must check tracked and untracked work"
         );
+        assert!(!p.contains("--untracked-files=no"));
     }
 
     /// Layout invariant (2026-07-07 migration): a NULL-source-tree WORKER must
