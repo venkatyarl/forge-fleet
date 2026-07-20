@@ -99,6 +99,7 @@ pub const OAUTH_PROVIDERS: &[OauthProvider] = &[
 /// every 30-60 min; 30s polling is overkill but cheap (one stat() per
 /// provider per cycle) and ensures peers see new tokens fast.
 pub const REFRESH_POLL_SECS: u64 = 30;
+pub const AUTO_REFRESH_SECS: u64 = 3600;
 
 /// Read the password value of a macOS Keychain generic-password entry
 /// via `security find-generic-password -s <service> -a $USER -w`. Used
@@ -479,6 +480,109 @@ pub async fn probe_all(pool: &PgPool) -> Vec<ProbeResult> {
     out
 }
 
+/// Exercise the vendor CLI's native refresh-token flow, then harvest and fan
+/// out the complete refreshed credential document. Copying the whole document
+/// deliberately preserves refresh tokens; ff never substitutes them for access
+/// tokens or reimplements provider-specific OAuth HTTP exchanges.
+pub async fn refresh_and_redistribute(pool: &PgPool, provider: &OauthProvider) -> Result<usize> {
+    let probe = probe_one(pool, provider).await;
+    if probe.status != "ok" {
+        anyhow::bail!(
+            "{} OAuth validation failed: {} ({})",
+            provider.name,
+            probe.status,
+            probe.message.unwrap_or_default()
+        );
+    }
+    import_token(pool, provider).await?;
+    distribute_token(pool, provider).await
+}
+
+/// Hourly proactive refresh. The immediate first interval tick makes daemon
+/// startup repair credentials without waiting an hour; the leader-cache gate
+/// guarantees followers never redistribute their local copies.
+pub fn spawn_oauth_refresh_tick(
+    pool: PgPool,
+    interval_secs: u64,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if !crate::leader_cache::is_current_leader() {
+                        continue;
+                    }
+                    for provider in OAUTH_PROVIDERS.iter().filter(|p| !p.cred_path.is_empty()) {
+                        match refresh_and_redistribute(&pool, provider).await {
+                            Ok(enqueued) => info!(provider = provider.name, enqueued, "OAuth auto-refresh distributed"),
+                            Err(error) => warn!(provider = provider.name, %error, "OAuth auto-refresh failed"),
+                        }
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { break; }
+                }
+            }
+        }
+    })
+}
+
+fn probe_requests_repush(result: &ProbeResult) -> bool {
+    matches!(result.status.as_str(), "unauthorized" | "no_token")
+}
+
+async fn request_leader_repush(pool: &PgPool, provider: &OauthProvider) -> Result<()> {
+    let leader = ff_db::pg_get_current_leader(pool)
+        .await?
+        .ok_or_else(|| anyhow!("no elected leader available for OAuth re-push"))?;
+    let summary = format!("oauth-repush/{}", provider.name);
+    let already_pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM fleet_tasks
+              WHERE summary = $1
+                AND status IN ('pending', 'running')
+                AND created_at > NOW() - INTERVAL '1 hour'
+         )",
+    )
+    .bind(&summary)
+    .fetch_one(pool)
+    .await?;
+    if already_pending {
+        return Ok(());
+    }
+    pg_enqueue_shell_task(
+        pool,
+        &summary,
+        &format!("ff oauth refresh {}", provider.name),
+        &[],
+        Some(&leader.member_name),
+        None,
+        90,
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Validate this node's installed OAuth sessions once at daemon startup. A
+/// follower never fans out its possibly stale file; it asks the elected leader
+/// to run the native refresh + distribution operation instead.
+pub fn spawn_startup_oauth_validation(pool: PgPool) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        for provider in OAUTH_PROVIDERS.iter().filter(|p| !p.cred_path.is_empty()) {
+            let result = probe_one(&pool, provider).await;
+            if probe_requests_repush(&result)
+                && let Err(error) = request_leader_repush(&pool, provider).await
+            {
+                warn!(provider = provider.name, %error, "failed to request OAuth re-push");
+            }
+        }
+    })
+}
+
 /// Leader-gated: spawned unconditionally on every node, but each tick checks
 /// the process-local leader cache and skips unless this node is the current
 /// leader (only the leader probes the shared OAuth credentials).
@@ -581,9 +685,16 @@ pub async fn probe_one(pool: &PgPool, provider: &OauthProvider) -> ProbeResult {
                 }
             } else {
                 let code = out.status.code();
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let class = crate::cloud_error::classify(
+                    provider.name,
+                    code,
+                    &format!("{stdout}\n{stderr}"),
+                );
                 ProbeResult {
                     provider: provider.name.to_string(),
-                    status: if code == Some(1) {
+                    status: if class == crate::cloud_error::CloudErrorClass::Unauthenticated {
                         "unauthorized".to_string()
                     } else {
                         "cli_error".to_string()
@@ -597,6 +708,26 @@ pub async fn probe_one(pool: &PgPool, provider: &OauthProvider) -> ProbeResult {
                     ),
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_confirmed_auth_failure_requests_repush() {
+        let result = |status: &str| ProbeResult {
+            provider: "codex".into(),
+            status: status.into(),
+            http_status: None,
+            message: None,
+        };
+        assert!(probe_requests_repush(&result("unauthorized")));
+        assert!(probe_requests_repush(&result("no_token")));
+        for status in ["ok", "timeout", "cli_missing", "cli_error"] {
+            assert!(!probe_requests_repush(&result(status)), "{status}");
         }
     }
 }

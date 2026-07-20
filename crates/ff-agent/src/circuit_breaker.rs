@@ -54,7 +54,7 @@ pub async fn record_usage_signal(
 /// router's 15% floor so the provider is deprioritized until it recovers.
 pub fn headroom_hint_for_category(category: &str) -> Option<f64> {
     match category {
-        "quota_exhausted" => Some(0.0),
+        "quota_exhausted" | "unauthenticated" => Some(0.0),
         "rate_limited" => Some(8.0),
         "overloaded" => Some(12.0),
         _ => None,
@@ -273,6 +273,7 @@ mod tests {
     #[test]
     fn headroom_hint_for_category_maps_usage_signals() {
         assert_eq!(headroom_hint_for_category("quota_exhausted"), Some(0.0));
+        assert_eq!(headroom_hint_for_category("unauthenticated"), Some(0.0));
         assert_eq!(headroom_hint_for_category("rate_limited"), Some(8.0));
         assert_eq!(headroom_hint_for_category("overloaded"), Some(12.0));
         assert_eq!(headroom_hint_for_category("bad_request"), None);

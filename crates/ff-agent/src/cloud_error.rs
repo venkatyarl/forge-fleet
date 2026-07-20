@@ -308,6 +308,10 @@ pub fn classify(provider: &str, _exit_code: Option<i32>, output: &str) -> CloudE
                 "no api key",
                 "expired token",
                 "oauth token has expired",
+                "refresh token: access revoked",
+                "access_terminated",
+                "oauth session expired",
+                "could not be refreshed",
             ],
         )
     {
@@ -537,6 +541,20 @@ mod tests {
 
         for (class, expected) in cases {
             assert_eq!(class.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn vendor_oauth_expiry_messages_are_unauthenticated() {
+        for (provider, message) in [
+            ("codex", "refresh token: access revoked"),
+            ("kimi", "access_terminated"),
+            ("claude", "OAuth session expired and could not be refreshed"),
+        ] {
+            let class = classify(provider, Some(1), message);
+            assert_eq!(class, CloudErrorClass::Unauthenticated, "{provider}");
+            assert!(!class.is_transient());
+            assert_eq!(class.action(), ErrorAction::FlipAuthThenSwitch);
         }
     }
 
