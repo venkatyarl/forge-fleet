@@ -25,6 +25,7 @@ This repo now uses a split documentation model:
 - [SEARXNG_GROUNDING.md](./SEARXNG_GROUNDING.md) — self-hosted SearXNG web-grounding backend for `ff research`
 - [POSTGRES_RUNTIME_MODE.md](./POSTGRES_RUNTIME_MODE.md)
 - [migrations.md](./migrations.md) — Postgres migration runner + v161 squashed baseline for fresh DB bootstrap
+- [postmortems/2026-04-18-wipe-to-july-blackout.md](./postmortems/2026-04-18-wipe-to-july-blackout.md) — Apr-18 metadata wipe → key rotation response → July alerting/monitoring blackout
 - [PHASE_38A_SQLITE_POSTGRES_INVENTORY.md](./PHASE_38A_SQLITE_POSTGRES_INVENTORY.md)
 - [checklists/POSTGRES_FULL_CUTOVER_CHECKLIST.md](./checklists/POSTGRES_FULL_CUTOVER_CHECKLIST.md)
 - [PORTFOLIO_LAYER.md](./PORTFOLIO_LAYER.md)
