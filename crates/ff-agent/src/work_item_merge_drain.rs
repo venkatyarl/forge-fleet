@@ -65,10 +65,17 @@ pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
                 "PR conflicted with advanced main — auto-reset for rebuild",
             )
             .await?;
+            // Preserve the dispatch lane on the reset: this item already BUILT
+            // a PR on whatever lane its attempts selected. Zeroing attempts
+            // re-routed cloud-built items onto the weak local lane after every
+            // sibling conflict, where hard tasks stall out 3x and die
+            // (2026-07-19: the observability batch looped this way all night).
+            // Cap at 2 so a conflict never pushes an item to the max-attempts
+            // kill threshold by itself.
             sqlx::query(
                 "UPDATE work_items \
-                    SET status = 'ready', attempts = 0, last_error = NULL, \
-                        assigned_computer = NULL \
+                    SET status = 'ready', attempts = LEAST(attempts, 2), \
+                        last_error = NULL, assigned_computer = NULL \
                   WHERE id = $1",
             )
             .bind(item.work_item_id)
@@ -192,10 +199,11 @@ pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
                             "PR conflicted at merge time (async mergeable race) — auto-reset for rebuild",
                         )
                         .await?;
+                        // Same lane-preservation rule as the DIRTY reset above.
                         sqlx::query(
                             "UPDATE work_items \
-                                SET status = 'ready', attempts = 0, last_error = NULL, \
-                                    assigned_computer = NULL \
+                                SET status = 'ready', attempts = LEAST(attempts, 2), \
+                                    last_error = NULL, assigned_computer = NULL \
                               WHERE id = $1",
                         )
                         .bind(item.work_item_id)
