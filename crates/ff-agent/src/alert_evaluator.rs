@@ -14,8 +14,10 @@
 //!   - `>= N`, `<= N`, `== N` — numeric comparisons
 //!   - `== 'str'` or `!= 'str'` — string comparisons (for `computer_status`)
 
-use std::time::Duration;
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use sqlx::{PgPool, Row};
 
 use crate::notifications::SHARED_HTTP;
@@ -244,6 +246,71 @@ pub fn classify_policy_fireability(metric: &str, condition: &str) -> PolicyFirea
     } else {
         PolicyFireability::UnknownMetric
     }
+}
+
+/// Default suppression window for repeated Telegram alerts sharing the same
+/// (metric, node) combination.
+const TELEGRAM_ALERT_THROTTLE_TTL: Duration = Duration::from_secs(3600);
+
+/// In-process throttle for Telegram alerts.
+///
+/// Repeated alerts for the same (metric, node) combination are suppressed
+/// for the configured TTL so that flapping conditions (or a fleet-wide
+/// incident that resolves and re-fires) do not flood the operator chat.
+#[derive(Debug)]
+struct TelegramAlertThrottle {
+    ttl: Duration,
+    seen: DashMap<(String, String), Instant>,
+}
+
+impl TelegramAlertThrottle {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            seen: DashMap::new(),
+        }
+    }
+
+    /// Return `true` if enough time has passed since the last Telegram alert
+    /// for this (metric, node) key, and record this send as the most recent.
+    fn should_send(&self, metric: &str, node: &str) -> bool {
+        use dashmap::mapref::entry::Entry;
+
+        let key = (metric.to_string(), node.to_string());
+        let now = Instant::now();
+        match self.seen.entry(key) {
+            Entry::Occupied(mut entry) => {
+                if now.duration_since(*entry.get()) >= self.ttl {
+                    entry.insert(now);
+                    true
+                } else {
+                    false
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(now);
+                true
+            }
+        }
+    }
+}
+
+static TELEGRAM_ALERT_THROTTLE: LazyLock<TelegramAlertThrottle> =
+    LazyLock::new(|| TelegramAlertThrottle::new(TELEGRAM_ALERT_THROTTLE_TTL));
+
+/// Extract the `metric=` and `computer=` values from an alert message so the
+/// Telegram path can throttle repeated alerts by (metric, node).
+fn parse_alert_metric_node(message: &str) -> Option<(String, String)> {
+    let mut metric = None;
+    let mut node = None;
+    for token in message.split_whitespace() {
+        if let Some(v) = token.strip_prefix("metric=") {
+            metric = Some(v.to_string());
+        } else if let Some(v) = token.strip_prefix("computer=") {
+            node = Some(v.to_string());
+        }
+    }
+    Some((metric?, node?))
 }
 
 pub struct AlertEvaluator {
@@ -742,6 +809,20 @@ pub async fn dispatch_alert(pg: &PgPool, channel: &str, severity: &str, message:
             "sent".to_string()
         }
         "telegram" => {
+            // Throttle repeated Telegram alerts for the same (metric, node)
+            // combination. This keeps the operator chat usable during flapping
+            // conditions without suppressing the underlying alert_event rows.
+            if let Some((metric, node)) = parse_alert_metric_node(message) {
+                if !TELEGRAM_ALERT_THROTTLE.should_send(&metric, &node) {
+                    tracing::debug!(
+                        metric = %metric,
+                        node = %node,
+                        "telegram alert throttled; recent alert for this metric/node still within TTL"
+                    );
+                    return "throttled".to_string();
+                }
+            }
+
             let chat_id = ff_db::pg_get_secret(pg, "telegram_chat_id")
                 .await
                 .ok()
@@ -986,5 +1067,38 @@ mod tests {
         assert!(!eval_numeric(&Condition::NumGt(90.0), 90.0));
         assert!(eval_numeric(&Condition::NumLt(10.0), 5.0));
         assert!(eval_numeric(&Condition::NumLe(10.0), 10.0));
+    }
+
+    #[test]
+    fn parse_alert_metric_node_extracts_fields() {
+        let msg = "[warning] high_cpu: computer=taylor metric=cpu_pct condition=> 90 value=95";
+        assert_eq!(
+            parse_alert_metric_node(msg),
+            Some(("cpu_pct".to_string(), "taylor".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_alert_metric_node_returns_none_when_fields_missing() {
+        assert!(parse_alert_metric_node("metric=cpu_pct value=95").is_none());
+        assert!(parse_alert_metric_node("computer=taylor value=95").is_none());
+        assert!(parse_alert_metric_node("plain message").is_none());
+    }
+
+    #[test]
+    fn telegram_alert_throttle_suppresses_repeated_metric_node() {
+        let throttle = TelegramAlertThrottle::new(Duration::from_secs(60));
+        assert!(throttle.should_send("cpu_pct", "taylor"));
+        assert!(!throttle.should_send("cpu_pct", "taylor"));
+        assert!(throttle.should_send("cpu_pct", "james"));
+        assert!(throttle.should_send("ram_pct", "taylor"));
+    }
+
+    #[test]
+    fn telegram_alert_throttle_allows_after_ttl() {
+        let throttle = TelegramAlertThrottle::new(Duration::from_millis(1));
+        assert!(throttle.should_send("cpu_pct", "taylor"));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(throttle.should_send("cpu_pct", "taylor"));
     }
 }
