@@ -120,6 +120,40 @@ pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
             Ok(0)
         }
         CiState::Failed(reason) => {
+            // Auto-recover semantic merge conflicts: a branch that is textually
+            // clean against main can still fail to compile when main gained a new
+            // construction site for a shared struct (E0063/E0308/missing field).
+            // Fetch the failing run log and, if it matches those signatures and
+            // we have not already auto-reset this item once, send it back for a
+            // fresh rebuild against current main.
+            if let Some(log) = failed_ci_log(&pr_url, &item.branch_name).await {
+                if log_indicates_semantic_merge_conflict(&log)
+                    && !semantic_merge_conflict_already_reset(pg, item.work_item_id).await?
+                {
+                    warn!(
+                        pr = %pr_url,
+                        work_item = %item.work_item_id,
+                        "merge_drain: CI failed with semantic merge-conflict signatures — auto-resetting item for rebuild"
+                    );
+                    ff_db::pg_mark_merge_failed(
+                        pg,
+                        item.id,
+                        item.work_item_id,
+                        SEMANTIC_MERGE_CONFLICT_MARKER,
+                    )
+                    .await?;
+                    sqlx::query(
+                        "UPDATE work_items \
+                            SET status = 'ready', attempts = 0, \
+                                last_error = NULL, assigned_computer = NULL \
+                          WHERE id = $1",
+                    )
+                    .bind(item.work_item_id)
+                    .execute(pg)
+                    .await?;
+                    return Ok(0);
+                }
+            }
             warn!(pr = %pr_url, %reason, "merge_drain: PR CI failed — marking work_item failed");
             ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &reason).await?;
             Ok(0)
@@ -556,6 +590,116 @@ fn parse_review_response(response: &str) -> (bool, String) {
     (approved, reason)
 }
 
+/// Marker stored in `work_item_merge_queue.failure_reason` when the drain
+/// auto-resets an item because CI failed with semantic merge-conflict
+/// signatures. Checking for this marker bounds auto-recovery to ONE reset per
+/// work_item (the failed queue row persists across re-dispatch).
+const SEMANTIC_MERGE_CONFLICT_MARKER: &str = "[semantic-merge-conflict-auto-reset]";
+
+/// Compile-error signatures that indicate a clean textual merge produced an
+/// inconsistent codebase, not a logic error in the PR itself.
+fn log_indicates_semantic_merge_conflict(log: &str) -> bool {
+    log.contains("error[E0063]") || log.contains("error[E0308]") || log.contains("missing field")
+}
+
+/// True if this work_item has already been auto-reset once for a semantic
+/// merge conflict. The failed `work_item_merge_queue` row is kept as the
+/// durable marker so re-dispatches do not loop.
+async fn semantic_merge_conflict_already_reset(
+    pg: &PgPool,
+    work_item_id: uuid::Uuid,
+) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_item_merge_queue \
+          WHERE work_item_id = $1 \
+            AND status = 'failed' \
+            AND failure_reason LIKE $2",
+    )
+    .bind(work_item_id)
+    .bind(format!("%{SEMANTIC_MERGE_CONFLICT_MARKER}%"))
+    .fetch_one(pg)
+    .await?;
+    Ok(count > 0)
+}
+
+/// Fetch the failed-step logs for the most recent failed CI run(s) on
+/// `branch_name`. Returns `None` if the logs are unavailable or there are no
+/// failed runs, which simply falls back to normal failure handling.
+async fn failed_ci_log(pr_url: &str, branch_name: &str) -> Option<String> {
+    let head_sha = gh_pr_head_sha(pr_url).await?;
+    let (owner, repo) = parse_owner_repo(pr_url)?;
+    let repo_spec = format!("{owner}/{repo}");
+
+    let mut list_cmd = gh_cmd().await;
+    list_cmd.args([
+        "run",
+        "list",
+        "-R",
+        &repo_spec,
+        "-b",
+        branch_name,
+        "-c",
+        &head_sha,
+        "-s",
+        "completed",
+        "--json",
+        "databaseId,conclusion",
+        "-L",
+        "10",
+    ]);
+    let out = list_cmd.output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let runs: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).ok()?;
+
+    let mut combined = String::new();
+    for run in runs {
+        let conclusion = run.get("conclusion").and_then(|s| s.as_str()).unwrap_or("");
+        if !matches!(
+            conclusion,
+            "failure" | "timed_out" | "startup_failure" | "cancelled"
+        ) {
+            continue;
+        }
+        let run_id = run
+            .get("databaseId")
+            .and_then(|v| v.as_i64())
+            .map(|i| i.to_string())?;
+        let mut log_cmd = gh_cmd().await;
+        log_cmd.args(["run", "view", "-R", &repo_spec, &run_id, "--log-failed"]);
+        let log_out = log_cmd.output().await.ok()?;
+        if !log_out.status.success() {
+            continue;
+        }
+        combined.push_str(&String::from_utf8_lossy(&log_out.stdout));
+        if combined.len() > 200_000 {
+            break;
+        }
+    }
+
+    if combined.is_empty() {
+        None
+    } else {
+        Some(combined)
+    }
+}
+
+/// Head commit SHA of a PR, for correlating CI runs with this exact push.
+async fn gh_pr_head_sha(pr_url: &str) -> Option<String> {
+    let mut cmd = gh_cmd().await;
+    cmd.args(["pr", "view", pr_url, "--json", "headRefOid"]);
+    let out = cmd.output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .ok()?
+        .get("headRefOid")?
+        .as_str()
+        .map(String::from)
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -918,7 +1062,10 @@ pub fn spawn_work_item_merge_drain(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_review_response, served_by_480b, update_branch_api_path};
+    use super::{
+        log_indicates_semantic_merge_conflict, parse_review_response, served_by_480b,
+        update_branch_api_path,
+    };
 
     #[test]
     fn pr_url_maps_to_update_branch_api_path() {
@@ -964,5 +1111,22 @@ mod tests {
         ] {
             assert!(update_branch_api_path(bad).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn detects_semantic_merge_conflict_signatures() {
+        assert!(log_indicates_semantic_merge_conflict(
+            "error[E0063]: missing field `foo` in initializer of `Bar`"
+        ));
+        assert!(log_indicates_semantic_merge_conflict(
+            "error[E0308]: mismatched types"
+        ));
+        assert!(log_indicates_semantic_merge_conflict(
+            "some unrelated text\nmissing field `baz` in `Thing`\nmore"
+        ));
+        assert!(!log_indicates_semantic_merge_conflict(
+            "error[E0005]: refutable pattern"
+        ));
+        assert!(!log_indicates_semantic_merge_conflict(""));
     }
 }
