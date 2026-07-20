@@ -2,8 +2,8 @@
 target/
 *.rs.bk
 
-# code-review-graph build artifacts (regenerated per-commit by the
-# graphify pre-commit hook on enrolled fleet computers; never tracked).
+# graphify build artifacts (regenerated per-commit by the graphify
+# pre-commit hook on enrolled fleet computers; never tracked).
 graphify-out/
 node-compile-cache/
 
@@ -37,7 +37,4 @@ dist/
 *.sqlite
 *.log
 .forgefleet/
-# Added by code-review-graph
-.code-review-graph/
-node-compile-cache/
 .claude/

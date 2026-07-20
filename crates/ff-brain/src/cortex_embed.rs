@@ -15,7 +15,7 @@
 //!
 //! Community detection ([`crate::detect_communities`]) is a separate, cheap
 //! graph pass the caller runs afterwards; the two together make the Cortex
-//! graph navigable the way graphify / code-review-graph are.
+//! graph navigable the way graphify / legacy code-graph tools are.
 
 use sqlx::{PgPool, Row};
 

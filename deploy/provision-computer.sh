@@ -9,7 +9,6 @@
 #   - Python3 + pip (if missing)
 #   - Claude Code (@anthropic-ai/claude-code)
 #   - Codex (OpenAI)
-#   - code-review-graph (MCP server)
 #   - Docker (if missing)
 #   - Rust/Cargo (if missing)
 
@@ -74,19 +73,6 @@ else
         log "Codex: installed ✓"
     else
         warn "Codex: install failed (may need manual setup)"
-    fi
-fi
-
-# ─── code-review-graph ────────────────────────────────────
-if command -v code-review-graph &>/dev/null; then
-    log "code-review-graph: $(code-review-graph --version 2>/dev/null || echo 'installed') ✓"
-else
-    log "Installing code-review-graph..."
-    pip3 install --break-system-packages code-review-graph 2>/dev/null || pip3 install code-review-graph 2>/dev/null || true
-    if command -v code-review-graph &>/dev/null; then
-        log "code-review-graph: installed ✓"
-    else
-        warn "code-review-graph: install failed"
     fi
 fi
 

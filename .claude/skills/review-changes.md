@@ -5,14 +5,14 @@ description: Perform a structured code review using change detection and impact
 
 ## Review Changes
 
-Perform a thorough, risk-aware code review using the knowledge graph.
+Perform a thorough, risk-aware code review using the Cortex code graph.
 
 ### Steps
 
-1. Run `detect_changes` to get risk-scored change analysis.
-2. Run `get_affected_flows` to find impacted execution paths.
-3. For each high-risk function, run `query_graph` with pattern="tests_for" to check test coverage.
-4. Run `get_impact_radius` to understand the blast radius.
+1. Run `cortex_review` to get a risk-scored change analysis.
+2. Run `cortex_impact` on changed symbols to find the blast radius.
+3. For each high-risk symbol, run `cortex_tests` to check test coverage.
+4. Run `cortex_path` between changed symbols and their callers to understand affected execution paths.
 5. For any untested changes, suggest specific test cases.
 
 ### Output Format
@@ -24,6 +24,6 @@ Provide findings grouped by risk level (high/medium/low) with:
 - Overall merge recommendation
 
 ## Token Efficiency Rules
-- ALWAYS start with `get_minimal_context(task="<your task>")` before any other graph tool.
-- Use `detail_level="minimal"` on all calls. Only escalate to "standard" when minimal is insufficient.
+- ALWAYS start with `cortex_find` or `cortex_search` to locate the relevant symbol(s) before reading files.
+- Use `cortex_context` for focused symbol context instead of reading whole files.
 - Target: complete any review/debug/refactor task in ≤5 tool calls and ≤800 total output tokens.

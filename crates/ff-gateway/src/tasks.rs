@@ -167,15 +167,6 @@ fn build_chat_payload(task_def: &TaskDef, req: &TaskRequest) -> Value {
 //  Helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn rewrite_endpoint(endpoint: &str, primary_ip: &str) -> String {
-    if primary_ip.is_empty() {
-        return endpoint.to_string();
-    }
-    endpoint
-        .replace("127.0.0.1", primary_ip)
-        .replace("localhost", primary_ip)
-}
-
 fn collect_available_capabilities(
     catalog_entries: &HashMap<String, (String, i32, Value)>,
 ) -> Vec<String> {
@@ -422,7 +413,7 @@ async fn handle_task_inner(
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
 
-        let endpoint = rewrite_endpoint(&endpoint_raw, &primary_ip);
+        let endpoint = crate::llm_routing::rewrite_endpoint(&endpoint_raw, &primary_ip);
         candidates.push((tier, qd, tps, raw_model_id, name, endpoint));
     }
 
