@@ -10789,6 +10789,90 @@ DROP TABLE IF EXISTS subagent_cleanup_log;
 DROP TABLE IF EXISTS fleet_workspaces;
 "#;
 
+/// V189 — Fleet capacity registry.
+///
+/// Adds `cloud_budget_buckets` and a read-only `v_fleet_capacity` view that
+/// unions inference deployments, available build slots per computer, and cloud
+/// budget buckets. This is the first slice of the router capacity epic; later
+/// consumers will query this view instead of scraping tables ad-hoc.
+pub const SCHEMA_V189_FLEET_CAPACITY_REGISTRY: &str = r#"
+-- ─── V189: Fleet capacity registry ───────────────────────────────────────────
+
+-- Cloud provider budget buckets. Tokens-per-minute is optional; when set the
+-- view marks the bucket `degraded` once spent_today crosses it.
+CREATE TABLE IF NOT EXISTS cloud_budget_buckets (
+    provider        TEXT PRIMARY KEY,
+    max_concurrent  INT NOT NULL,
+    tokens_per_min  BIGINT,
+    spent_today     NUMERIC NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Seed conservative defaults for the three cloud CLI backends.
+INSERT INTO cloud_budget_buckets (provider, max_concurrent, tokens_per_min)
+VALUES
+    ('claude', 3, 10000),
+    ('codex',  3, 10000),
+    ('kimi',   3, 10000)
+ON CONFLICT (provider) DO NOTHING;
+
+-- Read-only capacity view over inference pools, build slots, and cloud buckets.
+-- Each branch exposes a common shape so consumers can reason about capacity in
+-- one place.
+CREATE OR REPLACE VIEW v_fleet_capacity AS
+SELECT
+    'inference'::TEXT AS kind,
+    dep.catalog_id,
+    dep.worker_name AS worker,
+    dep.port,
+    dep.parallel_slots,
+    dep.health_status AS health,
+    NULL::INT AS max_concurrent,
+    NULL::BIGINT AS tokens_per_min,
+    NULL::NUMERIC AS spent_today
+FROM fleet_model_deployments dep
+LEFT JOIN fleet_model_catalog cat ON cat.id = dep.catalog_id
+
+UNION ALL
+
+SELECT
+    'build'::TEXT AS kind,
+    NULL::TEXT AS catalog_id,
+    c.name AS worker,
+    NULL::INT AS port,
+    GREATEST(0, fw.sub_agent_count - COALESCE(active_leases.lease_count, 0)) AS parallel_slots,
+    c.status AS health,
+    fw.sub_agent_count AS max_concurrent,
+    NULL::BIGINT AS tokens_per_min,
+    NULL::NUMERIC AS spent_today
+FROM fleet_workers fw
+JOIN computers c ON c.name = fw.name
+LEFT JOIN (
+    SELECT computer_id, COUNT(*) AS lease_count
+    FROM work_item_leases
+    WHERE released_at IS NULL
+    GROUP BY computer_id
+) active_leases ON active_leases.computer_id = c.id
+
+UNION ALL
+
+SELECT
+    'cloud'::TEXT AS kind,
+    NULL::TEXT AS catalog_id,
+    provider AS worker,
+    NULL::INT AS port,
+    max_concurrent AS parallel_slots,
+    CASE
+        WHEN tokens_per_min IS NULL OR tokens_per_min <= 0 THEN 'healthy'
+        WHEN spent_today < tokens_per_min THEN 'healthy'
+        ELSE 'degraded'
+    END AS health,
+    max_concurrent,
+    tokens_per_min,
+    spent_today
+FROM cloud_budget_buckets;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

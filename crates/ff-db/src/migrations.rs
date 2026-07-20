@@ -926,6 +926,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "align_subagent_paths_to_nested_full_clone",
         sql: schema::SCHEMA_V188_ALIGN_SUBAGENT_PATHS,
     },
+    PgMigration {
+        version: 189,
+        name: "fleet_capacity_registry",
+        sql: schema::SCHEMA_V189_FLEET_CAPACITY_REGISTRY,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
