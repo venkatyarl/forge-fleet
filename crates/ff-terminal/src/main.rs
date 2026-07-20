@@ -10,6 +10,7 @@
 //!   ff status / nodes / models / health / config / version
 
 use std::env;
+use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -76,6 +77,7 @@ mod model_serve_cmd;
 mod notify_cmd;
 mod offload_cmd;
 mod onboard_cmd;
+mod op_cmd;
 mod pm_cmd;
 mod ports_cmd;
 mod power_cmd;
@@ -527,6 +529,12 @@ enum Command {
     Secrets {
         #[command(subcommand)]
         command: SecretsCommand,
+    },
+    /// Run the 1Password CLI using the fleet service-account token.
+    Op {
+        /// Arguments forwarded verbatim to `op`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
     },
     /// Manage Jira site configurations stored in fleet secrets.
     Jira {
@@ -4159,6 +4167,9 @@ async fn main() -> Result<()> {
         Some(Command::Secrets { command }) => {
             return secrets_cmd::handle_secrets(command.clone()).await;
         }
+        Some(Command::Op { args }) => {
+            return op_cmd::handle_op(args.clone()).await;
+        }
         Some(Command::Jira { command }) => {
             return jira_cmd::handle_jira(command.clone()).await;
         }
@@ -4560,6 +4571,7 @@ async fn main() -> Result<()> {
         Some(Command::Task { command }) => task_cmd::handle_task(command, &config_path).await,
         Some(Command::Init { global, project }) => init_cmd::handle_init(global, project).await,
         Some(Command::Secrets { command }) => secrets_cmd::handle_secrets(command).await,
+        Some(Command::Op { args }) => op_cmd::handle_op(args).await,
         Some(Command::Jira { command }) => jira_cmd::handle_jira(command).await,
         Some(Command::Defer { command }) => defer_cmd::handle_defer(command).await,
         Some(Command::Interactions { command }) => {
