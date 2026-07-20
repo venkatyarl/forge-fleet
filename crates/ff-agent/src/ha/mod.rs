@@ -16,6 +16,7 @@ pub mod node_info;
 pub mod pg_failover;
 pub mod repair;
 pub mod restore_drill;
+pub mod review_worker;
 pub mod self_heal;
 pub mod slot_manager;
 
