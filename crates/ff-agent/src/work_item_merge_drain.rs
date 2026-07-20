@@ -260,6 +260,14 @@ async fn run_pr_review(
     pr_url: &str,
     work_item_id: uuid::Uuid,
 ) -> anyhow::Result<(bool, String)> {
+    let distributed = crate::fleet_info::distributed_review_mode_enabled();
+    tracing::debug!(
+        pr = %pr_url,
+        work_item = %work_item_id,
+        distributed_review_mode = distributed,
+        "run_pr_review: fleet_secrets.distributed_review_mode read"
+    );
+
     let mut diff_cmd = gh_cmd().await;
     diff_cmd.args(["pr", "diff", pr_url]);
     let diff_out = diff_cmd.output().await.context("spawn gh pr diff")?;

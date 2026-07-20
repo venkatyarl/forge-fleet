@@ -23,6 +23,13 @@ pub async fn enqueue_review(
     author: &str,
     diff_text: &str,
 ) -> Result<Uuid, sqlx::Error> {
+    let distributed = crate::fleet_info::distributed_review_mode_enabled();
+    tracing::debug!(
+        commit = %commit_sha,
+        distributed_review_mode = distributed,
+        "enqueue_review: fleet_secrets.distributed_review_mode read"
+    );
+
     let payload = json!({
         "repo_path": repo_path,
         "commit_sha": commit_sha,
