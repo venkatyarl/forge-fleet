@@ -11377,6 +11377,77 @@ CREATE TABLE IF NOT EXISTS calendar_event_actions (
 );
 "#;
 
+/// V210 — Unified capacity registry over inference, build, and cloud pools.
+pub const SCHEMA_V210_FLEET_CAPACITY_REGISTRY_VIEW: &str = r#"
+CREATE TABLE IF NOT EXISTS cloud_budget_buckets (
+    provider       TEXT PRIMARY KEY,
+    max_concurrent INT NOT NULL,
+    tokens_per_min BIGINT,
+    spent_today    NUMERIC NOT NULL DEFAULT 0,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO cloud_budget_buckets (provider, max_concurrent, tokens_per_min)
+VALUES
+    ('claude', 3, 10000),
+    ('codex',  3, 10000),
+    ('kimi',   3, 10000)
+ON CONFLICT (provider) DO NOTHING;
+
+CREATE OR REPLACE VIEW v_fleet_capacity AS
+SELECT
+    'inference'::TEXT AS kind,
+    d.catalog_id,
+    d.worker_name AS worker,
+    d.port,
+    d.parallel_slots,
+    d.health_status AS health,
+    NULL::INT AS max_concurrent,
+    NULL::BIGINT AS tokens_per_min,
+    NULL::NUMERIC AS spent_today
+FROM fleet_model_deployments d
+JOIN fleet_model_catalog c ON c.id = d.catalog_id
+
+UNION ALL
+
+SELECT
+    'build'::TEXT AS kind,
+    NULL::TEXT AS catalog_id,
+    c.name AS worker,
+    NULL::INT AS port,
+    GREATEST(0, fw.sub_agent_count - COALESCE(l.active_count, 0)) AS parallel_slots,
+    fw.status AS health,
+    fw.sub_agent_count AS max_concurrent,
+    NULL::BIGINT AS tokens_per_min,
+    NULL::NUMERIC AS spent_today
+FROM fleet_workers fw
+JOIN computers c ON c.name = fw.name
+LEFT JOIN (
+    SELECT computer_id, COUNT(*) AS active_count
+    FROM work_item_leases
+    WHERE released_at IS NULL
+    GROUP BY computer_id
+) l ON l.computer_id = c.id
+
+UNION ALL
+
+SELECT
+    'cloud'::TEXT AS kind,
+    NULL::TEXT AS catalog_id,
+    b.provider AS worker,
+    NULL::INT AS port,
+    b.max_concurrent AS parallel_slots,
+    CASE
+        WHEN b.tokens_per_min IS NULL OR b.tokens_per_min <= 0 THEN 'healthy'
+        WHEN b.spent_today < b.tokens_per_min THEN 'healthy'
+        ELSE 'degraded'
+    END AS health,
+    b.max_concurrent,
+    b.tokens_per_min,
+    b.spent_today
+FROM cloud_budget_buckets b;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
