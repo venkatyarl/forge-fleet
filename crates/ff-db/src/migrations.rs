@@ -876,6 +876,13 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "error_events",
         sql: schema::SCHEMA_V178_ERROR_EVENTS,
     },
+    // V179 (fleet_velocity_views / work_item_events_trigger / fleet_capacity_registry)
+    // and V180 (artifact_cache_index) are already claimed by in-flight branches.
+    PgMigration {
+        version: 181,
+        name: "merge_queue_review_claims",
+        sql: schema::SCHEMA_V181_MERGE_QUEUE_REVIEW_CLAIMS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

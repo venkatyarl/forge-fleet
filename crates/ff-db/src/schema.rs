@@ -10515,6 +10515,23 @@ CREATE INDEX IF NOT EXISTS idx_error_events_deployment
     ON error_events (deployment_id, occurred_at DESC) WHERE deployment_id IS NOT NULL;
 "#;
 
+/// V181 — Distributed review claims on the merge queue.
+///
+/// Review workers on any node claim unclaimed `work_item_merge_queue` entries
+/// via `FOR UPDATE SKIP LOCKED` and stamp `review_claimed_at` /
+/// `review_claimed_by`. The claim is a lease, not ownership: a worker that
+/// dies mid-review never clears its stamp, so claims older than a TTL are
+/// released (stamp nulled) and the row becomes claimable again. See
+/// `ff_agent::ha::review_worker`.
+pub const SCHEMA_V181_MERGE_QUEUE_REVIEW_CLAIMS: &str = r#"
+ALTER TABLE work_item_merge_queue
+    ADD COLUMN IF NOT EXISTS review_claimed_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS review_claimed_by TEXT;
+CREATE INDEX IF NOT EXISTS idx_work_item_merge_queue_review_claim
+    ON work_item_merge_queue (review_claimed_at)
+    WHERE review_claimed_at IS NOT NULL;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
