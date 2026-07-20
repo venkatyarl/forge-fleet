@@ -172,6 +172,7 @@ pub mod vault_sync;
 pub mod verify_computer;
 pub mod version_check;
 pub mod work_item_dispatch;
+pub mod work_item_feeder;
 pub mod work_item_merge_drain;
 pub mod work_item_scheduler;
 // work_stealer (V75) retired 2026-07-03 with batch_manager (dead fleet_work_items).
