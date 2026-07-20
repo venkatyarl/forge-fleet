@@ -251,6 +251,31 @@ async fn enqueue_upgrade_tasks(
         if node_is_leader && is_source_build_tool(tool) {
             continue;
         }
+        // Drift coalescing (2026-07-20 idle-gate race): `already()` only
+        // dedups against PENDING tasks, so the instant an upgrade completed
+        // (or failed) this tick re-enqueued the next one — with main advancing
+        // ~15 merges/hr that restarted adele's daemon 6 times in 21 min. Skip
+        // the (node, tool) pair while ANY upgrade task for it was created
+        // within the cooldown; the eventual next enqueue resolves the newest
+        // version anyway, so intermediate drift is batched, not lost. Errors
+        // fail-open (enqueue as before) so a query hiccup can't freeze
+        // upgrades.
+        if ff_db::pg_upgrade_recently_enqueued(
+            pool,
+            tool,
+            node,
+            crate::auto_upgrade::DAEMON_SELF_WAVE_COOLDOWN_SECS,
+        )
+        .await
+        .unwrap_or(false)
+        {
+            tracing::debug!(
+                tool = %tool,
+                node = %node,
+                "version-check: upgrade enqueued within cooldown — coalescing drift"
+            );
+            continue;
+        }
         let cur = current.get(tool).cloned().unwrap_or_default();
         let lat = latest.get(tool).cloned().unwrap_or_default();
         let title = format!("Upgrade {tool} on {node} ({cur} → {lat})");

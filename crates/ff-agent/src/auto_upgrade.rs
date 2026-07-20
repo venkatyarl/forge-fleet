@@ -466,6 +466,49 @@ pub(crate) fn is_daemon_self_software(software_id: &str) -> bool {
 /// *generations* once V52's same-wave barrier was in place).
 pub(crate) const DAEMON_SELF_SOFTWARE: &[&str] = &["ff_git", "forgefleetd_git", "forgefleet"];
 
+/// Drift-coalescing cooldown for AUTO-dispatched daemon-self waves. With main
+/// advancing ~15 merges/hr, each landed wave re-creates drift within minutes
+/// and the next tick immediately composes another restart wave — nodes thrash
+/// restart→stall→heal→restart (adele 2026-07-20: 6 daemon restarts in 21 min,
+/// the night's top stall source). One wave per 30 min batches intermediate
+/// drift: the eventual next wave resolves against the NEWEST origin/main SHA
+/// at compose time, so nothing is lost, only coalesced. Applies ONLY to the
+/// automatic tick — manual `ff fleet upgrade` and the staged-rollout tick are
+/// unaffected.
+pub(crate) const DAEMON_SELF_WAVE_COOLDOWN_SECS: i64 = 30 * 60;
+
+/// LIKE patterns matching the PARENT task summary of any daemon-self upgrade
+/// wave (`compose_fleet_upgrade_wave` writes
+/// `"fleet-upgrade-wave: {software_id} ({n} target(s), …)"`). Family-wide for
+/// the same reason as the V62 singleton: ff_git and forgefleetd_git waves both
+/// restart daemons, so the cooldown must span the whole family. Pure so the
+/// format coupling with the composer is unit-testable.
+pub(crate) fn daemon_self_wave_parent_patterns() -> Vec<String> {
+    DAEMON_SELF_SOFTWARE
+        .iter()
+        .map(|id| format!("fleet-upgrade-wave: {id} %"))
+        .collect()
+}
+
+/// Was ANY daemon-self wave (any status, including completed/failed) composed
+/// within the last [`DAEMON_SELF_WAVE_COOLDOWN_SECS`]? Errors read as `false`
+/// (fail-open) so a transient query failure can't freeze upgrades.
+async fn daemon_self_wave_recently_dispatched(pool: &PgPool) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+            SELECT 1 FROM fleet_tasks
+             WHERE task_type = 'compound'
+               AND summary LIKE ANY($1::text[])
+               AND created_at > NOW() - make_interval(secs => $2)
+        )",
+    )
+    .bind(daemon_self_wave_parent_patterns())
+    .bind(DAEMON_SELF_WAVE_COOLDOWN_SECS as f64)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false)
+}
+
 /// V67 install bootstrap: for every `software_registry.auto_install=true`
 /// row, insert a `computer_software` row (status='upgrade_available')
 /// for any computer that doesn't already have one. Idempotent — re-runs
@@ -921,6 +964,21 @@ impl AutoUpgradeTick {
             // would otherwise be filtered to empty), the wave still
             // sees and processes every non-leader target.
             if is_daemon_self_software(software_id) {
+                // Drift coalescing (2026-07-20 idle-gate race): at ~15
+                // merges/hr the drift check re-fires the moment a wave lands,
+                // so back-to-back waves restarted daemons continuously. Cap
+                // AUTO wave dispatch to one per family per cooldown window —
+                // the next wave batches all intermediate drift to the newest
+                // SHA. Complements (not replaces) the V62 in-flight singleton
+                // inside compose, which only spans a wave's own lifetime.
+                if daemon_self_wave_recently_dispatched(&self.pool).await {
+                    tracing::info!(
+                        software_id = %software_id,
+                        cooldown_secs = DAEMON_SELF_WAVE_COOLDOWN_SECS,
+                        "auto-upgrade: daemon-self wave dispatched within cooldown — coalescing drift into a later wave"
+                    );
+                    continue;
+                }
                 let leader_id: Option<uuid::Uuid> =
                     sqlx::query_scalar("SELECT computer_id FROM fleet_leader_state LIMIT 1")
                         .fetch_optional(&self.pool)
@@ -1575,6 +1633,41 @@ mod tests {
                 "{id} wrongly flagged daemon-self"
             );
         }
+    }
+
+    /// Drift-coalescing cooldown (2026-07-20 idle-gate race): the cooldown
+    /// patterns must match the EXACT parent summary `compose_fleet_upgrade_wave`
+    /// writes — a format drift here silently disables coalescing and revives
+    /// the restart→stall→heal→restart thrash.
+    #[test]
+    fn wave_cooldown_patterns_match_composer_parent_summaries() {
+        let patterns = daemon_self_wave_parent_patterns();
+        assert_eq!(patterns.len(), DAEMON_SELF_SOFTWARE.len());
+        for id in DAEMON_SELF_SOFTWARE {
+            // Same shape as task_runner::compose_fleet_upgrade_wave's
+            // parent_summary format string.
+            let sample = format!("fleet-upgrade-wave: {id} (14 target(s), fanout 4, 4 wave(s))");
+            let pattern = format!("fleet-upgrade-wave: {id} %");
+            assert!(patterns.contains(&pattern), "missing pattern for {id}");
+            // `LIKE 'prefix %'` semantics: the sample must start with the
+            // pattern's literal prefix (everything before the trailing %).
+            let prefix = pattern.trim_end_matches('%');
+            assert!(
+                sample.starts_with(prefix),
+                "pattern {pattern:?} would not match {sample:?}"
+            );
+            // And it must NOT match a CHILD task summary (those use the
+            // 'fleet-upgrade-wave/…' slash form) — else in-flight children
+            // would extend the cooldown indefinitely.
+            let child = format!("fleet-upgrade-wave/restart: {id} on adele");
+            assert!(
+                !child.starts_with(prefix),
+                "pattern matches child {child:?}"
+            );
+        }
+        // The cooldown must be long enough to actually coalesce (>= 10 min)
+        // yet bounded so upgrades still flow every tick interval or two.
+        assert!((600..=7200).contains(&DAEMON_SELF_WAVE_COOLDOWN_SECS));
     }
 
     #[test]

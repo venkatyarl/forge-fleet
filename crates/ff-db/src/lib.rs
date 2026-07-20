@@ -263,6 +263,7 @@ pub use queries::{
     pg_update_disk_move,
     pg_update_job_progress,
     pg_update_training_job_status,
+    pg_upgrade_recently_enqueued,
     pg_upsert_agent,
     pg_upsert_artifact_index,
     pg_upsert_brain_community,
