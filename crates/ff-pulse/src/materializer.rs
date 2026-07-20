@@ -50,7 +50,8 @@ const UPSERT_COMPUTER_ROW_SQL: &str = "UPDATE computers SET \
     gpu_kind = $6, \
     gpu_count = $7, \
     gpu_total_vram_gb = $8, \
-    has_gpu = ($7 > 0) \
+    has_gpu = ($7 > 0), \
+    dispatch_tick_at = $10 \
  WHERE id = $1";
 
 // -----------------------------------------------------------------------------
@@ -407,7 +408,7 @@ impl Materializer {
     /// Issues (at most) the following queries, in order:
     ///   Q1  SELECT_COMPUTER_BY_NAME
     ///   Q2  GET_PERSISTED_SNAPSHOT (redis)
-    ///   Q3  UPDATE_COMPUTER_LAST_SEEN_ONLY              (fast-path, snapshot match)
+    ///   Q3  UPDATE_COMPUTER_LAST_SEEN_AND_DISPATCH_TICK (fast-path, snapshot match)
     ///   Q4  UPSERT_COMPUTER_PERSISTENT_FIELDS           (delta-path, one atomic stmt)
     ///   Q5  UPDATE_COMPUTER_STATUS_TRANSITION           (on status change)
     ///   Q6  INSERT_DOWNTIME_EVENT                       (going_offline)
@@ -542,10 +543,13 @@ impl Materializer {
 
         if snapshots_match && !status_changed {
             // Q3: UPDATE_COMPUTER_LAST_SEEN_ONLY
-            sqlx::query("UPDATE computers SET last_seen_at = NOW() WHERE id = $1")
-                .bind(computer_id)
-                .execute(&self.pg)
-                .await?;
+            sqlx::query(
+                "UPDATE computers SET last_seen_at = NOW(), dispatch_tick_at = $2 WHERE id = $1",
+            )
+            .bind(computer_id)
+            .bind(beat.dispatch_tick_at)
+            .execute(&self.pg)
+            .await?;
 
             // Refresh the TTL on the snapshot so it doesn't expire mid-stream.
             let _: Result<(), _> = redis_conn
@@ -616,6 +620,7 @@ impl Materializer {
             .bind(beat.capabilities.gpu_count)
             .bind(beat.capabilities.gpu_total_vram_gb)
             .bind(&beat.network.primary_ip)
+            .bind(beat.dispatch_tick_at)
             .execute(&self.pg)
             .await?;
         report.wrote_computer_row =
@@ -1905,6 +1910,7 @@ mod tests {
             "gpu_count",
             "gpu_total_vram_gb",
             "has_gpu",
+            "dispatch_tick_at",
         ] {
             assert!(
                 UPSERT_COMPUTER_ROW_SQL.contains(col),

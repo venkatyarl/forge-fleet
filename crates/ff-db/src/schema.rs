@@ -10345,6 +10345,15 @@ CREATE INDEX IF NOT EXISTS idx_work_item_leases_dispatch_tick
     ON work_item_leases (lease_state, dispatch_tick_at) WHERE released_at IS NULL;
 "#;
 
+/// V175 — Persist the dispatch tick timestamp reported by each node's Pulse beat
+/// on the `computers` row. The scheduler treats a stale `dispatch_tick_at` as a
+/// signal that the host's work-item dispatch loop has gone quiet even though the
+/// heartbeat may still be healthy.
+pub const SCHEMA_V175_COMPUTERS_DISPATCH_TICK_AT: &str = r#"
+ALTER TABLE computers
+    ADD COLUMN IF NOT EXISTS dispatch_tick_at TIMESTAMPTZ;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

@@ -115,6 +115,12 @@ pub struct PulseBeatV2 {
     /// compatibility during mixed-generation deployments.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub receivers: Vec<String>,
+    /// When this node's work-item dispatch tick loop last fired. Carried by
+    /// the beat so the materializer can persist it to `computers.dispatch_tick_at`
+    /// for scheduler liveness checks. `None` on beats from daemons predating
+    /// this field or before the first tick fires.
+    #[serde(default)]
+    pub dispatch_tick_at: Option<DateTime<Utc>>,
 }
 
 // -----------------------------------------------------------------------------
@@ -519,6 +525,7 @@ impl PulseBeatV2 {
             encountered_bugs: Vec::new(),
             local_tasks: Vec::new(),
             receivers: Vec::new(),
+            dispatch_tick_at: None,
         }
     }
 }
@@ -679,6 +686,7 @@ mod tests {
             "encountered_bugs",
             "local_tasks",
             "receivers",
+            "dispatch_tick_at",
         ] {
             obj.remove(later_field);
         }
