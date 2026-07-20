@@ -533,14 +533,34 @@ impl Materializer {
             .await;
         }
 
-        // Fast path: if the snapshot matches exactly AND no status transition,
-        // only update last_seen_at.
+        // The Redis snapshot is only a write-churn cache, not the source of
+        // truth. Another writer may have changed (or partially cleared) the
+        // Postgres row since this snapshot was stored, so the fast path is
+        // safe only while the row still matches the beat as well.
+        let new_ips_json = &new_snapshot.all_ips_json;
+        let ips_differ = prev_all_ips_text
+            .as_deref()
+            .map(|s| normalize_json(s) != normalize_json(new_ips_json))
+            .unwrap_or(true);
+        let hw_differ = prev_cpu_cores != Some(beat.hardware.cpu_cores)
+            || prev_ram_gb != Some(beat.hardware.ram_gb)
+            || prev_disk_gb != Some(beat.hardware.disk_gb);
+        let cap_differ = prev_gpu_kind.as_deref() != Some(beat.capabilities.gpu_kind.as_str())
+            || prev_gpu_count != Some(beat.capabilities.gpu_count)
+            || prev_gpu_total_vram_gb != beat.capabilities.gpu_total_vram_gb;
+        let primary_ip_differ =
+            prev_primary_ip.as_deref() != Some(beat.network.primary_ip.as_str());
+        let persistent_row_differ =
+            persistent_fields_changed(ips_differ, hw_differ, cap_differ, primary_ip_differ);
+
+        // Fast path: if both cached and durable state match exactly AND no
+        // status transition, only update last_seen_at.
         let snapshots_match = prior_snapshot
             .as_ref()
             .map(|ps| ps == &new_snapshot)
             .unwrap_or(false);
 
-        if snapshots_match && !status_changed {
+        if can_use_last_seen_fast_path(snapshots_match, status_changed, persistent_row_differ) {
             // Q3: UPDATE_COMPUTER_LAST_SEEN_ONLY
             sqlx::query("UPDATE computers SET last_seen_at = NOW() WHERE id = $1")
                 .bind(computer_id)
@@ -562,24 +582,9 @@ impl Materializer {
         // Delta path.
 
         // IPs comparison.
-        let new_ips_json = &new_snapshot.all_ips_json;
-        let ips_differ = prev_all_ips_text
-            .as_deref()
-            .map(|s| normalize_json(s) != normalize_json(new_ips_json))
-            .unwrap_or(true);
         if ips_differ {
             report.ips_updated = true;
         }
-
-        // Hardware comparison.
-        let hw_differ = prev_cpu_cores != Some(beat.hardware.cpu_cores)
-            || prev_ram_gb != Some(beat.hardware.ram_gb)
-            || prev_disk_gb != Some(beat.hardware.disk_gb);
-
-        // Capability comparison.
-        let cap_differ = prev_gpu_kind.as_deref() != Some(beat.capabilities.gpu_kind.as_str())
-            || prev_gpu_count != Some(beat.capabilities.gpu_count)
-            || prev_gpu_total_vram_gb != beat.capabilities.gpu_total_vram_gb;
 
         // primary_ip comparison. Without this the column would be frozen to
         // whichever interface the node had at first enrollment — surfaced
@@ -587,9 +592,6 @@ impl Materializer {
         // (192.168.5.109) long after the laptop switched to ethernet
         // (192.168.5.110). `ff fleet versions --live` (and any other
         // primary_ip-using ssh path) was effectively unreachable.
-        let primary_ip_differ =
-            prev_primary_ip.as_deref() != Some(beat.network.primary_ip.as_str());
-
         // Q4: UPSERT_COMPUTER_PERSISTENT_FIELDS — single atomic statement.
         //
         // This used to be a read-compare-branch: the Q1 snapshot picked
@@ -661,8 +663,7 @@ impl Materializer {
                 .bind(&beat.network.primary_ip)
                 .execute(&self.pg)
                 .await?;
-            report.wrote_computer_row =
-                persistent_fields_changed(ips_differ, hw_differ, cap_differ, primary_ip_differ);
+            report.wrote_computer_row = persistent_row_differ;
         }
 
         // Always keep fleet_workers.ip in sync with the heartbeat's
@@ -1577,6 +1578,14 @@ fn persistent_fields_changed(
     ips_differ || hw_differ || cap_differ || primary_ip_differ
 }
 
+fn can_use_last_seen_fast_path(
+    snapshots_match: bool,
+    status_changed: bool,
+    persistent_row_differ: bool,
+) -> bool {
+    snapshots_match && !status_changed && !persistent_row_differ
+}
+
 fn computer_row_has_empty_node_attributes(primary_ip: Option<&str>, ram_gb: Option<i32>) -> bool {
     primary_ip.is_none_or(str::is_empty) || ram_gb.is_none_or(|ram| ram <= 0)
 }
@@ -1982,6 +1991,12 @@ mod tests {
     #[test]
     fn no_rewrite_when_nothing_changed() {
         assert!(!persistent_fields_changed(false, false, false, false));
+    }
+
+    #[test]
+    fn matching_redis_snapshot_does_not_hide_postgres_row_drift() {
+        assert!(!can_use_last_seen_fast_path(true, false, true));
+        assert!(can_use_last_seen_fast_path(true, false, false));
     }
 
     #[test]
