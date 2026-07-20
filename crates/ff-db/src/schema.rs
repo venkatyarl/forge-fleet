@@ -10649,6 +10649,29 @@ CREATE TRIGGER trg_work_item_status_change
     EXECUTE FUNCTION log_work_item_status_change();
 "#;
 
+/// V183 — Artifact cache index.
+///
+/// Tracks which computer holds a local copy of a cached build artifact, for
+/// the download-once-distribute-peer-to-peer cache (parent 468a7dc9): before
+/// re-downloading an artifact from its origin, callers check this table for
+/// a fleet peer that already has it.
+pub const SCHEMA_V183_ARTIFACT_CACHE_INDEX: &str = r#"
+CREATE TABLE IF NOT EXISTS artifact_cache_index (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    artifact_key   TEXT NOT NULL,
+    computer       TEXT NOT NULL,
+    file_path      TEXT NOT NULL,
+    size_bytes     BIGINT NOT NULL DEFAULT 0,
+    checksum       TEXT,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at   TIMESTAMPTZ,
+    UNIQUE (artifact_key, computer)
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifact_cache_index_artifact_key
+    ON artifact_cache_index (artifact_key);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
