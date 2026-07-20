@@ -4909,10 +4909,16 @@ fn build_router_interaction(
         channel: "gateway-router".to_string(),
         request_text,
         route_decision: route.cloned().unwrap_or_else(|| json!({})),
-        engine: response
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
+        // The router serves local fleet deployments — canonicalize the model
+        // name to `local:<catalog_id>` (plain `local` when the response omits
+        // `model`) so no gateway row lands with an empty engine.
+        engine: Some(
+            response
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(ff_agent::llm_attribution::engine_label)
+                .unwrap_or_else(|| "local".to_string()),
+        ),
         response_text: response
             .get("choices")
             .and_then(|v| v.as_array())
@@ -6872,7 +6878,7 @@ mod router_interaction_capture_tests {
         assert_eq!(rec.channel, "gateway-router");
         assert_eq!(rec.request_text, "meaning of life?");
         assert_eq!(rec.response_text, "42");
-        assert_eq!(rec.engine.as_deref(), Some("qwen3-30b-a3b"));
+        assert_eq!(rec.engine.as_deref(), Some("local:qwen3-30b-a3b"));
         assert_eq!(rec.tokens_in, 17);
         assert_eq!(rec.tokens_out, 5);
         assert_eq!(rec.latency_ms, Some(321));
@@ -6890,7 +6896,7 @@ mod router_interaction_capture_tests {
             "choices": [{"message": {"content": "ok"}}],
         });
         let rec = build_router_interaction("hi".to_string(), &response, 5);
-        assert_eq!(rec.engine, None);
+        assert_eq!(rec.engine.as_deref(), Some("local"));
         assert_eq!(rec.worker_name, None);
         assert_eq!(rec.endpoint, None);
         assert_eq!(rec.tokens_in, 0);

@@ -172,7 +172,7 @@ async fn run_pipeline(pool: PgPool, post_id: Uuid, url: String) -> Result<()> {
         .chars()
         .take(16000)
         .collect(),
-        engine: Some(model_id.clone()),
+        engine: Some(crate::llm_attribution::engine_label(&model_id)),
         response_text: analysis_json.to_string().chars().take(16000).collect(),
         outcome: "success".to_string(),
         endpoint: Some(endpoint.clone()),

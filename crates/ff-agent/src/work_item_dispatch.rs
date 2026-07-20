@@ -201,12 +201,22 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
         let worker_name = worker_name.to_string();
         tokio::spawn(async move {
             if let Err(e) = dispatch_one(pg.clone(), item.clone(), worker_name).await {
-                warn!(
-                    work_item_id = %item.work_item_id,
-                    sub_agent_id = %item.sub_agent_id,
-                    error = %e,
-                    "work_item_dispatch: dispatch failed"
-                );
+                if is_build_timeout(&e) {
+                    warn!(
+                        work_item_id = %item.work_item_id,
+                        sub_agent_id = %item.sub_agent_id,
+                        attempts = item.attempts + 1,
+                        error = %e,
+                        "work_item_dispatch: build timed out; requeueing for retry"
+                    );
+                } else {
+                    warn!(
+                        work_item_id = %item.work_item_id,
+                        sub_agent_id = %item.sub_agent_id,
+                        error = %e,
+                        "work_item_dispatch: dispatch failed"
+                    );
+                }
                 if let Err(cleanup) = requeue_or_fail(&pg, &item, &e.to_string()).await {
                     warn!(
                         work_item_id = %item.work_item_id,
@@ -225,6 +235,16 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
         );
     }
     Ok(started)
+}
+
+/// Whether a dispatch error was caused by a build command exceeding its time
+/// budget. Inspect the full anyhow chain because callers add context while the
+/// timeout itself is normally the innermost error.
+fn is_build_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("timed out") || message.contains("timeout")
+    })
 }
 
 /// Spawn the dispatch loop. PER-HOST (not leader-gated): the scheduler (leader)
@@ -805,7 +825,9 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     // codex (and most CLI agents) EDIT files but don't `git commit`. Commit any
     // changes it made in the worktree so they can become a PR. A clean worktree
     // (agent made no change) commits nothing → handled as "no commits" below.
-    let dirty = commit_worktree_changes(&worktree.worktree_path, &item.title)?;
+    let (git_name, git_email) = resolve_git_identity(&pg, &item.project_id).await;
+    let dirty =
+        commit_worktree_changes(&worktree.worktree_path, &item.title, &git_name, &git_email)?;
     info!(
         work_item_id = %item.work_item_id, dirty,
         "work_item_dispatch: committed agent changes (dirty={dirty})"
@@ -830,17 +852,22 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         // or unrelated branch (council guard: ahead-count alone isn't ancestry).
         && base_is_ancestor_of_head(&worktree.worktree_path, &worktree.base_branch)
     {
-        match adopt_worktree_head_onto_branch(&worktree.worktree_path, &worktree.task_branch) {
-            Ok(()) => {
+        match squash_adopt_worktree_head_onto_branch(
+            &worktree.worktree_path,
+            &worktree.base_branch,
+            &worktree.task_branch,
+            &item.title,
+        ) {
+            Ok(_) => {
                 warn!(
                     work_item_id = %item.work_item_id,
-                    "work_item_dispatch: agent committed to its own HEAD (not the task branch) — salvaged onto the task branch instead of discarding as a no-op"
+                    "work_item_dispatch: agent self-committed a clean tree — squashed/retitled onto the task branch instead of discarding as a no-op"
                 );
                 has_commits = true;
             }
             Err(e) => warn!(
                 work_item_id = %item.work_item_id, error = %e,
-                "work_item_dispatch: agent-committed HEAD detected but salvage-onto-task-branch failed; treating as no-op"
+                "work_item_dispatch: agent-committed HEAD detected but squash-onto-task-branch failed; treating as no-op"
             ),
         }
     }
@@ -1605,10 +1632,10 @@ has NO database and will PANIC otherwise). Never let a DB test panic in CI.\n\
 NEVER edit an existing migration const, and never add a second/redundant migration.\n\
 - STOP when done: once `cargo +1.88.0 fmt --check` + `cargo +1.88.0 check` + your \
 targeted test pass, STOP. LEAVE YOUR EDITS UNCOMMITTED in the working tree — do NOT \
-run `git add`, `git commit`, `git push`, or open a PR. The dispatch harness commits \
-your working-tree changes and opens the PR itself; if you commit them yourself it sees \
-a CLEAN tree and DISCARDS your work as a no-op (your task then fails despite the code \
-being correct).\n\
+run `git add`, `git commit`, `git push`, or open a PR. NEVER commit your edits yourself: \
+the harness can only commit and push UNCOMMITTED working-tree changes. If you run git \
+commit the tree becomes CLEAN and the harness DISCARDS your finished work as a no-op \
+(your task then fails despite the code being correct).\n\
 - Keep the diff minimal and scoped strictly to the task.\n";
 
 /// Whether a stored `last_error` is a TASK-level failure the coding agent can
@@ -1705,23 +1732,7 @@ fn dispatch_prompt(item: &AssignedWorkItem) -> String {
 /// `total tokens: 1234`. Best-effort — returns 0 when no count is found.
 #[doc(hidden)]
 pub fn parse_cli_tokens(output: &str) -> i32 {
-    let lower = output.to_ascii_lowercase();
-    // Find a "tokens" marker, then the nearest number after it (strip commas).
-    for marker in ["tokens used", "total tokens", "tokens:", "tokens"] {
-        if let Some(pos) = lower.find(marker) {
-            let tail = &output[pos + marker.len()..];
-            let digits: String = tail
-                .chars()
-                .skip_while(|c| !c.is_ascii_digit())
-                .take_while(|c| c.is_ascii_digit() || *c == ',')
-                .filter(|c| *c != ',')
-                .collect();
-            if let Ok(n) = digits.parse::<i32>() {
-                return n;
-            }
-        }
-    }
-    0
+    crate::llm_attribution::parse_total_tokens_marker(output)
 }
 
 /// Record a dispatch turn in `ff_interactions` (training data). Best-effort —
@@ -1735,14 +1746,22 @@ async fn record_dispatch_interaction(
     result: &Result<Output>,
     elapsed: Duration,
 ) {
-    let (response_text, outcome, error_text, tokens_out) = match result {
+    let request_text = dispatch_prompt(item);
+    let (response_text, outcome, error_text, tokens_in, tokens_out, tokens_estimated) = match result
+    {
         Ok(out) => {
             let text = String::from_utf8_lossy(&out.stdout)
                 .chars()
                 .take(16000)
                 .collect::<String>();
-            let toks = parse_cli_tokens(&text);
-            (text, "success".to_string(), None, toks)
+            // Scan stdout AND stderr — several vendor CLIs print their usage
+            // stats on stderr — then degrade to a flagged chars/4 estimate so
+            // the usage rollup counts this call instead of recording 0/0.
+            let combined = format!("{text}\n{}", String::from_utf8_lossy(&out.stderr));
+            let (tin, tout) = crate::llm_attribution::parse_cli_token_counts(&combined);
+            let (tin, tout, estimated) =
+                crate::llm_attribution::tokens_or_estimate(tin, tout, &request_text, &text);
+            (text, "success".to_string(), None, tin, tout, estimated)
         }
         Err(e) => (
             String::new(),
@@ -1751,6 +1770,8 @@ async fn record_dispatch_interaction(
             // the top-level wrapper (e.g. "fleet_oneshot round 1").
             Some(format!("{e:#}").chars().take(2000).collect::<String>()),
             0,
+            0,
+            false,
         ),
     };
 
@@ -1765,12 +1786,20 @@ async fn record_dispatch_interaction(
         sig
     });
 
+    // Vendor backends keep their name (claude/codex/kimi); the local codegen
+    // lane's "local" backend stays `local`. Cost comes from the config-driven
+    // rates table — $0 for local, published per-token rates for cloud.
+    let engine = crate::llm_attribution::engine_label(backend);
+    let cost_usd = crate::llm_attribution::cost_usd(&engine, tokens_in, tokens_out);
     let rec = ff_db::InteractionRecord {
         channel: "work_item_dispatch".to_string(),
-        request_text: dispatch_prompt(item),
-        engine: Some(backend.to_string()),
+        request_text,
+        request_meta: serde_json::json!({ "tokens_estimated": tokens_estimated }),
+        engine: Some(engine),
         response_text,
+        tokens_in,
         tokens_out,
+        cost_usd,
         latency_ms: i32::try_from(elapsed.as_millis()).ok(),
         outcome,
         error_text,
@@ -1987,6 +2016,22 @@ async fn run_ff_dispatch(
                             synthetic_output("salvaged diff after backend timeout"),
                         ));
                     }
+                    // The backend may have COMMITTED its changes and then hung.
+                    // A clean tree is not "no work done" when HEAD advanced past base.
+                    if head_has_deliverable_commits(&worktree.worktree_path, &worktree.base_branch)
+                    {
+                        warn!(backend = %backend, error = %e, "run_ff_dispatch: backend timed out but self-committed — salvaging");
+                        let _ = crate::circuit_breaker::record_provider_success(
+                            pg,
+                            computer_id,
+                            backend,
+                        )
+                        .await;
+                        return Ok((
+                            backend.clone(),
+                            synthetic_output("salvaged self-commits after backend timeout"),
+                        ));
+                    }
                     // No diff → genuine failure: record it and SWITCH to the next
                     // backend rather than `?`-propagating out (which would abort
                     // failover — the "codex hangs → whole dispatch dies" bug).
@@ -2033,10 +2078,21 @@ async fn run_ff_dispatch(
                     synthetic_output("salvaged diff after non-zero backend exit"),
                 ));
             }
+            // Same self-commit case: backend committed, then its own verify step
+            // failed and exited non-zero. The commits are still deliverable.
+            if head_has_deliverable_commits(&worktree.worktree_path, &worktree.base_branch) {
+                warn!(backend = %backend, code = ?out.status.code(), "run_ff_dispatch: backend exited non-zero but self-committed — salvaging");
+                let _ =
+                    crate::circuit_breaker::record_provider_success(pg, computer_id, backend).await;
+                return Ok((
+                    backend.clone(),
+                    synthetic_output("salvaged self-commits after non-zero backend exit"),
+                ));
+            }
             let combined = format!(
                 "{}\n{}",
                 String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
+                String::from_utf8_lossy(&out.stderr),
             );
             let class = crate::cloud_error::classify(backend, out.status.code(), &combined);
             let tripped = crate::circuit_breaker::record_provider_failure(
@@ -2086,6 +2142,19 @@ async fn run_ff_dispatch(
                     return Ok((
                         forced_backend,
                         synthetic_output("salvaged diff after forced backend timeout"),
+                    ));
+                }
+                if head_has_deliverable_commits(&worktree.worktree_path, &worktree.base_branch) {
+                    warn!(backend = %forced_backend, error = %e, "run_ff_dispatch: forced backend timed out but self-committed — salvaging");
+                    let _ = crate::circuit_breaker::record_provider_success(
+                        pg,
+                        computer_id,
+                        &forced_backend,
+                    )
+                    .await;
+                    return Ok((
+                        forced_backend,
+                        synthetic_output("salvaged self-commits after forced backend timeout"),
                     ));
                 }
                 return Err(e);
@@ -2520,7 +2589,12 @@ fn agent_output_tail(output: &std::process::Output, max_chars: usize) -> String 
     format!("…{tail}")
 }
 
-fn commit_worktree_changes(worktree_path: &Path, title: &str) -> Result<bool> {
+fn commit_worktree_changes(
+    worktree_path: &Path,
+    title: &str,
+    author_name: &str,
+    author_email: &str,
+) -> Result<bool> {
     // Auto-format BEFORE staging so a fleet-produced Rust PR passes CI
     // `cargo fmt --check` — LLM backends routinely emit un-formatted Rust, which
     // fails the fmt gate and blocks the PR (observed on PR #787). Best-effort +
@@ -2542,13 +2616,21 @@ fn commit_worktree_changes(worktree_path: &Path, title: &str) -> Result<bool> {
         return Ok(false); // nothing to commit
     }
     let msg = format!("{title}\n\nAutomated work_item dispatch (ForgeFleet Pillar 4).");
+    // Author with the resolved per-project identity via `-c` so it WINS over any
+    // repo-local config a backend set during its run (codex writes
+    // user.email=codex@openai.com into the slot clone; other agents leave
+    // noreply). `-c` overrides both global and local config for this one
+    // command, so fleet-authored commits always carry the operator/project
+    // identity, not a bot. Identity is DB-driven (see resolve_git_identity).
+    let name_cfg = format!("user.name={author_name}");
+    let email_cfg = format!("user.email={author_email}");
     run_git(
         worktree_path,
         [
             OsStr::new("-c"),
-            OsStr::new("user.name=ForgeFleet"),
+            OsStr::new(&name_cfg),
             OsStr::new("-c"),
-            OsStr::new("user.email=fleet@forgefleet.local"),
+            OsStr::new(&email_cfg),
             OsStr::new("commit"),
             OsStr::new("-m"),
             OsStr::new(&msg),
@@ -2556,6 +2638,34 @@ fn commit_worktree_changes(worktree_path: &Path, title: &str) -> Result<bool> {
         Duration::from_secs(60),
     )?;
     Ok(true)
+}
+
+/// Resolve a project's git author identity, DB-driven and per-project:
+/// `projects.metadata` git_author_name/email first (so different projects can
+/// commit under different identities), then the fleet-wide
+/// `fleet_secrets` git.author_name/email default, then a final hardcoded
+/// fallback so a commit never fails for lack of an identity.
+async fn resolve_git_identity(pg: &PgPool, project_id: &str) -> (String, String) {
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT metadata->>'git_author_name', metadata->>'git_author_email' \
+           FROM projects WHERE id = $1",
+    )
+    .bind(project_id)
+    .fetch_optional(pg)
+    .await
+    .ok()
+    .flatten();
+    let (mut name, mut email) = row.unwrap_or((None, None));
+    if name.is_none() {
+        name = crate::fleet_info::fetch_secret("git.author_name").await;
+    }
+    if email.is_none() {
+        email = crate::fleet_info::fetch_secret("git.author_email").await;
+    }
+    (
+        name.unwrap_or_else(|| "Venkat Yarlagadda".to_string()),
+        email.unwrap_or_else(|| "venkat.yarl@gmail.com".to_string()),
+    )
 }
 
 /// Run `cargo fmt` over the worktree so committed Rust is CI-fmt-clean. Uses a
@@ -2664,11 +2774,53 @@ fn base_is_ancestor_of_head(worktree_path: &Path, base_branch: &str) -> bool {
     }
 }
 
-/// Force `task_branch` to point at the worktree's current HEAD, adopting an
-/// agent's self-made commit onto the branch the harness pushes (#71). Only called
-/// when `task_branch` has no commits of its own, so it's not the checked-out
-/// branch and `git branch -f` won't be refused.
-fn adopt_worktree_head_onto_branch(worktree_path: &Path, task_branch: &str) -> Result<()> {
+/// Whether the worktree's HEAD has commits ahead of base AND those commits are a
+/// proper continuation of base (not a diverged/unrelated branch). This is the
+/// condition for treating the agent's self-made commits as the deliverable.
+fn head_has_deliverable_commits(worktree_path: &Path, base_branch: &str) -> bool {
+    worktree_head_ahead_of_base(worktree_path, base_branch).unwrap_or(false)
+        && base_is_ancestor_of_head(worktree_path, base_branch)
+}
+
+/// Resolve the ref to use as the task branch's squash base. Prefers
+/// `origin/<base_branch>` because the harness always fetches it; falls back to
+/// the local base branch ref.
+fn resolve_base_ref(worktree_path: &Path, base_branch: &str) -> Result<String> {
+    let origin_ref = format!("origin/{base_branch}");
+    if run_git(
+        worktree_path,
+        ["rev-parse", "--verify", &origin_ref],
+        Duration::from_secs(30),
+    )
+    .is_ok()
+    {
+        return Ok(origin_ref);
+    }
+    if run_git(
+        worktree_path,
+        ["rev-parse", "--verify", base_branch],
+        Duration::from_secs(30),
+    )
+    .is_ok()
+    {
+        return Ok(base_branch.to_string());
+    }
+    bail!("no base ref found for {base_branch} (needed to retitle self-commits)");
+}
+
+/// Adopt an agent's self-made HEAD commits onto the task branch the harness
+/// pushes, then squash/retitle them into a single commit with the work-item
+/// title (#71 / self-commit-salvage). Only called when `task_branch` has no
+/// commits of its own, so it's safe to force-update it. Returns the new HEAD
+/// SHA so the caller can avoid a second `git rev-parse`.
+fn squash_adopt_worktree_head_onto_branch(
+    worktree_path: &Path,
+    base_branch: &str,
+    task_branch: &str,
+    title: &str,
+) -> Result<String> {
+    let base_ref = resolve_base_ref(worktree_path, base_branch)?;
+    // Point the task branch at the agent's self-made HEAD.
     run_git(
         worktree_path,
         [
@@ -2679,7 +2831,46 @@ fn adopt_worktree_head_onto_branch(worktree_path: &Path, task_branch: &str) -> R
         ],
         Duration::from_secs(30),
     )?;
-    Ok(())
+    // Switch to it so the squash commit updates the branch we actually push.
+    run_git(
+        worktree_path,
+        ["checkout", task_branch],
+        Duration::from_secs(30),
+    )?;
+    // Squash everything since base into one commit with the canonical title.
+    run_git(
+        worktree_path,
+        ["reset", "--soft", &base_ref],
+        Duration::from_secs(30),
+    )?;
+    // Auto-format the agent's changes before recommitting, just like
+    // commit_worktree_changes does for dirty trees. Best-effort + Rust-only.
+    if worktree_path.join("Cargo.toml").exists() {
+        if let Err(e) = run_cargo_fmt(worktree_path) {
+            warn!(
+                error = %e,
+                "squash_adopt_worktree_head_onto_branch: cargo fmt failed (best-effort) — committing as-is"
+            );
+        }
+    }
+    // Stage any untracked files the agent left behind so they are folded into the
+    // single commit instead of remaining dirty (matches commit_worktree_changes).
+    let _ = run_git(worktree_path, ["add", "-A"], Duration::from_secs(30));
+    let msg = format!("{title}\n\nAutomated work_item dispatch (ForgeFleet Pillar 4).");
+    run_git(
+        worktree_path,
+        [
+            OsStr::new("-c"),
+            OsStr::new("user.name=ForgeFleet"),
+            OsStr::new("-c"),
+            OsStr::new("user.email=fleet@forgefleet.local"),
+            OsStr::new("commit"),
+            OsStr::new("-m"),
+            OsStr::new(&msg),
+        ],
+        Duration::from_secs(60),
+    )?;
+    git_head_sha(worktree_path)
 }
 
 fn git_head_sha(worktree_path: &Path) -> Result<String> {
@@ -3169,7 +3360,7 @@ mod tests {
     use super::{
         DISPATCH_HOUSE_RULES, DispatchOutcome, agent_output_tail, classify_dispatch_outcome,
         command_display, default_clone_path, dispatch_budget_for_host, expand_home,
-        parse_cli_tokens, primary_or_default_backend, repo_cache_path, repo_slug,
+        is_build_timeout, parse_cli_tokens, primary_or_default_backend, repo_cache_path, repo_slug,
         retry_error_is_actionable, rewrite_github_host_alias, task_prefers_cloud_lane,
         use_local_lane,
     };
@@ -3534,6 +3725,13 @@ mod tests {
     }
 
     #[test]
+    fn detects_build_timeout_through_error_context() {
+        let timeout = anyhow!("command timed out after 300s").context("run cargo build");
+        assert!(is_build_timeout(&timeout));
+        assert!(!is_build_timeout(&anyhow!("cargo build exited 1")));
+    }
+
+    #[test]
     fn budget_zero_free_slots_is_zero() {
         assert_eq!(dispatch_budget_for_host(0, 0), 0);
         assert_eq!(dispatch_budget_for_host(0, 10), 0);
@@ -3601,5 +3799,180 @@ mod tests {
     #[test]
     fn forced_fallback_defaults_to_codex_when_unrouted() {
         assert_eq!(primary_or_default_backend(&[]), "codex");
+    }
+
+    #[test]
+    fn squash_adopt_retitles_self_commits_to_single_task_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        super::run_git(repo, ["init"], std::time::Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.name", "Test"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.email", "test@example.com"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        std::fs::write(repo.join("base.txt"), "base").unwrap();
+        super::run_git(repo, ["add", "-A"], std::time::Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["commit", "-m", "base commit"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        // Make `main` the explicit base branch.
+        super::run_git(
+            repo,
+            ["checkout", "-B", "main"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        // Harness creates the task branch at base; agent does its work on a
+        // self-made branch.
+        super::run_git(
+            repo,
+            ["checkout", "-B", "task", "main"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            repo,
+            ["checkout", "-b", "agent", "task"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        std::fs::write(repo.join("a.txt"), "a").unwrap();
+        super::run_git(repo, ["add", "-A"], std::time::Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["commit", "-m", "agent commit 1"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        std::fs::write(repo.join("b.txt"), "b").unwrap();
+        super::run_git(repo, ["add", "-A"], std::time::Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["commit", "-m", "agent commit 2"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+
+        // The harness sees a clean tree and the task branch itself has no commits.
+        assert!(!super::worktree_has_diff(repo));
+        assert!(!super::branch_has_commits(repo, "main", "task").unwrap());
+
+        let head =
+            super::squash_adopt_worktree_head_onto_branch(repo, "main", "task", "Fix the thing")
+                .unwrap();
+        assert!(!head.is_empty());
+
+        // Task branch now has exactly one commit ahead of base, retitled with the
+        // work item title.
+        assert!(super::branch_has_commits(repo, "main", "task").unwrap());
+        let count = super::run_git(
+            repo,
+            ["rev-list", "--count", "main..task"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+        let log = super::run_git(
+            repo,
+            ["log", "-1", "--pretty=%s", "task"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let msg = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            msg.contains("Fix the thing"),
+            "commit should be retitled: {msg}"
+        );
+        // Changes from both agent commits are preserved.
+        assert!(repo.join("a.txt").exists());
+        assert!(repo.join("b.txt").exists());
+    }
+
+    #[test]
+    fn squash_adopt_includes_uncommitted_dirty_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        super::run_git(repo, ["init"], std::time::Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.name", "Test"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.email", "test@example.com"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        std::fs::write(repo.join("base.txt"), "base").unwrap();
+        super::run_git(repo, ["add", "-A"], std::time::Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["commit", "-m", "base commit"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            repo,
+            ["checkout", "-B", "main"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            repo,
+            ["checkout", "-B", "task", "main"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            repo,
+            ["checkout", "-b", "agent", "task"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        std::fs::write(repo.join("committed.txt"), "committed").unwrap();
+        super::run_git(repo, ["add", "-A"], std::time::Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["commit", "-m", "agent commit"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        // And a dirty change the agent forgot to commit.
+        std::fs::write(repo.join("dirty.txt"), "dirty").unwrap();
+        assert!(super::worktree_has_diff(repo));
+
+        super::squash_adopt_worktree_head_onto_branch(repo, "main", "task", "Fix with dirty")
+            .unwrap();
+
+        let log = super::run_git(
+            repo,
+            ["log", "-1", "--pretty=%s", "task"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&log.stdout).contains("Fix with dirty"));
+        let count = super::run_git(
+            repo,
+            ["rev-list", "--count", "main..task"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+        assert!(repo.join("committed.txt").exists());
+        assert!(repo.join("dirty.txt").exists());
+        assert!(!super::worktree_has_diff(repo));
     }
 }

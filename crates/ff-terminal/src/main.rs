@@ -7325,11 +7325,27 @@ async fn run_headless(
         let engine = capture_model.clone();
         tokio::spawn(async move {
             if let Some(pool) = cli_interaction_pool().await {
+                // Canonical engine (vendor CLI name passes through, local
+                // models become local:<catalog_id>) + flagged chars/4 token
+                // estimate — the agent loop doesn't surface a usage block.
+                let engine = ff_agent::llm_attribution::engine_label(&engine);
+                let (tokens_in, tokens_out, tokens_estimated) =
+                    ff_agent::llm_attribution::tokens_or_estimate(
+                        0,
+                        0,
+                        &request_text,
+                        &response_text,
+                    );
+                let cost_usd = ff_agent::llm_attribution::cost_usd(&engine, tokens_in, tokens_out);
                 let rec = ff_db::InteractionRecord {
                     channel: "cli".to_string(),
                     request_text,
+                    request_meta: serde_json::json!({ "tokens_estimated": tokens_estimated }),
                     engine: Some(engine),
                     response_text,
+                    tokens_in,
+                    tokens_out,
+                    cost_usd,
                     latency_ms: Some(latency_ms),
                     outcome: capture_outcome.to_string(),
                     ..Default::default()
