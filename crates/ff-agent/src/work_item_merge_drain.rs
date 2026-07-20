@@ -269,11 +269,180 @@ async fn run_pr_review(
         description = description.unwrap_or_default(),
     );
 
-    let response =
-        crate::fleet_oneshot::fleet_oneshot(pg, &prompt, None, Some(Duration::from_secs(180)))
+    // Primary reviewer: the 480B ring (operator-approved 2026-07-19) — zero
+    // cloud cost. Its verdict stands alone only on APPROVE; a REJECT must be
+    // confirmed by one cloud CLI review before the item is failed, so a local
+    // misjudgement can never kill a good PR by itself. 480B unavailable or
+    // timed out → fall back to the cloud review path. A cloud-review error
+    // propagates as Err, which the caller treats as "defer for manual review"
+    // — never a rejection.
+    match review_via_480b(pg, &prompt).await {
+        Ok((true, reason)) => Ok((true, format!("480b: {reason}"))),
+        Ok((false, reason_480b)) => {
+            info!(
+                pr = %pr_url,
+                reason = %reason_480b,
+                "merge_drain: 480b rejected — confirming with cloud review before failing"
+            );
+            let (approved, cloud_reason, backend) = cloud_cli_review(pg, &prompt)
+                .await
+                .context("cloud confirm of 480b rejection")?;
+            if approved {
+                Ok((
+                    true,
+                    format!("{backend} overturned 480b rejection ({reason_480b}): {cloud_reason}"),
+                ))
+            } else {
+                Ok((
+                    false,
+                    format!("480b: {reason_480b}; confirmed by {backend}: {cloud_reason}"),
+                ))
+            }
+        }
+        Err(e) => {
+            warn!(
+                pr = %pr_url,
+                error = %e,
+                "merge_drain: 480b reviewer unavailable — falling back to cloud review"
+            );
+            let (approved, reason, backend) = cloud_cli_review(pg, &prompt)
+                .await
+                .context("cloud PR review fallback")?;
+            Ok((approved, format!("{backend}: {reason}")))
+        }
+    }
+}
+
+/// Substring identifying the primary autonomous reviewer — the qwen3-coder-480b
+/// ring (single fleet instance). Used both as the `fleet_oneshot` routing hint
+/// and to verify which model actually served the call, because `fleet_oneshot`
+/// fails over to OTHER deployments when the hinted one is down — a review from
+/// a weaker fallback model must not be mistaken for a 480B verdict.
+const REVIEWER_480B_HINT: &str = "480b";
+
+/// Cap 480B review concurrency at 1: the ring is a single instance, and the
+/// drain is serial anyway — the gate makes that explicit for any future caller
+/// that reviews outside the drain loop.
+static REVIEW_480B_GATE: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(1));
+
+/// Primary PR review on the 480B ring. `Err` means the ring is unavailable
+/// (routing failed, timed out, or `fleet_oneshot` failed over to some other
+/// model) — the caller falls back to the cloud review path.
+async fn review_via_480b(pg: &PgPool, prompt: &str) -> Result<(bool, String)> {
+    let _permit = REVIEW_480B_GATE
+        .acquire()
+        .await
+        .expect("480b review gate is never closed");
+    let resp = crate::fleet_oneshot::fleet_oneshot(
+        pg,
+        prompt,
+        Some(REVIEWER_480B_HINT),
+        Some(Duration::from_secs(300)),
+    )
+    .await
+    .context("480b PR review")?;
+    if !served_by_480b(&resp.model) {
+        anyhow::bail!(
+            "480b ring unavailable — fleet_oneshot failed over to {} on {}",
+            resp.model,
+            resp.worker_name
+        );
+    }
+    record_review_interaction(
+        pg,
+        &resp.model,
+        prompt,
+        &resp.text,
+        resp.tokens_in,
+        resp.tokens_out,
+        i32::try_from(resp.latency_ms).ok(),
+        Some(resp.worker_name.clone()),
+        Some(resp.endpoint.clone()),
+    )
+    .await;
+    Ok(parse_review_response(&resp.text))
+}
+
+/// True when the model name that served a call is the 480B ring.
+fn served_by_480b(model: &str) -> bool {
+    model.to_lowercase().contains(REVIEWER_480B_HINT)
+}
+
+/// One cloud CLI review pass — first backend that produces output wins, so a
+/// leader node missing one vendor CLI still gets a review. Returns
+/// `(approved, reason, backend)`.
+async fn cloud_cli_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, String)> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for backend in ["codex", "claude", "kimi"] {
+        match crate::cli_executor::execute_cli(backend, prompt, &[], Some(Duration::from_secs(600)))
             .await
-            .context("fleet PR review")?;
-    Ok(parse_review_response(&response.text))
+        {
+            Ok(res) if res.exit_code == 0 && !res.stdout.trim().is_empty() => {
+                record_review_interaction(
+                    pg,
+                    backend,
+                    prompt,
+                    &res.stdout,
+                    0,
+                    0,
+                    i32::try_from(res.duration_ms).ok(),
+                    None,
+                    Some(format!("ff cli {backend}")),
+                )
+                .await;
+                let (approved, reason) = parse_review_response(&res.stdout);
+                return Ok((approved, reason, backend.to_string()));
+            }
+            Ok(res) => {
+                let e = anyhow::anyhow!(
+                    "{backend} exited {}: {}",
+                    res.exit_code,
+                    res.stderr.trim().chars().take(300).collect::<String>()
+                );
+                warn!(backend, error = %e, "merge_drain: cloud review backend failed — trying next");
+                last_err = Some(e);
+            }
+            Err(e) => {
+                warn!(backend, error = %e, "merge_drain: cloud review backend unavailable — trying next");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no cloud CLI review backend available")))
+}
+
+/// Best-effort `ff_interactions` row for one autonomous review turn (training
+/// data — part of the point of routing review through the fleet). Never fails
+/// the drain.
+#[allow(clippy::too_many_arguments)]
+async fn record_review_interaction(
+    pg: &PgPool,
+    engine: &str,
+    prompt: &str,
+    response: &str,
+    tokens_in: i32,
+    tokens_out: i32,
+    latency_ms: Option<i32>,
+    worker_name: Option<String>,
+    endpoint: Option<String>,
+) {
+    let rec = ff_db::InteractionRecord {
+        channel: "merge_drain_review".to_string(),
+        request_text: prompt.chars().take(16000).collect(),
+        engine: Some(engine.to_string()),
+        response_text: response.chars().take(16000).collect(),
+        tokens_in,
+        tokens_out,
+        latency_ms,
+        outcome: "success".to_string(),
+        worker_name,
+        endpoint,
+        ..Default::default()
+    };
+    if let Err(e) = ff_db::pg_record_interaction(pg, &rec).await {
+        warn!(error = %e, "merge_drain: failed to log review interaction (non-fatal)");
+    }
 }
 
 fn parse_review_response(response: &str) -> (bool, String) {
@@ -670,7 +839,7 @@ pub fn spawn_work_item_merge_drain(
 
 #[cfg(test)]
 mod tests {
-    use super::update_branch_api_path;
+    use super::{parse_review_response, served_by_480b, update_branch_api_path};
 
     #[test]
     fn pr_url_maps_to_update_branch_api_path() {
@@ -678,6 +847,31 @@ mod tests {
             update_branch_api_path("https://github.com/venkatyarl/forge-fleet/pull/930").as_deref(),
             Some("repos/venkatyarl/forge-fleet/pulls/930/update-branch")
         );
+    }
+
+    #[test]
+    fn served_by_480b_matches_the_ring_only() {
+        assert!(served_by_480b("qwen3-coder-480b"));
+        assert!(served_by_480b("Qwen3-Coder-480B-A35B"));
+        // A fail-over to any other deployment must NOT count as a 480B verdict.
+        assert!(!served_by_480b("qwen3-coder-30b"));
+        assert!(!served_by_480b("local"));
+        assert!(!served_by_480b(""));
+    }
+
+    #[test]
+    fn parse_review_response_verdicts() {
+        let (approved, reason) = parse_review_response("APPROVE\nmatches the work item intent");
+        assert!(approved);
+        assert_eq!(reason, "matches the work item intent");
+
+        let (approved, reason) = parse_review_response("\nREJECT\nplaceholder-only diff");
+        assert!(!approved);
+        assert_eq!(reason, "placeholder-only diff");
+
+        let (approved, reason) = parse_review_response("");
+        assert!(!approved);
+        assert_eq!(reason, "empty review response");
     }
 
     #[test]
