@@ -2542,17 +2542,14 @@ fn commit_worktree_changes(worktree_path: &Path, title: &str) -> Result<bool> {
         return Ok(false); // nothing to commit
     }
     let msg = format!("{title}\n\nAutomated work_item dispatch (ForgeFleet Pillar 4).");
+    // Author with the operator's git identity from global config
+    // (`git config --global user.{name,email}`, set fleet-wide to
+    // "Venkat Yarlagadda <venkat.yarl@gmail.com>") rather than a per-command
+    // `-c user.name=ForgeFleet` override — so fleet-authored commits attribute
+    // to the operator's GitHub account, not a generic bot identity.
     run_git(
         worktree_path,
-        [
-            OsStr::new("-c"),
-            OsStr::new("user.name=ForgeFleet"),
-            OsStr::new("-c"),
-            OsStr::new("user.email=fleet@forgefleet.local"),
-            OsStr::new("commit"),
-            OsStr::new("-m"),
-            OsStr::new(&msg),
-        ],
+        [OsStr::new("commit"), OsStr::new("-m"), OsStr::new(&msg)],
         Duration::from_secs(60),
     )?;
     Ok(true)
