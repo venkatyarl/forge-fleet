@@ -33,8 +33,9 @@ pub use health_gate::{
     HealthGate, HealthGateConfig, HealthGateEvaluation, HealthGateStatus, HealthSnapshot,
 };
 pub use node::{
-    drain_active_work_item_leases, forgefleetd_restart_command, restart_forgefleetd_local,
-    restart_forgefleetd_local_with_drain, restart_forgefleetd_with_drain,
+    drain_active_work_item_leases, forgefleetd_restart_command, requeue_claimed_items,
+    restart_forgefleetd_local, restart_forgefleetd_local_with_drain,
+    restart_forgefleetd_with_drain,
 };
 pub use release::{ReleaseChannel, ReleaseManifest, ReleaseRecord, ReleaseState};
 pub use resolution::{

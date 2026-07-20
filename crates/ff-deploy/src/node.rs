@@ -16,6 +16,58 @@ use uuid::Uuid;
 use crate::config::DeployConfig;
 use crate::daemon::{ActiveLease, RestartReport, restart_with_lease_drain};
 
+/// Release active leases and return their claimed/building work items to `ready`.
+///
+/// This is used when a deploy forces a daemon restart, so it intentionally does
+/// not modify `work_items.attempts`: a deploy is not a failed build attempt.
+pub async fn requeue_claimed_items(pool: &PgPool, leases: &[ActiveLease]) -> Result<u64> {
+    let lease_ids: Vec<Uuid> = leases
+        .iter()
+        .map(|lease| Uuid::parse_str(&lease.lease_id))
+        .collect::<std::result::Result<_, _>>()
+        .context("invalid work-item lease id returned by drain query")?;
+
+    let result = sqlx::query(
+        "WITH drained AS (
+             UPDATE work_item_leases
+                SET lease_state = 'released',
+                    released_at = NOW(),
+                    release_reason = 'deploy restart drain'
+              WHERE id = ANY($1)
+                AND released_at IS NULL
+          RETURNING work_item_id, sub_agent_id
+         ), freed_slots AS (
+             UPDATE sub_agents AS sa
+                SET current_work_item_id = NULL,
+                    status = 'idle',
+                    started_at = NULL,
+                    last_heartbeat_at = NOW()
+              WHERE EXISTS (
+                    SELECT 1 FROM drained d
+                     WHERE d.sub_agent_id = sa.id
+                       AND d.work_item_id = sa.current_work_item_id)
+         ), retired_worktrees AS (
+             UPDATE work_item_worktrees AS wt
+                SET status = 'failed'
+              WHERE wt.status IN ('creating', 'active')
+                AND EXISTS (
+                    SELECT 1 FROM drained d WHERE d.work_item_id = wt.work_item_id)
+         )
+         UPDATE work_items AS wi
+            SET status = 'ready',
+                assigned_computer = NULL
+          WHERE wi.status IN ('claimed', 'building')
+            AND EXISTS (
+                SELECT 1 FROM drained d WHERE d.work_item_id = wi.id)",
+    )
+    .bind(&lease_ids)
+    .execute(pool)
+    .await
+    .context("failed to requeue work items after lease drain timeout")?;
+
+    Ok(result.rows_affected())
+}
+
 /// Drain this node's in-flight work-item leases from the canonical Postgres store.
 ///
 /// Active leases are allowed to finish until `config.drain_timeout`. Any leases
@@ -51,50 +103,7 @@ pub async fn drain_active_work_item_leases(
                 .collect())
         },
         |leases| async move {
-            let lease_ids: Vec<Uuid> = leases
-                .iter()
-                .map(|lease| Uuid::parse_str(&lease.lease_id))
-                .collect::<std::result::Result<_, _>>()
-                .context("invalid work-item lease id returned by drain query")?;
-
-            sqlx::query(
-                "WITH drained AS (
-                     UPDATE work_item_leases
-                        SET lease_state = 'released',
-                            released_at = NOW(),
-                            release_reason = 'deploy restart drain'
-                      WHERE id = ANY($1)
-                        AND released_at IS NULL
-                  RETURNING work_item_id, sub_agent_id
-                 ), freed_slots AS (
-                     UPDATE sub_agents AS sa
-                        SET current_work_item_id = NULL,
-                            status = 'idle',
-                            started_at = NULL,
-                            last_heartbeat_at = NOW()
-                      WHERE EXISTS (
-                            SELECT 1 FROM drained d
-                             WHERE d.sub_agent_id = sa.id
-                               AND d.work_item_id = sa.current_work_item_id)
-                 ), retired_worktrees AS (
-                     UPDATE work_item_worktrees AS wt
-                        SET status = 'failed'
-                      WHERE wt.status IN ('creating', 'active')
-                        AND EXISTS (
-                            SELECT 1 FROM drained d WHERE d.work_item_id = wt.work_item_id)
-                 )
-                 UPDATE work_items AS wi
-                    SET status = 'ready',
-                        assigned_computer = NULL
-                  WHERE wi.status IN ('claimed', 'building')
-                    AND EXISTS (
-                        SELECT 1 FROM drained d WHERE d.work_item_id = wi.id)",
-            )
-            .bind(&lease_ids)
-            .execute(pool)
-            .await
-            .context("failed to requeue work items after lease drain timeout")?;
-
+            requeue_claimed_items(pool, &leases).await?;
             Ok(())
         },
     )
