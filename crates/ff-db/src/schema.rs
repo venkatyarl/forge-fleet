@@ -11338,6 +11338,12 @@ ALTER TABLE work_item_merge_queue
     ADD COLUMN IF NOT EXISTS review_completed_at TIMESTAMPTZ;
 "#;
 
+/// V208 — Store parked work-item state explicitly.
+pub const SCHEMA_V208_WORK_ITEMS_PARKED: &str = r#"
+ALTER TABLE work_items
+    ADD COLUMN IF NOT EXISTS parked BOOLEAN NOT NULL DEFAULT false;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

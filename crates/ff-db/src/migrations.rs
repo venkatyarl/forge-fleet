@@ -1021,6 +1021,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "merge_queue_review_tracking",
         sql: schema::SCHEMA_V207_MERGE_QUEUE_REVIEW_TRACKING,
     },
+    PgMigration {
+        version: 208,
+        name: "work_items_parked",
+        sql: schema::SCHEMA_V208_WORK_ITEMS_PARKED,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
