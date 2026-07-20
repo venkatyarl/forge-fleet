@@ -2096,7 +2096,15 @@ async fn run_ff_dispatch(
         .await
         .unwrap_or_default();
     let mut backends = if routed.is_empty() {
-        vec!["claude".to_string(), "codex".to_string()]
+        let otherwise_dispatchable = ff_db::pg_dispatchable_backends(pg, item.computer_id, 5400)
+            .await
+            .unwrap_or_default();
+        if !otherwise_dispatchable.is_empty() {
+            anyhow::bail!(
+                "all authenticated cloud backends are exhausted or circuit-breaker blocked"
+            );
+        }
+        vec!["codex".to_string()]
     } else {
         routed
     };

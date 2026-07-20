@@ -167,10 +167,12 @@ pub fn probe_indicates_unauthenticated(reason: &str) -> bool {
         "invalid authentication credentials",
         "invalid api key",
         "invalid credentials",
-        "authentication credentials expired",
-        "authentication token expired",
-        "access token expired",
-        "login session expired",
+        "credentials expired",
+        "token expired",
+        "session expired",
+        "refresh token: access revoked",
+        "access_terminated",
+        "oauth session expired and could not be refreshed",
         "please log in",
         "please login",
         "not logged in",
@@ -489,8 +491,13 @@ mod tests {
             "Failed to authenticate. API Error: 401 Invalid authentication credentials"
         ));
         assert!(probe_indicates_unauthenticated("not logged in"));
+        assert!(probe_indicates_unauthenticated("Your token expired"));
         assert!(probe_indicates_unauthenticated(
-            "Your authentication token expired"
+            "refresh token: access revoked"
+        ));
+        assert!(probe_indicates_unauthenticated("access_terminated"));
+        assert!(probe_indicates_unauthenticated(
+            "OAuth session expired and could not be refreshed"
         ));
         // Transient / flaky probes must NOT match — they keep the cred-file
         // benefit of the doubt (a genuinely-authenticated backend blipping).
