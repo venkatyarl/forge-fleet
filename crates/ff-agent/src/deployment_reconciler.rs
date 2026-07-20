@@ -476,9 +476,14 @@ pub async fn evict_deployment_row(
 
     // Fleet-wide lookup — deliberately NOT filtered by worker_name, unlike
     // unload_model's pg_list_deployments(Some(worker)) path that got us here.
+    // Retire and fetch the row atomically. A separate SELECT followed by an
+    // UPDATE leaves a window where the reconciler can still observe `active`
+    // and respawn the dead deployment before eviction takes effect.
     let row = sqlx::query_as::<_, (String, i32, Option<i32>, Option<String>)>(
-        "SELECT worker_name, port, pid, library_id::text
-           FROM fleet_model_deployments WHERE id = $1",
+        "UPDATE fleet_model_deployments
+            SET desired_state = 'retired'
+          WHERE id = $1
+      RETURNING worker_name, port, pid, library_id::text",
     )
     .bind(uuid)
     .fetch_optional(pool)
@@ -492,14 +497,6 @@ pub async fn evict_deployment_row(
              `ff model unload --node <name> --port <port>`"
         ));
     };
-
-    // Mark retired BEFORE any kill/delete so a racing reconciler tick doesn't
-    // see a missing process for an 'active' row and respawn it mid-evict.
-    sqlx::query("UPDATE fleet_model_deployments SET desired_state = 'retired' WHERE id = $1")
-        .bind(uuid)
-        .execute(pool)
-        .await
-        .map_err(|e| format!("mark retired: {e}"))?;
 
     let this_node = crate::fleet_info::resolve_this_worker_name().await;
     if !evict_deletes_row(&worker_name, &this_node) {
