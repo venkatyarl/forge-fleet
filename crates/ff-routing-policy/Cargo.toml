@@ -9,5 +9,5 @@ description = "Pure tiered LLM routing policy for ForgeFleet"
 [dependencies]
 chrono = { workspace = true }
 ff-capacity = { path = "../ff-capacity" }
+serde = { workspace = true }
 uuid = { workspace = true }
-

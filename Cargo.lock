@@ -1671,6 +1671,7 @@ version = "2026.4.7"
 dependencies = [
  "chrono",
  "ff-capacity",
+ "serde",
  "uuid",
 ]
 

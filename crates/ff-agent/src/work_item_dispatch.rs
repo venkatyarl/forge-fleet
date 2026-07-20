@@ -3172,7 +3172,26 @@ static CAPACITY_LOAD_STARTED: std::sync::atomic::AtomicBool =
 async fn routed_backends(pg: &PgPool, computer_id: Uuid, fresh_secs: i64) -> Vec<String> {
     if let Some(snapshot) = CAPACITY_SNAPSHOT.get() {
         let cutoff = chrono::Utc::now() - chrono::Duration::seconds(fresh_secs);
-        let selected = rank_cached_backends(snapshot.backend_capacity(computer_id), cutoff);
+        let budgets = snapshot
+            .cloud_budgets()
+            .into_iter()
+            .map(ff_routing_policy::CloudBudget::from)
+            .collect::<Vec<_>>();
+        let decision = evaluate_cached_backends(
+            snapshot.backend_capacity(computer_id),
+            &budgets,
+            cutoff,
+            "dispatch",
+        );
+        if let Err(error) = ff_db::pg_record_route_decision(pg, &decision).await {
+            tracing::warn!(%error, trace_id = %decision.trace_id, "work_item_dispatch: route decision capture failed");
+        }
+        let selected = decision
+            .candidates
+            .iter()
+            .filter(|candidate| !candidate.rejected)
+            .map(|candidate| candidate.backend.clone())
+            .collect::<Vec<_>>();
         tracing::info!(
             route_decision = ?serde_json::json!({
                 "source": "capacity_snapshot",
@@ -3225,19 +3244,35 @@ async fn routed_backends(pg: &PgPool, computer_id: Uuid, fresh_secs: i64) -> Vec
     selected
 }
 
+#[cfg(test)]
 fn rank_cached_backends(
     rows: Vec<ff_capacity::BackendCapacity>,
     cutoff: chrono::DateTime<chrono::Utc>,
 ) -> Vec<String> {
-    ff_routing_policy::rank_cloud_backends(
+    evaluate_cached_backends(rows, &[], cutoff, "test")
+        .candidates
+        .into_iter()
+        .filter(|candidate| !candidate.rejected)
+        .map(|candidate| candidate.backend)
+        .collect()
+}
+
+fn evaluate_cached_backends(
+    rows: Vec<ff_capacity::BackendCapacity>,
+    budgets: &[ff_routing_policy::CloudBudget],
+    cutoff: chrono::DateTime<chrono::Utc>,
+    mode: &str,
+) -> ff_routing_policy::RouteDecision {
+    ff_routing_policy::evaluate_cloud_route(
         rows,
+        budgets,
         cutoff,
         &ff_routing_policy::TaskRequirements::default(),
         &ff_routing_policy::PolicyConfig::default(),
+        chrono::Utc::now(),
+        uuid::Uuid::new_v4(),
+        mode,
     )
-    .into_iter()
-    .map(|(backend, _)| backend)
-    .collect()
 }
 
 /// Council cap: how many headless auto-continue re-injections to attempt on a

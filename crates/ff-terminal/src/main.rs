@@ -85,6 +85,7 @@ mod project_cmd;
 mod queue_cmd;
 mod repo_context;
 mod research_cmd;
+mod route_cmd;
 mod secrets_cmd;
 mod self_heal_cmd;
 mod skills_cmd;
@@ -199,6 +200,11 @@ enum Command {
         /// Emit JSON instead of a table.
         #[arg(long)]
         json: bool,
+    },
+    /// Inspect routing candidates and budget rejections without dispatching.
+    Route {
+        #[command(subcommand)]
+        command: RouteCommand,
     },
     /// List fleet nodes with hardware/GPU info from Postgres.
     Nodes {
@@ -914,6 +920,22 @@ enum Command {
     Arbiter {
         #[command(subcommand)]
         command: arbiter_cmd::ArbiterCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum RouteCommand {
+    /// Print candidates, the chosen backend, and all rejection reasons.
+    Debug {
+        /// Fleet computer whose installed/authenticated backends to inspect.
+        #[arg(long)]
+        computer: Option<String>,
+        /// Maximum age of a backend health check.
+        #[arg(long, default_value_t = 5400)]
+        fresh_secs: i64,
+        /// Emit the complete decision JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -4177,6 +4199,9 @@ async fn main() -> Result<()> {
         Some(Command::Interactions { command }) => {
             return interactions_cmd::handle_interactions(command.clone()).await;
         }
+        Some(Command::Route { command }) => {
+            return route_cmd::handle_route(command.clone()).await;
+        }
         Some(Command::Model { command }) => return model_cmd::handle_model(command.clone()).await,
         Some(Command::DeferWorker {
             as_node,
@@ -4577,6 +4602,7 @@ async fn main() -> Result<()> {
         Some(Command::Interactions { command }) => {
             interactions_cmd::handle_interactions(command).await
         }
+        Some(Command::Route { command }) => route_cmd::handle_route(command).await,
         Some(Command::Model { command }) => model_cmd::handle_model(command).await,
         Some(Command::DeferWorker {
             as_node,

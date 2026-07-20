@@ -54,10 +54,23 @@ pub struct BackendCapacity {
     pub breaker_state: String,
 }
 
+/// Declarative provider quota loaded from `cloud_budget_buckets` alongside the
+/// rest of the registry snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct CloudBudgetCapacity {
+    pub provider: String,
+    /// Percent used (0..=100), not percent remaining.
+    pub weekly_pct: Option<i16>,
+    /// Percent used (0..=100), not percent remaining.
+    pub monthly_pct: Option<i16>,
+    pub window_exhausted_until: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone)]
 struct CapacityData {
     rows: Vec<CapacityRow>,
     backends: Vec<BackendCapacity>,
+    cloud_budgets: Vec<CloudBudgetCapacity>,
     loaded_at: DateTime<Utc>,
 }
 
@@ -174,6 +187,12 @@ impl CapacitySnapshot {
             .collect()
     }
 
+    /// Current declarative cloud quota rows. Refresh failures retain the last
+    /// good values together with the rest of the capacity snapshot.
+    pub fn cloud_budgets(&self) -> Vec<CloudBudgetCapacity> {
+        self.inner.data.load().cloud_budgets.clone()
+    }
+
     async fn fetch(pool: &PgPool) -> Result<CapacityData> {
         // Normalize the live registry view into the stable read-API shape.
         // The view deliberately uses one compact inference/build/cloud schema;
@@ -228,9 +247,17 @@ impl CapacitySnapshot {
         .fetch_all(pool)
         .await?;
 
+        let cloud_budgets = sqlx::query_as::<_, CloudBudgetCapacity>(
+            "SELECT provider, weekly_pct, monthly_pct, window_exhausted_until \
+               FROM cloud_budget_buckets ORDER BY provider",
+        )
+        .fetch_all(pool)
+        .await?;
+
         Ok(CapacityData {
             rows,
             backends,
+            cloud_budgets,
             loaded_at: Utc::now(),
         })
     }

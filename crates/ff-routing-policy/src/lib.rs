@@ -5,6 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use ff_capacity::{BackendCapacity, CapacitySnapshot, InferenceDeployment};
+use serde::Serialize;
 
 /// A routing tier, ordered from cheapest to most expensive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -28,6 +29,12 @@ pub struct TierBudget {
 pub struct PolicyConfig {
     pub budgets: Vec<TierBudget>,
     pub backend_headroom_floor_pct: f64,
+    /// Minimum remaining weekly/monthly cloud allowance. Budget rows store
+    /// percent used, so 15% remaining corresponds to rejecting values > 85.
+    pub cloud_budget_headroom_floor_pct: i16,
+    /// Coarse per-dispatch estimate used for decision telemetry until a caller
+    /// has request/model-specific pricing data.
+    pub cloud_estimated_cost_usd: f64,
     pub headroom_weight: f64,
     pub preference_weight: f64,
     pub health_weight: f64,
@@ -59,12 +66,60 @@ impl Default for PolicyConfig {
                 },
             ],
             backend_headroom_floor_pct: 15.0,
+            cloud_budget_headroom_floor_pct: 15,
+            cloud_estimated_cost_usd: 0.0,
             headroom_weight: 0.60,
             preference_weight: 0.30,
             health_weight: 0.10,
             preferred_cloud_backstop: None,
         }
     }
+}
+
+/// Declarative provider allowance loaded by a caller from
+/// `cloud_budget_buckets`. The policy stays pure and database-independent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudBudget {
+    pub provider: String,
+    /// Percent used, not percent remaining.
+    pub weekly_pct: Option<i16>,
+    /// Percent used, not percent remaining.
+    pub monthly_pct: Option<i16>,
+    pub window_exhausted_until: Option<DateTime<Utc>>,
+}
+
+impl From<ff_capacity::CloudBudgetCapacity> for CloudBudget {
+    fn from(row: ff_capacity::CloudBudgetCapacity) -> Self {
+        Self {
+            provider: row.provider,
+            weekly_pct: row.weekly_pct,
+            monthly_pct: row.monthly_pct,
+            window_exhausted_until: row.window_exhausted_until,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CandidateDecision {
+    pub backend: String,
+    pub score: Option<f64>,
+    pub estimated_cost_usd: f64,
+    pub rejected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
+}
+
+/// Stable, serializable explanation shared by real dispatch and `ff route debug`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RouteDecision {
+    pub schema_version: u8,
+    pub trace_id: uuid::Uuid,
+    pub mode: String,
+    pub candidates: Vec<CandidateDecision>,
+    pub chosen: Option<String>,
+    pub estimated_cost_usd: f64,
 }
 
 /// Requirements supplied by the task/request being routed.
@@ -153,40 +208,194 @@ pub fn rank_cloud_backends(
     requirements: &TaskRequirements,
     config: &PolicyConfig,
 ) -> Vec<(String, f64)> {
+    evaluate_cloud_route(
+        rows,
+        &[],
+        fresh_after,
+        requirements,
+        config,
+        Utc::now(),
+        uuid::Uuid::new_v4(),
+        "legacy",
+    )
+    .candidates
+    .into_iter()
+    .filter(|candidate| !candidate.rejected)
+    .map(|candidate| (candidate.backend, candidate.score.unwrap_or_default()))
+    .collect()
+}
+
+/// Evaluate and explain every cloud candidate, including ineligible rows.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_cloud_route(
+    rows: Vec<BackendCapacity>,
+    budgets: &[CloudBudget],
+    fresh_after: DateTime<Utc>,
+    requirements: &TaskRequirements,
+    config: &PolicyConfig,
+    now: DateTime<Utc>,
+    trace_id: uuid::Uuid,
+    mode: impl Into<String>,
+) -> RouteDecision {
     if !tier_allowed(RoutingTier::Cloud, requirements, config) {
-        return Vec::new();
+        return RouteDecision {
+            schema_version: 1,
+            trace_id,
+            mode: mode.into(),
+            candidates: rows
+                .into_iter()
+                .map(|row| {
+                    rejected_candidate(
+                        row.backend,
+                        "tier_budget",
+                        "cloud tier is not allowed by task budget or capabilities",
+                        config,
+                    )
+                })
+                .collect(),
+            chosen: None,
+            estimated_cost_usd: 0.0,
+        };
     }
-    let mut scored: Vec<_> = rows
+    let mut candidates: Vec<_> = rows
         .into_iter()
-        .filter(|row| {
-            row.installed
-                && row.authenticated
-                && row.last_checked_at > fresh_after
-                && row.breaker_state != "open"
-                && row.remaining_pct.unwrap_or(100.0) >= config.backend_headroom_floor_pct
-        })
         .map(|row| {
+            let rejection = capacity_rejection(&row, fresh_after, config).or_else(|| {
+                budgets
+                    .iter()
+                    .find(|budget| budget.provider.eq_ignore_ascii_case(&row.backend))
+                    .and_then(|budget| budget_rejection(budget, now, config))
+            });
             let score = backend_score_with_config(
                 &row.backend,
                 row.remaining_pct,
                 &row.breaker_state,
                 config,
             );
-            (row.backend, score)
+            CandidateDecision {
+                backend: row.backend,
+                score: rejection.is_none().then_some(score),
+                estimated_cost_usd: config.cloud_estimated_cost_usd,
+                rejected: rejection.is_some(),
+                rejection_code: rejection.as_ref().map(|(code, _)| (*code).to_string()),
+                rejection_reason: rejection.map(|(_, reason)| reason),
+            }
         })
         .collect();
-    scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| backend_rank(&a.0).cmp(&backend_rank(&b.0)))
+    candidates.sort_by(|a, b| {
+        a.rejected.cmp(&b.rejected).then_with(|| {
+            b.score
+                .unwrap_or_default()
+                .partial_cmp(&a.score.unwrap_or_default())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| backend_rank(&a.backend).cmp(&backend_rank(&b.backend)))
+        })
     });
     if let Some(preferred) = &config.preferred_cloud_backstop
-        && let Some(index) = scored.iter().position(|(backend, _)| backend == preferred)
+        && let Some(index) = candidates
+            .iter()
+            .position(|candidate| !candidate.rejected && &candidate.backend == preferred)
     {
-        let preferred = scored.remove(index);
-        scored.insert(0, preferred);
+        let preferred = candidates.remove(index);
+        candidates.insert(0, preferred);
     }
-    scored
+    let chosen = candidates
+        .iter()
+        .find(|candidate| !candidate.rejected)
+        .map(|candidate| candidate.backend.clone());
+    RouteDecision {
+        schema_version: 1,
+        trace_id,
+        mode: mode.into(),
+        candidates,
+        estimated_cost_usd: chosen
+            .as_ref()
+            .map_or(0.0, |_| config.cloud_estimated_cost_usd),
+        chosen,
+    }
+}
+
+fn rejected_candidate(
+    backend: String,
+    code: &str,
+    reason: &str,
+    config: &PolicyConfig,
+) -> CandidateDecision {
+    CandidateDecision {
+        backend,
+        score: None,
+        estimated_cost_usd: config.cloud_estimated_cost_usd,
+        rejected: true,
+        rejection_code: Some(code.to_string()),
+        rejection_reason: Some(reason.to_string()),
+    }
+}
+
+fn capacity_rejection(
+    row: &BackendCapacity,
+    fresh_after: DateTime<Utc>,
+    config: &PolicyConfig,
+) -> Option<(&'static str, String)> {
+    if !row.installed {
+        Some(("not_installed", "backend is not installed".into()))
+    } else if !row.authenticated {
+        Some(("not_authenticated", "backend is not authenticated".into()))
+    } else if row.last_checked_at <= fresh_after {
+        Some(("stale", "backend health check is stale".into()))
+    } else if row.breaker_state == "open" {
+        Some(("breaker_open", "backend circuit breaker is open".into()))
+    } else if row.remaining_pct.unwrap_or(100.0) < config.backend_headroom_floor_pct {
+        Some((
+            "provider_headroom",
+            format!(
+                "provider headroom is below {:.0}%",
+                config.backend_headroom_floor_pct
+            ),
+        ))
+    } else {
+        None
+    }
+}
+
+fn budget_rejection(
+    budget: &CloudBudget,
+    now: DateTime<Utc>,
+    config: &PolicyConfig,
+) -> Option<(&'static str, String)> {
+    if budget
+        .window_exhausted_until
+        .is_some_and(|until| until > now)
+    {
+        return Some((
+            "window_exhausted",
+            format!(
+                "quota window is exhausted until {}",
+                budget.window_exhausted_until.unwrap()
+            ),
+        ));
+    }
+    let max_used = 100 - config.cloud_budget_headroom_floor_pct;
+    if budget.weekly_pct.is_some_and(|used| used > max_used) {
+        return Some((
+            "weekly_budget",
+            format!(
+                "weekly budget is {0}% used, leaving less than {1}% headroom",
+                budget.weekly_pct.unwrap(),
+                config.cloud_budget_headroom_floor_pct
+            ),
+        ));
+    }
+    if budget.monthly_pct.is_some_and(|used| used > max_used) {
+        return Some((
+            "monthly_budget",
+            format!(
+                "monthly budget is {0}% used, leaving less than {1}% headroom",
+                budget.monthly_pct.unwrap(),
+                config.cloud_budget_headroom_floor_pct
+            ),
+        ));
+    }
+    None
 }
 
 /// Promote a configured build backstop after ordinary score ordering.
@@ -272,6 +481,18 @@ fn backend_score_with_config(
 mod tests {
     use super::*;
 
+    fn backend(name: &str, now: DateTime<Utc>) -> BackendCapacity {
+        BackendCapacity {
+            computer_id: uuid::Uuid::nil(),
+            backend: name.to_string(),
+            installed: true,
+            authenticated: true,
+            last_checked_at: now,
+            remaining_pct: Some(100.0),
+            breaker_state: "closed".to_string(),
+        }
+    }
+
     #[test]
     fn backend_rank_preserves_existing_order() {
         let mut backends = vec!["grok", "claude", "codex", "kimi", "gemini"];
@@ -318,5 +539,94 @@ mod tests {
         };
         assert!(!tier_allowed(RoutingTier::Local30B, &cloud, &config));
         assert!(tier_allowed(RoutingTier::Cloud, &cloud, &config));
+    }
+
+    #[test]
+    fn cloud_budget_rejects_exhausted_windows_and_low_period_headroom() {
+        let now = Utc::now();
+        let budgets = vec![
+            CloudBudget {
+                provider: "codex".into(),
+                weekly_pct: Some(86),
+                monthly_pct: None,
+                window_exhausted_until: None,
+            },
+            CloudBudget {
+                provider: "claude".into(),
+                weekly_pct: Some(10),
+                monthly_pct: Some(90),
+                window_exhausted_until: None,
+            },
+            CloudBudget {
+                provider: "kimi".into(),
+                weekly_pct: None,
+                monthly_pct: None,
+                window_exhausted_until: Some(now + chrono::Duration::minutes(5)),
+            },
+        ];
+        let decision = evaluate_cloud_route(
+            vec![
+                backend("codex", now),
+                backend("claude", now),
+                backend("kimi", now),
+            ],
+            &budgets,
+            now - chrono::Duration::minutes(1),
+            &TaskRequirements::default(),
+            &PolicyConfig::default(),
+            now,
+            uuid::Uuid::nil(),
+            "test",
+        );
+
+        assert!(decision.chosen.is_none());
+        assert_eq!(decision.candidates.len(), 3);
+        assert!(
+            decision
+                .candidates
+                .iter()
+                .any(|candidate| candidate.rejection_code.as_deref() == Some("weekly_budget"))
+        );
+        assert!(
+            decision
+                .candidates
+                .iter()
+                .any(|candidate| candidate.rejection_code.as_deref() == Some("monthly_budget"))
+        );
+        assert!(
+            decision
+                .candidates
+                .iter()
+                .any(|candidate| candidate.rejection_code.as_deref() == Some("window_exhausted"))
+        );
+    }
+
+    #[test]
+    fn cloud_budget_boundary_and_missing_rows_remain_eligible() {
+        let now = Utc::now();
+        let decision = evaluate_cloud_route(
+            vec![backend("codex", now), backend("grok", now)],
+            &[CloudBudget {
+                provider: "codex".into(),
+                weekly_pct: Some(85),
+                monthly_pct: Some(85),
+                window_exhausted_until: Some(now),
+            }],
+            now - chrono::Duration::minutes(1),
+            &TaskRequirements::default(),
+            &PolicyConfig::default(),
+            now,
+            uuid::Uuid::nil(),
+            "debug",
+        );
+
+        assert_eq!(decision.chosen.as_deref(), Some("codex"));
+        assert!(
+            decision
+                .candidates
+                .iter()
+                .all(|candidate| !candidate.rejected)
+        );
+        assert_eq!(decision.mode, "debug");
     }
 }

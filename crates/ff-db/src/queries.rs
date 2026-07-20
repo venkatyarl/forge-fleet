@@ -8901,6 +8901,64 @@ pub async fn pg_upsert_computer_backend(
 // Compatibility exports while callers migrate to the policy crate directly.
 pub use ff_routing_policy::{backend_rank, backend_score};
 
+/// Evaluate one cloud route against declarative quota buckets and persist the
+/// complete explanation as training data. This is shared by dispatch and the
+/// no-dispatch CLI debugger.
+pub async fn pg_evaluate_cloud_route(
+    pool: &PgPool,
+    rows: Vec<ff_capacity::BackendCapacity>,
+    fresh_after: chrono::DateTime<chrono::Utc>,
+    mode: &str,
+) -> Result<ff_routing_policy::RouteDecision> {
+    let budgets = sqlx::query_as::<_, ff_capacity::CloudBudgetCapacity>(
+        "SELECT provider, weekly_pct, monthly_pct, window_exhausted_until \
+           FROM cloud_budget_buckets ORDER BY provider",
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(ff_routing_policy::CloudBudget::from)
+    .collect::<Vec<_>>();
+    let trace_id = uuid::Uuid::new_v4();
+    let decision = ff_routing_policy::evaluate_cloud_route(
+        rows,
+        &budgets,
+        fresh_after,
+        &ff_routing_policy::TaskRequirements::default(),
+        &ff_routing_policy::PolicyConfig::default(),
+        chrono::Utc::now(),
+        trace_id,
+        mode,
+    );
+    if let Err(error) = pg_record_route_decision(pool, &decision).await {
+        tracing::warn!(%error, trace_id = %decision.trace_id, "route decision capture failed");
+    }
+    Ok(decision)
+}
+
+/// Persist an already-evaluated route (for cached capacity consumers).
+pub async fn pg_record_route_decision(
+    pool: &PgPool,
+    decision: &ff_routing_policy::RouteDecision,
+) -> Result<uuid::Uuid> {
+    let record = InteractionRecord {
+        session_id: Some(decision.trace_id),
+        channel: "router-decision".to_string(),
+        request_text: "cloud backend route decision".to_string(),
+        route_decision: serde_json::to_value(&decision)?,
+        engine: decision.chosen.clone(),
+        cost_usd: decision.estimated_cost_usd,
+        outcome: if decision.mode == "debug" {
+            "dry_run"
+        } else {
+            "selected"
+        }
+        .to_string(),
+        ..Default::default()
+    };
+    pg_record_interaction(pool, &record).await
+}
+
 /// Headroom-aware routing (capability A5): the backends a node can dispatch to
 /// RIGHT NOW, ordered by [`backend_score`] (most usage-headroom + cheapest
 /// first) instead of bare rank. Excludes breaker-open providers and those
@@ -8917,6 +8975,25 @@ pub async fn pg_routed_backends(
     computer_id: uuid::Uuid,
     fresh_secs: i64,
 ) -> Result<Vec<String>> {
+    Ok(
+        pg_cloud_route_for_computer(pool, computer_id, fresh_secs, "dispatch")
+            .await?
+            .candidates
+            .into_iter()
+            .filter(|candidate| !candidate.rejected)
+            .map(|candidate| candidate.backend)
+            .collect(),
+    )
+}
+
+/// Load one computer's candidates and evaluate them without dispatching. The
+/// caller selects `mode`; `debug` produces a dry-run interaction row.
+pub async fn pg_cloud_route_for_computer(
+    pool: &PgPool,
+    computer_id: uuid::Uuid,
+    fresh_secs: i64,
+    mode: &str,
+) -> Result<ff_routing_policy::RouteDecision> {
     let rows: Vec<ff_capacity::BackendCapacity> = sqlx::query_as(
         "SELECT cb.computer_id,
                 cb.backend,
@@ -8941,15 +9018,7 @@ pub async fn pg_routed_backends(
     .fetch_all(pool)
     .await?;
     let cutoff = chrono::Utc::now() - chrono::Duration::seconds(fresh_secs);
-    Ok(ff_routing_policy::rank_cloud_backends(
-        rows,
-        cutoff,
-        &ff_routing_policy::TaskRequirements::default(),
-        &ff_routing_policy::PolicyConfig::default(),
-    )
-    .into_iter()
-    .map(|(backend, _)| backend)
-    .collect())
+    pg_evaluate_cloud_route(pool, rows, cutoff, mode).await
 }
 
 /// The backends a node can actually dispatch to RIGHT NOW (capability A3):
@@ -9492,5 +9561,35 @@ mod parent_completion_tests {
         assert_eq!(status_of(&pool, childless).await, "ready");
 
         drop_temp_db(admin, pool, &db_name).await;
+    }
+}
+
+#[cfg(test)]
+mod route_budget_db_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn live_cloud_budget_rows_map_into_policy() {
+        let Ok(url) = std::env::var("FORGEFLEET_POSTGRES_URL") else {
+            return;
+        };
+        let pool = PgPool::connect(&url).await.expect("connect test Postgres");
+        let rows = sqlx::query_as::<_, ff_capacity::CloudBudgetCapacity>(
+            "SELECT provider, weekly_pct, monthly_pct, window_exhausted_until \
+               FROM cloud_budget_buckets ORDER BY provider",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("load cloud budget rows");
+
+        assert!(rows.iter().all(|row| !row.provider.trim().is_empty()));
+        assert!(
+            rows.iter()
+                .all(|row| row.weekly_pct.is_none_or(|pct| (0..=100).contains(&pct)))
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.monthly_pct.is_none_or(|pct| (0..=100).contains(&pct)))
+        );
     }
 }
