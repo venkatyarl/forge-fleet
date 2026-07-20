@@ -2823,9 +2823,7 @@ async fn run_ff_dispatch(
     // So a 529 on codex retries then fails over to claude unattended, instead of
     // dying. Falls back to fast/reliable `claude` when no backend is known
     // dispatchable; loaded build nodes have shown codex needs materially longer.
-    let routed = ff_db::pg_routed_backends(pg, item.computer_id, 5400)
-        .await
-        .unwrap_or_default();
+    let routed = routed_backends(pg, item.computer_id, 5400).await;
     let mut backends = if routed.is_empty() {
         let otherwise_dispatchable = ff_db::pg_dispatchable_backends(pg, item.computer_id, 5400)
             .await
@@ -3151,11 +3149,99 @@ fn primary_or_default_backend(backends: &[String]) -> String {
 /// any backend produced output (so `run_ff_dispatch` returned Err, carrying no
 /// backend). Best-effort: the first routed backend, else the historical default.
 async fn primary_dispatch_backend(pg: &PgPool, computer_id: Uuid) -> String {
-    ff_db::pg_routed_backends(pg, computer_id, 5400)
+    primary_or_default_backend(&routed_backends(pg, computer_id, 5400).await)
+}
+
+static CAPACITY_SNAPSHOT: std::sync::OnceLock<ff_capacity::CapacitySnapshot> =
+    std::sync::OnceLock::new();
+static CAPACITY_LOAD_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Read cloud routing inputs from the registry's in-process snapshot. Cold
+/// start is deliberately non-blocking: one background load is started and this
+/// request uses the legacy SQL picker. Refresh failures retain the last good
+/// snapshot inside `ff-capacity`, so registry outages do not enter the token
+/// path.
+async fn routed_backends(pg: &PgPool, computer_id: Uuid, fresh_secs: i64) -> Vec<String> {
+    if let Some(snapshot) = CAPACITY_SNAPSHOT.get() {
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(fresh_secs);
+        let selected = rank_cached_backends(snapshot.backend_capacity(computer_id), cutoff);
+        tracing::info!(
+            route_decision = ?serde_json::json!({
+                "source": "capacity_snapshot",
+                "snapshot_loaded_at": snapshot.loaded_at(),
+                "computer_id": computer_id,
+                "candidates": selected,
+            }),
+            "work_item_dispatch: backend route decision"
+        );
+        return selected;
+    }
+
+    if CAPACITY_LOAD_STARTED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        let pool = pg.clone();
+        tokio::spawn(async move {
+            match ff_capacity::CapacitySnapshot::load(&pool).await {
+                Ok(snapshot) => {
+                    let _ = CAPACITY_SNAPSHOT.set(snapshot);
+                }
+                Err(error) => {
+                    CAPACITY_LOAD_STARTED.store(false, std::sync::atomic::Ordering::Release);
+                    tracing::warn!(
+                        %error,
+                        "work_item_dispatch: capacity snapshot unavailable; legacy picker remains active"
+                    );
+                }
+            }
+        });
+    }
+
+    let selected = ff_db::pg_routed_backends(pg, computer_id, fresh_secs)
         .await
-        .ok()
-        .map(|b| primary_or_default_backend(&b))
-        .unwrap_or_else(|| "claude".to_string())
+        .unwrap_or_default();
+    tracing::info!(
+        route_decision = ?serde_json::json!({
+            "source": "legacy_pg_fallback",
+            "computer_id": computer_id,
+            "candidates": selected,
+        }),
+        "work_item_dispatch: backend route decision"
+    );
+    selected
+}
+
+fn rank_cached_backends(
+    rows: Vec<ff_capacity::BackendCapacity>,
+    cutoff: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let mut scored: Vec<(String, f64)> = rows
+        .into_iter()
+        .filter(|row| {
+            row.installed
+                && row.authenticated
+                && row.last_checked_at > cutoff
+                && row.breaker_state != "open"
+                && row.remaining_pct.unwrap_or(100.0) >= 15.0
+        })
+        .map(|row| {
+            let score = ff_db::backend_score(&row.backend, row.remaining_pct, &row.breaker_state);
+            (row.backend, score)
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| ff_db::backend_rank(&a.0).cmp(&ff_db::backend_rank(&b.0)))
+    });
+    scored.into_iter().map(|(backend, _)| backend).collect()
 }
 
 /// Council cap: how many headless auto-continue re-injections to attempt on a
@@ -4454,13 +4540,52 @@ mod tests {
         builder_excludes_480b, classify_dispatch_outcome, command_display, default_clone_path,
         dispatch_budget_for_host, expand_home, is_build_timeout, order_cloud_reviewers,
         parse_cli_tokens, primary_or_default_backend, quick_empty_success_is_provider_failure,
-        repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
-        same_model_family, status_output_is_clean, task_failed_alert_text, task_prefers_cloud_lane,
-        try_acquire_lane15_480b_permit, use_local_lane,
+        rank_cached_backends, repo_cache_path, repo_slug, retry_error_is_actionable,
+        rewrite_github_host_alias, same_model_family, status_output_is_clean,
+        task_failed_alert_text, task_prefers_cloud_lane, try_acquire_lane15_480b_permit,
+        use_local_lane,
     };
     use std::path::PathBuf;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn cached_backend_routing_matches_legacy_guards_and_score() {
+        let computer_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let row = |backend: &str,
+                   authenticated: bool,
+                   checked_at: chrono::DateTime<chrono::Utc>,
+                   remaining_pct: Option<f64>,
+                   breaker_state: &str| ff_capacity::BackendCapacity {
+            computer_id,
+            backend: backend.to_string(),
+            installed: true,
+            authenticated,
+            last_checked_at: checked_at,
+            remaining_pct,
+            breaker_state: breaker_state.to_string(),
+        };
+        let rows = vec![
+            row("codex", true, now, Some(20.0), "closed"),
+            row("claude", true, now, Some(80.0), "closed"),
+            row("kimi", true, now, Some(100.0), "open"),
+            row("gemini", false, now, Some(100.0), "closed"),
+            row(
+                "grok",
+                true,
+                now - chrono::Duration::hours(2),
+                Some(100.0),
+                "closed",
+            ),
+            row("other", true, now, Some(14.9), "closed"),
+        ];
+
+        assert_eq!(
+            rank_cached_backends(rows, now - chrono::Duration::hours(1)),
+            vec!["claude".to_string(), "codex".to_string()]
+        );
+    }
 
     #[test]
     fn builder_excludes_480b_for_local_builds_only() {

@@ -31,9 +31,22 @@ pub struct CapacityRow {
     pub label: Option<String>,
 }
 
+/// Cached inputs used by the cloud-backend router.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct BackendCapacity {
+    pub computer_id: uuid::Uuid,
+    pub backend: String,
+    pub installed: bool,
+    pub authenticated: bool,
+    pub last_checked_at: DateTime<Utc>,
+    pub remaining_pct: Option<f64>,
+    pub breaker_state: String,
+}
+
 #[derive(Debug, Clone)]
 struct CapacityData {
     rows: Vec<CapacityRow>,
+    backends: Vec<BackendCapacity>,
     loaded_at: DateTime<Utc>,
 }
 
@@ -112,20 +125,68 @@ impl CapacitySnapshot {
             .and_then(|r| r.bucket.clone())
     }
 
+    /// Router inputs for one computer, read only from the in-process snapshot.
+    ///
+    /// The caller owns scoring so the policy remains shared with the legacy
+    /// database picker during the gated migration.
+    pub fn backend_capacity(&self, computer_id: uuid::Uuid) -> Vec<BackendCapacity> {
+        self.inner
+            .data
+            .load()
+            .backends
+            .iter()
+            .filter(|row| row.computer_id == computer_id)
+            .cloned()
+            .collect()
+    }
+
     async fn fetch(pool: &PgPool) -> Result<CapacityData> {
+        // Normalize the live registry view into the stable read-API shape.
+        // The view deliberately uses one compact inference/build/cloud schema;
+        // callers should not need to know that storage representation.
         let rows = sqlx::query_as::<_, CapacityRow>(
             r#"
             SELECT
-                kind,
-                catalog_family,
-                computer,
-                provider,
-                pool,
-                free_slots,
-                bucket,
-                label
-            FROM v_fleet_capacity
-            ORDER BY kind, label
+                CASE v.kind
+                    WHEN 'inference' THEN 'inference_pool'
+                    WHEN 'build' THEN 'free_build_slot'
+                    WHEN 'cloud' THEN 'cloud_bucket'
+                    ELSE v.kind
+                END AS kind,
+                c.family AS catalog_family,
+                CASE WHEN v.kind = 'build' THEN v.worker END AS computer,
+                CASE WHEN v.kind = 'cloud' THEN v.worker END AS provider,
+                CASE WHEN v.kind = 'inference' THEN v.catalog_id END AS pool,
+                CASE WHEN v.kind = 'build' THEN v.parallel_slots::int END AS free_slots,
+                CASE WHEN v.kind = 'cloud' THEN v.worker END AS bucket,
+                v.worker AS label
+            FROM v_fleet_capacity v
+            LEFT JOIN fleet_model_catalog c ON c.id = v.catalog_id
+            ORDER BY v.kind, v.worker
+            "#,
+        )
+        .fetch_all(pool)
+        .await?;
+
+        let backends = sqlx::query_as::<_, BackendCapacity>(
+            r#"
+            SELECT cb.computer_id,
+                   cb.backend,
+                   cb.installed,
+                   cb.authenticated,
+                   cb.last_checked_at,
+                   u.remaining_pct,
+                   COALESCE(h.breaker_state, 'closed') AS breaker_state
+              FROM computer_backends cb
+              LEFT JOIN fleet_backend_health h
+                ON h.computer_id = cb.computer_id AND h.provider = cb.backend
+              LEFT JOIN LATERAL (
+                   SELECT remaining_pct
+                     FROM fleet_provider_usage fu
+                    WHERE fu.computer_id = cb.computer_id AND fu.provider = cb.backend
+                    ORDER BY fu.sampled_at DESC
+                    LIMIT 1
+              ) u ON true
             "#,
         )
         .fetch_all(pool)
@@ -133,6 +194,7 @@ impl CapacitySnapshot {
 
         Ok(CapacityData {
             rows,
+            backends,
             loaded_at: Utc::now(),
         })
     }
@@ -207,15 +269,38 @@ mod tests {
             .await;
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS v_fleet_capacity (
-                kind           TEXT NOT NULL,
-                catalog_family TEXT,
-                computer       TEXT,
-                provider       TEXT,
-                pool           TEXT,
-                free_slots     INTEGER,
-                bucket         TEXT,
-                label          TEXT
+            CREATE TABLE fleet_model_catalog (
+                id TEXT PRIMARY KEY,
+                family TEXT
+            );
+            CREATE TABLE v_fleet_capacity (
+                kind TEXT NOT NULL,
+                catalog_id TEXT,
+                worker TEXT,
+                port INTEGER,
+                parallel_slots BIGINT,
+                health TEXT,
+                max_concurrent INTEGER,
+                tokens_per_min BIGINT,
+                spent_today NUMERIC
+            );
+            CREATE TABLE computer_backends (
+                computer_id UUID NOT NULL,
+                backend TEXT NOT NULL,
+                installed BOOLEAN NOT NULL,
+                authenticated BOOLEAN NOT NULL,
+                last_checked_at TIMESTAMPTZ NOT NULL
+            );
+            CREATE TABLE fleet_backend_health (
+                computer_id UUID NOT NULL,
+                provider TEXT NOT NULL,
+                breaker_state TEXT NOT NULL
+            );
+            CREATE TABLE fleet_provider_usage (
+                computer_id UUID NOT NULL,
+                provider TEXT NOT NULL,
+                remaining_pct DOUBLE PRECISION,
+                sampled_at TIMESTAMPTZ NOT NULL
             )
             "#,
         )
@@ -229,17 +314,19 @@ mod tests {
     async fn insert_fixtures(pool: &PgPool) {
         sqlx::query(
             r#"
+            INSERT INTO fleet_model_catalog (id, family) VALUES
+                ('coder', 'qwen'), ('chat', 'qwen'), ('judge', 'gemma');
             INSERT INTO v_fleet_capacity
-                (kind, catalog_family, computer, provider, pool, free_slots, bucket, label)
+                (kind, catalog_id, worker, parallel_slots, health)
             VALUES
-                ('inference_pool', 'qwen',  NULL,      NULL,  'coder', NULL, NULL,            'qwen coder pool'),
-                ('inference_pool', 'qwen',  NULL,      NULL,  'chat',  NULL, NULL,            'qwen chat pool'),
-                ('inference_pool', 'gemma', NULL,      NULL,  'judge', NULL, NULL,            'gemma judge pool'),
-                ('free_build_slot', NULL,   'builder-1', NULL, NULL,   4,    NULL,            'builder-1 slots'),
-                ('free_build_slot', NULL,   'builder-1', NULL, NULL,   2,    NULL,            'builder-1 extra'),
-                ('free_build_slot', NULL,   'builder-2', NULL, NULL,   1,    NULL,            'builder-2 slots'),
-                ('cloud_bucket',    NULL,   NULL,      'aws', NULL,   NULL, 'ff-aws-bucket', 'aws bucket'),
-                ('cloud_bucket',    NULL,   NULL,      'gcp', NULL,   NULL, 'ff-gcp-bucket', 'gcp bucket')
+                ('inference', 'coder', 'node-1', 1, 'healthy'),
+                ('inference', 'chat',  'node-2', 1, 'healthy'),
+                ('inference', 'judge', 'node-3', 1, 'healthy'),
+                ('build', NULL, 'builder-1', 4, 'online'),
+                ('build', NULL, 'builder-1', 2, 'online'),
+                ('build', NULL, 'builder-2', 1, 'online'),
+                ('cloud', NULL, 'aws', 3, 'healthy'),
+                ('cloud', NULL, 'gcp', 3, 'healthy')
             "#,
         )
         .execute(pool)
@@ -287,8 +374,8 @@ mod tests {
 
         let snap = CapacitySnapshot::load(&pool).await.expect("load snapshot");
 
-        assert_eq!(snap.cloud_bucket("aws"), Some("ff-aws-bucket".to_string()));
-        assert_eq!(snap.cloud_bucket("gcp"), Some("ff-gcp-bucket".to_string()));
+        assert_eq!(snap.cloud_bucket("aws"), Some("aws".to_string()));
+        assert_eq!(snap.cloud_bucket("gcp"), Some("gcp".to_string()));
         assert_eq!(snap.cloud_bucket("azure"), None);
     }
 
@@ -302,8 +389,12 @@ mod tests {
         let snap = CapacitySnapshot::load(&pool).await.expect("load snapshot");
         assert_eq!(snap.inference_pools("qwen").len(), 2);
 
+        sqlx::query("INSERT INTO fleet_model_catalog (id, family) VALUES ('reasoning', 'qwen')")
+            .execute(&pool)
+            .await
+            .expect("insert catalog row");
         sqlx::query(
-            "INSERT INTO v_fleet_capacity (kind, catalog_family, pool) VALUES ('inference_pool', 'qwen', 'reasoning')",
+            "INSERT INTO v_fleet_capacity (kind, catalog_id, worker, parallel_slots, health) VALUES ('inference', 'reasoning', 'node-4', 1, 'healthy')",
         )
         .execute(&pool)
         .await
