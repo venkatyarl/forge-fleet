@@ -13,6 +13,7 @@ pub mod log_monitor;
 pub mod manager;
 pub mod mirror_service;
 pub mod node_info;
+pub mod offline_mode;
 pub mod periodic;
 pub mod pg_failover;
 pub mod repair;
@@ -20,6 +21,8 @@ pub mod replica_monitor;
 pub mod restore_drill;
 pub mod self_heal;
 pub mod slot_manager;
+
+pub use offline_mode::*;
 
 #[cfg(test)]
 mod integration_tests;
