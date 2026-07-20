@@ -124,19 +124,18 @@ pub async fn handle_fabric_benchmark(
             }
         };
 
-    // 3. Start iperf3 -s on b in background.
-    println!("Starting iperf3 server on {b}...");
-    let _ = run_or_local(
-        b_is_me,
-        &b_target,
-        "pkill iperf3 2>/dev/null; iperf3 -s -D --logfile /tmp/iperf3.log",
-    );
-    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-
     let mut measurements: Vec<(String, f64, Option<i32>)> = Vec::new();
 
-    // 4. Forward direction A → B (unless reverse_only).
+    // 3. Forward direction A → B (unless reverse_only).
     if !reverse_only {
+        println!("Starting iperf3 server on {b}...");
+        let _ = run_or_local(
+            b_is_me,
+            &b_target,
+            "pkill iperf3 2>/dev/null; iperf3 -s -D --logfile /tmp/iperf3.log",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
         println!("Running iperf3 client on {a} → {b} ({duration}s, {streams} streams)...");
         let cmd = format!("iperf3 -c {b_fabric_ip} -t {duration} -P {streams} -J");
         let out = run_or_local(a_is_me, &a_target, &cmd).context("iperf3 forward failed")?;
@@ -155,12 +154,24 @@ pub async fn handle_fabric_benchmark(
         } else {
             println!("  {a} → {b}: failed (no parseable result)");
         }
+
+        let _ = run_or_local(b_is_me, &b_target, "pkill iperf3 2>/dev/null");
     }
 
-    // 5. Reverse direction B → A.
-    println!("Running iperf3 client on {b} → {a} (reverse, {duration}s, {streams} streams)...");
-    let cmd = format!("iperf3 -c {b_fabric_ip} -t {duration} -P {streams} -R -J");
-    let out = run_or_local(a_is_me, &a_target, &cmd).context("iperf3 reverse failed")?;
+    // 4. Reverse direction B → A. Swap the server and client instead of
+    //    reusing B's server with `-R`; this gives each direction a fresh server
+    //    and works when the reverse data channel is blocked.
+    println!("Starting iperf3 server on {a}...");
+    let _ = run_or_local(
+        a_is_me,
+        &a_target,
+        "pkill iperf3 2>/dev/null; iperf3 -s -D --logfile /tmp/iperf3.log",
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    println!("Running iperf3 client on {b} → {a} ({duration}s, {streams} streams)...");
+    let cmd = format!("iperf3 -c {a_fabric_ip} -t {duration} -P {streams} -J");
+    let out = run_or_local(b_is_me, &b_target, &cmd).context("iperf3 reverse failed")?;
     let body = String::from_utf8_lossy(&out.stdout);
     let (gbps, retr) = parse_iperf3_json(&body);
     if gbps > 0.0 {
@@ -177,10 +188,10 @@ pub async fn handle_fabric_benchmark(
         println!("  {b} → {a}: failed");
     }
 
-    // 6. Stop iperf3 server.
-    let _ = run_or_local(b_is_me, &b_target, "pkill iperf3 2>/dev/null");
+    // 5. Stop iperf3 server.
+    let _ = run_or_local(a_is_me, &a_target, "pkill iperf3 2>/dev/null");
 
-    // 7. Record measurements.
+    // 6. Record measurements.
     let measured_by = ff_agent::fleet_info::resolve_this_worker_name().await;
     let iperf_version = StdCommand::new("iperf3")
         .arg("--version")
