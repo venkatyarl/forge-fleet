@@ -4239,9 +4239,27 @@ async fn main() -> Result<()> {
 
     // Build the local-first inference router (probes localhost + fleet from DB).
     // If the user explicitly passed --llm, skip auto-routing and use that URL directly.
-    let (llm, router) =
+    let (llm, router, routed_model) =
         if let Some(explicit_url) = cli.llm.or_else(|| env::var("FORGEFLEET_LLM_URL").ok()) {
-            (explicit_url, None)
+            if let Some(model_hint) = explicit_url.strip_prefix("local:") {
+                if model_hint.is_empty() {
+                    anyhow::bail!("--llm local:<catalog-id> requires a catalog id");
+                }
+                let pool = ff_agent::fleet_info::get_fleet_pool()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("resolve --llm {explicit_url}: {e}"))?;
+                let candidate = ff_agent::fleet_oneshot::resolve_route_candidate(&pool, model_hint)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("resolve --llm {explicit_url}: {e}"))?;
+                let model = [candidate.catalog_name, candidate.catalog_id]
+                    .into_iter()
+                    .flatten()
+                    .find(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| model_hint.to_string());
+                (candidate.endpoint, None, Some(model))
+            } else {
+                (explicit_url, None, None)
+            }
         } else if let Some(url) = helpers::pick_agent_capable_url(&config_path, 32_768).await {
             // Agent-capable endpoint (tool-calling + usable_agent_ctx >= 32K).
             // 32K (not 16K) MATCHES the agent loop's default
@@ -4256,7 +4274,7 @@ async fn main() -> Result<()> {
             // the router would override this pick back to a small-per-slot-ctx
             // endpoint and the agent overflows on turn 1 (P0.1). Failover to a
             // small-ctx endpoint would just overflow anyway, so direct is right.
-            (url, None)
+            (url, None, None)
         } else {
             // No agent-capable deployment — fall back to the local-first
             // inference router (with failover), exactly as before. Fail-closed.
@@ -4266,12 +4284,13 @@ async fn main() -> Result<()> {
             } else {
                 helpers::detect_llm_from_db_or_local(&config_path).await
             };
-            (primary, Some(std::sync::Arc::new(r)))
+            (primary, Some(std::sync::Arc::new(r)), None)
         };
 
     let mut model = cli
         .model
         .or_else(|| env::var("FORGEFLEET_MODEL").ok())
+        .or(routed_model)
         .unwrap_or_else(|| "auto".into());
 
     // If model is "auto", query the LLM server for its actual model name

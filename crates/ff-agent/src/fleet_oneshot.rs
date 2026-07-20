@@ -117,56 +117,7 @@ pub async fn fleet_oneshot(
     model_hint: Option<&str>,
     timeout: Option<Duration>,
 ) -> Result<FleetOneshot> {
-    let filter = RouteFilter {
-        workload: None,
-        require_tool_calling: false,
-        min_ctx: None,
-        exclude_hosts: Vec::new(),
-        // Only dispatch to deployments whose health is fresh — never a wedged host
-        // lingering as 'healthy' with a stale heartbeat (the priya-wedge class).
-        max_health_age_sec: Some(180),
-        prefer_least_loaded: true,
-        // With a model hint, widen the candidate set so the match isn't truncated:
-        // the best-scored top-8 may not include the requested model (e.g. a lower-
-        // tier coder deployment), and we'd silently fall back. No hint → top-8.
-        limit: if model_hint.is_some() { 64 } else { 8 },
-    };
-    let all_candidates = pg_route_deployments(pool, &filter)
-        .await
-        .map_err(|e| anyhow!("route deployments: {e}"))?;
-    if all_candidates.is_empty() {
-        return Err(anyhow!(
-            "no healthy fleet deployment to serve a local council member"
-        ));
-    }
-    // Drop deployments with no usable model name (empty catalog_id AND
-    // catalog_name). Those are "unknown model" rows — e.g. ace's mlx:55000,
-    // which is marked healthy but is NOT a real chat-completions server: sending
-    // it `model="local"` makes it try to fetch a HF repo named "local" and
-    // return an HTTP error, which masked as "fleet_oneshot round 1" and forced
-    // every local codegen dispatch to fall back to slow cloud codex
-    // (dogfooded 2026-07-01). Only keep them as a last resort so a fleet with
-    // ONLY unknown-model deployments still attempts a call.
-    let named: Vec<RouteCandidate> = all_candidates
-        .iter()
-        .filter(|c| has_model_name(c))
-        .cloned()
-        .collect();
-    let candidates: &[RouteCandidate] = if named.is_empty() {
-        &all_candidates
-    } else {
-        &named
-    };
-
-    let this_worker = crate::fleet_info::resolve_this_worker_name().await;
-    let prefer_non_local = this_node_has_active_build_lease(pool).await;
-    let family = resolve_hint_family(candidates, model_hint);
-    let ordered = rank_candidates(
-        candidates,
-        &this_worker,
-        family.as_deref(),
-        prefer_non_local,
-    );
+    let ordered = resolve_route_candidates(pool, model_hint).await?;
 
     let client = reqwest::Client::builder()
         .timeout(timeout.unwrap_or(Duration::from_secs(180)))
@@ -219,6 +170,73 @@ pub async fn fleet_oneshot(
     }
 
     Err(last_err.unwrap_or_else(|| anyhow!("all fleet candidates failed")))
+}
+
+/// Resolve a catalog model hint to the same best-first deployment candidate
+/// ordering used by [`fleet_oneshot`].
+pub async fn resolve_route_candidate(pool: &PgPool, model_hint: &str) -> Result<RouteCandidate> {
+    resolve_route_candidates(pool, Some(model_hint))
+        .await?
+        .into_iter()
+        .find(|candidate| candidate_catalog_id_matches(candidate, model_hint))
+        .ok_or_else(|| anyhow!("no healthy fleet deployment matches local:{model_hint}"))
+}
+
+async fn resolve_route_candidates(
+    pool: &PgPool,
+    model_hint: Option<&str>,
+) -> Result<Vec<RouteCandidate>> {
+    let filter = RouteFilter {
+        workload: None,
+        require_tool_calling: false,
+        min_ctx: None,
+        exclude_hosts: Vec::new(),
+        // Only dispatch to deployments whose health is fresh — never a wedged host
+        // lingering as 'healthy' with a stale heartbeat (the priya-wedge class).
+        max_health_age_sec: Some(180),
+        prefer_least_loaded: true,
+        // With a model hint, widen the candidate set so the match isn't truncated:
+        // the best-scored top-8 may not include the requested model (e.g. a lower-
+        // tier coder deployment), and we'd silently fall back. No hint → top-8.
+        limit: if model_hint.is_some() { 64 } else { 8 },
+    };
+    let all_candidates = pg_route_deployments(pool, &filter)
+        .await
+        .map_err(|e| anyhow!("route deployments: {e}"))?;
+    if all_candidates.is_empty() {
+        return Err(anyhow!(
+            "no healthy fleet deployment to serve a local council member"
+        ));
+    }
+    // Drop deployments with no usable model name (empty catalog_id AND
+    // catalog_name). Those are "unknown model" rows — e.g. ace's mlx:55000,
+    // which is marked healthy but is NOT a real chat-completions server: sending
+    // it `model="local"` makes it try to fetch a HF repo named "local" and
+    // return an HTTP error, which masked as "fleet_oneshot round 1" and forced
+    // every local codegen dispatch to fall back to slow cloud codex
+    // (dogfooded 2026-07-01). Only keep them as a last resort so a fleet with
+    // ONLY unknown-model deployments still attempts a call.
+    let named: Vec<RouteCandidate> = all_candidates
+        .iter()
+        .filter(|c| has_model_name(c))
+        .cloned()
+        .collect();
+    let candidates: &[RouteCandidate] = if named.is_empty() {
+        &all_candidates
+    } else {
+        &named
+    };
+
+    let this_worker = crate::fleet_info::resolve_this_worker_name().await;
+    let prefer_non_local = this_node_has_active_build_lease(pool).await;
+    let family = resolve_hint_family(candidates, model_hint);
+    let ordered = rank_candidates(
+        candidates,
+        &this_worker,
+        family.as_deref(),
+        prefer_non_local,
+    );
+    Ok(ordered.into_iter().cloned().collect())
 }
 
 async fn dispatch_to_candidate(
@@ -307,20 +325,33 @@ async fn this_node_has_active_build_lease(pool: &PgPool) -> bool {
 /// (case-insensitive), then return that candidate's family so the whole
 /// family pool can be load-balanced.
 fn resolve_hint_family(candidates: &[RouteCandidate], hint: Option<&str>) -> Option<String> {
-    let hint = hint?.to_lowercase();
+    let hint = hint?;
     if hint.is_empty() {
         return None;
     }
     candidates
         .iter()
-        .find(|c| {
-            let matches =
-                |s: Option<&str>| s.map(|v| v.to_lowercase().contains(&hint)).unwrap_or(false);
-            matches(c.catalog_id.as_deref())
-                || matches(c.catalog_name.as_deref())
-                || matches(c.family.as_deref())
-        })
+        .find(|candidate| candidate_matches_hint(candidate, hint))
         .and_then(|c| c.family.clone())
+}
+
+fn candidate_matches_hint(candidate: &RouteCandidate, hint: &str) -> bool {
+    let hint = hint.to_lowercase();
+    let matches = |value: Option<&str>| {
+        value
+            .map(|value| value.to_lowercase().contains(&hint))
+            .unwrap_or(false)
+    };
+    matches(candidate.catalog_id.as_deref())
+        || matches(candidate.catalog_name.as_deref())
+        || matches(candidate.family.as_deref())
+}
+
+fn candidate_catalog_id_matches(candidate: &RouteCandidate, catalog_id: &str) -> bool {
+    candidate
+        .catalog_id
+        .as_deref()
+        .is_some_and(|id| id.eq_ignore_ascii_case(catalog_id))
 }
 
 /// Order candidates for dispatch.
@@ -535,7 +566,8 @@ mod tests {
 
     #[test]
     fn resolve_hint_family_matches_catalog_or_name_or_family() {
-        let c1 = candidate("http://a:1", "a", Some("qwen3-coder"), Some(2));
+        let mut c1 = candidate("http://a:1", "a", Some("qwen3-coder"), Some(2));
+        c1.catalog_id = Some("qwen3-coder-480b".to_string());
         let c2 = candidate("http://b:1", "b", Some("qwen3-coder"), Some(2));
         let c3 = candidate("http://c:1", "c", Some("gemma"), Some(2));
         let pool = vec![c1, c2, c3];
@@ -553,6 +585,10 @@ mod tests {
         // Unmatched or absent hint returns None.
         assert_eq!(resolve_hint_family(&pool, Some("unknown")), None);
         assert_eq!(resolve_hint_family(&pool, None), None);
+        assert!(candidate_matches_hint(&pool[0], "qwen3-coder-480b"));
+        assert!(!candidate_matches_hint(&pool[1], "qwen3-coder-480b"));
+        assert!(candidate_catalog_id_matches(&pool[0], "QWEN3-CODER-480B"));
+        assert!(!candidate_catalog_id_matches(&pool[0], "qwen3-coder"));
     }
 
     #[test]
