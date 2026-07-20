@@ -15,6 +15,7 @@ pub mod pg_failover;
 pub mod repair;
 pub mod restore_drill;
 pub mod self_heal;
+pub mod slot_manager;
 
 /// Gracefully release this computer's active work-item leases before an agent
 /// restart.
