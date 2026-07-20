@@ -516,9 +516,11 @@ pub async fn handle_fleet_db(pool: &sqlx::PgPool, cmd: FleetDbCommand) -> Result
             backup_id,
             to,
             target_db,
+            physical,
             yes,
         } => {
-            handle_fleet_db_restore(pool, &backup_id, to.as_deref(), &target_db, yes).await?;
+            handle_fleet_db_restore(pool, &backup_id, to.as_deref(), &target_db, yes, physical)
+                .await?;
         }
         FleetDbCommand::VerifyBackups {
             limit,
@@ -1040,9 +1042,9 @@ async fn has_age_header(path: &Path) -> Result<bool> {
         || prefix.starts_with(b"-----BEGIN AGE ENCRYPTED FILE-----"))
 }
 
-/// Restore an age-encrypted Postgres backup to a scratch database.
+/// Restore an age-encrypted Postgres backup.
 ///
-/// Steps:
+/// Logical restore (default):
 /// 1. Look up `backups` row.
 /// 2. Verify file exists + checksum matches.
 /// 3. Decrypt via `ff_agent::ha::backup::decrypt_backup_file` (uses the
@@ -1051,12 +1053,20 @@ async fn has_age_header(path: &Path) -> Result<bool> {
 /// 5. Stream the plaintext archive into the container and run
 ///    `pg_restore` (tar format) or `psql` (plain SQL, fallback).
 /// 6. Print `SELECT COUNT(*) FROM fleet_workers` as a sanity check.
+///
+/// Physical restore (`physical = true`):
+/// 1. Look up `backups` row.
+/// 2. Verify file exists + checksum matches.
+/// 3. Decrypt via `ff_agent::ha::backup::decrypt_backup_file`.
+/// 4. Stop `forgefleet-postgres`, wipe PGDATA, extract the pg_basebackup
+///    tar.gz, fix ownership, start Postgres, and wait until ready.
 pub async fn handle_fleet_db_restore(
     pool: &sqlx::PgPool,
     backup_id: &str,
     to: Option<&str>,
     target_db: &str,
     yes: bool,
+    physical: bool,
 ) -> Result<()> {
     if let Some(target_node) = to {
         let me = ff_agent::fleet_info::resolve_this_worker_name().await;
@@ -1069,11 +1079,19 @@ pub async fn handle_fleet_db_restore(
         }
     }
     if !yes {
-        eprintln!(
-            "{YELLOW}Restore creates a new database ('{target_db}') in the \
-             local forgefleet-postgres container and loads the backup \
-             into it. Re-run with --yes to proceed.{RESET}"
-        );
+        if physical {
+            eprintln!(
+                "{YELLOW}Physical restore DESTROYS the local forgefleet-postgres \
+                 PGDATA directory and replaces it with the backup archive. \
+                 Re-run with --yes to proceed.{RESET}"
+            );
+        } else {
+            eprintln!(
+                "{YELLOW}Restore creates a new database ('{target_db}') in the \
+                 local forgefleet-postgres container and loads the backup \
+                 into it. Re-run with --yes to proceed.{RESET}"
+            );
+        }
         std::process::exit(2);
     }
 
@@ -1188,16 +1206,19 @@ pub async fn handle_fleet_db_restore(
     {
         ("psql", vec!["-v", "ON_ERROR_STOP=1", "-d", target_db])
     } else if ext == "gz" || ext == "tgz" {
-        // pg_basebackup tar.gz — not a logical dump. We can't pg_restore
-        // it into an existing DB; the correct flow is to stop postgres,
-        // wipe PGDATA, untar, restart. That's way too destructive for a
-        // "scratch DB" helper. Report clearly instead of silently doing
-        // the wrong thing.
+        // pg_basebackup tar.gz — not a logical dump. Either do a physical
+        // restore (destructive — replaces PGDATA) or explain why we can't
+        // load it into a scratch DB.
+        if physical {
+            restore_physical_pg_basebackup(&plaintext_path).await?;
+            return Ok(());
+        }
         println!(
             "{YELLOW}note:{RESET} archive looks like a pg_basebackup \
              cluster snapshot (.tar.gz). That's a physical backup — \
              restoring it requires replacing PGDATA, not loading into a \
-             scratch DB. Plaintext is at {}.",
+             scratch DB. Pass `--physical --yes` to run that path. \
+             Plaintext is at {}.",
             plaintext_path.display()
         );
         let fm_count = count_fleet_workers_live(pool).await.unwrap_or(-1);
@@ -1278,6 +1299,315 @@ async fn count_fleet_workers_live(pool: &sqlx::PgPool) -> Result<i64> {
         .fetch_one(pool)
         .await?;
     Ok(n)
+}
+
+/// State of the local `forgefleet-postgres` container discovered via
+/// `docker inspect`.
+#[derive(Debug)]
+struct ContainerState {
+    running: bool,
+    pgdata: String,
+    volume: String,
+    image: String,
+}
+
+/// Restore a pg_basebackup tar.gz archive by replacing the local PGDATA
+/// directory. This is the DR path: stop Postgres, wipe PGDATA, extract,
+/// fix ownership, start Postgres, and wait for readiness.
+async fn restore_physical_pg_basebackup(plaintext_path: &Path) -> Result<()> {
+    const CONTAINER: &str = "forgefleet-postgres";
+    const DEFAULT_PGDATA: &str = "/var/lib/postgresql/data";
+    const DEFAULT_VOLUME: &str = "forgefleet_postgres_data";
+    const DEFAULT_IMAGE: &str = "pgvector/pgvector:pg16";
+
+    println!(
+        "{CYAN}▶ physical restore:{RESET} this will DESTROY the current PGDATA \
+         in container '{CONTAINER}' and replace it with {}",
+        plaintext_path.display()
+    );
+
+    // 1) Discover container state, PGDATA, and backing volume.
+    let state = docker_container_state(CONTAINER).await?;
+    let (pgdata, volume, image) = match &state {
+        Some(s) => {
+            if s.running {
+                println!("{CYAN}▶ stopping {CONTAINER}...{RESET}");
+                docker_ok(&["stop", CONTAINER]).await?;
+                println!("{GREEN}✓{RESET} container stopped");
+            } else {
+                println!("{YELLOW}note:{RESET} container '{CONTAINER}' is already stopped");
+            }
+            (s.pgdata.clone(), s.volume.clone(), s.image.clone())
+        }
+        None => {
+            println!(
+                "{YELLOW}note:{RESET} container '{CONTAINER}' not found; assuming \
+                 primary volume '{DEFAULT_VOLUME}' and PGDATA '{DEFAULT_PGDATA}'"
+            );
+            (
+                DEFAULT_PGDATA.to_string(),
+                DEFAULT_VOLUME.to_string(),
+                DEFAULT_IMAGE.to_string(),
+            )
+        }
+    };
+
+    // 2) Wipe PGDATA.
+    println!("{CYAN}▶ wiping PGDATA ({pgdata})...{RESET}");
+    let wipe_script = format!("rm -rf \"{pgdata}\"/* \"{pgdata}\"/.[!.]* 2>/dev/null || true");
+    docker_run_oneoff(
+        &image,
+        &volume,
+        &pgdata,
+        &["bash".to_string(), "-c".to_string(), wipe_script],
+    )
+    .await?;
+    println!("{GREEN}✓{RESET} PGDATA wiped");
+
+    // 3) Stream the plaintext archive into a temp container and extract it
+    //    directly into PGDATA.
+    println!("{CYAN}▶ extracting archive into PGDATA...{RESET}");
+    use tokio::io::AsyncWriteExt;
+    let file = tokio::fs::File::open(plaintext_path).await?;
+    let mut child = tokio::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "-i",
+            "-u",
+            "postgres",
+            "-v",
+            &format!("{volume}:{pgdata}"),
+            "-e",
+            &format!("PGDATA={pgdata}"),
+            &image,
+            "tar",
+            "-xzf",
+            "-",
+            "-C",
+            &pgdata,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("docker run tar spawn failed: {e}"))?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut reader = tokio::io::BufReader::new(file);
+    tokio::io::copy(&mut reader, &mut stdin)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to stream archive to docker tar: {e}"))?;
+    stdin.shutdown().await.ok();
+    let out = child.wait_with_output().await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "tar extraction failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    println!("{GREEN}✓{RESET} archive extracted");
+
+    // 4) Fix ownership/permissions so the real container can read PGDATA.
+    println!("{CYAN}▶ fixing ownership...{RESET}");
+    docker_run_oneoff(
+        &image,
+        &volume,
+        &pgdata,
+        &[
+            "chown".to_string(),
+            "-R".to_string(),
+            "postgres:postgres".to_string(),
+            pgdata.clone(),
+        ],
+    )
+    .await?;
+    docker_run_oneoff(
+        &image,
+        &volume,
+        &pgdata,
+        &["chmod".to_string(), "0700".to_string(), pgdata.clone()],
+    )
+    .await?;
+    println!("{GREEN}✓{RESET} ownership fixed");
+
+    // 5) Start the container if it exists; otherwise leave data in place and
+    //    tell the operator how to start it.
+    match state {
+        Some(_) => {
+            println!("{CYAN}▶ starting {CONTAINER}...{RESET}");
+            docker_ok(&["start", CONTAINER]).await?;
+            println!("{GREEN}✓{RESET} container started");
+        }
+        None => {
+            println!(
+                "{YELLOW}note:{RESET} container '{CONTAINER}' did not exist. Data is \
+                 in volume '{volume}' at '{pgdata}'. Start it with:\n  \
+                 docker compose -f deploy/docker-compose.yml up -d postgres"
+            );
+            return Ok(());
+        }
+    }
+
+    // 6) Wait for readiness.
+    println!("{CYAN}▶ waiting for postgres to accept connections...{RESET}");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let out = tokio::process::Command::new("docker")
+            .args([
+                "exec",
+                "-u",
+                "postgres",
+                CONTAINER,
+                "pg_isready",
+                "-U",
+                "forgefleet",
+                "-d",
+                "forgefleet",
+            ])
+            .output()
+            .await?;
+        if out.status.success() {
+            println!("{GREEN}✓{RESET} postgres is ready");
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "postgres did not become ready within 120s. Check logs: docker logs {CONTAINER}"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+
+    println!(
+        "{GREEN}✓{RESET} physical restore complete — '{CONTAINER}' is running with restored PGDATA"
+    );
+    Ok(())
+}
+
+/// Discover the state of a Docker container. Returns `None` if the container
+/// does not exist.
+async fn docker_container_state(container: &str) -> Result<Option<ContainerState>> {
+    // Status
+    let status_out = tokio::process::Command::new("docker")
+        .args(["inspect", "-f", "{{.State.Status}}", container])
+        .output()
+        .await?;
+    if !status_out.status.success() {
+        return Ok(None);
+    }
+    let status = String::from_utf8_lossy(&status_out.stdout)
+        .trim()
+        .to_string();
+    let running = status == "running";
+
+    // Image
+    let image_out = tokio::process::Command::new("docker")
+        .args(["inspect", "-f", "{{.Config.Image}}", container])
+        .output()
+        .await?;
+    let image = if image_out.status.success() {
+        String::from_utf8_lossy(&image_out.stdout)
+            .trim()
+            .to_string()
+    } else {
+        "pgvector/pgvector:pg16".to_string()
+    };
+
+    // PGDATA env
+    let env_out = tokio::process::Command::new("docker")
+        .args([
+            "inspect",
+            "-f",
+            "{{range .Config.Env}}{{println .}}{{end}}",
+            container,
+        ])
+        .output()
+        .await?;
+    let mut pgdata = "/var/lib/postgresql/data".to_string();
+    if env_out.status.success() {
+        for line in String::from_utf8_lossy(&env_out.stdout).lines() {
+            if let Some(rest) = line.strip_prefix("PGDATA=") {
+                pgdata = rest.to_string();
+                break;
+            }
+        }
+    }
+
+    // Mount for PGDATA
+    let mounts_out = tokio::process::Command::new("docker")
+        .args([
+            "inspect",
+            "-f",
+            "{{range .Mounts}}{{printf \"%s %s %s\\n\" .Type .Source .Destination}}{{end}}",
+            container,
+        ])
+        .output()
+        .await?;
+    let mut volume = "forgefleet_postgres_data".to_string();
+    if mounts_out.status.success() {
+        for line in String::from_utf8_lossy(&mounts_out.stdout).lines() {
+            let parts: Vec<&str> = line.splitn(3, ' ').collect();
+            if parts.len() == 3 && parts[0] == "volume" && parts[2] == pgdata {
+                volume = parts[1].to_string();
+                break;
+            }
+        }
+    }
+
+    Ok(Some(ContainerState {
+        running,
+        pgdata,
+        volume,
+        image,
+    }))
+}
+
+/// Run a Docker command and require success.
+async fn docker_ok(args: &[&str]) -> Result<()> {
+    let out = tokio::process::Command::new("docker")
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("docker {} spawn failed: {e}", args.join(" ")))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "docker {} exited {}: {}",
+            args.join(" "),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Run a one-off command in a throwaway container with the PGDATA volume
+/// mounted. Used for wipe/ownership operations while the real container is
+/// stopped.
+async fn docker_run_oneoff(image: &str, volume: &str, pgdata: &str, cmd: &[String]) -> Result<()> {
+    let mut args: Vec<String> = vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "-v".to_string(),
+        format!("{volume}:{pgdata}"),
+        "-e".to_string(),
+        format!("PGDATA={pgdata}"),
+        image.to_string(),
+    ];
+    args.extend(cmd.iter().cloned());
+    let out = tokio::process::Command::new("docker")
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("docker run spawn failed: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "docker run exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 pub async fn handle_fleet_db_verify_backups(
@@ -1413,7 +1743,8 @@ pub async fn handle_fleet_db_verify_backups(
         println!("    scratch db: {scratch}");
         // Invoke the same restore path, then drop the DB.
         let restore_res =
-            handle_fleet_db_restore(pool, &target.id.to_string(), None, &scratch, true).await;
+            handle_fleet_db_restore(pool, &target.id.to_string(), None, &scratch, true, false)
+                .await;
         // Always attempt cleanup, even on error.
         let drop_out = tokio::process::Command::new("docker")
             .args([
@@ -3400,9 +3731,27 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         FleetCommand::RotateSshKey { computer } => {
             let mgr = ff_agent::ssh_key_manager::SshKeyManager::new(pool.clone());
             match mgr.rotate_computer_keypair(&computer).await {
-                Ok(()) => println!("{GREEN}✓ rotate complete{RESET}"),
+                Ok(report) => {
+                    println!(
+                        "{GREEN}✓ rotate complete{RESET} for {}",
+                        report.rotated_node
+                    );
+                    println!("  new fingerprint: {}", report.new_fingerprint);
+                    if let Some(old) = &report.old_fingerprint {
+                        println!("  old fingerprint: {}", old);
+                    }
+                    println!(
+                        "  peers reached: {} / failed: {}",
+                        report.peers_reached, report.peers_failed
+                    );
+                    for t in &report.targets {
+                        if !t.installed && !t.verified && !t.removed_old {
+                            println!("    {}: {}", t.target, t.messages.join("; "));
+                        }
+                    }
+                }
                 Err(e) => {
-                    eprintln!("{YELLOW}Not yet implemented:{RESET} {e}");
+                    eprintln!("{RED}rotate failed:{RESET} {e}");
                     std::process::exit(2);
                 }
             }

@@ -10515,6 +10515,18 @@ CREATE INDEX IF NOT EXISTS idx_error_events_deployment
     ON error_events (deployment_id, occurred_at DESC) WHERE deployment_id IS NOT NULL;
 "#;
 
+/// V179 — Add review tracking columns to the work-item merge queue.
+///
+/// These fields support a lightweight human/LLM review gate before an item is
+/// allowed to land: who claimed the review, when, and the verdict + rationale.
+pub const SCHEMA_V179_MERGE_QUEUE_REVIEW_FIELDS: &str = r#"
+ALTER TABLE work_item_merge_queue
+    ADD COLUMN IF NOT EXISTS reviewer_computer TEXT,
+    ADD COLUMN IF NOT EXISTS review_claimed_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS review_verdict    TEXT,
+    ADD COLUMN IF NOT EXISTS review_reason     TEXT;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

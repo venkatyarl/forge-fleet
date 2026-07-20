@@ -876,6 +876,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "error_events",
         sql: schema::SCHEMA_V178_ERROR_EVENTS,
     },
+    PgMigration {
+        version: 179,
+        name: "merge_queue_review_fields",
+        sql: schema::SCHEMA_V179_MERGE_QUEUE_REVIEW_FIELDS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

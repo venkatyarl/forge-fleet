@@ -7117,7 +7117,11 @@ CREATE TABLE IF NOT EXISTS work_item_merge_queue (
     started_at     TIMESTAMPTZ,
     merged_at      TIMESTAMPTZ,
     failed_at      TIMESTAMPTZ,
-    failure_reason TEXT
+    failure_reason TEXT,
+    reviewer_computer TEXT,
+    review_claimed_at TIMESTAMPTZ,
+    review_verdict    TEXT,
+    review_reason     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_work_item_merge_queue_ready
     ON work_item_merge_queue (project_id, position)

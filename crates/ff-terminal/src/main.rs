@@ -2125,14 +2125,22 @@ pub enum FleetDbCommand {
         #[arg(long, default_value_t = 30)]
         lease_minutes: i64,
     },
-    /// Restore an age-encrypted backup into a *scratch* Postgres database.
+    /// Restore an age-encrypted backup into a *scratch* Postgres database
+    /// (logical dumps) or back to the physical PGDATA directory
+    /// (pg_basebackup tar.gz archives).
     ///
     /// Looks up the row in `backups` by id, decrypts using
-    /// `fleet_secrets.backup_encryption_privkey`, creates the target DB
-    /// (default: `forgefleet_restored`) inside the `forgefleet-postgres`
-    /// container, and streams the plaintext archive back in via
-    /// `pg_restore` (or `psql` for plain SQL dumps). Never overwrites the
-    /// live `forgefleet` database.
+    /// `fleet_secrets.backup_encryption_privkey`, and either:
+    ///
+    /// * logical (default): creates the target DB (default:
+    ///   `forgefleet_restored`) inside the `forgefleet-postgres` container,
+    ///   and streams the plaintext archive back in via `pg_restore` or `psql`.
+    /// * physical (`--physical`): stops the local `forgefleet-postgres`
+    ///   container, wipes its PGDATA volume, extracts the pg_basebackup
+    ///   tar.gz in place, and starts Postgres again. This is the DR path.
+    ///
+    /// Never overwrites the live `forgefleet` database unless `--physical`
+    /// is passed.
     Restore {
         /// Backup ID (UUID) from the `backups` table.
         backup_id: String,
@@ -2143,9 +2151,16 @@ pub enum FleetDbCommand {
         to: Option<String>,
         /// Target database name. A scratch DB is created and the archive
         /// is loaded into it. Defaults to `forgefleet_restored`.
+        /// Ignored when `--physical` is used.
         #[arg(long, default_value = "forgefleet_restored")]
         target_db: String,
-        /// Required — restore actually touches Postgres (creates the DB).
+        /// Physical (pg_basebackup) restore. Replaces the local PGDATA
+        /// directory with the archive contents. Destructive — use with
+        /// `--yes`.
+        #[arg(long, default_value_t = false)]
+        physical: bool,
+        /// Required — restore actually touches Postgres (creates the DB or
+        /// replaces PGDATA).
         #[arg(long, default_value_t = false)]
         yes: bool,
     },

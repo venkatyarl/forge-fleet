@@ -390,7 +390,13 @@ if [ ! -f "$KEY_PATH" ]; then
   run_as_user bash -lc "ssh-keyscan github.com >> '$USER_HOME/.ssh/known_hosts'" 2>/dev/null || true
   run_as_user ssh-keygen -t ed25519 -N "" -f "$KEY_PATH" -C "${SUDO_INVOKER}@${NAME}" >/dev/null
 fi
-USER_PUBKEY="$(cat "${KEY_PATH}.pub")"
+# Read the public key we just generated (or that already existed). Redirect
+# stderr so a failed `cat` can never leak an error message into the enrollment
+# payload, which would otherwise be written to peer authorized_keys files.
+USER_PUBKEY="$(cat "${KEY_PATH}.pub" 2>/dev/null || true)"
+if [ -z "$USER_PUBKEY" ] || ! printf '%s\n' "$USER_PUBKEY" | grep -qE '^ssh-(rsa|ed25519|ecdsa|dsa) '; then
+  die "no valid user SSH public key found at ${KEY_PATH}.pub"
+fi
 
 # Collect host keys (created automatically by sshd on first start).
 HOST_PUBKEYS=""
@@ -499,7 +505,16 @@ existing_known = known.read_text() if known.exists() else ""
 added_user, added_host = 0, 0
 for p in peers:
     upk = (p.get("user_public_key") or "").strip()
-    if upk and upk not in existing_authz:
+    # Reject anything that does not look like an OpenSSH public key line.
+    # This prevents shell error messages (e.g. from a failed `cat` on the
+    # peer) from being appended to authorized_keys.
+    if not upk:
+        continue
+    parts = upk.split(None, 2)
+    if len(parts) < 2 or not parts[0].startswith("ssh-"):
+        print(f"skipping bogus peer key from {p.get('name', '?')}: {upk[:40]!r}")
+        continue
+    if upk not in existing_authz:
         existing_authz += upk + "\n"
         added_user += 1
     ip = p.get("ip", "")
