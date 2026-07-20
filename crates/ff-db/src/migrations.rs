@@ -996,6 +996,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "artifact_cache_holders",
         sql: schema::SCHEMA_V202_ARTIFACT_CACHE_HOLDERS,
     },
+    PgMigration {
+        version: 203,
+        name: "work_item_provenance",
+        sql: schema::SCHEMA_V203_WORK_ITEM_PROVENANCE,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1783,6 +1788,32 @@ mod tests {
         .await
         .expect("read operator dedup columns");
         assert_eq!(columns, vec!["send_count", "suppressed_count"]);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v203_creates_work_item_provenance() {
+        // CI has no Postgres. Keep this integration test optional on both
+        // supported database URL variables.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'work_item_provenance'
+             ORDER BY ordinal_position",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read provenance columns");
+        assert!(columns.contains(&"builder_port".to_string()));
+        assert!(columns.contains(&"reviewer_port".to_string()));
+        assert!(columns.contains(&"cleanup_detail".to_string()));
 
         drop_temp_db(admin, pool, &db_name).await;
     }

@@ -460,6 +460,16 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
                 "  created_at:   {}",
                 created_at.format("%Y-%m-%d %H:%M UTC")
             );
+            let provenance: Option<serde_json::Value> = sqlx::query_scalar(
+                "SELECT to_jsonb(p) FROM work_item_provenance p WHERE work_item_id = $1",
+            )
+            .bind(uid)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("query work-item provenance: {e}"))?;
+            if let Some(provenance) = provenance {
+                println!("  provenance:   {}", serde_json::to_string(&provenance)?);
+            }
 
             let outputs: Vec<(
                 uuid::Uuid,
@@ -765,6 +775,13 @@ async fn print_board_summary(pool: &sqlx::PgPool) -> Result<()> {
     .await
     .map_err(|e| anyhow::anyhow!("board summary (merge-queue): {e}"))?;
     let mq_total: i64 = mq.iter().map(|(_, n)| n).sum();
+    let provenance: (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE cleanup_complete)::bigint \
+           FROM work_item_provenance",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("board summary (provenance): {e}"))?;
 
     let mq_detail = if mq.is_empty() {
         String::new()
@@ -780,6 +797,10 @@ async fn print_board_summary(pool: &sqlx::PgPool) -> Result<()> {
     println!(
         "{CYAN}▶ Fleet PM board — {total} work_items · {GREEN}{active_leases} building{RESET}{CYAN} \
          · merge-queue: {mq_total}{mq_detail}{RESET}"
+    );
+    println!(
+        "\x1b[2m  provenance: {} recorded · {} cleanup verified{RESET}",
+        provenance.0, provenance.1
     );
     if !status_counts.is_empty() {
         let statuses = status_counts

@@ -211,6 +211,20 @@ pub async fn evaluate_merge_queue(
             match gh_merge_squash(&pr_url).await {
                 Ok(()) => {
                     ff_db::pg_mark_merge_merged(pg, item.id, item.work_item_id).await?;
+                    let merger = std::env::var("FORGEFLEET_COMPUTER_NAME")
+                        .or_else(|_| std::env::var("HOSTNAME"))
+                        .unwrap_or_else(|_| "unknown-leader".to_string());
+                    sqlx::query(
+                        "INSERT INTO work_item_provenance (work_item_id, merged_by, merged_at) \
+                         VALUES ($1, $2, NOW()) \
+                         ON CONFLICT (work_item_id) DO UPDATE SET \
+                           merged_by = EXCLUDED.merged_by, merged_at = EXCLUDED.merged_at, \
+                           updated_at = NOW()",
+                    )
+                    .bind(item.work_item_id)
+                    .bind(merger)
+                    .execute(pg)
+                    .await?;
                     info!(pr = %pr_url, work_item = %item.work_item_id, "merge_drain: merged");
                     Ok(1)
                 }
@@ -703,11 +717,15 @@ async fn cloud_cli_review(
     stage: &str,
 ) -> Result<(bool, String, String)> {
     let mut last_err: Option<anyhow::Error> = None;
-    // claude first: it is the most reliable cloud reviewer here; codex has hung
-    // and auth-expired fleet-wide in the past, so every backend gets a short
-    // cap and loses the race quickly when unhealthy.
-    for backend in ["claude", "codex", "kimi"] {
-        let budget = crate::cloud_budget::provider_budget(pg, backend).await;
+    let backends: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT backend FROM computer_backends \
+          WHERE installed AND authenticated ORDER BY backend",
+    )
+    .fetch_all(pg)
+    .await
+    .context("load authenticated cloud review backends")?;
+    for backend in backends {
+        let budget = crate::cloud_budget::provider_budget(pg, &backend).await;
         if crate::cloud_budget::is_exhausted(budget.as_ref(), chrono::Utc::now()) {
             warn!(
                 backend,
@@ -716,13 +734,13 @@ async fn cloud_cli_review(
             );
             continue;
         }
-        match crate::cli_executor::execute_cli(backend, prompt, &[], Some(REVIEW_CLOUD_TIMEOUT))
+        match crate::cli_executor::execute_cli(&backend, prompt, &[], Some(REVIEW_CLOUD_TIMEOUT))
             .await
         {
             Ok(res) if res.exit_code == 0 && !res.stdout.trim().is_empty() => {
                 crate::cloud_budget::record_success(
                     pg,
-                    backend,
+                    &backend,
                     budget.as_ref().and_then(|row| row.window_exhausted_until),
                 )
                 .await;
@@ -733,7 +751,7 @@ async fn cloud_cli_review(
                 record_review_interaction(
                     pg,
                     stage,
-                    backend,
+                    &backend,
                     prompt,
                     &res.stdout,
                     tin,

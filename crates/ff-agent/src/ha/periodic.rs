@@ -46,6 +46,8 @@ pub struct DigestData {
     pub computer_builds: Vec<(String, i64, i64, i64)>,
     /// Cached per-provider quota state from `cloud_budget_buckets`.
     pub cloud_budgets: Vec<crate::cloud_budget::ProviderBudget>,
+    /// (records created, post-merge cleanups verified) over the last 24h.
+    pub provenance_24h: Option<(i64, i64)>,
 }
 
 /// Deterministic session id for one calendar day's digest. Doubles as the
@@ -94,6 +96,12 @@ pub fn format_digest(data: &DigestData) -> String {
         }
         Some(_) => "First-pass rate: no completions".to_string(),
         None => format!("First-pass rate: {NA}"),
+    });
+    lines.push(match data.provenance_24h {
+        Some((records, cleaned)) => {
+            format!("Work-item provenance (24h): {records} recorded, {cleaned} cleanup verified")
+        }
+        None => "Work-item provenance (24h): unavailable".to_string(),
     });
     if data.computer_builds.is_empty() {
         lines.push("Builds by computer: none recorded".to_string());
@@ -202,6 +210,19 @@ async fn collect_digest_data(pg: &PgPool) -> DigestData {
 
     data.cloud_budgets = crate::cloud_budget::all_provider_budgets(pg).await;
 
+    match sqlx::query_as::<_, (i64, i64)>(
+        "SELECT COUNT(*)::bigint, \
+                COUNT(*) FILTER (WHERE cleanup_complete)::bigint \
+           FROM work_item_provenance \
+          WHERE updated_at >= NOW() - INTERVAL '24 hours'",
+    )
+    .fetch_one(pg)
+    .await
+    {
+        Ok(row) => data.provenance_24h = Some(row),
+        Err(e) => tracing::debug!(error = %e, "nightly digest: provenance unavailable"),
+    }
+
     data
 }
 
@@ -282,6 +303,7 @@ mod tests {
             throughput_24h: Some((12, 3)),
             avg_lead_time_secs: Some(4_320.0),
             first_pass: Some((12, 10)),
+            provenance_24h: Some((12, 9)),
             computer_builds: vec![("alpha".into(), 6, 5, 1)],
             cloud_budgets: vec![crate::cloud_budget::ProviderBudget {
                 provider: "codex".into(),
@@ -293,6 +315,7 @@ mod tests {
         assert!(body.contains("Throughput (24h): 12 completed, 3 failed"));
         assert!(body.contains("Avg lead time: 1h 12m"));
         assert!(body.contains("First-pass rate: 83% (10/12)"));
+        assert!(body.contains("12 recorded, 9 cleanup verified"));
         assert!(body.contains("• alpha: 5 ok / 1 failed (6 started)"));
         assert!(body.contains("• codex: available; weekly 12%"));
     }

@@ -11177,6 +11177,33 @@ CREATE INDEX IF NOT EXISTS idx_artifact_cache_index_lookup
     ON artifact_cache_index (artifact_key, last_used_at DESC NULLS LAST, created_at DESC);
 "#;
 
+/// V203 — One queryable attribution record for the complete work-item lifecycle.
+pub const SCHEMA_V203_WORK_ITEM_PROVENANCE: &str = r#"
+CREATE TABLE work_item_provenance (
+    work_item_id UUID PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
+    builder_model TEXT,
+    builder_computer TEXT,
+    builder_port INTEGER,
+    builder_lane TEXT CHECK (builder_lane IS NULL OR builder_lane IN ('local', 'cloud')),
+    reviewer_model TEXT,
+    reviewer_computer TEXT,
+    reviewer_port INTEGER,
+    reviewer_lane TEXT CHECK (reviewer_lane IS NULL OR reviewer_lane IN ('local', 'cloud')),
+    confirmer_model TEXT,
+    pr_url TEXT,
+    pr_created_at TIMESTAMPTZ,
+    pr_created_by TEXT,
+    merged_by TEXT,
+    merged_at TIMESTAMPTZ,
+    cleanup_complete BOOLEAN NOT NULL DEFAULT FALSE,
+    cleanup_at TIMESTAMPTZ,
+    cleanup_detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_work_item_provenance_merged_at
+    ON work_item_provenance (merged_at DESC) WHERE merged_at IS NOT NULL;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

@@ -1050,6 +1050,7 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     let head_sha = git_head_sha(&worktree.worktree_path)?;
     push_branch(&item.repo_path, &worktree.task_branch)?;
     let pr_url = create_pr(&worktree.worktree_path, &item, &worktree).await?;
+    record_pr_provenance(&pg, &item, &backend_used, &pr_url).await?;
 
     // In-place review (Pillar-4 v2): judge the change IN the still-warm build
     // workspace — diff vs base + item spec + a real `cargo test` run — before
@@ -1100,6 +1101,43 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         &backend_used,
         Some(&review),
     )
+    .await?;
+    Ok(())
+}
+
+async fn record_pr_provenance(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    builder: &str,
+    pr_url: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO work_item_provenance
+              (work_item_id, builder_model, builder_computer, builder_port, builder_lane,
+               pr_url, pr_created_at, pr_created_by)
+            SELECT $1, $2, $3,
+                   NULLIF(substring(l.endpoint FROM ':(\d+)(?:/|$)'), '')::int,
+                   CASE WHEN l.endpoint LIKE 'cloud:%' OR $2 ~ '^(codex|claude|kimi|gemini|grok)(:|$)'
+                        THEN 'cloud' ELSE 'local' END,
+                   $4, NOW(), $5
+              FROM work_item_leases l WHERE l.work_item_id = $1
+              ORDER BY l.assigned_at DESC LIMIT 1
+            ON CONFLICT (work_item_id) DO UPDATE SET
+              builder_model = EXCLUDED.builder_model,
+              builder_computer = EXCLUDED.builder_computer,
+              builder_port = EXCLUDED.builder_port,
+              builder_lane = EXCLUDED.builder_lane,
+              pr_url = EXCLUDED.pr_url,
+              pr_created_at = COALESCE(work_item_provenance.pr_created_at, EXCLUDED.pr_created_at),
+              pr_created_by = EXCLUDED.pr_created_by,
+              updated_at = NOW()"#,
+    )
+    .bind(item.work_item_id)
+    .bind(builder)
+    .bind(&item.computer_name)
+    .bind(pr_url)
+    .bind(format!("sub-agent:{} / {builder}", item.sub_agent_id))
+    .execute(pg)
     .await?;
     Ok(())
 }
@@ -1435,6 +1473,49 @@ async fn mark_ready_for_review(
     .execute(&mut *tx)
     .await?;
 
+    sqlx::query(
+        r#"INSERT INTO work_item_provenance
+              (work_item_id, builder_model, builder_computer, builder_port, builder_lane,
+               reviewer_model, reviewer_computer, reviewer_port, reviewer_lane,
+               pr_url, pr_created_at, pr_created_by, updated_at)
+            SELECT $1, $2, $3,
+                   NULLIF(substring(l.endpoint FROM ':(\d+)(?:/|$)'), '')::int,
+                   CASE WHEN l.endpoint LIKE 'cloud:%' OR $2 ~ '^(codex|claude|kimi|gemini|grok)(:|$)'
+                        THEN 'cloud' ELSE 'local' END,
+                   $4, $7, $8,
+                   CASE WHEN $4 LIKE 'local:%' THEN 'local' ELSE 'cloud' END,
+                   $5, NOW(), $6, NOW()
+              FROM work_item_leases l WHERE l.work_item_id = $1
+              ORDER BY l.assigned_at DESC LIMIT 1
+            ON CONFLICT (work_item_id) DO UPDATE SET
+              builder_model = EXCLUDED.builder_model,
+              builder_computer = EXCLUDED.builder_computer,
+              builder_port = EXCLUDED.builder_port,
+              builder_lane = EXCLUDED.builder_lane,
+              reviewer_model = EXCLUDED.reviewer_model,
+              reviewer_computer = EXCLUDED.reviewer_computer,
+              reviewer_port = EXCLUDED.reviewer_port,
+              reviewer_lane = EXCLUDED.reviewer_lane,
+              pr_url = EXCLUDED.pr_url,
+              pr_created_at = COALESCE(work_item_provenance.pr_created_at, EXCLUDED.pr_created_at),
+              pr_created_by = EXCLUDED.pr_created_by,
+              updated_at = NOW()"#,
+    )
+    .bind(item.work_item_id)
+    .bind(builder)
+    .bind(&item.computer_name)
+    .bind(review.map(|r| r.reviewer.as_str()))
+    .bind(pr_url)
+    .bind(format!("sub-agent:{} / {builder}", item.sub_agent_id))
+    .bind(
+        review
+            .and_then(|r| r.reviewer_computer.as_deref())
+            .unwrap_or(&item.computer_name),
+    )
+    .bind(review.and_then(|r| r.reviewer_port))
+    .execute(&mut *tx)
+    .await?;
+
     // Folder ownership spans build -> review -> merge. Keep the slot occupied
     // until the serial drain reports the merged signal; the host reaper then
     // deletes the branch/tree before this folder can claim another item.
@@ -1451,10 +1532,6 @@ async fn mark_ready_for_review(
 }
 
 // ── Pillar 4 v2: in-place review stage (after build+PR, before enqueue) ──────
-
-/// Cloud CLI reviewer pool for the in-place dispatch review, in tie-break
-/// order. The 480B ring joins opportunistically (see [`GATE_480B`]).
-const CLOUD_REVIEWERS: [&str; 3] = ["claude", "codex", "kimi"];
 
 /// Reviewer label recorded when the qwen3-coder-480b ring reviews an item.
 const LOCAL_REVIEWER_480B: &str = "local:qwen3-coder-480b";
@@ -1484,6 +1561,8 @@ pub(crate) static GATE_480B: std::sync::LazyLock<tokio::sync::Semaphore> =
 /// signal that feeds `v_reviewer_stats` and future routing weights).
 struct ReviewOutcome {
     reviewer: String,
+    reviewer_computer: Option<String>,
+    reviewer_port: Option<i32>,
     approved: bool,
     reason: String,
     started_at: chrono::DateTime<chrono::Utc>,
@@ -1548,8 +1627,12 @@ const DEFAULT_REVIEW_LATENCY_SECS: f64 = 180.0;
 /// a reviewer twice as fast earns twice the turns before its score catches up,
 /// and a reviewer with no history scores 0 — tried first so the fleet gathers
 /// latency data on every backend. Pure for testability.
-fn order_cloud_reviewers(builder: &str, stats: &[ReviewerStat]) -> Vec<String> {
-    let mut scored: Vec<(f64, String)> = CLOUD_REVIEWERS
+fn order_cloud_reviewers(
+    builder: &str,
+    stats: &[ReviewerStat],
+    backends: &[String],
+) -> Vec<String> {
+    let mut scored: Vec<(f64, String)> = backends
         .iter()
         .filter(|b| !same_model_family(builder, b))
         .map(|b| {
@@ -1595,9 +1678,11 @@ async fn run_in_place_review(
             let verdict = review_via_480b_inplace(pg, &prompt).await;
             drop(permit);
             match verdict {
-                Ok((approved, reason)) => {
+                Ok((approved, reason, reviewer_computer, reviewer_port)) => {
                     return Ok(ReviewOutcome {
                         reviewer: LOCAL_REVIEWER_480B.to_string(),
+                        reviewer_computer: Some(reviewer_computer),
+                        reviewer_port,
                         approved,
                         reason,
                         started_at,
@@ -1619,8 +1704,18 @@ async fn run_in_place_review(
     }
 
     let stats = cloud_reviewer_stats(pg).await.unwrap_or_default();
+    // The fleet inventory is the routing source of truth. This deliberately
+    // avoids a compiled-in provider list/model hint and follows newly enrolled
+    // authenticated cloud CLIs without a daemon rebuild.
+    let backends: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT backend FROM computer_backends \
+          WHERE installed AND authenticated ORDER BY backend",
+    )
+    .fetch_all(pg)
+    .await
+    .context("load authenticated review backends")?;
     let mut last_err: Option<anyhow::Error> = None;
-    for backend in order_cloud_reviewers(builder, &stats) {
+    for backend in order_cloud_reviewers(builder, &stats, &backends) {
         let started_at = chrono::Utc::now();
         match crate::cli_executor::execute_cli_in_dir(
             &backend,
@@ -1644,6 +1739,8 @@ async fn run_in_place_review(
                     crate::work_item_merge_drain::parse_review_response(&res.stdout);
                 return Ok(ReviewOutcome {
                     reviewer: backend,
+                    reviewer_computer: Some(item.computer_name.clone()),
+                    reviewer_port: None,
                     approved,
                     reason,
                     started_at,
@@ -1671,7 +1768,10 @@ async fn run_in_place_review(
 /// One 480B ring review. Caller holds a [`GATE_480B`] permit. `Err` means the
 /// ring didn't serve the call (routing failed, timed out, or `fleet_oneshot`
 /// failed over to a weaker model — never trusted as a 480B verdict).
-async fn review_via_480b_inplace(pg: &PgPool, prompt: &str) -> Result<(bool, String)> {
+async fn review_via_480b_inplace(
+    pg: &PgPool,
+    prompt: &str,
+) -> Result<(bool, String, String, Option<i32>)> {
     let resp =
         crate::fleet_oneshot::fleet_oneshot(pg, prompt, Some("480b"), Some(REVIEW_480B_TIMEOUT))
             .await
@@ -1691,9 +1791,12 @@ async fn review_via_480b_inplace(pg: &PgPool, prompt: &str) -> Result<(bool, Str
         i32::try_from(resp.latency_ms).ok(),
     )
     .await;
-    Ok(crate::work_item_merge_drain::parse_review_response(
-        &resp.text,
-    ))
+    let (approved, reason) = crate::work_item_merge_drain::parse_review_response(&resp.text);
+    let port = resp
+        .endpoint
+        .rsplit_once(':')
+        .and_then(|(_, value)| value.trim_end_matches('/').parse().ok());
+    Ok((approved, reason, resp.worker_name, port))
 }
 
 /// Reviewer input: the branch diff vs base + the item spec + a real
@@ -1832,6 +1935,22 @@ async fn record_review_rejection(
     .bind(review.started_at)
     .bind(review.completed_at)
     .bind(&item.computer_name)
+    .execute(pg)
+    .await?;
+    sqlx::query(
+        "UPDATE work_item_provenance SET reviewer_model = $2, reviewer_computer = $3, \
+                reviewer_port = $4, reviewer_lane = CASE WHEN $2 LIKE 'local:%' \
+                THEN 'local' ELSE 'cloud' END, updated_at = NOW() WHERE work_item_id = $1",
+    )
+    .bind(item.work_item_id)
+    .bind(&review.reviewer)
+    .bind(
+        review
+            .reviewer_computer
+            .as_deref()
+            .unwrap_or(&item.computer_name),
+    )
+    .bind(review.reviewer_port)
     .execute(pg)
     .await?;
     Ok(())
@@ -4173,15 +4292,15 @@ pub async fn evaluate_worktree_reaper(pg: &PgPool, worker_name: &str) -> Result<
     for wt in reapable {
         let repo = PathBuf::from(&wt.repo_path);
         let tree = PathBuf::from(&wt.worktree_path);
-        // Best-effort filesystem cleanup; the DB mark below is the source of truth.
-        let _ = remove_worktree(&repo, &tree);
+        let worktree_removed =
+            remove_worktree(&repo, &tree).is_ok() && (tree == repo || !tree.exists());
         // Clone-direct rows: the "worktree" is the slot's long-lived clone —
         // reclaiming would delete its target/node_modules out from under the
         // next build. Only legacy detached worktree dirs are reclaimed.
         if tree != repo {
             reclaimed_bytes = reclaimed_bytes.saturating_add(reclaim_build_artifacts(&tree));
         }
-        let _ = run_git(
+        let branch_deleted = run_git(
             &repo,
             [
                 OsStr::new("branch"),
@@ -4189,13 +4308,31 @@ pub async fn evaluate_worktree_reaper(pg: &PgPool, worker_name: &str) -> Result<
                 OsStr::new(&wt.task_branch),
             ],
             Duration::from_secs(30),
-        );
+        )
+        .is_ok();
         let mut tx = pg.begin().await?;
         sqlx::query(
             "UPDATE work_item_worktrees SET status = 'cleaned', cleaned_at = NOW() \
               WHERE work_item_id = $1",
         )
         .bind(wt.work_item_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO work_item_provenance
+                 (work_item_id, cleanup_complete, cleanup_at, cleanup_detail)
+             VALUES ($1, $2, CASE WHEN $2 THEN NOW() END,
+                     jsonb_build_object('branch_deleted', $3, 'worktree_removed', $4))
+             ON CONFLICT (work_item_id) DO UPDATE SET
+                 cleanup_complete = EXCLUDED.cleanup_complete,
+                 cleanup_at = EXCLUDED.cleanup_at,
+                 cleanup_detail = EXCLUDED.cleanup_detail,
+                 updated_at = NOW()",
+        )
+        .bind(wt.work_item_id)
+        .bind(branch_deleted && worktree_removed)
+        .bind(branch_deleted)
+        .bind(worktree_removed)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -4347,6 +4484,11 @@ mod tests {
 
     #[test]
     fn order_cloud_reviewers_excludes_builder_and_weights_by_latency() {
+        let backends = vec![
+            "claude".to_string(),
+            "codex".to_string(),
+            "kimi".to_string(),
+        ];
         let stat = |reviewer: &str, reviews: i64, avg: f64| ReviewerStat {
             reviewer: reviewer.to_string(),
             reviews,
@@ -4354,16 +4496,18 @@ mod tests {
         };
 
         // Rule 1: the builder never reviews its own change.
-        let order = order_cloud_reviewers("codex", &[]);
+        let order = order_cloud_reviewers("codex", &[], &backends);
         assert_eq!(order, vec!["claude".to_string(), "kimi".to_string()]);
         assert!(same_model_family("cloud:codex", "codex"));
-        assert!(!order_cloud_reviewers("cloud:codex", &[]).contains(&"codex".to_string()));
+        assert!(
+            !order_cloud_reviewers("cloud:codex", &[], &backends).contains(&"codex".to_string())
+        );
         // A local builder excludes no cloud reviewer.
-        let order = order_cloud_reviewers("local", &[]);
+        let order = order_cloud_reviewers("local", &[], &backends);
         assert_eq!(order.len(), 3);
 
         // No history → declaration order preserved (all scores 0).
-        let order = order_cloud_reviewers("", &[]);
+        let order = order_cloud_reviewers("", &[], &backends);
         assert_eq!(
             order,
             vec![
@@ -4378,7 +4522,7 @@ mod tests {
         // 1 review (score 300); codex has no history (score 0 → first, so the
         // fleet gathers data on it).
         let stats = [stat("claude", 1, 300.0), stat("kimi", 2, 60.0)];
-        let order = order_cloud_reviewers("", &stats);
+        let order = order_cloud_reviewers("", &stats, &backends);
         assert_eq!(
             order,
             vec![
