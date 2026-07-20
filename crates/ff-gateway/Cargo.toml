@@ -8,6 +8,7 @@ description = "ForgeFleet multi-channel messaging gateway (Telegram, Discord, We
 
 [dependencies]
 ff-core = { path = "../ff-core" }
+ff-capacity = { path = "../ff-capacity" }
 ff-agent = { path = "../ff-agent" }
 ff-brain = { path = "../ff-brain" }
 ff-api = { path = "../ff-api" }

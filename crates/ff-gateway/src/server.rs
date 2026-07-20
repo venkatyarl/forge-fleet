@@ -281,6 +281,13 @@ pub struct GatewayServer {
 
 impl GatewayServer {
     pub fn new(config: GatewayConfig) -> anyhow::Result<Self> {
+        Self::new_with_capacity(config, None)
+    }
+
+    fn new_with_capacity(
+        config: GatewayConfig,
+        capacity: Option<Arc<ff_capacity::CapacitySnapshot>>,
+    ) -> anyhow::Result<Self> {
         let router =
             MessageRouter::new(config.bot_aliases.clone(), config.command_prefixes.clone());
         let mut state = GatewayState::new(router);
@@ -351,6 +358,10 @@ impl GatewayServer {
             Ok(pr) => {
                 let affinity = Arc::new(SessionAffinityCache::new());
                 let breaker = Arc::new(CircuitBreaker::new());
+                let pr = match capacity.clone() {
+                    Some(snapshot) => pr.with_capacity_snapshot(snapshot),
+                    None => pr,
+                };
                 let router = pr
                     .with_session_affinity(affinity)
                     .with_circuit_breaker(breaker);
@@ -529,7 +540,23 @@ async fn shutdown_signal(cancel: CancellationToken) {
 }
 
 pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {
-    GatewayServer::new(config)?.run().await
+    let capacity = match config
+        .operational_store
+        .as_ref()
+        .and_then(|store| store.pg_pool())
+    {
+        Some(pool) => match ff_capacity::CapacitySnapshot::load(pool).await {
+            Ok(snapshot) => Some(Arc::new(snapshot)),
+            Err(error) => {
+                warn!(%error, "capacity registry unavailable; using legacy Pulse discovery");
+                None
+            }
+        },
+        None => None,
+    };
+    GatewayServer::new_with_capacity(config, capacity)?
+        .run()
+        .await
 }
 
 // ─── Router ──────────────────────────────────────────────────────────────────

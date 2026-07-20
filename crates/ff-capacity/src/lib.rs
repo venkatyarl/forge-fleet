@@ -26,9 +26,20 @@ pub struct CapacityRow {
     pub computer: Option<String>,
     pub provider: Option<String>,
     pub pool: Option<String>,
+    pub port: Option<i32>,
+    pub health: Option<String>,
     pub free_slots: Option<i32>,
     pub bucket: Option<String>,
     pub label: Option<String>,
+}
+
+/// A healthy inference deployment advertised by the capacity registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferenceDeployment {
+    pub catalog_id: String,
+    pub catalog_family: Option<String>,
+    pub computer: String,
+    pub port: i32,
 }
 
 /// Cached inputs used by the cloud-backend router.
@@ -101,6 +112,29 @@ impl CapacitySnapshot {
             .collect()
     }
 
+    /// Healthy inference deployments in the current registry snapshot.
+    ///
+    /// Consumers may continue using this value after a refresh failure: the
+    /// refresh loop only replaces the snapshot after a successful fetch.
+    pub fn inference_deployments(&self) -> Vec<InferenceDeployment> {
+        self.inner
+            .data
+            .load()
+            .rows
+            .iter()
+            .filter(|r| r.kind == "inference_pool")
+            .filter(|r| r.health.as_deref() == Some("healthy"))
+            .filter_map(|r| {
+                Some(InferenceDeployment {
+                    catalog_id: r.pool.clone()?,
+                    catalog_family: r.catalog_family.clone(),
+                    computer: r.label.clone()?,
+                    port: r.port?,
+                })
+            })
+            .collect()
+    }
+
     /// Total free build slots for a given computer.
     pub fn free_build_slots(&self, computer: &str) -> i32 {
         self.inner
@@ -157,6 +191,8 @@ impl CapacitySnapshot {
                 CASE WHEN v.kind = 'build' THEN v.worker END AS computer,
                 CASE WHEN v.kind = 'cloud' THEN v.worker END AS provider,
                 CASE WHEN v.kind = 'inference' THEN v.catalog_id END AS pool,
+                CASE WHEN v.kind = 'inference' THEN v.port END AS port,
+                v.health,
                 CASE WHEN v.kind = 'build' THEN v.parallel_slots::int END AS free_slots,
                 CASE WHEN v.kind = 'cloud' THEN v.worker END AS bucket,
                 v.worker AS label
@@ -317,16 +353,16 @@ mod tests {
             INSERT INTO fleet_model_catalog (id, family) VALUES
                 ('coder', 'qwen'), ('chat', 'qwen'), ('judge', 'gemma');
             INSERT INTO v_fleet_capacity
-                (kind, catalog_id, worker, parallel_slots, health)
+                (kind, catalog_id, worker, port, parallel_slots, health)
             VALUES
-                ('inference', 'coder', 'node-1', 1, 'healthy'),
-                ('inference', 'chat',  'node-2', 1, 'healthy'),
-                ('inference', 'judge', 'node-3', 1, 'healthy'),
-                ('build', NULL, 'builder-1', 4, 'online'),
-                ('build', NULL, 'builder-1', 2, 'online'),
-                ('build', NULL, 'builder-2', 1, 'online'),
-                ('cloud', NULL, 'aws', 3, 'healthy'),
-                ('cloud', NULL, 'gcp', 3, 'healthy')
+                ('inference', 'coder', 'node-1', 8080, 1, 'healthy'),
+                ('inference', 'chat',  'node-2', 8081, 1, 'healthy'),
+                ('inference', 'judge', 'node-3', 8082, 1, 'healthy'),
+                ('build', NULL, 'builder-1', NULL, 4, 'online'),
+                ('build', NULL, 'builder-1', NULL, 2, 'online'),
+                ('build', NULL, 'builder-2', NULL, 1, 'online'),
+                ('cloud', NULL, 'aws', NULL, 3, 'healthy'),
+                ('cloud', NULL, 'gcp', NULL, 3, 'healthy')
             "#,
         )
         .execute(pool)
@@ -349,6 +385,16 @@ mod tests {
 
         assert_eq!(snap.inference_pools("gemma"), vec!["judge".to_string()]);
         assert!(snap.inference_pools("unknown").is_empty());
+
+        assert_eq!(
+            snap.inference_deployments()[0],
+            InferenceDeployment {
+                catalog_id: "coder".to_string(),
+                catalog_family: Some("qwen".to_string()),
+                computer: "node-1".to_string(),
+                port: 8080,
+            }
+        );
     }
 
     #[tokio::test]

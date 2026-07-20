@@ -324,6 +324,7 @@ pub struct RouterDiagnostics {
 #[derive(Clone)]
 pub struct PulseLlmRouter {
     reader: std::sync::Arc<PulseReader>,
+    capacity: Option<Arc<ff_capacity::CapacitySnapshot>>,
     http: Client,
     upstream_timeout: Duration,
     session_cache: Option<Arc<SessionAffinityCache>>,
@@ -356,11 +357,21 @@ impl PulseLlmRouter {
             .expect("build reqwest client");
         Ok(Self {
             reader: std::sync::Arc::new(reader),
+            capacity: None,
             http,
             upstream_timeout: Duration::from_secs(120),
             session_cache: None,
             circuit_breaker: None,
         })
+    }
+
+    /// Use the shared capacity registry as the deployment discovery source.
+    /// Pulse remains the source of live load and endpoint telemetry.
+    pub fn with_capacity_snapshot(self, capacity: Arc<ff_capacity::CapacitySnapshot>) -> Self {
+        Self {
+            capacity: Some(capacity),
+            ..self
+        }
     }
 
     /// Attach a [`SessionAffinityCache`] so follow-up turns in the same
@@ -406,6 +417,15 @@ impl PulseLlmRouter {
         self.circuit_breaker.clone()
     }
 
+    fn registry_allows(&self, computer: &str, server: &LlmServer) -> bool {
+        self.capacity.as_ref().is_none_or(|snapshot| {
+            snapshot.inference_deployments().iter().any(|deployment| {
+                deployment.computer.eq_ignore_ascii_case(computer)
+                    && endpoint_port(&server.endpoint) == Some(deployment.port as u16)
+            })
+        })
+    }
+
     /// Collect every active+healthy LLM server paired with the beat it
     /// came from, so callers can look up the node's primary IP for
     /// cross-host routing.
@@ -417,7 +437,8 @@ impl PulseLlmRouter {
                 continue;
             }
             for s in &b.llm_servers {
-                if s.status == "active" && s.is_healthy {
+                if self.registry_allows(&b.computer_name, s) && s.status == "active" && s.is_healthy
+                {
                     out.push((b.clone(), s.clone()));
                 }
             }
@@ -553,23 +574,60 @@ impl PulseLlmRouter {
         pg: &sqlx::PgPool,
         requested_model: &str,
     ) -> Result<Option<(String, String, LlmServer)>, LlmRoutingError> {
-        let picked = self
-            .reader
-            .pick_llm_server_for_with_pools(pg, requested_model)
-            .await?;
-        let Some((computer, server)) = picked else {
-            return Ok(None);
-        };
-        // Recover primary_ip from the beat (reader returns the computer name
-        // but not the IP; a single extra scan here is fine because alias
-        // routing is the uncommon path).
-        let beats = self.reader.all_beats().await?;
-        let primary_ip = beats
+        let pool_members: Option<Vec<String>> = sqlx::query_scalar::<_, String>(
+            "SELECT preferred_model_ids::text FROM fleet_task_coverage WHERE alias = $1 LIMIT 1",
+        )
+        .bind(requested_model)
+        .fetch_optional(pg)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_str(&value).ok());
+        let is_known_alias = pool_members
+            .as_ref()
+            .is_some_and(|members| !members.is_empty());
+        let candidate_norms: Vec<String> = pool_members
+            .filter(|members| !members.is_empty())
+            .unwrap_or_else(|| vec![requested_model.to_string()])
             .iter()
-            .find(|b| b.computer_name == computer)
-            .map(|b| b.network.primary_ip.clone())
-            .unwrap_or_default();
-        Ok(Some((computer, primary_ip, server)))
+            .map(|model| normalize_model_id(model))
+            .collect();
+
+        let active = self.collect_active().await?;
+        let mut candidates: Vec<(PulseBeatV2, LlmServer)> = active
+            .iter()
+            .filter(|(_, server)| {
+                let server_norm = normalize_model_id(&server.model.id);
+                candidate_norms.iter().any(|candidate| {
+                    candidate == &server_norm
+                        || (!candidate.is_empty()
+                            && !server_norm.is_empty()
+                            && (server_norm.starts_with(candidate.as_str())
+                                || candidate.starts_with(&server_norm)))
+                })
+            })
+            .cloned()
+            .collect();
+
+        if candidates.is_empty() && is_known_alias {
+            candidates = active
+                .into_iter()
+                .filter(|(_, server)| {
+                    server.openai_compatible && !looks_like_embedding_model(&server.model.id)
+                })
+                .collect();
+        }
+        candidates.sort_by(|(_, a), (_, b)| {
+            a.queue_depth.cmp(&b.queue_depth).then_with(|| {
+                b.tokens_per_sec_last_min
+                    .partial_cmp(&a.tokens_per_sec_last_min)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+        Ok(candidates
+            .into_iter()
+            .next()
+            .map(|(beat, server)| (beat.computer_name, beat.network.primary_ip, server)))
     }
 
     /// Shared helper: pick a server, rewrite the body, and build the upstream URL.
@@ -603,6 +661,7 @@ impl PulseLlmRouter {
                 for s in &beat.llm_servers {
                     if s.status == "active"
                         && s.is_healthy
+                        && self.registry_allows(&beat.computer_name, s)
                         && normalize_model_id(&s.model.id) == normalize_model_id(&entry.model_id)
                         && s.queue_depth <= SESSION_AFFINITY_QUEUE_THRESHOLD
                     {
@@ -659,7 +718,7 @@ impl PulseLlmRouter {
         };
 
         let Some((computer, primary_ip, server)) = picked else {
-            let all = self.reader.list_llm_servers().await?;
+            let all = self.collect_active().await?;
             let available: Vec<String> = all.into_iter().map(|(_, s)| s.model.id).collect();
             return Err(LlmRoutingError::NoMatch {
                 requested: requested_model,
@@ -997,6 +1056,15 @@ pub(crate) fn rewrite_endpoint(endpoint: &str, primary_ip: &str) -> String {
         }
     }
     endpoint.to_string()
+}
+
+fn endpoint_port(endpoint: &str) -> Option<u16> {
+    reqwest::Url::parse(endpoint).ok()?.port_or_known_default()
+}
+
+fn looks_like_embedding_model(model_id: &str) -> bool {
+    let id = model_id.to_ascii_lowercase();
+    id.contains("embed") || id.contains("bge-") || id.contains("rerank")
 }
 
 /// Shape an [`LlmRoutingError`] into a (status, json) tuple for axum handlers.
@@ -1456,6 +1524,12 @@ mod tests {
             rewrite_endpoint("http://0.0.0.0:51001", "10.0.0.5"),
             "http://10.0.0.5:51001"
         );
+    }
+
+    #[test]
+    fn endpoint_port_reads_registry_identity_port() {
+        assert_eq!(endpoint_port("http://127.0.0.1:55000/v1"), Some(55000));
+        assert_eq!(endpoint_port("not a url"), None);
     }
 
     #[test]
