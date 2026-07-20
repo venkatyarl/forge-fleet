@@ -9,6 +9,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use ff_core::config::AlertDeduplicationConfig;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -209,6 +210,8 @@ pub struct AlertEngine {
     history: Arc<DashMap<Uuid, Alert>>,
     /// How long repeated alerts are aggregated.
     dedup_window: chrono::Duration,
+    /// Occurrence at which matching alerts begin to be collapsed.
+    dedup_threshold_count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -232,7 +235,19 @@ impl AlertEngine {
             active_alerts: Arc::new(DashMap::new()),
             history: Arc::new(DashMap::new()),
             dedup_window,
+            dedup_threshold_count: 2,
         }
+    }
+
+    /// Create an alert engine using the deduplication settings from `fleet.toml`.
+    pub fn with_deduplication_config(
+        rules: Vec<AlertRule>,
+        config: &AlertDeduplicationConfig,
+    ) -> Self {
+        let window_secs = i64::try_from(config.window_secs).unwrap_or(i64::MAX);
+        let mut engine = Self::with_dedup_window(rules, chrono::Duration::seconds(window_secs));
+        engine.dedup_threshold_count = config.threshold_count.max(2);
+        engine
     }
 
     /// Create an engine with sensible default rules for ForgeFleet.
@@ -429,7 +444,8 @@ impl AlertEngine {
                 active.alert.count = active.alert.count.saturating_add(1);
                 active.last_seen_at = now;
                 self.history.insert(active.alert.id, active.alert.clone());
-                (active.alert.clone(), false)
+                let should_emit = active.alert.count < self.dedup_threshold_count;
+                (active.alert.clone(), should_emit)
             }
             Entry::Occupied(mut entry) => {
                 let active = ActiveAlert {
@@ -747,5 +763,22 @@ mod tests {
         assert_eq!(second.count, 1);
         assert_eq!(engine.active_count(), 1);
         assert_eq!(engine.alert_history().len(), 2);
+    }
+
+    #[test]
+    fn test_configured_threshold_delays_collapsing() {
+        let config = AlertDeduplicationConfig {
+            window_secs: 300,
+            threshold_count: 3,
+        };
+        let engine =
+            AlertEngine::with_deduplication_config(vec![AlertRule::high_cpu(90.0)], &config);
+        let metrics = MetricsCollector::new();
+        metrics.record_node(hot_node("taylor", 95.0));
+
+        assert_eq!(engine.evaluate(&metrics).len(), 1);
+        assert_eq!(engine.evaluate(&metrics).len(), 1);
+        assert!(engine.evaluate(&metrics).is_empty());
+        assert_eq!(engine.active_alerts()[0].count, 3);
     }
 }

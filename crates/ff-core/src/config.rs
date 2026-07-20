@@ -56,6 +56,10 @@ pub struct FleetConfig {
     #[serde(default)]
     pub notifications: NotificationsConfig,
 
+    /// Alert aggregation settings — `[alerts.deduplication]`.
+    #[serde(default)]
+    pub alerts: AlertsConfig,
+
     /// Runtime transport adapters — `[transport]`.
     #[serde(default)]
     pub transport: TransportConfig,
@@ -136,6 +140,7 @@ impl Default for FleetConfig {
             fleet: FleetSettings::default(),
             nodes: HashMap::new(),
             notifications: NotificationsConfig::default(),
+            alerts: AlertsConfig::default(),
             transport: TransportConfig::default(),
             services: HashMap::new(),
             llm: LlmConfig::default(),
@@ -481,6 +486,43 @@ pub struct NotificationsConfig {
     /// Telegram notifications — `[notifications.telegram]`.
     #[serde(default)]
     pub telegram: Option<TelegramNotification>,
+}
+
+/// Alert processing configuration — `[alerts]`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AlertsConfig {
+    /// Repeated-alert aggregation settings — `[alerts.deduplication]`.
+    #[serde(default)]
+    pub deduplication: AlertDeduplicationConfig,
+}
+
+/// Controls when repeated alerts are collapsed into one alert.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertDeduplicationConfig {
+    /// Time window, in seconds, in which matching alerts are considered duplicates.
+    #[serde(default = "default_alert_deduplication_window_secs")]
+    pub window_secs: u64,
+
+    /// Number of matching alerts required before they are collapsed.
+    #[serde(default = "default_alert_deduplication_threshold_count")]
+    pub threshold_count: u64,
+}
+
+impl Default for AlertDeduplicationConfig {
+    fn default() -> Self {
+        Self {
+            window_secs: default_alert_deduplication_window_secs(),
+            threshold_count: default_alert_deduplication_threshold_count(),
+        }
+    }
+}
+
+const fn default_alert_deduplication_window_secs() -> u64 {
+    300
+}
+
+const fn default_alert_deduplication_threshold_count() -> u64 {
+    2
 }
 
 /// Telegram notification settings.
@@ -1884,6 +1926,10 @@ preferred_workloads = ["coding", "review", "build"]
 chat_id = "8496613333"
 channel = "telegram"
 
+[alerts.deduplication]
+window_secs = 600
+threshold_count = 3
+
 [transport.telegram]
 enabled = true
 bot_token_env = "FORGEFLEET_TELEGRAM_BOT_TOKEN"
@@ -2049,6 +2095,9 @@ notes = "Setup started."
         let tg = config.notifications.telegram.as_ref().expect("telegram");
         assert_eq!(tg.chat_id, "8496613333");
 
+        assert_eq!(config.alerts.deduplication.window_secs, 600);
+        assert_eq!(config.alerts.deduplication.threshold_count, 3);
+
         // Check telegram transport.
         let transport = config
             .transport
@@ -2140,6 +2189,14 @@ notes = "Setup started."
         // Check bootstrap_targets.
         assert_eq!(config.bootstrap_targets.len(), 1);
         assert_eq!(config.bootstrap_targets[0].name, "logan");
+    }
+
+    #[test]
+    fn alert_deduplication_defaults_are_backward_compatible() {
+        let config: FleetConfig = toml::from_str("").unwrap();
+
+        assert_eq!(config.alerts.deduplication.window_secs, 300);
+        assert_eq!(config.alerts.deduplication.threshold_count, 2);
     }
 
     #[test]
