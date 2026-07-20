@@ -881,6 +881,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "work_item_events",
         sql: schema::SCHEMA_V179_WORK_ITEM_EVENTS,
     },
+    PgMigration {
+        version: 180,
+        name: "model_capacity_view",
+        sql: schema::SCHEMA_V180_MODEL_CAPACITY_VIEW,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1402,6 +1407,94 @@ mod tests {
                 .await
                 .expect("count events after cascade");
         assert_eq!(remaining, 0);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v180_model_capacity_view_freshness_gate() {
+        // Needs Postgres — create_fresh_temp_db returns None (and we early-
+        // return) when neither FORGEFLEET_POSTGRES_URL nor
+        // FORGEFLEET_DATABASE_URL is set, so this never panics in CI.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        sqlx::query("INSERT INTO fleet_workers (name, ip) VALUES ('v180-test-node', '10.0.0.1')")
+            .execute(&pool)
+            .await
+            .expect("insert test worker");
+        let deployment_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO fleet_model_deployments
+                 (worker_name, catalog_id, runtime, port, health_status)
+             VALUES ('v180-test-node', 'qwen3-coder-30b', 'llama.cpp', 55000, 'healthy')
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert test deployment");
+
+        // No scrape samples yet → status is 'unknown' with NULL metrics.
+        let (status, tokens_per_sec): (String, Option<f64>) = sqlx::query_as(
+            "SELECT status, tokens_per_sec FROM model_capacity WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read view without samples");
+        assert_eq!(status, "unknown");
+        assert!(tokens_per_sec.is_none());
+
+        // A stale sample (older than the 90s freshness gate) → still 'unknown'.
+        sqlx::query(
+            "INSERT INTO deployment_metrics_scrapes
+                 (deployment_id, worker_name, port, tokens_per_sec, queue_depth, scraped_at)
+             VALUES ($1, 'v180-test-node', 55000, 5.0, 9, NOW() - INTERVAL '5 minutes')",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("insert stale scrape");
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM model_capacity WHERE deployment_id = $1")
+                .bind(deployment_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read view with stale sample");
+        assert_eq!(status, "unknown");
+
+        // A fresh sample → status passes through health_status, and the view
+        // reports the newest sample's metrics, not the stale one's.
+        sqlx::query(
+            "INSERT INTO deployment_metrics_scrapes
+                 (deployment_id, worker_name, port, tokens_per_sec, queue_depth, scraped_at)
+             VALUES ($1, 'v180-test-node', 55000, 42.5, 2, NOW())",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("insert fresh scrape");
+        let (computer, status, tokens_per_sec, queue_depth): (
+            String,
+            String,
+            Option<f64>,
+            Option<i32>,
+        ) = sqlx::query_as(
+            "SELECT computer, status, tokens_per_sec, queue_depth
+             FROM model_capacity WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read view with fresh sample");
+        assert_eq!(computer, "v180-test-node");
+        assert_eq!(status, "healthy");
+        assert_eq!(tokens_per_sec, Some(42.5));
+        assert_eq!(queue_depth, Some(2));
 
         drop_temp_db(admin, pool, &db_name).await;
     }

@@ -10537,6 +10537,43 @@ CREATE INDEX IF NOT EXISTS idx_work_item_events_item_time
     ON work_item_events (work_item_id, occurred_at DESC);
 "#;
 
+/// V180 — `model_capacity` view over scraped deployment metrics.
+///
+/// Per (computer, deployment) capacity/utilization snapshot: each running
+/// deployment joined with the newest `deployment_metrics_scrapes` sample for
+/// it. Freshness gate per the council observability design: when the newest
+/// sample is older than 90 seconds (or no sample exists yet) `status` is
+/// 'unknown' — otherwise it passes through the deployment's `health_status`.
+/// Read-only observability surface; no routing logic lives here.
+pub const SCHEMA_V180_MODEL_CAPACITY_VIEW: &str = r#"
+CREATE OR REPLACE VIEW model_capacity AS
+SELECT
+    d.worker_name       AS computer,
+    d.id                AS deployment_id,
+    d.catalog_id,
+    d.runtime,
+    d.port,
+    d.context_window,
+    s.tokens_per_sec,
+    s.queue_depth,
+    s.active_requests,
+    s.scraped_at        AS last_scraped_at,
+    CASE
+        WHEN s.scraped_at IS NULL
+          OR s.scraped_at < NOW() - INTERVAL '90 seconds'
+        THEN 'unknown'
+        ELSE d.health_status
+    END                 AS status
+FROM fleet_model_deployments d
+LEFT JOIN LATERAL (
+    SELECT m.tokens_per_sec, m.queue_depth, m.active_requests, m.scraped_at
+    FROM deployment_metrics_scrapes m
+    WHERE m.deployment_id = d.id
+    ORDER BY m.scraped_at DESC
+    LIMIT 1
+) s ON TRUE;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
