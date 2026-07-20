@@ -886,6 +886,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_capacity_view",
         sql: schema::SCHEMA_V180_MODEL_CAPACITY_VIEW,
     },
+    PgMigration {
+        version: 181,
+        name: "fleet_velocity_views",
+        sql: schema::SCHEMA_V181_FLEET_VELOCITY_VIEWS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1495,6 +1500,102 @@ mod tests {
         assert_eq!(status, "healthy");
         assert_eq!(tokens_per_sec, Some(42.5));
         assert_eq!(queue_depth, Some(2));
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v181_fleet_velocity_views_aggregate_work_item_events() {
+        // Needs Postgres — create_fresh_temp_db returns None (and we early-
+        // return) when neither FORGEFLEET_POSTGRES_URL nor
+        // FORGEFLEET_DATABASE_URL is set, so this never panics in CI.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        sqlx::query(
+            "INSERT INTO projects (id, display_name) VALUES ('v181-test-proj', 'V181 Test')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert test project");
+        let work_item_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO work_items
+                 (project_id, kind, title, created_at, assigned_computer)
+             VALUES
+                 ('v181-test-proj', 'task', 'v181 test item',
+                  '2026-07-18 08:00:00+00', 'v181-fallback-node')
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert test work item");
+
+        sqlx::query(
+            "INSERT INTO work_item_events
+                 (work_item_id, from_status, to_status, occurred_at, computer, attempt)
+             VALUES
+                 ($1, 'ready', 'building', '2026-07-18 09:00:00+00', NULL, 1),
+                 ($1, 'building', 'failed', '2026-07-18 10:00:00+00', NULL, 1),
+                 ($1, 'failed', 'building', '2026-07-18 11:00:00+00', 'v181-node', 2),
+                 ($1, 'building', 'done', '2026-07-18 12:00:00+00', 'v181-node', 2)",
+        )
+        .bind(work_item_id)
+        .execute(&pool)
+        .await
+        .expect("insert work item events");
+
+        let (completed, failed): (i64, i64) = sqlx::query_as(
+            "SELECT completed_count, failed_count
+             FROM v_throughput_hourly
+             WHERE hour_bucket = '2026-07-18 12:00:00+00'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read throughput view");
+        assert_eq!((completed, failed), (1, 0));
+
+        let (completed, lead_time): (i64, f64) = sqlx::query_as(
+            "SELECT completed_count, avg_lead_time_seconds
+             FROM v_lead_time_daily
+             WHERE day_bucket = '2026-07-18 00:00:00+00'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read lead-time view");
+        assert_eq!(completed, 1);
+        assert_eq!(lead_time, 14_400.0);
+
+        let computer_rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT computer_name, builds_started, builds_succeeded, builds_failed
+             FROM v_computer_builds_daily
+             WHERE day_bucket = '2026-07-18 00:00:00+00'
+             ORDER BY computer_name",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read computer builds view");
+        assert_eq!(
+            computer_rows,
+            vec![
+                ("v181-fallback-node".to_string(), 1, 0, 1),
+                ("v181-node".to_string(), 1, 1, 0),
+            ]
+        );
+
+        let (completed, first_pass, rate): (i64, i64, f64) = sqlx::query_as(
+            "SELECT completed_count, first_pass_count, first_pass_rate
+             FROM v_first_pass_rate_daily
+             WHERE day_bucket = '2026-07-18 00:00:00+00'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read first-pass view");
+        assert_eq!((completed, first_pass, rate), (1, 0, 0.0));
 
         drop_temp_db(admin, pool, &db_name).await;
     }
