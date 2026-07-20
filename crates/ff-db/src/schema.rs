@@ -10515,6 +10515,17 @@ CREATE INDEX IF NOT EXISTS idx_error_events_deployment
     ON error_events (deployment_id, occurred_at DESC) WHERE deployment_id IS NOT NULL;
 "#;
 
+// V179 — canonical sub-agent slot kind
+//
+// Distinguishes regular sub-agent slots (kind='sub_agent') from the
+// canonical per-computer project checkout slot (kind='canonical', slot=99,
+// workspace_dir=~/projects/{project}). The scheduler prefers regular slots
+// and only falls back to canonical slots when all regular slots are busy.
+pub const SCHEMA_V179_SUB_AGENTS_KIND: &str = r#"
+ALTER TABLE sub_agents ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'sub_agent';
+CREATE INDEX IF NOT EXISTS idx_sub_agents_kind ON sub_agents(kind);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
