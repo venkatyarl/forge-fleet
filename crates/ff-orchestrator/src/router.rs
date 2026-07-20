@@ -103,6 +103,15 @@ impl NodeLoad {
     }
 }
 
+// ─── Escalation thresholds ───────────────────────────────────────────────────
+
+/// Parameter-count threshold for the 480B escalation path.
+pub const ESCALATION_PARAMS_B: f32 = 480.0;
+
+/// Complexity threshold above which a subtask is considered moderate or complex
+/// and is eligible for the 480B escalation path.
+pub const ESCALATION_COMPLEXITY_THRESHOLD: u8 = 6;
+
 // ─── Router Configuration ────────────────────────────────────────────────────
 
 /// Constraints that influence routing decisions.
@@ -153,6 +162,10 @@ impl TaskRouter {
 
     /// Route a single subtask to the best model/node.
     ///
+    /// Subtasks whose [`complexity`](SubTask::complexity) is moderate or complex
+    /// (>= [`ESCALATION_COMPLEXITY_THRESHOLD`]) are automatically escalated to the
+    /// 480B path via [`TaskRouter::route_480b`].
+    ///
     /// Returns `None` if no suitable model is available (all nodes offline,
     /// no models match constraints, etc.).
     pub fn route(
@@ -160,9 +173,50 @@ impl TaskRouter {
         subtask: &SubTask,
         constraints: &RouteConstraints,
     ) -> Option<RouteDecision> {
+        if self.should_escalate_to_480b(subtask) {
+            return self.route_480b(subtask, constraints);
+        }
+        self.route_internal(subtask, constraints, None)
+    }
+
+    /// Route a subtask to a 480B-class model.
+    ///
+    /// This is the escalation path for moderate or complex subtasks.  It only
+    /// considers models whose parameter count meets or exceeds
+    /// [`ESCALATION_PARAMS_B`].  If no such model is available, it falls back to
+    /// the normal routing path so the task still lands somewhere.
+    pub fn route_480b(
+        &self,
+        subtask: &SubTask,
+        constraints: &RouteConstraints,
+    ) -> Option<RouteDecision> {
+        self.route_internal(subtask, constraints, Some(ESCALATION_PARAMS_B))
+            .or_else(|| self.route_internal(subtask, constraints, None))
+    }
+
+    /// Returns true if the subtask is moderate or complex enough to use the 480B
+    /// escalation path.
+    fn should_escalate_to_480b(&self, subtask: &SubTask) -> bool {
+        subtask.complexity >= ESCALATION_COMPLEXITY_THRESHOLD
+    }
+
+    /// Internal routing implementation with an optional minimum parameter count.
+    fn route_internal(
+        &self,
+        subtask: &SubTask,
+        constraints: &RouteConstraints,
+        min_params_b: Option<f32>,
+    ) -> Option<RouteDecision> {
         let mut scores: Vec<ModelScore> = Vec::new();
 
         for model in &self.models {
+            // Optional 480B escalation filter
+            if let Some(min) = min_params_b
+                && model.params_b < min
+            {
+                continue;
+            }
+
             // Find the node(s) that serve this model
             for worker_name in &model.nodes {
                 let Some(node) = self.nodes.iter().find(|n| &n.name == worker_name) else {
@@ -228,6 +282,9 @@ impl TaskRouter {
     }
 
     /// Route multiple subtasks, returning decisions in the same order.
+    ///
+    /// Each subtask is routed individually; moderate or complex subtasks are
+    /// escalated to the 480B path automatically.
     pub fn route_batch(
         &self,
         subtasks: &[SubTask],
@@ -542,5 +599,86 @@ mod tests {
             avg_latency_ms: 0,
         };
         assert!((empty.utilization() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_route_escalates_complex_subtask_to_480b() {
+        let nodes = vec![make_node("taylor", NodeStatus::Online, 1024)];
+        let models = vec![
+            make_model("qwen3-32b", Tier::Tier2, 32.0, "taylor"),
+            make_model("deepseek-v4-480b", Tier::Tier4, 480.0, "taylor"),
+        ];
+        let router = TaskRouter::new(nodes, models, HashMap::new());
+
+        let st = SubTask::new(
+            0,
+            "complex code",
+            "design a distributed consensus protocol",
+            SubTaskType::Planning,
+        )
+        .with_complexity(8);
+        let decision = router.route(&st, &RouteConstraints::default()).unwrap();
+        assert_eq!(decision.model_id, "deepseek-v4-480b");
+    }
+
+    #[test]
+    fn test_route_480b_prefers_large_model() {
+        let nodes = vec![make_node("taylor", NodeStatus::Online, 1024)];
+        let models = vec![
+            make_model("qwen3-32b", Tier::Tier2, 32.0, "taylor"),
+            make_model("qwen3-235b", Tier::Tier4, 235.0, "taylor"),
+            make_model("deepseek-v4-480b", Tier::Tier4, 480.0, "taylor"),
+        ];
+        let router = TaskRouter::new(nodes, models, HashMap::new());
+
+        let st = SubTask::new(
+            0,
+            "complex task",
+            "explain quantum computing",
+            SubTaskType::Analysis,
+        );
+        let decision = router
+            .route_480b(&st, &RouteConstraints::default())
+            .unwrap();
+        assert_eq!(decision.model_id, "deepseek-v4-480b");
+    }
+
+    #[test]
+    fn test_route_480b_falls_back_when_no_large_model() {
+        let nodes = vec![make_node("taylor", NodeStatus::Online, 128)];
+        let models = vec![make_model("qwen3-32b", Tier::Tier2, 32.0, "taylor")];
+        let router = TaskRouter::new(nodes, models, HashMap::new());
+
+        let st = SubTask::new(
+            0,
+            "complex task",
+            "explain quantum computing",
+            SubTaskType::Analysis,
+        );
+        let decision = router
+            .route_480b(&st, &RouteConstraints::default())
+            .unwrap();
+        assert_eq!(decision.model_id, "qwen3-32b");
+    }
+
+    #[test]
+    fn test_route_batch_escalates_moderate_subtasks() {
+        let nodes = vec![make_node("taylor", NodeStatus::Online, 1024)];
+        let models = vec![
+            make_model("qwen3-9b", Tier::Tier1, 9.0, "taylor"),
+            make_model("deepseek-v4-480b", Tier::Tier4, 480.0, "taylor"),
+        ];
+        let router = TaskRouter::new(nodes, models, HashMap::new());
+
+        let subtasks = vec![
+            SubTask::new(0, "simple", "translate hello", SubTaskType::FastLookup)
+                .with_complexity(3),
+            SubTask::new(1, "moderate", "analyze trade-offs", SubTaskType::Analysis)
+                .with_complexity(6),
+        ];
+        let decisions = router.route_batch(&subtasks, &RouteConstraints::default());
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[0].as_ref().unwrap().model_id, "qwen3-9b");
+        assert_eq!(decisions[1].as_ref().unwrap().model_id, "deepseek-v4-480b");
     }
 }
