@@ -1,59 +1,69 @@
 scope: forge-fleet
 namespace: /forge-fleet/
-name: patroni
+name: ${NODE_NAME}
+
+restapi:
+  listen: 0.0.0.0:58008
+  connect_address: ${NODE_IP}:58008
+
+etcd3:
+  hosts:
+    - ${TAYLOR_IP}:52379
+    - ${MARCUS_IP}:52379
+    - ${SOPHIE_IP}:52379
 
 bootstrap:
   dcs:
     ttl: 30
-    loop_wait: 10
+    loop_wait: 5
     retry_timeout: 10
     maximum_lag_on_failover: 1048576
-    etcd:
-      hosts: "localhost:2379"
-  postgresql:
-    users:
-      admin:
-        password: admin
-        options:
-          - createrole
-          - createdb
-      replicator:
-        password: replicator
-        options:
-          - replication
-    parameters:
-      wal_level: replica
-      hot_standby: "on"
-      wal_keep_segments: 8
-      max_wal_senders: 10
-      max_replication_slots: 10
-      listen: 0.0.0.0:5432
-      bind_address: 0.0.0.0
-
-restapi:
-  listen: 0.0.0.0:8008
-  connect_address: localhost:8008
+    synchronous_mode: true
+    synchronous_mode_strict: true
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        wal_level: replica
+        hot_standby: "on"
+        max_connections: 500
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_keep_size: 256MB
+        synchronous_commit: "on"
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+  pg_hba:
+    - host replication replicator 0.0.0.0/0 scram-sha-256
+    - host all all 0.0.0.0/0 scram-sha-256
+  users:
+    forgefleet:
+      password: ${POSTGRES_PASSWORD}
+      options:
+        - createrole
+        - createdb
 
 postgresql:
-  listen: 0.0.0.0:5432
-  connect_address: localhost:5432
+  listen: 0.0.0.0:55432
+  connect_address: ${NODE_IP}:55432
   data_dir: /var/lib/postgresql/data/pgdata
-  bin_dir: /usr/bin
-  pg_hba:
-    - host replication replicator all md5
-    - host all all all md5
+  bin_dir: /usr/lib/postgresql/16/bin
+  authentication:
+    superuser:
+      username: postgres
+      password: ${POSTGRES_PASSWORD}
+    replication:
+      username: replicator
+      password: ${POSTGRES_REPLICATION_PASSWORD}
   parameters:
-    wal_level: replica
-    max_wal_senders: 10
-    wal_keep_size: 128
-    max_replication_slots: 10
-    hot_standby: "on"
-    synchronous_mode: "on"
-    synchronous_commit: "on"
-    wal_compression: "on"
+    unix_socket_directories: /var/run/postgresql
+  pg_hba:
+    - host replication replicator 0.0.0.0/0 scram-sha-256
+    - host all all 0.0.0.0/0 scram-sha-256
 
 tags:
-  no_sync: false
-  no_promote: false
-  clonefrom: false
+  nofailover: false
   noloadbalance: false
+  clonefrom: false
+  nosync: false

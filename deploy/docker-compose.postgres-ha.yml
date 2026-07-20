@@ -1,0 +1,100 @@
+# Run this file on each of three failure-domain hosts.  NODE_NAME/NODE_IP are
+# unique per host; the three *_IP values and credentials are identical on all
+# hosts (see postgres-ha.env.example).
+name: forgefleet-postgres-ha
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.15
+    network_mode: host
+    command:
+      - /usr/local/bin/etcd
+      - --name=${NODE_NAME:?set NODE_NAME}
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:52379
+      - --advertise-client-urls=http://${NODE_IP:?set NODE_IP}:52379
+      - --listen-peer-urls=http://0.0.0.0:52380
+      - --initial-advertise-peer-urls=http://${NODE_IP}:52380
+      - --initial-cluster=taylor=http://${TAYLOR_IP:?set TAYLOR_IP}:52380,marcus=http://${MARCUS_IP:?set MARCUS_IP}:52380,sophie=http://${SOPHIE_IP:?set SOPHIE_IP}:52380
+      - --initial-cluster-state=${ETCD_INITIAL_CLUSTER_STATE:-new}
+      - --initial-cluster-token=forgefleet-postgres-ha-v1
+    volumes:
+      - etcd_data:/etcd-data
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://127.0.0.1:52379", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  patroni:
+    build:
+      context: docker/patroni
+    network_mode: host
+    depends_on:
+      etcd:
+        condition: service_healthy
+    environment:
+      NODE_NAME: ${NODE_NAME}
+      NODE_IP: ${NODE_IP}
+      TAYLOR_IP: ${TAYLOR_IP}
+      MARCUS_IP: ${MARCUS_IP}
+      SOPHIE_IP: ${SOPHIE_IP}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD:?set POSTGRES_REPLICATION_PASSWORD}
+    volumes:
+      - patroni_data:/var/lib/postgresql/data
+      - ../config/patroni.yaml:/etc/patroni/patroni.yaml.in:ro
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:58008/patroni"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  haproxy:
+    image: haproxy:3.0-alpine
+    network_mode: host
+    environment:
+      TAYLOR_IP: ${TAYLOR_IP}
+      MARCUS_IP: ${MARCUS_IP}
+      SOPHIE_IP: ${SOPHIE_IP}
+    volumes:
+      - ./docker/haproxy-postgres.cfg:/usr/local/etc/haproxy/haproxy.cfg.in:ro
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        sed -e "s/__TAYLOR_IP__/$${TAYLOR_IP}/g" \
+            -e "s/__MARCUS_IP__/$${MARCUS_IP}/g" \
+            -e "s/__SOPHIE_IP__/$${SOPHIE_IP}/g" \
+            /usr/local/etc/haproxy/haproxy.cfg.in >/tmp/haproxy.cfg
+        exec haproxy -W -db -f /tmp/haproxy.cfg
+    healthcheck:
+      test: ["CMD", "haproxy", "-c", "-f", "/tmp/haproxy.cfg"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  pgcat:
+    image: ${PGCAT_IMAGE:-ghcr.io/postgresml/pgcat:latest}
+    network_mode: host
+    depends_on:
+      haproxy:
+        condition: service_healthy
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGCAT_ADMIN_PASSWORD: ${PGCAT_ADMIN_PASSWORD:?set PGCAT_ADMIN_PASSWORD}
+    volumes:
+      - ./docker/pgcat-ha.toml:/etc/pgcat/pgcat.toml.in:ro
+      - ./docker/pgcat-entrypoint.sh:/usr/local/bin/forgefleet-pgcat-entrypoint:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/forgefleet-pgcat-entrypoint"]
+    restart: unless-stopped
+
+volumes:
+  etcd_data:
+    name: forgefleet-etcd-${NODE_NAME}
+  patroni_data:
+    name: forgefleet-patroni-${NODE_NAME}

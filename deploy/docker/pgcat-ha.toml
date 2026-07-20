@@ -1,0 +1,30 @@
+[general]
+host = "0.0.0.0"
+port = 56432
+connect_timeout = 5000
+idle_timeout = 30000
+healthcheck_timeout = 1000
+healthcheck_delay = 5000
+ban_time = 10
+admin_username = "pgcat"
+admin_password = "__PGCAT_ADMIN_PASSWORD__"
+
+[pools.forgefleet]
+pool_mode = "transaction"
+load_balancing_mode = "random"
+default_role = "primary"
+query_parser_enabled = true
+query_parser_read_write_splitting = true
+primary_reads_enabled = false
+
+[pools.forgefleet.users.0]
+username = "forgefleet"
+password = "__POSTGRES_PASSWORD__"
+pool_size = 20
+
+[pools.forgefleet.shards.0]
+database = "forgefleet"
+servers = [
+  ["127.0.0.1", 55434, "primary"],
+  ["127.0.0.1", 55435, "replica"],
+]
