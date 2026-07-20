@@ -1479,13 +1479,49 @@ async fn release_slot_and_lease_tx(
     reason: &str,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE work_item_leases
-            SET lease_state = 'released',
-                released_at = NOW(),
-                release_reason = $3
-          WHERE work_item_id = $1
-            AND sub_agent_id = $2
-            AND released_at IS NULL",
+        "WITH releasing AS (
+             SELECT id, work_item_id, lease_state, endpoint, attempt, computer_id
+               FROM work_item_leases
+              WHERE work_item_id = $1
+                AND sub_agent_id = $2
+                AND released_at IS NULL
+              FOR UPDATE
+         ), released AS (
+             UPDATE work_item_leases l
+                SET lease_state = 'released',
+                    released_at = NOW(),
+                    release_reason = $3
+               FROM releasing r
+              WHERE l.id = r.id
+          RETURNING r.work_item_id,
+                    r.lease_state AS from_status,
+                    r.endpoint,
+                    r.attempt,
+                    l.release_reason,
+                    r.computer_id
+         )
+         INSERT INTO work_item_events
+             (work_item_id, from_status, to_status, computer, attempt, detail)
+         SELECT r.work_item_id,
+                r.from_status,
+                'lease_released',
+                c.name,
+                r.attempt,
+                jsonb_build_object(
+                    'event_type', 'lease_released',
+                    'endpoint', r.endpoint,
+                    'lane', CASE
+                        WHEN NULLIF(r.endpoint, '') IS NULL THEN NULL
+                        WHEN r.endpoint LIKE 'cloud:%'
+                          OR r.endpoint ~ '^(codex|claude|kimi|gemini|grok)(:|$)'
+                          THEN 'cloud'
+                        ELSE 'local'
+                    END,
+                    'attempt', r.attempt,
+                    'release_reason', r.release_reason
+                )
+           FROM released r
+           LEFT JOIN computers c ON c.id = r.computer_id",
     )
     .bind(item.work_item_id)
     .bind(item.sub_agent_id)
