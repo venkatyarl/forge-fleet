@@ -966,6 +966,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "computer_dispatch_tick",
         sql: schema::SCHEMA_V196_COMPUTER_DISPATCH_TICK,
     },
+    PgMigration {
+        version: 197,
+        name: "operator_alert_dedup_counts",
+        sql: schema::SCHEMA_V197_OPERATOR_ALERT_DEDUP_COUNTS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1728,6 +1733,32 @@ mod tests {
         .await
         .expect("count retained raw");
         assert_eq!(raw, 1);
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v197_adds_operator_alert_dedup_counts() {
+        // CI has no Postgres. The helper returns None unless one of the two
+        // supported database URL variables is set.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name FROM information_schema.columns
+             WHERE table_schema = 'public'
+               AND table_name = 'operator_notify_dedup'
+               AND column_name IN ('suppressed_count', 'send_count')
+             ORDER BY column_name",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read operator dedup columns");
+        assert_eq!(columns, vec!["send_count", "suppressed_count"]);
+
         drop_temp_db(admin, pool, &db_name).await;
     }
 }

@@ -14,10 +14,8 @@
 //!   - `>= N`, `<= N`, `== N` — numeric comparisons
 //!   - `== 'str'` or `!= 'str'` — string comparisons (for `computer_status`)
 
-use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use dashmap::DashMap;
 use sqlx::{PgPool, Row};
 
 use crate::notifications::SHARED_HTTP;
@@ -251,56 +249,6 @@ pub fn classify_policy_fireability(metric: &str, condition: &str) -> PolicyFirea
     }
 }
 
-/// Default suppression window for repeated Telegram alerts sharing the same
-/// (metric, node) combination.
-const TELEGRAM_ALERT_THROTTLE_TTL: Duration = Duration::from_secs(3600);
-
-/// In-process throttle for Telegram alerts.
-///
-/// Repeated alerts for the same (metric, node) combination are suppressed
-/// for the configured TTL so that flapping conditions (or a fleet-wide
-/// incident that resolves and re-fires) do not flood the operator chat.
-#[derive(Debug)]
-struct TelegramAlertThrottle {
-    ttl: Duration,
-    seen: DashMap<(String, String), Instant>,
-}
-
-impl TelegramAlertThrottle {
-    fn new(ttl: Duration) -> Self {
-        Self {
-            ttl,
-            seen: DashMap::new(),
-        }
-    }
-
-    /// Return `true` if enough time has passed since the last Telegram alert
-    /// for this (metric, node) key, and record this send as the most recent.
-    fn should_send(&self, metric: &str, node: &str) -> bool {
-        use dashmap::mapref::entry::Entry;
-
-        let key = (metric.to_string(), node.to_string());
-        let now = Instant::now();
-        match self.seen.entry(key) {
-            Entry::Occupied(mut entry) => {
-                if now.duration_since(*entry.get()) >= self.ttl {
-                    entry.insert(now);
-                    true
-                } else {
-                    false
-                }
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(now);
-                true
-            }
-        }
-    }
-}
-
-static TELEGRAM_ALERT_THROTTLE: LazyLock<TelegramAlertThrottle> =
-    LazyLock::new(|| TelegramAlertThrottle::new(TELEGRAM_ALERT_THROTTLE_TTL));
-
 /// Extract the `metric=` and `computer=` values from an alert message so the
 /// Telegram path can throttle repeated alerts by (metric, node).
 fn parse_alert_metric_node(message: &str) -> Option<(String, String)> {
@@ -314,6 +262,58 @@ fn parse_alert_metric_node(message: &str) -> Option<(String, String)> {
         }
     }
     Some((metric?, node?))
+}
+
+/// Atomically claim the hourly send slot for an alert key. A zero result means
+/// this occurrence was collapsed; a positive result is the number of identical
+/// occurrences represented by the alert that should now be delivered.
+async fn claim_telegram_alert(
+    pg: &PgPool,
+    metric: &str,
+    node: &str,
+) -> Result<(String, i64), sqlx::Error> {
+    let signature = format!("alert:{}:{metric}:{}:{node}", metric.len(), node.len());
+    let count = sqlx::query_scalar(
+        "INSERT INTO operator_notify_dedup
+             (signature, last_sent, suppressed_count, send_count)
+         VALUES ($1, NOW(), 0, 1)
+         ON CONFLICT (signature) DO UPDATE SET
+             send_count = CASE
+                 WHEN operator_notify_dedup.last_sent <= NOW() - INTERVAL '1 hour'
+                 THEN operator_notify_dedup.suppressed_count + 1
+                 ELSE 0
+             END,
+             suppressed_count = CASE
+                 WHEN operator_notify_dedup.last_sent <= NOW() - INTERVAL '1 hour' THEN 0
+                 ELSE operator_notify_dedup.suppressed_count + 1
+             END,
+             last_sent = CASE
+                 WHEN operator_notify_dedup.last_sent <= NOW() - INTERVAL '1 hour' THEN NOW()
+                 ELSE operator_notify_dedup.last_sent
+             END
+         RETURNING send_count",
+    )
+    .bind(&signature)
+    .fetch_one(pg)
+    .await?;
+    Ok((signature, count))
+}
+
+async fn release_telegram_alert_claim(pg: &PgPool, signature: &str, occurrence_count: i64) {
+    if let Err(error) = sqlx::query(
+        "UPDATE operator_notify_dedup
+         SET last_sent = '-infinity',
+             suppressed_count = suppressed_count + $2,
+             send_count = 0
+         WHERE signature = $1",
+    )
+    .bind(signature)
+    .bind(occurrence_count)
+    .execute(pg)
+    .await
+    {
+        tracing::warn!(%error, %signature, "failed to release Telegram alert dedup claim");
+    }
 }
 
 pub struct AlertEvaluator {
@@ -812,20 +812,6 @@ pub async fn dispatch_alert(pg: &PgPool, channel: &str, severity: &str, message:
             "sent".to_string()
         }
         "telegram" => {
-            // Throttle repeated Telegram alerts for the same (metric, node)
-            // combination. This keeps the operator chat usable during flapping
-            // conditions without suppressing the underlying alert_event rows.
-            if let Some((metric, node)) = parse_alert_metric_node(message) {
-                if !TELEGRAM_ALERT_THROTTLE.should_send(&metric, &node) {
-                    tracing::debug!(
-                        metric = %metric,
-                        node = %node,
-                        "telegram alert throttled; recent alert for this metric/node still within TTL"
-                    );
-                    return "throttled".to_string();
-                }
-            }
-
             let chat_id = ff_db::pg_get_secret(pg, "telegram_chat_id")
                 .await
                 .ok()
@@ -842,27 +828,56 @@ pub async fn dispatch_alert(pg: &PgPool, channel: &str, severity: &str, message:
                 return "failed: no bot token configured".into();
             };
 
+            let mut occurrence_count = 1;
+            let mut dedup_signature = None;
+            if let Some((metric, node)) = parse_alert_metric_node(message) {
+                match claim_telegram_alert(pg, &metric, &node).await {
+                    Ok((_, 0)) => {
+                        tracing::debug!(%metric, %node, "telegram alert collapsed into hourly metric/node summary");
+                        return "throttled".to_string();
+                    }
+                    Ok((signature, count)) => {
+                        occurrence_count = count;
+                        dedup_signature = Some(signature);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, %metric, %node, "telegram alert dedup failed; sending fail-open")
+                    }
+                }
+            }
+
             let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+            let text = if occurrence_count > 1 {
+                format!(
+                    "[{severity}] {message}\n(repeated {occurrence_count} times since the previous alert)"
+                )
+            } else {
+                format!("[{severity}] {message}")
+            };
             let payload = serde_json::json!({
                 "chat_id": chat_id,
-                "text": format!("[{severity}] {message}"),
+                "text": text,
                 "disable_web_page_preview": true,
             });
-            match SHARED_HTTP
+            let result = match SHARED_HTTP
                 .post(&url)
                 .json(&payload)
                 .timeout(Duration::from_secs(10))
                 .send()
                 .await
             {
-                Ok(resp) if resp.status().is_success() => "sent".into(),
+                Ok(resp) if resp.status().is_success() => return "sent".into(),
                 Ok(resp) => {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
                     format!("failed: telegram HTTP {status}: {}", body.trim())
                 }
                 Err(e) => format!("failed: telegram: {e}"),
+            };
+            if let Some(signature) = dedup_signature {
+                release_telegram_alert_claim(pg, &signature, occurrence_count).await;
             }
+            result
         }
         "webhook" => {
             let url = ff_db::pg_get_secret(pg, "alert_webhook_url")
@@ -1088,22 +1103,5 @@ mod tests {
         assert!(parse_alert_metric_node("metric=cpu_pct value=95").is_none());
         assert!(parse_alert_metric_node("computer=taylor value=95").is_none());
         assert!(parse_alert_metric_node("plain message").is_none());
-    }
-
-    #[test]
-    fn telegram_alert_throttle_suppresses_repeated_metric_node() {
-        let throttle = TelegramAlertThrottle::new(Duration::from_secs(60));
-        assert!(throttle.should_send("cpu_pct", "taylor"));
-        assert!(!throttle.should_send("cpu_pct", "taylor"));
-        assert!(throttle.should_send("cpu_pct", "james"));
-        assert!(throttle.should_send("ram_pct", "taylor"));
-    }
-
-    #[test]
-    fn telegram_alert_throttle_allows_after_ttl() {
-        let throttle = TelegramAlertThrottle::new(Duration::from_millis(1));
-        assert!(throttle.should_send("cpu_pct", "taylor"));
-        std::thread::sleep(Duration::from_millis(5));
-        assert!(throttle.should_send("cpu_pct", "taylor"));
     }
 }

@@ -11094,6 +11094,15 @@ CREATE INDEX IF NOT EXISTS idx_computers_dispatch_tick
     ON computers (dispatch_tick_at);
 "#;
 
+// V197 — persist suppressed operator-alert counts so Telegram throttling is
+// shared by every leader process and the next delivered alert can summarize
+// the identical (metric, node) occurrences collapsed during the window.
+pub const SCHEMA_V197_OPERATOR_ALERT_DEDUP_COUNTS: &str = r#"
+ALTER TABLE operator_notify_dedup
+    ADD COLUMN IF NOT EXISTS suppressed_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS send_count BIGINT NOT NULL DEFAULT 1;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
