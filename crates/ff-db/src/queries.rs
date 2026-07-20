@@ -8520,6 +8520,59 @@ pub async fn pg_ready_work_items(pool: &PgPool, limit: i64) -> Result<Vec<ReadyW
     Ok(items)
 }
 
+/// Count decomposed parent work_items (`kind` = 'bug' or 'feature') whose
+/// children are all in a terminal state (`done`, `merged`, or `cancelled`).
+/// Used by the scheduler to report how many parents are eligible for
+/// auto-completion each tick.
+pub async fn pg_count_completable_parent_work_items(pool: &PgPool) -> Result<i64> {
+    let n = sqlx::query_scalar(
+        "SELECT COUNT(*)
+           FROM work_items p
+          WHERE p.kind IN ('bug', 'feature')
+            AND p.status NOT IN ('done', 'failed', 'cancelled', 'merged', 'idea')
+            AND EXISTS (SELECT 1 FROM work_items c WHERE c.parent_id = p.id)
+            AND NOT EXISTS (
+                SELECT 1 FROM work_items c
+                 WHERE c.parent_id = p.id
+                   AND c.status NOT IN ('done', 'merged', 'cancelled'))",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+/// Auto-complete decomposed parent work_items (`kind` = 'bug' or 'feature')
+/// when every child has reached a terminal state. Parents with at least one
+/// terminally failed child become `failed`; otherwise they become `done`.
+///
+/// This prevents parent rows from lingering in `ready` after all of their
+/// task leaves have been scheduled and finished, which otherwise clutters
+/// the board with starved-looking work.
+pub async fn pg_complete_parent_work_items(pool: &PgPool) -> Result<u64> {
+    let res = sqlx::query(
+        "WITH eligible AS (
+            SELECT p.id,
+                   bool_or(c.status = 'failed') AS has_failed_child
+              FROM work_items p
+              JOIN work_items c ON c.parent_id = p.id
+             WHERE p.kind IN ('bug', 'feature')
+               AND p.status NOT IN ('done', 'failed', 'cancelled', 'merged', 'idea')
+             GROUP BY p.id
+            HAVING COUNT(*) > 0
+               AND COUNT(*) FILTER (WHERE c.status NOT IN ('done', 'merged', 'cancelled')) = 0
+        )
+        UPDATE work_items w
+           SET status = CASE WHEN e.has_failed_child THEN 'failed' ELSE 'done' END,
+               completed_at = NOW(),
+               last_error = CASE WHEN e.has_failed_child THEN 'auto-completed: child failed' ELSE NULL END
+          FROM eligible e
+         WHERE w.id = e.id",
+    )
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 /// Free fleet slots: sub_agents not currently running a work_item and with no
 /// active lease. `computer_filter` (computer name) optionally pins to one host.
 pub async fn pg_free_slots(
@@ -9114,4 +9167,264 @@ pub async fn pg_reapable_worktrees(
             task_branch: r.get("task_branch"),
         })
         .collect())
+}
+
+#[cfg(test)]
+mod parent_completion_tests {
+    use super::*;
+    use std::env;
+
+    use sqlx::postgres::PgPoolOptions;
+
+    fn base_db_url() -> Option<String> {
+        env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()
+    }
+
+    async fn temp_pool() -> Option<(PgPool, PgPool, String)> {
+        let base_url = base_db_url()?;
+        let (prefix, _) = base_url.rsplit_once('/')?;
+        let db_name = format!("ff_parent_complete_{}", uuid::Uuid::new_v4().simple());
+
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("{prefix}/postgres"))
+            .await
+            .expect("connect to admin db");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create temp db");
+
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&format!("{prefix}/{db_name}"))
+            .await
+            .expect("connect to temp db");
+
+        sqlx::raw_sql(
+            "CREATE EXTENSION IF NOT EXISTS pgcrypto;
+             CREATE TABLE projects (id TEXT PRIMARY KEY);
+             CREATE TABLE work_items (
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 project_id TEXT NOT NULL REFERENCES projects(id),
+                 parent_id UUID REFERENCES work_items(id),
+                 kind TEXT NOT NULL,
+                 title TEXT NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'idea',
+                 created_by TEXT NOT NULL DEFAULT 'test'
+             );",
+        )
+        .execute(&pool)
+        .await
+        .expect("create minimal work_items schema");
+
+        Some((admin, pool, db_name))
+    }
+
+    async fn drop_temp_db(admin: PgPool, pool: PgPool, db_name: &str) {
+        pool.close().await;
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid)
+               FROM pg_stat_activity
+              WHERE datname = $1
+                AND pid <> pg_backend_pid()",
+        )
+        .bind(db_name)
+        .execute(&admin)
+        .await
+        .expect("terminate temp db sessions");
+        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("drop temp db");
+        admin.close().await;
+    }
+
+    async fn insert_work_item(
+        pool: &PgPool,
+        project_id: &str,
+        kind: &str,
+        title: &str,
+        status: &str,
+        parent_id: Option<uuid::Uuid>,
+    ) -> uuid::Uuid {
+        let row = sqlx::query(
+            "INSERT INTO work_items (project_id, kind, title, status, parent_id, created_by)
+             VALUES ($1, $2, $3, $4, $5, 'test')
+             RETURNING id",
+        )
+        .bind(project_id)
+        .bind(kind)
+        .bind(title)
+        .bind(status)
+        .bind(parent_id)
+        .fetch_one(pool)
+        .await
+        .expect("insert work item");
+        row.get("id")
+    }
+
+    async fn status_of(pool: &PgPool, id: uuid::Uuid) -> String {
+        sqlx::query_scalar("SELECT status FROM work_items WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("fetch status")
+    }
+
+    #[tokio::test]
+    async fn parent_completes_when_all_children_done() {
+        let Some((admin, pool, db_name)) = temp_pool().await else {
+            return;
+        };
+
+        sqlx::query("INSERT INTO projects (id) VALUES ('p1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let parent = insert_work_item(&pool, "p1", "feature", "parent", "ready", None).await;
+        let _child = insert_work_item(&pool, "p1", "task", "child", "done", Some(parent)).await;
+
+        assert_eq!(
+            pg_count_completable_parent_work_items(&pool).await.unwrap(),
+            1
+        );
+        assert_eq!(pg_complete_parent_work_items(&pool).await.unwrap(), 1);
+        assert_eq!(status_of(&pool, parent).await, "done");
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn parent_fails_when_any_child_failed() {
+        let Some((admin, pool, db_name)) = temp_pool().await else {
+            return;
+        };
+
+        sqlx::query("INSERT INTO projects (id) VALUES ('p1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let parent = insert_work_item(&pool, "p1", "bug", "parent", "ready", None).await;
+        let _done_child =
+            insert_work_item(&pool, "p1", "task", "done child", "done", Some(parent)).await;
+        let _failed_child =
+            insert_work_item(&pool, "p1", "task", "failed child", "failed", Some(parent)).await;
+
+        assert_eq!(pg_complete_parent_work_items(&pool).await.unwrap(), 1);
+        assert_eq!(status_of(&pool, parent).await, "failed");
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn parent_unchanged_while_child_active() {
+        let Some((admin, pool, db_name)) = temp_pool().await else {
+            return;
+        };
+
+        sqlx::query("INSERT INTO projects (id) VALUES ('p1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let parent = insert_work_item(&pool, "p1", "feature", "parent", "ready", None).await;
+        let _done_child =
+            insert_work_item(&pool, "p1", "task", "done child", "done", Some(parent)).await;
+        let _ready_child =
+            insert_work_item(&pool, "p1", "task", "ready child", "ready", Some(parent)).await;
+
+        assert_eq!(
+            pg_count_completable_parent_work_items(&pool).await.unwrap(),
+            0
+        );
+        assert_eq!(pg_complete_parent_work_items(&pool).await.unwrap(), 0);
+        assert_eq!(status_of(&pool, parent).await, "ready");
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn parent_completes_when_all_children_cancelled() {
+        let Some((admin, pool, db_name)) = temp_pool().await else {
+            return;
+        };
+
+        sqlx::query("INSERT INTO projects (id) VALUES ('p1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let parent = insert_work_item(&pool, "p1", "bug", "parent", "ready", None).await;
+        let _child =
+            insert_work_item(&pool, "p1", "task", "child", "cancelled", Some(parent)).await;
+
+        assert_eq!(pg_complete_parent_work_items(&pool).await.unwrap(), 1);
+        assert_eq!(status_of(&pool, parent).await, "done");
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn parent_completes_when_child_merged() {
+        let Some((admin, pool, db_name)) = temp_pool().await else {
+            return;
+        };
+
+        sqlx::query("INSERT INTO projects (id) VALUES ('p1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let parent = insert_work_item(&pool, "p1", "feature", "parent", "in_progress", None).await;
+        let _child = insert_work_item(&pool, "p1", "task", "child", "merged", Some(parent)).await;
+
+        assert_eq!(pg_complete_parent_work_items(&pool).await.unwrap(), 1);
+        assert_eq!(status_of(&pool, parent).await, "done");
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn leaf_tasks_and_idea_parents_are_ignored() {
+        let Some((admin, pool, db_name)) = temp_pool().await else {
+            return;
+        };
+
+        sqlx::query("INSERT INTO projects (id) VALUES ('p1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let _leaf = insert_work_item(&pool, "p1", "task", "leaf", "done", None).await;
+        let idea_parent =
+            insert_work_item(&pool, "p1", "feature", "idea parent", "idea", None).await;
+        let _idea_child =
+            insert_work_item(&pool, "p1", "task", "child", "done", Some(idea_parent)).await;
+
+        assert_eq!(pg_complete_parent_work_items(&pool).await.unwrap(), 0);
+        assert_eq!(status_of(&pool, idea_parent).await, "idea");
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn childless_parent_is_not_completed() {
+        let Some((admin, pool, db_name)) = temp_pool().await else {
+            return;
+        };
+
+        sqlx::query("INSERT INTO projects (id) VALUES ('p1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let childless = insert_work_item(&pool, "p1", "feature", "childless", "ready", None).await;
+
+        assert_eq!(
+            pg_count_completable_parent_work_items(&pool).await.unwrap(),
+            0
+        );
+        assert_eq!(pg_complete_parent_work_items(&pool).await.unwrap(), 0);
+        assert_eq!(status_of(&pool, childless).await, "ready");
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
 }

@@ -189,7 +189,7 @@ pub const COMPUTER_STATUS_VALUES: &[&str] = &["offline", "online", "sdown"];
 /// (the tick resolves the policy by name, then INSERTs an `alert_event` and
 /// calls [`dispatch_alert`]) rather than by the evaluator poll. KEEP IN SYNC
 /// with the `POLICY_NAME`/metric used in `db_integrity`, `fleet_integrity`,
-/// `ha::restore_drill`, `upgrade_rollout`, and `secrets_rotation`.
+/// `ha::restore_drill`, `upgrade_rollout`, `secrets_rotation`, and `mesh_check`.
 pub const IMPERATIVE_METRICS: &[&str] = &[
     "db_index_corruption",
     "fleet_integrity_degraded",
@@ -197,6 +197,7 @@ pub const IMPERATIVE_METRICS: &[&str] = &[
     "upgrade_rollout_halted",
     "secret_expiry_days_remaining",
     "postgres_replica_dead",
+    "ssh_mesh_degraded",
 ];
 
 /// How (or whether) a policy can ever fire — the result of [`classify_policy_fireability`].

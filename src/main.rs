@@ -3609,62 +3609,7 @@ async fn start_pulse_v2_subsystems(
         shutdown_rx.clone(),
     ));
 
-    // (11) Shared workspace cleanup — daily temp/artifact purge for
-    // sub-agent workspaces. Leader-gated to avoid N-way races.
-    info!("starting subsystem: shared workspace cleanup (daily, leader-gated)");
-    {
-        let pool = pg_pool.clone();
-        let name = worker_name.clone();
-        let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() { break; }
-                    }
-                }
-                // Only run on leader
-                let is_leader: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM fleet_leader_state WHERE member_name = $1)",
-                )
-                .bind(&name)
-                .fetch_one(&pool)
-                .await
-                .unwrap_or(false);
-                if !is_leader {
-                    continue;
-                }
-
-                // Run cleanup for all agent workspaces
-                let agents = match ff_agent::shared_workspace::list_agent_workspaces().await {
-                    Ok(a) => a,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to list agent workspaces");
-                        continue;
-                    }
-                };
-                let node_id: Option<uuid::Uuid> =
-                    sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
-                        .bind(&name)
-                        .fetch_optional(&pool)
-                        .await
-                        .ok()
-                        .flatten();
-                for agent_id in agents {
-                    if let Err(e) =
-                        ff_agent::shared_workspace::run_cleanup(&agent_id, Some(&pool), node_id)
-                            .await
-                    {
-                        tracing::warn!(agent_id = %agent_id, error = %e, "workspace cleanup failed");
-                    }
-                }
-            }
-        });
-    }
-
-    // (12) Vault sync — hourly index regeneration + TODO scan.
+    // (11) Vault sync — hourly index regeneration + TODO scan.
     // Leader-gated to avoid N-way races.
     info!("starting subsystem: vault sync (hourly, leader-gated)");
     {
