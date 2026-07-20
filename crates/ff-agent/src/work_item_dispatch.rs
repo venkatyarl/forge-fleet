@@ -3278,11 +3278,11 @@ pub fn spawn_worktree_reaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        DISPATCH_HOUSE_RULES, DispatchOutcome, agent_output_tail, classify_dispatch_outcome,
-        command_display, default_clone_path, dispatch_budget_for_host, expand_home,
-        is_build_timeout, parse_cli_tokens, primary_or_default_backend, repo_cache_path, repo_slug,
-        retry_error_is_actionable, rewrite_github_host_alias, task_prefers_cloud_lane,
-        use_local_lane,
+        DISPATCH_HOUSE_RULES, DispatchOutcome, agent_output_tail, backend_failed_without_output,
+        classify_dispatch_outcome, command_display, default_clone_path, dispatch_budget_for_host,
+        expand_home, is_build_timeout, parse_cli_tokens, primary_or_default_backend,
+        repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
+        task_prefers_cloud_lane, use_local_lane,
     };
 
     #[test]
@@ -3642,6 +3642,42 @@ mod tests {
             classify_dispatch_outcome(&r2, false),
             DispatchOutcome::FailedNoDiff
         );
+    }
+
+    #[test]
+    fn quick_clean_empty_stdout_is_backend_failure() {
+        assert!(backend_failed_without_output(
+            false,
+            true,
+            b" \n\t",
+            Duration::from_secs(12),
+            false,
+        ));
+        assert!(!backend_failed_without_output(
+            false,
+            true,
+            b"completed",
+            Duration::from_secs(12),
+            false,
+        ));
+    }
+
+    #[test]
+    fn killed_timeout_without_diff_is_backend_failure() {
+        assert!(backend_failed_without_output(
+            true,
+            false,
+            b"",
+            Duration::from_secs(60),
+            false,
+        ));
+        assert!(!backend_failed_without_output(
+            true,
+            false,
+            b"",
+            Duration::from_secs(60),
+            true,
+        ));
     }
 
     #[test]
