@@ -1366,6 +1366,16 @@ pub enum InteractionsCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 enum SessionCommand {
+    /// Redact and export local Claude Code, Codex, and Kimi transcripts to
+    /// the central Obsidian vault (or stage and rsync them to Adele).
+    Export {
+        /// Override the local vault sessions directory (primarily for testing).
+        #[arg(long)]
+        vault: Option<std::path::PathBuf>,
+        /// Re-render transcripts even when the exported copy is newer.
+        #[arg(long)]
+        force: bool,
+    },
     /// Create a new outcome-driven session. No steps are added
     /// automatically — use `ff session step add` to compose the DAG
     /// (LLM-driven decomposition by the planner role is a follow-up).
@@ -4780,6 +4790,15 @@ async fn main() -> Result<()> {
             }
         }
         Some(Command::Session { command }) => {
+            if let SessionCommand::Export { vault, force } = &command {
+                let summary =
+                    ff_agent::session_export::export_local_sessions(vault.as_deref(), *force)?;
+                println!(
+                    "{GREEN}✓{RESET} scanned {}, exported {}, unchanged {}",
+                    summary.scanned, summary.exported, summary.skipped
+                );
+                return Ok(());
+            }
             let pool = ff_agent::fleet_info::get_fleet_pool()
                 .await
                 .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
@@ -4787,6 +4806,7 @@ async fn main() -> Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
             match command {
+                SessionCommand::Export { .. } => unreachable!("handled before database setup"),
                 SessionCommand::Spawn { goal, budget } => {
                     let who = ff_agent::fleet_info::resolve_this_worker_name().await;
                     let id = ff_agent::session_runner::create_session(

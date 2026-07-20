@@ -140,6 +140,7 @@ pub mod scratchpad;
 pub mod secrets_rotation;
 pub mod self_improvement;
 pub mod service_connectivity;
+pub mod session_export;
 pub mod session_runner;
 pub mod session_store;
 pub mod shared_storage;

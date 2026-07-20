@@ -82,6 +82,12 @@ impl TickRegistry {
                 runner: run_metrics_scraper_tick,
             },
             TickDefinition {
+                name: "session_transcript_export",
+                interval: Duration::from_secs(300),
+                scope: TickScope::EveryNode,
+                runner: run_session_export_tick,
+            },
+            TickDefinition {
                 // Clock-gated inside the runner: sends once per day at/after
                 // 08:00 local; the 60s interval is just the due-check cadence.
                 name: "nightly_telegram_digest",
@@ -244,6 +250,15 @@ fn run_metrics_scraper_tick(pg: PgPool, worker_name: String) -> BoxFuture<'stati
             .await
             .map(|_| ())
             .map_err(anyhow::Error::from)
+    })
+}
+
+fn run_session_export_tick(_pg: PgPool, _worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        tokio::task::spawn_blocking(|| crate::session_export::export_local_sessions(None, false))
+            .await
+            .map_err(anyhow::Error::from)??;
+        Ok(())
     })
 }
 
