@@ -1250,6 +1250,24 @@ fn use_local_lane(attempts: i32, breaker_open: bool, prefers_cloud: bool) -> boo
     attempts < ESCALATE_TO_CLOUD_AT && !breaker_open && !prefers_cloud
 }
 
+/// Whether to try the Lane-1.5 stronger local model stage: gated ON by default
+/// (work_item_lane15_mode), and skipped when the local-480B ring is sick.
+/// Pure so the routing is unit-testable.
+fn use_lane15(lane15_enabled: bool, breaker_open: bool) -> bool {
+    lane15_enabled && !breaker_open
+}
+
+/// Lane-1.5 (local 480B model) escalation stage. Default ON — tried after the
+/// cheap local codegen harness fails and before the cloud CLI backstop.
+async fn lane15_enabled(pg: &PgPool) -> bool {
+    matches!(
+        ff_db::pg_read_gate_value(pg, "work_item_lane15_mode", "on", "on")
+            .await
+            .as_deref(),
+        Ok("on") | Ok("true") | Ok("1")
+    )
+}
+
 /// Hard ceiling on the Lane-1 LOCAL codegen harness — kept STRICTLY BELOW the
 /// lease heartbeat-staleness window (`LEASE_STALE_SECS`) so a slow/hung local
 /// lane always fails over to the cloud backstop BEFORE the scheduler's
@@ -1918,6 +1936,104 @@ async fn run_ff_dispatch(
             work_item_id = %item.work_item_id,
             attempts = item.attempts,
             "work_item_dispatch: escalated (stage 2) — skipping local lane, straight to cloud backstop"
+        );
+    }
+
+    // Lane 1.5: stronger local model (480B) escalation stage. Runs between the
+    // cheap local codegen harness and the cloud CLI backstop when enabled.
+    const LANE15_PROVIDER: &str = "local_480b";
+    let lane15_mode_on = lane15_enabled(pg).await;
+    let lane15_breaker_open =
+        crate::circuit_breaker::is_provider_open(pg, item.computer_id, LANE15_PROVIDER)
+            .await
+            .unwrap_or(false);
+
+    if use_lane15(lane15_mode_on, lane15_breaker_open) {
+        info!(
+            work_item_id = %item.work_item_id,
+            stage = "lane1.5",
+            "work_item_dispatch: trying Lane 1.5 local 480B model"
+        );
+        let lane15 = tokio::time::timeout(
+            Duration::from_secs(LANE1_TIMEOUT_SECS),
+            crate::codegen_apply::codegen_apply(
+                pg,
+                &worktree.worktree_path,
+                &prompt,
+                Some(LANE15_PROVIDER),
+                4,
+            ),
+        )
+        .await;
+
+        let lane15_failed = |cat: &'static str| {
+            let pg = pg.clone();
+            let cid = item.computer_id;
+            async move {
+                let _ =
+                    crate::circuit_breaker::record_provider_failure(&pg, cid, LANE15_PROVIDER, cat)
+                        .await;
+            }
+        };
+
+        match lane15 {
+            Ok(Ok(outcome)) if outcome.applied => {
+                let _ = crate::circuit_breaker::record_provider_success(
+                    pg,
+                    item.computer_id,
+                    LANE15_PROVIDER,
+                )
+                .await;
+                info!(
+                    work_item_id = %item.work_item_id,
+                    stage = "lane1.5",
+                    rounds = outcome.rounds,
+                    "work_item_dispatch: Lane 1.5 local 480B landed the change"
+                );
+                return Ok((
+                    LANE15_PROVIDER.to_string(),
+                    synthetic_output(&outcome.final_diff.unwrap_or_else(|| "applied".into())),
+                ));
+            }
+            Ok(Ok(outcome)) => {
+                lane15_failed("local_480b_unavailable").await;
+                info!(
+                    work_item_id = %item.work_item_id,
+                    stage = "lane1.5",
+                    error = ?outcome.error,
+                    "work_item_dispatch: Lane 1.5 didn't land; falling back to cloud"
+                );
+            }
+            Ok(Err(e)) => {
+                lane15_failed("local_480b_unavailable").await;
+                warn!(
+                    work_item_id = %item.work_item_id,
+                    stage = "lane1.5",
+                    error = format!("{e:#}"),
+                    "work_item_dispatch: Lane 1.5 errored; falling back to cloud"
+                );
+            }
+            Err(_) => {
+                lane15_failed("local_480b_unavailable").await;
+                warn!(
+                    work_item_id = %item.work_item_id,
+                    stage = "lane1.5",
+                    timeout_secs = LANE1_TIMEOUT_SECS,
+                    "work_item_dispatch: Lane 1.5 TIMED OUT — falling back to cloud"
+                );
+            }
+        }
+    } else if !lane15_mode_on {
+        info!(
+            work_item_id = %item.work_item_id,
+            stage = "lane1.5",
+            "work_item_dispatch: Lane 1.5 disabled via work_item_lane15_mode"
+        );
+    } else {
+        info!(
+            work_item_id = %item.work_item_id,
+            stage = "lane1.5",
+            "work_item_dispatch: Lane 1.5 breaker OPEN on this node — skipping, straight to cloud"
         );
     }
 
@@ -3170,7 +3286,7 @@ mod tests {
         DISPATCH_HOUSE_RULES, DispatchOutcome, agent_output_tail, classify_dispatch_outcome,
         command_display, default_clone_path, dispatch_budget_for_host, expand_home,
         parse_cli_tokens, primary_or_default_backend, repo_cache_path, repo_slug,
-        retry_error_is_actionable, rewrite_github_host_alias, task_prefers_cloud_lane,
+        retry_error_is_actionable, rewrite_github_host_alias, task_prefers_cloud_lane, use_lane15,
         use_local_lane,
     };
 
@@ -3251,6 +3367,19 @@ mod tests {
         assert!(!use_local_lane(0, false, true));
         // Open local-codegen breaker → skip local even on attempt 0.
         assert!(!use_local_lane(0, true, false));
+    }
+
+    #[test]
+    fn use_lane15_gated_by_mode_and_breaker() {
+        // Lane-1.5 runs by default (mode on) when the local-480B ring is healthy.
+        assert!(
+            use_lane15(true, false),
+            "mode on + breaker closed → try lane 1.5"
+        );
+        // Disabled via gate OR breaker open → skip the stage.
+        assert!(!use_lane15(false, false), "mode off → skip lane 1.5");
+        assert!(!use_lane15(true, true), "breaker open → skip lane 1.5");
+        assert!(!use_lane15(false, true));
     }
 
     #[test]

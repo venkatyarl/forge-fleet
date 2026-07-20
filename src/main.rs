@@ -1204,6 +1204,32 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 20a1) CLI session transcript export tick — every 5min, PER-NODE.
+    //
+    // Each node scans its own local Claude Code / Codex / Kimi JSONL sessions,
+    // redacts tokens/keys, and writes them into the configured Obsidian vault.
+    // Fleet-wide aggregation is handled by an optional rsync_target in config.
+    if config.session_export.enabled {
+        let session_export_config = config.clone();
+        let session_export_worker = worker_name.clone();
+        info!("starting subsystem: session export tick (5min, per-node)");
+        subsystem_tasks.push(ff_agent::tick_registry::TickRegistry::register(
+            "session-export",
+            std::time::Duration::from_secs(300),
+            shutdown_rx.clone(),
+            move |_run| {
+                let cfg = session_export_config.clone();
+                let worker = session_export_worker.clone();
+                async move {
+                    match ff_core::session_export::run_export_tick(&cfg, Some(&worker)).await {
+                        Ok(()) => {}
+                        Err(e) => warn!(error = %e, "session export tick failed"),
+                    }
+                }
+            },
+        ));
+    }
+
     // 20b) Version-check tick — every 6h, PER-NODE (not leader-gated).
     //
     // Same legacy-daemon gap as the disk sampler above: `version_check_pass`

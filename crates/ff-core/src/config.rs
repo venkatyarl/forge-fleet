@@ -106,6 +106,10 @@ pub struct FleetConfig {
     #[serde(default)]
     pub obsidian_export: ObsidianExportConfig,
 
+    /// CLI session transcript export settings — `[session_export]`.
+    #[serde(default)]
+    pub session_export: SessionExportConfig,
+
     /// Pending nodes awaiting bootstrap — `[[bootstrap_targets]]`.
     #[serde(default)]
     pub bootstrap_targets: Vec<BootstrapTarget>,
@@ -144,6 +148,7 @@ impl Default for FleetConfig {
             database: DatabaseConfig::default(),
             redis: RedisConfig::default(),
             obsidian_export: ObsidianExportConfig::default(),
+            session_export: SessionExportConfig::default(),
             bootstrap_targets: vec![],
             leader: LeaderConfig::default(),
             discovery: DiscoveryConfig::default(),
@@ -1279,6 +1284,66 @@ pub struct ObsidianExportConfig {
     pub max_tokens: Option<u32>,
 }
 
+// ── Session Export Config ────────────────────────────────────────────────────
+
+/// CLI session transcript export configuration — `[session_export]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionExportConfig {
+    /// Enable the session transcript export daemon tick.
+    #[serde(default = "default_session_export_enabled")]
+    pub enabled: bool,
+
+    /// Root of the Obsidian vault (e.g. `~/projects/Yarli_KnowledgeBase`).
+    #[serde(default)]
+    pub vault_dir: Option<String>,
+
+    /// Directories to scan for `*.jsonl` session transcripts.
+    #[serde(default = "default_session_export_source_dirs")]
+    pub source_dirs: Vec<String>,
+
+    /// Computer name used in exported filenames (defaults to `hostname`).
+    #[serde(default)]
+    pub computer_name: Option<String>,
+
+    /// Fallback project-folder name when it cannot be inferred from a source dir.
+    #[serde(default = "default_session_export_project")]
+    pub project_folder: String,
+
+    /// Optional `rsync` destination for fleet-wide vault aggregation
+    /// (e.g. `adele:~/projects/Yarli_KnowledgeBase`).
+    #[serde(default)]
+    pub rsync_target: Option<String>,
+}
+
+impl Default for SessionExportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_session_export_enabled(),
+            vault_dir: None,
+            source_dirs: default_session_export_source_dirs(),
+            computer_name: None,
+            project_folder: default_session_export_project(),
+            rsync_target: None,
+        }
+    }
+}
+
+fn default_session_export_enabled() -> bool {
+    false
+}
+
+fn default_session_export_source_dirs() -> Vec<String> {
+    vec![
+        "~/.claude/projects".to_string(),
+        "~/.codex/projects".to_string(),
+        "~/.kimi/projects".to_string(),
+    ]
+}
+
+fn default_session_export_project() -> String {
+    "unknown".to_string()
+}
+
 // ── Bootstrap Targets ────────────────────────────────────────────────────────
 
 /// A pending node awaiting bootstrap — `[[bootstrap_targets]]`.
@@ -1406,6 +1471,11 @@ fn default_ctx_size() -> u32 {
 /// - `FORGEFLEET_OBSIDIAN_EXPORT_MODEL` → obsidian_export.model
 /// - `FORGEFLEET_OBSIDIAN_EXPORT_TEMPERATURE` → obsidian_export.temperature
 /// - `FORGEFLEET_OBSIDIAN_EXPORT_MAX_TOKENS` → obsidian_export.max_tokens
+/// - `FORGEFLEET_SESSION_EXPORT_ENABLED` → session_export.enabled
+/// - `FORGEFLEET_SESSION_EXPORT_VAULT_DIR` → session_export.vault_dir
+/// - `FORGEFLEET_SESSION_EXPORT_SOURCE_DIRS` → session_export.source_dirs (CSV)
+/// - `FORGEFLEET_SESSION_EXPORT_COMPUTER_NAME` → session_export.computer_name
+/// - `FORGEFLEET_SESSION_EXPORT_RSYNC_TARGET` → session_export.rsync_target
 pub fn apply_env_overrides(config: &mut FleetConfig) {
     if let Ok(v) = std::env::var("FORGEFLEET_FLEET_NAME") {
         info!(name = %v, "env override: fleet name");
@@ -1567,6 +1637,42 @@ pub fn apply_env_overrides(config: &mut FleetConfig) {
         && let Ok(n) = v.trim().parse::<u32>()
     {
         config.obsidian_export.max_tokens = Some(n);
+    }
+
+    if let Ok(v) = std::env::var("FORGEFLEET_SESSION_EXPORT_ENABLED") {
+        let enabled = matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+        config.session_export.enabled = enabled;
+    }
+
+    if let Ok(v) = std::env::var("FORGEFLEET_SESSION_EXPORT_VAULT_DIR")
+        && !v.trim().is_empty()
+    {
+        config.session_export.vault_dir = Some(v.trim().to_string());
+    }
+
+    if let Ok(v) = std::env::var("FORGEFLEET_SESSION_EXPORT_SOURCE_DIRS")
+        && !v.trim().is_empty()
+    {
+        config.session_export.source_dirs = v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+
+    if let Ok(v) = std::env::var("FORGEFLEET_SESSION_EXPORT_COMPUTER_NAME")
+        && !v.trim().is_empty()
+    {
+        config.session_export.computer_name = Some(v.trim().to_string());
+    }
+
+    if let Ok(v) = std::env::var("FORGEFLEET_SESSION_EXPORT_RSYNC_TARGET")
+        && !v.trim().is_empty()
+    {
+        config.session_export.rsync_target = Some(v.trim().to_string());
     }
 }
 

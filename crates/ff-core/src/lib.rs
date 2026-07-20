@@ -38,6 +38,7 @@ pub mod quarantine;
 pub mod queue;
 pub mod run_limits;
 pub mod schema;
+pub mod session_export;
 pub mod synthetic;
 pub mod task;
 pub mod task_error;
