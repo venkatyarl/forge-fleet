@@ -1060,9 +1060,389 @@ fn is_terminal_ci_status(status: &str) -> bool {
     matches!(status, "success" | "failure" | "cancelled" | "completed")
 }
 
+/// Parse the PR number out of a GitHub merge-group head_ref such as
+/// `refs/heads/gh-readonly-queue/main/pr-123[-<sha>]`.
+fn parse_merge_group_pr_number(head_ref: &str) -> Option<i64> {
+    let suffix = head_ref.rsplit_once("/pr-")?.1;
+    let digits: String = suffix.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Map GitHub CI status / conclusion onto `work_item_merge_queue.status`.
+fn map_merge_train_ci_status(gh_status: &str, conclusion: &str) -> &'static str {
+    match (gh_status, conclusion) {
+        ("completed", "success") | ("completed", "skipped") => "mergeable",
+        ("completed", "failure")
+        | ("completed", "cancelled")
+        | ("completed", "timed_out")
+        | ("completed", "action_required") => "failed",
+        ("in_progress", _) => "ci_running",
+        ("queued" | "pending" | "waiting", _) => "queued",
+        _ => "unknown",
+    }
+}
+
+/// Resolve a GitHub `owner/repo` full name to a ForgeFleet `project_id`.
+/// Prefers the explicit `project_repos` mapping, then falls back to the
+/// legacy short-repo-name convention used by `projects.id`.
+async fn resolve_project_id_for_repo(pool: &sqlx::PgPool, repo_full: &str) -> Option<String> {
+    let github_url = format!("https://github.com/{}", repo_full);
+    if let Ok(Some(row)) = sqlx::query(
+        "SELECT project_id FROM project_repos \
+            WHERE github_url = $1 \
+            ORDER BY is_primary DESC, created_at ASC LIMIT 1",
+    )
+    .bind(&github_url)
+    .fetch_optional(pool)
+    .await
+    {
+        if let Ok(pid) = row.try_get::<String, _>("project_id") {
+            return Some(pid);
+        }
+    }
+    let short = repo_full.split('/').nth(1).unwrap_or(repo_full);
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1)")
+        .bind(short)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
+    if exists {
+        Some(short.to_string())
+    } else {
+        None
+    }
+}
+
+/// Look up the merge-queue row and its work item for a PR number in a project.
+async fn find_merge_queue_by_pr(
+    pool: &sqlx::PgPool,
+    project_id: &str,
+    pr_number: i64,
+) -> Result<Option<(Uuid, Uuid)>, sqlx::Error> {
+    let pr_pattern = format!("%/pull/{}", pr_number);
+    let row = sqlx::query(
+        "SELECT id, work_item_id FROM work_item_merge_queue \
+            WHERE project_id = $1 AND pr_url LIKE $2 LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(&pr_pattern)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| (r.get("id"), r.get("work_item_id"))))
+}
+
+/// Look up the work item associated with a PR number in a project.
+async fn find_work_item_by_pr(
+    pool: &sqlx::PgPool,
+    project_id: &str,
+    pr_number: i64,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let pr_pattern = format!("%/pull/{}", pr_number);
+    sqlx::query_scalar("SELECT id FROM work_items WHERE project_id = $1 AND pr_url LIKE $2 LIMIT 1")
+        .bind(project_id)
+        .bind(&pr_pattern)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Mirror a CI status for a merge-train PR into `work_item_merge_queue`.
+async fn update_merge_queue_status(
+    pool: &sqlx::PgPool,
+    project_id: &str,
+    pr_number: i64,
+    status: &str,
+    conclusion: &str,
+) -> Result<u64, sqlx::Error> {
+    let pr_pattern = format!("%/pull/{}", pr_number);
+    let failure_reason = if status == "failed" {
+        Some(conclusion)
+    } else {
+        None
+    };
+    let result = sqlx::query(
+        "UPDATE work_item_merge_queue \
+            SET status = $1, \
+                failed_at = CASE WHEN $1 = 'failed' THEN NOW() ELSE failed_at END, \
+                failure_reason = COALESCE($2, failure_reason) \
+          WHERE project_id = $3 AND pr_url LIKE $4",
+    )
+    .bind(status)
+    .bind(failure_reason)
+    .bind(project_id)
+    .bind(&pr_pattern)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Handle a `merge_group` `checks_requested` event — a merge train has been
+/// created for one or more PRs. Attach it to the matching work item merge
+/// queue entry (creating the queue row if the agent dispatch hasn't yet).
+async fn handle_train_creation(pool: &sqlx::PgPool, payload: &Value) -> (StatusCode, Json<Value>) {
+    let repo_html_url = payload
+        .pointer("/repository/html_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let repo_full = payload
+        .pointer("/repository/full_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown/unknown");
+    let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    let mg = payload.get("merge_group").cloned().unwrap_or(Value::Null);
+    let head_ref = mg.get("head_ref").and_then(|v| v.as_str()).unwrap_or("");
+    let head_sha = mg.get("head_sha").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Use the shared parser to normalize owner/repo.
+    let (owner, repo) = ff_agent::project_github_sync::parse_owner_repo(repo_html_url)
+        .unwrap_or_else(|| {
+            let mut parts = repo_full.split('/');
+            let o = parts.next().unwrap_or("unknown").to_string();
+            let r = parts.next().unwrap_or("unknown").to_string();
+            (o, r)
+        });
+    let repo_full = format!("{}/{}", owner, repo);
+
+    let Some(project_id) = resolve_project_id_for_repo(pool, &repo_full).await else {
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({"accepted": false, "reason": "unknown project"})),
+        );
+    };
+
+    let Some(pr_number) = parse_merge_group_pr_number(head_ref) else {
+        return (
+            StatusCode::ACCEPTED,
+            Json(
+                json!({"accepted": false, "reason": "could not parse PR number from merge_group head_ref"}),
+            ),
+        );
+    };
+
+    let pr_url = format!("https://github.com/{}/pull/{}", repo_full, pr_number);
+
+    match find_merge_queue_by_pr(pool, &project_id, pr_number).await {
+        Ok(Some((id, _))) => {
+            let _ = sqlx::query(
+                "UPDATE work_item_merge_queue \
+                    SET status = 'ci_running', \
+                        branch_name = $1, \
+                        head_sha = $2, \
+                        pr_url = $3, \
+                        started_at = COALESCE(started_at, NOW()), \
+                        failed_at = NULL, \
+                        failure_reason = NULL \
+                  WHERE id = $4",
+            )
+            .bind(head_ref)
+            .bind(head_sha)
+            .bind(&pr_url)
+            .bind(id)
+            .execute(pool)
+            .await;
+        }
+        Ok(None) => match find_work_item_by_pr(pool, &project_id, pr_number).await {
+            Ok(Some(work_item_id)) => {
+                let _ = sqlx::query(
+                    "INSERT INTO work_item_merge_queue \
+                        (work_item_id, project_id, status, branch_name, pr_url, head_sha, started_at) \
+                     VALUES ($1, $2, 'ci_running', $3, $4, $5, NOW()) \
+                     ON CONFLICT (work_item_id) DO UPDATE \
+                        SET status = 'ci_running', \
+                            branch_name = EXCLUDED.branch_name, \
+                            pr_url = EXCLUDED.pr_url, \
+                            head_sha = EXCLUDED.head_sha, \
+                            started_at = COALESCE(work_item_merge_queue.started_at, NOW()), \
+                            failed_at = NULL, \
+                            failure_reason = NULL",
+                )
+                .bind(work_item_id)
+                .bind(&project_id)
+                .bind(head_ref)
+                .bind(&pr_url)
+                .bind(head_sha)
+                .execute(pool)
+                .await;
+            }
+            Ok(None) => {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(json!({"accepted": false, "reason": "no matching work item for PR"})),
+                );
+            }
+            Err(e) => {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(json!({"accepted": false, "reason": format!("db error: {}", e)})),
+                );
+            }
+        },
+        Err(e) => {
+            return (
+                StatusCode::ACCEPTED,
+                Json(json!({"accepted": false, "reason": format!("db error: {}", e)})),
+            );
+        }
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "accepted": true,
+            "event": "merge_group",
+            "action": action,
+            "project": project_id,
+            "pr": pr_number,
+            "head_sha": head_sha
+        })),
+    )
+}
+
+/// Handle `check_run` events against a merge-group commit. These are the
+/// per-check status updates for an in-flight train.
+async fn handle_train_status(pool: &sqlx::PgPool, payload: &Value) -> (StatusCode, Json<Value>) {
+    let repo_full = payload
+        .pointer("/repository/full_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown/unknown");
+    let cr = payload.get("check_run").cloned().unwrap_or(Value::Null);
+    let gh_status = cr.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let conclusion = cr.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
+    let head_sha = cr.get("head_sha").and_then(|v| v.as_str()).unwrap_or("");
+
+    let status = map_merge_train_ci_status(gh_status, conclusion);
+    if status == "unknown" {
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({"accepted": false, "reason": "unhandled check_run status/conclusion"})),
+        );
+    }
+
+    let Some(project_id) = resolve_project_id_for_repo(pool, repo_full).await else {
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({"accepted": false, "reason": "unknown project"})),
+        );
+    };
+
+    match sqlx::query(
+        "SELECT id, work_item_id FROM work_item_merge_queue \
+            WHERE project_id = $1 AND head_sha = $2 LIMIT 1",
+    )
+    .bind(&project_id)
+    .bind(head_sha)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(r)) => {
+            let id: Uuid = r.get("id");
+            let failure_reason = if status == "failed" {
+                Some(conclusion)
+            } else {
+                None
+            };
+            let _ = sqlx::query(
+                "UPDATE work_item_merge_queue \
+                    SET status = $1, \
+                        failed_at = CASE WHEN $1 = 'failed' THEN NOW() ELSE failed_at END, \
+                        failure_reason = COALESCE($2, failure_reason) \
+                  WHERE id = $3",
+            )
+            .bind(status)
+            .bind(failure_reason)
+            .bind(id)
+            .execute(pool)
+            .await;
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "accepted": true,
+                    "event": "check_run",
+                    "project": project_id,
+                    "status": status,
+                    "head_sha": head_sha
+                })),
+            )
+        }
+        Ok(None) => (
+            StatusCode::ACCEPTED,
+            Json(json!({"accepted": false, "reason": "no matching merge queue entry"})),
+        ),
+        Err(e) => (
+            StatusCode::ACCEPTED,
+            Json(json!({"accepted": false, "reason": format!("db error: {}", e)})),
+        ),
+    }
+}
+
+/// Handle `merge_group` `destroyed` (or any terminal train completion) — the
+/// train has either merged or been discarded. Mark the queue entry merged.
+async fn handle_train_completion(
+    pool: &sqlx::PgPool,
+    payload: &Value,
+) -> (StatusCode, Json<Value>) {
+    let repo_full = payload
+        .pointer("/repository/full_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown/unknown");
+    let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    let mg = payload.get("merge_group").cloned().unwrap_or(Value::Null);
+    let head_ref = mg.get("head_ref").and_then(|v| v.as_str()).unwrap_or("");
+    let head_sha = mg.get("head_sha").and_then(|v| v.as_str()).unwrap_or("");
+
+    let Some(project_id) = resolve_project_id_for_repo(pool, repo_full).await else {
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({"accepted": false, "reason": "unknown project"})),
+        );
+    };
+
+    let Some(pr_number) = parse_merge_group_pr_number(head_ref) else {
+        return (
+            StatusCode::ACCEPTED,
+            Json(
+                json!({"accepted": false, "reason": "could not parse PR number from merge_group head_ref"}),
+            ),
+        );
+    };
+
+    match find_merge_queue_by_pr(pool, &project_id, pr_number).await {
+        Ok(Some((id, work_item_id))) => {
+            match queries::pg_mark_merge_merged(pool, id, work_item_id).await {
+                Ok(()) => (
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "accepted": true,
+                        "event": "merge_group",
+                        "action": action,
+                        "project": project_id,
+                        "pr": pr_number,
+                        "head_sha": head_sha,
+                        "merged": true
+                    })),
+                ),
+                Err(e) => (
+                    StatusCode::ACCEPTED,
+                    Json(json!({"accepted": false, "reason": format!("db error: {}", e)})),
+                ),
+            }
+        }
+        Ok(None) => (
+            StatusCode::ACCEPTED,
+            Json(json!({"accepted": false, "reason": "no matching merge queue entry"})),
+        ),
+        Err(e) => (
+            StatusCode::ACCEPTED,
+            Json(json!({"accepted": false, "reason": format!("db error: {}", e)})),
+        ),
+    }
+}
+
 /// GitHub webhook receiver — drops `workflow_run` + `check_run` events
 /// into `project_ci_runs` so `ff project status <id>` + the dashboard
 /// can show live CI state without polling the GitHub API.
+///
+/// It also listens for merge-train (`merge_group`) events and mirrors them
+/// into `work_item_merge_queue` so the PM dashboard reflects queue state.
 ///
 /// HMAC-SHA256 signature verification is enforced when `fleet_secrets.github_webhook_secret`
 /// is configured. Unsigned webhooks are rejected in that case.
@@ -1244,6 +1624,22 @@ async fn github_webhook_handler(
                 .await;
             }
 
+            // If this workflow_run is for a GitHub merge-train branch, mirror the
+            // CI status into the matching `work_item_merge_queue` row.
+            if branch.starts_with("gh-readonly-queue/") {
+                if let Some(pr_number) = parse_merge_group_pr_number(&branch) {
+                    let train_status = map_merge_train_ci_status(gh_status.as_str(), conclusion);
+                    let _ = update_merge_queue_status(
+                        pool,
+                        &project_id,
+                        pr_number,
+                        train_status,
+                        conclusion,
+                    )
+                    .await;
+                }
+            }
+
             (
                 StatusCode::ACCEPTED,
                 Json(
@@ -1251,6 +1647,20 @@ async fn github_webhook_handler(
                 ),
             )
         }
+        "merge_group" => {
+            let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            match action {
+                "checks_requested" => handle_train_creation(pool, &payload).await,
+                "destroyed" => handle_train_completion(pool, &payload).await,
+                other => (
+                    StatusCode::ACCEPTED,
+                    Json(
+                        json!({"accepted": false, "reason": format!("merge_group action '{}' not handled", other)}),
+                    ),
+                ),
+            }
+        }
+        "check_run" => handle_train_status(pool, &payload).await,
         "ping" => (
             StatusCode::OK,
             Json(json!({"accepted": true, "event": "ping", "message": "pong"})),
@@ -4499,10 +4909,16 @@ fn build_router_interaction(
         channel: "gateway-router".to_string(),
         request_text,
         route_decision: route.cloned().unwrap_or_else(|| json!({})),
-        engine: response
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
+        // The router serves local fleet deployments — canonicalize the model
+        // name to `local:<catalog_id>` (plain `local` when the response omits
+        // `model`) so no gateway row lands with an empty engine.
+        engine: Some(
+            response
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(ff_agent::llm_attribution::engine_label)
+                .unwrap_or_else(|| "local".to_string()),
+        ),
         response_text: response
             .get("choices")
             .and_then(|v| v.as_array())
@@ -6462,7 +6878,7 @@ mod router_interaction_capture_tests {
         assert_eq!(rec.channel, "gateway-router");
         assert_eq!(rec.request_text, "meaning of life?");
         assert_eq!(rec.response_text, "42");
-        assert_eq!(rec.engine.as_deref(), Some("qwen3-30b-a3b"));
+        assert_eq!(rec.engine.as_deref(), Some("local:qwen3-30b-a3b"));
         assert_eq!(rec.tokens_in, 17);
         assert_eq!(rec.tokens_out, 5);
         assert_eq!(rec.latency_ms, Some(321));
@@ -6480,7 +6896,7 @@ mod router_interaction_capture_tests {
             "choices": [{"message": {"content": "ok"}}],
         });
         let rec = build_router_interaction("hi".to_string(), &response, 5);
-        assert_eq!(rec.engine, None);
+        assert_eq!(rec.engine.as_deref(), Some("local"));
         assert_eq!(rec.worker_name, None);
         assert_eq!(rec.endpoint, None);
         assert_eq!(rec.tokens_in, 0);
@@ -6537,5 +6953,49 @@ mod router_interaction_capture_tests {
             .execute(&pool)
             .await
             .expect("clean up test row");
+    }
+}
+
+#[cfg(test)]
+mod merge_train_webhook_tests {
+    use super::*;
+
+    #[test]
+    fn parse_merge_group_pr_number_handles_common_formats() {
+        assert_eq!(
+            parse_merge_group_pr_number("refs/heads/gh-readonly-queue/main/pr-123-deadbeef"),
+            Some(123)
+        );
+        assert_eq!(
+            parse_merge_group_pr_number("refs/heads/gh-readonly-queue/feature/x/pr-42"),
+            Some(42)
+        );
+        assert_eq!(
+            parse_merge_group_pr_number("refs/heads/gh-readonly-queue/main/pr-0-abc"),
+            Some(0)
+        );
+        assert_eq!(parse_merge_group_pr_number("refs/heads/main"), None);
+        assert_eq!(parse_merge_group_pr_number(""), None);
+    }
+
+    #[test]
+    fn map_merge_train_ci_status_values() {
+        assert_eq!(
+            map_merge_train_ci_status("completed", "success"),
+            "mergeable"
+        );
+        assert_eq!(
+            map_merge_train_ci_status("completed", "skipped"),
+            "mergeable"
+        );
+        assert_eq!(map_merge_train_ci_status("completed", "failure"), "failed");
+        assert_eq!(
+            map_merge_train_ci_status("completed", "cancelled"),
+            "failed"
+        );
+        assert_eq!(map_merge_train_ci_status("in_progress", ""), "ci_running");
+        assert_eq!(map_merge_train_ci_status("queued", ""), "queued");
+        assert_eq!(map_merge_train_ci_status("pending", ""), "queued");
+        assert_eq!(map_merge_train_ci_status("unknown", ""), "unknown");
     }
 }

@@ -620,7 +620,7 @@ impl ResearchSession {
             let rec = ff_db::InteractionRecord {
                 channel: "research_subtask".to_string(),
                 request_text: row.sub_question.chars().take(16000).collect(),
-                engine: Some(row.assigned_model.clone()),
+                engine: Some(crate::llm_attribution::engine_label(&row.assigned_model)),
                 response_text: result.output.chars().take(16000).collect(),
                 tokens_in: i32::try_from(tin).unwrap_or(0),
                 tokens_out: i32::try_from(tout).unwrap_or(0),
@@ -680,7 +680,9 @@ impl ResearchSession {
         let rec = ff_db::InteractionRecord {
             channel: "research".to_string(),
             request_text: self.config.query.chars().take(16000).collect(),
-            engine: Some(self.config.planner_model.clone()),
+            engine: Some(crate::llm_attribution::engine_label(
+                &self.config.planner_model,
+            )),
             response_text: markdown.chars().take(16000).collect(),
             tokens_in: i32::try_from(total_tokens_in).unwrap_or(0),
             tokens_out: i32::try_from(total_tokens_out).unwrap_or(0),
@@ -905,7 +907,9 @@ impl ResearchSession {
         let rec = ff_db::InteractionRecord {
             channel: "research".to_string(),
             request_text: query.chars().take(16000).collect(),
-            engine: Some(session.config.planner_model.clone()),
+            engine: Some(crate::llm_attribution::engine_label(
+                &session.config.planner_model,
+            )),
             response_text: markdown.chars().take(16000).collect(),
             latency_ms: i32::try_from(duration_ms).ok(),
             outcome: outcome.to_string(),

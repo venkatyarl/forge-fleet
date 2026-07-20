@@ -3,6 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use ff_deploy::resolution::{
+    ResolutionRetryPolicy, TargetLike, resolve_all_with_retry_async, resolve_with_retry_async,
+};
 
 use crate::{
     CYAN, FleetCommand, FleetDbCommand, GREEN, LeaderAction, RED, RESET, TaskCoverageCommand,
@@ -4112,6 +4115,32 @@ async fn handle_fleet_exec(
     Ok(())
 }
 
+/// Row shape returned by the deploy-target resolution queries. Kept separate
+/// from [`DeployTarget`] so it can implement [`ff_deploy::resolution::TargetLike`]
+/// and drive the retry helper without leaking the full deploy shape into
+/// `ff-deploy`.
+struct DeployTargetRow {
+    name: String,
+    primary_ip: String,
+    ssh_user: String,
+    ssh_port: i32,
+    os_family: String,
+    total_ram_gb: i32,
+    source_tree_path: Option<String>,
+}
+
+impl TargetLike for DeployTargetRow {
+    fn target_name(&self) -> &str {
+        &self.name
+    }
+    fn target_primary_ip(&self) -> &str {
+        &self.primary_ip
+    }
+    fn target_ram_gb(&self) -> i32 {
+        self.total_ram_gb
+    }
+}
+
 /// One deploy target, resolved from Postgres `computers` (+ `fleet_workers`
 /// for ssh_user). Mirrors the field set `handle_fleet_exec` resolves, plus
 /// the bits the deploy playbook + memory-tight gating need.
@@ -4250,14 +4279,25 @@ fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
         "cargo build --release -p forge-fleet -p ff-terminal"
     };
 
+    // Dirty-tree guard: mirror the leader-local refresh and refuse to run
+    // `git reset --hard` on a tree with tracked modifications. Untracked files
+    // are ignored so operator artifacts (`research/`, `graphify-out/`, etc.)
+    // do not block a deploy that only builds from tracked sources.
+    let dirty_guard = format!(
+        "if [ -n \"$(git status --porcelain --untracked-files=no)\" ]; then \
+         echo \"DEPLOY_DIRTY_TREE: refusing to reset --hard on dirty tree at {src}; commit or stash tracked changes first\" >&2; \
+         exit 1; \
+         fi"
+    );
+
     // git: force-converge to origin/main. Linux trees accumulate build
     // artifacts that block a clean reset, so clean those two paths first
     // (mirrors the upgrade playbook).
     let git_sync = if os_family == "macos" {
-        format!("cd \"{src}\" && git fetch origin && git reset --hard origin/main")
+        format!("cd \"{src}\" && {dirty_guard} && git fetch origin && git reset --hard origin/main")
     } else {
         format!(
-            "cd \"{src}\" && git fetch origin && git reset --hard origin/main && \
+            "cd \"{src}\" && {dirty_guard} && git fetch origin && git reset --hard origin/main && \
              git clean -fdx graphify-out node-compile-cache"
         )
     };
@@ -4866,6 +4906,122 @@ async fn set_alert_mute(pool: &sqlx::PgPool, secs_from_now: i64) {
     }
 }
 
+/// Resolve all online, non-leader, available deploy targets, retrying if any
+/// target has an empty `primary_ip` or zero RAM. Transiently incomplete rows
+/// are common for hosts that just came online.
+async fn resolve_all_deploy_targets(pool: &sqlx::PgPool) -> Result<Vec<DeployTargetRow>> {
+    let policy = ResolutionRetryPolicy::default();
+
+    resolve_all_with_retry_async(&policy, || async {
+        let rows: Vec<(String, String, String, i32, String, i32, Option<String>)> = sqlx::query_as(
+            "SELECT c.name,
+                    c.primary_ip,
+                    COALESCE(NULLIF(c.ssh_user, ''), fw.ssh_user, 'venkat') AS ssh_user,
+                    COALESCE(NULLIF(c.ssh_port, 0), 22)                     AS ssh_port,
+                    COALESCE(c.os_family, 'linux')                          AS os_family,
+                    COALESCE(c.total_ram_gb, 0)                             AS total_ram_gb,
+                    c.source_tree_path
+               FROM computers c
+               LEFT JOIN fleet_workers fw ON fw.name = c.name
+              WHERE c.status = 'online'
+                AND COALESCE(fw.role, '') <> 'leader'
+                AND COALESCE(c.reservation_state, 'available') = 'available'
+              ORDER BY string_to_array(c.primary_ip, '.')::int[]",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("query online non-leader computers: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    name,
+                    primary_ip,
+                    ssh_user,
+                    ssh_port,
+                    os_family,
+                    total_ram_gb,
+                    source_tree_path,
+                )| {
+                    DeployTargetRow {
+                        name,
+                        primary_ip,
+                        ssh_user,
+                        ssh_port,
+                        os_family,
+                        total_ram_gb,
+                        source_tree_path,
+                    }
+                },
+            )
+            .collect())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("resolve deploy targets: {e}"))
+}
+
+/// Resolve a single deploy target by name or IP, retrying if its `primary_ip`
+/// or RAM is not yet populated. Returns an error immediately if no matching
+/// computer exists.
+async fn resolve_deploy_target(pool: &sqlx::PgPool, node: &str) -> Result<DeployTargetRow> {
+    let policy = ResolutionRetryPolicy::default();
+
+    // Confirm the node exists so a typo doesn't silently wait through retries.
+    let exists: Option<(i32,)> = sqlx::query_as(
+        "SELECT 1
+           FROM computers c
+          WHERE LOWER(c.name) = LOWER($1) OR c.primary_ip = $1
+          LIMIT 1",
+    )
+    .bind(node)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("query computers: {e}"))?;
+
+    if exists.is_none() {
+        anyhow::bail!(
+            "no computer named (or IP) '{node}' in Postgres. \
+             Run `ff fleet computers` to list known hosts."
+        );
+    }
+
+    resolve_with_retry_async(&policy, || async {
+        sqlx::query_as::<_, (String, String, String, i32, String, i32, Option<String>)>(
+            "SELECT c.name,
+                    c.primary_ip,
+                    COALESCE(NULLIF(c.ssh_user, ''), fw.ssh_user, 'venkat') AS ssh_user,
+                    COALESCE(NULLIF(c.ssh_port, 0), 22)                     AS ssh_port,
+                    COALESCE(c.os_family, 'linux')                          AS os_family,
+                    COALESCE(c.total_ram_gb, 0)                             AS total_ram_gb,
+                    c.source_tree_path
+               FROM computers c
+               LEFT JOIN fleet_workers fw ON fw.name = c.name
+              WHERE LOWER(c.name) = LOWER($1) OR c.primary_ip = $1
+              LIMIT 1",
+        )
+        .bind(node)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("query computers: {e}"))?
+        .map(
+            |(name, primary_ip, ssh_user, ssh_port, os_family, total_ram_gb, source_tree_path)| {
+                DeployTargetRow {
+                    name,
+                    primary_ip,
+                    ssh_user,
+                    ssh_port,
+                    os_family,
+                    total_ram_gb,
+                    source_tree_path,
+                }
+            },
+        )
+        .ok_or_else(|| anyhow::anyhow!("target disappeared during resolution"))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("resolve deploy target '{node}': {e}"))
+}
+
 async fn handle_fleet_deploy(
     pool: &sqlx::PgPool,
     all: bool,
@@ -4885,77 +5041,37 @@ async fn handle_fleet_deploy(
     // online non-leader, --node matches one host by name or IP (leader
     // allowed — the only way to deploy the leader).
     let mut targets: Vec<DeployTarget> = if all {
-        sqlx::query_as::<_, (String, String, String, i32, String, i32, Option<String>)>(
-            "SELECT c.name,
-                    c.primary_ip,
-                    COALESCE(NULLIF(c.ssh_user, ''), fw.ssh_user, 'venkat') AS ssh_user,
-                    COALESCE(NULLIF(c.ssh_port, 0), 22)                     AS ssh_port,
-                    COALESCE(c.os_family, 'linux')                          AS os_family,
-                    COALESCE(c.total_ram_gb, 0)                             AS total_ram_gb,
-                    c.source_tree_path
-               FROM computers c
-               LEFT JOIN fleet_workers fw ON fw.name = c.name
-              WHERE c.status = 'online'
-                AND COALESCE(fw.role, '') <> 'leader'
-                -- Skip reserved/drained hosts (V114): a host the operator (or the
-                -- P3 autoscaler) reserved must not become a build target.
-                AND COALESCE(c.reservation_state, 'available') = 'available'
-              ORDER BY string_to_array(c.primary_ip, '.')::int[]",
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("query online non-leader computers: {e}"))?
-        .into_iter()
-        .map(
-            |(name, primary_ip, ssh_user, ssh_port, os_family, total_ram_gb, stp)| DeployTarget {
-                name,
-                primary_ip,
-                ssh_user,
-                ssh_port,
-                os_family,
+        resolve_all_deploy_targets(pool)
+            .await?
+            .into_iter()
+            .map(|r| DeployTarget {
+                name: r.name,
+                primary_ip: r.primary_ip,
+                ssh_user: r.ssh_user,
+                ssh_port: r.ssh_port,
+                os_family: r.os_family,
                 arch: String::new(),
-                total_ram_gb,
-                source_tree_path: stp.unwrap_or_else(|| CANONICAL_WORKER_SOURCE_TREE.into()),
-            },
-        )
-        .collect()
+                total_ram_gb: r.total_ram_gb,
+                source_tree_path: r
+                    .source_tree_path
+                    .unwrap_or_else(|| CANONICAL_WORKER_SOURCE_TREE.into()),
+            })
+            .collect()
     } else {
         let n = node.unwrap();
-        let row = sqlx::query_as::<_, (String, String, String, i32, String, i32, Option<String>)>(
-            "SELECT c.name,
-                    c.primary_ip,
-                    COALESCE(NULLIF(c.ssh_user, ''), fw.ssh_user, 'venkat') AS ssh_user,
-                    COALESCE(NULLIF(c.ssh_port, 0), 22)                     AS ssh_port,
-                    COALESCE(c.os_family, 'linux')                          AS os_family,
-                    COALESCE(c.total_ram_gb, 0)                             AS total_ram_gb,
-                    c.source_tree_path
-               FROM computers c
-               LEFT JOIN fleet_workers fw ON fw.name = c.name
-              WHERE LOWER(c.name) = LOWER($1) OR c.primary_ip = $1
-              LIMIT 1",
-        )
-        .bind(&n)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("query computers: {e}"))?;
-        match row {
-            Some((name, primary_ip, ssh_user, ssh_port, os_family, total_ram_gb, stp)) => {
-                vec![DeployTarget {
-                    name,
-                    primary_ip,
-                    ssh_user,
-                    ssh_port,
-                    os_family,
-                    arch: String::new(),
-                    total_ram_gb,
-                    source_tree_path: stp.unwrap_or_else(|| CANONICAL_WORKER_SOURCE_TREE.into()),
-                }]
-            }
-            None => anyhow::bail!(
-                "no computer named (or IP) '{n}' in Postgres. \
-                 Run `ff fleet computers` to list known hosts."
-            ),
-        }
+        let r = resolve_deploy_target(pool, &n).await?;
+        vec![DeployTarget {
+            name: r.name,
+            primary_ip: r.primary_ip,
+            ssh_user: r.ssh_user,
+            ssh_port: r.ssh_port,
+            os_family: r.os_family,
+            arch: String::new(),
+            total_ram_gb: r.total_ram_gb,
+            source_tree_path: r
+                .source_tree_path
+                .unwrap_or_else(|| CANONICAL_WORKER_SOURCE_TREE.into()),
+        }]
     };
 
     // Non-leader hosts that `--all` EXCLUDED — offline or reserved/drained. The
@@ -5682,6 +5798,22 @@ mod route_tests {
         let p = super::deploy_playbook("linux", "~/projects/forge-fleet");
         assert!(p.contains("systemctl --user"));
         assert!(!p.contains("launchctl"));
+    }
+
+    #[test]
+    fn deploy_playbook_refuses_dirty_tree_before_reset_hard() {
+        let p = super::deploy_playbook("macos", "~/projects/forge-fleet");
+        let dirty = p
+            .find("DEPLOY_DIRTY_TREE")
+            .expect("must check dirty tree before reset");
+        let reset = p
+            .find("git reset --hard origin/main")
+            .expect("must reset --hard");
+        assert!(dirty < reset, "dirty-tree guard must precede reset --hard");
+        assert!(
+            p.contains("git status --porcelain --untracked-files=no"),
+            "must use tracked-only dirty check like leader-local guard"
+        );
     }
 
     /// Layout invariant (2026-07-07 migration): a NULL-source-tree WORKER must
