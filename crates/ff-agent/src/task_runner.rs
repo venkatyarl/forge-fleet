@@ -1,11 +1,11 @@
-//! Distributed shell-task worker for `fleet_tasks` (V44).
+//! Distributed shell-task and code-review worker for `fleet_tasks` (V44).
 //!
 //! Every daemon runs a [`TaskRunner`] tick. It looks for `pending`
 //! rows in `fleet_tasks` whose `requires_capability` set is satisfied
 //! by this computer and either has no preferred computer or names this
 //! one. It atomically claims the row via `FOR UPDATE SKIP LOCKED`,
-//! runs the shell payload, heartbeats every 30s while running, and
-//! marks `completed` / `failed`.
+//! runs the shell payload or code-review pipeline, heartbeats every 30s
+//! while running, and marks `completed` / `failed`.
 //!
 //! The leader runs an additional handoff watchdog that finds rows
 //! whose claimed worker has gone stale (`last_heartbeat_at` older than
@@ -13,7 +13,8 @@
 //! After [`MAX_HANDOFFS`] re-tries the row is marked permanently
 //! `failed` so we don't loop forever on a poison task.
 //!
-//! Today only `task_type = "shell"` is dispatched. The payload shape:
+//! `task_type = "shell"` and `task_type = "code_review"` are both
+//! dispatched. Shell payload shape:
 //!
 //! ```json
 //! { "command": "echo hi", "shell": "/bin/bash" }
@@ -22,6 +23,9 @@
 //! `shell` is optional and defaults to `/bin/bash` (or `sh` on
 //! systems where bash is absent). Stdout + stderr are captured into
 //! `result.stdout` / `result.stderr`; exit code into `result.exit`.
+//!
+//! Code-review tasks are limited to one concurrent review per computer
+//! so a single node cannot run multiple simultaneous review pipelines.
 
 use std::collections::HashSet;
 use std::process::Stdio;
@@ -29,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Row, postgres::PgRow};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -60,6 +64,13 @@ const MAX_TASK_DURATION: Duration = Duration::from_secs(10 * 60);
 /// uses the whole fleet (see the claim query's `NOT EXISTS (other caller)`
 /// branch). Default 6; override via `FF_FAIR_SHARE_MAX_RUNNING`.
 const DEFAULT_FAIR_SHARE_MAX_RUNNING: i64 = 6;
+
+/// Max number of `running` `code_review` tasks a single computer may hold
+/// at once. Reviews are heavy (LLM + cargo checks) and double-running them
+/// on one node causes memory contention and redundant model loading. The
+/// guard is enforced both in the claim query and by the `TaskRunner` tick
+/// flow, which only attempts a review task when no shell task is available.
+const MAX_CONCURRENT_REVIEWS_PER_COMPUTER: i64 = 1;
 
 /// Resolve the fair-share cap, honoring the `FF_FAIR_SHARE_MAX_RUNNING`
 /// env override (must be a positive integer; anything else falls back to
@@ -462,8 +473,20 @@ impl TaskRunner {
         .fetch_optional(&self.pg)
         .await?;
 
-        let Some(row) = row else {
-            return Ok(None);
+        let row = if let Some(row) = row {
+            row
+        } else {
+            // No shell work available; try a code-review task. Reviews are
+            // independently capped so a node never runs more than one at a
+            // time (see [`MAX_CONCURRENT_REVIEWS_PER_COMPUTER`]).
+            match self.claim_review_task().await {
+                Ok(Some(row)) => row,
+                Ok(None) => return Ok(None),
+                Err(e) => {
+                    debug!(error = %e, "review claim query failed");
+                    return Ok(None);
+                }
+            }
         };
 
         let task_id: uuid::Uuid = row.get("id");
@@ -522,7 +545,11 @@ impl TaskRunner {
         // `bash`, orphaning any ssh/git/rsync/cargo grandchildren — the
         // exact leak that wedged priya/sophie (stuck rsync + days-old
         // `git fetch` processes) until every subsequent task hit the cap.
-        let outcome = run_shell_payload(&payload, &self.env, max_duration).await;
+        let outcome = match task_type.as_str() {
+            "shell" => run_shell_payload(&payload, &self.env, max_duration).await,
+            "code_review" => run_review_payload(&payload, max_duration).await,
+            other => Err(TaskRunnerError::UnsupportedType(other.to_string())),
+        };
         let _ = cancel_tx.send(());
         let _ = hb_task.await;
 
@@ -582,6 +609,58 @@ impl TaskRunner {
         }
 
         Ok(Some(task_id))
+    }
+
+    /// Atomically claim at most one pending `code_review` task, but only
+    /// if this computer is not already running a review. The concurrency
+    /// guard is enforced in the claim subquery so it holds even if the
+    /// worker process is restarted — a stale `running` review from a
+    /// crashed daemon will block new claims until the watchdog re-queues
+    /// it (see [`handoff_stuck_tasks`]).
+    async fn claim_review_task(&self) -> Result<Option<PgRow>, TaskRunnerError> {
+        let cap_array: Vec<String> = self.my_capabilities.iter().cloned().collect();
+        let row = sqlx::query(
+            r#"
+            UPDATE fleet_tasks
+               SET status                 = 'running',
+                   claimed_by_computer_id = $1,
+                   claimed_at             = NOW(),
+                   started_at             = COALESCE(started_at, NOW()),
+                   last_heartbeat_at      = NOW()
+             WHERE id = (
+               SELECT id FROM fleet_tasks t
+                WHERE t.status = 'pending'
+                  AND t.task_type = 'code_review'
+                  AND (t.preferred_computer_id IS NULL
+                       OR t.preferred_computer_id = $1)
+                  AND t.requires_capability <@ to_jsonb($2::text[])
+                  AND NOT (t.excludes_computer_ids @> to_jsonb(ARRAY[$1::uuid]))
+                  AND (t.routing_mode != 'local_only'
+                       OR t.created_by_computer_id = $1)
+                  -- Per-computer review concurrency guard: only one
+                  -- `code_review` task may be `running` on this computer
+                  -- at a time. This is the distributed half of the
+                  -- concurrency control; the other half is that each
+                  -- `TaskRunner` only claims one task per tick.
+                  AND (
+                    SELECT COUNT(*) FROM fleet_tasks r
+                     WHERE r.claimed_by_computer_id = $1
+                       AND r.status = 'running'
+                       AND r.task_type = 'code_review'
+                  ) < $3
+                ORDER BY t.priority DESC, t.created_at ASC
+                  FOR UPDATE SKIP LOCKED
+                LIMIT 1
+             )
+            RETURNING id, payload, summary, task_type, timeout_secs
+            "#,
+        )
+        .bind(self.my_computer_id)
+        .bind(&cap_array)
+        .bind(MAX_CONCURRENT_REVIEWS_PER_COMPUTER)
+        .fetch_optional(&self.pg)
+        .await?;
+        Ok(row)
     }
 
     /// Spawn the worker tick loop. Tries to claim one task every
@@ -1186,6 +1265,48 @@ async fn run_shell_payload(
             Err(TaskRunnerError::Timeout(max_duration.as_secs()))
         }
     }
+}
+
+/// Run a `task_type = "code_review"` payload via the testing pipeline.
+///
+/// The payload shape is produced by [`crate::review_pipeline::enqueue_review`]:
+///
+/// ```json
+/// { "repo_path": "...", "commit_sha": "...", "branch": "...", "author": "...", "diff": "..." }
+/// ```
+///
+/// Only `repo_path`, `commit_sha`, and `branch` are required to drive the
+/// T1/T2/T3 pipeline. The result is stored as JSON in `fleet_tasks.result`
+/// with an `exit` key so the caller can treat it like a shell result.
+async fn run_review_payload(
+    payload: &Value,
+    max_duration: Duration,
+) -> Result<Value, TaskRunnerError> {
+    let repo_path = payload
+        .get("repo_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| TaskRunnerError::BadPayload("repo_path".to_string()))?;
+    let commit_sha = payload
+        .get("commit_sha")
+        .and_then(Value::as_str)
+        .ok_or_else(|| TaskRunnerError::BadPayload("commit_sha".to_string()))?;
+    let branch = payload
+        .get("branch")
+        .and_then(Value::as_str)
+        .ok_or_else(|| TaskRunnerError::BadPayload("branch".to_string()))?;
+
+    let pipeline_result = tokio::time::timeout(
+        max_duration,
+        ff_pipeline::testing_pipeline::run_pipeline(repo_path, commit_sha, branch),
+    )
+    .await
+    .map_err(|_| TaskRunnerError::Timeout(max_duration.as_secs()))?;
+
+    let exit = if pipeline_result.overall_pass { 0 } else { 1 };
+    Ok(json!({
+        "exit": exit,
+        "pipeline": pipeline_result,
+    }))
 }
 
 /// SIGKILL an entire process group by its leader pid.
@@ -2324,6 +2445,58 @@ mod wave_playbook_tests {
 
 #[cfg(test)]
 mod claim_query_tests {
+    /// The distributed review worker must never run more than one review
+    /// at a time on a single computer. The constant is wired into the
+    /// review claim query; this test keeps it from drifting accidentally.
+    #[test]
+    fn review_concurrency_limit_is_one() {
+        assert_eq!(super::MAX_CONCURRENT_REVIEWS_PER_COMPUTER, 1);
+    }
+
+    /// DB-backed validation that the review claim query (including the
+    /// per-computer concurrency guard) parses and type-checks against the
+    /// real `fleet_tasks` schema. Ignored so CI skips it; run on a host
+    /// with the fleet pool:
+    ///
+    ///   cargo test -p ff-agent --lib -- --ignored explain_review_concurrency_guard
+    #[tokio::test]
+    #[ignore]
+    async fn explain_review_concurrency_guard() {
+        let pool = crate::fleet_info::get_fleet_pool()
+            .await
+            .expect("fleet pool");
+        let computer_id = uuid::Uuid::nil();
+        sqlx::query(
+            r#"
+            EXPLAIN
+            SELECT id FROM fleet_tasks t
+             WHERE t.status = 'pending'
+               AND t.task_type = 'code_review'
+               AND (t.preferred_computer_id IS NULL
+                    OR t.preferred_computer_id = $1)
+               AND t.requires_capability <@ to_jsonb($2::text[])
+               AND NOT (t.excludes_computer_ids @> to_jsonb(ARRAY[$1::uuid]))
+               AND (t.routing_mode != 'local_only'
+                    OR t.created_by_computer_id = $1)
+               AND (
+                 SELECT COUNT(*) FROM fleet_tasks r
+                  WHERE r.claimed_by_computer_id = $1
+                    AND r.status = 'running'
+                    AND r.task_type = 'code_review'
+               ) < $3
+             ORDER BY t.priority DESC, t.created_at ASC
+               FOR UPDATE SKIP LOCKED
+             LIMIT 1
+            "#,
+        )
+        .bind(computer_id)
+        .bind(&[] as &[String])
+        .bind(super::MAX_CONCURRENT_REVIEWS_PER_COMPUTER)
+        .fetch_all(&pool)
+        .await
+        .expect("review concurrency guard clause must parse + type-check");
+    }
+
     /// DB-backed validation that the within-wave executor-kill guard clause
     /// (2026-05-26) parses and type-checks against the real `fleet_tasks`
     /// schema — the claim query uses runtime-checked `sqlx::query`, so a
