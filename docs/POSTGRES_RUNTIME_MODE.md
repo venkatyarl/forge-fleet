@@ -118,6 +118,23 @@ The checklist defines:
 
 No SQLite file deletion is allowed without completed evidence.
 
+## PITR / WAL Archiving
+
+Postgres base backups remain on the existing 4h cadence. The primary compose
+also enables `archive_mode=on` and writes completed WAL segments to:
+
+```text
+~/.forgefleet/backups/postgres-wal/
+```
+
+`archive_timeout=300` forces a completed segment at least every 5 minutes on a
+quiet database, so PITR recovery points are not limited to natural WAL segment
+rotation. The backup orchestrator prunes this WAL archive to 7 days and rsyncs
+new segments to the same off-fleet destinations as Postgres base backups. Until
+the Tailscale/Neon off-fleet copy work lands, set `fleet_backup_config.dest_hosts`
+for `postgres` to the intended external node; the WAL fan-out follows that same
+destination policy.
+
 ---
 
 ## Verify against Docker `forgefleet-postgres`

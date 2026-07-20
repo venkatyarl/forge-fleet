@@ -941,6 +941,16 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "cloud_budget_buckets",
         sql: schema::SCHEMA_V191_CLOUD_BUDGET_BUCKETS,
     },
+    PgMigration {
+        version: 192,
+        name: "postgres_wal_archiving_config",
+        sql: schema::SCHEMA_V192_POSTGRES_WAL_ARCHIVING_CONFIG,
+    },
+    PgMigration {
+        version: 193,
+        name: "stale_local_backup_alert",
+        sql: schema::SCHEMA_V193_STALE_LOCAL_BACKUP_ALERT,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

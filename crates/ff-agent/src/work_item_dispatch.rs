@@ -17,7 +17,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, SemaphorePermit, watch};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -49,6 +49,11 @@ pub(crate) const MAX_DISPATCH_PER_TICK: i64 = 3;
 /// Recent-failure count at/above which the host throttles back to a single
 /// dispatch per tick (backpressure — stop feeding a host that's failing).
 const BACKPRESSURE_FAILURE_THRESHOLD: usize = 3;
+
+/// The 480B coder ring is a single shared deployment launched with `--parallel 2`.
+/// Never let dispatches queue behind it: if both slots are busy, Lane-1.5 skips
+/// straight to the cloud backstop.
+static LANE15_480B_SEMAPHORE: Semaphore = Semaphore::const_new(LANE15_480B_PERMITS);
 
 /// Capacity-aware per-tick dispatch budget for one host: dispatch up to as many
 /// items as it has free slots, capped at [`MAX_DISPATCH_PER_TICK`]. If the host
@@ -1813,45 +1818,45 @@ const LANE1_STALE_MARGIN_SECS: u64 = 30;
 // Compile-time invariant: Lane-1 must self-abort strictly before the reaper.
 const _: () = assert!(LANE1_TIMEOUT_SECS < crate::work_item_scheduler::LEASE_STALE_SECS as u64);
 
-/// Lane-1.5 routing hint: the qwen3-coder-480b ring (catalog id `qwen3-coder-480b`,
-/// single fleet instance beyonce:55010). `fleet_oneshot` resolves it by matching
-/// this substring against the deployment catalog id/name.
-const LANE15_MODEL_HINT: &str = "qwen3-coder-480b";
-
-/// Engine label recorded for a Lane-1.5 win, written into the lease/interaction
-/// endpoint field so velocity attribution can tell a 480B-ring build apart from a
-/// Lane-1 local build (`"local"`) or a cloud build (`ff cli <backend>`).
-const LANE15_ENGINE: &str = "local-480b";
-
-/// GLOBAL concurrency cap for the Lane-1.5 480B ring. The ring is a single
-/// ~11 tok/s instance launched with `--parallel 2`, so at most 2 builds may hold
-/// it at once. A `static` semaphore makes the cap process-global (every dispatch
-/// slot on this host shares it); a build that can't get a permit quickly SKIPS
-/// straight to the cloud backstop rather than queueing behind the slow ring.
-static LANE15_480B_GATE: std::sync::LazyLock<tokio::sync::Semaphore> =
-    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(LANE15_480B_PERMITS));
-/// The `--parallel 2` of the single 480B instance (see [`LANE15_480B_GATE`]).
+const LANE15_480B_MODEL_HINT: &str = "local:qwen3-coder-480b";
 const LANE15_480B_PERMITS: usize = 2;
+const LANE15_480B_PERMIT_WAIT_MS: u64 = 750;
 
-/// How long a build waits for a Lane-1.5 480B permit before giving up and
-/// skipping to cloud. Short on purpose: the ring is a fast-path only when free —
-/// we never want a build to QUEUE behind it, so a saturated ring degrades
-/// immediately to the cloud backstop instead of stalling.
-const LANE15_PERMIT_WAIT: Duration = Duration::from_secs(2);
-
-/// Take a permit from `sem` within `wait`, or `None` if none frees up in time.
-/// `None` is the "ring saturated — skip to cloud" signal: Lane-1.5 must never
-/// block a build waiting on the slow 480B ring. Extracted from the dispatch flow
-/// so the permit-or-skip decision is unit-testable against any semaphore/cap.
-async fn acquire_within(
-    sem: &tokio::sync::Semaphore,
+async fn try_acquire_lane15_480b_permit(
+    sem: &Semaphore,
     wait: Duration,
-) -> Option<tokio::sync::SemaphorePermit<'_>> {
-    match tokio::time::timeout(wait, sem.acquire()).await {
-        Ok(Ok(permit)) => Some(permit),
-        // Either the wait elapsed (all permits busy) or the semaphore was closed
-        // (never happens — it's a 'static LazyLock): both mean "skip to cloud".
-        _ => None,
+) -> Option<SemaphorePermit<'_>> {
+    tokio::time::timeout(wait, sem.acquire())
+        .await
+        .ok()
+        .and_then(Result::ok)
+}
+
+#[cfg(test)]
+async fn acquire_within(sem: &Semaphore, wait: Duration) -> Option<SemaphorePermit<'_>> {
+    try_acquire_lane15_480b_permit(sem, wait).await
+}
+
+async fn mark_lease_endpoint(pg: &PgPool, item: &AssignedWorkItem, endpoint: &str) {
+    if let Err(e) = sqlx::query(
+        "UPDATE work_item_leases
+            SET endpoint = $3
+          WHERE work_item_id = $1
+            AND sub_agent_id = $2
+            AND released_at IS NULL",
+    )
+    .bind(item.work_item_id)
+    .bind(item.sub_agent_id)
+    .bind(endpoint)
+    .execute(pg)
+    .await
+    {
+        warn!(
+            work_item_id = %item.work_item_id,
+            endpoint,
+            error = %e,
+            "work_item_dispatch: failed to mark lease endpoint"
+        );
     }
 }
 
@@ -2447,6 +2452,7 @@ async fn run_ff_dispatch(
     // heavy) — the local lane wedges/half-finishes on those, so we send them
     // straight to the capable cloud CLI from attempt 0 instead of burning a
     // wedge-prone local attempt first.
+    let mut lane1_failed_or_timed_out = false;
     if use_local_lane(item.attempts, lane1_breaker_open, item.prefers_cloud_lane()) {
         // Bound Lane 1 with a hard timeout so a hung local codegen harness fails
         // OVER to the cloud backstop instead of wedging the slot forever (see
@@ -2491,29 +2497,32 @@ async fn run_ff_dispatch(
                 ));
             }
             Ok(Ok(outcome)) => {
+                lane1_failed_or_timed_out = true;
                 lane1_failed("local_codegen_unavailable").await;
                 info!(
                     work_item_id = %item.work_item_id,
                     error = ?outcome.error,
-                    "work_item_dispatch: local codegen didn't land; backstop to codex"
+                    "work_item_dispatch: local codegen didn't land; trying Lane-1.5 before cloud backstop"
                 );
             }
             Ok(Err(e)) => {
+                lane1_failed_or_timed_out = true;
                 lane1_failed("local_codegen_unavailable").await;
                 warn!(
                     work_item_id = %item.work_item_id,
                     // Full anyhow chain so the REAL cause surfaces (e.g. the underlying
                     // fleet_oneshot failure), not just the "fleet_oneshot round 1" wrapper.
                     error = format!("{e:#}"),
-                    "work_item_dispatch: local codegen errored; backstop to codex"
+                    "work_item_dispatch: local codegen errored; trying Lane-1.5 before cloud backstop"
                 );
             }
             Err(_) => {
+                lane1_failed_or_timed_out = true;
                 lane1_failed("local_codegen_unavailable").await;
                 warn!(
                     work_item_id = %item.work_item_id,
                     timeout_secs = LANE1_TIMEOUT_SECS,
-                    "work_item_dispatch: local codegen TIMED OUT (hung) — backstop to codex"
+                    "work_item_dispatch: local codegen TIMED OUT (hung) — trying Lane-1.5 before cloud backstop"
                 );
             }
         }
@@ -2530,75 +2539,75 @@ async fn run_ff_dispatch(
         );
     }
 
-    // Lane 1.5: ONE escalation round on the 480B ring (qwen3-coder-480b, a single
-    // fleet instance) BEFORE burning the cloud CLI. The 480B model lands changes
-    // the 30B Lane-1 coder can't, at $0 — but it's a single ~11 tok/s instance
-    // (`--parallel 2`), so a GLOBAL semaphore caps concurrent 480B builds at 2. If
-    // no permit frees up within LANE15_PERMIT_WAIT we SKIP straight to cloud rather
-    // than queue a build behind the slow ring. Bounded by LANE1_TIMEOUT_SECS (the
-    // same sub-stale budget as Lane-1) so a hung round fails over to cloud before
-    // the reaper. A win is attributed under LANE15_ENGINE so velocity reporting can
-    // tell a 480B build apart from a Lane-1 local or a cloud build. (fleet_oneshot
-    // may fail over off the 480B ring if it's down; that degrades to a second local
-    // round before cloud — still a net win, never a hang.) We reach this whether
-    // Lane-1 ran and failed, was breaker-skipped, or was cloud-routed: in every
-    // case we're between the local lane and the cloud backstop.
-    if let Some(_permit) = acquire_within(&LANE15_480B_GATE, LANE15_PERMIT_WAIT).await {
-        info!(
-            work_item_id = %item.work_item_id,
-            "work_item_dispatch: Lane-1.5 — escalating to the 480B ring before cloud"
-        );
-        let lane15 = tokio::time::timeout(
-            Duration::from_secs(LANE1_TIMEOUT_SECS),
-            crate::codegen_apply::codegen_apply(
-                pg,
-                &worktree.worktree_path,
-                &prompt,
-                Some(LANE15_MODEL_HINT),
-                1,
-            ),
+    // Lane 1.5: one bounded escalation round on the shared 480B coder ring. The
+    // ring has one 11 tok/s instance with --parallel 2, so cap concurrency
+    // process-wide and skip instead of queueing when both slots are busy.
+    if lane1_failed_or_timed_out {
+        match try_acquire_lane15_480b_permit(
+            &LANE15_480B_SEMAPHORE,
+            Duration::from_millis(LANE15_480B_PERMIT_WAIT_MS),
         )
-        .await;
-        match lane15 {
-            Ok(Ok(outcome)) if outcome.applied => {
+        .await
+        {
+            Some(_permit) => {
+                mark_lease_endpoint(pg, item, "lane1.5:local:qwen3-coder-480b").await;
+                let lane15 = tokio::time::timeout(
+                    Duration::from_secs(LANE1_TIMEOUT_SECS),
+                    crate::codegen_apply::codegen_apply(
+                        pg,
+                        &worktree.worktree_path,
+                        &prompt,
+                        Some(LANE15_480B_MODEL_HINT),
+                        1,
+                    ),
+                )
+                .await;
+                match lane15 {
+                    Ok(Ok(outcome)) if outcome.applied => {
+                        info!(
+                            work_item_id = %item.work_item_id,
+                            rounds = outcome.rounds,
+                            "work_item_dispatch: Lane-1.5 480B codegen landed the change"
+                        );
+                        return Ok((
+                            "local-480b".to_string(),
+                            synthetic_output(
+                                &outcome.final_diff.unwrap_or_else(|| "applied".into()),
+                            ),
+                        ));
+                    }
+                    Ok(Ok(outcome)) => {
+                        info!(
+                            work_item_id = %item.work_item_id,
+                            error = ?outcome.error,
+                            "work_item_dispatch: Lane-1.5 480B codegen didn't land; backstop to cloud"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        warn!(
+                            work_item_id = %item.work_item_id,
+                            error = format!("{e:#}"),
+                            "work_item_dispatch: Lane-1.5 480B codegen errored; backstop to cloud"
+                        );
+                    }
+                    Err(_) => {
+                        warn!(
+                            work_item_id = %item.work_item_id,
+                            timeout_secs = LANE1_TIMEOUT_SECS,
+                            "work_item_dispatch: Lane-1.5 480B codegen TIMED OUT; backstop to cloud"
+                        );
+                    }
+                }
+            }
+            None => {
                 info!(
                     work_item_id = %item.work_item_id,
-                    rounds = outcome.rounds,
-                    "work_item_dispatch: Lane-1.5 480B ring landed the change"
-                );
-                return Ok((
-                    LANE15_ENGINE.to_string(),
-                    synthetic_output(&outcome.final_diff.unwrap_or_else(|| "applied".into())),
-                ));
-            }
-            Ok(Ok(outcome)) => {
-                info!(
-                    work_item_id = %item.work_item_id,
-                    error = ?outcome.error,
-                    "work_item_dispatch: Lane-1.5 480B didn't land; backstop to cloud"
-                );
-            }
-            Ok(Err(e)) => {
-                warn!(
-                    work_item_id = %item.work_item_id,
-                    error = format!("{e:#}"),
-                    "work_item_dispatch: Lane-1.5 480B errored; backstop to cloud"
-                );
-            }
-            Err(_) => {
-                warn!(
-                    work_item_id = %item.work_item_id,
-                    timeout_secs = LANE1_TIMEOUT_SECS,
-                    "work_item_dispatch: Lane-1.5 480B TIMED OUT (hung) — backstop to cloud"
+                    permits = LANE15_480B_PERMITS,
+                    wait_ms = LANE15_480B_PERMIT_WAIT_MS,
+                    "work_item_dispatch: Lane-1.5 480B ring busy; skipping to cloud backstop"
                 );
             }
         }
-    } else {
-        info!(
-            work_item_id = %item.work_item_id,
-            permits = LANE15_480B_PERMITS,
-            "work_item_dispatch: Lane-1.5 480B ring saturated — skipping to cloud backstop"
-        );
     }
 
     // Lane 2: dispatch to an AVAILABLE backend (capability A4/A5) with the full
@@ -4144,13 +4153,13 @@ pub fn spawn_worktree_reaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        DISPATCH_HOUSE_RULES, DispatchOutcome, ReviewerStat, agent_output_tail,
-        backend_failed_without_output, builder_excludes_480b, classify_dispatch_outcome,
-        command_display, default_clone_path, dispatch_budget_for_host, expand_home,
-        is_build_timeout, order_cloud_reviewers, parse_cli_tokens, primary_or_default_backend,
-        quick_empty_success_is_provider_failure, repo_cache_path, repo_slug,
-        retry_error_is_actionable, rewrite_github_host_alias, status_output_is_clean,
-        task_prefers_cloud_lane, use_local_lane,
+        DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS, ReviewerStat,
+        agent_output_tail, backend_failed_without_output, builder_excludes_480b,
+        classify_dispatch_outcome, command_display, default_clone_path, dispatch_budget_for_host,
+        expand_home, is_build_timeout, order_cloud_reviewers, parse_cli_tokens,
+        primary_or_default_backend, quick_empty_success_is_provider_failure, repo_cache_path,
+        repo_slug, retry_error_is_actionable, rewrite_github_host_alias, status_output_is_clean,
+        task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
     };
     use std::time::Duration;
 
@@ -4328,6 +4337,31 @@ mod tests {
         assert!(!use_local_lane(0, false, true));
         // Open local-codegen breaker → skip local even on attempt 0.
         assert!(!use_local_lane(0, true, false));
+    }
+
+    #[tokio::test]
+    async fn lane15_permit_acquires_when_capacity_available() {
+        let sem = tokio::sync::Semaphore::new(LANE15_480B_PERMITS);
+        let permit =
+            try_acquire_lane15_480b_permit(&sem, std::time::Duration::from_millis(10)).await;
+
+        assert!(permit.is_some(), "free 480B lane capacity should run");
+        assert_eq!(sem.available_permits(), LANE15_480B_PERMITS - 1);
+    }
+
+    #[tokio::test]
+    async fn lane15_permit_skips_instead_of_queueing_when_full() {
+        let sem = tokio::sync::Semaphore::new(LANE15_480B_PERMITS);
+        let _held = sem
+            .acquire_many(LANE15_480B_PERMITS as u32)
+            .await
+            .expect("test semaphore should be open");
+
+        let permit =
+            try_acquire_lane15_480b_permit(&sem, std::time::Duration::from_millis(1)).await;
+
+        assert!(permit.is_none(), "busy 480B lane should skip to cloud");
+        assert_eq!(sem.available_permits(), 0);
     }
 
     #[test]

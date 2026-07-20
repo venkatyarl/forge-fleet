@@ -193,6 +193,7 @@ pub const COMPUTER_STATUS_VALUES: &[&str] = &["offline", "online", "sdown"];
 pub const IMPERATIVE_METRICS: &[&str] = &[
     "db_index_corruption",
     "fleet_integrity_degraded",
+    "stale_local_backup_age_secs",
     "backup_restore_drill_failed",
     "upgrade_rollout_halted",
     "secret_expiry_days_remaining",
@@ -986,6 +987,7 @@ mod tests {
             "beat_age_secs",
             "db_index_corruption",
             "fleet_integrity_degraded",
+            "stale_local_backup_age_secs",
             "secret_expiry_days_remaining",
             "backup_restore_drill_failed",
             "upgrade_rollout_halted",
