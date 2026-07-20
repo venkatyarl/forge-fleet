@@ -12,6 +12,9 @@ pub enum ControlError {
     #[error("missing subsystem handle: {0}")]
     MissingSubsystem(&'static str),
 
+    #[error("480B codegen error: {0}")]
+    Llm480b(String),
+
     #[error("node not configured: {0}")]
     UnknownNode(String),
 
