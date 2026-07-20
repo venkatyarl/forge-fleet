@@ -161,8 +161,12 @@ fn default_endpoint_480b_timeout_secs() -> u64 {
 }
 
 /// Top-level control-plane configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlConfig {
+    /// Maximum wall-clock duration for a single build, in seconds.
+    #[serde(default = "default_max_build_duration_secs")]
+    pub max_build_duration_secs: u64,
+
     /// Alert deduplication settings — `[control.alerts.deduplication]`.
     #[serde(default)]
     pub alerts: AlertConfig,
@@ -170,6 +174,27 @@ pub struct ControlConfig {
     /// 480B escalation settings — `[control.escalation]`.
     #[serde(default)]
     pub escalation: EscalationConfig,
+}
+
+impl ControlConfig {
+    /// Return the maximum build duration as a `std::time::Duration`.
+    pub fn max_build_duration(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.max_build_duration_secs)
+    }
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            max_build_duration_secs: default_max_build_duration_secs(),
+            alerts: AlertConfig::default(),
+            escalation: EscalationConfig::default(),
+        }
+    }
+}
+
+fn default_max_build_duration_secs() -> u64 {
+    300
 }
 
 /// Alert handling configuration.
@@ -183,6 +208,27 @@ pub struct AlertConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_config_max_build_duration_defaults() {
+        let cfg: ControlConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.max_build_duration_secs, 300);
+        assert_eq!(
+            cfg.max_build_duration(),
+            std::time::Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn control_config_max_build_duration_deserializes() {
+        let cfg: ControlConfig =
+            serde_json::from_str(r#"{"max_build_duration_secs": 900}"#).unwrap();
+        assert_eq!(cfg.max_build_duration_secs, 900);
+        assert_eq!(
+            cfg.max_build_duration(),
+            std::time::Duration::from_secs(900)
+        );
+    }
 
     #[test]
     fn deduplication_config_defaults() {
