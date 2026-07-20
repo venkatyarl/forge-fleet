@@ -96,6 +96,13 @@ async fn main() -> anyhow::Result<()> {
         config.task_poll_interval_secs,
     ));
 
+    let build_monitor_handle = tokio::spawn(run_build_timeout_monitor(
+        shared_state.clone(),
+        config.max_build_duration_secs,
+        config.build_monitor_poll_secs,
+        cancel.clone(),
+    ));
+
     let executor_handle = tokio::spawn(run_task_executor(
         shared_state,
         task_rx,
@@ -117,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
     health_handle.abort();
     activity_handle.abort();
     poller_handle.abort();
+    build_monitor_handle.abort();
     executor_handle.abort();
 
     Ok(())
@@ -290,6 +298,60 @@ async fn run_activity_monitor(
             let mut locked = state.write().await;
             locked.activity_level = level;
             locked.yield_resources = yield_resources;
+        }
+    }
+}
+
+/// Background watchdog that kills builds exceeding `max_build_duration`.
+///
+/// The executor registers a `BuildWatch` (start time + cancellation token) for
+/// every build shell-command it runs. This task periodically scans those
+/// watches and, for any build whose elapsed wall-clock has passed
+/// `max_build_duration`, fires its cancellation token — the executor is
+/// `select!`ing on that token and drops the child, killing the stuck build.
+///
+/// A `max_build_duration_secs` of `0` disables the monitor entirely.
+async fn run_build_timeout_monitor(
+    state: SharedState,
+    max_build_duration_secs: u64,
+    poll_interval_secs: u64,
+    cancel: CancellationToken,
+) {
+    if max_build_duration_secs == 0 {
+        info!("build timeout monitor disabled (max_build_duration = 0)");
+        return;
+    }
+
+    let max = Duration::from_secs(max_build_duration_secs);
+    let interval = Duration::from_secs(poll_interval_secs.max(1));
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = cancel.cancelled() => {
+                info!("build timeout monitor shutting down");
+                break;
+            }
+        }
+
+        // Collect stuck builds under a read lock, then cancel outside it.
+        let stuck: Vec<_> = {
+            let locked = state.read().await;
+            locked
+                .build_watches
+                .iter()
+                .filter(|(_, watch)| watch.started_at.elapsed() >= max)
+                .map(|(id, watch)| (*id, watch.cancel.clone()))
+                .collect()
+        };
+
+        for (task_id, token) in stuck {
+            warn!(
+                %task_id,
+                max_secs = max_build_duration_secs,
+                "build exceeded max_build_duration; killing"
+            );
+            token.cancel();
         }
     }
 }
