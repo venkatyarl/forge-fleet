@@ -14,8 +14,8 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
 use anyhow::Context;
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind,
