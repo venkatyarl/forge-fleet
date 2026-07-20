@@ -681,6 +681,38 @@ mod tests {
         assert_eq!(repeated.id, first.id);
         assert_eq!(repeated.count, 2);
         assert_eq!(engine.active_count(), 3);
+        let james_node_down = engine
+            .active_alerts()
+            .into_iter()
+            .find(|alert| alert.id == first.id)
+            .expect("the deduplicated alert should remain active");
+        assert_eq!(james_node_down.count, 2);
+        assert_eq!(engine.alert_history().len(), 3);
+    }
+
+    #[test]
+    fn test_new_alert_fires_while_existing_alert_is_deduplicated() {
+        let engine = AlertEngine::new(vec![AlertRule::high_cpu(90.0)]);
+        let metrics = MetricsCollector::new();
+        metrics.record_node(hot_node("james", 95.0));
+
+        let first = engine.evaluate(&metrics);
+        assert_eq!(first.len(), 1);
+
+        metrics.record_node(hot_node("taylor", 96.0));
+        let new_alerts = engine.evaluate(&metrics);
+
+        assert_eq!(new_alerts.len(), 1);
+        assert_eq!(new_alerts[0].node.as_deref(), Some("taylor"));
+        assert_eq!(new_alerts[0].count, 1);
+        assert_eq!(engine.active_count(), 2);
+        let james = engine
+            .active_alerts()
+            .into_iter()
+            .find(|alert| alert.node.as_deref() == Some("james"))
+            .expect("the original alert should remain active");
+        assert_eq!(james.id, first[0].id);
+        assert_eq!(james.count, 2);
     }
 
     #[test]
