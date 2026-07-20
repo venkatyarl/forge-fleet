@@ -119,6 +119,10 @@ pub struct FleetConfig {
     #[serde(default)]
     pub discovery: DiscoveryConfig,
 
+    /// Fleet-wide secrets and feature gates — `[fleet_secrets]`.
+    #[serde(default)]
+    pub fleet_secrets: FleetSecretsConfig,
+
     /// Standalone model definitions — backward compat for programmatic construction.
     /// Real fleet.toml nests models under `[nodes.<name>.models.<slug>]`.
     #[serde(default)]
@@ -147,6 +151,7 @@ impl Default for FleetConfig {
             bootstrap_targets: vec![],
             leader: LeaderConfig::default(),
             discovery: DiscoveryConfig::default(),
+            fleet_secrets: FleetSecretsConfig::default(),
             models: vec![],
         }
     }
@@ -267,6 +272,24 @@ fn default_subnet_scan_interval() -> u64 {
 }
 fn default_subnet_scan_enabled() -> bool {
     false
+}
+
+// ── FleetSecretsConfig (maps to [fleet_secrets]) ─────────────────────────────
+
+/// Fleet-wide secrets and feature gates — `[fleet_secrets]`.
+///
+/// Values here are separate from the `fleet_secrets` Postgres table (which
+/// stores actual secret material). This section holds non-secret toggles that
+/// control fleet-wide behavior and are safe to keep in fleet.toml.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FleetSecretsConfig {
+    /// Enable distributed review mode for work-item PRs.
+    ///
+    /// When `true`, the merge drain delegates autonomous PR review to the
+    /// fleet's distributed review workers instead of running it locally.
+    /// Defaults to `false` to preserve the existing local review path.
+    #[serde(default)]
+    pub distributed_review_mode: bool,
 }
 
 // ── NodeConfig (maps to [nodes.<name>]) ──────────────────────────────────────
@@ -1395,6 +1418,7 @@ fn default_ctx_size() -> u32 {
 /// - `FORGEFLEET_OBSIDIAN_EXPORT_MODEL` → obsidian_export.model
 /// - `FORGEFLEET_OBSIDIAN_EXPORT_TEMPERATURE` → obsidian_export.temperature
 /// - `FORGEFLEET_OBSIDIAN_EXPORT_MAX_TOKENS` → obsidian_export.max_tokens
+/// - `FORGEFLEET_DISTRIBUTED_REVIEW_MODE` → fleet_secrets.distributed_review_mode
 pub fn apply_env_overrides(config: &mut FleetConfig) {
     if let Ok(v) = std::env::var("FORGEFLEET_FLEET_NAME") {
         info!(name = %v, "env override: fleet name");
@@ -1556,6 +1580,14 @@ pub fn apply_env_overrides(config: &mut FleetConfig) {
         && let Ok(n) = v.trim().parse::<u32>()
     {
         config.obsidian_export.max_tokens = Some(n);
+    }
+
+    if let Ok(v) = std::env::var("FORGEFLEET_DISTRIBUTED_REVIEW_MODE") {
+        let enabled = matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+        config.fleet_secrets.distributed_review_mode = enabled;
     }
 }
 
@@ -1936,6 +1968,9 @@ url = "postgresql://forgefleet:forgefleet@127.0.0.1:55432/forgefleet"
 preferred = "taylor"
 fallback_order = ["marcus"]
 
+[fleet_secrets]
+distributed_review_mode = true
+
 [obsidian_export]
 enabled = true
 target_dir = "/tmp/forgefleet-obsidian"
@@ -2078,6 +2113,9 @@ notes = "Setup started."
         // Check leader.
         assert_eq!(config.leader.preferred, "taylor");
 
+        // Check fleet secrets.
+        assert!(config.fleet_secrets.distributed_review_mode);
+
         // Check obsidian export daemon config.
         assert!(config.obsidian_export.enabled);
         assert_eq!(
@@ -2132,6 +2170,7 @@ notes = "Setup started."
         assert!(config.models.is_empty());
         assert!(config.transport.telegram.is_none());
         assert!(!config.obsidian_export.enabled);
+        assert!(!config.fleet_secrets.distributed_review_mode);
         assert!(config.obsidian_export.target_dir.is_none());
         assert!(config.obsidian_export.model.is_none());
     }

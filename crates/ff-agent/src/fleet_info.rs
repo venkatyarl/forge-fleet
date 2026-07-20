@@ -65,20 +65,37 @@ pub async fn get_fleet_pool() -> Result<PgPool, String> {
     Ok(FLEET_POOL.get_or_init(|| async { pool }).await.clone())
 }
 
-/// Resolve the Postgres URL from `~/.forgefleet/fleet.toml` (shared by both the
-/// main pool and the dedicated heartbeat pool).
-fn read_db_url() -> Result<String, String> {
+/// Resolve the fleet config path from `FORGEFLEET_HOME` or `~/.forgefleet`.
+fn fleet_config_path() -> Result<std::path::PathBuf, String> {
     let home = std::env::var("FORGEFLEET_HOME")
         .ok()
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".forgefleet")))
         .ok_or_else(|| "no home dir".to_string())?;
-    let config_path = home.join("fleet.toml");
+    Ok(home.join("fleet.toml"))
+}
+
+/// Load `FleetConfig` from `~/.forgefleet/fleet.toml`.
+fn read_fleet_config() -> Result<ff_core::config::FleetConfig, String> {
+    let config_path = fleet_config_path()?;
     let toml_str =
         std::fs::read_to_string(&config_path).map_err(|e| format!("read fleet.toml: {e}"))?;
-    let config: ff_core::config::FleetConfig =
-        toml::from_str(&toml_str).map_err(|e| format!("parse fleet.toml: {e}"))?;
-    Ok(config.database.url)
+    toml::from_str(&toml_str).map_err(|e| format!("parse fleet.toml: {e}"))
+}
+
+/// Resolve the Postgres URL from `~/.forgefleet/fleet.toml` (shared by both the
+/// main pool and the dedicated heartbeat pool).
+fn read_db_url() -> Result<String, String> {
+    Ok(read_fleet_config()?.database.url)
+}
+
+/// Read the distributed review mode flag from `~/.forgefleet/fleet.toml`.
+///
+/// Returns `false` if the config cannot be loaded, matching the default.
+pub fn distributed_review_mode_enabled() -> bool {
+    read_fleet_config()
+        .map(|c| c.fleet_secrets.distributed_review_mode)
+        .unwrap_or(false)
 }
 
 async fn build_fleet_pool() -> Result<PgPool, String> {
