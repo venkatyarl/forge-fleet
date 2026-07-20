@@ -257,7 +257,7 @@ pub async fn cortex_cross_repo_find(params: Option<Value>) -> HandlerResult {
 }
 
 /// Show a code symbol's source — resolve a name to its file + line span and
-/// return just that symbol's definition. The Cortex-native `get_review_context`:
+/// return just that symbol's definition. The Cortex-native symbol-source lookup:
 /// one call instead of cortex_find → read the file → slice the span.
 pub async fn cortex_show(params: Option<Value>) -> HandlerResult {
     let corpus_slug = params

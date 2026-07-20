@@ -881,6 +881,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "work_item_events",
         sql: schema::SCHEMA_V179_WORK_ITEM_EVENTS,
     },
+    PgMigration {
+        version: 180,
+        name: "retire_code_review_graph",
+        sql: schema::SCHEMA_V180_RETIRE_CODE_REVIEW_GRAPH,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

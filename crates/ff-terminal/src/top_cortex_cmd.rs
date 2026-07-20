@@ -159,7 +159,7 @@ pub enum TopCortexCommand {
     },
     /// Show a code symbol's source — resolve a name to its file + line span and
     /// print just that symbol's definition. Token-efficient: collapses
-    /// find→open-file→read into one call (the Cortex `get_review_context`).
+    /// find→open-file→read into one call.
     /// Corpus defaults to the cwd's slug; needs the indexed checkout present.
     Show {
         /// Symbol name (qualified or leaf, case-insensitive). An exact qualified
