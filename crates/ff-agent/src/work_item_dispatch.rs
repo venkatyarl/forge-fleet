@@ -11,6 +11,10 @@ use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
@@ -83,8 +87,10 @@ struct AssignedWorkItem {
     /// so the model doesn't repeat the same mistake (retry-with-context).
     last_error: Option<String>,
     /// Task complexity from the decomposer (`mechanical` | `moderate` | `complex`).
-    /// A non-mechanical task skips the weak local codegen lane and dispatches
-    /// straight to the cloud CLI backstop (see [`AssignedWorkItem::prefers_cloud_lane`]).
+    /// Mechanical and moderate tasks try the cheap local Lane-1 codegen harness
+    /// first; complex tasks and any task predicted to touch more than
+    /// [`PREDICTED_PATHS_CLOUD_THRESHOLD`] files skip straight to the cloud CLI
+    /// backstop (see [`AssignedWorkItem::prefers_cloud_lane`]).
     complexity: String,
     /// How many files the decomposer predicted this task touches. A multi-file
     /// change is beyond the local codegen harness's reliable range, so it too
@@ -102,20 +108,30 @@ struct AssignedWorkItem {
 impl AssignedWorkItem {
     /// Whether this task should SKIP the local Lane-1 codegen harness and go
     /// straight to the cloud CLI (codex/claude/kimi). The local lane is great for
-    /// small mechanical single-file edits but HANGS or half-finishes on complex
-    /// multi-file work (observed 2026-07-06: a 3-file React feature wedged a slot
-    /// for 24min producing nothing). Route those to the more capable cloud lane
-    /// from attempt 0 instead of burning a wedge-prone local attempt first.
+    /// small mechanical and moderate edits, but complex or multi-file-heavy work
+    /// (predicted to touch more than [`PREDICTED_PATHS_CLOUD_THRESHOLD`] files)
+    /// can hang or half-finish there (observed 2026-07-06: a 3-file React feature
+    /// wedged a slot for 24min producing nothing). Route those to the more capable
+    /// cloud lane from attempt 0 instead of burning a wedge-prone local attempt
+    /// first.
     fn prefers_cloud_lane(&self) -> bool {
         task_prefers_cloud_lane(&self.complexity, self.predicted_paths_count)
     }
 }
 
+/// Number of predicted touched paths above which a task is treated as
+/// "multi-file-heavy" and routed straight to the cloud CLI, even when its
+/// complexity is `mechanical` or `moderate`. Chosen so the local Lane-1 harness
+/// gets the majority of moderate single/double-file edits while avoiding the
+/// multi-file wedge class that local codegen fumbles.
+const PREDICTED_PATHS_CLOUD_THRESHOLD: i32 = 3;
+
 /// Pure routing predicate (unit-testable): a task skips the local Lane-1 codegen
-/// harness for the cloud CLI when it's `moderate`/`complex` OR touches more than
-/// one file. Mechanical single-file edits stay on the cheap local lane.
+/// harness for the cloud CLI when it's `complex` OR predicted to touch more than
+/// [`PREDICTED_PATHS_CLOUD_THRESHOLD`] files. Mechanical and moderate tasks that
+/// are not multi-file-heavy stay on the cheap local lane.
 fn task_prefers_cloud_lane(complexity: &str, predicted_paths_count: i32) -> bool {
-    matches!(complexity, "moderate" | "complex") || predicted_paths_count > 1
+    matches!(complexity, "complex") || predicted_paths_count > PREDICTED_PATHS_CLOUD_THRESHOLD
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +162,12 @@ async fn recent_host_failures(pg: &PgPool, worker_name: &str) -> Result<usize> {
 /// One dispatch pass. Returns the number of work_items started by this host.
 pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Result<usize> {
     let repo_path = std::env::current_dir().context("resolve current repo path")?;
+
+    // Bump the dispatch tick for every active lease on this host. The stale-lease
+    // reaper watches `dispatch_tick_at` independently of `heartbeat_at` so it can
+    // reclaim a lease whose host dispatch loop wedged even though the in-build
+    // process keeps heartbeating.
+    bump_dispatch_tick_at(pg, worker_name).await;
 
     // Capacity-aware budget: dispatch up to this host's free-slot count, capped
     // at MAX_DISPATCH_PER_TICK, throttled to 1 under recent-failure backpressure.
@@ -236,10 +258,20 @@ pub fn spawn_work_item_dispatch(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let start = Instant::now();
+        let last_tick_at = Arc::new(AtomicU64::new(start.elapsed().as_secs()));
+        let watchdog_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(crate::daemon::dispatch_tick_watchdog(
+            start,
+            last_tick_at.clone(),
+            watchdog_shutdown_rx,
+        ));
+
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    last_tick_at.store(start.elapsed().as_secs(), Ordering::Relaxed);
                     if let Err(e) = evaluate_work_item_dispatch(&pg, &worker_name).await {
                         warn!(error = %e, "work_item_dispatch tick failed");
                     }
@@ -858,6 +890,30 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         return Ok(());
     }
 
+    // SELF-VERIFY GATE — catch garbage at the source, before it costs a PR + CI
+    // + review cycle. "Has a diff" != "is good": empty stub files or
+    // non-compiling code must never reach the review drain (2026-07-20: an item
+    // committed three 0-byte files and the review drain was the FIRST place it
+    // was caught). On failure, requeue with the specific reason as context —
+    // the next attempt (warm or fresh) gets an actionable problem to fix —
+    // instead of opening a broken PR.
+    if let Err(reason) = self_verify_worktree(&worktree.worktree_path, &worktree.base_branch).await
+    {
+        warn!(
+            work_item_id = %item.work_item_id,
+            %reason,
+            "work_item_dispatch: self-verify gate rejected the build before PR — requeue with context"
+        );
+        requeue_or_fail(
+            &pg,
+            &item,
+            &format!("self-verify failed before opening PR: {reason}"),
+        )
+        .await?;
+        remove_worktree(&item.repo_path, &worktree.worktree_path)?;
+        return Ok(());
+    }
+
     let head_sha = git_head_sha(&worktree.worktree_path)?;
     push_branch(&item.repo_path, &worktree.task_branch)?;
     let pr_url = create_pr(&worktree.worktree_path, &item, &worktree).await?;
@@ -948,6 +1004,28 @@ async fn heartbeat_lease_once(work_item_id: Uuid) {
         work_item_id = %work_item_id,
         "work_item_dispatch: lease heartbeat FAILED after 3 tries — lease may go stale (watchdog could reap a LIVE build)"
     );
+}
+
+/// Bump `dispatch_tick_at` for every active lease on this host. Best-effort:
+/// if the update fails (e.g. the host has no computers row yet), the next tick
+/// retries. A missed tick eventually triggers the stale-dispatch-tick reaper.
+async fn bump_dispatch_tick_at(pg: &PgPool, worker_name: &str) {
+    if let Err(e) = sqlx::query(
+        "UPDATE work_item_leases
+            SET dispatch_tick_at = NOW()
+          WHERE computer_id = (SELECT id FROM computers WHERE name = $1)
+            AND released_at IS NULL",
+    )
+    .bind(worker_name)
+    .execute(pg)
+    .await
+    {
+        warn!(
+            worker_name = %worker_name,
+            error = %e,
+            "work_item_dispatch: failed to bump dispatch_tick_at"
+        );
+    }
 }
 
 /// Human-readable task branch: `feature/<title-slug>-<id4>` (operator
@@ -1177,10 +1255,10 @@ const MAX_DISPATCH_ATTEMPTS: i32 = 3;
 /// local attempt just burns another ~190s + slot cycle for a task that keeps
 /// hanging the same way, before finally reaching cloud. The CLOUD lane does NOT
 /// starve the heartbeat (verified: cloud attempts run 900s+ with no stale-reap).
-/// Only MECHANICAL tasks use the local lane (moderate/complex already
-/// `prefers_cloud_lane`), so this narrows the local exposure to ONE cheap try then
-/// the reliable cloud lane — unblocking the mechanical backlog with no heartbeat
-/// rearchitecture.
+/// Mechanical and moderate tasks use the local lane; complex or multi-file-heavy
+/// tasks already `prefers_cloud_lane`, so this narrows the local exposure to ONE
+/// cheap try then the reliable cloud lane — unblocking the backlog with no
+/// heartbeat rearchitecture.
 const ESCALATE_TO_CLOUD_AT: i32 = 1;
 
 /// Whether to try the cheap LOCAL codegen lane for this dispatch: only while UNDER
@@ -1445,13 +1523,49 @@ async fn release_slot_and_lease_tx(
     reason: &str,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE work_item_leases
-            SET lease_state = 'released',
-                released_at = NOW(),
-                release_reason = $3
-          WHERE work_item_id = $1
-            AND sub_agent_id = $2
-            AND released_at IS NULL",
+        "WITH releasing AS (
+             SELECT id, work_item_id, lease_state, endpoint, attempt, computer_id
+               FROM work_item_leases
+              WHERE work_item_id = $1
+                AND sub_agent_id = $2
+                AND released_at IS NULL
+              FOR UPDATE
+         ), released AS (
+             UPDATE work_item_leases l
+                SET lease_state = 'released',
+                    released_at = NOW(),
+                    release_reason = $3
+               FROM releasing r
+              WHERE l.id = r.id
+          RETURNING r.work_item_id,
+                    r.lease_state AS from_status,
+                    r.endpoint,
+                    r.attempt,
+                    l.release_reason,
+                    r.computer_id
+         )
+         INSERT INTO work_item_events
+             (work_item_id, from_status, to_status, computer, attempt, detail)
+         SELECT r.work_item_id,
+                r.from_status,
+                'lease_released',
+                c.name,
+                r.attempt,
+                jsonb_build_object(
+                    'event_type', 'lease_released',
+                    'endpoint', r.endpoint,
+                    'lane', CASE
+                        WHEN NULLIF(r.endpoint, '') IS NULL THEN NULL
+                        WHEN r.endpoint LIKE 'cloud:%'
+                          OR r.endpoint ~ '^(codex|claude|kimi|gemini|grok)(:|$)'
+                          THEN 'cloud'
+                        ELSE 'local'
+                    END,
+                    'attempt', r.attempt,
+                    'release_reason', r.release_reason
+                )
+           FROM released r
+           LEFT JOIN computers c ON c.id = r.computer_id",
     )
     .bind(item.work_item_id)
     .bind(item.sub_agent_id)
@@ -1659,6 +1773,18 @@ async fn record_dispatch_interaction(
             0,
         ),
     };
+
+    // Track the recurrence count for this error signature and populate the
+    // interaction-log column that the leader's self-heal tick aggregates.
+    let error_signature = error_text.as_deref().map(|err| {
+        let tracker = crate::log_signature::global_tracker();
+        let sig = tracker.signature_for(err);
+        // Also update the process-level tracker so recurrence counts are
+        // available for diagnostics even though the DB is the canonical store.
+        tracker.observe(err);
+        sig
+    });
+
     let rec = ff_db::InteractionRecord {
         channel: "work_item_dispatch".to_string(),
         request_text: dispatch_prompt(item),
@@ -1668,6 +1794,7 @@ async fn record_dispatch_interaction(
         latency_ms: i32::try_from(elapsed.as_millis()).ok(),
         outcome,
         error_text,
+        error_signature,
         worker_name: Some(worker_name.to_string()),
         endpoint: Some(format!("ff cli {backend}")),
         ..Default::default()
@@ -1727,9 +1854,9 @@ async fn run_ff_dispatch(
     // Lane 1: local codegen harness — but skip it once we've escalated to cloud
     // (stage 2, after ESCALATE_TO_CLOUD_AT local failures it has failed the same
     // way), when this node's local-codegen breaker is open (it's been failing),
-    // OR when the task is complexity-routed to cloud (moderate/complex or
-    // multi-file) — the local lane wedges/half-finishes on those, so we send
-    // them straight to the capable cloud CLI from attempt 0 instead of burning a
+    // OR when the task is complexity-routed to cloud (complex or multi-file-
+    // heavy) — the local lane wedges/half-finishes on those, so we send them
+    // straight to the capable cloud CLI from attempt 0 instead of burning a
     // wedge-prone local attempt first.
     if use_local_lane(item.attempts, lane1_breaker_open, item.prefers_cloud_lane()) {
         // Bound Lane 1 with a hard timeout so a hung local codegen harness fails
@@ -2120,6 +2247,28 @@ fn synthetic_output(summary: &str) -> Output {
     }
 }
 
+/// Environment variable holding an optional LAN git mirror URL. When set, fetches
+/// are routed through this mirror while pushes continue to target the canonical
+/// GitHub origin (`git remote set-url --push`).
+const LAN_MIRROR_URL_ENV: &str = "FORGEFLEET_LAN_MIRROR_URL";
+
+/// Max attempts for each fetch phase (mirror and direct fallback).
+const FETCH_ATTEMPTS: usize = 3;
+
+/// Bounded exponential backoff base: 500ms → 1s → 2s before each retry.
+const FETCH_BACKOFF_BASE_MS: u64 = 500;
+
+/// Return a small non-cryptographic jitter (0..max_ms) derived from the current
+/// time so concurrent retries across slots don't stampede the same remote.
+fn fetch_jitter(max_ms: u64) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let jitter_ms = nanos % max_ms.max(1);
+    Duration::from_millis(jitter_ms)
+}
+
 /// Prepare the slot's clone for a fresh build attempt. Fetch origin/<base>
 /// (same no-stale-base contract as ever: fail rather than branch from a stale
 /// ref), then a FULL clean — `reset --hard` + `clean -fd` — so leftovers from
@@ -2127,27 +2276,136 @@ fn synthetic_output(summary: &str) -> Output {
 /// `checkout -B wi/<id> origin/<base>`. `-B` resets the task branch even if a
 /// prior attempt left it behind, which is what makes retries collision-free
 /// without any worktree bookkeeping.
+///
+/// LAN mirror: if `FORGEFLEET_LAN_MIRROR_URL` is set, origin's fetch URL is
+/// pointed at the mirror and `--push` is pointed at the canonical GitHub URL.
+/// Mirror fetches are retried with exponential backoff + jitter; if they all
+/// fail we transparently fall back to a direct GitHub fetch.
 fn checkout_clone_for_build(repo_path: &Path, base_branch: &str, task_branch: &str) -> Result<()> {
     let base_ref = format!("origin/{base_branch}");
+
+    // Remember the canonical GitHub origin so we can restore it on fallback
+    // and configure --push correctly when a mirror is in play.
+    let github_url = run_git(
+        repo_path,
+        ["remote", "get-url", "origin"],
+        Duration::from_secs(30),
+    )
+    .ok()
+    .and_then(|o| {
+        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    });
+
+    // Optionally configure the LAN mirror: fetch from mirror, push to GitHub.
+    let mirror_url = std::env::var(LAN_MIRROR_URL_ENV).ok();
+    let mirror_configured = match (&mirror_url, &github_url) {
+        (Some(mirror), Some(github)) if mirror != github => {
+            run_git(
+                repo_path,
+                ["remote", "set-url", "origin", mirror],
+                Duration::from_secs(30),
+            )
+            .with_context(|| format!("set origin fetch URL to LAN mirror {mirror}"))?;
+            run_git(
+                repo_path,
+                ["remote", "set-url", "--push", "origin", github],
+                Duration::from_secs(30),
+            )
+            .with_context(|| format!("set origin push URL to GitHub {github}"))?;
+            info!(
+                mirror_url = mirror,
+                push_url = github,
+                "checkout_clone_for_build: configured LAN mirror fetch with GitHub push"
+            );
+            true
+        }
+        _ => false,
+    };
+
     let mut fetched = false;
-    for attempt in 0..3 {
-        match run_git(
-            repo_path,
-            ["fetch", "origin", base_branch],
-            Duration::from_secs(120),
-        ) {
-            Ok(_) => {
-                fetched = true;
-                break;
+
+    // Phase 1: fetch from the LAN mirror (if configured) with backoff + jitter.
+    if mirror_configured {
+        for attempt in 0..FETCH_ATTEMPTS {
+            if attempt > 0 {
+                let backoff =
+                    Duration::from_millis(FETCH_BACKOFF_BASE_MS * (1u64 << (attempt - 1)));
+                std::thread::sleep(backoff + fetch_jitter(200));
             }
-            Err(e) => {
-                warn!(base_branch, attempt, error = %e, "checkout_clone_for_build: fetch origin failed; retrying")
+            match run_git(
+                repo_path,
+                ["fetch", "origin", base_branch],
+                Duration::from_secs(120),
+            ) {
+                Ok(_) => {
+                    fetched = true;
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        base_branch,
+                        attempt,
+                        error = %e,
+                        "checkout_clone_for_build: LAN mirror fetch failed; retrying"
+                    )
+                }
             }
         }
     }
+
+    // Phase 2: fallback to direct GitHub fetch, restoring the canonical origin.
+    if !fetched {
+        if mirror_configured {
+            if let Some(github) = &github_url {
+                run_git(
+                    repo_path,
+                    ["remote", "set-url", "origin", github],
+                    Duration::from_secs(30),
+                )
+                .with_context(|| format!("restore origin URL to GitHub {github}"))?;
+                // Push should also use GitHub now that we're not mirroring.
+                let _ = run_git(
+                    repo_path,
+                    ["remote", "set-url", "--push", "origin", github],
+                    Duration::from_secs(30),
+                );
+            }
+            warn!(
+                base_branch,
+                "checkout_clone_for_build: LAN mirror fetch failed; falling back to direct GitHub fetch"
+            );
+        }
+        for attempt in 0..FETCH_ATTEMPTS {
+            if attempt > 0 {
+                let backoff =
+                    Duration::from_millis(FETCH_BACKOFF_BASE_MS * (1u64 << (attempt - 1)));
+                std::thread::sleep(backoff + fetch_jitter(200));
+            }
+            match run_git(
+                repo_path,
+                ["fetch", "origin", base_branch],
+                Duration::from_secs(120),
+            ) {
+                Ok(_) => {
+                    fetched = true;
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        base_branch,
+                        attempt,
+                        error = %e,
+                        "checkout_clone_for_build: direct fetch failed; retrying"
+                    )
+                }
+            }
+        }
+    }
+
     if !fetched {
         bail!(
-            "checkout_clone_for_build: could not fetch origin/{base_branch} in 3 tries — \
+            "checkout_clone_for_build: could not fetch origin/{base_branch} in {FETCH_ATTEMPTS} tries — \
              refusing to build from a possibly-stale base"
         );
     }
@@ -2451,6 +2709,71 @@ fn git_head_sha(worktree_path: &Path) -> Result<String> {
         Duration::from_secs(30),
     )?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Self-verify a built worktree BEFORE it becomes a PR — the cheap local checks
+/// a competent engineer runs before calling a change "done": no empty /
+/// whitespace-only added files, and (best-effort) the tree still compiles.
+/// Returns `Err(reason)` on the first problem so the retry gets actionable
+/// context. Catching garbage here saves a PR + CI + review cycle (2026-07-20:
+/// an item committed three 0-byte files and reached the review drain).
+async fn self_verify_worktree(
+    worktree_path: &Path,
+    base_branch: &str,
+) -> std::result::Result<(), String> {
+    // 1) Reject empty / whitespace-only ADDED files (instant, catches the
+    //    empty-stub failure mode directly).
+    let range = format!("{base_branch}...HEAD");
+    let out = run_git(
+        worktree_path,
+        ["diff", "--diff-filter=A", "--name-only", &range],
+        Duration::from_secs(30),
+    )
+    .map_err(|e| format!("git diff for self-verify failed: {e}"))?;
+    for f in String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
+        let full = worktree_path.join(f);
+        let empty = match std::fs::read(&full) {
+            Ok(bytes) => bytes.is_empty() || bytes.iter().all(u8::is_ascii_whitespace),
+            Err(_) => false, // unreadable/deleted — not this gate's concern
+        };
+        if empty {
+            return Err(format!("added file is empty or whitespace-only: {f}"));
+        }
+    }
+
+    // 2) Compile check — best-effort and bounded. Only an ACTUAL compile error
+    //    blocks the PR; a tooling error or timeout must not (never freeze the
+    //    pipeline on check infra). Skipped for a non-Rust repo.
+    if !worktree_path.join("Cargo.toml").exists() {
+        return Ok(());
+    }
+    let check = tokio::time::timeout(
+        Duration::from_secs(300),
+        tokio::process::Command::new("cargo")
+            .args(["check", "--quiet"])
+            .current_dir(worktree_path)
+            .output(),
+    )
+    .await;
+    if let Ok(Ok(o)) = check {
+        if !o.status.success() {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if let Some(err_line) = stderr
+                .lines()
+                .find(|l| l.contains("error[") || l.trim_start().starts_with("error:"))
+            {
+                return Err(format!(
+                    "cargo check failed: {}",
+                    err_line.trim().chars().take(200).collect::<String>()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn push_branch(repo_path: &Path, task_branch: &str) -> Result<()> {
@@ -2944,7 +3267,7 @@ mod tests {
             "#62: 2nd attempt goes cloud"
         );
         assert!(!use_local_lane(2, false, false));
-        // A complexity-routed (moderate/complex) task never touches the local lane.
+        // A complexity-routed (complex or multi-file-heavy) task never touches the local lane.
         assert!(!use_local_lane(0, false, true));
         // Open local-codegen breaker → skip local even on attempt 0.
         assert!(!use_local_lane(0, true, false));
@@ -3061,11 +3384,13 @@ mod tests {
         // Mechanical single-file → cheap local lane.
         assert!(!task_prefers_cloud_lane("mechanical", 1));
         assert!(!task_prefers_cloud_lane("mechanical", 0));
-        // Non-mechanical complexity → cloud from attempt 0 (the wedge-avoidance).
-        assert!(task_prefers_cloud_lane("moderate", 1));
+        // Moderate tasks that are not multi-file-heavy try local first.
+        assert!(!task_prefers_cloud_lane("moderate", 1));
+        assert!(!task_prefers_cloud_lane("moderate", 3));
+        // Complex tasks bypass the local lane regardless of file count.
         assert!(task_prefers_cloud_lane("complex", 0));
-        // Multi-file even if labelled mechanical → cloud (local lane fumbles them).
-        assert!(task_prefers_cloud_lane("mechanical", 3));
+        // Multi-file-heavy tasks (above the threshold) go cloud even if mechanical.
+        assert!(task_prefers_cloud_lane("mechanical", 4));
         // Unknown/empty complexity is treated as mechanical (safe default).
         assert!(!task_prefers_cloud_lane("", 1));
     }
