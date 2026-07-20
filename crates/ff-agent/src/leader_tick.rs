@@ -971,9 +971,7 @@ impl LeaderTick {
             // bug we already dispatched a fix for" for operational logging.
             let is_recurring = {
                 let mut state = self.self_heal_state.lock().unwrap();
-                let reappearing = state.is_reappearing(&sig, "detected");
-                state.track(&sig);
-                reappearing
+                state.record_detected(&sig)
             };
             if is_recurring {
                 tracing::info!(

@@ -47,6 +47,14 @@ impl SelfHealState {
     pub fn is_reappearing(&self, signature: &str, current_status: &str) -> bool {
         self.is_tracked(signature) && current_status == "detected"
     }
+
+    /// Record a detected bug signature and report whether it was already seen.
+    ///
+    /// Keeping the check and insertion together prevents callers from
+    /// accidentally checking for recurrence without updating the state.
+    pub fn record_detected(&mut self, signature: &str) -> bool {
+        !self.track(signature)
+    }
 }
 
 /// Map a self-heal tier to a `fleet_tasks` priority.
@@ -1035,5 +1043,14 @@ mod tests {
         assert!(!state.is_reappearing("recurring-sig", "fixing"));
         assert!(!state.is_reappearing("recurring-sig", "verified"));
         assert!(!state.is_reappearing("unknown-sig", "detected"));
+    }
+
+    #[test]
+    fn self_heal_state_records_detected_signatures_for_rearming() {
+        let mut state = SelfHealState::new();
+
+        assert!(!state.record_detected("recurring-sig"));
+        assert!(state.is_tracked("recurring-sig"));
+        assert!(state.record_detected("recurring-sig"));
     }
 }
