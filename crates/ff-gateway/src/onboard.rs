@@ -861,7 +861,15 @@ pub async fn secret_peek(
         ));
     }
     // Whitelist which keys are allowed — never expose arbitrary secrets.
-    let allowed = ["github.venkat_pat", "github.default_owner"];
+    let allowed = [
+        "github.venkat_pat",
+        "github.default_owner",
+        "github_ssh_id_venkat_priv",
+        "github_ssh_id_venkat_pub",
+        "anthropic.oauth_token",
+        "openai.oauth_token",
+        "moonshot.oauth_token",
+    ];
     if !allowed.contains(&q.key.as_str()) {
         return Err((
             StatusCode::FORBIDDEN,
