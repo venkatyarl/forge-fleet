@@ -168,13 +168,13 @@ mod tests {
             working_dir: dir.to_path_buf(),
             session_id: "test-session".to_string(),
             shell_state: Arc::new(Mutex::new(Default::default())),
-            edit_lock: Arc::new(Mutex::new(())),
+            edit_lock: crate::tools::checkout_edit_lock(dir),
             pg_pool: None,
         }
     }
 
-    /// Concurrent Edit calls in the same session must not lose updates: each
-    /// read-modify-write holds the session edit lock, so every replacement
+    /// Concurrent Edit calls in the same checkout must not lose updates: each
+    /// read-modify-write holds the checkout edit lock, so every replacement
     /// survives even when the agent loop runs the calls in parallel.
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_edits_are_serialized() {
@@ -218,5 +218,14 @@ mod tests {
                 "lost update: new{i:02} missing from {final_content:?}"
             );
         }
+    }
+
+    #[test]
+    fn edit_lock_is_shared_by_sessions_in_the_same_checkout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = test_ctx(dir.path());
+        let second = test_ctx(dir.path());
+
+        assert!(Arc::ptr_eq(&first.edit_lock, &second.edit_lock));
     }
 }

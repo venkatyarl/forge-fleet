@@ -129,9 +129,9 @@ pub struct AgentToolContext {
     pub session_id: String,
     /// Persistent shell state (cwd + env vars) across Bash invocations.
     pub shell_state: Arc<Mutex<ShellState>>,
-    /// Serializes file mutations (Edit/Write/NotebookEdit) within this agent
-    /// session. The agent loop executes a turn's tool calls in parallel, so
-    /// unsynchronized read-modify-write edits can lose each other's updates.
+    /// Serializes file mutations (Edit/Write/NotebookEdit) within this checkout.
+    /// Multiple sessions can share a worktree during one build, so the lock is
+    /// keyed by working directory rather than session ID.
     pub edit_lock: Arc<Mutex<()>>,
     /// Optional Postgres pool for audit logging and security checks.
     pub pg_pool: Option<sqlx::PgPool>,
@@ -203,24 +203,28 @@ pub fn session_shell_state(session_id: &str) -> Arc<Mutex<ShellState>> {
         .clone()
 }
 
-/// Clear the shell state (and edit lock) for a session (on session end).
+/// Clear the shell state for a session (on session end).
 pub fn clear_session_shell_state(session_id: &str) {
     SHELL_STATES.remove(session_id);
-    EDIT_LOCKS.remove(session_id);
 }
 
-/// Global registry of per-session edit locks, so file-mutating tools
-/// (Edit/Write/NotebookEdit) in the same session serialize their
-/// read-modify-write even though tool calls execute in parallel.
-static EDIT_LOCKS: std::sync::LazyLock<DashMap<String, Arc<Mutex<()>>>> =
+/// Global registry of per-checkout edit locks. Weak references avoid retaining
+/// every checkout path seen by a long-running agent after its sessions finish.
+static EDIT_LOCKS: std::sync::LazyLock<DashMap<PathBuf, std::sync::Weak<Mutex<()>>>> =
     std::sync::LazyLock::new(DashMap::new);
 
-/// Get or create the edit-serialization lock for the given session.
-pub fn session_edit_lock(session_id: &str) -> Arc<Mutex<()>> {
-    EDIT_LOCKS
-        .entry(session_id.to_string())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
+/// Get or create the edit-serialization lock for a checkout.
+pub fn checkout_edit_lock(working_dir: &std::path::Path) -> Arc<Mutex<()>> {
+    let key = std::fs::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf());
+    EDIT_LOCKS.retain(|_, lock| lock.strong_count() > 0);
+    let mut entry = EDIT_LOCKS.entry(key).or_default();
+    if let Some(lock) = entry.upgrade() {
+        return lock;
+    }
+
+    let lock = Arc::new(Mutex::new(()));
+    *entry = Arc::downgrade(&lock);
+    lock
 }
 
 // ---------------------------------------------------------------------------
