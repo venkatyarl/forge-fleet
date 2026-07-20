@@ -956,6 +956,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "merge_queue_review_fields",
         sql: schema::SCHEMA_V194_MERGE_QUEUE_REVIEW_FIELDS,
     },
+    PgMigration {
+        version: 195,
+        name: "bootstrap_v161_v1_baseline",
+        sql: schema::SCHEMA_V195_BOOTSTRAP_V161_V1_BASELINE,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

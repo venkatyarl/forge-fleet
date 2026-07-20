@@ -11062,6 +11062,19 @@ ALTER TABLE work_item_merge_queue
     ADD COLUMN IF NOT EXISTS review_reason     TEXT;
 "#;
 
+/// V195 — Record the squashed v161 bootstrap as baseline generation v1.
+pub const SCHEMA_V195_BOOTSTRAP_V161_V1_BASELINE: &str = r#"
+CREATE TABLE IF NOT EXISTS _migration_baselines (
+    generation       INTEGER PRIMARY KEY,
+    migration_version INTEGER NOT NULL,
+    name             TEXT NOT NULL
+);
+
+INSERT INTO _migration_baselines (generation, migration_version, name)
+VALUES (1, 161, 'bootstrap_v161')
+ON CONFLICT (generation) DO NOTHING;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

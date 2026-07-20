@@ -91,6 +91,14 @@ async fn migration_fresh_bootstrap_starts_from_v161_baseline_and_is_idempotent()
         "v161 (canonical_github_alias) must be recorded in _migrations after fresh bootstrap"
     );
 
+    let baseline_version: i32 = sqlx::query_scalar(
+        "SELECT migration_version FROM _migration_baselines WHERE generation = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query v1 bootstrap baseline");
+    assert_eq!(baseline_version, 161);
+
     // Second run must be a no-op and must not fail with a replay conflict on
     // the _migrations primary key.
     let second_version = run().await;
