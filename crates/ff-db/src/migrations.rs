@@ -886,6 +886,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_capacity_view",
         sql: schema::SCHEMA_V180_MODEL_CAPACITY_VIEW,
     },
+    PgMigration {
+        version: 181,
+        name: "cloud_budget_buckets",
+        sql: schema::SCHEMA_V181_CLOUD_BUDGET_BUCKETS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
