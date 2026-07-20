@@ -10537,6 +10537,43 @@ CREATE INDEX IF NOT EXISTS idx_work_item_events_item_time
     ON work_item_events (work_item_id, occurred_at DESC);
 "#;
 
+/// V182 — In-place dispatch review (Pillar-4 v2).
+///
+/// The dispatch reviews a built change IN the warm build workspace before it
+/// enters the merge queue. These columns record who built and who reviewed
+/// (rule: never the same model), the verdict + rationale, and the review's
+/// start/complete timestamps — the latency signal that makes reviewer routing
+/// data-driven via `v_reviewer_stats` (folds into the fleet velocity views:
+/// per-reviewer volume, verdict quality vs downstream merge outcome, and
+/// average latency, which weights the cloud-trio round-robin).
+pub const SCHEMA_V182_MERGE_QUEUE_INPLACE_REVIEW: &str = r#"
+ALTER TABLE work_item_merge_queue
+    ADD COLUMN IF NOT EXISTS builder             TEXT,
+    ADD COLUMN IF NOT EXISTS reviewer            TEXT,
+    ADD COLUMN IF NOT EXISTS review_verdict      TEXT,
+    ADD COLUMN IF NOT EXISTS review_reason       TEXT,
+    ADD COLUMN IF NOT EXISTS review_started_at   TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS review_completed_at TIMESTAMPTZ;
+
+CREATE OR REPLACE VIEW v_reviewer_stats AS
+SELECT
+    reviewer,
+    COUNT(*)                                                           AS reviews,
+    COUNT(*) FILTER (WHERE review_verdict = 'approve')                 AS approvals,
+    COUNT(*) FILTER (WHERE review_verdict = 'reject')                  AS rejections,
+    COUNT(*) FILTER (WHERE review_verdict = 'approve'
+                       AND status = 'merged')                          AS approved_then_merged,
+    COUNT(*) FILTER (WHERE review_verdict = 'approve'
+                       AND status = 'failed')                          AS approved_then_failed,
+    AVG(EXTRACT(EPOCH FROM (review_completed_at - review_started_at))) AS avg_latency_secs,
+    MAX(review_completed_at)                                           AS last_review_at
+FROM work_item_merge_queue
+WHERE reviewer IS NOT NULL
+  AND review_started_at IS NOT NULL
+  AND review_completed_at IS NOT NULL
+GROUP BY reviewer;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

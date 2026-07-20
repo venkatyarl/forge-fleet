@@ -881,6 +881,13 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "work_item_events",
         sql: schema::SCHEMA_V179_WORK_ITEM_EVENTS,
     },
+    // V180 (several claimants) and V181 (merge_queue_review_claims /
+    // wal_archiving) are already claimed by in-flight branches — skip to 182.
+    PgMigration {
+        version: 182,
+        name: "merge_queue_inplace_review",
+        sql: schema::SCHEMA_V182_MERGE_QUEUE_INPLACE_REVIEW,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
