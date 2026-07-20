@@ -312,7 +312,10 @@ async fn review_ladder(pg: &PgPool, pr_url: &str, prompt: &str) -> Result<(bool,
     // 30B REJECT: trust it, spend nothing. Item fails → rebuilds locally with
     // this reason as context — the free "local coder fixes it" path.
     if !local_ok {
-        return Ok((false, format!("local:{local_model} rejected: {local_reason}")));
+        return Ok((
+            false,
+            format!("local:{local_model} rejected: {local_reason}"),
+        ));
     }
 
     // 30B APPROVE: confirm before merging (a weak 30B can miss a subtle bug).
