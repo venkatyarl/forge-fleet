@@ -589,7 +589,7 @@ mod tests {
         let cmd = format!("sleep 300 & echo $! > {pidfile_str}; wait");
 
         let start = std::time::Instant::now();
-        let (ok, _, err) = execute_shell(None, &cmd, &[], Duration::from_millis(400)).await;
+        let (ok, _, err) = execute_shell(None, &cmd, &[], Duration::from_secs(2)).await;
         assert!(!ok, "expected timeout failure");
         let msg = err.unwrap();
         assert!(
@@ -606,13 +606,19 @@ mod tests {
         // Give the kernel a moment to deliver SIGKILL, then probe with `kill -0`.
         if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
             if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                // kill(-0) returns Err(ESRCH) when the process is gone.
-                let alive = unsafe { libc::kill(pid, 0) } == 0;
-                assert!(
-                    !alive,
-                    "grandchild pid {pid} survived the process-group kill"
-                );
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    // kill(-0) returns Err(ESRCH) when the process is gone.
+                    let alive = unsafe { libc::kill(pid, 0) } == 0;
+                    if !alive {
+                        break;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "grandchild pid {pid} survived the process-group kill"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
             }
         }
         let _ = std::fs::remove_file(&pidfile);

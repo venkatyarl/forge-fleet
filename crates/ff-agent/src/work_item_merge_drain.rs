@@ -13,6 +13,8 @@
 
 use anyhow::{Context, Result};
 use sqlx::PgPool;
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -114,12 +116,34 @@ pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
     // Mark that we're watching this PR's CI (idempotent).
     ff_db::pg_mark_merge_ci_running(pg, item.id).await?;
 
-    match pr_ci_state(&pr_url).await {
+    let ci_state = pr_ci_state(&pr_url).await;
+    if let CiState::Failed(failure) = &ci_state {
+        match rerun_failed_ci_once(&pr_url, failure).await {
+            Ok(true) => {
+                // GitHub can briefly keep reporting the stale failed check
+                // snapshot after accepting a rerun. Defer this PR so the next
+                // drain tick evaluates the fresh attempt instead of failing the
+                // work item on the pre-rerun state.
+                return Ok(0);
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    pr = %pr_url,
+                    error = %e,
+                    "merge_drain: failed CI rerun unavailable — evaluating original failure"
+                );
+            }
+        }
+    }
+
+    match ci_state {
         CiState::Pending => {
             // Still running — leave it; we'll re-check next tick.
             Ok(0)
         }
-        CiState::Failed(reason) => {
+        CiState::Failed(failure) => {
+            let reason = failure.reason;
             warn!(pr = %pr_url, %reason, "merge_drain: PR CI failed — marking work_item failed");
             ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &reason).await?;
             Ok(0)
@@ -581,7 +605,12 @@ async fn automerge_enabled(pg: &PgPool) -> bool {
 enum CiState {
     Pending,
     Success,
-    Failed(String),
+    Failed(FailedCi),
+}
+
+struct FailedCi {
+    reason: String,
+    run_ids: Vec<u64>,
 }
 
 /// GitHub's view of how the PR head relates to its base branch.
@@ -662,33 +691,53 @@ fn update_branch_api_path(pr_url: &str) -> Option<String> {
 /// (or gh transient error) is treated as Pending so we never merge prematurely.
 async fn pr_ci_state(pr_url: &str) -> CiState {
     let mut cmd = gh_cmd().await;
-    cmd.args(["pr", "checks", pr_url, "--json", "state"]);
+    cmd.args(["pr", "checks", pr_url, "--json", "state,link"]);
     let out = match cmd.output().await {
         Ok(o) => o,
-        Err(e) => return CiState::Failed(format!("gh pr checks spawn: {e}")),
+        Err(e) => {
+            return CiState::Failed(FailedCi {
+                reason: format!("gh pr checks spawn: {e}"),
+                run_ids: vec![],
+            });
+        }
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
     // gh exits non-zero when checks are failing OR still pending; rely on the
     // JSON states rather than the exit code.
-    let states: Vec<String> = serde_json::from_str::<serde_json::Value>(&stdout)
+    let checks = serde_json::from_str::<serde_json::Value>(&stdout)
         .ok()
-        .and_then(|v| {
-            v.as_array().map(|a| {
-                a.iter()
-                    .filter_map(|c| c.get("state").and_then(|s| s.as_str()).map(str::to_string))
-                    .collect()
-            })
-        })
+        .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
+    let states: Vec<String> = checks
+        .iter()
+        .filter_map(|c| c.get("state").and_then(|s| s.as_str()).map(str::to_string))
+        .collect();
 
     if states.is_empty() {
         return CiState::Pending; // no checks reported yet
     }
-    if states
-        .iter()
-        .any(|s| matches!(s.as_str(), "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT"))
-    {
-        return CiState::Failed(format!("a check is {states:?}"));
+    let has_failed = states.iter().any(|s| is_failed_ci_state(s));
+    if has_failed {
+        let mut run_ids = Vec::new();
+        for check in &checks {
+            let state = check.get("state").and_then(|s| s.as_str()).unwrap_or("");
+            if !is_failed_ci_state(state) {
+                continue;
+            }
+            if let Some(run_id) = check
+                .get("link")
+                .and_then(|l| l.as_str())
+                .and_then(extract_actions_run_id)
+            {
+                if !run_ids.contains(&run_id) {
+                    run_ids.push(run_id);
+                }
+            }
+        }
+        return CiState::Failed(FailedCi {
+            reason: format!("a check is {states:?}"),
+            run_ids,
+        });
     }
     if states
         .iter()
@@ -697,6 +746,77 @@ async fn pr_ci_state(pr_url: &str) -> CiState {
         return CiState::Pending;
     }
     CiState::Success
+}
+
+fn is_failed_ci_state(state: &str) -> bool {
+    matches!(state, "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT")
+}
+
+fn extract_actions_run_id(link: &str) -> Option<u64> {
+    let rest = link.split("/actions/runs/").nth(1)?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+static CI_RERUN_ATTEMPTS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+async fn rerun_failed_ci_once(pr_url: &str, failure: &FailedCi) -> Result<bool> {
+    if failure.run_ids.is_empty() {
+        return Ok(false);
+    }
+
+    let (owner, repo) =
+        parse_owner_repo(pr_url).with_context(|| format!("unrecognized PR url: {pr_url}"))?;
+    let repo_arg = format!("{owner}/{repo}");
+    let mut run_ids = Vec::new();
+    {
+        let mut attempts = CI_RERUN_ATTEMPTS
+            .lock()
+            .expect("CI rerun attempt set is never poisoned");
+        for run_id in &failure.run_ids {
+            if attempts.insert(format!("{pr_url}#{run_id}")) {
+                run_ids.push(*run_id);
+            }
+        }
+    }
+
+    let mut reran_any = false;
+    for run_id in run_ids {
+        let mut cmd = gh_cmd().await;
+        cmd.args([
+            "run",
+            "rerun",
+            &run_id.to_string(),
+            "--failed",
+            "--repo",
+            &repo_arg,
+        ]);
+        let out = cmd
+            .output()
+            .await
+            .with_context(|| format!("spawn gh run rerun {run_id}"))?;
+        if out.status.success() {
+            reran_any = true;
+            info!(
+                pr = %pr_url,
+                run_id,
+                "merge_drain: reran failed CI jobs once before failing PR"
+            );
+        } else {
+            warn!(
+                pr = %pr_url,
+                run_id,
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "merge_drain: gh run rerun --failed failed"
+            );
+        }
+    }
+    Ok(reran_any)
 }
 
 /// `gh pr merge <url> --squash --delete-branch` (the project policy — always
@@ -918,7 +1038,10 @@ pub fn spawn_work_item_merge_drain(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_review_response, served_by_480b, update_branch_api_path};
+    use super::{
+        extract_actions_run_id, is_failed_ci_state, parse_review_response, served_by_480b,
+        update_branch_api_path,
+    };
 
     #[test]
     fn pr_url_maps_to_update_branch_api_path() {
@@ -964,5 +1087,35 @@ mod tests {
         ] {
             assert!(update_branch_api_path(bad).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn failed_ci_states_match_github_terminal_failures() {
+        for failed in ["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT"] {
+            assert!(is_failed_ci_state(failed), "{failed}");
+        }
+        for other in ["SUCCESS", "IN_PROGRESS", "QUEUED", "PENDING", "SKIPPED"] {
+            assert!(!is_failed_ci_state(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn actions_run_id_is_extracted_from_check_links() {
+        assert_eq!(
+            extract_actions_run_id("https://github.com/o/r/actions/runs/123456789/job/987"),
+            Some(123456789)
+        );
+        assert_eq!(
+            extract_actions_run_id("https://github.com/o/r/actions/runs/42"),
+            Some(42)
+        );
+        assert_eq!(
+            extract_actions_run_id("https://github.com/o/r/pull/1"),
+            None
+        );
+        assert_eq!(
+            extract_actions_run_id("https://github.com/o/r/actions/runs/not-a-number"),
+            None
+        );
     }
 }
