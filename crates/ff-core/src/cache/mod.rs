@@ -9,6 +9,8 @@ pub use crate::artifact_fetch::{
     ArtifactCacheManager, FetchSource, LanPeer, default_artifact_cache_root, sha256_file,
 };
 
+pub mod eviction;
+
 #[cfg(test)]
 mod tests {
     use super::*;
