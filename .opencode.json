@@ -1,13 +1,8 @@
 {
   "mcpServers": {
-    "code-review-graph": {
-      "command": "uvx",
-      "args": [
-        "code-review-graph",
-        "serve"
-      ],
-      "type": "stdio",
-      "env": []
+    "forgefleet": {
+      "type": "http",
+      "url": "http://localhost:50001/mcp"
     }
   }
 }

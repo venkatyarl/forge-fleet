@@ -1,11 +1,8 @@
 {
   "mcpServers": {
-    "context-mode": {
-      "command": "npx",
-      "args": [
-        "context-mode"
-      ],
-      "type": "stdio"
+    "forgefleet": {
+      "type": "http",
+      "url": "http://localhost:50001/mcp"
     }
   }
 }
