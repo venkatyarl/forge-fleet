@@ -1747,6 +1747,7 @@ dependencies = [
  "ff-brain",
  "ff-core",
  "ff-db",
+ "ff-deploy",
  "ff-pulse",
  "ff-voice",
  "futures",

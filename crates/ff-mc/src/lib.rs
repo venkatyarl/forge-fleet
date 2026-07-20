@@ -39,6 +39,7 @@ pub mod operational_api;
 pub mod operational_portfolio;
 pub mod portfolio;
 pub mod review_item;
+pub mod runner;
 pub mod sprint;
 pub mod task_group;
 pub mod work_item;

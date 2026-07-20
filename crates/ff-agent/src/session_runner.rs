@@ -224,10 +224,14 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            // Fleet tasks run on local models: label the override as
+            // `local:<catalog_id>`, or plain `local` when none was recorded,
+            // so session rows never land with an empty engine.
             let engine = step_memory
                 .get("model_override")
                 .and_then(Value::as_str)
-                .map(str::to_string);
+                .map(crate::llm_attribution::engine_label)
+                .unwrap_or_else(|| "local".to_string());
             // task_result may be a bare string or an object with a text-ish field.
             let response_text = match &task_result {
                 Some(Value::String(s)) => s.clone(),
@@ -246,7 +250,7 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
                 channel: "session".to_string(),
                 request_text,
                 route_decision: serde_json::json!({ "role": role }),
-                engine,
+                engine: Some(engine),
                 response_text,
                 outcome: new_status.to_string(),
                 error_text: task_error.clone(),

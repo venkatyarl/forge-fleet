@@ -83,6 +83,7 @@ pub mod leader_tick;
 pub mod learning;
 pub mod lease_takeover;
 pub mod legacy_daemon_reaper;
+pub mod llm_attribution;
 pub mod local_healer;
 pub mod log_analysis_worker;
 pub mod log_rotate;
