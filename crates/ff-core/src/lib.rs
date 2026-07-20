@@ -16,6 +16,7 @@ pub mod artifact_fetch;
 pub mod audit;
 pub mod build_version;
 pub mod chaos;
+pub mod ci_trigger;
 pub mod circuit_breaker;
 pub mod computer;
 pub mod config;
@@ -52,6 +53,7 @@ pub use artifact_fetch::{ArtifactCacheManager, FetchSource, LanPeer, default_art
 pub use chaos::{
     ChaosConfig, ChaosEngine, ChaosHooks, Simulation, SimulationId, SimulationState, SimulationType,
 };
+pub use ci_trigger::CiPipelineTrigger;
 pub use circuit_breaker::{
     BackendId, CircuitBreaker, CircuitBreakerConfig, CircuitBreakerRegistry,
     CircuitBreakerSnapshot, CircuitState,
