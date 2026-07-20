@@ -23,9 +23,12 @@ pub mod strategy;
 
 pub use config::DeployConfig;
 pub use daemon::{ActiveLease, RestartReport, restart_with_lease_drain};
-pub use deploy::{LeaseSource, RestartCoordinator};
+pub use deploy::{
+    LeaseSource, RestartCoordinator, git_fetch_and_reset_hard, git_stash_dirty_tree,
+    git_tree_is_dirty,
+};
 pub use deployer::{DeploymentAdapter, DeploymentOrchestrator, DeploymentReport, StepOutcome};
-pub use git_utils::git_tree_is_dirty;
+
 pub use health_gate::{
     HealthGate, HealthGateConfig, HealthGateEvaluation, HealthGateStatus, HealthSnapshot,
 };
