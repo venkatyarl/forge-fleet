@@ -1,5 +1,79 @@
 use crate::{RESET, YELLOW, whoami_tag};
 use anyhow::{Context, Result};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct OnePasswordItem {
+    #[serde(default)]
+    fields: Vec<OnePasswordField>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct OnePasswordField {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn parse_onepassword_mappings(mappings: &[String]) -> Result<Vec<(&str, &str)>> {
+    mappings
+        .iter()
+        .map(|mapping| {
+            let (key, label) = mapping.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("invalid --map '{mapping}'; expected fleet_key=field_label")
+            })?;
+            let (key, label) = (key.trim(), label.trim());
+            if key.is_empty() || label.is_empty() {
+                anyhow::bail!("invalid --map '{mapping}'; neither side may be empty");
+            }
+            Ok((key, label))
+        })
+        .collect()
+}
+
+fn onepassword_client() -> Result<(reqwest::Client, String)> {
+    let host = std::env::var("OP_CONNECT_HOST")
+        .context("OP_CONNECT_HOST is required for 1Password Connect")?;
+    let token = std::env::var("OP_CONNECT_TOKEN")
+        .context("OP_CONNECT_TOKEN is required for 1Password Connect")?;
+    let mut headers = HeaderMap::new();
+    let auth = HeaderValue::from_str(&format!("Bearer {token}"))
+        .context("OP_CONNECT_TOKEN is not a valid HTTP header value")?;
+    headers.insert(AUTHORIZATION, auth);
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .context("build 1Password HTTP client")?;
+    Ok((client, host.trim_end_matches('/').to_string()))
+}
+
+async fn fetch_onepassword_item(
+    vault: &str,
+    item: &str,
+) -> Result<(reqwest::Client, String, OnePasswordItem)> {
+    let (client, host) = onepassword_client()?;
+    let url = format!("{host}/v1/vaults/{vault}/items/{item}");
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .context("request 1Password item")?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "1Password item request failed with HTTP {}",
+            response.status()
+        );
+    }
+    let item = response.json().await.context("decode 1Password item")?;
+    Ok((client, url, item))
+}
 
 /// Resolve the value for `ff secrets set`: from the positional arg, or from
 /// stdin when `--stdin` is passed or no value arg was given. Reading from stdin
@@ -168,6 +242,76 @@ pub async fn handle_secrets(cmd: crate::SecretsCommand) -> Result<()> {
                 report.already_expired.len(),
             );
         }
+        crate::SecretsCommand::ImportOnePassword {
+            vault,
+            item,
+            mappings,
+        } => {
+            let mappings = parse_onepassword_mappings(&mappings)?;
+            let (_, _, source) = fetch_onepassword_item(&vault, &item).await?;
+            let who = whoami_tag();
+            // Resolve every requested field before writing any of them so a
+            // miss cannot leave the fleet with a partially imported item.
+            let values = mappings
+                .iter()
+                .map(|(key, label)| {
+                    let value = source
+                        .fields
+                        .iter()
+                        .find(|field| field.label == *label)
+                        .and_then(|field| field.value.as_deref())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("1Password item has no value for field '{label}'")
+                        })?;
+                    Ok((*key, *label, value))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (key, label, value) in values {
+                ff_db::pg_set_secret(
+                    &pool,
+                    key,
+                    value,
+                    Some(&format!("Imported from 1Password field '{label}'")),
+                    Some(&who),
+                )
+                .await?;
+            }
+            println!("Imported {} secret(s) from 1Password", mappings.len());
+        }
+        crate::SecretsCommand::ExportOnePassword {
+            vault,
+            item,
+            mappings,
+        } => {
+            let mappings = parse_onepassword_mappings(&mappings)?;
+            let (client, url, mut destination) = fetch_onepassword_item(&vault, &item).await?;
+            for (key, label) in &mappings {
+                let value = ff_db::pg_get_secret(&pool, key)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("no fleet secret set for key '{key}'"))?;
+                let field = destination
+                    .fields
+                    .iter_mut()
+                    .find(|field| field.label == *label)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("1Password item has no field labeled '{label}'")
+                    })?;
+                field.value = Some(value);
+            }
+            let response = client
+                .put(url)
+                .json(&destination)
+                .send()
+                .await
+                .context("update 1Password item")?;
+            if !response.status().is_success() {
+                anyhow::bail!(
+                    "1Password item update failed with HTTP {}",
+                    response.status()
+                );
+            }
+            println!("Exported {} secret(s) to 1Password", mappings.len());
+        }
         crate::SecretsCommand::DisableGate { key, hours, reason } => {
             if reason.trim().is_empty() {
                 anyhow::bail!(
@@ -226,5 +370,35 @@ mod tests {
         assert!(v["description"].is_null());
         assert!(v["updated_by"].is_null());
         assert_eq!(v["key"], "orphan_key");
+    }
+
+    #[test]
+    fn onepassword_mappings_are_explicit_and_validated() {
+        let mappings = vec![
+            "github.token=credential".to_string(),
+            "api_key=API key".to_string(),
+        ];
+        assert_eq!(
+            parse_onepassword_mappings(&mappings).unwrap(),
+            vec![("github.token", "credential"), ("api_key", "API key")]
+        );
+        assert!(parse_onepassword_mappings(&["missing-separator".into()]).is_err());
+        assert!(parse_onepassword_mappings(&["key= ".into()]).is_err());
+    }
+
+    #[test]
+    fn onepassword_item_preserves_unknown_fields_when_updated() {
+        let mut item: OnePasswordItem = serde_json::from_value(serde_json::json!({
+            "id": "item-id",
+            "title": "ForgeFleet",
+            "fields": [{"id": "password", "label": "credential", "type": "CONCEALED", "value": "old"}]
+        }))
+        .unwrap();
+        item.fields[0].value = Some("new".into());
+        let value = serde_json::to_value(item).unwrap();
+        assert_eq!(value["id"], "item-id");
+        assert_eq!(value["title"], "ForgeFleet");
+        assert_eq!(value["fields"][0]["type"], "CONCEALED");
+        assert_eq!(value["fields"][0]["value"], "new");
     }
 }

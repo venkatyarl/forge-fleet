@@ -3939,6 +3939,26 @@ pub enum SecretsCommand {
     },
     /// List secrets whose `expires_at` is within `rotate_before_days`.
     Expirations,
+    /// Import selected fields from a 1Password Connect item.
+    ImportOnePassword {
+        /// Vault UUID.
+        vault: String,
+        /// Item UUID.
+        item: String,
+        /// Mapping in the form `fleet_secret_key=1password_field_label` (repeatable).
+        #[arg(long = "map", required = true)]
+        mappings: Vec<String>,
+    },
+    /// Export selected fleet secrets to fields in a 1Password Connect item.
+    ExportOnePassword {
+        /// Vault UUID.
+        vault: String,
+        /// Item UUID.
+        item: String,
+        /// Mapping in the form `fleet_secret_key=1password_field_label` (repeatable).
+        #[arg(long = "map", required = true)]
+        mappings: Vec<String>,
+    },
     /// Disable a safety-gate fleet_secret with a required TTL and reason.
     /// The kill-switch auto-restores after `--hours` so a forgotten flip
     /// can't silently outlive its purpose (V58 behavior). Use this instead
