@@ -16,8 +16,10 @@ ff-deploy = { path = "../ff-deploy" }
 
 chrono.workspace = true
 libc = "0.2"
+reqwest.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
