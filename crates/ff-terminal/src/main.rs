@@ -385,8 +385,8 @@ enum Command {
     Council {
         /// The question to put to the council.
         question: String,
-        /// Comma-separated council members (vendor CLIs): codex,kimi,claude.
-        #[arg(long, default_value = "codex,kimi")]
+        /// Comma-separated council members (vendor CLIs). Default codex,claude (kimi is opt-in until its CLI flags are verified fleet-wide).
+        #[arg(long, default_value = "codex,claude")]
         members: String,
         /// Kill each member after this many seconds.
         #[arg(long)]
