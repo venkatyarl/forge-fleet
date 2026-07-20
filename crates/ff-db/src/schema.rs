@@ -10910,6 +10910,95 @@ WHERE reviewer IS NOT NULL
 GROUP BY reviewer;
 "#;
 
+/// V191 — Cloud budget bucket status seeds.
+///
+/// Operator-provided provider budget windows for cloud LLM routing. This
+/// extends the V189 capacity table with provider budget-window status and
+/// seeds the current operator-provided values.
+pub const SCHEMA_V191_CLOUD_BUDGET_BUCKETS: &str = r#"
+CREATE TABLE IF NOT EXISTS cloud_budget_buckets (
+    provider                TEXT PRIMARY KEY,
+    max_concurrent          INT NOT NULL DEFAULT 3,
+    tokens_per_min          BIGINT,
+    spent_today             NUMERIC NOT NULL DEFAULT 0,
+    window_exhausted_until  TIMESTAMPTZ,
+    weekly_pct              SMALLINT,
+    weekly_reset_at         TIMESTAMPTZ,
+    monthly_pct             SMALLINT,
+    monthly_reset_at        TIMESTAMPTZ,
+    credit_pool_spent_usd   NUMERIC DEFAULT 0,
+    last_error_at           TIMESTAMPTZ,
+    last_success_at         TIMESTAMPTZ,
+    source                  TEXT,
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE cloud_budget_buckets
+    ADD COLUMN IF NOT EXISTS window_exhausted_until TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS weekly_pct SMALLINT,
+    ADD COLUMN IF NOT EXISTS weekly_reset_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS monthly_pct SMALLINT,
+    ADD COLUMN IF NOT EXISTS monthly_reset_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS credit_pool_spent_usd NUMERIC DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS last_error_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS last_success_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS source TEXT;
+
+INSERT INTO cloud_budget_buckets (
+    provider,
+    window_exhausted_until,
+    weekly_pct,
+    weekly_reset_at,
+    monthly_pct,
+    monthly_reset_at,
+    credit_pool_spent_usd,
+    source,
+    updated_at
+) VALUES
+    (
+        'claude',
+        NULL,
+        64,
+        '2026-07-23 01:59:00+00'::timestamptz,
+        NULL,
+        NULL,
+        0,
+        'fable-tier exhausted; credits on',
+        NOW()
+    ),
+    (
+        'codex',
+        NULL,
+        12,
+        '2026-07-24 23:30:00+00'::timestamptz,
+        NULL,
+        NULL,
+        0,
+        'weekly budget used',
+        NOW()
+    ),
+    (
+        'kimi',
+        '2026-07-20 04:20:00+00'::timestamptz,
+        64,
+        '2026-07-21 16:23:00+00'::timestamptz,
+        19,
+        '2026-08-03 00:00:00+00'::timestamptz,
+        0,
+        '5h window exhausted; 7day and monthly buckets',
+        NOW()
+    )
+ON CONFLICT (provider) DO UPDATE SET
+    window_exhausted_until = EXCLUDED.window_exhausted_until,
+    weekly_pct = EXCLUDED.weekly_pct,
+    weekly_reset_at = EXCLUDED.weekly_reset_at,
+    monthly_pct = EXCLUDED.monthly_pct,
+    monthly_reset_at = EXCLUDED.monthly_reset_at,
+    credit_pool_spent_usd = EXCLUDED.credit_pool_spent_usd,
+    source = EXCLUDED.source,
+    updated_at = NOW();
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

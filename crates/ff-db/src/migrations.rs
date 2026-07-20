@@ -936,6 +936,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "merge_queue_inplace_review",
         sql: schema::SCHEMA_V190_MERGE_QUEUE_INPLACE_REVIEW,
     },
+    PgMigration {
+        version: 191,
+        name: "cloud_budget_buckets",
+        sql: schema::SCHEMA_V191_CLOUD_BUDGET_BUCKETS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
