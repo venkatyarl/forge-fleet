@@ -14,6 +14,7 @@ pub mod config;
 pub mod control_plane;
 pub mod dispatcher;
 pub mod errors;
+pub mod executor;
 pub mod ha_coordinator;
 pub mod health;
 pub mod llm_480b_wrapper;
@@ -40,6 +41,7 @@ pub use control_plane::{
 };
 pub use dispatcher::{DEFAULT_LEASE_DURATION, DEFAULT_MAX_BUILD_DURATION, WorkItemDispatch};
 pub use errors::{ControlError, Result};
+pub use executor::{clear_slot_edit_lock, slot_edit_lock};
 pub use ha_coordinator::{
     DEFAULT_MAX_REPLICATION_LAG_BYTES, HaAction, HaClusterEvent, HaCoordinator,
     PatroniClusterMember, PatroniClusterState, PatroniMemberRole,
