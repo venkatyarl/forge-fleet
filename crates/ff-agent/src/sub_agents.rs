@@ -3,7 +3,9 @@
 //! Each daemon host gets N concurrent worker slots (N =
 //! `fleet_workers.sub_agent_count`), each with its own workspace directory
 //! at `~/.forgefleet/sub-agents/sub-agent-{i}/` containing `scratch/`,
-//! `checkpoints/`, and `cache/` subdirs.
+//! `checkpoints/`, `cache/`, and `tmp/` subdirs. `tmp/` is cleaned by the
+//! worktree reaper but skips active slots and unharvested work so a running
+//! dispatch is never torn down from under its temporary files.
 //!
 //! The defer-worker calls [`Slots::try_reserve`] before claiming a task.
 //! The returned [`SlotGuard`] auto-releases on drop, so each concurrent
@@ -137,7 +139,7 @@ pub fn ensure_workspaces(count: u32) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::with_capacity(count as usize);
     for i in 0..count {
         let ws = parent.join(format!("sub-agent-{i}"));
-        for sub in ["scratch", "checkpoints", "cache"] {
+        for sub in ["scratch", "checkpoints", "cache", "tmp"] {
             let p = ws.join(sub);
             std::fs::create_dir_all(&p).map_err(|e| format!("create {}: {e}", p.display()))?;
         }
