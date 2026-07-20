@@ -2576,9 +2576,11 @@ async fn handle_model_download(
                     // the matcher? (No — glob_match is case-sensitive.)
                     // Add both common casings to be safe across repos.
                     pats.push(format!("*{q}*.gguf"));
+                    pats.push(format!("*{q}*/*.gguf"));
                     let lower = q.to_lowercase();
                     if lower != q {
                         pats.push(format!("*{lower}*.gguf"));
+                        pats.push(format!("*{lower}*/*.gguf"));
                     }
                 }
                 _ => pats.push("*.gguf".into()),
@@ -2688,7 +2690,11 @@ async fn handle_model_download(
             });
         }
     })
-    .await;
+    .await
+    .and_then(|files| {
+        validate_variant_download(&files, &target_runtime, size_gb)?;
+        Ok(files)
+    });
     eprintln!(); // newline after progress bar
 
     match result {
@@ -2732,6 +2738,40 @@ async fn handle_model_download(
         }
     }
     Ok(())
+}
+
+fn validate_variant_download(
+    files: &[std::path::PathBuf],
+    runtime: &str,
+    size_gb: f64,
+) -> Result<u64, String> {
+    let weight_extensions: &[&str] = match runtime {
+        "llama.cpp" => &[".gguf"],
+        "mlx" | "vllm" => &[".safetensors"],
+        _ => &[".gguf", ".safetensors", ".bin", ".pt", ".pth", ".onnx"],
+    };
+    if !files.iter().any(|path| {
+        let lower = path.to_string_lossy().to_ascii_lowercase();
+        weight_extensions.iter().any(|ext| lower.ends_with(ext))
+    }) {
+        return Err("no weight files matched".to_string());
+    }
+
+    let total_bytes = files.iter().try_fold(0u64, |total, path| {
+        let bytes = std::fs::metadata(path)
+            .map_err(|e| format!("failed to stat downloaded file {}: {e}", path.display()))?
+            .len();
+        Ok::<u64, String>(total.saturating_add(bytes))
+    })?;
+    if size_gb > 0.0 {
+        let minimum_bytes = (size_gb * 0.5 * (1024.0 * 1024.0 * 1024.0)) as u64;
+        if total_bytes < minimum_bytes {
+            return Err(format!(
+                "downloaded payload too small: materialized {total_bytes} bytes, expected at least {minimum_bytes} bytes (50% of catalog size)"
+            ));
+        }
+    }
+    Ok(total_bytes)
 }
 
 /// Human-readable size: GiB with one decimal at >= 1 GiB, else whole MiB.
@@ -3367,6 +3407,35 @@ fn print_coverage_explain(rows: &[ff_agent::coverage_guard::TaskExplanation]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variant_download_requires_weights_and_half_catalog_size() {
+        let metadata = tempfile::Builder::new().suffix(".md").tempfile().unwrap();
+        let metadata_paths = vec![metadata.path().to_path_buf()];
+        assert_eq!(
+            validate_variant_download(&metadata_paths, "llama.cpp", 0.0).unwrap_err(),
+            "no weight files matched"
+        );
+
+        let weights = tempfile::Builder::new().suffix(".gguf").tempfile().unwrap();
+        let paths = vec![weights.path().to_path_buf()];
+        weights.as_file().set_len(49).unwrap();
+        assert!(
+            validate_variant_download(&paths, "llama.cpp", 100.0 / (1u64 << 30) as f64)
+                .unwrap_err()
+                .contains("downloaded payload too small")
+        );
+
+        weights.as_file().set_len(50).unwrap();
+        assert_eq!(
+            validate_variant_download(&paths, "llama.cpp", 100.0 / (1u64 << 30) as f64).unwrap(),
+            50
+        );
+        assert_eq!(
+            validate_variant_download(&paths, "llama.cpp", 0.0).unwrap(),
+            50
+        );
+    }
     use ff_agent::model_runtime::AGENT_MIN_CTX;
 
     #[test]

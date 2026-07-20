@@ -456,4 +456,19 @@ mod tests {
         assert!(!passes_filters("qwen-f16.gguf", &allow, &deny));
         assert!(!passes_filters("README.md", &allow, &deny));
     }
+
+    #[test]
+    fn quant_subdirectory_pattern_matches_generic_gguf_shards() {
+        let allow = vec!["*UD-Q2_K_XL*/*.gguf".to_string()];
+        assert!(passes_filters(
+            "UD-Q2_K_XL/Qwen3-Coder-00001-of-00009.gguf",
+            &allow,
+            &[]
+        ));
+        assert!(!passes_filters(
+            "UD-Q3_K_XL/Qwen3-Coder-00001-of-00006.gguf",
+            &allow,
+            &[]
+        ));
+    }
 }
