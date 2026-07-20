@@ -375,6 +375,13 @@ fn served_by_480b(model: &str) -> bool {
 async fn cloud_cli_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, String)> {
     let mut last_err: Option<anyhow::Error> = None;
     for backend in ["codex", "claude", "kimi"] {
+        if crate::cloud_budget::provider_is_exhausted(pg, backend).await {
+            warn!(
+                backend,
+                "merge_drain: skipping known exhausted cloud review backend"
+            );
+            continue;
+        }
         match crate::cli_executor::execute_cli(backend, prompt, &[], Some(Duration::from_secs(600)))
             .await
         {

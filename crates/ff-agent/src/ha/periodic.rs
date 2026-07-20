@@ -44,6 +44,13 @@ pub struct DigestData {
     pub first_pass: Option<(i64, i64)>,
     /// Per-computer (name, started, succeeded, failed) builds since yesterday.
     pub computer_builds: Vec<(String, i64, i64, i64)>,
+    /// (provider, exhausted-until, weekly percent used, weekly reset).
+    pub cloud_budgets: Vec<(
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<i16>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )>,
 }
 
 /// Deterministic session id for one calendar day's digest. Doubles as the
@@ -101,6 +108,24 @@ pub fn format_digest(data: &DigestData) -> String {
             lines.push(format!(
                 "  • {name}: {succeeded} ok / {failed} failed ({started} started)"
             ));
+        }
+    }
+    if data.cloud_budgets.is_empty() {
+        lines.push("Cloud capacity: unknown".to_string());
+    } else {
+        lines.push("Cloud capacity:".to_string());
+        for (provider, exhausted, weekly, reset) in &data.cloud_budgets {
+            let state = exhausted
+                .filter(|until| *until > chrono::Utc::now())
+                .map(|until| format!("exhausted until {}", until.to_rfc3339()))
+                .unwrap_or_else(|| "available".to_string());
+            let weekly = weekly
+                .map(|pct| format!(", weekly {pct}% used"))
+                .unwrap_or_default();
+            let reset = reset
+                .map(|at| format!(", resets {}", at.to_rfc3339()))
+                .unwrap_or_default();
+            lines.push(format!("  • {provider}: {state}{weekly}{reset}"));
         }
     }
     lines.join("\n")
@@ -171,6 +196,25 @@ async fn collect_digest_data(pg: &PgPool) -> DigestData {
         Err(e) => {
             tracing::debug!(error = %e, "nightly digest: v_computer_builds_daily unavailable")
         }
+    }
+
+    match sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<i16>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ),
+    >(
+        "SELECT provider, MAX(window_exhausted_until), MAX(weekly_pct), MAX(weekly_reset_at) \
+         FROM cloud_budget_buckets GROUP BY provider ORDER BY provider",
+    )
+    .fetch_all(pg)
+    .await
+    {
+        Ok(rows) => data.cloud_budgets = rows,
+        Err(e) => tracing::debug!(error = %e, "nightly digest: cloud budgets unavailable"),
     }
 
     data
@@ -254,6 +298,7 @@ mod tests {
             avg_lead_time_secs: Some(4_320.0),
             first_pass: Some((12, 10)),
             computer_builds: vec![("alpha".into(), 6, 5, 1)],
+            cloud_budgets: vec![("kimi".into(), None, Some(64), None)],
         };
         let body = format_digest(&data);
         assert!(body.contains("Throughput (24h): 12 completed, 3 failed"));

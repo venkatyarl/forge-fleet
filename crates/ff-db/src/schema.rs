@@ -10537,6 +10537,36 @@ CREATE INDEX IF NOT EXISTS idx_work_item_events_item_time
     ON work_item_events (work_item_id, occurred_at DESC);
 "#;
 
+/// Provider quota windows learned from consoles, pollers, and inference
+/// responses. A provider may have several independent windows (rolling,
+/// weekly, subscription tier, or paid-credit pool).
+pub const SCHEMA_V180_CLOUD_BUDGET_WINDOWS: &str = r#"
+CREATE TABLE IF NOT EXISTS cloud_budget_buckets (
+    provider TEXT NOT NULL,
+    window_kind TEXT NOT NULL DEFAULT 'rolling',
+    window_exhausted_until TIMESTAMPTZ,
+    weekly_pct SMALLINT CHECK (weekly_pct BETWEEN 0 AND 100),
+    weekly_reset_at TIMESTAMPTZ,
+    last_error_at TIMESTAMPTZ,
+    source TEXT NOT NULL DEFAULT 'inference',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (provider, window_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_cloud_budget_buckets_exhausted
+    ON cloud_budget_buckets (provider, window_exhausted_until)
+    WHERE window_exhausted_until IS NOT NULL;
+
+INSERT INTO cloud_budget_buckets
+    (provider, window_kind, weekly_pct, weekly_reset_at, source)
+VALUES
+    ('codex', 'weekly', 12, '2026-07-24 23:30:00-04', 'operator_console_2026-07-20'),
+    ('kimi', 'weekly_code', 64, '2026-07-21 16:23:00-04', 'operator_console_2026-07-20'),
+    ('kimi', 'monthly', 19, '2026-08-03 00:00:00-04', 'operator_console_2026-07-20'),
+    ('claude', 'weekly_all_models', 64, '2026-07-23 01:59:00-04', 'operator_console_2026-07-20'),
+    ('claude', 'weekly_fable', 100, '2026-07-23 01:59:00-04', 'operator_console_2026-07-20')
+ON CONFLICT (provider, window_kind) DO NOTHING;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

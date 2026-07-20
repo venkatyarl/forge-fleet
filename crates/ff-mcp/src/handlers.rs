@@ -2366,14 +2366,59 @@ pub async fn fleet_pulse(params: Option<Value>) -> HandlerResult {
             .get_metrics(node)
             .await
             .map_err(|e| format!("Redis error: {e}"))?;
-        Ok(json!({ "node": node, "metrics": metrics }))
+        let cloud_budgets = pulse_cloud_budgets().await;
+        Ok(json!({ "node": node, "metrics": metrics, "cloud_budgets": cloud_budgets }))
     } else {
         let snapshot = pulse
             .get_all_metrics()
             .await
             .map_err(|e| format!("Redis error: {e}"))?;
-        Ok(serde_json::to_value(snapshot).map_err(|e| e.to_string())?)
+        let mut value = serde_json::to_value(snapshot).map_err(|e| e.to_string())?;
+        if let Value::Object(ref mut object) = value {
+            object.insert("cloud_budgets".into(), pulse_cloud_budgets().await);
+        }
+        Ok(value)
     }
+}
+
+async fn pulse_cloud_budgets() -> Value {
+    let Ok((config, _)) = load_config_auto() else {
+        return json!([]);
+    };
+    let Ok(pool) = get_pg_pool(&config).await else {
+        return json!([]);
+    };
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<i16>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            String,
+        ),
+    >(
+        "SELECT provider, MAX(window_exhausted_until), MAX(weekly_pct), \
+         MAX(weekly_reset_at), MIN(source) FROM cloud_budget_buckets \
+         GROUP BY provider ORDER BY provider",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
+    json!(
+        rows.into_iter()
+            .map(
+                |(provider, exhausted_until, weekly_pct, weekly_reset_at, source)| json!({
+                    "provider": provider,
+                    "available": exhausted_until.map(|u| u <= chrono::Utc::now()).unwrap_or(true),
+                    "exhausted_until": exhausted_until,
+                    "weekly_pct": weekly_pct,
+                    "weekly_reset_at": weekly_reset_at,
+                    "source": source,
+                })
+            )
+            .collect::<Vec<_>>()
+    )
 }
 
 // ─── Fleet Nodes DB (Postgres persistent registry) ──────────────────────────

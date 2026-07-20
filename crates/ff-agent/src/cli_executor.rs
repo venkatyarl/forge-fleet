@@ -229,6 +229,16 @@ pub async fn execute_cli_in_dir(
         )
     })?;
 
+    let budget_pool = budget_pool().await;
+    if let Some(pg) = &budget_pool
+        && crate::cloud_budget::provider_is_exhausted(pg, cfg.name).await
+    {
+        return Err(anyhow!(
+            "backend '{}' skipped: known cloud quota window is exhausted",
+            cfg.name
+        ));
+    }
+
     // Verify the binary is on PATH before bothering to spawn.
     let bin_path = which_on_path(cfg.binary).ok_or_else(|| {
         anyhow!(
@@ -332,9 +342,41 @@ pub async fn execute_cli_in_dir(
     };
     let duration_ms = start.elapsed().as_millis();
 
-    let exit_code = out.status.code().map(|c| c as i64).unwrap_or(-1);
+    let mut exit_code = out.status.code().map(|c| c as i64).unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    // Some exhausted CLIs (observed with Kimi) return exit 0 and no output.
+    // Promote that to a provider failure so callers never classify it as a
+    // legitimate no-diff result and retry healthy work against the same lane.
+    if exit_code == 0 && stdout.trim().is_empty() {
+        exit_code = 75;
+        if stderr.trim().is_empty() {
+            stderr = "provider returned success with empty output; probable quota exhaustion"
+                .to_string();
+        }
+    }
+
+    if let Some(pg) = &budget_pool {
+        if exit_code == 0 {
+            crate::cloud_budget::record_success(pg, cfg.name).await;
+        } else {
+            let combined = format!("{stdout}\n{stderr}");
+            // Empty-output failures have no vendor reset hint. Treat them as a
+            // one-hour window, matching Kimi's observed rolling reset.
+            let signal =
+                crate::cloud_budget::parse_quota_signal(exit_code, &combined, chrono::Utc::now())
+                    .or_else(|| {
+                        (exit_code == 75).then(|| crate::cloud_budget::QuotaSignal {
+                            exhausted_until: chrono::Utc::now() + chrono::Duration::hours(1),
+                            source: "empty_success",
+                        })
+                    });
+            if let Some(signal) = signal {
+                crate::cloud_budget::record_failure(pg, cfg.name, &signal).await;
+            }
+        }
+    }
 
     info!(
         backend = cfg.name,
@@ -352,6 +394,18 @@ pub async fn execute_cli_in_dir(
         stderr,
         duration_ms,
     })
+}
+
+async fn budget_pool() -> Option<sqlx::PgPool> {
+    let url = std::env::var("FORGEFLEET_POSTGRES_URL")
+        .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+        .ok()?;
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(1))
+        .connect(&url)
+        .await
+        .ok()
 }
 
 /// Resolve a binary name through `$PATH`. Returns the absolute path if
