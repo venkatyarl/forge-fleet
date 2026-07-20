@@ -624,12 +624,23 @@ mod tests {
         );
 
         // The backgrounded grandchild must have been reaped by the group kill.
-        // Give the kernel a moment to deliver SIGKILL, then probe with `kill -0`.
+        // POLL for its disappearance up to a generous deadline rather than
+        // sleeping a single fixed interval: on a loaded CI runner, SIGKILL
+        // delivery + reaping routinely takes longer than a fixed 300ms, which
+        // made this assertion flaky (fails intermittently, blocking the merge
+        // drain). Polling exits fast in the common case and tolerates load.
         if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
             if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                // kill(-0) returns Err(ESRCH) when the process is gone.
-                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut alive = true;
+                while std::time::Instant::now() < deadline {
+                    // kill(-0) returns Err(ESRCH) when the process is gone.
+                    alive = unsafe { libc::kill(pid, 0) } == 0;
+                    if !alive {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 assert!(
                     !alive,
                     "grandchild pid {pid} survived the process-group kill"
