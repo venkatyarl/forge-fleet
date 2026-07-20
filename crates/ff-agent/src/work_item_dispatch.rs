@@ -2002,7 +2002,12 @@ async fn run_ff_dispatch(
                     break; // try the next routed backend
                 }
             };
-            if out.status.success() {
+            // Exit 0 with empty stdout and no diff is not a successful agent
+            // turn. Some vendor CLIs report expired OAuth on stderr this way,
+            // so let classification exhaust that provider immediately.
+            if out.status.success()
+                && (!out.stdout.is_empty() || worktree_has_diff(&worktree.worktree_path))
+            {
                 let _ =
                     crate::circuit_breaker::record_provider_success(pg, computer_id, backend).await;
                 // Clean run → full headroom signal (self-corrects a prior limit).

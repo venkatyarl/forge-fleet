@@ -474,6 +474,31 @@ async fn cloud_cli_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, St
                 return Ok((approved, reason, backend.to_string()));
             }
             Ok(res) => {
+                let combined = format!("{}\n{}", res.stdout, res.stderr);
+                let class = crate::cloud_error::classify(
+                    backend,
+                    i32::try_from(res.exit_code).ok(),
+                    &combined,
+                );
+                if let Some(remaining) =
+                    crate::circuit_breaker::headroom_hint_for_category(class.as_str())
+                    && let Ok(Some(leader)) = ff_db::pg_get_current_leader(pg).await
+                {
+                    let _ = crate::circuit_breaker::record_provider_failure(
+                        pg,
+                        leader.computer_id,
+                        backend,
+                        class.as_str(),
+                    )
+                    .await;
+                    let _ = crate::circuit_breaker::record_usage_signal(
+                        pg,
+                        leader.computer_id,
+                        backend,
+                        remaining,
+                    )
+                    .await;
+                }
                 let e = anyhow::anyhow!(
                     "{backend} exited {}: {}",
                     res.exit_code,

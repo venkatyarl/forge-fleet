@@ -624,6 +624,26 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         }
     }
 
+    // Daemon-owned sub-agent capacity: reconcile immediately at startup and
+    // every six hours even when Pulse v2/Redis is disabled.
+    if let Some(pool) = operational_store.pg_pool().cloned() {
+        let mut shutdown_rx_capacity = shutdown_rx.clone();
+        subsystem_tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx_capacity.changed() => break,
+                    _ = tick.tick() => {
+                        if let Err(e) = ff_agent::sub_agents::reconcile_capacity(&pool).await {
+                            warn!("periodic sub-agent capacity reconcile failed: {e}");
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
     // 14) Pulse v2 — heartbeat_v2 + materializer + leader_tick
     //
     // Preconditions: Postgres pool (for computer_id / fleet_members lookup)
@@ -1661,13 +1681,17 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         }));
     }
 
-    // 20b8) OAuth probe tick — every 6h, leader-gated inside the tick.
+    // 20b8) OAuth maintenance: every node validates once at startup and asks
+    // the leader for a re-push when stale; the leader proactively exercises
+    // provider-native refresh-token flows and redistributes hourly.
     if let Some(pg_pool) = operational_store.pg_pool().cloned() {
-        info!("starting subsystem: oauth probe tick (6h, leader-gated)");
-        subsystem_tasks.push(ff_agent::oauth_distributor::spawn_oauth_probe_tick(
+        info!("starting subsystem: OAuth startup validation + hourly leader refresh");
+        subsystem_tasks.push(ff_agent::oauth_distributor::spawn_startup_oauth_validation(
+            pg_pool.clone(),
+        ));
+        subsystem_tasks.push(ff_agent::oauth_distributor::spawn_oauth_refresh_tick(
             pg_pool,
-            worker_name.clone(),
-            6 * 3600,
+            ff_agent::oauth_distributor::AUTO_REFRESH_SECS,
             shutdown_rx.clone(),
         ));
     }
@@ -3089,6 +3113,9 @@ async fn start_pulse_v2_subsystems(
                     _ = tick.tick() => {
                         match ff_agent::deployment_reconciler::reconcile_local(&pool).await {
                             Ok(s) => {
+                                if let Err(e) = ff_agent::sub_agents::reconcile_capacity(&pool).await {
+                                    warn!("sub-agent capacity reconcile after deployment pass failed: {e}");
+                                }
                                 if s.respawned > 0
                                     || s.recovered > 0
                                     || s.reaped > 0

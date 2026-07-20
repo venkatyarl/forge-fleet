@@ -5074,24 +5074,13 @@ async fn main() -> Result<()> {
                 OauthCommand::Refresh { provider } => {
                     let providers = resolve(&provider)?;
                     for p in providers {
-                        // Step 1: probe — spawns vendor CLI with a tiny
-                        // prompt; that causes the CLI to refresh stale
-                        // tokens against its own backend if needed.
-                        let r = ff_agent::oauth_distributor::probe_one(&pool, p).await;
-                        let probe_color = match r.status.as_str() {
-                            "ok" => GREEN,
-                            _ => YELLOW,
-                        };
-                        println!("{:<10} probe → {probe_color}{}{RESET}", p.name, r.status);
-                        // Step 2: re-import — re-reads the cred source
-                        // (file or Keychain), capturing any token the
-                        // CLI just wrote during step 1.
-                        match ff_agent::oauth_distributor::import_token(&pool, p).await {
-                            Ok(()) => println!(
-                                "{:<10} {GREEN}✓{RESET} re-imported to fleet_secrets[{}]",
-                                p.name, p.secret_key
+                        match ff_agent::oauth_distributor::refresh_and_redistribute(&pool, p).await
+                        {
+                            Ok(n) => println!(
+                                "{:<10} {GREEN}✓{RESET} refreshed, imported, and enqueued {n} re-push task(s)",
+                                p.name
                             ),
-                            Err(e) => println!("{:<10} {RED}✗{RESET} import: {e}", p.name),
+                            Err(e) => println!("{:<10} {RED}✗{RESET} refresh: {e}", p.name),
                         }
                     }
                     Ok(())

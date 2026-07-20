@@ -12,6 +12,159 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+const OS_HEADROOM_GB: f64 = 8.0;
+const BYTES_PER_CONTEXT_TOKEN: f64 = 2048.0;
+
+/// Capacity formula owned by the daemon. Resource divisions deliberately use
+/// floors so a partially available slot never becomes schedulable.
+pub fn compute_capacity_count(cores: u32, usable_ram_gb: f64, free_disk_gb: f64) -> u32 {
+    let by_cores = cores / 3;
+    let by_ram = (usable_ram_gb.max(0.0) / 6.0).floor() as u32;
+    let by_disk = (free_disk_gb.max(0.0) / 20.0).floor() as u32;
+    by_cores.min(by_ram).min(by_disk).clamp(1, 10)
+}
+
+/// Recompute this daemon's durable sub-agent rows from local hardware and
+/// resident model deployments. Excess busy rows are intentionally untouched;
+/// they become eligible for disabling on a later pass after their build ends.
+pub async fn reconcile_capacity(pool: &sqlx::PgPool) -> Result<u32, String> {
+    let worker_name = crate::fleet_info::resolve_this_worker_name().await;
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1);
+    let total_ram_gb = local_total_ram_gb().unwrap_or(0.0);
+    let free_disk_gb = local_free_disk_gb(&workspaces_root()).unwrap_or(0.0);
+
+    let resident_gb: f64 = sqlx::query_scalar(
+        r#"SELECT COALESCE(SUM(
+                   COALESCE(lib.size_bytes, 0)::float8
+                   + GREATEST(COALESCE(d.context_window, 0), 0)::float8
+                     * GREATEST(COALESCE(d.parallel_slots, 1), 1)::float8 * $2
+               ), 0) / 1e9
+             FROM fleet_model_deployments d
+             LEFT JOIN fleet_model_library lib ON lib.id = d.library_id
+            WHERE LOWER(d.worker_name) = LOWER($1)
+              AND d.desired_state = 'active'"#,
+    )
+    .bind(&worker_name)
+    .bind(BYTES_PER_CONTEXT_TOKEN)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("resident model memory query: {e}"))?;
+
+    let usable_ram_gb = (total_ram_gb - resident_gb - OS_HEADROOM_GB).max(0.0);
+    let desired = compute_capacity_count(cores, usable_ram_gb, free_disk_gb);
+    let workspace_root = workspaces_root().join("sub-agents");
+    std::fs::create_dir_all(&workspace_root)
+        .map_err(|e| format!("create {}: {e}", workspace_root.display()))?;
+
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    let computer_id: sqlx::types::Uuid =
+        sqlx::query_scalar("SELECT id FROM computers WHERE LOWER(name) = LOWER($1) LIMIT 1")
+            .bind(&worker_name)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| format!("computer lookup for {worker_name}: {e}"))?;
+
+    for slot in 0..desired as i32 {
+        let workspace = workspace_root.join(format!("sub-agent-{slot}"));
+        for sub in ["scratch", "checkpoints", "cache"] {
+            std::fs::create_dir_all(workspace.join(sub))
+                .map_err(|e| format!("create {}: {e}", workspace.display()))?;
+        }
+        sqlx::query(
+            "INSERT INTO sub_agents (computer_id, slot, status, workspace_dir) \
+             VALUES ($1, $2, 'idle', $3) \
+             ON CONFLICT (computer_id, slot) DO UPDATE SET \
+                 status = CASE WHEN sub_agents.status = 'disabled' THEN 'idle' \
+                               ELSE sub_agents.status END, \
+                 workspace_dir = EXCLUDED.workspace_dir",
+        )
+        .bind(computer_id)
+        .bind(slot)
+        .bind(workspace.to_string_lossy().as_ref())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("upsert sub-agent slot {slot}: {e}"))?;
+    }
+
+    sqlx::query(
+        "UPDATE sub_agents SET status = 'disabled' \
+         WHERE computer_id = $1 AND slot >= $2 \
+           AND status IN ('idle', 'error', 'disabled')",
+    )
+    .bind(computer_id)
+    .bind(desired as i32)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("disable excess sub-agent slots: {e}"))?;
+
+    sqlx::query(
+        "UPDATE fleet_workers SET sub_agent_count = $1, updated_at = NOW() \
+         WHERE LOWER(name) = LOWER($2)",
+    )
+    .bind(desired as i32)
+    .bind(&worker_name)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("update fleet worker capacity: {e}"))?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    tracing::info!(
+        worker = %worker_name,
+        desired,
+        cores,
+        total_ram_gb,
+        resident_gb,
+        usable_ram_gb,
+        free_disk_gb,
+        "reconciled sub-agent capacity"
+    );
+    Ok(desired)
+}
+
+fn local_total_ram_gb() -> Option<f64> {
+    if cfg!(target_os = "macos") {
+        let output = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        let bytes: u64 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .ok()?;
+        return Some(bytes as f64 / 1e9);
+    }
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: f64 = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .ok()?;
+    Some(kb / 1_000_000.0)
+}
+
+fn local_free_disk_gb(path: &Path) -> Option<f64> {
+    let output = std::process::Command::new("df")
+        .args(["-Pk", path.to_str()?])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let available_kb: f64 = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .last()?
+        .split_whitespace()
+        .nth(3)?
+        .parse()
+        .ok()?;
+    Some(available_kb / 1_000_000.0)
+}
+
 /// Compute the default sub-agent slot count for a host based on its
 /// hardware. Formula: `max(1, min(cores/2, ram_gb/16, cap))` where `cap`
 /// = 8 if the host has an NVIDIA GPU AND ram_gb >= 64, else 4.
@@ -266,6 +419,14 @@ mod tests {
         assert_eq!(compute_default_count(2, 4, false), 1);
         // NVIDIA but low RAM uses cap=4
         assert_eq!(compute_default_count(64, 32, true), 2);
+    }
+
+    #[test]
+    fn capacity_formula_uses_tightest_resource_and_clamps() {
+        assert_eq!(compute_capacity_count(32, 120.0, 500.0), 10);
+        assert_eq!(compute_capacity_count(32, 30.0, 500.0), 5);
+        assert_eq!(compute_capacity_count(32, 120.0, 79.9), 3);
+        assert_eq!(compute_capacity_count(1, 0.0, 0.0), 1);
     }
 
     #[test]
