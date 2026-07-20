@@ -724,6 +724,7 @@ mod tests {
             has_gpu: None,
             computer_ram_gb: None,
             computer_cpu_cores: None,
+            computer_status: None,
         }
     }
 

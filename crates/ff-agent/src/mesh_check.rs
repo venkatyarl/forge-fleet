@@ -8,6 +8,52 @@ use sqlx::PgPool;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+const SKIPPED_COMPUTER_STATUSES: [&str; 3] = ["offline", "reserved", "decommissioned"];
+
+fn mesh_eligible(node: &ff_db::FleetNodeRow) -> bool {
+    computer_status_eligible(node.computer_status.as_deref())
+}
+
+fn computer_status_eligible(status: Option<&str>) -> bool {
+    !status.is_some_and(|status| SKIPPED_COMPUTER_STATUSES.contains(&status))
+}
+
+fn retry_cap_reached(
+    attempts: impl Iterator<Item = (chrono::DateTime<chrono::Utc>, i32)>,
+    window_start: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    attempts
+        .filter(|(created_at, _)| *created_at >= window_start)
+        .map(|(_, attempts)| attempts.max(1))
+        .sum::<i32>()
+        >= 5
+}
+
+async fn mark_ineligible_pairs_skipped(
+    pool: &PgPool,
+    nodes: &[ff_db::FleetNodeRow],
+) -> Result<(), String> {
+    let names: Vec<&str> = nodes
+        .iter()
+        .filter(|node| !mesh_eligible(node))
+        .map(|node| node.name.as_str())
+        .collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "UPDATE fleet_mesh_status
+            SET status = 'skipped', last_checked = NOW(),
+                last_error = 'endpoint computer is offline, reserved, or decommissioned'
+          WHERE src_node = ANY($1) OR dst_node = ANY($1)",
+    )
+    .bind(&names)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("mark skipped mesh rows: {e}"))?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct MeshCell {
     pub src: String,
@@ -26,6 +72,7 @@ pub async fn pairwise_ssh_check(pool: &PgPool) -> Result<MeshMatrix, String> {
     let nodes = ff_db::pg_list_nodes(pool)
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
+    mark_ineligible_pairs_skipped(pool, &nodes).await?;
     pairwise_ssh_check_inner(pool, &nodes, None).await
 }
 
@@ -33,6 +80,7 @@ pub async fn pairwise_ssh_check_node(pool: &PgPool, node: &str) -> Result<MeshMa
     let nodes = ff_db::pg_list_nodes(pool)
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
+    mark_ineligible_pairs_skipped(pool, &nodes).await?;
     pairwise_ssh_check_inner(pool, &nodes, Some(node)).await
 }
 
@@ -51,7 +99,7 @@ async fn pairwise_ssh_check_inner(
     let mut pairs: Vec<(String, String, String, String, String)> = Vec::new();
     for src in nodes {
         for dst in nodes {
-            if src.name == dst.name {
+            if src.name == dst.name || !mesh_eligible(src) || !mesh_eligible(dst) {
                 continue;
             }
             if let Some(n) = only_node
@@ -214,10 +262,11 @@ pub async fn local_reach_check(
     let nodes = ff_db::pg_list_nodes(pool)
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
+    mark_ineligible_pairs_skipped(pool, &nodes).await?;
 
     let mut futs = FuturesUnordered::new();
     let mut probes = Vec::new();
-    for n in nodes.iter().filter(|n| n.name != me) {
+    for n in nodes.iter().filter(|n| n.name != me && mesh_eligible(n)) {
         if let Some(o) = only_node
             && n.name != o
         {
@@ -366,10 +415,18 @@ pub async fn mesh_propagate(
     let nodes = ff_db::pg_list_nodes(pool)
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
+    mark_ineligible_pairs_skipped(pool, &nodes).await?;
+    if nodes
+        .iter()
+        .find(|node| node.name == new_node)
+        .is_some_and(|node| !mesh_eligible(node))
+    {
+        return Ok((0, 0));
+    }
     let mut ok = 0usize;
     let mut fail = 0usize;
     for peer in &nodes {
-        if peer.name == new_node {
+        if peer.name == new_node || !mesh_eligible(peer) {
             continue;
         }
         match propagate_to_peer(peer, user_key, &known_lines, new_user, new_ip).await {
@@ -477,6 +534,7 @@ pub async fn probe_single_pair(pool: &PgPool, src: &str, dst: &str) -> Result<Me
     let nodes = ff_db::pg_list_nodes(pool)
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
+    mark_ineligible_pairs_skipped(pool, &nodes).await?;
     let s = nodes
         .iter()
         .find(|n| n.name == src)
@@ -485,6 +543,14 @@ pub async fn probe_single_pair(pool: &PgPool, src: &str, dst: &str) -> Result<Me
         .iter()
         .find(|n| n.name == dst)
         .ok_or_else(|| format!("dst node '{dst}' not in fleet_workers"))?;
+    if !mesh_eligible(s) || !mesh_eligible(d) {
+        return Ok(MeshCell {
+            src: src.to_string(),
+            dst: dst.to_string(),
+            status: "skipped".into(),
+            last_error: Some("endpoint computer is offline, reserved, or decommissioned".into()),
+        });
+    }
     let cell = probe_pair(
         s.name.clone(),
         s.ssh_user.clone(),
@@ -507,32 +573,60 @@ pub async fn probe_single_pair(pool: &PgPool, src: &str, dst: &str) -> Result<Me
 
 /// For every `fleet_mesh_status` row in status='failed' whose last_checked is
 /// older than 10 minutes, enqueue a `mesh_retry` deferred task — de-duplicated
-/// against any already-pending retry for the same (src,dst) pair. Capped at
-/// 5 attempts per 24h via the deferred_tasks `max_attempts` column.
+/// against any active retry for the same (src,dst) pair. Capped at 5 attempts
+/// per 24h across task IDs so a completed task cannot reset the retry budget.
 pub async fn enqueue_retries(pool: &PgPool) -> Result<usize, String> {
     let cutoff = chrono::Utc::now() - chrono::Duration::minutes(10);
+    let retry_window = chrono::Utc::now() - chrono::Duration::hours(24);
+    let nodes = ff_db::pg_list_nodes(pool)
+        .await
+        .map_err(|e| format!("pg_list_nodes: {e}"))?;
+    mark_ineligible_pairs_skipped(pool, &nodes).await?;
+    let eligible: HashSet<&str> = nodes
+        .iter()
+        .filter(|node| mesh_eligible(node))
+        .map(|node| node.name.as_str())
+        .collect();
     let rows = ff_db::pg_list_mesh_status(pool, None)
         .await
         .map_err(|e| format!("pg_list_mesh_status: {e}"))?;
     let stale: Vec<(String, String)> = rows
         .iter()
-        .filter(|r| r.status == "failed" && r.last_checked.map(|t| t < cutoff).unwrap_or(true))
+        .filter(|r| {
+            r.status == "failed"
+                && eligible.contains(r.src_node.as_str())
+                && eligible.contains(r.dst_node.as_str())
+                && r.last_checked.map(|t| t < cutoff).unwrap_or(true)
+        })
         .map(|r| (r.src_node.clone(), r.dst_node.clone()))
         .collect();
     if stale.is_empty() {
         return Ok(0);
     }
-    let existing = ff_db::pg_list_deferred(pool, Some("pending"), 500)
+    let existing = ff_db::pg_list_deferred(pool, None, 500)
         .await
         .map_err(|e| format!("pg_list_deferred: {e}"))?;
     let mut created = 0;
     for (src, dst) in stale {
-        let already = existing.iter().any(|t| {
-            t.kind == "mesh_retry"
-                && t.payload.get("src").and_then(|v| v.as_str()) == Some(&src)
-                && t.payload.get("dst").and_then(|v| v.as_str()) == Some(&dst)
+        let matching: Vec<_> = existing
+            .iter()
+            .filter(|t| {
+                t.kind == "mesh_retry"
+                    && t.payload.get("src").and_then(|v| v.as_str()) == Some(&src)
+                    && t.payload.get("dst").and_then(|v| v.as_str()) == Some(&dst)
+            })
+            .collect();
+        let active = matching.iter().any(|t| {
+            matches!(
+                t.status.as_str(),
+                "pending" | "dispatchable" | "claimed" | "running"
+            )
         });
-        if already {
+        let capped = retry_cap_reached(
+            matching.iter().map(|t| (t.created_at, t.attempts)),
+            retry_window,
+        );
+        if active || capped {
             continue;
         }
         let title = format!("Mesh retry {src} → {dst}");
@@ -647,5 +741,28 @@ mod tests {
         let (status, detail) = classify_direct_probe(true, Some("exit 255: refused".into()));
         assert_eq!(status, "failed");
         assert_eq!(detail.as_deref(), Some("ping ok; ssh exit 255: refused"));
+    }
+
+    #[test]
+    fn inactive_computer_statuses_are_not_mesh_eligible() {
+        assert!(computer_status_eligible(None));
+        assert!(computer_status_eligible(Some("online")));
+        for status in SKIPPED_COMPUTER_STATUSES {
+            assert!(!computer_status_eligible(Some(status)));
+        }
+    }
+
+    #[test]
+    fn retry_cap_counts_attempts_across_recreated_tasks() {
+        let now = chrono::Utc::now();
+        let recent = now - chrono::Duration::hours(24);
+        assert!(retry_cap_reached(
+            [(now, 2), (now, 2), (now, 1)].into_iter(),
+            recent
+        ));
+        assert!(!retry_cap_reached(
+            [(now, 4), (now - chrono::Duration::hours(25), 20),].into_iter(),
+            recent
+        ));
     }
 }
