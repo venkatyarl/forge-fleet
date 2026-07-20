@@ -16,6 +16,8 @@ use sqlx::PgPool;
 use std::time::Duration;
 use tracing::{info, warn};
 
+use crate::project_github_sync::parse_owner_repo;
+
 /// Build a `gh` invocation with the fleet GitHub token injected as `GH_TOKEN`.
 ///
 /// The merge-drain runs on whichever node is currently leader, and that node's
@@ -451,6 +453,11 @@ async fn pr_ci_state(pr_url: &str) -> CiState {
 
 /// `gh pr merge <url> --squash --delete-branch` (the project policy — always
 /// delete the branch; see feedback_pr_merge_delete_branch.md).
+///
+/// If `gh` reports failure because the branch delete step errored (e.g. a
+/// transient GitHub 503), but the PR itself is `MERGED`, we treat the merge as
+/// a success and only best-effort clean up the branch. A merged PR must never
+/// be marked failed because of cleanup.
 async fn gh_merge_squash(pr_url: &str) -> Result<()> {
     let mut cmd = gh_cmd().await;
     cmd.args(["pr", "merge", pr_url, "--squash", "--delete-branch"]);
@@ -458,13 +465,78 @@ async fn gh_merge_squash(pr_url: &str) -> Result<()> {
     if out.status.success() {
         return Ok(());
     }
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The squash may have landed even though the --delete-branch step failed.
+    if let Some(state) = gh_pr_view_state(pr_url).await {
+        if state.eq_ignore_ascii_case("MERGED") {
+            warn!(
+                pr = %pr_url,
+                stderr = %stderr.trim(),
+                "merge_drain: PR merged but branch deletion failed — best-effort cleanup"
+            );
+            if let Err(e) = gh_delete_branch(pr_url).await {
+                warn!(
+                    pr = %pr_url,
+                    error = %e,
+                    "merge_drain: best-effort branch delete failed — leaving for janitor"
+                );
+            }
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!("{}", stderr.trim().chars().take(500).collect::<String>());
+}
+
+/// Fetch `state` from `gh pr view --json state`. Used as a reliability check
+/// when `gh pr merge` exits non-zero.
+async fn gh_pr_view_state(pr_url: &str) -> Option<String> {
+    let mut cmd = gh_cmd().await;
+    cmd.args(["pr", "view", pr_url, "--json", "state"]);
+    let out = cmd.output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .ok()
+        .and_then(|v| v.get("state").and_then(|s| s.as_str()).map(str::to_string))
+}
+
+/// Best-effort deletion of a PR's head branch via the GitHub API. Used when
+/// `gh pr merge --delete-branch` merged the PR but failed to delete the branch.
+async fn gh_delete_branch(pr_url: &str) -> Result<()> {
+    let mut cmd = gh_cmd().await;
+    cmd.args(["pr", "view", pr_url, "--json", "headRefName"]);
+    let out = cmd.output().await.context("spawn gh pr view headRefName")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "gh pr view headRefName failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let head_ref = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .ok()
+        .and_then(|v| {
+            v.get("headRefName")
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+        })
+        .context("missing headRefName in gh pr view response")?;
+
+    let (owner, repo) =
+        parse_owner_repo(pr_url).with_context(|| format!("unrecognized PR url: {pr_url}"))?;
+    let path = format!("repos/{owner}/{repo}/git/refs/heads/{head_ref}");
+
+    let mut del = gh_cmd().await;
+    del.args(["api", "-X", "DELETE", &path]);
+    let out = del.output().await.context("spawn gh api delete branch")?;
+    if out.status.success() {
+        return Ok(());
+    }
     anyhow::bail!(
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-            .trim()
-            .chars()
-            .take(500)
-            .collect::<String>()
+        "gh api delete branch failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
     );
 }
 
