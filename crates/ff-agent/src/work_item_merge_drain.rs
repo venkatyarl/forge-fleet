@@ -454,10 +454,25 @@ async fn cloud_cli_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, St
     // hung/failing backend loses the race to the next one within seconds instead
     // of stalling every drain tick for ten minutes.
     for backend in ["claude", "codex", "kimi"] {
+        let budget = crate::cloud_budget::provider_budget(pg, backend).await;
+        if crate::cloud_budget::is_exhausted(budget.as_ref(), chrono::Utc::now()) {
+            warn!(
+                backend,
+                exhausted_until = ?budget.as_ref().and_then(|row| row.window_exhausted_until),
+                "merge_drain: skipping quota-exhausted cloud reviewer"
+            );
+            continue;
+        }
         match crate::cli_executor::execute_cli(backend, prompt, &[], Some(Duration::from_secs(90)))
             .await
         {
             Ok(res) if res.exit_code == 0 && !res.stdout.trim().is_empty() => {
+                crate::cloud_budget::record_success(
+                    pg,
+                    backend,
+                    budget.as_ref().and_then(|row| row.window_exhausted_until),
+                )
+                .await;
                 record_review_interaction(
                     pg,
                     backend,

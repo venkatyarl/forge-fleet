@@ -44,6 +44,8 @@ pub struct DigestData {
     pub first_pass: Option<(i64, i64)>,
     /// Per-computer (name, started, succeeded, failed) builds since yesterday.
     pub computer_builds: Vec<(String, i64, i64, i64)>,
+    /// Cached per-provider quota state from `cloud_budget_buckets`.
+    pub cloud_budgets: Vec<crate::cloud_budget::ProviderBudget>,
 }
 
 /// Deterministic session id for one calendar day's digest. Doubles as the
@@ -100,6 +102,31 @@ pub fn format_digest(data: &DigestData) -> String {
         for (name, started, succeeded, failed) in &data.computer_builds {
             lines.push(format!(
                 "  • {name}: {succeeded} ok / {failed} failed ({started} started)"
+            ));
+        }
+    }
+    if data.cloud_budgets.is_empty() {
+        lines.push("Cloud budgets: unavailable".to_string());
+    } else {
+        lines.push("Cloud budgets:".to_string());
+        let now = chrono::Utc::now();
+        for budget in &data.cloud_budgets {
+            let status = match budget.window_exhausted_until {
+                Some(until) if until > now => {
+                    format!(
+                        "exhausted until {}",
+                        until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                    )
+                }
+                _ => "available".to_string(),
+            };
+            let weekly = budget
+                .weekly_pct
+                .map(|pct| format!("{pct}%"))
+                .unwrap_or_else(|| "n/a".to_string());
+            lines.push(format!(
+                "  • {}: {status}; weekly {weekly}",
+                budget.provider
             ));
         }
     }
@@ -172,6 +199,8 @@ async fn collect_digest_data(pg: &PgPool) -> DigestData {
             tracing::debug!(error = %e, "nightly digest: v_computer_builds_daily unavailable")
         }
     }
+
+    data.cloud_budgets = crate::cloud_budget::all_provider_budgets(pg).await;
 
     data
 }
@@ -254,12 +283,18 @@ mod tests {
             avg_lead_time_secs: Some(4_320.0),
             first_pass: Some((12, 10)),
             computer_builds: vec![("alpha".into(), 6, 5, 1)],
+            cloud_budgets: vec![crate::cloud_budget::ProviderBudget {
+                provider: "codex".into(),
+                window_exhausted_until: None,
+                weekly_pct: Some(12),
+            }],
         };
         let body = format_digest(&data);
         assert!(body.contains("Throughput (24h): 12 completed, 3 failed"));
         assert!(body.contains("Avg lead time: 1h 12m"));
         assert!(body.contains("First-pass rate: 83% (10/12)"));
         assert!(body.contains("• alpha: 5 ok / 1 failed (6 started)"));
+        assert!(body.contains("• codex: available; weekly 12%"));
     }
 
     #[test]
