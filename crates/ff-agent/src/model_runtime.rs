@@ -115,6 +115,76 @@ fn resolve_agent_profile(
     explicit_agent || (mode == ServingMode::Chat && tool_calling && explicit_parallel.is_none())
 }
 
+/// Classified model-server error kinds persisted to `error_events`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum ModelErrorKind {
+    /// Binary failed to start (not found, bad env, immediate exit).
+    Startup,
+    /// Model failed to load inside the runtime (bad GGUF, OOM during load, etc.).
+    Load,
+    /// Server process exited unexpectedly after becoming healthy.
+    Crash,
+    /// Server was killed by the OOM killer or ran out of memory.
+    Oom,
+}
+
+impl ModelErrorKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Load => "load",
+            Self::Crash => "crash",
+            Self::Oom => "oom",
+        }
+    }
+}
+
+/// Best-effort tail of a log file for error context.
+fn tail_log_file(path: &Path, max_bytes: usize) -> Option<String> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return None;
+    };
+    let len = meta.len() as usize;
+    let start = len.saturating_sub(max_bytes);
+    let Ok(data) = std::fs::read(path) else {
+        return None;
+    };
+    let tail = &data[start..];
+    String::from_utf8(tail.to_vec()).ok()
+}
+
+/// Best-effort persistence of a model-server error to `error_events`.
+/// Never fails the caller — errors here are traced and dropped.
+#[allow(clippy::too_many_arguments)]
+async fn log_model_error(
+    pool: &sqlx::PgPool,
+    worker_name: &str,
+    deployment_id: Option<&str>,
+    library_id: Option<&str>,
+    catalog_id: Option<&str>,
+    runtime: &str,
+    kind: ModelErrorKind,
+    summary: &str,
+    details: serde_json::Value,
+    stderr_tail: Option<&str>,
+) {
+    let event = ff_db::ErrorEventInsert {
+        worker_name: worker_name.to_string(),
+        deployment_id: deployment_id.map(String::from),
+        library_id: library_id.map(String::from),
+        catalog_id: catalog_id.map(String::from),
+        runtime: runtime.to_string(),
+        error_kind: kind.as_str().to_string(),
+        summary: summary.to_string(),
+        details,
+        stderr_tail: stderr_tail.map(String::from),
+    };
+    if let Err(e) = ff_db::pg_insert_error_event(pool, &event).await {
+        tracing::warn!(error = %e, "failed to persist model error event");
+    }
+}
+
 /// Result of a successful load.
 #[derive(Debug, Clone)]
 pub struct LoadResult {
@@ -272,8 +342,26 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
             // sophie: ff was passing `/home/sophie/models/qwen3-coder-30b-a3b`
             // and llama-server bailed with `gguf_init_from_file_ptr: failed
             // to read magic` because that's a directory.
-            let model_path = resolve_gguf_for_llamacpp(&lib.file_path)
-                .map_err(|e| format!("resolve gguf for {}: {e}", lib.file_path))?;
+            let model_path = match resolve_gguf_for_llamacpp(&lib.file_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    let msg = format!("resolve gguf for {}: {e}", lib.file_path);
+                    log_model_error(
+                        pool,
+                        &worker_name,
+                        None,
+                        Some(&lib.id),
+                        Some(&lib.catalog_id),
+                        "llama.cpp",
+                        ModelErrorKind::Load,
+                        &msg,
+                        serde_json::json!({"port": port, "file_path": lib.file_path}),
+                        None,
+                    )
+                    .await;
+                    return Err(msg);
+                }
+            };
             let mut args = vec![
                 "--model".into(),
                 model_path.clone(),
@@ -297,6 +385,11 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
                 // its loaded models, otherwise --mlock would have
                 // failed anyway.
                 "--mlock".into(),
+                // Silence the per-slot KV-cache dump llama-server prints at
+                // launch ("slot load_model: id N | task -1 | new slot ...").
+                // -lv 2 keeps warnings/errors while hiding routine info spam.
+                "-lv".into(),
+                "2".into(),
             ];
             // Vision projector: explicit opts.mmproj_path wins; otherwise
             // auto-detect a sibling `mmproj*.gguf` next to the model file. With
@@ -352,10 +445,24 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
             // Fail loud rather than silently launching a chat server for an
             // embedder.
             if mode != ServingMode::Chat {
-                return Err(format!(
+                let msg = format!(
                     "mlx runtime does not support {mode:?} mode (chat only); \
                      use the llama.cpp variant instead"
-                ));
+                );
+                log_model_error(
+                    pool,
+                    &worker_name,
+                    None,
+                    Some(&lib.id),
+                    Some(&lib.catalog_id),
+                    "mlx",
+                    ModelErrorKind::Load,
+                    &msg,
+                    serde_json::json!({"port": port, "mode": format!("{mode:?}")}),
+                    None,
+                )
+                .await;
+                return Err(msg);
             }
             // mlx_lm.server expects the MODEL to be either an HF repo id or a local dir
             // with config/weights. We use the local dir.
@@ -371,10 +478,24 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         }
         "vllm" => {
             if mode != ServingMode::Chat {
-                return Err(format!(
+                let msg = format!(
                     "vllm runtime via this launcher does not yet support \
                      {mode:?} mode; needs --task embedding wiring"
-                ));
+                );
+                log_model_error(
+                    pool,
+                    &worker_name,
+                    None,
+                    Some(&lib.id),
+                    Some(&lib.catalog_id),
+                    "vllm",
+                    ModelErrorKind::Load,
+                    &msg,
+                    serde_json::json!({"port": port, "mode": format!("{mode:?}")}),
+                    None,
+                )
+                .await;
+                return Err(msg);
             }
             let args = vec![
                 "serve".into(),
@@ -514,7 +635,26 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
     let pid = if let Some(p) = systemd_pid {
         p
     } else {
-        let mut child = cmd.spawn().map_err(|e| format!("spawn {program}: {e}"))?;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("spawn {program}: {e}");
+                log_model_error(
+                    pool,
+                    &worker_name,
+                    None,
+                    Some(&lib.id),
+                    Some(&lib.catalog_id),
+                    runtime_label,
+                    ModelErrorKind::Startup,
+                    &msg,
+                    serde_json::json!({"port": port, "program": program}),
+                    tail_log_file(&log_path, 16_384).as_deref(),
+                )
+                .await;
+                return Err(msg);
+            }
+        };
         let pid = child.id();
         // Reap in background so the child doesn't become a zombie.
         tokio::task::spawn_blocking(move || {
@@ -563,6 +703,19 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
             port,
             "inference server did not become healthy within 90s"
         );
+        log_model_error(
+            pool,
+            &worker_name,
+            Some(&deployment_id),
+            Some(&lib.id),
+            Some(&lib.catalog_id),
+            runtime_label,
+            ModelErrorKind::Load,
+            "inference server did not become healthy within 90s",
+            serde_json::json!({"port": port, "pid": pid}),
+            tail_log_file(&log_path, 16_384).as_deref(),
+        )
+        .await;
     }
 
     // V106: mark this library row as hot + bump last_used_at. Single

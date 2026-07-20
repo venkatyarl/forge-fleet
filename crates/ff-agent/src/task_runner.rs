@@ -51,6 +51,9 @@ const MAX_HANDOFFS: i32 = 3;
 /// Per-task override via `payload.max_duration_secs` for known-slow
 /// jobs (e.g. model downloads).
 const MAX_TASK_DURATION: Duration = Duration::from_secs(10 * 60);
+/// Maximum number of worker ticks before returning, to prevent
+/// over-processing in a long-running task runner.
+const MAX_ITERATIONS: usize = 100;
 
 /// GAP-C fair-share cap: the max number of `running` tasks a single caller
 /// (one `parent_task_id` — a swarm/fanout/build invocation) may hold
@@ -596,9 +599,19 @@ impl TaskRunner {
     pub fn spawn(self, interval_secs: u64, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
         let interval = Duration::from_secs(interval_secs.max(2));
         tokio::spawn(async move {
+            let mut iterations = 0;
             loop {
                 if let Err(e) = self.tick_once().await {
                     debug!(error = %e, computer = %self.my_name, "task tick error");
+                }
+                iterations += 1;
+                if iterations >= MAX_ITERATIONS {
+                    warn!(
+                        max_iterations = MAX_ITERATIONS,
+                        computer = %self.my_name,
+                        "task runner iteration cap reached; stopping worker"
+                    );
+                    break;
                 }
                 tokio::select! {
                     result = crate::ha::agent::listen_for_tasks() => {

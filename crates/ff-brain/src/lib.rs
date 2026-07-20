@@ -34,6 +34,7 @@ pub mod facts;
 pub mod image_index;
 pub mod procedural_memory;
 pub mod stack_backlog;
+pub mod train_conflict;
 pub mod vault;
 pub mod vector_search;
 
