@@ -23,6 +23,7 @@ dashmap.workspace = true
 reqwest.workspace = true
 dirs.workspace = true
 notify = "7"
+regex = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
