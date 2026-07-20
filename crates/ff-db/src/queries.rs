@@ -7738,20 +7738,56 @@ pub async fn pg_reap_stale_work_item_leases(
         let outcome = async {
             let mut tx = pool.begin().await?;
             let released = sqlx::query(
-                "UPDATE work_item_leases
-                    SET lease_state = 'stale',
-                        released_at = NOW(),
-                        release_reason = CASE
-                            WHEN heartbeat_at < NOW() - make_interval(secs => $2)
-                              THEN 'stale-heartbeat takeover'
-                            WHEN dispatch_tick_at < NOW() - make_interval(secs => $2)
-                              THEN 'stale-dispatch-tick takeover'
-                            ELSE 'max-build-duration exceeded' END
-                  WHERE id = $1
-                    AND released_at IS NULL
-                    AND (heartbeat_at      < NOW() - make_interval(secs => $2)
-                         OR dispatch_tick_at < NOW() - make_interval(secs => $2)
-                         OR created_at       < NOW() - make_interval(secs => $3))",
+                "WITH releasing AS (
+                     SELECT id, work_item_id, lease_state, endpoint, attempt, computer_id
+                       FROM work_item_leases
+                      WHERE id = $1
+                        AND released_at IS NULL
+                        AND (heartbeat_at      < NOW() - make_interval(secs => $2)
+                             OR dispatch_tick_at < NOW() - make_interval(secs => $2)
+                             OR created_at       < NOW() - make_interval(secs => $3))
+                      FOR UPDATE
+                 ), released AS (
+                     UPDATE work_item_leases l
+                        SET lease_state = 'stale',
+                            released_at = NOW(),
+                            release_reason = CASE
+                                WHEN l.heartbeat_at < NOW() - make_interval(secs => $2)
+                                  THEN 'stale-heartbeat takeover'
+                                WHEN l.dispatch_tick_at < NOW() - make_interval(secs => $2)
+                                  THEN 'stale-dispatch-tick takeover'
+                                ELSE 'max-build-duration exceeded' END
+                       FROM releasing r
+                      WHERE l.id = r.id
+                  RETURNING r.work_item_id,
+                            r.lease_state AS from_status,
+                            r.endpoint,
+                            r.attempt,
+                            l.release_reason,
+                            r.computer_id
+                 )
+                 INSERT INTO work_item_events
+                     (work_item_id, from_status, to_status, computer, attempt, detail)
+                 SELECT r.work_item_id,
+                        r.from_status,
+                        'lease_released',
+                        c.name,
+                        r.attempt,
+                        jsonb_build_object(
+                            'event_type', 'lease_released',
+                            'endpoint', r.endpoint,
+                            'lane', CASE
+                                WHEN NULLIF(r.endpoint, '') IS NULL THEN NULL
+                                WHEN r.endpoint LIKE 'cloud:%'
+                                  OR r.endpoint ~ '^(codex|claude|kimi|gemini|grok)(:|$)'
+                                  THEN 'cloud'
+                                ELSE 'local'
+                            END,
+                            'attempt', r.attempt,
+                            'release_reason', r.release_reason
+                        )
+                   FROM released r
+                   LEFT JOIN computers c ON c.id = r.computer_id",
             )
             .bind(lease_id)
             .bind(stale_secs as f64)
