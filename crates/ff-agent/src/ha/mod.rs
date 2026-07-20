@@ -24,6 +24,9 @@ pub mod slot_manager;
 #[cfg(test)]
 mod integration_tests;
 
+#[cfg(test)]
+mod self_heal_tests;
+
 /// Gracefully release this computer's active work-item leases before an agent
 /// restart.
 ///
