@@ -9,6 +9,12 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs on the same ref (PR branch / main) instead of stacking
+# them — a re-push or update-branch supersedes the in-flight run. Cuts CI noise + minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   fmt:
     name: cargo fmt --check
