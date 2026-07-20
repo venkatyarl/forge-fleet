@@ -273,8 +273,9 @@ async fn run_pr_review(
     // cloud cost. Its verdict stands alone only on APPROVE; a REJECT must be
     // confirmed by one cloud CLI review before the item is failed, so a local
     // misjudgement can never kill a good PR by itself. 480B unavailable or
-    // timed out → fall back to the cloud review path. A cloud-review error
-    // propagates as Err, which the caller treats as "defer for manual review"
+    // timed out → fall back through short-lived cloud reviews and then the
+    // always-available local 30B pool. If every backend is unavailable the
+    // error propagates, which the caller treats as "defer for manual review"
     // — never a rejection.
     match review_via_480b(pg, &prompt).await {
         Ok((true, reason)) => Ok((true, format!("480b: {reason}"))),
@@ -284,9 +285,9 @@ async fn run_pr_review(
                 reason = %reason_480b,
                 "merge_drain: 480b rejected — confirming with cloud review before failing"
             );
-            let (approved, cloud_reason, backend) = cloud_cli_review(pg, &prompt)
+            let (approved, cloud_reason, backend) = fallback_review(pg, &prompt)
                 .await
-                .context("cloud confirm of 480b rejection")?;
+                .context("secondary confirmation of 480b rejection")?;
             if approved {
                 Ok((
                     true,
@@ -303,15 +304,19 @@ async fn run_pr_review(
             warn!(
                 pr = %pr_url,
                 error = %e,
-                "merge_drain: 480b reviewer unavailable — falling back to cloud review"
+                "merge_drain: 480b reviewer unavailable — trying fallback reviewers"
             );
-            let (approved, reason, backend) = cloud_cli_review(pg, &prompt)
+            let (approved, reason, backend) = fallback_review(pg, &prompt)
                 .await
-                .context("cloud PR review fallback")?;
+                .context("PR review fallback")?;
             Ok((approved, format!("{backend}: {reason}")))
         }
     }
 }
+
+/// Every reviewer gets a deliberately short budget so one wedged process or
+/// endpoint cannot pin the serial merge drain for an entire tick.
+const REVIEW_BACKEND_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// Substring identifying the primary autonomous reviewer — the qwen3-coder-480b
 /// ring (single fleet instance). Used both as the `fleet_oneshot` routing hint
@@ -334,13 +339,17 @@ async fn review_via_480b(pg: &PgPool, prompt: &str) -> Result<(bool, String)> {
         .acquire()
         .await
         .expect("480b review gate is never closed");
-    let resp = crate::fleet_oneshot::fleet_oneshot(
-        pg,
-        prompt,
-        Some(REVIEWER_480B_HINT),
-        Some(Duration::from_secs(300)),
+    let resp = tokio::time::timeout(
+        REVIEW_BACKEND_TIMEOUT,
+        crate::fleet_oneshot::fleet_oneshot(
+            pg,
+            prompt,
+            Some(REVIEWER_480B_HINT),
+            Some(REVIEW_BACKEND_TIMEOUT),
+        ),
     )
     .await
+    .context("480b PR review timed out")?
     .context("480b PR review")?;
     if !served_by_480b(&resp.model) {
         anyhow::bail!(
@@ -369,13 +378,71 @@ fn served_by_480b(model: &str) -> bool {
     model.to_lowercase().contains(REVIEWER_480B_HINT)
 }
 
+const REVIEWER_30B_HINT: &str = "qwen3-coder-30b";
+
+fn served_by_30b(model: &str) -> bool {
+    model.to_lowercase().contains(REVIEWER_30B_HINT)
+}
+
+/// Try cloud reviewers first, then the fleet's local 30B pool. The local pass
+/// makes autonomous review independent of both the 480B ring and vendor CLIs.
+async fn fallback_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, String)> {
+    match cloud_cli_review(pg, prompt).await {
+        Ok(review) => Ok(review),
+        Err(cloud_err) => {
+            warn!(error = %cloud_err, "merge_drain: cloud reviewers unavailable — trying local 30b pool");
+            review_via_30b(pg, prompt)
+                .await
+                .map(|(approved, reason)| (approved, reason, "local-30b".to_string()))
+                .with_context(|| {
+                    format!("cloud reviewers failed ({cloud_err:#}); local 30b failed")
+                })
+        }
+    }
+}
+
+async fn review_via_30b(pg: &PgPool, prompt: &str) -> Result<(bool, String)> {
+    let resp = tokio::time::timeout(
+        REVIEW_BACKEND_TIMEOUT,
+        crate::fleet_oneshot::fleet_oneshot(
+            pg,
+            prompt,
+            Some(REVIEWER_30B_HINT),
+            Some(REVIEW_BACKEND_TIMEOUT),
+        ),
+    )
+    .await
+    .context("local 30b PR review timed out")?
+    .context("local 30b PR review")?;
+    if !served_by_30b(&resp.model) {
+        anyhow::bail!(
+            "local 30b pool unavailable — fleet_oneshot failed over to {} on {}",
+            resp.model,
+            resp.worker_name
+        );
+    }
+    record_review_interaction(
+        pg,
+        &resp.model,
+        prompt,
+        &resp.text,
+        resp.tokens_in,
+        resp.tokens_out,
+        i32::try_from(resp.latency_ms).ok(),
+        Some(resp.worker_name.clone()),
+        Some(resp.endpoint.clone()),
+    )
+    .await;
+    Ok(parse_review_response(&resp.text))
+}
+
 /// One cloud CLI review pass — first backend that produces output wins, so a
 /// leader node missing one vendor CLI still gets a review. Returns
 /// `(approved, reason, backend)`.
 async fn cloud_cli_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, String)> {
     let mut last_err: Option<anyhow::Error> = None;
     for backend in ["codex", "claude", "kimi"] {
-        match crate::cli_executor::execute_cli(backend, prompt, &[], Some(Duration::from_secs(600)))
+        match crate::cli_executor::execute_cli(backend, prompt, &[], Some(REVIEW_BACKEND_TIMEOUT))
             .await
         {
             Ok(res) if res.exit_code == 0 && !res.stdout.trim().is_empty() => {
@@ -839,7 +906,10 @@ pub fn spawn_work_item_merge_drain(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_review_response, served_by_480b, update_branch_api_path};
+    use super::{
+        REVIEW_BACKEND_TIMEOUT, parse_review_response, served_by_30b, served_by_480b,
+        update_branch_api_path,
+    };
 
     #[test]
     fn pr_url_maps_to_update_branch_api_path() {
@@ -857,6 +927,22 @@ mod tests {
         assert!(!served_by_480b("qwen3-coder-30b"));
         assert!(!served_by_480b("local"));
         assert!(!served_by_480b(""));
+    }
+
+    #[test]
+    fn local_fallback_matches_30b_pool_only() {
+        assert!(served_by_30b("qwen3-coder-30b"));
+        assert!(served_by_30b("QWEN3-CODER-30B-A3B"));
+        assert!(!served_by_30b("qwen3-vl-30b-a3b"));
+        assert!(!served_by_30b("qwen3-coder-480b"));
+        assert!(!served_by_30b("qwen36-35b-a3b"));
+        assert!(!served_by_30b("local"));
+    }
+
+    #[test]
+    fn review_backends_fail_fast() {
+        assert!(REVIEW_BACKEND_TIMEOUT >= std::time::Duration::from_secs(60));
+        assert!(REVIEW_BACKEND_TIMEOUT <= std::time::Duration::from_secs(90));
     }
 
     #[test]
