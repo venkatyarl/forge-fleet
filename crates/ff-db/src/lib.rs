@@ -97,8 +97,6 @@ pub use queries::{
     TrainingJobRow,
     WorkIntentRow,
     WorkerSshKeyRow,
-    backend_rank,
-    backend_score,
     load_fleet_config_from_postgres,
     pg_active_deployment_counts,
     pg_advance_intent_cursor,

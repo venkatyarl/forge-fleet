@@ -1473,6 +1473,9 @@ fn parse_flag_value(cmdline: &str, flag: &str) -> Option<String> {
 }
 
 fn pid_is_alive(pid: u32) -> bool {
+    if pid > i32::MAX as u32 {
+        return false;
+    }
     // `kill -0 <pid>` returns 0 if the process exists and we can signal it.
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])

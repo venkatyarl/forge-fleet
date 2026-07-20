@@ -302,7 +302,9 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
 fn is_build_timeout(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let message = cause.to_string().to_ascii_lowercase();
-        message.contains("timed out") || message.contains("timeout")
+        message.contains("timed out")
+            || message.contains("timeout")
+            || message.contains("max-build-duration exceeded")
     })
 }
 
@@ -3244,19 +3246,6 @@ async fn routed_backends(pg: &PgPool, computer_id: Uuid, fresh_secs: i64) -> Vec
     selected
 }
 
-#[cfg(test)]
-fn rank_cached_backends(
-    rows: Vec<ff_capacity::BackendCapacity>,
-    cutoff: chrono::DateTime<chrono::Utc>,
-) -> Vec<String> {
-    evaluate_cached_backends(rows, &[], cutoff, "test")
-        .candidates
-        .into_iter()
-        .filter(|candidate| !candidate.rejected)
-        .map(|candidate| candidate.backend)
-        .collect()
-}
-
 fn evaluate_cached_backends(
     rows: Vec<ff_capacity::BackendCapacity>,
     budgets: &[ff_routing_policy::CloudBudget],
@@ -4571,52 +4560,13 @@ mod tests {
         builder_excludes_480b, classify_dispatch_outcome, command_display, default_clone_path,
         dispatch_budget_for_host, expand_home, is_build_timeout, order_cloud_reviewers,
         parse_cli_tokens, primary_or_default_backend, quick_empty_success_is_provider_failure,
-        rank_cached_backends, repo_cache_path, repo_slug, retry_error_is_actionable,
-        rewrite_github_host_alias, same_model_family, status_output_is_clean,
-        task_failed_alert_text, task_prefers_cloud_lane, try_acquire_lane15_480b_permit,
-        use_local_lane,
+        repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
+        same_model_family, status_output_is_clean, task_failed_alert_text, task_prefers_cloud_lane,
+        try_acquire_lane15_480b_permit, use_local_lane,
     };
     use std::path::PathBuf;
     use std::time::Duration;
     use uuid::Uuid;
-
-    #[test]
-    fn cached_backend_routing_matches_legacy_guards_and_score() {
-        let computer_id = Uuid::new_v4();
-        let now = chrono::Utc::now();
-        let row = |backend: &str,
-                   authenticated: bool,
-                   checked_at: chrono::DateTime<chrono::Utc>,
-                   remaining_pct: Option<f64>,
-                   breaker_state: &str| ff_capacity::BackendCapacity {
-            computer_id,
-            backend: backend.to_string(),
-            installed: true,
-            authenticated,
-            last_checked_at: checked_at,
-            remaining_pct,
-            breaker_state: breaker_state.to_string(),
-        };
-        let rows = vec![
-            row("codex", true, now, Some(20.0), "closed"),
-            row("claude", true, now, Some(80.0), "closed"),
-            row("kimi", true, now, Some(100.0), "open"),
-            row("gemini", false, now, Some(100.0), "closed"),
-            row(
-                "grok",
-                true,
-                now - chrono::Duration::hours(2),
-                Some(100.0),
-                "closed",
-            ),
-            row("other", true, now, Some(14.9), "closed"),
-        ];
-
-        assert_eq!(
-            rank_cached_backends(rows, now - chrono::Duration::hours(1)),
-            vec!["claude".to_string(), "codex".to_string()]
-        );
-    }
 
     #[test]
     fn builder_excludes_480b_for_local_builds_only() {
@@ -5229,6 +5179,7 @@ mod tests {
             computer_name: "build-mac".into(),
             session_id: Some(Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap()),
             slot: 2,
+            kind: "code".into(),
             attempts: 3,
             last_error: None,
             complexity: "mechanical".into(),

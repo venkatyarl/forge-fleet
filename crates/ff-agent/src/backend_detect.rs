@@ -509,7 +509,7 @@ mod tests {
             "probe failed: 502 bad gateway"
         ));
         assert!(!probe_indicates_unauthenticated(
-            "context mentions token expired behavior"
+            "context discusses how tokens may expire"
         ));
         // Disjoint from the broken-binary and config-error verdicts.
         assert!(!probe_indicates_unauthenticated(

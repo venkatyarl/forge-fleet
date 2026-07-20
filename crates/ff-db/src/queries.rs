@@ -4511,72 +4511,6 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
 
     #[test]
-    fn backend_rank_orders_cheapest_capable_first() {
-        // codex is the proven build backend → leads; unknowns sink to the back.
-        assert_eq!(backend_rank("codex"), 0);
-        assert_eq!(backend_rank("claude"), 1);
-        assert_eq!(backend_rank("kimi"), 2);
-        assert_eq!(backend_rank("gemini"), 3);
-        assert_eq!(backend_rank("grok"), 4);
-        assert_eq!(backend_rank("totally-unknown"), 9);
-
-        assert!(backend_rank("codex") < backend_rank("claude"));
-        assert!(backend_rank("claude") < backend_rank("kimi"));
-        assert!(backend_rank("kimi") < backend_rank("gemini"));
-        assert!(backend_rank("gemini") < backend_rank("grok"));
-        assert!(backend_rank("grok") < backend_rank("totally-unknown"));
-        // A jumbled list sorts into the documented preference order.
-        let mut v = vec!["grok", "claude", "codex", "kimi", "gemini"];
-        v.sort_by_key(|b| backend_rank(b));
-        assert_eq!(v, ["codex", "claude", "kimi", "gemini", "grok"]);
-    }
-
-    #[test]
-    fn backend_score_prefers_headroom_then_rank() {
-        // With equal (no) usage data, score follows rank: codex > claude.
-        assert!(backend_score("codex", None, "closed") > backend_score("claude", None, "closed"));
-        // A low-rank backend with lots of headroom beats a high-rank one that's
-        // nearly exhausted — quota dominates (0.60 weight).
-        let idle_kimi = backend_score("kimi", Some(99.0), "closed");
-        let drained_codex = backend_score("codex", Some(5.0), "closed");
-        assert!(
-            idle_kimi > drained_codex,
-            "idle kimi {idle_kimi} should beat drained codex {drained_codex}"
-        );
-        // A half-open breaker drags the health term down vs a closed one.
-        assert!(
-            backend_score("codex", Some(50.0), "closed")
-                > backend_score("codex", Some(50.0), "half_open")
-        );
-        // Scores stay within [0,1].
-        for s in [
-            backend_score("codex", Some(100.0), "closed"),
-            backend_score("grok", Some(0.0), "half_open"),
-        ] {
-            assert!((0.0..=1.0).contains(&s), "score {s} out of range");
-        }
-    }
-
-    #[test]
-    fn backend_score_headroom_floor_behavior() {
-        assert!(
-            backend_score("codex", Some(100.0), "closed")
-                > backend_score("codex", Some(10.0), "closed")
-        );
-
-        for s in [
-            backend_score("codex", None, "closed"),
-            backend_score("codex", Some(100.0), "closed"),
-            backend_score("codex", Some(10.0), "closed"),
-            backend_score("codex", Some(0.0), "open"),
-            backend_score("claude", Some(50.0), "half_open"),
-            backend_score("grok", Some(120.0), "closed"),
-        ] {
-            assert!((0.0..=1.0).contains(&s), "score {s} out of range");
-        }
-    }
-
-    #[test]
     fn test_classify_collision_buckets() {
         // 0 same-language candidates ⇒ collides only across a language boundary.
         assert_eq!(classify_collision(0), SuspiciousBucket::CrossLanguage);
@@ -8898,9 +8832,6 @@ pub async fn pg_upsert_computer_backend(
     Ok(())
 }
 
-// Compatibility exports while callers migrate to the policy crate directly.
-pub use ff_routing_policy::{backend_rank, backend_score};
-
 /// Evaluate one cloud route against declarative quota buckets and persist the
 /// complete explanation as training data. This is shared by dispatch and the
 /// no-dispatch CLI debugger.
@@ -8960,16 +8891,16 @@ pub async fn pg_record_route_decision(
 }
 
 /// Headroom-aware routing (capability A5): the backends a node can dispatch to
-/// RIGHT NOW, ordered by [`backend_score`] (most usage-headroom + cheapest
+/// RIGHT NOW, ordered by policy score (most usage-headroom + cheapest
 /// first) instead of bare rank. Excludes breaker-open providers and those
 /// under the council headroom floor (15%). Degrades gracefully: when no
 /// `fleet_provider_usage` rows exist yet, every backend scores at full
-/// headroom and the order collapses to [`backend_rank`] — so this is always
+/// headroom and the order collapses to policy rank — so this is always
 /// safe to use in place of [`pg_dispatchable_backends`].
-/// Returns dispatchable backends ordered by `backend_score` (headroom + rank).
+/// Returns dispatchable backends ordered by policy score (headroom + rank).
 ///
 /// Excludes breaker-open providers and backends under the 15% headroom floor.
-/// Degrades to `backend_rank` ordering when no usage rows exist.
+/// Degrades to policy rank ordering when no usage rows exist.
 pub async fn pg_routed_backends(
     pool: &PgPool,
     computer_id: uuid::Uuid,
@@ -9023,7 +8954,7 @@ pub async fn pg_cloud_route_for_computer(
 
 /// The backends a node can actually dispatch to RIGHT NOW (capability A3):
 /// installed AND authenticated AND auth-checked within `fresh_secs`, ordered
-/// cheapest-capable-first via [`backend_rank`]. Empty ⇒ no usable backend on
+/// cheapest-capable-first via the shared routing policy. Empty ⇒ no usable backend on
 /// this node (caller falls back / re-probes). The freshness bound is the
 /// council guard against routing to a backend whose cached auth has gone stale.
 pub async fn pg_dispatchable_backends(
@@ -9043,7 +8974,7 @@ pub async fn pg_dispatchable_backends(
     .bind(fresh_secs as f64)
     .fetch_all(pool)
     .await?;
-    backends.sort_by_key(|b| backend_rank(b));
+    backends.sort_by_key(|b| ff_routing_policy::backend_rank(b));
     Ok(backends)
 }
 

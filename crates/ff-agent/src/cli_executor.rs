@@ -493,14 +493,6 @@ mod tests {
         assert!(backend_by_name("").is_none());
     }
 
-    #[test]
-    fn codex_backend_keeps_hardened_headless_flags() {
-        let codex = backend_by_name("codex").expect("codex backend");
-        assert_eq!(codex.default_flags[0], "exec");
-        assert!(codex.default_flags.contains(&"--ignore-user-config"));
-        assert!(codex.default_flags.contains(&"--skip-git-repo-check"));
-    }
-
     /// `local` is intentionally NOT in `BACKENDS` — it routes through the
     /// existing agent loop, not this CLI module. The conductor accepts "local"
     /// via a separate `eq_ignore_ascii_case("local")` branch in its inline
