@@ -59,6 +59,20 @@ pub const BACKUP_ENC_PUBKEY: &str = "backup_encryption_pubkey";
 /// fleet_secrets key that stores the age X25519 identity (private key).
 /// Only operators performing a restore should fetch this.
 pub const BACKUP_ENC_PRIVKEY: &str = "backup_encryption_privkey";
+/// fleet_secrets key holding EXTRA age recipients (operator personal keys,
+/// offline HSM keys, ...) — comma/whitespace/newline separated `age1...`
+/// strings. Every backup is encrypted to the fleet key PLUS these, so an
+/// operator can restore without the fleet privkey (which lives inside the
+/// very Postgres DB the backups protect — the circular dependency this
+/// breaks). Malformed entries are skipped with a warning, never fatal.
+pub const BACKUP_ENC_EXTRA_RECIPIENTS: &str = "backup_encryption_extra_recipients";
+/// File name (under the backups dir root) of the key-escrow artifact: the
+/// fleet age identity, armor-encrypted to the extra recipients. Lets an
+/// operator recover even PRE-multi-recipient backups after total DB loss:
+/// `age -d -i <operator-key> backup_age_identity.age` → fleet identity →
+/// decrypt any backup. Sits outside the per-kind dirs so the prune/reap
+/// machinery (which matches kind prefixes inside kind dirs) never touches it.
+pub const BACKUP_IDENTITY_ESCROW_FILE: &str = "backup_age_identity.age";
 
 const DEFAULT_POSTGRES_INTERVAL_HOURS: u64 = 4;
 const DEFAULT_REDIS_INTERVAL_HOURS: u64 = 2;
@@ -512,14 +526,10 @@ impl BackupOrchestrator {
         tokio::fs::create_dir_all(&out_dir).await?;
 
         // Ensure an age keypair is provisioned in fleet_secrets before we
-        // try to encrypt. If the operator hasn't set one, we generate a
-        // fresh X25519 keypair and store it. Skipped entirely when the
-        // kind's policy disables encryption.
-        let recipient = if cfg.encrypt {
-            Some(ensure_backup_keypair(&self.pg).await?)
-        } else {
-            None
-        };
+        // try to encrypt, gather any extra operator recipients, and refresh
+        // the local key escrow. Empty when the kind's policy disables
+        // encryption.
+        let recipients = self.encryption_recipients(cfg).await?;
 
         // Ensure the `replicator` Postgres role exists before we shell
         // pg_basebackup -U replicator. On a fresh / post-wipe DB the role is
@@ -547,7 +557,7 @@ impl BackupOrchestrator {
                  pg_basebackup -h 127.0.0.1 -U replicator -D - -Ft -z -X fetch\
                  {age} > {out}",
             pw = REPLICATOR_DEFAULT_PASSWORD,
-            age = age_stage(recipient.as_deref()),
+            age = age_stage(&recipients),
             out = shell_quote(&path.to_string_lossy()),
         );
 
@@ -562,6 +572,9 @@ impl BackupOrchestrator {
 
         let (size_bytes, sha256) = file_metadata(&path).await?;
         validate_backup_size("postgres", &path, size_bytes).await?;
+        if !recipients.is_empty() {
+            verify_backup_decryptable(&self.pg, &path).await?;
+        }
         let backup_id = self
             .insert_backup_row("postgres", &file_name, size_bytes, &sha256)
             .await?;
@@ -588,11 +601,7 @@ impl BackupOrchestrator {
         let out_dir = self.backup_dir.join(kind_dir("redis"));
         tokio::fs::create_dir_all(&out_dir).await?;
 
-        let recipient = if cfg.encrypt {
-            Some(ensure_backup_keypair(&self.pg).await?)
-        } else {
-            None
-        };
+        let recipients = self.encryption_recipients(cfg).await?;
 
         let ts = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
         let file_name = format!("redis-{ts}.rdb.zst{}", age_ext(cfg.encrypt));
@@ -628,7 +637,7 @@ impl BackupOrchestrator {
         let shell_cmd = format!(
             "docker exec forgefleet-redis cat /data/dump.rdb \
                 | zstd -q{age} > {out}",
-            age = age_stage(recipient.as_deref()),
+            age = age_stage(&recipients),
             out = shell_quote(&path.to_string_lossy()),
         );
         let status = run_pipeline(&shell_cmd).await?;
@@ -641,7 +650,7 @@ impl BackupOrchestrator {
             let shell_cmd_gz = format!(
                 "docker exec forgefleet-redis cat /data/dump.rdb \
                     | gzip{age} > {out}",
-                age = age_stage(recipient.as_deref()),
+                age = age_stage(&recipients),
                 out = shell_quote(&path_gz.to_string_lossy()),
             );
             let status_gz = run_pipeline(&shell_cmd_gz).await?;
@@ -652,6 +661,9 @@ impl BackupOrchestrator {
             }
             let (size_bytes, sha256) = file_metadata(&path_gz).await?;
             validate_backup_size("redis", &path_gz, size_bytes).await?;
+            if !recipients.is_empty() {
+                verify_backup_decryptable(&self.pg, &path_gz).await?;
+            }
             let backup_id = self
                 .insert_backup_row("redis", &file_name_gz, size_bytes, &sha256)
                 .await?;
@@ -672,6 +684,9 @@ impl BackupOrchestrator {
 
         let (size_bytes, sha256) = file_metadata(&path).await?;
         validate_backup_size("redis", &path, size_bytes).await?;
+        if !recipients.is_empty() {
+            verify_backup_decryptable(&self.pg, &path).await?;
+        }
         let backup_id = self
             .insert_backup_row("redis", &file_name, size_bytes, &sha256)
             .await?;
@@ -702,11 +717,7 @@ impl BackupOrchestrator {
         let out_dir = self.backup_dir.join(kind_dir("falkordb"));
         tokio::fs::create_dir_all(&out_dir).await?;
 
-        let recipient = if cfg.encrypt {
-            Some(ensure_backup_keypair(&self.pg).await?)
-        } else {
-            None
-        };
+        let recipients = self.encryption_recipients(cfg).await?;
 
         // 1) Ask FalkorDB to write an RDB snapshot.
         let bgsave = Command::new("docker")
@@ -736,7 +747,7 @@ impl BackupOrchestrator {
         let path = out_dir.join(&file_name);
 
         // 3) tar dump.rdb + AOF dir out of the container, compress, encrypt.
-        let shell_cmd = falkordb_dump_cmd(recipient.as_deref(), &path.to_string_lossy());
+        let shell_cmd = falkordb_dump_cmd(&recipients, &path.to_string_lossy());
         info!(path = %path.display(), "running falkordb tar | zstd | age");
         let status = run_pipeline(&shell_cmd).await?;
         if !status.success() {
@@ -748,6 +759,9 @@ impl BackupOrchestrator {
 
         let (size_bytes, sha256) = file_metadata(&path).await?;
         validate_backup_size("falkordb", &path, size_bytes).await?;
+        if !recipients.is_empty() {
+            verify_backup_decryptable(&self.pg, &path).await?;
+        }
         let backup_id = self
             .insert_backup_row("falkordb", &file_name, size_bytes, &sha256)
             .await?;
@@ -768,6 +782,31 @@ impl BackupOrchestrator {
     }
 
     // ─── Shared helpers ───────────────────────────────────────────────
+
+    /// Full recipient set a kind's artifact is encrypted to, or empty when
+    /// its policy disables encryption: the fleet key (provisioned on first
+    /// use) first, then any operator extras from
+    /// [`BACKUP_ENC_EXTRA_RECIPIENTS`] (deduped). Also refreshes the local
+    /// key escrow as a side effect — best-effort, so an escrow hiccup can
+    /// never block the backup itself.
+    async fn encryption_recipients(
+        &self,
+        cfg: &BackupKindConfig,
+    ) -> Result<Vec<String>, BackupError> {
+        if !cfg.encrypt {
+            return Ok(Vec::new());
+        }
+        let primary = ensure_backup_keypair(&self.pg).await?;
+        let extras = load_extra_recipients(&self.pg).await;
+        escrow_backup_identity(&self.pg, &self.backup_dir, &extras).await;
+        let mut all = vec![primary];
+        for r in extras {
+            if !all.contains(&r) {
+                all.push(r);
+            }
+        }
+        Ok(all)
+    }
 
     async fn i_am_leader(&self) -> Result<bool, BackupError> {
         let cur = pg_get_current_leader(&self.pg).await?;
@@ -1300,13 +1339,179 @@ fn age_ext(encrypt: bool) -> &'static str {
     if encrypt { ".age" } else { "" }
 }
 
-/// The ` | age -r <recipient>` pipeline stage, or empty when the kind's
-/// policy disables encryption.
-fn age_stage(recipient: Option<&str>) -> String {
-    match recipient {
-        Some(r) => format!(" | age -r {}", shell_quote(r)),
-        None => String::new(),
+/// The ` | age -r <r1> -r <r2> ...` pipeline stage encrypting to every
+/// recipient (fleet key + operator extras), or empty when the kind's policy
+/// disables encryption (no recipients).
+fn age_stage(recipients: &[String]) -> String {
+    if recipients.is_empty() {
+        return String::new();
     }
+    let flags: Vec<String> = recipients
+        .iter()
+        .map(|r| format!("-r {}", shell_quote(r)))
+        .collect();
+    format!(" | age {}", flags.join(" "))
+}
+
+/// Split the [`BACKUP_ENC_EXTRA_RECIPIENTS`] secret (comma / whitespace /
+/// newline separated) into `(valid, invalid)` recipient strings. Validity =
+/// parses as an age X25519 recipient; valid entries are deduped in order.
+/// Pure — no IO — so the operator-input handling is unit-testable.
+fn parse_extra_recipients(raw: &str) -> (Vec<String>, Vec<String>) {
+    let mut valid: Vec<String> = Vec::new();
+    let mut invalid: Vec<String> = Vec::new();
+    for tok in raw
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        if tok.parse::<age::x25519::Recipient>().is_ok() {
+            if !valid.iter().any(|v| v == tok) {
+                valid.push(tok.to_string());
+            }
+        } else {
+            invalid.push(tok.to_string());
+        }
+    }
+    (valid, invalid)
+}
+
+/// Operator-configured extra age recipients from
+/// `fleet_secrets.backup_encryption_extra_recipients`. Malformed entries are
+/// skipped with a warning and a lookup error yields an empty set — an
+/// operator typo or DB blip must degrade to fleet-key-only encryption, never
+/// block the backup.
+async fn load_extra_recipients(pool: &PgPool) -> Vec<String> {
+    let raw = match pg_get_secret(pool, BACKUP_ENC_EXTRA_RECIPIENTS).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Vec::new(),
+        Err(e) => {
+            warn!(error = %e, "extra backup recipients lookup failed; encrypting to fleet key only");
+            return Vec::new();
+        }
+    };
+    let (valid, invalid) = parse_extra_recipients(&raw);
+    if !invalid.is_empty() {
+        warn!(
+            invalid = ?invalid,
+            "ignoring malformed entries in fleet_secrets.{BACKUP_ENC_EXTRA_RECIPIENTS}"
+        );
+    }
+    valid
+}
+
+/// Escrow the fleet backup identity locally, encrypted to the operator's
+/// extra recipients: `<backup_dir>/backup_age_identity.age` (armored, 0600).
+///
+/// The fleet privkey lives ONLY in `fleet_secrets` — inside the very
+/// Postgres DB the backups protect. Without escrow, total DB loss makes
+/// every `.age` artifact undecryptable (the key is inside the ciphertext it
+/// unlocks). The escrow is itself encrypted (never a plaintext key on disk):
+/// `age -d -i <operator-key> backup_age_identity.age` recovers the fleet
+/// identity, which then opens ANY backup — including pre-multi-recipient
+/// ones. Rewritten every cycle so recipient changes self-heal; with no extra
+/// recipients configured there is nothing safe to escrow to, so we only
+/// warn about the DR gap. Best-effort by contract — never fails the caller.
+async fn escrow_backup_identity(pool: &PgPool, backup_dir: &Path, extra_recipients: &[String]) {
+    if extra_recipients.is_empty() {
+        warn!(
+            "no {BACKUP_ENC_EXTRA_RECIPIENTS} configured — backup privkey has no escrow \
+             and backups are unrecoverable if Postgres is lost; set operator age \
+             recipient(s) via `ff secrets set {BACKUP_ENC_EXTRA_RECIPIENTS}`"
+        );
+        return;
+    }
+    let identity = match pg_get_secret(pool, BACKUP_ENC_PRIVKEY).await {
+        Ok(Some(k)) => k,
+        Ok(None) => return, // nothing provisioned yet — nothing to escrow
+        Err(e) => {
+            warn!(error = %e, "key escrow: fleet_secrets lookup failed");
+            return;
+        }
+    };
+    let ciphertext =
+        match ff_security::age_vault::encrypt_to_recipients(&identity, extra_recipients) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "key escrow: encrypt to operator recipients failed");
+                return;
+            }
+        };
+    let path = backup_dir.join(BACKUP_IDENTITY_ESCROW_FILE);
+    if let Err(e) = write_escrow_file(&path, &ciphertext).await {
+        warn!(path = %path.display(), error = %e, "key escrow: write failed");
+    } else {
+        debug!(path = %path.display(), recipients = extra_recipients.len(),
+               "backup identity escrow refreshed");
+    }
+}
+
+/// Write the (already-encrypted) escrow artifact with 0600 perms.
+async fn write_escrow_file(path: &Path, ciphertext: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(path, ciphertext).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    Ok(())
+}
+
+/// Prove an encrypted artifact opens with the FLEET identity: parse the age
+/// header, unwrap the file key, and read the first payload chunk (verifying
+/// its MAC). Catches the silent-catastrophe class where fleet_secrets holds a
+/// pubkey whose matching privkey was lost/rotated away — every backup would
+/// encrypt cleanly and be unrestorable. Reads only the header + one chunk, so
+/// it's cheap even on multi-GB artifacts. Pure/sync — called via
+/// `spawn_blocking`; unit-testable without a DB.
+fn check_age_decryptable(path: &Path, identity: &age::x25519::Identity) -> Result<(), String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
+    let decryptor = age::Decryptor::new(std::io::BufReader::new(file))
+        .map_err(|e| format!("age header: {e}"))?;
+    let mut reader = decryptor
+        .decrypt(std::iter::once(identity as &dyn age::Identity))
+        .map_err(|e| format!("age unwrap (stored identity does not match): {e}"))?;
+    let mut probe = [0u8; 64];
+    reader
+        .read(&mut probe)
+        .map_err(|e| format!("payload read: {e}"))?;
+    Ok(())
+}
+
+/// Decryptability gate run on every encrypted artifact BEFORE it reaches the
+/// catalog or the rsync fan-out. Failure unlinks the artifact (mirroring
+/// [`validate_backup_size`]) and errors the cycle loudly — an undecryptable
+/// backup replicated fleet-wide is worse than no backup, because it looks
+/// like DR coverage until the day of the restore.
+async fn verify_backup_decryptable(pool: &PgPool, path: &Path) -> Result<(), BackupError> {
+    let privkey = pg_get_secret(pool, BACKUP_ENC_PRIVKEY)
+        .await
+        .map_err(|e| BackupError::Cmd(format!("fleet_secrets lookup: {e}")))?
+        .ok_or_else(|| {
+            BackupError::Cmd(format!(
+                "fleet_secrets.{BACKUP_ENC_PRIVKEY} is not set but an encrypted \
+                 artifact was produced — refusing to catalog an unrestorable backup"
+            ))
+        })?;
+    let identity = age::x25519::Identity::from_str(privkey.trim())
+        .map_err(|e| BackupError::Cmd(format!("parse stored age identity: {e}")))?;
+    let p = path.to_path_buf();
+    let res = tokio::task::spawn_blocking(move || check_age_decryptable(&p, &identity))
+        .await
+        .map_err(|e| BackupError::Cmd(format!("decrypt-check task: {e}")))?;
+    if let Err(e) = res {
+        let _ = tokio::fs::remove_file(path).await;
+        return Err(BackupError::Cmd(format!(
+            "backup artifact {} failed the decryptability check ({e}); \
+             removed it so an unrestorable backup is never catalogued or replicated",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Shell pipeline that streams `dump.rdb` plus the multi-part AOF dir (when
@@ -1314,12 +1519,12 @@ fn age_stage(recipient: Option<&str>) -> String {
 /// optionally encrypts. The inner `sh -c` runs INSIDE the container; tar'ing
 /// only the two known paths means a stray file in /data is never captured.
 /// Pure — no IO — so the command shape is unit-testable.
-fn falkordb_dump_cmd(recipient: Option<&str>, out_path: &str) -> String {
+fn falkordb_dump_cmd(recipients: &[String], out_path: &str) -> String {
     format!(
         "docker exec {FALKORDB_CONTAINER} sh -c \
            'cd /data && tar cf - dump.rdb $(test -d appendonlydir && echo appendonlydir)' \
          | zstd -q{age} > {out}",
-        age = age_stage(recipient),
+        age = age_stage(recipients),
         out = shell_quote(out_path),
     )
 }
@@ -1896,7 +2101,7 @@ mod tests {
 
     #[test]
     fn falkordb_dump_cmd_captures_rdb_and_aof() {
-        let cmd = falkordb_dump_cmd(Some("age1abc"), "/tmp/falkordb-x.tar.zst.age");
+        let cmd = falkordb_dump_cmd(&["age1abc".to_string()], "/tmp/falkordb-x.tar.zst.age");
         assert!(
             cmd.contains("docker exec forgefleet-falkordb"),
             "cmd: {cmd}"
@@ -1912,7 +2117,7 @@ mod tests {
         );
 
         // encrypt=false policy → no age stage at all.
-        let plain = falkordb_dump_cmd(None, "/tmp/falkordb-x.tar.zst");
+        let plain = falkordb_dump_cmd(&[], "/tmp/falkordb-x.tar.zst");
         assert!(!plain.contains("age -r"), "cmd: {plain}");
         assert!(plain.contains("| zstd -q > "), "cmd: {plain}");
     }
@@ -1921,8 +2126,125 @@ mod tests {
     fn age_helpers_follow_encrypt_policy() {
         assert_eq!(age_ext(true), ".age");
         assert_eq!(age_ext(false), "");
-        assert_eq!(age_stage(Some("age1xyz")), " | age -r 'age1xyz'");
-        assert_eq!(age_stage(None), "");
+        assert_eq!(age_stage(&["age1xyz".to_string()]), " | age -r 'age1xyz'");
+        // Multi-recipient: every key gets its own -r flag so the artifact is
+        // decryptable by the fleet key OR any operator key independently.
+        assert_eq!(
+            age_stage(&["age1xyz".to_string(), "age1op".to_string()]),
+            " | age -r 'age1xyz' -r 'age1op'"
+        );
+        assert_eq!(age_stage(&[]), "");
+    }
+
+    #[test]
+    fn parse_extra_recipients_validates_dedupes_and_splits() {
+        let a = age::x25519::Identity::generate().to_public().to_string();
+        let b = age::x25519::Identity::generate().to_public().to_string();
+        // Mixed separators (comma, newline, spaces), a duplicate, and two
+        // malformed entries — only the valid unique keys survive, in order,
+        // and the garbage is reported (not silently dropped).
+        let raw = format!("{a}, not-a-key\n{b}  {a}\nage1tooshort");
+        let (valid, invalid) = parse_extra_recipients(&raw);
+        assert_eq!(valid, vec![a, b]);
+        assert_eq!(
+            invalid,
+            vec!["not-a-key".to_string(), "age1tooshort".to_string()]
+        );
+        // Empty / all-whitespace input → nothing, no error.
+        assert_eq!(parse_extra_recipients("  \n ,, "), (vec![], vec![]));
+    }
+
+    /// Encrypt `payload` to `recipients` in the binary (non-armored) age
+    /// format — the same on-disk shape the `age -r` CLI pipeline produces.
+    fn age_encrypt_binary(payload: &[u8], recipients: &[age::x25519::Recipient]) -> Vec<u8> {
+        use std::io::Write;
+        let refs: Vec<&dyn age::Recipient> = recipients
+            .iter()
+            .map(|r| r as &dyn age::Recipient)
+            .collect();
+        let mut out = vec![];
+        let mut w = age::Encryptor::with_recipients(refs.into_iter())
+            .unwrap()
+            .wrap_output(&mut out)
+            .unwrap();
+        w.write_all(payload).unwrap();
+        w.finish().unwrap();
+        out
+    }
+
+    #[test]
+    fn check_age_decryptable_accepts_matching_key_rejects_others() {
+        let fleet = age::x25519::Identity::generate();
+        let operator = age::x25519::Identity::generate();
+        let stranger = age::x25519::Identity::generate();
+
+        let dir = std::env::temp_dir().join(format!("ff-bk-dec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pg-fake.tar.gz.age");
+        // Multi-recipient artifact: fleet + operator.
+        std::fs::write(
+            &path,
+            age_encrypt_binary(
+                b"pretend this is a base backup",
+                &[fleet.to_public(), operator.to_public()],
+            ),
+        )
+        .unwrap();
+
+        // Either enrolled key opens it; an unenrolled key must fail — that's
+        // exactly the lost-privkey catastrophe the gate exists to catch.
+        assert!(check_age_decryptable(&path, &fleet).is_ok());
+        assert!(check_age_decryptable(&path, &operator).is_ok());
+        assert!(check_age_decryptable(&path, &stranger).is_err());
+
+        // Garbage that isn't an age file at all is rejected, not mistaken
+        // for a decryptable artifact.
+        let junk = dir.join("pg-junk.tar.gz.age");
+        std::fs::write(&junk, vec![0u8; 4096]).unwrap();
+        assert!(check_age_decryptable(&junk, &fleet).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn escrow_file_roundtrips_through_operator_key() {
+        // The escrow artifact must (a) recover the exact fleet identity via
+        // the operator's key, (b) never touch disk unencrypted, (c) be 0600.
+        let fleet = age::x25519::Identity::generate();
+        let operator = age::x25519::Identity::generate();
+        let fleet_identity_str = {
+            use secrecy::ExposeSecret;
+            fleet.to_string().expose_secret().to_string()
+        };
+        let ciphertext = ff_security::age_vault::encrypt_to_recipients(
+            &fleet_identity_str,
+            &[operator.to_public().to_string()],
+        )
+        .unwrap();
+        assert!(
+            !ciphertext.contains("AGE-SECRET-KEY"),
+            "escrow must never contain the plaintext identity"
+        );
+
+        let dir = std::env::temp_dir().join(format!("ff-bk-escrow-{}", std::process::id()));
+        let path = dir.join(BACKUP_IDENTITY_ESCROW_FILE);
+        write_escrow_file(&path, &ciphertext).await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "escrow file must be 0600");
+        }
+
+        let stored = tokio::fs::read_to_string(&path).await.unwrap();
+        let operator_key = {
+            use secrecy::ExposeSecret;
+            operator.to_string().expose_secret().to_string()
+        };
+        let recovered = ff_security::age_vault::decrypt(&stored, &operator_key).unwrap();
+        assert_eq!(recovered, fleet_identity_str);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[test]
