@@ -84,6 +84,8 @@ struct AssignedWorkItem {
     repo_path: PathBuf,
     sub_agent_id: Uuid,
     computer_id: Uuid,
+    computer_name: String,
+    session_id: Option<Uuid>,
     slot: i32,
     kind: String,
     /// Prior failed attempts (escalation ladder). Drives backend escalation
@@ -441,7 +443,9 @@ async fn assigned_work_items(
             sa.computer_id,
             sa.slot,
             sa.kind,
-            sa.workspace_dir
+            sa.workspace_dir,
+            c.name AS computer_name,
+            l.session_id
           FROM sub_agents sa
           JOIN computers c ON c.id = sa.computer_id
           JOIN work_items w ON w.id = sa.current_work_item_id
@@ -526,6 +530,8 @@ async fn assigned_work_items(
                 kind,
                 sub_agent_id: r.get("sub_agent_id"),
                 computer_id: r.get("computer_id"),
+                computer_name: r.get("computer_name"),
+                session_id: r.try_get("session_id").ok().flatten(),
                 slot: r.get("slot"),
                 attempts: r.try_get("attempts").unwrap_or(0),
                 last_error: r.try_get("last_error").ok().flatten(),
@@ -2019,7 +2025,7 @@ async fn mark_failed_and_release(pg: &PgPool, item: &AssignedWorkItem, error: &s
     // Escalation ladder stage 3: the fleet (local + cloud) couldn't build this
     // after the full retry budget — tell the operator. Best-effort; a notify
     // failure never fails the dispatch.
-    notify_operator_task_failed(pg, item.work_item_id, &item.title, error).await;
+    notify_operator_task_failed(pg, item, error).await;
     Ok(())
 }
 
@@ -2027,7 +2033,8 @@ async fn mark_failed_and_release(pg: &PgPool, item: &AssignedWorkItem, error: &s
 /// and lands on terminal `failed` — "Jarvis tells you when it's genuinely
 /// stuck." Reads the same `telegram_bot_token` / `telegram_chat_id` secrets
 /// the alert evaluator uses. NEVER returns an error or panics: any failure is logged and swallowed.
-async fn notify_operator_task_failed(pg: &PgPool, work_item_id: Uuid, title: &str, error: &str) {
+async fn notify_operator_task_failed(pg: &PgPool, item: &AssignedWorkItem, error: &str) {
+    let work_item_id = item.work_item_id;
     let token = match ff_db::pg_get_secret(pg, "telegram_bot_token").await {
         Ok(Some(t)) if !t.trim().is_empty() => t,
         _ => {
@@ -2074,10 +2081,7 @@ async fn notify_operator_task_failed(pg: &PgPool, work_item_id: Uuid, title: &st
             tracing::warn!(error = %e, "notify_operator_task_failed: dedup check failed; sending anyway (fail-open)")
         }
     }
-    let err_clip: String = error.chars().take(800).collect();
-    let text = format!(
-        "🛑 ForgeFleet task FAILED after max retries\n\n{title}\n\nwork_item: {work_item_id}\n\nlast error:\n{err_clip}"
-    );
+    let text = task_failed_alert_text(item, error);
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -2107,6 +2111,23 @@ async fn notify_operator_task_failed(pg: &PgPool, work_item_id: Uuid, title: &st
             tracing::warn!(error = %e, %work_item_id, "notify_operator_task_failed: telegram send failed")
         }
     }
+}
+
+fn task_failed_alert_text(item: &AssignedWorkItem, error: &str) -> String {
+    let err_clip: String = error.chars().take(800).collect();
+    let session_name = format!("sub-agent-{}", item.slot);
+    let session_id = item
+        .session_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "not recorded".to_string());
+
+    format!(
+        "🛑 {title}\n\nFAILED after max retries\nForgeFleet couldn't complete this task after all retry attempts.\n\nSession: {session_name} on {computer_name}\n\nLast error (diagnostic):\n{err_clip}\n\nIDs (diagnostic)\nwork_item: {work_item_id}\nsession: {session_id}\ncomputer: {computer_id}",
+        title = item.title,
+        computer_name = item.computer_name,
+        work_item_id = item.work_item_id,
+        computer_id = item.computer_id,
+    )
 }
 
 async fn release_slot_and_lease_tx(
@@ -4153,15 +4174,19 @@ pub fn spawn_worktree_reaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS, ReviewerStat,
+        AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS,
+        ReviewerStat,
         agent_output_tail, backend_failed_without_output, builder_excludes_480b,
         classify_dispatch_outcome, command_display, default_clone_path, dispatch_budget_for_host,
         expand_home, is_build_timeout, order_cloud_reviewers, parse_cli_tokens,
         primary_or_default_backend, quick_empty_success_is_provider_failure, repo_cache_path,
         repo_slug, retry_error_is_actionable, rewrite_github_host_alias, status_output_is_clean,
-        task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
+        task_failed_alert_text, task_prefers_cloud_lane, try_acquire_lane15_480b_permit,
+        use_local_lane,
     };
+    use std::path::PathBuf;
     use std::time::Duration;
+    use uuid::Uuid;
 
     #[test]
     fn builder_excludes_480b_for_local_builds_only() {
@@ -4736,6 +4761,40 @@ mod tests {
         assert_eq!(dispatch_budget_for_host(50, 99), 1);
         // Below the threshold → no throttle.
         assert_eq!(dispatch_budget_for_host(50, 2), 3);
+    }
+
+    #[test]
+    fn terminal_failure_alert_leads_with_human_context_and_puts_ids_last() {
+        let item = AssignedWorkItem {
+            work_item_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            project_id: "forge-fleet".into(),
+            title: "Make Telegram alerts readable".into(),
+            description: None,
+            base_branch: None,
+            repo_id: None,
+            repo_url: None,
+            repo_path: PathBuf::new(),
+            sub_agent_id: Uuid::nil(),
+            computer_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+            computer_name: "build-mac".into(),
+            session_id: Some(Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap()),
+            slot: 2,
+            attempts: 3,
+            last_error: None,
+            complexity: "mechanical".into(),
+            predicted_paths_count: 1,
+            brain_node_ids: Vec::new(),
+            touched_paths: Vec::new(),
+        };
+
+        let alert = task_failed_alert_text(&item, "branch: raw-name\nstderr: compile failed");
+        assert!(alert.starts_with("🛑 Make Telegram alerts readable"));
+        assert!(alert.contains("Session: sub-agent-2 on build-mac"));
+        assert!(alert.find("IDs (diagnostic)").unwrap() < alert.find("11111111-").unwrap());
+        assert!(
+            alert.find("Last error (diagnostic)").unwrap()
+                < alert.find("IDs (diagnostic)").unwrap()
+        );
     }
 
     #[test]
