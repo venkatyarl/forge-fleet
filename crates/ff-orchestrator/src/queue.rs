@@ -3,8 +3,14 @@
 //! Tasks are queued by priority (Critical → Background) and dequeued
 //! highest-priority-first. Supports task reservation (mark as assigned
 //! without removing), timeout-based priority boosting, and bulk drain.
+//!
+//! The queue uses interior mutability so a single instance can be shared
+//! across threads and await-style callers without external locking. All
+//! edits are serialized through a single mutex, preventing races when
+//! multiple workers update the same build slot concurrently.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -82,17 +88,28 @@ impl QueuedTask {
 
 // ─── Priority Queue ──────────────────────────────────────────────────────────
 
+/// Mutable state guarded by the queue mutex.
+#[derive(Debug)]
+struct PriorityQueueState {
+    /// Priority → FIFO queue of tasks at that level.
+    buckets: BTreeMap<TaskPriority, VecDeque<QueuedTask>>,
+    /// Task ID → priority lookup for O(1) finding.
+    index: HashMap<Uuid, TaskPriority>,
+}
+
 /// Priority-based task queue.
 ///
 /// Backed by a `BTreeMap<TaskPriority, VecDeque<QueuedTask>>` so that
 /// iteration naturally yields highest-priority tasks first (Critical has
 /// the smallest discriminant and comes first in BTreeMap order).
+///
+/// All mutating operations acquire an internal mutex, so a single
+/// [`PriorityQueue`] can safely be shared between threads and concurrent
+/// await-style callers. This serializes edits within the same build slot
+/// and prevents races on the queue buckets and index.
 #[derive(Debug)]
 pub struct PriorityQueue {
-    /// Priority → FIFO queue of tasks at that level.
-    buckets: BTreeMap<TaskPriority, VecDeque<QueuedTask>>,
-    /// Task ID → priority lookup for O(1) finding.
-    index: HashMap<Uuid, TaskPriority>,
+    state: Mutex<PriorityQueueState>,
     /// How long a task can wait before its priority is boosted.
     boost_timeout: Duration,
 }
@@ -104,8 +121,10 @@ impl PriorityQueue {
     /// promoted one priority level (e.g. Low → Normal).
     pub fn new(boost_timeout: Duration) -> Self {
         Self {
-            buckets: BTreeMap::new(),
-            index: HashMap::new(),
+            state: Mutex::new(PriorityQueueState {
+                buckets: BTreeMap::new(),
+                index: HashMap::new(),
+            }),
             boost_timeout,
         }
     }
@@ -115,11 +134,18 @@ impl PriorityQueue {
         Self::new(Duration::from_secs(600))
     }
 
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, PriorityQueueState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Enqueue a task at the given priority.
-    pub fn enqueue(&mut self, task: QueuedTask, priority: TaskPriority) {
+    pub fn enqueue(&self, task: QueuedTask, priority: TaskPriority) {
         let id = task.id;
-        self.buckets.entry(priority).or_default().push_back(task);
-        self.index.insert(id, priority);
+        let mut state = self.lock_state();
+        state.buckets.entry(priority).or_default().push_back(task);
+        state.index.insert(id, priority);
 
         debug!(task_id = %id, priority = %priority, "task enqueued");
     }
@@ -129,25 +155,34 @@ impl PriorityQueue {
     /// Removes and returns the first unreserved task from the highest
     /// priority bucket. Returns `None` if the queue is empty or all
     /// tasks are reserved.
-    pub fn dequeue(&mut self) -> Option<QueuedTask> {
+    pub fn dequeue(&self) -> Option<QueuedTask> {
+        let mut state = self.lock_state();
         // Iterate priorities highest first (BTreeMap is ascending, Critical=0 is first)
-        let priorities: Vec<TaskPriority> = self.buckets.keys().copied().collect();
+        let priorities: Vec<TaskPriority> = state.buckets.keys().copied().collect();
 
         for priority in priorities {
-            if let Some(deque) = self.buckets.get_mut(&priority) {
+            let removed = if let Some(deque) = state.buckets.get_mut(&priority) {
                 // Find first unreserved task
-                if let Some(pos) = deque.iter().position(|t| !t.reserved) {
+                deque.iter().position(|t| !t.reserved).map(|pos| {
                     let task = deque.remove(pos).unwrap();
-                    self.index.remove(&task.id);
+                    let is_empty = deque.is_empty();
+                    (task, is_empty)
+                })
+            } else {
+                None
+            };
 
-                    // Clean up empty bucket
-                    if deque.is_empty() {
-                        self.buckets.remove(&priority);
-                    }
+            if let Some((task, is_empty)) = removed {
+                let task_id = task.id;
 
-                    debug!(task_id = %task.id, priority = %priority, "task dequeued");
-                    return Some(task);
+                // Clean up empty bucket
+                if is_empty {
+                    state.buckets.remove(&priority);
                 }
+                state.index.remove(&task_id);
+
+                debug!(task_id = %task_id, priority = %priority, "task dequeued");
+                return Some(task);
             }
         }
 
@@ -155,10 +190,11 @@ impl PriorityQueue {
     }
 
     /// Peek at the highest-priority unreserved task without removing it.
-    pub fn peek(&self) -> Option<&QueuedTask> {
-        for deque in self.buckets.values() {
+    pub fn peek(&self) -> Option<QueuedTask> {
+        let state = self.lock_state();
+        for deque in state.buckets.values() {
             if let Some(task) = deque.iter().find(|t| !t.reserved) {
-                return Some(task);
+                return Some(task.clone());
             }
         }
         None
@@ -166,12 +202,15 @@ impl PriorityQueue {
 
     /// Total number of tasks in the queue (including reserved).
     pub fn len(&self) -> usize {
-        self.buckets.values().map(|d| d.len()).sum()
+        let state = self.lock_state();
+        state.buckets.values().map(|d| d.len()).sum()
     }
 
     /// Number of unreserved tasks.
     pub fn unreserved_count(&self) -> usize {
-        self.buckets
+        let state = self.lock_state();
+        state
+            .buckets
             .values()
             .flat_map(|d| d.iter())
             .filter(|t| !t.reserved)
@@ -180,16 +219,18 @@ impl PriorityQueue {
 
     /// Whether the queue is empty.
     pub fn is_empty(&self) -> bool {
-        self.buckets.is_empty()
+        let state = self.lock_state();
+        state.buckets.is_empty()
     }
 
     /// Drain all tasks at a specific priority level.
     ///
     /// Removes and returns all tasks (including reserved) at the given priority.
-    pub fn drain_by_priority(&mut self, priority: TaskPriority) -> Vec<QueuedTask> {
-        if let Some(deque) = self.buckets.remove(&priority) {
+    pub fn drain_by_priority(&self, priority: TaskPriority) -> Vec<QueuedTask> {
+        let mut state = self.lock_state();
+        if let Some(deque) = state.buckets.remove(&priority) {
             for task in &deque {
-                self.index.remove(&task.id);
+                state.index.remove(&task.id);
             }
             let tasks: Vec<QueuedTask> = deque.into();
             info!(
@@ -208,10 +249,11 @@ impl PriorityQueue {
     /// Reserved tasks are skipped by `dequeue()` and `peek()` but remain
     /// in the queue for tracking. Call `confirm_reservation()` to remove
     /// or `cancel_reservation()` to un-reserve.
-    pub fn reserve(&mut self, task_id: Uuid, worker_name: impl Into<String>) -> bool {
+    pub fn reserve(&self, task_id: Uuid, worker_name: impl Into<String>) -> bool {
         let node = worker_name.into();
-        if let Some(&priority) = self.index.get(&task_id) {
-            if let Some(deque) = self.buckets.get_mut(&priority) {
+        let mut state = self.lock_state();
+        if let Some(&priority) = state.index.get(&task_id) {
+            if let Some(deque) = state.buckets.get_mut(&priority) {
                 if let Some(task) = deque.iter_mut().find(|t| t.id == task_id) {
                     task.reserved = true;
                     task.reserved_node = Some(node.clone());
@@ -224,27 +266,39 @@ impl PriorityQueue {
     }
 
     /// Confirm a reservation — remove the reserved task from the queue.
-    pub fn confirm_reservation(&mut self, task_id: Uuid) -> Option<QueuedTask> {
-        if let Some(&priority) = self.index.get(&task_id) {
-            if let Some(deque) = self.buckets.get_mut(&priority) {
-                if let Some(pos) = deque.iter().position(|t| t.id == task_id && t.reserved) {
-                    let task = deque.remove(pos).unwrap();
-                    self.index.remove(&task_id);
-                    if deque.is_empty() {
-                        self.buckets.remove(&priority);
-                    }
-                    debug!(task_id = %task_id, "reservation confirmed, task removed");
-                    return Some(task);
+    pub fn confirm_reservation(&self, task_id: Uuid) -> Option<QueuedTask> {
+        let mut state = self.lock_state();
+        if let Some(&priority) = state.index.get(&task_id) {
+            let removed = if let Some(deque) = state.buckets.get_mut(&priority) {
+                deque
+                    .iter()
+                    .position(|t| t.id == task_id && t.reserved)
+                    .map(|pos| {
+                        let task = deque.remove(pos).unwrap();
+                        let is_empty = deque.is_empty();
+                        (task, is_empty)
+                    })
+            } else {
+                None
+            };
+
+            if let Some((task, is_empty)) = removed {
+                state.index.remove(&task_id);
+                if is_empty {
+                    state.buckets.remove(&priority);
                 }
+                debug!(task_id = %task_id, "reservation confirmed, task removed");
+                return Some(task);
             }
         }
         None
     }
 
     /// Cancel a reservation — make the task available for dequeue again.
-    pub fn cancel_reservation(&mut self, task_id: Uuid) -> bool {
-        if let Some(&priority) = self.index.get(&task_id) {
-            if let Some(deque) = self.buckets.get_mut(&priority) {
+    pub fn cancel_reservation(&self, task_id: Uuid) -> bool {
+        let mut state = self.lock_state();
+        if let Some(&priority) = state.index.get(&task_id) {
+            if let Some(deque) = state.buckets.get_mut(&priority) {
                 if let Some(task) = deque.iter_mut().find(|t| t.id == task_id) {
                     task.reserved = false;
                     task.reserved_node = None;
@@ -257,17 +311,25 @@ impl PriorityQueue {
     }
 
     /// Remove a specific task by ID (regardless of reservation status).
-    pub fn remove(&mut self, task_id: Uuid) -> Option<QueuedTask> {
-        if let Some(&priority) = self.index.get(&task_id) {
-            if let Some(deque) = self.buckets.get_mut(&priority) {
-                if let Some(pos) = deque.iter().position(|t| t.id == task_id) {
+    pub fn remove(&self, task_id: Uuid) -> Option<QueuedTask> {
+        let mut state = self.lock_state();
+        if let Some(&priority) = state.index.get(&task_id) {
+            let removed = if let Some(deque) = state.buckets.get_mut(&priority) {
+                deque.iter().position(|t| t.id == task_id).map(|pos| {
                     let task = deque.remove(pos).unwrap();
-                    self.index.remove(&task_id);
-                    if deque.is_empty() {
-                        self.buckets.remove(&priority);
-                    }
-                    return Some(task);
+                    let is_empty = deque.is_empty();
+                    (task, is_empty)
+                })
+            } else {
+                None
+            };
+
+            if let Some((task, is_empty)) = removed {
+                state.index.remove(&task_id);
+                if is_empty {
+                    state.buckets.remove(&priority);
                 }
+                return Some(task);
             }
         }
         None
@@ -279,12 +341,13 @@ impl PriorityQueue {
     /// level (e.g. Low → Normal). Critical tasks cannot be boosted further.
     ///
     /// Returns the number of tasks that were boosted.
-    pub fn apply_timeout_boosts(&mut self) -> usize {
+    pub fn apply_timeout_boosts(&self) -> usize {
         let now = Utc::now();
         let timeout_secs = self.boost_timeout.as_secs() as i64;
         let mut to_boost: Vec<(Uuid, TaskPriority, TaskPriority)> = Vec::new();
 
-        for (&priority, deque) in &self.buckets {
+        let mut state = self.lock_state();
+        for (&priority, deque) in &state.buckets {
             for task in deque.iter() {
                 if task.reserved {
                     continue; // Don't boost reserved tasks
@@ -302,32 +365,45 @@ impl PriorityQueue {
 
         for (task_id, old_priority, new_priority) in to_boost {
             // Remove from old bucket
-            if let Some(deque) = self.buckets.get_mut(&old_priority) {
-                if let Some(pos) = deque.iter().position(|t| t.id == task_id) {
-                    let mut task = deque.remove(pos).unwrap();
-                    task.effective_priority = new_priority;
-                    // Reset enqueued_at so the boost timer restarts
-                    task.enqueued_at = now;
+            let task = {
+                let removed = if let Some(deque) = state.buckets.get_mut(&old_priority) {
+                    deque.iter().position(|t| t.id == task_id).map(|pos| {
+                        let mut task = deque.remove(pos).unwrap();
+                        task.effective_priority = new_priority;
+                        // Reset enqueued_at so the boost timer restarts
+                        task.enqueued_at = now;
 
-                    if deque.is_empty() {
-                        self.buckets.remove(&old_priority);
+                        let is_empty = deque.is_empty();
+                        (task, is_empty)
+                    })
+                } else {
+                    None
+                };
+
+                if let Some((task, is_empty)) = removed {
+                    if is_empty {
+                        state.buckets.remove(&old_priority);
                     }
-
-                    // Insert into new bucket
-                    self.index.insert(task_id, new_priority);
-                    self.buckets
-                        .entry(new_priority)
-                        .or_default()
-                        .push_back(task);
-
-                    info!(
-                        task_id = %task_id,
-                        from = %old_priority,
-                        to = %new_priority,
-                        "task priority boosted due to timeout"
-                    );
+                    task
+                } else {
+                    continue;
                 }
-            }
+            };
+
+            // Insert into new bucket
+            state.index.insert(task_id, new_priority);
+            state
+                .buckets
+                .entry(new_priority)
+                .or_default()
+                .push_back(task);
+
+            info!(
+                task_id = %task_id,
+                from = %old_priority,
+                to = %new_priority,
+                "task priority boosted due to timeout"
+            );
         }
 
         count
@@ -335,12 +411,20 @@ impl PriorityQueue {
 
     /// Get counts per priority level.
     pub fn counts_by_priority(&self) -> BTreeMap<TaskPriority, usize> {
-        self.buckets.iter().map(|(&p, d)| (p, d.len())).collect()
+        let state = self.lock_state();
+        state.buckets.iter().map(|(&p, d)| (p, d.len())).collect()
     }
 
     /// Iterate over all tasks (immutable, in priority order).
-    pub fn iter(&self) -> impl Iterator<Item = &QueuedTask> {
-        self.buckets.values().flat_map(|d| d.iter())
+    ///
+    /// Returns a cloned snapshot so callers do not hold the queue lock.
+    pub fn iter(&self) -> Vec<QueuedTask> {
+        let state = self.lock_state();
+        state
+            .buckets
+            .values()
+            .flat_map(|d| d.iter().cloned())
+            .collect()
     }
 }
 
@@ -367,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_enqueue_dequeue_fifo() {
-        let mut q = PriorityQueue::with_default_timeout();
+        let q = PriorityQueue::with_default_timeout();
 
         let t1 = make_queued_task("first", TaskPriority::Normal);
         let t2 = make_queued_task("second", TaskPriority::Normal);
@@ -391,7 +475,7 @@ mod tests {
 
     #[test]
     fn test_priority_ordering() {
-        let mut q = PriorityQueue::with_default_timeout();
+        let q = PriorityQueue::with_default_timeout();
 
         let low = make_queued_task("low", TaskPriority::Low);
         let high = make_queued_task("high", TaskPriority::High);
@@ -413,7 +497,7 @@ mod tests {
 
     #[test]
     fn test_peek() {
-        let mut q = PriorityQueue::with_default_timeout();
+        let q = PriorityQueue::with_default_timeout();
         assert!(q.peek().is_none());
 
         let t = make_queued_task("test", TaskPriority::Normal);
@@ -426,7 +510,7 @@ mod tests {
 
     #[test]
     fn test_drain_by_priority() {
-        let mut q = PriorityQueue::with_default_timeout();
+        let q = PriorityQueue::with_default_timeout();
 
         q.enqueue(
             make_queued_task("n1", TaskPriority::Normal),
@@ -448,7 +532,7 @@ mod tests {
 
     #[test]
     fn test_reservation() {
-        let mut q = PriorityQueue::with_default_timeout();
+        let q = PriorityQueue::with_default_timeout();
 
         let t1 = make_queued_task("reservable", TaskPriority::Normal);
         let t2 = make_queued_task("available", TaskPriority::Normal);
@@ -480,7 +564,7 @@ mod tests {
 
     #[test]
     fn test_cancel_reservation() {
-        let mut q = PriorityQueue::with_default_timeout();
+        let q = PriorityQueue::with_default_timeout();
 
         let t = make_queued_task("task", TaskPriority::Normal);
         let id = t.id;
@@ -498,7 +582,7 @@ mod tests {
 
     #[test]
     fn test_remove() {
-        let mut q = PriorityQueue::with_default_timeout();
+        let q = PriorityQueue::with_default_timeout();
 
         let t = make_queued_task("task", TaskPriority::Normal);
         let id = t.id;
@@ -511,7 +595,7 @@ mod tests {
 
     #[test]
     fn test_timeout_boost() {
-        let mut q = PriorityQueue::new(Duration::from_secs(0)); // instant boost
+        let q = PriorityQueue::new(Duration::from_secs(0)); // instant boost
 
         let mut t = make_queued_task("old task", TaskPriority::Low);
         // Backdate the enqueue time
@@ -558,7 +642,7 @@ mod tests {
 
     #[test]
     fn test_counts_by_priority() {
-        let mut q = PriorityQueue::with_default_timeout();
+        let q = PriorityQueue::with_default_timeout();
 
         q.enqueue(
             make_queued_task("h1", TaskPriority::High),
@@ -585,7 +669,7 @@ mod tests {
 
     #[test]
     fn test_iter() {
-        let mut q = PriorityQueue::with_default_timeout();
+        let q = PriorityQueue::with_default_timeout();
 
         q.enqueue(
             make_queued_task("bg", TaskPriority::Background),
@@ -600,7 +684,7 @@ mod tests {
             TaskPriority::Normal,
         );
 
-        let descriptions: Vec<&str> = q.iter().map(|t| t.description.as_str()).collect();
+        let descriptions: Vec<String> = q.iter().into_iter().map(|t| t.description).collect();
         // Should iterate in priority order: Critical, Normal, Background
         assert_eq!(descriptions, vec!["crit", "norm", "bg"]);
     }

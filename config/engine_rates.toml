@@ -1,0 +1,37 @@
+# Published per-token USD rates for cloud engines, used to fill
+# ff_interactions.cost_usd (see ff_agent::llm_attribution::cost_usd).
+#
+# Keys match the `engine` column values for cloud calls (the vendor CLI backend
+# names in ff_agent::cli_executor::BACKENDS). Local engines (`local:*`) are
+# always $0 and are never listed here. Rates are USD per 1 MILLION tokens,
+# taken from the vendors' published API pricing (checked 2026-07):
+#   claude = Claude Sonnet 4.5 (Claude Code default)
+#   codex  = GPT-5-class (Codex CLI default)
+#   kimi   = Kimi K2
+#   gemini = Gemini 2.5 Pro (<=200k prompt)
+#   grok   = Grok 4
+# Update this file when vendors reprice — nothing is hardcoded in ff.
+#
+# Load order (first parseable file wins):
+#   $FORGEFLEET_ENGINE_RATES, ~/.forgefleet/engine_rates.toml,
+#   ./config/engine_rates.toml, <operator checkout>/config/engine_rates.toml
+
+[claude]
+input_per_mtok = 3.00
+output_per_mtok = 15.00
+
+[codex]
+input_per_mtok = 1.25
+output_per_mtok = 10.00
+
+[kimi]
+input_per_mtok = 0.60
+output_per_mtok = 2.50
+
+[gemini]
+input_per_mtok = 1.25
+output_per_mtok = 10.00
+
+[grok]
+input_per_mtok = 3.00
+output_per_mtok = 15.00
