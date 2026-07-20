@@ -1,0 +1,17 @@
+[Unit]
+Description=ForgeFleet MCP server (DB-independent)
+After=network.target
+StartLimitIntervalSec=3600
+StartLimitBurst=100
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/forgefleetd mcp --listen 0.0.0.0:50001
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=2
+StandardOutput=append:%h/.forgefleet/logs/forgefleet-mcp.log
+StandardError=append:%h/.forgefleet/logs/forgefleet-mcp.log
+
+[Install]
+WantedBy=default.target

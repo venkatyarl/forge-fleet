@@ -1006,6 +1006,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "work_item_velocity_instrumentation",
         sql: schema::SCHEMA_V204_WORK_ITEM_VELOCITY_INSTRUMENTATION,
     },
+    PgMigration {
+        version: 205,
+        name: "mcp_bootstrap_generation",
+        sql: schema::SCHEMA_V205_MCP_BOOTSTRAP_GENERATION,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

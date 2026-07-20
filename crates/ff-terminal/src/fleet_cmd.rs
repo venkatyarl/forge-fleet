@@ -4874,7 +4874,9 @@ fn deploy_install_restart_playbook(os_family: &str) -> String {
              if command -v systemctl >/dev/null 2>&1 && [ -f deploy/systemd/forgefleetd.service ]; then \
                mkdir -p \"$HOME/.config/systemd/user\"; \
                sed \"s|__COMPUTER_NAME__|$(hostname -s)|g\" deploy/systemd/forgefleetd.service > \"$HOME/.config/systemd/user/forgefleetd.service\"; \
-               systemctl --user daemon-reload 2>/dev/null; systemctl --user enable forgefleetd.service 2>/dev/null; \
+               cp deploy/systemd/forgefleet-mcp.service \"$HOME/.config/systemd/user/forgefleet-mcp.service\"; \
+               systemctl --user daemon-reload 2>/dev/null; systemctl --user enable forgefleetd.service forgefleet-mcp.service 2>/dev/null; \
+               systemctl --user restart forgefleet-mcp.service 2>/dev/null; \
              fi; \
              systemctl --user stop forgefleetd.service 2>/dev/null; \
              for p in $(pgrep -x forgefleetd); do kill -TERM \"$p\" 2>/dev/null; done; sleep 2; \

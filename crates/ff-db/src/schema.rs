@@ -11282,6 +11282,21 @@ WHERE q.merged_at IS NOT NULL
 GROUP BY 1;
 "#;
 
+/// V205 — Desired generation for the DB-independent MCP bootstrap contract.
+/// Installers can compare this value when reconciling client configurations.
+pub const SCHEMA_V205_MCP_BOOTSTRAP_GENERATION: &str = r#"
+INSERT INTO fleet_secrets (key, value, description)
+VALUES (
+    'mcp_bootstrap_generation',
+    '2',
+    'MCP clients use the DB-independent forgefleetd mcp --stdio bootstrap'
+)
+ON CONFLICT (key) DO UPDATE SET
+    value = EXCLUDED.value,
+    description = EXCLUDED.description,
+    updated_at = NOW();
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

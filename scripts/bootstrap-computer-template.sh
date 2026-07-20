@@ -767,14 +767,17 @@ if [ "$OS_ID" != "macos" ]; then
   }
   run_as_user mkdir -p "$USER_SYSTEMD_DIR" "$USER_HOME/.forgefleet/logs"
   run_as_user bash -c "sed 's|__COMPUTER_NAME__|$NAME|g' '$REPO_DIR/deploy/systemd/forgefleetd.service' > '$USER_SYSTEMD_DIR/forgefleetd.service'"
+  run_as_user cp "$REPO_DIR/deploy/systemd/forgefleet-mcp.service" "$USER_SYSTEMD_DIR/forgefleet-mcp.service"
   user_systemctl daemon-reload \
     || die "systemctl --user daemon-reload failed for $SUDO_INVOKER"
-  user_systemctl enable forgefleetd.service \
-    || die "failed to enable forgefleetd.service for reboot persistence"
+  user_systemctl enable forgefleetd.service forgefleet-mcp.service \
+    || die "failed to enable ForgeFleet services for reboot persistence"
   # restart (not just enable --now): an idempotent re-run must pick up the
   # freshly built binary, not keep the old process.
   user_systemctl restart forgefleetd.service \
     || die "failed to restart forgefleetd.service"
+  user_systemctl restart forgefleet-mcp.service \
+    || die "failed to restart DB-independent forgefleet-mcp.service"
   sleep 2
   if ! user_systemctl is-enabled forgefleetd.service >/dev/null 2>&1; then
     die "systemctl --user reports forgefleetd.service disabled; run: systemctl --user enable forgefleetd.service"

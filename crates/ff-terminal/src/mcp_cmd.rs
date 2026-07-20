@@ -176,7 +176,7 @@ fn install_claude_code(
     dry_run: bool,
 ) -> Result<()> {
     let settings_path = home.join(".claude").join("settings.json");
-    upsert_mcp_server_json(&settings_path, "forgefleet", server_url, dry_run)?;
+    upsert_resilient_mcp_server_json(&settings_path, "forgefleet", server_url, dry_run)?;
     println!("  ✓ claude-code: {}", settings_path.display());
     if write_instructions {
         let claude_md = home.join(".claude").join("CLAUDE.md");
@@ -245,7 +245,7 @@ fn install_kimi(
     // Kimi Code CLI uses ~/.kimi/config.json with the same mcpServers shape
     // as Claude Code.
     let config = home.join(".kimi").join("config.json");
-    upsert_mcp_server_json(&config, "forgefleet", server_url, dry_run)?;
+    upsert_resilient_mcp_server_json(&config, "forgefleet", server_url, dry_run)?;
     println!("  ✓ kimi: {}", config.display());
     if write_instructions {
         // Kimi reads agent instructions from ~/.kimi/AGENTS.md (the cross-tool
@@ -335,6 +335,31 @@ fn upsert_mcp_server_json(
     upsert_mcp_entry(path, server_name, entry, dry_run)
 }
 
+/// A local stdio server is available as soon as the installed binary can be
+/// spawned. Unlike a one-shot remote HTTP enumeration it survives an MCP HTTP
+/// daemon or Postgres outage at agent startup; DB-backed calls degrade with a
+/// normal tool error while schema-independent tools remain usable.
+fn upsert_resilient_mcp_server_json(
+    path: &std::path::Path,
+    server_name: &str,
+    server_url: &str,
+    dry_run: bool,
+) -> Result<()> {
+    if matches!(
+        server_url,
+        "http://localhost:50001/mcp" | "http://127.0.0.1:50001/mcp"
+    ) {
+        upsert_mcp_entry(
+            path,
+            server_name,
+            json!({ "command": "forgefleetd", "args": ["mcp", "--stdio"] }),
+            dry_run,
+        )
+    } else {
+        upsert_mcp_server_json(path, server_name, server_url, dry_run)
+    }
+}
+
 /// Like [`upsert_mcp_server_json`] but writes a STDIO entry that bridges the
 /// remote HTTP MCP endpoint through `npx mcp-remote`. Required by the Claude
 /// Desktop app, whose config loader only launches stdio (`command`) servers and
@@ -413,14 +438,40 @@ fn upsert_codex_mcp(
         String::new()
     };
 
-    let block = format!("\n[mcp_servers.{server_name}]\ntype = \"http\"\nurl = \"{server_url}\"\n");
+    if !matches!(
+        server_url,
+        "http://localhost:50001/mcp" | "http://127.0.0.1:50001/mcp"
+    ) {
+        // Remote Codex configs retain the native HTTP transport. The local
+        // default is the resilient DB-independent stdio bootstrap below.
+        let block =
+            format!("\n[mcp_servers.{server_name}]\ntype = \"http\"\nurl = \"{server_url}\"\n");
+        return replace_codex_section(path, &existing, server_name, &block, dry_run);
+    }
+    let block = format!(
+        "\n[mcp_servers.{server_name}]\ncommand = \"forgefleetd\"\nargs = [\"mcp\", \"--stdio\"]\nstartup_timeout_sec = 30\ntool_timeout_sec = 120\n"
+    );
 
     // If the marker is already present and points at the same URL, skip.
     let marker = format!("[mcp_servers.{server_name}]");
-    if existing.contains(&marker) && existing.contains(&format!("url = \"{server_url}\"")) {
+    if existing.contains(&marker)
+        && existing.contains("command = \"forgefleetd\"")
+        && existing.contains("args = [\"mcp\", \"--stdio\"]")
+    {
         return Ok(());
     }
 
+    replace_codex_section(path, &existing, server_name, &block, dry_run)
+}
+
+fn replace_codex_section(
+    path: &std::path::Path,
+    existing: &str,
+    server_name: &str,
+    block: &str,
+    dry_run: bool,
+) -> Result<()> {
+    let marker = format!("[mcp_servers.{server_name}]");
     let new_content = if existing.contains(&marker) {
         // Replace the existing block: crude approach — keep only lines
         // outside this server's section.
@@ -445,11 +496,11 @@ fn upsert_codex_mcp(
         out.push_str(&block);
         out
     } else {
-        let mut out = existing;
+        let mut out = existing.to_string();
         if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');
         }
-        out.push_str(&block);
+        out.push_str(block);
         out
     };
 

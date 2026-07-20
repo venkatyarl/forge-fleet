@@ -13,6 +13,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::{debug, info};
 
+const CONNECT_ATTEMPTS: usize = 6;
+const CONNECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Configuration for an MCP server connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
@@ -75,6 +78,22 @@ impl McpClientManager {
 
     /// Connect to an MCP server and discover its tools.
     pub async fn connect(&mut self, config: McpServerConfig) -> anyhow::Result<Vec<McpToolDef>> {
+        let mut last_error = None;
+        for attempt in 1..=CONNECT_ATTEMPTS {
+            match self.connect_once(config.clone()).await {
+                Ok(tools) => return Ok(tools),
+                Err(error) if attempt < CONNECT_ATTEMPTS => {
+                    tracing::warn!(server = %config.name, attempt, error = %error, "MCP unavailable; retrying discovery");
+                    last_error = Some(error);
+                    tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("MCP connection retry exhausted")))
+    }
+
+    async fn connect_once(&mut self, config: McpServerConfig) -> anyhow::Result<Vec<McpToolDef>> {
         let name = config.name.clone();
 
         let mut conn = if let Some(url) = &config.url {

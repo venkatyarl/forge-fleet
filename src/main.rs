@@ -76,6 +76,19 @@ enum Command {
     Start(StartArgs),
     Status,
     Version,
+    /// Run only the MCP server. This path deliberately does not initialise
+    /// Postgres, so tools/list remains available during database outages.
+    Mcp(McpArgs),
+}
+
+#[derive(Debug, Args)]
+struct McpArgs {
+    /// Serve MCP over stdio instead of HTTP.
+    #[arg(long, default_value_t = false)]
+    stdio: bool,
+    /// HTTP listen address (ignored with --stdio).
+    #[arg(long, default_value = "0.0.0.0:50001")]
+    listen: String,
 }
 
 #[derive(Debug, Args)]
@@ -101,10 +114,22 @@ async fn main() -> Result<()> {
     match command {
         Command::Start(args) => run_daemon(&cli, args).await,
         Command::Status => run_status(&cli),
+        Command::Mcp(args) => run_mcp(args).await,
         Command::Version => {
             println!("forgefleet {FORGEFLEET_LONG_VERSION}");
             Ok(())
         }
+    }
+}
+
+async fn run_mcp(args: &McpArgs) -> Result<()> {
+    let server = ff_mcp::McpServer::new();
+    if args.stdio {
+        ff_mcp::transport::StdioTransport::new(server).run().await
+    } else {
+        ff_mcp::transport::HttpTransport::new(server)
+            .run(&args.listen)
+            .await
     }
 }
 
@@ -593,9 +618,8 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         info!("subsystem disabled: mcp federation loop");
     }
 
-    // 12) MCP HTTP server
-    info!("starting subsystem: mcp http server");
-    subsystem_tasks.push(start_mcp_http_subsystem(config.clone()));
+    // MCP HTTP runs as the separately supervised `forgefleetd mcp` service,
+    // independent of this DB-backed daemon's startup health.
 
     // Shared by the work-item dispatch loop and Pulse v2. Keeping this clock
     // independent from the general heartbeat makes a wedged dispatch task
@@ -3673,25 +3697,6 @@ async fn start_pulse_v2_subsystems(
     }
 
     Ok(handles)
-}
-
-fn start_mcp_http_subsystem(config: FleetConfig) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let server = ff_mcp::McpServer::new();
-        let transport = ff_mcp::transport::HttpTransport::new(server);
-        let addr = format!(
-            "0.0.0.0:{}",
-            config
-                .mcp
-                .get("forgefleet")
-                .and_then(|m| m.port)
-                .unwrap_or(50001)
-        );
-        info!(addr = %addr, "MCP HTTP server starting");
-        if let Err(e) = transport.run(&addr).await {
-            error!(error = %e, "MCP HTTP server failed");
-        }
-    })
 }
 
 fn build_embedded_agent_config(
