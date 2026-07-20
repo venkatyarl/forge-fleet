@@ -10,7 +10,7 @@ use crate::error::{DbError, Result};
 use crate::schema;
 
 /// The highest migration version baked into the squashed fresh-DB bootstrap.
-const BOOTSTRAP_BASELINE_VERSION: u32 = 161;
+const BOOTSTRAP_BASELINE_VERSION: u32 = schema::PG_BASELINE_VERSION;
 
 // ─── Postgres Migrations ─────────────────────────────────────────────────────
 
