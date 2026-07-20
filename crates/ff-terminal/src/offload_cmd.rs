@@ -200,7 +200,7 @@ pub async fn handle_offload(
     let rec = ff_db::InteractionRecord {
         channel: "offload".to_string(),
         request_text: prompt.chars().take(16000).collect(),
-        engine: Some(model.clone()),
+        engine: Some(ff_agent::llm_attribution::engine_label(&model)),
         response_text: result.chars().take(16000).collect(),
         tokens_in: usage_tok("prompt_tokens"),
         tokens_out: usage_tok("completion_tokens"),
