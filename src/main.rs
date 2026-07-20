@@ -720,6 +720,18 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 15b.0a) Pillar 4 work_item feeder — every 60s, leader-gated.
+    // Promotes or decomposes a queued idea when the execution pipeline has room.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: work_item feeder (60s, leader-gated)");
+        subsystem_tasks.push(ff_agent::work_item_feeder::spawn_work_item_feeder(
+            pg_pool,
+            worker_name.clone(),
+            60,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 15b.0b) Task-history retention — every 6h, leader-gated.
     // Prunes terminal rows older than `fleet_secrets.task_retention_days` (default
     // 7) from the ephemeral fleet_tasks/deferred_tasks tables so they can't grow
