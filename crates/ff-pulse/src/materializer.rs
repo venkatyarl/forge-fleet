@@ -538,11 +538,15 @@ impl Materializer {
         // A legacy beat has no value, so leave the existing timestamp alone
         // during rolling upgrades rather than erasing a newer observation.
         if let Some(dispatch_tick_at) = beat.dispatch_tick_at {
-            sqlx::query("UPDATE computers SET dispatch_tick_at = $1 WHERE id = $2")
-                .bind(dispatch_tick_at)
-                .bind(computer_id)
-                .execute(&self.pg)
-                .await?;
+            sqlx::query(
+                "UPDATE computers SET dispatch_tick_at = $1 \
+                 WHERE id = $2 \
+                   AND (dispatch_tick_at IS NULL OR dispatch_tick_at < $1)",
+            )
+            .bind(dispatch_tick_at)
+            .bind(computer_id)
+            .execute(&self.pg)
+            .await?;
         }
 
         // The Redis snapshot is only a write-churn cache, not the source of
