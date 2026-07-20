@@ -16,6 +16,7 @@ pub mod dispatcher;
 pub mod errors;
 pub mod ha_coordinator;
 pub mod health;
+pub mod task_processor;
 pub mod timeout;
 
 #[cfg(test)]
@@ -46,3 +47,4 @@ pub use health::{
     AggregateHealthStatus, ControlPlaneHealthSnapshot, DiscoveryHealthAggregate,
     RuntimeHealthAggregate, SchedulerHealthAggregate, aggregate_health_snapshot,
 };
+pub use task_processor::{TaskComplexity, TaskProcessor};
