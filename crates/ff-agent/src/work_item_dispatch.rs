@@ -1250,6 +1250,48 @@ const LANE1_STALE_MARGIN_SECS: u64 = 30;
 // Compile-time invariant: Lane-1 must self-abort strictly before the reaper.
 const _: () = assert!(LANE1_TIMEOUT_SECS < crate::work_item_scheduler::LEASE_STALE_SECS as u64);
 
+/// Lane-1.5 routing hint: the qwen3-coder-480b ring (catalog id `qwen3-coder-480b`,
+/// single fleet instance beyonce:55010). `fleet_oneshot` resolves it by matching
+/// this substring against the deployment catalog id/name.
+const LANE15_MODEL_HINT: &str = "qwen3-coder-480b";
+
+/// Engine label recorded for a Lane-1.5 win, written into the lease/interaction
+/// endpoint field so velocity attribution can tell a 480B-ring build apart from a
+/// Lane-1 local build (`"local"`) or a cloud build (`ff cli <backend>`).
+const LANE15_ENGINE: &str = "local-480b";
+
+/// GLOBAL concurrency cap for the Lane-1.5 480B ring. The ring is a single
+/// ~11 tok/s instance launched with `--parallel 2`, so at most 2 builds may hold
+/// it at once. A `static` semaphore makes the cap process-global (every dispatch
+/// slot on this host shares it); a build that can't get a permit quickly SKIPS
+/// straight to the cloud backstop rather than queueing behind the slow ring.
+static LANE15_480B_GATE: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(LANE15_480B_PERMITS));
+/// The `--parallel 2` of the single 480B instance (see [`LANE15_480B_GATE`]).
+const LANE15_480B_PERMITS: usize = 2;
+
+/// How long a build waits for a Lane-1.5 480B permit before giving up and
+/// skipping to cloud. Short on purpose: the ring is a fast-path only when free —
+/// we never want a build to QUEUE behind it, so a saturated ring degrades
+/// immediately to the cloud backstop instead of stalling.
+const LANE15_PERMIT_WAIT: Duration = Duration::from_secs(2);
+
+/// Take a permit from `sem` within `wait`, or `None` if none frees up in time.
+/// `None` is the "ring saturated — skip to cloud" signal: Lane-1.5 must never
+/// block a build waiting on the slow 480B ring. Extracted from the dispatch flow
+/// so the permit-or-skip decision is unit-testable against any semaphore/cap.
+async fn acquire_within(
+    sem: &tokio::sync::Semaphore,
+    wait: Duration,
+) -> Option<tokio::sync::SemaphorePermit<'_>> {
+    match tokio::time::timeout(wait, sem.acquire()).await {
+        Ok(Ok(permit)) => Some(permit),
+        // Either the wait elapsed (all permits busy) or the semaphore was closed
+        // (never happens — it's a 'static LazyLock): both mean "skip to cloud".
+        _ => None,
+    }
+}
+
 /// Deterministic execution-contract outcome of a dispatch (roadmap item #3).
 /// Formalizes what previously was ad-hoc: a dispatch either succeeds, fails with
 /// no diff (retryable), fails but left a real diff (salvageable — treat as a
@@ -1858,6 +1900,77 @@ async fn run_ff_dispatch(
             work_item_id = %item.work_item_id,
             attempts = item.attempts,
             "work_item_dispatch: escalated (stage 2) — skipping local lane, straight to cloud backstop"
+        );
+    }
+
+    // Lane 1.5: ONE escalation round on the 480B ring (qwen3-coder-480b, a single
+    // fleet instance) BEFORE burning the cloud CLI. The 480B model lands changes
+    // the 30B Lane-1 coder can't, at $0 — but it's a single ~11 tok/s instance
+    // (`--parallel 2`), so a GLOBAL semaphore caps concurrent 480B builds at 2. If
+    // no permit frees up within LANE15_PERMIT_WAIT we SKIP straight to cloud rather
+    // than queue a build behind the slow ring. Bounded by LANE1_TIMEOUT_SECS (the
+    // same sub-stale budget as Lane-1) so a hung round fails over to cloud before
+    // the reaper. A win is attributed under LANE15_ENGINE so velocity reporting can
+    // tell a 480B build apart from a Lane-1 local or a cloud build. (fleet_oneshot
+    // may fail over off the 480B ring if it's down; that degrades to a second local
+    // round before cloud — still a net win, never a hang.) We reach this whether
+    // Lane-1 ran and failed, was breaker-skipped, or was cloud-routed: in every
+    // case we're between the local lane and the cloud backstop.
+    if let Some(_permit) = acquire_within(&LANE15_480B_GATE, LANE15_PERMIT_WAIT).await {
+        info!(
+            work_item_id = %item.work_item_id,
+            "work_item_dispatch: Lane-1.5 — escalating to the 480B ring before cloud"
+        );
+        let lane15 = tokio::time::timeout(
+            Duration::from_secs(LANE1_TIMEOUT_SECS),
+            crate::codegen_apply::codegen_apply(
+                pg,
+                &worktree.worktree_path,
+                &prompt,
+                Some(LANE15_MODEL_HINT),
+                1,
+            ),
+        )
+        .await;
+        match lane15 {
+            Ok(Ok(outcome)) if outcome.applied => {
+                info!(
+                    work_item_id = %item.work_item_id,
+                    rounds = outcome.rounds,
+                    "work_item_dispatch: Lane-1.5 480B ring landed the change"
+                );
+                return Ok((
+                    LANE15_ENGINE.to_string(),
+                    synthetic_output(&outcome.final_diff.unwrap_or_else(|| "applied".into())),
+                ));
+            }
+            Ok(Ok(outcome)) => {
+                info!(
+                    work_item_id = %item.work_item_id,
+                    error = ?outcome.error,
+                    "work_item_dispatch: Lane-1.5 480B didn't land; backstop to cloud"
+                );
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    work_item_id = %item.work_item_id,
+                    error = format!("{e:#}"),
+                    "work_item_dispatch: Lane-1.5 480B errored; backstop to cloud"
+                );
+            }
+            Err(_) => {
+                warn!(
+                    work_item_id = %item.work_item_id,
+                    timeout_secs = LANE1_TIMEOUT_SECS,
+                    "work_item_dispatch: Lane-1.5 480B TIMED OUT (hung) — backstop to cloud"
+                );
+            }
+        }
+    } else {
+        info!(
+            work_item_id = %item.work_item_id,
+            permits = LANE15_480B_PERMITS,
+            "work_item_dispatch: Lane-1.5 480B ring saturated — skipping to cloud backstop"
         );
     }
 
@@ -3090,6 +3203,34 @@ mod tests {
         assert!(
             DISPATCH_HOUSE_RULES.contains("UNCOMMITTED"),
             "house rules must tell the agent to leave edits UNCOMMITTED for the harness"
+        );
+    }
+
+    #[tokio::test]
+    async fn lane15_permit_or_skip_degrades_when_saturated() {
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+        // A 2-permit ring modelling the single 480B instance's `--parallel 2`.
+        let sem = Semaphore::new(super::LANE15_480B_PERMITS);
+        let short = Duration::from_millis(50);
+
+        // Both permits are free → two builds may hold the ring at once.
+        let p1 = super::acquire_within(&sem, short).await;
+        let p2 = super::acquire_within(&sem, short).await;
+        assert!(p1.is_some() && p2.is_some(), "first 2 builds get a permit");
+
+        // Ring saturated → a third build gets None (skip straight to cloud), and
+        // does NOT block indefinitely — the timed wait returns.
+        assert!(
+            super::acquire_within(&sem, short).await.is_none(),
+            "a 3rd build must skip (None), never queue behind the slow ring"
+        );
+
+        // Releasing a permit frees the ring for the next build.
+        drop(p1);
+        assert!(
+            super::acquire_within(&sem, short).await.is_some(),
+            "a freed permit lets the next build onto the ring"
         );
     }
 
