@@ -1473,6 +1473,11 @@ fn parse_flag_value(cmdline: &str, flag: &str) -> Option<String> {
 }
 
 fn pid_is_alive(pid: u32) -> bool {
+    // Unix PIDs use signed `pid_t`; values above its positive range can wrap
+    // to a process-group selector (u32::MAX becomes -1) in external `kill`.
+    if pid > i32::MAX as u32 {
+        return false;
+    }
     // `kill -0 <pid>` returns 0 if the process exists and we can signal it.
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])

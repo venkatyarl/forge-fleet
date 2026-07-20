@@ -302,7 +302,9 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
 fn is_build_timeout(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let message = cause.to_string().to_ascii_lowercase();
-        message.contains("timed out") || message.contains("timeout")
+        message.contains("timed out")
+            || message.contains("timeout")
+            || message.contains("max-build-duration exceeded")
     })
 }
 
@@ -5229,6 +5231,7 @@ mod tests {
             computer_name: "build-mac".into(),
             session_id: Some(Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap()),
             slot: 2,
+            kind: "ephemeral".into(),
             attempts: 3,
             last_error: None,
             complexity: "mechanical".into(),
