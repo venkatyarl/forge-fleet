@@ -262,7 +262,6 @@ impl SshKeyManager {
         let _target_os_family: String = row.try_get("os_family").unwrap_or_default();
 
         let target_host = target_ip.as_deref().unwrap_or(&target_name);
-        let target_dest = ssh_dest(&target_ssh_user, target_host);
 
         // 2. Look up the current user key (the one we will replace).
         let old_key_row = sqlx::query(
@@ -617,7 +616,6 @@ impl SshKeyManager {
         public_key: &str,
     ) -> Result<String, SshError> {
         let host = primary_ip.unwrap_or(target);
-        let dest = ssh_dest(ssh_user, host);
         let quoted = shell_single_quote(public_key);
         let remote_cmd = format!(
             "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && \
@@ -643,7 +641,6 @@ impl SshKeyManager {
         fingerprint: &str,
     ) -> Result<String, SshError> {
         let host = primary_ip.unwrap_or(target);
-        let dest = ssh_dest(ssh_user, host);
         let body = extract_key_body(public_key).unwrap_or_else(|| fingerprint.to_string());
         let remote_cmd = format!(
             "mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && \
@@ -662,23 +659,32 @@ impl SshKeyManager {
     /// Execute one SSH command and return stdout on success.
     async fn ssh_exec(
         &self,
-        dest: &str,
+        user: &str,
+        host: &str,
+        port: i32,
         remote_cmd: &str,
         timeout_secs: u64,
     ) -> Result<String, SshError> {
-        debug!(dest = %dest, "ssh exec");
+        let dest = ssh_dest(user, host);
+        debug!(dest = %dest, port = %port, "ssh exec");
+        let mut args: Vec<String> = vec![
+            "-o".to_string(),
+            "ConnectTimeout=5".to_string(),
+            "-o".to_string(),
+            "StrictHostKeyChecking=accept-new".to_string(),
+        ];
+        if port != 22 {
+            args.push("-p".to_string());
+            args.push(port.to_string());
+        }
+        args.push(dest);
+        args.push(remote_cmd.to_string());
+
         let output = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
             Command::new("ssh")
                 .args(crate::ssh_opts::ssh_bypass_args())
-                .args([
-                    "-o",
-                    "ConnectTimeout=5",
-                    "-o",
-                    "StrictHostKeyChecking=accept-new",
-                    dest,
-                    remote_cmd,
-                ])
+                .args(&args)
                 .output(),
         )
         .await
@@ -692,7 +698,7 @@ impl SshKeyManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(SshError::Io(std::io::Error::other(format!(
-                "ssh on {dest}: exit {:?}: {stderr}",
+                "ssh on {user}@{host}:{port}: exit {:?}: {stderr}",
                 output.status.code()
             ))));
         }
@@ -711,12 +717,17 @@ async fn lookup_computer_id(
     Ok(row)
 }
 
-/// Build an SSH destination string, optionally including a non-default port.
-fn ssh_dest(user: &str, host: &str, port: i32) -> String {
+/// Build an SSH destination string (`user@host`).
+fn ssh_dest(user: &str, host: &str) -> String {
+    format!("{user}@{host}")
+}
+
+/// Shell-form port argument fragment for an embedded `ssh` command.
+fn ssh_port_args(port: i32) -> String {
     if port == 22 {
-        format!("{user}@{host}")
+        String::new()
     } else {
-        format!("-p {port} {user}@{host}")
+        format!("-p {port}")
     }
 }
 
@@ -785,8 +796,13 @@ mod tests {
     }
 
     #[test]
-    fn ssh_dest_uses_port() {
-        assert_eq!(ssh_dest("git", "host", 22), "git@host");
-        assert_eq!(ssh_dest("git", "host", 2222), "-p 2222 git@host");
+    fn ssh_dest_builds_user_at_host() {
+        assert_eq!(ssh_dest("git", "host"), "git@host");
+    }
+
+    #[test]
+    fn ssh_port_args_omits_default() {
+        assert_eq!(ssh_port_args(22), "");
+        assert_eq!(ssh_port_args(2222), "-p 2222");
     }
 }

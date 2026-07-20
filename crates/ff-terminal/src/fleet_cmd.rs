@@ -1165,6 +1165,30 @@ pub async fn handle_fleet_db_restore(
         return Ok(());
     }
 
+    // Physical restore short-circuit: don't try to create a scratch DB
+    // (the container may be stopped) and don't stream into pg_restore.
+    let ext = plaintext_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let is_physical_archive = (ext == "gz" || ext == "tgz")
+        && !plaintext_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|n| n.ends_with(".sql.gz"))
+            .unwrap_or(false);
+    if physical {
+        if !is_physical_archive {
+            anyhow::bail!(
+                "--physical only makes sense for pg_basebackup tar.gz archives, \
+                 not this plaintext file ({})",
+                plaintext_path.display()
+            );
+        }
+        restore_physical_pg_basebackup(&plaintext_path).await?;
+        return Ok(());
+    }
+
     // 1) Create the scratch DB (idempotent — swallow "already exists").
     let createdb = tokio::process::Command::new("docker")
         .args([
@@ -1194,10 +1218,6 @@ pub async fn handle_fleet_db_restore(
     //    file as a custom/plain pg_dump archive *or* a pg_basebackup
     //    tarball and pick the right tool based on extension.
     println!("{CYAN}▶ loading archive into '{target_db}'...{RESET}");
-    let ext = plaintext_path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
     let (prog, extra_args): (&str, Vec<&str>) = if plaintext_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -1206,13 +1226,8 @@ pub async fn handle_fleet_db_restore(
     {
         ("psql", vec!["-v", "ON_ERROR_STOP=1", "-d", target_db])
     } else if ext == "gz" || ext == "tgz" {
-        // pg_basebackup tar.gz — not a logical dump. Either do a physical
-        // restore (destructive — replaces PGDATA) or explain why we can't
+        // pg_basebackup tar.gz — not a logical dump. Explain why we can't
         // load it into a scratch DB.
-        if physical {
-            restore_physical_pg_basebackup(&plaintext_path).await?;
-            return Ok(());
-        }
         println!(
             "{YELLOW}note:{RESET} archive looks like a pg_basebackup \
              cluster snapshot (.tar.gz). That's a physical backup — \
