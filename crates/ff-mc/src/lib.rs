@@ -9,6 +9,7 @@
 //! - **Auto-link** — keyword-based related item suggestions
 //! - **Operational API** — Axum REST endpoints backed by `ff_db::OperationalStore`
 //! - **Legal/Compliance** — legal entities, obligations, and filing deadlines
+//! - **Alerts** — aggregation of repeated alerts before observability export
 //!
 //! ## Storage
 //!
@@ -17,12 +18,15 @@
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use ff_mc::operational_api::operational_router;
+//! use ff_db::OperationalStore;
+//! use ff_mc::operational_api::mc_router_operational;
 //!
-//! let router = operational_router(store);
+//! let store: OperationalStore = todo!();
+//! let router = mc_router_operational(store);
 //! // Mount `router` into your axum application
 //! ```
 
+pub mod alerts;
 pub mod auto_link;
 pub mod board;
 pub mod counsel;

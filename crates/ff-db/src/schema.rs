@@ -10282,6 +10282,210 @@ CREATE INDEX IF NOT EXISTS idx_artifact_index_sha256
     ON artifact_index (sha256);
 "#;
 
+/// V173 — Atomic `primary_ip` / `total_ram_gb` updates on `computers`.
+///
+/// Every legitimate writer of a computer's network identity carries its
+/// hardware profile in the SAME statement (materializer Q4, self-enroll
+/// upsert), so a row where one half moved without the other is always a
+/// partial update — e.g. an IP rewrite that leaves RAM from a different
+/// enrollment, which mis-sizes autoscaler placement. Postgres triggers can't
+/// see an UPDATE's SET list, so the enforceable invariant is value-level:
+/// a `primary_ip` change must leave `total_ram_gb` populated, and a
+/// `total_ram_gb` change must leave `primary_ip` non-blank. The trigger's
+/// WHEN clause keeps the hot last_seen_at-only heartbeat UPDATE from ever
+/// invoking the function.
+pub const SCHEMA_V173_COMPUTERS_IP_RAM_ATOMIC: &str = r#"
+CREATE OR REPLACE FUNCTION computers_ip_ram_paired_update_guard()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $guard$
+BEGIN
+    IF NEW.primary_ip IS DISTINCT FROM OLD.primary_ip
+       AND NEW.total_ram_gb IS NULL
+    THEN
+        RAISE EXCEPTION
+            'computers: partial update rejected — primary_ip changed (% -> %) with total_ram_gb NULL; update primary_ip and total_ram_gb together in one statement',
+            OLD.primary_ip, NEW.primary_ip
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    IF NEW.total_ram_gb IS DISTINCT FROM OLD.total_ram_gb
+       AND btrim(NEW.primary_ip) = ''
+    THEN
+        RAISE EXCEPTION
+            'computers: partial update rejected — total_ram_gb changed (% -> %) with primary_ip blank; update primary_ip and total_ram_gb together in one statement',
+            OLD.total_ram_gb, NEW.total_ram_gb
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    RETURN NEW;
+END;
+$guard$;
+
+DROP TRIGGER IF EXISTS trg_computers_ip_ram_paired_update ON computers;
+CREATE TRIGGER trg_computers_ip_ram_paired_update
+    BEFORE UPDATE ON computers
+    FOR EACH ROW
+    WHEN (OLD.primary_ip IS DISTINCT FROM NEW.primary_ip
+          OR OLD.total_ram_gb IS DISTINCT FROM NEW.total_ram_gb)
+    EXECUTE FUNCTION computers_ip_ram_paired_update_guard();
+"#;
+
+/// V174 — Dispatch tick tracking for active work_item leases.
+///
+/// `heartbeat_at` tracks the in-build process, but a host's dispatch loop can
+/// stall while the build keeps heartbeating (e.g. the outer tokio task wedges).
+/// `dispatch_tick_at` is bumped by the host's dispatch loop every tick so the
+/// stale-lease reaper can also reclaim leases whose host stopped dispatching.
+pub const SCHEMA_V174_DISPATCH_TICK_AT: &str = r#"
+ALTER TABLE work_item_leases
+    ADD COLUMN IF NOT EXISTS dispatch_tick_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+CREATE INDEX IF NOT EXISTS idx_work_item_leases_dispatch_tick
+    ON work_item_leases (lease_state, dispatch_tick_at) WHERE released_at IS NULL;
+"#;
+
+/// V175 — Per-deployment `/metrics` scrape samples.
+///
+/// The ff-agent metrics scraper polls each local inference server's
+/// Prometheus `/metrics` endpoint every 30s and appends one row per reachable
+/// deployment per pass. Stale-record lifecycle: `deployment_id` cascades so
+/// samples vanish with their deployment row, and rows older than the
+/// retention window are pruned by the scraper on each pass.
+pub const SCHEMA_V175_DEPLOYMENT_METRICS_SCRAPES: &str = r#"
+CREATE TABLE IF NOT EXISTS deployment_metrics_scrapes (
+    id               BIGSERIAL PRIMARY KEY,
+    deployment_id    UUID NOT NULL REFERENCES fleet_model_deployments(id) ON DELETE CASCADE,
+    worker_name      TEXT NOT NULL,
+    port             INT NOT NULL,
+    runtime          TEXT,
+    tokens_per_sec   DOUBLE PRECISION,
+    queue_depth      INT,
+    active_requests  INT,
+    metric_count     INT NOT NULL DEFAULT 0,
+    scraped_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_deployment_metrics_scrapes_by_time
+    ON deployment_metrics_scrapes (scraped_at DESC);
+CREATE INDEX IF NOT EXISTS idx_deployment_metrics_scrapes_by_deployment
+    ON deployment_metrics_scrapes (deployment_id, scraped_at DESC);
+"#;
+
+/// V176 — Merge train status tracking.
+///
+/// A merge train groups PRs/branches targeting the same base branch so they can
+/// be built and merged as an ordered unit. `merge_trains` tracks the composite
+/// train state and outcome; `merge_train_members` tracks PR membership and
+/// per-member merge outcomes. Existing per-PR `work_item_merge_queue` rows are
+/// linked to their parent train via `train_id`.
+pub const SCHEMA_V176_MERGE_TRAINS: &str = r#"
+CREATE TABLE IF NOT EXISTS merge_trains (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id     TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    base_branch    TEXT NOT NULL,
+    base_sha       TEXT,
+    head_sha       TEXT,
+    status         TEXT NOT NULL DEFAULT 'assembling'
+        CHECK (status IN ('assembling','running','merged','failed','cancelled')),
+    outcome        TEXT,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at     TIMESTAMPTZ,
+    completed_at   TIMESTAMPTZ,
+    failure_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_merge_trains_project_status
+    ON merge_trains (project_id, status);
+CREATE INDEX IF NOT EXISTS idx_merge_trains_status_created
+    ON merge_trains (status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS merge_train_members (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    train_id       UUID NOT NULL REFERENCES merge_trains(id) ON DELETE CASCADE,
+    work_item_id   UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    queue_id       UUID REFERENCES work_item_merge_queue(id) ON DELETE SET NULL,
+    position       INT NOT NULL,
+    branch_name    TEXT NOT NULL,
+    pr_url         TEXT,
+    head_sha       TEXT,
+    status         TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','running','merged','failed','skipped')),
+    joined_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    merged_at      TIMESTAMPTZ,
+    failed_at      TIMESTAMPTZ,
+    failure_reason TEXT,
+    UNIQUE (train_id, work_item_id),
+    UNIQUE (train_id, position)
+);
+CREATE INDEX IF NOT EXISTS idx_merge_train_members_train
+    ON merge_train_members (train_id, position);
+CREATE INDEX IF NOT EXISTS idx_merge_train_members_work_item
+    ON merge_train_members (work_item_id);
+
+ALTER TABLE work_item_merge_queue
+    ADD COLUMN IF NOT EXISTS train_id UUID REFERENCES merge_trains(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_work_item_merge_queue_train
+    ON work_item_merge_queue (train_id) WHERE train_id IS NOT NULL;
+"#;
+
+/// V177 — Tiered fleet metrics storage (partitioned).
+///
+/// Three retention tiers for fleet-wide time-series metrics, all natively
+/// range-partitioned on their time column so retention is a cheap partition
+/// DROP instead of a bloating DELETE:
+///
+/// - `fleet_metrics_raw`    — every sample as written; DAILY partitions kept 7 days.
+/// - `fleet_metrics_1min`   — 1-minute rollups; DAILY partitions kept 30 days.
+/// - `fleet_metrics_hourly` — hourly rollups; MONTHLY partitions kept forever.
+///
+/// The migration creates only the partitioned parents (plus partitioned
+/// indexes, which cascade to every child). Dated child partitions are created
+/// ahead of time and expired ones dropped by the partition-maintenance tick
+/// (`ff_db::metrics_partitions`, driven leader-gated from forgefleetd) — a
+/// parent with no children rejects inserts, so writers depend on that tick
+/// having run at least once.
+pub const SCHEMA_V177_FLEET_METRICS: &str = r#"
+CREATE TABLE IF NOT EXISTS fleet_metrics_raw (
+    worker_name  TEXT NOT NULL,
+    metric       TEXT NOT NULL,
+    value        DOUBLE PRECISION NOT NULL,
+    labels       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    recorded_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+) PARTITION BY RANGE (recorded_at);
+CREATE INDEX IF NOT EXISTS idx_fleet_metrics_raw_metric_time
+    ON fleet_metrics_raw (metric, recorded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fleet_metrics_raw_worker_time
+    ON fleet_metrics_raw (worker_name, recorded_at DESC);
+
+CREATE TABLE IF NOT EXISTS fleet_metrics_1min (
+    worker_name  TEXT NOT NULL,
+    metric       TEXT NOT NULL,
+    bucket_start TIMESTAMPTZ NOT NULL,
+    sample_count BIGINT NOT NULL DEFAULT 0,
+    value_min    DOUBLE PRECISION NOT NULL,
+    value_max    DOUBLE PRECISION NOT NULL,
+    value_avg    DOUBLE PRECISION NOT NULL,
+    value_last   DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (worker_name, metric, bucket_start)
+) PARTITION BY RANGE (bucket_start);
+CREATE INDEX IF NOT EXISTS idx_fleet_metrics_1min_metric_time
+    ON fleet_metrics_1min (metric, bucket_start DESC);
+
+CREATE TABLE IF NOT EXISTS fleet_metrics_hourly (
+    worker_name  TEXT NOT NULL,
+    metric       TEXT NOT NULL,
+    bucket_start TIMESTAMPTZ NOT NULL,
+    sample_count BIGINT NOT NULL DEFAULT 0,
+    value_min    DOUBLE PRECISION NOT NULL,
+    value_max    DOUBLE PRECISION NOT NULL,
+    value_avg    DOUBLE PRECISION NOT NULL,
+    value_last   DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (worker_name, metric, bucket_start)
+) PARTITION BY RANGE (bucket_start);
+CREATE INDEX IF NOT EXISTS idx_fleet_metrics_hourly_metric_time
+    ON fleet_metrics_hourly (metric, bucket_start DESC);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

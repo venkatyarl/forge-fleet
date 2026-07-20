@@ -10,7 +10,7 @@ use crate::error::{DbError, Result};
 use crate::schema;
 
 /// The highest migration version baked into the squashed fresh-DB bootstrap.
-const BOOTSTRAP_BASELINE_VERSION: u32 = 161;
+const BOOTSTRAP_BASELINE_VERSION: u32 = schema::PG_BASELINE_VERSION;
 
 // ─── Postgres Migrations ─────────────────────────────────────────────────────
 
@@ -840,6 +840,37 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "artifact_index",
         sql: schema::SCHEMA_V171_ARTIFACT_INDEX,
     },
+    // 172 was reserved by the metrics-schema branch, but 173–176 landed before
+    // it did — the runner only applies versions ABOVE the current one, so a
+    // late 172 would be silently skipped on any DB already at 173+. The
+    // metrics schema landed as 177 instead; 172 stays a permanent gap (gaps
+    // are fine, duplicates are not — see
+    // migration_versions_are_strictly_increasing).
+    PgMigration {
+        version: 173,
+        name: "computers_ip_ram_atomic",
+        sql: schema::SCHEMA_V173_COMPUTERS_IP_RAM_ATOMIC,
+    },
+    PgMigration {
+        version: 174,
+        name: "dispatch_tick_at",
+        sql: schema::SCHEMA_V174_DISPATCH_TICK_AT,
+    },
+    PgMigration {
+        version: 175,
+        name: "deployment_metrics_scrapes",
+        sql: schema::SCHEMA_V175_DEPLOYMENT_METRICS_SCRAPES,
+    },
+    PgMigration {
+        version: 176,
+        name: "merge_trains",
+        sql: schema::SCHEMA_V176_MERGE_TRAINS,
+    },
+    PgMigration {
+        version: 177,
+        name: "fleet_metrics",
+        sql: schema::SCHEMA_V177_FLEET_METRICS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1150,6 +1181,94 @@ mod tests {
             .await
             .expect("v161 bootstrap should be recorded in _migrations");
         assert_eq!(row.0 as u32, BOOTSTRAP_BASELINE_VERSION);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v173_rejects_partial_primary_ip_ram_updates() {
+        // Needs Postgres — create_fresh_temp_db returns None (and we early-
+        // return) when neither FORGEFLEET_POSTGRES_URL nor
+        // FORGEFLEET_DATABASE_URL is set, so this never panics in CI.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO computers (name, primary_ip, os_family, ssh_user)
+             VALUES ('v173-guard-test', '10.0.0.1', 'linux-ubuntu', 'ff')
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert test computer");
+
+        // The row has no RAM recorded yet: moving primary_ip alone would
+        // leave a half-updated hardware identity.
+        let err = sqlx::query("UPDATE computers SET primary_ip = '10.0.0.2' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect_err("primary_ip change with NULL total_ram_gb must be rejected");
+        assert!(
+            err.to_string().contains("partial update rejected"),
+            "unexpected error: {err}"
+        );
+
+        // Both halves carried in one statement: allowed.
+        sqlx::query(
+            "UPDATE computers SET primary_ip = '10.0.0.2', total_ram_gb = 64 WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("paired primary_ip + total_ram_gb update should pass");
+
+        // Moving the IP while wiping RAM in the same statement: rejected.
+        let err = sqlx::query(
+            "UPDATE computers SET primary_ip = '10.0.0.3', total_ram_gb = NULL WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect_err("primary_ip change that wipes total_ram_gb must be rejected");
+        assert!(
+            err.to_string().contains("partial update rejected"),
+            "unexpected error: {err}"
+        );
+
+        // Changing RAM while blanking the IP: rejected.
+        let err =
+            sqlx::query("UPDATE computers SET primary_ip = '', total_ram_gb = 128 WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect_err("total_ram_gb change that blanks primary_ip must be rejected");
+        assert!(
+            err.to_string().contains("partial update rejected"),
+            "unexpected error: {err}"
+        );
+
+        // Updates that touch neither column are unaffected by the guard.
+        sqlx::query("UPDATE computers SET status = 'online' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("unrelated column update should pass");
+
+        // The rejected statements rolled back: the last good pair survives.
+        let (ip, ram): (String, Option<i32>) =
+            sqlx::query_as("SELECT primary_ip, total_ram_gb FROM computers WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("re-read test computer");
+        assert_eq!(ip, "10.0.0.2");
+        assert_eq!(ram, Some(64));
 
         drop_temp_db(admin, pool, &db_name).await;
     }

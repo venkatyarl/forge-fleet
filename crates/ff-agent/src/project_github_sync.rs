@@ -490,7 +490,7 @@ async fn fetch_pulls(
         .collect())
 }
 
-async fn send_gh(
+pub async fn send_gh(
     http: &reqwest::Client,
     url: &str,
     token: Option<&str>,

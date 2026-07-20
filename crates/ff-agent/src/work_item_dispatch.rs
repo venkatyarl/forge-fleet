@@ -11,6 +11,10 @@ use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
@@ -147,6 +151,12 @@ async fn recent_host_failures(pg: &PgPool, worker_name: &str) -> Result<usize> {
 pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Result<usize> {
     let repo_path = std::env::current_dir().context("resolve current repo path")?;
 
+    // Bump the dispatch tick for every active lease on this host. The stale-lease
+    // reaper watches `dispatch_tick_at` independently of `heartbeat_at` so it can
+    // reclaim a lease whose host dispatch loop wedged even though the in-build
+    // process keeps heartbeating.
+    bump_dispatch_tick_at(pg, worker_name).await;
+
     // Capacity-aware budget: dispatch up to this host's free-slot count, capped
     // at MAX_DISPATCH_PER_TICK, throttled to 1 under recent-failure backpressure.
     // Replaces the old hard 1/tick that left the fleet mostly idle.
@@ -216,10 +226,20 @@ pub fn spawn_work_item_dispatch(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let start = Instant::now();
+        let last_tick_at = Arc::new(AtomicU64::new(start.elapsed().as_secs()));
+        let watchdog_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(crate::daemon::dispatch_tick_watchdog(
+            start,
+            last_tick_at.clone(),
+            watchdog_shutdown_rx,
+        ));
+
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    last_tick_at.store(start.elapsed().as_secs(), Ordering::Relaxed);
                     if let Err(e) = evaluate_work_item_dispatch(&pg, &worker_name).await {
                         warn!(error = %e, "work_item_dispatch tick failed");
                     }
@@ -928,6 +948,28 @@ async fn heartbeat_lease_once(work_item_id: Uuid) {
         work_item_id = %work_item_id,
         "work_item_dispatch: lease heartbeat FAILED after 3 tries — lease may go stale (watchdog could reap a LIVE build)"
     );
+}
+
+/// Bump `dispatch_tick_at` for every active lease on this host. Best-effort:
+/// if the update fails (e.g. the host has no computers row yet), the next tick
+/// retries. A missed tick eventually triggers the stale-dispatch-tick reaper.
+async fn bump_dispatch_tick_at(pg: &PgPool, worker_name: &str) {
+    if let Err(e) = sqlx::query(
+        "UPDATE work_item_leases
+            SET dispatch_tick_at = NOW()
+          WHERE computer_id = (SELECT id FROM computers WHERE name = $1)
+            AND released_at IS NULL",
+    )
+    .bind(worker_name)
+    .execute(pg)
+    .await
+    {
+        warn!(
+            worker_name = %worker_name,
+            error = %e,
+            "work_item_dispatch: failed to bump dispatch_tick_at"
+        );
+    }
 }
 
 /// Human-readable task branch: `feature/<title-slug>-<id4>` (operator
@@ -1639,6 +1681,18 @@ async fn record_dispatch_interaction(
             0,
         ),
     };
+
+    // Track the recurrence count for this error signature and populate the
+    // interaction-log column that the leader's self-heal tick aggregates.
+    let error_signature = error_text.as_deref().map(|err| {
+        let tracker = crate::log_signature::global_tracker();
+        let sig = tracker.signature_for(err);
+        // Also update the process-level tracker so recurrence counts are
+        // available for diagnostics even though the DB is the canonical store.
+        tracker.observe(err);
+        sig
+    });
+
     let rec = ff_db::InteractionRecord {
         channel: "work_item_dispatch".to_string(),
         request_text: dispatch_prompt(item),
@@ -1648,6 +1702,7 @@ async fn record_dispatch_interaction(
         latency_ms: i32::try_from(elapsed.as_millis()).ok(),
         outcome,
         error_text,
+        error_signature,
         worker_name: Some(worker_name.to_string()),
         endpoint: Some(format!("ff cli {backend}")),
         ..Default::default()
@@ -2100,6 +2155,28 @@ fn synthetic_output(summary: &str) -> Output {
     }
 }
 
+/// Environment variable holding an optional LAN git mirror URL. When set, fetches
+/// are routed through this mirror while pushes continue to target the canonical
+/// GitHub origin (`git remote set-url --push`).
+const LAN_MIRROR_URL_ENV: &str = "FORGEFLEET_LAN_MIRROR_URL";
+
+/// Max attempts for each fetch phase (mirror and direct fallback).
+const FETCH_ATTEMPTS: usize = 3;
+
+/// Bounded exponential backoff base: 500ms → 1s → 2s before each retry.
+const FETCH_BACKOFF_BASE_MS: u64 = 500;
+
+/// Return a small non-cryptographic jitter (0..max_ms) derived from the current
+/// time so concurrent retries across slots don't stampede the same remote.
+fn fetch_jitter(max_ms: u64) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let jitter_ms = nanos % max_ms.max(1);
+    Duration::from_millis(jitter_ms)
+}
+
 /// Prepare the slot's clone for a fresh build attempt. Fetch origin/<base>
 /// (same no-stale-base contract as ever: fail rather than branch from a stale
 /// ref), then a FULL clean — `reset --hard` + `clean -fd` — so leftovers from
@@ -2107,27 +2184,136 @@ fn synthetic_output(summary: &str) -> Output {
 /// `checkout -B wi/<id> origin/<base>`. `-B` resets the task branch even if a
 /// prior attempt left it behind, which is what makes retries collision-free
 /// without any worktree bookkeeping.
+///
+/// LAN mirror: if `FORGEFLEET_LAN_MIRROR_URL` is set, origin's fetch URL is
+/// pointed at the mirror and `--push` is pointed at the canonical GitHub URL.
+/// Mirror fetches are retried with exponential backoff + jitter; if they all
+/// fail we transparently fall back to a direct GitHub fetch.
 fn checkout_clone_for_build(repo_path: &Path, base_branch: &str, task_branch: &str) -> Result<()> {
     let base_ref = format!("origin/{base_branch}");
+
+    // Remember the canonical GitHub origin so we can restore it on fallback
+    // and configure --push correctly when a mirror is in play.
+    let github_url = run_git(
+        repo_path,
+        ["remote", "get-url", "origin"],
+        Duration::from_secs(30),
+    )
+    .ok()
+    .and_then(|o| {
+        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    });
+
+    // Optionally configure the LAN mirror: fetch from mirror, push to GitHub.
+    let mirror_url = std::env::var(LAN_MIRROR_URL_ENV).ok();
+    let mirror_configured = match (&mirror_url, &github_url) {
+        (Some(mirror), Some(github)) if mirror != github => {
+            run_git(
+                repo_path,
+                ["remote", "set-url", "origin", mirror],
+                Duration::from_secs(30),
+            )
+            .with_context(|| format!("set origin fetch URL to LAN mirror {mirror}"))?;
+            run_git(
+                repo_path,
+                ["remote", "set-url", "--push", "origin", github],
+                Duration::from_secs(30),
+            )
+            .with_context(|| format!("set origin push URL to GitHub {github}"))?;
+            info!(
+                mirror_url = mirror,
+                push_url = github,
+                "checkout_clone_for_build: configured LAN mirror fetch with GitHub push"
+            );
+            true
+        }
+        _ => false,
+    };
+
     let mut fetched = false;
-    for attempt in 0..3 {
-        match run_git(
-            repo_path,
-            ["fetch", "origin", base_branch],
-            Duration::from_secs(120),
-        ) {
-            Ok(_) => {
-                fetched = true;
-                break;
+
+    // Phase 1: fetch from the LAN mirror (if configured) with backoff + jitter.
+    if mirror_configured {
+        for attempt in 0..FETCH_ATTEMPTS {
+            if attempt > 0 {
+                let backoff =
+                    Duration::from_millis(FETCH_BACKOFF_BASE_MS * (1u64 << (attempt - 1)));
+                std::thread::sleep(backoff + fetch_jitter(200));
             }
-            Err(e) => {
-                warn!(base_branch, attempt, error = %e, "checkout_clone_for_build: fetch origin failed; retrying")
+            match run_git(
+                repo_path,
+                ["fetch", "origin", base_branch],
+                Duration::from_secs(120),
+            ) {
+                Ok(_) => {
+                    fetched = true;
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        base_branch,
+                        attempt,
+                        error = %e,
+                        "checkout_clone_for_build: LAN mirror fetch failed; retrying"
+                    )
+                }
             }
         }
     }
+
+    // Phase 2: fallback to direct GitHub fetch, restoring the canonical origin.
+    if !fetched {
+        if mirror_configured {
+            if let Some(github) = &github_url {
+                run_git(
+                    repo_path,
+                    ["remote", "set-url", "origin", github],
+                    Duration::from_secs(30),
+                )
+                .with_context(|| format!("restore origin URL to GitHub {github}"))?;
+                // Push should also use GitHub now that we're not mirroring.
+                let _ = run_git(
+                    repo_path,
+                    ["remote", "set-url", "--push", "origin", github],
+                    Duration::from_secs(30),
+                );
+            }
+            warn!(
+                base_branch,
+                "checkout_clone_for_build: LAN mirror fetch failed; falling back to direct GitHub fetch"
+            );
+        }
+        for attempt in 0..FETCH_ATTEMPTS {
+            if attempt > 0 {
+                let backoff =
+                    Duration::from_millis(FETCH_BACKOFF_BASE_MS * (1u64 << (attempt - 1)));
+                std::thread::sleep(backoff + fetch_jitter(200));
+            }
+            match run_git(
+                repo_path,
+                ["fetch", "origin", base_branch],
+                Duration::from_secs(120),
+            ) {
+                Ok(_) => {
+                    fetched = true;
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        base_branch,
+                        attempt,
+                        error = %e,
+                        "checkout_clone_for_build: direct fetch failed; retrying"
+                    )
+                }
+            }
+        }
+    }
+
     if !fetched {
         bail!(
-            "checkout_clone_for_build: could not fetch origin/{base_branch} in 3 tries — \
+            "checkout_clone_for_build: could not fetch origin/{base_branch} in {FETCH_ATTEMPTS} tries — \
              refusing to build from a possibly-stale base"
         );
     }
