@@ -725,6 +725,9 @@ async fn run_agent_loop(
     let mut compaction_retries: u32 = 0;
     let mut iteration_count: u32 = 0;
 
+    // `iteration_count` mirrors `turn` today but is deliberately a distinct
+    // hard cap (MAX_AGENT_ITERATIONS) independent of `max_turns` — keep it.
+    #[allow(clippy::explicit_counter_loop)]
     for turn in 1..=session.config.max_turns {
         if iteration_count >= MAX_AGENT_ITERATIONS {
             break;
