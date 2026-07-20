@@ -33,6 +33,7 @@ members = [
     "crates/ff-terminal",
     "crates/ff-pulse",
     "crates/ff-brain",
+    "crates/ff-capacity",
     "crates/ra2a",
 ]
 
