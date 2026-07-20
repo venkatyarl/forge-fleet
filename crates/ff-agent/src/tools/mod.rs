@@ -41,6 +41,7 @@ pub mod network_check;
 pub mod notebook_edit;
 pub mod orchestrate;
 pub mod plan_tools;
+pub mod pr_review;
 pub mod project_mgmt;
 pub mod research;
 pub mod research_ext;
@@ -289,6 +290,7 @@ pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(git_tools::GitBlameTool),
         Box::new(git_tools::TestGenTool),
         Box::new(git_pr::GitPRTool),
+        Box::new(pr_review::PrReviewTool),
         // DevOps tools
         Box::new(docker_manage::DockerManageTool),
         Box::new(lint_fix::LintFixTool),
