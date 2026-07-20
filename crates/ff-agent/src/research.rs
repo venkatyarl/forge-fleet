@@ -1046,6 +1046,28 @@ impl ResearchSession {
             );
         }
 
+        // Let the shared policy own cheapest-capable-first eligibility and tier
+        // ordering.  The SQL candidates remain the source of endpoint and live
+        // health/load data; intersecting the two also keeps stale deployments
+        // out even when they remain in the last good capacity snapshot.
+        let snapshot = ff_capacity::CapacitySnapshot::load(&self.pool)
+            .await
+            .context("load capacity snapshot for research routing")?;
+        let requirements = ff_routing_policy::TaskRequirements {
+            capability_tags: vec!["tool_calling".into()],
+            ..Default::default()
+        };
+        let ranked = ff_routing_policy::rank_inference_deployments(
+            &snapshot,
+            &requirements,
+            &ff_routing_policy::PolicyConfig::default(),
+        );
+        let candidates = rank_research_candidates(candidates, &ranked);
+
+        if candidates.is_empty() {
+            anyhow::bail!("no research deployment satisfies ff-routing-policy");
+        }
+
         // `pg_route_deployments` already builds `http://{host}:{port}` from the
         // LAN primary_ip and resolves the port from the deployment row, so no
         // loopback rewrite is needed here.
@@ -1692,13 +1714,55 @@ mod recover_status_tests {
 
 #[cfg(test)]
 mod backend_pick_tests {
-    use super::{FleetBackend, select_distinct_round_robin};
+    use super::{FleetBackend, rank_research_candidates, select_distinct_round_robin};
 
     fn b(computer: &str, model: &str) -> FleetBackend {
         FleetBackend {
             computer_name: computer.into(),
             endpoint: format!("http://{computer}:55000"),
             model_id: model.into(),
+        }
+    }
+
+    fn candidate(computer: &str, model: &str, port: i32) -> ff_db::RouteCandidate {
+        ff_db::RouteCandidate {
+            worker_name: computer.into(),
+            endpoint: format!("http://{computer}:{port}"),
+            port,
+            runtime: None,
+            catalog_id: Some(model.into()),
+            catalog_name: None,
+            family: None,
+            tier: 0,
+            tool_calling: true,
+            context_window: None,
+            usable_agent_ctx: None,
+            parallel_slots: None,
+            health_status: "healthy".into(),
+            health_age_sec: Some(1),
+            os_family: None,
+            has_gpu: None,
+            is_unified_memory: None,
+            total_ram_gb: None,
+            cpu_pct: None,
+            llm_active_requests: None,
+        }
+    }
+
+    fn ranked(
+        computer: &str,
+        model: &str,
+        port: i32,
+        tier: ff_routing_policy::RoutingTier,
+    ) -> ff_routing_policy::RankedBackend {
+        ff_routing_policy::RankedBackend::Inference {
+            tier,
+            deployment: ff_capacity::InferenceDeployment {
+                catalog_id: model.into(),
+                catalog_family: None,
+                computer: computer.into(),
+                port,
+            },
         }
     }
 
@@ -1737,6 +1801,36 @@ mod backend_pick_tests {
         let got = select_distinct_round_robin(backends, 2);
         let computers: Vec<&str> = got.iter().map(|x| x.computer_name.as_str()).collect();
         assert_eq!(computers, vec!["c1", "c2"]);
+    }
+
+    #[test]
+    fn policy_ranking_filters_and_orders_live_candidates() {
+        let candidates = vec![
+            candidate("a", "large-480b", 2),
+            candidate("b", "small-30b", 1),
+            candidate("stale-policy", "not-ranked", 3),
+        ];
+        let policy = vec![
+            ranked(
+                "b",
+                "small-30b",
+                1,
+                ff_routing_policy::RoutingTier::Local30B,
+            ),
+            ranked(
+                "a",
+                "large-480b",
+                2,
+                ff_routing_policy::RoutingTier::Local480B,
+            ),
+        ];
+
+        let got = rank_research_candidates(candidates, &policy);
+        let models: Vec<_> = got
+            .iter()
+            .map(|candidate| candidate.catalog_id.as_deref().unwrap())
+            .collect();
+        assert_eq!(models, ["small-30b", "large-480b"]);
     }
 
     #[test]
@@ -1805,6 +1899,50 @@ fn select_distinct_round_robin(backends: Vec<FleetBackend>, n: usize) -> Vec<Fle
         i += 1;
     }
     out
+}
+
+/// Apply the shared policy's eligibility/tier ranking to the live SQL route
+/// candidates. Stable sorting preserves the SQL picker's least-loaded order
+/// within a policy tier, after which `select_distinct_round_robin` adds the
+/// research-specific deployment diversity.
+fn rank_research_candidates(
+    candidates: Vec<ff_db::RouteCandidate>,
+    ranked: &[ff_routing_policy::RankedBackend],
+) -> Vec<ff_db::RouteCandidate> {
+    let rank_by_deployment: std::collections::HashMap<_, _> = ranked
+        .iter()
+        .enumerate()
+        .filter_map(|(rank, candidate)| match candidate {
+            ff_routing_policy::RankedBackend::Inference { deployment, .. } => Some((
+                (
+                    deployment.computer.as_str(),
+                    deployment.catalog_id.as_str(),
+                    deployment.port,
+                ),
+                rank,
+            )),
+            ff_routing_policy::RankedBackend::Cloud { .. } => None,
+        })
+        .collect();
+    let mut eligible: Vec<_> = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let key = (
+                candidate.worker_name.as_str(),
+                candidate.catalog_id.as_deref()?,
+                candidate.port,
+            );
+            rank_by_deployment
+                .get(&key)
+                .copied()
+                .map(|rank| (rank, candidate))
+        })
+        .collect();
+    eligible.sort_by_key(|(rank, _)| *rank);
+    eligible
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect()
 }
 
 #[derive(Debug, Clone)]
