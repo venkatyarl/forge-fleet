@@ -42,7 +42,7 @@ use ff_db::leader_state::{
 use ff_pulse::reader::{PulseError, PulseReader};
 
 use crate::ha::pg_failover::{FailoverOutcome, PostgresFailoverManager};
-use crate::ha::self_heal::rearm_self_heal_task;
+use crate::ha::self_heal::{rearm_self_heal_task, scan_daemon_logs_for_self_heal};
 #[cfg(test)]
 use crate::ha::self_heal::{self_heal_priority_for_tier, self_heal_task_status};
 use crate::leader_cache::{LeaderCache, LeaderInfo};
@@ -326,6 +326,19 @@ impl LeaderTick {
                                             node = %self.my_name,
                                             error = %err,
                                             "scan_interaction_errors failed"
+                                        );
+                                    }
+
+                                    // V122+: feed daemon log errors into the
+                                    // self-heal queue so recurring runtime
+                                    // patterns are not lost in rotated log files.
+                                    if let Err(err) =
+                                        scan_daemon_logs_for_self_heal(&self.pg, &self.my_name).await
+                                    {
+                                        tracing::warn!(
+                                            node = %self.my_name,
+                                            error = %err,
+                                            "scan_daemon_logs_for_self_heal failed"
                                         );
                                     }
 
