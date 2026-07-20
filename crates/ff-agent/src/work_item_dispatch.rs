@@ -44,7 +44,7 @@ const FF_TIMEOUT_SECS: u64 = 1080;
 /// with the host's free sub-agent slots up to this cap (and drops to 1 under
 /// backpressure). Replaces the old hard `1/tick`, which left the fleet mostly
 /// idle even with many ready tasks and dozens of free slots.
-const MAX_DISPATCH_PER_TICK: i64 = 3;
+pub(crate) const MAX_DISPATCH_PER_TICK: i64 = 3;
 
 /// Recent-failure count at/above which the host throttles back to a single
 /// dispatch per tick (backpressure — stop feeding a host that's failing).
@@ -883,12 +883,12 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
 /// on ANY path (success, no-commit early return, or error). This holds the lease
 /// for the whole dispatch (build → commit → push → PR) so the leader watchdog
 /// can't reap it mid-finalize.
-struct HeartbeatGuard {
+pub(crate) struct HeartbeatGuard {
     stop_tx: watch::Sender<bool>,
 }
 
 impl HeartbeatGuard {
-    fn spawn(work_item_id: Uuid) -> Self {
+    pub(crate) fn spawn(work_item_id: Uuid) -> Self {
         let (stop_tx, stop_rx) = watch::channel(false);
         // Detached: the task loops on its own timer and exits promptly when the
         // guard's drop sends `true` on stop_tx. (spawn_heartbeat already

@@ -14,7 +14,8 @@
 //! Design: `.forgefleet/plans/DECISION-pillar4-canonical-home.md`.
 
 use anyhow::Result;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
+use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
 /// Lease heartbeat deadline: a slot must heartbeat within this window or its
@@ -81,7 +82,24 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
     }
 
     // Slots that are free fleet-wide (a pinned item filters to its host).
-    let global_free = ff_db::pg_free_slots(pg, None, MAX_ASSIGN_PER_TICK).await?;
+    let mut active_by_computer: HashMap<uuid::Uuid, usize> = sqlx::query(
+        "SELECT computer_id, COUNT(*)::bigint AS active \
+           FROM work_item_leases \
+          WHERE released_at IS NULL \
+          GROUP BY computer_id",
+    )
+    .fetch_all(pg)
+    .await?
+    .into_iter()
+    .map(|row| {
+        (
+            row.get("computer_id"),
+            row.get::<i64, _>("active").max(0) as usize,
+        )
+    })
+    .collect();
+    let mut global_free = ff_db::pg_free_slots(pg, None, MAX_ASSIGN_PER_TICK).await?;
+    global_free.retain(|slot| dispatch_capacity_left(&active_by_computer, slot.computer_id));
     if global_free.is_empty() {
         info!(
             ready = ready.len(),
@@ -96,11 +114,7 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
     // priya). This is a PREFERENCE, not a gate — `pop_slot` falls back to any
     // free slot if no viable one remains, so assignment never starves when the
     // deployment rows are momentarily stale (e.g. right after a deploy).
-    let viable: std::collections::HashSet<uuid::Uuid> = match ff_db::pg_agent_viable_computer_ids(
-        pg,
-    )
-    .await
-    {
+    let viable: HashSet<uuid::Uuid> = match ff_db::pg_agent_viable_computer_ids(pg).await {
         Ok(ids) => ids.into_iter().collect(),
         Err(e) => {
             warn!(error = %e, "work_item_scheduler: agent-viability lookup failed; assigning without preference");
@@ -116,7 +130,9 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         // the shared pool, preferring an agent-viable computer.
         let slot = if let Some(host) = item.assigned_computer.as_deref() {
             match ff_db::pg_free_slots(pg, Some(host), 1).await {
-                Ok(mut v) => v.pop(),
+                Ok(mut v) => v
+                    .pop()
+                    .filter(|slot| dispatch_capacity_left(&active_by_computer, slot.computer_id)),
                 Err(e) => {
                     warn!(host, error = %e, "work_item_scheduler: pinned-slot lookup failed");
                     None
@@ -138,9 +154,15 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         {
             Ok(true) => {
                 assigned += 1;
+                *active_by_computer.entry(slot.computer_id).or_default() += 1;
+                spawn_claim_heartbeat(pg.clone(), item.id);
                 // Keep the shared pool consistent if a pinned assignment consumed
-                // a slot that also sat in `pool`.
-                pool.retain(|s| s.sub_agent_id != slot.sub_agent_id);
+                // a slot that also sat in `pool`, and remove the rest of this
+                // computer's slots as soon as its dispatch capacity is full.
+                pool.retain(|s| {
+                    s.sub_agent_id != slot.sub_agent_id
+                        && dispatch_capacity_left(&active_by_computer, s.computer_id)
+                });
             }
             Ok(false) => { /* lost the race / already leased — skip */ }
             Err(e) => warn!(item = %item.id, error = %e, "work_item_scheduler: assign failed"),
@@ -164,6 +186,39 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         );
     }
     Ok(assigned)
+}
+
+/// Keep a newly-created lease alive while it waits for the owning host's
+/// dispatch loop. Once dispatch changes the item from `claimed` to `building`,
+/// `dispatch_one`'s own guard takes over for the rest of the lease lifecycle.
+fn spawn_claim_heartbeat(pg: PgPool, work_item_id: uuid::Uuid) {
+    tokio::spawn(async move {
+        let _guard = crate::work_item_dispatch::HeartbeatGuard::spawn(work_item_id);
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+            crate::work_item_dispatch::HEARTBEAT_SECS,
+        ));
+        loop {
+            ticker.tick().await;
+            let still_queued = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM work_items WHERE id = $1 AND status = 'claimed')",
+            )
+            .bind(work_item_id)
+            .fetch_one(&pg)
+            .await
+            .unwrap_or(true);
+            if !still_queued {
+                break;
+            }
+        }
+    });
+}
+
+fn dispatch_capacity_left(
+    active_by_computer: &HashMap<uuid::Uuid, usize>,
+    computer_id: uuid::Uuid,
+) -> bool {
+    active_by_computer.get(&computer_id).copied().unwrap_or(0)
+        < crate::work_item_dispatch::MAX_DISPATCH_PER_TICK as usize
 }
 
 /// Take one free slot from `pool`, preferring a slot whose computer currently
@@ -226,6 +281,18 @@ mod tests {
             sub_agent_id: uuid::Uuid::new_v4(),
             computer_id: computer,
         }
+    }
+
+    #[test]
+    fn dispatch_capacity_counts_active_leases() {
+        let computer = uuid::Uuid::new_v4();
+        let mut active = HashMap::new();
+        assert!(dispatch_capacity_left(&active, computer));
+        active.insert(
+            computer,
+            crate::work_item_dispatch::MAX_DISPATCH_PER_TICK as usize,
+        );
+        assert!(!dispatch_capacity_left(&active, computer));
     }
 
     /// E3 finding: prefer an agent-viable computer's slot when one exists, so a

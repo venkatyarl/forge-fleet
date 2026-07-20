@@ -11,7 +11,7 @@ use sqlx::PgPool;
 use std::time::Duration;
 use tracing::{info, warn};
 
-const STALE_HEARTBEAT_SECS: i64 = 5 * 60;
+const STALE_HEARTBEAT_SECS: i64 = crate::work_item_scheduler::LEASE_STALE_SECS;
 /// Hard ceiling on how long a single lease may be HELD regardless of heartbeat.
 /// The stale-heartbeat reaper cannot reclaim a wedged dispatch whose daemon keeps
 /// the heartbeat fresh (the "building forever with a live heartbeat" wedge —
@@ -83,6 +83,11 @@ mod tests {
     #[test]
     fn stale_window_clears_two_heartbeats() {
         let cadence = crate::work_item_dispatch::HEARTBEAT_SECS as i64;
+        assert_eq!(
+            STALE_HEARTBEAT_SECS,
+            crate::work_item_scheduler::LEASE_STALE_SECS,
+            "all work_item lease reapers must share one stale-heartbeat cutoff"
+        );
         assert!(
             STALE_HEARTBEAT_SECS >= 2 * cadence,
             "STALE_HEARTBEAT_SECS ({STALE_HEARTBEAT_SECS}) must be >= 2x the dispatch heartbeat ({cadence})"
