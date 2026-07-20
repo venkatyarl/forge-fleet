@@ -10574,6 +10574,57 @@ LEFT JOIN LATERAL (
 ) s ON TRUE;
 "#;
 
+/// V181 — Fleet work-item velocity views.
+///
+/// Aggregates the V179 transition log into stable hourly and daily reporting
+/// surfaces consumed by the nightly fleet digest. Successful completions are
+/// the PM terminal states `done` and `merged`; retries remain visible through
+/// the event attempt number.
+pub const SCHEMA_V181_FLEET_VELOCITY_VIEWS: &str = r#"
+CREATE OR REPLACE VIEW v_throughput_hourly AS
+SELECT
+    date_trunc('hour', occurred_at) AS hour_bucket,
+    COUNT(*) FILTER (WHERE to_status IN ('done', 'merged'))::BIGINT AS completed_count,
+    COUNT(*) FILTER (WHERE to_status = 'failed')::BIGINT AS failed_count
+FROM work_item_events
+WHERE to_status IN ('done', 'merged', 'failed')
+GROUP BY 1;
+
+CREATE OR REPLACE VIEW v_lead_time_daily AS
+SELECT
+    date_trunc('day', e.occurred_at) AS day_bucket,
+    COUNT(*)::BIGINT AS completed_count,
+    AVG(EXTRACT(EPOCH FROM (e.occurred_at - w.created_at)))::DOUBLE PRECISION
+        AS avg_lead_time_seconds
+FROM work_item_events e
+JOIN work_items w ON w.id = e.work_item_id
+WHERE e.to_status IN ('done', 'merged')
+GROUP BY 1;
+
+CREATE OR REPLACE VIEW v_computer_builds_daily AS
+SELECT
+    date_trunc('day', e.occurred_at) AS day_bucket,
+    COALESCE(e.computer, w.assigned_computer, 'unknown') AS computer_name,
+    COUNT(*) FILTER (WHERE e.to_status = 'building')::BIGINT AS builds_started,
+    COUNT(*) FILTER (WHERE e.to_status IN ('done', 'merged'))::BIGINT AS builds_succeeded,
+    COUNT(*) FILTER (WHERE e.to_status = 'failed')::BIGINT AS builds_failed
+FROM work_item_events e
+JOIN work_items w ON w.id = e.work_item_id
+WHERE e.to_status IN ('building', 'done', 'merged', 'failed')
+GROUP BY 1, 2;
+
+CREATE OR REPLACE VIEW v_first_pass_rate_daily AS
+SELECT
+    date_trunc('day', occurred_at) AS day_bucket,
+    COUNT(*)::BIGINT AS completed_count,
+    COUNT(*) FILTER (WHERE COALESCE(attempt, 1) <= 1)::BIGINT AS first_pass_count,
+    (COUNT(*) FILTER (WHERE COALESCE(attempt, 1) <= 1)::DOUBLE PRECISION
+        / NULLIF(COUNT(*), 0))::DOUBLE PRECISION AS first_pass_rate
+FROM work_item_events
+WHERE to_status IN ('done', 'merged')
+GROUP BY 1;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
