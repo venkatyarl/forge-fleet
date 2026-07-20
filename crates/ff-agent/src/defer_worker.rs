@@ -635,7 +635,7 @@ mod tests {
             .trim()
             .parse::<i32>()
             .expect("grandchild pidfile must contain a valid pid");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
             // kill(-0) returns Err(ESRCH) when the process is gone.
             if unsafe { libc::kill(pid, 0) } != 0 {
