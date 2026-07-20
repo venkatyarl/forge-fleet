@@ -25,6 +25,7 @@ use async_nats::jetstream::{AckKind, Context, Message};
 use futures::StreamExt;
 use tracing::{error, info, warn};
 
+use super::MESSAGE_PROCESSING_LOCK;
 use crate::nats::stream_config::{self, FF_TASKS_SUBJECT_PREFIX, STREAM_FF_TASKS};
 
 /// Dead-letter stream. Lives on the distinct `ff.dlq.` prefix so DLQ
@@ -151,7 +152,10 @@ where
     let mut processed = 0;
     while let Some(next) = messages.next().await {
         match next {
-            Ok(msg) => process_message(&js, msg, &handler).await,
+            Ok(msg) => {
+                let _processing_guard = MESSAGE_PROCESSING_LOCK.lock().await;
+                process_message(&js, msg, &handler).await;
+            }
             Err(e) => warn!(error = %e, "scheduler consumer pull error"),
         }
         processed += 1;

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use ff_core::ActivityLevel;
 
 #[derive(Debug, Clone)]
@@ -10,6 +12,13 @@ pub struct AgentConfig {
     pub activity_poll_interval_secs: u64,
     pub task_poll_interval_secs: u64,
     pub activity_override: Option<ActivityLevel>,
+    /// Max wall-clock a build shell-command may run before the background
+    /// timeout monitor kills it. Maps to `max_build_duration` in the fleet
+    /// config (seconds). `0` disables the monitor.
+    pub max_build_duration_secs: u64,
+    /// How often the build timeout monitor scans running builds.
+    pub build_monitor_poll_secs: u64,
+    pub log_monitor: LogMonitoringConfig,
 }
 
 impl AgentConfig {
@@ -40,8 +49,100 @@ impl AgentConfig {
             activity_override: std::env::var("FF_AGENT_ACTIVITY_OVERRIDE")
                 .ok()
                 .and_then(|v| parse_activity_level(&v)),
+            max_build_duration_secs: std::env::var("FF_AGENT_MAX_BUILD_DURATION_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(300),
+            build_monitor_poll_secs: std::env::var("FF_AGENT_BUILD_MONITOR_POLL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(10),
+            log_monitor: LogMonitoringConfig::from_env(),
         }
     }
+}
+
+/// Log monitoring configuration for the local agent daemon.
+///
+/// Watches configured log files for recurring patterns and dispatches
+/// notifications when a recurrence threshold is crossed within a lookback
+/// window.
+#[derive(Debug, Clone)]
+pub struct LogMonitoringConfig {
+    /// Enable log monitoring.
+    pub enabled: bool,
+    /// Log file paths to watch. Supports comma-separated paths in the
+    /// `FF_AGENT_LOG_MONITOR_PATHS` environment variable.
+    pub log_paths: Vec<PathBuf>,
+    /// Number of matching log lines required to trigger an alert.
+    pub recurrence_threshold: u32,
+    /// Lookback window in seconds for recurrence counting.
+    pub recurrence_window_secs: u64,
+    /// Polling interval in seconds.
+    pub poll_interval_secs: u64,
+    /// Notification channels to use when a recurrence threshold is crossed
+    /// (e.g. "telegram", "slack", "desktop", "webhook").
+    pub notification_channels: Vec<String>,
+}
+
+impl LogMonitoringConfig {
+    pub fn from_env() -> Self {
+        Self {
+            enabled: std::env::var("FF_AGENT_LOG_MONITOR_ENABLED")
+                .ok()
+                .map(|v| v.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            log_paths: std::env::var("FF_AGENT_LOG_MONITOR_PATHS")
+                .ok()
+                .map(|v| parse_path_list(&v))
+                .unwrap_or_else(default_log_paths),
+            recurrence_threshold: std::env::var("FF_AGENT_LOG_MONITOR_RECURRENCE_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(5),
+            recurrence_window_secs: std::env::var("FF_AGENT_LOG_MONITOR_WINDOW_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(300),
+            poll_interval_secs: std::env::var("FF_AGENT_LOG_MONITOR_POLL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(60),
+            notification_channels: std::env::var("FF_AGENT_LOG_MONITOR_CHANNELS")
+                .ok()
+                .map(|v| parse_string_list(&v))
+                .unwrap_or_default(),
+        }
+    }
+}
+
+fn default_log_paths() -> Vec<PathBuf> {
+    dirs::home_dir()
+        .map(|home| {
+            let logs = home.join(".forgefleet").join("logs");
+            vec![
+                logs.join("forgefleetd.log"),
+                logs.join("forgefleetd.out.log"),
+                logs.join("forgefleetd.err.log"),
+            ]
+        })
+        .unwrap_or_default()
+}
+
+fn parse_path_list(raw: &str) -> Vec<PathBuf> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn parse_string_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 fn parse_activity_level(raw: &str) -> Option<ActivityLevel> {

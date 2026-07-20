@@ -16,6 +16,8 @@ use sqlx::PgPool;
 use std::time::Duration;
 use tracing::{info, warn};
 
+use crate::project_github_sync::parse_owner_repo;
+
 /// Build a `gh` invocation with the fleet GitHub token injected as `GH_TOKEN`.
 ///
 /// The merge-drain runs on whichever node is currently leader, and that node's
@@ -65,10 +67,17 @@ pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
                 "PR conflicted with advanced main — auto-reset for rebuild",
             )
             .await?;
+            // Preserve the dispatch lane on the reset: this item already BUILT
+            // a PR on whatever lane its attempts selected. Zeroing attempts
+            // re-routed cloud-built items onto the weak local lane after every
+            // sibling conflict, where hard tasks stall out 3x and die
+            // (2026-07-19: the observability batch looped this way all night).
+            // Cap at 2 so a conflict never pushes an item to the max-attempts
+            // kill threshold by itself.
             sqlx::query(
                 "UPDATE work_items \
-                    SET status = 'ready', attempts = 0, last_error = NULL, \
-                        assigned_computer = NULL \
+                    SET status = 'ready', attempts = LEAST(attempts, 2), \
+                        last_error = NULL, assigned_computer = NULL \
                   WHERE id = $1",
             )
             .bind(item.work_item_id)
@@ -129,40 +138,72 @@ pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
                 );
                 return Ok(0);
             }
-            match run_pr_review(pg, &pr_url, item.work_item_id).await {
-                Ok((true, reason)) => {
+            // Honor an existing PR review verdict before spending an
+            // autonomous review: APPROVED (operator or external reviewer
+            // already signed off) skips the fleet's own review entirely, and
+            // CHANGES_REQUESTED rejects the item with the reviewer's reason
+            // written to `last_error` so a retry attempt sees why. No verdict
+            // (or a gh hiccup) falls through to the autonomous review path,
+            // unchanged.
+            match pr_review_verdict(&pr_url).await {
+                PrReviewVerdict::Approved => {
                     info!(
                         pr = %pr_url,
                         work_item = %item.work_item_id,
-                        %reason,
-                        "merge_drain: autonomous review approved"
+                        "merge_drain: PR already has an approved review verdict — skipping autonomous review"
                     );
                 }
-                Ok((false, reason)) => {
-                    let failure = format!("review rejected: {reason}");
+                PrReviewVerdict::ChangesRequested(reason) => {
+                    let failure = format!("review verdict changes_requested: {reason}");
                     warn!(
                         pr = %pr_url,
                         work_item = %item.work_item_id,
                         reason = %failure,
-                        "merge_drain: autonomous review rejected PR"
+                        "merge_drain: PR has a rejecting review verdict — marking work_item failed"
                     );
                     ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &failure).await?;
-                    if let Err(e) =
-                        gh_pr_comment(&pr_url, &format!("Autonomous review REJECTED: {reason}"))
-                            .await
-                    {
-                        warn!(pr = %pr_url, error = %e, "merge_drain: failed to comment review rejection");
-                    }
                     return Ok(0);
                 }
-                Err(e) => {
-                    warn!(
-                        pr = %pr_url,
-                        work_item = %item.work_item_id,
-                        error = %e,
-                        "merge_drain: review unavailable, deferring PR for manual review"
-                    );
-                    return Ok(0);
+                PrReviewVerdict::None => {
+                    match run_pr_review(pg, &pr_url, item.work_item_id).await {
+                        Ok((true, reason)) => {
+                            info!(
+                                pr = %pr_url,
+                                work_item = %item.work_item_id,
+                                %reason,
+                                "merge_drain: autonomous review approved"
+                            );
+                        }
+                        Ok((false, reason)) => {
+                            let failure = format!("review rejected: {reason}");
+                            warn!(
+                                pr = %pr_url,
+                                work_item = %item.work_item_id,
+                                reason = %failure,
+                                "merge_drain: autonomous review rejected PR"
+                            );
+                            ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &failure)
+                                .await?;
+                            if let Err(e) = gh_pr_comment(
+                                &pr_url,
+                                &format!("Autonomous review REJECTED: {reason}"),
+                            )
+                            .await
+                            {
+                                warn!(pr = %pr_url, error = %e, "merge_drain: failed to comment review rejection");
+                            }
+                            return Ok(0);
+                        }
+                        Err(e) => {
+                            warn!(
+                                pr = %pr_url,
+                                work_item = %item.work_item_id,
+                                error = %e,
+                                "merge_drain: review unavailable, deferring PR for manual review"
+                            );
+                            return Ok(0);
+                        }
+                    }
                 }
             }
             match gh_merge_squash(&pr_url).await {
@@ -192,10 +233,11 @@ pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
                             "PR conflicted at merge time (async mergeable race) — auto-reset for rebuild",
                         )
                         .await?;
+                        // Same lane-preservation rule as the DIRTY reset above.
                         sqlx::query(
                             "UPDATE work_items \
-                                SET status = 'ready', attempts = 0, last_error = NULL, \
-                                    assigned_computer = NULL \
+                                SET status = 'ready', attempts = LEAST(attempts, 2), \
+                                    last_error = NULL, assigned_computer = NULL \
                               WHERE id = $1",
                         )
                         .bind(item.work_item_id)
@@ -259,11 +301,271 @@ async fn run_pr_review(
         description = description.unwrap_or_default(),
     );
 
-    let response =
-        crate::fleet_oneshot::fleet_oneshot(pg, &prompt, None, Some(Duration::from_secs(180)))
+    review_ladder(pg, pr_url, &prompt).await
+}
+
+/// Cost-optimal PR review ladder (operator design 2026-07-20).
+///
+/// Free local 30B reviews FIRST; paid/scarce reviewers (480B ring, cloud CLIs)
+/// are spent ONLY to CONFIRM a 30B APPROVE — i.e. only to bless a likely merge,
+/// never to do the initial review and never on a REJECT. A rejected PR costs
+/// zero cloud: it fails and rebuilds locally with the reviewer reason as
+/// context (a local coder "fixes it" for free). A weak 30B can false-APPROVE a
+/// subtle bug, so approves — not rejects — are the verdict worth a confirmer.
+///
+/// Ladder:
+/// 1. 30B review. REJECT → done (free, rebuild). APPROVE → confirm (step 2).
+/// 2. Confirm the approve with the 480B ring if up (stronger, still local);
+///    else one cloud CLI; else — no confirmer available — merge on the 30B
+///    approve alone (CI is already green and the drain must never freeze).
+/// If NO local model is even reachable, fall back to the 480B→cloud path so a
+/// review still happens.
+async fn review_ladder(pg: &PgPool, pr_url: &str, prompt: &str) -> Result<(bool, String)> {
+    let (local_ok, local_reason, local_model) = match local_pool_review(pg, prompt).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                pr = %pr_url,
+                error = %e,
+                "merge_drain: no local reviewer — falling back to 480b/cloud review"
+            );
+            return match review_via_480b(pg, prompt).await {
+                Ok((approved, reason)) => Ok((approved, format!("480b: {reason}"))),
+                Err(_) => {
+                    let (approved, reason, backend) = cloud_cli_review(pg, prompt)
+                        .await
+                        .context("cloud PR review (no local reviewer)")?;
+                    Ok((approved, format!("{backend}: {reason}")))
+                }
+            };
+        }
+    };
+
+    // 30B REJECT: trust it, spend nothing. Item fails → rebuilds locally with
+    // this reason as context — the free "local coder fixes it" path.
+    if !local_ok {
+        return Ok((
+            false,
+            format!("local:{local_model} rejected: {local_reason}"),
+        ));
+    }
+
+    // 30B APPROVE: confirm before merging (a weak 30B can miss a subtle bug).
+    info!(
+        pr = %pr_url,
+        model = %local_model,
+        "merge_drain: local 30B approved — confirming before merge"
+    );
+    match review_via_480b(pg, prompt).await {
+        Ok((true, r)) => Ok((
+            true,
+            format!("local:{local_model} approved, 480b confirmed: {r}"),
+        )),
+        Ok((false, r)) => Ok((
+            false,
+            format!("local:{local_model} approved but 480b rejected: {r}"),
+        )),
+        Err(_) => match cloud_cli_review(pg, prompt).await {
+            Ok((true, r, backend)) => Ok((
+                true,
+                format!("local:{local_model} approved, {backend} confirmed: {r}"),
+            )),
+            Ok((false, r, backend)) => Ok((
+                false,
+                format!("local:{local_model} approved but {backend} rejected: {r}"),
+            )),
+            Err(_) => {
+                // No confirmer up (480B ring + every cloud CLI down). CI is green
+                // and the 30B approved — merge rather than freeze the drain.
+                warn!(
+                    pr = %pr_url,
+                    "merge_drain: no confirmer available — merging on CI-green + 30B approval"
+                );
+                Ok((
+                    true,
+                    format!("local:{local_model} approved (no confirmer available; CI green)"),
+                ))
+            }
+        },
+    }
+}
+
+/// Last-resort PR review on ANY healthy local model (a 30B coder). Used only
+/// when the 480B ring AND every cloud CLI are unavailable, so a backend outage
+/// can never freeze the merge drain. Routes via `fleet_oneshot` with a coder
+/// hint; a short timeout keeps a slow node from stalling the drain.
+async fn local_pool_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, String)> {
+    let resp = crate::fleet_oneshot::fleet_oneshot(
+        pg,
+        prompt,
+        Some("qwen3-coder"),
+        Some(Duration::from_secs(120)),
+    )
+    .await
+    .context("local pool PR review")?;
+    record_review_interaction(
+        pg,
+        &resp.model,
+        prompt,
+        &resp.text,
+        resp.tokens_in,
+        resp.tokens_out,
+        i32::try_from(resp.latency_ms).ok(),
+        Some(resp.worker_name.clone()),
+        Some(resp.endpoint.clone()),
+    )
+    .await;
+    let (approved, reason) = parse_review_response(&resp.text);
+    Ok((approved, reason, resp.model))
+}
+
+/// Substring identifying the primary autonomous reviewer — the qwen3-coder-480b
+/// ring (single fleet instance). Used both as the `fleet_oneshot` routing hint
+/// and to verify which model actually served the call, because `fleet_oneshot`
+/// fails over to OTHER deployments when the hinted one is down — a review from
+/// a weaker fallback model must not be mistaken for a 480B verdict.
+const REVIEWER_480B_HINT: &str = "480b";
+
+/// Cap 480B review concurrency at 1: the ring is a single instance, and the
+/// drain is serial anyway — the gate makes that explicit for any future caller
+/// that reviews outside the drain loop.
+static REVIEW_480B_GATE: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(1));
+
+/// Primary PR review on the 480B ring. `Err` means the ring is unavailable
+/// (routing failed, timed out, or `fleet_oneshot` failed over to some other
+/// model) — the caller falls back to the cloud review path.
+async fn review_via_480b(pg: &PgPool, prompt: &str) -> Result<(bool, String)> {
+    let _permit = REVIEW_480B_GATE
+        .acquire()
+        .await
+        .expect("480b review gate is never closed");
+    let resp = crate::fleet_oneshot::fleet_oneshot(
+        pg,
+        prompt,
+        Some(REVIEWER_480B_HINT),
+        Some(Duration::from_secs(300)),
+    )
+    .await
+    .context("480b PR review")?;
+    if !served_by_480b(&resp.model) {
+        anyhow::bail!(
+            "480b ring unavailable — fleet_oneshot failed over to {} on {}",
+            resp.model,
+            resp.worker_name
+        );
+    }
+    record_review_interaction(
+        pg,
+        &resp.model,
+        prompt,
+        &resp.text,
+        resp.tokens_in,
+        resp.tokens_out,
+        i32::try_from(resp.latency_ms).ok(),
+        Some(resp.worker_name.clone()),
+        Some(resp.endpoint.clone()),
+    )
+    .await;
+    Ok(parse_review_response(&resp.text))
+}
+
+/// True when the model name that served a call is the 480B ring.
+fn served_by_480b(model: &str) -> bool {
+    model.to_lowercase().contains(REVIEWER_480B_HINT)
+}
+
+/// One cloud CLI review pass — first backend that produces output wins, so a
+/// leader node missing one vendor CLI still gets a review. Returns
+/// `(approved, reason, backend)`.
+async fn cloud_cli_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, String)> {
+    let mut last_err: Option<anyhow::Error> = None;
+    // claude first: it is the most reliable cloud reviewer here; codex has hung
+    // (600s stdin block) and auth-expired fleet-wide, so trying it first froze
+    // the whole serial drain (2026-07-20 outage). A 90s per-backend cap means a
+    // hung/failing backend loses the race to the next one within seconds instead
+    // of stalling every drain tick for ten minutes.
+    for backend in ["claude", "codex", "kimi"] {
+        match crate::cli_executor::execute_cli(backend, prompt, &[], Some(Duration::from_secs(90)))
             .await
-            .context("fleet PR review")?;
-    Ok(parse_review_response(&response.text))
+        {
+            Ok(res) if res.exit_code == 0 && !res.stdout.trim().is_empty() => {
+                let (tin, tout) = crate::llm_attribution::parse_cli_token_counts(&format!(
+                    "{}\n{}",
+                    res.stdout, res.stderr
+                ));
+                record_review_interaction(
+                    pg,
+                    backend,
+                    prompt,
+                    &res.stdout,
+                    tin,
+                    tout,
+                    i32::try_from(res.duration_ms).ok(),
+                    None,
+                    Some(format!("ff cli {backend}")),
+                )
+                .await;
+                let (approved, reason) = parse_review_response(&res.stdout);
+                return Ok((approved, reason, backend.to_string()));
+            }
+            Ok(res) => {
+                let e = anyhow::anyhow!(
+                    "{backend} exited {}: {}",
+                    res.exit_code,
+                    res.stderr.trim().chars().take(300).collect::<String>()
+                );
+                warn!(backend, error = %e, "merge_drain: cloud review backend failed — trying next");
+                last_err = Some(e);
+            }
+            Err(e) => {
+                warn!(backend, error = %e, "merge_drain: cloud review backend unavailable — trying next");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no cloud CLI review backend available")))
+}
+
+/// Best-effort `ff_interactions` row for one autonomous review turn (training
+/// data — part of the point of routing review through the fleet). Never fails
+/// the drain.
+#[allow(clippy::too_many_arguments)]
+async fn record_review_interaction(
+    pg: &PgPool,
+    engine: &str,
+    prompt: &str,
+    response: &str,
+    tokens_in: i32,
+    tokens_out: i32,
+    latency_ms: Option<i32>,
+    worker_name: Option<String>,
+    endpoint: Option<String>,
+) {
+    // Canonical engine (cloud CLI name or local:<catalog_id>), flagged chars/4
+    // estimate when the caller had no reported counts, and config-driven cost.
+    let engine = crate::llm_attribution::engine_label(engine);
+    let (tokens_in, tokens_out, tokens_estimated) =
+        crate::llm_attribution::tokens_or_estimate(tokens_in, tokens_out, prompt, response);
+    let cost_usd = crate::llm_attribution::cost_usd(&engine, tokens_in, tokens_out);
+    let rec = ff_db::InteractionRecord {
+        channel: "merge_drain_review".to_string(),
+        request_text: prompt.chars().take(16000).collect(),
+        request_meta: serde_json::json!({ "tokens_estimated": tokens_estimated }),
+        engine: Some(engine),
+        response_text: response.chars().take(16000).collect(),
+        tokens_in,
+        tokens_out,
+        cost_usd,
+        latency_ms,
+        outcome: "success".to_string(),
+        worker_name,
+        endpoint,
+        ..Default::default()
+    };
+    if let Err(e) = ff_db::pg_record_interaction(pg, &rec).await {
+        warn!(error = %e, "merge_drain: failed to log review interaction (non-fatal)");
+    }
 }
 
 fn parse_review_response(response: &str) -> (bool, String) {
@@ -339,6 +641,71 @@ enum PrMergeState {
     /// Everything else (CLEAN/BLOCKED/UNSTABLE or a gh/API error) — take no
     /// special action; the normal CI→review→merge path decides.
     Other,
+}
+
+/// An existing review verdict on the PR, from GitHub's `reviewDecision`.
+#[derive(Debug, PartialEq, Eq)]
+enum PrReviewVerdict {
+    /// `reviewDecision == APPROVED` — someone already signed off; the drain
+    /// skips its own autonomous review.
+    Approved,
+    /// `reviewDecision == CHANGES_REQUESTED` — the PR was rejected; the string
+    /// is the rejecting review's reason (its body), surfaced into the
+    /// work_item's `last_error` so a retry has the context.
+    ChangesRequested(String),
+    /// No verdict yet (`REVIEW_REQUIRED` / empty) — the drain runs its own
+    /// autonomous review as before.
+    None,
+}
+
+/// `gh pr view <url> --json reviewDecision,latestReviews`. Any gh/parse error
+/// maps to `None` so a hiccup can never fail a healthy item or block the
+/// drain — worst case the drain just runs its own review.
+async fn pr_review_verdict(pr_url: &str) -> PrReviewVerdict {
+    let mut cmd = gh_cmd().await;
+    cmd.args([
+        "pr",
+        "view",
+        pr_url,
+        "--json",
+        "reviewDecision,latestReviews",
+    ]);
+    let out = match cmd.output().await {
+        Ok(o) if o.status.success() => o,
+        _ => return PrReviewVerdict::None,
+    };
+    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .map(|v| parse_review_verdict(&v))
+        .unwrap_or(PrReviewVerdict::None)
+}
+
+/// Pure mapping of `gh pr view --json reviewDecision,latestReviews` output to
+/// a verdict. On CHANGES_REQUESTED the reason is the most recent rejecting
+/// review's non-empty body (bounded so it fits `last_error`).
+fn parse_review_verdict(v: &serde_json::Value) -> PrReviewVerdict {
+    match v.get("reviewDecision").and_then(|d| d.as_str()) {
+        Some("APPROVED") => PrReviewVerdict::Approved,
+        Some("CHANGES_REQUESTED") => {
+            let reason = v
+                .get("latestReviews")
+                .and_then(|r| r.as_array())
+                .and_then(|reviews| {
+                    reviews
+                        .iter()
+                        .rev()
+                        .filter(|r| {
+                            r.get("state").and_then(|s| s.as_str()) == Some("CHANGES_REQUESTED")
+                        })
+                        .filter_map(|r| r.get("body").and_then(|b| b.as_str()))
+                        .map(str::trim)
+                        .find(|body| !body.is_empty())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "no reason given".to_string());
+            PrReviewVerdict::ChangesRequested(truncate_chars(&reason, 1000))
+        }
+        _ => PrReviewVerdict::None,
+    }
 }
 
 /// `gh pr view <url> --json mergeStateStatus`. Any error maps to `Other` so a
@@ -443,6 +810,11 @@ async fn pr_ci_state(pr_url: &str) -> CiState {
 
 /// `gh pr merge <url> --squash --delete-branch` (the project policy — always
 /// delete the branch; see feedback_pr_merge_delete_branch.md).
+///
+/// If `gh` reports failure because the branch delete step errored (e.g. a
+/// transient GitHub 503), but the PR itself is `MERGED`, we treat the merge as
+/// a success and only best-effort clean up the branch. A merged PR must never
+/// be marked failed because of cleanup.
 async fn gh_merge_squash(pr_url: &str) -> Result<()> {
     let mut cmd = gh_cmd().await;
     cmd.args(["pr", "merge", pr_url, "--squash", "--delete-branch"]);
@@ -450,13 +822,78 @@ async fn gh_merge_squash(pr_url: &str) -> Result<()> {
     if out.status.success() {
         return Ok(());
     }
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The squash may have landed even though the --delete-branch step failed.
+    if let Some(state) = gh_pr_view_state(pr_url).await {
+        if state.eq_ignore_ascii_case("MERGED") {
+            warn!(
+                pr = %pr_url,
+                stderr = %stderr.trim(),
+                "merge_drain: PR merged but branch deletion failed — best-effort cleanup"
+            );
+            if let Err(e) = gh_delete_branch(pr_url).await {
+                warn!(
+                    pr = %pr_url,
+                    error = %e,
+                    "merge_drain: best-effort branch delete failed — leaving for janitor"
+                );
+            }
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!("{}", stderr.trim().chars().take(500).collect::<String>());
+}
+
+/// Fetch `state` from `gh pr view --json state`. Used as a reliability check
+/// when `gh pr merge` exits non-zero.
+async fn gh_pr_view_state(pr_url: &str) -> Option<String> {
+    let mut cmd = gh_cmd().await;
+    cmd.args(["pr", "view", pr_url, "--json", "state"]);
+    let out = cmd.output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .ok()
+        .and_then(|v| v.get("state").and_then(|s| s.as_str()).map(str::to_string))
+}
+
+/// Best-effort deletion of a PR's head branch via the GitHub API. Used when
+/// `gh pr merge --delete-branch` merged the PR but failed to delete the branch.
+async fn gh_delete_branch(pr_url: &str) -> Result<()> {
+    let mut cmd = gh_cmd().await;
+    cmd.args(["pr", "view", pr_url, "--json", "headRefName"]);
+    let out = cmd.output().await.context("spawn gh pr view headRefName")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "gh pr view headRefName failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let head_ref = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .ok()
+        .and_then(|v| {
+            v.get("headRefName")
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+        })
+        .context("missing headRefName in gh pr view response")?;
+
+    let (owner, repo) =
+        parse_owner_repo(pr_url).with_context(|| format!("unrecognized PR url: {pr_url}"))?;
+    let path = format!("repos/{owner}/{repo}/git/refs/heads/{head_ref}");
+
+    let mut del = gh_cmd().await;
+    del.args(["api", "-X", "DELETE", &path]);
+    let out = del.output().await.context("spawn gh api delete branch")?;
+    if out.status.success() {
+        return Ok(());
+    }
     anyhow::bail!(
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-            .trim()
-            .chars()
-            .take(500)
-            .collect::<String>()
+        "gh api delete branch failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
     );
 }
 
@@ -550,7 +987,7 @@ async fn reconcile_orphaned_reviews(pg: &PgPool) -> Result<usize> {
 /// Spawn the leader-gated drain loop. Mirrors the scheduler's leader check.
 pub fn spawn_work_item_merge_drain(
     pg: PgPool,
-    _worker_name: String,
+    worker_name: String,
     interval_secs: u64,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -560,7 +997,20 @@ pub fn spawn_work_item_merge_drain(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if !crate::leader_cache::is_current_leader() {
+                    // Leader gate with an authoritative DB fallback. The
+                    // in-memory leader_cache defaults to FALSE after a daemon
+                    // restart and is only warmed by leader_tick on its interval;
+                    // during that cold window the (leader-gated) drain silently
+                    // no-ops for minutes — the 2026-07-20 freeze where merges
+                    // stuck at 141 with ~99 green PRs waiting while priya was the
+                    // continuous DB leader. When the cache says "not leader",
+                    // confirm against fleet_leader_state (the durable source of
+                    // truth) before skipping. Safe: merges are serialized by
+                    // FOR UPDATE SKIP LOCKED, so a DB-confirmed leader can never
+                    // double-merge.
+                    if !crate::leader_cache::is_current_leader()
+                        && !db_confirms_leader(&pg, &worker_name).await
+                    {
                         continue;
                     }
                     if let Err(e) = evaluate_merge_queue(&pg).await {
@@ -588,9 +1038,28 @@ pub fn spawn_work_item_merge_drain(
     })
 }
 
+/// Authoritative leader check straight from `fleet_leader_state` — the durable
+/// singleton that decides leadership. Used as a fallback for the cold-cache
+/// window right after a daemon restart (see the leader gate above). A fresh
+/// heartbeat (<60s) on our own member row means we ARE the leader regardless of
+/// the not-yet-warmed in-memory cache.
+async fn db_confirms_leader(pg: &PgPool, worker_name: &str) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM fleet_leader_state \
+         WHERE member_name = $1 AND heartbeat_at > NOW() - INTERVAL '60 seconds')",
+    )
+    .bind(worker_name)
+    .fetch_one(pg)
+    .await
+    .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::update_branch_api_path;
+    use super::{
+        PrReviewVerdict, parse_review_response, parse_review_verdict, served_by_480b,
+        update_branch_api_path,
+    };
 
     #[test]
     fn pr_url_maps_to_update_branch_api_path() {
@@ -598,6 +1067,78 @@ mod tests {
             update_branch_api_path("https://github.com/venkatyarl/forge-fleet/pull/930").as_deref(),
             Some("repos/venkatyarl/forge-fleet/pulls/930/update-branch")
         );
+    }
+
+    #[test]
+    fn served_by_480b_matches_the_ring_only() {
+        assert!(served_by_480b("qwen3-coder-480b"));
+        assert!(served_by_480b("Qwen3-Coder-480B-A35B"));
+        // A fail-over to any other deployment must NOT count as a 480B verdict.
+        assert!(!served_by_480b("qwen3-coder-30b"));
+        assert!(!served_by_480b("local"));
+        assert!(!served_by_480b(""));
+    }
+
+    #[test]
+    fn parse_review_response_verdicts() {
+        let (approved, reason) = parse_review_response("APPROVE\nmatches the work item intent");
+        assert!(approved);
+        assert_eq!(reason, "matches the work item intent");
+
+        let (approved, reason) = parse_review_response("\nREJECT\nplaceholder-only diff");
+        assert!(!approved);
+        assert_eq!(reason, "placeholder-only diff");
+
+        let (approved, reason) = parse_review_response("");
+        assert!(!approved);
+        assert_eq!(reason, "empty review response");
+    }
+
+    #[test]
+    fn approved_review_verdict_skips_own_review() {
+        let v = serde_json::json!({
+            "reviewDecision": "APPROVED",
+            "latestReviews": [{"state": "APPROVED", "body": "lgtm"}],
+        });
+        assert_eq!(parse_review_verdict(&v), PrReviewVerdict::Approved);
+    }
+
+    #[test]
+    fn changes_requested_verdict_carries_the_latest_rejection_reason() {
+        let v = serde_json::json!({
+            "reviewDecision": "CHANGES_REQUESTED",
+            "latestReviews": [
+                {"state": "CHANGES_REQUESTED", "body": "older reason"},
+                {"state": "APPROVED", "body": "lgtm"},
+                {"state": "CHANGES_REQUESTED", "body": "  breaks the scheduler tick  "},
+            ],
+        });
+        assert_eq!(
+            parse_review_verdict(&v),
+            PrReviewVerdict::ChangesRequested("breaks the scheduler tick".to_string())
+        );
+
+        // Empty bodies fall back to a placeholder rather than an empty reason.
+        let v = serde_json::json!({
+            "reviewDecision": "CHANGES_REQUESTED",
+            "latestReviews": [{"state": "CHANGES_REQUESTED", "body": ""}],
+        });
+        assert_eq!(
+            parse_review_verdict(&v),
+            PrReviewVerdict::ChangesRequested("no reason given".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_or_pending_review_verdict_runs_own_review() {
+        for v in [
+            serde_json::json!({}),
+            serde_json::json!({"reviewDecision": ""}),
+            serde_json::json!({"reviewDecision": "REVIEW_REQUIRED"}),
+            serde_json::json!({"reviewDecision": null}),
+        ] {
+            assert_eq!(parse_review_verdict(&v), PrReviewVerdict::None, "{v}");
+        }
     }
 
     #[test]

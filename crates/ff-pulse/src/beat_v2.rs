@@ -675,7 +675,7 @@ mod tests {
     /// `deny_unknown_fields` ever sneaks onto the struct).
     #[test]
     fn beat_deserializes_across_schema_generations() {
-        let beat = PulseBeatV2::skeleton("sia");
+        let beat = PulseBeatV2::skeleton("test-node-fake");
         let mut json: serde_json::Value = serde_json::to_value(&beat).expect("to_value");
         let obj = json.as_object_mut().expect("beat serializes to an object");
 
@@ -693,7 +693,7 @@ mod tests {
         }
         let parsed: PulseBeatV2 =
             serde_json::from_value(json.clone()).expect("older-format beat must deserialize");
-        assert_eq!(parsed.computer_name, "sia");
+        assert_eq!(parsed.computer_name, "test-node-fake");
         assert!(parsed.encountered_bugs.is_empty());
         assert!(parsed.build_sha.is_none());
 
