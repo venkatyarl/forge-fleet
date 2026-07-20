@@ -3331,6 +3331,38 @@ pub async fn pg_upsert_mesh_status(
     Ok(())
 }
 
+/// Upsert both diagnostics from a mesh probe. `status` remains SSH-derived for
+/// compatibility with existing health and alert consumers.
+pub async fn pg_upsert_mesh_probe(
+    pool: &PgPool,
+    src_node: &str,
+    dst_node: &str,
+    status: &str,
+    last_error: Option<&str>,
+    ping_ok: Option<bool>,
+    ssh_ok: Option<bool>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO fleet_mesh_status
+            (src_node, dst_node, status, last_checked, last_error, attempts, ping_ok, ssh_ok)
+         VALUES ($1, $2, $3, NOW(), $4, 1, $5, $6)
+         ON CONFLICT (src_node, dst_node) DO UPDATE SET
+            status = EXCLUDED.status, last_checked = NOW(),
+            last_error = EXCLUDED.last_error,
+            attempts = fleet_mesh_status.attempts + 1,
+            ping_ok = EXCLUDED.ping_ok, ssh_ok = EXCLUDED.ssh_ok",
+    )
+    .bind(src_node)
+    .bind(dst_node)
+    .bind(status)
+    .bind(last_error)
+    .bind(ping_ok)
+    .bind(ssh_ok)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Fetch the full mesh matrix; optionally filter by node (returns rows where
 /// src_node = node OR dst_node = node).
 pub async fn pg_list_mesh_status(pool: &PgPool, node: Option<&str>) -> Result<Vec<MeshStatusRow>> {

@@ -11554,6 +11554,14 @@ UPDATE sub_agents sa
    AND sa.current_work_item_id IS NULL;
 "#;
 
+/// V216 — retain both diagnostics produced by the full-mesh probe. SSH remains
+/// authoritative in `status`; ICMP is diagnostic because healthy hosts may drop it.
+pub const SCHEMA_V216_MESH_PROBE_DIAGNOSTICS: &str = r#"
+ALTER TABLE fleet_mesh_status
+    ADD COLUMN IF NOT EXISTS ping_ok BOOLEAN,
+    ADD COLUMN IF NOT EXISTS ssh_ok BOOLEAN;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

@@ -62,6 +62,8 @@ pub struct MeshCell {
     pub dst: String,
     pub status: String,
     pub last_error: Option<String>,
+    pub ping_ok: Option<bool>,
+    pub ssh_ok: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -141,24 +143,28 @@ async fn pairwise_ssh_check_inner(
         if futs.len() >= 8
             && let Some(cell) = futs.next().await
         {
-            let _ = ff_db::pg_upsert_mesh_status(
+            let _ = ff_db::pg_upsert_mesh_probe(
                 pool,
                 &cell.src,
                 &cell.dst,
                 &cell.status,
                 cell.last_error.as_deref(),
+                cell.ping_ok,
+                Some(cell.ssh_ok),
             )
             .await;
             cells.push(cell);
         }
     }
     while let Some(cell) = futs.next().await {
-        let _ = ff_db::pg_upsert_mesh_status(
+        let _ = ff_db::pg_upsert_mesh_probe(
             pool,
             &cell.src,
             &cell.dst,
             &cell.status,
             cell.last_error.as_deref(),
+            cell.ping_ok,
+            Some(cell.ssh_ok),
         )
         .await;
         cells.push(cell);
@@ -183,8 +189,9 @@ async fn probe_pair(
     // `crate::ssh_opts`.
     let ssh_bypass = crate::ssh_opts::SSH_AGENT_BYPASS;
     let inner = format!(
-        "ssh {ssh_bypass} -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
-         {dst_user}@{dst_ip} true"
+        "ping -c 1 {dst_ip} >/dev/null 2>&1; p=$?; \
+         ssh {ssh_bypass} -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+         {dst_user}@{dst_ip} true; s=$?; printf '__FF_MESH__%s:%s\\n' \"$p\" \"$s\"; exit \"$s\""
     );
     let result = timeout(
         Duration::from_secs(12),
@@ -204,12 +211,16 @@ async fn probe_pair(
 
     match result {
         Ok(Ok(out)) if out.status.success() => MeshCell {
+            ping_ok: parse_remote_probe_marker(&out.stdout).map(|(ping, _)| ping),
+            ssh_ok: true,
             src,
             dst,
             status: "ok".into(),
             last_error: None,
         },
         Ok(Ok(out)) => MeshCell {
+            ping_ok: parse_remote_probe_marker(&out.stdout).map(|(ping, _)| ping),
+            ssh_ok: false,
             src,
             dst,
             status: "failed".into(),
@@ -224,18 +235,32 @@ async fn probe_pair(
             )),
         },
         Ok(Err(e)) => MeshCell {
+            ping_ok: None,
+            ssh_ok: false,
             src,
             dst,
             status: "failed".into(),
             last_error: Some(format!("spawn: {e}")),
         },
         Err(_) => MeshCell {
+            ping_ok: None,
+            ssh_ok: false,
             src,
             dst,
             status: "failed".into(),
             last_error: Some("timeout".into()),
         },
     }
+}
+
+fn parse_remote_probe_marker(stdout: &[u8]) -> Option<(bool, bool)> {
+    let text = String::from_utf8_lossy(stdout);
+    let marker = text
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("__FF_MESH__"))?;
+    let (ping, ssh) = marker.split_once(':')?;
+    Some((ping == "0", ssh == "0"))
 }
 
 /// One direct (this node → dst) reachability probe: ICMP ping + single-hop SSH.
@@ -287,15 +312,30 @@ pub async fn local_reach_check(
         if futs.len() >= 8
             && let Some(p) = futs.next().await
         {
-            let _ =
-                ff_db::pg_upsert_mesh_status(pool, &p.src, &p.dst, &p.status, p.detail.as_deref())
-                    .await;
+            let _ = ff_db::pg_upsert_mesh_probe(
+                pool,
+                &p.src,
+                &p.dst,
+                &p.status,
+                p.detail.as_deref(),
+                Some(p.ping_ok),
+                Some(p.ssh_ok),
+            )
+            .await;
             probes.push(p);
         }
     }
     while let Some(p) = futs.next().await {
-        let _ = ff_db::pg_upsert_mesh_status(pool, &p.src, &p.dst, &p.status, p.detail.as_deref())
-            .await;
+        let _ = ff_db::pg_upsert_mesh_probe(
+            pool,
+            &p.src,
+            &p.dst,
+            &p.status,
+            p.detail.as_deref(),
+            Some(p.ping_ok),
+            Some(p.ssh_ok),
+        )
+        .await;
         probes.push(p);
     }
     let _ = fire_mesh_alert(pool).await;
@@ -727,6 +767,8 @@ pub async fn probe_single_pair(pool: &PgPool, src: &str, dst: &str) -> Result<Me
             dst: dst.to_string(),
             status: "skipped".into(),
             last_error: Some("endpoint computer is offline, reserved, or decommissioned".into()),
+            ping_ok: None,
+            ssh_ok: false,
         });
     }
     let cell = probe_pair(
@@ -738,12 +780,14 @@ pub async fn probe_single_pair(pool: &PgPool, src: &str, dst: &str) -> Result<Me
         d.ip.clone(),
     )
     .await;
-    let _ = ff_db::pg_upsert_mesh_status(
+    let _ = ff_db::pg_upsert_mesh_probe(
         pool,
         &cell.src,
         &cell.dst,
         &cell.status,
         cell.last_error.as_deref(),
+        cell.ping_ok,
+        Some(cell.ssh_ok),
     )
     .await;
     Ok(cell)
@@ -897,6 +941,19 @@ pub fn spawn_mesh_refresh_tick(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_remote_ping_and_ssh_verdicts() {
+        assert_eq!(
+            parse_remote_probe_marker(b"__FF_MESH__0:0\n"),
+            Some((true, true))
+        );
+        assert_eq!(
+            parse_remote_probe_marker(b"noise\n__FF_MESH__1:0\n"),
+            Some((false, true))
+        );
+        assert_eq!(parse_remote_probe_marker(b"no marker"), None);
+    }
 
     #[test]
     fn classify_both_ok_is_clean_ok() {

@@ -282,6 +282,7 @@ pub use queries::{
     pg_upsert_computer_backend,
     pg_upsert_deployment,
     pg_upsert_library,
+    pg_upsert_mesh_probe,
     pg_upsert_mesh_status,
     pg_upsert_model,
     pg_upsert_node,

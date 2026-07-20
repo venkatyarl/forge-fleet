@@ -3546,9 +3546,17 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
             }
             .map_err(|e| anyhow::anyhow!(e))?;
             if json {
-                let arr: Vec<_> = matrix.cells.iter().map(|c| serde_json::json!({
-                    "src": c.src, "dst": c.dst, "status": c.status, "last_error": c.last_error,
-                })).collect();
+                let arr: Vec<_> = matrix
+                    .cells
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "src": c.src, "dst": c.dst, "status": c.status,
+                            "ping_ok": c.ping_ok, "ssh_ok": c.ssh_ok,
+                            "last_error": c.last_error,
+                        })
+                    })
+                    .collect();
                 println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
             } else {
                 let mut ok = 0;
@@ -3561,7 +3569,12 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                         fail += 1;
                     }
                     let err = c.last_error.as_deref().unwrap_or("");
-                    println!("  {:<10} → {:<10}  {}  {}", c.src, c.dst, marker, err);
+                    let ping = c.ping_ok.map_or("?", |ok| if ok { "ok" } else { "fail" });
+                    let ssh = if c.ssh_ok { "ok" } else { "fail" };
+                    println!(
+                        "  {:<10} → {:<10}  {}  ping={ping} ssh={ssh}  {err}",
+                        c.src, c.dst, marker
+                    );
                 }
                 println!(
                     "\n{ok} ok, {fail} failed — checked {} pairs",

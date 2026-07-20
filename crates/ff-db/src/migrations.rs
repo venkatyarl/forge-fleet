@@ -1061,6 +1061,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "sub_agent_capacity_boundary",
         sql: schema::SCHEMA_V215_SUB_AGENT_CAPACITY_BOUNDARY,
     },
+    PgMigration {
+        version: 216,
+        name: "mesh_probe_diagnostics",
+        sql: schema::SCHEMA_V216_MESH_PROBE_DIAGNOSTICS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

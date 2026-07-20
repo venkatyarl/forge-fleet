@@ -104,6 +104,12 @@ impl TickRegistry {
                 scope: TickScope::LeaderOnly,
                 runner: run_kimi_usage_poller_tick,
             },
+            TickDefinition {
+                name: "ssh_mesh_check",
+                interval: Duration::from_secs(6 * 60 * 60),
+                scope: TickScope::LeaderOnly,
+                runner: run_ssh_mesh_check_tick,
+            },
         ]
         .into_iter()
         .map(|definition| RegisteredTick {
@@ -271,6 +277,15 @@ fn run_kimi_usage_poller_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'st
         crate::kimi_usage_poller::poll_kimi_usage_once(&pg)
             .await
             .map(|_| ())
+    })
+}
+
+fn run_ssh_mesh_check_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::mesh_check::pairwise_ssh_check(&pg)
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::msg)
     })
 }
 
