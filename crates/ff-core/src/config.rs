@@ -207,6 +207,12 @@ pub struct FleetSettings {
     /// Base API port.
     #[serde(default = "default_api_port")]
     pub api_port: u16,
+
+    /// Maximum wall-clock time a build is allowed to run before it is killed.
+    ///
+    /// Maps to `max_build_duration` in `[general]` (value is in seconds).
+    #[serde(default = "default_max_build_duration", rename = "max_build_duration")]
+    pub max_build_duration_secs: u64,
 }
 
 /// Backward-compatible type alias.
@@ -225,6 +231,10 @@ fn default_api_port() -> u16 {
     51000
 }
 
+fn default_max_build_duration() -> u64 {
+    300
+}
+
 impl Default for FleetSettings {
     fn default() -> Self {
         Self {
@@ -234,6 +244,7 @@ impl Default for FleetSettings {
             heartbeat_interval_secs: default_heartbeat_interval(),
             heartbeat_timeout_secs: default_heartbeat_timeout(),
             api_port: default_api_port(),
+            max_build_duration_secs: default_max_build_duration(),
         }
     }
 }
@@ -2134,6 +2145,24 @@ notes = "Setup started."
         assert!(!config.obsidian_export.enabled);
         assert!(config.obsidian_export.target_dir.is_none());
         assert!(config.obsidian_export.model.is_none());
+    }
+
+    #[test]
+    fn test_max_build_duration_defaults_to_300_seconds() {
+        let config: FleetConfig = toml::from_str("").unwrap();
+        assert_eq!(config.fleet.max_build_duration_secs, 300);
+    }
+
+    #[test]
+    fn test_max_build_duration_parses_from_toml() {
+        let config: FleetConfig = toml::from_str(
+            r#"
+[general]
+max_build_duration = 900
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.fleet.max_build_duration_secs, 900);
     }
 
     #[test]
