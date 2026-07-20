@@ -881,6 +881,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "work_item_events",
         sql: schema::SCHEMA_V179_WORK_ITEM_EVENTS,
     },
+    PgMigration {
+        version: 180,
+        name: "fleet_model_catalog_real_sized",
+        sql: schema::SCHEMA_V180_FLEET_MODEL_CATALOG_REAL_SIZED,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

@@ -10537,6 +10537,146 @@ CREATE INDEX IF NOT EXISTS idx_work_item_events_item_time
     ON work_item_events (work_item_id, occurred_at DESC);
 "#;
 
+// ─── V180: Add real-sized model catalog entries + offload-only markers ──────
+//
+// Fleet model catalog had speculative Qwen3.5/3.6/Gemma4 entries but lacked
+// sized real entries for Qwen3-4B, Qwen3-Coder-30B, gpt-oss, GLM, and watch/
+// adopt entries for GLM-5.2/DeepSeek-V4-Flash. Also marks Kimi K2/K3 and
+// Qwen3-Coder-480B as OFFLOAD-ONLY / multi-node-ring-only because they exceed
+// the 122-123 GB RAM ceiling of a single fleet node.
+pub const SCHEMA_V180_FLEET_MODEL_CATALOG_REAL_SIZED: &str = r#"
+INSERT INTO fleet_model_catalog
+    (id, name, family, parameters, tier, description, gated,
+     preferred_workloads, variants, tool_calling)
+VALUES
+  ('qwen3-4b-instruct-2507',
+   'Qwen3-4B-Instruct-2507',
+   'qwen',
+   '4B',
+   1,
+   'Qwen3 4B Instruct (July 2025). ~2.5 GB Q4_K_M — SLM floor for lightweight agent tasks.',
+   false,
+   '["chat", "tool_calling"]'::jsonb,
+   '[{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "Qwen/Qwen3-4B-Instruct-2507-GGUF", "size_gb": 2.5},
+     {"runtime": "mlx", "quant": "4bit", "hf_repo": "mlx-community/Qwen3-4B-Instruct-2507-4bit", "size_gb": 2.5}]'::jsonb,
+   true),
+
+  ('qwen3-coder-30b',
+   'Qwen3-Coder-30B-A3B-Instruct',
+   'qwen',
+   '30B',
+   2,
+   'Qwen3 MoE coding model (~3B active). ~17.7 GB Q4_K_M — sized local coding workhorse.',
+   false,
+   '["code", "tool_calling", "reasoning"]'::jsonb,
+   '[{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF", "size_gb": 17.7},
+     {"runtime": "mlx", "quant": "4bit", "hf_repo": "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit", "size_gb": 17.7},
+     {"runtime": "vllm", "quant": "fp16", "hf_repo": "Qwen/Qwen3-Coder-30B-A3B-Instruct", "size_gb": 60.0}]'::jsonb,
+   true),
+
+  ('gpt-oss-20b',
+   'gpt-oss-20B',
+   'gpt-oss',
+   '20B',
+   2,
+   'OpenAI gpt-oss 20B (agentic floor). ~14 GB Q4_K_M — strong tool use for mid-tier nodes.',
+   false,
+   '["chat", "reasoning", "tool_calling"]'::jsonb,
+   '[{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "openai/gpt-oss-20b-GGUF", "size_gb": 14.0},
+     {"runtime": "mlx", "quant": "4bit", "hf_repo": "mlx-community/gpt-oss-20b-4bit", "size_gb": 14.0}]'::jsonb,
+   true),
+
+  ('gpt-oss-120b',
+   'gpt-oss-120B',
+   'gpt-oss',
+   '120B',
+   3,
+   'OpenAI gpt-oss 120B. ~58 GB Q4_K_M — large agentic model for 64 GB+ VRAM hosts.',
+   false,
+   '["reasoning", "long_context", "tool_calling"]'::jsonb,
+   '[{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "openai/gpt-oss-120b-GGUF", "size_gb": 58.0},
+     {"runtime": "vllm", "quant": "fp16", "hf_repo": "openai/gpt-oss-120b", "size_gb": 240.0}]'::jsonb,
+   true),
+
+  ('glm-4.5-air',
+   'GLM-4.5-Air',
+   'glm',
+   '4.5',
+   3,
+   'Zhipu GLM-4.5-Air. ~64 GB Q4_K_M — sweet spot for 122 GB unified-memory nodes.',
+   true,
+   '["chat", "reasoning", "tool_calling"]'::jsonb,
+   '[{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "THUDM/glm-4.5-air-GGUF", "size_gb": 64.0},
+     {"runtime": "vllm", "quant": "fp16", "hf_repo": "THUDM/glm-4.5-air", "size_gb": 140.0}]'::jsonb,
+   true),
+
+  ('glm-5.2',
+   'GLM-5.2',
+   'glm',
+   '5.2',
+   4,
+   'Zhipu GLM-5.2 (watch/adopt). Size and quant TBD; placeholder for fleet evaluation.',
+   true,
+   '["chat", "reasoning", "tool_calling", "watch_adopt"]'::jsonb,
+   '[]'::jsonb,
+   true),
+
+  ('deepseek-v4-flash',
+   'DeepSeek-V4-Flash',
+   'deepseek',
+   'V4',
+   4,
+   'DeepSeek-V4-Flash (watch/adopt). Fast MoE successor; size and quant TBD.',
+   true,
+   '["code", "reasoning", "watch_adopt"]'::jsonb,
+   '[]'::jsonb,
+   true),
+
+  ('kimi-k2',
+   'Kimi K2',
+   'kimi',
+   'K2',
+   4,
+   'Moonshot Kimi K2. ~247 GB at 1.8-bit. OFFLOAD-ONLY / multi-node-ring-only: exceeds any single 122-123 GB node.',
+   true,
+   '["chat", "reasoning", "tool_calling", "offload_only"]'::jsonb,
+   '[{"runtime": "llama.cpp", "quant": "Q2_K", "hf_repo": "moonshotai/kimi-k2-GGUF", "size_gb": 247.0}]'::jsonb,
+   true),
+
+  ('kimi-k3',
+   'Kimi K3',
+   'kimi',
+   'K3',
+   4,
+   'Moonshot Kimi K3. ~2.8T parameters. OFFLOAD-ONLY / multi-node-ring-only: far beyond single-node RAM.',
+   true,
+   '["chat", "reasoning", "tool_calling", "offload_only"]'::jsonb,
+   '[]'::jsonb,
+   true),
+
+  ('qwen3-coder-480b',
+   'Qwen3-Coder-480B',
+   'qwen',
+   '480B',
+   4,
+   'Qwen3-Coder-480B. ~180 GB at Q2. OFFLOAD-ONLY / multi-node-ring-only: too large for a single 122-123 GB node.',
+   false,
+   '["code", "reasoning", "tool_calling", "offload_only"]'::jsonb,
+   '[{"runtime": "llama.cpp", "quant": "Q2_K", "hf_repo": "Qwen/Qwen3-Coder-480B-GGUF", "size_gb": 180.0}]'::jsonb,
+   true)
+ON CONFLICT (id) DO UPDATE SET
+    name = EXCLUDED.name,
+    family = EXCLUDED.family,
+    parameters = EXCLUDED.parameters,
+    tier = EXCLUDED.tier,
+    description = EXCLUDED.description,
+    gated = EXCLUDED.gated,
+    preferred_workloads = EXCLUDED.preferred_workloads,
+    variants = EXCLUDED.variants,
+    tool_calling = EXCLUDED.tool_calling,
+    updated_at = NOW();
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

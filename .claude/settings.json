@@ -1,1 +1,8 @@
-{}
+{
+  "mcpServers": {
+    "forgefleet": {
+      "type": "http",
+      "url": "http://localhost:50001/mcp"
+    }
+  }
+}
