@@ -11448,6 +11448,26 @@ SELECT
 FROM cloud_budget_buckets b;
 "#;
 
+/// V211 — Make venkatyarl the sole permanent fleet GitHub identity and remove
+/// the retired taylor-oclaw credentials from the fleet-wide registry.
+pub const SCHEMA_V211_DECOMMISSION_TAYLOR_GITHUB_IDENTITY: &str = r#"
+UPDATE github_ssh_aliases
+SET is_canonical = (alias_name = 'github.com-venkat'),
+    description = CASE
+        WHEN alias_name = 'github.com-venkat'
+            THEN 'Permanent venkatyarl identity — canonical fleet GitHub account'
+        ELSE description
+    END,
+    updated_at = NOW()
+WHERE hostname = 'github.com';
+
+DELETE FROM github_ssh_aliases
+WHERE alias_name = 'github.com-taylor';
+
+DELETE FROM fleet_secrets
+WHERE key IN ('github_ssh_id_taylor_priv', 'github_ssh_id_taylor_pub');
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

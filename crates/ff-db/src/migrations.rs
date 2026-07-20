@@ -1036,6 +1036,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "fleet_capacity_registry_view",
         sql: schema::SCHEMA_V210_FLEET_CAPACITY_REGISTRY_VIEW,
     },
+    PgMigration {
+        version: 211,
+        name: "decommission_taylor_github_identity",
+        sql: schema::SCHEMA_V211_DECOMMISSION_TAYLOR_GITHUB_IDENTITY,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1796,6 +1801,40 @@ mod tests {
         assert!(columns.contains(&"builder_port".to_string()));
         assert!(columns.contains(&"reviewer_port".to_string()));
         assert!(columns.contains(&"cleanup_detail".to_string()));
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v211_decommissions_taylor_github_identity() {
+        // CI has no Postgres. Keep this integration test optional on both
+        // supported database URL variables.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        let aliases: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT alias_name, is_canonical
+               FROM github_ssh_aliases
+              WHERE alias_name IN ('github.com-venkat', 'github.com-taylor')
+              ORDER BY alias_name",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read GitHub identities");
+        assert_eq!(aliases, vec![("github.com-venkat".to_string(), true)]);
+
+        let legacy_secrets: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fleet_secrets
+              WHERE key IN ('github_ssh_id_taylor_priv', 'github_ssh_id_taylor_pub')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count legacy GitHub secrets");
+        assert_eq!(legacy_secrets, 0);
 
         drop_temp_db(admin, pool, &db_name).await;
     }
