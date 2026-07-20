@@ -1528,11 +1528,11 @@ pub struct RouteFilter {
 /// per candidate, negligible cost. Compile-time constant — never a SQL injection
 /// vector.
 const LOAD_METRICS_JOIN: &str = "LEFT JOIN LATERAL (
-                 SELECT m.cpu_pct, m.llm_active_requests
+                 SELECT AVG(m.cpu_pct) AS cpu_pct,
+                        ROUND(AVG(m.llm_active_requests))::int AS llm_active_requests
                    FROM computer_metrics_history m
                   WHERE m.computer_id = c.id
-                  ORDER BY m.recorded_at DESC
-                  LIMIT 1
+                    AND m.recorded_at >= NOW() - INTERVAL '15 minutes'
              ) load ON TRUE";
 
 /// ORDER BY columns injected into [`pg_route_deployments`] between `cat.tier ASC`
@@ -2492,6 +2492,10 @@ pub struct PlacementCandidate {
     pub resident_model_gb: f64,
     /// Conservative free RAM after accounting for resident models.
     pub free_ram_gb: f64,
+    /// Recent host saturation from the raw history. Missing/stale history is
+    /// `None` and therefore does not make a host ineligible.
+    pub recent_cpu_pct: Option<f64>,
+    pub recent_queue_depth: Option<f64>,
 }
 
 /// All online computers as placement candidates, with reservation state, current
@@ -2519,9 +2523,18 @@ pub async fn pg_placement_candidates(pool: &PgPool) -> Result<Vec<PlacementCandi
                c.reservation_state AS reservation_state,
                c.status            AS status,
                COALESCE(r.n_active, 0)        AS active_deployments,
-               COALESCE(r.resident_bytes, 0)  AS resident_bytes
+               COALESCE(r.resident_bytes, 0)  AS resident_bytes,
+               load.cpu_pct                   AS recent_cpu_pct,
+               load.queue_depth               AS recent_queue_depth
           FROM computers c
           LEFT JOIN resident r ON LOWER(r.worker_name) = LOWER(c.name)
+          LEFT JOIN LATERAL (
+              SELECT AVG(m.cpu_pct) AS cpu_pct,
+                     AVG(m.llm_queue_depth) AS queue_depth
+                FROM computer_metrics_history m
+               WHERE m.computer_id = c.id
+                 AND m.recorded_at >= NOW() - INTERVAL '15 minutes'
+          ) load ON TRUE
          WHERE c.status = 'online'
         "#,
     )
@@ -2550,6 +2563,8 @@ pub async fn pg_placement_candidates(pool: &PgPool) -> Result<Vec<PlacementCandi
                 active_deployments: r.try_get("active_deployments").unwrap_or(0),
                 resident_model_gb,
                 free_ram_gb,
+                recent_cpu_pct: r.try_get("recent_cpu_pct").ok().flatten(),
+                recent_queue_depth: r.try_get("recent_queue_depth").ok().flatten(),
             }
         })
         .collect())
@@ -4495,13 +4510,13 @@ mod tests {
     }
 
     #[test]
-    fn load_metrics_join_always_pulls_latest_row() {
+    fn load_metrics_join_uses_recent_history_window() {
         // The metrics LATERAL is always present (so cpu_pct / llm_active_requests
         // are available for display on every candidate) and pulls exactly the
         // latest sample per host.
         assert!(LOAD_METRICS_JOIN.contains("computer_metrics_history"));
-        assert!(LOAD_METRICS_JOIN.contains("ORDER BY m.recorded_at DESC"));
-        assert!(LOAD_METRICS_JOIN.contains("LIMIT 1"));
+        assert!(LOAD_METRICS_JOIN.contains("INTERVAL '15 minutes'"));
+        assert!(LOAD_METRICS_JOIN.contains("AVG(m.cpu_pct)"));
         // Aliased `load` so the SELECT/ORDER fragments can reference it.
         assert!(LOAD_METRICS_JOIN.contains(") load ON TRUE"));
     }
@@ -7899,11 +7914,10 @@ pub async fn pg_rank_computers_by_capacity(pool: &PgPool) -> Result<Vec<HostCapa
           LEFT JOIN idle i ON i.computer_id = c.id
           LEFT JOIN active a ON a.computer_id = c.id
           LEFT JOIN LATERAL (
-              SELECT cpu_pct
+              SELECT AVG(cpu_pct) AS cpu_pct
                 FROM computer_metrics_history
                WHERE computer_id = c.id
-               ORDER BY recorded_at DESC
-               LIMIT 1
+                 AND recorded_at >= NOW() - INTERVAL '15 minutes'
           ) m ON TRUE
          ORDER BY score DESC, c.name ASC
         "#,
@@ -8191,6 +8205,95 @@ pub async fn pg_prune_terminal_task_history(
     .await?
     .rows_affected();
     Ok((fleet, deferred))
+}
+
+/// Roll up and retain typed computer metrics in one transaction. Raw samples
+/// remain for 7 days, hourly buckets for 90 days, and daily buckets for 180
+/// days. The transaction-level advisory lock makes overlapping cron ticks a
+/// cheap no-op; source rows are never pruned unless their rollup succeeds.
+pub async fn pg_maintain_computer_metrics_history(pool: &PgPool) -> Result<(u64, u64, u64)> {
+    let mut tx = pool.begin().await?;
+    let locked: bool = sqlx::query_scalar(
+        "SELECT pg_try_advisory_xact_lock(hashtext('computer_metrics_history_retention'))",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if !locked {
+        return Ok((0, 0, 0));
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO computer_metrics_history_hourly
+            (computer_id, recorded_at, sample_count, cpu_pct, ram_pct,
+             ram_used_gb, disk_free_gb, gpu_pct, llm_ram_allocated_gb,
+             llm_queue_depth, llm_active_requests, llm_tokens_per_sec)
+        SELECT computer_id, date_trunc('hour', recorded_at), COUNT(*),
+               AVG(cpu_pct), AVG(ram_pct), AVG(ram_used_gb), MIN(disk_free_gb),
+               AVG(gpu_pct), AVG(llm_ram_allocated_gb), AVG(llm_queue_depth),
+               AVG(llm_active_requests), AVG(llm_tokens_per_sec)
+          FROM computer_metrics_history
+         WHERE recorded_at < date_trunc('hour', NOW() - INTERVAL '7 days')
+           AND recorded_at >= NOW() - INTERVAL '180 days'
+         GROUP BY computer_id, date_trunc('hour', recorded_at)
+        ON CONFLICT (computer_id, recorded_at) DO UPDATE SET
+            sample_count = EXCLUDED.sample_count, cpu_pct = EXCLUDED.cpu_pct,
+            ram_pct = EXCLUDED.ram_pct, ram_used_gb = EXCLUDED.ram_used_gb,
+            disk_free_gb = EXCLUDED.disk_free_gb, gpu_pct = EXCLUDED.gpu_pct,
+            llm_ram_allocated_gb = EXCLUDED.llm_ram_allocated_gb,
+            llm_queue_depth = EXCLUDED.llm_queue_depth,
+            llm_active_requests = EXCLUDED.llm_active_requests,
+            llm_tokens_per_sec = EXCLUDED.llm_tokens_per_sec
+        "#,
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO computer_metrics_history_daily
+            (computer_id, recorded_at, sample_count, cpu_pct, ram_pct,
+             ram_used_gb, disk_free_gb, gpu_pct, llm_ram_allocated_gb,
+             llm_queue_depth, llm_active_requests, llm_tokens_per_sec)
+        SELECT computer_id, date_trunc('day', recorded_at), SUM(sample_count),
+               SUM(cpu_pct * sample_count) / NULLIF(SUM(sample_count) FILTER (WHERE cpu_pct IS NOT NULL), 0),
+               SUM(ram_pct * sample_count) / NULLIF(SUM(sample_count) FILTER (WHERE ram_pct IS NOT NULL), 0),
+               SUM(ram_used_gb * sample_count) / NULLIF(SUM(sample_count) FILTER (WHERE ram_used_gb IS NOT NULL), 0),
+               MIN(disk_free_gb),
+               SUM(gpu_pct * sample_count) / NULLIF(SUM(sample_count) FILTER (WHERE gpu_pct IS NOT NULL), 0),
+               SUM(llm_ram_allocated_gb * sample_count) / NULLIF(SUM(sample_count) FILTER (WHERE llm_ram_allocated_gb IS NOT NULL), 0),
+               SUM(llm_queue_depth * sample_count) / NULLIF(SUM(sample_count) FILTER (WHERE llm_queue_depth IS NOT NULL), 0),
+               SUM(llm_active_requests * sample_count) / NULLIF(SUM(sample_count) FILTER (WHERE llm_active_requests IS NOT NULL), 0),
+               SUM(llm_tokens_per_sec * sample_count) / NULLIF(SUM(sample_count) FILTER (WHERE llm_tokens_per_sec IS NOT NULL), 0)
+          FROM computer_metrics_history_hourly
+         WHERE recorded_at < date_trunc('day', NOW() - INTERVAL '90 days')
+           AND recorded_at >= NOW() - INTERVAL '180 days'
+         GROUP BY computer_id, date_trunc('day', recorded_at)
+        ON CONFLICT (computer_id, recorded_at) DO UPDATE SET
+            sample_count = EXCLUDED.sample_count, cpu_pct = EXCLUDED.cpu_pct,
+            ram_pct = EXCLUDED.ram_pct, ram_used_gb = EXCLUDED.ram_used_gb,
+            disk_free_gb = EXCLUDED.disk_free_gb, gpu_pct = EXCLUDED.gpu_pct,
+            llm_ram_allocated_gb = EXCLUDED.llm_ram_allocated_gb,
+            llm_queue_depth = EXCLUDED.llm_queue_depth,
+            llm_active_requests = EXCLUDED.llm_active_requests,
+            llm_tokens_per_sec = EXCLUDED.llm_tokens_per_sec
+        "#,
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    let raw = sqlx::query(
+        "DELETE FROM computer_metrics_history WHERE recorded_at < NOW() - INTERVAL '7 days'",
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let hourly = sqlx::query("DELETE FROM computer_metrics_history_hourly WHERE recorded_at < NOW() - INTERVAL '90 days'")
+        .execute(&mut *tx).await?.rows_affected();
+    let daily = sqlx::query("DELETE FROM computer_metrics_history_daily WHERE recorded_at < NOW() - INTERVAL '180 days'")
+        .execute(&mut *tx).await?.rows_affected();
+    tx.commit().await?;
+    Ok((raw, hourly, daily))
 }
 
 /// Work_items ready to schedule: explicitly status='ready', leaf kind='task',

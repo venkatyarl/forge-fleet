@@ -901,6 +901,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "artifact_cache_index",
         sql: schema::SCHEMA_V183_ARTIFACT_CACHE_INDEX,
     },
+    PgMigration {
+        version: 184,
+        name: "computer_metrics_rollups",
+        sql: schema::SCHEMA_V184_COMPUTER_METRICS_ROLLUPS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1607,6 +1612,62 @@ mod tests {
         .expect("read first-pass view");
         assert_eq!((completed, first_pass, rate), (1, 0, 0.0));
 
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v184_rolls_up_and_prunes_computer_metrics_history() {
+        // CI has no Postgres. The helper returns None unless one of the two
+        // supported database URL variables is set, so this test never panics.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+        let computer_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO computers (name, primary_ip, total_ram_gb)
+             VALUES ('v184-metrics-node', '127.0.0.184', 64) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert computer");
+        sqlx::query(
+            "INSERT INTO computer_metrics_history
+                (computer_id, recorded_at, cpu_pct, disk_free_gb,
+                 llm_queue_depth, llm_active_requests)
+             VALUES
+                ($1, date_trunc('hour', NOW() - INTERVAL '8 days') + INTERVAL '1 minute', 20, 50, 1, 0),
+                ($1, date_trunc('hour', NOW() - INTERVAL '8 days') + INTERVAL '2 minutes', 40, 45, 3, 2),
+                ($1, NOW() - INTERVAL '1 day', 70, 40, 4, 1)",
+        )
+        .bind(computer_id)
+        .execute(&pool)
+        .await
+        .expect("insert samples");
+
+        crate::queries::pg_maintain_computer_metrics_history(&pool)
+            .await
+            .expect("maintain metrics");
+        let (samples, cpu, disk): (i64, f64, f64) = sqlx::query_as(
+            "SELECT sample_count, cpu_pct, disk_free_gb
+               FROM computer_metrics_history_hourly WHERE computer_id = $1",
+        )
+        .bind(computer_id)
+        .fetch_one(&pool)
+        .await
+        .expect("hourly rollup");
+        assert_eq!(samples, 2);
+        assert_eq!(cpu, 30.0);
+        assert_eq!(disk, 45.0);
+        let raw: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM computer_metrics_history WHERE computer_id = $1",
+        )
+        .bind(computer_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count retained raw");
+        assert_eq!(raw, 1);
         drop_temp_db(admin, pool, &db_name).await;
     }
 }

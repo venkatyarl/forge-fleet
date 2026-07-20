@@ -538,7 +538,15 @@ pub async fn probe_one(pool: &PgPool, provider: &OauthProvider) -> ProbeResult {
     let _ = token;
     let (cmd, cli_args): (&str, Vec<&str>) = match provider.name {
         "claude" => ("claude", vec!["-p", "ping"]),
-        "codex" => ("codex", vec!["exec", "ping"]),
+        "codex" => (
+            "codex",
+            vec![
+                "exec",
+                "--ignore-user-config",
+                "--skip-git-repo-check",
+                "ping",
+            ],
+        ),
         "gemini" => ("gemini", vec!["-p", "ping"]),
         "kimi" => ("kimi", vec!["--print", "ping"]),
         "grok" => ("grok", vec!["-p", "ping"]),
@@ -554,7 +562,10 @@ pub async fn probe_one(pool: &PgPool, provider: &OauthProvider) -> ProbeResult {
 
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        tokio::process::Command::new(cmd).args(&cli_args).output(),
+        tokio::process::Command::new(cmd)
+            .args(&cli_args)
+            .stdin(std::process::Stdio::null())
+            .output(),
     )
     .await;
 

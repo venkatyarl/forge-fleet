@@ -10672,6 +10672,32 @@ CREATE INDEX IF NOT EXISTS idx_artifact_cache_index_artifact_key
     ON artifact_cache_index (artifact_key);
 "#;
 
+/// V184 — bounded retention tiers for typed per-computer metrics history.
+pub const SCHEMA_V184_COMPUTER_METRICS_ROLLUPS: &str = r#"
+CREATE TABLE IF NOT EXISTS computer_metrics_history_hourly (
+    computer_id UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    recorded_at TIMESTAMPTZ NOT NULL,
+    sample_count BIGINT NOT NULL,
+    cpu_pct DOUBLE PRECISION,
+    ram_pct DOUBLE PRECISION,
+    ram_used_gb DOUBLE PRECISION,
+    disk_free_gb DOUBLE PRECISION,
+    gpu_pct DOUBLE PRECISION,
+    llm_ram_allocated_gb DOUBLE PRECISION,
+    llm_queue_depth DOUBLE PRECISION,
+    llm_active_requests DOUBLE PRECISION,
+    llm_tokens_per_sec DOUBLE PRECISION,
+    PRIMARY KEY (computer_id, recorded_at)
+);
+CREATE INDEX IF NOT EXISTS idx_computer_metrics_hourly_time
+    ON computer_metrics_history_hourly (recorded_at DESC);
+
+CREATE TABLE IF NOT EXISTS computer_metrics_history_daily
+    (LIKE computer_metrics_history_hourly INCLUDING ALL);
+CREATE INDEX IF NOT EXISTS idx_computer_metrics_daily_time
+    ON computer_metrics_history_daily (recorded_at DESC);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

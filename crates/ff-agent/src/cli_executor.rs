@@ -84,7 +84,7 @@ pub struct CliBackend {
 ///
 /// Headless invocations verified on the leader 2026-05-31:
 ///   claude -p --output-format text "<prompt>"   (cwd via process + --add-dir)
-///   codex exec --skip-git-repo-check "<prompt>"  (cwd via -C/--cd)
+///   codex exec --ignore-user-config --skip-git-repo-check "<prompt>"  (cwd via -C/--cd)
 ///   kimi --print --yes --prompt "<prompt>"       (cwd via -w/--work-dir)
 pub const BACKENDS: &[CliBackend] = &[
     CliBackend {
@@ -102,8 +102,10 @@ pub const BACKENDS: &[CliBackend] = &[
         name: "codex",
         binary: "codex",
         port: 51101,
-        // Codex `exec` is the headless equivalent. `--skip-git-repo-check`
-        // lets it run outside a git repo (matches `ff cli` running anywhere).
+        // Codex `exec` is the headless equivalent. `--ignore-user-config`
+        // prevents host-local MCP/config startup from turning a headless call
+        // into an indefinite "Reading additional input from stdin..." wait.
+        // `--skip-git-repo-check` lets it run outside a git repo.
         //
         // `--sandbox danger-full-access` DISABLES codex's OS-level filesystem
         // sandbox. Codex's `workspace-write` (and `read-only`) sandboxes shell
@@ -122,6 +124,7 @@ pub const BACKENDS: &[CliBackend] = &[
         // exit 0, seconds not minutes.
         default_flags: &[
             "exec",
+            "--ignore-user-config",
             "--skip-git-repo-check",
             "--sandbox",
             "danger-full-access",
@@ -447,6 +450,14 @@ mod tests {
     fn backend_by_name_rejects_unknown() {
         assert!(backend_by_name("bogus").is_none());
         assert!(backend_by_name("").is_none());
+    }
+
+    #[test]
+    fn codex_backend_keeps_hardened_headless_flags() {
+        let codex = backend_by_name("codex").expect("codex backend");
+        assert_eq!(codex.default_flags[0], "exec");
+        assert!(codex.default_flags.contains(&"--ignore-user-config"));
+        assert!(codex.default_flags.contains(&"--skip-git-repo-check"));
     }
 
     /// `local` is intentionally NOT in `BACKENDS` — it routes through the

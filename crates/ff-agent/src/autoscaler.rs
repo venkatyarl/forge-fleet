@@ -490,7 +490,17 @@ pub fn score_host(
         0.0
     };
     // Least-loaded: normalize active deployment count (cap at 6 for the curve).
-    let load_norm = (host.active_deployments as f64 / 6.0).clamp(0.0, 1.0);
+    let deployment_load = (host.active_deployments as f64 / 6.0).clamp(0.0, 1.0);
+    // History is a soft signal only. Missing/stale samples contribute no
+    // penalty, so telemetry loss can never make a host ineligible.
+    let history_load = host
+        .recent_cpu_pct
+        .map(|v| v / 100.0)
+        .into_iter()
+        .chain(host.recent_queue_depth.map(|v| v / 4.0))
+        .fold(0.0_f64, f64::max)
+        .clamp(0.0, 1.0);
+    let load_norm = deployment_load.max(history_load);
     let score = W_FIT * fit_quality + W_PERF * perf_tier(host) + W_IDLE * (1.0 - load_norm);
     Some(score)
 }
@@ -1288,6 +1298,8 @@ mod tests {
             active_deployments: active,
             resident_model_gb: resident,
             free_ram_gb: ram as f64 - resident,
+            recent_cpu_pct: None,
+            recent_queue_depth: None,
         }
     }
 
@@ -1720,5 +1732,26 @@ mod tests {
         let s_idle = score_host(&idle, "llama.cpp", 20.0).unwrap();
         let s_busy = score_host(&busy, "llama.cpp", 20.0).unwrap();
         assert!(s_idle > s_busy, "idle {s_idle} should beat busy {s_busy}");
+    }
+
+    #[test]
+    fn recent_metrics_penalize_saturation_but_missing_history_fails_open() {
+        let quiet = host(
+            "quiet",
+            "online",
+            "linux-ubuntu",
+            "amd_rocm",
+            Some(2.1),
+            96,
+            0.0,
+            "available",
+            0,
+        );
+        let mut saturated = quiet.clone();
+        saturated.worker_name = "saturated".into();
+        saturated.recent_cpu_pct = Some(95.0);
+        saturated.recent_queue_depth = Some(8.0);
+        assert!(score_host(&quiet, "llama.cpp", 20.0) > score_host(&saturated, "llama.cpp", 20.0));
+        assert!(score_host(&quiet, "llama.cpp", 20.0).is_some());
     }
 }

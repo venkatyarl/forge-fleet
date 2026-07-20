@@ -15,6 +15,7 @@ run_to() {
     eval {
       local $SIG{ALRM} = sub { die "TIMEOUT\n" };
       alarm $s;
+      open(STDIN, "<", "/dev/null") or die "NOEXEC\n";
       open(my $fh, "-|", @ARGV) or die "NOEXEC\n";
       local $/; $out = <$fh>; close $fh;
       alarm 0;
@@ -68,6 +69,6 @@ CODEX=$(findbin codex);  CODEX=${CODEX:-codex}
 CLAUDE=$(findbin claude); CLAUDE=${CLAUDE:-claude}
 KIMI=$(findbin kimi);    KIMI=${KIMI:-kimi}
 
-probe codex  "--version" "$CODEX"  exec --skip-git-repo-check "Reply with only the word: PONG"
+probe codex  "--version" "$CODEX"  exec --ignore-user-config --skip-git-repo-check "Reply with only the word: PONG"
 probe claude "--version" "$CLAUDE" -p "Reply with only the word: PONG" --output-format text
 probe kimi   "--version" "$KIMI"   --print --yes --prompt "Reply with only the word: PONG"

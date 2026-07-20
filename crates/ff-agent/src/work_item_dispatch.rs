@@ -1338,6 +1338,15 @@ pub fn classify_dispatch_outcome(
     }
 }
 
+/// A quick clean exit without any stdout is a broken CLI invocation, not a
+/// task-level no-op. Slow successful runs may legitimately be quiet until the
+/// end, so only the observed sub-30-second failure signature is special-cased.
+fn quick_empty_success_is_provider_failure(output: &Output, elapsed: Duration) -> bool {
+    output.status.success()
+        && output.stdout.iter().all(u8::is_ascii_whitespace)
+        && elapsed <= Duration::from_secs(30)
+}
+
 /// Failure-aware retry (roadmap item #2). On a dispatch failure, requeue the
 /// work_item (status → `ready`, `attempts` + 1, prior error appended to
 /// `last_error` so the next run has the failure context) UNTIL `attempts`
@@ -1954,12 +1963,13 @@ async fn run_ff_dispatch(
     //   • breaker-tripped / terminal-for-this-backend (auth/quota/overload-after-
     //     retries) → SWITCH to the next backend.
     // So a 529 on codex retries then fails over to claude unattended, instead of
-    // dying. Falls back to `codex` only when no backend is known dispatchable.
+    // dying. Falls back to fast/reliable `claude` when no backend is known
+    // dispatchable; loaded build nodes have shown codex needs materially longer.
     let routed = ff_db::pg_routed_backends(pg, item.computer_id, 5400)
         .await
         .unwrap_or_default();
     let backends = if routed.is_empty() {
-        vec!["codex".to_string()]
+        vec!["claude".to_string()]
     } else {
         routed
     };
@@ -1985,6 +1995,7 @@ async fn run_ff_dispatch(
         attempted_backend = true;
         let mut attempt: u32 = 0;
         loop {
+            let started = std::time::Instant::now();
             let out = match run_backend_cli(backend, &worktree.worktree_path, &prompt).await {
                 Ok(o) => o,
                 Err(e) => {
@@ -2021,9 +2032,34 @@ async fn run_ff_dispatch(
                         "timeout",
                     )
                     .await;
+                    let _ = crate::cloud_budget::record_failure(
+                        pg,
+                        backend,
+                        Duration::from_secs(30 * 60),
+                    )
+                    .await;
                     break; // try the next routed backend
                 }
             };
+            let elapsed = started.elapsed();
+            if quick_empty_success_is_provider_failure(&out, elapsed) {
+                warn!(backend = %backend, elapsed_ms = elapsed.as_millis(), "run_ff_dispatch: backend exited quickly with empty stdout — provider failure; switching");
+                backend_errors.push(format!(
+                    "{backend}: exited successfully with empty stdout after {}ms",
+                    elapsed.as_millis()
+                ));
+                let _ = crate::circuit_breaker::record_provider_failure(
+                    pg,
+                    computer_id,
+                    backend,
+                    "empty_stdout",
+                )
+                .await;
+                let _ =
+                    crate::cloud_budget::record_failure(pg, backend, Duration::from_secs(30 * 60))
+                        .await;
+                break;
+            }
             if out.status.success() {
                 let _ =
                     crate::circuit_breaker::record_provider_success(pg, computer_id, backend).await;
@@ -2031,6 +2067,7 @@ async fn run_ff_dispatch(
                 let _ =
                     crate::circuit_breaker::record_usage_signal(pg, computer_id, backend, 100.0)
                         .await;
+                let _ = crate::cloud_budget::record_success(pg, backend).await;
                 if attempt > 0 || backend != &backends[0] {
                     info!(backend = %backend, attempt, "run_ff_dispatch: recovered via auto-continue/failover");
                 }
@@ -2061,6 +2098,9 @@ async fn run_ff_dispatch(
                 String::from_utf8_lossy(&out.stderr)
             );
             let class = crate::cloud_error::classify(backend, out.status.code(), &combined);
+            if let Some(window) = crate::cloud_budget::failure_window(&combined) {
+                let _ = crate::cloud_budget::record_failure(pg, backend, window).await;
+            }
             let tripped = crate::circuit_breaker::record_provider_failure(
                 pg,
                 computer_id,
@@ -2094,8 +2134,23 @@ async fn run_ff_dispatch(
             backend = %forced_backend,
             "run_ff_dispatch: all routed backends were skipped before launch; forcing one direct attempt"
         );
+        let started = std::time::Instant::now();
         match run_backend_cli(&forced_backend, &worktree.worktree_path, &prompt).await {
-            Ok(out) => return Ok((forced_backend, out)),
+            Ok(out) => {
+                if quick_empty_success_is_provider_failure(&out, started.elapsed()) {
+                    let _ = crate::cloud_budget::record_failure(
+                        pg,
+                        &forced_backend,
+                        Duration::from_secs(30 * 60),
+                    )
+                    .await;
+                    bail!("forced backend {forced_backend} exited successfully with empty stdout");
+                }
+                if out.status.success() {
+                    let _ = crate::cloud_budget::record_success(pg, &forced_backend).await;
+                }
+                return Ok((forced_backend, out));
+            }
             Err(e) => {
                 if worktree_has_diff(&worktree.worktree_path) {
                     warn!(backend = %forced_backend, error = %e, "run_ff_dispatch: forced backend timed out but wrote a real diff — salvaging");
@@ -2110,6 +2165,19 @@ async fn run_ff_dispatch(
                         synthetic_output("salvaged diff after forced backend timeout"),
                     ));
                 }
+                let _ = crate::circuit_breaker::record_provider_failure(
+                    pg,
+                    computer_id,
+                    &forced_backend,
+                    "timeout",
+                )
+                .await;
+                let _ = crate::cloud_budget::record_failure(
+                    pg,
+                    &forced_backend,
+                    Duration::from_secs(30 * 60),
+                )
+                .await;
                 return Err(e);
             }
         }
@@ -2136,7 +2204,7 @@ fn primary_or_default_backend(backends: &[String]) -> String {
     backends
         .first()
         .cloned()
-        .unwrap_or_else(|| "codex".to_string())
+        .unwrap_or_else(|| "claude".to_string())
 }
 
 /// The backend name for interaction attribution when a dispatch errored before
@@ -2147,7 +2215,7 @@ async fn primary_dispatch_backend(pg: &PgPool, computer_id: Uuid) -> String {
         .await
         .ok()
         .map(|b| primary_or_default_backend(&b))
-        .unwrap_or_else(|| "codex".to_string())
+        .unwrap_or_else(|| "claude".to_string())
 }
 
 /// Council cap: how many headless auto-continue re-injections to attempt on a
@@ -3232,10 +3300,12 @@ mod tests {
     use super::{
         DISPATCH_HOUSE_RULES, DispatchOutcome, agent_output_tail, classify_dispatch_outcome,
         command_display, default_clone_path, dispatch_budget_for_host, expand_home,
-        is_build_timeout, parse_cli_tokens, primary_or_default_backend, repo_cache_path, repo_slug,
+        is_build_timeout, parse_cli_tokens, primary_or_default_backend,
+        quick_empty_success_is_provider_failure, repo_cache_path, repo_slug,
         retry_error_is_actionable, rewrite_github_host_alias, task_prefers_cloud_lane,
         use_local_lane,
     };
+    use std::time::Duration;
 
     #[test]
     fn agent_output_tail_keeps_the_end_and_is_char_safe() {
@@ -3564,6 +3634,33 @@ mod tests {
     }
 
     #[test]
+    fn quick_empty_success_is_a_provider_failure() {
+        let empty = Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b" \n".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert!(quick_empty_success_is_provider_failure(
+            &empty,
+            Duration::from_secs(12)
+        ));
+        assert!(!quick_empty_success_is_provider_failure(
+            &empty,
+            Duration::from_secs(31)
+        ));
+
+        let nonempty = Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"done".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert!(!quick_empty_success_is_provider_failure(
+            &nonempty,
+            Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
     fn classify_failed_no_diff_is_retryable_class() {
         let r: anyhow::Result<Output> = Err(anyhow!("codex exited 1"));
         assert_eq!(
@@ -3669,7 +3766,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_fallback_defaults_to_codex_when_unrouted() {
-        assert_eq!(primary_or_default_backend(&[]), "codex");
+    fn forced_fallback_defaults_to_claude_when_unrouted() {
+        assert_eq!(primary_or_default_backend(&[]), "claude");
     }
 }
