@@ -584,6 +584,24 @@ impl AgentTool for NodeHealthCheckTool {
 /// BinaryDeploy — build and deploy ForgeFleet binary to a node.
 pub struct BinaryDeployTool;
 
+const USER_BIN_DIR: &str = ".local/bin";
+
+fn remote_binary_path(binary: &str) -> String {
+    format!("~/{USER_BIN_DIR}/{binary}")
+}
+
+fn remote_build_command(binary: &str) -> String {
+    let package = if binary == "forgefleetd" {
+        "forge-fleet"
+    } else {
+        "ff-terminal"
+    };
+    format!(
+        "cd ~/projects/forge-fleet && git pull && cargo build --release -p {package} && mkdir -p ~/{USER_BIN_DIR} && install -m 755 target/release/{binary} {}",
+        remote_binary_path(binary)
+    )
+}
+
 #[async_trait]
 impl AgentTool for BinaryDeployTool {
     fn name(&self) -> &str {
@@ -616,28 +634,41 @@ impl AgentTool for BinaryDeployTool {
         if host.is_empty() {
             return AgentToolResult::err("Missing 'host'");
         }
+        if !matches!(binary, "ff" | "forgefleetd") {
+            return AgentToolResult::err("Binary must be 'ff' or 'forgefleetd'");
+        }
 
         if build_local {
             // Build locally
+            let package = if binary == "forgefleetd" {
+                "forge-fleet"
+            } else {
+                "ff-terminal"
+            };
             let build = Command::new("cargo")
-                .args(["build", "--release", "-p", "ff-terminal"])
+                .args(["build", "--release", "-p", package])
                 .current_dir(&ctx.working_dir)
                 .output()
                 .await;
             match build {
                 Ok(out) if out.status.success() => {
+                    let prepare = ssh_cmd(user, host, &format!("mkdir -p ~/{USER_BIN_DIR}")).await;
+                    if prepare.starts_with("SSH failed:") {
+                        return AgentToolResult::err(prepare);
+                    }
                     // SCP to target
-                    let binary_path = ctx.working_dir.join("target/release/ff");
+                    let binary_path = ctx.working_dir.join("target/release").join(binary);
+                    let destination = remote_binary_path(binary);
                     let scp = Command::new("scp")
                         .args([
                             &binary_path.to_string_lossy().to_string(),
-                            &format!("{user}@{host}:/usr/local/bin/{binary}"),
+                            &format!("{user}@{host}:{destination}"),
                         ])
                         .output()
                         .await;
                     match scp {
                         Ok(out) if out.status.success() => AgentToolResult::ok(format!(
-                            "Binary deployed: {binary} → {host}:/usr/local/bin/{binary}"
+                            "Binary deployed: {binary} → {host}:{destination}"
                         )),
                         _ => AgentToolResult::err(
                             "SCP failed. Check SSH access and permissions.".to_string(),
@@ -652,13 +683,34 @@ impl AgentTool for BinaryDeployTool {
             }
         } else {
             // Build on target
-            let build_cmd = "cd ~/projects/forge-fleet && git pull && cargo build --release -p ff-terminal && cp target/release/ff /usr/local/bin/ff".to_string();
+            let build_cmd = remote_build_command(binary);
             let result = ssh_cmd(user, host, &build_cmd).await;
             AgentToolResult::ok(format!(
                 "Remote build on {host}:\n{}",
                 truncate_output(&result, 2000)
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod binary_deploy_tests {
+    use super::{remote_binary_path, remote_build_command};
+
+    #[test]
+    fn deploys_to_the_standard_user_bin_directory() {
+        assert_eq!(remote_binary_path("ff"), "~/.local/bin/ff");
+        let command = remote_build_command("ff");
+        assert!(command.contains("mkdir -p ~/.local/bin"));
+        assert!(command.contains("install -m 755 target/release/ff ~/.local/bin/ff"));
+        assert!(!command.contains("/usr/local/bin"));
+
+        let daemon_command = remote_build_command("forgefleetd");
+        assert!(daemon_command.contains("cargo build --release -p forge-fleet"));
+        assert!(
+            daemon_command
+                .contains("install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd")
+        );
     }
 }
 
