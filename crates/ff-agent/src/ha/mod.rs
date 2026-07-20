@@ -13,6 +13,7 @@ pub mod log_monitor;
 pub mod manager;
 pub mod mirror_service;
 pub mod node_info;
+pub mod periodic;
 pub mod pg_failover;
 pub mod repair;
 pub mod restore_drill;
@@ -31,14 +32,49 @@ pub async fn drain_work_item_leases(
     computer_id: uuid::Uuid,
 ) -> Result<u64, sqlx::Error> {
     let drained: i64 = sqlx::query_scalar(
-        "WITH drained AS (
-             UPDATE work_item_leases
+        "WITH draining AS (
+             SELECT id, work_item_id, sub_agent_id, lease_state, endpoint, attempt, computer_id
+               FROM work_item_leases
+              WHERE computer_id = $1
+                AND released_at IS NULL
+              FOR UPDATE
+         ), drained AS (
+             UPDATE work_item_leases l
                 SET lease_state = 'released',
                     released_at = NOW(),
                     release_reason = 'agent restart drain'
-              WHERE computer_id = $1
-                AND released_at IS NULL
-          RETURNING work_item_id, sub_agent_id
+               FROM draining d
+              WHERE l.id = d.id
+          RETURNING d.work_item_id,
+                    d.sub_agent_id,
+                    d.lease_state AS from_status,
+                    d.endpoint,
+                    d.attempt,
+                    l.release_reason,
+                    d.computer_id
+         ), lease_events AS (
+             INSERT INTO work_item_events
+                 (work_item_id, from_status, to_status, computer, attempt, detail)
+             SELECT d.work_item_id,
+                    d.from_status,
+                    'lease_released',
+                    c.name,
+                    d.attempt,
+                    jsonb_build_object(
+                        'event_type', 'lease_released',
+                        'endpoint', d.endpoint,
+                        'lane', CASE
+                            WHEN NULLIF(d.endpoint, '') IS NULL THEN NULL
+                            WHEN d.endpoint LIKE 'cloud:%'
+                              OR d.endpoint ~ '^(codex|claude|kimi|gemini|grok)(:|$)'
+                              THEN 'cloud'
+                            ELSE 'local'
+                        END,
+                        'attempt', d.attempt,
+                        'release_reason', d.release_reason
+                    )
+               FROM drained d
+               LEFT JOIN computers c ON c.id = d.computer_id
          ), freed_slots AS (
              UPDATE sub_agents AS sa
                 SET current_work_item_id = NULL,
