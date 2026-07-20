@@ -301,48 +301,122 @@ async fn run_pr_review(
         description = description.unwrap_or_default(),
     );
 
-    // Primary reviewer: the 480B ring (operator-approved 2026-07-19) — zero
-    // cloud cost. Its verdict stands alone only on APPROVE; a REJECT must be
-    // confirmed by one cloud CLI review before the item is failed, so a local
-    // misjudgement can never kill a good PR by itself. 480B unavailable or
-    // timed out → fall back to the cloud review path. A cloud-review error
-    // propagates as Err, which the caller treats as "defer for manual review"
-    // — never a rejection.
-    match review_via_480b(pg, &prompt).await {
-        Ok((true, reason)) => Ok((true, format!("480b: {reason}"))),
-        Ok((false, reason_480b)) => {
-            info!(
-                pr = %pr_url,
-                reason = %reason_480b,
-                "merge_drain: 480b rejected — confirming with cloud review before failing"
-            );
-            let (approved, cloud_reason, backend) = cloud_cli_review(pg, &prompt)
-                .await
-                .context("cloud confirm of 480b rejection")?;
-            if approved {
-                Ok((
-                    true,
-                    format!("{backend} overturned 480b rejection ({reason_480b}): {cloud_reason}"),
-                ))
-            } else {
-                Ok((
-                    false,
-                    format!("480b: {reason_480b}; confirmed by {backend}: {cloud_reason}"),
-                ))
-            }
-        }
+    review_ladder(pg, pr_url, &prompt).await
+}
+
+/// Cost-optimal PR review ladder (operator design 2026-07-20).
+///
+/// Free local 30B reviews FIRST; paid/scarce reviewers (480B ring, cloud CLIs)
+/// are spent ONLY to CONFIRM a 30B APPROVE — i.e. only to bless a likely merge,
+/// never to do the initial review and never on a REJECT. A rejected PR costs
+/// zero cloud: it fails and rebuilds locally with the reviewer reason as
+/// context (a local coder "fixes it" for free). A weak 30B can false-APPROVE a
+/// subtle bug, so approves — not rejects — are the verdict worth a confirmer.
+///
+/// Ladder:
+/// 1. 30B review. REJECT → done (free, rebuild). APPROVE → confirm (step 2).
+/// 2. Confirm the approve with the 480B ring if up (stronger, still local);
+///    else one cloud CLI; else — no confirmer available — merge on the 30B
+///    approve alone (CI is already green and the drain must never freeze).
+/// If NO local model is even reachable, fall back to the 480B→cloud path so a
+/// review still happens.
+async fn review_ladder(pg: &PgPool, pr_url: &str, prompt: &str) -> Result<(bool, String)> {
+    let (local_ok, local_reason, local_model) = match local_pool_review(pg, prompt).await {
+        Ok(v) => v,
         Err(e) => {
             warn!(
                 pr = %pr_url,
                 error = %e,
-                "merge_drain: 480b reviewer unavailable — falling back to cloud review"
+                "merge_drain: no local reviewer — falling back to 480b/cloud review"
             );
-            let (approved, reason, backend) = cloud_cli_review(pg, &prompt)
-                .await
-                .context("cloud PR review fallback")?;
-            Ok((approved, format!("{backend}: {reason}")))
+            return match review_via_480b(pg, prompt).await {
+                Ok((approved, reason)) => Ok((approved, format!("480b: {reason}"))),
+                Err(_) => {
+                    let (approved, reason, backend) = cloud_cli_review(pg, prompt)
+                        .await
+                        .context("cloud PR review (no local reviewer)")?;
+                    Ok((approved, format!("{backend}: {reason}")))
+                }
+            };
         }
+    };
+
+    // 30B REJECT: trust it, spend nothing. Item fails → rebuilds locally with
+    // this reason as context — the free "local coder fixes it" path.
+    if !local_ok {
+        return Ok((
+            false,
+            format!("local:{local_model} rejected: {local_reason}"),
+        ));
     }
+
+    // 30B APPROVE: confirm before merging (a weak 30B can miss a subtle bug).
+    info!(
+        pr = %pr_url,
+        model = %local_model,
+        "merge_drain: local 30B approved — confirming before merge"
+    );
+    match review_via_480b(pg, prompt).await {
+        Ok((true, r)) => Ok((
+            true,
+            format!("local:{local_model} approved, 480b confirmed: {r}"),
+        )),
+        Ok((false, r)) => Ok((
+            false,
+            format!("local:{local_model} approved but 480b rejected: {r}"),
+        )),
+        Err(_) => match cloud_cli_review(pg, prompt).await {
+            Ok((true, r, backend)) => Ok((
+                true,
+                format!("local:{local_model} approved, {backend} confirmed: {r}"),
+            )),
+            Ok((false, r, backend)) => Ok((
+                false,
+                format!("local:{local_model} approved but {backend} rejected: {r}"),
+            )),
+            Err(_) => {
+                // No confirmer up (480B ring + every cloud CLI down). CI is green
+                // and the 30B approved — merge rather than freeze the drain.
+                warn!(
+                    pr = %pr_url,
+                    "merge_drain: no confirmer available — merging on CI-green + 30B approval"
+                );
+                Ok((
+                    true,
+                    format!("local:{local_model} approved (no confirmer available; CI green)"),
+                ))
+            }
+        },
+    }
+}
+
+/// Last-resort PR review on ANY healthy local model (a 30B coder). Used only
+/// when the 480B ring AND every cloud CLI are unavailable, so a backend outage
+/// can never freeze the merge drain. Routes via `fleet_oneshot` with a coder
+/// hint; a short timeout keeps a slow node from stalling the drain.
+async fn local_pool_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, String)> {
+    let resp = crate::fleet_oneshot::fleet_oneshot(
+        pg,
+        prompt,
+        Some("qwen3-coder"),
+        Some(Duration::from_secs(120)),
+    )
+    .await
+    .context("local pool PR review")?;
+    record_review_interaction(
+        pg,
+        &resp.model,
+        prompt,
+        &resp.text,
+        resp.tokens_in,
+        resp.tokens_out,
+        i32::try_from(resp.latency_ms).ok(),
+        Some(resp.worker_name.clone()),
+        Some(resp.endpoint.clone()),
+    )
+    .await;
+    let (approved, reason) = parse_review_response(&resp.text);
+    Ok((approved, reason, resp.model))
 }
 
 /// Substring identifying the primary autonomous reviewer — the qwen3-coder-480b
@@ -406,8 +480,13 @@ fn served_by_480b(model: &str) -> bool {
 /// `(approved, reason, backend)`.
 async fn cloud_cli_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, String)> {
     let mut last_err: Option<anyhow::Error> = None;
-    for backend in ["codex", "claude", "kimi"] {
-        match crate::cli_executor::execute_cli(backend, prompt, &[], Some(Duration::from_secs(600)))
+    // claude first: it is the most reliable cloud reviewer here; codex has hung
+    // (600s stdin block) and auth-expired fleet-wide, so trying it first froze
+    // the whole serial drain (2026-07-20 outage). A 90s per-backend cap means a
+    // hung/failing backend loses the race to the next one within seconds instead
+    // of stalling every drain tick for ten minutes.
+    for backend in ["claude", "codex", "kimi"] {
+        match crate::cli_executor::execute_cli(backend, prompt, &[], Some(Duration::from_secs(90)))
             .await
         {
             Ok(res) if res.exit_code == 0 && !res.stdout.trim().is_empty() => {
