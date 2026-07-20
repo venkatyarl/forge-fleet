@@ -892,7 +892,7 @@ async fn dispatch_to_fleet(client: &reqwest::Client, pool: &sqlx::PgPool, query:
         let pool = pool.clone();
         let query_owned = query.to_string();
         let answer_owned = answer.clone();
-        let engine_owned = model.clone();
+        let engine_owned = ff_agent::llm_attribution::engine_label(&model);
         let latency_ms = started.elapsed().as_millis().min(i32::MAX as u128) as i32;
         let tokens_in = payload
             .get("usage")

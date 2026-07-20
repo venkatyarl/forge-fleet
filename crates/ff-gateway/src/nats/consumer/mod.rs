@@ -2,6 +2,7 @@
 
 use tokio::sync::Mutex;
 
+pub mod alerts;
 pub mod scheduler;
 
 /// Serializes message handling for the gateway's durable consumer.
