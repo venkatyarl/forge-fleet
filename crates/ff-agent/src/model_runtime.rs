@@ -156,6 +156,7 @@ fn tail_log_file(path: &Path, max_bytes: usize) -> Option<String> {
 
 /// Best-effort persistence of a model-server error to `error_events`.
 /// Never fails the caller — errors here are traced and dropped.
+#[allow(clippy::too_many_arguments)]
 async fn log_model_error(
     pool: &sqlx::PgPool,
     worker_name: &str,
