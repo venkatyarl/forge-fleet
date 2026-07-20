@@ -13,6 +13,10 @@ use tracing::{info, warn};
 
 use crate::config::DeployConfig;
 
+// Re-export git helpers so the deploy module exposes the full dirty-tree reset
+// workflow: detect dirty trees, stash them with a labeled ref, then reset.
+pub use crate::git_utils::{git_fetch_and_reset_hard, git_stash_dirty_tree, git_tree_is_dirty};
+
 /// Default sleep interval between lease polls.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
