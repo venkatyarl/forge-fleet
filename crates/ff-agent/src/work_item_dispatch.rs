@@ -805,7 +805,9 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     // codex (and most CLI agents) EDIT files but don't `git commit`. Commit any
     // changes it made in the worktree so they can become a PR. A clean worktree
     // (agent made no change) commits nothing → handled as "no commits" below.
-    let dirty = commit_worktree_changes(&worktree.worktree_path, &item.title)?;
+    let (git_name, git_email) = resolve_git_identity(&pg, &item.project_id).await;
+    let dirty =
+        commit_worktree_changes(&worktree.worktree_path, &item.title, &git_name, &git_email)?;
     info!(
         work_item_id = %item.work_item_id, dirty,
         "work_item_dispatch: committed agent changes (dirty={dirty})"
@@ -2520,7 +2522,12 @@ fn agent_output_tail(output: &std::process::Output, max_chars: usize) -> String 
     format!("…{tail}")
 }
 
-fn commit_worktree_changes(worktree_path: &Path, title: &str) -> Result<bool> {
+fn commit_worktree_changes(
+    worktree_path: &Path,
+    title: &str,
+    author_name: &str,
+    author_email: &str,
+) -> Result<bool> {
     // Auto-format BEFORE staging so a fleet-produced Rust PR passes CI
     // `cargo fmt --check` — LLM backends routinely emit un-formatted Rust, which
     // fails the fmt gate and blocks the PR (observed on PR #787). Best-effort +
@@ -2542,17 +2549,56 @@ fn commit_worktree_changes(worktree_path: &Path, title: &str) -> Result<bool> {
         return Ok(false); // nothing to commit
     }
     let msg = format!("{title}\n\nAutomated work_item dispatch (ForgeFleet Pillar 4).");
-    // Author with the operator's git identity from global config
-    // (`git config --global user.{name,email}`, set fleet-wide to
-    // "Venkat Yarlagadda <venkat.yarl@gmail.com>") rather than a per-command
-    // `-c user.name=ForgeFleet` override — so fleet-authored commits attribute
-    // to the operator's GitHub account, not a generic bot identity.
+    // Author with the resolved per-project identity via `-c` so it WINS over any
+    // repo-local config a backend set during its run (codex writes
+    // user.email=codex@openai.com into the slot clone; other agents leave
+    // noreply). `-c` overrides both global and local config for this one
+    // command, so fleet-authored commits always carry the operator/project
+    // identity, not a bot. Identity is DB-driven (see resolve_git_identity).
+    let name_cfg = format!("user.name={author_name}");
+    let email_cfg = format!("user.email={author_email}");
     run_git(
         worktree_path,
-        [OsStr::new("commit"), OsStr::new("-m"), OsStr::new(&msg)],
+        [
+            OsStr::new("-c"),
+            OsStr::new(&name_cfg),
+            OsStr::new("-c"),
+            OsStr::new(&email_cfg),
+            OsStr::new("commit"),
+            OsStr::new("-m"),
+            OsStr::new(&msg),
+        ],
         Duration::from_secs(60),
     )?;
     Ok(true)
+}
+
+/// Resolve a project's git author identity, DB-driven and per-project:
+/// `projects.metadata` git_author_name/email first (so different projects can
+/// commit under different identities), then the fleet-wide
+/// `fleet_secrets` git.author_name/email default, then a final hardcoded
+/// fallback so a commit never fails for lack of an identity.
+async fn resolve_git_identity(pg: &PgPool, project_id: &str) -> (String, String) {
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT metadata->>'git_author_name', metadata->>'git_author_email' \
+           FROM projects WHERE id = $1",
+    )
+    .bind(project_id)
+    .fetch_optional(pg)
+    .await
+    .ok()
+    .flatten();
+    let (mut name, mut email) = row.unwrap_or((None, None));
+    if name.is_none() {
+        name = crate::fleet_info::fetch_secret("git.author_name").await;
+    }
+    if email.is_none() {
+        email = crate::fleet_info::fetch_secret("git.author_email").await;
+    }
+    (
+        name.unwrap_or_else(|| "Venkat Yarlagadda".to_string()),
+        email.unwrap_or_else(|| "venkat.yarl@gmail.com".to_string()),
+    )
 }
 
 /// Run `cargo fmt` over the worktree so committed Rust is CI-fmt-clean. Uses a
