@@ -1,22 +1,23 @@
 //! Storage backend abstraction for Cortex.
 //!
-//! This is the migration scaffold for making the code graph target either the
-//! current Postgres/pgvector tables or a native FalkorDB graph. The production
-//! read/write path still calls the existing Postgres helpers directly; this
-//! module defines the boundary the next step can route through without removing
-//! the Postgres implementation.
+//! Postgres remains the production write backend. Cortex reads can opt into a
+//! native FalkorDB graph, with transparent per-operation Postgres fallback.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+const FALKOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 use super::{
-    CommunityExplanation, FileOutline, SymbolHit, SymbolRef, TestHit, add_edge_with_metadata,
-    call_path, callees, callers, explain_community, find_symbols, find_symbols_semantic, impact,
-    outline_file, tests_for, upsert_code_node,
+    CommunityExplanation, FileOutline, OutlineEntry, SymbolHit, SymbolRef, TestHit,
+    add_edge_with_metadata, call_path_postgres, callees_postgres, callers_postgres,
+    explain_community_postgres, find_symbols_postgres, find_symbols_semantic_postgres,
+    impact_postgres, is_test_symbol, outline_file_postgres, resolve_kind_filter,
+    tests_for_postgres, upsert_code_node,
 };
 
 /// A Cortex node as stored in the backend-neutral graph contract.
@@ -194,9 +195,9 @@ impl CortexGraphStore for PostgresCortexGraphStore {
         semantic: bool,
     ) -> Result<Vec<SymbolHit>> {
         if semantic {
-            find_symbols_semantic(&self.pool, corpus_slug, query, limit, kind).await
+            find_symbols_semantic_postgres(&self.pool, corpus_slug, query, limit, kind).await
         } else {
-            find_symbols(&self.pool, corpus_slug, query, limit, kind).await
+            find_symbols_postgres(&self.pool, corpus_slug, query, limit, kind).await
         }
     }
 
@@ -206,7 +207,7 @@ impl CortexGraphStore for PostgresCortexGraphStore {
         symbol: &str,
         min_confidence: f32,
     ) -> Result<Vec<SymbolRef>> {
-        callers(&self.pool, corpus_slug, symbol, min_confidence).await
+        callers_postgres(&self.pool, corpus_slug, symbol, min_confidence).await
     }
 
     async fn callees(
@@ -215,7 +216,7 @@ impl CortexGraphStore for PostgresCortexGraphStore {
         symbol: &str,
         min_confidence: f32,
     ) -> Result<Vec<SymbolRef>> {
-        callees(&self.pool, corpus_slug, symbol, min_confidence).await
+        callees_postgres(&self.pool, corpus_slug, symbol, min_confidence).await
     }
 
     async fn impact(
@@ -225,7 +226,7 @@ impl CortexGraphStore for PostgresCortexGraphStore {
         max_depth: usize,
         min_confidence: f32,
     ) -> Result<Vec<SymbolRef>> {
-        impact(&self.pool, corpus_slug, symbol, max_depth, min_confidence).await
+        impact_postgres(&self.pool, corpus_slug, symbol, max_depth, min_confidence).await
     }
 
     async fn call_path(
@@ -236,7 +237,7 @@ impl CortexGraphStore for PostgresCortexGraphStore {
         max_depth: usize,
         min_confidence: f32,
     ) -> Result<Option<Vec<SymbolRef>>> {
-        call_path(&self.pool, corpus_slug, from, to, max_depth, min_confidence).await
+        call_path_postgres(&self.pool, corpus_slug, from, to, max_depth, min_confidence).await
     }
 
     async fn tests_for(
@@ -246,7 +247,7 @@ impl CortexGraphStore for PostgresCortexGraphStore {
         max_depth: usize,
         min_confidence: f32,
     ) -> Result<Vec<TestHit>> {
-        tests_for(&self.pool, corpus_slug, symbol, max_depth, min_confidence).await
+        tests_for_postgres(&self.pool, corpus_slug, symbol, max_depth, min_confidence).await
     }
 
     async fn explain_community(
@@ -256,7 +257,7 @@ impl CortexGraphStore for PostgresCortexGraphStore {
         kind: Option<&str>,
         member_limit: i64,
     ) -> Result<Option<CommunityExplanation>> {
-        explain_community(&self.pool, corpus_slug, symbol, kind, member_limit).await
+        explain_community_postgres(&self.pool, corpus_slug, symbol, kind, member_limit).await
     }
 
     async fn outline_file(
@@ -265,28 +266,26 @@ impl CortexGraphStore for PostgresCortexGraphStore {
         file: &str,
         kind: Option<&str>,
     ) -> Result<Option<FileOutline>> {
-        outline_file(&self.pool, corpus_slug, file, kind).await
+        outline_file_postgres(&self.pool, corpus_slug, file, kind).await
     }
 }
 
-/// FalkorDB/OpenCypher implementation scaffold.
-///
-/// The struct owns a Redis connection manager because FalkorDB is addressed via
-/// Redis commands (`GRAPH.QUERY`). The read methods are intentionally left as
-/// explicit TODOs until the parser for FalkorDB's tabular responses is added;
-/// the Cypher strings below document the intended query shape for each Cortex
-/// operation.
+/// FalkorDB/OpenCypher implementation. Reads use the read-only Redis command
+/// `GRAPH.RO_QUERY`; the phase-2 write methods remain available only as an
+/// un-routed scaffold and are never selected by [`CortexReadRouter`].
 #[derive(Clone)]
 pub struct FalkorCortexGraphStore {
     connection: ConnectionManager,
     graph_name: String,
+    pool: PgPool,
 }
 
 impl FalkorCortexGraphStore {
-    pub fn new(connection: ConnectionManager, graph_name: impl Into<String>) -> Self {
+    pub fn new(connection: ConnectionManager, graph_name: impl Into<String>, pool: PgPool) -> Self {
         Self {
             connection,
             graph_name: graph_name.into(),
+            pool,
         }
     }
 
@@ -298,6 +297,22 @@ impl FalkorCortexGraphStore {
             .query_async(&mut conn)
             .await?;
         Ok(value)
+    }
+
+    async fn graph_read(&self, cypher: &str) -> Result<Vec<Vec<redis::Value>>> {
+        let mut conn = self.connection.clone();
+        let value = tokio::time::timeout(
+            FALKOR_TIMEOUT,
+            redis::cmd("GRAPH.RO_QUERY")
+                .arg(&self.graph_name)
+                .arg(cypher)
+                .arg("TIMEOUT")
+                .arg(FALKOR_TIMEOUT.as_millis() as u64)
+                .query_async(&mut conn),
+        )
+        .await
+        .context("FalkorDB read timed out")??;
+        decode_rows(value)
     }
 
     /// Create the indexes expected by the FalkorDB backend.
@@ -395,6 +410,101 @@ fn stable_uuid_from_path(path: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+fn decode_rows(value: redis::Value) -> Result<Vec<Vec<redis::Value>>> {
+    let redis::Value::Array(mut response) = value else {
+        anyhow::bail!("unexpected FalkorDB response: expected top-level array");
+    };
+    if response.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let redis::Value::Array(rows) = response.swap_remove(1) else {
+        anyhow::bail!("unexpected FalkorDB response: expected result rows");
+    };
+    rows.into_iter()
+        .map(|row| match row {
+            redis::Value::Array(values) => Ok(values),
+            _ => anyhow::bail!("unexpected FalkorDB response: row is not an array"),
+        })
+        .collect()
+}
+
+fn value_string(value: &redis::Value) -> Result<String> {
+    match value {
+        redis::Value::BulkString(bytes) => {
+            String::from_utf8(bytes.clone()).context("FalkorDB returned non-UTF8 text")
+        }
+        redis::Value::SimpleString(value) => Ok(value.clone()),
+        other => anyhow::bail!("unexpected FalkorDB string value: {other:?}"),
+    }
+}
+
+fn value_optional_string(value: &redis::Value) -> Result<Option<String>> {
+    if matches!(value, redis::Value::Nil) {
+        Ok(None)
+    } else {
+        value_string(value).map(Some)
+    }
+}
+
+fn value_i64(value: &redis::Value) -> Result<i64> {
+    match value {
+        redis::Value::Int(value) => Ok(*value),
+        redis::Value::Double(value) => Ok(*value as i64),
+        _ => value_string(value)?
+            .parse()
+            .context("invalid FalkorDB integer"),
+    }
+}
+
+fn value_optional_i32(value: &redis::Value) -> Result<Option<i32>> {
+    if matches!(value, redis::Value::Nil) {
+        Ok(None)
+    } else {
+        Ok(Some(
+            i32::try_from(value_i64(value)?).context("FalkorDB integer exceeds i32")?,
+        ))
+    }
+}
+
+fn value_f32(value: &redis::Value) -> Result<f32> {
+    match value {
+        redis::Value::Double(value) => Ok(*value as f32),
+        redis::Value::Int(value) => Ok(*value as f32),
+        _ => value_string(value)?
+            .parse()
+            .context("invalid FalkorDB float"),
+    }
+}
+
+fn value_uuid(value: &redis::Value) -> Result<Uuid> {
+    Uuid::parse_str(&value_string(value)?).context("invalid FalkorDB node UUID")
+}
+
+fn symbol_ref(row: &[redis::Value]) -> Result<SymbolRef> {
+    if row.len() < 5 {
+        anyhow::bail!("FalkorDB symbol row has {} columns, expected 5", row.len());
+    }
+    Ok(SymbolRef {
+        id: value_uuid(&row[0])?,
+        qualified_name: value_string(&row[1])?,
+        node_type: value_string(&row[2])?,
+        start_line: value_optional_i32(&row[3])?,
+        file: value_optional_string(&row[4])?,
+    })
+}
+
+fn selector_predicate(alias: &str, corpus: &str, symbol: &str) -> String {
+    let path = format!("code://{corpus}/{symbol}");
+    let suffix = format!("%::{symbol}");
+    format!(
+        "{alias}.project = {project} AND ({alias}.path = {path} OR {alias}.title = {symbol} OR {alias}.title ENDS WITH {suffix})",
+        project = cypher_string(corpus),
+        path = cypher_string(&path),
+        symbol = cypher_string(symbol),
+        suffix = cypher_string(suffix.trim_start_matches('%')),
+    )
+}
+
 #[async_trait]
 impl CortexGraphStore for FalkorCortexGraphStore {
     fn backend_name(&self) -> &'static str {
@@ -486,74 +596,219 @@ impl CortexGraphStore for FalkorCortexGraphStore {
 
     async fn find_symbols(
         &self,
-        _corpus_slug: &str,
-        _query: &str,
-        _limit: i64,
-        _kind: Option<&str>,
-        _semantic: bool,
+        corpus_slug: &str,
+        query: &str,
+        limit: i64,
+        kind: Option<&str>,
+        semantic: bool,
     ) -> Result<Vec<SymbolHit>> {
-        anyhow::bail!(
-            "FalkorDB result decoding is not wired yet. Query templates:\n{FALKOR_FIND_SYMBOLS_CYPHER}\n{FALKOR_SEMANTIC_SEARCH_CYPHER}"
-        )
+        let limit = limit.clamp(1, 500);
+        let kind_types = resolve_kind_filter(kind)?;
+        let kind_clause = kind_types
+            .map(|types| {
+                format!(
+                    " AND n.node_type IN [{}]",
+                    types
+                        .into_iter()
+                        .map(|value| cypher_string(&value))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .unwrap_or_default();
+        let (match_clause, score_expr) = if semantic {
+            let client = crate::embeddings::fleet_embedding_client(&self.pool)
+                .await
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no healthy fleet embedding endpoint for FalkorDB semantic search"
+                    )
+                })?;
+            let embedding = client
+                .embed(query)
+                .await
+                .map_err(|e| anyhow::anyhow!("embed query: {e}"))?;
+            let vector = embedding
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            (
+                format!(
+                    "CALL db.idx.vector.queryNodes('CortexNode', 'embedding', {limit}, vecf32([{vector}])) YIELD node AS n, score"
+                ),
+                "score".to_string(),
+            )
+        } else {
+            (
+                format!(
+                    "MATCH (n:CortexNode) WHERE toLower(n.title) CONTAINS toLower({})",
+                    cypher_string(query)
+                ),
+                "NULL".to_string(),
+            )
+        };
+        let connector = if semantic { "WHERE" } else { "AND" };
+        let cypher = format!(
+            "{match_clause} {connector} n.project = {project} AND n.node_type STARTS WITH 'code:'{kind_clause} \
+             OPTIONAL MATCH (file:CortexNode {{node_type: 'content:file'}})-[:contains*1..]->(n) \
+             OPTIONAL MATCH (:CortexNode)-[incoming:calls]->(n) \
+             RETURN n.id, n.title, n.node_type, n.start_line, file.path, count(DISTINCT incoming), {score_expr} \
+             ORDER BY {score_expr} DESC, count(DISTINCT incoming) DESC, n.title LIMIT {limit}",
+            project = cypher_string(corpus_slug),
+        );
+        self.graph_read(&cypher)
+            .await?
+            .into_iter()
+            .map(|row| {
+                if row.len() < 7 {
+                    anyhow::bail!("FalkorDB find row has {} columns, expected 7", row.len());
+                }
+                Ok(SymbolHit {
+                    id: value_uuid(&row[0])?,
+                    qualified_name: value_string(&row[1])?,
+                    node_type: value_string(&row[2])?,
+                    start_line: value_optional_i32(&row[3])?,
+                    file: value_optional_string(&row[4])?,
+                    fan_in: value_i64(&row[5])?,
+                    score: if semantic {
+                        Some(value_f32(&row[6])?)
+                    } else {
+                        None
+                    },
+                })
+            })
+            .collect()
     }
 
     async fn callers(
         &self,
-        _corpus_slug: &str,
-        _symbol: &str,
-        _min_confidence: f32,
+        corpus_slug: &str,
+        symbol: &str,
+        min_confidence: f32,
     ) -> Result<Vec<SymbolRef>> {
-        anyhow::bail!(
-            "FalkorDB result decoding is not wired yet. Query template:\n{FALKOR_CALLERS_CYPHER}"
-        )
+        let cypher = format!(
+            "MATCH (target:CortexNode)<-[e:calls]-(n:CortexNode) WHERE {} AND e.confidence >= {} OPTIONAL MATCH (file:CortexNode {{node_type: 'content:file'}})-[:contains*1..]->(n) RETURN DISTINCT n.id, n.title, n.node_type, n.start_line, file.path ORDER BY n.title",
+            selector_predicate("target", corpus_slug, symbol),
+            min_confidence
+        );
+        self.graph_read(&cypher)
+            .await?
+            .iter()
+            .map(|row| symbol_ref(row))
+            .collect()
     }
 
     async fn callees(
         &self,
-        _corpus_slug: &str,
-        _symbol: &str,
-        _min_confidence: f32,
+        corpus_slug: &str,
+        symbol: &str,
+        min_confidence: f32,
     ) -> Result<Vec<SymbolRef>> {
-        anyhow::bail!(
-            "FalkorDB result decoding is not wired yet. Query template:\n{FALKOR_CALLEES_CYPHER}"
-        )
+        let cypher = format!(
+            "MATCH (source:CortexNode)-[e:calls]->(n:CortexNode) WHERE {} AND e.confidence >= {} OPTIONAL MATCH (file:CortexNode {{node_type: 'content:file'}})-[:contains*1..]->(n) RETURN DISTINCT n.id, n.title, n.node_type, n.start_line, file.path ORDER BY n.title",
+            selector_predicate("source", corpus_slug, symbol),
+            min_confidence
+        );
+        self.graph_read(&cypher)
+            .await?
+            .iter()
+            .map(|row| symbol_ref(row))
+            .collect()
     }
 
     async fn impact(
         &self,
-        _corpus_slug: &str,
-        _symbol: &str,
-        _max_depth: usize,
-        _min_confidence: f32,
+        corpus_slug: &str,
+        symbol: &str,
+        max_depth: usize,
+        min_confidence: f32,
     ) -> Result<Vec<SymbolRef>> {
-        anyhow::bail!(
-            "FalkorDB result decoding is not wired yet. Query template:\n{FALKOR_IMPACT_CYPHER}"
-        )
+        let depth = max_depth.clamp(1, 20);
+        let cypher = format!(
+            "MATCH p=(target:CortexNode)<-[:calls*1..{depth}]-(n:CortexNode) WHERE {} AND all(e IN relationships(p) WHERE e.confidence >= {}) OPTIONAL MATCH (file:CortexNode {{node_type: 'content:file'}})-[:contains*1..]->(n) RETURN DISTINCT n.id, n.title, n.node_type, n.start_line, file.path ORDER BY n.title",
+            selector_predicate("target", corpus_slug, symbol),
+            min_confidence
+        );
+        self.graph_read(&cypher)
+            .await?
+            .iter()
+            .map(|row| symbol_ref(row))
+            .collect()
     }
 
     async fn call_path(
         &self,
-        _corpus_slug: &str,
-        _from: &str,
-        _to: &str,
-        _max_depth: usize,
-        _min_confidence: f32,
+        corpus_slug: &str,
+        from: &str,
+        to: &str,
+        max_depth: usize,
+        min_confidence: f32,
     ) -> Result<Option<Vec<SymbolRef>>> {
-        anyhow::bail!(
-            "FalkorDB result decoding is not wired yet. Query template:\n{FALKOR_CALL_PATH_CYPHER}"
-        )
+        let depth = max_depth.clamp(1, 20);
+        let cypher = format!(
+            "MATCH p=shortestPath((source:CortexNode)-[:calls*1..{depth}]->(target:CortexNode)) WHERE {} AND {} AND all(e IN relationships(p) WHERE e.confidence >= {}) UNWIND nodes(p) AS n OPTIONAL MATCH (file:CortexNode {{node_type: 'content:file'}})-[:contains*1..]->(n) RETURN n.id, n.title, n.node_type, n.start_line, file.path",
+            selector_predicate("source", corpus_slug, from),
+            selector_predicate("target", corpus_slug, to),
+            min_confidence
+        );
+        let rows = self.graph_read(&cypher).await?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            rows.iter()
+                .map(|row| symbol_ref(row))
+                .collect::<Result<_>>()?,
+        ))
     }
 
     async fn tests_for(
         &self,
-        _corpus_slug: &str,
-        _symbol: &str,
-        _max_depth: usize,
-        _min_confidence: f32,
+        corpus_slug: &str,
+        symbol: &str,
+        max_depth: usize,
+        min_confidence: f32,
     ) -> Result<Vec<TestHit>> {
-        anyhow::bail!(
-            "FalkorDB tests_for should reuse the impact query then filter test-like callers"
-        )
+        let depth = max_depth.clamp(1, 20);
+        let cypher = format!(
+            "MATCH p=(target:CortexNode)<-[:calls*1..{depth}]-(n:CortexNode) WHERE {} AND n.node_type = 'code:function' AND all(e IN relationships(p) WHERE e.confidence >= {}) OPTIONAL MATCH (file:CortexNode {{node_type: 'content:file'}})-[:contains*1..]->(n) RETURN n.id, n.title, n.start_line, file.path, min(length(p)) ORDER BY min(length(p)), n.title",
+            selector_predicate("target", corpus_slug, symbol),
+            min_confidence
+        );
+        let mut out = self
+            .graph_read(&cypher)
+            .await?
+            .into_iter()
+            .filter_map(|row| {
+                let parsed = (|| -> Result<TestHit> {
+                    if row.len() < 5 {
+                        anyhow::bail!("FalkorDB test row has {} columns, expected 5", row.len());
+                    }
+                    Ok(TestHit {
+                        id: value_uuid(&row[0])?,
+                        qualified_name: value_string(&row[1])?,
+                        start_line: value_optional_i32(&row[2])?,
+                        file: value_optional_string(&row[3])?,
+                        depth: usize::try_from(value_i64(&row[4])?)
+                            .context("invalid FalkorDB path depth")?,
+                    })
+                })();
+                match parsed {
+                    Ok(hit) if is_test_symbol(&hit.qualified_name, hit.file.as_deref()) => {
+                        Some(Ok(hit))
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        out.sort_by(|a, b| {
+            a.depth
+                .cmp(&b.depth)
+                .then(a.qualified_name.cmp(&b.qualified_name))
+        });
+        Ok(out)
     }
 
     async fn explain_community(
@@ -568,12 +823,329 @@ impl CortexGraphStore for FalkorCortexGraphStore {
 
     async fn outline_file(
         &self,
-        _corpus_slug: &str,
-        _file: &str,
-        _kind: Option<&str>,
+        corpus_slug: &str,
+        file: &str,
+        kind: Option<&str>,
     ) -> Result<Option<FileOutline>> {
-        anyhow::bail!(
-            "FalkorDB result decoding is not wired yet. Query template:\n{FALKOR_OUTLINE_FILE_CYPHER}"
+        let kind_types = resolve_kind_filter(kind)?;
+        let kind_clause = kind_types
+            .map(|types| {
+                format!(
+                    " AND n.node_type IN [{}]",
+                    types
+                        .into_iter()
+                        .map(|value| cypher_string(&value))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .unwrap_or_default();
+        let suffix = format!("/{file}");
+        let cypher = format!(
+            "MATCH (f:CortexNode)-[:contains*1..]->(n:CortexNode) WHERE f.project = {} AND f.node_type = 'content:file' AND (f.path = {} OR f.path ENDS WITH {}) AND n.node_type STARTS WITH 'code:'{} OPTIONAL MATCH (:CortexNode)-[incoming:calls]->(n) RETURN f.path, n.title, n.node_type, n.start_line, n.end_line, count(DISTINCT incoming) ORDER BY n.start_line, n.title",
+            cypher_string(corpus_slug),
+            cypher_string(file),
+            cypher_string(&suffix),
+            kind_clause
+        );
+        let rows = self.graph_read(&cypher).await?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let paths = rows
+            .iter()
+            .map(|row| value_string(&row[0]))
+            .collect::<Result<Vec<_>>>()?;
+        let first = &paths[0];
+        if paths.iter().any(|path| path != first) {
+            anyhow::bail!(
+                "'{file}' matches multiple files in corpus '{corpus_slug}' — pass more of the path to disambiguate"
+            );
+        }
+        let symbols = rows
+            .into_iter()
+            .map(|row| {
+                if row.len() < 6 {
+                    anyhow::bail!("FalkorDB outline row has {} columns, expected 6", row.len());
+                }
+                Ok(OutlineEntry {
+                    qualified_name: value_string(&row[1])?,
+                    node_type: value_string(&row[2])?,
+                    start_line: value_optional_i32(&row[3])?,
+                    end_line: value_optional_i32(&row[4])?,
+                    fan_in: value_i64(&row[5])?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(Some(FileOutline {
+            file: first.clone(),
+            symbols,
+        }))
+    }
+}
+
+/// Opt-in read router. Writes always remain on Postgres in phase 1; FalkorDB is
+/// attempted only when `CORTEX_GRAPH_BACKEND=falkordb`, and every failed read
+/// is transparently retried against Postgres.
+pub struct CortexReadRouter {
+    postgres: PostgresCortexGraphStore,
+    falkor: Option<FalkorCortexGraphStore>,
+}
+
+impl CortexReadRouter {
+    pub async fn from_env(pool: &PgPool) -> Self {
+        let postgres = PostgresCortexGraphStore::new(pool.clone());
+        if std::env::var("CORTEX_GRAPH_BACKEND").as_deref() != Ok("falkordb") {
+            return Self {
+                postgres,
+                falkor: None,
+            };
+        }
+        let falkor = async {
+            let url = std::env::var("FALKORDB_URL").context(
+                "CORTEX_GRAPH_BACKEND=falkordb requires FALKORDB_URL (for example redis://priya:63379)",
+            )?;
+            let graph = std::env::var("FALKORDB_GRAPH").unwrap_or_else(|_| "cortex".to_string());
+            let client = redis::Client::open(url).context("open FalkorDB Redis client")?;
+            let connection = tokio::time::timeout(FALKOR_TIMEOUT, ConnectionManager::new(client))
+                .await
+                .context("FalkorDB connection timed out")?
+                .context("connect to FalkorDB")?;
+            Ok::<_, anyhow::Error>(FalkorCortexGraphStore::new(connection, graph, pool.clone()))
+        }.await;
+        match falkor {
+            Ok(falkor) => Self {
+                postgres,
+                falkor: Some(falkor),
+            },
+            Err(error) => {
+                tracing::warn!(%error, "FalkorDB Cortex read adapter unavailable; using Postgres");
+                Self {
+                    postgres,
+                    falkor: None,
+                }
+            }
+        }
+    }
+
+    async fn fallback<T, F, P>(&self, operation: &'static str, falkor: F, postgres: P) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+        P: std::future::Future<Output = Result<T>>,
+    {
+        if self.falkor.is_some() {
+            match falkor.await {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    tracing::warn!(%error, operation, "FalkorDB Cortex read failed; falling back to Postgres")
+                }
+            }
+        }
+        postgres.await
+    }
+
+    pub async fn find_symbols(
+        &self,
+        corpus: &str,
+        query: &str,
+        limit: i64,
+        kind: Option<&str>,
+        semantic: bool,
+    ) -> Result<Vec<SymbolHit>> {
+        let falkor = async {
+            self.falkor
+                .as_ref()
+                .context("FalkorDB disabled")?
+                .find_symbols(corpus, query, limit, kind, semantic)
+                .await
+        };
+        self.fallback(
+            "find_symbols",
+            falkor,
+            self.postgres
+                .find_symbols(corpus, query, limit, kind, semantic),
         )
+        .await
+    }
+    pub async fn callers(
+        &self,
+        corpus: &str,
+        symbol: &str,
+        confidence: f32,
+    ) -> Result<Vec<SymbolRef>> {
+        let falkor = async {
+            self.falkor
+                .as_ref()
+                .context("FalkorDB disabled")?
+                .callers(corpus, symbol, confidence)
+                .await
+        };
+        self.fallback(
+            "callers",
+            falkor,
+            self.postgres.callers(corpus, symbol, confidence),
+        )
+        .await
+    }
+    pub async fn callees(
+        &self,
+        corpus: &str,
+        symbol: &str,
+        confidence: f32,
+    ) -> Result<Vec<SymbolRef>> {
+        let falkor = async {
+            self.falkor
+                .as_ref()
+                .context("FalkorDB disabled")?
+                .callees(corpus, symbol, confidence)
+                .await
+        };
+        self.fallback(
+            "callees",
+            falkor,
+            self.postgres.callees(corpus, symbol, confidence),
+        )
+        .await
+    }
+    pub async fn impact(
+        &self,
+        corpus: &str,
+        symbol: &str,
+        depth: usize,
+        confidence: f32,
+    ) -> Result<Vec<SymbolRef>> {
+        let falkor = async {
+            self.falkor
+                .as_ref()
+                .context("FalkorDB disabled")?
+                .impact(corpus, symbol, depth, confidence)
+                .await
+        };
+        self.fallback(
+            "impact",
+            falkor,
+            self.postgres.impact(corpus, symbol, depth, confidence),
+        )
+        .await
+    }
+    pub async fn call_path(
+        &self,
+        corpus: &str,
+        from: &str,
+        to: &str,
+        depth: usize,
+        confidence: f32,
+    ) -> Result<Option<Vec<SymbolRef>>> {
+        let falkor = async {
+            self.falkor
+                .as_ref()
+                .context("FalkorDB disabled")?
+                .call_path(corpus, from, to, depth, confidence)
+                .await
+        };
+        self.fallback(
+            "call_path",
+            falkor,
+            self.postgres.call_path(corpus, from, to, depth, confidence),
+        )
+        .await
+    }
+    pub async fn tests_for(
+        &self,
+        corpus: &str,
+        symbol: &str,
+        depth: usize,
+        confidence: f32,
+    ) -> Result<Vec<TestHit>> {
+        let falkor = async {
+            self.falkor
+                .as_ref()
+                .context("FalkorDB disabled")?
+                .tests_for(corpus, symbol, depth, confidence)
+                .await
+        };
+        self.fallback(
+            "tests_for",
+            falkor,
+            self.postgres.tests_for(corpus, symbol, depth, confidence),
+        )
+        .await
+    }
+    pub async fn explain_community(
+        &self,
+        corpus: &str,
+        symbol: &str,
+        kind: Option<&str>,
+        limit: i64,
+    ) -> Result<Option<CommunityExplanation>> {
+        let falkor = async {
+            self.falkor
+                .as_ref()
+                .context("FalkorDB disabled")?
+                .explain_community(corpus, symbol, kind, limit)
+                .await
+        };
+        self.fallback(
+            "explain_community",
+            falkor,
+            self.postgres.explain_community(corpus, symbol, kind, limit),
+        )
+        .await
+    }
+    pub async fn outline_file(
+        &self,
+        corpus: &str,
+        file: &str,
+        kind: Option<&str>,
+    ) -> Result<Option<FileOutline>> {
+        let falkor = async {
+            self.falkor
+                .as_ref()
+                .context("FalkorDB disabled")?
+                .outline_file(corpus, file, kind)
+                .await
+        };
+        self.fallback(
+            "outline_file",
+            falkor,
+            self.postgres.outline_file(corpus, file, kind),
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_graph_ro_query_rows() {
+        let response = redis::Value::Array(vec![
+            redis::Value::Array(vec![redis::Value::BulkString(b"name".to_vec())]),
+            redis::Value::Array(vec![redis::Value::Array(vec![
+                redis::Value::BulkString(b"cortex::find".to_vec()),
+                redis::Value::Int(7),
+            ])]),
+            redis::Value::Array(vec![redis::Value::BulkString(
+                b"Query internal execution time: 0.1 milliseconds".to_vec(),
+            )]),
+        ]);
+        let rows = decode_rows(response).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(value_string(&rows[0][0]).unwrap(), "cortex::find");
+        assert_eq!(value_i64(&rows[0][1]).unwrap(), 7);
+    }
+
+    #[test]
+    fn cypher_literals_escape_user_input() {
+        assert_eq!(cypher_string("a'b\\c"), "'a\\'b\\\\c'");
+        let predicate = selector_predicate("n", "forge-fleet", "a'b");
+        assert!(predicate.contains("n.project = 'forge-fleet'"));
+        assert!(predicate.contains("n.title = 'a\\'b'"));
+    }
+
+    #[test]
+    fn malformed_graph_response_is_rejected() {
+        assert!(decode_rows(redis::Value::Int(1)).is_err());
     }
 }

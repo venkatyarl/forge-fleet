@@ -1653,6 +1653,59 @@ pub struct SymbolRef {
     pub start_line: Option<i32>,
 }
 
+/// Backend-neutral Cortex reads. Postgres remains the default; when the
+/// FalkorDB adapter is selected each operation falls back to Postgres on error.
+pub async fn callers(
+    pool: &PgPool,
+    corpus: &str,
+    symbol: &str,
+    confidence: f32,
+) -> Result<Vec<SymbolRef>> {
+    storage::CortexReadRouter::from_env(pool)
+        .await
+        .callers(corpus, symbol, confidence)
+        .await
+}
+
+pub async fn callees(
+    pool: &PgPool,
+    corpus: &str,
+    symbol: &str,
+    confidence: f32,
+) -> Result<Vec<SymbolRef>> {
+    storage::CortexReadRouter::from_env(pool)
+        .await
+        .callees(corpus, symbol, confidence)
+        .await
+}
+
+pub async fn impact(
+    pool: &PgPool,
+    corpus: &str,
+    symbol: &str,
+    depth: usize,
+    confidence: f32,
+) -> Result<Vec<SymbolRef>> {
+    storage::CortexReadRouter::from_env(pool)
+        .await
+        .impact(corpus, symbol, depth, confidence)
+        .await
+}
+
+pub async fn call_path(
+    pool: &PgPool,
+    corpus: &str,
+    from: &str,
+    to: &str,
+    depth: usize,
+    confidence: f32,
+) -> Result<Option<Vec<SymbolRef>>> {
+    storage::CortexReadRouter::from_env(pool)
+        .await
+        .call_path(corpus, from, to, depth, confidence)
+        .await
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DbMigrationRef {
     pub title: String,
@@ -2147,7 +2200,7 @@ async fn callers_of_ids(
 /// EXTRACTED edges (primary resolver named a real internal symbol), `0.6` adds
 /// INFERRED (heuristic redirect). A high-precision consumer passes `1.0` to drop
 /// the ~40% of edges that come from heuristic redirects.
-pub async fn callers(
+pub(crate) async fn callers_postgres(
     pool: &PgPool,
     corpus_slug: &str,
     sel: &str,
@@ -2165,7 +2218,7 @@ pub async fn callers(
 
 /// Callees of a symbol: nodes a `calls` edge points to from the symbol.
 /// `min_confidence` filters edges by tier — see [`callers`].
-pub async fn callees(
+pub(crate) async fn callees_postgres(
     pool: &PgPool,
     corpus_slug: &str,
     sel: &str,
@@ -2358,7 +2411,7 @@ pub async fn impact_all_corpora(
 }
 
 /// Transitive caller closure up to `max_depth` (impact / blast radius).
-pub async fn impact(
+pub(crate) async fn impact_postgres(
     pool: &PgPool,
     corpus_slug: &str,
     sel: &str,
@@ -2491,7 +2544,7 @@ async fn fetch_refs_ordered(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<SymbolRef
 /// connect", which is the legitimate `None`.
 ///
 /// `min_confidence` filters traversed edges by resolution tier — see [`callers`].
-pub async fn call_path(
+pub(crate) async fn call_path_postgres(
     pool: &PgPool,
     corpus_slug: &str,
     from_sel: &str,
@@ -2581,6 +2634,19 @@ pub struct TestHit {
     pub depth: usize,
 }
 
+pub async fn tests_for(
+    pool: &PgPool,
+    corpus: &str,
+    symbol: &str,
+    depth: usize,
+    confidence: f32,
+) -> Result<Vec<TestHit>> {
+    storage::CortexReadRouter::from_env(pool)
+        .await
+        .tests_for(corpus, symbol, depth, confidence)
+        .await
+}
+
 /// Does this file path look like a test file? Cross-language heuristic over the
 /// (case-insensitive) path: common test directories plus per-language basename
 /// conventions. A discovery aid, not a correctness gate — favours recall, so a
@@ -2665,7 +2731,7 @@ pub fn is_test_symbol(qualified_name: &str, file: Option<&str>) -> bool {
 /// recall — the default), `1.0` keeps only EXTRACTED edges so the result is the
 /// stricter "tests that *provably* reach this symbol via a directly-resolved call
 /// chain", dropping coverage that only exists through a heuristic redirect.
-pub async fn tests_for(
+pub(crate) async fn tests_for_postgres(
     pool: &PgPool,
     corpus_slug: &str,
     sel: &str,
@@ -2772,6 +2838,32 @@ pub struct SymbolHit {
     pub score: Option<f32>,
 }
 
+pub async fn find_symbols(
+    pool: &PgPool,
+    corpus: &str,
+    query: &str,
+    limit: i64,
+    kind: Option<&str>,
+) -> Result<Vec<SymbolHit>> {
+    storage::CortexReadRouter::from_env(pool)
+        .await
+        .find_symbols(corpus, query, limit, kind, false)
+        .await
+}
+
+pub async fn find_symbols_semantic(
+    pool: &PgPool,
+    corpus: &str,
+    query: &str,
+    limit: i64,
+    kind: Option<&str>,
+) -> Result<Vec<SymbolHit>> {
+    storage::CortexReadRouter::from_env(pool)
+        .await
+        .find_symbols(corpus, query, limit, kind, true)
+        .await
+}
+
 /// Escape SQL `LIKE`/`ILIKE` wildcards (`%`, `_`) and the escape char (`\`) in a
 /// user query so a search for `load_model` matches the literal underscore rather
 /// than "any single char". Paired with `ESCAPE '\'` in the query below.
@@ -2835,7 +2927,7 @@ fn resolve_kind_filter(kind: Option<&str>) -> Result<Option<Vec<String>>> {
 /// ranked by fan-in desc then name, capped at `limit` (clamped to 1..=500).
 /// `kind` optionally narrows to a node-type class (see [`kind_filter_types`]).
 /// The discovery entrypoint for the relationship queries.
-pub async fn find_symbols(
+pub(crate) async fn find_symbols_postgres(
     pool: &PgPool,
     corpus_slug: &str,
     query: &str,
@@ -3251,7 +3343,7 @@ pub fn similarity_from_distance(distance: f64) -> f32 {
 /// Errors — rather than silently degrading — when no fleet embedding endpoint is
 /// live (the query would otherwise embed to hash-stub noise and rank garbage) or
 /// when the corpus has no embedded nodes yet (run `ff cortex embed` first).
-pub async fn find_symbols_semantic(
+pub(crate) async fn find_symbols_semantic_postgres(
     pool: &PgPool,
     corpus_slug: &str,
     query: &str,
@@ -3682,13 +3774,26 @@ pub struct CommunityExplanation {
     pub subsystem_chain: Vec<CommunitySubsystem>,
 }
 
+pub async fn explain_community(
+    pool: &PgPool,
+    corpus: &str,
+    symbol: &str,
+    kind: Option<&str>,
+    limit: i64,
+) -> Result<Option<CommunityExplanation>> {
+    storage::CortexReadRouter::from_env(pool)
+        .await
+        .explain_community(corpus, symbol, kind, limit)
+        .await
+}
+
 /// Resolve `query` to a code symbol, then return the community it belongs to plus
 /// that community's stored summary and top members. Resolution mirrors
 /// [`show_symbol`] (exact qualified → exact leaf, highest fan-in → top hit).
 /// Returns `Ok(None)` only when nothing matched the query at all; a matched
 /// symbol with no community / no summary yet returns `Ok(Some(..))` with the
 /// relevant field `None` so the caller can guide the user to the right command.
-pub async fn explain_community(
+pub(crate) async fn explain_community_postgres(
     pool: &PgPool,
     corpus_slug: &str,
     query: &str,
@@ -3871,6 +3976,18 @@ pub struct FileOutline {
     pub symbols: Vec<OutlineEntry>,
 }
 
+pub async fn outline_file(
+    pool: &PgPool,
+    corpus: &str,
+    file: &str,
+    kind: Option<&str>,
+) -> Result<Option<FileOutline>> {
+    storage::CortexReadRouter::from_env(pool)
+        .await
+        .outline_file(corpus, file, kind)
+        .await
+}
+
 /// Outcome of matching a file argument against the corpus's `content:file` paths.
 /// Pure (no Uuids) so it can be unit-tested against the candidate path list.
 #[derive(Debug, PartialEq)]
@@ -3969,7 +4086,7 @@ async fn resolve_file_node(
 /// (multiple suffix hits) so the caller disambiguates. No file IO — purely a graph
 /// query (unlike `show`, which reads the source), so it works even when the
 /// indexed checkout isn't present on this host.
-pub async fn outline_file(
+pub(crate) async fn outline_file_postgres(
     pool: &PgPool,
     corpus_slug: &str,
     file_arg: &str,
