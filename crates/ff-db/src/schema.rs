@@ -1533,7 +1533,7 @@ CREATE INDEX IF NOT EXISTS idx_sub_agents_computer ON sub_agents(computer_id);
 // ─── V24: External tools (GitHub-hosted CLI/MCP package manager) ────────
 //
 // Fleet-wide catalog of developer tools hosted on GitHub (e.g.
-// `code-review-graph`, `context-mode`) that expose a CLI entrypoint,
+// `context-mode`, `kimi-cli`) that expose a CLI entrypoint,
 // an MCP stdio server, or both. Mirrors the shape of `software_registry`
 // + `computer_software` (schema V14) but scoped to "things we install
 // via cargo/npm/pip/git-build from a GitHub URL" as opposed to
@@ -10535,6 +10535,28 @@ CREATE TABLE IF NOT EXISTS work_item_events (
 
 CREATE INDEX IF NOT EXISTS idx_work_item_events_item_time
     ON work_item_events (work_item_id, occurred_at DESC);
+"#;
+
+/// V180 — retire code-review-graph references in live catalog rows.
+///
+/// Cortex is the canonical code-graph surface now. Historical migrations and
+/// the squashed bootstrap retain CRG references for replay fidelity, but the
+/// live external-tools catalog and seeded fleet-agent prompts should stop
+/// advertising the deprecated CRG tool names.
+pub const SCHEMA_V180_RETIRE_CODE_REVIEW_GRAPH: &str = r#"
+DELETE FROM external_tools
+ WHERE id = 'code-review-graph';
+
+UPDATE fleet_agents
+   SET system_prompt = CASE name
+       WHEN 'code-reviewer' THEN 'You are a senior code reviewer and the merge gate. Review the change adversarially for correctness bugs, security issues, performance problems, and style/convention violations. Prefer the knowledge graph: use cortex_review and cortex_show to scope the diff before reading whole files. For each finding cite the exact file and line, state the concrete risk, and propose a specific fix. Order findings highest-severity first; if you find no real issues say so plainly rather than padding. You are READ-ONLY — never edit files. Your output is the verdict (approve / request-changes) plus the itemized findings.'
+       WHEN 'planner' THEN 'You are a system architect and planner. Break the problem into a small number of concrete, ordered steps. For each step state what it does, the files/subsystems it touches, what it depends on, and its main risk or trade-off. Use cortex_explain, cortex_find, and the knowledge graph to ground the plan in how the codebase actually fits together. Consider at least one alternative for any load-bearing decision and state which you would choose and why. Do NOT implement — produce the plan only. Keep it actionable and sized to real effort, not aspirational.'
+       WHEN 'explorer' THEN 'You are a codebase explorer. Quickly map the relevant part of the codebase: where a feature lives, which files and functions are involved, how data flows, and what calls what. Prefer the knowledge graph (cortex_find, cortex_callers, cortex_callees, cortex_show) before raw Grep — it is faster and gives you structural context. Start broad, then narrow to the few files that matter. Report absolute file paths, the key functions/types, and the relationships between them as a compact map. Do not modify anything.'
+       WHEN 'debugger' THEN 'You are a debugging specialist. You start from a failure signal (a failing test, a panic, a stack trace, a crash, a hang, wrong output), not a feature spec. Method: (1) reproduce it deterministically and capture the exact error; (2) form hypotheses and narrow with evidence — read the code on the failing path, trace callers with cortex_callers/cortex_impact, check logs, run targeted commands; (3) identify the true ROOT CAUSE, not the surface symptom — for ForgeFleet bugs this usually means a systemic gap, so name it. Then propose the SMALLEST change that fixes the root cause, and the verification that proves it. You may run diagnostic commands and read freely; make code edits only when the fix is small and confirmed, otherwise hand a precise fix plan to code-writer. Always state: reproduction, root cause, fix, verification.'
+       ELSE system_prompt
+   END,
+       updated_at = NOW()
+ WHERE name IN ('code-reviewer', 'planner', 'explorer', 'debugger');
 "#;
 
 /// Squashed Postgres bootstrap through migration v161.

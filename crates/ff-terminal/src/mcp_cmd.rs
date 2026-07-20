@@ -62,7 +62,7 @@ the `ff` CLI before generic shell / grep / web primitives.
 ### Discovery-FIRST — search before you build (hard rule)
 Before writing any new table/module/feature, inventory what ALREADY exists — the
 #1 waste is rebuilding a capability the fleet already has. Order:
-1. **Cortex / code graph** — `cortex_find` / `semantic_search_nodes` ("what
+1. **Cortex / code graph** — `cortex_find` / `cortex_show` ("what
    handles X?") to find the owning crate/module. Faster + cheaper than grep.
 2. **`ff db query "<read-only SQL>"`** — confirm the LIVE Postgres schema; source
    `CREATE TABLE` strings can drift from the live DB. Never extend a table you

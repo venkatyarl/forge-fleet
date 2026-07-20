@@ -977,7 +977,7 @@ impl ToolRegistry {
     fn cortex_show() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_show".to_string(),
-            description: "Cortex code graph: show a code symbol's SOURCE — resolve a name to its file + line span and return just that symbol's definition. One call instead of cortex_find → read the file → slice the span (the Cortex get_review_context). An exact qualified-name match wins, else an exact leaf match (highest fan-in), else the top fan-in hit; other matches are returned so you can disambiguate. Needs the indexed checkout present on the host (like cortex_review).".to_string(),
+            description: "Cortex code graph: show a code symbol's SOURCE — resolve a name to its file + line span and return just that symbol's definition. One call instead of cortex_find → read the file → slice the span. An exact qualified-name match wins, else an exact leaf match (highest fan-in), else the top fan-in hit; other matches are returned so you can disambiguate. Needs the indexed checkout present on the host (like cortex_review).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

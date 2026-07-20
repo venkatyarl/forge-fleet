@@ -1,26 +1,26 @@
-<!-- code-review-graph MCP tools -->
-## MCP Tools: code-review-graph
+<!-- cortex MCP tools -->
+## MCP Tools: Cortex
 
 **IMPORTANT: This project has a knowledge graph. ALWAYS use the
-code-review-graph MCP tools BEFORE using Grep/Glob/Read to explore
+ForgeFleet Cortex MCP tools BEFORE using Grep/Glob/Read to explore
 the codebase.** The graph is faster, cheaper (fewer tokens), and gives
 you structural context (callers, dependents, test coverage) that file
 scanning cannot.
 
 ### When to use graph tools FIRST
 
-- **Exploring code**: `semantic_search_nodes` or `query_graph` instead of Grep
-- **Understanding impact**: `get_impact_radius` instead of manually tracing imports
-- **Code review**: `detect_changes` + `get_review_context` instead of reading entire files
-- **Finding relationships**: `query_graph` with callers_of/callees_of/imports_of/tests_for
-- **Architecture questions**: `get_architecture_overview` + `list_communities`
+- **Exploring code**: `cortex_find`, `cortex_show`, or `cortex_outline` instead of Grep
+- **Understanding impact**: `cortex_impact` instead of manually tracing imports
+- **Code review**: `cortex_review` + `cortex_show` instead of reading entire files
+- **Finding relationships**: `cortex_callers` / `cortex_callees` instead of manual tracing
+- **Architecture questions**: `cortex_explain` for subsystem-level context
 
 Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
 
 ### ⛔ Discovery-first — search before you build (hard rule)
 The #1 waste here is rebuilding a capability the fleet already has. Before writing any
 new table/module/feature, inventory what exists, in this order:
-1. **Cortex / code graph** — `cortex_find` / `semantic_search_nodes` ("what handles X?")
+1. **Cortex / code graph** — `cortex_find` / `cortex_show` ("what handles X?")
    to find the owning crate. Faster + cheaper than grep.
 2. **`ff db query "<read-only SQL>"`** — confirm the LIVE Postgres schema. Source
    `CREATE TABLE` strings can DRIFT from the live DB; never extend a table you haven't
@@ -44,21 +44,21 @@ is logged to `ff_interactions` (the training corpus for ff's own LLM):
 
 | Tool | Use when |
 |------|----------|
-| `detect_changes` | Reviewing code changes — gives risk-scored analysis |
-| `get_review_context` | Need source snippets for review — token-efficient |
-| `get_impact_radius` | Understanding blast radius of a change |
-| `get_affected_flows` | Finding which execution paths are impacted |
-| `query_graph` | Tracing callers, callees, imports, tests, dependencies |
-| `semantic_search_nodes` | Finding functions/classes by name or keyword |
-| `get_architecture_overview` | Understanding high-level codebase structure |
-| `refactor_tool` | Planning renames, finding dead code |
+| `cortex_review` | Reviewing code changes — gives risk-scored analysis |
+| `cortex_show` | Need a symbol definition/snippet — token-efficient |
+| `cortex_impact` | Understanding blast radius of a change |
+| `cortex_callers` | Finding who depends on a symbol |
+| `cortex_callees` | Finding what a symbol calls |
+| `cortex_find` | Finding functions/types by name or intent |
+| `cortex_explain` | Understanding the owning subsystem |
+| `cortex_outline` | Orienting within a file without reading all of it |
 
 ### Workflow
 
 1. The graph auto-updates on file changes (via hooks).
-2. Use `detect_changes` for code review.
-3. Use `get_affected_flows` to understand impact.
-4. Use `query_graph` pattern="tests_for" to check coverage.
+2. Use `cortex_review` for code review.
+3. Use `cortex_impact` to understand blast radius.
+4. Use `cortex_callers` / `cortex_callees` before falling back to file scans.
 
 <!-- ff-build-methodology -->
 ## ForgeFleet build methodology (DEFAULT for every terminal: Claude Code, Codex, Kimi)

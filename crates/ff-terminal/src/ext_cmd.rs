@@ -18,9 +18,7 @@ pub async fn handle_ext_list(pool: &sqlx::PgPool, json: bool) -> Result<()> {
     }
 
     if tools.is_empty() {
-        println!(
-            "{YELLOW}(external_tools is empty — run `ff ext seed` to load config/external_tools.toml){RESET}"
-        );
+        println!("{YELLOW}(external_tools is empty){RESET}");
         return Ok(());
     }
 

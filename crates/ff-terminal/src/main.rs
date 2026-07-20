@@ -615,8 +615,8 @@ enum Command {
     },
     /// External tools — GitHub-hosted CLIs / MCP servers (schema V24).
     ///
-    /// Fleet-wide package manager for dev tools like `code-review-graph`
-    /// and `context-mode`. Tracks what's installed where, checks upstream
+    /// Fleet-wide package manager for GitHub-hosted CLIs and MCP servers
+    /// like `context-mode` and `kimi-cli`. Tracks what's installed where, checks upstream
     /// for new releases, and dispatches installs via the deferred queue.
     Ext {
         #[command(subcommand)]

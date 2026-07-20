@@ -202,21 +202,6 @@ mod tests {
 
     const SAMPLE_TOML: &str = r#"
 [[tool]]
-id = "code-review-graph"
-display_name = "Code Review Graph"
-github_url = "https://github.com/anthropics/code-review-graph"
-kind = "mcp"
-install_method = "cargo_install"
-install_spec = { repo = "anthropics/code-review-graph", bin = "code-review-graph-mcp" }
-cli_entrypoint = "crg"
-mcp_server_command = "code-review-graph-mcp --stdio"
-register_as_mcp = true
-version_source = { method = "github_release", repo = "anthropics/code-review-graph" }
-
-[tool.upgrade_playbook]
-all = "cargo install --git https://github.com/anthropics/code-review-graph --force"
-
-[[tool]]
 id = "context-mode"
 display_name = "Context Mode"
 github_url = "https://github.com/context-mode/context-mode"
@@ -229,6 +214,20 @@ version_source = { method = "github_release", repo = "context-mode/context-mode"
 
 [tool.upgrade_playbook]
 all = "npm install -g @context-mode/mcp@latest"
+
+[[tool]]
+id = "gh-cli"
+display_name = "GitHub CLI"
+github_url = "https://github.com/cli/cli"
+kind = "cli"
+install_method = "binary_release"
+install_spec = { repo = "cli/cli", asset_pattern = "gh_*_linux_amd64.tar.gz" }
+cli_entrypoint = "gh"
+register_as_mcp = false
+version_source = { method = "github_release", repo = "cli/cli" }
+
+[tool.upgrade_playbook]
+linux-ubuntu = "sudo apt-get update && sudo apt-get install -y gh"
 "#;
 
     #[test]
@@ -236,39 +235,37 @@ all = "npm install -g @context-mode/mcp@latest"
         let doc: ExternalToolsFile = toml::from_str(SAMPLE_TOML).expect("parse toml");
         assert_eq!(doc.tool.len(), 2);
 
-        let crg = &doc.tool[0];
-        assert_eq!(crg.id, "code-review-graph");
-        assert_eq!(crg.kind, "mcp");
-        assert_eq!(crg.install_method, "cargo_install");
-        assert_eq!(crg.cli_entrypoint.as_deref(), Some("crg"));
-        assert!(crg.register_as_mcp);
+        let ctx = &doc.tool[0];
+        assert_eq!(ctx.id, "context-mode");
+        assert_eq!(ctx.kind, "mcp");
+        assert_eq!(ctx.install_method, "npm_global");
+        assert_eq!(ctx.cli_entrypoint.as_deref(), Some("context-mode"));
+        assert!(ctx.register_as_mcp);
         assert_eq!(
-            crg.install_spec.get("repo").and_then(|v| v.as_str()),
-            Some("anthropics/code-review-graph")
+            ctx.install_spec.get("package").and_then(|v| v.as_str()),
+            Some("@context-mode/mcp")
         );
         assert_eq!(
-            crg.upgrade_playbook.get("all").and_then(|v| v.as_str()),
-            Some("cargo install --git https://github.com/anthropics/code-review-graph --force")
+            ctx.upgrade_playbook.get("all").and_then(|v| v.as_str()),
+            Some("npm install -g @context-mode/mcp@latest")
         );
 
-        let ctx = &doc.tool[1];
-        assert_eq!(ctx.id, "context-mode");
-        assert_eq!(ctx.install_method, "npm_global");
-        assert!(ctx.mcp_server_command.is_none());
+        let gh = &doc.tool[1];
+        assert_eq!(gh.id, "gh-cli");
+        assert_eq!(gh.install_method, "binary_release");
+        assert_eq!(gh.cli_entrypoint.as_deref(), Some("gh"));
+        assert!(!gh.register_as_mcp);
     }
 
     #[test]
     fn install_spec_round_trips_to_json() {
         let doc: ExternalToolsFile = toml::from_str(SAMPLE_TOML).expect("parse toml");
-        let crg = &doc.tool[0];
-        let js = toml_table_to_json(&crg.install_spec).expect("install_spec to json");
+        let gh = &doc.tool[1];
+        let js = toml_table_to_json(&gh.install_spec).expect("install_spec to json");
+        assert_eq!(js.get("repo").and_then(|v| v.as_str()), Some("cli/cli"));
         assert_eq!(
-            js.get("repo").and_then(|v| v.as_str()),
-            Some("anthropics/code-review-graph")
-        );
-        assert_eq!(
-            js.get("bin").and_then(|v| v.as_str()),
-            Some("code-review-graph-mcp")
+            js.get("asset_pattern").and_then(|v| v.as_str()),
+            Some("gh_*_linux_amd64.tar.gz")
         );
     }
 }
