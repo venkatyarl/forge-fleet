@@ -806,6 +806,15 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     // when a cached row is stale.
     if let Some(pg_pool) = operational_store.pg_pool().cloned() {
         info!("starting subsystem: backend availability detector (1h, per-host)");
+        let startup_pg = pg_pool.clone();
+        let startup_worker = worker_name.clone();
+        subsystem_tasks.push(tokio::spawn(async move {
+            ff_agent::oauth_distributor::validate_startup_and_request_repush(
+                &startup_pg,
+                &startup_worker,
+            )
+            .await;
+        }));
         let detector_worker = worker_name.clone();
         subsystem_tasks.push(ff_agent::tick_registry::TickRegistry::register(
             "backend-detector",
@@ -1661,13 +1670,13 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         }));
     }
 
-    // 20b8) OAuth probe tick — every 6h, leader-gated inside the tick.
+    // 20b8) OAuth native refresh + distribution — hourly, leader-gated.
     if let Some(pg_pool) = operational_store.pg_pool().cloned() {
-        info!("starting subsystem: oauth probe tick (6h, leader-gated)");
+        info!("starting subsystem: oauth refresh tick (1h, leader-gated)");
         subsystem_tasks.push(ff_agent::oauth_distributor::spawn_oauth_probe_tick(
             pg_pool,
             worker_name.clone(),
-            6 * 3600,
+            3600,
             shutdown_rx.clone(),
         ));
     }

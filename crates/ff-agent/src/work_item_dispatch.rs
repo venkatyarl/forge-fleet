@@ -1937,6 +1937,14 @@ async fn run_ff_dispatch(
         .await
         .unwrap_or_default();
     let backends = if routed.is_empty() {
+        let otherwise_dispatchable = ff_db::pg_dispatchable_backends(pg, item.computer_id, 5400)
+            .await
+            .unwrap_or_default();
+        if !otherwise_dispatchable.is_empty() {
+            anyhow::bail!(
+                "all authenticated cloud backends are exhausted or circuit-breaker blocked"
+            );
+        }
         vec!["codex".to_string()]
     } else {
         routed
@@ -2002,7 +2010,10 @@ async fn run_ff_dispatch(
                     break; // try the next routed backend
                 }
             };
-            if out.status.success() {
+            // Exit-0 with no answer is not success. Several vendor CLIs have
+            // emitted auth-expiry diagnostics on stderr while returning zero;
+            // classify that output so the provider is exhausted immediately.
+            if out.status.success() && !out.stdout.is_empty() {
                 let _ =
                     crate::circuit_breaker::record_provider_success(pg, computer_id, backend).await;
                 // Clean run → full headroom signal (self-corrects a prior limit).

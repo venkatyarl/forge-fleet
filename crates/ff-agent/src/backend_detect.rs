@@ -170,6 +170,9 @@ pub fn probe_indicates_unauthenticated(reason: &str) -> bool {
         "credentials expired",
         "token expired",
         "session expired",
+        "refresh token: access revoked",
+        "access_terminated",
+        "oauth session expired and could not be refreshed",
         "please log in",
         "please login",
         "not logged in",
@@ -489,6 +492,13 @@ mod tests {
         ));
         assert!(probe_indicates_unauthenticated("not logged in"));
         assert!(probe_indicates_unauthenticated("Your token expired"));
+        assert!(probe_indicates_unauthenticated(
+            "refresh token: access revoked"
+        ));
+        assert!(probe_indicates_unauthenticated("access_terminated"));
+        assert!(probe_indicates_unauthenticated(
+            "OAuth session expired and could not be refreshed"
+        ));
         // Transient / flaky probes must NOT match — they keep the cred-file
         // benefit of the doubt (a genuinely-authenticated backend blipping).
         assert!(!probe_indicates_unauthenticated("503 service unavailable"));

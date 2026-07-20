@@ -100,6 +100,11 @@ pub const OAUTH_PROVIDERS: &[OauthProvider] = &[
 /// provider per cycle) and ensures peers see new tokens fast.
 pub const REFRESH_POLL_SECS: u64 = 30;
 
+/// Providers whose CLIs own renewable OAuth sessions. Invoking the CLI before
+/// reading its credential file lets its native refresh-token flow run; ff then
+/// copies the resulting complete credential document to peers.
+const AUTO_REFRESH_PROVIDERS: &[&str] = &["claude", "codex", "kimi"];
+
 /// Read the password value of a macOS Keychain generic-password entry
 /// via `security find-generic-password -s <service> -a $USER -w`. Used
 /// by `import_token` when the vendor CLI stores creds in Keychain
@@ -479,6 +484,74 @@ pub async fn probe_all(pool: &PgPool) -> Vec<ProbeResult> {
     out
 }
 
+/// Trigger the provider CLI's native refresh flow, then import and distribute
+/// the complete refreshed credential. Import still runs after a failed probe:
+/// some CLIs rotate credentials before returning a non-zero diagnostic.
+pub async fn refresh_and_distribute(pool: &PgPool, provider: &OauthProvider) -> Result<usize> {
+    let probe = probe_one(pool, provider).await;
+    if probe.status != "ok" {
+        warn!(provider = provider.name, status = %probe.status, detail = ?probe.message,
+            "OAuth native refresh probe did not return cleanly; importing freshest credential anyway");
+    }
+    import_token(pool, provider).await?;
+    distribute_token(pool, provider).await
+}
+
+/// Validate this node's distributed credentials once at daemon startup. A
+/// stale follower asks the current leader for an immediate provider refresh;
+/// the leader-side task is naturally serialized by the fleet task runner.
+pub async fn validate_startup_and_request_repush(pool: &PgPool, worker_name: &str) {
+    if crate::leader_cache::is_current_leader() {
+        return;
+    }
+    let leader = match ff_db::pg_get_current_leader(pool).await {
+        Ok(Some(leader)) => leader,
+        _ => return,
+    };
+    let leader_name: Option<String> =
+        sqlx::query_scalar("SELECT name FROM computers WHERE id = $1")
+            .bind(leader.computer_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let Some(leader_name) = leader_name else {
+        return;
+    };
+    if leader_name == worker_name {
+        return;
+    }
+
+    for name in AUTO_REFRESH_PROVIDERS {
+        let Some(provider) = provider_by_name(name) else {
+            continue;
+        };
+        let probe = probe_one(pool, provider).await;
+        if probe.status == "ok" {
+            continue;
+        }
+        let title = format!("oauth-repush/{} requested-by {worker_name}", provider.name);
+        let command = format!("ff oauth refresh {}", provider.name);
+        if let Err(error) = pg_enqueue_shell_task(
+            pool,
+            &title,
+            &command,
+            &[],
+            Some(&leader_name),
+            None,
+            90,
+            None,
+        )
+        .await
+        {
+            warn!(provider = provider.name, %error, "failed to request OAuth re-push from leader");
+        } else {
+            warn!(provider = provider.name, status = %probe.status,
+                "startup OAuth validation failed; requested leader re-push");
+        }
+    }
+}
+
 /// Leader-gated: spawned unconditionally on every node, but each tick checks
 /// the process-local leader cache and skips unless this node is the current
 /// leader (only the leader probes the shared OAuth credentials).
@@ -498,11 +571,15 @@ pub fn spawn_oauth_probe_tick(
                         continue;
                     }
 
-                    let results = probe_all(&pg).await;
-                    info!(
-                        result_count = results.len(),
-                        "oauth probe tick complete"
-                    );
+                    for name in AUTO_REFRESH_PROVIDERS {
+                        let Some(provider) = provider_by_name(name) else { continue };
+                        match refresh_and_distribute(&pg, provider).await {
+                            Ok(enqueued) => info!(provider = provider.name, enqueued,
+                                "periodic OAuth refresh and distribution complete"),
+                            Err(error) => warn!(provider = provider.name, %error,
+                                "periodic OAuth refresh and distribution failed"),
+                        }
+                    }
                 }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
