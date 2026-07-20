@@ -12,6 +12,12 @@ pub struct AgentConfig {
     pub activity_poll_interval_secs: u64,
     pub task_poll_interval_secs: u64,
     pub activity_override: Option<ActivityLevel>,
+    /// Max wall-clock a build shell-command may run before the background
+    /// timeout monitor kills it. Maps to `max_build_duration` in the fleet
+    /// config (seconds). `0` disables the monitor.
+    pub max_build_duration_secs: u64,
+    /// How often the build timeout monitor scans running builds.
+    pub build_monitor_poll_secs: u64,
     pub log_monitor: LogMonitoringConfig,
 }
 
@@ -43,6 +49,14 @@ impl AgentConfig {
             activity_override: std::env::var("FF_AGENT_ACTIVITY_OVERRIDE")
                 .ok()
                 .and_then(|v| parse_activity_level(&v)),
+            max_build_duration_secs: std::env::var("FF_AGENT_MAX_BUILD_DURATION_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(300),
+            build_monitor_poll_secs: std::env::var("FF_AGENT_BUILD_MONITOR_POLL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(10),
             log_monitor: LogMonitoringConfig::from_env(),
         }
     }
