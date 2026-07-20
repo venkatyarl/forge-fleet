@@ -11344,6 +11344,39 @@ ALTER TABLE work_items
     ADD COLUMN IF NOT EXISTS parked BOOLEAN NOT NULL DEFAULT false;
 "#;
 
+/// V209 — Pollable iCalendar feeds and exactly-once event actions.
+pub const SCHEMA_V209_CALENDAR_MONITORING: &str = r#"
+CREATE TABLE IF NOT EXISTS calendar_monitors (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id            TEXT NOT NULL,
+    name                  TEXT NOT NULL,
+    feed_url              TEXT NOT NULL,
+    task_template         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    lead_time_minutes     INTEGER NOT NULL DEFAULT 15 CHECK (lead_time_minutes >= 0),
+    poll_interval_minutes INTEGER NOT NULL DEFAULT 5 CHECK (poll_interval_minutes > 0),
+    enabled               BOOLEAN NOT NULL DEFAULT true,
+    next_poll_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_polled_at        TIMESTAMPTZ,
+    last_error            TEXT,
+    etag                  TEXT,
+    last_modified         TEXT,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (project_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_calendar_monitors_due
+    ON calendar_monitors (next_poll_at) WHERE enabled;
+
+CREATE TABLE IF NOT EXISTS calendar_event_actions (
+    monitor_id UUID NOT NULL REFERENCES calendar_monitors(id) ON DELETE CASCADE,
+    event_uid  TEXT NOT NULL,
+    event_start TIMESTAMPTZ NOT NULL,
+    task_id    UUID NOT NULL REFERENCES fleet_tasks(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (monitor_id, event_uid, event_start)
+);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

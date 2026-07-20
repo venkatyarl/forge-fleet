@@ -1026,6 +1026,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "work_items_parked",
         sql: schema::SCHEMA_V208_WORK_ITEMS_PARKED,
     },
+    PgMigration {
+        version: 209,
+        name: "calendar_monitoring",
+        sql: schema::SCHEMA_V209_CALENDAR_MONITORING,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

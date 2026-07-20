@@ -707,6 +707,17 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 15a) Calendar monitor — poll due iCalendar feeds and enqueue imminent events.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: calendar monitor (60s, leader-gated)");
+        subsystem_tasks.push(ff_agent::calendar_monitor::spawn_calendar_monitor(
+            pg_pool,
+            worker_name.clone(),
+            60,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 15b) Pillar 4 work_item scheduler — every 10s, leader-gated.
     // Assigns status='ready' work_items to free fleet slots via work_item_leases
     // (reaps stale leases first). Only touches execution-flagged items.

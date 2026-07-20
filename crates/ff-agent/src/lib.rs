@@ -36,6 +36,7 @@ pub mod bash_security;
 // work_items + lease scheduler; its fleet_work_items table was 0-row dead (V153).
 pub mod brain;
 pub mod brain_mirror;
+pub mod calendar_monitor;
 pub mod capability_synthesis;
 pub mod chat_manager;
 pub mod cli_executor;
