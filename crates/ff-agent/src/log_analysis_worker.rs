@@ -363,7 +363,7 @@ pub async fn run_log_analysis_tick(pg: &PgPool, worker_name: &str) -> Result<usi
 }
 
 /// Expand a glob pattern, expanding a leading `~` to the user's home directory.
-fn expand_path_pattern(pattern: &str) -> Vec<PathBuf> {
+pub(crate) fn expand_path_pattern(pattern: &str) -> Vec<PathBuf> {
     let expanded = if let Some(rest) = pattern.strip_prefix("~/") {
         dirs::home_dir()
             .map(|h| h.join(rest).to_string_lossy().to_string())
@@ -383,7 +383,7 @@ fn expand_path_pattern(pattern: &str) -> Vec<PathBuf> {
 /// Normalization collapses variable tokens (timestamps, UUIDs, hex, numbers,
 /// IPs, paths) so the same underlying message groups together across many
 /// occurrences.
-fn normalize_log_line(line: &str, patterns: &[String]) -> Option<String> {
+pub(crate) fn normalize_log_line(line: &str, patterns: &[String]) -> Option<String> {
     let uppercase = line.to_ascii_uppercase();
     if !patterns.iter().any(|p| uppercase.contains(p)) {
         return None;
@@ -400,7 +400,7 @@ fn normalize_log_line(line: &str, patterns: &[String]) -> Option<String> {
 }
 
 /// Replace variable tokens (UUIDs, IPs, hex runs, numbers) with placeholders.
-fn replace_tokens(s: &str) -> String {
+pub(crate) fn replace_tokens(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -513,7 +513,7 @@ fn looks_like_ipv4_at(bytes: &[u8], start: usize) -> bool {
     dots >= 3 && digits >= 4
 }
 
-fn compute_signature(normalized: &str) -> String {
+pub(crate) fn compute_signature(normalized: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(normalized.as_bytes());
     format!("{:x}", hasher.finalize())
