@@ -534,10 +534,25 @@ async fn cloud_cli_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, St
     // and auth-expired fleet-wide in the past, so every backend gets a short
     // cap and loses the race quickly when unhealthy.
     for backend in ["claude", "codex", "kimi"] {
+        let budget = crate::cloud_budget::provider_budget(pg, backend).await;
+        if crate::cloud_budget::is_exhausted(budget.as_ref(), chrono::Utc::now()) {
+            warn!(
+                backend,
+                exhausted_until = ?budget.as_ref().and_then(|row| row.window_exhausted_until),
+                "merge_drain: skipping quota-exhausted cloud reviewer"
+            );
+            continue;
+        }
         match crate::cli_executor::execute_cli(backend, prompt, &[], Some(REVIEW_CLOUD_TIMEOUT))
             .await
         {
             Ok(res) if res.exit_code == 0 && !res.stdout.trim().is_empty() => {
+                crate::cloud_budget::record_success(
+                    pg,
+                    backend,
+                    budget.as_ref().and_then(|row| row.window_exhausted_until),
+                )
+                .await;
                 let (tin, tout) = crate::llm_attribution::parse_cli_token_counts(&format!(
                     "{}\n{}",
                     res.stdout, res.stderr

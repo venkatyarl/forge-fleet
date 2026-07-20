@@ -2639,6 +2639,7 @@ async fn run_ff_dispatch(
     let computer_id = item.computer_id;
     let forced_backend = primary_or_default_backend(&backends);
     let mut attempted_backend = false;
+    let mut quota_skipped_backend = false;
     let mut last_output: Option<(String, Output)> = None;
     // Capture EVERY backend's error so a total failure surfaces WHY for ALL of
     // them (codex + claude + kimi) in the DB `last_error` — not just the last —
@@ -2648,6 +2649,16 @@ async fn run_ff_dispatch(
     let mut backend_errors: Vec<String> = Vec::new();
 
     for backend in &backends {
+        let budget = crate::cloud_budget::provider_budget(pg, backend).await;
+        if crate::cloud_budget::is_exhausted(budget.as_ref(), chrono::Utc::now()) {
+            quota_skipped_backend = true;
+            info!(
+                backend = %backend,
+                exhausted_until = ?budget.as_ref().and_then(|row| row.window_exhausted_until),
+                "run_ff_dispatch: skipping quota-exhausted backend"
+            );
+            continue;
+        }
         if crate::circuit_breaker::is_provider_open(pg, computer_id, backend)
             .await
             .unwrap_or(false)
@@ -2676,6 +2687,12 @@ async fn run_ff_dispatch(
                             pg,
                             computer_id,
                             backend,
+                        )
+                        .await;
+                        crate::cloud_budget::record_success(
+                            pg,
+                            backend,
+                            budget.as_ref().and_then(|row| row.window_exhausted_until),
                         )
                         .await;
                         return Ok((
@@ -2739,11 +2756,16 @@ async fn run_ff_dispatch(
             if out.status.success() {
                 let _ =
                     crate::circuit_breaker::record_provider_success(pg, computer_id, backend).await;
+                crate::cloud_budget::record_success(
+                    pg,
+                    backend,
+                    budget.as_ref().and_then(|row| row.window_exhausted_until),
+                )
+                .await;
                 // Clean run → full headroom signal (self-corrects a prior limit).
                 let _ =
                     crate::circuit_breaker::record_usage_signal(pg, computer_id, backend, 100.0)
                         .await;
-                let _ = crate::cloud_budget::record_success(pg, backend).await;
                 if attempt > 0 || backend != &backends[0] {
                     info!(backend = %backend, attempt, "run_ff_dispatch: recovered via auto-continue/failover");
                 }
@@ -2763,6 +2785,12 @@ async fn run_ff_dispatch(
                 warn!(backend = %backend, code = ?out.status.code(), "run_ff_dispatch: backend exited non-zero but wrote a real diff — salvaging");
                 let _ =
                     crate::circuit_breaker::record_provider_success(pg, computer_id, backend).await;
+                crate::cloud_budget::record_success(
+                    pg,
+                    backend,
+                    budget.as_ref().and_then(|row| row.window_exhausted_until),
+                )
+                .await;
                 return Ok((
                     backend.clone(),
                     synthetic_output("salvaged diff after non-zero backend exit"),
@@ -2817,6 +2845,9 @@ async fn run_ff_dispatch(
         }
     }
     if !attempted_backend {
+        if quota_skipped_backend {
+            bail!("run_ff_dispatch: no dispatchable backend on this node (cloud budget exhausted)");
+        }
         warn!(
             backend = %forced_backend,
             "run_ff_dispatch: all routed backends were skipped before launch; forcing one direct attempt"
@@ -2834,7 +2865,7 @@ async fn run_ff_dispatch(
                     bail!("forced backend {forced_backend} exited successfully with empty stdout");
                 }
                 if out.status.success() {
-                    let _ = crate::cloud_budget::record_success(pg, &forced_backend).await;
+                    crate::cloud_budget::record_success(pg, &forced_backend, None).await;
                 }
                 return Ok((forced_backend, out));
             }
