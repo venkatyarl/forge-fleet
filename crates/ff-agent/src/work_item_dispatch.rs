@@ -1317,6 +1317,23 @@ pub enum DispatchOutcome {
     TimeoutSalvaged,
 }
 
+/// A clean, quick exit with no stdout and no diff is a backend failure: the
+/// task never received a usable agent result. Timeouts without a diff are the
+/// same class regardless of elapsed time.
+fn backend_failed_without_output(
+    timed_out: bool,
+    status_ok: bool,
+    stdout: &[u8],
+    elapsed: Duration,
+    worktree_has_diff: bool,
+) -> bool {
+    !worktree_has_diff
+        && (timed_out
+            || (status_ok
+                && stdout.iter().all(u8::is_ascii_whitespace)
+                && elapsed < Duration::from_secs(30)))
+}
+
 /// Classify a dispatch result into the [`DispatchOutcome`] contract. Pure +
 /// unit-testable. `worktree_has_diff` is the caller's git-status check on the
 /// worktree after the run. A timeout/kill error that nonetheless left a diff is
@@ -1965,11 +1982,17 @@ async fn run_ff_dispatch(
     let routed = ff_db::pg_routed_backends(pg, item.computer_id, 5400)
         .await
         .unwrap_or_default();
-    let backends = if routed.is_empty() {
-        vec!["codex".to_string()]
+    let mut backends = if routed.is_empty() {
+        vec!["claude".to_string(), "codex".to_string()]
     } else {
         routed
     };
+    // Claude is the fast build backstop; loaded nodes can make codex exceed a
+    // short probe even though it succeeds given time.
+    if let Some(index) = backends.iter().position(|backend| backend == "claude") {
+        let claude = backends.remove(index);
+        backends.insert(0, claude);
+    }
     let computer_id = item.computer_id;
     let forced_backend = primary_or_default_backend(&backends);
     let mut attempted_backend = false;
@@ -1992,6 +2015,7 @@ async fn run_ff_dispatch(
         attempted_backend = true;
         let mut attempt: u32 = 0;
         loop {
+            let started = Instant::now();
             let out = match run_backend_cli(backend, &worktree.worktree_path, &prompt).await {
                 Ok(o) => o,
                 Err(e) => {
@@ -2044,9 +2068,31 @@ async fn run_ff_dispatch(
                         "timeout",
                     )
                     .await;
+                    crate::cloud_budget::record_backend_failure(pg, backend).await;
                     break; // try the next routed backend
                 }
             };
+            if backend_failed_without_output(
+                false,
+                out.status.success(),
+                &out.stdout,
+                started.elapsed(),
+                worktree_has_diff(&worktree.worktree_path),
+            ) {
+                warn!(backend = %backend, "run_ff_dispatch: backend exited cleanly with empty stdout and no diff — switching");
+                backend_errors.push(format!(
+                    "{backend}: clean exit with empty stdout and no diff"
+                ));
+                let _ = crate::circuit_breaker::record_provider_failure(
+                    pg,
+                    computer_id,
+                    backend,
+                    "empty_stdout",
+                )
+                .await;
+                crate::cloud_budget::record_backend_failure(pg, backend).await;
+                break;
+            }
             if out.status.success() {
                 let _ =
                     crate::circuit_breaker::record_provider_success(pg, computer_id, backend).await;
@@ -2054,6 +2100,7 @@ async fn run_ff_dispatch(
                 let _ =
                     crate::circuit_breaker::record_usage_signal(pg, computer_id, backend, 100.0)
                         .await;
+                crate::cloud_budget::record_success(pg, backend).await;
                 if attempt > 0 || backend != &backends[0] {
                     info!(backend = %backend, attempt, "run_ff_dispatch: recovered via auto-continue/failover");
                 }
@@ -2095,6 +2142,7 @@ async fn run_ff_dispatch(
                 String::from_utf8_lossy(&out.stderr),
             );
             let class = crate::cloud_error::classify(backend, out.status.code(), &combined);
+            crate::cloud_budget::record_failure(pg, backend, &combined).await;
             let tripped = crate::circuit_breaker::record_provider_failure(
                 pg,
                 computer_id,
