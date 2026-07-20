@@ -1078,6 +1078,12 @@ pub async fn list_local_processes() -> Vec<RunningProcess> {
             continue;
         };
 
+        // The process may exit after `ps` takes its snapshot.  Re-check the PID
+        // before exposing it to `ff model ps` or the deployment reconciler.
+        if !pid_is_alive(pid) {
+            continue;
+        }
+
         // Parse --port <N>
         let port = parse_flag_value(rest, "--port").and_then(|v| v.parse::<u16>().ok());
 
@@ -2082,5 +2088,11 @@ mod tests {
         assert_eq!(parse_flag_value("llama-server --port 1", "--model"), None);
         // Flag present as the final token with no value.
         assert_eq!(parse_flag_value("llama-server --model", "--model"), None);
+    }
+
+    #[test]
+    fn pid_liveness_rejects_a_process_that_is_gone() {
+        assert!(pid_is_alive(std::process::id()));
+        assert!(!pid_is_alive(u32::MAX));
     }
 }
