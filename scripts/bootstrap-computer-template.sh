@@ -175,6 +175,59 @@ if [ "$OS_ID" != "macos" ]; then
   report "hosts" ok
 fi
 
+# ─── 1c. GDM desktop autologin ────────────────────────────────────────────
+# Linger keeps user services alive but does not start the graphical desktop
+# session after reboot. Match established fleet desktop nodes while leaving
+# headless Linux nodes alone (they do not have this GDM configuration file).
+if [ -f /etc/gdm3/custom.conf ]; then
+  report "gdm_autologin" running
+  GDM_CONFIG="/etc/gdm3/custom.conf"
+  GDM_TMP="$(mktemp /tmp/forgefleet-gdm.XXXXXX)"
+  if ! awk -v user="$SUDO_INVOKER" '
+    BEGIN { in_daemon=0; saw_daemon=0; enable_set=0; user_set=0 }
+    function add_missing() {
+      if (!enable_set) print "AutomaticLoginEnable=True"
+      if (!user_set) print "AutomaticLogin=" user
+    }
+    /^\[daemon\][[:space:]]*$/ {
+      saw_daemon=1
+      in_daemon=1
+      print
+      next
+    }
+    /^\[/ {
+      if (in_daemon) add_missing()
+      in_daemon=0
+    }
+    in_daemon && /^[[:space:]]*AutomaticLoginEnable[[:space:]]*=/ {
+      if (!enable_set) print "AutomaticLoginEnable=True"
+      enable_set=1
+      next
+    }
+    in_daemon && /^[[:space:]]*AutomaticLogin[[:space:]]*=/ {
+      if (!user_set) print "AutomaticLogin=" user
+      user_set=1
+      next
+    }
+    { print }
+    END {
+      if (in_daemon) add_missing()
+      if (!saw_daemon) {
+        print ""
+        print "[daemon]"
+        print "AutomaticLoginEnable=True"
+        print "AutomaticLogin=" user
+      }
+    }
+  ' "$GDM_CONFIG" > "$GDM_TMP"; then
+    rm -f "$GDM_TMP"
+    die "failed to configure GDM autologin"
+  fi
+  install -m 0644 "$GDM_TMP" "$GDM_CONFIG"
+  rm -f "$GDM_TMP"
+  report "gdm_autologin" ok "$SUDO_INVOKER"
+fi
+
 # ─── 2. Prerequisites ─────────────────────────────────────────────────────
 
 report "prereqs" running
