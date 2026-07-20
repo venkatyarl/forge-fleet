@@ -4951,6 +4951,9 @@ async fn main() -> Result<()> {
                             .map(|p| p.to_string_lossy().to_string())
                             .collect();
                     }
+                    // Explicit `ff session export` invocation always runs, regardless
+                    // of the daemon-gating enabled flag in fleet.toml.
+                    config.session_export.enabled = true;
 
                     let tmp_vault: Option<tempfile::TempDir> = if dry_run {
                         let tmp = tempfile::tempdir()?;

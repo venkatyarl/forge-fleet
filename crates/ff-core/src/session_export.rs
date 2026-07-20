@@ -184,16 +184,10 @@ fn process_source_dir(
         return Ok(ExportResult::default());
     }
 
-    let project_folder = project_folder_for_source_dir(source_dir);
     let mut result = ExportResult::default();
 
-    for entry in fs::read_dir(source_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-            continue;
-        }
-
+    for path in find_jsonl_files(source_dir) {
+        let project_folder = project_folder_for_jsonl(source_dir, &path);
         let session_id = path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -603,6 +597,40 @@ fn extract_part_index(path: &Path) -> Option<usize> {
 
 fn count_redactions(redacted: &str) -> usize {
     redacted.matches("[REDACTED-").count()
+}
+
+fn find_jsonl_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if !dir.is_dir() {
+        return out;
+    }
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = match fs::read_dir(&current) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn project_folder_for_jsonl(source_dir: &Path, jsonl: &Path) -> String {
+    jsonl
+        .parent()
+        .filter(|p| p != &source_dir)
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| project_folder_for_source_dir(source_dir))
 }
 
 fn project_folder_for_source_dir(source_dir: &Path) -> String {

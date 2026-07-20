@@ -329,8 +329,10 @@ def export_sessions(vault_dir: Path, source_dirs: list[str], computer_name: str)
         source_dir = Path(raw_dir).expanduser()
         if not source_dir.is_dir():
             continue
-        project_folder = source_dir.name or "unknown"
-        for path in sorted(source_dir.glob("*.jsonl")):
+        for path in sorted(source_dir.rglob("*.jsonl")):
+            project_folder = (
+                path.parent.name if path.parent != source_dir else source_dir.name
+            ) or "unknown"
             exported, redactions = process_jsonl(
                 path, vault_dir, project_folder, computer_name, cursor
             )
