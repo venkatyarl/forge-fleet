@@ -469,6 +469,7 @@ pub async fn index_langs_incremental(
                 .bind(fid)
                 .execute(pool)
                 .await?;
+                storage::mirror_delete_edges(pool, &[fid], &["imports"]).await;
             }
             sqlx::query("DELETE FROM cortex_file_index WHERE corpus_slug = $1 AND file_path = $2")
                 .bind(corpus_slug)
@@ -592,19 +593,21 @@ pub async fn index_langs_incremental(
 /// can legitimately have no incoming `calls` edge (entrypoints, dead-but-defined) —
 /// are never touched. Returns the number of nodes deleted.
 async fn gc_orphan_placeholders(pool: &PgPool, corpus_slug: &str) -> Result<usize> {
-    let res = sqlx::query(
+    let deleted: Vec<Uuid> = sqlx::query_scalar(
         r#"DELETE FROM brain_vault_nodes
             WHERE project = $1
               AND node_type IN ('code:extern', 'code:import')
               AND NOT EXISTS (
                   SELECT 1 FROM brain_vault_edges e
                    WHERE e.dst_id = brain_vault_nodes.id
-              )"#,
+              )
+            RETURNING id"#,
     )
     .bind(corpus_slug)
-    .execute(pool)
+    .fetch_all(pool)
     .await?;
-    Ok(res.rows_affected() as usize)
+    storage::mirror_delete_nodes(pool, &deleted).await;
+    Ok(deleted.len())
 }
 
 /// Idempotency: drop all prior code:* nodes for this corpus (edges cascade).
@@ -616,6 +619,7 @@ async fn wipe_code_nodes(pool: &PgPool, corpus_slug: &str) -> Result<()> {
     .bind(corpus_slug)
     .execute(pool)
     .await?;
+    storage::mirror_wipe_code_nodes(pool, corpus_slug).await;
     Ok(())
 }
 
@@ -1012,6 +1016,7 @@ async fn remove_code_symbols(pool: &PgPool, ids: &[Uuid]) -> Result<()> {
         .bind(&demote)
         .execute(pool)
         .await?;
+        storage::mirror_demote_nodes(pool, &demote).await;
         // An extern never calls out — drop any outgoing edges the old symbol had
         // (a deleted file's symbols still carry theirs at this point).
         delete_outgoing_edges(pool, &demote).await?;
@@ -1075,6 +1080,7 @@ async fn delete_outgoing_edges(pool: &PgPool, src_ids: &[Uuid]) -> Result<()> {
     .bind(src_ids)
     .execute(pool)
     .await?;
+    storage::mirror_delete_outgoing_edges(pool, src_ids).await;
     Ok(())
 }
 
@@ -1087,6 +1093,7 @@ async fn delete_nodes_by_id(pool: &PgPool, ids: &[Uuid]) -> Result<()> {
         .bind(ids)
         .execute(pool)
         .await?;
+    storage::mirror_delete_nodes(pool, ids).await;
     Ok(())
 }
 
@@ -4555,6 +4562,22 @@ async fn upsert_code_node(
     .bind(provenance)
     .fetch_one(pool)
     .await?;
+    storage::mirror_node_upsert(
+        pool,
+        id,
+        storage::CortexGraphNode {
+            path: path.to_string(),
+            title: title.to_string(),
+            node_type: node_type.to_string(),
+            project: project.to_string(),
+            start_line,
+            end_line,
+            generation,
+            confidence,
+            provenance: provenance.to_string(),
+        },
+    )
+    .await;
     Ok(id)
 }
 
@@ -4627,6 +4650,20 @@ async fn add_edge_with_metadata(
     .bind(generation)
     .fetch_one(pool)
     .await?;
+    storage::mirror_edge_upsert(
+        pool,
+        storage::CortexGraphEdge {
+            src_id: src,
+            dst_id: dst,
+            edge_type: edge_type.to_string(),
+            generation,
+            confidence,
+            provenance: provenance.to_string(),
+            method: method.map(str::to_string),
+            evidence: evidence.cloned(),
+        },
+    )
+    .await;
     Ok(inserted)
 }
 
@@ -4682,6 +4719,20 @@ async fn add_call_edge(
     .bind(generation)
     .execute(pool)
     .await?;
+    storage::mirror_edge_upsert(
+        pool,
+        storage::CortexGraphEdge {
+            src_id: src,
+            dst_id: dst,
+            edge_type: "calls".to_string(),
+            generation,
+            confidence,
+            provenance: "cortex".to_string(),
+            method: Some(method.to_string()),
+            evidence: None,
+        },
+    )
+    .await;
     Ok(())
 }
 

@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 const FALKOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -183,6 +184,7 @@ impl CortexGraphStore for PostgresCortexGraphStore {
         .bind(node_id)
         .execute(&self.pool)
         .await?;
+        mirror_embedding(&self.pool, node_id, embedding).await;
         Ok(())
     }
 
@@ -270,9 +272,8 @@ impl CortexGraphStore for PostgresCortexGraphStore {
     }
 }
 
-/// FalkorDB/OpenCypher implementation. Reads use the read-only Redis command
-/// `GRAPH.RO_QUERY`; the phase-2 write methods remain available only as an
-/// un-routed scaffold and are never selected by [`CortexReadRouter`].
+/// FalkorDB/OpenCypher implementation. Reads use `GRAPH.RO_QUERY`; opt-in
+/// best-effort mirrors use `GRAPH.QUERY` after the authoritative Postgres write.
 #[derive(Clone)]
 pub struct FalkorCortexGraphStore {
     connection: ConnectionManager,
@@ -291,12 +292,41 @@ impl FalkorCortexGraphStore {
 
     async fn graph_query(&self, cypher: &str) -> Result<redis::Value> {
         let mut conn = self.connection.clone();
-        let value = redis::cmd("GRAPH.QUERY")
-            .arg(&self.graph_name)
-            .arg(cypher)
-            .query_async(&mut conn)
-            .await?;
+        let value = tokio::time::timeout(
+            FALKOR_TIMEOUT,
+            redis::cmd("GRAPH.QUERY")
+                .arg(&self.graph_name)
+                .arg(cypher)
+                .arg("TIMEOUT")
+                .arg(FALKOR_TIMEOUT.as_millis() as u64)
+                .query_async(&mut conn),
+        )
+        .await
+        .context("FalkorDB write timed out")??;
         Ok(value)
+    }
+
+    async fn upsert_node_with_id(&self, id: Uuid, node: &CortexGraphNode) -> Result<()> {
+        let query = format!(
+            "MERGE (n:CortexNode {{path: {path}}}) \
+             SET n.id = {id}, n.title = {title}, n.node_type = {node_type}, \
+                 n.project = {project}, n.start_line = {start_line}, \
+                 n.end_line = {end_line}, n.generation = {generation}, \
+                 n.confidence = {confidence}, n.provenance = {provenance}, \
+                 n.valid_until = NULL",
+            path = cypher_string(&node.path),
+            id = cypher_string(&id.to_string()),
+            title = cypher_string(&node.title),
+            node_type = cypher_string(&node.node_type),
+            project = cypher_string(&node.project),
+            start_line = cypher_optional_i32(node.start_line),
+            end_line = cypher_optional_i32(node.end_line),
+            generation = node.generation,
+            confidence = finite_f32(node.confidence)?,
+            provenance = cypher_string(&node.provenance),
+        );
+        self.graph_query(&query).await?;
+        Ok(())
     }
 
     async fn graph_read(&self, cypher: &str) -> Result<Vec<Vec<redis::Value>>> {
@@ -400,7 +430,19 @@ ORDER BY symbol.start_line, symbol.title
 "#;
 
 fn cypher_string(value: &str) -> String {
-    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+    format!(
+        "'{}'",
+        value
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
+    )
+}
+
+fn cypher_optional_i32(value: Option<i32>) -> String {
+    value.map_or_else(|| "NULL".to_string(), |value| value.to_string())
 }
 
 fn stable_uuid_from_path(path: &str) -> Uuid {
@@ -408,6 +450,26 @@ fn stable_uuid_from_path(path: &str) -> Uuid {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&hash[..16]);
     Uuid::from_bytes(bytes)
+}
+
+fn finite_f32(value: f32) -> Result<String> {
+    if !value.is_finite() {
+        anyhow::bail!("non-finite float cannot be written to FalkorDB");
+    }
+    Ok(value.to_string())
+}
+
+fn cypher_relationship_type(value: &str) -> Result<&str> {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && value.as_bytes()[0].is_ascii_alphabetic()
+    {
+        Ok(value)
+    } else {
+        anyhow::bail!("invalid FalkorDB relationship type {value:?}")
+    }
 }
 
 fn decode_rows(value: redis::Value) -> Result<Vec<Vec<redis::Value>>> {
@@ -513,36 +575,12 @@ impl CortexGraphStore for FalkorCortexGraphStore {
 
     async fn upsert_node(&self, node: &CortexGraphNode) -> Result<Uuid> {
         let id = stable_uuid_from_path(&node.path);
-        let query = format!(
-            "MERGE (n:CortexNode {{path: {path}}}) \
-             SET n.id = {id}, n.title = {title}, n.node_type = {node_type}, \
-                 n.project = {project}, n.start_line = {start_line}, \
-                 n.end_line = {end_line}, n.generation = {generation}, \
-                 n.confidence = {confidence}, n.provenance = {provenance}, \
-                 n.valid_until = NULL \
-             RETURN n.id",
-            path = cypher_string(&node.path),
-            id = cypher_string(&id.to_string()),
-            title = cypher_string(&node.title),
-            node_type = cypher_string(&node.node_type),
-            project = cypher_string(&node.project),
-            start_line = node
-                .start_line
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "NULL".to_string()),
-            end_line = node
-                .end_line
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "NULL".to_string()),
-            generation = node.generation,
-            confidence = node.confidence,
-            provenance = cypher_string(&node.provenance),
-        );
-        self.graph_query(&query).await?;
+        self.upsert_node_with_id(id, node).await?;
         Ok(id)
     }
 
     async fn add_edge(&self, edge: &CortexGraphEdge) -> Result<bool> {
+        let edge_type = cypher_relationship_type(&edge.edge_type)?;
         let query = format!(
             "MATCH (s:CortexNode {{id: {src}}}), (d:CortexNode {{id: {dst}}}) \
              MERGE (s)-[e:{edge_type}]->(d) \
@@ -551,8 +589,8 @@ impl CortexGraphStore for FalkorCortexGraphStore {
              RETURN id(e)",
             src = cypher_string(&edge.src_id.to_string()),
             dst = cypher_string(&edge.dst_id.to_string()),
-            edge_type = edge.edge_type,
-            confidence = edge.confidence,
+            edge_type = edge_type,
+            confidence = finite_f32(edge.confidence)?,
             provenance = cypher_string(&edge.provenance),
             method = edge
                 .method
@@ -582,8 +620,8 @@ impl CortexGraphStore for FalkorCortexGraphStore {
     async fn store_embedding(&self, node_id: Uuid, embedding: &[f32]) -> Result<()> {
         let vector = embedding
             .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
+            .map(|value| finite_f32(*value))
+            .collect::<Result<Vec<_>>>()?
             .join(", ");
         let query = format!(
             "MATCH (n:CortexNode {{id: {}}}) SET n.embedding = vecf32([{}]) RETURN n.id",
@@ -884,9 +922,203 @@ impl CortexGraphStore for FalkorCortexGraphStore {
     }
 }
 
-/// Opt-in read router. Writes always remain on Postgres in phase 1; FalkorDB is
-/// attempted only when `CORTEX_GRAPH_BACKEND=falkordb`, and every failed read
-/// is transparently retried against Postgres.
+static FALKOR_WRITE_STORE: OnceCell<Option<FalkorCortexGraphStore>> = OnceCell::const_new();
+
+async fn fleet_setting(pool: &PgPool, key: &str) -> Option<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT value FROM fleet_secrets WHERE key = $1 AND disabled_reason IS NULL",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+}
+
+fn enabled_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "falkordb"
+    )
+}
+
+async fn falkor_write_store(pool: &PgPool) -> Option<&'static FalkorCortexGraphStore> {
+    FALKOR_WRITE_STORE
+        .get_or_init(|| async {
+            let backend = std::env::var("CORTEX_GRAPH_BACKEND").ok();
+            let dual_write = std::env::var("CORTEX_DUAL_WRITE").ok();
+            let enabled = backend.as_deref() == Some("falkordb")
+                || dual_write.as_deref().is_some_and(enabled_value)
+                || fleet_setting(pool, "cortex.graph_backend").await.as_deref()
+                    == Some("falkordb")
+                || fleet_setting(pool, "cortex.dual_write")
+                    .await
+                    .as_deref()
+                    .is_some_and(enabled_value);
+            if !enabled {
+                return None;
+            }
+
+            let result = async {
+                let url = match std::env::var("FALKORDB_URL") {
+                    Ok(url) => url,
+                    Err(_) => fleet_setting(pool, "falkordb.url")
+                        .await
+                        .context("FalkorDB dual-write requires FALKORDB_URL or fleet_secrets falkordb.url")?,
+                };
+                let graph = std::env::var("FALKORDB_GRAPH")
+                    .ok()
+                    .or(fleet_setting(pool, "falkordb.graph").await)
+                    .unwrap_or_else(|| "cortex".to_string());
+                let client = redis::Client::open(url).context("open FalkorDB Redis client")?;
+                let connection = tokio::time::timeout(FALKOR_TIMEOUT, ConnectionManager::new(client))
+                    .await
+                    .context("FalkorDB connection timed out")?
+                    .context("connect to FalkorDB")?;
+                Ok::<_, anyhow::Error>(FalkorCortexGraphStore::new(
+                    connection,
+                    graph,
+                    pool.clone(),
+                ))
+            }
+            .await;
+            match result {
+                Ok(store) => Some(store),
+                Err(error) => {
+                    tracing::warn!(%error, "FalkorDB Cortex dual-write unavailable; Postgres remains authoritative");
+                    None
+                }
+            }
+        })
+        .await
+        .as_ref()
+}
+
+async fn best_effort_write<F>(pool: &PgPool, operation: &'static str, write: F)
+where
+    F: for<'a> FnOnce(
+        &'a FalkorCortexGraphStore,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>,
+    >,
+{
+    let Some(store) = falkor_write_store(pool).await else {
+        return;
+    };
+    if let Err(error) = write(store).await {
+        tracing::warn!(%error, operation, "FalkorDB Cortex dual-write failed; Postgres write retained");
+    }
+}
+
+pub(super) async fn mirror_node_upsert(pool: &PgPool, id: Uuid, node: CortexGraphNode) {
+    best_effort_write(pool, "upsert_node", move |store| {
+        Box::pin(async move { store.upsert_node_with_id(id, &node).await })
+    })
+    .await;
+}
+
+pub(super) async fn mirror_edge_upsert(pool: &PgPool, edge: CortexGraphEdge) {
+    best_effort_write(pool, "add_edge", move |store| {
+        Box::pin(async move { store.add_edge(&edge).await.map(|_| ()) })
+    })
+    .await;
+}
+
+pub(super) async fn mirror_wipe_code_nodes(pool: &PgPool, corpus_slug: &str) {
+    let corpus_slug = corpus_slug.to_string();
+    best_effort_write(pool, "wipe_code_nodes", move |store| {
+        Box::pin(async move { store.wipe_code_nodes(&corpus_slug).await })
+    })
+    .await;
+}
+
+fn uuid_list(ids: &[Uuid]) -> String {
+    ids.iter()
+        .map(|id| cypher_string(&id.to_string()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub(super) async fn mirror_delete_nodes(pool: &PgPool, ids: &[Uuid]) {
+    if ids.is_empty() {
+        return;
+    }
+    let ids = uuid_list(ids);
+    best_effort_write(pool, "delete_nodes", move |store| {
+        Box::pin(async move {
+            store
+                .graph_query(&format!(
+                    "MATCH (n:CortexNode) WHERE n.id IN [{ids}] DETACH DELETE n"
+                ))
+                .await?;
+            Ok(())
+        })
+    })
+    .await;
+}
+
+pub(super) async fn mirror_delete_outgoing_edges(pool: &PgPool, ids: &[Uuid]) {
+    mirror_delete_edges(pool, ids, &["calls", "contains", "imports"]).await;
+}
+
+pub(super) async fn mirror_delete_edges(pool: &PgPool, ids: &[Uuid], edge_types: &[&str]) {
+    if ids.is_empty() {
+        return;
+    }
+    let ids = uuid_list(ids);
+    let edge_types = match edge_types
+        .iter()
+        .map(|value| cypher_relationship_type(value))
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(values) => values.join("|"),
+        Err(error) => {
+            tracing::warn!(%error, "invalid Cortex edge type; skipping FalkorDB mirror delete");
+            return;
+        }
+    };
+    best_effort_write(pool, "delete_outgoing_edges", move |store| {
+        Box::pin(async move {
+            store
+                .graph_query(&format!(
+                    "MATCH (n:CortexNode)-[e:{edge_types}]->() WHERE n.id IN [{ids}] DELETE e"
+                ))
+                .await?;
+            Ok(())
+        })
+    })
+    .await;
+}
+
+pub(super) async fn mirror_demote_nodes(pool: &PgPool, ids: &[Uuid]) {
+    if ids.is_empty() {
+        return;
+    }
+    let ids = uuid_list(ids);
+    best_effort_write(pool, "demote_nodes", move |store| {
+        Box::pin(async move {
+            store
+                .graph_query(&format!(
+                    "MATCH (n:CortexNode) WHERE n.id IN [{ids}] SET n.node_type = 'code:extern', n.start_line = NULL, n.end_line = NULL, n.embedding = NULL"
+                ))
+                .await?;
+            Ok(())
+        })
+    })
+    .await;
+}
+
+pub(crate) async fn mirror_embedding(pool: &PgPool, node_id: Uuid, embedding: &[f32]) {
+    let embedding = embedding.to_vec();
+    best_effort_write(pool, "store_embedding", move |store| {
+        Box::pin(async move { store.store_embedding(node_id, &embedding).await })
+    })
+    .await;
+}
+
+/// Opt-in read router. FalkorDB is attempted only when
+/// `CORTEX_GRAPH_BACKEND=falkordb`, and every failed read is transparently
+/// retried against Postgres.
 pub struct CortexReadRouter {
     postgres: PostgresCortexGraphStore,
     falkor: Option<FalkorCortexGraphStore>,
@@ -1138,7 +1370,7 @@ mod tests {
 
     #[test]
     fn cypher_literals_escape_user_input() {
-        assert_eq!(cypher_string("a'b\\c"), "'a\\'b\\\\c'");
+        assert_eq!(cypher_string("a'b\\c\n"), "'a\\'b\\\\c\\n'");
         let predicate = selector_predicate("n", "forge-fleet", "a'b");
         assert!(predicate.contains("n.project = 'forge-fleet'"));
         assert!(predicate.contains("n.title = 'a\\'b'"));
@@ -1147,5 +1379,19 @@ mod tests {
     #[test]
     fn malformed_graph_response_is_rejected() {
         assert!(decode_rows(redis::Value::Int(1)).is_err());
+    }
+
+    #[test]
+    fn relationship_types_cannot_inject_cypher() {
+        assert_eq!(cypher_relationship_type("calls_2").unwrap(), "calls_2");
+        assert!(cypher_relationship_type("calls]->() DELETE n //").is_err());
+        assert!(cypher_relationship_type("2calls").is_err());
+    }
+
+    #[test]
+    fn non_finite_graph_numbers_are_rejected() {
+        assert!(finite_f32(f32::NAN).is_err());
+        assert!(finite_f32(f32::INFINITY).is_err());
+        assert_eq!(finite_f32(0.6).unwrap(), "0.6");
     }
 }

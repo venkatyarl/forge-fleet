@@ -267,7 +267,10 @@ where
             .execute(pool)
             .await
             {
-                Ok(_) => stats.embedded += 1,
+                Ok(_) => {
+                    stats.embedded += 1;
+                    crate::cortex::storage::mirror_embedding(pool, *id, vec).await;
+                }
                 Err(e) => {
                     tracing::warn!(node = %id, "store embedding failed: {e}");
                     stats.failed += 1;
