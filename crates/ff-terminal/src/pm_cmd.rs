@@ -1059,11 +1059,29 @@ fn validate_decomposition(
             if let Some(tracked) = &tracked
                 && !tracked.contains(file)
             {
-                return Err(anyhow::anyhow!(
-                    "decomposition quality gate: '{}' references untracked file '{}'",
-                    task.title,
-                    file
-                ));
+                // A greenfield feature task may legitimately CREATE a new file.
+                // Only reject an untracked reference whose parent directory has NO
+                // tracked files — that indicates a hallucinated path in a
+                // nonexistent module. A new file inside a real, existing directory
+                // is a valid create-target and must be allowed.
+                let dir = std::path::Path::new(file)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let parent_has_tracked = dir.is_empty()
+                    || tracked.iter().any(|t| {
+                        std::path::Path::new(t)
+                            .parent()
+                            .map(|tp| tp.to_string_lossy() == dir)
+                            .unwrap_or(false)
+                    });
+                if !parent_has_tracked {
+                    return Err(anyhow::anyhow!(
+                        "decomposition quality gate: '{}' references file '{}' in a nonexistent directory (likely hallucinated)",
+                        task.title,
+                        file
+                    ));
+                }
             }
             if !claimed.insert(file.clone()) {
                 return Err(anyhow::anyhow!(
