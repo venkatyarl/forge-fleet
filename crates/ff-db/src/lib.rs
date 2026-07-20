@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 pub mod dsn_of_record;
 pub mod leader_state;
+pub mod metrics_partitions;
 pub mod migrations;
 pub mod operational_store;
 pub mod pm;
@@ -26,6 +27,7 @@ pub mod work_queue;
 
 pub use leader_state::*;
 
+pub use metrics_partitions::{pg_drop_expired_metrics_partitions, pg_ensure_metrics_partitions};
 pub use migrations::run_postgres_migrations;
 pub use operational_store::OperationalStore;
 pub use queries::{
