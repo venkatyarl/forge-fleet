@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 pub mod dsn_of_record;
 pub mod leader_state;
+pub mod metrics_partitions;
 pub mod migrations;
 pub mod operational_store;
 pub mod pm;
@@ -26,12 +27,15 @@ pub mod work_queue;
 
 pub use leader_state::*;
 
+pub use metrics_partitions::{pg_drop_expired_metrics_partitions, pg_ensure_metrics_partitions};
 pub use migrations::run_postgres_migrations;
 pub use operational_store::OperationalStore;
 pub use queries::{
     AgentReadinessRow,
     // Resource arbiter (V119)
     ArbiterReservedHost,
+    // Fleet artifact cache index (V171)
+    ArtifactIndexRow,
     BrainCandidateRow,
     BrainCommunityRow,
     BrainMessageRow,
@@ -53,6 +57,9 @@ pub use queries::{
     DemandVector,
     // Fleet dispatch outcome feedback (roadmap #8)
     DispatchOutcomeStat,
+    // V178 model-server error events
+    ErrorEventInsert,
+    ErrorEventRow,
     // Fleet agents catalog (V112)
     FleetAgentRow,
     FleetModelRow,
@@ -122,6 +129,7 @@ pub use queries::{
     // Orchestrator P2 — demand sensing (V116)
     pg_current_demand_vector,
     pg_deferred_stats,
+    pg_delete_artifact_index,
     pg_delete_deployment,
     pg_delete_library,
     pg_delete_mesh_status_for_node,
@@ -139,6 +147,7 @@ pub use queries::{
     pg_force_cancel_deferred,
     pg_free_slots,
     pg_get_agent,
+    pg_get_artifact_index,
     pg_get_attached_thread,
     pg_get_benchmark_results,
     pg_get_brain_thread,
@@ -162,6 +171,7 @@ pub use queries::{
     pg_insert_brain_reminder,
     pg_insert_disk_policy_run,
     pg_insert_disk_usage,
+    pg_insert_error_event,
     pg_insert_node_ssh_key,
     pg_insert_work_intent,
     // Interaction log (V121 ff_interactions)
@@ -170,6 +180,7 @@ pub use queries::{
     pg_latest_demand_snapshot,
     pg_latest_disk_usage,
     pg_list_agents,
+    pg_list_artifact_index,
     pg_list_brain_candidates_pending,
     pg_list_brain_communities,
     pg_list_brain_messages,
@@ -180,6 +191,7 @@ pub use queries::{
     pg_list_deferred,
     pg_list_deployments,
     pg_list_due_reminders,
+    pg_list_error_events,
     pg_list_interactions,
     pg_list_jobs,
     pg_list_library,
@@ -246,11 +258,13 @@ pub use queries::{
     pg_supplied_slots_by_kind,
     pg_touch_brain_thread,
     pg_unreserve_host,
+    pg_update_artifact_index_holders,
     pg_update_brain_candidate_status,
     pg_update_disk_move,
     pg_update_job_progress,
     pg_update_training_job_status,
     pg_upsert_agent,
+    pg_upsert_artifact_index,
     pg_upsert_brain_community,
     pg_upsert_brain_vault_edge,
     pg_upsert_brain_vault_node,
