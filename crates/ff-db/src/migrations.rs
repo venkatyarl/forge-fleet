@@ -896,6 +896,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "work_item_events_trigger",
         sql: schema::SCHEMA_V182_WORK_ITEM_EVENTS_TRIGGER,
     },
+    PgMigration {
+        version: 183,
+        name: "artifact_cache_index",
+        sql: schema::SCHEMA_V183_ARTIFACT_CACHE_INDEX,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

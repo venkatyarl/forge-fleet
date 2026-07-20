@@ -606,20 +606,64 @@ impl Materializer {
         // NOT NULL and absent from beats), which is why this is an UPDATE
         // keyed on id rather than an INSERT .. ON CONFLICT: an unknown
         // computer must stay an UnknownComputer error, not auto-enroll.
-        sqlx::query(UPSERT_COMPUTER_ROW_SQL)
-            .bind(computer_id)
-            .bind(new_ips_json)
-            .bind(beat.hardware.cpu_cores)
-            .bind(beat.hardware.ram_gb)
-            .bind(beat.hardware.disk_gb)
-            .bind(&beat.capabilities.gpu_kind)
-            .bind(beat.capabilities.gpu_count)
-            .bind(beat.capabilities.gpu_total_vram_gb)
-            .bind(&beat.network.primary_ip)
-            .execute(&self.pg)
-            .await?;
-        report.wrote_computer_row =
-            persistent_fields_changed(ips_differ, hw_differ, cap_differ, primary_ip_differ);
+        //
+        // Guard: a skeleton/degenerate beat (empty primary_ip, or
+        // ram_gb <= 0 — e.g. a daemon publishing before hardware probing
+        // finished) must not be allowed to clobber a previously-good row
+        // with empty values. Reject the whole persistent-field write in
+        // that case and fall back to a last_seen_at-only touch; the next
+        // beat with real hardware data will apply on the normal delta path.
+        if computer_row_has_empty_node_attributes(
+            Some(beat.network.primary_ip.as_str()),
+            Some(beat.hardware.ram_gb),
+        ) {
+            warn!(
+                computer = %beat.computer_name,
+                primary_ip = %beat.network.primary_ip,
+                ram_gb = beat.hardware.ram_gb,
+                "materializer: beat has empty primary_ip or non-positive ram_gb; \
+                 rejecting computers-row upsert to avoid corrupting persisted values"
+            );
+            sqlx::query("UPDATE computers SET last_seen_at = NOW() WHERE id = $1")
+                .bind(computer_id)
+                .execute(&self.pg)
+                .await?;
+        } else {
+            // Track transient empty writes: primary_ip/ram are already gated
+            // above, but a partially-probed beat can still carry an empty
+            // all_ips / zero cpu_cores / zero disk / empty gpu_kind that this
+            // (non-rejected) write persists onto the row. Log the exact column
+            // set so the "computers row briefly went empty" drift is traceable
+            // to the beat that caused it.
+            let empty_fields = empty_persistent_beat_fields(beat, new_ips_json);
+            if !empty_fields.is_empty() {
+                warn!(
+                    computer = %beat.computer_name,
+                    empty_fields = ?empty_fields,
+                    primary_ip = %beat.network.primary_ip,
+                    all_ips = %new_ips_json,
+                    cpu_cores = beat.hardware.cpu_cores,
+                    ram_gb = beat.hardware.ram_gb,
+                    disk_gb = beat.hardware.disk_gb,
+                    gpu_kind = %beat.capabilities.gpu_kind,
+                    "materializer: updating computers row with empty persistent value(s)"
+                );
+            }
+            sqlx::query(UPSERT_COMPUTER_ROW_SQL)
+                .bind(computer_id)
+                .bind(new_ips_json)
+                .bind(beat.hardware.cpu_cores)
+                .bind(beat.hardware.ram_gb)
+                .bind(beat.hardware.disk_gb)
+                .bind(&beat.capabilities.gpu_kind)
+                .bind(beat.capabilities.gpu_count)
+                .bind(beat.capabilities.gpu_total_vram_gb)
+                .bind(&beat.network.primary_ip)
+                .execute(&self.pg)
+                .await?;
+            report.wrote_computer_row =
+                persistent_fields_changed(ips_differ, hw_differ, cap_differ, primary_ip_differ);
+        }
 
         // Always keep fleet_workers.ip in sync with the heartbeat's
         // primary_ip — this is the worker-role registry (V83 rename from
@@ -641,15 +685,16 @@ impl Materializer {
         // at the 8GB/4-core enrollment placeholder while `computers` carried the
         // real hardware (marcus is 31GB/12c). Wrong specs make the autoscaler /
         // placement skip these nodes — why so many sat with no model. Guard each
-        // with `$N > 0` so a degenerate beat can't zero a good value.
+        // with `$N > 0` (and ip with `$1 <> ''`) so a degenerate beat can't zero
+        // a good value.
         match sqlx::query(
             "UPDATE fleet_workers SET \
-                 ip = $1, \
+                 ip = CASE WHEN $1 <> '' THEN $1 ELSE ip END, \
                  ram_gb = CASE WHEN $3 > 0 THEN $3 ELSE ram_gb END, \
                  cpu_cores = CASE WHEN $4 > 0 THEN $4 ELSE cpu_cores END, \
                  updated_at = NOW() \
              WHERE name = $2 AND ( \
-                 ip <> $1 \
+                 ($1 <> '' AND ip <> $1) \
                  OR ($3 > 0 AND ram_gb IS DISTINCT FROM $3) \
                  OR ($4 > 0 AND cpu_cores IS DISTINCT FROM $4))",
         )
@@ -1536,6 +1581,38 @@ fn computer_row_has_empty_node_attributes(primary_ip: Option<&str>, ram_gb: Opti
     primary_ip.is_none_or(str::is_empty) || ram_gb.is_none_or(|ram| ram <= 0)
 }
 
+/// Names of the persistent `computers` columns whose incoming beat value is
+/// empty/zero. Used only for observability: a beat that fails
+/// `computer_row_has_empty_node_attributes` (empty primary_ip or non-positive
+/// ram) is rejected upstream, but the remaining persistent columns
+/// (`all_ips`, `cpu_cores`, `total_disk_gb`, `gpu_kind`) can still be written
+/// empty by a partially-probed beat — a daemon that finished IP+RAM probing
+/// but not disk/GPU enumeration. Those transient empty writes were previously
+/// invisible; logging the exact column set makes the "row briefly went empty"
+/// class of drift traceable to the beat that caused it.
+fn empty_persistent_beat_fields(beat: &PulseBeatV2, all_ips_json: &str) -> Vec<&'static str> {
+    let mut empty = Vec::new();
+    if beat.network.primary_ip.is_empty() {
+        empty.push("primary_ip");
+    }
+    if normalize_json(all_ips_json) == "[]" {
+        empty.push("all_ips");
+    }
+    if beat.hardware.cpu_cores <= 0 {
+        empty.push("cpu_cores");
+    }
+    if beat.hardware.ram_gb <= 0 {
+        empty.push("total_ram_gb");
+    }
+    if beat.hardware.disk_gb <= 0 {
+        empty.push("total_disk_gb");
+    }
+    if beat.capabilities.gpu_kind.is_empty() {
+        empty.push("gpu_kind");
+    }
+    empty
+}
+
 /// RAM tier key for server-policy resolution: <=8GB is `tiny` (CPU-only
 /// llama-server, no model seed), everything else `standard`. Callers must
 /// gate out non-positive ram_gb (degenerate beats) before classifying.
@@ -1868,6 +1945,38 @@ mod tests {
             Some("10.0.0.1"),
             Some(32)
         ));
+    }
+
+    #[test]
+    fn empty_persistent_beat_fields_flags_partial_probes() {
+        // A fully-probed online beat has no empty persistent columns.
+        let mut good = beat_online("marcus");
+        good.network.all_ips = vec![crate::beat_v2::Ip {
+            iface: "en0".to_string(),
+            ip: "10.0.0.1".to_string(),
+            kind: "v4".to_string(),
+            paired_with: None,
+            link_speed_gbps: None,
+            medium: None,
+        }];
+        let good_ips = serde_json::to_string(&good.network.all_ips).unwrap();
+        assert!(empty_persistent_beat_fields(&good, &good_ips).is_empty());
+
+        // A partially-probed beat: IP+RAM present (so it isn't rejected
+        // upstream) but disk/GPU enumeration hasn't finished. Those columns
+        // must be reported so the transient empty write is traceable.
+        let mut partial = beat_online("marcus");
+        partial.hardware.disk_gb = 0;
+        partial.capabilities.gpu_kind = String::new();
+        let partial_ips = serde_json::to_string(&partial.network.all_ips).unwrap();
+        let fields = empty_persistent_beat_fields(&partial, &partial_ips);
+        assert!(fields.contains(&"total_disk_gb"));
+        assert!(fields.contains(&"gpu_kind"));
+        assert!(!fields.contains(&"primary_ip"));
+        assert!(!fields.contains(&"total_ram_gb"));
+
+        // An empty all_ips array is flagged (`[]` normalizes to `[]`).
+        assert!(empty_persistent_beat_fields(&partial, "[]").contains(&"all_ips"));
     }
 
     #[test]
