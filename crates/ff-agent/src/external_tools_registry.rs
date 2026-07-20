@@ -202,19 +202,19 @@ mod tests {
 
     const SAMPLE_TOML: &str = r#"
 [[tool]]
-id = "code-review-graph"
-display_name = "Code Review Graph"
-github_url = "https://github.com/anthropics/code-review-graph"
+id = "example-mcp-tool"
+display_name = "Example MCP Tool"
+github_url = "https://github.com/example/example-mcp-tool"
 kind = "mcp"
 install_method = "cargo_install"
-install_spec = { repo = "anthropics/code-review-graph", bin = "code-review-graph-mcp" }
-cli_entrypoint = "crg"
-mcp_server_command = "code-review-graph-mcp --stdio"
+install_spec = { repo = "example/example-mcp-tool", bin = "example-mcp-tool" }
+cli_entrypoint = "example"
+mcp_server_command = "example-mcp-tool --stdio"
 register_as_mcp = true
-version_source = { method = "github_release", repo = "anthropics/code-review-graph" }
+version_source = { method = "github_release", repo = "example/example-mcp-tool" }
 
 [tool.upgrade_playbook]
-all = "cargo install --git https://github.com/anthropics/code-review-graph --force"
+all = "cargo install --git https://github.com/example/example-mcp-tool --force"
 
 [[tool]]
 id = "context-mode"
@@ -236,19 +236,19 @@ all = "npm install -g @context-mode/mcp@latest"
         let doc: ExternalToolsFile = toml::from_str(SAMPLE_TOML).expect("parse toml");
         assert_eq!(doc.tool.len(), 2);
 
-        let crg = &doc.tool[0];
-        assert_eq!(crg.id, "code-review-graph");
-        assert_eq!(crg.kind, "mcp");
-        assert_eq!(crg.install_method, "cargo_install");
-        assert_eq!(crg.cli_entrypoint.as_deref(), Some("crg"));
-        assert!(crg.register_as_mcp);
+        let example = &doc.tool[0];
+        assert_eq!(example.id, "example-mcp-tool");
+        assert_eq!(example.kind, "mcp");
+        assert_eq!(example.install_method, "cargo_install");
+        assert_eq!(example.cli_entrypoint.as_deref(), Some("example"));
+        assert!(example.register_as_mcp);
         assert_eq!(
-            crg.install_spec.get("repo").and_then(|v| v.as_str()),
-            Some("anthropics/code-review-graph")
+            example.install_spec.get("repo").and_then(|v| v.as_str()),
+            Some("example/example-mcp-tool")
         );
         assert_eq!(
-            crg.upgrade_playbook.get("all").and_then(|v| v.as_str()),
-            Some("cargo install --git https://github.com/anthropics/code-review-graph --force")
+            example.upgrade_playbook.get("all").and_then(|v| v.as_str()),
+            Some("cargo install --git https://github.com/example/example-mcp-tool --force")
         );
 
         let ctx = &doc.tool[1];
@@ -260,15 +260,15 @@ all = "npm install -g @context-mode/mcp@latest"
     #[test]
     fn install_spec_round_trips_to_json() {
         let doc: ExternalToolsFile = toml::from_str(SAMPLE_TOML).expect("parse toml");
-        let crg = &doc.tool[0];
-        let js = toml_table_to_json(&crg.install_spec).expect("install_spec to json");
+        let example = &doc.tool[0];
+        let js = toml_table_to_json(&example.install_spec).expect("install_spec to json");
         assert_eq!(
             js.get("repo").and_then(|v| v.as_str()),
-            Some("anthropics/code-review-graph")
+            Some("example/example-mcp-tool")
         );
         assert_eq!(
             js.get("bin").and_then(|v| v.as_str()),
-            Some("code-review-graph-mcp")
+            Some("example-mcp-tool")
         );
     }
 }
