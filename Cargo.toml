@@ -34,6 +34,7 @@ members = [
     "crates/ff-pulse",
     "crates/ff-brain",
     "crates/ff-capacity",
+    "crates/ff-routing-policy",
     "crates/ra2a",
 ]
 

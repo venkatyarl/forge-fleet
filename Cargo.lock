@@ -1193,6 +1193,7 @@ dependencies = [
  "ff-orchestrator",
  "ff-pipeline",
  "ff-pulse",
+ "ff-routing-policy",
  "ff-security",
  "futures",
  "glob",
@@ -1400,7 +1401,9 @@ version = "2026.4.7"
 dependencies = [
  "anyhow",
  "chrono",
+ "ff-capacity",
  "ff-core",
+ "ff-routing-policy",
  "rand 0.8.5",
  "reqwest",
  "serde",
@@ -1487,6 +1490,7 @@ dependencies = [
  "ff-observability",
  "ff-orchestrator",
  "ff-pulse",
+ "ff-routing-policy",
  "ff-security",
  "ff-voice",
  "futures",
@@ -1658,6 +1662,15 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ff-routing-policy"
+version = "2026.4.7"
+dependencies = [
+ "chrono",
+ "ff-capacity",
  "uuid",
 ]
 

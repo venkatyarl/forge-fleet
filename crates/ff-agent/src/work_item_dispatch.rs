@@ -1974,15 +1974,23 @@ const MAX_DISPATCH_ATTEMPTS: i32 = 3;
 /// tasks already `prefers_cloud_lane`, so this narrows the local exposure to ONE
 /// cheap try then the reliable cloud lane — unblocking the backlog with no
 /// heartbeat rearchitecture.
-const ESCALATE_TO_CLOUD_AT: i32 = 1;
-
 /// Whether to try the cheap LOCAL codegen lane for this dispatch: only while UNDER
 /// the cloud-escalation threshold, the node's local-codegen breaker is closed, and
 /// the task isn't complexity-routed to cloud. Pure so the routing is testable —
 /// the `ESCALATE_TO_CLOUD_AT = 1` value means a mechanical task gets ONE local try
 /// then goes cloud (#62: the local lane starves the heartbeat; cloud does not).
 fn use_local_lane(attempts: i32, breaker_open: bool, prefers_cloud: bool) -> bool {
-    attempts < ESCALATE_TO_CLOUD_AT && !breaker_open && !prefers_cloud
+    let requirements = ff_routing_policy::TaskRequirements {
+        prior_failure_count: attempts.max(0) as u32,
+        capability_tags: if prefers_cloud {
+            vec!["cloud".to_string()]
+        } else {
+            Vec::new()
+        },
+        ..Default::default()
+    };
+    ff_routing_policy::use_local_30b(&requirements, &ff_routing_policy::PolicyConfig::default())
+        && !breaker_open
 }
 
 /// Hard ceiling on the Lane-1 LOCAL codegen harness — kept STRICTLY BELOW the
@@ -2839,10 +2847,9 @@ async fn run_ff_dispatch(
     };
     // Claude is the fast build backstop; loaded nodes can make codex exceed a
     // short probe even though it succeeds given time.
-    if let Some(index) = backends.iter().position(|backend| backend == "claude") {
-        let claude = backends.remove(index);
-        backends.insert(0, claude);
-    }
+    let mut policy = ff_routing_policy::PolicyConfig::default();
+    policy.preferred_cloud_backstop = Some("claude".to_string());
+    ff_routing_policy::promote_cloud_backstop(&mut backends, &policy);
     let computer_id = item.computer_id;
     let forced_backend = primary_or_default_backend(&backends);
     let mut attempted_backend = false;
@@ -3222,26 +3229,15 @@ fn rank_cached_backends(
     rows: Vec<ff_capacity::BackendCapacity>,
     cutoff: chrono::DateTime<chrono::Utc>,
 ) -> Vec<String> {
-    let mut scored: Vec<(String, f64)> = rows
-        .into_iter()
-        .filter(|row| {
-            row.installed
-                && row.authenticated
-                && row.last_checked_at > cutoff
-                && row.breaker_state != "open"
-                && row.remaining_pct.unwrap_or(100.0) >= 15.0
-        })
-        .map(|row| {
-            let score = ff_db::backend_score(&row.backend, row.remaining_pct, &row.breaker_state);
-            (row.backend, score)
-        })
-        .collect();
-    scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| ff_db::backend_rank(&a.0).cmp(&ff_db::backend_rank(&b.0)))
-    });
-    scored.into_iter().map(|(backend, _)| backend).collect()
+    ff_routing_policy::rank_cloud_backends(
+        rows,
+        cutoff,
+        &ff_routing_policy::TaskRequirements::default(),
+        &ff_routing_policy::PolicyConfig::default(),
+    )
+    .into_iter()
+    .map(|(backend, _)| backend)
+    .collect()
 }
 
 /// Council cap: how many headless auto-continue re-injections to attempt on a

@@ -8898,39 +8898,8 @@ pub async fn pg_upsert_computer_backend(
     Ok(())
 }
 
-/// Dispatch-preference rank for an LLM-CLI backend (capability A3). Lower =
-/// preferred (cheapest-capable-first). `codex` is the proven build backend so it
-/// leads; the rest follow by general reliability for autonomous code edits.
-/// Pure + total so the picker's ordering is unit-testable.
-pub fn backend_rank(backend: &str) -> u8 {
-    match backend {
-        "codex" => 0,
-        "claude" => 1,
-        "kimi" => 2,
-        "gemini" => 3,
-        "grok" => 4,
-        _ => 9,
-    }
-}
-
-/// Council-tuned routing score for one backend (higher = pick first).
-///
-/// `score = 0.60*headroom + 0.30*preference + 0.10*health` (+ caller jitter).
-/// `headroom` = remaining-quota fraction (0..1); `preference` = normalized
-/// [`backend_rank`] (best rank → 1.0); `health` = {closed 1.0, half_open 0.5}.
-/// Breaker-open backends are excluded upstream, not scored. Pure fn → unit
-/// testable; the SQL feeds it `remaining_pct` + `breaker_state`.
-pub fn backend_score(backend: &str, remaining_pct: Option<f64>, breaker_state: &str) -> f64 {
-    let headroom = (remaining_pct.unwrap_or(100.0) / 100.0).clamp(0.0, 1.0);
-    // backend_rank 0 (best) → 1.0, 9 (unknown) → ~0.0.
-    let preference = 1.0 - (backend_rank(backend) as f64 / 9.0);
-    let health = match breaker_state {
-        "half_open" => 0.5,
-        "open" => 0.0,
-        _ => 1.0,
-    };
-    0.60 * headroom + 0.30 * preference + 0.10 * health
-}
+// Compatibility exports while callers migrate to the policy crate directly.
+pub use ff_routing_policy::{backend_rank, backend_score};
 
 /// Headroom-aware routing (capability A5): the backends a node can dispatch to
 /// RIGHT NOW, ordered by [`backend_score`] (most usage-headroom + cheapest
@@ -8948,8 +8917,12 @@ pub async fn pg_routed_backends(
     computer_id: uuid::Uuid,
     fresh_secs: i64,
 ) -> Result<Vec<String>> {
-    let rows: Vec<(String, Option<f64>, String)> = sqlx::query_as(
-        "SELECT cb.backend,
+    let rows: Vec<ff_capacity::BackendCapacity> = sqlx::query_as(
+        "SELECT cb.computer_id,
+                cb.backend,
+                cb.installed,
+                cb.authenticated,
+                cb.last_checked_at,
                 u.remaining_pct,
                 COALESCE(h.breaker_state, 'closed') AS breaker_state
            FROM computer_backends cb
@@ -8962,32 +8935,21 @@ pub async fn pg_routed_backends(
                  ORDER BY fu.sampled_at DESC
                  LIMIT 1
            ) u ON true
-          WHERE cb.computer_id = $1
-            AND cb.installed
-            AND cb.authenticated
-            AND cb.last_checked_at > NOW() - make_interval(secs => $2)
-            AND COALESCE(h.breaker_state, 'closed') <> 'open'
-            AND COALESCE(u.remaining_pct, 100) >= 15",
+          WHERE cb.computer_id = $1",
     )
     .bind(computer_id)
-    .bind(fresh_secs as f64)
     .fetch_all(pool)
     .await?;
-
-    let mut scored: Vec<(String, f64)> = rows
-        .into_iter()
-        .map(|(b, rem, state)| {
-            let s = backend_score(&b, rem, &state);
-            (b, s)
-        })
-        .collect();
-    // Highest score first; tie-break by rank for determinism.
-    scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| backend_rank(&a.0).cmp(&backend_rank(&b.0)))
-    });
-    Ok(scored.into_iter().map(|(b, _)| b).collect())
+    let cutoff = chrono::Utc::now() - chrono::Duration::seconds(fresh_secs);
+    Ok(ff_routing_policy::rank_cloud_backends(
+        rows,
+        cutoff,
+        &ff_routing_policy::TaskRequirements::default(),
+        &ff_routing_policy::PolicyConfig::default(),
+    )
+    .into_iter()
+    .map(|(backend, _)| backend)
+    .collect())
 }
 
 /// The backends a node can actually dispatch to RIGHT NOW (capability A3):

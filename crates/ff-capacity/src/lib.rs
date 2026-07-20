@@ -459,4 +459,24 @@ mod tests {
             ]
         );
     }
+
+    #[tokio::test]
+    async fn failed_refresh_preserves_last_good_inference_snapshot() {
+        let Some(pool) = setup_pool().await else {
+            return;
+        };
+        insert_fixtures(&pool).await;
+
+        let snap = CapacitySnapshot::load(&pool).await.expect("load snapshot");
+        let before = snap.inference_deployments();
+        assert!(!before.is_empty());
+
+        sqlx::query("DROP TABLE v_fleet_capacity")
+            .execute(&pool)
+            .await
+            .expect("make registry refresh fail");
+
+        assert!(snap.refresh().await.is_err());
+        assert_eq!(snap.inference_deployments(), before);
+    }
 }

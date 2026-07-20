@@ -1,0 +1,13 @@
+[package]
+name = "ff-routing-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Pure tiered LLM routing policy for ForgeFleet"
+
+[dependencies]
+chrono = { workspace = true }
+ff-capacity = { path = "../ff-capacity" }
+uuid = { workspace = true }
+

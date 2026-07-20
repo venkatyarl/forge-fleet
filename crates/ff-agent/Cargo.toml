@@ -16,6 +16,7 @@ ff-pulse = { path = "../ff-pulse" }
 ff-security = { path = "../ff-security" }
 ff-cron = { path = "../ff-cron" }
 ff-capacity = { path = "../ff-capacity" }
+ff-routing-policy = { path = "../ff-routing-policy" }
 
 anyhow.workspace = true
 base64 = "0.22"

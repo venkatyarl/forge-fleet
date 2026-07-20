@@ -418,12 +418,28 @@ impl PulseLlmRouter {
     }
 
     fn registry_allows(&self, computer: &str, server: &LlmServer) -> bool {
-        self.capacity.as_ref().is_none_or(|snapshot| {
-            snapshot.inference_deployments().iter().any(|deployment| {
-                deployment.computer.eq_ignore_ascii_case(computer)
-                    && endpoint_port(&server.endpoint) == Some(deployment.port as u16)
-            })
-        })
+        let deployments: Option<Vec<ff_capacity::InferenceDeployment>> =
+            self.capacity.as_ref().map(|snapshot| {
+                ff_routing_policy::rank_inference_deployments(
+                    snapshot,
+                    &ff_routing_policy::TaskRequirements::default(),
+                    &ff_routing_policy::PolicyConfig::default(),
+                )
+                .into_iter()
+                .filter_map(|candidate| match candidate {
+                    ff_routing_policy::RankedBackend::Inference { deployment, .. } => {
+                        Some(deployment)
+                    }
+                    ff_routing_policy::RankedBackend::Cloud { .. } => None,
+                })
+                .collect()
+            });
+        registry_allows_endpoint(
+            deployments.as_deref(),
+            computer,
+            &server.endpoint,
+            &server.model.id,
+        )
     }
 
     /// Collect every active+healthy LLM server paired with the beat it
@@ -1062,9 +1078,31 @@ fn endpoint_port(endpoint: &str) -> Option<u16> {
     reqwest::Url::parse(endpoint).ok()?.port_or_known_default()
 }
 
+fn registry_allows_endpoint(
+    deployments: Option<&[ff_capacity::InferenceDeployment]>,
+    computer: &str,
+    endpoint: &str,
+    model_id: &str,
+) -> bool {
+    deployments.is_none_or(|deployments| {
+        deployments.iter().any(|deployment| {
+            deployment.computer.eq_ignore_ascii_case(computer)
+                && u16::try_from(deployment.port).ok() == endpoint_port(endpoint)
+                && {
+                    let catalog = normalize_model_id(&deployment.catalog_id);
+                    let model = normalize_model_id(model_id);
+                    catalog == model
+                        || (!catalog.is_empty()
+                            && !model.is_empty()
+                            && (catalog.starts_with(&model) || model.starts_with(&catalog)))
+                }
+        })
+    })
+}
+
 fn looks_like_embedding_model(model_id: &str) -> bool {
-    let id = model_id.to_ascii_lowercase();
-    id.contains("embed") || id.contains("bge-") || id.contains("rerank")
+    let id = normalize_model_id(model_id);
+    id.contains("bge") || id.contains("embed") || id.contains("rerank")
 }
 
 /// Shape an [`LlmRoutingError`] into a (status, json) tuple for axum handlers.
@@ -1290,6 +1328,7 @@ impl LlmRoutingCache {
             let guard = self.cache.read().await;
             if let Some(entry) = guard.get(&key)
                 && entry.refreshed_at.elapsed() < CACHE_TTL
+                && self.router.registry_allows(&entry.computer, &entry.server)
             {
                 ff_observability::metrics::PULSE_ROUTER_CACHE_HITS_TOTAL
                     .with_label_values(&[model_id])
@@ -1530,6 +1569,59 @@ mod tests {
     fn endpoint_port_reads_registry_identity_port() {
         assert_eq!(endpoint_port("http://127.0.0.1:55000/v1"), Some(55000));
         assert_eq!(endpoint_port("not a url"), None);
+    }
+
+    #[test]
+    fn registry_discovery_matches_computer_and_port() {
+        let deployments = vec![ff_capacity::InferenceDeployment {
+            catalog_id: "qwen3-coder-30b".to_string(),
+            catalog_family: Some("qwen".to_string()),
+            computer: "node-1".to_string(),
+            port: 55000,
+        }];
+
+        assert!(registry_allows_endpoint(
+            Some(&deployments),
+            "NODE-1",
+            "http://127.0.0.1:55000/v1",
+            "Qwen3-Coder-30B-Q4_K_M"
+        ));
+        assert!(!registry_allows_endpoint(
+            Some(&deployments),
+            "node-1",
+            "http://127.0.0.1:55001/v1",
+            "qwen3-coder-30b"
+        ));
+        assert!(!registry_allows_endpoint(
+            Some(&deployments),
+            "node-2",
+            "http://127.0.0.1:55000/v1",
+            "qwen3-coder-30b"
+        ));
+        assert!(!registry_allows_endpoint(
+            Some(&deployments),
+            "node-1",
+            "http://127.0.0.1:55000/v1",
+            "another-model"
+        ));
+    }
+
+    #[test]
+    fn registry_discovery_degrades_to_legacy_when_unavailable() {
+        assert!(registry_allows_endpoint(
+            None,
+            "node-1",
+            "http://127.0.0.1:55000/v1",
+            "any-model"
+        ));
+    }
+
+    #[test]
+    fn stale_alias_fallback_excludes_normalized_embedder_names() {
+        assert!(looks_like_embedding_model("bge_m3"));
+        assert!(looks_like_embedding_model("vendor/embedding-model"));
+        assert!(looks_like_embedding_model("reranker-v2"));
+        assert!(!looks_like_embedding_model("qwen3-coder"));
     }
 
     #[test]
