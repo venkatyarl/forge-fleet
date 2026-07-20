@@ -209,6 +209,10 @@ pub struct MemoryInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capabilities {
     pub can_serve_ff_gateway: bool,
+    /// Deprecated wire tombstone retained for one deploy generation so nodes
+    /// running the previous schema can deserialize beats during a rollout.
+    #[serde(default)]
+    pub can_serve_openclaw_gateway: bool,
     pub can_host_postgres_replica: bool,
     pub can_host_redis_replica: bool,
     /// `"none" | "integrated" | "apple_silicon" | "nvidia_cuda" | "amd_rocm"`.
@@ -503,6 +507,7 @@ impl PulseBeatV2 {
             },
             capabilities: Capabilities {
                 can_serve_ff_gateway: false,
+                can_serve_openclaw_gateway: false,
                 can_host_postgres_replica: false,
                 can_host_redis_replica: false,
                 gpu_kind: "none".to_string(),
@@ -570,7 +575,7 @@ mod tests {
     /// the current schema. This protects rolling deployments where the fleet
     /// runs mixed versions and older beats may still be in Redis/Postgres.
     #[test]
-    fn legacy_beat_schema_deserializes_with_defaults() {
+    fn pulse_beat_schema_legacy_deserializes_with_defaults() {
         let legacy_json = r#"{
             "pulse_protocol_version": 2,
             "computer_id": null,
@@ -661,6 +666,7 @@ mod tests {
         assert!(parsed.multi_host_participation.is_none());
         assert!(parsed.encountered_bugs.is_empty());
         assert!(parsed.local_tasks.is_empty());
+        assert!(!parsed.capabilities.can_serve_openclaw_gateway);
     }
 
     #[test]
@@ -684,7 +690,7 @@ mod tests {
     /// deserialize (serde ignores unknown keys by default; this pins that no
     /// `deny_unknown_fields` ever sneaks onto the struct).
     #[test]
-    fn beat_deserializes_across_schema_generations() {
+    fn pulse_beat_schema_deserializes_across_generations() {
         let beat = PulseBeatV2::skeleton("test-node-fake");
         let mut json: serde_json::Value = serde_json::to_value(&beat).expect("to_value");
         let obj = json.as_object_mut().expect("beat serializes to an object");
@@ -715,5 +721,26 @@ mod tests {
         let parsed: PulseBeatV2 =
             serde_json::from_value(json).expect("beat with unknown future field must deserialize");
         assert_eq!(parsed.pulse_protocol_version, 2);
+    }
+
+    /// Forward-compatibility guard for the previous deploy generation: its
+    /// receiver still requires the removed OpenClaw capability on the wire.
+    #[test]
+    fn pulse_beat_schema_serializes_for_previous_generation() {
+        #[derive(Deserialize)]
+        struct PreviousGenerationBeat {
+            capabilities: PreviousGenerationCapabilities,
+        }
+
+        #[derive(Deserialize)]
+        struct PreviousGenerationCapabilities {
+            can_serve_openclaw_gateway: bool,
+        }
+
+        let json = serde_json::to_string(&PulseBeatV2::skeleton("rolling-node"))
+            .expect("serialize current beat");
+        let previous: PreviousGenerationBeat = serde_json::from_str(&json)
+            .expect("previous-generation receiver must deserialize current beat");
+        assert!(!previous.capabilities.can_serve_openclaw_gateway);
     }
 }

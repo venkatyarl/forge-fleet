@@ -21,7 +21,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Run schema backward compatibility tests
-        # These tests assert that payloads serialized by older daemons still
-        # deserialize into the current PulseBeatV2 schema, guarding rolling
-        # deployments against accidental breaking changes.
-        run: cargo test -p ff-pulse --lib -- legacy_beat_schema
+        # These tests assert both directions of mixed-generation PulseBeatV2
+        # compatibility, guarding rolling deployments against accidental
+        # breaking changes.
+        run: cargo test -p ff-pulse --lib -- pulse_beat_schema

@@ -328,6 +328,7 @@ impl HeartbeatV2Publisher {
 
                 beat.capabilities = Capabilities {
                     can_serve_ff_gateway: true,
+                    can_serve_openclaw_gateway: false,
                     can_host_postgres_replica: disk_free_gb > 100.0,
                     can_host_redis_replica: ram_total_gb >= 16,
                     gpu_kind: gpu_kind.clone(),
