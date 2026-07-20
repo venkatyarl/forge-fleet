@@ -8,8 +8,10 @@
 //! - **log_ingest** — Ingest and buffer structured logs from nodes and agents
 //! - **alerting** — Rule-based alerts (node down, model unavailable, high load)
 //! - **alerts** — TTL-based deduplication state for alert delivery
+//! - **alert_dedup** — Metric-and-node aware alert collapsing with occurrence counts
 //! - **dashboard** — Aggregate status snapshots and axum API routes
 
+pub mod alert_dedup;
 pub mod alerting;
 pub mod alerts;
 pub mod dashboard;
@@ -22,6 +24,7 @@ pub mod tracing_ext;
 pub mod work_queue;
 
 // Re-export the most commonly used items at crate root.
+pub use alert_dedup::{AlertDedupKey, AlertDedupTracker};
 pub use alerting::{Alert, AlertEngine, AlertRule, AlertSeverity};
 pub use alerts::{AlertDedupState, AlertDeduplicationState};
 pub use dashboard::{DashboardState, FleetSnapshot, ModelSummary, NodeSummary};
