@@ -518,8 +518,10 @@ async fn review_via_480b(pg: &PgPool, prompt: &str) -> Result<(bool, String)> {
     Ok(parse_review_response(&resp.text))
 }
 
-/// True when the model name that served a call is the 480B ring.
-fn served_by_480b(model: &str) -> bool {
+/// True when the model name that served a call is the 480B ring. `pub(crate)`
+/// because the in-place dispatch review makes the same failed-over-to-a-weaker-
+/// model check before trusting a verdict as a 480B verdict.
+pub(crate) fn served_by_480b(model: &str) -> bool {
     model.to_lowercase().contains(REVIEWER_480B_HINT)
 }
 
@@ -614,7 +616,9 @@ async fn record_review_interaction(
     }
 }
 
-fn parse_review_response(response: &str) -> (bool, String) {
+/// Parse a reviewer's `APPROVE`/`REJECT` first-line verdict + reason. Shared
+/// with the in-place dispatch review, which uses the same response contract.
+pub(crate) fn parse_review_response(response: &str) -> (bool, String) {
     let mut first_idx = None;
     let mut first_line = "";
     for (idx, line) in response.lines().enumerate() {

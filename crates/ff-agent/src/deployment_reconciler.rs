@@ -744,6 +744,11 @@ mod tests {
 
     #[test]
     fn match_library_empty_path_never_matches() {
+        if std::env::var("FORGEFLEET_POSTGRES_URL").is_err()
+            && std::env::var("FORGEFLEET_DATABASE_URL").is_err()
+        {
+            return;
+        }
         let mut l = lib("id-empty", "weird");
         l.file_path = String::new();
         let libs = vec![l];

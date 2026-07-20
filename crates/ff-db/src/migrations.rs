@@ -931,6 +931,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "fleet_capacity_registry",
         sql: schema::SCHEMA_V189_FLEET_CAPACITY_REGISTRY,
     },
+    PgMigration {
+        version: 190,
+        name: "merge_queue_inplace_review",
+        sql: schema::SCHEMA_V190_MERGE_QUEUE_INPLACE_REVIEW,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
