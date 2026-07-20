@@ -298,6 +298,10 @@ pub struct FleetNodeRow {
     /// often-stale `cpu_cores` worker-registry value when present.
     #[serde(default)]
     pub computer_cpu_cores: Option<i32>,
+    /// Lifecycle status from the physical `computers` registry. This is kept
+    /// separate from `fleet_workers.status`, whose heartbeat can be stale.
+    #[serde(default)]
+    pub computer_status: Option<String>,
 }
 
 fn default_runtime() -> String {
@@ -348,7 +352,7 @@ pub async fn pg_list_nodes(pool: &PgPool) -> Result<Vec<FleetNodeRow>> {
                 COALESCE(fw.tooling, '{}'::jsonb) AS tooling,
                 c.gpu_kind, c.gpu_model, c.gpu_vram_gb, c.gpu_total_vram_gb, c.has_gpu,
                 c.total_ram_gb AS computer_ram_gb,
-                c.cpu_cores AS computer_cpu_cores
+                c.cpu_cores AS computer_cpu_cores, c.status AS computer_status
          FROM fleet_workers fw
          LEFT JOIN computers c ON c.name = fw.name
          ORDER BY fw.election_priority, fw.name
@@ -387,6 +391,7 @@ pub async fn pg_list_nodes(pool: &PgPool) -> Result<Vec<FleetNodeRow>> {
             has_gpu: r.get("has_gpu"),
             computer_ram_gb: r.get("computer_ram_gb"),
             computer_cpu_cores: r.get("computer_cpu_cores"),
+            computer_status: r.get("computer_status"),
         })
         .collect())
 }
@@ -405,7 +410,7 @@ pub async fn pg_get_node(pool: &PgPool, name: &str) -> Result<Option<FleetNodeRo
                 COALESCE(fw.tooling, '{}'::jsonb) AS tooling,
                 c.gpu_kind, c.gpu_model, c.gpu_vram_gb, c.gpu_total_vram_gb, c.has_gpu,
                 c.total_ram_gb AS computer_ram_gb,
-                c.cpu_cores AS computer_cpu_cores
+                c.cpu_cores AS computer_cpu_cores, c.status AS computer_status
          FROM fleet_workers fw
          LEFT JOIN computers c ON c.name = fw.name
          WHERE fw.name = $1",
@@ -442,6 +447,7 @@ pub async fn pg_get_node(pool: &PgPool, name: &str) -> Result<Option<FleetNodeRo
         has_gpu: r.get("has_gpu"),
         computer_ram_gb: r.get("computer_ram_gb"),
         computer_cpu_cores: r.get("computer_cpu_cores"),
+        computer_status: r.get("computer_status"),
     }))
 }
 
@@ -4103,6 +4109,7 @@ pub async fn seed_from_fleet_toml(
             has_gpu: None,
             computer_ram_gb: None,
             computer_cpu_cores: None,
+            computer_status: None,
         };
 
         pg_upsert_node(pool, &node_row).await?;
