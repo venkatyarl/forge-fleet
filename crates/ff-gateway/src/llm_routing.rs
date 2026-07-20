@@ -981,7 +981,7 @@ pub(crate) fn apply_qwen3_max_tokens_floor(body: &mut Value, resolved_model_id: 
 /// Replace `127.0.0.1` / `localhost` / `0.0.0.0` in an endpoint URL with
 /// the node's reachable `primary_ip`. If `primary_ip` is empty, returns
 /// the original endpoint unchanged.
-fn rewrite_endpoint(endpoint: &str, primary_ip: &str) -> String {
+pub(crate) fn rewrite_endpoint(endpoint: &str, primary_ip: &str) -> String {
     if primary_ip.is_empty() {
         return endpoint.to_string();
     }

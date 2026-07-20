@@ -1084,3 +1084,43 @@ fn parse_redis_hostport(url: &str) -> Option<(String, u16)> {
     let port: u16 = port_str.parse().ok()?;
     Some((host, port))
 }
+
+#[cfg(test)]
+mod bootstrap_lifecycle_tests {
+    use super::BOOTSTRAP_TEMPLATE;
+
+    const SYSTEMD_UNIT: &str = include_str!("../../../deploy/systemd/forgefleetd.service");
+
+    #[test]
+    fn linux_bootstrap_enforces_reboot_persistent_user_service() {
+        for required in [
+            "loginctl enable-linger \"$SUDO_INVOKER\"",
+            "loginctl show-user \"$SUDO_INVOKER\" -p Linger --value",
+            "user_systemctl daemon-reload",
+            "user_systemctl enable forgefleetd.service",
+            "user_systemctl restart forgefleetd.service",
+            "user_systemctl is-enabled forgefleetd.service",
+            "user_systemctl is-active forgefleetd.service",
+        ] {
+            assert!(
+                BOOTSTRAP_TEMPLATE.contains(required),
+                "bootstrap is missing persistence step: {required}"
+            );
+        }
+        assert!(
+            !BOOTSTRAP_TEMPLATE
+                .contains("loginctl enable-linger \"$SUDO_INVOKER\" 2>/dev/null || true")
+        );
+        assert!(
+            !BOOTSTRAP_TEMPLATE
+                .contains("user_systemctl enable forgefleetd.service >/dev/null 2>&1 || true")
+        );
+    }
+
+    #[test]
+    fn canonical_user_unit_starts_at_boot_and_recovers_from_failure() {
+        assert!(SYSTEMD_UNIT.contains("Restart=on-failure"));
+        assert!(SYSTEMD_UNIT.contains("[Install]\nWantedBy=default.target"));
+        assert!(SYSTEMD_UNIT.contains("ExecStart=%h/.local/bin/forgefleetd start"));
+    }
+}

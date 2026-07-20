@@ -601,7 +601,11 @@ if [ "$OS_ID" != "macos" ]; then
   # enable-linger starts the user manager at boot (and creates
   # /run/user/<uid>, which `systemctl --user` from a sudo context needs).
   USER_UID="$(run_as_user id -u)"
-  loginctl enable-linger "$SUDO_INVOKER" 2>/dev/null || true
+  [ "$USER_UID" -ne 0 ] || die "refusing to install the user service for root; set SUDO_USER or SSH_USER to the fleet account"
+  loginctl enable-linger "$SUDO_INVOKER" \
+    || die "loginctl enable-linger failed for $SUDO_INVOKER"
+  [ "$(loginctl show-user "$SUDO_INVOKER" -p Linger --value 2>/dev/null)" = "yes" ] \
+    || die "lingering is not enabled for $SUDO_INVOKER; run: sudo loginctl enable-linger $SUDO_INVOKER"
   user_systemctl() {
     run_as_user env XDG_RUNTIME_DIR="/run/user/$USER_UID" \
       DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" \
@@ -609,16 +613,21 @@ if [ "$OS_ID" != "macos" ]; then
   }
   run_as_user mkdir -p "$USER_SYSTEMD_DIR" "$USER_HOME/.forgefleet/logs"
   run_as_user bash -c "sed 's|__COMPUTER_NAME__|$NAME|g' '$REPO_DIR/deploy/systemd/forgefleetd.service' > '$USER_SYSTEMD_DIR/forgefleetd.service'"
-  user_systemctl daemon-reload >/dev/null 2>&1 || true
-  user_systemctl enable forgefleetd.service >/dev/null 2>&1 || true
+  user_systemctl daemon-reload \
+    || die "systemctl --user daemon-reload failed for $SUDO_INVOKER"
+  user_systemctl enable forgefleetd.service \
+    || die "failed to enable forgefleetd.service for reboot persistence"
   # restart (not just enable --now): an idempotent re-run must pick up the
   # freshly built binary, not keep the old process.
-  user_systemctl restart forgefleetd.service >/dev/null 2>&1 || true
+  user_systemctl restart forgefleetd.service \
+    || die "failed to restart forgefleetd.service"
   sleep 2
-  if user_systemctl is-active forgefleetd.service >/dev/null 2>&1; then
+  if ! user_systemctl is-enabled forgefleetd.service >/dev/null 2>&1; then
+    die "systemctl --user reports forgefleetd.service disabled; run: systemctl --user enable forgefleetd.service"
+  elif user_systemctl is-active forgefleetd.service >/dev/null 2>&1; then
     report "service" ok
   else
-    report "service" failed "systemctl --user reports forgefleetd inactive"
+    die "systemctl --user reports forgefleetd.service inactive; inspect: systemctl --user status forgefleetd.service"
   fi
 else
   # macOS: install LaunchAgent plist so `launchctl kickstart -k` works

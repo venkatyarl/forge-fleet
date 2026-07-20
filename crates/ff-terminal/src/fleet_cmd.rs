@@ -2408,9 +2408,9 @@ pub async fn handle_fleet_leader_step_down(
 }
 
 pub async fn handle_fleet_health(pool: &sqlx::PgPool, json: bool) -> Result<()> {
-    // Pull computer rows — name, primary_ip, status, last_seen_at.
+    // Pull computer rows — name, primary_ip, SSH endpoint, and daemon beat state.
     let rows = sqlx::query(
-        "SELECT name, primary_ip, status, last_seen_at
+        "SELECT name, primary_ip, ssh_port, status, last_seen_at
          FROM computers
          ORDER BY name ASC",
     )
@@ -2428,6 +2428,8 @@ pub async fn handle_fleet_health(pool: &sqlx::PgPool, json: bool) -> Result<()> 
         ram_pct: Option<f64>,
         llm_servers: Option<usize>,
         software_count: Option<i64>,
+        computer_reachable: bool,
+        daemon_joined: bool,
         sdown: bool,
         odown: bool,
     }
@@ -2458,8 +2460,17 @@ pub async fn handle_fleet_health(pool: &sqlx::PgPool, json: bool) -> Result<()> 
         sw_map.insert(name, cnt);
     }
 
+    // Host reachability is deliberately independent from Pulse membership: a
+    // powered-on computer with a stopped forgefleetd remains SSH-reachable.
+    let reachability = futures::future::join_all(rows.iter().map(|r| {
+        let ip: String = sqlx::Row::get(r, "primary_ip");
+        let port: i32 = sqlx::Row::get(r, "ssh_port");
+        async move { computer_reachable(&ip, port as u16).await }
+    }))
+    .await;
+
     let mut out: Vec<HealthRow> = Vec::with_capacity(rows.len());
-    for r in &rows {
+    for (r, computer_reachable) in rows.iter().zip(reachability) {
         let name: String = sqlx::Row::get(r, "name");
         let ip: String = sqlx::Row::get(r, "primary_ip");
         let status: String = sqlx::Row::get(r, "status");
@@ -2490,6 +2501,8 @@ pub async fn handle_fleet_health(pool: &sqlx::PgPool, json: bool) -> Result<()> 
             ram_pct: beat.map(|b| b.load.ram_pct),
             llm_servers: beat.map(|b| b.llm_servers.len()),
             software_count: sw_map.get(&name).copied(),
+            computer_reachable,
+            daemon_joined: !sdown,
             sdown,
             odown,
         });
@@ -2513,6 +2526,8 @@ pub async fn handle_fleet_health(pool: &sqlx::PgPool, json: bool) -> Result<()> 
                     "ram_pct": h.ram_pct,
                     "llm_servers": h.llm_servers,
                     "software_count": h.software_count,
+                    "computer_reachable": h.computer_reachable,
+                    "daemon_joined": h.daemon_joined,
                     "sdown": h.sdown,
                     "odown": h.odown,
                 })
@@ -2528,8 +2543,17 @@ pub async fn handle_fleet_health(pool: &sqlx::PgPool, json: bool) -> Result<()> 
     }
 
     println!(
-        "{:<11} {:<14} {:<9} {:<10} {:<5} {:<5} {:<12} {:<8}",
-        "NAME", "IP", "STATUS", "LAST_BEAT", "CPU%", "RAM%", "LLM SERVERS", "SOFTWARE"
+        "{:<11} {:<14} {:<10} {:<8} {:<9} {:<10} {:<5} {:<5} {:<12} {:<8}",
+        "NAME",
+        "IP",
+        "REACHABLE",
+        "DAEMON",
+        "STATUS",
+        "LAST_BEAT",
+        "CPU%",
+        "RAM%",
+        "LLM SERVERS",
+        "SOFTWARE"
     );
     for h in &out {
         let status = if h.odown {
@@ -2560,11 +2584,45 @@ pub async fn handle_fleet_health(pool: &sqlx::PgPool, json: bool) -> Result<()> 
             .map(|n| n.to_string())
             .unwrap_or_else(|| "-".into());
         println!(
-            "{:<11} {:<14} {:<9} {:<10} {:<5} {:<5} {:<12} {:<8}",
-            h.name, h.ip, status, beat, cpu, ram, llms, sw
+            "{:<11} {:<14} {:<10} {:<8} {:<9} {:<10} {:<5} {:<5} {:<12} {:<8}",
+            h.name,
+            h.ip,
+            if h.computer_reachable { "yes" } else { "no" },
+            if h.daemon_joined { "joined" } else { "absent" },
+            status,
+            beat,
+            cpu,
+            ram,
+            llms,
+            sw
         );
     }
     Ok(())
+}
+
+async fn computer_reachable(ip: &str, ssh_port: u16) -> bool {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        tokio::net::TcpStream::connect((ip, ssh_port)),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+#[cfg(test)]
+mod computer_reachability_tests {
+    use super::computer_reachable;
+
+    #[tokio::test]
+    async fn distinguishes_host_reachability_from_daemon_state() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        assert!(computer_reachable("127.0.0.1", port).await);
+
+        drop(listener);
+        assert!(!computer_reachable("127.0.0.1", port).await);
+    }
 }
 
 /// Show per-host code identity (SHA-first), with a convergence summary.
