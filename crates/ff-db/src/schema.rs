@@ -10428,6 +10428,64 @@ CREATE INDEX IF NOT EXISTS idx_work_item_merge_queue_train
     ON work_item_merge_queue (train_id) WHERE train_id IS NOT NULL;
 "#;
 
+/// V177 — Tiered fleet metrics storage (partitioned).
+///
+/// Three retention tiers for fleet-wide time-series metrics, all natively
+/// range-partitioned on their time column so retention is a cheap partition
+/// DROP instead of a bloating DELETE:
+///
+/// - `fleet_metrics_raw`    — every sample as written; DAILY partitions kept 7 days.
+/// - `fleet_metrics_1min`   — 1-minute rollups; DAILY partitions kept 30 days.
+/// - `fleet_metrics_hourly` — hourly rollups; MONTHLY partitions kept forever.
+///
+/// The migration creates only the partitioned parents (plus partitioned
+/// indexes, which cascade to every child). Dated child partitions are created
+/// ahead of time and expired ones dropped by the partition-maintenance tick
+/// (`ff_db::metrics_partitions`, driven leader-gated from forgefleetd) — a
+/// parent with no children rejects inserts, so writers depend on that tick
+/// having run at least once.
+pub const SCHEMA_V177_FLEET_METRICS: &str = r#"
+CREATE TABLE IF NOT EXISTS fleet_metrics_raw (
+    worker_name  TEXT NOT NULL,
+    metric       TEXT NOT NULL,
+    value        DOUBLE PRECISION NOT NULL,
+    labels       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    recorded_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+) PARTITION BY RANGE (recorded_at);
+CREATE INDEX IF NOT EXISTS idx_fleet_metrics_raw_metric_time
+    ON fleet_metrics_raw (metric, recorded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fleet_metrics_raw_worker_time
+    ON fleet_metrics_raw (worker_name, recorded_at DESC);
+
+CREATE TABLE IF NOT EXISTS fleet_metrics_1min (
+    worker_name  TEXT NOT NULL,
+    metric       TEXT NOT NULL,
+    bucket_start TIMESTAMPTZ NOT NULL,
+    sample_count BIGINT NOT NULL DEFAULT 0,
+    value_min    DOUBLE PRECISION NOT NULL,
+    value_max    DOUBLE PRECISION NOT NULL,
+    value_avg    DOUBLE PRECISION NOT NULL,
+    value_last   DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (worker_name, metric, bucket_start)
+) PARTITION BY RANGE (bucket_start);
+CREATE INDEX IF NOT EXISTS idx_fleet_metrics_1min_metric_time
+    ON fleet_metrics_1min (metric, bucket_start DESC);
+
+CREATE TABLE IF NOT EXISTS fleet_metrics_hourly (
+    worker_name  TEXT NOT NULL,
+    metric       TEXT NOT NULL,
+    bucket_start TIMESTAMPTZ NOT NULL,
+    sample_count BIGINT NOT NULL DEFAULT 0,
+    value_min    DOUBLE PRECISION NOT NULL,
+    value_max    DOUBLE PRECISION NOT NULL,
+    value_avg    DOUBLE PRECISION NOT NULL,
+    value_last   DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (worker_name, metric, bucket_start)
+) PARTITION BY RANGE (bucket_start);
+CREATE INDEX IF NOT EXISTS idx_fleet_metrics_hourly_metric_time
+    ON fleet_metrics_hourly (metric, bucket_start DESC);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

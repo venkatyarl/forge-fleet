@@ -840,8 +840,12 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "artifact_index",
         sql: schema::SCHEMA_V171_ARTIFACT_INDEX,
     },
-    // 172 is reserved by the in-flight metrics-schema branch; gaps are fine,
-    // duplicates are not (see migration_versions_are_strictly_increasing).
+    // 172 was reserved by the metrics-schema branch, but 173–176 landed before
+    // it did — the runner only applies versions ABOVE the current one, so a
+    // late 172 would be silently skipped on any DB already at 173+. The
+    // metrics schema landed as 177 instead; 172 stays a permanent gap (gaps
+    // are fine, duplicates are not — see
+    // migration_versions_are_strictly_increasing).
     PgMigration {
         version: 173,
         name: "computers_ip_ram_atomic",
@@ -861,6 +865,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         version: 176,
         name: "merge_trains",
         sql: schema::SCHEMA_V176_MERGE_TRAINS,
+    },
+    PgMigration {
+        version: 177,
+        name: "fleet_metrics",
+        sql: schema::SCHEMA_V177_FLEET_METRICS,
     },
 ];
 
