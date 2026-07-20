@@ -83,6 +83,15 @@ impl TickRegistry {
                 scope: TickScope::LeaderOnly,
                 runner: run_nightly_digest_tick,
             },
+            TickDefinition {
+                // Poll the Kimi coding-plan usage endpoint and refresh the
+                // `kimi` row of `cloud_budget_buckets`. Leader-only so one
+                // fleet-wide poll hits the provider, not one per node.
+                name: "kimi_usage_poller",
+                interval: Duration::from_secs(600),
+                scope: TickScope::LeaderOnly,
+                runner: run_kimi_usage_poller_tick,
+            },
         ]
         .into_iter()
         .map(|definition| RegisteredTick {
@@ -223,6 +232,14 @@ fn run_metrics_scraper_tick(pg: PgPool, worker_name: String) -> BoxFuture<'stati
 
 fn run_nightly_digest_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
     Box::pin(async move { crate::ha::periodic::run_nightly_digest_tick(&pg, &worker_name).await })
+}
+
+fn run_kimi_usage_poller_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::kimi_usage_poller::poll_kimi_usage_once(&pg)
+            .await
+            .map(|_| ())
+    })
 }
 
 /// How often the dispatch-tick watchdog wakes up to check liveness.
