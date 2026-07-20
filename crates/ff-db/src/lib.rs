@@ -55,6 +55,9 @@ pub use queries::{
     DemandVector,
     // Fleet dispatch outcome feedback (roadmap #8)
     DispatchOutcomeStat,
+    // V178 model-server error events
+    ErrorEventInsert,
+    ErrorEventRow,
     // Fleet agents catalog (V112)
     FleetAgentRow,
     FleetModelRow,
@@ -164,6 +167,7 @@ pub use queries::{
     pg_insert_brain_reminder,
     pg_insert_disk_policy_run,
     pg_insert_disk_usage,
+    pg_insert_error_event,
     pg_insert_node_ssh_key,
     pg_insert_work_intent,
     // Interaction log (V121 ff_interactions)
@@ -182,6 +186,7 @@ pub use queries::{
     pg_list_deferred,
     pg_list_deployments,
     pg_list_due_reminders,
+    pg_list_error_events,
     pg_list_interactions,
     pg_list_jobs,
     pg_list_library,

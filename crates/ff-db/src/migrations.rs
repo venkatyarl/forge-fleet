@@ -871,6 +871,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "fleet_metrics",
         sql: schema::SCHEMA_V177_FLEET_METRICS,
     },
+    PgMigration {
+        version: 178,
+        name: "error_events",
+        sql: schema::SCHEMA_V178_ERROR_EVENTS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1269,6 +1274,56 @@ mod tests {
                 .expect("re-read test computer");
         assert_eq!(ip, "10.0.0.2");
         assert_eq!(ram, Some(64));
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v178_error_events_round_trip() {
+        // Needs Postgres — create_fresh_temp_db returns None (and we early-
+        // return) when neither FORGEFLEET_POSTGRES_URL nor
+        // FORGEFLEET_DATABASE_URL is set, so this never panics in CI.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        let event = crate::ErrorEventInsert {
+            worker_name: "v178-test-node".to_string(),
+            deployment_id: None,
+            library_id: None,
+            catalog_id: Some("qwen3-coder-30b".to_string()),
+            runtime: "llama.cpp".to_string(),
+            error_kind: "load".to_string(),
+            summary: "resolve gguf for /tmp/model: no .gguf files".to_string(),
+            details: serde_json::json!({"port": 55000}),
+            stderr_tail: Some("slot load_model: id 0 | new slot".to_string()),
+        };
+        let id = crate::pg_insert_error_event(&pool, &event)
+            .await
+            .expect("insert error event");
+        assert!(id > 0);
+
+        let rows = crate::pg_list_error_events(&pool, Some("v178-test-node"), None, 10)
+            .await
+            .expect("list error events");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].worker_name, "v178-test-node");
+        assert_eq!(rows[0].error_kind, "load");
+        assert_eq!(rows[0].runtime, "llama.cpp");
+
+        let filtered = crate::pg_list_error_events(&pool, None, Some("load"), 10)
+            .await
+            .expect("list error events by kind");
+        assert_eq!(filtered.len(), 1);
+
+        let none = crate::pg_list_error_events(&pool, None, Some("oom"), 10)
+            .await
+            .expect("list error events by kind oom");
+        assert!(none.is_empty());
 
         drop_temp_db(admin, pool, &db_name).await;
     }
