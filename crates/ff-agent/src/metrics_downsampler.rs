@@ -8,8 +8,11 @@
 //!
 //! Retention and rollups run on the deferred-task retention cron.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use thiserror::Error;
 use tokio::sync::watch;
@@ -34,6 +37,47 @@ pub struct SampleReport {
     /// Rows we saw beats for but skipped because no `computers` row
     /// matched the beat's `computer_name`.
     pub skipped_no_computer_row: usize,
+    /// Beats ignored because an older sample arrived after a newer one.
+    pub skipped_stale_beats: usize,
+    /// Nodes whose boot identity (or legacy uptime) indicated a restart.
+    pub restarts_detected: usize,
+}
+
+#[derive(Debug, Clone)]
+struct LastBeat {
+    timestamp: DateTime<Utc>,
+    boot_id: Option<String>,
+    uptime_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BeatOrder {
+    Current,
+    Restarted,
+    Stale,
+}
+
+fn classify_beat(previous: Option<&LastBeat>, current: &LastBeat) -> BeatOrder {
+    let Some(previous) = previous else {
+        return BeatOrder::Current;
+    };
+    if current.timestamp <= previous.timestamp {
+        return BeatOrder::Stale;
+    }
+
+    let boot_changed = match (&previous.boot_id, &current.boot_id) {
+        (Some(previous), Some(current)) => previous != current,
+        _ => false,
+    };
+    let uptime_reset = match (previous.uptime_secs, current.uptime_secs) {
+        (Some(previous), Some(current)) => current < previous,
+        _ => false,
+    };
+    if boot_changed || uptime_reset {
+        BeatOrder::Restarted
+    } else {
+        BeatOrder::Current
+    }
 }
 
 /// Periodic downsampler: reads Pulse beats and INSERTs into
@@ -41,12 +85,17 @@ pub struct SampleReport {
 pub struct MetricsDownsampler {
     pg: PgPool,
     pulse: PulseReader,
+    last_beats: Mutex<HashMap<String, LastBeat>>,
 }
 
 impl MetricsDownsampler {
     /// Build a new downsampler.
     pub fn new(pg: PgPool, pulse: PulseReader, _my_name: String) -> Self {
-        Self { pg, pulse }
+        Self {
+            pg,
+            pulse,
+            last_beats: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Check whether this process currently owns leadership.
@@ -61,6 +110,31 @@ impl MetricsDownsampler {
         let mut report = SampleReport::default();
 
         for beat in beats {
+            let current = LastBeat {
+                timestamp: beat.timestamp,
+                boot_id: beat.boot_id.clone(),
+                uptime_secs: beat.system_uptime_secs,
+            };
+            let order = {
+                let mut last_beats = self.last_beats.lock().unwrap_or_else(|e| e.into_inner());
+                let order = classify_beat(last_beats.get(&beat.computer_name), &current);
+                if order != BeatOrder::Stale {
+                    // A restart replaces the old baseline. Any future
+                    // cumulative counters must start fresh from this beat,
+                    // never subtract across boots.
+                    last_beats.insert(beat.computer_name.clone(), current.clone());
+                }
+                order
+            };
+            match order {
+                BeatOrder::Stale => {
+                    report.skipped_stale_beats += 1;
+                    continue;
+                }
+                BeatOrder::Restarted => report.restarts_detected += 1,
+                BeatOrder::Current => {}
+            }
+
             // Look up computer_id by name. Beats may report names that aren't
             // yet in `computers` (e.g. mid-enrollment) — skip them cleanly.
             let row: Option<(uuid::Uuid,)> =
@@ -95,14 +169,15 @@ impl MetricsDownsampler {
                     llm_tokens_per_sec
                 )
                 VALUES (
-                    $1, date_trunc('minute', NOW()),
-                    $2, $3, $4, $5, $6,
-                    $7, $8, $9, $10
+                    $1, date_trunc('minute', $2::timestamptz),
+                    $3, $4, $5, $6, $7,
+                    $8, $9, $10, $11
                 )
                 ON CONFLICT (computer_id, recorded_at) DO NOTHING
                 "#,
             )
             .bind(computer_id)
+            .bind(beat.timestamp)
             .bind(beat.load.cpu_pct)
             .bind(beat.load.ram_pct)
             .bind(beat.memory.ram_used_gb)
@@ -141,6 +216,8 @@ impl MetricsDownsampler {
                                 tracing::debug!(
                                     rows = report.rows_written,
                                     skipped = report.skipped_no_computer_row,
+                                    stale = report.skipped_stale_beats,
+                                    restarts = report.restarts_detected,
                                     "metrics downsample tick"
                                 );
                             }
@@ -247,4 +324,44 @@ pub async fn history_for_computer(
             },
         )
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn observed(timestamp: i64, boot_id: Option<&str>, uptime_secs: Option<u64>) -> LastBeat {
+        LastBeat {
+            timestamp: DateTime::from_timestamp(timestamp, 0).unwrap(),
+            boot_id: boot_id.map(str::to_string),
+            uptime_secs,
+        }
+    }
+
+    #[test]
+    fn boot_id_change_resets_the_baseline() {
+        let previous = observed(100, Some("boot-a"), Some(500));
+        let current = observed(101, Some("boot-b"), Some(2));
+        assert_eq!(
+            classify_beat(Some(&previous), &current),
+            BeatOrder::Restarted
+        );
+    }
+
+    #[test]
+    fn uptime_rollback_detects_restart_for_legacy_beats() {
+        let previous = observed(100, None, Some(500));
+        let current = observed(101, None, Some(2));
+        assert_eq!(
+            classify_beat(Some(&previous), &current),
+            BeatOrder::Restarted
+        );
+    }
+
+    #[test]
+    fn older_sample_is_stale_even_if_its_boot_id_differs() {
+        let previous = observed(101, Some("boot-b"), Some(2));
+        let current = observed(100, Some("boot-a"), Some(500));
+        assert_eq!(classify_beat(Some(&previous), &current), BeatOrder::Stale);
+    }
 }

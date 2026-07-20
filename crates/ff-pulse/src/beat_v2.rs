@@ -52,6 +52,14 @@ pub struct PulseBeatV2 {
     pub computer_id: Option<Uuid>,
     pub computer_name: String,
     pub timestamp: DateTime<Utc>,
+    /// Stable identifier for the current operating-system boot. Optional for
+    /// backward compatibility with older publishers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    /// Host uptime at the time this beat was built. Used as a restart fallback
+    /// when an older publisher cannot provide a boot ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_uptime_secs: Option<u64>,
     /// Monotonic epoch counter, per-computer.
     pub epoch: u64,
     /// `"leader"` or `"member"`.
@@ -452,6 +460,8 @@ impl PulseBeatV2 {
             computer_id: None,
             computer_name: computer_name.into(),
             timestamp: now,
+            boot_id: None,
+            system_uptime_secs: None,
             epoch: 0,
             role_claimed: "member".to_string(),
             election_priority: 0,

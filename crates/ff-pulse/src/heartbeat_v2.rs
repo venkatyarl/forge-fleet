@@ -55,11 +55,29 @@ pub struct HeartbeatV2Publisher {
     /// published on every beat so the materializer can refresh
     /// computer_software.installed_version without an explicit upgrade.
     build_sha: Option<String>,
+    /// Stable for the lifetime of the current OS boot. Capture once so every
+    /// beat from this publisher carries the same restart identity.
+    boot_id: Option<String>,
 }
 
 // Small compatibility shim — we use std RwLock to avoid pulling parking_lot.
 mod parking_lot_compat {
     pub use std::sync::RwLock;
+}
+
+fn detect_boot_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    if let Ok(id) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+        let id = id.trim();
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+
+    // `boot_time` is the same health signal used to derive uptime, and gives
+    // non-Linux hosts a stable identity without invoking a subprocess.
+    let boot_time = System::boot_time();
+    (boot_time != 0).then(|| format!("boot-time-{boot_time}"))
 }
 
 impl HeartbeatV2Publisher {
@@ -79,6 +97,7 @@ impl HeartbeatV2Publisher {
             dispatch_tick_at_unix: Arc::new(AtomicU64::new(0)),
             election_priority,
             build_sha: None,
+            boot_id: detect_boot_id(),
         }
     }
 
@@ -142,6 +161,7 @@ impl HeartbeatV2Publisher {
         let is_yielding = self.is_yielding.clone();
         let election_priority = self.election_priority;
         let build_sha = self.build_sha.clone();
+        let boot_id = self.boot_id.clone();
 
         // Phase A: blocking system probes — must not block the async runtime.
         // Hard timeout: if any macOS framework call (IOKit, DiskArbitration,
@@ -161,6 +181,8 @@ impl HeartbeatV2Publisher {
                 beat.election_priority = election_priority;
                 beat.is_yielding = is_yielding.load(Ordering::Relaxed);
                 beat.timestamp = Utc::now();
+                beat.boot_id = boot_id;
+                beat.system_uptime_secs = Some(System::uptime());
 
                 // V43: drain any queued panics from the local panic_hook into the
                 // beat. Leader's materializer deduplicates into fleet_bug_reports.
