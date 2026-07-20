@@ -19,6 +19,9 @@
 //! and every statement is marked non-persistent so sqlx never relies on a
 //! cross-transaction statement cache.
 
+use std::collections::HashMap;
+use std::io::{Read, Seek};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use sqlx::PgPool;
@@ -66,6 +69,9 @@ pub struct ParsedMetrics {
     pub tokens_per_sec: Option<f64>,
     pub queue_depth: Option<i32>,
     pub active_requests: Option<i32>,
+    pub prompt_tokens_total: Option<f64>,
+    pub predicted_tokens_total: Option<f64>,
+    pub inference_seconds_total: Option<f64>,
     /// Non-comment sample lines seen — a liveness signal even when none of
     /// the known metric names matched.
     pub metric_count: i32,
@@ -77,6 +83,10 @@ struct ScrapeTarget {
     id: uuid::Uuid,
     port: i32,
     runtime: String,
+    parallel_slots: Option<i32>,
+    previous_prompt_tokens: Option<f64>,
+    previous_predicted_tokens: Option<f64>,
+    previous_inference_seconds: Option<f64>,
 }
 
 /// One sample ready to insert.
@@ -85,6 +95,10 @@ struct Sample {
     port: i32,
     runtime: String,
     metrics: ParsedMetrics,
+    endpoint: String,
+    requests_per_sec: Option<f64>,
+    batch_occupancy: Option<f64>,
+    avg_latency_ms: Option<f64>,
 }
 
 /// Retention window for scrape samples, tunable per node without a restart.
@@ -119,9 +133,19 @@ impl MetricsScraper {
     /// pgcat-transaction-mode-safe transaction.
     pub async fn scrape_once(&self) -> Result<ScrapeReport, ScrapeError> {
         let targets: Vec<ScrapeTarget> = sqlx::query_as(
-            "SELECT id, port, runtime FROM fleet_model_deployments \
-             WHERE worker_name = $1 AND health_status <> 'stopped' \
-             ORDER BY port",
+            "SELECT d.id, d.port, d.runtime, d.parallel_slots, \
+                    prev.prompt_tokens_total AS previous_prompt_tokens, \
+                    prev.predicted_tokens_total AS previous_predicted_tokens, \
+                    prev.inference_seconds_total AS previous_inference_seconds \
+             FROM fleet_model_deployments d \
+             LEFT JOIN LATERAL ( \
+                 SELECT prompt_tokens_total, predicted_tokens_total, inference_seconds_total \
+                 FROM deployment_metrics_scrapes \
+                 WHERE deployment_id = d.id AND endpoint = 'all' \
+                 ORDER BY scraped_at DESC LIMIT 1 \
+             ) prev ON TRUE \
+             WHERE d.worker_name = $1 AND d.health_status <> 'stopped' \
+             ORDER BY d.port",
         )
         .persistent(false)
         .bind(&self.my_name)
@@ -150,12 +174,65 @@ impl MetricsScraper {
                 }
             };
 
-            samples.push(Sample {
+            let metrics = parse_prometheus(&body);
+            let requests = if target.runtime == "llama.cpp" {
+                consume_llama_log(target.port)
+            } else {
+                HashMap::new()
+            };
+            let request_count: u64 = requests.values().sum();
+            let inference_delta = counter_delta(
+                metrics.inference_seconds_total,
+                target.previous_inference_seconds,
+            );
+            let token_delta =
+                counter_delta(metrics.prompt_tokens_total, target.previous_prompt_tokens)
+                    .unwrap_or(0.0)
+                    + counter_delta(
+                        metrics.predicted_tokens_total,
+                        target.previous_predicted_tokens,
+                    )
+                    .unwrap_or(0.0);
+            let interval_secs = DEFAULT_INTERVAL.as_secs_f64();
+            let avg_latency_ms = inference_delta
+                .filter(|_| request_count > 0)
+                .map(|seconds| seconds * 1000.0 / request_count as f64);
+            let batch_occupancy = metrics.active_requests.and_then(|active| {
+                target
+                    .parallel_slots
+                    .filter(|slots| *slots > 0)
+                    .map(|slots| (active.max(0) as f64 / slots as f64).clamp(0.0, 1.0))
+            });
+            let mut all_metrics = metrics;
+            if token_delta > 0.0 {
+                all_metrics.tokens_per_sec = Some(token_delta / interval_secs);
+            }
+            let all_sample = Sample {
                 deployment_id: target.id,
                 port: target.port,
                 runtime: target.runtime,
-                metrics: parse_prometheus(&body),
-            });
+                metrics: all_metrics,
+                endpoint: "all".into(),
+                requests_per_sec: Some(request_count as f64 / interval_secs),
+                batch_occupancy,
+                avg_latency_ms,
+            };
+            for (endpoint, count) in requests {
+                samples.push(Sample {
+                    deployment_id: target.id,
+                    port: target.port,
+                    runtime: "llama.cpp".into(),
+                    metrics: ParsedMetrics::default(),
+                    endpoint,
+                    requests_per_sec: Some(count as f64 / interval_secs),
+                    batch_occupancy,
+                    avg_latency_ms,
+                });
+            }
+            // Keep the aggregate row newest: the existing model_capacity view
+            // selects the latest deployment sample and must not land on a
+            // path-specific row whose process counters are intentionally NULL.
+            samples.push(all_sample);
         }
 
         let (written, pruned) = self.write_pass(&samples).await?;
@@ -177,8 +254,10 @@ impl MetricsScraper {
             let result = sqlx::query(
                 "INSERT INTO deployment_metrics_scrapes \
                     (deployment_id, worker_name, port, runtime, \
-                     tokens_per_sec, queue_depth, active_requests, metric_count) \
-                 SELECT $1, $2, $3, $4, $5, $6, $7, $8 \
+                    tokens_per_sec, queue_depth, active_requests, metric_count, endpoint, \
+                    requests_per_sec, batch_occupancy, avg_latency_ms, prompt_tokens_total, \
+                    predicted_tokens_total, inference_seconds_total) \
+                 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15 \
                  WHERE EXISTS (SELECT 1 FROM fleet_model_deployments WHERE id = $1)",
             )
             .persistent(false)
@@ -190,6 +269,13 @@ impl MetricsScraper {
             .bind(sample.metrics.queue_depth)
             .bind(sample.metrics.active_requests)
             .bind(sample.metrics.metric_count)
+            .bind(&sample.endpoint)
+            .bind(sample.requests_per_sec)
+            .bind(sample.batch_occupancy)
+            .bind(sample.avg_latency_ms)
+            .bind(sample.metrics.prompt_tokens_total)
+            .bind(sample.metrics.predicted_tokens_total)
+            .bind(sample.metrics.inference_seconds_total)
             .execute(&mut *tx)
             .await?;
             written += result.rows_affected() as usize;
@@ -255,6 +341,87 @@ pub async fn run_metrics_scraper_tick(
     scraper.scrape_once().await
 }
 
+fn counter_delta(current: Option<f64>, previous: Option<f64>) -> Option<f64> {
+    match (current, previous) {
+        (Some(current), Some(previous)) if current >= previous => Some(current - previous),
+        _ => None,
+    }
+}
+
+/// Consume llama-server's text stream after `/metrics` has captured its useful
+/// counters. Completion lines become bounded endpoint counts; startup/errors
+/// are retained in a small events log; verbose slot dumps are discarded.
+fn consume_llama_log(port: i32) -> HashMap<String, u64> {
+    const READ_MAX: u64 = 16 * 1024 * 1024;
+    const EVENTS_MAX: u64 = 10 * 1024 * 1024;
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let log_dir = PathBuf::from(home).join(".forgefleet/logs");
+    let raw_path = log_dir.join(format!("model-{port}.log"));
+    let events_path = log_dir.join(format!("model-{port}.events.log"));
+    let counts = HashMap::new();
+
+    if crate::model_runtime::cap_model_log(&raw_path, crate::model_runtime::MODEL_LOG_MAX_BYTES)
+        .is_err()
+    {
+        return counts;
+    }
+    let Ok(mut raw) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&raw_path)
+    else {
+        return counts;
+    };
+    let len = raw.metadata().map(|m| m.len()).unwrap_or(0);
+    if len > READ_MAX && raw.seek(std::io::SeekFrom::Start(len - READ_MAX)).is_err() {
+        return counts;
+    }
+    let mut text = String::new();
+    if raw.read_to_string(&mut text).is_err() {
+        return counts;
+    }
+
+    let (counts, retained) = parse_llama_log(&text);
+    if !retained.is_empty() {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&events_path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, retained.as_bytes()));
+        let _ = crate::model_runtime::cap_model_log(&events_path, EVENTS_MAX);
+    }
+    let _ = raw.set_len(0);
+    counts
+}
+
+fn parse_llama_log(text: &str) -> (HashMap<String, u64>, String) {
+    let mut counts = HashMap::new();
+    let mut retained = String::new();
+    for line in text.lines() {
+        if let Some(rest) = line.split("done request:").nth(1) {
+            let mut fields = rest.split_whitespace();
+            let _method = fields.next();
+            if let Some(path) = fields.next() {
+                let endpoint = path.split('?').next().unwrap_or(path).to_string();
+                *counts.entry(endpoint).or_insert(0) += 1;
+            }
+        } else {
+            let lower = line.to_ascii_lowercase();
+            if lower.contains("error")
+                || lower.contains("warn")
+                || lower.contains("failed")
+                || lower.contains("listening")
+                || lower.contains("loading model")
+            {
+                retained.push_str(line);
+                retained.push('\n');
+            }
+        }
+    }
+    (counts, retained)
+}
+
 /// Parse a Prometheus text-format body into the key metrics we track.
 ///
 /// Labels are ignored; for a metric that appears multiple times (one per
@@ -281,6 +448,8 @@ fn parse_prometheus(body: &str) -> ParsedMetrics {
 
         match name {
             "llamacpp:prompt_tokens_per_second"
+            | "llamacpp:prompt_tokens_seconds"
+            | "llamacpp:predicted_tokens_seconds"
             | "vllm:avg_generation_throughput_tokens_per_s"
             | "tokens_per_second" => {
                 parsed.tokens_per_sec = Some(value);
@@ -290,6 +459,20 @@ fn parse_prometheus(body: &str) -> ParsedMetrics {
             }
             "llamacpp:requests_processing" | "vllm:num_requests_running" | "active_requests" => {
                 parsed.active_requests = Some(value as i32);
+            }
+            "llamacpp:prompt_tokens_total" | "vllm:prompt_tokens_total" => {
+                parsed.prompt_tokens_total = Some(value);
+            }
+            "llamacpp:tokens_predicted_total" | "vllm:generation_tokens_total" => {
+                parsed.predicted_tokens_total = Some(value);
+            }
+            "llamacpp:prompt_seconds_total" => {
+                parsed.inference_seconds_total =
+                    Some(parsed.inference_seconds_total.unwrap_or(0.0) + value);
+            }
+            "llamacpp:tokens_predicted_seconds_total" => {
+                parsed.inference_seconds_total =
+                    Some(parsed.inference_seconds_total.unwrap_or(0.0) + value);
             }
             _ => {}
         }
@@ -311,12 +494,34 @@ llamacpp:prompt_tokens_per_second 42.5
 llamacpp:requests_deferred 3
 llamacpp:requests_processing 2
 llamacpp:kv_cache_tokens 1024
+llamacpp:prompt_tokens_total 100
+llamacpp:tokens_predicted_total 50
+llamacpp:prompt_seconds_total 2.5
+llamacpp:tokens_predicted_seconds_total 5.0
 ";
         let parsed = parse_prometheus(body);
         assert_eq!(parsed.tokens_per_sec, Some(42.5));
         assert_eq!(parsed.queue_depth, Some(3));
         assert_eq!(parsed.active_requests, Some(2));
-        assert_eq!(parsed.metric_count, 4);
+        assert_eq!(parsed.prompt_tokens_total, Some(100.0));
+        assert_eq!(parsed.predicted_tokens_total, Some(50.0));
+        assert_eq!(parsed.inference_seconds_total, Some(7.5));
+        assert_eq!(parsed.metric_count, 8);
+    }
+
+    #[test]
+    fn llama_log_converts_requests_and_drops_slot_dumps() {
+        let log = "slot update_slots: id 2 | noisy dump\n\
+srv log_server_r: done request: POST /v1/embeddings 127.0.0.1 200\n\
+srv log_server_r: done request: POST /v1/chat/completions?x=1 127.0.0.1 200\n\
+server is listening on 0.0.0.0:55001\n\
+ERROR failed to decode request\n";
+        let (counts, retained) = parse_llama_log(log);
+        assert_eq!(counts.get("/v1/embeddings"), Some(&1));
+        assert_eq!(counts.get("/v1/chat/completions"), Some(&1));
+        assert!(!retained.contains("slot update_slots"));
+        assert!(retained.contains("server is listening"));
+        assert!(retained.contains("ERROR failed"));
     }
 
     #[test]

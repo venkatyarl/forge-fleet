@@ -11297,6 +11297,36 @@ ON CONFLICT (key) DO UPDATE SET
     updated_at = NOW();
 "#;
 
+/// V206 — Request-level model endpoint metrics converted from llama-server logs.
+pub const SCHEMA_V206_MODEL_ENDPOINT_METRICS: &str = r#"
+ALTER TABLE deployment_metrics_scrapes
+    ADD COLUMN IF NOT EXISTS endpoint TEXT NOT NULL DEFAULT 'all',
+    ADD COLUMN IF NOT EXISTS requests_per_sec DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS batch_occupancy DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS avg_latency_ms DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS prompt_tokens_total DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS predicted_tokens_total DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS inference_seconds_total DOUBLE PRECISION;
+
+CREATE INDEX IF NOT EXISTS idx_deployment_metrics_endpoint_time
+    ON deployment_metrics_scrapes (deployment_id, endpoint, scraped_at DESC);
+
+CREATE OR REPLACE VIEW model_capacity AS
+SELECT
+    d.worker_name AS computer, d.id AS deployment_id, d.catalog_id, d.runtime,
+    d.port, d.context_window, s.tokens_per_sec, s.queue_depth, s.active_requests,
+    s.scraped_at AS last_scraped_at,
+    CASE WHEN s.scraped_at IS NULL OR s.scraped_at < NOW() - INTERVAL '90 seconds'
+         THEN 'unknown' ELSE d.health_status END AS status
+FROM fleet_model_deployments d
+LEFT JOIN LATERAL (
+    SELECT m.tokens_per_sec, m.queue_depth, m.active_requests, m.scraped_at
+    FROM deployment_metrics_scrapes m
+    WHERE m.deployment_id = d.id AND m.endpoint = 'all'
+    ORDER BY m.scraped_at DESC, m.id DESC LIMIT 1
+) s ON TRUE;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

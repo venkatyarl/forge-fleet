@@ -31,7 +31,31 @@ pub async fn sample_local_disk(pool: &sqlx::PgPool) -> Result<DiskSample, String
 
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     let models_dir = expand_tilde(&node.models_dir, &home);
-    let quota_pct = node.disk_quota_pct.max(1) as u32;
+    // A misconfigured quota must never delay the first warning until the disk
+    // is already at 90%. Most nodes use 80%; 85% is the hard safety ceiling.
+    let quota_pct = (node.disk_quota_pct.max(1) as u32).min(85);
+
+    // Emergency cap for model logs even if the faster metrics scraper is
+    // unhealthy. The active writer keeps the inode open, so copy+truncate is
+    // intentional here (rename would let the hidden old inode keep growing).
+    let log_dir = PathBuf::from(&home).join(".forgefleet/logs");
+    if let Ok(entries) = std::fs::read_dir(&log_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_model_log = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("model-") && n.ends_with(".log"));
+            if is_model_log
+                && let Err(error) = crate::model_runtime::cap_model_log(
+                    &path,
+                    crate::model_runtime::MODEL_LOG_MAX_BYTES,
+                )
+            {
+                tracing::warn!(%error, path = %path.display(), "failed to cap model log");
+            }
+        }
+    }
 
     // Get FS totals via `df -Pk <models_dir>` — POSIX 1024-byte blocks, portable across Mac/Linux.
     let df_out = std::process::Command::new("df")

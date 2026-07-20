@@ -4,6 +4,7 @@
 //! Processes are spawned detached from the caller. When loaded, a row is upserted into
 //! `fleet_model_deployments` so the rest of the fleet can discover the new endpoint.
 
+use std::io::Seek;
 use std::path::{Path, PathBuf};
 
 static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
@@ -385,6 +386,9 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
                 // its loaded models, otherwise --mlock would have
                 // failed anyway.
                 "--mlock".into(),
+                // Convert request activity into bounded structured metrics via
+                // the agent scraper instead of relying on verbose slot logs.
+                "--metrics".into(),
                 // Silence the per-slot KV-cache dump llama-server prints at
                 // launch ("slot load_model: id N | task -1 | new slot ...").
                 // -lv 2 keeps warnings/errors while hiding routine info spam.
@@ -519,6 +523,7 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         .join(".forgefleet/logs");
     let _ = std::fs::create_dir_all(&log_dir);
     let log_path = log_dir.join(format!("model-{port}.log"));
+    cap_model_log(&log_path, MODEL_LOG_MAX_BYTES)?;
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -734,6 +739,36 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         port,
         model_path: lib.file_path,
     })
+}
+
+/// Hard fallback cap for a live append log. The 30-second metrics scraper
+/// normally consumes and truncates these files; this protects hosts when the
+/// scraper or Postgres is unavailable. `set_len(0)` also works for the open
+/// descriptor held by systemd, unlike rename-based rotation.
+pub const MODEL_LOG_MAX_BYTES: u64 = 500 * 1024 * 1024;
+
+pub fn cap_model_log(path: &std::path::Path, max_bytes: u64) -> Result<(), String> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    if meta.len() <= max_bytes {
+        return Ok(());
+    }
+    let archive = path.with_extension("log.1");
+    let mut source = std::fs::File::open(path)
+        .map_err(|e| format!("open oversized model log {}: {e}", path.display()))?;
+    source
+        .seek(std::io::SeekFrom::End(-(max_bytes.min(meta.len()) as i64)))
+        .map_err(|e| format!("seek model log {}: {e}", path.display()))?;
+    let mut dest = std::fs::File::create(&archive)
+        .map_err(|e| format!("create model log archive {}: {e}", archive.display()))?;
+    std::io::copy(&mut source, &mut dest)
+        .map_err(|e| format!("archive model log {}: {e}", path.display()))?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_len(0))
+        .map_err(|e| format!("truncate model log {}: {e}", path.display()))
 }
 
 /// Stop a running inference server tracked under `deployment_id`.

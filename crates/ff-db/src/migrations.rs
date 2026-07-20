@@ -1011,6 +1011,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "mcp_bootstrap_generation",
         sql: schema::SCHEMA_V205_MCP_BOOTSTRAP_GENERATION,
     },
+    PgMigration {
+        version: 206,
+        name: "model_endpoint_metrics",
+        sql: schema::SCHEMA_V206_MODEL_ENDPOINT_METRICS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
