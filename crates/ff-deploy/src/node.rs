@@ -9,10 +9,110 @@
 //! attempt counters, and only then dispatch the actual daemon restart.
 
 use anyhow::{Context, Result};
+use sqlx::PgPool;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::config::DeployConfig;
 use crate::daemon::{ActiveLease, RestartReport, restart_with_lease_drain};
+
+/// Drain this node's in-flight work-item leases from the canonical Postgres store.
+///
+/// Active leases are allowed to finish until `config.drain_timeout`. Any leases
+/// still held at the deadline are released and their work items are atomically
+/// returned to `ready` without incrementing `work_items.attempts`.
+pub async fn drain_active_work_item_leases(
+    pool: &PgPool,
+    computer_id: Uuid,
+    config: &DeployConfig,
+) -> Result<RestartReport> {
+    restart_with_lease_drain(
+        config,
+        || async {
+            let rows = sqlx::query_as::<_, (Uuid, Uuid)>(
+                "SELECT l.id, l.work_item_id
+                   FROM work_item_leases l
+                   JOIN work_items wi ON wi.id = l.work_item_id
+                  WHERE l.computer_id = $1
+                    AND l.released_at IS NULL
+                    AND wi.status IN ('claimed', 'building')",
+            )
+            .bind(computer_id)
+            .fetch_all(pool)
+            .await
+            .context("failed to load in-flight work-item leases")?;
+
+            Ok(rows
+                .into_iter()
+                .map(|(lease_id, work_item_id)| ActiveLease {
+                    lease_id: lease_id.to_string(),
+                    work_item_ids: vec![work_item_id.to_string()],
+                })
+                .collect())
+        },
+        |leases| async move {
+            let lease_ids: Vec<Uuid> = leases
+                .iter()
+                .map(|lease| Uuid::parse_str(&lease.lease_id))
+                .collect::<std::result::Result<_, _>>()
+                .context("invalid work-item lease id returned by drain query")?;
+
+            sqlx::query(
+                "WITH drained AS (
+                     UPDATE work_item_leases
+                        SET lease_state = 'released',
+                            released_at = NOW(),
+                            release_reason = 'deploy restart drain'
+                      WHERE id = ANY($1)
+                        AND released_at IS NULL
+                  RETURNING work_item_id, sub_agent_id
+                 ), freed_slots AS (
+                     UPDATE sub_agents AS sa
+                        SET current_work_item_id = NULL,
+                            status = 'idle',
+                            started_at = NULL,
+                            last_heartbeat_at = NOW()
+                      WHERE EXISTS (
+                            SELECT 1 FROM drained d
+                             WHERE d.sub_agent_id = sa.id
+                               AND d.work_item_id = sa.current_work_item_id)
+                 ), retired_worktrees AS (
+                     UPDATE work_item_worktrees AS wt
+                        SET status = 'failed'
+                      WHERE wt.status IN ('creating', 'active')
+                        AND EXISTS (
+                            SELECT 1 FROM drained d WHERE d.work_item_id = wt.work_item_id)
+                 )
+                 UPDATE work_items AS wi
+                    SET status = 'ready',
+                        assigned_computer = NULL
+                  WHERE wi.status IN ('claimed', 'building')
+                    AND EXISTS (
+                        SELECT 1 FROM drained d WHERE d.work_item_id = wi.id)",
+            )
+            .bind(&lease_ids)
+            .execute(pool)
+            .await
+            .context("failed to requeue work items after lease drain timeout")?;
+
+            Ok(())
+        },
+    )
+    .await
+}
+
+/// Drain this node's real work-item leases, then restart local `forgefleetd`.
+pub async fn restart_forgefleetd_local_with_drain(
+    pool: &PgPool,
+    computer_id: Uuid,
+    config: &DeployConfig,
+) -> Result<RestartReport> {
+    let report = drain_active_work_item_leases(pool, computer_id, config)
+        .await
+        .context("lease drain failed; forgefleetd restart not dispatched")?;
+    restart_forgefleetd_local().await?;
+    Ok(report)
+}
 
 /// Drain active leases, then restart `forgefleetd`.
 ///
@@ -40,6 +140,10 @@ where
     R: FnOnce() -> RFut,
     RFut: std::future::Future<Output = Result<()>>,
 {
+    // Drain active leases first — `restart_with_lease_drain` waits for
+    // in-flight items to complete, then requeues anything still claimed at
+    // the timeout deadline.  The requeue path sets status='ready' without
+    // touching `work_items.attempts`, so retry counters are preserved.
     let report = restart_with_lease_drain(config, active_leases, requeue_items)
         .await
         .context("lease drain failed; forgefleetd restart not dispatched")?;
@@ -53,6 +157,9 @@ where
         );
     }
 
+    // Only dispatch the actual daemon restart after the drain phase
+    // completes (success or timeout), never while leases are in an
+    // unknown state.
     restart_daemon()
         .await
         .context("failed to dispatch forgefleetd restart after drain")?;
@@ -100,107 +207,4 @@ pub async fn restart_forgefleetd_local() -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
-
-    use super::*;
-
-    fn config(drain_timeout: Duration) -> DeployConfig {
-        DeployConfig { drain_timeout }
-    }
-
-    #[tokio::test]
-    async fn restarts_after_clean_drain() {
-        let restarts = Arc::new(AtomicUsize::new(0));
-
-        let r = restarts.clone();
-        let report = restart_forgefleetd_with_drain(
-            &config(Duration::from_secs(1)),
-            || async { Ok::<_, anyhow::Error>(vec![]) },
-            |_leases| async { Ok(()) },
-            move || async move {
-                r.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            },
-        )
-        .await
-        .unwrap();
-
-        assert!(report.drained);
-        assert!(report.requeued_item_ids.is_empty());
-        assert_eq!(restarts.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn requeues_then_restarts_when_drain_times_out() {
-        let restarts = Arc::new(AtomicUsize::new(0));
-        let requeues = Arc::new(AtomicUsize::new(0));
-
-        let rs = restarts.clone();
-        let rq = requeues.clone();
-        let report = restart_forgefleetd_with_drain(
-            &config(Duration::from_millis(50)),
-            || async {
-                Ok(vec![ActiveLease {
-                    lease_id: "slot-1".into(),
-                    work_item_ids: vec!["wi-1".into()],
-                }])
-            },
-            move |_leases| {
-                let rq = rq.clone();
-                async move {
-                    rq.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                }
-            },
-            move || async move {
-                rs.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            },
-        )
-        .await
-        .unwrap();
-
-        assert!(!report.drained);
-        assert_eq!(report.requeued_item_ids, &["wi-1"]);
-        assert_eq!(requeues.load(Ordering::SeqCst), 1);
-        assert_eq!(restarts.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn does_not_restart_when_drain_errors() {
-        let restarts = Arc::new(AtomicUsize::new(0));
-
-        let r = restarts.clone();
-        let result = restart_forgefleetd_with_drain(
-            &config(Duration::from_secs(1)),
-            || async { Err::<Vec<ActiveLease>, _>(anyhow::anyhow!("lease query down")) },
-            |_leases| async { Ok(()) },
-            move || async move {
-                r.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            },
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert_eq!(restarts.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn restart_command_uses_launchctl_on_macos() {
-        let cmd = forgefleetd_restart_command("macos");
-        assert!(cmd.contains("launchctl kickstart -k"));
-        assert!(cmd.contains("com.forgefleet.forgefleetd"));
-    }
-
-    #[test]
-    fn restart_command_uses_detached_nonblocking_systemctl_on_linux() {
-        let cmd = forgefleetd_restart_command("linux");
-        assert!(cmd.contains("systemctl --user restart --no-block forgefleetd.service"));
-        assert!(cmd.contains("setsid"));
-        assert!(cmd.contains("XDG_RUNTIME_DIR"));
-    }
-}
+mod tests;

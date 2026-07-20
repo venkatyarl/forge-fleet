@@ -73,6 +73,8 @@ use anyhow::Result;
 use sqlx::{PgPool, Row};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use tokio::sync::Mutex as TokioMutex;
 use tree_sitter::{Node, Parser};
 use uuid::Uuid;
 
@@ -122,6 +124,13 @@ pub mod storage;
 pub mod types;
 #[path = "cortex/extractors/work_item_context.rs"]
 pub mod work_item_context;
+
+/// Serialize all Cortex edit passes within a single process. The Postgres
+/// advisory lock prevents cross-process races for the same corpus, but a local
+/// Mutex is still needed so multiple tokio tasks in this process do not
+/// interleave structural edits and contend on shared table locks / parsing
+/// resources. Pattern borrowed from ff-agent's sub-agent slot guard.
+static CORTEX_EDIT_LOCK: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex::new(()));
 
 /// Summary of a Cortex indexing run.
 #[derive(Debug, Default, Clone)]
@@ -268,6 +277,7 @@ fn lang_patterns(lang: &str) -> Result<Vec<String>> {
 /// multi-language repos use [`index_langs`], which wipes ONCE then indexes each
 /// language (back-to-back `index` calls would clobber each other's nodes).
 pub async fn index(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result<CortexStats> {
+    let _edit_guard = CORTEX_EDIT_LOCK.lock().await;
     lang_patterns(lang)?; // validate before wiping
     let Some(lock) = try_begin_cortex_generation(pool, corpus_slug).await? else {
         tracing::info!("another node is indexing {corpus_slug}, skipping");
@@ -292,6 +302,7 @@ pub async fn index_langs(
     corpus_slug: &str,
     langs: &[String],
 ) -> Result<Vec<(String, CortexStats)>> {
+    let _edit_guard = CORTEX_EDIT_LOCK.lock().await;
     // Validate every language up front so a bad one doesn't wipe the graph.
     for l in langs {
         lang_patterns(l)?;
@@ -391,6 +402,7 @@ pub async fn index_langs_incremental(
     corpus_slug: &str,
     langs: &[String],
 ) -> Result<IncrementalReport> {
+    let _edit_guard = CORTEX_EDIT_LOCK.lock().await;
     for l in langs {
         lang_patterns(l)?;
     }

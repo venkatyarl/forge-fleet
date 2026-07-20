@@ -3,11 +3,26 @@ use chrono::{DateTime, Utc};
 use ff_core::{ActivityLevel, AgentTask, WorkerRole};
 use ff_discovery::{HardwareProfile, HealthSnapshot};
 use serde::Serialize;
+use std::time::Instant;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub type SharedState = Arc<RwLock<AgentState>>;
+
+/// Bookkeeping for a build shell-command currently executing on this node.
+///
+/// The executor registers one of these when it starts a build and removes it
+/// when the build finishes. The background build-timeout monitor scans these,
+/// and when `started_at.elapsed()` exceeds the configured `max_build_duration`
+/// it fires `cancel` — the executor is `select!`ing on that token and drops the
+/// child process (killed via `kill_on_drop`).
+#[derive(Debug)]
+pub struct BuildWatch {
+    pub started_at: Instant,
+    pub cancel: CancellationToken,
+}
 
 #[derive(Debug)]
 pub struct AgentState {
@@ -19,6 +34,9 @@ pub struct AgentState {
     pub activity_level: ActivityLevel,
     pub yield_resources: bool,
     pub active_tasks: HashMap<Uuid, AgentTask>,
+    /// Builds currently running on this node, keyed by task id. Populated by
+    /// the executor and consumed by the build-timeout monitor.
+    pub build_watches: HashMap<Uuid, BuildWatch>,
     pub running_models: Vec<String>,
 }
 
@@ -33,6 +51,7 @@ impl AgentState {
             activity_level: ActivityLevel::Idle,
             yield_resources: false,
             active_tasks: HashMap::new(),
+            build_watches: HashMap::new(),
             running_models: vec![],
         }
     }

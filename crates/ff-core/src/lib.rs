@@ -12,10 +12,13 @@
 
 pub mod activity;
 pub mod artifact_cache;
+pub mod artifact_cache_dir;
 pub mod artifact_fetch;
 pub mod audit;
 pub mod build_version;
+pub mod cache;
 pub mod chaos;
+pub mod ci_trigger;
 pub mod circuit_breaker;
 pub mod computer;
 pub mod config;
@@ -48,10 +51,15 @@ pub use activity::{ActivitySignals, ActivityState, YieldMode};
 pub use artifact_cache::{
     ArtifactEvictionPolicy, evaluate_artifact_eviction, spawn_artifact_eviction_loop,
 };
+pub use artifact_cache_dir::{
+    artifact_cache_path, default_cache_root, detect_arch, detect_os_family,
+    ensure_artifact_cache_path, ensure_platform_cache_dir, platform_cache_dir,
+};
 pub use artifact_fetch::{ArtifactCacheManager, FetchSource, LanPeer, default_artifact_cache_root};
 pub use chaos::{
     ChaosConfig, ChaosEngine, ChaosHooks, Simulation, SimulationId, SimulationState, SimulationType,
 };
+pub use ci_trigger::CiPipelineTrigger;
 pub use circuit_breaker::{
     BackendId, CircuitBreaker, CircuitBreakerConfig, CircuitBreakerRegistry,
     CircuitBreakerSnapshot, CircuitState,

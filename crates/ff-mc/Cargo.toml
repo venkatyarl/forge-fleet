@@ -9,6 +9,7 @@ description = "ForgeFleet Mission Control — work items, epics, sprints, kanban
 [dependencies]
 ff-core = { path = "../ff-core" }
 ff-db = { path = "../ff-db" }
+ff-observability = { path = "../ff-observability" }
 
 # Workspace deps
 tokio.workspace = true

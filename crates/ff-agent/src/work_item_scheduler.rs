@@ -22,7 +22,13 @@ use tracing::{info, warn};
 /// path can keep the Lane-1 local-codegen timeout STRICTLY BELOW it (see
 /// `work_item_dispatch::LANE1_TIMEOUT_SECS`) — a slow local lane must fail over
 /// to the cloud backstop before this reaper can reclaim the lease.
-pub(crate) const LEASE_STALE_SECS: i64 = 180;
+///
+/// 480 (was 180): with a 45s heartbeat cadence, 180s tolerated only ~3 missed
+/// beats — under wave-burst load daemons routinely missed that window and
+/// healthy builds were reaped as "stalled" (2026-07-19: 100+ takeovers in 2h
+/// fleet-wide, most of the night's stall-class failures). 480s tolerates ~10
+/// missed beats while MAX_LEASE_DURATION_SECS still bounds true wedges.
+pub(crate) const LEASE_STALE_SECS: i64 = 480;
 /// Hard ceiling on lease HOLD time regardless of heartbeat — reclaims a wedged
 /// dispatch that keeps its heartbeat fresh but makes no progress (the
 /// "building forever, live heartbeat" wedge). Above a real build's Lane-2 cap
