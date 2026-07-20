@@ -1457,6 +1457,22 @@ enum SessionCommand {
         #[arg(long)]
         name: String,
     },
+    /// Export local CLI session transcripts (Claude Code / Codex / Kimi)
+    /// to the Obsidian vault, with a redaction pass for tokens/keys.
+    Export {
+        /// Override the vault root (default: `~/projects/Yarli_KnowledgeBase`).
+        #[arg(long)]
+        vault: Option<PathBuf>,
+        /// Override the computer name used in filenames.
+        #[arg(long)]
+        computer: Option<String>,
+        /// Extra source directory to scan (repeatable).
+        #[arg(long = "source-dir")]
+        source_dirs: Vec<PathBuf>,
+        /// Print what would be exported without writing files.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Cancel a session in flight: flips status to `cancelled`,
     /// marks pending steps `cancelled`, and cancels still-running
     /// fleet_tasks via the existing pg_cancel_task helper.
@@ -4909,6 +4925,68 @@ async fn main() -> Result<()> {
                         serde_json::to_string_pretty(&snap).unwrap_or_default()
                     );
                     Ok(())
+                }
+                SessionCommand::Export {
+                    vault,
+                    computer,
+                    source_dirs,
+                    dry_run,
+                } => {
+                    let mut config: ff_core::config::FleetConfig = if config_path.exists() {
+                        toml::from_str(&std::fs::read_to_string(&config_path)?)?
+                    } else {
+                        ff_core::config::FleetConfig::default()
+                    };
+                    ff_core::config::apply_env_overrides(&mut config);
+
+                    if let Some(v) = vault {
+                        config.session_export.vault_dir = Some(v.to_string_lossy().to_string());
+                    }
+                    if let Some(c) = computer {
+                        config.session_export.computer_name = Some(c);
+                    }
+                    if !source_dirs.is_empty() {
+                        config.session_export.source_dirs = source_dirs
+                            .iter()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .collect();
+                    }
+
+                    let tmp_vault: Option<tempfile::TempDir> = if dry_run {
+                        let tmp = tempfile::tempdir()?;
+                        config.session_export.vault_dir =
+                            Some(tmp.path().to_string_lossy().to_string());
+                        Some(tmp)
+                    } else {
+                        None
+                    };
+
+                    let result = tokio::task::spawn_blocking(move || {
+                        ff_core::session_export::export_cli_sessions(
+                            &config,
+                            config.session_export.computer_name.as_deref(),
+                        )
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("session export panicked: {e}"))?;
+
+                    // Keep TempDir alive until export completes.
+                    let _ = tmp_vault;
+
+                    match result {
+                        Ok(r) => {
+                            if dry_run {
+                                println!("{YELLOW}!{RESET} dry run — no files written");
+                            } else {
+                                println!("{GREEN}✓{RESET} session export complete");
+                            }
+                            println!("  files processed: {}", r.files_processed);
+                            println!("  sessions exported: {}", r.sessions_exported);
+                            println!("  redactions: {}", r.redactions);
+                            Ok(())
+                        }
+                        Err(e) => Err(anyhow::anyhow!("session export failed: {e}")),
+                    }
                 }
                 SessionCommand::Cancel { id } => {
                     let sid = uuid::Uuid::parse_str(&id)
