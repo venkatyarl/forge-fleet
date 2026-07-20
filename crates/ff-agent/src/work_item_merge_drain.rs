@@ -878,7 +878,7 @@ async fn reconcile_orphaned_reviews(pg: &PgPool) -> Result<usize> {
 /// Spawn the leader-gated drain loop. Mirrors the scheduler's leader check.
 pub fn spawn_work_item_merge_drain(
     pg: PgPool,
-    _worker_name: String,
+    worker_name: String,
     interval_secs: u64,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -888,7 +888,20 @@ pub fn spawn_work_item_merge_drain(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if !crate::leader_cache::is_current_leader() {
+                    // Leader gate with an authoritative DB fallback. The
+                    // in-memory leader_cache defaults to FALSE after a daemon
+                    // restart and is only warmed by leader_tick on its interval;
+                    // during that cold window the (leader-gated) drain silently
+                    // no-ops for minutes — the 2026-07-20 freeze where merges
+                    // stuck at 141 with ~99 green PRs waiting while priya was the
+                    // continuous DB leader. When the cache says "not leader",
+                    // confirm against fleet_leader_state (the durable source of
+                    // truth) before skipping. Safe: merges are serialized by
+                    // FOR UPDATE SKIP LOCKED, so a DB-confirmed leader can never
+                    // double-merge.
+                    if !crate::leader_cache::is_current_leader()
+                        && !db_confirms_leader(&pg, &worker_name).await
+                    {
                         continue;
                     }
                     if let Err(e) = evaluate_merge_queue(&pg).await {
@@ -914,6 +927,22 @@ pub fn spawn_work_item_merge_drain(
         }
         info!("work_item_merge_drain loop stopped");
     })
+}
+
+/// Authoritative leader check straight from `fleet_leader_state` — the durable
+/// singleton that decides leadership. Used as a fallback for the cold-cache
+/// window right after a daemon restart (see the leader gate above). A fresh
+/// heartbeat (<60s) on our own member row means we ARE the leader regardless of
+/// the not-yet-warmed in-memory cache.
+async fn db_confirms_leader(pg: &PgPool, worker_name: &str) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM fleet_leader_state \
+         WHERE member_name = $1 AND heartbeat_at > NOW() - INTERVAL '60 seconds')",
+    )
+    .bind(worker_name)
+    .fetch_one(pg)
+    .await
+    .unwrap_or(false)
 }
 
 #[cfg(test)]
