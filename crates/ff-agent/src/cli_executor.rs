@@ -114,9 +114,9 @@ pub const BACKENDS: &[CliBackend] = &[
         // ("Failed to write file …") and a real multi-file dispatch retried/
         // reasoned until it hit the 1800s timeout — the "codex hangs 30 min,
         // 0 PRs" symptom (dogfooded 2026-06-30). The bwrap sandbox is redundant
-        // here anyway: `ff cli` already runs codex inside a DEDICATED per-task
-        // git worktree under `~/.forgefleet/sub-agents/`, so isolation comes from
-        // the worktree, not bwrap. `danger-full-access` is the minimal change
+        // here anyway: `ff cli` dispatches into sub-agent slots that each hold
+        // their OWN full clone under `~/.forgefleet/sub-agents/sub-agent-{N}/`,
+        // so isolation comes from the per-slot clone, not bwrap. `danger-full-access` is the minimal change
         // that lets codex actually write (approval policy is unchanged — `exec`
         // is `approval: never` regardless). Verified on adele: file created,
         // exit 0, seconds not minutes.

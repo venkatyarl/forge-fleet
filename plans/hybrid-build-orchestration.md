@@ -197,7 +197,7 @@ longer judge `dispatch`/`audit`/`epic` rows as orphaned.
 
 ### Conflict 2 — D2 hard-reset vs the shared dispatch workspace — DESIGN (GAP-D-iso)
 D2's clean-sync `reset --hard` is only safe on a workspace exclusive to the run,
-but `run_cwd` defaults to the single shared `~/.forgefleet/sub-agent-0/forge-fleet`
+but `run_cwd` defaults to the single shared `~/.forgefleet/sub-agents/sub-agent-0/forge-fleet`
 (slot 0 hardcoded), NOT the per-slot `sub-agent-{N}` the plan's collision-safety
 assumes. `dispatch-each` (1/member) is safe; `fanout`-to-same-member or two
 concurrent `ff agent` callers on one member race, and the hard reset makes that

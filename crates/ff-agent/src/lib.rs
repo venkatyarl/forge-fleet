@@ -135,7 +135,6 @@ pub mod self_improvement;
 pub mod session_runner;
 pub mod session_store;
 pub mod shared_storage;
-pub mod shared_workspace;
 pub mod skills_db;
 pub mod smart_lru;
 pub mod social_ingest;
