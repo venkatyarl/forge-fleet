@@ -15,9 +15,8 @@ use tracing::{error, info, warn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TickScope {
-    /// Not yet used — every registered tick today is leader-gated; kept as
-    /// the documented shape for per-node ticks (disk sampler etc. migrate in).
-    #[allow(dead_code)]
+    /// Runs on every node — for ticks that only touch node-local state
+    /// (e.g. the metrics scraper polling this node's inference servers).
     EveryNode,
     LeaderOnly,
 }
@@ -69,6 +68,12 @@ impl TickRegistry {
                 interval: crate::log_analysis_worker::DEFAULT_INTERVAL,
                 scope: TickScope::LeaderOnly,
                 runner: run_log_analysis_tick,
+            },
+            TickDefinition {
+                name: "metrics_scraper",
+                interval: crate::metrics_scraper::DEFAULT_INTERVAL,
+                scope: TickScope::EveryNode,
+                runner: run_metrics_scraper_tick,
             },
         ]
         .into_iter()
@@ -196,6 +201,15 @@ fn run_log_analysis_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, 
         crate::log_analysis_worker::run_log_analysis_tick(&pg, &worker_name)
             .await
             .map(|_| ())
+    })
+}
+
+fn run_metrics_scraper_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::metrics_scraper::run_metrics_scraper_tick(&pg, &worker_name)
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
     })
 }
 

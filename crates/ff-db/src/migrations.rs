@@ -852,6 +852,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "dispatch_tick_at",
         sql: schema::SCHEMA_V174_DISPATCH_TICK_AT,
     },
+    PgMigration {
+        version: 175,
+        name: "deployment_metrics_scrapes",
+        sql: schema::SCHEMA_V175_DEPLOYMENT_METRICS_SCRAPES,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

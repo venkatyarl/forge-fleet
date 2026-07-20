@@ -91,6 +91,7 @@ pub mod mcp_tools;
 pub mod memory;
 pub mod mesh_check;
 pub mod metrics_downsampler;
+pub mod metrics_scraper;
 pub mod model_benchmark;
 pub mod model_catalog;
 pub mod model_catalog_seed;

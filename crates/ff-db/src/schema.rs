@@ -10345,6 +10345,33 @@ CREATE INDEX IF NOT EXISTS idx_work_item_leases_dispatch_tick
     ON work_item_leases (lease_state, dispatch_tick_at) WHERE released_at IS NULL;
 "#;
 
+/// V175 — Per-deployment `/metrics` scrape samples.
+///
+/// The ff-agent metrics scraper polls each local inference server's
+/// Prometheus `/metrics` endpoint every 30s and appends one row per reachable
+/// deployment per pass. Stale-record lifecycle: `deployment_id` cascades so
+/// samples vanish with their deployment row, and rows older than the
+/// retention window are pruned by the scraper on each pass.
+pub const SCHEMA_V175_DEPLOYMENT_METRICS_SCRAPES: &str = r#"
+CREATE TABLE IF NOT EXISTS deployment_metrics_scrapes (
+    id               BIGSERIAL PRIMARY KEY,
+    deployment_id    UUID NOT NULL REFERENCES fleet_model_deployments(id) ON DELETE CASCADE,
+    worker_name      TEXT NOT NULL,
+    port             INT NOT NULL,
+    runtime          TEXT,
+    tokens_per_sec   DOUBLE PRECISION,
+    queue_depth      INT,
+    active_requests  INT,
+    metric_count     INT NOT NULL DEFAULT 0,
+    scraped_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_deployment_metrics_scrapes_by_time
+    ON deployment_metrics_scrapes (scraped_at DESC);
+CREATE INDEX IF NOT EXISTS idx_deployment_metrics_scrapes_by_deployment
+    ON deployment_metrics_scrapes (deployment_id, scraped_at DESC);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
