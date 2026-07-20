@@ -26,6 +26,10 @@ use super::{AgentTool, AgentToolContext, AgentToolResult, MAX_TOOL_RESULT_CHARS,
 
 pub struct VersionManagerTool;
 
+fn fleet_deploy_destination(ip: &str) -> String {
+    format!("root@{ip}:~/.local/bin/ff")
+}
+
 #[async_trait]
 impl AgentTool for VersionManagerTool {
     fn name(&self) -> &str {
@@ -245,10 +249,20 @@ impl AgentTool for VersionManagerTool {
 
                 let mut results = Vec::new();
                 for (name, ip) in &nodes {
+                    let prepare = Command::new("ssh")
+                        .args([&format!("root@{ip}"), "mkdir -p ~/.local/bin"])
+                        .output()
+                        .await;
+                    if !matches!(prepare, Ok(ref output) if output.status.success()) {
+                        results.push(format!(
+                            "  {name} ({ip}): FAILED (cannot create install directory)"
+                        ));
+                        continue;
+                    }
                     let scp = Command::new("scp")
                         .args([
                             &binary_path.to_string_lossy().to_string(),
-                            &format!("root@{ip}:/usr/local/bin/ff"),
+                            &fleet_deploy_destination(ip),
                         ])
                         .output()
                         .await;
@@ -374,5 +388,18 @@ impl AgentTool for VersionManagerTool {
 
             _ => AgentToolResult::err(format!("Unknown action: {action}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod deploy_tests {
+    use super::fleet_deploy_destination;
+
+    #[test]
+    fn fleet_deploy_uses_the_standard_user_bin_directory() {
+        assert_eq!(
+            fleet_deploy_destination("192.0.2.1"),
+            "root@192.0.2.1:~/.local/bin/ff"
+        );
     }
 }

@@ -16,7 +16,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 source "$SCRIPT_DIR/lib/fleet.sh"
 
 BINARY_NAME="forgefleetd"
-INSTALL_DIR="/usr/local/bin"
+INSTALL_DIR=".local/bin"
 SSH_USER="${FORGEFLEET_SSH_USER:-venkat}"
 SSH_OPTS="-o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes"
 DRY_RUN=false
@@ -141,10 +141,11 @@ for node in "${NODE_LIST[@]}"; do
 
     # Install and restart
     if ssh $SSH_OPTS "$SSH_USER@$node" "
-        sudo mv /tmp/$BINARY_NAME $INSTALL_DIR/$BINARY_NAME && \
-        sudo chmod +x $INSTALL_DIR/$BINARY_NAME && \
+        mkdir -p ~/$INSTALL_DIR && \
+        install -m 755 /tmp/$BINARY_NAME ~/$INSTALL_DIR/$BINARY_NAME && \
+        rm /tmp/$BINARY_NAME && \
         (sudo systemctl restart forgefleet 2>/dev/null || \
-         sudo launchctl kickstart -k gui/\$(id - u)/com.forgefleet.forgefleetd 2>/dev/null || \
+         launchctl kickstart -k gui/\$(id -u)/com.forgefleet.forgefleetd 2>/dev/null || \
          echo 'manual restart needed') && \
         echo 'ok'
     " >/dev/null 2>&1; then

@@ -25,8 +25,10 @@
 
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use ff_core::config::FleetConfig;
 use serde_json::Value;
 use sqlx::PgPool;
+use std::env;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use tokio::sync::watch;
@@ -51,6 +53,12 @@ pub struct OauthProvider {
     /// Field name(s) inside the JSON cred file that hold the access
     /// token. Tried in order; first hit wins.
     pub token_fields: &'static [&'static str],
+    /// Optional environment variable that nodes should export the token to.
+    /// When set, `distribute_token` skips the cred-file copy and relies on
+    /// `export_oauth_env_from_fleet_secrets` to surface the secret as an env
+    /// var. This is the durable path for headless tokens (e.g.
+    /// `claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN`).
+    pub env_var: Option<&'static str>,
 }
 
 /// Catalog of providers we know how to harvest credentials for.
@@ -65,18 +73,25 @@ pub const OAUTH_PROVIDERS: &[OauthProvider] = &[
         cred_path: "~/.claude/.credentials.json",
         secret_key: "anthropic.oauth_token",
         token_fields: &["accessToken", "access_token"],
+        // Durable headless path: `claude setup-token` writes a long-lived
+        // token into ~/.claude/.credentials.json under claudeAiOauth.accessToken.
+        // We import it into fleet_secrets and export it as this env var so
+        // nodes never share a rotating refresh token via file copy.
+        env_var: Some("CLAUDE_CODE_OAUTH_TOKEN"),
     },
     OauthProvider {
         name: "codex",
         cred_path: "~/.codex/auth.json",
         secret_key: "openai.oauth_token",
         token_fields: &["access_token", "accessToken", "token"],
+        env_var: None,
     },
     OauthProvider {
         name: "gemini",
         cred_path: "~/.gemini/oauth_creds.json",
         secret_key: "google.oauth_token",
         token_fields: &["access_token", "accessToken"],
+        env_var: None,
     },
     OauthProvider {
         name: "kimi",
@@ -86,12 +101,14 @@ pub const OAUTH_PROVIDERS: &[OauthProvider] = &[
         cred_path: "~/.kimi/credentials/kimi-code.json",
         secret_key: "moonshot.oauth_token",
         token_fields: &["access_token", "accessToken", "token"],
+        env_var: None,
     },
     OauthProvider {
         name: "grok",
         cred_path: "",
         secret_key: "xai.oauth_token",
         token_fields: &[],
+        env_var: None,
     },
 ];
 
@@ -143,6 +160,74 @@ pub fn provider_by_name(name: &str) -> Option<&'static OauthProvider> {
     OAUTH_PROVIDERS
         .iter()
         .find(|p| p.name.eq_ignore_ascii_case(name))
+}
+
+/// Export configured OAuth tokens from `fleet_secrets` to environment
+/// variables so vendor CLI children inherit them.
+///
+/// Reads `[oauth.env]` from `fleet.toml` (key = provider name, value = env
+/// var name). For each entry, if the env var is not already set, looks up
+/// `fleet_secrets[<provider>.oauth_token]` and sets it. This is the durable
+/// path for headless tokens such as `claude setup-token` →
+/// `CLAUDE_CODE_OAUTH_TOKEN`; it keeps secrets out of systemd/launchd units
+/// and avoids sharing a single refresh-token file across the fleet.
+pub async fn export_oauth_env_from_fleet_secrets(config: &FleetConfig, pool: Option<&PgPool>) {
+    let Some(pool) = pool else {
+        return;
+    };
+
+    for (provider_name, env_var) in &config.oauth.env {
+        let provider_name = provider_name.trim();
+        let env_var = env_var.trim();
+        if provider_name.is_empty() || env_var.is_empty() {
+            continue;
+        }
+
+        // An already-set env var wins (operator override / unit injection),
+        // but we never expect units to bake these after #44.
+        if env::var(env_var).is_ok() {
+            continue;
+        }
+
+        let secret_key = match provider_by_name(provider_name) {
+            Some(p) => p.secret_key,
+            None => {
+                warn!(
+                    provider = provider_name,
+                    "unknown OAuth provider in [oauth.env]; skipping"
+                );
+                continue;
+            }
+        };
+
+        match ff_db::pg_get_secret(pool, secret_key).await {
+            Ok(Some(token)) if !token.trim().is_empty() => {
+                unsafe {
+                    env::set_var(env_var, token.trim());
+                }
+                info!(
+                    provider = provider_name,
+                    env_var = env_var,
+                    "exported OAuth token from fleet_secrets"
+                );
+            }
+            Ok(_) => {
+                info!(
+                    provider = provider_name,
+                    secret_key = secret_key,
+                    "no OAuth token in fleet_secrets; env var not exported"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    provider = provider_name,
+                    secret_key = secret_key,
+                    "fleet_secrets lookup failed"
+                );
+            }
+        }
+    }
 }
 
 /// Expand `~/` prefix to `$HOME/`. Pure path manipulation, no I/O.

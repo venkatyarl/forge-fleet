@@ -119,6 +119,10 @@ pub struct FleetConfig {
     #[serde(default)]
     pub discovery: DiscoveryConfig,
 
+    /// OAuth token distribution — `[oauth]`.
+    #[serde(default)]
+    pub oauth: OauthConfig,
+
     /// Standalone model definitions — backward compat for programmatic construction.
     /// Real fleet.toml nests models under `[nodes.<name>.models.<slug>]`.
     #[serde(default)]
@@ -147,6 +151,7 @@ impl Default for FleetConfig {
             bootstrap_targets: vec![],
             leader: LeaderConfig::default(),
             discovery: DiscoveryConfig::default(),
+            oauth: OauthConfig::default(),
             models: vec![],
         }
     }
@@ -267,6 +272,26 @@ fn default_subnet_scan_interval() -> u64 {
 }
 fn default_subnet_scan_enabled() -> bool {
     false
+}
+
+// ── OauthConfig (maps to [oauth]) ────────────────────────────────────────────
+
+/// OAuth token distribution settings from `[oauth]` in fleet.toml.
+///
+/// The durable path for headless CLI auth (e.g. `claude setup-token`) is:
+/// import the token into `fleet_secrets`, then let each node export it as an
+/// environment variable for the vendor CLI. This avoids copying credential
+/// files that contain a shared refresh token across the fleet.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OauthConfig {
+    /// Per-provider env-var exports.
+    ///
+    /// Key = provider name (e.g. `claude`), value = env var name (e.g.
+    /// `CLAUDE_CODE_OAUTH_TOKEN`). The daemon reads
+    /// `fleet_secrets[<provider>.oauth_token]` at startup and sets the env var
+    /// so vendor CLI children inherit it. Empty keys/values are ignored.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 // ── NodeConfig (maps to [nodes.<name>]) ──────────────────────────────────────
@@ -1840,6 +1865,9 @@ preferred_workloads = ["coding", "review", "build"]
 [notifications.telegram]
 chat_id = "8496613333"
 channel = "telegram"
+
+[oauth.env]
+claude = "CLAUDE_CODE_OAUTH_TOKEN"
 
 [transport.telegram]
 enabled = true

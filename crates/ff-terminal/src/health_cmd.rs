@@ -1,12 +1,14 @@
 use crate::{GREEN, RED, RESET, YELLOW};
 use anyhow::Result;
 use ff_agent::agent_loop::AgentSessionConfig;
+use ff_agent::service_connectivity::{ConnectivityStatus, check_services};
 
 pub async fn handle_health(c: &AgentSessionConfig) -> Result<()> {
     static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
         std::sync::LazyLock::new(reqwest::Client::new);
 
     let nodes = load_fleet_nodes_for_health(c).await;
+    let config = load_fleet_config().await.unwrap_or_default();
 
     let futs: Vec<_> = nodes
         .iter()
@@ -35,7 +37,10 @@ pub async fn handle_health(c: &AgentSessionConfig) -> Result<()> {
         })
         .collect();
 
-    let results = futures::future::join_all(futs).await;
+    let (results, services) = tokio::join!(
+        futures::future::join_all(futs),
+        check_services(&config, &SHARED_HTTP, std::time::Duration::from_secs(3))
+    );
 
     println!("{GREEN}✓ ForgeFleet Health{RESET}");
     for (name, ip, port, daemon_ok, agent_ok) in results {
@@ -51,7 +56,26 @@ pub async fn handle_health(c: &AgentSessionConfig) -> Result<()> {
         };
         println!("  {name:<12} {ip}:{port}  {daemon_str}{agent_str}");
     }
+    println!("\n  Services");
+    for check in services {
+        let status = match check.status {
+            ConnectivityStatus::Healthy => format!("{GREEN}OK{RESET}"),
+            ConnectivityStatus::Unavailable => format!("{RED}UNAVAILABLE{RESET}"),
+            ConnectivityStatus::Unconfigured => format!("{YELLOW}UNCONFIGURED{RESET}"),
+        };
+        let latency = check
+            .latency_ms
+            .map(|ms| format!(" {ms}ms"))
+            .unwrap_or_default();
+        println!("    {:<16} {status}{latency}", check.service);
+    }
     Ok(())
+}
+
+async fn load_fleet_config() -> Option<ff_core::config::FleetConfig> {
+    let path = dirs::home_dir()?.join(".forgefleet/fleet.toml");
+    let contents = tokio::fs::read_to_string(path).await.ok()?;
+    toml::from_str(&contents).ok()
 }
 
 async fn load_fleet_nodes_for_health(_c: &AgentSessionConfig) -> Vec<(String, String, u16)> {
