@@ -84,7 +84,7 @@ pub struct CliBackend {
 ///
 /// Headless invocations verified on the leader 2026-05-31:
 ///   claude -p --output-format text "<prompt>"   (cwd via process + --add-dir)
-///   codex exec --skip-git-repo-check "<prompt>"  (cwd via -C/--cd)
+///   codex exec --ignore-user-config --skip-git-repo-check "<prompt>"  (cwd via -C/--cd)
 ///   kimi --print --yes --prompt "<prompt>"       (cwd via -w/--work-dir)
 pub const BACKENDS: &[CliBackend] = &[
     CliBackend {
@@ -105,6 +105,15 @@ pub const BACKENDS: &[CliBackend] = &[
         // Codex `exec` is the headless equivalent. `--skip-git-repo-check`
         // lets it run outside a git repo (matches `ff cli` running anywhere).
         //
+        // `--ignore-user-config` is deliberate. On priya, codex-cli 0.142.5
+        // consistently wedged in headless mode when it loaded ~/.codex/config.toml
+        // containing the local MCP server block, printing "Reading additional
+        // input from stdin..." forever even though the prompt was passed as argv
+        // and stdin was already detached. The same binary succeeds immediately
+        // with `--ignore-user-config`, and adele's newer 0.144.6 succeeds either
+        // way. Treat the user config as optional for fleet dispatch so a bad or
+        // version-skewed local config cannot stall builds/reviews for 30 minutes.
+        //
         // `--sandbox danger-full-access` DISABLES codex's OS-level filesystem
         // sandbox. Codex's `workspace-write` (and `read-only`) sandboxes shell
         // out to **bubblewrap**, which needs to create a user namespace + uid
@@ -122,6 +131,7 @@ pub const BACKENDS: &[CliBackend] = &[
         // exit 0, seconds not minutes.
         default_flags: &[
             "exec",
+            "--ignore-user-config",
             "--skip-git-repo-check",
             "--sandbox",
             "danger-full-access",
@@ -439,6 +449,21 @@ mod tests {
         // Spot-check the other shipped backends resolve too.
         assert_eq!(backend_by_name("codex").map(|b| b.name), Some("codex"));
         assert_eq!(backend_by_name("KIMI").map(|b| b.name), Some("kimi"));
+    }
+
+    #[test]
+    fn codex_backend_keeps_hardened_headless_flags() {
+        let codex = backend_by_name("codex").expect("codex backend must exist");
+        assert_eq!(
+            codex.default_flags,
+            &[
+                "exec",
+                "--ignore-user-config",
+                "--skip-git-repo-check",
+                "--sandbox",
+                "danger-full-access",
+            ]
+        );
     }
 
     /// Unknown names are rejected (`None`) so callers can surface an
