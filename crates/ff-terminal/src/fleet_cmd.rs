@@ -4240,6 +4240,7 @@ fn deploy_install_restart_playbook(os_family: &str) -> String {
                || ( nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
                     </dev/null >/tmp/forgefleetd.log 2>&1 & disown ); \
              sleep 4; ~/.local/bin/ff model resume-from-build 2>/dev/null || true; \
+             ~/.local/bin/ff skills sync 2>/dev/null || true; \
              RN=$(pgrep -x forgefleetd 2>/dev/null | wc -l | tr -d ' '); \
              echo \"RESTART_VERIFY count=$RN (macos: launchd-managed, orphans cleared)\"; \
              [ \"$RN\" -le 1 ] || echo \"RESTART_DUP: $RN forgefleetd running — orphan not cleared\" >&2".to_string(),
@@ -4261,6 +4262,7 @@ fn deploy_install_restart_playbook(os_family: &str) -> String {
                || ( nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
                     </dev/null >/tmp/forgefleetd.log 2>&1 & disown ); \
              sleep 4; ~/.local/bin/ff model resume-from-build 2>/dev/null || true; \
+             ~/.local/bin/ff skills sync 2>/dev/null || true; \
              RP=$(pgrep -x forgefleetd | head -1); RN=$(pgrep -x forgefleetd 2>/dev/null | wc -l | tr -d ' '); \
              RE=$(readlink /proc/$RP/exe 2>/dev/null); \
              echo \"RESTART_VERIFY count=$RN exe=$RE\"; \
@@ -4354,6 +4356,7 @@ fn leader_refresh_playbook(os_family: &str, source_tree_path: &str) -> String {
              RN=0; for _i in $(seq 1 30); do \
                RN=$(pgrep -x forgefleetd 2>/dev/null | wc -l | tr -d ' '); \
                [ \"$RN\" -ge 1 ] && break; sleep 1; done; \
+             ~/.local/bin/ff skills sync 2>/dev/null || true; \
              echo \"LEADER_REFRESH count=$RN\"; [ \"$RN\" -ge 1 ]"
         ),
         _ => format!(
@@ -4369,6 +4372,7 @@ fn leader_refresh_playbook(os_family: &str, source_tree_path: &str) -> String {
              RN=0; for _i in $(seq 1 30); do \
                RN=$(pgrep -x forgefleetd 2>/dev/null | wc -l | tr -d ' '); \
                [ \"$RN\" -ge 1 ] && break; sleep 1; done; \
+             ~/.local/bin/ff skills sync 2>/dev/null || true; \
              echo \"LEADER_REFRESH count=$RN\"; [ \"$RN\" -ge 1 ]"
         ),
     }

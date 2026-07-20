@@ -745,6 +745,22 @@ else
   report "github-identity" warn "ff not on PATH — skipping github sync"
 fi
 
+# ─── Skills catalog sync (V105) ──────────────────────────────────────────
+# Materialize the DB skills catalog onto disk under ~/.forgefleet/skills/
+# so the runtime skill_catalog.rs reader has a populated catalog from this
+# node's very first session, instead of the operator having to remember to
+# run `ff skills sync` by hand after every new-node bootstrap.
+report "skills-sync" running
+if run_as_user bash -lc 'command -v ff >/dev/null 2>&1'; then
+  if run_as_user bash -lc 'ff skills sync 2>&1'; then
+    report "skills-sync" ok "materialized skills catalog from DB"
+  else
+    report "skills-sync" warn "ff skills sync failed — run manually after bootstrap"
+  fi
+else
+  report "skills-sync" warn "ff not on PATH — skipping skills sync"
+fi
+
 # ─── Done ────────────────────────────────────────────────────────────────
 
 report "done" ok "$NAME is now a ForgeFleet computer"
