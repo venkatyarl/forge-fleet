@@ -35,6 +35,24 @@ const PERSISTED_SNAPSHOT_PREFIX: &str = "pulse:persisted:";
 /// TTL for the persisted snapshot in Redis (1 hour).
 const PERSISTED_SNAPSHOT_TTL_SECS: u64 = 3600;
 
+/// Q4: the delta-path computers-row write. One atomic statement that
+/// refreshes `last_seen_at` and rewrites every persistent field from the
+/// beat, so a stale Q1 read can never decide to skip fields another writer
+/// changed underneath us. Idempotent: every assignment is a pure function
+/// of the bind values, so replaying the same beat converges to the same row.
+const UPSERT_COMPUTER_ROW_SQL: &str = "UPDATE computers SET \
+    last_seen_at = NOW(), \
+    primary_ip = $9, \
+    all_ips = $2::jsonb, \
+    cpu_cores = $3, \
+    total_ram_gb = $4, \
+    total_disk_gb = $5, \
+    gpu_kind = $6, \
+    gpu_count = $7, \
+    gpu_total_vram_gb = $8, \
+    has_gpu = ($7 > 0) \
+ WHERE id = $1";
+
 // -----------------------------------------------------------------------------
 // Errors
 // -----------------------------------------------------------------------------
@@ -390,7 +408,7 @@ impl Materializer {
     ///   Q1  SELECT_COMPUTER_BY_NAME
     ///   Q2  GET_PERSISTED_SNAPSHOT (redis)
     ///   Q3  UPDATE_COMPUTER_LAST_SEEN_ONLY              (fast-path, snapshot match)
-    ///   Q4  UPDATE_COMPUTER_PERSISTENT_FIELDS           (delta-path)
+    ///   Q4  UPSERT_COMPUTER_PERSISTENT_FIELDS           (delta-path, one atomic stmt)
     ///   Q5  UPDATE_COMPUTER_STATUS_TRANSITION           (on status change)
     ///   Q6  INSERT_DOWNTIME_EVENT                       (going_offline)
     ///   Q7  CLOSE_DOWNTIME_EVENT                        (return online)
@@ -572,22 +590,23 @@ impl Materializer {
         let primary_ip_differ =
             prev_primary_ip.as_deref() != Some(beat.network.primary_ip.as_str());
 
-        // Q4: UPDATE_COMPUTER_PERSISTENT_FIELDS
-        if persistent_fields_changed(ips_differ, hw_differ, cap_differ, primary_ip_differ) {
-            sqlx::query(
-                "UPDATE computers SET \
-                    last_seen_at = NOW(), \
-                    primary_ip = $9, \
-                    all_ips = $2::jsonb, \
-                    cpu_cores = $3, \
-                    total_ram_gb = $4, \
-                    total_disk_gb = $5, \
-                    gpu_kind = $6, \
-                    gpu_count = $7, \
-                    gpu_total_vram_gb = $8, \
-                    has_gpu = ($7 > 0) \
-                 WHERE id = $1",
-            )
+        // Q4: UPSERT_COMPUTER_PERSISTENT_FIELDS — single atomic statement.
+        //
+        // This used to be a read-compare-branch: the Q1 snapshot picked
+        // between a full persistent-field UPDATE and a last_seen_at-only
+        // touch. That decision raced concurrent writers (overlapping leader
+        // during failover, operator UPDATE): a "nothing changed" verdict
+        // computed from the stale Q1 read skipped the write and left the
+        // beat's values unapplied until the next differing beat. The row is
+        // rewritten on every delta-path beat anyway (last_seen_at), so one
+        // unconditional statement carrying every persistent field costs no
+        // extra tuple write, cannot interleave with other writers, and is
+        // idempotent — reapplying the same beat yields the same row. The
+        // row itself is created at enrollment (`ssh_user`/`os_family` are
+        // NOT NULL and absent from beats), which is why this is an UPDATE
+        // keyed on id rather than an INSERT .. ON CONFLICT: an unknown
+        // computer must stay an UnknownComputer error, not auto-enroll.
+        sqlx::query(UPSERT_COMPUTER_ROW_SQL)
             .bind(computer_id)
             .bind(new_ips_json)
             .bind(beat.hardware.cpu_cores)
@@ -599,14 +618,8 @@ impl Materializer {
             .bind(&beat.network.primary_ip)
             .execute(&self.pg)
             .await?;
-            report.wrote_computer_row = true;
-        } else {
-            // At minimum refresh last_seen_at.
-            sqlx::query("UPDATE computers SET last_seen_at = NOW() WHERE id = $1")
-                .bind(computer_id)
-                .execute(&self.pg)
-                .await?;
-        }
+        report.wrote_computer_row =
+            persistent_fields_changed(ips_differ, hw_differ, cap_differ, primary_ip_differ);
 
         // Always keep fleet_workers.ip in sync with the heartbeat's
         // primary_ip — this is the worker-role registry (V83 rename from
@@ -1499,10 +1512,13 @@ fn normalize_json(s: &str) -> String {
     }
 }
 
-/// Whether the persistent `computers` row must be rewritten (vs a cheap
-/// `last_seen_at`-only touch). Extracted as a pure function so the drift
-/// invariants are unit-testable — in particular that a changed `primary_ip`
-/// ALONE forces a rewrite. That branch matters: `computers.primary_ip` once
+/// Whether the persistent content of the `computers` row changed (vs a pure
+/// `last_seen_at` refresh). Since the delta-path write became one atomic
+/// statement this no longer gates the write itself — Q4 always carries every
+/// persistent field — it feeds `ProcessReport.wrote_computer_row` so drift
+/// stays observable. Extracted as a pure function so the drift invariants
+/// are unit-testable — in particular that a changed `primary_ip` ALONE
+/// counts as a rewrite. That signal matters: `computers.primary_ip` once
 /// froze to a node's dead wifi address (aura, 2026-04-28) and `fleet_workers.ip`
 /// drifted on 9/15 computers undetected for weeks, because the drift signal was
 /// missing from the write condition. This guard keeps `primary_ip` in the OR so
@@ -1857,6 +1873,44 @@ mod tests {
     #[test]
     fn no_rewrite_when_nothing_changed() {
         assert!(!persistent_fields_changed(false, false, false, false));
+    }
+
+    #[test]
+    fn computers_row_upsert_is_one_atomic_statement() {
+        // The delta-path computers write must stay a SINGLE statement — no
+        // DELETE+INSERT, no read-then-branch partial UPDATE — so concurrent
+        // writers can never interleave between deciding what to write and
+        // writing it.
+        let sql = UPSERT_COMPUTER_ROW_SQL;
+        assert!(!sql.contains(';'), "must be a single statement");
+        assert!(sql.trim_start().starts_with("UPDATE computers SET"));
+        assert!(!sql.contains("DELETE"), "must not delete-then-insert");
+        assert!(!sql.contains("INSERT"), "row creation is enrollment's job");
+    }
+
+    #[test]
+    fn computers_row_upsert_carries_every_persistent_field() {
+        // Idempotency guard: the atomic statement must assign every
+        // persistent column unconditionally so replaying the same beat
+        // always converges to the same row, regardless of what a prior
+        // (possibly stale) read believed had changed.
+        for col in [
+            "last_seen_at",
+            "primary_ip",
+            "all_ips",
+            "cpu_cores",
+            "total_ram_gb",
+            "total_disk_gb",
+            "gpu_kind",
+            "gpu_count",
+            "gpu_total_vram_gb",
+            "has_gpu",
+        ] {
+            assert!(
+                UPSERT_COMPUTER_ROW_SQL.contains(col),
+                "atomic computers upsert must set {col}"
+            );
+        }
     }
 
     #[test]
