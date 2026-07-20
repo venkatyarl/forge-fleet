@@ -11514,6 +11514,46 @@ CREATE INDEX IF NOT EXISTS idx_self_heal_bug_history_completed
     ON self_heal_bug_history(completed_at DESC);
 "#;
 
+// V215 — make daemon-computed sub-agent capacity an invariant at release.
+// Capacity reconciliation never disables a busy excess slot. Once that slot
+// finishes, this trigger converts the normal `idle` release into `disabled`,
+// preventing it from immediately claiming another build. Growing capacity is
+// unaffected: the daemon raises fleet_workers.sub_agent_count before it
+// re-enables the newly in-range rows.
+pub const SCHEMA_V215_SUB_AGENT_CAPACITY_BOUNDARY: &str = r#"
+CREATE OR REPLACE FUNCTION enforce_sub_agent_capacity_boundary()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.status = 'idle' AND EXISTS (
+        SELECT 1
+          FROM computers c
+          JOIN fleet_workers fw ON LOWER(fw.name) = LOWER(c.name)
+         WHERE c.id = NEW.computer_id
+           AND NEW.slot >= GREATEST(COALESCE(fw.sub_agent_count, 1), 1)
+    ) THEN
+        NEW.status := 'disabled';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_sub_agent_capacity_boundary ON sub_agents;
+CREATE TRIGGER trg_sub_agent_capacity_boundary
+BEFORE INSERT OR UPDATE OF status, slot, computer_id ON sub_agents
+FOR EACH ROW EXECUTE FUNCTION enforce_sub_agent_capacity_boundary();
+
+UPDATE sub_agents sa
+   SET status = 'disabled'
+  FROM computers c
+  JOIN fleet_workers fw ON LOWER(fw.name) = LOWER(c.name)
+ WHERE sa.computer_id = c.id
+   AND sa.slot >= GREATEST(COALESCE(fw.sub_agent_count, 1), 1)
+   AND sa.status = 'idle'
+   AND sa.current_work_item_id IS NULL;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

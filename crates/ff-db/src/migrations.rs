@@ -1056,6 +1056,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "self_heal_bug_history",
         sql: schema::SCHEMA_V214_SELF_HEAL_BUG_HISTORY,
     },
+    PgMigration {
+        version: 215,
+        name: "sub_agent_capacity_boundary",
+        sql: schema::SCHEMA_V215_SUB_AGENT_CAPACITY_BOUNDARY,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1886,6 +1891,79 @@ mod tests {
         .await
         .expect("count legacy GitHub secrets");
         assert_eq!(legacy_secrets, 0);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v215_disables_excess_slots_lazily() {
+        // CI has no Postgres. Keep this integration test optional on both
+        // supported database URL variables.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        sqlx::query(
+            "INSERT INTO fleet_workers (name, ip, sub_agent_count)
+             VALUES ('v215-test-node', '10.0.0.215', 2)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert test worker");
+        let computer_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO computers (name, primary_ip, os_family)
+             VALUES ('v215-test-node', '10.0.0.215', 'linux-ubuntu')
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert test computer");
+
+        sqlx::query(
+            "INSERT INTO sub_agents (computer_id, slot, status, workspace_dir)
+             VALUES ($1, 1, 'idle', '/tmp/slot-1'),
+                    ($1, 2, 'busy', '/tmp/slot-2')",
+        )
+        .bind(computer_id)
+        .execute(&pool)
+        .await
+        .expect("insert in-range and busy excess slots");
+
+        let initial: Vec<(i32, String)> =
+            sqlx::query_as("SELECT slot, status FROM sub_agents ORDER BY slot")
+                .fetch_all(&pool)
+                .await
+                .expect("read initial statuses");
+        assert_eq!(initial, vec![(1, "idle".into()), (2, "busy".into())]);
+
+        sqlx::query("UPDATE sub_agents SET status = 'idle' WHERE slot = 2")
+            .execute(&pool)
+            .await
+            .expect("release excess slot");
+        let released_status: String =
+            sqlx::query_scalar("SELECT status FROM sub_agents WHERE slot = 2")
+                .fetch_one(&pool)
+                .await
+                .expect("read released status");
+        assert_eq!(released_status, "disabled");
+
+        sqlx::query("UPDATE fleet_workers SET sub_agent_count = 3 WHERE name = 'v215-test-node'")
+            .execute(&pool)
+            .await
+            .expect("grow capacity");
+        sqlx::query("UPDATE sub_agents SET status = 'idle' WHERE slot = 2")
+            .execute(&pool)
+            .await
+            .expect("re-enable newly in-range slot");
+        let grown_status: String =
+            sqlx::query_scalar("SELECT status FROM sub_agents WHERE slot = 2")
+                .fetch_one(&pool)
+                .await
+                .expect("read grown status");
+        assert_eq!(grown_status, "idle");
 
         drop_temp_db(admin, pool, &db_name).await;
     }
