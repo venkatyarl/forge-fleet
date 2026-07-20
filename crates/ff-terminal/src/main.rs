@@ -155,7 +155,7 @@ fn print_ff_version_long() {
 #[derive(Debug, Parser)]
 #[command(name = "ff", version = FF_LONG_VERSION, about = "ForgeFleet — distributed AI agent platform")]
 struct Cli {
-    #[arg(long, global = true)]
+    #[arg(long)]
     config: Option<PathBuf>,
     #[arg(long, global = true)]
     llm: Option<String>,
@@ -4031,8 +4031,8 @@ pub enum JiraCommand {
     Monitor {
         #[command(subcommand)]
         command: Option<JiraMonitorCommand>,
-        #[arg(long)]
-        config: Option<String>,
+        #[arg(long = "config", value_name = "NAME")]
+        site: Option<String>,
         #[arg(long, conflicts_with_all = ["once", "dry_run"])]
         daemon: bool,
         #[arg(long, conflicts_with_all = ["daemon", "dry_run"])]
@@ -4042,13 +4042,13 @@ pub enum JiraCommand {
     },
     /// Print the ordered assigned queue and current issue lease holders.
     Queue {
-        #[arg(long)]
-        config: Option<String>,
+        #[arg(long = "config", value_name = "NAME")]
+        site: Option<String>,
     },
     /// Re-sync Jira state into Postgres after a crash.
     Reconcile {
-        #[arg(long)]
-        config: Option<String>,
+        #[arg(long = "config", value_name = "NAME")]
+        site: Option<String>,
         #[arg(long)]
         dry_run: bool,
     },
@@ -7732,6 +7732,70 @@ mod cortex_format_tests {
     fn unknown_value_is_rejected() {
         assert!(CortexFormat::from_str("csv", true).is_err());
         assert!(CortexFormat::from_str("jsn", true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod jira_cli_tests {
+    use super::{Cli, Command, JiraCommand};
+    use clap::Parser;
+
+    #[test]
+    fn jira_config_flag_is_the_site_selector() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "ff",
+                    "jira",
+                    "monitor",
+                    "--config",
+                    "hireflow360",
+                    "--dry-run",
+                ])
+                .expect("Jira site selector should parse");
+
+                assert!(cli.config.is_none(), "global config-file argument was set");
+                assert!(matches!(
+                    cli.command,
+                    Some(Command::Jira {
+                        command: JiraCommand::Monitor {
+                            site: Some(ref site),
+                            dry_run: true,
+                            ..
+                        }
+                    }) if site == "hireflow360"
+                ));
+
+                for args in [
+                    vec![
+                        "ff",
+                        "jira",
+                        "monitor",
+                        "--config",
+                        "hireflow360",
+                        "--daemon",
+                    ],
+                    vec!["ff", "jira", "monitor", "--config", "hireflow360", "--once"],
+                    vec!["ff", "jira", "monitor", "--config", "hireflow360", "status"],
+                    vec!["ff", "jira", "monitor", "--config", "hireflow360", "stop"],
+                    vec!["ff", "jira", "queue", "--config", "hireflow360"],
+                    vec![
+                        "ff",
+                        "jira",
+                        "reconcile",
+                        "--config",
+                        "hireflow360",
+                        "--dry-run",
+                    ],
+                    vec!["ff", "jira", "config", "validate", "hireflow360"],
+                ] {
+                    Cli::try_parse_from(args).expect("supported Jira command should parse");
+                }
+            })
+            .expect("spawn parser test")
+            .join()
+            .expect("parser test panicked");
     }
 }
 

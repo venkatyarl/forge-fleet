@@ -579,10 +579,10 @@ pub async fn handle_jira(cmd: crate::JiraCommand) -> Result<()> {
         }
         crate::JiraCommand::Monitor {
             command: Some(crate::JiraMonitorCommand::Status),
-            config,
+            site,
             ..
         } => {
-            let c = load_config(&pool, config.as_deref()).await?;
+            let c = load_config(&pool, site.as_deref()).await?;
             let row: Option<(String, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as("SELECT session_id,heartbeat_at,lease_until FROM jira_monitor_leases WHERE config_id=$1")
                 .bind(&c.name).fetch_optional(&pool).await?;
             match row {
@@ -596,10 +596,10 @@ pub async fn handle_jira(cmd: crate::JiraCommand) -> Result<()> {
         }
         crate::JiraCommand::Monitor {
             command: Some(crate::JiraMonitorCommand::Stop),
-            config,
+            site,
             ..
         } => {
-            let c = load_config(&pool, config.as_deref()).await?;
+            let c = load_config(&pool, site.as_deref()).await?;
             sqlx::query("DELETE FROM jira_monitor_leases WHERE config_id=$1")
                 .bind(&c.name)
                 .execute(&pool)
@@ -608,14 +608,14 @@ pub async fn handle_jira(cmd: crate::JiraCommand) -> Result<()> {
         }
         crate::JiraCommand::Monitor {
             command: None,
-            config,
+            site,
             daemon,
             once,
             dry_run,
-        } => run_monitor(&pool, config.as_deref(), daemon, once, dry_run).await?,
-        crate::JiraCommand::Queue { config } => show_queue(&pool, config.as_deref()).await?,
-        crate::JiraCommand::Reconcile { config, dry_run } => {
-            run_monitor(&pool, config.as_deref(), false, true, dry_run).await?
+        } => run_monitor(&pool, site.as_deref(), daemon, once, dry_run).await?,
+        crate::JiraCommand::Queue { site } => show_queue(&pool, site.as_deref()).await?,
+        crate::JiraCommand::Reconcile { site, dry_run } => {
+            run_monitor(&pool, site.as_deref(), false, true, dry_run).await?
         }
         crate::JiraCommand::Config {
             command: crate::JiraConfigCommand::Validate { name },
