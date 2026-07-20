@@ -1,10 +1,15 @@
-use crate::{leader::LeaderClient, state::SharedState};
+use crate::{
+    leader::LeaderClient,
+    state::{BuildWatch, SharedState},
+};
 use chrono::Utc;
 use ff_core::{AgentTask, AgentTaskKind, TaskResult};
 use serde_json::json;
 use std::time::{Duration, Instant};
 use tokio::{process::Command, sync::mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 pub async fn run_task_executor(
     state: SharedState,
@@ -71,7 +76,7 @@ async fn execute_task(
         AgentTaskKind::ShellCommand {
             command,
             timeout_secs,
-        } => execute_shell_command(state, &command, timeout_secs).await,
+        } => execute_shell_command(state, task.id, &command, timeout_secs).await,
         AgentTaskKind::ModelInference {
             model,
             prompt,
@@ -92,6 +97,7 @@ async fn execute_task(
 
 async fn execute_shell_command(
     state: &SharedState,
+    task_id: Uuid,
     command: &str,
     timeout_secs: Option<u64>,
 ) -> (bool, String) {
@@ -125,8 +131,51 @@ async fn execute_shell_command(
 
     cmd.kill_on_drop(true);
 
+    // Builds are watched by the background timeout monitor. Register a
+    // cancellation token keyed by task id so the monitor can kill this build if
+    // it outruns `max_build_duration`; the executor `select!`s on that token
+    // and dropping the child future kills the process via `kill_on_drop`.
+    let is_build = looks_like_build(command);
+    let build_cancel = if is_build {
+        let token = CancellationToken::new();
+        let mut locked = state.write().await;
+        locked.build_watches.insert(
+            task_id,
+            BuildWatch {
+                started_at: Instant::now(),
+                cancel: token.clone(),
+            },
+        );
+        Some(token)
+    } else {
+        None
+    };
+
     let future = cmd.output();
-    let output = tokio::time::timeout(timeout, future).await;
+    let output = match &build_cancel {
+        Some(token) => {
+            tokio::select! {
+                res = tokio::time::timeout(timeout, future) => Some(res),
+                _ = token.cancelled() => None,
+            }
+        }
+        None => Some(tokio::time::timeout(timeout, future).await),
+    };
+
+    if is_build {
+        let mut locked = state.write().await;
+        locked.build_watches.remove(&task_id);
+    }
+
+    // `None` means the build-timeout monitor cancelled us for exceeding
+    // `max_build_duration` — the child was already dropped/killed above.
+    let Some(output) = output else {
+        warn!(%task_id, "build killed by timeout monitor (exceeded max_build_duration)");
+        return (
+            false,
+            "build killed: exceeded max_build_duration".to_string(),
+        );
+    };
 
     match output {
         Ok(Ok(out)) => {
@@ -211,6 +260,26 @@ async fn execute_model_inference(
     (success, output)
 }
 
+/// Heuristic: does this shell command look like a project build we should
+/// watch against `max_build_duration`? These are the long-running compile
+/// steps that can wedge and hold a build slot indefinitely.
+fn looks_like_build(command: &str) -> bool {
+    let c = command.to_ascii_lowercase();
+    [
+        "cargo build",
+        "cargo +",
+        "cargo test",
+        "docker build",
+        "npm run build",
+        "yarn build",
+        "pnpm build",
+        "cmake --build",
+        "make ",
+    ]
+    .iter()
+    .any(|needle| c.contains(needle))
+}
+
 fn looks_compute_heavy(command: &str) -> bool {
     let c = command.to_ascii_lowercase();
     [
@@ -225,4 +294,28 @@ fn looks_compute_heavy(command: &str) -> bool {
     ]
     .iter()
     .any(|needle| c.contains(needle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_build;
+
+    #[test]
+    fn detects_common_build_commands() {
+        assert!(looks_like_build("cargo build"));
+        assert!(looks_like_build("cargo build --release"));
+        assert!(looks_like_build("CARGO BUILD --release"));
+        assert!(looks_like_build("cargo +1.88.0 build"));
+        assert!(looks_like_build("cargo test --lib"));
+        assert!(looks_like_build("docker build -t img ."));
+        assert!(looks_like_build("cd app && npm run build"));
+        assert!(looks_like_build("make release"));
+    }
+
+    #[test]
+    fn ignores_non_build_commands() {
+        assert!(!looks_like_build("echo hello"));
+        assert!(!looks_like_build("ls -la"));
+        assert!(!looks_like_build("git status"));
+    }
 }
