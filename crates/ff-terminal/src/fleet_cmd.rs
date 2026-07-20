@@ -4596,6 +4596,93 @@ struct DeployResult {
 const MEMORY_TIGHT_RAM_GB: i32 = 40;
 const DEPLOY_TIMEOUT_ROOMY_SECS: u64 = 25 * 60;
 const DEPLOY_TIMEOUT_TIGHT_SECS: u64 = 45 * 60;
+/// Maximum time to let work already running on deploy targets finish before
+/// requeueing it attempt-neutrally. Targets are marked drained first, so no
+/// new leases can race the final empty check.
+const DEPLOY_LEASE_DRAIN_TIMEOUT_SECS: u64 = 2 * 60;
+const DEPLOY_LEASE_DRAIN_POLL_SECS: u64 = 2;
+
+/// Prevent new work-item assignments to deploy targets and wait for their
+/// existing leases to finish. At the deadline, remaining leases are released
+/// through the HA handoff path, which requeues claimed/building items without
+/// incrementing their attempt count.
+async fn drain_deploy_targets(
+    pool: &sqlx::PgPool,
+    target_names: &[String],
+) -> Result<Vec<(uuid::Uuid, String)>> {
+    let mut tx = pool.begin().await?;
+    let previous = sqlx::query_as::<_, (uuid::Uuid, String)>(
+        "SELECT id, COALESCE(reservation_state, 'available')
+           FROM computers
+          WHERE name = ANY($1)
+          FOR UPDATE",
+    )
+    .bind(target_names)
+    .fetch_all(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE computers
+            SET reservation_state = 'drained'
+          WHERE name = ANY($1)",
+    )
+    .bind(target_names)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    let computer_ids: Vec<uuid::Uuid> = previous.iter().map(|(id, _)| *id).collect();
+    let drain_result: Result<()> = async {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(DEPLOY_LEASE_DRAIN_TIMEOUT_SECS);
+        loop {
+            let active: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)
+                   FROM work_item_leases
+                  WHERE computer_id = ANY($1)
+                    AND released_at IS NULL",
+            )
+            .bind(&computer_ids)
+            .fetch_one(pool)
+            .await?;
+            if active == 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                eprintln!(
+                    "{YELLOW}⚠ deploy drain timed out with {active} active lease(s); requeueing attempt-neutrally{RESET}"
+                );
+                for computer_id in &computer_ids {
+                    ff_agent::ha::drain_work_item_leases(pool, *computer_id).await?;
+                }
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(DEPLOY_LEASE_DRAIN_POLL_SECS)).await;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = drain_result {
+        restore_deploy_targets(pool, &previous).await;
+        return Err(error);
+    }
+
+    Ok(previous)
+}
+
+async fn restore_deploy_targets(pool: &sqlx::PgPool, previous: &[(uuid::Uuid, String)]) {
+    for (computer_id, reservation_state) in previous {
+        if let Err(error) = sqlx::query("UPDATE computers SET reservation_state = $2 WHERE id = $1")
+            .bind(computer_id)
+            .bind(reservation_state)
+            .execute(pool)
+            .await
+        {
+            eprintln!(
+                "{YELLOW}⚠ failed to restore deploy target reservation {computer_id}: {error}{RESET}"
+            );
+        }
+    }
+}
 
 /// Expand a leading `~/` to `$HOME/` so the path is safe inside a
 /// double-quoted shell string (tilde does not expand there). Same trick the
@@ -4878,7 +4965,13 @@ async fn refresh_local_leader_if_self(pool: &sqlx::PgPool) -> Option<(bool, Stri
     eprintln!(
         "{CYAN}▶ refreshing leader '{leader_name}' forgefleetd locally (tree clean @ HEAD)…{RESET}"
     );
+    let previous_reservation =
+        match drain_deploy_targets(pool, std::slice::from_ref(&leader_name)).await {
+            Ok(previous) => previous,
+            Err(error) => return Some((false, format!("leader lease drain failed: {error}"))),
+        };
     let (code, _out, err) = run_local_shell(&leader_refresh_playbook(&os_family, &src), 2700).await;
+    restore_deploy_targets(pool, &previous_reservation).await;
     if code == 0 {
         Some((true, "leader daemon rebuilt + restarted".into()))
     } else {
@@ -5570,6 +5663,12 @@ async fn handle_fleet_deploy(
         }
     }
 
+    // Stop new assignments before any build starts, then let in-flight work
+    // finish before a restart can tear down its daemon. A bounded timeout
+    // falls back to the attempt-neutral HA lease handoff.
+    let target_names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
+    let previous_reservations = drain_deploy_targets(pool, &target_names).await?;
+
     // Group targets by (os_family, arch). One build per group is executed on a
     // designated builder; binaries are then scp'd to the remaining receivers.
     let mut groups: std::collections::HashMap<(String, String), Vec<DeployTarget>> =
@@ -5673,6 +5772,7 @@ async fn handle_fleet_deploy(
     // Deploys done (daemons restarted + beating again) — lift the presence-
     // alert mute rather than letting the 50min stamp ride out.
     set_alert_mute(pool, 0).await;
+    restore_deploy_targets(pool, &previous_reservations).await;
 
     // Convergence target = the most-common SHA among successful hosts.
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -6227,6 +6327,35 @@ mod route_tests {
             p.contains("codesign --force --sign -"),
             "macOS still code-signs"
         );
+    }
+
+    #[test]
+    fn fleet_deploy_drains_before_any_daemon_restart() {
+        let source = include_str!("fleet_cmd.rs");
+        let deploy = source
+            .split("async fn handle_fleet_deploy")
+            .nth(1)
+            .expect("fleet deploy handler");
+        let drain = deploy
+            .find("drain_deploy_targets(pool")
+            .expect("deploy must drain target leases");
+        let run = deploy
+            .find("deploy_group(plan")
+            .expect("deploy must run grouped restarts");
+        assert!(drain < run, "lease drain must precede daemon restarts");
+        assert!(deploy.contains("restore_deploy_targets(pool"));
+
+        let leader = source
+            .split("async fn refresh_local_leader_if_self")
+            .nth(1)
+            .expect("leader refresh handler");
+        let leader_drain = leader
+            .find("drain_deploy_targets(pool")
+            .expect("leader must drain leases");
+        let leader_restart = leader
+            .find("leader_refresh_playbook")
+            .expect("leader must restart");
+        assert!(leader_drain < leader_restart, "leader must drain first");
     }
 
     #[test]
