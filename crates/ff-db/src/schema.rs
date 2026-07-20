@@ -10944,6 +10944,12 @@ ALTER TABLE cloud_budget_buckets
     ADD COLUMN IF NOT EXISTS last_success_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS source TEXT;
 
+-- ensure max_concurrent has a default even if the table pre-existed without one
+-- (older cloud_budget_buckets had max_concurrent INT NOT NULL with no default; the
+-- CREATE IF NOT EXISTS above is a no-op there, so the seed INSERT below would 401 on NOT NULL)
+ALTER TABLE cloud_budget_buckets ALTER COLUMN max_concurrent SET DEFAULT 3;
+UPDATE cloud_budget_buckets SET max_concurrent = 3 WHERE max_concurrent IS NULL;
+
 INSERT INTO cloud_budget_buckets (
     provider,
     window_exhausted_until,
