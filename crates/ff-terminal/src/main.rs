@@ -5035,6 +5035,22 @@ async fn main() -> Result<()> {
                             s.token_preview.unwrap_or_else(|| "-".into()),
                         );
                     }
+                    let setup_token = ff_db::pg_get_secret(&pool, "claude.setup_token")
+                        .await
+                        .ok()
+                        .flatten();
+                    println!();
+                    match setup_token {
+                        Some(t) if !t.trim().is_empty() => println!(
+                            "{GREEN}✓{RESET} durable headless claude token set (fleet_secrets[claude.setup_token]) \
+                             — every node exports it as CLAUDE_CODE_OAUTH_TOKEN when spawning `claude`"
+                        ),
+                        _ => println!(
+                            "{YELLOW}!{RESET} no durable headless claude token — run `claude setup-token` once \
+                             (browser approval), then `ff secrets set claude.setup_token` (or pipe via --stdin) \
+                             to mint one that survives refresh-token rotation fleet-wide"
+                        ),
+                    }
                     Ok(())
                 }
                 OauthCommand::RefreshWatch => {

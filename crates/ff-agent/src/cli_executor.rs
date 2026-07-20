@@ -252,6 +252,23 @@ pub async fn execute_cli_in_dir(
     // any node/git subprocess it forks resolve even under a minimal
     // non-interactive PATH (same reason we resolve `bin_path` absolutely above).
     cmd.env("PATH", augmented_path_env());
+    // Durable headless claude auth: `fleet_secrets[claude.setup_token]` holds a
+    // long-lived token minted once by the operator via `claude setup-token`
+    // (browser approval) and stored with `ff secrets set claude.setup_token`.
+    // Every node reads the SAME Postgres-backed secret, so distribution is
+    // implicit — no per-node file copy, no systemd Environment= line (which
+    // would drift from the DB and bake the secret into a unit file). This is
+    // independent of and more durable than the shared-refresh-token
+    // `~/.claude/.credentials.json` copy in `oauth_distributor`: that file
+    // holds ONE refresh token for the whole fleet, so a single rotation kills
+    // every copy at once (the Jul-8 fleet-wide claude OAuth expiry). A no-op
+    // when the secret is unset — falls through to the CLI's normal credential
+    // resolution (cred file / Keychain) exactly as before.
+    if cfg.name == "claude"
+        && let Some(token) = crate::fleet_info::fetch_secret("claude.setup_token").await
+    {
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+    }
     // Tell the CLI which directory to operate in (sets the process cwd and,
     // where the vendor has one, the dedicated working-dir flag).
     //
