@@ -983,7 +983,20 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
-    // 18b) Staged upgrade rollout + auto-halt — every 60s, leader-gated.
+    // 18d) Postgres replica-death monitor — every 60s, leader-gated.
+    // Complement to `pg_failover`: failover only acts when the primary is
+    // down, so a scenario where both replicas die while the primary stays up
+    // was previously silent. This tick probes every registered replica's
+    // Postgres port and fires the `postgres_replica_dead` alert on transition.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: postgres replica-death monitor (60s, leader-gated)");
+        subsystem_tasks.push(
+            ff_agent::ha::replica_monitor::ReplicaMonitorTick::new(pg_pool, worker_name.clone())
+                .spawn(shutdown_rx.clone()),
+        );
+    }
+
+    // 18e) Staged upgrade rollout + auto-halt — every 60s, leader-gated.
     // PROD_READINESS item 26: a bad build must be caught on a canary host
     // instead of rolling all 14 non-leader hosts. For each in_progress
     // `upgrade_rollouts` row the tick gates stage progression on the current

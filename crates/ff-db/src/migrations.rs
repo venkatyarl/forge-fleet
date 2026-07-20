@@ -901,6 +901,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "artifact_cache_index",
         sql: schema::SCHEMA_V183_ARTIFACT_CACHE_INDEX,
     },
+    PgMigration {
+        version: 184,
+        name: "postgres_replica_dead_alert",
+        sql: schema::SCHEMA_V184_POSTGRES_REPLICA_DEAD_ALERT,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

@@ -10672,6 +10672,25 @@ CREATE INDEX IF NOT EXISTS idx_artifact_cache_index_artifact_key
     ON artifact_cache_index (artifact_key);
 "#;
 
+/// V184 — Postgres replica-death alert policy.
+///
+/// Seeds the imperative `postgres_replica_dead` alert policy used by
+/// `ff_agent::ha::replica_monitor`. The tick probes every registered Postgres
+/// replica via TCP and fires this alert when one or more replicas are
+/// unreachable, closing the "both replicas silently dead while hosts stay up"
+/// monitoring gap.
+pub const SCHEMA_V184_POSTGRES_REPLICA_DEAD_ALERT: &str = r#"
+INSERT INTO alert_policies
+    (name, description, metric, scope, condition,
+     duration_secs, severity, cooldown_secs, channel, enabled)
+VALUES
+  ('postgres_replica_dead',
+   'One or more Postgres replicas are unreachable (TCP probe failed)',
+   'postgres_replica_dead', 'leader_only', '> 0',
+   0, 'critical', 3600, 'telegram', true)
+ON CONFLICT (name) DO NOTHING;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
