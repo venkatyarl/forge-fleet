@@ -167,9 +167,10 @@ pub fn probe_indicates_unauthenticated(reason: &str) -> bool {
         "invalid authentication credentials",
         "invalid api key",
         "invalid credentials",
-        "credentials expired",
-        "token expired",
-        "session expired",
+        "authentication credentials expired",
+        "authentication token expired",
+        "access token expired",
+        "login session expired",
         "please log in",
         "please login",
         "not logged in",
@@ -488,7 +489,9 @@ mod tests {
             "Failed to authenticate. API Error: 401 Invalid authentication credentials"
         ));
         assert!(probe_indicates_unauthenticated("not logged in"));
-        assert!(probe_indicates_unauthenticated("Your token expired"));
+        assert!(probe_indicates_unauthenticated(
+            "Your authentication token expired"
+        ));
         // Transient / flaky probes must NOT match — they keep the cred-file
         // benefit of the doubt (a genuinely-authenticated backend blipping).
         assert!(!probe_indicates_unauthenticated("503 service unavailable"));
@@ -497,6 +500,9 @@ mod tests {
         ));
         assert!(!probe_indicates_unauthenticated(
             "probe failed: 502 bad gateway"
+        ));
+        assert!(!probe_indicates_unauthenticated(
+            "context mentions token expired behavior"
         ));
         // Disjoint from the broken-binary and config-error verdicts.
         assert!(!probe_indicates_unauthenticated(

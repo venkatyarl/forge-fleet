@@ -491,6 +491,11 @@ async fn try_cloud_then_fail(
     body: &Value,
     available_caps: &[String],
 ) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    let cloud_fallback_attempted = state
+        .operational_store
+        .as_ref()
+        .and_then(|s| s.pg_pool())
+        .is_some();
     if let Some(pool) = state.operational_store.as_ref().and_then(|s| s.pg_pool()) {
         let model_id = req.model.as_deref().unwrap_or("gpt-4o-mini");
         if let Some(result) =
@@ -511,11 +516,14 @@ async fn try_cloud_then_fail(
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
             "error": {
-                "message": "no healthy fleet endpoint matches the required capabilities and no cloud fallback is available",
+                "message": "no healthy fleet endpoint currently matches the required capabilities; endpoints may be draining for an upgrade, so retry after active work checkpoints and the binary swap completes",
                 "type": "backend_unavailable",
                 "task": task_type,
                 "required_capabilities": task_def.capabilities,
                 "available_capabilities": available_caps,
+                "retryable": true,
+                "retry_after_seconds": 30,
+                "cloud_fallback_attempted": cloud_fallback_attempted,
             }
         })),
     ))
