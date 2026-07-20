@@ -34,10 +34,13 @@ struct MemberRaw {
     /// The fleet computer that answered (local members only).
     worker_name: Option<String>,
     /// Prompt/completion tokens for this dispatch. Populated for local fleet
-    /// members (the endpoint returns a `usage` block); `0` for vendor CLIs,
-    /// which don't report token counts.
+    /// members (the endpoint returns a `usage` block) and for vendor CLIs
+    /// that echo usage in their output; `0` when nothing was reported.
     tokens_in: i32,
     tokens_out: i32,
+    /// Canonical engine that answered (`local:<catalog_id>` for fleet models);
+    /// `None` falls back to the member name (the vendor CLI case).
+    engine: Option<String>,
 }
 
 impl MemberRaw {
@@ -50,6 +53,7 @@ impl MemberRaw {
             worker_name: None,
             tokens_in: 0,
             tokens_out: 0,
+            engine: None,
         }
     }
 }
@@ -203,6 +207,7 @@ async fn dispatch_member(
                 worker_name: Some(o.worker_name),
                 tokens_in: o.tokens_in,
                 tokens_out: o.tokens_out,
+                engine: Some(ff_agent::llm_attribution::engine_label(&o.model)),
             },
             Err(e) => MemberRaw::fail(e.to_string()),
         };
@@ -210,15 +215,23 @@ async fn dispatch_member(
 
     // Vendor CLI member.
     match ff_agent::cli_executor::execute_cli_in_dir(member, prompt, &[], None, timeout).await {
-        Ok(r) if r.exit_code == 0 && !r.stdout.trim().is_empty() => MemberRaw {
-            answer: Some(r.stdout.trim().to_string()),
-            error: None,
-            latency_ms: i32::try_from(r.duration_ms).ok(),
-            endpoint: Some(format!("ff council/{member}")),
-            worker_name: None,
-            tokens_in: 0,
-            tokens_out: 0,
-        },
+        Ok(r) if r.exit_code == 0 && !r.stdout.trim().is_empty() => {
+            // Vendor CLIs sometimes echo usage (JSON keys or a "tokens used"
+            // line) on stdout/stderr — scrape what's there.
+            let (tokens_in, tokens_out) = ff_agent::llm_attribution::parse_cli_token_counts(
+                &format!("{}\n{}", r.stdout, r.stderr),
+            );
+            MemberRaw {
+                answer: Some(r.stdout.trim().to_string()),
+                error: None,
+                latency_ms: i32::try_from(r.duration_ms).ok(),
+                endpoint: Some(format!("ff council/{member}")),
+                worker_name: None,
+                tokens_in,
+                tokens_out,
+                engine: None,
+            }
+        }
         Ok(r) => MemberRaw {
             answer: None,
             error: Some(format!(
@@ -235,6 +248,7 @@ async fn dispatch_member(
             worker_name: None,
             tokens_in: 0,
             tokens_out: 0,
+            engine: None,
         },
         Err(e) => MemberRaw::fail(e.to_string()),
     }
@@ -265,14 +279,35 @@ async fn log_council(
                 .map(|e| e.chars().take(2000).collect::<String>()),
         ),
     };
+    // Canonical engine: the fleet model that actually answered when known
+    // (local members), else the member's vendor CLI name (claude/codex/kimi).
+    // Estimate missing token counts (chars/4, flagged) on successful answers
+    // and price cloud engines from the config rates table — local is $0.
+    let engine = raw
+        .engine
+        .clone()
+        .unwrap_or_else(|| ff_agent::llm_attribution::engine_label(member));
+    let (tokens_in, tokens_out, tokens_estimated) = if raw.answer.is_some() {
+        ff_agent::llm_attribution::tokens_or_estimate(
+            raw.tokens_in,
+            raw.tokens_out,
+            request,
+            raw.answer.as_deref().unwrap_or_default(),
+        )
+    } else {
+        (raw.tokens_in, raw.tokens_out, false)
+    };
+    let cost_usd = ff_agent::llm_attribution::cost_usd(&engine, tokens_in, tokens_out);
     let rec = ff_db::InteractionRecord {
         channel: channel.to_string(),
         request_text: request.chars().take(16000).collect(),
-        engine: Some(member.to_string()),
+        request_meta: serde_json::json!({ "tokens_estimated": tokens_estimated }),
+        engine: Some(engine),
         response_text,
         latency_ms: raw.latency_ms,
-        tokens_in: raw.tokens_in,
-        tokens_out: raw.tokens_out,
+        tokens_in,
+        tokens_out,
+        cost_usd,
         outcome,
         error_text,
         endpoint: raw

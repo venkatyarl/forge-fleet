@@ -691,11 +691,17 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                 .map(str::to_string)
                 .unwrap_or_default();
             let route_decision = value.get("strategy").cloned().unwrap_or(json!({}));
+            // Strategy dispatch runs on the local tier cascade; its result JSON
+            // carries no model/usage today, so without a fallback these rows
+            // landed as engine=NULL with 0 tokens. Label the engine
+            // (`local:<catalog_id>` when the strategy names a model, plain
+            // `local` otherwise) and degrade to a flagged chars/4 estimate.
             let engine_owned = value
                 .get("strategy")
                 .and_then(|s| s.get("model").or_else(|| s.get("engine")))
                 .and_then(|v| v.as_str())
-                .map(str::to_string);
+                .map(ff_agent::llm_attribution::engine_label)
+                .unwrap_or_else(|| "local".to_string());
             let tokens_out = value
                 .get("usage")
                 .and_then(|u| u.get("completion_tokens"))
@@ -706,6 +712,13 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                 .and_then(|u| u.get("prompt_tokens"))
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0) as i32;
+            let (tokens_in, tokens_out, tokens_estimated) =
+                ff_agent::llm_attribution::tokens_or_estimate(
+                    tokens_in,
+                    tokens_out,
+                    prompt,
+                    &response_owned,
+                );
             let latency_ms = started.elapsed().as_millis().min(i32::MAX as u128) as i32;
             let strategy_label = strategy_str.to_string();
             if let Ok((cfg2, _)) = load_config_auto() {
@@ -714,9 +727,12 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                         let rec = ff_db::InteractionRecord {
                             channel: "mcp".to_string(),
                             request_text: prompt_owned,
-                            request_meta: json!({ "strategy": strategy_label }),
+                            request_meta: json!({
+                                "strategy": strategy_label,
+                                "tokens_estimated": tokens_estimated,
+                            }),
                             route_decision,
-                            engine: engine_owned,
+                            engine: Some(engine_owned),
                             response_text: response_owned,
                             tokens_in,
                             tokens_out,
@@ -901,7 +917,9 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                     {
                         let prompt_owned = prompt.to_string();
                         let response_owned = text.clone().unwrap_or_default();
-                        let engine_owned = backend.model.clone();
+                        // `backend.model` is a local deployment's model name /
+                        // gguf filename — record the canonical local engine.
+                        let engine_owned = ff_agent::llm_attribution::engine_label(&backend.model);
                         let latency_ms = latency.as_millis().min(i32::MAX as u128) as i32;
                         let tokens_in = payload
                             .get("usage")
