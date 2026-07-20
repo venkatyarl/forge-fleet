@@ -58,6 +58,7 @@ pub mod deployment_reconciler;
 pub mod deployment_staleness;
 pub mod disk_reconcile;
 pub mod disk_sampler;
+pub mod dreamer;
 pub mod dynamic_loader;
 pub mod external_tools_installer;
 pub mod external_tools_registry;

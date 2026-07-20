@@ -217,8 +217,29 @@ async fn execute(
         "internal" => {
             // ForgeFleet-internal tasks dispatched by title. Ported from the
             // legacy `ff daemon` (decision-2 Phase A1) so forgefleetd no longer
-            // strands `internal` deferred work. Today: SSH mesh propagation.
-            if task.title.starts_with("Mesh propagate SSH for ") {
+            // strands `internal` deferred work. Today: SSH mesh propagation and
+            // the memory-dreamer consolidation chain.
+            if task.title == crate::dreamer::DREAMER_TASK_TITLE {
+                match crate::fleet_info::get_fleet_pool().await {
+                    Ok(pool) => {
+                        let pass = crate::dreamer::run_dreamer_pass(&pool).await;
+                        // Chain the next link REGARDLESS of pass outcome — the
+                        // chain dying with one bad pass is the failure mode
+                        // this must never have. The link itself never retries
+                        // (max_attempts=1); the next link re-covers the work.
+                        if let Err(e) =
+                            crate::dreamer::schedule_next_run(&pool, Some(&task.id)).await
+                        {
+                            warn!(error = %e, "dreamer: failed to schedule next chain link");
+                        }
+                        match pass {
+                            Ok(report) => (true, Some(report), None),
+                            Err(e) => (false, None, Some(format!("dreamer pass: {e}"))),
+                        }
+                    }
+                    Err(e) => (false, None, Some(format!("pool: {e}"))),
+                }
+            } else if task.title.starts_with("Mesh propagate SSH for ") {
                 match crate::fleet_info::get_fleet_pool().await {
                     Ok(pool) => match crate::mesh_check::mesh_propagate(&pool, &task.payload).await
                     {

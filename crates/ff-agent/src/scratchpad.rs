@@ -202,7 +202,8 @@ async fn write_block(
 /// paths / commands / IDs / failures), push the full pre-summary content into
 /// Brain, record an eviction row, and replace the block with the summary.
 /// Falls back to a hard trim if the summarizer is unavailable.
-async fn consolidate_and_forget(
+/// `pub(crate)` for the dreamer's cap re-enforcement sweep.
+pub(crate) async fn consolidate_and_forget(
     pool: &PgPool,
     scope_type: &str,
     scope_key: &str,
@@ -282,6 +283,46 @@ async fn consolidate_and_forget(
         }
     }
     Ok(did_anything)
+}
+
+/// Archive a dead `session`-scope scratchpad: push every non-empty block's
+/// FULL content into Brain as a knowledge candidate, record an eviction audit
+/// row per block, then delete the scope's rows. Called by the dreamer
+/// ([`crate::dreamer`]) for session scopes idle past their TTL — the write-path
+/// consolidation above can never reach them because writes have stopped.
+/// No summarizer involved: the session is over, so the whole text graduates to
+/// Brain verbatim and the scratchpad rows are dropped. Idempotent (a re-run on
+/// the same scope finds no rows). Returns the number of blocks archived.
+pub(crate) async fn archive_session_scope(pool: &PgPool, scope_key: &str) -> Result<usize> {
+    let blocks = ff_db::queries::pg_memory_get_all(pool, "session", scope_key).await?;
+    let mut archived = 0usize;
+    for b in blocks.iter().filter(|b| !b.content.is_empty()) {
+        let brain_ref = push_to_brain(pool, "session", scope_key, &b.block, &b.content).await;
+        ff_db::queries::pg_memory_record_eviction(
+            pool,
+            "session",
+            scope_key,
+            &b.block,
+            &hex_sha256(&b.content),
+            b.bytes,
+            "(archived whole: session-scope TTL sweep)",
+            "dreamer",
+            brain_ref.as_deref(),
+        )
+        .await
+        .context("record session-archive eviction")?;
+        archived += 1;
+    }
+    sqlx::query("DELETE FROM agent_memory WHERE scope_type = 'session' AND scope_key = $1")
+        .bind(scope_key)
+        .execute(pool)
+        .await
+        .context("delete archived session scope")?;
+    info!(
+        scope_key,
+        archived, "scratchpad: archived dead session scope to Brain"
+    );
+    Ok(archived)
 }
 
 /// Hard-trim a block to its newest half (keeps the most recent lines). Never
