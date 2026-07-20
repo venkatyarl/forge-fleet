@@ -7,6 +7,7 @@
 //! - health gate evaluation (`health_gate`)
 //! - rollback decisioning and planning (`rollback`)
 //! - deployment orchestration interfaces (`deployer`)
+//! - node-level daemon restart with lease draining (`node`)
 
 pub mod config;
 pub mod daemon;
