@@ -2,13 +2,11 @@
 
 use sqlx::PgPool;
 use std::time::Duration;
-use tracing::warn;
-
-const DEFAULT_EXHAUSTION: Duration = Duration::from_secs(30 * 60);
+const DEFAULT_FAILURE_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 /// Infer a quota reset window from vendor CLI output. `None` means the failure
 /// did not look quota-related and must not suppress an otherwise healthy lane.
-pub fn inferred_exhaustion(text: &str) -> Option<Duration> {
+pub fn failure_window(text: &str) -> Option<Duration> {
     let lower = text.to_ascii_lowercase();
     let usage_limit = lower.contains("usage limit")
         || lower.contains("usage-limit")
@@ -22,7 +20,7 @@ pub fn inferred_exhaustion(text: &str) -> Option<Duration> {
         return None;
     }
 
-    reset_hours(&lower).or(Some(DEFAULT_EXHAUSTION))
+    reset_hours(&lower).or(Some(DEFAULT_FAILURE_WINDOW))
 }
 
 fn reset_hours(text: &str) -> Option<Duration> {
@@ -45,24 +43,19 @@ fn reset_hours(text: &str) -> Option<Duration> {
     None
 }
 
-/// Mark all active budget windows for a provider exhausted. Fail-open while T1
-/// rolls out: dispatch must continue if the table is not deployed yet.
-pub async fn record_failure(pg: &PgPool, provider: &str, text: &str) {
-    let Some(duration) = inferred_exhaustion(text) else {
-        return;
-    };
-    record_exhausted_for(pg, provider, duration).await;
-}
-
 /// Provider failures without response text (timeout/empty stdout) use the safe
 /// short default window so the next lane is tried without disabling it all day.
-pub async fn record_backend_failure(pg: &PgPool, provider: &str) {
-    record_exhausted_for(pg, provider, DEFAULT_EXHAUSTION).await;
+pub async fn record_backend_failure(pg: &PgPool, provider: &str) -> Result<(), sqlx::Error> {
+    record_failure(pg, provider, DEFAULT_FAILURE_WINDOW).await
 }
 
-async fn record_exhausted_for(pg: &PgPool, provider: &str, duration: Duration) {
+pub async fn record_failure(
+    pg: &PgPool,
+    provider: &str,
+    duration: Duration,
+) -> Result<(), sqlx::Error> {
     let seconds = duration.as_secs().min(i64::MAX as u64) as i64;
-    if let Err(error) = sqlx::query(
+    sqlx::query(
         "UPDATE cloud_budget_buckets \
          SET window_exhausted_until = GREATEST(COALESCE(window_exhausted_until, NOW()), \
                                                NOW() + make_interval(secs => $2::double precision)) \
@@ -71,25 +64,21 @@ async fn record_exhausted_for(pg: &PgPool, provider: &str, duration: Duration) {
     .bind(provider)
     .bind(seconds as f64)
     .execute(pg)
-    .await
-    {
-        warn!(%provider, %error, "cloud budget failure update skipped");
-    }
+    .await?;
+    Ok(())
 }
 
 /// A successful CLI call proves the provider is usable again.
-pub async fn record_success(pg: &PgPool, provider: &str) {
-    if let Err(error) = sqlx::query(
+pub async fn record_success(pg: &PgPool, provider: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
         "UPDATE cloud_budget_buckets \
          SET window_exhausted_until = NULL, last_success_at = NOW() \
          WHERE provider = $1",
     )
     .bind(provider)
     .execute(pg)
-    .await
-    {
-        warn!(%provider, %error, "cloud budget success update skipped");
-    }
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -97,9 +86,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_reset_hours() {
+    fn parses_explicit_reset_hours() {
         assert_eq!(
-            inferred_exhaustion("429 usage limit reached; resets in 2.5 hours"),
+            failure_window("429 usage limit; resets in 2.5 hours"),
             Some(Duration::from_secs(9_000))
         );
     }
@@ -107,17 +96,26 @@ mod tests {
     #[test]
     fn recognizes_billing_and_kimi_usage_limits() {
         assert_eq!(
-            inferred_exhaustion("limit renews next billing cycle"),
-            Some(DEFAULT_EXHAUSTION)
+            failure_window("limit renews next billing cycle"),
+            Some(DEFAULT_FAILURE_WINDOW)
         );
         assert_eq!(
-            inferred_exhaustion("access_terminated_error: usage-limit exceeded"),
-            Some(DEFAULT_EXHAUSTION)
+            failure_window("access_terminated_error: usage-limit exceeded"),
+            Some(DEFAULT_FAILURE_WINDOW)
         );
     }
 
     #[test]
     fn ignores_unrelated_backend_failures() {
-        assert_eq!(inferred_exhaustion("process exited 1: syntax error"), None);
+        assert_eq!(failure_window("process exited 1: syntax error"), None);
+        assert_eq!(
+            failure_window("HTTP 403 forbidden"),
+            Some(DEFAULT_FAILURE_WINDOW)
+        );
+        assert_eq!(
+            failure_window("HTTP 429 too many requests"),
+            Some(DEFAULT_FAILURE_WINDOW)
+        );
+        assert_eq!(failure_window("ordinary compiler error"), None);
     }
 }

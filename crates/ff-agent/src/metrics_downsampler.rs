@@ -6,8 +6,7 @@
 //! `ON CONFLICT (computer_id, recorded_at) DO NOTHING`, so multiple
 //! leaders during election churn cannot produce duplicate rows.
 //!
-//! Retention is applied by [`delete_older_than_days`]; the daemon calls it
-//! once per day after the first successful sample.
+//! Retention and rollups run on the deferred-task retention cron.
 
 use std::time::Duration;
 
@@ -131,9 +130,6 @@ impl MetricsDownsampler {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // Track last retention run to apply it at most once per day.
-            let mut last_retention = std::time::Instant::now() - Duration::from_secs(86_400);
-
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
@@ -152,16 +148,6 @@ impl MetricsDownsampler {
                                 tracing::warn!(error = %err, "metrics downsample failed");
                             }
                         }
-
-                        if last_retention.elapsed() > Duration::from_secs(86_400) {
-                            match delete_older_than_days(&self.pg, 90).await {
-                                Ok(n) => {
-                                    tracing::info!(rows = n, "metrics retention sweep deleted old rows");
-                                    last_retention = std::time::Instant::now();
-                                }
-                                Err(e) => tracing::warn!(error = %e, "metrics retention sweep failed"),
-                            }
-                        }
                     }
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() {
@@ -173,17 +159,6 @@ impl MetricsDownsampler {
             }
         })
     }
-}
-
-/// Delete metrics history older than `days` days. Returns the row count.
-pub async fn delete_older_than_days(pg: &PgPool, days: i32) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "DELETE FROM computer_metrics_history WHERE recorded_at < NOW() - ($1 || ' days')::interval",
-    )
-    .bind(days.to_string())
-    .execute(pg)
-    .await?;
-    Ok(result.rows_affected())
 }
 
 /// Pretty-printable row used by `ff metrics history`.
@@ -215,15 +190,34 @@ pub async fn history_for_computer(
             Option<f64>,
             Option<f64>,
             Option<f64>,
-            Option<i32>,
-            Option<i32>,
+            Option<f64>,
+            Option<f64>,
             Option<f64>,
         ),
     >(
         r#"
         SELECT recorded_at, cpu_pct, ram_pct, ram_used_gb, disk_free_gb, gpu_pct,
                llm_queue_depth, llm_active_requests, llm_tokens_per_sec
-        FROM computer_metrics_history m
+        FROM (
+            SELECT computer_id, recorded_at, cpu_pct, ram_pct, ram_used_gb,
+                   disk_free_gb, gpu_pct, llm_queue_depth::double precision,
+                   llm_active_requests::double precision, llm_tokens_per_sec
+              FROM computer_metrics_history
+             WHERE recorded_at >= NOW() - INTERVAL '7 days'
+            UNION ALL
+            SELECT computer_id, recorded_at, cpu_pct, ram_pct, ram_used_gb,
+                   disk_free_gb, gpu_pct, llm_queue_depth,
+                   llm_active_requests, llm_tokens_per_sec
+              FROM computer_metrics_history_hourly
+             WHERE recorded_at < NOW() - INTERVAL '7 days'
+               AND recorded_at >= NOW() - INTERVAL '90 days'
+            UNION ALL
+            SELECT computer_id, recorded_at, cpu_pct, ram_pct, ram_used_gb,
+                   disk_free_gb, gpu_pct, llm_queue_depth,
+                   llm_active_requests, llm_tokens_per_sec
+              FROM computer_metrics_history_daily
+             WHERE recorded_at < NOW() - INTERVAL '90 days'
+        ) m
         JOIN computers c ON c.id = m.computer_id
         WHERE c.name = $1
           AND recorded_at > NOW() - ($2 || ' seconds')::interval
@@ -246,8 +240,8 @@ pub async fn history_for_computer(
                     ram_used_gb,
                     disk_free_gb,
                     gpu_pct,
-                    llm_queue_depth: q,
-                    llm_active_requests: a,
+                    llm_queue_depth: q.map(|v| v.round() as i32),
+                    llm_active_requests: a.map(|v| v.round() as i32),
                     llm_tokens_per_sec: t,
                 }
             },

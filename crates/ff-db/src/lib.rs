@@ -211,6 +211,7 @@ pub use queries::{
     pg_list_work_intents,
     // Orchestrator P3 — adaptive serving-mix autoscaler
     pg_loadable_library_for_kind,
+    pg_maintain_computer_metrics_history,
     pg_mark_merge_ci_running,
     pg_mark_merge_failed,
     pg_mark_merge_mergeable,

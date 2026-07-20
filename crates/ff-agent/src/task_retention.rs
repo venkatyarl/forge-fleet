@@ -54,12 +54,19 @@ pub async fn evaluate_retention(pg: &PgPool) -> Result<(u64, u64)> {
             .as_deref(),
     );
     let (fleet, deferred) = ff_db::pg_prune_terminal_task_history(pg, days).await?;
+    let (raw, hourly, daily) = ff_db::pg_maintain_computer_metrics_history(pg).await?;
     if fleet > 0 || deferred > 0 {
         info!(
             fleet_tasks = fleet,
             deferred_tasks = deferred,
             retention_days = days,
             "task_retention: pruned terminal task history"
+        );
+    }
+    if raw > 0 || hourly > 0 || daily > 0 {
+        info!(
+            raw,
+            hourly, daily, "task_retention: rolled up and pruned computer metrics history"
         );
     }
     Ok((fleet, deferred))

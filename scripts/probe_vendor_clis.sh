@@ -15,6 +15,7 @@ run_to() {
     eval {
       local $SIG{ALRM} = sub { die "TIMEOUT\n" };
       alarm $s;
+      open(STDIN, "<", "/dev/null") or die "NOEXEC\n";
       open(my $fh, "-|", @ARGV) or die "NOEXEC\n";
       local $/; $out = <$fh>; close $fh;
       alarm 0;

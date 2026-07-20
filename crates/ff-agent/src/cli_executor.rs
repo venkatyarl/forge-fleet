@@ -102,8 +102,10 @@ pub const BACKENDS: &[CliBackend] = &[
         name: "codex",
         binary: "codex",
         port: 51101,
-        // Codex `exec` is the headless equivalent. `--skip-git-repo-check`
-        // lets it run outside a git repo (matches `ff cli` running anywhere).
+        // Codex `exec` is the headless equivalent. `--ignore-user-config`
+        // prevents host-local MCP/config startup from turning a headless call
+        // into an indefinite "Reading additional input from stdin..." wait.
+        // `--skip-git-repo-check` lets it run outside a git repo.
         //
         // `--ignore-user-config` is deliberate. On priya, codex-cli 0.142.5
         // consistently wedged in headless mode when it loaded ~/.codex/config.toml
@@ -489,6 +491,14 @@ mod tests {
     fn backend_by_name_rejects_unknown() {
         assert!(backend_by_name("bogus").is_none());
         assert!(backend_by_name("").is_none());
+    }
+
+    #[test]
+    fn codex_backend_keeps_hardened_headless_flags() {
+        let codex = backend_by_name("codex").expect("codex backend");
+        assert_eq!(codex.default_flags[0], "exec");
+        assert!(codex.default_flags.contains(&"--ignore-user-config"));
+        assert!(codex.default_flags.contains(&"--skip-git-repo-check"));
     }
 
     /// `local` is intentionally NOT in `BACKENDS` — it routes through the
