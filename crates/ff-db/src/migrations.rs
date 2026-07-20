@@ -876,6 +876,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "error_events",
         sql: schema::SCHEMA_V178_ERROR_EVENTS,
     },
+    PgMigration {
+        version: 179,
+        name: "postgres_replica_dead_alert",
+        sql: schema::SCHEMA_V179_POSTGRES_REPLICA_DEAD_ALERT,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
