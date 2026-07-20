@@ -138,40 +138,72 @@ pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
                 );
                 return Ok(0);
             }
-            match run_pr_review(pg, &pr_url, item.work_item_id).await {
-                Ok((true, reason)) => {
+            // Honor an existing PR review verdict before spending an
+            // autonomous review: APPROVED (operator or external reviewer
+            // already signed off) skips the fleet's own review entirely, and
+            // CHANGES_REQUESTED rejects the item with the reviewer's reason
+            // written to `last_error` so a retry attempt sees why. No verdict
+            // (or a gh hiccup) falls through to the autonomous review path,
+            // unchanged.
+            match pr_review_verdict(&pr_url).await {
+                PrReviewVerdict::Approved => {
                     info!(
                         pr = %pr_url,
                         work_item = %item.work_item_id,
-                        %reason,
-                        "merge_drain: autonomous review approved"
+                        "merge_drain: PR already has an approved review verdict — skipping autonomous review"
                     );
                 }
-                Ok((false, reason)) => {
-                    let failure = format!("review rejected: {reason}");
+                PrReviewVerdict::ChangesRequested(reason) => {
+                    let failure = format!("review verdict changes_requested: {reason}");
                     warn!(
                         pr = %pr_url,
                         work_item = %item.work_item_id,
                         reason = %failure,
-                        "merge_drain: autonomous review rejected PR"
+                        "merge_drain: PR has a rejecting review verdict — marking work_item failed"
                     );
                     ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &failure).await?;
-                    if let Err(e) =
-                        gh_pr_comment(&pr_url, &format!("Autonomous review REJECTED: {reason}"))
-                            .await
-                    {
-                        warn!(pr = %pr_url, error = %e, "merge_drain: failed to comment review rejection");
-                    }
                     return Ok(0);
                 }
-                Err(e) => {
-                    warn!(
-                        pr = %pr_url,
-                        work_item = %item.work_item_id,
-                        error = %e,
-                        "merge_drain: review unavailable, deferring PR for manual review"
-                    );
-                    return Ok(0);
+                PrReviewVerdict::None => {
+                    match run_pr_review(pg, &pr_url, item.work_item_id).await {
+                        Ok((true, reason)) => {
+                            info!(
+                                pr = %pr_url,
+                                work_item = %item.work_item_id,
+                                %reason,
+                                "merge_drain: autonomous review approved"
+                            );
+                        }
+                        Ok((false, reason)) => {
+                            let failure = format!("review rejected: {reason}");
+                            warn!(
+                                pr = %pr_url,
+                                work_item = %item.work_item_id,
+                                reason = %failure,
+                                "merge_drain: autonomous review rejected PR"
+                            );
+                            ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &failure)
+                                .await?;
+                            if let Err(e) = gh_pr_comment(
+                                &pr_url,
+                                &format!("Autonomous review REJECTED: {reason}"),
+                            )
+                            .await
+                            {
+                                warn!(pr = %pr_url, error = %e, "merge_drain: failed to comment review rejection");
+                            }
+                            return Ok(0);
+                        }
+                        Err(e) => {
+                            warn!(
+                                pr = %pr_url,
+                                work_item = %item.work_item_id,
+                                error = %e,
+                                "merge_drain: review unavailable, deferring PR for manual review"
+                            );
+                            return Ok(0);
+                        }
+                    }
                 }
             }
             match gh_merge_squash(&pr_url).await {
@@ -599,6 +631,71 @@ enum PrMergeState {
     Other,
 }
 
+/// An existing review verdict on the PR, from GitHub's `reviewDecision`.
+#[derive(Debug, PartialEq, Eq)]
+enum PrReviewVerdict {
+    /// `reviewDecision == APPROVED` — someone already signed off; the drain
+    /// skips its own autonomous review.
+    Approved,
+    /// `reviewDecision == CHANGES_REQUESTED` — the PR was rejected; the string
+    /// is the rejecting review's reason (its body), surfaced into the
+    /// work_item's `last_error` so a retry has the context.
+    ChangesRequested(String),
+    /// No verdict yet (`REVIEW_REQUIRED` / empty) — the drain runs its own
+    /// autonomous review as before.
+    None,
+}
+
+/// `gh pr view <url> --json reviewDecision,latestReviews`. Any gh/parse error
+/// maps to `None` so a hiccup can never fail a healthy item or block the
+/// drain — worst case the drain just runs its own review.
+async fn pr_review_verdict(pr_url: &str) -> PrReviewVerdict {
+    let mut cmd = gh_cmd().await;
+    cmd.args([
+        "pr",
+        "view",
+        pr_url,
+        "--json",
+        "reviewDecision,latestReviews",
+    ]);
+    let out = match cmd.output().await {
+        Ok(o) if o.status.success() => o,
+        _ => return PrReviewVerdict::None,
+    };
+    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .map(|v| parse_review_verdict(&v))
+        .unwrap_or(PrReviewVerdict::None)
+}
+
+/// Pure mapping of `gh pr view --json reviewDecision,latestReviews` output to
+/// a verdict. On CHANGES_REQUESTED the reason is the most recent rejecting
+/// review's non-empty body (bounded so it fits `last_error`).
+fn parse_review_verdict(v: &serde_json::Value) -> PrReviewVerdict {
+    match v.get("reviewDecision").and_then(|d| d.as_str()) {
+        Some("APPROVED") => PrReviewVerdict::Approved,
+        Some("CHANGES_REQUESTED") => {
+            let reason = v
+                .get("latestReviews")
+                .and_then(|r| r.as_array())
+                .and_then(|reviews| {
+                    reviews
+                        .iter()
+                        .rev()
+                        .filter(|r| {
+                            r.get("state").and_then(|s| s.as_str()) == Some("CHANGES_REQUESTED")
+                        })
+                        .filter_map(|r| r.get("body").and_then(|b| b.as_str()))
+                        .map(str::trim)
+                        .find(|body| !body.is_empty())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "no reason given".to_string());
+            PrReviewVerdict::ChangesRequested(truncate_chars(&reason, 1000))
+        }
+        _ => PrReviewVerdict::None,
+    }
+}
+
 /// `gh pr view <url> --json mergeStateStatus`. Any error maps to `Other` so a
 /// gh hiccup can never reset a healthy item or block the drain.
 async fn pr_merge_state(pr_url: &str) -> PrMergeState {
@@ -878,7 +975,7 @@ async fn reconcile_orphaned_reviews(pg: &PgPool) -> Result<usize> {
 /// Spawn the leader-gated drain loop. Mirrors the scheduler's leader check.
 pub fn spawn_work_item_merge_drain(
     pg: PgPool,
-    _worker_name: String,
+    worker_name: String,
     interval_secs: u64,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -888,7 +985,20 @@ pub fn spawn_work_item_merge_drain(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if !crate::leader_cache::is_current_leader() {
+                    // Leader gate with an authoritative DB fallback. The
+                    // in-memory leader_cache defaults to FALSE after a daemon
+                    // restart and is only warmed by leader_tick on its interval;
+                    // during that cold window the (leader-gated) drain silently
+                    // no-ops for minutes — the 2026-07-20 freeze where merges
+                    // stuck at 141 with ~99 green PRs waiting while priya was the
+                    // continuous DB leader. When the cache says "not leader",
+                    // confirm against fleet_leader_state (the durable source of
+                    // truth) before skipping. Safe: merges are serialized by
+                    // FOR UPDATE SKIP LOCKED, so a DB-confirmed leader can never
+                    // double-merge.
+                    if !crate::leader_cache::is_current_leader()
+                        && !db_confirms_leader(&pg, &worker_name).await
+                    {
                         continue;
                     }
                     if let Err(e) = evaluate_merge_queue(&pg).await {
@@ -916,9 +1026,28 @@ pub fn spawn_work_item_merge_drain(
     })
 }
 
+/// Authoritative leader check straight from `fleet_leader_state` — the durable
+/// singleton that decides leadership. Used as a fallback for the cold-cache
+/// window right after a daemon restart (see the leader gate above). A fresh
+/// heartbeat (<60s) on our own member row means we ARE the leader regardless of
+/// the not-yet-warmed in-memory cache.
+async fn db_confirms_leader(pg: &PgPool, worker_name: &str) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM fleet_leader_state \
+         WHERE member_name = $1 AND heartbeat_at > NOW() - INTERVAL '60 seconds')",
+    )
+    .bind(worker_name)
+    .fetch_one(pg)
+    .await
+    .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_review_response, served_by_480b, update_branch_api_path};
+    use super::{
+        PrReviewVerdict, parse_review_response, parse_review_verdict, served_by_480b,
+        update_branch_api_path,
+    };
 
     #[test]
     fn pr_url_maps_to_update_branch_api_path() {
@@ -951,6 +1080,53 @@ mod tests {
         let (approved, reason) = parse_review_response("");
         assert!(!approved);
         assert_eq!(reason, "empty review response");
+    }
+
+    #[test]
+    fn approved_review_verdict_skips_own_review() {
+        let v = serde_json::json!({
+            "reviewDecision": "APPROVED",
+            "latestReviews": [{"state": "APPROVED", "body": "lgtm"}],
+        });
+        assert_eq!(parse_review_verdict(&v), PrReviewVerdict::Approved);
+    }
+
+    #[test]
+    fn changes_requested_verdict_carries_the_latest_rejection_reason() {
+        let v = serde_json::json!({
+            "reviewDecision": "CHANGES_REQUESTED",
+            "latestReviews": [
+                {"state": "CHANGES_REQUESTED", "body": "older reason"},
+                {"state": "APPROVED", "body": "lgtm"},
+                {"state": "CHANGES_REQUESTED", "body": "  breaks the scheduler tick  "},
+            ],
+        });
+        assert_eq!(
+            parse_review_verdict(&v),
+            PrReviewVerdict::ChangesRequested("breaks the scheduler tick".to_string())
+        );
+
+        // Empty bodies fall back to a placeholder rather than an empty reason.
+        let v = serde_json::json!({
+            "reviewDecision": "CHANGES_REQUESTED",
+            "latestReviews": [{"state": "CHANGES_REQUESTED", "body": ""}],
+        });
+        assert_eq!(
+            parse_review_verdict(&v),
+            PrReviewVerdict::ChangesRequested("no reason given".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_or_pending_review_verdict_runs_own_review() {
+        for v in [
+            serde_json::json!({}),
+            serde_json::json!({"reviewDecision": ""}),
+            serde_json::json!({"reviewDecision": "REVIEW_REQUIRED"}),
+            serde_json::json!({"reviewDecision": null}),
+        ] {
+            assert_eq!(parse_review_verdict(&v), PrReviewVerdict::None, "{v}");
+        }
     }
 
     #[test]

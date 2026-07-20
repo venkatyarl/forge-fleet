@@ -42,7 +42,7 @@ use ff_db::leader_state::{
 use ff_pulse::reader::{PulseError, PulseReader};
 
 use crate::ha::pg_failover::{FailoverOutcome, PostgresFailoverManager};
-use crate::ha::self_heal::{rearm_self_heal_task, scan_daemon_logs_for_self_heal};
+use crate::ha::self_heal::{SelfHealState, rearm_self_heal_task, scan_daemon_logs_for_self_heal};
 #[cfg(test)]
 use crate::ha::self_heal::{self_heal_priority_for_tier, self_heal_task_status};
 use crate::leader_cache::{LeaderCache, LeaderInfo};
@@ -140,6 +140,16 @@ pub struct LeaderTick {
     /// over cleanly. `None` when no publisher handle was attached (the node
     /// still functions; it just can't be told to step down).
     yield_flag: Option<Arc<AtomicBool>>,
+
+    /// In-memory record of bug signatures this leader has already dispatched
+    /// a self-heal writer for, so [`self_heal_scan`](Self::self_heal_scan) can
+    /// recognise when a previously-healed signature reappears (as opposed to
+    /// a brand-new bug) and log the reactivation distinctly. The durable
+    /// reactivation itself (resetting `fleet_tasks.status` back to
+    /// `pending`/`detected`) is handled at the DB layer by the aggregation
+    /// UPSERT and [`rearm_self_heal_task`]; this is purely a recognition
+    /// signal for operational visibility.
+    self_heal_state: std::sync::Mutex<SelfHealState>,
 }
 
 /// Parse a `leader_yield_request` fleet_secret value of the form
@@ -180,6 +190,7 @@ impl LeaderTick {
             error_tracker: crate::ha::error_tracker::ErrorTracker::default(),
             leader_pulse_silent_since: tokio::sync::Mutex::new(None),
             yield_flag: None,
+            self_heal_state: std::sync::Mutex::new(SelfHealState::new()),
         }
     }
 
@@ -909,6 +920,24 @@ impl LeaderTick {
 
         for row in &detected {
             let sig: String = row.try_get("bug_signature")?;
+
+            // Recognise a previously-healed signature reactivating: the DB
+            // aggregation UPSERT above already reset its status back to
+            // `detected` once its terminal cooldown passed, but callers care
+            // about the distinction between "brand-new bug" and "recurring
+            // bug we already dispatched a fix for" for operational logging.
+            let is_recurring = {
+                let mut state = self.self_heal_state.lock().unwrap();
+                let reappearing = state.is_reappearing(&sig, "detected");
+                state.track(&sig);
+                reappearing
+            };
+            if is_recurring {
+                tracing::info!(
+                    bug_signature = %sig,
+                    "self_heal: previously healed bug signature reactivated for another fix attempt"
+                );
+            }
 
             // De-dupe: is a writer task already in-flight?
             let inflight = sqlx::query(
