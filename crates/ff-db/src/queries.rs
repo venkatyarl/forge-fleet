@@ -8464,25 +8464,7 @@ pub async fn pg_prune_terminal_task_history(
     pool: &PgPool,
     retention_days: i32,
 ) -> Result<(u64, u64)> {
-    let fleet = sqlx::query(
-        "DELETE FROM fleet_tasks
-          WHERE status IN ('completed','failed','cancelled')
-            AND created_at < NOW() - make_interval(days => $1)",
-    )
-    .bind(retention_days)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    let deferred = sqlx::query(
-        "DELETE FROM deferred_tasks
-          WHERE status IN ('completed','failed','cancelled')
-            AND created_at < NOW() - make_interval(days => $1)",
-    )
-    .bind(retention_days)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    Ok((fleet, deferred))
+    crate::models::task::prune_terminal_history(pool, retention_days).await
 }
 
 /// Roll up and retain typed computer metrics in one transaction. Raw samples

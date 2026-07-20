@@ -17,6 +17,7 @@ pub mod dsn_of_record;
 pub mod leader_state;
 pub mod metrics_partitions;
 pub mod migrations;
+pub mod models;
 pub mod operational_store;
 pub mod pm;
 pub mod postgres;

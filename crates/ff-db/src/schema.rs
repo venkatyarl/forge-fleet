@@ -11501,6 +11501,19 @@ SET migration_version = EXCLUDED.migration_version,
     name = EXCLUDED.name;
 "#;
 
+/// V214 — Retain self-heal bug identities after ephemeral task pruning.
+pub const SCHEMA_V214_SELF_HEAL_BUG_HISTORY: &str = r#"
+CREATE TABLE IF NOT EXISTS self_heal_bug_history (
+    bug_signature  TEXT PRIMARY KEY,
+    last_task_id   UUID NOT NULL,
+    last_status    TEXT NOT NULL,
+    completed_at   TIMESTAMPTZ,
+    last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_self_heal_bug_history_completed
+    ON self_heal_bug_history(completed_at DESC);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

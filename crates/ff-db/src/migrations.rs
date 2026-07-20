@@ -1051,6 +1051,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "bootstrap_v161_baseline",
         sql: schema::SCHEMA_V213_BOOTSTRAP_V161_BASELINE,
     },
+    PgMigration {
+        version: 214,
+        name: "self_heal_bug_history",
+        sql: schema::SCHEMA_V214_SELF_HEAL_BUG_HISTORY,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
