@@ -10372,6 +10372,62 @@ CREATE INDEX IF NOT EXISTS idx_deployment_metrics_scrapes_by_deployment
     ON deployment_metrics_scrapes (deployment_id, scraped_at DESC);
 "#;
 
+/// V176 — Merge train status tracking.
+///
+/// A merge train groups PRs/branches targeting the same base branch so they can
+/// be built and merged as an ordered unit. `merge_trains` tracks the composite
+/// train state and outcome; `merge_train_members` tracks PR membership and
+/// per-member merge outcomes. Existing per-PR `work_item_merge_queue` rows are
+/// linked to their parent train via `train_id`.
+pub const SCHEMA_V176_MERGE_TRAINS: &str = r#"
+CREATE TABLE IF NOT EXISTS merge_trains (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id     TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    base_branch    TEXT NOT NULL,
+    base_sha       TEXT,
+    head_sha       TEXT,
+    status         TEXT NOT NULL DEFAULT 'assembling'
+        CHECK (status IN ('assembling','running','merged','failed','cancelled')),
+    outcome        TEXT,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at     TIMESTAMPTZ,
+    completed_at   TIMESTAMPTZ,
+    failure_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_merge_trains_project_status
+    ON merge_trains (project_id, status);
+CREATE INDEX IF NOT EXISTS idx_merge_trains_status_created
+    ON merge_trains (status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS merge_train_members (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    train_id       UUID NOT NULL REFERENCES merge_trains(id) ON DELETE CASCADE,
+    work_item_id   UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    queue_id       UUID REFERENCES work_item_merge_queue(id) ON DELETE SET NULL,
+    position       INT NOT NULL,
+    branch_name    TEXT NOT NULL,
+    pr_url         TEXT,
+    head_sha       TEXT,
+    status         TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','running','merged','failed','skipped')),
+    joined_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    merged_at      TIMESTAMPTZ,
+    failed_at      TIMESTAMPTZ,
+    failure_reason TEXT,
+    UNIQUE (train_id, work_item_id),
+    UNIQUE (train_id, position)
+);
+CREATE INDEX IF NOT EXISTS idx_merge_train_members_train
+    ON merge_train_members (train_id, position);
+CREATE INDEX IF NOT EXISTS idx_merge_train_members_work_item
+    ON merge_train_members (work_item_id);
+
+ALTER TABLE work_item_merge_queue
+    ADD COLUMN IF NOT EXISTS train_id UUID REFERENCES merge_trains(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_work_item_merge_queue_train
+    ON work_item_merge_queue (train_id) WHERE train_id IS NOT NULL;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

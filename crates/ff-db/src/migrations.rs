@@ -857,6 +857,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "deployment_metrics_scrapes",
         sql: schema::SCHEMA_V175_DEPLOYMENT_METRICS_SCRAPES,
     },
+    PgMigration {
+        version: 176,
+        name: "merge_trains",
+        sql: schema::SCHEMA_V176_MERGE_TRAINS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
