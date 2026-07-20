@@ -15,6 +15,7 @@ ff-orchestrator = { path = "../ff-orchestrator" }
 ff-pulse = { path = "../ff-pulse" }
 ff-security = { path = "../ff-security" }
 ff-cron = { path = "../ff-cron" }
+ff-observability = { path = "../ff-observability" }
 
 anyhow.workspace = true
 base64 = "0.22"
