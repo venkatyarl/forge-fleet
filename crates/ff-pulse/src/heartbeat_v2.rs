@@ -147,6 +147,12 @@ impl HeartbeatV2Publisher {
         self.dispatch_tick_at_unix.clone()
     }
 
+    /// Use the daemon's dispatch-loop liveness clock in published beats.
+    pub fn with_dispatch_tick_handle(mut self, handle: Arc<AtomicU64>) -> Self {
+        self.dispatch_tick_at_unix = handle;
+        self
+    }
+
     /// Build a single beat from local system state.
     ///
     /// **Blocking safety**: all synchronous blocking work (sysinfo, subprocess

@@ -597,6 +597,11 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     info!("starting subsystem: mcp http server");
     subsystem_tasks.push(start_mcp_http_subsystem(config.clone()));
 
+    // Shared by the work-item dispatch loop and Pulse v2. Keeping this clock
+    // independent from the general heartbeat makes a wedged dispatch task
+    // visible while the rest of the daemon continues beating.
+    let dispatch_tick_at_unix = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     // 13) Fleet Pulse heartbeat (Redis real-time metrics)
     {
         let redis_url = config.redis.url.clone();
@@ -647,6 +652,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                 pg_pool,
                 redis_url,
                 worker_name.clone(),
+                dispatch_tick_at_unix.clone(),
                 shutdown_rx.clone(),
             )
             .await
@@ -766,6 +772,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
             pg_pool,
             worker_name.clone(),
             15,
+            dispatch_tick_at_unix.clone(),
             shutdown_rx.clone(),
         ));
     }
@@ -3005,6 +3012,7 @@ async fn start_pulse_v2_subsystems(
     pg_pool: ff_db::PgPool,
     redis_url: String,
     worker_name: String,
+    dispatch_tick_at_unix: std::sync::Arc<std::sync::atomic::AtomicU64>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<Vec<JoinHandle<()>>> {
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
@@ -3065,7 +3073,8 @@ async fn start_pulse_v2_subsystems(
         worker_name.clone(),
         election_priority,
     )
-    .with_build_sha(env!("FF_GIT_SHA"));
+    .with_build_sha(env!("FF_GIT_SHA"))
+    .with_dispatch_tick_handle(dispatch_tick_at_unix);
     // epoch_handle + role_handle are shared with leader_tick below when
     // available; for now we just spawn the publisher.
     let _epoch_handle = v2_pub.epoch_handle();

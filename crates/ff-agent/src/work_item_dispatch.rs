@@ -294,6 +294,7 @@ pub fn spawn_work_item_dispatch(
     pg: PgPool,
     worker_name: String,
     interval_secs: u64,
+    pulse_tick_at_unix: Arc<AtomicU64>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -311,6 +312,7 @@ pub fn spawn_work_item_dispatch(
             tokio::select! {
                 _ = ticker.tick() => {
                     last_tick_at.store(start.elapsed().as_secs(), Ordering::Relaxed);
+                    pulse_tick_at_unix.store(chrono::Utc::now().timestamp() as u64, Ordering::Relaxed);
                     if let Err(e) = evaluate_work_item_dispatch(&pg, &worker_name).await {
                         warn!(error = %e, "work_item_dispatch tick failed");
                     }

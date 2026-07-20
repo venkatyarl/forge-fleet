@@ -11075,6 +11075,19 @@ VALUES (1, 161, 'bootstrap_v161')
 ON CONFLICT (generation) DO NOTHING;
 "#;
 
+/// V196 — Per-host work-item dispatch loop liveness.
+///
+/// Pulse materializes the most recent dispatch tick here so the leader's
+/// work-item scheduler can avoid leasing work to a daemon whose general
+/// heartbeat is still fresh while its dispatch subsystem is wedged.
+pub const SCHEMA_V196_COMPUTER_DISPATCH_TICK: &str = r#"
+ALTER TABLE computers
+    ADD COLUMN IF NOT EXISTS dispatch_tick_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_computers_dispatch_tick
+    ON computers (dispatch_tick_at);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

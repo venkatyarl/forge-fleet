@@ -4676,6 +4676,11 @@ fn deploy_install_restart_playbook(os_family: &str) -> String {
              install -m 755 target/release/ff ~/.local/bin/ff && \
              install -m 755 target/release/ff ~/.cargo/bin/ff 2>/dev/null || true; \
              export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; \
+             if command -v systemctl >/dev/null 2>&1 && [ -f deploy/systemd/forgefleetd.service ]; then \
+               mkdir -p \"$HOME/.config/systemd/user\"; \
+               sed \"s|__COMPUTER_NAME__|$(hostname -s)|g\" deploy/systemd/forgefleetd.service > \"$HOME/.config/systemd/user/forgefleetd.service\"; \
+               systemctl --user daemon-reload 2>/dev/null; systemctl --user enable forgefleetd.service 2>/dev/null; \
+             fi; \
              systemctl --user stop forgefleetd.service 2>/dev/null; \
              for p in $(pgrep -x forgefleetd); do kill -TERM \"$p\" 2>/dev/null; done; sleep 2; \
              for p in $(pgrep -x forgefleetd); do kill -KILL \"$p\" 2>/dev/null; done; \
@@ -4787,6 +4792,11 @@ fn leader_refresh_playbook(os_family: &str, source_tree_path: &str) -> String {
              install -m 755 target/release/ff ~/.local/bin/ff && \
              install -m 755 target/release/ff ~/.cargo/bin/ff 2>/dev/null || true; \
              export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
+             if command -v systemctl >/dev/null 2>&1 && [ -f deploy/systemd/forgefleetd.service ]; then \
+               mkdir -p \"$HOME/.config/systemd/user\"; \
+               sed \"s|__COMPUTER_NAME__|$(hostname -s)|g\" deploy/systemd/forgefleetd.service > \"$HOME/.config/systemd/user/forgefleetd.service\"; \
+               systemctl --user daemon-reload 2>/dev/null; systemctl --user enable forgefleetd.service 2>/dev/null; \
+             fi; \
              ( systemctl --user restart --no-block forgefleetd.service 2>/dev/null ) \
                || ( for p in $(pgrep -x forgefleetd); do kill -TERM \"$p\" 2>/dev/null; done; sleep 2; \
                     nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
@@ -6223,6 +6233,13 @@ mod route_tests {
     fn linux_deploy_uses_systemd_not_launchctl() {
         let p = super::deploy_playbook("linux", "~/projects/forge-fleet");
         assert!(p.contains("systemctl --user"));
+        assert!(p.contains("deploy/systemd/forgefleetd.service"));
+        assert!(p.contains("systemctl --user enable forgefleetd.service"));
+        assert!(
+            p.find("systemctl --user enable forgefleetd.service")
+                < p.find("nohup \"$HOME/.local/bin/forgefleetd\""),
+            "canonical systemd unit must be installed before nohup fallback"
+        );
         assert!(!p.contains("launchctl"));
     }
 

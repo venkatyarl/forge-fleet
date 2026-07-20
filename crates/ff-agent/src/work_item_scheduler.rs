@@ -14,6 +14,7 @@
 //! Design: `.forgefleet/plans/DECISION-pillar4-canonical-home.md`.
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
@@ -48,6 +49,9 @@ const ORPHAN_MIN_AGE_SECS: i64 = 3600;
 /// A task the swarm genuinely can't build must STOP thrashing and surface for a
 /// human or a retry-with-error-context — 3 tries is enough signal.
 const MAX_BUILD_ATTEMPTS: i32 = 3;
+/// Four missed 15-second dispatch passes makes a host ineligible. General
+/// Pulse beats may still be fresh when this subsystem clock is stale.
+const DISPATCH_TICK_STALE_SECS: i64 = 60;
 
 /// One scheduler pass. Returns the number of work_items assigned this tick.
 pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
@@ -110,6 +114,19 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
     })
     .collect();
     let mut global_free = ff_db::pg_free_slots(pg, None, MAX_ASSIGN_PER_TICK).await?;
+    let now = Utc::now();
+    let dispatch_live: HashSet<uuid::Uuid> =
+        sqlx::query("SELECT id, dispatch_tick_at FROM computers")
+            .fetch_all(pg)
+            .await?
+            .into_iter()
+            .filter_map(|row| {
+                let id = row.get("id");
+                let tick = row.get::<Option<DateTime<Utc>>, _>("dispatch_tick_at");
+                dispatch_tick_is_fresh(tick, now).then_some(id)
+            })
+            .collect();
+    global_free.retain(|slot| dispatch_live.contains(&slot.computer_id));
     global_free.retain(|slot| dispatch_capacity_left(&active_by_computer, slot.computer_id));
     if global_free.is_empty() {
         info!(
@@ -143,6 +160,7 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
             match ff_db::pg_free_slots(pg, Some(host), 1).await {
                 Ok(mut v) => v
                     .pop()
+                    .filter(|slot| dispatch_live.contains(&slot.computer_id))
                     .filter(|slot| dispatch_capacity_left(&active_by_computer, slot.computer_id)),
                 Err(e) => {
                     warn!(host, error = %e, "work_item_scheduler: pinned-slot lookup failed");
@@ -197,6 +215,10 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         );
     }
     Ok(assigned)
+}
+
+fn dispatch_tick_is_fresh(tick_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    tick_at.is_none_or(|tick| tick >= now - chrono::Duration::seconds(DISPATCH_TICK_STALE_SECS))
 }
 
 /// Keep a newly-created lease alive while it waits for the owning host's
@@ -349,5 +371,22 @@ mod tests {
             LEASE_STALE_SECS >= 2 * cadence,
             "LEASE_STALE_SECS ({LEASE_STALE_SECS}) must be >= 2x the dispatch heartbeat ({cadence})"
         );
+    }
+
+    #[test]
+    fn stale_dispatch_tick_is_not_assignment_eligible() {
+        let now = Utc::now();
+        assert!(
+            dispatch_tick_is_fresh(None, now),
+            "legacy hosts remain eligible during rollout"
+        );
+        assert!(dispatch_tick_is_fresh(
+            Some(now - chrono::Duration::seconds(DISPATCH_TICK_STALE_SECS)),
+            now
+        ));
+        assert!(!dispatch_tick_is_fresh(
+            Some(now - chrono::Duration::seconds(DISPATCH_TICK_STALE_SECS + 1)),
+            now
+        ));
     }
 }

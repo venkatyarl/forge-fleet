@@ -533,6 +533,18 @@ impl Materializer {
             .await;
         }
 
+        // Subsystem liveness is intentionally outside PersistedSnapshot: it
+        // changes every dispatch tick and must be refreshed on the fast path.
+        // A legacy beat has no value, so leave the existing timestamp alone
+        // during rolling upgrades rather than erasing a newer observation.
+        if let Some(dispatch_tick_at) = beat.dispatch_tick_at {
+            sqlx::query("UPDATE computers SET dispatch_tick_at = $1 WHERE id = $2")
+                .bind(dispatch_tick_at)
+                .bind(computer_id)
+                .execute(&self.pg)
+                .await?;
+        }
+
         // The Redis snapshot is only a write-churn cache, not the source of
         // truth. Another writer may have changed (or partially cleared) the
         // Postgres row since this snapshot was stored, so the fast path is
