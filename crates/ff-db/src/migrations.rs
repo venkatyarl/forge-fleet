@@ -10,7 +10,7 @@ use crate::error::{DbError, Result};
 use crate::schema;
 
 /// The highest migration version baked into the squashed fresh-DB bootstrap.
-const BOOTSTRAP_BASELINE_VERSION: u32 = 161;
+const BOOTSTRAP_BASELINE_VERSION: u32 = schema::PG_BASELINE_VERSION;
 
 // ─── Postgres Migrations ─────────────────────────────────────────────────────
 
@@ -840,12 +840,66 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "artifact_index",
         sql: schema::SCHEMA_V171_ARTIFACT_INDEX,
     },
-    // 172 is reserved by the in-flight metrics-schema branch; gaps are fine,
-    // duplicates are not (see migration_versions_are_strictly_increasing).
+    // 172 was reserved by the metrics-schema branch, but 173–176 landed before
+    // it did — the runner only applies versions ABOVE the current one, so a
+    // late 172 would be silently skipped on any DB already at 173+. The
+    // metrics schema landed as 177 instead; 172 stays a permanent gap (gaps
+    // are fine, duplicates are not — see
+    // migration_versions_are_strictly_increasing).
     PgMigration {
         version: 173,
         name: "computers_ip_ram_atomic",
         sql: schema::SCHEMA_V173_COMPUTERS_IP_RAM_ATOMIC,
+    },
+    PgMigration {
+        version: 174,
+        name: "dispatch_tick_at",
+        sql: schema::SCHEMA_V174_DISPATCH_TICK_AT,
+    },
+    PgMigration {
+        version: 175,
+        name: "deployment_metrics_scrapes",
+        sql: schema::SCHEMA_V175_DEPLOYMENT_METRICS_SCRAPES,
+    },
+    PgMigration {
+        version: 176,
+        name: "merge_trains",
+        sql: schema::SCHEMA_V176_MERGE_TRAINS,
+    },
+    PgMigration {
+        version: 177,
+        name: "fleet_metrics",
+        sql: schema::SCHEMA_V177_FLEET_METRICS,
+    },
+    PgMigration {
+        version: 178,
+        name: "error_events",
+        sql: schema::SCHEMA_V178_ERROR_EVENTS,
+    },
+    PgMigration {
+        version: 179,
+        name: "work_item_events",
+        sql: schema::SCHEMA_V179_WORK_ITEM_EVENTS,
+    },
+    PgMigration {
+        version: 180,
+        name: "model_capacity_view",
+        sql: schema::SCHEMA_V180_MODEL_CAPACITY_VIEW,
+    },
+    PgMigration {
+        version: 181,
+        name: "fleet_velocity_views",
+        sql: schema::SCHEMA_V181_FLEET_VELOCITY_VIEWS,
+    },
+    PgMigration {
+        version: 182,
+        name: "work_item_events_trigger",
+        sql: schema::SCHEMA_V182_WORK_ITEM_EVENTS_TRIGGER,
+    },
+    PgMigration {
+        version: 183,
+        name: "artifact_cache_index",
+        sql: schema::SCHEMA_V183_ARTIFACT_CACHE_INDEX,
     },
 ];
 
@@ -1245,6 +1299,313 @@ mod tests {
                 .expect("re-read test computer");
         assert_eq!(ip, "10.0.0.2");
         assert_eq!(ram, Some(64));
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v178_error_events_round_trip() {
+        // Needs Postgres — create_fresh_temp_db returns None (and we early-
+        // return) when neither FORGEFLEET_POSTGRES_URL nor
+        // FORGEFLEET_DATABASE_URL is set, so this never panics in CI.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        let event = crate::ErrorEventInsert {
+            worker_name: "v178-test-node".to_string(),
+            deployment_id: None,
+            library_id: None,
+            catalog_id: Some("qwen3-coder-30b".to_string()),
+            runtime: "llama.cpp".to_string(),
+            error_kind: "load".to_string(),
+            summary: "resolve gguf for /tmp/model: no .gguf files".to_string(),
+            details: serde_json::json!({"port": 55000}),
+            stderr_tail: Some("slot load_model: id 0 | new slot".to_string()),
+        };
+        let id = crate::pg_insert_error_event(&pool, &event)
+            .await
+            .expect("insert error event");
+        assert!(id > 0);
+
+        let rows = crate::pg_list_error_events(&pool, Some("v178-test-node"), None, 10)
+            .await
+            .expect("list error events");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].worker_name, "v178-test-node");
+        assert_eq!(rows[0].error_kind, "load");
+        assert_eq!(rows[0].runtime, "llama.cpp");
+
+        let filtered = crate::pg_list_error_events(&pool, None, Some("load"), 10)
+            .await
+            .expect("list error events by kind");
+        assert_eq!(filtered.len(), 1);
+
+        let none = crate::pg_list_error_events(&pool, None, Some("oom"), 10)
+            .await
+            .expect("list error events by kind oom");
+        assert!(none.is_empty());
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v179_work_item_events_round_trip() {
+        // Needs Postgres — create_fresh_temp_db returns None (and we early-
+        // return) when neither FORGEFLEET_POSTGRES_URL nor
+        // FORGEFLEET_DATABASE_URL is set, so this never panics in CI.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        sqlx::query(
+            "INSERT INTO projects (id, display_name) VALUES ('v179-test-proj', 'V179 Test')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert test project");
+        let work_item_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO work_items (project_id, kind, title)
+             VALUES ('v179-test-proj', 'task', 'v179 test item') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert test work item");
+
+        sqlx::query(
+            "INSERT INTO work_item_events
+                 (work_item_id, from_status, to_status, computer, attempt, detail)
+             VALUES ($1, 'idea', 'in_progress', 'v179-test-node', 1,
+                     '{\"reason\": \"test\"}'::jsonb)",
+        )
+        .bind(work_item_id)
+        .execute(&pool)
+        .await
+        .expect("insert work item event");
+
+        let (from_status, to_status, computer, attempt): (
+            Option<String>,
+            String,
+            Option<String>,
+            Option<i32>,
+        ) = sqlx::query_as(
+            "SELECT from_status, to_status, computer, attempt
+             FROM work_item_events WHERE work_item_id = $1",
+        )
+        .bind(work_item_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read back work item event");
+        assert_eq!(from_status.as_deref(), Some("idea"));
+        assert_eq!(to_status, "in_progress");
+        assert_eq!(computer.as_deref(), Some("v179-test-node"));
+        assert_eq!(attempt, Some(1));
+
+        // Deleting the work item cascades to its events.
+        sqlx::query("DELETE FROM work_items WHERE id = $1")
+            .bind(work_item_id)
+            .execute(&pool)
+            .await
+            .expect("delete test work item");
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM work_item_events WHERE work_item_id = $1")
+                .bind(work_item_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count events after cascade");
+        assert_eq!(remaining, 0);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v180_model_capacity_view_freshness_gate() {
+        // Needs Postgres — create_fresh_temp_db returns None (and we early-
+        // return) when neither FORGEFLEET_POSTGRES_URL nor
+        // FORGEFLEET_DATABASE_URL is set, so this never panics in CI.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        sqlx::query("INSERT INTO fleet_workers (name, ip) VALUES ('v180-test-node', '10.0.0.1')")
+            .execute(&pool)
+            .await
+            .expect("insert test worker");
+        let deployment_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO fleet_model_deployments
+                 (worker_name, catalog_id, runtime, port, health_status)
+             VALUES ('v180-test-node', 'qwen3-coder-30b', 'llama.cpp', 55000, 'healthy')
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert test deployment");
+
+        // No scrape samples yet → status is 'unknown' with NULL metrics.
+        let (status, tokens_per_sec): (String, Option<f64>) = sqlx::query_as(
+            "SELECT status, tokens_per_sec FROM model_capacity WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read view without samples");
+        assert_eq!(status, "unknown");
+        assert!(tokens_per_sec.is_none());
+
+        // A stale sample (older than the 90s freshness gate) → still 'unknown'.
+        sqlx::query(
+            "INSERT INTO deployment_metrics_scrapes
+                 (deployment_id, worker_name, port, tokens_per_sec, queue_depth, scraped_at)
+             VALUES ($1, 'v180-test-node', 55000, 5.0, 9, NOW() - INTERVAL '5 minutes')",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("insert stale scrape");
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM model_capacity WHERE deployment_id = $1")
+                .bind(deployment_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read view with stale sample");
+        assert_eq!(status, "unknown");
+
+        // A fresh sample → status passes through health_status, and the view
+        // reports the newest sample's metrics, not the stale one's.
+        sqlx::query(
+            "INSERT INTO deployment_metrics_scrapes
+                 (deployment_id, worker_name, port, tokens_per_sec, queue_depth, scraped_at)
+             VALUES ($1, 'v180-test-node', 55000, 42.5, 2, NOW())",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("insert fresh scrape");
+        let (computer, status, tokens_per_sec, queue_depth): (
+            String,
+            String,
+            Option<f64>,
+            Option<i32>,
+        ) = sqlx::query_as(
+            "SELECT computer, status, tokens_per_sec, queue_depth
+             FROM model_capacity WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read view with fresh sample");
+        assert_eq!(computer, "v180-test-node");
+        assert_eq!(status, "healthy");
+        assert_eq!(tokens_per_sec, Some(42.5));
+        assert_eq!(queue_depth, Some(2));
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v181_fleet_velocity_views_aggregate_work_item_events() {
+        // Needs Postgres — create_fresh_temp_db returns None (and we early-
+        // return) when neither FORGEFLEET_POSTGRES_URL nor
+        // FORGEFLEET_DATABASE_URL is set, so this never panics in CI.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        sqlx::query(
+            "INSERT INTO projects (id, display_name) VALUES ('v181-test-proj', 'V181 Test')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert test project");
+        let work_item_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO work_items
+                 (project_id, kind, title, created_at, assigned_computer)
+             VALUES
+                 ('v181-test-proj', 'task', 'v181 test item',
+                  '2026-07-18 08:00:00+00', 'v181-fallback-node')
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert test work item");
+
+        sqlx::query(
+            "INSERT INTO work_item_events
+                 (work_item_id, from_status, to_status, occurred_at, computer, attempt)
+             VALUES
+                 ($1, 'ready', 'building', '2026-07-18 09:00:00+00', NULL, 1),
+                 ($1, 'building', 'failed', '2026-07-18 10:00:00+00', NULL, 1),
+                 ($1, 'failed', 'building', '2026-07-18 11:00:00+00', 'v181-node', 2),
+                 ($1, 'building', 'done', '2026-07-18 12:00:00+00', 'v181-node', 2)",
+        )
+        .bind(work_item_id)
+        .execute(&pool)
+        .await
+        .expect("insert work item events");
+
+        let (completed, failed): (i64, i64) = sqlx::query_as(
+            "SELECT completed_count, failed_count
+             FROM v_throughput_hourly
+             WHERE hour_bucket = '2026-07-18 12:00:00+00'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read throughput view");
+        assert_eq!((completed, failed), (1, 0));
+
+        let (completed, lead_time): (i64, f64) = sqlx::query_as(
+            "SELECT completed_count, avg_lead_time_seconds
+             FROM v_lead_time_daily
+             WHERE day_bucket = '2026-07-18 00:00:00+00'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read lead-time view");
+        assert_eq!(completed, 1);
+        assert_eq!(lead_time, 14_400.0);
+
+        let computer_rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT computer_name, builds_started, builds_succeeded, builds_failed
+             FROM v_computer_builds_daily
+             WHERE day_bucket = '2026-07-18 00:00:00+00'
+             ORDER BY computer_name",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read computer builds view");
+        assert_eq!(
+            computer_rows,
+            vec![
+                ("v181-fallback-node".to_string(), 1, 0, 1),
+                ("v181-node".to_string(), 1, 1, 0),
+            ]
+        );
+
+        let (completed, first_pass, rate): (i64, i64, f64) = sqlx::query_as(
+            "SELECT completed_count, first_pass_count, first_pass_rate
+             FROM v_first_pass_rate_daily
+             WHERE day_bucket = '2026-07-18 00:00:00+00'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read first-pass view");
+        assert_eq!((completed, first_pass, rate), (1, 0, 0.0));
 
         drop_temp_db(admin, pool, &db_name).await;
     }

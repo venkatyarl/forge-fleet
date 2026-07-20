@@ -4250,14 +4250,25 @@ fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
         "cargo build --release -p forge-fleet -p ff-terminal"
     };
 
+    // Dirty-tree guard: mirror the leader-local refresh and refuse to run
+    // `git reset --hard` on a tree with tracked modifications. Untracked files
+    // are ignored so operator artifacts (`research/`, `graphify-out/`, etc.)
+    // do not block a deploy that only builds from tracked sources.
+    let dirty_guard = format!(
+        "if [ -n \"$(git status --porcelain --untracked-files=no)\" ]; then \
+         echo \"DEPLOY_DIRTY_TREE: refusing to reset --hard on dirty tree at {src}; commit or stash tracked changes first\" >&2; \
+         exit 1; \
+         fi"
+    );
+
     // git: force-converge to origin/main. Linux trees accumulate build
     // artifacts that block a clean reset, so clean those two paths first
     // (mirrors the upgrade playbook).
     let git_sync = if os_family == "macos" {
-        format!("cd \"{src}\" && git fetch origin && git reset --hard origin/main")
+        format!("cd \"{src}\" && {dirty_guard} && git fetch origin && git reset --hard origin/main")
     } else {
         format!(
-            "cd \"{src}\" && git fetch origin && git reset --hard origin/main && \
+            "cd \"{src}\" && {dirty_guard} && git fetch origin && git reset --hard origin/main && \
              git clean -fdx graphify-out node-compile-cache"
         )
     };
@@ -5682,6 +5693,22 @@ mod route_tests {
         let p = super::deploy_playbook("linux", "~/projects/forge-fleet");
         assert!(p.contains("systemctl --user"));
         assert!(!p.contains("launchctl"));
+    }
+
+    #[test]
+    fn deploy_playbook_refuses_dirty_tree_before_reset_hard() {
+        let p = super::deploy_playbook("macos", "~/projects/forge-fleet");
+        let dirty = p
+            .find("DEPLOY_DIRTY_TREE")
+            .expect("must check dirty tree before reset");
+        let reset = p
+            .find("git reset --hard origin/main")
+            .expect("must reset --hard");
+        assert!(dirty < reset, "dirty-tree guard must precede reset --hard");
+        assert!(
+            p.contains("git status --porcelain --untracked-files=no"),
+            "must use tracked-only dirty check like leader-local guard"
+        );
     }
 
     /// Layout invariant (2026-07-07 migration): a NULL-source-tree WORKER must
