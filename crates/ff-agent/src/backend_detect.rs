@@ -168,7 +168,7 @@ pub fn probe_indicates_unauthenticated(reason: &str) -> bool {
         "invalid api key",
         "invalid credentials",
         "credentials expired",
-        "token expired",
+        "your token expired",
         "session expired",
         "refresh token: access revoked",
         "access_terminated",
