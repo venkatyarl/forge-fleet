@@ -166,7 +166,7 @@ pub const BACKENDS: &[CliBackend] = &[
         // hosts (operator-reported 2026-06-20). `--print`/`--quiet` are the
         // fundamental headless flags present across kimi versions, so this is the
         // version-robust form. `--yolo` was redundant with --print's auto-approve.
-        default_flags: &["--quiet", "-p"],
+        default_flags: &["--print", "-p"],
         // `-w/--work-dir <dir>` sets the agent's working directory.
         cwd_mode: CwdMode::Flag("-w"),
         prompt_is_positional: true,
