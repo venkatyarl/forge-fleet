@@ -207,6 +207,18 @@ pub struct FleetStatusSummary {
     #[serde(default)]
     pub unhealthy_nodes: Option<usize>,
     #[serde(default)]
+    pub reachable_computers: Option<usize>,
+    #[serde(default)]
+    pub unreachable_computers: Option<usize>,
+    #[serde(default)]
+    pub computer_reachability_unknown: Option<usize>,
+    #[serde(default)]
+    pub joined_daemons: Option<usize>,
+    #[serde(default)]
+    pub unjoined_daemons: Option<usize>,
+    #[serde(default)]
+    pub daemon_join_unknown: Option<usize>,
+    #[serde(default)]
     pub enrolled_nodes: Option<usize>,
     #[serde(default)]
     pub seed_nodes: Option<usize>,
@@ -233,6 +245,10 @@ pub struct FleetComputer {
     pub status: Option<String>,
     #[serde(default)]
     pub health: Option<String>,
+    #[serde(default)]
+    pub computer_reachable: Option<bool>,
+    #[serde(default)]
+    pub daemon_joined: Option<bool>,
     #[serde(default)]
     pub leader_state: Option<String>,
     #[serde(default)]

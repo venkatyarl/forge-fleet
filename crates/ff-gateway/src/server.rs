@@ -1860,6 +1860,12 @@ struct FleetStatusSummary {
     total_nodes: usize,
     connected_nodes: usize,
     unhealthy_nodes: usize,
+    reachable_computers: usize,
+    unreachable_computers: usize,
+    computer_reachability_unknown: usize,
+    joined_daemons: usize,
+    unjoined_daemons: usize,
+    daemon_join_unknown: usize,
     enrolled_nodes: usize,
     seed_nodes: usize,
     model_count: usize,
@@ -1933,6 +1939,8 @@ struct FleetNodeView {
     source_kind: String,
     seeded_from_config: bool,
     runtime_enrolled: bool,
+    computer_reachable: Option<bool>,
+    daemon_joined: Option<bool>,
     runtime_provenance: Vec<String>,
     last_heartbeat: String,
     heartbeat_source: String,
@@ -2949,6 +2957,13 @@ fn assemble_fleet_status_payload(
                 config.fleet.api_port,
                 leader_hint.as_deref(),
                 config_by_name.get(name),
+                db_snapshot.and_then(|snapshot| {
+                    snapshot
+                        .nodes_by_name
+                        .get(name)
+                        .or_else(|| snapshot.nodes_by_host.get(ip))
+                }),
+                db_snapshot.is_some(),
             );
 
             if !ip.is_empty() {
@@ -2969,6 +2984,31 @@ fn assemble_fleet_status_payload(
     let unhealthy_nodes = node_views
         .iter()
         .filter(|node| node.status != "online")
+        .count();
+
+    let reachable_computers = node_views
+        .iter()
+        .filter(|node| node.computer_reachable == Some(true))
+        .count();
+    let unreachable_computers = node_views
+        .iter()
+        .filter(|node| node.computer_reachable == Some(false))
+        .count();
+    let computer_reachability_unknown = node_views
+        .iter()
+        .filter(|node| node.computer_reachable.is_none())
+        .count();
+    let joined_daemons = node_views
+        .iter()
+        .filter(|node| node.daemon_joined == Some(true))
+        .count();
+    let unjoined_daemons = node_views
+        .iter()
+        .filter(|node| node.daemon_joined == Some(false))
+        .count();
+    let daemon_join_unknown = node_views
+        .iter()
+        .filter(|node| node.daemon_joined.is_none())
         .count();
 
     let enrolled_nodes = node_views
@@ -3005,6 +3045,12 @@ fn assemble_fleet_status_payload(
             total_nodes: node_views.len(),
             connected_nodes,
             unhealthy_nodes,
+            reachable_computers,
+            unreachable_computers,
+            computer_reachability_unknown,
+            joined_daemons,
+            unjoined_daemons,
+            daemon_join_unknown,
             enrolled_nodes,
             seed_nodes,
             model_count: model_ids.len(),
@@ -3036,6 +3082,8 @@ fn build_fleet_worker_view(
 
     let seeded_from_config = node.config_name.is_some() || config_hint.is_some();
     let runtime_enrolled = is_runtime_enrolled(node, db_node);
+    let computer_reachable = derive_computer_reachable(node.health.as_ref().map(|h| &h.status));
+    let daemon_joined = derive_daemon_joined(db_available, db_node.is_some());
     let source_kind = if runtime_enrolled {
         "enrolled/live".to_string()
     } else if seeded_from_config {
@@ -3158,6 +3206,8 @@ fn build_fleet_worker_view(
         source_kind,
         seeded_from_config,
         runtime_enrolled,
+        computer_reachable,
+        daemon_joined,
         runtime_provenance,
         last_heartbeat: heartbeat.value,
         heartbeat_source: heartbeat.source,
@@ -3191,6 +3241,8 @@ fn build_seed_node_view(
     default_api_port: u16,
     leader_hint: Option<&str>,
     config_hint: Option<&ConfigNodeHints>,
+    db_node: Option<&DbNodeSnapshot>,
+    db_available: bool,
 ) -> FleetNodeView {
     let role = config_hint
         .and_then(|hint| hint.role.clone())
@@ -3243,6 +3295,8 @@ fn build_seed_node_view(
         source_kind: "seed/static".to_string(),
         seeded_from_config: true,
         runtime_enrolled: false,
+        computer_reachable: None,
+        daemon_joined: derive_daemon_joined(db_available, db_node.is_some()),
         runtime_provenance: vec!["fleet.toml.seed".to_string()],
         last_heartbeat: "unknown".to_string(),
         heartbeat_source: "unreported".to_string(),
@@ -3342,6 +3396,14 @@ fn derive_node_status(health: Option<&HealthStatus>, db_status: Option<&str>) ->
         Some(status) if status == "offline" => "offline".to_string(),
         _ => "unknown".to_string(),
     }
+}
+
+fn derive_computer_reachable(health: Option<&HealthStatus>) -> Option<bool> {
+    health.map(|status| !matches!(status, HealthStatus::Unreachable))
+}
+
+fn derive_daemon_joined(db_available: bool, node_present: bool) -> Option<bool> {
+    db_available.then_some(node_present)
 }
 
 fn derive_node_resources(
@@ -6731,8 +6793,9 @@ mod ci_status_tests {
 #[cfg(test)]
 mod node_status_tests {
     use super::{
-        HealthStatus, classify_heartbeat_freshness, derive_node_status,
-        normalize_status_for_runtime, parse_heartbeat_timestamp,
+        HealthStatus, classify_heartbeat_freshness, derive_computer_reachable,
+        derive_daemon_joined, derive_node_status, normalize_status_for_runtime,
+        parse_heartbeat_timestamp,
     };
     use chrono::{Duration, Utc};
 
@@ -6765,6 +6828,31 @@ mod node_status_tests {
         // No signal / unrecognized → unknown.
         assert_eq!(derive_node_status(None, None), "unknown");
         assert_eq!(derive_node_status(None, Some("weird")), "unknown");
+    }
+
+    #[test]
+    fn computer_reachability_uses_only_discovery_health() {
+        assert_eq!(
+            derive_computer_reachable(Some(&HealthStatus::Healthy)),
+            Some(true)
+        );
+        assert_eq!(
+            derive_computer_reachable(Some(&HealthStatus::Degraded)),
+            Some(true)
+        );
+        assert_eq!(
+            derive_computer_reachable(Some(&HealthStatus::Unreachable)),
+            Some(false)
+        );
+        assert_eq!(derive_computer_reachable(None), None);
+    }
+
+    #[test]
+    fn daemon_join_requires_an_available_db_snapshot() {
+        assert_eq!(derive_daemon_joined(true, true), Some(true));
+        assert_eq!(derive_daemon_joined(true, false), Some(false));
+        assert_eq!(derive_daemon_joined(false, true), None);
+        assert_eq!(derive_daemon_joined(false, false), None);
     }
 
     #[test]
