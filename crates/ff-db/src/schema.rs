@@ -10625,6 +10625,30 @@ WHERE to_status IN ('done', 'merged')
 GROUP BY 1;
 "#;
 
+/// V182 — trigger that records every `work_items.status` transition into
+/// `work_item_events`. A DB-level trigger (not app-side inserts) is deliberate:
+/// it captures ALL writers, including manual `psql` heals and out-of-band
+/// updates, so the V181 velocity views see the complete journey. Fires only
+/// when status actually changes; `detail` is left as the table default.
+pub const SCHEMA_V182_WORK_ITEM_EVENTS_TRIGGER: &str = r#"
+CREATE OR REPLACE FUNCTION log_work_item_status_change() RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO work_item_events
+        (work_item_id, from_status, to_status, computer, attempt)
+    VALUES
+        (NEW.id, OLD.status, NEW.status, NEW.assigned_computer, NEW.attempts);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_work_item_status_change ON work_items;
+CREATE TRIGGER trg_work_item_status_change
+    AFTER UPDATE OF status ON work_items
+    FOR EACH ROW
+    WHEN (OLD.status IS DISTINCT FROM NEW.status)
+    EXECUTE FUNCTION log_work_item_status_change();
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
