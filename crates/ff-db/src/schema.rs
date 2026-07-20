@@ -11117,6 +11117,26 @@ VALUES ('auto_feeder_mode', 'off')
 ON CONFLICT (key) DO NOTHING;
 "#;
 
+/// V199 — Continuous daemon rollout safety gate and provenance.
+///
+/// The operator-visible gate deliberately has only two values: `manual` keeps
+/// the existing explicit rollout workflow, while `auto` allows the leader tick
+/// to create a canary rollout after merge/time drift crosses its threshold.
+pub const SCHEMA_V199_CONTINUOUS_ROLLOUT: &str = r#"
+INSERT INTO fleet_secrets (key, value)
+VALUES ('rollout_mode', 'manual')
+ON CONFLICT (key) DO NOTHING;
+
+ALTER TABLE upgrade_rollouts
+    ADD COLUMN IF NOT EXISTS target_version TEXT,
+    ADD COLUMN IF NOT EXISTS automatic BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS canary_bake_started_at TIMESTAMPTZ;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_upgrade_rollouts_one_auto_inflight
+    ON upgrade_rollouts (software_id)
+    WHERE automatic = TRUE AND status = 'in_progress';
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

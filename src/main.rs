@@ -1011,11 +1011,11 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     // stage's failure rate crosses its threshold (canary halts on the first
     // failure), and otherwise composes ONLY the next stage's targets — never
     // more than one stage in flight (preserves the V62 wave singleton). DEFAULTS
-    // TO OFF: with `fleet_secrets.staged_rollout_mode` at `off`/unset the tick is
-    // a pure no-op; `dry-run` logs the decision; `active` actuates.
+    // `fleet_secrets.rollout_mode=manual|auto` controls only automatic rollout
+    // creation; already-started manual and automatic rollouts keep progressing.
     if let Some(pg_pool) = operational_store.pg_pool().cloned() {
         info!(
-            "starting subsystem: staged-rollout tick (60s, leader-gated, gate=fleet_secrets.staged_rollout_mode default off)"
+            "starting subsystem: staged-rollout tick (60s, leader-gated, gate=fleet_secrets.rollout_mode default manual)"
         );
         subsystem_tasks.push(ff_agent::upgrade_rollout::spawn_upgrade_rollout_tick(
             pg_pool,

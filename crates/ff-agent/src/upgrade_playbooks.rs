@@ -50,6 +50,7 @@ pub fn atomic_install_cmd(bin: &str, dest: &str, codesign: bool) -> String {
     format!(
         "{{ install -m 755 target/release/{bin} \"{dest}.new\" && \
          {sign}\"{dest}.new\" --version >/dev/null 2>&1 && \
+         {{ [ ! -f \"{dest}\" ] || cp -f \"{dest}\" \"{dest}.prev\"; }} && \
          mv -f \"{dest}.new\" \"{dest}\"; }} || \
          {{ rm -f \"{dest}.new\"; \
          echo \"upgrade: install/validate of {dest} failed; kept existing binary\" >&2; \

@@ -976,6 +976,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "auto_backlog_feeder",
         sql: schema::SCHEMA_V198_AUTO_BACKLOG_FEEDER,
     },
+    PgMigration {
+        version: 199,
+        name: "continuous_rollout",
+        sql: schema::SCHEMA_V199_CONTINUOUS_ROLLOUT,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

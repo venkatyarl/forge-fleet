@@ -670,7 +670,8 @@ async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str, running_sha: &s
          {install_ffd}\n\
          {install_ff}\n\
          if [ -f \"$HOME/.cargo/bin/ff\" ]; then {install_ff_cargo}; fi\n\
-         echo \"build+install OK; restarting daemon\"\n\
+         echo \"build+install OK; waiting for leader handoff\"\n\
+         sleep 15\n\
          {restart}\n"
     );
     let script_path = format!("{home}/.forgefleet/leader-self-upgrade.sh");
@@ -679,6 +680,22 @@ async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str, running_sha: &s
         return false;
     }
     let _ = std::fs::write(&marker, &target_sha);
+
+    // Ask the election loop to hand leadership to a follower before the
+    // detached helper restarts this node. The request expires automatically.
+    let handoff_until = chrono::Utc::now() + chrono::Duration::minutes(10);
+    if let Err(e) = ff_db::pg_set_secret(
+        pool,
+        "leader_yield_request",
+        &format!("{my_name}|{}", handoff_until.to_rfc3339()),
+        Some("continuous rollout leader-last restart"),
+        Some("auto-upgrade"),
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "leader self-upgrade: handoff request failed");
+        return false;
+    }
 
     // Spawn DETACHED in a new session so the daemon restart (which kills
     // forgefleetd's process group) can't take the in-flight build down with it.
@@ -812,7 +829,33 @@ impl AutoUpgradeTick {
         // forgefleetd_git drift even when no other software is drifted — which
         // is the common case (the wave already upgraded everyone else). Gated
         // by fleet_secrets.leader_self_upgrade (OFF by default).
-        let _ = maybe_self_upgrade_leader(&self.pool, &self.my_name, &self.running_sha).await;
+        // Continuous rollouts converge followers first. The leader's detached
+        // self-upgrade is considered only after no automatic follower rollout
+        // remains in progress (leader-last invariant).
+        let auto_mode = crate::upgrade_rollout::continuous_mode_is_auto(&self.pool).await;
+        let auto_rollout_inflight: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM upgrade_rollouts \
+             WHERE automatic = TRUE AND status = 'in_progress')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false);
+        let followers_converged: bool = if auto_mode {
+            sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM upgrade_rollouts ur \
+                 JOIN software_registry sr ON sr.id = ur.software_id \
+                 WHERE ur.automatic = TRUE AND ur.status = 'completed' \
+                   AND ur.target_version = sr.latest_version)",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(false)
+        } else {
+            true
+        };
+        if !auto_rollout_inflight && followers_converged {
+            let _ = maybe_self_upgrade_leader(&self.pool, &self.my_name, &self.running_sha).await;
+        }
 
         let ids = software_ids_with_drift(&self.pool).await?;
         if ids.is_empty() {
@@ -921,6 +964,27 @@ impl AutoUpgradeTick {
             // would otherwise be filtered to empty), the wave still
             // sees and processes every non-leader target.
             if is_daemon_self_software(software_id) {
+                if crate::upgrade_rollout::continuous_mode_is_auto(&self.pool).await {
+                    let target_sha = plans
+                        .iter()
+                        .find_map(|p| p.latest_version.as_deref())
+                        .unwrap_or_default();
+                    match crate::upgrade_rollout::maybe_start_continuous_rollout(
+                        &self.pool,
+                        software_id,
+                        &self.my_name,
+                        &self.running_sha,
+                        target_sha,
+                    )
+                    .await
+                    {
+                        Ok(true) => total += plans.len().max(1),
+                        Ok(false) => {}
+                        Err(e) => tracing::warn!(software_id = %software_id, error = %e,
+                            "continuous-rollout: auto start failed"),
+                    }
+                    continue;
+                }
                 let leader_id: Option<uuid::Uuid> =
                     sqlx::query_scalar("SELECT computer_id FROM fleet_leader_state LIMIT 1")
                         .fetch_optional(&self.pool)

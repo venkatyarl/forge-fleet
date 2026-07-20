@@ -25,18 +25,14 @@
 //!        `status='completed'` when no stages remain.
 //!
 //! The halt DECISION (`decide_stage`) is a pure function so it is unit-tested
-//! without a database. We never auto-rollback — per the fleet "updates never
-//! auto-applied" rule, we halt + alert + recommend; the operator executes any
-//! downgrade.
+//! without a database. Restart tasks restore `forgefleetd.prev` on failed
+//! verification; this tick then halts the rollout and alerts.
 //!
-//! ## Safety — gate `fleet_secrets.staged_rollout_mode`
-//! Read EVERY tick, EXACTLY like `disk_reconcile::read_mode` /
-//! `fleet_integrity::read_mode`:
-//!   - `off`     (DEFAULT, and the value when the key is missing/unparseable):
-//!               the tick does NOTHING. Deploying this is harmless.
-//!   - `dry-run`: evaluate + LOG the decision for each rollout, actuate NOTHING
-//!               (no status change, no stage compose, no alert).
-//!   - `active`:  actuate (advance / halt / complete + alert + compose).
+//! ## Safety — gate `fleet_secrets.rollout_mode`
+//! `manual` (the default) permits explicit staged rollouts but creates none;
+//! `auto` lets the leader create a rollout once merge/time drift crosses the
+//! threshold. Existing rollouts progress in either mode so flipping back to
+//! manual never strands an in-flight safety operation.
 //!
 //! Mirrors the other leader ticks for the leader gate: rollout state is global,
 //! so only the leader advances it (no N-way compose races). On failover the new
@@ -46,8 +42,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use tracing::{info, warn};
 
-/// `fleet_secrets` key holding the three-mode gate. Off / missing = no-op.
-const STAGED_ROLLOUT_MODE_KEY: &str = "staged_rollout_mode";
+/// Operator gate for continuous convergence. Missing/invalid is manual.
+const ROLLOUT_MODE_KEY: &str = "rollout_mode";
+const AUTO_MERGE_THRESHOLD: usize = 3;
+const AUTO_AGE_THRESHOLD_SECS: i64 = 15 * 60;
+const CANARY_BAKE_SECS: i64 = 10 * 60;
 
 /// Alert policy seeded by migration V134.
 const POLICY_NAME: &str = "upgrade_rollout_halted";
@@ -56,34 +55,28 @@ const POLICY_NAME: &str = "upgrade_rollout_halted";
 /// concurrency unit, so a generous fanout lets a whole stage build in parallel.
 const STAGE_FANOUT: usize = 8;
 
-/// The operating mode read from `fleet_secrets.staged_rollout_mode` each tick.
+/// The operating mode read from `fleet_secrets.rollout_mode` each tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RolloutMode {
-    /// Tick does nothing (default — fail-safe).
-    Off,
-    /// Evaluate + log the decision per rollout; actuate nothing.
-    DryRun,
-    /// Actuate: advance / halt / complete + alert + compose the next stage.
-    Active,
+    Manual,
+    Auto,
 }
 
 impl RolloutMode {
     /// Parse the raw secret value. `None`, empty, or any unrecognised value →
-    /// [`RolloutMode::Off`] — the tick must never start actuating because a gate
+    /// [`RolloutMode::Manual`] — the tick must never start actuating because a gate
     /// was mistyped.
     pub fn parse(raw: Option<&str>) -> Self {
         match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-            Some("active") => RolloutMode::Active,
-            Some("dry-run") | Some("dry_run") | Some("dryrun") => RolloutMode::DryRun,
-            _ => RolloutMode::Off,
+            Some("auto") => RolloutMode::Auto,
+            _ => RolloutMode::Manual,
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
-            RolloutMode::Off => "off",
-            RolloutMode::DryRun => "dry-run",
-            RolloutMode::Active => "active",
+            RolloutMode::Manual => "manual",
+            RolloutMode::Auto => "auto",
         }
     }
 }
@@ -181,15 +174,19 @@ pub fn decide_stage(
     }
 }
 
-/// Read the gate. Unreadable secret → `Off` (fail-safe), logged once.
+/// Read the gate. Unreadable secret → `Manual` (fail-safe), logged once.
 async fn read_mode(pg: &PgPool) -> RolloutMode {
-    match ff_db::pg_read_gate_value(pg, STAGED_ROLLOUT_MODE_KEY, "off", "off").await {
+    match ff_db::pg_read_gate_value(pg, ROLLOUT_MODE_KEY, "manual", "manual").await {
         Ok(v) => RolloutMode::parse(Some(v.as_str())),
         Err(e) => {
-            warn!(error = %e, "staged-rollout: gate read failed; treating as off");
-            RolloutMode::Off
+            warn!(error = %e, "continuous-rollout: gate read failed; treating as manual");
+            RolloutMode::Manual
         }
     }
+}
+
+pub async fn continuous_mode_is_auto(pg: &PgPool) -> bool {
+    read_mode(pg).await == RolloutMode::Auto
 }
 
 /// A live rollout row (only the columns the tick needs).
@@ -200,6 +197,8 @@ struct RolloutRow {
     stages: Vec<RolloutStage>,
     current_stage: i32,
     failure_threshold_pct: i32,
+    canary_bake_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    automatic: bool,
 }
 
 /// Load every `in_progress` rollout (oldest first for stable ordering).
@@ -208,7 +207,7 @@ async fn load_in_progress(pg: &PgPool) -> Result<Vec<RolloutRow>, sqlx::Error> {
         r#"
         SELECT id, COALESCE(software_id, '') AS software_id,
                COALESCE(stages, '[]'::jsonb) AS stages,
-               current_stage, failure_threshold_pct
+               current_stage, failure_threshold_pct, canary_bake_started_at, automatic
           FROM upgrade_rollouts
          WHERE status = 'in_progress'
          ORDER BY created_at ASC
@@ -227,6 +226,8 @@ async fn load_in_progress(pg: &PgPool) -> Result<Vec<RolloutRow>, sqlx::Error> {
             stages,
             current_stage: r.try_get("current_stage")?,
             failure_threshold_pct: r.try_get("failure_threshold_pct")?,
+            canary_bake_started_at: r.try_get("canary_bake_started_at")?,
+            automatic: r.try_get("automatic")?,
         });
     }
     Ok(out)
@@ -259,6 +260,57 @@ async fn tally_stage(
     })
 }
 
+/// Canary promotion requires a full bake window after restart, a fresh daemon
+/// beat, and proof that every canary subsequently claimed and completed real
+/// fleet work. This catches binaries that merely start but cannot build.
+async fn canary_bake_passed(pg: &PgPool, rollout: &RolloutRow) -> Result<bool, sqlx::Error> {
+    let Some(stage) = rollout.stages.first() else {
+        return Ok(false);
+    };
+    let Some(started) = rollout.canary_bake_started_at else {
+        sqlx::query(
+            "UPDATE upgrade_rollouts SET canary_bake_started_at = NOW(), updated_at = NOW() \
+             WHERE id = $1 AND canary_bake_started_at IS NULL",
+        )
+        .bind(rollout.id)
+        .execute(pg)
+        .await?;
+        return Ok(false);
+    };
+    if chrono::Utc::now()
+        .signed_duration_since(started)
+        .num_seconds()
+        < CANARY_BAKE_SECS
+    {
+        return Ok(false);
+    }
+    let ready: bool = sqlx::query_scalar(
+        r#"
+        SELECT NOT EXISTS (
+            SELECT 1
+              FROM computers c
+             WHERE c.name = ANY($1::text[])
+               AND (
+                    c.last_seen_at IS NULL OR c.last_seen_at < $2
+                    OR NOT EXISTS (
+                        SELECT 1
+                          FROM work_item_leases l
+                          JOIN work_items w ON w.id = l.work_item_id
+                         WHERE l.computer_id = c.id
+                           AND l.created_at >= $2
+                           AND w.status IN ('done','merged')
+                    )
+               )
+        )
+        "#,
+    )
+    .bind(&stage.target_names)
+    .bind(started)
+    .fetch_one(pg)
+    .await?;
+    Ok(ready)
+}
+
 /// Resolve the leader's `computers.id` (rollouts always exclude the leader).
 async fn leader_computer_id(pg: &PgPool, my_name: &str) -> Result<uuid::Uuid, sqlx::Error> {
     sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
@@ -281,6 +333,18 @@ pub async fn compose_stage(
     leader_id: uuid::Uuid,
 ) -> Result<usize, String> {
     if target_names.is_empty() {
+        return Ok(0);
+    }
+    let busy: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM work_item_leases l \
+         JOIN computers c ON c.id = l.computer_id \
+         WHERE c.name = ANY($1::text[]) AND l.released_at IS NULL)",
+    )
+    .bind(target_names)
+    .fetch_one(pg)
+    .await
+    .map_err(|e| format!("check rollout target leases: {e}"))?;
+    if busy {
         return Ok(0);
     }
     let plan = crate::task_runner::compose_fleet_upgrade_wave_filtered(
@@ -313,6 +377,156 @@ pub async fn compose_stage(
     .await
     .map_err(|e| format!("tag rollout tasks: {e}"))?;
     Ok(tagged.rows_affected() as usize)
+}
+
+/// Pure drift trigger used by the leader tick.
+pub fn drift_exceeds_threshold(merges: usize, age_secs: i64) -> bool {
+    merges >= AUTO_MERGE_THRESHOLD || age_secs >= AUTO_AGE_THRESHOLD_SECS
+}
+
+/// Start one automatic daemon rollout, if the DB gate and merge/time drift
+/// threshold permit it. The first stage contains exactly one canary from each
+/// architecture; the second contains the remaining followers. A partial unique
+/// index provides the cross-leader singleton during failover.
+pub async fn maybe_start_continuous_rollout(
+    pg: &PgPool,
+    software_id: &str,
+    my_name: &str,
+    running_sha: &str,
+    target_sha: &str,
+) -> Result<bool, String> {
+    if read_mode(pg).await != RolloutMode::Auto || running_sha.trim().is_empty() {
+        return Ok(false);
+    }
+    let source_tree: Option<String> =
+        sqlx::query_scalar("SELECT source_tree_path FROM computers WHERE lower(name) = lower($1)")
+            .bind(my_name)
+            .fetch_optional(pg)
+            .await
+            .map_err(|e| format!("continuous rollout source tree: {e}"))?
+            .flatten();
+    let Some(mut source_tree) = source_tree else {
+        return Ok(false);
+    };
+    if let Some(rest) = source_tree.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        source_tree = format!("{home}/{rest}");
+    }
+    let count = tokio::process::Command::new("git")
+        .args([
+            "-C",
+            &source_tree,
+            "rev-list",
+            "--merges",
+            "--count",
+            &format!("{running_sha}..{target_sha}"),
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("count merge drift: {e}"))?;
+    let merges = String::from_utf8_lossy(&count.stdout)
+        .trim()
+        .parse::<usize>()
+        .unwrap_or(0);
+    let shown = tokio::process::Command::new("git")
+        .args(["-C", &source_tree, "show", "-s", "--format=%ct", target_sha])
+        .output()
+        .await
+        .map_err(|e| format!("read target age: {e}"))?;
+    let committed_at = String::from_utf8_lossy(&shown.stdout)
+        .trim()
+        .parse::<i64>()
+        .unwrap_or(i64::MAX);
+    let age_secs = chrono::Utc::now().timestamp().saturating_sub(committed_at);
+    if !count.status.success()
+        || !shown.status.success()
+        || !drift_exceeds_threshold(merges, age_secs)
+    {
+        return Ok(false);
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT c.name,
+               COALESCE(c.metadata->>'arch', c.build_archs->>0, c.os_family, 'unknown') AS arch
+          FROM computers c
+          JOIN computer_software cs ON cs.computer_id = c.id
+         WHERE cs.software_id = $1
+           AND lower(c.name) <> lower($2)
+           AND c.status = 'online'
+           AND COALESCE(c.reservation_state, 'available') = 'available'
+         ORDER BY arch, c.name
+        "#,
+    )
+    .bind(software_id)
+    .bind(my_name)
+    .fetch_all(pg)
+    .await
+    .map_err(|e| format!("select continuous rollout targets: {e}"))?;
+    let mut by_arch: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        by_arch
+            .entry(row.try_get("arch").unwrap_or_else(|_| "unknown".into()))
+            .or_default()
+            .push(row.try_get("name").map_err(|e| e.to_string())?);
+    }
+    let mut canaries = Vec::new();
+    let mut remaining = Vec::new();
+    for names in by_arch.values() {
+        if let Some((first, rest)) = names.split_first() {
+            canaries.push(first.clone());
+            remaining.extend_from_slice(rest);
+        }
+    }
+    if canaries.is_empty() {
+        return Ok(false);
+    }
+    let mut stages = vec![RolloutStage {
+        stage_idx: 0,
+        target_names: canaries,
+    }];
+    if !remaining.is_empty() {
+        stages.push(RolloutStage {
+            stage_idx: 1,
+            target_names: remaining,
+        });
+    }
+    let stages_json = serde_json::to_value(&stages).map_err(|e| e.to_string())?;
+    let rollout_id: uuid::Uuid = match sqlx::query_scalar(
+        r#"INSERT INTO upgrade_rollouts
+              (software_id, started_by, stages, current_stage, status,
+               failure_threshold_pct, target_version, automatic)
+            VALUES ($1, $2, $3, 0, 'in_progress', 0, $4, TRUE)
+            RETURNING id"#,
+    )
+    .bind(software_id)
+    .bind(my_name)
+    .bind(stages_json)
+    .bind(target_sha)
+    .fetch_one(pg)
+    .await
+    {
+        Ok(id) => id,
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => return Ok(false),
+        Err(e) => return Err(format!("insert continuous rollout: {e}")),
+    };
+    let leader_id = leader_computer_id(pg, my_name)
+        .await
+        .map_err(|e| format!("continuous rollout leader: {e}"))?;
+    compose_stage(
+        pg,
+        software_id,
+        rollout_id,
+        0,
+        &stages[0].target_names,
+        leader_id,
+    )
+    .await?;
+    info!(%rollout_id, merges, age_secs, architectures = stages[0].target_names.len(),
+          "continuous-rollout: automatic canary wave started");
+    Ok(true)
 }
 
 /// Create a staged rollout row and compose ONLY stage 0 (the canary). Stages
@@ -535,9 +749,6 @@ pub struct RolloutAction {
 /// per-rollout actions (empty when gated off) so callers/tests can assert.
 pub async fn run_once(pg: &PgPool, my_name: &str) -> Vec<RolloutAction> {
     let mode = read_mode(pg).await;
-    if mode == RolloutMode::Off {
-        return Vec::new();
-    }
 
     let rollouts = match load_in_progress(pg).await {
         Ok(r) => r,
@@ -559,7 +770,39 @@ pub async fn run_once(pg: &PgPool, my_name: &str) -> Vec<RolloutAction> {
         };
         let has_more = (stage as usize + 1) < r.stages.len();
         let is_canary = stage == 0;
-        let decision = decide_stage(tally, is_canary, r.failure_threshold_pct, has_more);
+        if r.automatic && tally.total_terminal() == 0 && tally.running == 0 {
+            let targets = r
+                .stages
+                .get(stage as usize)
+                .map(|s| s.target_names.clone())
+                .unwrap_or_default();
+            if let Ok(leader_id) = leader_computer_id(pg, my_name).await {
+                match compose_stage(pg, &r.software_id, r.id, stage, &targets, leader_id).await {
+                    Ok(0) => info!(rollout_id = %r.id, stage,
+                                  "continuous-rollout: stage targets busy; revisiting"),
+                    Ok(n) => info!(rollout_id = %r.id, stage, tagged = n,
+                                  "continuous-rollout: deferred stage composed"),
+                    Err(e) => warn!(rollout_id = %r.id, stage, error = %e,
+                                    "continuous-rollout: deferred stage compose failed"),
+                }
+            }
+            actions.push(RolloutAction {
+                rollout_id: r.id,
+                decision: StageDecision::Wait,
+            });
+            continue;
+        }
+        let mut decision = decide_stage(tally, is_canary, r.failure_threshold_pct, has_more);
+        if is_canary && matches!(decision, StageDecision::Advance | StageDecision::Complete) {
+            match canary_bake_passed(pg, r).await {
+                Ok(true) => {}
+                Ok(false) => decision = StageDecision::Wait,
+                Err(e) => {
+                    warn!(error = %e, rollout_id = %r.id, "continuous-rollout: canary bake evidence unavailable");
+                    decision = StageDecision::Wait;
+                }
+            }
+        }
 
         info!(
             rollout_id = %r.id,
@@ -578,11 +821,8 @@ pub async fn run_once(pg: &PgPool, my_name: &str) -> Vec<RolloutAction> {
             decision,
         });
 
-        if mode == RolloutMode::DryRun {
-            continue;
-        }
-
-        // active: actuate.
+        // Both modes progress already-created rollouts; `manual` only prevents
+        // the leader tick from creating a new automatic rollout.
         match decision {
             StageDecision::Wait => {}
             StageDecision::Halt { failed, total } => {
@@ -625,20 +865,6 @@ pub async fn run_once(pg: &PgPool, my_name: &str) -> Vec<RolloutAction> {
             }
             StageDecision::Advance => {
                 let next = stage + 1;
-                // Advance the cursor first so a compose failure doesn't loop.
-                if let Err(e) = sqlx::query(
-                    "UPDATE upgrade_rollouts \
-                       SET current_stage = $2, updated_at = NOW() \
-                     WHERE id = $1 AND status = 'in_progress'",
-                )
-                .bind(r.id)
-                .bind(next)
-                .execute(pg)
-                .await
-                {
-                    warn!(error = %e, rollout_id = %r.id, "staged-rollout: failed to advance stage");
-                    continue;
-                }
                 let targets = r
                     .stages
                     .get(next as usize)
@@ -652,10 +878,25 @@ pub async fn run_once(pg: &PgPool, my_name: &str) -> Vec<RolloutAction> {
                     }
                 };
                 match compose_stage(pg, &r.software_id, r.id, next, &targets, leader_id).await {
-                    Ok(n) => info!(
-                        rollout_id = %r.id, stage = next, tagged = n,
-                        "staged-rollout: composed next stage"
-                    ),
+                    Ok(n) if n > 0 => {
+                        if let Err(e) = sqlx::query(
+                            "UPDATE upgrade_rollouts SET current_stage = $2, updated_at = NOW() \
+                             WHERE id = $1 AND status = 'in_progress' AND current_stage = $3",
+                        )
+                        .bind(r.id)
+                        .bind(next)
+                        .bind(stage)
+                        .execute(pg)
+                        .await
+                        {
+                            warn!(error = %e, rollout_id = %r.id, "staged-rollout: failed to advance stage");
+                        } else {
+                            info!(rollout_id = %r.id, stage = next, tagged = n,
+                                  "staged-rollout: composed next stage");
+                        }
+                    }
+                    Ok(_) => info!(rollout_id = %r.id, stage = next,
+                                  "continuous-rollout: targets busy; will revisit after leases drain"),
                     Err(e) => warn!(
                         error = %e, rollout_id = %r.id, stage = next,
                         "staged-rollout: next-stage compose failed (will retry next tick)"
@@ -704,21 +945,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mode_defaults_off_and_is_failsafe() {
-        assert_eq!(RolloutMode::parse(None), RolloutMode::Off);
-        assert_eq!(RolloutMode::parse(Some("")), RolloutMode::Off);
-        assert_eq!(RolloutMode::parse(Some("garbage")), RolloutMode::Off);
-        assert_eq!(RolloutMode::parse(Some("off")), RolloutMode::Off);
+    fn mode_defaults_manual_and_is_failsafe() {
+        assert_eq!(RolloutMode::parse(None), RolloutMode::Manual);
+        assert_eq!(RolloutMode::parse(Some("")), RolloutMode::Manual);
+        assert_eq!(RolloutMode::parse(Some("garbage")), RolloutMode::Manual);
+        assert_eq!(RolloutMode::parse(Some("manual")), RolloutMode::Manual);
     }
 
     #[test]
-    fn mode_parses_dry_run_and_active() {
-        assert_eq!(RolloutMode::parse(Some("dry-run")), RolloutMode::DryRun);
-        assert_eq!(RolloutMode::parse(Some("DRY_RUN")), RolloutMode::DryRun);
-        assert_eq!(RolloutMode::parse(Some(" active ")), RolloutMode::Active);
-        assert_eq!(RolloutMode::Off.as_str(), "off");
-        assert_eq!(RolloutMode::DryRun.as_str(), "dry-run");
-        assert_eq!(RolloutMode::Active.as_str(), "active");
+    fn mode_parses_auto() {
+        assert_eq!(RolloutMode::parse(Some(" AUTO ")), RolloutMode::Auto);
+        assert_eq!(RolloutMode::Manual.as_str(), "manual");
+        assert_eq!(RolloutMode::Auto.as_str(), "auto");
+    }
+
+    #[test]
+    fn continuous_drift_uses_merge_or_time_threshold() {
+        assert!(!drift_exceeds_threshold(2, 899));
+        assert!(drift_exceeds_threshold(3, 0));
+        assert!(drift_exceeds_threshold(0, 900));
     }
 
     fn tally(completed: usize, failed: usize, running: usize) -> StageTally {

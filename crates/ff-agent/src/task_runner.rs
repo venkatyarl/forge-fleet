@@ -2101,7 +2101,13 @@ pub async fn compose_fleet_upgrade_wave_filtered(
                  sleep 1; \
                  nohup \"$HOME/.local/bin/forgefleetd\" >/tmp/forgefleetd.out 2>&1 </dev/null & \
                  disown; \
-                 echo \"respawned via nohup, pid=$!\")"
+                 echo \"respawned via nohup, pid=$!\"); \
+             sleep 5; RN=$(pgrep -x forgefleetd 2>/dev/null | wc -l | tr -d ' '); \
+             if [ \"$RN\" -lt 1 ]; then \
+               echo \"restart health failed; restoring forgefleetd.prev\" >&2; \
+               cp -f \"$HOME/.local/bin/forgefleetd.prev\" \"$HOME/.local/bin/forgefleetd\"; \
+               launchctl kickstart -k \"gui/${USER_ID}/com.forgefleet.forgefleetd\" 2>/dev/null || true; exit 1; \
+             fi; echo \"RESTART_VERIFY count=$RN\""
                 .to_string()
         } else {
             // 2026-05-24 (fix C): the standalone restart used a plain
@@ -2120,7 +2126,13 @@ pub async fn compose_fleet_upgrade_wave_filtered(
              setsid systemctl --user restart --no-block forgefleetd.service </dev/null >/dev/null 2>&1 \
                || setsid systemctl --user restart --no-block forgefleet-node.service </dev/null >/dev/null 2>&1 \
                || setsid systemctl --user restart --no-block forgefleet-daemon.service </dev/null >/dev/null 2>&1; \
-             echo \"restart job dispatched (--no-block, detached) on $(hostname)\""
+             echo \"restart job dispatched (--no-block, detached) on $(hostname)\"; \
+             sleep 5; RN=$(pgrep -x forgefleetd 2>/dev/null | wc -l | tr -d ' '); \
+             if [ \"$RN\" -lt 1 ]; then \
+               echo \"restart health failed; restoring forgefleetd.prev\" >&2; \
+               cp -f \"$HOME/.local/bin/forgefleetd.prev\" \"$HOME/.local/bin/forgefleetd\"; \
+               systemctl --user restart --no-block forgefleetd.service 2>/dev/null || true; exit 1; \
+             fi; echo \"RESTART_VERIFY count=$RN\""
                 .to_string()
         };
         let restart_command = format!(
