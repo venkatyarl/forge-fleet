@@ -34,6 +34,7 @@ pub use log_ingest::{LogBuffer, LogEntry, LogIngestor, LogLevel};
 pub use metrics::{
     // Prometheus exports
     ACTIVE_CONNECTIONS,
+    BUILD_TIMEOUT_COUNT,
     DB_POOL_SIZE,
     FleetMetrics,
     HTTP_REQUEST_DURATION_SECONDS,
