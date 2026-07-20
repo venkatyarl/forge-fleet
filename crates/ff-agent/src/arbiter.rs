@@ -552,11 +552,17 @@ mod tests {
 
     #[test]
     fn default_plans_offload_then_reload() {
-        let (pre, post) = default_plans(&["sia".to_string()]);
+        let (pre, post) = default_plans(&["sia".to_string(), "adele".to_string()]);
+        assert_eq!(pre.as_array().unwrap().len(), 2);
+        assert_eq!(post.as_array().unwrap().len(), 2);
         assert_eq!(pre[0]["step"], "offload_models_to_disk");
         assert_eq!(pre[0]["host"], "sia");
+        assert_eq!(pre[1]["step"], "offload_models_to_disk");
+        assert_eq!(pre[1]["host"], "adele");
         assert_eq!(post[0]["step"], "reload_model");
         assert_eq!(post[0]["host"], "sia");
+        assert_eq!(post[1]["step"], "reload_model");
+        assert_eq!(post[1]["host"], "adele");
     }
 
     fn smoke_intent(id: &str, hosts: &[&str], prio: i64, secs: i64) -> WorkIntentRow {

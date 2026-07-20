@@ -13,14 +13,95 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Compute the default sub-agent slot count for a host based on its
-/// hardware. Formula: `max(1, min(cores/2, ram_gb/16, cap))` where `cap`
-/// = 8 if the host has an NVIDIA GPU AND ram_gb >= 64, else 4.
-pub fn compute_default_count(cores: u32, ram_gb: u32, has_nvidia_gpu: bool) -> u32 {
-    let cap: u32 = if has_nvidia_gpu && ram_gb >= 64 { 8 } else { 4 };
-    let by_cores = cores / 2;
-    let by_ram = ram_gb / 16;
-    let candidate = by_cores.min(by_ram).min(cap);
-    candidate.max(1)
+/// hardware. This compatibility wrapper applies the daemon formula without
+/// model-residency or disk constraints.
+pub fn compute_default_count(cores: u32, ram_gb: u32, _has_nvidia_gpu: bool) -> u32 {
+    compute_capacity(cores, ram_gb as f64, 0.0, f64::INFINITY)
+}
+
+pub fn compute_capacity(cores: u32, total_ram_gb: f64, resident_gb: f64, free_disk_gb: f64) -> u32 {
+    let usable_ram_gb = (total_ram_gb - resident_gb - 8.0).max(0.0);
+    (cores / 3)
+        .min((usable_ram_gb / 6.0).floor() as u32)
+        .min((free_disk_gb / 20.0).floor() as u32)
+        .clamp(1, 10)
+}
+
+pub async fn reconcile_capacity(pool: &sqlx::PgPool, worker_name: &str) -> Result<u32, String> {
+    use sqlx::Row;
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
+    let total_ram_gb = local_total_ram_gb().unwrap_or(8.0);
+    let free_disk_gb = local_free_disk_gb().unwrap_or(20.0);
+    let resident_gb: f64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(COALESCE(l.size_bytes, 0)::float8 / 1e9 + COALESCE(d.context_window, 0)::float8 / 8192.0 * 0.5), 0) FROM fleet_model_deployments d LEFT JOIN fleet_model_library l ON l.id = d.library_id WHERE LOWER(d.worker_name) = LOWER($1) AND d.desired_state = 'active'",
+    ).bind(worker_name).fetch_one(pool).await.map_err(|e| format!("read resident model memory: {e}"))?;
+    let desired = compute_capacity(cores, total_ram_gb, resident_gb, free_disk_gb);
+    ensure_workspaces(desired)?;
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    let row = sqlx::query("SELECT id FROM computers WHERE LOWER(name) = LOWER($1)")
+        .bind(worker_name)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("computer row not found for {worker_name}"))?;
+    let computer_id: sqlx::types::Uuid = row.get("id");
+    let parent = workspaces_root().join("sub-agents");
+    for slot in 0..desired as i32 {
+        let workspace = parent
+            .join(format!("sub-agent-{slot}"))
+            .to_string_lossy()
+            .into_owned();
+        sqlx::query("INSERT INTO sub_agents (computer_id, slot, status, workspace_dir) VALUES ($1, $2, 'idle', $3) ON CONFLICT (computer_id, slot) DO UPDATE SET status = CASE WHEN sub_agents.status = 'disabled' THEN 'idle' ELSE sub_agents.status END, workspace_dir = EXCLUDED.workspace_dir")
+            .bind(computer_id).bind(slot).bind(workspace).execute(&mut *tx).await.map_err(|e| e.to_string())?;
+    }
+    sqlx::query("UPDATE sub_agents SET status = 'disabled' WHERE computer_id = $1 AND slot >= $2 AND current_work_item_id IS NULL AND status <> 'busy'")
+        .bind(computer_id).bind(desired as i32).execute(&mut *tx).await.map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE fleet_workers SET sub_agent_count = $1, updated_at = NOW() WHERE LOWER(name) = LOWER($2)")
+        .bind(desired as i32).bind(worker_name).execute(&mut *tx).await.map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(desired)
+}
+
+fn local_total_ram_gb() -> Option<f64> {
+    if cfg!(target_os = "macos") {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        return String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(|b| b as f64 / 1e9);
+    }
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("MemTotal:")?
+                .trim()
+                .trim_end_matches("kB")
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .map(|kb| kb as f64 / 1e6)
+        })
+}
+
+fn local_free_disk_gb() -> Option<f64> {
+    let root = workspaces_root();
+    let out = std::process::Command::new("df")
+        .args(["-Pk", root.to_str()?])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .last()?
+        .split_whitespace()
+        .nth(3)?
+        .parse::<u64>()
+        .ok()
+        .map(|kb| kb as f64 / 1e6)
 }
 
 /// Returns the root directory (~/.forgefleet) for sub-agent workspaces.
@@ -260,12 +341,13 @@ mod tests {
     fn formula_basic() {
         // 8 cores, 32 GB, no gpu -> min(4, 2, 4) = 2
         assert_eq!(compute_default_count(8, 32, false), 2);
-        // 32 cores, 128 GB, gpu -> min(16, 8, 8) = 8
-        assert_eq!(compute_default_count(32, 128, true), 8);
+        assert_eq!(compute_default_count(32, 128, true), 10);
         // Tiny box: 2 cores, 4 GB -> max(1, min(1, 0, 4)) = 1
         assert_eq!(compute_default_count(2, 4, false), 1);
-        // NVIDIA but low RAM uses cap=4
-        assert_eq!(compute_default_count(64, 32, true), 2);
+        assert_eq!(compute_default_count(64, 32, true), 4);
+        assert_eq!(compute_capacity(32, 128.0, 20.0, 500.0), 10);
+        assert_eq!(compute_capacity(32, 64.0, 32.0, 500.0), 4);
+        assert_eq!(compute_capacity(64, 256.0, 0.0, 55.0), 2);
     }
 
     #[test]

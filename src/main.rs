@@ -3076,16 +3076,27 @@ async fn start_pulse_v2_subsystems(
     // crates/ff-agent/src/deployment_reconciler.rs.
     {
         let pool = pg_pool.clone();
+        let capacity_worker = worker_name.clone();
         let mut shutdown_rx_dep = shutdown_rx.clone();
         handles.push(tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut capacity_tick = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+            if let Err(e) = ff_agent::sub_agents::reconcile_capacity(&pool, &capacity_worker).await {
+                warn!("sub-agent capacity startup reconcile failed: {e}");
+            }
             // Skip the first immediate fire so we don't race forgefleetd
             // startup before pulse + workers are ready.
             tick.tick().await;
+            capacity_tick.tick().await;
             loop {
                 tokio::select! {
                     biased;
                     _ = shutdown_rx_dep.changed() => break,
+                    _ = capacity_tick.tick() => {
+                        if let Err(e) = ff_agent::sub_agents::reconcile_capacity(&pool, &capacity_worker).await {
+                            warn!("sub-agent capacity periodic reconcile failed: {e}");
+                        }
+                    }
                     _ = tick.tick() => {
                         match ff_agent::deployment_reconciler::reconcile_local(&pool).await {
                             Ok(s) => {
@@ -3111,6 +3122,9 @@ async fn start_pulse_v2_subsystems(
                                 }
                             }
                             Err(e) => warn!("deployment reconciler failed: {e}"),
+                        }
+                        if let Err(e) = ff_agent::sub_agents::reconcile_capacity(&pool, &capacity_worker).await {
+                            warn!("sub-agent capacity post-deployment reconcile failed: {e}");
                         }
                     }
                 }
