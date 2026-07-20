@@ -490,13 +490,17 @@ async fn cloud_cli_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, St
             .await
         {
             Ok(res) if res.exit_code == 0 && !res.stdout.trim().is_empty() => {
+                let (tin, tout) = crate::llm_attribution::parse_cli_token_counts(&format!(
+                    "{}\n{}",
+                    res.stdout, res.stderr
+                ));
                 record_review_interaction(
                     pg,
                     backend,
                     prompt,
                     &res.stdout,
-                    0,
-                    0,
+                    tin,
+                    tout,
                     i32::try_from(res.duration_ms).ok(),
                     None,
                     Some(format!("ff cli {backend}")),
@@ -538,13 +542,21 @@ async fn record_review_interaction(
     worker_name: Option<String>,
     endpoint: Option<String>,
 ) {
+    // Canonical engine (cloud CLI name or local:<catalog_id>), flagged chars/4
+    // estimate when the caller had no reported counts, and config-driven cost.
+    let engine = crate::llm_attribution::engine_label(engine);
+    let (tokens_in, tokens_out, tokens_estimated) =
+        crate::llm_attribution::tokens_or_estimate(tokens_in, tokens_out, prompt, response);
+    let cost_usd = crate::llm_attribution::cost_usd(&engine, tokens_in, tokens_out);
     let rec = ff_db::InteractionRecord {
         channel: "merge_drain_review".to_string(),
         request_text: prompt.chars().take(16000).collect(),
-        engine: Some(engine.to_string()),
+        request_meta: serde_json::json!({ "tokens_estimated": tokens_estimated }),
+        engine: Some(engine),
         response_text: response.chars().take(16000).collect(),
         tokens_in,
         tokens_out,
+        cost_usd,
         latency_ms,
         outcome: "success".to_string(),
         worker_name,

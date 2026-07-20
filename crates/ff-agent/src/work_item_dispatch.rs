@@ -1732,23 +1732,7 @@ fn dispatch_prompt(item: &AssignedWorkItem) -> String {
 /// `total tokens: 1234`. Best-effort — returns 0 when no count is found.
 #[doc(hidden)]
 pub fn parse_cli_tokens(output: &str) -> i32 {
-    let lower = output.to_ascii_lowercase();
-    // Find a "tokens" marker, then the nearest number after it (strip commas).
-    for marker in ["tokens used", "total tokens", "tokens:", "tokens"] {
-        if let Some(pos) = lower.find(marker) {
-            let tail = &output[pos + marker.len()..];
-            let digits: String = tail
-                .chars()
-                .skip_while(|c| !c.is_ascii_digit())
-                .take_while(|c| c.is_ascii_digit() || *c == ',')
-                .filter(|c| *c != ',')
-                .collect();
-            if let Ok(n) = digits.parse::<i32>() {
-                return n;
-            }
-        }
-    }
-    0
+    crate::llm_attribution::parse_total_tokens_marker(output)
 }
 
 /// Record a dispatch turn in `ff_interactions` (training data). Best-effort —
@@ -1762,14 +1746,22 @@ async fn record_dispatch_interaction(
     result: &Result<Output>,
     elapsed: Duration,
 ) {
-    let (response_text, outcome, error_text, tokens_out) = match result {
+    let request_text = dispatch_prompt(item);
+    let (response_text, outcome, error_text, tokens_in, tokens_out, tokens_estimated) = match result
+    {
         Ok(out) => {
             let text = String::from_utf8_lossy(&out.stdout)
                 .chars()
                 .take(16000)
                 .collect::<String>();
-            let toks = parse_cli_tokens(&text);
-            (text, "success".to_string(), None, toks)
+            // Scan stdout AND stderr — several vendor CLIs print their usage
+            // stats on stderr — then degrade to a flagged chars/4 estimate so
+            // the usage rollup counts this call instead of recording 0/0.
+            let combined = format!("{text}\n{}", String::from_utf8_lossy(&out.stderr));
+            let (tin, tout) = crate::llm_attribution::parse_cli_token_counts(&combined);
+            let (tin, tout, estimated) =
+                crate::llm_attribution::tokens_or_estimate(tin, tout, &request_text, &text);
+            (text, "success".to_string(), None, tin, tout, estimated)
         }
         Err(e) => (
             String::new(),
@@ -1778,6 +1770,8 @@ async fn record_dispatch_interaction(
             // the top-level wrapper (e.g. "fleet_oneshot round 1").
             Some(format!("{e:#}").chars().take(2000).collect::<String>()),
             0,
+            0,
+            false,
         ),
     };
 
@@ -1792,12 +1786,20 @@ async fn record_dispatch_interaction(
         sig
     });
 
+    // Vendor backends keep their name (claude/codex/kimi); the local codegen
+    // lane's "local" backend stays `local`. Cost comes from the config-driven
+    // rates table — $0 for local, published per-token rates for cloud.
+    let engine = crate::llm_attribution::engine_label(backend);
+    let cost_usd = crate::llm_attribution::cost_usd(&engine, tokens_in, tokens_out);
     let rec = ff_db::InteractionRecord {
         channel: "work_item_dispatch".to_string(),
-        request_text: dispatch_prompt(item),
-        engine: Some(backend.to_string()),
+        request_text,
+        request_meta: serde_json::json!({ "tokens_estimated": tokens_estimated }),
+        engine: Some(engine),
         response_text,
+        tokens_in,
         tokens_out,
+        cost_usd,
         latency_ms: i32::try_from(elapsed.as_millis()).ok(),
         outcome,
         error_text,
