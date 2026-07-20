@@ -34,6 +34,29 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+fn shell_task_capabilities(command: &str, capabilities: &[String]) -> Vec<String> {
+    let mut tags: Vec<String> = capabilities
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let first = command
+        .trim_start()
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    if first == "ff" && !tags.iter().any(|tag| tag == "ff") {
+        tags.push("ff".into());
+    }
+    tags.sort_unstable();
+    tags.dedup();
+    tags
+}
+
 /// How long a `running` row may sit without a heartbeat before the
 /// leader re-queues it.
 const STUCK_AFTER_SECS: i64 = 120;
@@ -626,7 +649,14 @@ pub async fn handoff_stuck_tasks(pg: &PgPool) -> Result<usize, sqlx::Error> {
     // handed off too many times — those become permanent failures.
     let demoted = sqlx::query(
         r#"
-        UPDATE fleet_tasks
+        WITH stale AS (
+          SELECT id FROM fleet_tasks
+           WHERE status = 'running'
+             AND last_heartbeat_at < NOW() - make_interval(secs => $1::int)
+             AND handoff_count < $2
+           FOR UPDATE SKIP LOCKED
+        )
+        UPDATE fleet_tasks AS t
            SET status                 = 'pending',
                claimed_by_computer_id = NULL,
                claimed_at             = NULL,
@@ -634,10 +664,9 @@ pub async fn handoff_stuck_tasks(pg: &PgPool) -> Result<usize, sqlx::Error> {
                handoff_count          = handoff_count + 1,
                handoff_reason         = 'heartbeat_stale',
                original_computer_id   = COALESCE(original_computer_id, claimed_by_computer_id)
-         WHERE status = 'running'
-           AND last_heartbeat_at < NOW() - make_interval(secs => $1::int)
-           AND handoff_count < $2
-        RETURNING id
+          FROM stale
+         WHERE t.id = stale.id
+        RETURNING t.id
         "#,
     )
     .bind(STUCK_AFTER_SECS as i32)
@@ -647,13 +676,19 @@ pub async fn handoff_stuck_tasks(pg: &PgPool) -> Result<usize, sqlx::Error> {
 
     let _ = sqlx::query(
         r#"
-        UPDATE fleet_tasks
+        WITH exhausted AS (
+          SELECT id FROM fleet_tasks
+           WHERE status = 'running'
+             AND last_heartbeat_at < NOW() - make_interval(secs => $1::int)
+             AND handoff_count >= $2
+           FOR UPDATE SKIP LOCKED
+        )
+        UPDATE fleet_tasks AS t
            SET status       = 'failed',
                completed_at = NOW(),
                error        = 'exceeded MAX_HANDOFFS retries'
-         WHERE status = 'running'
-           AND last_heartbeat_at < NOW() - make_interval(secs => $1::int)
-           AND handoff_count >= $2
+          FROM exhausted
+         WHERE t.id = exhausted.id
         "#,
     )
     .bind(STUCK_AFTER_SECS as i32)
@@ -861,6 +896,7 @@ pub async fn pg_enqueue_shell_task_full(
         Some(secs) => json!({ "command": command, "max_duration_secs": secs }),
         None => json!({ "command": command }),
     };
+    let capabilities = shell_task_capabilities(command, capabilities);
     let caps = serde_json::Value::Array(
         capabilities
             .iter()
@@ -2447,6 +2483,26 @@ mod watchdog_threshold_tests {
         assert!(
             STUCK_AFTER_SECS >= 2 * cadence,
             "STUCK_AFTER_SECS ({STUCK_AFTER_SECS}) must be >= 2x the heartbeat cadence ({cadence})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shell_task_capability_tests {
+    use super::shell_task_capabilities;
+
+    #[test]
+    fn enqueue_pretags_ff_commands_and_normalizes_explicit_tags() {
+        assert_eq!(
+            shell_task_capabilities("~/.local/bin/ff fleet health", &[]),
+            vec!["ff"]
+        );
+        assert_eq!(
+            shell_task_capabilities(
+                "ff model list",
+                &[" leader ".into(), "ff".into(), "leader".into()]
+            ),
+            vec!["ff", "leader"]
         );
     }
 }
