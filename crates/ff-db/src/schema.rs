@@ -11468,6 +11468,30 @@ DELETE FROM fleet_secrets
 WHERE key IN ('github_ssh_id_taylor_priv', 'github_ssh_id_taylor_pub');
 "#;
 
+/// V212 — One bounded read interface across raw, hourly, and daily computer
+/// metrics. Consumers can use retained history without knowing tier cutovers.
+pub const SCHEMA_V212_COMPUTER_METRICS_RETAINED_VIEW: &str = r#"
+CREATE OR REPLACE VIEW computer_metrics_history_retained AS
+SELECT computer_id, recorded_at, 'raw'::TEXT AS resolution, 1::BIGINT AS sample_count,
+       cpu_pct, ram_pct, ram_used_gb, disk_free_gb, gpu_pct,
+       llm_ram_allocated_gb, llm_queue_depth::DOUBLE PRECISION AS llm_queue_depth,
+       llm_active_requests::DOUBLE PRECISION AS llm_active_requests,
+       llm_tokens_per_sec
+  FROM computer_metrics_history
+UNION ALL
+SELECT computer_id, recorded_at, 'hourly'::TEXT, sample_count,
+       cpu_pct, ram_pct, ram_used_gb, disk_free_gb, gpu_pct,
+       llm_ram_allocated_gb, llm_queue_depth, llm_active_requests,
+       llm_tokens_per_sec
+  FROM computer_metrics_history_hourly
+UNION ALL
+SELECT computer_id, recorded_at, 'daily'::TEXT, sample_count,
+       cpu_pct, ram_pct, ram_used_gb, disk_free_gb, gpu_pct,
+       llm_ram_allocated_gb, llm_queue_depth, llm_active_requests,
+       llm_tokens_per_sec
+  FROM computer_metrics_history_daily;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

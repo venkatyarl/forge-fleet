@@ -1525,8 +1525,8 @@ pub struct RouteFilter {
     pub limit: i64,
 }
 
-/// `LEFT JOIN LATERAL` that pulls each host's latest `computer_metrics_history`
-/// row (written once/minute/host by the leader downsampler), aliased `load`.
+/// `LEFT JOIN LATERAL` that pulls each host's recent retained metrics (raw for
+/// this 15-minute window), aliased `load`.
 /// Always injected into [`pg_route_deployments`] so `cpu_pct` /
 /// `llm_active_requests` are available for DISPLAY on every candidate (the
 /// observability views surface them as a LOAD column), independent of whether
@@ -1537,7 +1537,7 @@ pub struct RouteFilter {
 const LOAD_METRICS_JOIN: &str = "LEFT JOIN LATERAL (
                  SELECT AVG(m.cpu_pct) AS cpu_pct,
                         ROUND(AVG(m.llm_active_requests))::int AS llm_active_requests
-                   FROM computer_metrics_history m
+                   FROM computer_metrics_history_retained m
                   WHERE m.computer_id = c.id
                     AND m.recorded_at >= NOW() - INTERVAL '15 minutes'
              ) load ON TRUE";
@@ -2538,7 +2538,7 @@ pub async fn pg_placement_candidates(pool: &PgPool) -> Result<Vec<PlacementCandi
           LEFT JOIN LATERAL (
               SELECT AVG(m.cpu_pct) AS cpu_pct,
                      AVG(m.llm_queue_depth) AS queue_depth
-                FROM computer_metrics_history m
+                FROM computer_metrics_history_retained m
                WHERE m.computer_id = c.id
                  AND m.recorded_at >= NOW() - INTERVAL '15 minutes'
           ) load ON TRUE
@@ -4571,7 +4571,7 @@ mod tests {
         // The metrics LATERAL is always present (so cpu_pct / llm_active_requests
         // are available for display on every candidate) and pulls exactly the
         // latest sample per host.
-        assert!(LOAD_METRICS_JOIN.contains("computer_metrics_history"));
+        assert!(LOAD_METRICS_JOIN.contains("computer_metrics_history_retained"));
         assert!(LOAD_METRICS_JOIN.contains("INTERVAL '15 minutes'"));
         assert!(LOAD_METRICS_JOIN.contains("AVG(m.cpu_pct)"));
         // Aliased `load` so the SELECT/ORDER fragments can reference it.

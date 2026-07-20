@@ -1041,6 +1041,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "decommission_taylor_github_identity",
         sql: schema::SCHEMA_V211_DECOMMISSION_TAYLOR_GITHUB_IDENTITY,
     },
+    PgMigration {
+        version: 212,
+        name: "computer_metrics_retained_view",
+        sql: schema::SCHEMA_V212_COMPUTER_METRICS_RETAINED_VIEW,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1750,6 +1755,42 @@ mod tests {
         .await
         .expect("count retained raw");
         assert_eq!(raw, 1);
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v212_exposes_all_retained_metrics_tiers() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        let tiers: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT resolution
+               FROM computer_metrics_history_retained
+              ORDER BY resolution",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read retained metrics view");
+        // An empty history cannot prove UNION branches at runtime, so verify
+        // the view definition also retains every tier name.
+        let definition: String = sqlx::query_scalar(
+            "SELECT pg_get_viewdef('computer_metrics_history_retained'::regclass, true)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read retained metrics view definition");
+        assert!(tiers.is_empty());
+        for tier in ["raw", "hourly", "daily"] {
+            assert!(
+                definition.contains(tier),
+                "missing {tier} tier: {definition}"
+            );
+        }
+
         drop_temp_db(admin, pool, &db_name).await;
     }
 
