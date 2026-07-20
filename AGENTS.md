@@ -1,3 +1,10 @@
+## HireFlow360 Jira handoff
+
+Map “start working on hireflow360 jiras”, “start jira monitoring”, and “get jira
+details for hireflow360 and start working” to
+`ff jira monitor --config hireflow360 --daemon`. Shared Postgres cursors,
+awaiting state, and leases are authoritative; do not ask the operator to restate them.
+
 <!-- forgefleet MCP tools -->
 ## MCP Tools: forgefleet
 

@@ -2244,6 +2244,14 @@ VALUES
    60, 'warning', 86400, 'telegram', true)
 
 ON CONFLICT (name) DO NOTHING;
+
+-- Preserve the existing `ff jira` secret-backed configuration contract. Never
+-- overwrite operator-managed values or the API token itself.
+INSERT INTO fleet_secrets(key,value,description,updated_by) VALUES
+  ('jira.hireflow360.base_url','https://hireflow360.atlassian.net','HireFlow360 Jira base URL','migration-v217'),
+  ('jira.hireflow360.auth_email','venkat@hireflow360.com','HireFlow360 Jira auth email','migration-v217'),
+  ('jira.hireflow360.token_secret_key','hireflow360_jira_api_token','Fleet-secret key containing the Jira API token','migration-v217')
+ON CONFLICT (key) DO NOTHING;
 "#;
 
 // ─── V35: retire config/cloud_llm_providers.toml → Postgres ─────────────────
@@ -11560,6 +11568,112 @@ pub const SCHEMA_V216_MESH_PROBE_DIAGNOSTICS: &str = r#"
 ALTER TABLE fleet_mesh_status
     ADD COLUMN IF NOT EXISTS ping_ok BOOLEAN,
     ADD COLUMN IF NOT EXISTS ssh_ok BOOLEAN;
+"#;
+
+/// V217 — durable, lease-coordinated Jira monitor state.
+pub const SCHEMA_V217_JIRA_MONITORING: &str = r#"
+CREATE TABLE IF NOT EXISTS jira_rulesets (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    rules_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    content_hash TEXT NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT true,
+    UNIQUE (name, version)
+);
+
+CREATE TABLE IF NOT EXISTS jira_configs (
+    name TEXT PRIMARY KEY,
+    project_key TEXT NOT NULL,
+    owner_account_id TEXT NOT NULL,
+    jira_secret_ref TEXT NOT NULL,
+    poll_interval_s INTEGER NOT NULL DEFAULT 300 CHECK (poll_interval_s > 0),
+    retag_after_s INTEGER NOT NULL DEFAULT 86400 CHECK (retag_after_s > 0),
+    queue_jql TEXT NOT NULL,
+    ruleset_id TEXT NOT NULL REFERENCES jira_rulesets(id),
+    label_policy_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    transition_policy_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    repo_map_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    cwd_path_globs TEXT[] NOT NULL DEFAULT '{}',
+    version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0)
+);
+
+CREATE TABLE IF NOT EXISTS jira_monitor_leases (
+    config_id TEXT PRIMARY KEY REFERENCES jira_configs(name) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    lease_token UUID NOT NULL,
+    heartbeat_at TIMESTAMPTZ NOT NULL,
+    lease_until TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS jira_issue_leases (
+    config_id TEXT NOT NULL REFERENCES jira_configs(name) ON DELETE CASCADE,
+    issue_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    lease_token UUID NOT NULL,
+    branch TEXT,
+    repo TEXT,
+    heartbeat_at TIMESTAMPTZ NOT NULL,
+    lease_until TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (config_id, issue_id)
+);
+
+CREATE TABLE IF NOT EXISTS jira_watch_state (
+    config_id TEXT NOT NULL REFERENCES jira_configs(name) ON DELETE CASCADE,
+    issue_id TEXT NOT NULL,
+    last_seen_comment_id TEXT,
+    last_seen_comment_created_at TIMESTAMPTZ,
+    last_seen_status TEXT,
+    last_seen_assignee_id TEXT,
+    awaiting_party TEXT,
+    awaiting_since TIMESTAMPTZ,
+    last_retag_at TIMESTAMPTZ,
+    next_action_at TIMESTAMPTZ,
+    active_work_lease_id UUID,
+    state_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (config_id, issue_id)
+);
+
+CREATE TABLE IF NOT EXISTS jira_action_log (
+    id BIGSERIAL PRIMARY KEY,
+    event_key TEXT NOT NULL UNIQUE,
+    config_id TEXT NOT NULL REFERENCES jira_configs(name) ON DELETE CASCADE,
+    issue_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_jira_watch_due ON jira_watch_state(config_id, next_action_at);
+CREATE INDEX IF NOT EXISTS idx_jira_issue_leases_until ON jira_issue_leases(config_id, lease_until);
+
+INSERT INTO jira_rulesets (id, name, version, rules_json, content_hash, active)
+VALUES (
+    'hireflow360-v1', 'hireflow360', 1,
+    jsonb_build_object(
+      'instructions_secret_ref', 'jira.hireflow360.instructions',
+      'queue_policy', ARRAY['Blocker summary','Priority summary','reopen','reporter reply','Jira priority','oldest assigned bug','other'],
+      'scope', 'assignee=currentUser() AND statusCategory != Done',
+      'repo_name_labels', ARRAY['hireflow360','hireflow360-api','hireflow360-web']
+    ),
+    md5('jira.hireflow360.instructions:v1'), true
+)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO jira_configs (
+    name, project_key, owner_account_id, jira_secret_ref, poll_interval_s,
+    retag_after_s, queue_jql, ruleset_id, label_policy_json,
+    transition_policy_json, repo_map_json, cwd_path_globs, version
+) VALUES (
+    'hireflow360', 'HFPROD', 'venkat@hireflow360.com',
+    'hireflow360_jira_api_token', 300, 86400,
+    'project = HFPROD AND assignee = currentUser() AND statusCategory != Done',
+    'hireflow360-v1',
+    '{"product_label":"hireflow360","labels_from_repos":true}'::jsonb,
+    '{"todo":"11","in_progress":"21","review":"31","done":"41"}'::jsonb,
+    '{"hireflow360":"hireflow360","hireflow360-api":"hireflow360-api","hireflow360-web":"hireflow360-web"}'::jsonb,
+    ARRAY['**/projects/HireFlow360/**'], 1
+)
+ON CONFLICT (name) DO NOTHING;
 "#;
 
 /// Squashed Postgres bootstrap through migration v161.

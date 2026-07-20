@@ -4019,6 +4019,50 @@ pub enum JiraCommand {
     Instructions { alias: String, text: Option<String> },
     /// Resolve and print the Jira API token for a site.
     Token { alias: String },
+    /// Run or control the durable Jira work monitor.
+    Monitor {
+        #[command(subcommand)]
+        command: Option<JiraMonitorCommand>,
+        #[arg(long)]
+        config: Option<String>,
+        #[arg(long, conflicts_with_all = ["once", "dry_run"])]
+        daemon: bool,
+        #[arg(long, conflicts_with_all = ["daemon", "dry_run"])]
+        once: bool,
+        #[arg(long, conflicts_with_all = ["daemon", "once"])]
+        dry_run: bool,
+    },
+    /// Print the ordered assigned queue and current issue lease holders.
+    Queue {
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Re-sync Jira state into Postgres after a crash.
+    Reconcile {
+        #[arg(long)]
+        config: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Validate a durable Jira monitor configuration.
+    Config {
+        #[command(subcommand)]
+        command: JiraConfigCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum JiraMonitorCommand {
+    /// Show monitor ownership, heartbeat, and expiry.
+    Status,
+    /// Revoke the monitor lease so its holder stops before the next poll.
+    Stop,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum JiraConfigCommand {
+    /// Validate credentials, rules, policies, and CWD mappings.
+    Validate { name: String },
 }
 
 #[derive(Debug, Subcommand)]

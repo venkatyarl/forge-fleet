@@ -1066,6 +1066,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "mesh_probe_diagnostics",
         sql: schema::SCHEMA_V216_MESH_PROBE_DIAGNOSTICS,
     },
+    PgMigration {
+        version: 217,
+        name: "jira_monitoring",
+        sql: schema::SCHEMA_V217_JIRA_MONITORING,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1970,6 +1975,38 @@ mod tests {
                 .expect("read grown status");
         assert_eq!(grown_status, "idle");
 
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v217_creates_and_seeds_jira_monitoring() {
+        // CI commonly has no Postgres; the helper checks both supported URL vars.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on a fresh database");
+
+        let seeded: (String, i32, i32) = sqlx::query_as(
+            "SELECT project_key,poll_interval_s,retag_after_s
+               FROM jira_configs WHERE name='hireflow360'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read seeded Jira config");
+        assert_eq!(seeded, ("HFPROD".into(), 300, 86_400));
+
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.tables
+              WHERE table_schema='public' AND table_name IN
+                ('jira_configs','jira_rulesets','jira_monitor_leases',
+                 'jira_watch_state','jira_issue_leases','jira_action_log')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count Jira monitor tables");
+        assert_eq!(tables, 6);
         drop_temp_db(admin, pool, &db_name).await;
     }
 }
