@@ -20,6 +20,9 @@ pub mod restore_drill;
 pub mod self_heal;
 pub mod slot_manager;
 
+#[cfg(test)]
+pub mod self_heal_tests;
+
 /// Gracefully release this computer's active work-item leases before an agent
 /// restart.
 ///
