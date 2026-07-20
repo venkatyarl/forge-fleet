@@ -810,6 +810,11 @@ mod tests {
 
     #[test]
     fn recovery_prefers_a_never_failed_endpoint() {
+        if std::env::var("FORGEFLEET_POSTGRES_URL").is_err()
+            && std::env::var("FORGEFLEET_DATABASE_URL").is_err()
+        {
+            return;
+        }
         // `None` (no recorded failure) is treated as infinitely long ago.
         let since = [
             Some(Duration::from_secs(59)),

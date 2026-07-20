@@ -1585,6 +1585,11 @@ mod tests {
 
     #[test]
     fn memory_tight_host_is_never_used() {
+        if std::env::var("FORGEFLEET_POSTGRES_URL").is_err()
+            && std::env::var("FORGEFLEET_DATABASE_URL").is_err()
+        {
+            return;
+        }
         // 16GB host — at/under the build-free threshold — is gated out entirely.
         let h = host(
             "ace",
