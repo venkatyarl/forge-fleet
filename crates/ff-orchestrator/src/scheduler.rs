@@ -120,6 +120,27 @@ mod humantime_serde_compat {
     }
 }
 
+// ─── Dispatch-tick staleness threshold ───────────────────────────────────────
+
+/// Default staleness threshold for a node's dispatch tick (3 minutes).
+const DEFAULT_DISPATCH_TICK_STALE_SECS: i64 = 180;
+
+/// Env var overriding the stale dispatch-tick threshold, in seconds.
+pub const DISPATCH_TICK_STALE_SECS_ENV: &str = "FORGEFLEET_DISPATCH_TICK_STALE_SECS";
+
+/// Resolve the dispatch-tick staleness threshold in seconds, honoring
+/// `FORGEFLEET_DISPATCH_TICK_STALE_SECS`. Invalid or non-positive values fall
+/// back to the 180s default.
+pub fn dispatch_tick_stale_secs() -> i64 {
+    parse_dispatch_tick_stale_secs(std::env::var(DISPATCH_TICK_STALE_SECS_ENV).ok().as_deref())
+}
+
+fn parse_dispatch_tick_stale_secs(raw: Option<&str>) -> i64 {
+    raw.and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_DISPATCH_TICK_STALE_SECS)
+}
+
 // ─── Node Capacity (runtime snapshot) ────────────────────────────────────────
 
 /// Runtime resource snapshot for a single node.
@@ -170,15 +191,20 @@ impl NodeCapacity {
         }
     }
 
+    /// Returns `true` if this node's dispatch tick is older than the
+    /// configured staleness threshold (see [`dispatch_tick_stale_secs`]).
+    pub fn dispatch_tick_is_stale(&self) -> bool {
+        self.dispatch_tick_at.is_some_and(|tick| {
+            tick < Utc::now() - chrono::Duration::seconds(dispatch_tick_stale_secs())
+        })
+    }
+
     /// Check if this node can satisfy the given requirements.
     pub fn can_fit(&self, req: &ResourceRequirements) -> bool {
         if !self.online {
             return false;
         }
-        if self
-            .dispatch_tick_at
-            .is_some_and(|tick| tick < Utc::now() - chrono::Duration::minutes(3))
-        {
+        if self.dispatch_tick_is_stale() {
             return false;
         }
         if req.gpu_required && !self.has_gpu {
@@ -409,6 +435,17 @@ impl Scheduler {
         }
     }
 
+    /// Update the last dispatch-tick timestamp for a node.
+    ///
+    /// Called when the agent reports a dispatch tick (or a heartbeat that
+    /// implies the dispatch loop is still running). Keeps the scheduler's
+    /// dispatch-tick liveness window fresh.
+    pub fn update_dispatch_tick(&mut self, worker_name: &str, tick_at: Option<DateTime<Utc>>) {
+        if let Some(node) = self.nodes.get_mut(worker_name) {
+            node.dispatch_tick_at = tick_at;
+        }
+    }
+
     /// Release resources for a completed task.
     pub fn release_task(&mut self, worker_name: &str, task_id: Uuid) -> Option<RunningTask> {
         self.nodes
@@ -549,11 +586,7 @@ impl Scheduler {
         let mut preempt_candidates: Vec<(String, Uuid, f64)> = Vec::new();
 
         for (name, cap) in &self.nodes {
-            if !cap.online
-                || cap
-                    .dispatch_tick_at
-                    .is_some_and(|tick| tick < Utc::now() - chrono::Duration::minutes(3))
-            {
+            if !cap.online || cap.dispatch_tick_is_stale() {
                 continue;
             }
             // GPU check
@@ -815,6 +848,28 @@ mod tests {
             }
             other => panic!("Expected Queue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_parse_dispatch_tick_stale_secs() {
+        assert_eq!(
+            parse_dispatch_tick_stale_secs(None),
+            DEFAULT_DISPATCH_TICK_STALE_SECS
+        );
+        assert_eq!(parse_dispatch_tick_stale_secs(Some("60")), 60);
+        assert_eq!(parse_dispatch_tick_stale_secs(Some(" 600 ")), 600);
+        assert_eq!(
+            parse_dispatch_tick_stale_secs(Some("0")),
+            DEFAULT_DISPATCH_TICK_STALE_SECS
+        );
+        assert_eq!(
+            parse_dispatch_tick_stale_secs(Some("-5")),
+            DEFAULT_DISPATCH_TICK_STALE_SECS
+        );
+        assert_eq!(
+            parse_dispatch_tick_stale_secs(Some("bogus")),
+            DEFAULT_DISPATCH_TICK_STALE_SECS
+        );
     }
 
     #[test]

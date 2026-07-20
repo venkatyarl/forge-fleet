@@ -15,9 +15,8 @@ use tracing::{error, info, warn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TickScope {
-    /// Not yet used — every registered tick today is leader-gated; kept as
-    /// the documented shape for per-node ticks (disk sampler etc. migrate in).
-    #[allow(dead_code)]
+    /// Runs on every node — for ticks that only touch node-local state
+    /// (e.g. the metrics scraper polling this node's inference servers).
     EveryNode,
     LeaderOnly,
 }
@@ -63,6 +62,26 @@ impl TickRegistry {
                 interval: Duration::from_secs(30),
                 scope: TickScope::LeaderOnly,
                 runner: run_telegram_reply_poller_tick,
+            },
+            TickDefinition {
+                name: "log_analysis_worker",
+                interval: crate::log_analysis_worker::DEFAULT_INTERVAL,
+                scope: TickScope::LeaderOnly,
+                runner: run_log_analysis_tick,
+            },
+            TickDefinition {
+                name: "metrics_scraper",
+                interval: crate::metrics_scraper::DEFAULT_INTERVAL,
+                scope: TickScope::EveryNode,
+                runner: run_metrics_scraper_tick,
+            },
+            TickDefinition {
+                // Clock-gated inside the runner: sends once per day at/after
+                // 08:00 local; the 60s interval is just the due-check cadence.
+                name: "nightly_telegram_digest",
+                interval: Duration::from_secs(60),
+                scope: TickScope::LeaderOnly,
+                runner: run_nightly_digest_tick,
             },
         ]
         .into_iter()
@@ -185,12 +204,33 @@ fn run_telegram_reply_poller_tick(
     })
 }
 
+fn run_log_analysis_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::log_analysis_worker::run_log_analysis_tick(&pg, &worker_name)
+            .await
+            .map(|_| ())
+    })
+}
+
+fn run_metrics_scraper_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::metrics_scraper::run_metrics_scraper_tick(&pg, &worker_name)
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
+    })
+}
+
+fn run_nightly_digest_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move { crate::ha::periodic::run_nightly_digest_tick(&pg, &worker_name).await })
+}
+
 /// How often the dispatch-tick watchdog wakes up to check liveness.
-const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Maximum allowed silence from the dispatch-tick scheduler loop before the
 /// watchdog considers the daemon stuck and triggers a restart.
-const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub fn start_tick_scheduler(
     pg: PgPool,
@@ -273,7 +313,7 @@ pub fn start_tick_scheduler(
 /// trigger an out-of-process restart. Under systemd we ask systemd to restart
 /// the canonical unit; otherwise we fall back to `nohup`-re-executing the
 /// current binary and then exit.
-async fn dispatch_tick_watchdog(
+pub(crate) async fn dispatch_tick_watchdog(
     start: Instant,
     last_tick_at: Arc<AtomicU64>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -310,7 +350,7 @@ async fn dispatch_tick_watchdog(
 /// On Linux with systemd available, this asks systemd to restart the canonical
 /// `forgefleetd.service` unit. On failure, or on non-systemd platforms, it
 /// falls back to `nohup`-re-executing the current binary.
-async fn restart_agent() {
+pub(crate) async fn restart_agent() {
     if try_systemd_restart().await {
         info!("dispatch tick watchdog: systemd restart triggered; exiting");
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -328,7 +368,7 @@ async fn restart_agent() {
 /// Attempt to restart via systemd user units. Returns `true` if the systemctl
 /// command reported success. This matches the restart pattern used elsewhere
 /// in the fleet (`local_healer`, `revive`, `panic_stop`).
-async fn try_systemd_restart() -> bool {
+pub(crate) async fn try_systemd_restart() -> bool {
     if !cfg!(target_os = "linux") {
         return false;
     }
@@ -362,7 +402,7 @@ async fn try_systemd_restart() -> bool {
 
 /// Fall-back restart: re-execute the current binary with `nohup` so it
 /// survives this process exiting, then terminate.
-fn try_nohup_restart() -> anyhow::Result<()> {
+pub(crate) fn try_nohup_restart() -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
 

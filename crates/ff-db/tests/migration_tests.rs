@@ -111,3 +111,105 @@ async fn migration_fresh_bootstrap_starts_from_v161_baseline_and_is_idempotent()
 
     drop_temp_db(admin, pool, &db_name).await;
 }
+
+/// V176 adds merge train tracking tables. Verify they are created by the
+/// migration and support the expected insert patterns.
+#[tokio::test]
+async fn v176_merge_train_tables_are_created() {
+    let Some((admin, pool, db_name)) = create_temp_db().await else {
+        eprintln!("skipping v176 merge train test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL");
+        return;
+    };
+
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .expect("run postgres migrations");
+
+    // Insert a minimal project/work_item so foreign keys resolve.
+    let project_id = "v176-test-project";
+    sqlx::query("INSERT INTO projects (id, display_name, status) VALUES ($1, $2, 'active')")
+        .bind(project_id)
+        .bind("v176 test project")
+        .execute(&pool)
+        .await
+        .expect("insert test project");
+
+    let work_item_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO work_items (project_id, kind, title, created_by)
+         VALUES ($1, 'task', 'v176 test', 'test') RETURNING id",
+    )
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .expect("insert test work item");
+
+    let queue_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO work_item_merge_queue (work_item_id, project_id, branch_name)
+         VALUES ($1, $2, 'v176-branch') RETURNING id",
+    )
+    .bind(work_item_id)
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .expect("insert test merge queue entry");
+
+    let train_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO merge_trains (project_id, base_branch, status)
+         VALUES ($1, 'main', 'assembling') RETURNING id",
+    )
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .expect("insert merge train");
+
+    let member_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO merge_train_members
+         (train_id, work_item_id, queue_id, position, branch_name, status)
+         VALUES ($1, $2, $3, 1, 'v176-branch', 'pending') RETURNING id",
+    )
+    .bind(train_id)
+    .bind(work_item_id)
+    .bind(queue_id)
+    .fetch_one(&pool)
+    .await
+    .expect("insert merge train member");
+
+    // Link the queue entry back to the train.
+    sqlx::query("UPDATE work_item_merge_queue SET train_id = $1 WHERE id = $2")
+        .bind(train_id)
+        .bind(queue_id)
+        .execute(&pool)
+        .await
+        .expect("link queue entry to train");
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM merge_train_members WHERE train_id = $1")
+            .bind(train_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count merge train members");
+    assert_eq!(count, 1, "expected one member in the train");
+
+    let linked_train: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT train_id FROM work_item_merge_queue WHERE id = $1")
+            .bind(queue_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read queue entry train_id");
+    assert_eq!(
+        linked_train,
+        Some(train_id),
+        "queue entry must reference its train"
+    );
+
+    // Clean up the member explicitly so the train can be dropped before the
+    // work_item/queue rows (foreign keys are CASCADE, but the explicit delete
+    // makes the test intent clear).
+    sqlx::query("DELETE FROM merge_train_members WHERE id = $1")
+        .bind(member_id)
+        .execute(&pool)
+        .await
+        .expect("delete merge train member");
+
+    drop_temp_db(admin, pool, &db_name).await;
+}
