@@ -14,8 +14,8 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
 use anyhow::Context;
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind,
@@ -64,6 +64,7 @@ mod helpers;
 mod init_cmd;
 mod instructions_cmd;
 mod interactions_cmd;
+mod jira_cmd;
 mod lifecycle_cmd;
 mod llm_cmd;
 mod logs_cmd;
@@ -526,6 +527,11 @@ enum Command {
     Secrets {
         #[command(subcommand)]
         command: SecretsCommand,
+    },
+    /// Manage Jira site configurations stored in fleet secrets.
+    Jira {
+        #[command(subcommand)]
+        command: JiraCommand,
     },
     /// Deferred task queue — schedule work that runs when conditions are met
     /// (node comes online, a time is reached, manual retry).
@@ -3958,6 +3964,33 @@ pub enum SecretsCommand {
     },
 }
 
+#[derive(Debug, Clone, Subcommand)]
+pub enum JiraCommand {
+    /// List configured Jira site aliases.
+    #[command(alias = "ls")]
+    List,
+    /// Print a Jira site configuration (never prints the API token).
+    Get { alias: String },
+    /// Set or update a Jira site configuration.
+    Set {
+        alias: String,
+        #[arg(long)]
+        base_url: String,
+        #[arg(long = "project")]
+        project_key: String,
+        #[arg(long = "email")]
+        auth_email: String,
+        #[arg(long = "token-key")]
+        token_secret_key: String,
+        #[arg(long)]
+        instructions: Option<String>,
+    },
+    /// Get or set the instructions for a Jira site.
+    Instructions { alias: String, text: Option<String> },
+    /// Resolve and print the Jira API token for a site.
+    Token { alias: String },
+}
+
 #[derive(Debug, Subcommand)]
 pub enum TaskCommand {
     /// List recent tasks
@@ -4051,6 +4084,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Secrets { command }) => {
             return secrets_cmd::handle_secrets(command.clone()).await;
+        }
+        Some(Command::Jira { command }) => {
+            return jira_cmd::handle_jira(command.clone()).await;
         }
         Some(Command::Defer { command }) => return defer_cmd::handle_defer(command.clone()).await,
         Some(Command::Interactions { command }) => {
@@ -4431,6 +4467,7 @@ async fn main() -> Result<()> {
         Some(Command::Task { command }) => task_cmd::handle_task(command, &config_path).await,
         Some(Command::Init { global, project }) => init_cmd::handle_init(global, project).await,
         Some(Command::Secrets { command }) => secrets_cmd::handle_secrets(command).await,
+        Some(Command::Jira { command }) => jira_cmd::handle_jira(command).await,
         Some(Command::Defer { command }) => defer_cmd::handle_defer(command).await,
         Some(Command::Interactions { command }) => {
             interactions_cmd::handle_interactions(command).await

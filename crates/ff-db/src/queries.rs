@@ -4035,8 +4035,7 @@ pub async fn pg_list_secrets(
 > {
     let rows = sqlx::query(
         "SELECT key, description, updated_by, updated_at
-         FROM fleet_secrets ORDER BY key
-         LIMIT 100",
+         FROM fleet_secrets ORDER BY key",
     )
     .fetch_all(pool)
     .await?;
