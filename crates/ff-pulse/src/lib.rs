@@ -64,6 +64,9 @@ pub mod ray_detect;
 pub mod reader;
 pub mod software_collector;
 pub mod subscriber;
+pub mod worker;
+
+pub use worker::Worker;
 
 pub use client::PulseClient;
 pub use error::{PulseError, Result};
