@@ -115,6 +115,13 @@ pub struct PulseBeatV2 {
     /// compatibility during mixed-generation deployments.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub receivers: Vec<String>,
+    /// When this node's work-item dispatch tick loop last fired, recorded via
+    /// [`crate::heartbeat_v2::note_dispatch_tick`]. Consumers (scheduler
+    /// `NodeCapacity`) treat a stale or absent tick as "not a safe assignment
+    /// target". Always serialized (null until the first tick) so every beat
+    /// carries the field; `None` on beats from daemons predating it.
+    #[serde(default)]
+    pub dispatch_tick_at: Option<DateTime<Utc>>,
 }
 
 // -----------------------------------------------------------------------------
@@ -519,6 +526,7 @@ impl PulseBeatV2 {
             encountered_bugs: Vec::new(),
             local_tasks: Vec::new(),
             receivers: Vec::new(),
+            dispatch_tick_at: None,
         }
     }
 }
@@ -642,6 +650,25 @@ mod tests {
         assert!(parsed.multi_host_participation.is_none());
         assert!(parsed.encountered_bugs.is_empty());
         assert!(parsed.local_tasks.is_empty());
+        assert!(parsed.dispatch_tick_at.is_none());
+    }
+
+    /// The dispatch-tick field must be present on the wire in every beat —
+    /// even before the first tick fires (as null) — so consumers never have
+    /// to distinguish "field omitted" from "tick never fired".
+    #[test]
+    fn dispatch_tick_at_is_serialized_on_every_beat() {
+        let mut beat = PulseBeatV2::skeleton("taylor");
+        let value = serde_json::to_value(&beat).expect("serialize");
+        let obj = value.as_object().expect("object");
+        assert!(obj.contains_key("dispatch_tick_at"));
+        assert!(obj["dispatch_tick_at"].is_null());
+
+        let tick = Utc::now();
+        beat.dispatch_tick_at = Some(tick);
+        let json = serde_json::to_string(&beat).expect("serialize");
+        let parsed: PulseBeatV2 = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.dispatch_tick_at, Some(tick));
     }
 
     #[test]
@@ -679,6 +706,7 @@ mod tests {
             "encountered_bugs",
             "local_tasks",
             "receivers",
+            "dispatch_tick_at",
         ] {
             obj.remove(later_field);
         }

@@ -10,10 +10,10 @@
 //! result in DB writes. See materializer.rs.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use redis::AsyncCommands;
 use sysinfo::{Disks, System};
 use tokio::sync::watch;
@@ -28,6 +28,28 @@ use crate::beat_v2::{
 use crate::docker_probe::DockerProbe;
 use crate::llm_probe::LlmProbe;
 use crate::software_collector::SoftwareCollector;
+
+/// Wall-clock of the last dispatch tick, as epoch millis (0 = never fired).
+/// A process-wide atomic rather than a publisher field so the daemon's
+/// dispatch-tick scheduler loop (crates/ff-agent) can stamp it without
+/// holding a publisher handle, and so the hot tick path never takes a lock.
+static DISPATCH_TICK_AT_MS: AtomicI64 = AtomicI64::new(0);
+
+/// Record that the work-item dispatch tick just fired. Called by the daemon's
+/// tick scheduler loop once per iteration; every subsequently published beat
+/// carries this instant as [`PulseBeatV2::dispatch_tick_at`].
+pub fn note_dispatch_tick() {
+    DISPATCH_TICK_AT_MS.store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+}
+
+/// The last recorded dispatch tick, or `None` if it has never fired in this
+/// process.
+fn last_dispatch_tick_at() -> Option<DateTime<Utc>> {
+    match DISPATCH_TICK_AT_MS.load(Ordering::Relaxed) {
+        0 => None,
+        ms => DateTime::from_timestamp_millis(ms),
+    }
+}
 
 /// Publisher for PulseBeatV2 — richer payload used by Pulse v2 subsystems.
 pub struct HeartbeatV2Publisher {
@@ -347,6 +369,11 @@ impl HeartbeatV2Publisher {
                 (skeleton, false)
             }
         };
+
+        // Stamped after the match so every beat carries it — the fully-probed
+        // beat, both degraded skeleton fallbacks, and the LWT final beat
+        // (which also goes through build_beat).
+        beat.dispatch_tick_at = last_dispatch_tick_at();
 
         // Phase B: async probes — safe to .await because blocking work above
         // is now on a separate thread.
@@ -1315,14 +1342,28 @@ mod tests {
         let client = redis::Client::open("redis://localhost:56379").unwrap();
         let pub_ =
             HeartbeatV2Publisher::new(client, "test-computer".into(), Duration::from_secs(15), 100);
+        // Simulate the daemon's dispatch loop having ticked: the built beat
+        // must carry the recorded instant through serialization.
+        note_dispatch_tick();
         let beat = pub_.build_beat().await;
         assert_eq!(beat.pulse_protocol_version, 2);
         assert_eq!(beat.computer_name, "test-computer");
         assert!(beat.hardware.cpu_cores > 0);
+        assert!(beat.dispatch_tick_at.is_some());
         let json = serde_json::to_string(&beat).expect("serialize");
         let decoded: PulseBeatV2 = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.computer_name, "test-computer");
         assert_eq!(decoded.hardware.cpu_cores, beat.hardware.cpu_cores);
+        assert_eq!(decoded.dispatch_tick_at, beat.dispatch_tick_at);
+    }
+
+    #[test]
+    fn note_dispatch_tick_records_current_instant() {
+        let before = Utc::now();
+        note_dispatch_tick();
+        let tick = last_dispatch_tick_at().expect("tick recorded");
+        assert!(tick >= before - chrono::Duration::seconds(1));
+        assert!(tick <= Utc::now() + chrono::Duration::seconds(1));
     }
 
     #[test]

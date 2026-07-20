@@ -68,7 +68,7 @@ pub mod subscriber;
 pub use client::PulseClient;
 pub use error::{PulseError, Result};
 pub use heartbeat::HeartbeatPublisher;
-pub use heartbeat_v2::HeartbeatV2Publisher;
+pub use heartbeat_v2::{HeartbeatV2Publisher, note_dispatch_tick};
 pub use metrics::{FleetSnapshot, LoadedModel, NodeMetrics, PulseEvent, PulseEventType};
 pub use software_collector::SoftwareCollector;
 pub use subscriber::PulseSubscriber;
