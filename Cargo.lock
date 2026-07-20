@@ -1327,6 +1327,7 @@ dependencies = [
  "ff-orchestrator",
  "ff-runtime",
  "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
