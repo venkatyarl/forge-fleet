@@ -8531,6 +8531,67 @@ pub async fn pg_reconcile_sub_agent_slots(pool: &PgPool) -> Result<(u64, u64)> {
     Ok((relinked, freed))
 }
 
+/// Reconcile `sub_agents.status` / `current_work_item_id` from the lease
+/// source of truth (`work_item_leases`). The mutable slot columns are written
+/// on the claim path but can drift from the lease lifecycle (observed
+/// 2026-07-20: 1 busy slot while 36 leases were active, and 51 busy while ~17
+/// were): the stuck-slot reaper used to wipe a busy slot whose long build was
+/// still heartbeating its lease, and several release paths (guarded
+/// `WHERE current_work_item_id = $2`, HA drain, cancel) can miss the slot
+/// update. Two directions, returns `(relinked, freed)`:
+///
+/// 1. relink — a slot holding an ACTIVE lease must read `busy` with that
+///    lease's work_item (newest lease wins if several). `'disabled'` slots are
+///    left alone: that status is an operator quarantine, not lifecycle state.
+/// 2. free — a `busy` slot with NO active lease whose recorded work_item's
+///    lease on this slot was RELEASED is a missed release; reset it to idle.
+///    The released-lease guard keeps this from clobbering the agent
+///    coordinator's non-lease claims (`fleet_run` dispatch never writes lease
+///    rows), which stay owned by the stuck-slot reaper's age ceiling.
+pub async fn pg_reconcile_sub_agent_slots(pool: &PgPool) -> Result<(u64, u64)> {
+    let relinked = sqlx::query(
+        "UPDATE sub_agents sa
+            SET status = 'busy',
+                current_work_item_id = l.work_item_id,
+                started_at = COALESCE(sa.started_at, l.created_at),
+                last_heartbeat_at = NOW()
+           FROM (SELECT DISTINCT ON (sub_agent_id) sub_agent_id, work_item_id, created_at
+                   FROM work_item_leases
+                  WHERE released_at IS NULL AND sub_agent_id IS NOT NULL
+                  ORDER BY sub_agent_id, created_at DESC) l
+          WHERE sa.id = l.sub_agent_id
+            AND sa.status <> 'disabled'
+            AND (sa.status <> 'busy'
+                 OR sa.current_work_item_id IS DISTINCT FROM l.work_item_id)",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    let freed = sqlx::query(
+        "UPDATE sub_agents sa
+            SET status = 'idle',
+                current_work_item_id = NULL,
+                started_at = NULL,
+                last_heartbeat_at = NOW()
+          WHERE sa.status = 'busy'
+            AND sa.current_work_item_id IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM work_item_leases l
+                 WHERE l.sub_agent_id = sa.id AND l.released_at IS NULL)
+            AND EXISTS (
+                SELECT 1 FROM work_item_leases l
+                 WHERE l.sub_agent_id = sa.id
+                   AND l.work_item_id = sa.current_work_item_id
+                   AND l.released_at IS NOT NULL)",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok((relinked, freed))
+}
+
 /// Computer ids that currently host a LIVE, agent-capable model deployment:
 /// healthy, with enough per-slot context to actually drive a coding agent, and a
 /// recent health check (so a model that died after its row was written doesn't
