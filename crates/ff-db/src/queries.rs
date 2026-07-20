@@ -8437,7 +8437,10 @@ pub async fn pg_free_slots(
                 SELECT 1 FROM work_item_leases l
                  WHERE l.sub_agent_id = sa.id AND l.released_at IS NULL)
             AND ($1::text IS NULL OR c.name = $1)
-          ORDER BY sa.last_heartbeat_at DESC NULLS LAST
+          -- Prefer regular sub-agent slots; only fall back to canonical
+          -- checkouts (kind='canonical') when all regular slots are busy.
+          ORDER BY CASE WHEN sa.kind = 'canonical' THEN 1 ELSE 0 END,
+                   sa.last_heartbeat_at DESC NULLS LAST
           LIMIT $2",
     )
     .bind(computer_filter)

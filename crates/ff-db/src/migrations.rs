@@ -906,6 +906,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "postgres_replica_dead_alert",
         sql: schema::SCHEMA_V184_POSTGRES_REPLICA_DEAD_ALERT,
     },
+    PgMigration {
+        version: 185,
+        name: "sub_agents_kind",
+        sql: schema::SCHEMA_V185_SUB_AGENTS_KIND,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

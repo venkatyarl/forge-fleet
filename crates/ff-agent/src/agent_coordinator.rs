@@ -19,7 +19,14 @@
 //! Slot seeding lives in [`ensure_sub_agent_rows`] — the daemon calls it
 //! once at startup per computer, so every live computer has at least one
 //! worker row ready.
+//!
+//! A special canonical slot (slot 99, kind='canonical') can be registered per
+//! computer pointing at `~/projects/{project}`. It is treated as the lowest-
+//! preference slot and is only usable when the tree is clean and no interactive
+//! operator session owns it.
 
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -536,6 +543,140 @@ pub async fn ensure_sub_agent_rows(
     Ok(created)
 }
 
+/// Reserved slot index for the canonical per-computer project checkout.
+const CANONICAL_SLOT: i32 = 99;
+/// Environment override for the canonical project name (defaults to "forge-fleet").
+const CANONICAL_PROJECT_ENV: &str = "FORGEFLEET_CANONICAL_PROJECT";
+/// How recently `.git/index` must have been touched before we consider an
+/// operator actively editing the canonical tree (5 minutes).
+const INTERACTIVE_SESSION_THRESHOLD_SECS: u64 = 300;
+
+/// Expand a leading `~` to `$HOME`. Returns the input unchanged if there is no
+/// leading tilde or `$HOME` is not set.
+fn expand_tilde(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().to_string();
+        }
+    }
+    p.to_string()
+}
+
+/// Check whether `path` (a `~/projects/{project}` style canonical checkout) is
+/// safe to use as a build workspace.
+///
+/// Requirements:
+/// * directory exists and contains a `.git` repo
+/// * working tree is clean (`git status --porcelain` is empty)
+/// * `.git/index` has not been touched recently (no active operator session)
+/// * no `.operator_session` marker file is present
+/// * on `adele`, no `.adele_operator_session` marker is present
+///
+/// This is a filesystem-only, synchronous guard. Callers running on the target
+/// computer pass the local path; never call this for a remote path and trust
+/// the result.
+pub fn is_canonical_workspace_usable(path: &str, computer_name: Option<&str>) -> bool {
+    let expanded = expand_tilde(path);
+    let p = Path::new(&expanded);
+
+    if !p.is_dir() {
+        return false;
+    }
+    if !p.join(".git").is_dir() {
+        return false;
+    }
+
+    // Check filesystem state BEFORE running `git status`, because `git status`
+    // refreshes `.git/index` and would make the mtime check falsely recent.
+
+    // Recent `.git/index` mtime implies an active interactive session.
+    let index = p.join(".git/index");
+    if let Ok(meta) = index.metadata() {
+        if let Ok(mtime) = meta.modified() {
+            let elapsed = std::time::SystemTime::now()
+                .duration_since(mtime)
+                .unwrap_or_default();
+            if elapsed.as_secs() < INTERACTIVE_SESSION_THRESHOLD_SECS {
+                return false;
+            }
+        }
+    }
+
+    // Explicit operator-session markers.
+    if p.join(".operator_session").exists() {
+        return false;
+    }
+    if computer_name == Some("adele") && p.join(".adele_operator_session").exists() {
+        return false;
+    }
+
+    // Tree must be clean.
+    let clean = match Command::new("git")
+        .args(["-C", &expanded, "status", "--porcelain"])
+        .output()
+    {
+        Ok(out) => out.status.success() && out.stdout.is_empty(),
+        Err(_) => return false,
+    };
+    if !clean {
+        return false;
+    }
+
+    true
+}
+
+/// Ensure a canonical slot (slot 99, kind='canonical') exists for `computer_id`
+/// pointing at `~/projects/{project_name}`. The row's `status` is set to `idle`
+/// only if the local tree passes [`is_canonical_workspace_usable`]; otherwise
+/// it is `disabled` so the scheduler never assigns work to a dirty/owned tree.
+///
+/// Returns `true` if the upsert resulted in an idle (usable) canonical slot.
+/// This must run on the target computer because the guard inspects the local
+/// filesystem.
+pub async fn ensure_canonical_sub_agent_row(
+    pool: &PgPool,
+    computer_id: Uuid,
+    project_name: &str,
+    computer_name: Option<&str>,
+) -> Result<bool, CoordError> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let workspace = format!("{home}/projects/{project_name}");
+    let workspace2 = workspace.clone();
+    let computer_name_owned = computer_name.map(|s| s.to_string());
+    let usable = tokio::task::spawn_blocking(move || {
+        is_canonical_workspace_usable(&workspace2, computer_name_owned.as_deref())
+    })
+    .await
+    .map_err(|e| CoordError::Internal(format!("canonical guard panicked: {e}")))?;
+    let status = if usable { "idle" } else { "disabled" };
+
+    let result = sqlx::query(
+        "INSERT INTO sub_agents (computer_id, slot, kind, status, workspace_dir) \
+         VALUES ($1, $2, 'canonical', $3, $4) \
+         ON CONFLICT (computer_id, slot) DO UPDATE SET \
+             kind = EXCLUDED.kind, \
+             status = EXCLUDED.status, \
+             workspace_dir = EXCLUDED.workspace_dir",
+    )
+    .bind(computer_id)
+    .bind(CANONICAL_SLOT)
+    .bind(status)
+    .bind(&workspace)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() >= 1 && usable)
+}
+
+/// Resolve the canonical project name: `FORGEFLEET_CANONICAL_PROJECT`, then
+/// fall back to the Cargo package name of this build, then "forge-fleet".
+pub fn canonical_project_name() -> String {
+    std::env::var(CANONICAL_PROJECT_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| env!("CARGO_PKG_NAME").to_string())
+}
+
 /// Seed slot-0 for every computer in `computers`. Idempotent.
 pub async fn seed_slot_zero_for_all(pool: &PgPool) -> Result<u32, CoordError> {
     let rows: Vec<(Uuid, Option<i32>)> = sqlx::query_as("SELECT id, cpu_cores FROM computers")
@@ -636,6 +777,7 @@ pub struct SubAgentListRow {
     pub id: Uuid,
     pub computer: String,
     pub slot: i32,
+    pub kind: String,
     pub status: String,
     pub workspace_dir: String,
     pub current_work_item_id: Option<Uuid>,
@@ -652,11 +794,12 @@ pub async fn list_sub_agents(pool: &PgPool) -> Result<Vec<SubAgentListRow>, Coor
         i32,
         String,
         String,
+        String,
         Option<Uuid>,
         Option<chrono::DateTime<chrono::Utc>>,
         Option<chrono::DateTime<chrono::Utc>>,
     )> = sqlx::query_as(
-        "SELECT sa.id, c.name, sa.slot, sa.status, sa.workspace_dir, \
+        "SELECT sa.id, c.name, sa.slot, sa.kind, sa.status, sa.workspace_dir, \
                 sa.current_work_item_id, sa.started_at, sa.last_heartbeat_at \
          FROM sub_agents sa \
          JOIN computers c ON c.id = sa.computer_id \
@@ -667,11 +810,22 @@ pub async fn list_sub_agents(pool: &PgPool) -> Result<Vec<SubAgentListRow>, Coor
     Ok(rows
         .into_iter()
         .map(
-            |(id, computer, slot, status, workspace_dir, work_item, started_at, heartbeat)| {
+            |(
+                id,
+                computer,
+                slot,
+                kind,
+                status,
+                workspace_dir,
+                work_item,
+                started_at,
+                heartbeat,
+            )| {
                 SubAgentListRow {
                     id,
                     computer,
                     slot,
+                    kind,
                     status,
                     workspace_dir,
                     current_work_item_id: work_item,
@@ -702,5 +856,181 @@ mod tests {
         assert!(!CoordError::UnknownComputer("nope".into()).is_transient());
         assert!(!CoordError::Pulse("redis down".into()).is_transient());
         assert!(!CoordError::Internal("bug".into()).is_transient());
+    }
+
+    #[test]
+    fn canonical_project_name_defaults_to_cargo_pkg() {
+        // CARGO_PKG_NAME in this crate is "ff-agent", but the env override wins.
+        assert_eq!(super::canonical_project_name(), env!("CARGO_PKG_NAME"));
+    }
+
+    #[cfg(unix)]
+    mod canonical_workspace_guard {
+        use std::fs;
+        use std::process::Command;
+
+        use super::super::is_canonical_workspace_usable;
+
+        fn tmp_dir() -> std::path::PathBuf {
+            let base = std::env::temp_dir()
+                .join(format!("ff-agent-canonical-guard-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&base).unwrap();
+            base
+        }
+
+        fn init_git(path: &std::path::Path) {
+            let p = path.to_string_lossy();
+            let out = Command::new("git")
+                .args(["init", p.as_ref()])
+                .output()
+                .expect("git init");
+            assert!(out.status.success(), "git init failed: {:?}", out.stderr);
+            let out = Command::new("git")
+                .args(["-C", p.as_ref(), "config", "user.email", "test@example.com"])
+                .output()
+                .expect("git config email");
+            assert!(out.status.success());
+            let out = Command::new("git")
+                .args(["-C", p.as_ref(), "config", "user.name", "Test"])
+                .output()
+                .expect("git config name");
+            assert!(out.status.success());
+            // Create an initial commit so `.git/index` exists and `status` is clean.
+            let readme = path.join("README");
+            std::fs::write(&readme, "init\n").unwrap();
+            let out = Command::new("git")
+                .args(["-C", p.as_ref(), "add", "README"])
+                .output()
+                .expect("git add");
+            assert!(out.status.success());
+            let out = Command::new("git")
+                .args(["-C", p.as_ref(), "commit", "-m", "init"])
+                .output()
+                .expect("git commit");
+            assert!(out.status.success(), "git commit failed: {:?}", out.stderr);
+            // Ignore operator-session markers so the dirty-tree check doesn't
+            // trip on the marker files themselves.
+            std::fs::write(
+                path.join(".gitignore"),
+                ".operator_session\n.adele_operator_session\n",
+            )
+            .unwrap();
+            let out = Command::new("git")
+                .args(["-C", p.as_ref(), "add", ".gitignore"])
+                .output()
+                .expect("git add gitignore");
+            assert!(out.status.success());
+            let out = Command::new("git")
+                .args(["-C", p.as_ref(), "commit", "-m", "ignore markers"])
+                .output()
+                .expect("git commit gitignore");
+            assert!(out.status.success());
+        }
+
+        #[test]
+        fn missing_directory_is_unusable() {
+            let path = tmp_dir().join("does-not-exist");
+            assert!(!is_canonical_workspace_usable(
+                path.to_string_lossy().as_ref(),
+                None
+            ));
+        }
+
+        #[test]
+        fn non_git_directory_is_unusable() {
+            let path = tmp_dir();
+            assert!(!is_canonical_workspace_usable(
+                path.to_string_lossy().as_ref(),
+                None
+            ));
+        }
+
+        #[test]
+        fn dirty_tree_is_unusable() {
+            let path = tmp_dir();
+            init_git(&path);
+            fs::write(path.join("untracked.txt"), "hello").unwrap();
+            assert!(!is_canonical_workspace_usable(
+                path.to_string_lossy().as_ref(),
+                None
+            ));
+        }
+
+        #[test]
+        fn clean_tree_with_old_index_is_usable() {
+            let path = tmp_dir();
+            init_git(&path);
+            // Make the index old enough to pass the interactive-session threshold.
+            let out = Command::new("touch")
+                .args([
+                    "-d",
+                    "1 hour ago",
+                    path.join(".git/index").to_string_lossy().as_ref(),
+                ])
+                .output()
+                .expect("touch");
+            assert!(out.status.success());
+            assert!(is_canonical_workspace_usable(
+                path.to_string_lossy().as_ref(),
+                None
+            ));
+        }
+
+        #[test]
+        fn clean_tree_with_recent_index_is_unusable() {
+            let path = tmp_dir();
+            init_git(&path);
+            // A freshly-initialized repo has a recent index mtime.
+            assert!(!is_canonical_workspace_usable(
+                path.to_string_lossy().as_ref(),
+                None
+            ));
+        }
+
+        #[test]
+        fn operator_session_marker_is_unusable() {
+            let path = tmp_dir();
+            init_git(&path);
+            let out = Command::new("touch")
+                .args([
+                    "-d",
+                    "1 hour ago",
+                    path.join(".git/index").to_string_lossy().as_ref(),
+                ])
+                .output()
+                .expect("touch");
+            assert!(out.status.success());
+            fs::write(path.join(".operator_session"), "").unwrap();
+            assert!(!is_canonical_workspace_usable(
+                path.to_string_lossy().as_ref(),
+                None
+            ));
+        }
+
+        #[test]
+        fn adele_operator_session_marker_is_unusable_only_on_adele() {
+            let path = tmp_dir();
+            init_git(&path);
+            let out = Command::new("touch")
+                .args([
+                    "-d",
+                    "1 hour ago",
+                    path.join(".git/index").to_string_lossy().as_ref(),
+                ])
+                .output()
+                .expect("touch");
+            assert!(out.status.success());
+            fs::write(path.join(".adele_operator_session"), "").unwrap();
+            // Non-adele computer ignores the adele-specific marker.
+            assert!(is_canonical_workspace_usable(
+                path.to_string_lossy().as_ref(),
+                Some("priya")
+            ));
+            // Adele respects it.
+            assert!(!is_canonical_workspace_usable(
+                path.to_string_lossy().as_ref(),
+                Some("adele")
+            ));
+        }
     }
 }

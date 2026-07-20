@@ -80,6 +80,7 @@ struct AssignedWorkItem {
     sub_agent_id: Uuid,
     computer_id: Uuid,
     slot: i32,
+    kind: String,
     /// Prior failed attempts (escalation ladder). Drives backend escalation
     /// (local → cloud) and prompt context injection.
     attempts: i32,
@@ -163,6 +164,26 @@ async fn recent_host_failures(pg: &PgPool, worker_name: &str) -> Result<usize> {
 pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Result<usize> {
     let repo_path = std::env::current_dir().context("resolve current repo path")?;
 
+    // Keep this computer's canonical slot row in sync with the local filesystem:
+    // disabled when the tree is dirty or an operator session owns it, idle otherwise.
+    if let Some(computer_id) =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM computers WHERE name = $1")
+            .bind(worker_name)
+            .fetch_optional(pg)
+            .await
+            .ok()
+            .flatten()
+    {
+        let project = crate::agent_coordinator::canonical_project_name();
+        let _ = crate::agent_coordinator::ensure_canonical_sub_agent_row(
+            pg,
+            computer_id,
+            &project,
+            Some(worker_name),
+        )
+        .await;
+    }
+
     // Bump the dispatch tick for every active lease on this host. The stale-lease
     // reaper watches `dispatch_tick_at` independently of `heartbeat_at` so it can
     // reclaim a lease whose host dispatch loop wedged even though the in-build
@@ -184,8 +205,19 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
         return Ok(0);
     }
 
-    let max_slot = assigned.iter().map(|w| w.slot).max().unwrap_or(0).max(0) as u32;
-    ensure_workspaces(max_slot + 1).map_err(|e| anyhow!("ensure sub-agent workspaces: {e}"))?;
+    // Only ensure on-disk sub-agent directories for regular slots. Canonical
+    // slots use an existing project checkout (~/projects/{project}) and must not
+    // have a synthetic sub-agent-N directory created for them.
+    let regular_slots: Vec<_> = assigned.iter().filter(|w| w.kind != "canonical").collect();
+    if !regular_slots.is_empty() {
+        let max_slot = regular_slots
+            .iter()
+            .map(|w| w.slot)
+            .max()
+            .unwrap_or(0)
+            .max(0) as u32;
+        ensure_workspaces(max_slot + 1).map_err(|e| anyhow!("ensure sub-agent workspaces: {e}"))?;
+    }
 
     // SPAWN each dispatch so a multi-minute build doesn't BLOCK this tick — the
     // handler awaits evaluate_work_item_dispatch, so a serial `.await` per item
@@ -402,7 +434,9 @@ async fn assigned_work_items(
             ) AS fallback_repo_path,
             sa.id AS sub_agent_id,
             sa.computer_id,
-            sa.slot
+            sa.slot,
+            sa.kind,
+            sa.workspace_dir
           FROM sub_agents sa
           JOIN computers c ON c.id = sa.computer_id
           JOIN work_items w ON w.id = sa.current_work_item_id
@@ -445,19 +479,36 @@ async fn assigned_work_items(
                 .flatten()
                 .map(|p| PathBuf::from(expand_tilde(&p)));
             let fallback_repo_path: String = r.get("fallback_repo_path");
+            let kind: String = r.get("kind");
+            let workspace_dir: Option<PathBuf> = r
+                .try_get::<Option<String>, _>("workspace_dir")
+                .ok()
+                .flatten()
+                .map(|p| PathBuf::from(expand_tilde(&p)));
             let local_bound_path = bound_repo_path.as_ref().filter(|p| p.exists()).cloned();
             // Clone-per-slot ALWAYS (operator decision 2026-07-17): when the
             // item has a repo_url, the workspace is the slot's own clone — the
             // ensure-clone step creates it on first dispatch. Bound/metadata
             // paths are only honored for repo-url-less items (nothing to clone
             // from), where the single shared path is all we have.
-            let repo_path = repo_url
-                .as_deref()
-                .map(|url| default_clone_path(r.get::<i32, _>("slot"), url))
-                .or(local_bound_path)
-                .or(metadata_repo_path)
-                .or(bound_repo_path)
-                .unwrap_or_else(|| PathBuf::from(fallback_repo_path));
+            // Exception: canonical slots (kind='canonical') use their configured
+            // workspace_dir (e.g. ~/projects/forge-fleet) as the repo path.
+            let repo_path = if kind == "canonical" {
+                workspace_dir.clone().unwrap_or_else(|| {
+                    repo_url
+                        .as_deref()
+                        .map(|url| default_clone_path(r.get::<i32, _>("slot"), url))
+                        .unwrap_or_else(|| PathBuf::from(&fallback_repo_path))
+                })
+            } else {
+                repo_url
+                    .as_deref()
+                    .map(|url| default_clone_path(r.get::<i32, _>("slot"), url))
+                    .or(local_bound_path)
+                    .or(metadata_repo_path)
+                    .or(bound_repo_path)
+                    .unwrap_or_else(|| PathBuf::from(fallback_repo_path))
+            };
             Ok(AssignedWorkItem {
                 work_item_id: r.get("work_item_id"),
                 project_id: r.get("project_id"),
@@ -467,6 +518,7 @@ async fn assigned_work_items(
                 repo_id: r.try_get("repo_id").ok().flatten(),
                 repo_url,
                 repo_path,
+                kind,
                 sub_agent_id: r.get("sub_agent_id"),
                 computer_id: r.get("computer_id"),
                 slot: r.get("slot"),
@@ -1072,12 +1124,12 @@ async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Resul
     };
     let task_branch = task_branch_name(&item.title, item.work_item_id);
 
-    let workspaces = ensure_workspaces((item.slot.max(0) as u32) + 1)
-        .map_err(|e| anyhow!("ensure sub-agent workspaces: {e}"))?;
-    let slot_ws = workspaces
-        .get(item.slot.max(0) as usize)
-        .cloned()
-        .ok_or_else(|| anyhow!("missing workspace for slot {}", item.slot))?;
+    // Canonical slots reuse an existing project checkout (~/projects/{project});
+    // don't create a synthetic sub-agent-N directory for them.
+    if item.kind != "canonical" {
+        let _ = ensure_workspaces((item.slot.max(0) as u32) + 1)
+            .map_err(|e| anyhow!("ensure sub-agent workspaces: {e}"))?;
+    }
 
     // NO git worktrees (operator decision 2026-07-17): every build runs
     // directly in the slot's own clone — fetch + full clean + `checkout -B`
@@ -1086,7 +1138,6 @@ async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Resul
     // guarantees repo_path is the slot clone whenever the item has a repo_url;
     // a repo-url-less item bound outside the slot uses that path the same way
     // (it is the only workspace that exists for it).
-    let _ = slot_ws; // workspace dirs ensured above; the clone lives inside.
     let worktree_path = item.repo_path.clone();
     insert_worktree_creating(pg, item, &worktree_path, &base_branch, &task_branch).await?;
     match checkout_clone_for_build(&item.repo_path, &base_branch, &task_branch) {

@@ -1189,6 +1189,7 @@ CREATE TABLE IF NOT EXISTS sub_agents (
     id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     computer_id           UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
     slot                  INT NOT NULL,
+    kind                  TEXT NOT NULL DEFAULT 'sub_agent',
     status                TEXT NOT NULL DEFAULT 'idle',
     current_work_item_id  UUID REFERENCES work_items(id),
     started_at            TIMESTAMPTZ,
