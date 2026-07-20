@@ -68,6 +68,6 @@ CODEX=$(findbin codex);  CODEX=${CODEX:-codex}
 CLAUDE=$(findbin claude); CLAUDE=${CLAUDE:-claude}
 KIMI=$(findbin kimi);    KIMI=${KIMI:-kimi}
 
-probe codex  "--version" "$CODEX"  exec --skip-git-repo-check "Reply with only the word: PONG"
-probe claude "--version" "$CLAUDE" -p "Reply with only the word: PONG" --output-format text
-probe kimi   "--version" "$KIMI"   --print --yes --prompt "Reply with only the word: PONG"
+probe codex  "--version" bash -lc 'exec "$1" exec --ignore-user-config --skip-git-repo-check "$2" </dev/null' bash "$CODEX" "Reply with only the word: PONG"
+probe claude "--version" bash -lc 'exec "$1" -p "$2" --output-format text </dev/null' bash "$CLAUDE" "Reply with only the word: PONG"
+probe kimi   "--version" bash -lc 'exec "$1" --print --yes --prompt "$2" </dev/null' bash "$KIMI" "Reply with only the word: PONG"

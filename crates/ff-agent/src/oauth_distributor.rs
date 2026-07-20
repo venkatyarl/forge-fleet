@@ -533,46 +533,33 @@ pub async fn probe_one(pool: &PgPool, provider: &OauthProvider) -> ProbeResult {
     };
 
     // Vendor subscription tokens are NOT API bearer tokens — probe by
-    // spawning the vendor CLI with a tiny prompt. See feedback in
-    // 2026-05-03 session: api.openai.com 403 on a valid Plus token.
+    // spawning the vendor CLI with a tiny prompt. Reuse cli_executor so probes
+    // and fleet dispatch share the same hardened headless flags and detached
+    // stdin behavior. See feedback in 2026-05-03 session: api.openai.com 403
+    // on a valid Plus token.
     let _ = token;
-    let (cmd, cli_args): (&str, Vec<&str>) = match provider.name {
-        "claude" => ("claude", vec!["-p", "ping"]),
-        "codex" => ("codex", vec!["exec", "ping"]),
-        "gemini" => ("gemini", vec!["-p", "ping"]),
-        "kimi" => ("kimi", vec!["--print", "ping"]),
-        "grok" => ("grok", vec!["-p", "ping"]),
-        other => {
-            return ProbeResult {
-                provider: other.to_string(),
-                status: "no_token".to_string(),
-                http_status: None,
-                message: Some(format!("unknown provider `{other}`; no probe path")),
-            };
-        }
-    };
+    if crate::cli_executor::backend_by_name(provider.name).is_none() {
+        return ProbeResult {
+            provider: provider.name.to_string(),
+            status: "no_token".to_string(),
+            http_status: None,
+            message: Some(format!(
+                "unknown provider `{}`; no probe path",
+                provider.name
+            )),
+        };
+    }
 
-    let result = tokio::time::timeout(
-        Duration::from_secs(30),
-        tokio::process::Command::new(cmd).args(&cli_args).output(),
+    match crate::cli_executor::execute_cli(
+        provider.name,
+        "ping",
+        &[],
+        Some(Duration::from_secs(30)),
     )
-    .await;
-
-    match result {
-        Err(_) => ProbeResult {
-            provider: provider.name.to_string(),
-            status: "timeout".to_string(),
-            http_status: None,
-            message: Some(format!("{cmd} did not respond within 30s")),
-        },
-        Ok(Err(e)) => ProbeResult {
-            provider: provider.name.to_string(),
-            status: "cli_missing".to_string(),
-            http_status: None,
-            message: Some(format!("spawn {cmd}: {e}")),
-        },
-        Ok(Ok(out)) => {
-            if out.status.success() && !out.stdout.is_empty() {
+    .await
+    {
+        Ok(out) => {
+            if out.exit_code == 0 && !out.stdout.is_empty() {
                 ProbeResult {
                     provider: provider.name.to_string(),
                     status: "ok".to_string(),
@@ -580,22 +567,35 @@ pub async fn probe_one(pool: &PgPool, provider: &OauthProvider) -> ProbeResult {
                     message: None,
                 }
             } else {
-                let code = out.status.code();
                 ProbeResult {
                     provider: provider.name.to_string(),
-                    status: if code == Some(1) {
+                    status: if out.exit_code == 1 {
                         "unauthorized".to_string()
                     } else {
                         "cli_error".to_string()
                     },
-                    http_status: code.map(|c| c as u16),
-                    message: Some(
-                        String::from_utf8_lossy(&out.stderr)
-                            .chars()
-                            .take(200)
-                            .collect(),
-                    ),
+                    http_status: Some(out.exit_code as u16),
+                    message: Some(out.stderr.chars().take(200).collect()),
                 }
+            }
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let (status, message) = if msg.contains("requires `") {
+                ("cli_missing".to_string(), msg)
+            } else if msg.contains("exceeded 30s timeout") {
+                (
+                    "timeout".to_string(),
+                    format!("{} did not respond within 30s", provider.name),
+                )
+            } else {
+                ("cli_error".to_string(), msg)
+            };
+            ProbeResult {
+                provider: provider.name.to_string(),
+                status,
+                http_status: None,
+                message: Some(message),
             }
         }
     }
