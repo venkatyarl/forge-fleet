@@ -6465,6 +6465,11 @@ const DAEMON_GATES: &[GateSpec] = &[
         controls: "Pillar-4 merge-queue auto-merge",
     },
     GateSpec {
+        key: "auto_feeder_mode",
+        default: "off",
+        controls: "idea backlog decomposition and promotion",
+    },
+    GateSpec {
         key: "cortex_index_mode",
         default: "on",
         controls: "cortex reindex tick",

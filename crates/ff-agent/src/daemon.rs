@@ -58,6 +58,12 @@ impl TickRegistry {
                 runner: run_work_item_scheduler_tick,
             },
             TickDefinition {
+                name: "auto_backlog_feeder",
+                interval: Duration::from_secs(30),
+                scope: TickScope::LeaderOnly,
+                runner: run_auto_backlog_feeder_tick,
+            },
+            TickDefinition {
                 name: "telegram_reply_poller",
                 interval: Duration::from_secs(30),
                 scope: TickScope::LeaderOnly,
@@ -197,6 +203,17 @@ fn run_work_item_scheduler_tick(
 ) -> BoxFuture<'static, Result<()>> {
     Box::pin(async move {
         crate::work_item_scheduler::evaluate_work_items(&pg)
+            .await
+            .map(|_| ())
+    })
+}
+
+fn run_auto_backlog_feeder_tick(
+    pg: PgPool,
+    _worker_name: String,
+) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::auto_backlog_feeder::run_auto_backlog_feeder_tick(&pg)
             .await
             .map(|_| ())
     })

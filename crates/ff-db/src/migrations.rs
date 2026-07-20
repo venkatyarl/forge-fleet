@@ -971,6 +971,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "operator_alert_dedup_counts",
         sql: schema::SCHEMA_V197_OPERATOR_ALERT_DEDUP_COUNTS,
     },
+    PgMigration {
+        version: 198,
+        name: "auto_backlog_feeder",
+        sql: schema::SCHEMA_V198_AUTO_BACKLOG_FEEDER,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

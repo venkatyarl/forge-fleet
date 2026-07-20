@@ -2,6 +2,16 @@ use crate::{CYAN, GREEN, RED, RESET, YELLOW};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
+#[derive(serde::Deserialize)]
+struct LeafTask {
+    title: String,
+    description: String,
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    complexity: Option<String>,
+}
+
 pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
@@ -929,22 +939,12 @@ async fn handle_pm_decompose(
             ));
         }
     };
-    #[derive(serde::Deserialize)]
-    struct LeafTask {
-        title: String,
-        description: String,
-        // Optional so an older-shape response (title+description only) still
-        // parses — fail-open, the columns just stay at their defaults.
-        #[serde(default)]
-        files: Vec<String>,
-        #[serde(default)]
-        complexity: Option<String>,
-    }
     let tasks: Vec<LeafTask> = serde_json::from_str(json_slice)
         .map_err(|e| anyhow::anyhow!("parse decomposed tasks JSON: {e}"))?;
     if tasks.is_empty() {
         return Err(anyhow::anyhow!("LLM returned zero tasks"));
     }
+    validate_decomposition(&tasks, repo_context.as_ref())?;
 
     let created_by = ff_agent::fleet_info::resolve_this_worker_name().await;
     println!(
@@ -984,6 +984,16 @@ async fn handle_pm_decompose(
                 .await
                 .map_err(|e| anyhow::anyhow!("flag ready {id}: {e}"))?;
         }
+        if let Some(parent_id) = parent_id {
+            sqlx::query(
+                "UPDATE work_items SET status = 'decomposed', last_error = NULL \
+                 WHERE id = $1 AND status = 'idea'",
+            )
+            .bind(parent_id)
+            .execute(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("mark parent {parent_id} decomposed: {e}"))?;
+        }
         println!(
             "{GREEN}✓ flagged {} task(s) ready — the Pillar-4 scheduler will fan them across the fleet{RESET}",
             ids.len()
@@ -992,6 +1002,55 @@ async fn handle_pm_decompose(
         println!(
             "{YELLOW}note:{RESET} created as 'idea' — re-run with --ready (or `ff pm ready <id>`) to dispatch"
         );
+    }
+    Ok(())
+}
+
+fn validate_decomposition(
+    tasks: &[LeafTask],
+    repo_context: Option<&crate::repo_context::RepoContext>,
+) -> Result<()> {
+    let autonomous = std::env::var_os("FORGEFLEET_AUTO_FEEDER").is_some();
+    let tracked = repo_context
+        .and_then(|ctx| ctx.repo_path.as_deref())
+        .and_then(git_ls_files)
+        .map(|files| {
+            files
+                .lines()
+                .map(str::to_owned)
+                .collect::<std::collections::HashSet<_>>()
+        });
+    if autonomous && tracked.is_none() {
+        return Err(anyhow::anyhow!(
+            "decomposition quality gate needs a local git repo for file validation"
+        ));
+    }
+
+    let mut claimed = std::collections::HashSet::new();
+    for task in tasks {
+        if autonomous && task.files.is_empty() {
+            return Err(anyhow::anyhow!(
+                "decomposition quality gate: '{}' has no file references",
+                task.title
+            ));
+        }
+        for file in &task.files {
+            if let Some(tracked) = &tracked
+                && !tracked.contains(file)
+            {
+                return Err(anyhow::anyhow!(
+                    "decomposition quality gate: '{}' references untracked file '{}'",
+                    task.title,
+                    file
+                ));
+            }
+            if !claimed.insert(file.clone()) {
+                return Err(anyhow::anyhow!(
+                    "decomposition quality gate: sibling tasks overlap on '{}'",
+                    file
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1982,6 +2041,26 @@ async fn handle_pm_purge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decomposition_quality_gate_rejects_sibling_file_overlap() {
+        let tasks = vec![
+            LeafTask {
+                title: "first".into(),
+                description: String::new(),
+                files: vec!["src/lib.rs".into()],
+                complexity: None,
+            },
+            LeafTask {
+                title: "second".into(),
+                description: String::new(),
+                files: vec!["src/lib.rs".into()],
+                complexity: None,
+            },
+        ];
+        let error = validate_decomposition(&tasks, None).unwrap_err();
+        assert!(error.to_string().contains("sibling tasks overlap"));
+    }
 
     #[test]
     fn claude_project_slug_encodes_every_non_alphanumeric() {

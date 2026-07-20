@@ -11103,6 +11103,20 @@ ALTER TABLE operator_notify_dedup
     ADD COLUMN IF NOT EXISTS send_count BIGINT NOT NULL DEFAULT 1;
 "#;
 
+/// V198 — Persist explicit backlog parking and seed the autonomous feeder off.
+pub const SCHEMA_V198_AUTO_BACKLOG_FEEDER: &str = r#"
+ALTER TABLE work_items
+    ADD COLUMN IF NOT EXISTS parked BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE INDEX IF NOT EXISTS idx_work_items_feedable_ideas
+    ON work_items (priority, created_at)
+    WHERE status = 'idea' AND parked = FALSE;
+
+INSERT INTO fleet_secrets (key, value)
+VALUES ('auto_feeder_mode', 'off')
+ON CONFLICT (key) DO NOTHING;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
