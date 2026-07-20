@@ -11492,6 +11492,15 @@ SELECT computer_id, recorded_at, 'daily'::TEXT, sample_count,
   FROM computer_metrics_history_daily;
 "#;
 
+/// V213 — Canonically configure v161 as the fresh-database bootstrap baseline.
+pub const SCHEMA_V213_BOOTSTRAP_V161_BASELINE: &str = r#"
+INSERT INTO _migration_baselines (generation, migration_version, name)
+VALUES (1, 161, 'bootstrap_v161')
+ON CONFLICT (generation) DO UPDATE
+SET migration_version = EXCLUDED.migration_version,
+    name = EXCLUDED.name;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

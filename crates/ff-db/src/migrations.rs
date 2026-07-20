@@ -1046,6 +1046,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "computer_metrics_retained_view",
         sql: schema::SCHEMA_V212_COMPUTER_METRICS_RETAINED_VIEW,
     },
+    PgMigration {
+        version: 213,
+        name: "bootstrap_v161_baseline",
+        sql: schema::SCHEMA_V213_BOOTSTRAP_V161_BASELINE,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
