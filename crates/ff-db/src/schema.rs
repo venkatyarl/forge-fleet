@@ -10574,6 +10574,104 @@ LEFT JOIN LATERAL (
 ) s ON TRUE;
 "#;
 
+/// V181 — Fleet work-item velocity views.
+///
+/// Aggregates the V179 transition log into stable hourly and daily reporting
+/// surfaces consumed by the nightly fleet digest. Successful completions are
+/// the PM terminal states `done` and `merged`; retries remain visible through
+/// the event attempt number.
+pub const SCHEMA_V181_FLEET_VELOCITY_VIEWS: &str = r#"
+CREATE OR REPLACE VIEW v_throughput_hourly AS
+SELECT
+    date_trunc('hour', occurred_at) AS hour_bucket,
+    COUNT(*) FILTER (WHERE to_status IN ('done', 'merged'))::BIGINT AS completed_count,
+    COUNT(*) FILTER (WHERE to_status = 'failed')::BIGINT AS failed_count
+FROM work_item_events
+WHERE to_status IN ('done', 'merged', 'failed')
+GROUP BY 1;
+
+CREATE OR REPLACE VIEW v_lead_time_daily AS
+SELECT
+    date_trunc('day', e.occurred_at) AS day_bucket,
+    COUNT(*)::BIGINT AS completed_count,
+    AVG(EXTRACT(EPOCH FROM (e.occurred_at - w.created_at)))::DOUBLE PRECISION
+        AS avg_lead_time_seconds
+FROM work_item_events e
+JOIN work_items w ON w.id = e.work_item_id
+WHERE e.to_status IN ('done', 'merged')
+GROUP BY 1;
+
+CREATE OR REPLACE VIEW v_computer_builds_daily AS
+SELECT
+    date_trunc('day', e.occurred_at) AS day_bucket,
+    COALESCE(e.computer, w.assigned_computer, 'unknown') AS computer_name,
+    COUNT(*) FILTER (WHERE e.to_status = 'building')::BIGINT AS builds_started,
+    COUNT(*) FILTER (WHERE e.to_status IN ('done', 'merged'))::BIGINT AS builds_succeeded,
+    COUNT(*) FILTER (WHERE e.to_status = 'failed')::BIGINT AS builds_failed
+FROM work_item_events e
+JOIN work_items w ON w.id = e.work_item_id
+WHERE e.to_status IN ('building', 'done', 'merged', 'failed')
+GROUP BY 1, 2;
+
+CREATE OR REPLACE VIEW v_first_pass_rate_daily AS
+SELECT
+    date_trunc('day', occurred_at) AS day_bucket,
+    COUNT(*)::BIGINT AS completed_count,
+    COUNT(*) FILTER (WHERE COALESCE(attempt, 1) <= 1)::BIGINT AS first_pass_count,
+    (COUNT(*) FILTER (WHERE COALESCE(attempt, 1) <= 1)::DOUBLE PRECISION
+        / NULLIF(COUNT(*), 0))::DOUBLE PRECISION AS first_pass_rate
+FROM work_item_events
+WHERE to_status IN ('done', 'merged')
+GROUP BY 1;
+"#;
+
+/// V182 — trigger that records every `work_items.status` transition into
+/// `work_item_events`. A DB-level trigger (not app-side inserts) is deliberate:
+/// it captures ALL writers, including manual `psql` heals and out-of-band
+/// updates, so the V181 velocity views see the complete journey. Fires only
+/// when status actually changes; `detail` is left as the table default.
+pub const SCHEMA_V182_WORK_ITEM_EVENTS_TRIGGER: &str = r#"
+CREATE OR REPLACE FUNCTION log_work_item_status_change() RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO work_item_events
+        (work_item_id, from_status, to_status, computer, attempt)
+    VALUES
+        (NEW.id, OLD.status, NEW.status, NEW.assigned_computer, NEW.attempts);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_work_item_status_change ON work_items;
+CREATE TRIGGER trg_work_item_status_change
+    AFTER UPDATE OF status ON work_items
+    FOR EACH ROW
+    WHEN (OLD.status IS DISTINCT FROM NEW.status)
+    EXECUTE FUNCTION log_work_item_status_change();
+"#;
+
+/// V183 — Artifact cache index.
+///
+/// Tracks which computer holds a local copy of a cached build artifact, for
+/// the download-once-distribute-peer-to-peer cache (parent 468a7dc9): before
+/// re-downloading an artifact from its origin, callers check this table for
+/// a fleet peer that already has it.
+pub const SCHEMA_V183_ARTIFACT_CACHE_INDEX: &str = r#"
+CREATE TABLE IF NOT EXISTS artifact_cache_index (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    artifact_key   TEXT NOT NULL,
+    computer       TEXT NOT NULL,
+    file_path      TEXT NOT NULL,
+    size_bytes     BIGINT NOT NULL DEFAULT 0,
+    checksum       TEXT,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at   TIMESTAMPTZ,
+    UNIQUE (artifact_key, computer)
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifact_cache_index_artifact_key
+    ON artifact_cache_index (artifact_key);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
