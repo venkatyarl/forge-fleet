@@ -56,6 +56,15 @@ die() {
   exit 1
 }
 
+# Fetch one explicitly allowlisted fleet secret through the enrollment-token
+# bootstrap endpoint. The endpoint never permits arbitrary secret names.
+peek_secret() {
+  local key="$1"
+  curl -fsS -m 10 \
+    "$LEADER/api/fleet/secret-peek?token=$TOKEN&key=$key" \
+    2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin).get("value",""))' 2>/dev/null || true
+}
+
 # Run as the target user (not as root). Used for cargo, git, etc. When
 # invoked by `sudo bash`, we drop to the real invoker.
 SUDO_INVOKER="${SUDO_USER:-$SSH_USER}"
@@ -245,9 +254,7 @@ report "gh" ok
 report "gh_auth" running
 # We don't have ff installed yet on this new box, so fetch the secret via HTTP.
 # The enrollment token doubles as auth for this one-time lookup.
-PAT_VALUE="$(curl -fsS -m 10 \
-  "$LEADER/api/fleet/secret-peek?token=$TOKEN&key=$GITHUB_PAT_SECRET_KEY" \
-  2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin).get("value",""))' 2>/dev/null || true)"
+PAT_VALUE="$(peek_secret "$GITHUB_PAT_SECRET_KEY")"
 
 if [ -n "$PAT_VALUE" ]; then
   if run_as_user bash -lc "echo \"$PAT_VALUE\" | gh auth login --with-token >/dev/null 2>&1"; then
@@ -272,32 +279,62 @@ run_as_user git config --global user.name 'Venkat Yarlagadda'
 run_as_user git config --global user.email 'venkatyarl@users.noreply.github.com'
 report "git_identity" ok
 
+# ─── 5d. Canonical GitHub deploy key ─────────────────────────────────────
+# Materialize the fleet's canonical GitHub identity before cloning. This
+# avoids an HTTPS staging clone that is rewritten only after ff is built.
+report "github_deploy_key" running
+VENKAT_PRIV="$(peek_secret github_ssh_id_venkat_priv)"
+VENKAT_PUB="$(peek_secret github_ssh_id_venkat_pub)"
+if [ -n "$VENKAT_PRIV" ] && [ -n "$VENKAT_PUB" ]; then
+  run_as_user mkdir -p "$USER_HOME/.ssh"
+  run_as_user chmod 700 "$USER_HOME/.ssh"
+  printf '%s\n' "$VENKAT_PRIV" | run_as_user tee "$USER_HOME/.ssh/id_venkat" >/dev/null
+  printf '%s\n' "$VENKAT_PUB" | run_as_user tee "$USER_HOME/.ssh/id_venkat.pub" >/dev/null
+  run_as_user chmod 600 "$USER_HOME/.ssh/id_venkat"
+  run_as_user chmod 644 "$USER_HOME/.ssh/id_venkat.pub"
+  run_as_user touch "$USER_HOME/.ssh/known_hosts" "$USER_HOME/.ssh/config"
+  if ! run_as_user ssh-keygen -F github.com -f "$USER_HOME/.ssh/known_hosts" >/dev/null 2>&1; then
+    run_as_user bash -c "ssh-keyscan github.com >> '$USER_HOME/.ssh/known_hosts'" 2>/dev/null \
+      || die "failed to record github.com host key"
+  fi
+  if ! run_as_user grep -qFx 'Host github.com-venkat' "$USER_HOME/.ssh/config"; then
+    run_as_user bash -c "cat >> '$USER_HOME/.ssh/config' <<'EOF'
+
+Host github.com-venkat
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/id_venkat
+  IdentitiesOnly yes
+EOF"
+  fi
+  run_as_user chmod 600 "$USER_HOME/.ssh/config"
+  report "github_deploy_key" ok "installed id_venkat"
+else
+  report "github_deploy_key" warn "id_venkat is not available in fleet_secrets"
+fi
+
 # ─── 6. Clone forge-fleet + build ff ─────────────────────────────────────
 #
 # Canonical source-tree location (per reference_source_tree_locations.md +
 # the V31 `computers.source_tree_path` backfill):
-#   - Taylor (leader / dev workstation):      ~/projects/forge-fleet
-#   - Every other fleet member:               ~/.forgefleet/sub-agents/sub-agent-0/forge-fleet
-#
-# The sub-agent-0 path is the canonical workspace for dispatched fleet-LLM
-# work (`ff supervise` / `ff run`). Keeping the bootstrap clone there
-# eliminates a wasted re-clone on the first auto-upgrade tick (V32's
-# playbook would otherwise clone to the canonical path separately).
+# Builder-role nodes use ~/projects/forge-fleet because auto-upgrade and the
+# config loaders treat it as the canonical source tree. Never stage a second
+# checkout at ~/forge-fleet or under a sub-agent workspace during onboarding.
 
 report "clone" running
-if [ "$OS_ID" = "macos" ]; then
-  # macOS nodes are rare in the current fleet and usually the leader (Taylor).
-  # Keep the legacy path — the macOS Ace box isn't a dispatch target.
-  REPO_DIR="/Users/${SUDO_INVOKER}/projects/forge-fleet"
-elif [ "$ROLE" = "leader" ]; then
-  REPO_DIR="/home/${SUDO_INVOKER}/projects/forge-fleet"
+if [ "$ROLE" = "builder" ] || [ "$ROLE" = "leader" ]; then
+  REPO_DIR="$USER_HOME/projects/forge-fleet"
 else
   REPO_DIR="/home/${SUDO_INVOKER}/.forgefleet/sub-agents/sub-agent-0/forge-fleet"
 fi
 
 run_as_user mkdir -p "$(dirname "$REPO_DIR")"
 if [ ! -d "$REPO_DIR/.git" ]; then
-  run_as_user git clone --depth 50 "https://github.com/${GITHUB_OWNER}/forge-fleet.git" "$REPO_DIR" \
+  CLONE_URL="https://github.com/${GITHUB_OWNER}/forge-fleet.git"
+  if [ -f "$USER_HOME/.ssh/id_venkat" ]; then
+    CLONE_URL="git@github.com-venkat:${GITHUB_OWNER}/forge-fleet.git"
+  fi
+  run_as_user git clone --depth 50 "$CLONE_URL" "$REPO_DIR" \
     || die "git clone failed"
 else
   run_as_user bash -c "cd '$REPO_DIR' && git fetch origin main && git reset --hard origin/main" \
@@ -345,9 +382,53 @@ case "$OS_ID" in
         || die "NodeSource setup_22 failed"
       apt-get install -y nodejs >/dev/null 2>&1 \
         || die "apt-get install nodejs (NodeSource) failed"
-      report "nodejs" ok "$(node --version)"
+report "nodejs" ok "$(node --version)"
     fi ;;
 esac
+
+# ─── 6b. Cloud coding CLIs + centralized auth ────────────────────────────
+# Install every supported cloud CLI as the target user, then materialize the
+# allowlisted centralized OAuth tokens at each CLI's canonical credential path.
+report "cloud_clis" running
+if ! run_as_user bash -lc 'command -v claude >/dev/null 2>&1'; then
+  run_as_user bash -lc 'curl -fsSL https://claude.ai/install.sh | bash' \
+    || die "Claude Code install failed"
+fi
+if ! run_as_user bash -lc 'command -v codex >/dev/null 2>&1'; then
+  run_as_user npm install -g --prefix "$USER_HOME/.local/node" @openai/codex \
+    || die "Codex install failed"
+fi
+CODEX_BIN="$USER_HOME/.local/node/bin/codex"
+if [ -x "$CODEX_BIN" ]; then
+  run_as_user ln -sf "$CODEX_BIN" "$USER_HOME/.local/bin/codex"
+fi
+if ! run_as_user bash -lc 'command -v uv >/dev/null 2>&1'; then
+  run_as_user bash -lc 'curl -LsSf https://astral.sh/uv/install.sh | sh' || die "uv install failed"
+fi
+if ! run_as_user bash -lc 'command -v kimi >/dev/null 2>&1'; then
+  run_as_user bash -lc 'uv tool install kimi-cli' || die "Kimi CLI install failed"
+fi
+
+CLAUDE_TOKEN="$(peek_secret anthropic.oauth_token)"
+CODEX_TOKEN="$(peek_secret openai.oauth_token)"
+KIMI_TOKEN="$(peek_secret moonshot.oauth_token)"
+run_as_user mkdir -p "$USER_HOME/.claude" "$USER_HOME/.codex" "$USER_HOME/.kimi/credentials"
+if [ -n "$CLAUDE_TOKEN" ]; then
+  printf '%s' "$CLAUDE_TOKEN" | python3 -c 'import json,sys; print(json.dumps({"claudeAiOauth":{"accessToken":sys.stdin.read()}}))' \
+    | run_as_user tee "$USER_HOME/.claude/.credentials.json" >/dev/null
+  run_as_user chmod 600 "$USER_HOME/.claude/.credentials.json"
+fi
+if [ -n "$CODEX_TOKEN" ]; then
+  printf '%s' "$CODEX_TOKEN" | python3 -c 'import json,sys; print(json.dumps({"tokens":{"access_token":sys.stdin.read()}}))' \
+    | run_as_user tee "$USER_HOME/.codex/auth.json" >/dev/null
+  run_as_user chmod 600 "$USER_HOME/.codex/auth.json"
+fi
+if [ -n "$KIMI_TOKEN" ]; then
+  printf '%s' "$KIMI_TOKEN" | python3 -c 'import json,sys; print(json.dumps({"access_token":sys.stdin.read()}))' \
+    | run_as_user tee "$USER_HOME/.kimi/credentials/kimi-code.json" >/dev/null
+  run_as_user chmod 600 "$USER_HOME/.kimi/credentials/kimi-code.json"
+fi
+report "cloud_clis" ok "claude, codex, kimi"
 
 report "dashboard_build" running
 run_as_user bash -lc "cd '$REPO_DIR/dashboard' && npm install --no-audit --no-fund --silent 2>&1 | tail -2 && npm run build 2>&1 | tail -3" \
