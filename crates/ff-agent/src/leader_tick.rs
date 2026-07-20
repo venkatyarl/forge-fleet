@@ -42,7 +42,7 @@ use ff_db::leader_state::{
 use ff_pulse::reader::{PulseError, PulseReader};
 
 use crate::ha::pg_failover::{FailoverOutcome, PostgresFailoverManager};
-use crate::ha::self_heal::rearm_self_heal_task;
+use crate::ha::self_heal::{rearm_self_heal_task, scan_daemon_logs_for_self_heal};
 #[cfg(test)]
 use crate::ha::self_heal::{self_heal_priority_for_tier, self_heal_task_status};
 use crate::leader_cache::{LeaderCache, LeaderInfo};
@@ -122,6 +122,9 @@ pub struct LeaderTick {
     /// primary and promote the local replica if we host one.
     pg_failover_manager: Option<Arc<PostgresFailoverManager>>,
 
+    /// In-process deduplication for novel error Telegram alerts.
+    error_tracker: crate::ha::error_tracker::ErrorTracker,
+
     /// First wall-clock instant at which we observed the current leader
     /// as ODOWN on the Pulse channel despite a fresh Postgres heartbeat.
     /// Reset to `None` whenever the leader becomes pulse-alive again OR
@@ -174,6 +177,7 @@ impl LeaderTick {
             on_became_leader: Arc::new(|_| {}),
             on_lost_leader: Arc::new(|_| {}),
             pg_failover_manager: None,
+            error_tracker: crate::ha::error_tracker::ErrorTracker::default(),
             leader_pulse_silent_since: tokio::sync::Mutex::new(None),
             yield_flag: None,
         }
@@ -322,6 +326,19 @@ impl LeaderTick {
                                             node = %self.my_name,
                                             error = %err,
                                             "scan_interaction_errors failed"
+                                        );
+                                    }
+
+                                    // V122+: feed daemon log errors into the
+                                    // self-heal queue so recurring runtime
+                                    // patterns are not lost in rotated log files.
+                                    if let Err(err) =
+                                        scan_daemon_logs_for_self_heal(&self.pg, &self.my_name).await
+                                    {
+                                        tracing::warn!(
+                                            node = %self.my_name,
+                                            error = %err,
+                                            "scan_daemon_logs_for_self_heal failed"
                                         );
                                     }
 
@@ -1057,6 +1074,9 @@ impl LeaderTick {
                     error_text = error_text.as_deref().unwrap_or(""),
                     "scan_interaction_errors: enqueued novel error signature for self-heal"
                 );
+                self.error_tracker
+                    .alert(&self.pg, &sig, error_text.as_deref())
+                    .await;
             } else {
                 // Signature already exists. If it has been processed to a
                 // terminal state and cooled down, re-arm it so recurring
