@@ -874,7 +874,64 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     push_branch(&item.repo_path, &worktree.task_branch)?;
     let pr_url = create_pr(&worktree.worktree_path, &item, &worktree).await?;
 
-    mark_ready_for_review(&pg, &item, &worktree, &head_sha, &pr_url).await?;
+    // In-place review (Pillar-4 v2): judge the change IN the still-warm build
+    // workspace — diff vs base + item spec + a real `cargo test` run — before
+    // it enters the merge queue. Gated by the `distributed_review_mode` fleet
+    // secret. Fail-open on reviewer-infrastructure errors: with the PR already
+    // pushed, stranding a built change because every reviewer was unreachable
+    // is worse than enqueueing it unreviewed (the merge drain still gates it).
+    let review = if distributed_review_enabled(&pg).await {
+        match run_in_place_review(&pg, &item, &worktree, &backend_used).await {
+            Ok(r) => Some(r),
+            Err(e) => {
+                warn!(
+                    work_item_id = %item.work_item_id,
+                    error = format!("{e:#}"),
+                    "work_item_dispatch: in-place review unavailable — enqueueing unreviewed"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(r) = review.as_ref().filter(|r| !r.approved) {
+        let reason = format!("in-place review rejected by {}: {}", r.reviewer, r.reason);
+        warn!(
+            work_item_id = %item.work_item_id,
+            reviewer = %r.reviewer,
+            builder = %backend_used,
+            reason = %r.reason,
+            "work_item_dispatch: in-place review REJECTED — failing item with reason"
+        );
+        // Best-effort: persist the verdict on the merge-queue row even though
+        // the item never enqueues, so rejections feed v_reviewer_stats too.
+        if let Err(e) =
+            record_review_rejection(&pg, &item, &worktree, &head_sha, &pr_url, &backend_used, r)
+                .await
+        {
+            warn!(
+                work_item_id = %item.work_item_id, error = %e,
+                "work_item_dispatch: failed to record review rejection on queue row (non-fatal)"
+            );
+        }
+        // Same retry-with-context ladder as a build failure: the reviewer's
+        // reason lands in last_error so the next attempt sees what to fix.
+        requeue_or_fail(&pg, &item, &reason).await?;
+        remove_worktree(&item.repo_path, &worktree.worktree_path)?;
+        return Ok(());
+    }
+
+    mark_ready_for_review(
+        &pg,
+        &item,
+        &worktree,
+        &head_sha,
+        &pr_url,
+        &backend_used,
+        review.as_ref(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1142,6 +1199,8 @@ async fn mark_ready_for_review(
     worktree: &WorktreeRecord,
     head_sha: &str,
     pr_url: &str,
+    builder: &str,
+    review: Option<&ReviewOutcome>,
 ) -> Result<()> {
     let mut tx = pg.begin().await?;
     sqlx::query(
@@ -1173,15 +1232,23 @@ async fn mark_ready_for_review(
     sqlx::query(
         r#"
         INSERT INTO work_item_merge_queue
-            (work_item_id, project_id, status, branch_name, pr_url, head_sha)
-        VALUES ($1, $2, 'queued', $3, $4, $5)
+            (work_item_id, project_id, status, branch_name, pr_url, head_sha,
+             builder, reviewer, review_verdict, review_reason,
+             review_started_at, review_completed_at)
+        VALUES ($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (work_item_id) DO UPDATE
             SET status = 'queued',
                 branch_name = EXCLUDED.branch_name,
                 pr_url = EXCLUDED.pr_url,
                 head_sha = EXCLUDED.head_sha,
                 failed_at = NULL,
-                failure_reason = NULL
+                failure_reason = NULL,
+                builder = EXCLUDED.builder,
+                reviewer = EXCLUDED.reviewer,
+                review_verdict = EXCLUDED.review_verdict,
+                review_reason = EXCLUDED.review_reason,
+                review_started_at = EXCLUDED.review_started_at,
+                review_completed_at = EXCLUDED.review_completed_at
         "#,
     )
     .bind(item.work_item_id)
@@ -1189,11 +1256,405 @@ async fn mark_ready_for_review(
     .bind(&worktree.task_branch)
     .bind(pr_url)
     .bind(head_sha)
+    .bind(builder)
+    .bind(review.map(|r| r.reviewer.as_str()))
+    .bind(review.map(|r| if r.approved { "approve" } else { "reject" }))
+    .bind(review.map(|r| truncate_for_db(&r.reason)))
+    .bind(review.map(|r| r.started_at))
+    .bind(review.map(|r| r.completed_at))
     .execute(&mut *tx)
     .await?;
 
     release_slot_and_lease_tx(&mut tx, item, "ready for review").await?;
     tx.commit().await?;
+    Ok(())
+}
+
+// ── Pillar 4 v2: in-place review stage (after build+PR, before enqueue) ──────
+
+/// Cloud CLI reviewer pool for the in-place dispatch review, in tie-break
+/// order. The 480B ring joins opportunistically (see [`GATE_480B`]).
+const CLOUD_REVIEWERS: [&str; 3] = ["claude", "codex", "kimi"];
+
+/// Reviewer label recorded when the qwen3-coder-480b ring reviews an item.
+const LOCAL_REVIEWER_480B: &str = "local:qwen3-coder-480b";
+
+/// Hard cap on a single cloud reviewer invocation.
+const REVIEW_CLOUD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Hard cap on a 480B ring review (matches the merge drain's budget).
+const REVIEW_480B_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Budget for the `cargo test` run whose output is fed to the reviewer. The
+/// per-slot CARGO_TARGET_DIR is warm from the build, so this is incremental.
+const REVIEW_CARGO_TEST_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// Global concurrency gate for the qwen3-coder-480b ring: 2 permits (what the
+/// single ring instance sustains). BUILDS (Lane-1.5) have PRIORITY on the 480B
+/// — it is the only local escalation tier, so a build path may block on
+/// `acquire()`. REVIEW may only ever `try_acquire`: a free permit means the
+/// 480B reviews for $0, an unavailable permit means the review falls straight
+/// to a cloud reviewer WITHOUT waiting (review has 3 cloud alternatives;
+/// builds have none locally).
+pub(crate) static GATE_480B: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(2));
+
+/// Outcome of one in-place review: who judged it, the verdict + rationale, and
+/// the start/complete timestamps written to the merge-queue row (the latency
+/// signal that feeds `v_reviewer_stats` and future routing weights).
+struct ReviewOutcome {
+    reviewer: String,
+    approved: bool,
+    reason: String,
+    started_at: chrono::DateTime<chrono::Utc>,
+    completed_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Whether the operator has opted into the in-place dispatch review. Default
+/// OFF — flipped via `ff secrets set distributed_review_mode on`.
+async fn distributed_review_enabled(pg: &PgPool) -> bool {
+    matches!(
+        ff_db::pg_read_gate_value(pg, "distributed_review_mode", "off", "off")
+            .await
+            .as_deref(),
+        Ok("on") | Ok("true") | Ok("1")
+    )
+}
+
+/// A `local` build may have escalated to the 480B inside the codegen cascade,
+/// so any local builder conservatively excludes the 480B reviewer (rule 1:
+/// never the model that built the change). Pure for testability.
+fn builder_excludes_480b(builder: &str) -> bool {
+    let b = builder.to_ascii_lowercase();
+    b == "local" || b.starts_with("local:") || b.contains("480b")
+}
+
+/// Observed per-reviewer review history (recent window), read from the same
+/// merge-queue columns `v_reviewer_stats` aggregates.
+#[derive(Debug, Clone)]
+struct ReviewerStat {
+    reviewer: String,
+    reviews: i64,
+    avg_latency_secs: f64,
+}
+
+async fn cloud_reviewer_stats(pg: &PgPool) -> Result<Vec<ReviewerStat>> {
+    let rows = sqlx::query(
+        "SELECT reviewer, COUNT(*) AS reviews, \
+                AVG(EXTRACT(EPOCH FROM (review_completed_at - review_started_at)))::float8 \
+                    AS avg_latency_secs \
+           FROM work_item_merge_queue \
+          WHERE reviewer IS NOT NULL \
+            AND review_started_at IS NOT NULL \
+            AND review_completed_at IS NOT NULL \
+            AND review_completed_at > NOW() - INTERVAL '7 days' \
+          GROUP BY reviewer",
+    )
+    .fetch_all(pg)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ReviewerStat {
+            reviewer: r.get("reviewer"),
+            reviews: r.get("reviews"),
+            avg_latency_secs: r.try_get::<f64, _>("avg_latency_secs").unwrap_or(0.0),
+        })
+        .collect())
+}
+
+/// Assumed latency for a reviewer with no observed history. Only used as the
+/// weighting unit; an unknown reviewer's score is 0 (tried first) regardless.
+const DEFAULT_REVIEW_LATENCY_SECS: f64 = 180.0;
+
+/// Latency-weighted round-robin order for the cloud trio (rule 2), builder
+/// excluded (rule 1). Score = observed review count × observed avg latency, so
+/// a reviewer twice as fast earns twice the turns before its score catches up,
+/// and a reviewer with no history scores 0 — tried first so the fleet gathers
+/// latency data on every backend. Pure for testability.
+fn order_cloud_reviewers(builder: &str, stats: &[ReviewerStat]) -> Vec<String> {
+    let mut scored: Vec<(f64, String)> = CLOUD_REVIEWERS
+        .iter()
+        .filter(|b| !b.eq_ignore_ascii_case(builder))
+        .map(|b| {
+            let score = stats
+                .iter()
+                .find(|s| s.reviewer.eq_ignore_ascii_case(b))
+                .map(|s| {
+                    let lat = if s.avg_latency_secs > 0.0 {
+                        s.avg_latency_secs
+                    } else {
+                        DEFAULT_REVIEW_LATENCY_SECS
+                    };
+                    s.reviews as f64 * lat
+                })
+                .unwrap_or(0.0);
+            (score, b.to_string())
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().map(|(_, b)| b).collect()
+}
+
+/// Run the in-place review in the warm build workspace. Reviewer selection:
+///   1. NEVER the model that built the change (builder recorded alongside).
+///   2. Cloud trio (claude/codex/kimi) in latency-weighted round-robin order,
+///      falling through to the next on a backend failure.
+///   3. The 480B ring participates only when [`GATE_480B`] has a free permit
+///      RIGHT NOW (`try_acquire`) — builds have priority on the ring, and a
+///      busy ring means cloud review without waiting.
+/// `Err` means NO reviewer produced a verdict — the caller enqueues unreviewed
+/// (fail-open) rather than stranding an already-pushed PR.
+async fn run_in_place_review(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    worktree: &WorktreeRecord,
+    builder: &str,
+) -> Result<ReviewOutcome> {
+    let prompt = build_review_prompt(item, worktree).await;
+
+    if !builder_excludes_480b(builder) {
+        if let Ok(permit) = GATE_480B.try_acquire() {
+            let started_at = chrono::Utc::now();
+            let verdict = review_via_480b_inplace(pg, &prompt).await;
+            drop(permit);
+            match verdict {
+                Ok((approved, reason)) => {
+                    return Ok(ReviewOutcome {
+                        reviewer: LOCAL_REVIEWER_480B.to_string(),
+                        approved,
+                        reason,
+                        started_at,
+                        completed_at: chrono::Utc::now(),
+                    });
+                }
+                Err(e) => warn!(
+                    work_item_id = %item.work_item_id,
+                    error = format!("{e:#}"),
+                    "work_item_dispatch: 480b in-place review unavailable — falling to cloud"
+                ),
+            }
+        } else {
+            info!(
+                work_item_id = %item.work_item_id,
+                "work_item_dispatch: 480b busy (builds have priority) — cloud review without waiting"
+            );
+        }
+    }
+
+    let stats = cloud_reviewer_stats(pg).await.unwrap_or_default();
+    let mut last_err: Option<anyhow::Error> = None;
+    for backend in order_cloud_reviewers(builder, &stats) {
+        let started_at = chrono::Utc::now();
+        match crate::cli_executor::execute_cli_in_dir(
+            &backend,
+            &prompt,
+            &[],
+            Some(&worktree.worktree_path),
+            Some(REVIEW_CLOUD_TIMEOUT),
+        )
+        .await
+        {
+            Ok(res) if res.exit_code == 0 && !res.stdout.trim().is_empty() => {
+                record_review_interaction(
+                    pg,
+                    &backend,
+                    &prompt,
+                    &res.stdout,
+                    i32::try_from(res.duration_ms).ok(),
+                )
+                .await;
+                let (approved, reason) =
+                    crate::work_item_merge_drain::parse_review_response(&res.stdout);
+                return Ok(ReviewOutcome {
+                    reviewer: backend,
+                    approved,
+                    reason,
+                    started_at,
+                    completed_at: chrono::Utc::now(),
+                });
+            }
+            Ok(res) => {
+                let e = anyhow!(
+                    "{backend} exited {}: {}",
+                    res.exit_code,
+                    err_tail(&res.stderr)
+                );
+                warn!(backend = %backend, error = %e, "work_item_dispatch: in-place review backend failed — trying next");
+                last_err = Some(e);
+            }
+            Err(e) => {
+                warn!(backend = %backend, error = format!("{e:#}"), "work_item_dispatch: in-place review backend unavailable — trying next");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("no in-place review backend available")))
+}
+
+/// One 480B ring review. Caller holds a [`GATE_480B`] permit. `Err` means the
+/// ring didn't serve the call (routing failed, timed out, or `fleet_oneshot`
+/// failed over to a weaker model — never trusted as a 480B verdict).
+async fn review_via_480b_inplace(pg: &PgPool, prompt: &str) -> Result<(bool, String)> {
+    let resp =
+        crate::fleet_oneshot::fleet_oneshot(pg, prompt, Some("480b"), Some(REVIEW_480B_TIMEOUT))
+            .await
+            .context("480b in-place review")?;
+    if !crate::work_item_merge_drain::served_by_480b(&resp.model) {
+        bail!(
+            "480b ring unavailable — fleet_oneshot failed over to {} on {}",
+            resp.model,
+            resp.worker_name
+        );
+    }
+    record_review_interaction(
+        pg,
+        &resp.model,
+        prompt,
+        &resp.text,
+        i32::try_from(resp.latency_ms).ok(),
+    )
+    .await;
+    Ok(crate::work_item_merge_drain::parse_review_response(
+        &resp.text,
+    ))
+}
+
+/// Reviewer input: the branch diff vs base + the item spec + a real
+/// `cargo test` run from the warm workspace. Never fails — a missing piece is
+/// reported inline so the reviewer knows what it could not see.
+async fn build_review_prompt(item: &AssignedWorkItem, worktree: &WorktreeRecord) -> String {
+    let base = &worktree.base_branch;
+    let diff = run_git(
+        &worktree.worktree_path,
+        ["diff", &format!("origin/{base}...HEAD")],
+        Duration::from_secs(60),
+    )
+    .ok()
+    .filter(|o| o.status.success())
+    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    .unwrap_or_else(|| "(diff unavailable)".to_string());
+    let diff: String = diff.chars().take(40_000).collect();
+    let test_output = run_workspace_cargo_test(&worktree.worktree_path).await;
+
+    format!(
+        "You are reviewing a change built by an autonomous coding fleet, in the build workspace, \
+         before it enters the merge queue.\n\
+         Judge whether the diff correctly and cleanly implements the requested work item.\n\n\
+         Work item title:\n{title}\n\n\
+         Work item description:\n{description}\n\n\
+         Requirements for approval:\n\
+         - The diff matches the stated intent.\n\
+         - The diff introduces no regressions.\n\
+         - The diff does NOT DEGRADE existing code, documentation, comments, tests, or behavior.\n\
+         - The diff is a real, complete change rather than a placeholder, superficial edit, or \
+           partial implementation.\n\
+         - The `cargo test` output below does not show failures caused by this change.\n\n\
+         Answer with exactly APPROVE or REJECT on the first line. Put a one-line reason on the \
+         next line.\n\n\
+         Branch diff vs origin/{base} (truncated to 40000 chars if needed):\n\
+         ```diff\n{diff}\n```\n\n\
+         `cargo test` output from the build workspace:\n```\n{test_output}\n```",
+        title = item.title,
+        description = item.description.as_deref().unwrap_or_default(),
+    )
+}
+
+/// `cargo test` in the warm build workspace so the reviewer sees real test
+/// results, not a guess. Reuses the per-slot CARGO_TARGET_DIR (incremental —
+/// the build already compiled here). Any failure to run is reported as text.
+async fn run_workspace_cargo_test(worktree_path: &Path) -> String {
+    if !worktree_path.join("Cargo.toml").exists() {
+        return "(not a cargo workspace — no test run)".to_string();
+    }
+    let cwd = worktree_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = Command::new("cargo");
+        cmd.arg("test")
+            .current_dir(&cwd)
+            .env("CARGO_TARGET_DIR", slot_cargo_target(&cwd));
+        match run_command_capture(cmd, REVIEW_CARGO_TEST_TIMEOUT) {
+            Ok(out) => format!("(exit: {})\n{}", out.status, agent_output_tail(&out, 6000)),
+            Err(e) => format!("cargo test did not complete: {e:#}"),
+        }
+    })
+    .await
+    .unwrap_or_else(|e| format!("cargo test task failed: {e}"))
+}
+
+/// Best-effort `ff_interactions` row for one in-place review turn (training
+/// data — the point of routing review through ff). Never fails the dispatch.
+async fn record_review_interaction(
+    pg: &PgPool,
+    engine: &str,
+    prompt: &str,
+    response: &str,
+    latency_ms: Option<i32>,
+) {
+    let rec = ff_db::InteractionRecord {
+        channel: "dispatch_inplace_review".to_string(),
+        request_text: prompt.chars().take(16000).collect(),
+        engine: Some(engine.to_string()),
+        response_text: response.chars().take(16000).collect(),
+        latency_ms,
+        outcome: "success".to_string(),
+        ..Default::default()
+    };
+    if let Err(e) = ff_db::pg_record_interaction(pg, &rec).await {
+        warn!(error = %e, "work_item_dispatch: failed to log review interaction (non-fatal)");
+    }
+}
+
+/// Persist a REJECT verdict on the merge-queue row (status 'failed') so
+/// rejections feed `v_reviewer_stats` even though the item never enqueues. A
+/// later successful retry's enqueue overwrites this row via its upsert.
+async fn record_review_rejection(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    worktree: &WorktreeRecord,
+    head_sha: &str,
+    pr_url: &str,
+    builder: &str,
+    review: &ReviewOutcome,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO work_item_merge_queue
+            (work_item_id, project_id, status, branch_name, pr_url, head_sha,
+             failed_at, failure_reason,
+             builder, reviewer, review_verdict, review_reason,
+             review_started_at, review_completed_at)
+        VALUES ($1, $2, 'failed', $3, $4, $5, NOW(), $6, $7, $8, 'reject', $9, $10, $11)
+        ON CONFLICT (work_item_id) DO UPDATE
+            SET status = 'failed',
+                branch_name = EXCLUDED.branch_name,
+                pr_url = EXCLUDED.pr_url,
+                head_sha = EXCLUDED.head_sha,
+                failed_at = NOW(),
+                failure_reason = EXCLUDED.failure_reason,
+                builder = EXCLUDED.builder,
+                reviewer = EXCLUDED.reviewer,
+                review_verdict = 'reject',
+                review_reason = EXCLUDED.review_reason,
+                review_started_at = EXCLUDED.review_started_at,
+                review_completed_at = EXCLUDED.review_completed_at
+        "#,
+    )
+    .bind(item.work_item_id)
+    .bind(&item.project_id)
+    .bind(&worktree.task_branch)
+    .bind(pr_url)
+    .bind(head_sha)
+    .bind(truncate_for_db(&format!(
+        "in-place review rejected by {}: {}",
+        review.reviewer, review.reason
+    )))
+    .bind(builder)
+    .bind(&review.reviewer)
+    .bind(truncate_for_db(&review.reason))
+    .bind(review.started_at)
+    .bind(review.completed_at)
+    .execute(pg)
+    .await?;
     Ok(())
 }
 
@@ -3042,12 +3503,68 @@ pub fn spawn_worktree_reaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        DISPATCH_HOUSE_RULES, DispatchOutcome, agent_output_tail, classify_dispatch_outcome,
-        command_display, default_clone_path, dispatch_budget_for_host, expand_home,
-        parse_cli_tokens, primary_or_default_backend, repo_cache_path, repo_slug,
-        retry_error_is_actionable, rewrite_github_host_alias, task_prefers_cloud_lane,
-        use_local_lane,
+        DISPATCH_HOUSE_RULES, DispatchOutcome, ReviewerStat, agent_output_tail,
+        builder_excludes_480b, classify_dispatch_outcome, command_display, default_clone_path,
+        dispatch_budget_for_host, expand_home, order_cloud_reviewers, parse_cli_tokens,
+        primary_or_default_backend, repo_cache_path, repo_slug, retry_error_is_actionable,
+        rewrite_github_host_alias, task_prefers_cloud_lane, use_local_lane,
     };
+
+    #[test]
+    fn builder_excludes_480b_for_local_builds_only() {
+        // Rule 1: never the model that built the change. A local build may have
+        // escalated to the 480B inside the codegen cascade, so any local
+        // builder keeps the 480B out of the reviewer pool.
+        assert!(builder_excludes_480b("local"));
+        assert!(builder_excludes_480b("local:qwen3-coder-480b"));
+        assert!(builder_excludes_480b("qwen3-coder-480b"));
+        // Cloud builds leave the 480B eligible.
+        assert!(!builder_excludes_480b("codex"));
+        assert!(!builder_excludes_480b("claude"));
+        assert!(!builder_excludes_480b("kimi"));
+    }
+
+    #[test]
+    fn order_cloud_reviewers_excludes_builder_and_weights_by_latency() {
+        let stat = |reviewer: &str, reviews: i64, avg: f64| ReviewerStat {
+            reviewer: reviewer.to_string(),
+            reviews,
+            avg_latency_secs: avg,
+        };
+
+        // Rule 1: the builder never reviews its own change.
+        let order = order_cloud_reviewers("codex", &[]);
+        assert_eq!(order, vec!["claude".to_string(), "kimi".to_string()]);
+        // A local builder excludes no cloud reviewer.
+        let order = order_cloud_reviewers("local", &[]);
+        assert_eq!(order.len(), 3);
+
+        // No history → declaration order preserved (all scores 0).
+        let order = order_cloud_reviewers("", &[]);
+        assert_eq!(
+            order,
+            vec![
+                "claude".to_string(),
+                "codex".to_string(),
+                "kimi".to_string()
+            ]
+        );
+
+        // Weighted round-robin: score = reviews × avg latency. kimi is fast
+        // (60s) and has done 2 reviews (score 120); claude is slow (300s) with
+        // 1 review (score 300); codex has no history (score 0 → first, so the
+        // fleet gathers data on it).
+        let stats = [stat("claude", 1, 300.0), stat("kimi", 2, 60.0)];
+        let order = order_cloud_reviewers("", &stats);
+        assert_eq!(
+            order,
+            vec![
+                "codex".to_string(),
+                "kimi".to_string(),
+                "claude".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn agent_output_tail_keeps_the_end_and_is_char_safe() {
