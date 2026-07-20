@@ -10,6 +10,7 @@ pub mod backup;
 pub mod error_tracker;
 pub mod handoff;
 pub mod manager;
+pub mod mirror_service;
 pub mod node_info;
 pub mod pg_failover;
 pub mod repair;
