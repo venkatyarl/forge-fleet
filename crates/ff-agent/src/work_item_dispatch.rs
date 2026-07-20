@@ -46,6 +46,21 @@ const FF_TIMEOUT_SECS: u64 = 1080;
 /// idle even with many ready tasks and dozens of free slots.
 const MAX_DISPATCH_PER_TICK: i64 = 3;
 
+const DISTRIBUTED_REVIEW_MODE_KEY: &str = "distributed_review_mode";
+const REVIEWER_480B_HINT: &str = "480b";
+static REVIEW_480B_GATE: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(2));
+static CLOUD_REVIEW_CURSOR: AtomicU64 = AtomicU64::new(0);
+static LOCAL_REVIEW_CURSOR: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+struct DispatchReview {
+    approved: bool,
+    reviewer: String,
+    reason: String,
+    latency_ms: i64,
+}
+
 /// Recent-failure count at/above which the host throttles back to a single
 /// dispatch per tick (backpressure — stop feeding a host that's failing).
 const BACKPRESSURE_FAILURE_THRESHOLD: usize = 3;
@@ -874,7 +889,32 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     push_branch(&item.repo_path, &worktree.task_branch)?;
     let pr_url = create_pr(&worktree.worktree_path, &item, &worktree).await?;
 
-    mark_ready_for_review(&pg, &item, &worktree, &head_sha, &pr_url).await?;
+    let review_enabled = distributed_review_enabled(&pg).await;
+    if review_enabled {
+        prepare_review_row(&pg, &item, &worktree, &head_sha, &pr_url, &backend_used).await?;
+        let review = run_in_place_review(&pg, &item, &worktree, &backend_used).await?;
+        record_review_result(&pg, item.work_item_id, &review).await?;
+        if !review.approved {
+            let reason = format!(
+                "in-place review rejected by {}: {}",
+                review.reviewer, review.reason
+            );
+            requeue_or_fail(&pg, &item, &reason).await?;
+            remove_worktree(&item.repo_path, &worktree.worktree_path)?;
+            return Ok(());
+        }
+    }
+
+    mark_ready_for_review(
+        &pg,
+        &item,
+        &worktree,
+        &head_sha,
+        &pr_url,
+        &backend_used,
+        review_enabled,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1136,12 +1176,249 @@ async fn mark_building(pg: &PgPool, item: &AssignedWorkItem) -> Result<bool> {
     Ok(true)
 }
 
+async fn distributed_review_enabled(pg: &PgPool) -> bool {
+    matches!(
+        ff_db::pg_get_secret(pg, DISTRIBUTED_REVIEW_MODE_KEY)
+            .await
+            .ok()
+            .flatten()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "on" | "enabled")
+    )
+}
+
+async fn prepare_review_row(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    worktree: &WorktreeRecord,
+    head_sha: &str,
+    pr_url: &str,
+    builder: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO work_item_merge_queue
+            (work_item_id, project_id, status, branch_name, pr_url, head_sha,
+             builder, review_started_at)
+        VALUES ($1, $2, 'reviewing', $3, $4, $5, $6, NOW())
+        ON CONFLICT (work_item_id) DO UPDATE
+            SET status = 'reviewing', branch_name = EXCLUDED.branch_name,
+                pr_url = EXCLUDED.pr_url, head_sha = EXCLUDED.head_sha,
+                builder = EXCLUDED.builder, reviewer = NULL,
+                review_verdict = NULL, review_reason = NULL,
+                review_started_at = NOW(), review_completed_at = NULL,
+                review_latency_ms = NULL, failed_at = NULL, failure_reason = NULL
+        "#,
+    )
+    .bind(item.work_item_id)
+    .bind(&item.project_id)
+    .bind(&worktree.task_branch)
+    .bind(pr_url)
+    .bind(head_sha)
+    .bind(builder)
+    .execute(pg)
+    .await?;
+    Ok(())
+}
+
+async fn record_review_result(
+    pg: &PgPool,
+    work_item_id: Uuid,
+    review: &DispatchReview,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE work_item_merge_queue
+            SET reviewer = $2, review_verdict = $3, review_reason = $4,
+                review_completed_at = NOW(), review_latency_ms = $5,
+                status = CASE WHEN $3 = 'approve' THEN status ELSE 'failed' END,
+                failed_at = CASE WHEN $3 = 'reject' THEN NOW() ELSE failed_at END,
+                failure_reason = CASE WHEN $3 = 'reject' THEN $4 ELSE failure_reason END
+          WHERE work_item_id = $1",
+    )
+    .bind(work_item_id)
+    .bind(&review.reviewer)
+    .bind(if review.approved { "approve" } else { "reject" })
+    .bind(truncate_for_db(&review.reason))
+    .bind(review.latency_ms)
+    .execute(pg)
+    .await?;
+    Ok(())
+}
+
+fn parse_dispatch_review(response: &str) -> (bool, String) {
+    let mut lines = response
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let Some(verdict) = lines.next() else {
+        return (false, "empty review response".to_string());
+    };
+    let approved = verdict.to_ascii_uppercase().starts_with("APPROVE");
+    let reason = lines.collect::<Vec<_>>().join(" ");
+    (
+        approved,
+        if reason.is_empty() {
+            verdict.to_string()
+        } else {
+            reason
+        },
+    )
+}
+
+fn builder_matches_reviewer(builder: &str, reviewer: &str) -> bool {
+    let builder = builder.to_ascii_lowercase();
+    builder == reviewer || builder.contains(reviewer)
+}
+
+fn bounded_review_input(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut bounded: String = value.chars().take(max_chars).collect();
+    bounded.push_str("\n[truncated]");
+    bounded
+}
+
+async fn weighted_cloud_reviewer(pg: &PgPool, builder: &str) -> Result<String> {
+    let stats: Vec<(String, Option<f64>, Option<f64>)> = sqlx::query_as(
+        "SELECT reviewer, avg_latency_ms, verdict_quality
+           FROM v_reviewer_stats
+          WHERE reviewer = ANY($1)",
+    )
+    .bind(vec!["claude", "codex", "kimi"])
+    .fetch_all(pg)
+    .await
+    .unwrap_or_default();
+    let mut weighted = Vec::new();
+    for reviewer in ["claude", "codex", "kimi"] {
+        if builder_matches_reviewer(builder, reviewer) {
+            continue;
+        }
+        let (latency, quality) = stats
+            .iter()
+            .find(|(name, _, _)| name == reviewer)
+            .map(|(_, latency, quality)| (latency.unwrap_or(90_000.0), quality.unwrap_or(1.0)))
+            .unwrap_or((90_000.0, 1.0));
+        let weight = ((90_000.0 / latency.max(1_000.0)) * quality.max(0.25))
+            .round()
+            .clamp(1.0, 8.0) as usize;
+        weighted.extend(std::iter::repeat_n(reviewer, weight));
+    }
+    if weighted.is_empty() {
+        bail!("reviewer pool exhausted: builder {builder} matches every cloud reviewer");
+    }
+    let index = CLOUD_REVIEW_CURSOR.fetch_add(1, Ordering::Relaxed) as usize % weighted.len();
+    Ok(weighted[index].to_string())
+}
+
+fn cargo_test_output(worktree_path: &Path) -> String {
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(worktree_path)
+        .args(["+1.88.0", "test", "--lib"]);
+    match run_command_capture(cmd, Duration::from_secs(600)) {
+        Ok(output) => truncate_for_db(&format!(
+            "exit={}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )),
+        Err(error) => format!("cargo test could not complete: {error:#}"),
+    }
+}
+
+async fn run_in_place_review(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    worktree: &WorktreeRecord,
+    builder: &str,
+) -> Result<DispatchReview> {
+    let diff = run_git(
+        &worktree.worktree_path,
+        ["diff", "origin/main...HEAD"],
+        Duration::from_secs(60),
+    )?;
+    let tests = cargo_test_output(&worktree.worktree_path);
+    let diff = bounded_review_input(&String::from_utf8_lossy(&diff.stdout), 80_000);
+    let prompt = format!(
+        "Review this work item in its warm build workspace. The reviewer MUST be independent of builder {builder}.\n\
+         Reply with exactly APPROVE or REJECT on the first non-empty line, followed by a concise reason.\n\n\
+         ITEM SPEC:\n{}\n\nGIT DIFF origin/main...HEAD:\n{}\n\nCARGO TEST OUTPUT:\n{}",
+        format!(
+            "{}\n\n{}",
+            item.title,
+            item.description.as_deref().unwrap_or("")
+        ),
+        diff,
+        tests
+    );
+    let started = Instant::now();
+
+    // Give 480B a minority share. Its permit is strictly non-blocking: if both
+    // global slots are occupied by higher-priority Lane-1.5 builds/reviews, use
+    // one of the three cloud alternatives immediately.
+    if !builder_matches_reviewer(builder, REVIEWER_480B_HINT)
+        && LOCAL_REVIEW_CURSOR.fetch_add(1, Ordering::Relaxed) % 4 == 3
+        && let Ok(_permit) = REVIEW_480B_GATE.try_acquire()
+    {
+        if let Ok(response) = crate::fleet_oneshot::fleet_oneshot(
+            pg,
+            &prompt,
+            Some(REVIEWER_480B_HINT),
+            Some(Duration::from_secs(300)),
+        )
+        .await
+            && response
+                .model
+                .to_ascii_lowercase()
+                .contains(REVIEWER_480B_HINT)
+        {
+            let (approved, reason) = parse_dispatch_review(&response.text);
+            return Ok(DispatchReview {
+                approved,
+                reviewer: "local:qwen3-coder-480b".to_string(),
+                reason,
+                latency_ms: started.elapsed().as_millis() as i64,
+            });
+        }
+    }
+
+    let reviewer = weighted_cloud_reviewer(pg, builder).await?;
+    let result = crate::cli_executor::execute_cli_in_dir(
+        &reviewer,
+        &prompt,
+        &[],
+        Some(&worktree.worktree_path),
+        Some(Duration::from_secs(120)),
+    )
+    .await
+    .with_context(|| format!("in-place review via {reviewer}"))?;
+    if result.exit_code != 0 || result.stdout.trim().is_empty() {
+        bail!(
+            "reviewer {reviewer} exited {}: {}",
+            result.exit_code,
+            result.stderr.trim()
+        );
+    }
+    let (approved, reason) = parse_dispatch_review(&result.stdout);
+    Ok(DispatchReview {
+        approved,
+        reviewer,
+        reason,
+        latency_ms: started.elapsed().as_millis() as i64,
+    })
+}
+
 async fn mark_ready_for_review(
     pg: &PgPool,
     item: &AssignedWorkItem,
     worktree: &WorktreeRecord,
     head_sha: &str,
     pr_url: &str,
+    builder: &str,
+    review_enabled: bool,
 ) -> Result<()> {
     let mut tx = pg.begin().await?;
     sqlx::query(
@@ -1173,13 +1450,20 @@ async fn mark_ready_for_review(
     sqlx::query(
         r#"
         INSERT INTO work_item_merge_queue
-            (work_item_id, project_id, status, branch_name, pr_url, head_sha)
-        VALUES ($1, $2, 'queued', $3, $4, $5)
+            (work_item_id, project_id, status, branch_name, pr_url, head_sha, builder)
+        VALUES ($1, $2, 'queued', $3, $4, $5, $6)
         ON CONFLICT (work_item_id) DO UPDATE
             SET status = 'queued',
                 branch_name = EXCLUDED.branch_name,
                 pr_url = EXCLUDED.pr_url,
                 head_sha = EXCLUDED.head_sha,
+                builder = EXCLUDED.builder,
+                reviewer = CASE WHEN $7 THEN reviewer ELSE NULL END,
+                review_verdict = CASE WHEN $7 THEN review_verdict ELSE NULL END,
+                review_reason = CASE WHEN $7 THEN review_reason ELSE NULL END,
+                review_started_at = CASE WHEN $7 THEN review_started_at ELSE NULL END,
+                review_completed_at = CASE WHEN $7 THEN review_completed_at ELSE NULL END,
+                review_latency_ms = CASE WHEN $7 THEN review_latency_ms ELSE NULL END,
                 failed_at = NULL,
                 failure_reason = NULL
         "#,
@@ -1189,6 +1473,8 @@ async fn mark_ready_for_review(
     .bind(&worktree.task_branch)
     .bind(pr_url)
     .bind(head_sha)
+    .bind(builder)
+    .bind(review_enabled)
     .execute(&mut *tx)
     .await?;
 
@@ -3042,11 +3328,11 @@ pub fn spawn_worktree_reaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        DISPATCH_HOUSE_RULES, DispatchOutcome, agent_output_tail, classify_dispatch_outcome,
-        command_display, default_clone_path, dispatch_budget_for_host, expand_home,
-        parse_cli_tokens, primary_or_default_backend, repo_cache_path, repo_slug,
-        retry_error_is_actionable, rewrite_github_host_alias, task_prefers_cloud_lane,
-        use_local_lane,
+        DISPATCH_HOUSE_RULES, DispatchOutcome, agent_output_tail, bounded_review_input,
+        builder_matches_reviewer, classify_dispatch_outcome, command_display, default_clone_path,
+        dispatch_budget_for_host, expand_home, parse_cli_tokens, parse_dispatch_review,
+        primary_or_default_backend, repo_cache_path, repo_slug, retry_error_is_actionable,
+        rewrite_github_host_alias, task_prefers_cloud_lane, use_local_lane,
     };
 
     #[test]
@@ -3069,6 +3355,31 @@ mod tests {
         assert!(tail.starts_with('…'));
         assert_eq!(tail.chars().count(), 101); // 100 + the ellipsis
         assert!(tail.chars().all(|c| c == '…' || c == 'é'));
+    }
+
+    #[test]
+    fn parses_strict_dispatch_review_verdicts() {
+        assert_eq!(
+            parse_dispatch_review("APPROVE\nTests and implementation match the spec."),
+            (true, "Tests and implementation match the spec.".to_string())
+        );
+        assert_eq!(
+            parse_dispatch_review("\nREJECT\nBuilder and reviewer are the same."),
+            (false, "Builder and reviewer are the same.".to_string())
+        );
+        assert_eq!(
+            parse_dispatch_review(""),
+            (false, "empty review response".to_string())
+        );
+    }
+
+    #[test]
+    fn review_inputs_are_bounded_and_builder_is_excluded() {
+        assert_eq!(bounded_review_input("abc", 3), "abc");
+        assert_eq!(bounded_review_input("abcdef", 3), "abc\n[truncated]");
+        assert!(builder_matches_reviewer("codex", "codex"));
+        assert!(builder_matches_reviewer("cloud:claude", "claude"));
+        assert!(!builder_matches_reviewer("kimi", "codex"));
     }
 
     #[test]

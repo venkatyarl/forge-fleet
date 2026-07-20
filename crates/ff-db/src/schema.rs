@@ -10625,6 +10625,33 @@ WHERE to_status IN ('done', 'merged')
 GROUP BY 1;
 "#;
 
+/// V182 — in-place distributed review metadata and routing statistics.
+pub const SCHEMA_V182_DISTRIBUTED_REVIEW: &str = r#"
+ALTER TABLE work_item_merge_queue
+    ADD COLUMN IF NOT EXISTS builder TEXT,
+    ADD COLUMN IF NOT EXISTS reviewer TEXT,
+    ADD COLUMN IF NOT EXISTS review_verdict TEXT,
+    ADD COLUMN IF NOT EXISTS review_reason TEXT,
+    ADD COLUMN IF NOT EXISTS review_started_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS review_completed_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS review_latency_ms BIGINT;
+
+CREATE OR REPLACE VIEW v_reviewer_stats AS
+SELECT
+    reviewer,
+    COUNT(*)::BIGINT AS review_count,
+    AVG(review_latency_ms)::DOUBLE PRECISION AS avg_latency_ms,
+    COUNT(*) FILTER (WHERE review_verdict = 'approve')::BIGINT AS approved_count,
+    COUNT(*) FILTER (WHERE review_verdict = 'reject')::BIGINT AS rejected_count,
+    (COUNT(*) FILTER (
+        WHERE (review_verdict = 'approve' AND status IN ('merged', 'mergeable', 'queued'))
+           OR (review_verdict = 'reject' AND status = 'failed')
+    )::DOUBLE PRECISION / NULLIF(COUNT(*), 0))::DOUBLE PRECISION AS verdict_quality
+FROM work_item_merge_queue
+WHERE reviewer IS NOT NULL AND review_completed_at IS NOT NULL
+GROUP BY reviewer;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
