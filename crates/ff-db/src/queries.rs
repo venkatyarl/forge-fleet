@@ -8589,6 +8589,29 @@ pub async fn pg_next_merge_queue_item(pool: &PgPool) -> Result<Option<MergeQueue
     }))
 }
 
+/// Rotate a merge-queue entry to the BACK of its project's active queue by
+/// giving it a `position` greater than any current sibling in the same project.
+///
+/// The drain is serial and always picks the lowest-`position` entry per project
+/// (see [`pg_next_merge_queue_item`]). When the head PR is stuck with GitHub
+/// still computing mergeability (`UNKNOWN`), that ONE slow-to-compute PR blocks
+/// every other (already-computed, mergeable) PR behind it. Moving it to the back
+/// lets the drain make progress on the rest while GitHub catches up on this one.
+pub async fn pg_defer_merge_queue_item_to_back(pool: &PgPool, id: uuid::Uuid) -> Result<()> {
+    sqlx::query(
+        "UPDATE work_item_merge_queue AS q \
+            SET position = ( \
+                SELECT COALESCE(MAX(q2.position), q.position) + 1 \
+                  FROM work_item_merge_queue q2 \
+                 WHERE q2.project_id = q.project_id) \
+          WHERE q.id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Mark a merge-queue entry as ci_running (we're watching its PR CI).
 pub async fn pg_mark_merge_ci_running(pool: &PgPool, id: uuid::Uuid) -> Result<()> {
     sqlx::query(

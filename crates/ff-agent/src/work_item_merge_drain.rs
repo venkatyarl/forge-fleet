@@ -13,8 +13,10 @@
 
 use anyhow::{Context, Result};
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::project_github_sync::parse_owner_repo;
 
@@ -36,8 +38,22 @@ async fn gh_cmd() -> tokio::process::Command {
     c
 }
 
+/// After this many consecutive ticks stuck on the SAME head PR still computing
+/// mergeability (UNKNOWN), stop letting it block the serial queue: poke it
+/// (force GitHub to recompute) and rotate it to the back of its project queue so
+/// the already-computed, mergeable PRs behind it can drain meanwhile.
+const MAX_UNKNOWN_DEFERS: u32 = 3;
+
 /// One drain pass. Returns 1 if it merged something this tick, else 0.
-pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
+///
+/// `unknown_defers` tracks, per head merge-queue entry id, how many consecutive
+/// ticks GitHub has left it in the `UNKNOWN` (mergeability-computing) state; it
+/// is owned by the drain loop so the count survives across ticks. See
+/// [`MAX_UNKNOWN_DEFERS`].
+pub async fn evaluate_merge_queue(
+    pg: &PgPool,
+    unknown_defers: &mut HashMap<Uuid, u32>,
+) -> Result<usize> {
     let Some(item) = ff_db::pg_next_merge_queue_item(pg).await? else {
         return Ok(0);
     };
@@ -83,6 +99,7 @@ pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
             .bind(item.work_item_id)
             .execute(pg)
             .await?;
+            unknown_defers.remove(&item.id);
             return Ok(0);
         }
         PrMergeState::Behind => match gh_update_pr_branch(&pr_url).await {
@@ -102,14 +119,42 @@ pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
             }
         },
         PrMergeState::Unknown => {
+            let defers = unknown_defers.entry(item.id).or_insert(0);
+            *defers += 1;
+            if *defers >= MAX_UNKNOWN_DEFERS {
+                // A single slow-to-compute head PR must NOT block the whole
+                // serial queue (2026-07-20: a batch update-branch put many PRs
+                // into UNKNOWN at once and the drain stalled behind the head).
+                // Poke it (best-effort update-branch forces GitHub to recompute
+                // mergeability) and rotate it to the back so computed, mergeable
+                // PRs drain meanwhile.
+                warn!(
+                    pr = %pr_url,
+                    defers = *defers,
+                    "merge_drain: PR stuck UNKNOWN — poking + rotating to back of queue"
+                );
+                if let Err(e) = gh_update_pr_branch(&pr_url).await {
+                    warn!(pr = %pr_url, error = %e, "merge_drain: poke update-branch failed");
+                }
+                if let Err(e) = ff_db::pg_defer_merge_queue_item_to_back(pg, item.id).await {
+                    warn!(pr = %pr_url, error = %e, "merge_drain: rotate-to-back failed");
+                }
+                unknown_defers.remove(&item.id);
+                return Ok(0);
+            }
             info!(
                 pr = %pr_url,
+                defers = *defers,
                 "merge_drain: mergeability still computing (UNKNOWN) — deferring to next tick"
             );
             return Ok(0);
         }
         PrMergeState::Other => {}
     }
+
+    // Past the mergeability gate — this item is computed, so clear any stale
+    // UNKNOWN-defer count for it.
+    unknown_defers.remove(&item.id);
 
     // Mark that we're watching this PR's CI (idempotent).
     ff_db::pg_mark_merge_ci_running(pg, item.id).await?;
@@ -885,6 +930,9 @@ pub fn spawn_work_item_merge_drain(
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         let mut tick_n: u64 = 0;
+        // Per-head UNKNOWN-defer counts, owned by the loop so they persist across
+        // ticks (see MAX_UNKNOWN_DEFERS / evaluate_merge_queue).
+        let mut unknown_defers: HashMap<Uuid, u32> = HashMap::new();
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -904,8 +952,20 @@ pub fn spawn_work_item_merge_drain(
                     {
                         continue;
                     }
-                    if let Err(e) = evaluate_merge_queue(&pg).await {
+                    if let Err(e) = evaluate_merge_queue(&pg, &mut unknown_defers).await {
                         warn!(error = %e, "work_item_merge_drain tick failed");
+                    }
+                    // Drain-tick heartbeat: a leader-gated loop that goes silent
+                    // (e.g. a cold leader-cache after a daemon restart) is
+                    // otherwise invisible. Emitting an alive marker while we ARE
+                    // draining makes silent-death observable — a gap in these
+                    // lines while PRs pile up is the signal (2026-07-20 freeze).
+                    if tick_n % 30 == 0 {
+                        info!(
+                            tick = tick_n,
+                            pending_unknown = unknown_defers.len(),
+                            "work_item_merge_drain: alive (leader, draining)"
+                        );
                     }
                     // Every ~20th tick, sweep for PRs merged/closed out-of-band
                     // (hand-merges) so their work_items don't rot in `in_review`.

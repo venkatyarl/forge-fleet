@@ -128,6 +128,7 @@ pub use queries::{
     pg_create_training_job,
     // Orchestrator P2 — demand sensing (V116)
     pg_current_demand_vector,
+    pg_defer_merge_queue_item_to_back,
     pg_deferred_stats,
     pg_delete_artifact_index,
     pg_delete_deployment,
