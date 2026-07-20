@@ -2330,7 +2330,13 @@ fn checkout_clone_for_build(repo_path: &Path, base_branch: &str, task_branch: &s
         );
     }
     run_git(repo_path, ["reset", "--hard"], Duration::from_secs(120))?;
-    run_git(repo_path, ["clean", "-fd"], Duration::from_secs(120))?;
+    // `tmp/` is the slot's harvest boundary: a killed agent may have useful,
+    // uncommitted output there even when git has no diff yet.
+    run_git(
+        repo_path,
+        ["clean", "-fd", "-e", "tmp/"],
+        Duration::from_secs(120),
+    )?;
     run_git(
         repo_path,
         [
@@ -2356,7 +2362,11 @@ fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
             Duration::from_secs(60),
         );
         let _ = run_git(repo_path, ["reset", "--hard"], Duration::from_secs(120));
-        let _ = run_git(repo_path, ["clean", "-fd"], Duration::from_secs(120));
+        let _ = run_git(
+            repo_path,
+            ["clean", "-fd", "-e", "tmp/"],
+            Duration::from_secs(120),
+        );
         return Ok(());
     }
     // Legacy row from the pre-clone-direct era: the detached worktree dirs
