@@ -815,6 +815,7 @@ impl LeaderTick {
                     'tier', MAX(tier), \
                     'status', 'detected', \
                     'report_count', COUNT(*), \
+                    'last_reported_at', MAX(reported_at), \
                     'attempts', 0 \
                 ), \
                 CASE MAX(tier) \
@@ -834,36 +835,57 @@ impl LeaderTick {
                 summary = EXCLUDED.summary, \
                 priority = EXCLUDED.priority, \
                 status = CASE \
-                    WHEN fleet_tasks.status = ANY($1) THEN 'pending' \
+                    WHEN fleet_tasks.status = ANY($1) \
+                         AND (EXCLUDED.payload->>'last_reported_at')::timestamptz \
+                             > COALESCE(fleet_tasks.completed_at, fleet_tasks.created_at) THEN 'pending' \
                     ELSE fleet_tasks.status \
                 END, \
                 created_at = CASE \
-                    WHEN fleet_tasks.status = ANY($1) THEN NOW() \
+                    WHEN fleet_tasks.status = ANY($1) \
+                         AND (EXCLUDED.payload->>'last_reported_at')::timestamptz \
+                             > COALESCE(fleet_tasks.completed_at, fleet_tasks.created_at) THEN NOW() \
                     ELSE fleet_tasks.created_at \
+                END, \
+                completed_at = CASE \
+                    WHEN fleet_tasks.status = ANY($1) \
+                         AND (EXCLUDED.payload->>'last_reported_at')::timestamptz \
+                             > COALESCE(fleet_tasks.completed_at, fleet_tasks.created_at) THEN NULL \
+                    ELSE fleet_tasks.completed_at \
                 END, \
                 payload = fleet_tasks.payload || jsonb_build_object( \
                     'bug_signature', COALESCE(fleet_tasks.payload->>'bug_signature', EXCLUDED.payload->>'bug_signature'), \
                     'tier', EXCLUDED.payload->>'tier', \
                     'report_count', COALESCE((fleet_tasks.payload->>'report_count')::int, 0) \
                         + COALESCE((EXCLUDED.payload->>'report_count')::int, 0), \
+                    'last_reported_at', EXCLUDED.payload->>'last_reported_at', \
                     'status', CASE \
-                        WHEN fleet_tasks.status = ANY($1) THEN 'detected' \
+                        WHEN fleet_tasks.status = ANY($1) \
+                             AND (EXCLUDED.payload->>'last_reported_at')::timestamptz \
+                                 > COALESCE(fleet_tasks.completed_at, fleet_tasks.created_at) THEN 'detected' \
                         ELSE COALESCE(fleet_tasks.payload->>'status', 'detected') \
                     END, \
                     'attempts', CASE \
-                        WHEN fleet_tasks.status = ANY($1) THEN 0 \
+                        WHEN fleet_tasks.status = ANY($1) \
+                             AND (EXCLUDED.payload->>'last_reported_at')::timestamptz \
+                                 > COALESCE(fleet_tasks.completed_at, fleet_tasks.created_at) THEN 0 \
                         ELSE COALESCE((fleet_tasks.payload->>'attempts')::int, 0) \
                     END, \
                     'last_attempt_at', CASE \
-                        WHEN fleet_tasks.status = ANY($1) THEN NULL \
+                        WHEN fleet_tasks.status = ANY($1) \
+                             AND (EXCLUDED.payload->>'last_reported_at')::timestamptz \
+                                 > COALESCE(fleet_tasks.completed_at, fleet_tasks.created_at) THEN NULL \
                         ELSE fleet_tasks.payload->>'last_attempt_at' \
                     END, \
                     'writer_computer_id', CASE \
-                        WHEN fleet_tasks.status = ANY($1) THEN NULL \
+                        WHEN fleet_tasks.status = ANY($1) \
+                             AND (EXCLUDED.payload->>'last_reported_at')::timestamptz \
+                                 > COALESCE(fleet_tasks.completed_at, fleet_tasks.created_at) THEN NULL \
                         ELSE fleet_tasks.payload->>'writer_computer_id' \
                     END, \
                     'escalated_to_operator_at', CASE \
-                        WHEN fleet_tasks.status = ANY($1) THEN NULL \
+                        WHEN fleet_tasks.status = ANY($1) \
+                             AND (EXCLUDED.payload->>'last_reported_at')::timestamptz \
+                                 > COALESCE(fleet_tasks.completed_at, fleet_tasks.created_at) THEN NULL \
                         ELSE fleet_tasks.payload->>'escalated_to_operator_at' \
                     END \
                 )",
@@ -889,6 +911,10 @@ impl LeaderTick {
                     WHEN stale.attempts >= 2 THEN 'failed' \
                     ELSE 'pending' \
                 END, \
+                    completed_at = CASE \
+                        WHEN stale.attempts >= 2 THEN NOW() \
+                        ELSE t.completed_at \
+                    END, \
                     payload = t.payload || jsonb_build_object( \
                         'status', CASE \
                             WHEN stale.attempts >= 2 THEN 'escalated' \
@@ -1581,6 +1607,7 @@ mod tests {
         bug_signature: &str,
         tier: &str,
         report_count: i32,
+        reported_at: chrono::DateTime<Utc>,
     ) -> Uuid {
         let terminal_statuses = ["completed", "cancelled", "failed"];
         let row = sqlx::query(
@@ -1595,6 +1622,7 @@ mod tests {
                     'tier', $2, \
                     'status', 'detected', \
                     'report_count', $3, \
+                    'last_reported_at', $7, \
                     'attempts', 0 \
                 ), \
                 $4, \
@@ -1607,11 +1635,18 @@ mod tests {
                 summary = EXCLUDED.summary, \
                 priority = EXCLUDED.priority, \
                 status = CASE \
-                    WHEN fleet_tasks.status = ANY($6) THEN 'pending' \
+                    WHEN fleet_tasks.status = ANY($6) \
+                         AND $7 > COALESCE(fleet_tasks.completed_at, fleet_tasks.created_at) THEN 'pending' \
                     ELSE fleet_tasks.status \
                 END, \
+                completed_at = CASE \
+                    WHEN fleet_tasks.status = ANY($6) \
+                         AND $7 > COALESCE(fleet_tasks.completed_at, fleet_tasks.created_at) THEN NULL \
+                    ELSE fleet_tasks.completed_at \
+                END, \
                 created_at = CASE \
-                    WHEN fleet_tasks.status = ANY($6) THEN NOW() \
+                    WHEN fleet_tasks.status = ANY($6) \
+                         AND $7 > COALESCE(fleet_tasks.completed_at, fleet_tasks.created_at) THEN NOW() \
                     ELSE fleet_tasks.created_at \
                 END, \
                 payload = fleet_tasks.payload || jsonb_build_object( \
@@ -1620,23 +1655,28 @@ mod tests {
                     'report_count', COALESCE((fleet_tasks.payload->>'report_count')::int, 0) \
                         + COALESCE((EXCLUDED.payload->>'report_count')::int, 0), \
                     'status', CASE \
-                        WHEN fleet_tasks.status = ANY($6) THEN 'detected' \
+                        WHEN fleet_tasks.status = ANY($6) \
+                             AND $7 > COALESCE(fleet_tasks.completed_at, fleet_tasks.created_at) THEN 'detected' \
                         ELSE COALESCE(fleet_tasks.payload->>'status', 'detected') \
                     END, \
                     'attempts', CASE \
-                        WHEN fleet_tasks.status = ANY($6) THEN 0 \
+                        WHEN fleet_tasks.status = ANY($6) \
+                             AND $7 > COALESCE(fleet_tasks.completed_at, fleet_tasks.created_at) THEN 0 \
                         ELSE COALESCE((fleet_tasks.payload->>'attempts')::int, 0) \
                     END, \
                     'last_attempt_at', CASE \
-                        WHEN fleet_tasks.status = ANY($6) THEN NULL \
+                        WHEN fleet_tasks.status = ANY($6) \
+                             AND $7 > COALESCE(fleet_tasks.completed_at, fleet_tasks.created_at) THEN NULL \
                         ELSE fleet_tasks.payload->>'last_attempt_at' \
                     END, \
                     'writer_computer_id', CASE \
-                        WHEN fleet_tasks.status = ANY($6) THEN NULL \
+                        WHEN fleet_tasks.status = ANY($6) \
+                             AND $7 > COALESCE(fleet_tasks.completed_at, fleet_tasks.created_at) THEN NULL \
                         ELSE fleet_tasks.payload->>'writer_computer_id' \
                     END, \
                     'escalated_to_operator_at', CASE \
-                        WHEN fleet_tasks.status = ANY($6) THEN NULL \
+                        WHEN fleet_tasks.status = ANY($6) \
+                             AND $7 > COALESCE(fleet_tasks.completed_at, fleet_tasks.created_at) THEN NULL \
                         ELSE fleet_tasks.payload->>'escalated_to_operator_at' \
                     END \
                 ) \
@@ -1648,6 +1688,7 @@ mod tests {
         .bind(self_heal_priority_for_tier(tier))
         .bind(self_heal_task_status("detected"))
         .bind(&terminal_statuses[..])
+        .bind(reported_at)
         .fetch_one(pg)
         .await
         .expect("upsert self-heal task");
@@ -1669,8 +1710,9 @@ mod tests {
         }
         let (admin, pool, db_name) = create_temp_db().await;
 
-        let first_id = upsert_self_heal_task(&pool, "sig-same-bug", "T2", 1).await;
-        let second_id = upsert_self_heal_task(&pool, "sig-same-bug", "T1", 3).await;
+        let now = Utc::now();
+        let first_id = upsert_self_heal_task(&pool, "sig-same-bug", "T2", 1, now).await;
+        let second_id = upsert_self_heal_task(&pool, "sig-same-bug", "T1", 3, now).await;
 
         let active_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) \
@@ -1715,12 +1757,13 @@ mod tests {
         }
         let (admin, pool, db_name) = create_temp_db().await;
 
-        let id = upsert_self_heal_task(&pool, "sig-recur", "T2", 1).await;
+        let first_reported_at = Utc::now();
+        let id = upsert_self_heal_task(&pool, "sig-recur", "T2", 1, first_reported_at).await;
 
         // Simulate a previous self-heal attempt that exhausted its retries.
         sqlx::query(
             "UPDATE fleet_tasks \
-             SET status = 'failed', \
+             SET status = 'failed', completed_at = $3, \
                  payload = payload || jsonb_build_object( \
                      'status', 'failed', \
                      'attempts', 2, \
@@ -1732,11 +1775,29 @@ mod tests {
         )
         .bind("sig-recur")
         .bind(Uuid::new_v4())
+        .bind(first_reported_at + chrono::Duration::seconds(1))
         .execute(&pool)
         .await
         .expect("mark self-heal task terminal");
 
-        let rearmed_id = upsert_self_heal_task(&pool, "sig-recur", "T1", 3).await;
+        let still_terminal_id =
+            upsert_self_heal_task(&pool, "sig-recur", "T1", 0, first_reported_at).await;
+        let status: String = sqlx::query_scalar("SELECT status FROM fleet_tasks WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch task after stale report");
+        assert_eq!(still_terminal_id, id);
+        assert_eq!(status, "failed");
+
+        let rearmed_id = upsert_self_heal_task(
+            &pool,
+            "sig-recur",
+            "T1",
+            3,
+            first_reported_at + chrono::Duration::seconds(2),
+        )
+        .await;
 
         let row = sqlx::query(
             "SELECT id, status, payload->>'status' AS payload_status, \
