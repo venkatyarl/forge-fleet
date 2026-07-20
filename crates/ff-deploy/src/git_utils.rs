@@ -101,6 +101,26 @@ fn git_run(repo_path: &Path, args: &[&str]) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
+
+    fn run_git(repo: &std::path::Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .expect("failed to spawn git");
+        assert!(status.success(), "git {} failed", args.join(" "));
+    }
+
+    fn run_git_output(repo: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("failed to spawn git");
+        assert!(output.status.success(), "git {} failed", args.join(" "));
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
 
     fn init_repo(temp: &std::path::Path) {
         let _ = Command::new("git")
@@ -177,5 +197,56 @@ mod tests {
 
         fs::write(temp.path().join("untracked.txt"), "ignored").unwrap();
         assert!(!git_tree_is_dirty(temp.path()).unwrap());
+    }
+
+    #[test]
+    fn stash_dirty_tree_creates_labeled_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        init_repo(temp.path());
+        fs::write(temp.path().join("file.txt"), "hello").unwrap();
+        run_git(temp.path(), &["add", "file.txt"]);
+        run_git(temp.path(), &["commit", "-m", "init", "-q"]);
+
+        fs::write(temp.path().join("file.txt"), "dirty").unwrap();
+        let label = git_stash_dirty_tree(temp.path()).unwrap();
+        assert!(label.starts_with("ff-deploy-dirty-guard-"));
+
+        // Tracked modification should be reverted to the committed state.
+        let content = fs::read_to_string(temp.path().join("file.txt")).unwrap();
+        assert_eq!(content, "hello");
+
+        // The labeled stash should be reachable via `git stash list`.
+        let stash_list = run_git_output(temp.path(), &["stash", "list"]);
+        assert!(stash_list.contains(&label));
+    }
+
+    #[test]
+    fn fetch_and_reset_hard_stashes_dirty_tree_before_reset() {
+        let origin = tempfile::tempdir().unwrap();
+        init_repo(origin.path());
+        fs::write(origin.path().join("file.txt"), "origin").unwrap();
+        run_git(origin.path(), &["add", "file.txt"]);
+        run_git(origin.path(), &["commit", "-m", "init", "-q"]);
+        run_git(origin.path(), &["branch", "-M", "main"]);
+
+        let local = tempfile::tempdir().unwrap();
+        run_git(
+            local.path(),
+            &["clone", "-q", origin.path().to_str().unwrap(), "."],
+        );
+
+        // Make a tracked modification on the local checkout.
+        fs::write(local.path().join("file.txt"), "local changes").unwrap();
+        assert!(git_tree_is_dirty(local.path()).unwrap());
+
+        git_fetch_and_reset_hard(local.path(), "origin/main").unwrap();
+
+        // The tree should now match the remote ref.
+        let content = fs::read_to_string(local.path().join("file.txt")).unwrap();
+        assert_eq!(content, "origin");
+
+        // The local modification should have been preserved in a labeled stash.
+        let stash_list = run_git_output(local.path(), &["stash", "list"]);
+        assert!(stash_list.contains("ff-deploy-dirty-guard-"));
     }
 }

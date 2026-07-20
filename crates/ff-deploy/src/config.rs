@@ -4,6 +4,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// Default time to wait for active leases to drain before restarting a daemon.
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Top-level deployment configuration.
 ///
 /// Controls orchestration behavior such as how long to wait for leases and
@@ -24,7 +27,7 @@ impl Default for DeployConfig {
 }
 
 fn default_drain_timeout() -> Duration {
-    Duration::from_secs(300)
+    DEFAULT_DRAIN_TIMEOUT
 }
 
 #[cfg(test)]
@@ -34,13 +37,13 @@ mod tests {
     #[test]
     fn default_drain_timeout_is_five_minutes() {
         let cfg = DeployConfig::default();
-        assert_eq!(cfg.drain_timeout, Duration::from_secs(300));
+        assert_eq!(cfg.drain_timeout, DEFAULT_DRAIN_TIMEOUT);
     }
 
     #[test]
     fn deserialize_uses_default_when_field_missing() {
         let cfg: DeployConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(cfg.drain_timeout, Duration::from_secs(300));
+        assert_eq!(cfg.drain_timeout, DEFAULT_DRAIN_TIMEOUT);
     }
 
     #[test]
