@@ -75,6 +75,14 @@ impl TickRegistry {
                 scope: TickScope::EveryNode,
                 runner: run_metrics_scraper_tick,
             },
+            TickDefinition {
+                // Clock-gated inside the runner: sends once per day at/after
+                // 08:00 local; the 60s interval is just the due-check cadence.
+                name: "nightly_telegram_digest",
+                interval: Duration::from_secs(60),
+                scope: TickScope::LeaderOnly,
+                runner: run_nightly_digest_tick,
+            },
         ]
         .into_iter()
         .map(|definition| RegisteredTick {
@@ -211,6 +219,10 @@ fn run_metrics_scraper_tick(pg: PgPool, worker_name: String) -> BoxFuture<'stati
             .map(|_| ())
             .map_err(anyhow::Error::from)
     })
+}
+
+fn run_nightly_digest_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move { crate::ha::periodic::run_nightly_digest_tick(&pg, &worker_name).await })
 }
 
 /// How often the dispatch-tick watchdog wakes up to check liveness.
