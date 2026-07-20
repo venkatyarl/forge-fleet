@@ -1101,6 +1101,12 @@ mod bootstrap_lifecycle_tests {
     const SYSTEMD_UNIT: &str = include_str!("../../../deploy/systemd/forgefleetd.service");
 
     #[test]
+    fn linux_bootstrap_uses_canonical_redis_port() {
+        assert!(BOOTSTRAP_TEMPLATE.contains("redis://{{LEADER_HOST}}:56379"));
+        assert!(!BOOTSTRAP_TEMPLATE.contains("redis://{{LEADER_HOST}}:6380"));
+    }
+
+    #[test]
     fn linux_bootstrap_enforces_reboot_persistent_user_service() {
         for required in [
             "loginctl enable-linger \"$SUDO_INVOKER\"",
