@@ -398,7 +398,7 @@ impl LeaderCoordinator {
         // Schedule at most one task per tick. Peek (don't dequeue) so the task
         // stays reserved in the queue until an agent heartbeat confirms it.
         // This avoids losing the task if the agent is slow to heartbeat.
-        if let Some(task) = self.queue.peek().cloned() {
+        if let Some(task) = self.queue.peek() {
             let scheduled = ScheduledTask::from_queued(&task);
             let task_id = scheduled.id;
 
