@@ -764,7 +764,9 @@ mod tests {
         assert!(rearmed);
 
         let row = sqlx::query(
-            "SELECT id, status, completed_at, payload->>'status' AS payload_status,
+            "SELECT id, status, priority, completed_at, payload->>'status' AS payload_status,
+                    payload->>'tier' AS tier,
+                    (payload->>'report_count')::int AS report_count,
                     (payload->>'attempts')::int AS attempts
                FROM fleet_tasks
               WHERE dedup_signature = $1",
@@ -776,7 +778,13 @@ mod tests {
 
         assert_eq!(row.get::<uuid::Uuid, _>("id"), id);
         assert_eq!(row.get::<String, _>("status"), "pending");
+        assert_eq!(
+            row.get::<i32, _>("priority"),
+            self_heal_priority_for_tier("T1")
+        );
         assert_eq!(row.get::<String, _>("payload_status"), "detected");
+        assert_eq!(row.get::<String, _>("tier"), "T1");
+        assert_eq!(row.get::<i32, _>("report_count"), 2);
         assert_eq!(row.get::<i32, _>("attempts"), 0);
         assert!(
             row.get::<Option<DateTime<Utc>>, _>("completed_at")
