@@ -610,7 +610,7 @@ mod tests {
         let cmd = format!("sleep 300 & echo $! > {pidfile_str}; wait");
 
         let start = std::time::Instant::now();
-        let (ok, _, err) = execute_shell(None, &cmd, &[], Duration::from_millis(400)).await;
+        let (ok, _, err) = execute_shell(None, &cmd, &[], Duration::from_secs(2)).await;
         assert!(!ok, "expected timeout failure");
         let msg = err.unwrap();
         assert!(
@@ -629,23 +629,23 @@ mod tests {
         // delivery + reaping routinely takes longer than a fixed 300ms, which
         // made this assertion flaky (fails intermittently, blocking the merge
         // drain). Polling exits fast in the common case and tolerates load.
-        if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
-            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                let deadline = std::time::Instant::now() + Duration::from_secs(5);
-                let mut alive = true;
-                while std::time::Instant::now() < deadline {
-                    // kill(-0) returns Err(ESRCH) when the process is gone.
-                    alive = unsafe { libc::kill(pid, 0) } == 0;
-                    if !alive {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                assert!(
-                    !alive,
-                    "grandchild pid {pid} survived the process-group kill"
-                );
+        let pid_str = std::fs::read_to_string(&pidfile)
+            .expect("timed command must start its grandchild and write the pidfile");
+        let pid = pid_str
+            .trim()
+            .parse::<i32>()
+            .expect("grandchild pidfile must contain a valid pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // kill(-0) returns Err(ESRCH) when the process is gone.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                break;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild pid {pid} survived the process-group kill"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let _ = std::fs::remove_file(&pidfile);
     }
