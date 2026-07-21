@@ -2773,6 +2773,7 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "fleet_models_disk_usage" => fleet_models_disk_usage(params).await,
         "fleet_agents" => fleet_agents(params).await,
         "work_item_context" => crate::verbs::context_retrieval::work_item_context(params).await,
+        "fabric_topology" => crate::verbs::fabric_topology::fabric_topology(params).await,
         // Virtual Brain
         // Scratchpad (agent working memory)
         "memory_get" => crate::memory_tools::memory_get(params).await,

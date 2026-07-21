@@ -96,6 +96,7 @@ impl ToolRegistry {
         self.register(Self::fleet_models_disk_usage());
         self.register(Self::fleet_agents());
         self.register(Self::work_item_context());
+        self.register(Self::fabric_topology());
 
         // ── Virtual Brain tools ─────────────────────────────────────────
         self.register(Self::brain_search());
@@ -164,6 +165,19 @@ impl ToolRegistry {
                     }
                 },
                 "required": ["work_item_id"]
+            }),
+        }
+    }
+
+    fn fabric_topology() -> ToolDefinition {
+        ToolDefinition {
+            name: "fabric_topology".to_string(),
+            description: "Show the private-fabric ring nodes, edges, and verification state."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
             }),
         }
     }
@@ -1772,6 +1786,7 @@ mod tests {
             "fleet_models_disk_usage",
             "fleet_agents",
             "work_item_context",
+            "fabric_topology",
             // Virtual Brain
             "brain_search",
             "brain_vault_read",
