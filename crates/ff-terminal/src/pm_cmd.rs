@@ -2,7 +2,7 @@ use crate::{CYAN, GREEN, RED, RESET, YELLOW};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize)]
 struct LeafTask {
     title: String,
     description: String,
@@ -949,23 +949,33 @@ async fn handle_pm_decompose(
     .await
     .map_err(|e| anyhow::anyhow!("fleet_oneshot decompose: {e}"))?;
 
-    // Pull the JSON array out of the completion (models sometimes wrap it).
-    let text = resp.text.trim();
-    let json_slice = match (text.find('['), text.rfind(']')) {
-        (Some(a), Some(b)) if b > a => &text[a..=b],
-        _ => {
-            return Err(anyhow::anyhow!(
-                "LLM did not return a JSON array; got: {}",
-                text.chars().take(200).collect::<String>()
-            ));
+    let tasks = parse_leaf_tasks(&resp.text)?;
+    let tasks = match quality_gate_decomposition(tasks, repo_context.as_ref()) {
+        Ok(tasks) => tasks,
+        Err(first_error) => {
+            // Bad paths and false assumptions are planning errors, not work for a
+            // builder to discover after taking a lease. Give the planner exactly
+            // one chance to regenerate with the deterministic findings.
+            let retry_prompt = format!(
+                "{prompt}\n\nYour previous decomposition failed deterministic repository checks:\n\
+                 {first_error}\nRegenerate the complete JSON array. Use only tracked files unless the task \
+                 explicitly creates a new file in an existing directory, and do not repeat \
+                 the same file scope in sibling tasks."
+            );
+            let retry = ff_agent::fleet_oneshot::fleet_oneshot(
+                pool,
+                &retry_prompt,
+                effective_hint.as_deref(),
+                Some(std::time::Duration::from_secs(180)),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("fleet_oneshot decompose regeneration: {e}"))?;
+            let retry_tasks = parse_leaf_tasks(&retry.text)?;
+            quality_gate_decomposition(retry_tasks, repo_context.as_ref()).map_err(|e| {
+                anyhow::anyhow!("decomposition quality gate failed after regeneration: {e}")
+            })?
         }
     };
-    let tasks: Vec<LeafTask> = serde_json::from_str(json_slice)
-        .map_err(|e| anyhow::anyhow!("parse decomposed tasks JSON: {e}"))?;
-    if tasks.is_empty() {
-        return Err(anyhow::anyhow!("LLM returned zero tasks"));
-    }
-    validate_decomposition(&tasks, repo_context.as_ref())?;
 
     let created_by = ff_agent::fleet_info::resolve_this_worker_name().await;
     println!(
@@ -1027,10 +1037,24 @@ async fn handle_pm_decompose(
     Ok(())
 }
 
-fn validate_decomposition(
-    tasks: &[LeafTask],
+fn parse_leaf_tasks(text: &str) -> Result<Vec<LeafTask>> {
+    let text = text.trim();
+    let json_slice = match (text.find('['), text.rfind(']')) {
+        (Some(a), Some(b)) if b > a => &text[a..=b],
+        _ => return Err(anyhow::anyhow!("LLM did not return a JSON array")),
+    };
+    let tasks: Vec<LeafTask> = serde_json::from_str(json_slice)
+        .map_err(|e| anyhow::anyhow!("parse decomposed tasks JSON: {e}"))?;
+    if tasks.is_empty() {
+        return Err(anyhow::anyhow!("LLM returned zero tasks"));
+    }
+    Ok(tasks)
+}
+
+fn quality_gate_decomposition(
+    tasks: Vec<LeafTask>,
     repo_context: Option<&crate::repo_context::RepoContext>,
-) -> Result<()> {
+) -> Result<Vec<LeafTask>> {
     let autonomous = std::env::var_os("FORGEFLEET_AUTO_FEEDER").is_some();
     let tracked = repo_context
         .and_then(|ctx| ctx.repo_path.as_deref())
@@ -1047,8 +1071,7 @@ fn validate_decomposition(
         ));
     }
 
-    let mut claimed = std::collections::HashSet::new();
-    for task in tasks {
+    for task in &tasks {
         if autonomous && task.files.is_empty() {
             return Err(anyhow::anyhow!(
                 "decomposition quality gate: '{}' has no file references",
@@ -1075,23 +1098,146 @@ fn validate_decomposition(
                             .map(|tp| tp.to_string_lossy() == dir)
                             .unwrap_or(false)
                     });
-                if !parent_has_tracked {
+                let explicitly_creates = task.description.to_ascii_lowercase().contains("create")
+                    || task.description.to_ascii_lowercase().contains("new file")
+                    || task.title.to_ascii_lowercase().starts_with("add ");
+                if !parent_has_tracked || !explicitly_creates {
                     return Err(anyhow::anyhow!(
-                        "decomposition quality gate: '{}' references file '{}' in a nonexistent directory (likely hallucinated)",
+                        "decomposition quality gate: '{}' references untracked file '{}' without an explicit, valid create-file scope",
                         task.title,
                         file
                     ));
                 }
             }
-            if !claimed.insert(file.clone()) {
+        }
+        if let Some(repo_path) = repo_context.and_then(|ctx| ctx.repo_path.as_deref()) {
+            verify_symbol_claims(task, repo_path)?;
+        }
+    }
+    Ok(merge_overlapping_siblings(tasks))
+}
+
+/// Collapse siblings whose predicted file sets intersect. Keeping the first
+/// title makes output stable; combining descriptions preserves both requested
+/// changes while ensuring two workers cannot race on the same file.
+fn merge_overlapping_siblings(tasks: Vec<LeafTask>) -> Vec<LeafTask> {
+    let mut merged: Vec<LeafTask> = Vec::new();
+    for mut task in tasks {
+        // Remove and fold every intersection, not just the first: a task that
+        // bridges two otherwise-disjoint scopes must collapse all three.
+        let mut index = 0;
+        let mut retained_title = None;
+        while index < merged.len() {
+            if merged[index]
+                .files
+                .iter()
+                .any(|file| task.files.contains(file))
+            {
+                let existing = merged.remove(index);
+                if retained_title.is_none() {
+                    retained_title = Some(existing.title.clone());
+                }
+                if !task.description.contains(&existing.description) {
+                    task.description =
+                        format!("{}\n\nAlso: {}", existing.description, task.description);
+                }
+                for file in existing.files {
+                    if !task.files.contains(&file) {
+                        task.files.push(file);
+                    }
+                }
+                task.complexity = Some(merge_complexity(
+                    existing.complexity.as_deref(),
+                    task.complexity.as_deref(),
+                ));
+            } else {
+                index += 1;
+            }
+        }
+        if let Some(title) = retained_title {
+            task.title = title;
+        }
+        merged.push(task);
+    }
+    merged
+}
+
+fn merge_complexity(left: Option<&str>, right: Option<&str>) -> String {
+    let rank = |value: Option<&str>| match normalize_complexity(value) {
+        "complex" => 2,
+        "moderate" => 1,
+        _ => 0,
+    };
+    match rank(left).max(rank(right)) {
+        2 => "complex",
+        1 => "moderate",
+        _ => "mechanical",
+    }
+    .to_string()
+}
+
+/// Check explicit existence/absence claims around backticked Rust-like symbols.
+/// This deliberately ignores ordinary mentions: only sentences containing a
+/// claim word are checked, keeping the deterministic grep conservative.
+fn verify_symbol_claims(task: &LeafTask, repo_path: &Path) -> Result<()> {
+    for sentence in task.description.split(['.', '\n']) {
+        let lower = sentence.to_ascii_lowercase();
+        let claims_absent = lower.contains("does not exist")
+            || lower.contains("doesn't exist")
+            || lower.contains("is missing")
+            || lower.contains("is absent");
+        let claims_present = lower.contains("existing")
+            || lower.contains("already exists")
+            || lower.contains("is present");
+        if !claims_absent && !claims_present {
+            continue;
+        }
+        for symbol in backticked_symbols(sentence) {
+            let exists = git_grep_symbol(repo_path, symbol);
+            if (claims_absent && exists) || (claims_present && !exists) {
                 return Err(anyhow::anyhow!(
-                    "decomposition quality gate: sibling tasks overlap on '{}'",
-                    file
+                    "decomposition quality gate: '{}' makes a false {} claim about symbol `{}`",
+                    task.title,
+                    if claims_absent {
+                        "absence"
+                    } else {
+                        "existence"
+                    },
+                    symbol
                 ));
             }
         }
     }
     Ok(())
+}
+
+fn backticked_symbols(text: &str) -> Vec<&str> {
+    let mut parts = text.split('`');
+    let mut symbols = Vec::new();
+    while let Some(_) = parts.next() {
+        let Some(candidate) = parts.next() else { break };
+        if !candidate.is_empty()
+            && candidate
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':'))
+            && candidate.chars().any(|c| c.is_ascii_alphabetic())
+        {
+            symbols.push(candidate);
+        }
+    }
+    symbols
+}
+
+fn git_grep_symbol(repo_path: &Path, symbol: &str) -> bool {
+    let grep = |pattern: &str| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["grep", "-q", "-F", "--", pattern])
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    grep(symbol) || symbol.rsplit_once("::").is_some_and(|(_, leaf)| grep(leaf))
 }
 
 fn repo_context_from_binding(
@@ -2082,23 +2228,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decomposition_quality_gate_rejects_sibling_file_overlap() {
+    fn decomposition_quality_gate_merges_sibling_file_overlap() {
         let tasks = vec![
             LeafTask {
                 title: "first".into(),
-                description: String::new(),
+                description: "change parser".into(),
                 files: vec!["src/lib.rs".into()],
-                complexity: None,
+                complexity: Some("mechanical".into()),
             },
             LeafTask {
                 title: "second".into(),
-                description: String::new(),
-                files: vec!["src/lib.rs".into()],
-                complexity: None,
+                description: "add parser test".into(),
+                files: vec!["src/lib.rs".into(), "src/tests.rs".into()],
+                complexity: Some("moderate".into()),
             },
         ];
-        let error = validate_decomposition(&tasks, None).unwrap_err();
-        assert!(error.to_string().contains("sibling tasks overlap"));
+        let gated = quality_gate_decomposition(tasks, None).unwrap();
+        assert_eq!(gated.len(), 1);
+        assert_eq!(gated[0].files, ["src/lib.rs", "src/tests.rs"]);
+        assert!(gated[0].description.contains("add parser test"));
+        assert_eq!(gated[0].complexity.as_deref(), Some("moderate"));
+    }
+
+    #[test]
+    fn backticked_symbols_ignores_paths_and_commands() {
+        assert_eq!(
+            backticked_symbols(
+                "existing `LeaseManager` calls `lease::reap`; run `cargo test` and edit `src/lib.rs`"
+            ),
+            ["LeaseManager", "lease::reap"]
+        );
+    }
+
+    #[test]
+    fn decomposition_quality_gate_merges_transitive_overlap() {
+        let task = |title: &str, files: &[&str]| LeafTask {
+            title: title.into(),
+            description: title.into(),
+            files: files.iter().map(|file| (*file).into()).collect(),
+            complexity: None,
+        };
+        let gated = quality_gate_decomposition(
+            vec![
+                task("first", &["a.rs"]),
+                task("second", &["b.rs"]),
+                task("bridge", &["a.rs", "b.rs"]),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(gated.len(), 1);
+        assert!(gated[0].files.contains(&"a.rs".into()));
+        assert!(gated[0].files.contains(&"b.rs".into()));
     }
 
     #[test]
