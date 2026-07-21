@@ -11982,6 +11982,14 @@ AFTER INSERT OR DELETE OR UPDATE OF computer_id, slot, status ON sub_agents
 FOR EACH ROW EXECUTE FUNCTION sync_fleet_worker_sub_agent_count();
 "#;
 
+/// Give computer upserts a database-enforced conflict key for network identity.
+/// Blank placeholder addresses remain allowed for not-yet-discovered hosts.
+pub const SCHEMA_V227_COMPUTERS_PRIMARY_IP_UPSERT_KEY: &str = r#"
+CREATE UNIQUE INDEX IF NOT EXISTS computers_primary_ip_upsert_key
+    ON computers (primary_ip)
+    WHERE btrim(primary_ip) <> '';
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

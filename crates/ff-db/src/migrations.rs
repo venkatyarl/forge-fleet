@@ -1116,6 +1116,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "registry_hygiene",
         sql: schema::SCHEMA_V226_REGISTRY_HYGIENE,
     },
+    PgMigration {
+        version: 227,
+        name: "computers_primary_ip_upsert_key",
+        sql: schema::SCHEMA_V227_COMPUTERS_PRIMARY_IP_UPSERT_KEY,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1514,6 +1519,51 @@ mod tests {
                 .expect("re-read test computer");
         assert_eq!(ip, "10.0.0.2");
         assert_eq!(ram, Some(64));
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v227_supports_atomic_computer_upsert_by_primary_ip() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        let first_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO computers (name, primary_ip, total_ram_gb)
+             VALUES ('v227-old-name', '10.0.0.227', 32)
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert initial computer");
+
+        let upserted_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO computers (name, primary_ip, total_ram_gb)
+             VALUES ('v227-new-name', '10.0.0.227', 64)
+             ON CONFLICT (primary_ip) WHERE btrim(primary_ip) <> ''
+             DO UPDATE SET name = EXCLUDED.name,
+                           total_ram_gb = EXCLUDED.total_ram_gb
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("atomically upsert computer by primary_ip");
+
+        assert_eq!(upserted_id, first_id);
+        let row: (String, i32, i64) = sqlx::query_as(
+            "SELECT MIN(name), MIN(total_ram_gb), COUNT(*)
+               FROM computers
+              WHERE primary_ip = '10.0.0.227'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read upserted computer");
+        assert_eq!(row, ("v227-new-name".into(), 64, 1));
 
         drop_temp_db(admin, pool, &db_name).await;
     }
