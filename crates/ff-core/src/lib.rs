@@ -27,6 +27,7 @@ pub mod db_health;
 pub mod error;
 pub mod fleet_resolver;
 pub mod hardware;
+pub mod health;
 pub mod leader;
 pub mod maintenance;
 pub mod model_id;
