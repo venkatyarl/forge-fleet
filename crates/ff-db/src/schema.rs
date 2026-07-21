@@ -11676,6 +11676,19 @@ INSERT INTO jira_configs (
 ON CONFLICT (name) DO NOTHING;
 "#;
 
+/// Model-facing fabric-pair fields derived from the existing topology rows.
+pub const SCHEMA_V218_FABRIC_PAIR_MODEL_COLUMNS: &str = r#"
+ALTER TABLE fabric_pairs
+    ADD COLUMN IF NOT EXISTS source_node TEXT
+        GENERATED ALWAYS AS (split_part(pair_name, '-', 1)) STORED,
+    ADD COLUMN IF NOT EXISTS target_node TEXT
+        GENERATED ALWAYS AS (split_part(pair_name, '-', 2)) STORED,
+    ADD COLUMN IF NOT EXISTS cidr TEXT
+        GENERATED ALWAYS AS (set_masklen(a_ip::inet, 30)::cidr::text) STORED,
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending',
+    ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

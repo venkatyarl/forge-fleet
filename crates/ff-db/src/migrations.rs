@@ -1071,6 +1071,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "jira_monitoring",
         sql: schema::SCHEMA_V217_JIRA_MONITORING,
     },
+    PgMigration {
+        version: 218,
+        name: "fabric_pair_model_columns",
+        sql: schema::SCHEMA_V218_FABRIC_PAIR_MODEL_COLUMNS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
