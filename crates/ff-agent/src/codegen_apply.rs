@@ -29,6 +29,10 @@ pub struct CodegenOutcome {
 /// present / needs no change (as opposed to a confused/empty response). Deliberately requires a
 /// completion phrase AND a no-change phrase to avoid false positives on genuine failures.
 fn response_reports_already_done(text: &str) -> bool {
+    // Explicit sentinel the prompt now asks for.
+    if text.trim_start().to_lowercase().starts_with("already_implemented:") {
+        return true;
+    }
     let t = text.to_lowercase();
     let completion = [
         "already implemented",
@@ -351,7 +355,20 @@ fn build_prompt(
          - For large files, you are shown only RELEVANT REGIONS with line numbers; SEARCH blocks must match lines shown in those regions EXACTLY.\n\
          - To create a NEW file, leave the SEARCH section empty.\n\
          - To append, SEARCH a unique existing snippet and include it in REPLACE plus the new code.\n\
-         - Paths must be relative to the repo root."
+         - Paths must be relative to the repo root.\n\
+         - You do NOT have a shell or file access. You CANNOT edit files directly. Do not say you \
+           'made the edits', 'left them uncommitted', or 'ran the tests' — you MUST emit the edit \
+           blocks as your entire response; the harness applies them.\n\
+         - If NO change is needed because the task is already implemented, reply with exactly the \
+           single line: ALREADY_IMPLEMENTED: <one-sentence reason>.\n\n\
+         Worked example — a valid response for 'add a greeting fn to src/util.rs':\n\
+         *** FILE: src/util.rs\n\
+         <<<<<<< SEARCH\n\
+         =======\n\
+         pub fn greeting(name: &str) -> String {{\n\
+             format!(\"hello, {{name}}\")\n\
+         }}\n\
+         >>>>>>> REPLACE"
     );
 
     let identifiers = task_identifiers(task);
