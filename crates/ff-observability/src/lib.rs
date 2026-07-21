@@ -16,6 +16,7 @@ pub mod dashboard;
 pub mod events;
 pub mod file_logger;
 pub mod log_ingest;
+pub mod metric_writer;
 pub mod metrics;
 pub mod telemetry;
 pub mod tracing_ext;
@@ -28,6 +29,7 @@ pub use dashboard::{DashboardState, FleetSnapshot, ModelSummary, NodeSummary};
 pub use events::{EventRecord, EventSink, FleetEvent, InMemoryEventSink};
 pub use file_logger::FileLogConfig;
 pub use log_ingest::{LogBuffer, LogEntry, LogIngestor, LogLevel};
+pub use metric_writer::{NormalizedMetricRow, write_metrics};
 pub use metrics::{
     // Prometheus exports
     ACTIVE_CONNECTIONS,

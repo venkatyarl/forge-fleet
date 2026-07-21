@@ -11994,6 +11994,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS computers_primary_ip_upsert_key
 pub const SCHEMA_V228_MODEL_SERVER_METRICS: &str =
     include_str!("migrations/20260719120000_create_model_server_metrics.sql");
 
+/// V229 — Record boot identity and explicit gaps in model metric samples.
+pub const SCHEMA_V229_MODEL_METRIC_BOOT_STALENESS: &str = r#"
+ALTER TABLE model_metrics
+    ADD COLUMN IF NOT EXISTS boot_id TEXT,
+    ADD COLUMN IF NOT EXISTS is_stale BOOLEAN NOT NULL DEFAULT FALSE;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

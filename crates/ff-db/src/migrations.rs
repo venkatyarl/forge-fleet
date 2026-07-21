@@ -1126,6 +1126,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_server_metrics",
         sql: schema::SCHEMA_V228_MODEL_SERVER_METRICS,
     },
+    PgMigration {
+        version: 229,
+        name: "model_metric_boot_staleness",
+        sql: schema::SCHEMA_V229_MODEL_METRIC_BOOT_STALENESS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
