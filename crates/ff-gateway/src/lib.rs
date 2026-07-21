@@ -12,6 +12,7 @@
 pub mod brain_api;
 pub mod cli_bridge;
 pub mod cloud_llm;
+pub mod connection_monitor;
 pub mod discord;
 pub mod embed;
 pub mod interactions_api;
@@ -40,6 +41,7 @@ pub mod voice_api;
 pub mod webhook;
 pub mod websocket;
 
+pub use connection_monitor::{ConnectionMonitor, ConnectionState};
 pub use discord::{DiscordClient, DiscordError};
 pub use embed::{EmbedConfig, build_widget_script};
 pub use message::{
