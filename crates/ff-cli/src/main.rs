@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
 };
 
@@ -34,7 +35,7 @@ struct Cli {
 
     /// Number of llama.cpp threads to use for the local SLM
     #[arg(long, global = true)]
-    slm_threads: Option<usize>,
+    slm_threads: Option<NonZeroUsize>,
 
     /// Maximum RAM available to the local SLM, in MiB
     #[arg(long, global = true)]
@@ -270,12 +271,12 @@ async fn main() -> Result<()> {
 fn configure_slm(
     config_path: &Path,
     model: Option<PathBuf>,
-    threads: Option<usize>,
+    threads: Option<NonZeroUsize>,
     mem_budget_mb: Option<u64>,
 ) -> Result<()> {
     let cfg = load_config(config_path)?;
     let model = model.or(cfg.slm_model);
-    let threads = threads.or(cfg.slm_threads);
+    let threads = threads.map(NonZeroUsize::get).or(cfg.slm_threads);
     let mem_budget_mb = mem_budget_mb.or(cfg.slm_mem_budget_mb);
 
     if threads == Some(0) {
