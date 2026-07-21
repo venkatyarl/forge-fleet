@@ -96,6 +96,14 @@ impl ResolutionRetryPolicy {
 /// Target resolution failure.
 #[derive(Debug, Error)]
 pub enum ResolutionError {
+    /// The retry budget was exhausted and the circuit breaker opened.
+    #[error("deploy target resolution circuit opened after {attempts} attempt(s): {last_error}")]
+    CircuitOpen {
+        /// Attempts performed before opening the circuit.
+        attempts: u32,
+        /// Last incomplete-target error observed.
+        last_error: Box<ResolutionError>,
+    },
     /// Every attempt errored; carries the last lookup error.
     #[error("target lookup failed after {attempts} attempt(s): {source}")]
     LookupFailed {
@@ -130,6 +138,13 @@ impl ResolutionError {
     /// themselves on retry (empty `primary_ip` or zero `ram_gb`).
     pub fn is_retryable(&self) -> bool {
         matches!(self, ResolutionError::Retryable { .. })
+    }
+}
+
+fn open_circuit<T: TargetLike>(target: &T, attempts: u32) -> ResolutionError {
+    ResolutionError::CircuitOpen {
+        attempts,
+        last_error: Box::new(retryable_error(target, attempts)),
     }
 }
 
@@ -170,22 +185,7 @@ where
     }
 
     match last.expect("at least one attempt runs") {
-        Ok(target) => {
-            let mut missing = Vec::new();
-            if target.primary_ip.trim().is_empty() {
-                missing.push("primary_ip");
-            }
-            if target.ram_gb <= 0 {
-                missing.push("ram");
-            }
-            Err(ResolutionError::Retryable {
-                attempts: max_attempts,
-                name: target.name,
-                primary_ip: target.primary_ip,
-                ram_gb: target.ram_gb,
-                missing: missing.join(", "),
-            })
-        }
+        Ok(target) => Err(open_circuit(&target, max_attempts)),
         Err(source) => Err(ResolutionError::LookupFailed {
             attempts: max_attempts,
             source,
@@ -252,7 +252,7 @@ where
     }
 
     match last.expect("at least one attempt runs") {
-        Ok(target) => Err(retryable_error(&target, max_attempts)),
+        Ok(target) => Err(open_circuit(&target, max_attempts)),
         Err(source) => Err(ResolutionError::LookupFailed {
             attempts: max_attempts,
             source,
@@ -309,7 +309,7 @@ where
                 .into_iter()
                 .find(|t| !t.is_complete())
                 .expect("at least one target was incomplete");
-            Err(retryable_error(&target, max_attempts))
+            Err(open_circuit(&target, max_attempts))
         }
         Err(source) => Err(ResolutionError::LookupFailed {
             attempts: max_attempts,
@@ -405,9 +405,9 @@ mod tests {
         assert_eq!(calls, 5);
         assert!(matches!(
             err,
-            ResolutionError::Retryable { attempts: 5, .. }
+            ResolutionError::CircuitOpen { attempts: 5, .. }
         ));
-        assert!(err.is_retryable());
+        assert!(!err.is_retryable());
     }
 
     #[test]
@@ -415,11 +415,36 @@ mod tests {
         let err = resolve_with_retry(&instant_policy(), || Ok(target("", 64)))
             .expect_err("empty ip never completes");
         match err {
-            ResolutionError::Retryable { missing, .. } => {
-                assert_eq!(missing, "primary_ip");
-            }
+            ResolutionError::CircuitOpen { last_error, .. } => match *last_error {
+                ResolutionError::Retryable { missing, .. } => {
+                    assert_eq!(missing, "primary_ip");
+                }
+                other => panic!("unexpected last error: {other}"),
+            },
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn circuit_opens_after_configured_attempt_budget() {
+        let policy = ResolutionRetryPolicy {
+            max_attempts: 2,
+            initial_delay: Duration::ZERO,
+            backoff_multiplier: 1,
+        };
+        let mut calls = 0;
+        let err = resolve_with_retry(&policy, || {
+            calls += 1;
+            Ok(target("", 64))
+        })
+        .expect_err("incomplete target opens circuit");
+
+        assert_eq!(calls, 2);
+        assert!(matches!(
+            err,
+            ResolutionError::CircuitOpen { attempts: 2, .. }
+        ));
+        assert!(!err.is_retryable());
     }
 
     #[test]
@@ -427,9 +452,12 @@ mod tests {
         let err = resolve_with_retry(&instant_policy(), || Ok(target("192.168.1.20", 0)))
             .expect_err("zero ram never completes");
         match err {
-            ResolutionError::Retryable { missing, .. } => {
-                assert_eq!(missing, "ram");
-            }
+            ResolutionError::CircuitOpen { last_error, .. } => match *last_error {
+                ResolutionError::Retryable { missing, .. } => {
+                    assert_eq!(missing, "ram");
+                }
+                other => panic!("unexpected last error: {other}"),
+            },
             other => panic!("unexpected error: {other}"),
         }
     }
@@ -439,9 +467,12 @@ mod tests {
         let err = resolve_with_retry(&instant_policy(), || Ok(target("", 0)))
             .expect_err("both missing never completes");
         match err {
-            ResolutionError::Retryable { missing, .. } => {
-                assert_eq!(missing, "primary_ip, ram");
-            }
+            ResolutionError::CircuitOpen { last_error, .. } => match *last_error {
+                ResolutionError::Retryable { missing, .. } => {
+                    assert_eq!(missing, "primary_ip, ram");
+                }
+                other => panic!("unexpected last error: {other}"),
+            },
             other => panic!("unexpected error: {other}"),
         }
     }
@@ -525,6 +556,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn async_incomplete_target_opens_circuit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let err = resolve_with_retry_async(&instant_policy(), {
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(target("", 128)) }
+            }
+        })
+        .await
+        .expect_err("incomplete target opens circuit");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert!(matches!(
+            err,
+            ResolutionError::CircuitOpen { attempts: 5, .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn async_lookup_error_retries_then_succeeds() {
         let calls = Arc::new(AtomicUsize::new(0));
         let resolved = resolve_with_retry_async(&instant_policy(), {
@@ -589,5 +640,25 @@ mod tests {
         .expect("resolves once all complete");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert!(resolved.iter().all(|t| t.is_complete()));
+    }
+
+    #[tokio::test]
+    async fn async_all_incomplete_target_opens_circuit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let err = resolve_all_with_retry_async(&instant_policy(), {
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(vec![target("192.168.1.20", 128), target("", 64)]) }
+            }
+        })
+        .await
+        .expect_err("incomplete target opens circuit");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert!(matches!(
+            err,
+            ResolutionError::CircuitOpen { attempts: 5, .. }
+        ));
     }
 }
