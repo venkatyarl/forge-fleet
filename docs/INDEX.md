@@ -24,6 +24,7 @@ This repo now uses a split documentation model:
 - [FLEET_BRINGUP_PLAYBOOK.md](./FLEET_BRINGUP_PLAYBOOK.md)
 - [SEARXNG_GROUNDING.md](./SEARXNG_GROUNDING.md) — self-hosted SearXNG web-grounding backend for `ff research`
 - [POSTGRES_RUNTIME_MODE.md](./POSTGRES_RUNTIME_MODE.md)
+- [JIRA_MONITOR.md](./JIRA_MONITOR.md) — enable, configure, and trigger the durable Jira monitor
 - [migrations.md](./migrations.md) — Postgres migration runner + v161 squashed baseline for fresh DB bootstrap
 - [postmortems/2026-04-18-wipe-to-july-blackout.md](./postmortems/2026-04-18-wipe-to-july-blackout.md) — Apr-18 metadata wipe → key rotation response → July alerting/monitoring blackout
 - [PHASE_38A_SQLITE_POSTGRES_INVENTORY.md](./PHASE_38A_SQLITE_POSTGRES_INVENTORY.md)

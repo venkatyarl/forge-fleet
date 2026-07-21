@@ -267,6 +267,49 @@ async fn renew_monitor_lease(
     Ok(())
 }
 
+async fn release_monitor_lease(
+    pool: &PgPool,
+    c: &MonitorConfig,
+    session: &str,
+    token: Uuid,
+) -> Result<bool> {
+    let released = sqlx::query(
+        "DELETE FROM jira_monitor_leases
+         WHERE config_id=$1 AND session_id=$2 AND lease_token=$3",
+    )
+    .bind(&c.name)
+    .bind(session)
+    .bind(token)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(released == 1)
+}
+
+fn reconciliation_event_kind(
+    has_previous: bool,
+    prior_status: Option<&str>,
+    current_status: &str,
+    newer_human: bool,
+    comment_changed: bool,
+) -> &'static str {
+    if !has_previous {
+        "new-assigned"
+    } else if prior_status.is_some_and(|s| s != current_status) {
+        if prior_status.is_some_and(|s| s.eq_ignore_ascii_case("done")) {
+            "reopen"
+        } else {
+            "status-change"
+        }
+    } else if newer_human {
+        "reply"
+    } else if comment_changed {
+        "comment"
+    } else {
+        "observed"
+    }
+}
+
 async fn reconcile_once(
     pool: &PgPool,
     client: &reqwest::Client,
@@ -306,21 +349,13 @@ async fn reconcile_once(
             previous.as_ref().and_then(|x| x.4)
         };
         let prior_status = previous.as_ref().and_then(|x| x.2.as_deref());
-        let event_kind = if previous.is_none() {
-            "new-assigned"
-        } else if prior_status.is_some_and(|s| s != issue.fields.status.name) {
-            if prior_status.is_some_and(|s| s.eq_ignore_ascii_case("done")) {
-                "reopen"
-            } else {
-                "status-change"
-            }
-        } else if newer_human {
-            "reply"
-        } else if previous.as_ref().and_then(|x| x.0.as_deref()) != latest.map(|x| x.id.as_str()) {
-            "comment"
-        } else {
-            "observed"
-        };
+        let event_kind = reconciliation_event_kind(
+            previous.is_some(),
+            prior_status,
+            &issue.fields.status.name,
+            newer_human,
+            previous.as_ref().and_then(|x| x.0.as_deref()) != latest.map(|x| x.id.as_str()),
+        );
         let cursor = latest
             .map(|x| format!("{}:{}", x.id, x.created.timestamp_millis()))
             .unwrap_or_else(|| "none".into());
@@ -374,6 +409,29 @@ async fn reconcile_once(
 
 async fn validate_config(pool: &PgPool, name: &str) -> Result<()> {
     let c = load_config(pool, Some(name)).await?;
+    validate_config_fields(&c)?;
+    let _: (String, bool) =
+        sqlx::query_as("SELECT content_hash,active FROM jira_rulesets WHERE id=$1 AND active")
+            .bind(&c.ruleset_id)
+            .fetch_optional(pool)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("ruleset '{}' is missing or inactive", c.ruleset_id))?;
+    let auth = load_auth(pool, &c).await?;
+    reqwest::Client::new()
+        .get(format!("{}/rest/api/3/myself", auth.base_url))
+        .basic_auth(auth.email, Some(auth.token))
+        .send()
+        .await?
+        .error_for_status()
+        .context("Jira credential validation")?;
+    println!(
+        "{}: valid (schema version {}, poll {}s, retag {}s)",
+        c.name, c.version, c.poll_interval_s, c.retag_after_s
+    );
+    Ok(())
+}
+
+fn validate_config_fields(c: &MonitorConfig) -> Result<()> {
     if c.queue_jql.trim().is_empty() {
         bail!("queue_jql is empty");
     }
@@ -390,12 +448,6 @@ async fn validate_config(pool: &PgPool, name: &str) -> Result<()> {
     {
         bail!("queue_jql must retain assignee=currentUser() AND statusCategory != Done");
     }
-    let _: (String, bool) =
-        sqlx::query_as("SELECT content_hash,active FROM jira_rulesets WHERE id=$1 AND active")
-            .bind(&c.ruleset_id)
-            .fetch_optional(pool)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("ruleset '{}' is missing or inactive", c.ruleset_id))?;
     if !c.label_policy_json.is_object()
         || !c.transition_policy_json.is_object()
         || !c.repo_map_json.is_object()
@@ -405,18 +457,6 @@ async fn validate_config(pool: &PgPool, name: &str) -> Result<()> {
     if c.cwd_path_globs.is_empty() {
         bail!("cwd_path_globs is empty");
     }
-    let auth = load_auth(pool, &c).await?;
-    reqwest::Client::new()
-        .get(format!("{}/rest/api/3/myself", auth.base_url))
-        .basic_auth(auth.email, Some(auth.token))
-        .send()
-        .await?
-        .error_for_status()
-        .context("Jira credential validation")?;
-    println!(
-        "{}: valid (schema version {}, poll {}s, retag {}s)",
-        c.name, c.version, c.poll_interval_s, c.retag_after_s
-    );
     Ok(())
 }
 
@@ -476,19 +516,26 @@ async fn run_monitor(
     }
     let session = format!("{}-{}", whoami_tag(), Uuid::new_v4());
     let token = acquire_monitor_lease(pool, &c, &session).await?;
-    loop {
-        let issues = reconcile_once(pool, &client, &auth, &c, &session, token, dry_run).await?;
-        println!(
-            "{}: reconciled {} assigned issue(s){}",
-            c.name,
-            issues.len(),
-            if dry_run { " (dry-run)" } else { "" }
-        );
-        if !daemon {
-            break;
+    let run_result: Result<()> = async {
+        loop {
+            let issues = reconcile_once(pool, &client, &auth, &c, &session, token, dry_run).await?;
+            println!(
+                "{}: reconciled {} assigned issue(s){}",
+                c.name,
+                issues.len(),
+                if dry_run { " (dry-run)" } else { "" }
+            );
+            if !daemon {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(c.poll_interval_s as u64)).await;
         }
-        tokio::time::sleep(Duration::from_secs(c.poll_interval_s as u64)).await;
+        Ok(())
     }
+    .await;
+    let release_result = release_monitor_lease(pool, &c, &session, token).await;
+    run_result?;
+    release_result?;
     Ok(())
 }
 
@@ -627,6 +674,26 @@ pub async fn handle_jira(cmd: crate::JiraCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn monitor_config() -> MonitorConfig {
+        MonitorConfig {
+            name: "test".into(),
+            project_key: "HFPROD".into(),
+            owner_account_id: "owner".into(),
+            jira_secret_ref: "jira.test.token".into(),
+            poll_interval_s: 30,
+            retag_after_s: 60,
+            queue_jql: "project = HFPROD AND assignee = currentUser() AND statusCategory != Done"
+                .into(),
+            ruleset_id: "hireflow360-v1".into(),
+            label_policy_json: json!({}),
+            transition_policy_json: json!({}),
+            repo_map_json: json!({}),
+            cwd_path_globs: vec!["**/projects/HireFlow360/**".into()],
+            version: 1,
+        }
+    }
+
     fn issue(summary: &str, kind: &str, created: &str) -> JiraIssue {
         JiraIssue {
             id: "1".into(),
@@ -677,5 +744,121 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Blocker: down", "Priority: now", "old bug", "normal"]
         );
+    }
+
+    #[test]
+    fn reconciliation_classifies_critical_queue_changes() {
+        assert_eq!(
+            reconciliation_event_kind(false, None, "To Do", false, false),
+            "new-assigned"
+        );
+        assert_eq!(
+            reconciliation_event_kind(true, Some("Done"), "To Do", false, false),
+            "reopen"
+        );
+        assert_eq!(
+            reconciliation_event_kind(true, Some("To Do"), "In Progress", false, false),
+            "status-change"
+        );
+        assert_eq!(
+            reconciliation_event_kind(true, Some("To Do"), "To Do", true, true),
+            "reply"
+        );
+        assert_eq!(
+            reconciliation_event_kind(true, Some("To Do"), "To Do", false, true),
+            "comment"
+        );
+        assert_eq!(
+            reconciliation_event_kind(true, Some("To Do"), "To Do", false, false),
+            "observed"
+        );
+    }
+
+    #[test]
+    fn config_validation_accepts_required_queue_contract() {
+        validate_config_fields(&monitor_config()).expect("valid monitor config");
+    }
+
+    #[test]
+    fn config_validation_rejects_unsafe_queue_and_policy_shapes() {
+        let mut config = monitor_config();
+        config.queue_jql = "project = OTHER".into();
+        assert!(
+            validate_config_fields(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("does not constrain project")
+        );
+
+        let mut config = monitor_config();
+        config.queue_jql = "project = HFPROD".into();
+        assert!(
+            validate_config_fields(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("must retain assignee")
+        );
+
+        let mut config = monitor_config();
+        config.repo_map_json = json!([]);
+        assert!(
+            validate_config_fields(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("must be JSON objects")
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_lease_is_exclusive_and_token_fenced_on_release() -> Result<()> {
+        let database_url = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"));
+        let Ok(database_url) = database_url else {
+            return Ok(());
+        };
+
+        let pool = PgPool::connect(&database_url).await?;
+        ff_db::run_postgres_migrations(&pool).await?;
+        let mut config = monitor_config();
+        config.name = format!("jira-lease-test-{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO jira_configs
+             (name,project_key,owner_account_id,jira_secret_ref,poll_interval_s,retag_after_s,
+              queue_jql,ruleset_id,label_policy_json,transition_policy_json,repo_map_json,
+              cwd_path_globs,version)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+        )
+        .bind(&config.name)
+        .bind(&config.project_key)
+        .bind(&config.owner_account_id)
+        .bind(&config.jira_secret_ref)
+        .bind(config.poll_interval_s)
+        .bind(config.retag_after_s)
+        .bind(&config.queue_jql)
+        .bind(&config.ruleset_id)
+        .bind(&config.label_policy_json)
+        .bind(&config.transition_policy_json)
+        .bind(&config.repo_map_json)
+        .bind(&config.cwd_path_globs)
+        .bind(config.version)
+        .execute(&pool)
+        .await?;
+
+        let token = acquire_monitor_lease(&pool, &config, "session-a").await?;
+        assert!(
+            acquire_monitor_lease(&pool, &config, "session-b")
+                .await
+                .is_err()
+        );
+        assert!(!release_monitor_lease(&pool, &config, "session-b", token).await?);
+        assert!(release_monitor_lease(&pool, &config, "session-a", token).await?);
+        let second_token = acquire_monitor_lease(&pool, &config, "session-b").await?;
+        assert!(release_monitor_lease(&pool, &config, "session-b", second_token).await?);
+
+        sqlx::query("DELETE FROM jira_configs WHERE name=$1")
+            .bind(&config.name)
+            .execute(&pool)
+            .await?;
+        Ok(())
     }
 }
