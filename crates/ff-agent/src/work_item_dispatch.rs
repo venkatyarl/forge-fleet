@@ -2047,6 +2047,12 @@ const MAX_DISPATCH_ATTEMPTS: i32 = 3;
 /// the `ESCALATE_TO_CLOUD_AT = 1` value means a mechanical task gets ONE local try
 /// then goes cloud (#62: the local lane starves the heartbeat; cloud does not).
 fn use_local_lane(attempts: i32, breaker_open: bool, prefers_cloud: bool) -> bool {
+    // Dispatch deliberately allows only one cheap local attempt.  The shared
+    // routing policy may permit additional local retries for other consumers,
+    // so keep this dispatch-specific heartbeat safeguard explicit here.
+    if attempts > 0 {
+        return false;
+    }
     let requirements = ff_routing_policy::TaskRequirements {
         prior_failure_count: attempts.max(0) as u32,
         capability_tags: if prefers_cloud {
