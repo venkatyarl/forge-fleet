@@ -98,6 +98,7 @@ impl ToolRegistry {
         self.register(Self::work_item_context());
         self.register(Self::fabric_topology());
         self.register(Self::pm_board());
+        self.register(Self::pm_claim());
 
         // ── Virtual Brain tools ─────────────────────────────────────────
         self.register(Self::brain_search());
@@ -198,6 +199,37 @@ impl ToolRegistry {
                         "default": 100
                     }
                 },
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn pm_claim() -> ToolDefinition {
+        ToolDefinition {
+            name: "pm_claim".to_string(),
+            description:
+                "Claim a project-management work item for an agent and attach claim context."
+                    .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "work_item_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Work item UUID to claim"
+                    },
+                    "agent": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Agent or execution context claiming the item"
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "Optional claim-time context merged into the work item",
+                        "default": {}
+                    }
+                },
+                "required": ["work_item_id", "agent"],
                 "additionalProperties": false
             }),
         }
@@ -1840,6 +1872,7 @@ mod tests {
             "work_item_context",
             "fabric_topology",
             "pm_board",
+            "pm_claim",
             // Virtual Brain
             "brain_search",
             "brain_vault_read",
