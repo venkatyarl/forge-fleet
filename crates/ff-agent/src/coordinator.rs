@@ -20,6 +20,13 @@ pub struct PendingAction {
     pub payload: Value,
 }
 
+/// Callback invoked once per queued action when connectivity is restored.
+pub type RecoveryHandler = Arc<dyn Fn(PendingAction) + Send + Sync>;
+
+fn is_local_state(state: ConnectionState) -> bool {
+    matches!(state, ConnectionState::Offline | ConnectionState::Degraded)
+}
+
 /// Process-local FIFO for actions deferred during local mode.
 #[derive(Debug, Default)]
 pub struct LocalOutbox {
@@ -67,6 +74,7 @@ pub struct Coordinator {
     fleet_router: Arc<InferenceRouter>,
     local_router: LocalLlmRouter,
     outbox: Arc<LocalOutbox>,
+    recovery_handler: Arc<RwLock<Option<RecoveryHandler>>>,
 }
 
 impl Coordinator {
@@ -76,7 +84,13 @@ impl Coordinator {
             local_router: LocalLlmRouter::new(Arc::clone(&fleet_router)),
             fleet_router,
             outbox: Arc::new(LocalOutbox::default()),
+            recovery_handler: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Register the callback that replays queued actions after recovery.
+    pub async fn set_recovery_handler(&self, handler: RecoveryHandler) {
+        *self.recovery_handler.write().await = Some(handler);
     }
 
     /// Listen until cancellation or until all connection-state senders close.
@@ -102,14 +116,34 @@ impl Coordinator {
     }
 
     pub async fn set_connection_state(&self, state: ConnectionState) {
-        *self.connection_state.write().await = state;
+        let was_local = {
+            let mut current = self.connection_state.write().await;
+            let was_local = is_local_state(*current);
+            *current = state;
+            was_local
+        };
+        if was_local && !is_local_state(state) {
+            self.flush_outbox().await;
+        }
     }
 
     pub async fn is_local_mode(&self) -> bool {
-        matches!(
-            *self.connection_state.read().await,
-            ConnectionState::Offline | ConnectionState::Degraded
-        )
+        is_local_state(*self.connection_state.read().await)
+    }
+
+    /// Replay queued actions through the recovery handler in FIFO order.
+    /// Actions stay queued until a handler is registered. Returns the number
+    /// of actions replayed.
+    pub async fn flush_outbox(&self) -> usize {
+        let Some(handler) = self.recovery_handler.read().await.clone() else {
+            return 0;
+        };
+        let mut flushed = 0;
+        while let Some(action) = self.outbox.pop().await {
+            handler(action);
+            flushed += 1;
+        }
+        flushed
     }
 
     /// Select an LLM route appropriate for the current connectivity state.
@@ -225,5 +259,85 @@ mod tests {
 
         assert_eq!(coordinator.route_action(action.clone()).await, Some(action));
         assert!(coordinator.outbox().is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn recovery_flushes_outbox_in_fifo_order() {
+        let coordinator = coordinator(ConnectionState::Offline);
+        let replayed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&replayed);
+        coordinator
+            .set_recovery_handler(Arc::new(move |action: PendingAction| {
+                sink.lock().unwrap().push(action.kind);
+            }))
+            .await;
+
+        for kind in ["first", "second"] {
+            coordinator
+                .route_action(PendingAction {
+                    kind: kind.into(),
+                    payload: Value::Null,
+                })
+                .await;
+        }
+
+        coordinator
+            .set_connection_state(ConnectionState::Online)
+            .await;
+        assert_eq!(*replayed.lock().unwrap(), ["first", "second"]);
+        assert!(coordinator.outbox().is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn flush_without_handler_retains_queued_actions() {
+        let coordinator = coordinator(ConnectionState::Offline);
+        coordinator
+            .route_action(PendingAction {
+                kind: "keep".into(),
+                payload: Value::Null,
+            })
+            .await;
+
+        coordinator
+            .set_connection_state(ConnectionState::Online)
+            .await;
+        assert_eq!(coordinator.flush_outbox().await, 0);
+        assert_eq!(coordinator.outbox().len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn listener_flushes_outbox_when_monitor_reports_online() {
+        let coordinator = coordinator(ConnectionState::Offline);
+        let replayed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&replayed);
+        coordinator
+            .set_recovery_handler(Arc::new(move |action: PendingAction| {
+                sink.lock().unwrap().push(action.kind);
+            }))
+            .await;
+
+        let (tx, rx) = watch::channel(ConnectionState::Offline);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let cancel = cancel.clone();
+            async move { coordinator.listen(rx, cancel).await }
+        });
+
+        tokio::task::yield_now().await;
+        coordinator
+            .route_action(PendingAction {
+                kind: "deferred".into(),
+                payload: Value::Null,
+            })
+            .await;
+
+        tx.send(ConnectionState::Online).unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(*replayed.lock().unwrap(), ["deferred"]);
+        assert!(coordinator.outbox().is_empty().await);
+
+        cancel.cancel();
+        task.await.unwrap();
     }
 }
