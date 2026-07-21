@@ -191,10 +191,10 @@ impl NodeCapacity {
         }
     }
 
-    /// Returns `true` if this node's dispatch tick is older than the
-    /// configured staleness threshold (see [`dispatch_tick_stale_secs`]).
+    /// Returns `true` if this node has no dispatch tick or its tick is older
+    /// than the configured staleness threshold (see [`dispatch_tick_stale_secs`]).
     pub fn dispatch_tick_is_stale(&self) -> bool {
-        self.dispatch_tick_at.is_some_and(|tick| {
+        self.dispatch_tick_at.is_none_or(|tick| {
             tick < Utc::now() - chrono::Duration::seconds(dispatch_tick_stale_secs())
         })
     }
@@ -878,6 +878,19 @@ mod tests {
         let mut stale = make_node("james", 16, 64, false);
         stale.dispatch_tick_at = Some(Utc::now() - chrono::Duration::minutes(4));
         scheduler.add_node(stale);
+        scheduler.add_node(make_node("marcus", 16, 64, false));
+
+        let decision = scheduler.schedule_task(&make_task("build", 4, 8, false));
+
+        assert_eq!(decision.target_node(), Some("marcus"));
+    }
+
+    #[test]
+    fn test_missing_dispatch_tick_node_excluded() {
+        let mut scheduler = Scheduler::new(PlacementPolicy::BinPack);
+        let mut missing = make_node("james", 16, 64, false);
+        missing.dispatch_tick_at = None;
+        scheduler.add_node(missing);
         scheduler.add_node(make_node("marcus", 16, 64, false));
 
         let decision = scheduler.schedule_task(&make_task("build", 4, 8, false));

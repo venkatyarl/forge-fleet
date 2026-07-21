@@ -218,7 +218,7 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
 }
 
 fn dispatch_tick_is_fresh(tick_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
-    tick_at.is_none_or(|tick| tick >= now - chrono::Duration::seconds(DISPATCH_TICK_STALE_SECS))
+    tick_at.is_some_and(|tick| tick >= now - chrono::Duration::seconds(DISPATCH_TICK_STALE_SECS))
 }
 
 /// Keep a newly-created lease alive while it waits for the owning host's
@@ -376,10 +376,7 @@ mod tests {
     #[test]
     fn stale_dispatch_tick_is_not_assignment_eligible() {
         let now = Utc::now();
-        assert!(
-            dispatch_tick_is_fresh(None, now),
-            "legacy hosts remain eligible during rollout"
-        );
+        assert!(!dispatch_tick_is_fresh(None, now));
         assert!(dispatch_tick_is_fresh(
             Some(now - chrono::Duration::seconds(DISPATCH_TICK_STALE_SECS)),
             now
