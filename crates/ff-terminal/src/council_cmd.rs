@@ -13,12 +13,108 @@
 
 use crate::{CYAN, GREEN, RESET, YELLOW};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::time::Duration;
 
 const MEMBER_PROMPT_PREAMBLE: &str = "You are a COUNCIL MEMBER. Give your own INDEPENDENT, \
     decisive answer to the question below — your honest best judgment, not a hedge. Be concise \
-    and specific; lead with the recommendation, then the key reasoning. Question:\n\n";
+    and specific; lead with the recommendation, then the key reasoning.\n\n\
+    Return ONLY a JSON object with this exact schema so the chairman can weigh your input:\n\
+    {\"answer\": <string>, \"confidence\": <float 0.0-1.0>, \"evidence\": [<string>, …], \
+    \"citations\": [<string>, …]}\n\
+    `confidence` is your self-assessed certainty in [0.0, 1.0]; `evidence` lists the facts \
+    backing the answer; `citations` lists sources (URLs, files, refs). Question:\n\n";
+
+/// Default self-assessed certainty when a member omits `confidence` or returns
+/// prose instead of the schema — neutral, so it neither dominates nor is ignored.
+fn default_confidence() -> f64 {
+    0.5
+}
+
+/// Structured council response schema shared by ALL member types (vendor CLI and
+/// local fleet models). Members are asked to return this JSON; the chairman uses
+/// `confidence`/`evidence`/`citations` to weigh each input instead of treating
+/// every answer as equally certain. Serde `default`s make every field but
+/// `answer` optional so a schema-ignoring member still parses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CouncilResponse {
+    /// The member's actual recommendation/answer text.
+    pub answer: String,
+    /// Self-assessed certainty in `[0.0, 1.0]`.
+    #[serde(default = "default_confidence")]
+    pub confidence: f64,
+    /// Facts/reasoning the member offers in support of `answer`.
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    /// Sources backing the answer (URLs, file paths, references).
+    #[serde(default)]
+    pub citations: Vec<String>,
+}
+
+impl CouncilResponse {
+    /// Coerce a parsed response into a safe, weighable shape: clamp `confidence`
+    /// to `[0.0, 1.0]` (mapping non-finite values to the neutral default) and
+    /// drop blank evidence/citation entries.
+    fn normalize(&mut self) {
+        if !self.confidence.is_finite() {
+            self.confidence = default_confidence();
+        }
+        self.confidence = self.confidence.clamp(0.0, 1.0);
+        self.evidence.retain(|s| !s.trim().is_empty());
+        self.citations.retain(|s| !s.trim().is_empty());
+    }
+
+    /// Serialization validation: reject a response that can't be safely persisted
+    /// or weighed (empty answer, or a `confidence` that is non-finite or outside
+    /// `[0.0, 1.0]`). Callers fall back to plain-text handling on `Err`.
+    fn validate(&self) -> Result<()> {
+        if self.answer.trim().is_empty() {
+            anyhow::bail!("council response has an empty answer");
+        }
+        if !self.confidence.is_finite() {
+            anyhow::bail!(
+                "confidence must be a finite number, got {}",
+                self.confidence
+            );
+        }
+        if !(0.0..=1.0).contains(&self.confidence) {
+            anyhow::bail!("confidence {} out of range [0.0, 1.0]", self.confidence);
+        }
+        Ok(())
+    }
+}
+
+/// Parse a member's raw output into the shared [`CouncilResponse`] schema. Tries
+/// the structured JSON first (members are prompted for it); on any miss — no JSON,
+/// malformed JSON, or a response that fails [`CouncilResponse::validate`] — falls
+/// back to treating the whole text as the `answer` with a neutral confidence, so
+/// EVERY member type yields a uniform, chairman-weighable response.
+fn parse_council_response(text: &str) -> CouncilResponse {
+    if let Some(json) = extract_json_object(text) {
+        if let Ok(mut resp) = serde_json::from_str::<CouncilResponse>(&json) {
+            resp.normalize();
+            if resp.validate().is_ok() {
+                return resp;
+            }
+        }
+    }
+    CouncilResponse {
+        answer: text.trim().to_string(),
+        confidence: default_confidence(),
+        evidence: Vec::new(),
+        citations: Vec::new(),
+    }
+}
+
+/// Extract the first balanced-looking JSON object from free text (a member may
+/// wrap the schema in prose or a ```json fence). Spans the first `{` to the last
+/// `}`; `serde_json` rejects it if that span isn't valid JSON.
+fn extract_json_object(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    (end > start).then(|| text[start..=end].to_string())
+}
 
 /// Normalized result of one member dispatch (vendor CLI or local fleet model),
 /// holding everything the council needs to print AND to log to `ff_interactions`.
@@ -99,8 +195,10 @@ pub async fn handle_council(
         }));
     }
 
-    // Collect answers (member, answer) for the chairman; print + log each.
-    let mut answers: Vec<(String, String)> = Vec::with_capacity(members.len());
+    // Collect answers for the chairman; print + log each. Every member type's
+    // raw output is normalized into the shared CouncilResponse schema so the
+    // chairman can weigh confidence/evidence/citations uniformly.
+    let mut answers: Vec<(String, CouncilResponse)> = Vec::with_capacity(members.len());
     for handle in handles {
         let (member, raw) = match handle.await {
             Ok(pair) => pair,
@@ -113,8 +211,15 @@ pub async fn handle_council(
         println!("\n{CYAN}═══════════ {member} ═══════════{RESET}");
         match raw.answer {
             Some(answer) => {
-                println!("{answer}");
-                answers.push((member, answer));
+                let resp = parse_council_response(&answer);
+                println!("{}", resp.answer);
+                eprintln!(
+                    "{CYAN}  ↳ confidence {:.2}, {} evidence, {} citation(s){RESET}",
+                    resp.confidence,
+                    resp.evidence.len(),
+                    resp.citations.len()
+                );
+                answers.push((member, resp));
             }
             None => eprintln!(
                 "{YELLOW}⚠ {member} returned no usable answer{RESET}{}",
@@ -146,7 +251,7 @@ pub async fn handle_council(
     if ok == 1 {
         println!(
             "\n{GREEN}═══════════ CONSENSUS (sole answer) ═══════════{RESET}\n{}",
-            answers[0].1
+            answers[0].1.answer
         );
         return Ok(());
     }
@@ -157,12 +262,23 @@ pub async fn handle_council(
     let chair = chairman.unwrap_or_else(|| members[0].clone());
     let mut synth = format!(
         "You are the CHAIRMAN of an LLM council. {ok} members answered the question below \
-         independently. Synthesize their answers into ONE decisive consensus: state the \
-         recommendation first, note where members AGREE, and explicitly surface any DISSENT \
-         (don't average it away). Be concise.\n\n=== QUESTION ===\n{question}\n"
+         independently. Each member reports a `confidence` in [0.0, 1.0] plus supporting \
+         `evidence` and `citations` — WEIGH higher-confidence, better-evidenced answers more \
+         heavily. Synthesize into ONE decisive consensus: state the recommendation first, note \
+         where members AGREE, and explicitly surface any DISSENT (don't average it away). Be \
+         concise.\n\n=== QUESTION ===\n{question}\n"
     );
-    for (member, answer) in &answers {
-        synth.push_str(&format!("\n=== MEMBER {member} ===\n{answer}\n"));
+    for (member, resp) in &answers {
+        synth.push_str(&format!(
+            "\n=== MEMBER {member} (confidence {:.2}) ===\n{}\n",
+            resp.confidence, resp.answer
+        ));
+        if !resp.evidence.is_empty() {
+            synth.push_str(&format!("evidence: {}\n", resp.evidence.join("; ")));
+        }
+        if !resp.citations.is_empty() {
+            synth.push_str(&format!("citations: {}\n", resp.citations.join("; ")));
+        }
     }
 
     eprintln!("\n{CYAN}▶ Chairman ({chair}) synthesizing {ok} answers…{RESET}");
@@ -319,5 +435,103 @@ async fn log_council(
     };
     if let Err(e) = ff_db::pg_record_interaction(pool, &rec).await {
         eprintln!("{YELLOW}⚠ council: failed to log interaction (non-fatal): {e}{RESET}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CouncilResponse, parse_council_response};
+
+    #[test]
+    fn parses_full_structured_response() {
+        let text = r#"Sure — here is my verdict:
+        {"answer": "Use Postgres", "confidence": 0.9,
+         "evidence": ["ACID guarantees", "mature ecosystem"],
+         "citations": ["https://postgresql.org/docs"]}"#;
+        let r = parse_council_response(text);
+        assert_eq!(r.answer, "Use Postgres");
+        assert!((r.confidence - 0.9).abs() < 1e-9);
+        assert_eq!(r.evidence, vec!["ACID guarantees", "mature ecosystem"]);
+        assert_eq!(r.citations, vec!["https://postgresql.org/docs"]);
+        assert!(r.validate().is_ok());
+    }
+
+    #[test]
+    fn missing_optional_fields_get_defaults() {
+        // A member that returns only `answer` still parses; confidence defaults
+        // to the neutral value and the lists default to empty.
+        let r = parse_council_response(r#"{"answer": "Ship it"}"#);
+        assert_eq!(r.answer, "Ship it");
+        assert!((r.confidence - 0.5).abs() < 1e-9);
+        assert!(r.evidence.is_empty());
+        assert!(r.citations.is_empty());
+    }
+
+    #[test]
+    fn plain_prose_falls_back_to_answer() {
+        // No JSON at all: the whole text becomes the answer with neutral confidence.
+        let r = parse_council_response("Just go with option B, it's simpler.");
+        assert_eq!(r.answer, "Just go with option B, it's simpler.");
+        assert!((r.confidence - 0.5).abs() < 1e-9);
+        assert!(r.evidence.is_empty() && r.citations.is_empty());
+    }
+
+    #[test]
+    fn out_of_range_confidence_is_clamped_and_blanks_dropped() {
+        let r = parse_council_response(
+            r#"{"answer": "x", "confidence": 5.0, "evidence": ["real", "  "], "citations": [""]}"#,
+        );
+        assert!((r.confidence - 1.0).abs() < 1e-9);
+        assert_eq!(r.evidence, vec!["real"]);
+        assert!(r.citations.is_empty());
+        assert!(r.validate().is_ok());
+    }
+
+    #[test]
+    fn non_finite_confidence_normalizes_to_default() {
+        // NaN/Inf can't be weighed — normalize maps them back to the neutral default.
+        let mut r = CouncilResponse {
+            answer: "x".into(),
+            confidence: f64::NAN,
+            evidence: vec![],
+            citations: vec![],
+        };
+        r.normalize();
+        assert!((r.confidence - 0.5).abs() < 1e-9);
+        assert!(r.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_bad_fields() {
+        let bad_conf = CouncilResponse {
+            answer: "x".into(),
+            confidence: 2.0,
+            evidence: vec![],
+            citations: vec![],
+        };
+        assert!(bad_conf.validate().is_err());
+        let empty_answer = CouncilResponse {
+            answer: "   ".into(),
+            confidence: 0.5,
+            evidence: vec![],
+            citations: vec![],
+        };
+        assert!(empty_answer.validate().is_err());
+    }
+
+    #[test]
+    fn schema_serde_round_trips() {
+        let r = CouncilResponse {
+            answer: "a".into(),
+            confidence: 0.7,
+            evidence: vec!["e".into()],
+            citations: vec!["c".into()],
+        };
+        let s = serde_json::to_string(&r).expect("serialize");
+        let back: CouncilResponse = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back.answer, "a");
+        assert!((back.confidence - 0.7).abs() < 1e-9);
+        assert_eq!(back.evidence, vec!["e".to_string()]);
+        assert_eq!(back.citations, vec!["c".to_string()]);
     }
 }
