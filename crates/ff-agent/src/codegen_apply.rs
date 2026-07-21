@@ -204,6 +204,78 @@ struct FileSnapshot {
     previous: Option<String>,
 }
 
+/// Build a bounded repo-structure anchor for the codegen prompt: the crate/top-level layout
+/// plus tracked source files whose path matches a task identifier. Prevents the model from
+/// hallucinating non-existent paths. Returns None if `git ls-files` yields nothing.
+fn repo_structure_context(repo_path: &Path, identifiers: &[String]) -> Option<String> {
+    const MAX_CHARS: usize = 6_000;
+    const MAX_RELEVANT_FILES: usize = 60;
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["ls-files"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let files: Vec<&str> = listing.lines().filter(|l| !l.is_empty()).collect();
+    if files.is_empty() {
+        return None;
+    }
+
+    // Top-level layout: the distinct crate roots (crates/<name>) + other top dirs.
+    let mut roots: BTreeSet<String> = BTreeSet::new();
+    for f in &files {
+        let parts: Vec<&str> = f.split('/').collect();
+        let root = if parts.len() >= 2 && parts[0] == "crates" {
+            format!("crates/{}", parts[1])
+        } else if parts.len() >= 2 {
+            parts[0].to_string()
+        } else {
+            f.to_string()
+        };
+        roots.insert(root);
+    }
+
+    // Files whose path matches any task identifier (case-insensitive) — the likely edit targets.
+    let ids_lower: Vec<String> = identifiers.iter().map(|s| s.to_lowercase()).collect();
+    let mut relevant: Vec<&str> = files
+        .iter()
+        .filter(|f| {
+            let fl = f.to_lowercase();
+            ids_lower.iter().any(|id| id.len() >= 3 && fl.contains(id.as_str()))
+        })
+        .copied()
+        .take(MAX_RELEVANT_FILES)
+        .collect();
+    relevant.sort_unstable();
+
+    let mut out = String::from("Top-level layout:\n");
+    for r in &roots {
+        out.push_str("  ");
+        out.push_str(r);
+        out.push('\n');
+        if out.len() > MAX_CHARS {
+            break;
+        }
+    }
+    if !relevant.is_empty() {
+        out.push_str("Tracked files relevant to this task:\n");
+        for f in &relevant {
+            out.push_str("  ");
+            out.push_str(f);
+            out.push('\n');
+            if out.len() > MAX_CHARS {
+                break;
+            }
+        }
+    }
+    Some(out)
+}
+
 fn build_prompt(
     repo_path: &Path,
     task: &str,
@@ -229,6 +301,16 @@ fn build_prompt(
     );
 
     let identifiers = task_identifiers(task);
+
+    // Repo structure anchor: without a listing of what files ACTUALLY exist, the model invents
+    // plausible-but-wrong paths (e.g. a Python `src/work_item/relations.py` in a Rust repo) and
+    // every edit fails to apply. Inject the real crate layout + task-relevant tracked files so
+    // SEARCH/REPLACE edits target files that exist. (build_prompt runs inside spawn_blocking.)
+    if let Some(tree) = repo_structure_context(repo_path, &identifiers) {
+        prompt.push_str("\n\nThis repository's actual structure (edit ONLY files that exist here; do not invent paths):\n");
+        prompt.push_str(&tree);
+    }
+
     for path in task_context_paths(repo_path, task)? {
         let abs = repo_path.join(&path);
         let content =
