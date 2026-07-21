@@ -3,6 +3,8 @@ use ff_discovery::{HardwareProfile, HealthSnapshot};
 use reqwest::StatusCode;
 use serde::Serialize;
 
+use crate::pulse::PulsePayload;
+
 #[derive(Clone)]
 pub struct LeaderClient {
     http: reqwest::Client,
@@ -55,24 +57,21 @@ impl LeaderClient {
         activity_level: ActivityLevel,
         health: &HealthSnapshot,
     ) -> anyhow::Result<()> {
-        #[derive(Serialize)]
-        struct HeartbeatPayload<'a> {
-            node_id: &'a str,
-            role: WorkerRole,
-            activity_level: ActivityLevel,
-            health: &'a HealthSnapshot,
-        }
-
-        let payload = HeartbeatPayload {
+        let payload = PulsePayload {
             node_id: &self.node_id,
             role,
             activity_level,
             health,
+            install_diff: Vec::new(),
         };
 
+        self.send_pulse(&payload).await
+    }
+
+    pub async fn send_pulse(&self, payload: &PulsePayload<'_>) -> anyhow::Result<()> {
         self.post_best_effort(
             &["/agent/heartbeat", "/heartbeat", "/fleet/heartbeat"],
-            &payload,
+            payload,
         )
         .await
     }

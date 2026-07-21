@@ -12,6 +12,7 @@
 //! [`PulseBeatV2::skeleton`] and progressively fill fields.
 
 use chrono::{DateTime, Utc};
+use ff_core::health::InstallDiff;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -105,6 +106,9 @@ pub struct PulseBeatV2 {
     pub llm_servers: Vec<LlmServer>,
     pub available_models: Vec<AvailableModel>,
     pub installed_software: Vec<InstalledSoftware>,
+    /// Required software missing when this node emitted its first pulse.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub install_diff: Vec<InstallDiff>,
     pub docker: DockerStatus,
     pub peers_seen: Vec<PeerSeen>,
     pub db_topology: DbTopology,
@@ -523,6 +527,7 @@ impl PulseBeatV2 {
             llm_servers: Vec::new(),
             available_models: Vec::new(),
             installed_software: Vec::new(),
+            install_diff: Vec::new(),
             docker: DockerStatus {
                 daemon_running: false,
                 total_cpu_pct: 0.0,
@@ -666,6 +671,7 @@ mod tests {
         assert!(parsed.multi_host_participation.is_none());
         assert!(parsed.encountered_bugs.is_empty());
         assert!(parsed.local_tasks.is_empty());
+        assert!(parsed.install_diff.is_empty());
         assert!(!parsed.capabilities.can_serve_openclaw_gateway);
     }
 
@@ -678,6 +684,21 @@ mod tests {
         let json = serde_json::to_string(&value).expect("re-serialize");
         let parsed: PulseBeatV2 = serde_json::from_str(&json).expect("deserialize older beat");
         assert!(parsed.receivers.is_empty());
+    }
+
+    #[test]
+    fn install_diff_serializes_when_missing_software_is_reported() {
+        let mut beat = PulseBeatV2::skeleton("new-node");
+        beat.install_diff.push(InstallDiff {
+            software_id: "ff_git".into(),
+            display_name: "ForgeFleet".into(),
+            installed: false,
+            installed_version: None,
+            playbook_key: "linux".into(),
+        });
+
+        let value = serde_json::to_value(beat).expect("serialize beat");
+        assert_eq!(value["install_diff"][0]["software_id"], "ff_git");
     }
 
     /// Cross-generation compat contract (the 2026-07-19 mixed-fleet incident:
@@ -704,6 +725,7 @@ mod tests {
             "encountered_bugs",
             "local_tasks",
             "receivers",
+            "install_diff",
         ] {
             obj.remove(later_field);
         }
@@ -711,6 +733,7 @@ mod tests {
             serde_json::from_value(json.clone()).expect("older-format beat must deserialize");
         assert_eq!(parsed.computer_name, "test-node-fake");
         assert!(parsed.encountered_bugs.is_empty());
+        assert!(parsed.install_diff.is_empty());
         assert!(parsed.build_sha.is_none());
 
         // Newer-generation sender: an unknown field must be ignored, not fatal.

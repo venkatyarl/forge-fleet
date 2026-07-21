@@ -2,6 +2,7 @@ mod activity;
 mod executor;
 mod http;
 mod leader;
+mod pulse;
 mod state;
 
 use crate::{
@@ -40,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
 
     let leader = LeaderClient::new(config.leader_url.clone(), config.node_id.clone());
     let registration = leader.register(&hardware).await;
+    pulse::on_first_pulse(&leader, &config.node_id, &hardware, registration.role).await;
 
     {
         let mut locked = shared_state.write().await;
