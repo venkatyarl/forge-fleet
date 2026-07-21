@@ -80,7 +80,7 @@ impl AgentTool for SendMessageTool {
             "timestamp": chrono::Utc::now().to_rfc3339(),
         });
 
-        match self.client.post(&target_url).json(&payload).send().await {
+        match crate::http_auth::send_signed_json(&self.client, &target_url, &payload).await {
             Ok(resp) if resp.status().is_success() => {
                 AgentToolResult::ok(format!("Message delivered to '{to}' ({})", resp.status()))
             }

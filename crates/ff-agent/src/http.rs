@@ -2,7 +2,7 @@ use crate::state::{AgentStatus, SharedState};
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
 use chrono::Utc;
@@ -15,6 +15,7 @@ use tracing::info;
 pub struct AppContext {
     pub state: SharedState,
     pub task_tx: mpsc::Sender<AgentTask>,
+    pub auth_secret: String,
 }
 
 pub fn build_router(ctx: AppContext) -> Router {
@@ -47,9 +48,13 @@ async fn health(State(ctx): State<AppContext>) -> Json<HealthResponse> {
     })
 }
 
-async fn status(State(ctx): State<AppContext>) -> Json<AgentStatus> {
+async fn status(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+) -> Result<Json<AgentStatus>, (StatusCode, String)> {
+    authorize(&ctx.auth_secret, "GET", "/status", &headers, "")?;
     let locked: tokio::sync::RwLockReadGuard<'_, crate::state::AgentState> = ctx.state.read().await;
-    Json(locked.to_status())
+    Ok(Json(locked.to_status()))
 }
 
 #[derive(Debug, Serialize)]
@@ -60,8 +65,12 @@ struct AssignmentAccepted {
 
 async fn assign_task(
     State(ctx): State<AppContext>,
-    Json(task): Json<AgentTask>,
+    headers: HeaderMap,
+    body: String,
 ) -> Result<Json<AssignmentAccepted>, (StatusCode, String)> {
+    authorize(&ctx.auth_secret, "POST", "/assign", &headers, &body)?;
+    let task = serde_json::from_str(&body)
+        .map_err(|err| (StatusCode::BAD_REQUEST, format!("invalid JSON: {err}")))?;
     ctx.task_tx.send(task).await.map_err(|e| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -76,9 +85,13 @@ async fn assign_task(
 }
 
 async fn receive_message(
-    State(_ctx): State<AppContext>,
-    Json(payload): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    authorize(&ctx.auth_secret, "POST", "/agent/message", &headers, &body)?;
+    let payload: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|err| (StatusCode::BAD_REQUEST, format!("invalid JSON: {err}")))?;
     let from = payload
         .get("from")
         .and_then(|v| v.as_str())
@@ -115,5 +128,78 @@ async fn receive_message(
         }
     }
 
-    Json(serde_json::json!({ "ok": true, "received": true }))
+    Ok(Json(serde_json::json!({ "ok": true, "received": true })))
+}
+
+fn authorize(
+    secret: &str,
+    method: &str,
+    path: &str,
+    headers: &HeaderMap,
+    body: &str,
+) -> Result<(), (StatusCode, String)> {
+    ff_agent::http_auth::authorize(secret, method, path, headers, body)
+        .map_err(|message| (StatusCode::UNAUTHORIZED, message.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use tower::ServiceExt;
+
+    fn test_router() -> Router {
+        let (task_tx, _task_rx) = mpsc::channel(1);
+        build_router(AppContext {
+            state: Arc::new(RwLock::new(crate::state::AgentState::new(
+                "test-node".to_string(),
+                ff_discovery::detect_hardware_profile(),
+            ))),
+            task_tx,
+            auth_secret: "test-control-secret".to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn assign_rejects_unsigned_and_accepts_authenticated_requests() {
+        let app = test_router();
+        let body = "{}";
+        let unsigned = app
+            .clone()
+            .oneshot(
+                Request::post("/assign")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+
+        let timestamp = Utc::now().timestamp();
+        let signature = ff_security::computer_auth::sign_request(
+            "test-control-secret",
+            "POST",
+            "/assign",
+            timestamp,
+            body,
+        );
+        let authenticated = app
+            .oneshot(
+                Request::post("/assign")
+                    .header("content-type", "application/json")
+                    .header(ff_agent::http_auth::TIMESTAMP_HEADER, timestamp)
+                    .header(ff_agent::http_auth::SIGNATURE_HEADER, signature)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authenticated.status(), StatusCode::BAD_REQUEST);
+    }
 }

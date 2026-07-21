@@ -13,7 +13,7 @@ use crate::{
 };
 use ff_agent::config::AgentConfig;
 use ff_discovery::{collect_health_snapshot, detect_hardware_profile, read_activity_signals};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -62,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
     let http_ctx = AppContext {
         state: shared_state.clone(),
         task_tx: task_tx.clone(),
+        auth_secret: ff_agent::http_auth::control_plane_secret().map_err(anyhow::Error::msg)?,
     };
 
     let http_cancel = cancel.clone();
@@ -135,7 +136,13 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_http_server(port: u16, ctx: AppContext, cancel: CancellationToken) {
     let app = build_router(ctx);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = match ff_agent::http_auth::bind_addr(port) {
+        Ok(addr) => addr,
+        Err(err) => {
+            error!(error = %err, "invalid agent HTTP bind configuration");
+            return;
+        }
+    };
 
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {

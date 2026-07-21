@@ -10,7 +10,7 @@ pub async fn handle_task(cmd: crate::TaskCommand, _config_path: &Path) -> Result
 
     match cmd {
         crate::TaskCommand::List { status, limit } => {
-            let resp = client.get(format!("{base}/tasks")).send().await;
+            let resp = ff_agent::http_auth::send_signed_get(client, &format!("{base}/tasks")).await;
             let body = match resp {
                 Ok(r) => r.json::<serde_json::Value>().await.unwrap_or_default(),
                 Err(e) => {
@@ -69,7 +69,7 @@ pub async fn handle_task(cmd: crate::TaskCommand, _config_path: &Path) -> Result
             }
         }
         crate::TaskCommand::Get { id } => {
-            let resp = client.get(format!("{base}/tasks")).send().await;
+            let resp = ff_agent::http_auth::send_signed_get(client, &format!("{base}/tasks")).await;
             let body = match resp {
                 Ok(r) => r.json::<serde_json::Value>().await.unwrap_or_default(),
                 Err(e) => {
@@ -127,11 +127,12 @@ pub async fn handle_task(cmd: crate::TaskCommand, _config_path: &Path) -> Result
                 "output": "",
                 "from": "ff-cli",
             });
-            let r = client
-                .post(format!("{base}/agent/message"))
-                .json(&payload)
-                .send()
-                .await;
+            let r = ff_agent::http_auth::send_signed_json(
+                client,
+                &format!("{base}/agent/message"),
+                &payload,
+            )
+            .await;
             match r {
                 Ok(_) => println!("{GREEN}✓ Task #{id} → {status}{RESET}"),
                 Err(e) => println!("{RED}✗ Failed: {e}{RESET}"),

@@ -245,7 +245,7 @@ impl AgentTool for TaskUpdateTool {
             });
             let client = self.client.clone();
             tokio::spawn(async move {
-                let _ = client.post(&callback_url).json(&payload).send().await;
+                let _ = crate::http_auth::send_signed_json(&client, &callback_url, &payload).await;
             });
         }
 

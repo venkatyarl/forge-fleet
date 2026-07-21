@@ -81,6 +81,7 @@ pub mod hf_download;
 pub mod hf_version_check;
 pub mod hive_sync;
 pub mod hooks;
+pub mod http_auth;
 pub mod inference_router;
 pub mod instructions_sync;
 pub mod job_sweeper;
@@ -363,21 +364,19 @@ pub async fn run(
     // Start the agent HTTP server for inter-node messaging callbacks on port 50002.
     // Uses a minimal standalone router so it compiles without the binary-only state module.
     {
-        let message_router = axum::Router::new()
-            .route("/health", axum::routing::get(agent_http_health))
-            .route("/agent/message", axum::routing::post(handle_agent_message))
-            .route("/tasks", axum::routing::get(list_agent_tasks));
-        let agent_http_addr = "0.0.0.0:50002";
+        let auth_secret = http_auth::control_plane_secret().map_err(anyhow::Error::msg)?;
+        let message_router = build_agent_message_router(auth_secret);
+        let agent_http_addr = http_auth::bind_addr(50002).map_err(anyhow::Error::msg)?;
         tokio::spawn(async move {
             match tokio::net::TcpListener::bind(agent_http_addr).await {
                 Ok(listener) => {
-                    tracing::info!(addr = agent_http_addr, "agent message server listening");
+                    tracing::info!(addr = %agent_http_addr, "agent message server listening");
                     if let Err(err) = axum::serve(listener, message_router).await {
                         tracing::error!(error = %err, "agent HTTP server failed");
                     }
                 }
                 Err(err) => {
-                    tracing::error!(error = %err, addr = agent_http_addr, "failed to bind agent HTTP server");
+                    tracing::error!(error = %err, addr = %agent_http_addr, "failed to bind agent HTTP server");
                 }
             }
         });
@@ -1050,7 +1049,19 @@ async fn agent_http_health() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({"ok": true, "service": "ff-agent-message-server"}))
 }
 
-async fn list_agent_tasks() -> axum::Json<serde_json::Value> {
+fn build_agent_message_router(auth_secret: String) -> axum::Router {
+    axum::Router::new()
+        .route("/health", axum::routing::get(agent_http_health))
+        .route("/agent/message", axum::routing::post(handle_agent_message))
+        .route("/tasks", axum::routing::get(list_agent_tasks))
+        .with_state(auth_secret)
+}
+
+async fn list_agent_tasks(
+    axum::extract::State(auth_secret): axum::extract::State<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    authorize_agent_request(&auth_secret, "GET", "/tasks", &headers, "")?;
     use crate::tools::task_tools::TASK_STORE_PUB;
     let mut tasks: Vec<serde_json::Value> = TASK_STORE_PUB
         .iter()
@@ -1073,12 +1084,23 @@ async fn list_agent_tasks() -> axum::Json<serde_json::Value> {
         cb.cmp(ca)
     });
     let count = tasks.len();
-    axum::Json(serde_json::json!({"tasks": tasks, "count": count}))
+    Ok(axum::Json(
+        serde_json::json!({"tasks": tasks, "count": count}),
+    ))
 }
 
 async fn handle_agent_message(
-    axum::Json(payload): axum::Json<serde_json::Value>,
-) -> axum::Json<serde_json::Value> {
+    axum::extract::State(auth_secret): axum::extract::State<String>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    authorize_agent_request(&auth_secret, "POST", "/agent/message", &headers, &body)?;
+    let payload: serde_json::Value = serde_json::from_str(&body).map_err(|err| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("invalid JSON: {err}"),
+        )
+    })?;
     let task_id = payload
         .get("task_id")
         .and_then(|v| v.as_str())
@@ -1098,5 +1120,87 @@ async fn handle_agent_message(
         }
     }
 
-    axum::Json(serde_json::json!({"ok": true}))
+    Ok(axum::Json(serde_json::json!({"ok": true})))
+}
+
+fn authorize_agent_request(
+    secret: &str,
+    method: &str,
+    path: &str,
+    headers: &axum::http::HeaderMap,
+    body: &str,
+) -> Result<(), (axum::http::StatusCode, String)> {
+    http_auth::authorize(secret, method, path, headers, body)
+        .map_err(|message| (axum::http::StatusCode::UNAUTHORIZED, message.to_string()))
+}
+
+#[cfg(test)]
+mod agent_http_auth_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use chrono::Utc;
+    use tower::ServiceExt;
+
+    fn signed_request(method: &str, path: &str, body: &str) -> Request<Body> {
+        let secret = "agent-http-test-secret";
+        let timestamp = Utc::now().timestamp();
+        let signature =
+            ff_security::computer_auth::sign_request(secret, method, path, timestamp, body);
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(http_auth::TIMESTAMP_HEADER, timestamp)
+            .header(http_auth::SIGNATURE_HEADER, signature)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn only_health_is_public_and_signed_control_requests_are_authorized() {
+        let app = build_agent_message_router("agent-http-test-secret".to_string());
+
+        let health = app
+            .clone()
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let unsigned_tasks = app
+            .clone()
+            .oneshot(Request::get("/tasks").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unsigned_tasks.status(), StatusCode::UNAUTHORIZED);
+
+        let signed_tasks = app
+            .clone()
+            .oneshot(signed_request("GET", "/tasks", ""))
+            .await
+            .unwrap();
+        assert_eq!(signed_tasks.status(), StatusCode::OK);
+
+        let body = r#"{"task_id":"missing","status":"completed"}"#;
+        let unsigned_message = app
+            .clone()
+            .oneshot(
+                Request::post("/agent/message")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsigned_message.status(), StatusCode::UNAUTHORIZED);
+
+        let signed_message = app
+            .oneshot(signed_request("POST", "/agent/message", body))
+            .await
+            .unwrap();
+        assert_eq!(signed_message.status(), StatusCode::OK);
+    }
 }
