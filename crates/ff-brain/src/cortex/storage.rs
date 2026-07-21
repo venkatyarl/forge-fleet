@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::collections::BTreeMap;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
@@ -46,6 +47,39 @@ pub struct CortexGraphEdge {
     pub provenance: String,
     pub method: Option<String>,
     pub evidence: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CortexBackfillReport {
+    pub nodes: usize,
+    pub edges: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CortexParitySample {
+    pub corpus: String,
+    pub symbol: String,
+    pub query: String,
+    pub postgres_rows: usize,
+    pub falkordb_rows: usize,
+    pub matches: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CortexParityReport {
+    pub postgres_nodes: i64,
+    pub falkordb_nodes: i64,
+    pub postgres_edges: i64,
+    pub falkordb_edges: i64,
+    pub samples: Vec<CortexParitySample>,
+}
+
+impl CortexParityReport {
+    pub fn matches(&self) -> bool {
+        self.postgres_nodes == self.falkordb_nodes
+            && self.postgres_edges == self.falkordb_edges
+            && self.samples.iter().all(|sample| sample.matches)
+    }
 }
 
 /// Storage operations Cortex needs from any graph backend.
@@ -329,6 +363,58 @@ impl FalkorCortexGraphStore {
         Ok(())
     }
 
+    async fn upsert_nodes_batch(&self, rows: &[BackfillNodeRow]) -> Result<()> {
+        let values = rows
+            .iter()
+            .map(|row| {
+                Ok(format!(
+                    "{{id: {id}, path: {path}, title: {title}, node_type: {node_type}, project: {project}, start_line: {start_line}, end_line: {end_line}, generation: {generation}, confidence: {confidence}, provenance: {provenance}}}",
+                    id = cypher_string(&row.id.to_string()),
+                    path = cypher_string(&row.path),
+                    title = cypher_string(&row.title),
+                    node_type = cypher_string(&row.node_type),
+                    project = cypher_string(&row.project),
+                    start_line = cypher_optional_i32(row.start_line),
+                    end_line = cypher_optional_i32(row.end_line),
+                    generation = row.generation,
+                    confidence = finite_f32(row.confidence)?,
+                    provenance = cypher_string(&row.provenance),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
+        self.graph_query(&format!(
+            "UNWIND [{values}] AS row MERGE (n:CortexNode {{path: row.path}}) SET n.id=row.id, n.title=row.title, n.node_type=row.node_type, n.project=row.project, n.start_line=row.start_line, n.end_line=row.end_line, n.generation=row.generation, n.confidence=row.confidence, n.provenance=row.provenance, n.valid_until=NULL"
+        ))
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_edges_batch(&self, edge_type: &str, rows: &[&BackfillEdgeRow]) -> Result<()> {
+        let edge_type = cypher_relationship_type(edge_type)?;
+        let values = rows
+            .iter()
+            .map(|row| {
+                Ok(format!(
+                    "{{src: {src}, dst: {dst}, generation: {generation}, confidence: {confidence}, provenance: {provenance}, method: {method}, evidence: {evidence}}}",
+                    src = cypher_string(&row.src_id.to_string()),
+                    dst = cypher_string(&row.dst_id.to_string()),
+                    generation = row.generation,
+                    confidence = finite_f32(row.confidence)?,
+                    provenance = cypher_string(&row.provenance),
+                    method = row.method.as_deref().map(cypher_string).unwrap_or_else(|| "NULL".to_string()),
+                    evidence = row.evidence.as_ref().map(|value| cypher_string(&value.to_string())).unwrap_or_else(|| "NULL".to_string()),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
+        self.graph_query(&format!(
+            "UNWIND [{values}] AS row MATCH (s:CortexNode {{id: row.src}}), (d:CortexNode {{id: row.dst}}) MERGE (s)-[e:{edge_type}]->(d) SET e.confidence=row.confidence, e.provenance=row.provenance, e.method=row.method, e.evidence=row.evidence, e.generation=row.generation"
+        ))
+        .await?;
+        Ok(())
+    }
+
     async fn graph_read(&self, cypher: &str) -> Result<Vec<Vec<redis::Value>>> {
         let mut conn = self.connection.clone();
         let value = tokio::time::timeout(
@@ -353,9 +439,27 @@ impl FalkorCortexGraphStore {
             FALKOR_CREATE_TITLE_INDEX,
             FALKOR_CREATE_VECTOR_INDEX,
         ] {
-            self.graph_query(query).await?;
+            if let Err(error) = self.graph_query(query).await {
+                let message = error.to_string().to_ascii_lowercase();
+                if !message.contains("already indexed") && !message.contains("already exists") {
+                    return Err(error);
+                }
+            }
         }
         Ok(())
+    }
+
+    async fn graph_counts(&self) -> Result<(i64, i64)> {
+        let rows = self
+            .graph_read("MATCH (n:CortexNode) OPTIONAL MATCH (n)-[e]->() RETURN count(DISTINCT n), count(e)")
+            .await?;
+        let row = rows
+            .first()
+            .context("FalkorDB count query returned no rows")?;
+        if row.len() < 2 {
+            anyhow::bail!("FalkorDB count row has {} columns, expected 2", row.len());
+        }
+        Ok((value_i64(&row[0])?, value_i64(&row[1])?))
     }
 }
 
@@ -942,6 +1046,172 @@ fn enabled_value(value: &str) -> bool {
     )
 }
 
+async fn connect_falkor(pool: &PgPool) -> Result<FalkorCortexGraphStore> {
+    let url = match std::env::var("FALKORDB_URL") {
+        Ok(url) => url,
+        Err(_) => fleet_setting(pool, "falkordb.url").await.context(
+            "FalkorDB administration requires FALKORDB_URL or fleet_secrets falkordb.url",
+        )?,
+    };
+    let graph = std::env::var("FALKORDB_GRAPH")
+        .ok()
+        .or(fleet_setting(pool, "falkordb.graph").await)
+        .unwrap_or_else(|| "cortex".to_string());
+    let client = redis::Client::open(url).context("open FalkorDB Redis client")?;
+    let connection = tokio::time::timeout(FALKOR_TIMEOUT, ConnectionManager::new(client))
+        .await
+        .context("FalkorDB connection timed out")?
+        .context("connect to FalkorDB")?;
+    Ok(FalkorCortexGraphStore::new(connection, graph, pool.clone()))
+}
+
+#[derive(sqlx::FromRow)]
+struct BackfillNodeRow {
+    id: Uuid,
+    path: String,
+    title: String,
+    node_type: String,
+    project: String,
+    start_line: Option<i32>,
+    end_line: Option<i32>,
+    generation: i64,
+    confidence: f32,
+    provenance: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct BackfillEdgeRow {
+    src_id: Uuid,
+    dst_id: Uuid,
+    edge_type: String,
+    generation: i64,
+    confidence: f32,
+    provenance: String,
+    method: Option<String>,
+    evidence: Option<serde_json::Value>,
+}
+
+/// Copy the current authoritative Postgres Cortex graph into FalkorDB. Both
+/// node and relationship writes use MERGE, so interrupted runs can be retried.
+pub async fn backfill_falkordb(pool: &PgPool) -> Result<CortexBackfillReport> {
+    let falkor = connect_falkor(pool).await?;
+    falkor.ensure_schema().await?;
+    let nodes = sqlx::query_as::<_, BackfillNodeRow>(
+        "SELECT id, path, title, node_type, project, start_line, end_line, generation, confidence, provenance FROM brain_vault_nodes WHERE valid_until IS NULL ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    for chunk in nodes.chunks(250) {
+        falkor.upsert_nodes_batch(chunk).await?;
+    }
+    let edges = sqlx::query_as::<_, BackfillEdgeRow>(
+        "SELECT e.src_id, e.dst_id, e.edge_type, e.generation, e.confidence, e.provenance, e.method, e.evidence FROM brain_vault_edges e JOIN brain_vault_nodes s ON s.id=e.src_id AND s.valid_until IS NULL JOIN brain_vault_nodes d ON d.id=e.dst_id AND d.valid_until IS NULL ORDER BY e.src_id, e.dst_id, e.edge_type",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut by_type: BTreeMap<&str, Vec<&BackfillEdgeRow>> = BTreeMap::new();
+    for row in &edges {
+        by_type.entry(&row.edge_type).or_default().push(row);
+    }
+    for (edge_type, rows) in by_type {
+        for chunk in rows.chunks(250) {
+            falkor.upsert_edges_batch(edge_type, chunk).await?;
+        }
+    }
+    Ok(CortexBackfillReport {
+        nodes: nodes.len(),
+        edges: edges.len(),
+    })
+}
+
+fn symbol_keys(rows: &[SymbolRef]) -> Vec<(Uuid, String, String, Option<i32>, Option<String>)> {
+    let mut keys = rows
+        .iter()
+        .map(|row| {
+            (
+                row.id,
+                row.qualified_name.clone(),
+                row.node_type.clone(),
+                row.start_line,
+                row.file.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
+}
+
+fn hit_keys(rows: &[SymbolHit]) -> Vec<(Uuid, String, String, Option<i32>, Option<String>, i64)> {
+    let mut keys = rows
+        .iter()
+        .map(|row| {
+            (
+                row.id,
+                row.qualified_name.clone(),
+                row.node_type.clone(),
+                row.start_line,
+                row.file.clone(),
+                row.fan_in,
+            )
+        })
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
+}
+
+/// Compare both backends directly. This deliberately bypasses
+/// `CortexReadRouter`, because fallback would conceal a FalkorDB read failure.
+pub async fn parity_check_falkordb(pool: &PgPool, sample_limit: i64) -> Result<CortexParityReport> {
+    let postgres = PostgresCortexGraphStore::new(pool.clone());
+    let falkor = connect_falkor(pool).await?;
+    let (postgres_nodes, postgres_edges): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM brain_vault_nodes WHERE valid_until IS NULL), (SELECT count(*) FROM brain_vault_edges e JOIN brain_vault_nodes s ON s.id=e.src_id AND s.valid_until IS NULL JOIN brain_vault_nodes d ON d.id=e.dst_id AND d.valid_until IS NULL)",
+    )
+    .fetch_one(pool)
+    .await?;
+    let (falkordb_nodes, falkordb_edges) = falkor.graph_counts().await?;
+    let candidates: Vec<(String, String)> = sqlx::query_as(
+        "SELECT project, title FROM brain_vault_nodes WHERE valid_until IS NULL AND node_type LIKE 'code:%' ORDER BY references_ DESC, title LIMIT $1",
+    )
+    .bind(sample_limit.clamp(0, 20))
+    .fetch_all(pool)
+    .await?;
+    let mut samples = Vec::with_capacity(candidates.len() * 2);
+    for (corpus, symbol) in candidates {
+        let pg_find = postgres
+            .find_symbols(&corpus, &symbol, 20, None, false)
+            .await?;
+        let fk_find = falkor
+            .find_symbols(&corpus, &symbol, 20, None, false)
+            .await?;
+        samples.push(CortexParitySample {
+            corpus: corpus.clone(),
+            symbol: symbol.clone(),
+            query: "find_symbols".to_string(),
+            postgres_rows: pg_find.len(),
+            falkordb_rows: fk_find.len(),
+            matches: hit_keys(&pg_find) == hit_keys(&fk_find),
+        });
+        let pg_callers = postgres.callers(&corpus, &symbol, 0.0).await?;
+        let fk_callers = falkor.callers(&corpus, &symbol, 0.0).await?;
+        samples.push(CortexParitySample {
+            corpus,
+            symbol,
+            query: "callers".to_string(),
+            postgres_rows: pg_callers.len(),
+            falkordb_rows: fk_callers.len(),
+            matches: symbol_keys(&pg_callers) == symbol_keys(&fk_callers),
+        });
+    }
+    Ok(CortexParityReport {
+        postgres_nodes,
+        falkordb_nodes,
+        postgres_edges,
+        falkordb_edges,
+        samples,
+    })
+}
+
 async fn falkor_write_store(pool: &PgPool) -> Option<&'static FalkorCortexGraphStore> {
     FALKOR_WRITE_STORE
         .get_or_init(|| async {
@@ -1393,5 +1663,29 @@ mod tests {
         assert!(finite_f32(f32::NAN).is_err());
         assert!(finite_f32(f32::INFINITY).is_err());
         assert_eq!(finite_f32(0.6).unwrap(), "0.6");
+    }
+
+    #[test]
+    fn parity_requires_counts_and_every_sample_to_match() {
+        let mut report = CortexParityReport {
+            postgres_nodes: 2,
+            falkordb_nodes: 2,
+            postgres_edges: 1,
+            falkordb_edges: 1,
+            samples: vec![CortexParitySample {
+                corpus: "test".to_string(),
+                symbol: "test::symbol".to_string(),
+                query: "callers".to_string(),
+                postgres_rows: 1,
+                falkordb_rows: 1,
+                matches: true,
+            }],
+        };
+        assert!(report.matches());
+        report.samples[0].matches = false;
+        assert!(!report.matches());
+        report.samples[0].matches = true;
+        report.falkordb_edges = 0;
+        assert!(!report.matches());
     }
 }

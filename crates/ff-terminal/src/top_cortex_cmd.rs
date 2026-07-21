@@ -59,6 +59,16 @@ pub enum TopCortexCommand {
         #[arg(long)]
         corpus: Option<String>,
     },
+    /// Idempotently copy the authoritative Postgres Cortex graph to FalkorDB.
+    FalkordbBackfill,
+    /// Compare Postgres and FalkorDB counts plus representative Cortex reads.
+    ParityCheck {
+        /// Number of high-reference symbols to sample (each runs find + callers).
+        #[arg(long, default_value_t = 3)]
+        samples: i64,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
     /// Show the indexed corpus for the cwd (or --all corpora): node/edge counts.
     Status {
         /// Show all corpora, not just the one matching the cwd.
@@ -835,6 +845,54 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
         TopCortexCommand::Entities { corpus } => {
             crate::cortex_cmd::handle_cortex(&pool, crate::CortexCommand::Entities { corpus })
                 .await?;
+        }
+        TopCortexCommand::FalkordbBackfill => {
+            let report = cortex::storage::backfill_falkordb(&pool).await?;
+            println!(
+                "{GREEN}backfilled FalkorDB{RESET} {} node(s), {} edge(s)",
+                report.nodes, report.edges
+            );
+        }
+        TopCortexCommand::ParityCheck { samples, format } => {
+            let report = cortex::storage::parity_check_falkordb(&pool, samples).await?;
+            if format.as_str() == "json" {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{CYAN}\u{25b} cortex backend parity{RESET}");
+                println!(
+                    "  nodes: postgres={} falkordb={} {}",
+                    report.postgres_nodes,
+                    report.falkordb_nodes,
+                    if report.postgres_nodes == report.falkordb_nodes {
+                        "match"
+                    } else {
+                        "MISMATCH"
+                    }
+                );
+                println!(
+                    "  edges: postgres={} falkordb={} {}",
+                    report.postgres_edges,
+                    report.falkordb_edges,
+                    if report.postgres_edges == report.falkordb_edges {
+                        "match"
+                    } else {
+                        "MISMATCH"
+                    }
+                );
+                for sample in &report.samples {
+                    println!(
+                        "  {:<12} {:<28} pg={:<4} falkor={:<4} {}",
+                        sample.query,
+                        sample.symbol,
+                        sample.postgres_rows,
+                        sample.falkordb_rows,
+                        if sample.matches { "match" } else { "MISMATCH" }
+                    );
+                }
+            }
+            if !report.matches() {
+                anyhow::bail!("Cortex Postgres/FalkorDB parity check failed");
+            }
         }
         TopCortexCommand::Embed {
             max,
