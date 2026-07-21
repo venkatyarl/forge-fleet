@@ -1846,42 +1846,17 @@ struct RemoveComputerReport {
 /// Returns a row-level report. Errors are surfaced to the caller; the
 /// transaction rolls back on any SQL failure.
 async fn remove_computer_core(pool: &sqlx::PgPool, name: &str) -> Result<RemoveComputerReport> {
-    let mut tx = pool.begin().await?;
-    let mut report = RemoveComputerReport::default();
-
-    // fleet_models has no ON DELETE CASCADE on the fleet_workers FK.
-    let r = sqlx::query("DELETE FROM fleet_models WHERE worker_name = $1")
-        .bind(name)
-        .execute(&mut *tx)
-        .await?;
-    report.fleet_models_rows = r.rows_affected();
-
-    // fleet_leader_state references computers(id) WITHOUT cascade; the spec
-    // says key by member_name so we don't have to resolve the UUID first.
-    let r = sqlx::query("DELETE FROM fleet_leader_state WHERE member_name = $1")
-        .bind(name)
-        .execute(&mut *tx)
-        .await?;
-    report.leader_state_rows = r.rows_affected();
-
-    // fleet_workers cascades: fleet_workers_ssh_keys, fleet_model_library,
-    // fleet_model_deployments, fleet_disk_usage (all ON DELETE CASCADE).
-    let r = sqlx::query("DELETE FROM fleet_workers WHERE name = $1")
-        .bind(name)
-        .execute(&mut *tx)
-        .await?;
-    report.fleet_worker_rows = r.rows_affected();
-
-    // computers cascades: computer_software, computer_models,
-    // computer_model_deployments, computer_downtime_events, computer_trust,
-    // fleet_workers, computer_docker_containers.
-    let r = sqlx::query("DELETE FROM computers WHERE name = $1")
-        .bind(name)
-        .execute(&mut *tx)
-        .await?;
-    report.computer_rows = r.rows_affected();
-
-    tx.commit().await?;
+    // DB-level deletes (fleet_models, fleet_leader_state, fleet_workers,
+    // computers) live in ff_db::pg_remove_computer so ff-api's removal
+    // endpoint shares the exact same transaction instead of duplicating it.
+    let db_report = ff_db::pg_remove_computer(pool, name).await?;
+    let mut report = RemoveComputerReport {
+        computer_rows: db_report.computer_rows,
+        fleet_worker_rows: db_report.fleet_worker_rows,
+        fleet_models_rows: db_report.fleet_models_rows,
+        leader_state_rows: db_report.leader_state_rows,
+        revocation_task_id: None,
+    };
 
     // Enqueue SSH revocation as a deferred task so it survives Taylor being
     // offline or the operator running this from a non-leader. Payload is a

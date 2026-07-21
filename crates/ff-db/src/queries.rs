@@ -526,6 +526,58 @@ pub async fn pg_upsert_node(pool: &PgPool, node: &FleetNodeRow) -> Result<()> {
     Ok(())
 }
 
+/// Rows-deleted breakdown for [`pg_remove_computer`]. Each field corresponds
+/// to one DELETE inside the transaction.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RemoveComputerReport {
+    pub computer_rows: u64,
+    pub fleet_worker_rows: u64,
+    pub fleet_models_rows: u64,
+    pub leader_state_rows: u64,
+}
+
+/// Remove a computer and its non-cascading dependent rows in a single
+/// transaction, keyed by `name`.
+///
+/// `fleet_models` and `fleet_leader_state` have no `ON DELETE CASCADE` from
+/// `fleet_workers`/`computers`, so they're deleted explicitly first. The
+/// `fleet_workers` and `computers` deletes that follow cascade to their own
+/// dependents (ssh keys, model library/deployments, disk usage, computer
+/// software/models/downtime/trust/docker containers).
+///
+/// `report.computer_rows == 0` means no computer with that name existed.
+pub async fn pg_remove_computer(pool: &PgPool, name: &str) -> Result<RemoveComputerReport> {
+    let mut tx = pool.begin().await?;
+    let mut report = RemoveComputerReport::default();
+
+    let r = sqlx::query("DELETE FROM fleet_models WHERE worker_name = $1")
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    report.fleet_models_rows = r.rows_affected();
+
+    let r = sqlx::query("DELETE FROM fleet_leader_state WHERE member_name = $1")
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    report.leader_state_rows = r.rows_affected();
+
+    let r = sqlx::query("DELETE FROM fleet_workers WHERE name = $1")
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    report.fleet_worker_rows = r.rows_affected();
+
+    let r = sqlx::query("DELETE FROM computers WHERE name = $1")
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    report.computer_rows = r.rows_affected();
+
+    tx.commit().await?;
+    Ok(report)
+}
+
 // ─── Postgres Model Queries ──────────────────────────────────────────────────
 
 /// List all fleet models from Postgres.
@@ -5340,6 +5392,30 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn remove_computer_of_unknown_name_deletes_nothing() {
+        let Some(url) = env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()
+        else {
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect to test database");
+
+        let name = format!("nonexistent-computer-{}", uuid::Uuid::new_v4());
+        let report = pg_remove_computer(&pool, &name)
+            .await
+            .expect("pg_remove_computer should succeed with zero rows");
+        assert_eq!(report.computer_rows, 0);
+        assert_eq!(report.fleet_worker_rows, 0);
+        assert_eq!(report.fleet_models_rows, 0);
+        assert_eq!(report.leader_state_rows, 0);
     }
 }
 

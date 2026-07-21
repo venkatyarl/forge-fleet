@@ -8,12 +8,14 @@ use axum::{
     extract::State,
     http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header},
     middleware::{self, Next},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use chrono::Utc;
 use dashmap::DashMap;
 use ff_security::auth::{ApiKey, ApiKeyStore, Scope, extract_api_key_from_headers};
 use serde::Serialize;
+use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
@@ -28,7 +30,7 @@ use crate::{
     registry::BackendRegistry,
     router::{ModelRouter, TierRouter},
     routes::{
-        slm,
+        computers, slm,
         work_queue::{self, WorkQueue},
     },
     types::{
@@ -45,11 +47,16 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub request_metrics: Arc<RequestMetrics>,
     pub work_queue: Arc<WorkQueue>,
+    pub db_pool: PgPool,
     api_keys: Arc<ApiKeyStore>,
 }
 
 impl AppState {
-    pub fn new(registry: Arc<BackendRegistry>, api_keys: Vec<ApiKey>) -> anyhow::Result<Self> {
+    pub fn new(
+        registry: Arc<BackendRegistry>,
+        api_keys: Vec<ApiKey>,
+        database_url: &str,
+    ) -> anyhow::Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .pool_idle_timeout(std::time::Duration::from_secs(30))
@@ -65,6 +72,12 @@ impl AppState {
             quality_tracker,
         ));
 
+        // Lazy pool: no connection attempt happens until the first query, so
+        // ff-api starts (and its router-building tests run) without Postgres.
+        let db_pool = PgPoolOptions::new()
+            .connect_lazy(database_url)
+            .context("failed to build Postgres pool")?;
+
         let api_key_store = ApiKeyStore::new();
         for key in api_keys {
             api_key_store.insert(key);
@@ -77,6 +90,7 @@ impl AppState {
             http_client,
             request_metrics: Arc::new(RequestMetrics::default()),
             work_queue: Arc::new(WorkQueue::new()),
+            db_pool,
             api_keys: Arc::new(api_key_store),
         })
     }
@@ -125,6 +139,10 @@ pub fn build_http_router(state: Arc<AppState>, allowed_origins: &[String]) -> Ro
         .route(
             "/v1/work-queue/items/{id}/status",
             post(work_queue::update_work_item_status),
+        )
+        .route(
+            "/v1/computers/{computer_id}",
+            delete(computers::remove_computer),
         )
         .route_layer(middleware::from_fn_with_state(state.clone(), require_write));
 
@@ -552,7 +570,14 @@ mod tests {
         );
         let (user_token, user_key) =
             generate_api_key("user", vec![Scope::Read, Scope::Proxy], None);
-        let state = Arc::new(AppState::new(registry, vec![service_key, user_key]).unwrap());
+        let state = Arc::new(
+            AppState::new(
+                registry,
+                vec![service_key, user_key],
+                "postgres://forgefleet:forgefleet@localhost/forgefleet",
+            )
+            .unwrap(),
+        );
         (
             build_http_router(state, allowed_origins),
             service_token,
@@ -630,6 +655,27 @@ mod tests {
             .unwrap();
         let service_response = app.oneshot(service_request).await.unwrap();
         assert_eq!(service_response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn computer_removal_requires_service_authorization() {
+        let (app, _service_token, user_token) = test_app(&[]);
+        let unauthenticated = app
+            .clone()
+            .oneshot(request(Method::DELETE, "/v1/computers/some-node"))
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let user_response = app
+            .oneshot(authenticated_request(
+                Method::DELETE,
+                "/v1/computers/some-node",
+                &user_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(user_response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ pub struct ApiConfig {
     pub backends: Vec<BackendEndpoint>,
     pub api_keys: Vec<ApiKey>,
     pub cors_allowed_origins: Vec<String>,
+    pub database_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,12 +79,17 @@ impl ApiConfig {
         let cors_allowed_origins =
             parse_cors_origins(&env::var("FF_API_CORS_ORIGINS").unwrap_or_default());
 
+        let database_url = env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
+            .unwrap_or_else(|_| default_database_url());
+
         Self {
             host,
             port,
             backends,
             api_keys,
             cors_allowed_origins,
+            database_url,
         }
     }
 
@@ -110,6 +116,10 @@ fn default_true() -> bool {
 
 fn default_http() -> String {
     "http".to_string()
+}
+
+fn default_database_url() -> String {
+    "postgres://forgefleet:forgefleet@localhost/forgefleet".to_string()
 }
 
 #[cfg(test)]
