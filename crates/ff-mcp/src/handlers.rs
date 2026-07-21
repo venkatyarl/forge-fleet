@@ -2802,6 +2802,7 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "cortex_callers" => crate::cortex_tools::cortex_callers(params).await,
         "cortex_callees" => crate::cortex_tools::cortex_callees(params).await,
         "cortex_impact" => crate::cortex_tools::cortex_impact(params).await,
+        "cortex_affected_flows" => crate::cortex_tools::cortex_affected_flows(params).await,
         "cortex_deps" => crate::cortex_tools::cortex_deps(params).await,
         "cortex_readers" => crate::cortex_tools::cortex_readers(params).await,
         "cortex_writers" => crate::cortex_tools::cortex_writers(params).await,

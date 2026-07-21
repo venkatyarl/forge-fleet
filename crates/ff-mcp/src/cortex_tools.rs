@@ -648,6 +648,44 @@ pub async fn cortex_impact(params: Option<Value>) -> HandlerResult {
     }))
 }
 
+/// One-call change-impact view: direct callers/callees, transitive impact, and
+/// covering tests for the same symbol and confidence threshold.
+pub async fn cortex_affected_flows(params: Option<Value>) -> HandlerResult {
+    let (corpus_slug, symbol) = corpus_and_symbol(&params)?;
+    let max_depth = params
+        .as_ref()
+        .and_then(|p| p.get("max_depth"))
+        .and_then(|v| v.as_u64())
+        .map(|d| d.clamp(1, 20) as usize)
+        .unwrap_or(5);
+    let min_confidence = min_confidence_param(&params);
+    let pool = get_pool().await?;
+
+    let (callers, callees, impacted, tests) = tokio::try_join!(
+        callers(&pool, &corpus_slug, &symbol, min_confidence),
+        callees(&pool, &corpus_slug, &symbol, min_confidence),
+        impact(&pool, &corpus_slug, &symbol, max_depth, min_confidence),
+        tests_for(&pool, &corpus_slug, &symbol, max_depth, min_confidence),
+    )
+    .map_err(|e| format!("affected_flows: {e}"))?;
+
+    Ok(json!({
+        "corpus": corpus_slug,
+        "symbol": symbol,
+        "max_depth": max_depth,
+        "min_confidence": min_confidence,
+        "callers": symbols_json(&callers),
+        "callees": symbols_json(&callees),
+        "impacted": symbols_json(&impacted),
+        "tests": tests.iter().map(|t| json!({
+            "qualified_name": t.qualified_name,
+            "file": t.file,
+            "start_line": t.start_line,
+            "depth": t.depth,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
 /// Dependency graph. With no `crate`: list dependency packages and how many
 /// crates depend on each. With a `crate`: that crate's forward dependencies
 /// (what it needs) + reverse dependents (what needs it — the rebuild blast

@@ -149,6 +149,8 @@ impl McpServer {
                      • `cortex_*` — pre-indexed code graph. `cortex_corpora` lists\n\
                        indexed repos; `cortex_callers`/`cortex_callees`/`cortex_impact`\n\
                        answer who-calls / what-it-calls / blast-radius for a symbol;\n\
+                       `cortex_affected_flows` combines those relationships with\n\
+                       covering tests in one change-impact view;\n\
                        `cortex_path` returns the shortest call chain between two\n\
                        symbols (HOW one reaches the other) —\n\
                        token-cheaper than grepping for call sites. `cortex_review`\n\
@@ -335,6 +337,31 @@ mod tests {
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
         assert!(tools.len() >= 11);
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool["name"] == "cortex_affected_flows")
+        );
+    }
+
+    #[tokio::test]
+    async fn affected_flows_dispatches_to_cortex_handler() {
+        let server = McpServer::new();
+        let req = make_request(
+            "tools/call",
+            Some(json!({
+                "name": "cortex_affected_flows",
+                "arguments": { "symbol": "example" }
+            })),
+        );
+        let resp = server.handle_request(req).await.unwrap();
+        let detail = resp.error.unwrap().data.unwrap();
+        assert!(
+            detail
+                .as_str()
+                .unwrap()
+                .contains("missing required parameter: corpus")
+        );
     }
 
     #[tokio::test]

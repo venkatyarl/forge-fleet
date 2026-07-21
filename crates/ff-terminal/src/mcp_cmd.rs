@@ -1,5 +1,5 @@
 //! `ff mcp install` — wire the local forgefleet MCP server into each
-//! client tool's config so Claude Code / Codex / Kimi / Cursor / Windsurf /
+//! client tool's config so Claude Code / Codex / Gemini / Kimi / Cursor / Windsurf /
 //! Goose all reach for ff's fleet_run / fleet_crew / brain_search by default
 //! instead of generic bash / grep / web-fetch.
 //!
@@ -20,12 +20,12 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Subcommand)]
 pub enum McpCommand {
     /// Install the forgefleet MCP server into one or more coding-agent
-    /// configs (Claude Code, Claude Desktop, Codex, Kimi, Cursor, Windsurf,
+    /// configs (Claude Code, Claude Desktop, Codex, Gemini, Kimi, Cursor, Windsurf,
     /// Goose, Grok).
     Install {
         /// Which client to install for. Pass `all` to install everywhere
         /// we can detect a config file.
-        #[arg(long, value_parser = ["all", "claude-code", "claude-desktop", "codex", "kimi", "kimi-desktop", "cursor", "windsurf", "goose", "grok"])]
+        #[arg(long, value_parser = ["all", "claude-code", "claude-desktop", "codex", "gemini", "kimi", "kimi-desktop", "cursor", "windsurf", "goose", "grok"])]
         r#for: String,
         /// MCP server URL. Defaults to the per-computer federation endpoint
         /// (`http://localhost:50001/mcp`) which every fleet computer hosts.
@@ -62,7 +62,7 @@ the `ff` CLI before generic shell / grep / web primitives.
 ### Discovery-FIRST — search before you build (hard rule)
 Before writing any new table/module/feature, inventory what ALREADY exists — the
 #1 waste is rebuilding a capability the fleet already has. Order:
-1. **Cortex / code graph** — `cortex_find` / `semantic_search_nodes` ("what
+1. **Cortex / code graph** — `cortex_find` / `cortex_search` ("what
    handles X?") to find the owning crate/module. Faster + cheaper than grep.
 2. **`ff db query "<read-only SQL>"`** — confirm the LIVE Postgres schema; source
    `CREATE TABLE` strings can drift from the live DB. Never extend a table you
@@ -124,6 +124,7 @@ fn resolve_targets(arg: &str) -> Vec<&'static str> {
             "claude-code",
             "claude-desktop",
             "codex",
+            "gemini",
             "kimi",
             "kimi-desktop",
             "cursor",
@@ -135,6 +136,7 @@ fn resolve_targets(arg: &str) -> Vec<&'static str> {
             "claude-code" => "claude-code",
             "claude-desktop" => "claude-desktop",
             "codex" => "codex",
+            "gemini" => "gemini",
             "kimi" => "kimi",
             "kimi-desktop" => "kimi-desktop",
             "cursor" => "cursor",
@@ -158,6 +160,7 @@ async fn install_one(
         "claude-code" => install_claude_code(&home, server_url, write_instructions, dry_run),
         "claude-desktop" => install_claude_desktop(&home, server_url, dry_run),
         "codex" => install_codex(&home, server_url, write_instructions, dry_run),
+        "gemini" => install_gemini(&home, server_url, write_instructions, dry_run),
         "kimi" => install_kimi(&home, server_url, write_instructions, dry_run),
         "kimi-desktop" => install_kimi_desktop(&home, server_url, dry_run),
         "cursor" => install_cursor(&home, server_url, dry_run),
@@ -231,6 +234,32 @@ fn install_codex(
         let agents_md = home.join(".codex").join("AGENTS.md");
         append_instructions_md(&agents_md, dry_run)?;
         println!("    + ff routing rule: {}", agents_md.display());
+    }
+    Ok(())
+}
+
+// ─── Gemini CLI ─────────────────────────────────────────────────────────────
+fn install_gemini(
+    home: &std::path::Path,
+    server_url: &str,
+    write_instructions: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let config = home.join(".gemini").join("settings.json");
+    let entry = if matches!(
+        server_url,
+        "http://localhost:50001/mcp" | "http://127.0.0.1:50001/mcp"
+    ) {
+        json!({ "command": "forgefleetd", "args": ["mcp", "--stdio"] })
+    } else {
+        json!({ "httpUrl": server_url })
+    };
+    upsert_mcp_entry(&config, "forgefleet", entry, dry_run)?;
+    println!("  ✓ gemini: {}", config.display());
+    if write_instructions {
+        let gemini_md = home.join(".gemini").join("GEMINI.md");
+        append_instructions_md(&gemini_md, dry_run)?;
+        println!("    + ff routing rule: {}", gemini_md.display());
     }
     Ok(())
 }
@@ -623,6 +652,7 @@ fn print_status(as_json: bool) {
         ),
         ("claude-desktop", vec![claude_desktop_config_path(&home)]),
         ("codex", vec![home.join(".codex").join("config.toml")]),
+        ("gemini", vec![home.join(".gemini").join("settings.json")]),
         ("kimi", vec![home.join(".kimi").join("config.json")]),
         ("kimi-desktop", vec![kimi_desktop_config_path(&home)]),
         ("cursor", vec![home.join(".cursor").join("mcp.json")]),
@@ -699,5 +729,35 @@ mod tests {
         assert_eq!(text_mark("absent"), "—");
         assert_eq!(text_mark("installed"), "✓ forgefleet installed");
         assert_eq!(text_mark("not_installed"), "× forgefleet missing");
+    }
+
+    #[test]
+    fn all_targets_include_gemini() {
+        assert!(resolve_targets("all").contains(&"gemini"));
+    }
+
+    #[test]
+    fn gemini_install_preserves_settings_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join(".gemini").join("settings.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            r#"{"theme":"dark","mcpServers":{"other":{"command":"other"}}}"#,
+        )
+        .unwrap();
+
+        install_gemini(temp.path(), "https://fleet.example/mcp", false, false).unwrap();
+        let first = std::fs::read_to_string(&config).unwrap();
+        let doc: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(doc["theme"], "dark");
+        assert_eq!(doc["mcpServers"]["other"]["command"], "other");
+        assert_eq!(
+            doc["mcpServers"]["forgefleet"]["httpUrl"],
+            "https://fleet.example/mcp"
+        );
+
+        install_gemini(temp.path(), "https://fleet.example/mcp", false, false).unwrap();
+        assert_eq!(std::fs::read_to_string(config).unwrap(), first);
     }
 }

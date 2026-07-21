@@ -122,6 +122,7 @@ impl ToolRegistry {
         self.register(Self::cortex_callers());
         self.register(Self::cortex_callees());
         self.register(Self::cortex_impact());
+        self.register(Self::cortex_affected_flows());
         self.register(Self::cortex_deps());
         self.register(Self::cortex_readers());
         self.register(Self::cortex_writers());
@@ -1212,6 +1213,37 @@ impl ToolRegistry {
         }
     }
 
+    fn cortex_affected_flows() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_affected_flows".to_string(),
+            description: "Cortex code graph: one-call change-impact view for a symbol, combining direct callers, direct callees, transitive caller impact, and covering tests. Use before changing a symbol to see its upstream consumers, downstream dependencies, blast radius, and test coverage without four separate calls.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "corpus": {
+                        "type": "string",
+                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'"
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Code symbol — bare leaf or qualified name"
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "Max transitive hops for impact and test coverage (1-20, default 5)",
+                        "default": 5
+                    },
+                    "min_confidence": {
+                        "type": "number",
+                        "description": "Only traverse calls edges at/above this confidence (0.0-1.0, default 0.0)",
+                        "default": 0.0
+                    }
+                },
+                "required": ["corpus", "symbol"]
+            }),
+        }
+    }
+
     fn cortex_deps() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_deps".to_string(),
@@ -1810,6 +1842,7 @@ mod tests {
             "cortex_callers",
             "cortex_callees",
             "cortex_impact",
+            "cortex_affected_flows",
             "cortex_deps",
             "cortex_readers",
             "cortex_writers",
