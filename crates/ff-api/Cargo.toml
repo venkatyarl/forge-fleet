@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 ff-db = { path = "../ff-db" }
+ff-security = { path = "../ff-security" }
 
 anyhow.workspace = true
 axum.workspace = true
@@ -24,3 +25,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tower.workspace = true

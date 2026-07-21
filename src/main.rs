@@ -3859,11 +3859,10 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
 
     info!(backend_count = backends.len(), "built API backend registry");
 
-    ApiConfig {
-        host: "0.0.0.0".to_string(),
-        port: config.fleet.api_port,
-        backends,
-    }
+    let mut api_config = ApiConfig::from_env();
+    api_config.port = config.fleet.api_port;
+    api_config.backends = backends;
+    api_config
 }
 
 async fn wait_for_shutdown_signal() {

@@ -1,14 +1,17 @@
 use std::env;
 
+use ff_security::auth::ApiKey;
 use serde::Deserialize;
 
 use crate::registry::BackendEndpoint;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiConfig {
     pub host: String,
     pub port: u16,
     pub backends: Vec<BackendEndpoint>,
+    pub api_keys: Vec<ApiKey>,
+    pub cors_allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,7 +39,7 @@ struct BackendEnvConfig {
 
 impl ApiConfig {
     pub fn from_env() -> Self {
-        let host = env::var("FF_API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+        let host = env::var("FF_API_HOST").unwrap_or_else(|_| default_host());
         let port = env::var("FF_API_PORT")
             .ok()
             .and_then(|p| p.parse::<u16>().ok())
@@ -68,10 +71,19 @@ impl ApiConfig {
             })
             .unwrap_or_default();
 
+        let api_keys = env::var("FF_API_KEYS_JSON")
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Vec<ApiKey>>(&raw).ok())
+            .unwrap_or_default();
+        let cors_allowed_origins =
+            parse_cors_origins(&env::var("FF_API_CORS_ORIGINS").unwrap_or_default());
+
         Self {
             host,
             port,
             backends,
+            api_keys,
+            cors_allowed_origins,
         }
     }
 
@@ -80,10 +92,41 @@ impl ApiConfig {
     }
 }
 
+fn default_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn parse_cors_origins(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty() && *origin != "*")
+        .map(str::to_owned)
+        .collect()
+}
+
 fn default_true() -> bool {
     true
 }
 
 fn default_http() -> String {
     "http".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listener_default_is_loopback() {
+        assert_eq!(default_host(), "127.0.0.1");
+    }
+
+    #[test]
+    fn cors_origins_are_an_exact_allowlist_without_wildcards() {
+        assert_eq!(
+            parse_cors_origins(" https://one.example,*,https://two.example "),
+            vec!["https://one.example", "https://two.example"]
+        );
+        assert!(parse_cors_origins("").is_empty());
+    }
 }

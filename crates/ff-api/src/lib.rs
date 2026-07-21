@@ -26,9 +26,9 @@ use server::{AppState, build_http_router};
 pub async fn run(config: ApiConfig) -> anyhow::Result<()> {
     let bind_addr = config.bind_addr();
     let registry = Arc::new(BackendRegistry::new(config.backends));
-    let state = Arc::new(AppState::new(registry)?);
+    let state = Arc::new(AppState::new(registry, config.api_keys)?);
 
-    let app = build_http_router(state);
+    let app = build_http_router(state, &config.cors_allowed_origins);
     let listener = TcpListener::bind(bind_addr).await?;
     info!(address = %listener.local_addr()?, "ff-api listening");
 
