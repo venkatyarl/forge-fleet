@@ -53,6 +53,7 @@ pub mod model_manager;
 pub mod ollama;
 pub mod process_manager;
 pub mod scheduler;
+pub mod sharding;
 pub mod vllm;
 
 // Re-export key types at crate root.
@@ -61,3 +62,4 @@ pub use config::BuildConfig;
 pub use engine::{EngineConfig, EngineStatus, InferenceEngine};
 pub use error::{Result, RuntimeError};
 pub use process_manager::{DetectedProcess, ManagedModel, ProcessManager, ProcessManagerConfig};
+pub use sharding::{Quant, RingLink, ShardingMap, SparkShard};
