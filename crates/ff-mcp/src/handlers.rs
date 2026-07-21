@@ -2373,6 +2373,11 @@ pub async fn project_policy_resolve(params: Option<Value>) -> HandlerResult {
 
 pub async fn fleet_pulse(params: Option<Value>) -> HandlerResult {
     let mut pulse = crate::pool::shared_pulse().await?;
+    let (config, _) = load_config_auto()?;
+    let pg = get_pg_pool(&config).await?;
+    let unschedulable_ready = ff_db::pg_unschedulable_ready_count(&pg)
+        .await
+        .map_err(|e| format!("Postgres work-item query failed: {e}"))?;
 
     let node_filter = params
         .as_ref()
@@ -2384,13 +2389,19 @@ pub async fn fleet_pulse(params: Option<Value>) -> HandlerResult {
             .get_metrics(node)
             .await
             .map_err(|e| format!("Redis error: {e}"))?;
-        Ok(json!({ "node": node, "metrics": metrics }))
+        Ok(json!({
+            "node": node,
+            "metrics": metrics,
+            "unschedulable_ready_work_items": unschedulable_ready
+        }))
     } else {
         let snapshot = pulse
             .get_all_metrics()
             .await
             .map_err(|e| format!("Redis error: {e}"))?;
-        Ok(serde_json::to_value(snapshot).map_err(|e| e.to_string())?)
+        let mut value = serde_json::to_value(snapshot).map_err(|e| e.to_string())?;
+        value["unschedulable_ready_work_items"] = json!(unschedulable_ready);
+        Ok(value)
     }
 }
 

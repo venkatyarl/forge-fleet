@@ -11,6 +11,7 @@ use uuid::Uuid;
 pub const REVIEW_CEILING: i64 = 40;
 pub const FEED_TARGET: i64 = 30;
 pub const MAX_FEEDS_PER_TICK: usize = 1;
+pub const READY_PARENT_MIN_AGE_MINUTES: i64 = 5;
 
 #[derive(Debug)]
 struct Idea {
@@ -23,11 +24,12 @@ struct Idea {
 /// Run one feeder pass. Leadership is enforced by the daemon tick registry;
 /// this function owns the feature gate and pipeline backpressure checks.
 pub async fn run_auto_backlog_feeder_tick(pg: &PgPool) -> Result<usize> {
+    let rescued = rescue_ready_parent(pg).await?;
     if !auto_feeder_enabled(pg).await? {
-        return Ok(0);
+        return Ok(rescued);
     }
     if !has_headroom(pg).await? {
-        return Ok(0);
+        return Ok(rescued);
     }
 
     let mut fed = 0;
@@ -73,7 +75,62 @@ pub async fn run_auto_backlog_feeder_tick(pg: &PgPool) -> Result<usize> {
     if fed > 0 {
         info!(fed, "auto backlog feeder promoted ideas");
     }
-    Ok(fed)
+    Ok(rescued + fed)
+}
+
+/// Convert one stale, scheduler-ineligible ready parent into dispatchable leaf
+/// tasks. The transient status is an atomic claim across leader handoffs.
+async fn rescue_ready_parent(pg: &PgPool) -> Result<usize> {
+    // A parent that already has children was decomposed by an older CLI which
+    // did not transition ready parents. Repair it without generating duplicates.
+    sqlx::query(
+        "UPDATE work_items p SET status = 'decomposed', last_error = NULL \
+         WHERE p.status = 'ready' AND p.kind IN ('bug', 'feature') \
+           AND EXISTS (SELECT 1 FROM work_items c WHERE c.parent_id = p.id)",
+    )
+    .execute(pg)
+    .await?;
+
+    let row = sqlx::query(
+        "UPDATE work_items p SET status = 'decomposing', last_error = NULL \
+         WHERE p.id = ( \
+             SELECT w.id FROM work_items w \
+              WHERE w.status = 'ready' AND w.kind IN ('bug', 'feature') \
+                AND COALESCE(w.parked, FALSE) = FALSE \
+                AND w.created_at <= NOW() - make_interval(mins => $1) \
+                AND NOT EXISTS (SELECT 1 FROM work_items c WHERE c.parent_id = w.id) \
+              ORDER BY w.created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED) \
+         RETURNING p.id, p.project_id, p.kind, p.repo_path",
+    )
+    .bind(READY_PARENT_MIN_AGE_MINUTES as i32)
+    .fetch_optional(pg)
+    .await?;
+    let Some(row) = row else { return Ok(0) };
+    let parent = Idea {
+        id: row.get("id"),
+        project_id: row.get("project_id"),
+        kind: row.get("kind"),
+        repo_path: row.try_get("repo_path").ok().flatten(),
+    };
+
+    match decompose_idea(&parent).await {
+        Ok(()) => {
+            info!(item = %parent.id, "rescued unschedulable ready parent");
+            Ok(1)
+        }
+        Err(error) => {
+            warn!(item = %parent.id, %error, "ready parent decomposition failed");
+            sqlx::query(
+                "UPDATE work_items SET status = 'ready', last_error = $2 \
+                 WHERE id = $1 AND status = 'decomposing'",
+            )
+            .bind(parent.id)
+            .bind(format!("ready parent auto-decompose: {error:#}"))
+            .execute(pg)
+            .await?;
+            Ok(0)
+        }
+    }
 }
 
 async fn auto_feeder_enabled(pg: &PgPool) -> Result<bool> {
@@ -180,5 +237,6 @@ mod tests {
         assert_eq!(REVIEW_CEILING, 40);
         assert_eq!(FEED_TARGET, 30);
         assert!((1..=2).contains(&MAX_FEEDS_PER_TICK));
+        assert_eq!(READY_PARENT_MIN_AGE_MINUTES, 5);
     }
 }

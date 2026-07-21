@@ -267,6 +267,7 @@ pub use queries::{
     pg_supplied_slots_by_kind,
     pg_touch_brain_thread,
     pg_unreserve_host,
+    pg_unschedulable_ready_count,
     pg_update_artifact_index_holders,
     pg_update_brain_candidate_status,
     pg_update_disk_move,

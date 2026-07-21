@@ -725,7 +725,7 @@ impl ToolRegistry {
     fn fleet_pulse() -> ToolDefinition {
         ToolDefinition {
             name: "fleet_pulse".to_string(),
-            description: "Get real-time fleet metrics from Redis. Returns FleetSnapshot with per-node CPU/RAM/disk/tokens_per_sec/active_tasks. Optionally filter by node name.".to_string(),
+            description: "Get real-time fleet metrics plus the Postgres count of unschedulable ready bug/feature parents. Optionally filter by node name.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

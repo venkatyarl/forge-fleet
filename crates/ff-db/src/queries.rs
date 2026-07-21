@@ -8563,6 +8563,18 @@ pub async fn pg_ready_work_items(pool: &PgPool, limit: i64) -> Result<Vec<ReadyW
     Ok(items)
 }
 
+/// Ready parent items cannot enter the lease scheduler, which intentionally
+/// dispatches only leaf tasks. Expose their count as an operator health signal.
+pub async fn pg_unschedulable_ready_count(pool: &PgPool) -> Result<i64> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM work_items \
+         WHERE status = 'ready' AND kind IN ('bug', 'feature')",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(Into::into)
+}
+
 /// Count decomposed parent work_items (`kind` = 'bug' or 'feature') whose
 /// children are all in a terminal state (`done`, `merged`, or `cancelled`).
 /// Used by the scheduler to report how many parents are eligible for

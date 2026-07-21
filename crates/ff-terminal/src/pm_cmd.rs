@@ -1018,7 +1018,7 @@ async fn handle_pm_decompose(
         if let Some(parent_id) = parent_id {
             sqlx::query(
                 "UPDATE work_items SET status = 'decomposed', last_error = NULL \
-                 WHERE id = $1 AND status = 'idea'",
+                 WHERE id = $1 AND status IN ('idea', 'ready', 'decomposing')",
             )
             .bind(parent_id)
             .execute(pool)
