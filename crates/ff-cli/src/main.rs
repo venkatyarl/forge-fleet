@@ -58,6 +58,8 @@ enum Command {
     Proxy(ProxyArgs),
     Discover(DiscoverArgs),
     Health,
+    /// Diagnose the local installation or installation state across the fleet
+    Doctor(DoctorArgs),
     Tools(ToolsArgs),
     Config(ConfigArgs),
     /// Export data to external systems
@@ -141,6 +143,16 @@ struct ProxyArgs {
 struct DiscoverArgs {
     #[arg(long, default_value = "192.168.5.0/24")]
     subnet: String,
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    /// Show installation status reported by every fleet node
+    #[arg(long, default_value_t = false)]
+    fleet: bool,
+    /// Show software names instead of summary counts
+    #[arg(long, default_value_t = false)]
+    verbose: bool,
 }
 
 #[derive(Debug, Args)]
@@ -243,6 +255,7 @@ async fn main() -> Result<()> {
         Command::Proxy(args) => handle_proxy(args, &config_path),
         Command::Discover(args) => handle_discover(args, &config_path),
         Command::Health => handle_health(&config_path),
+        Command::Doctor(args) => handle_doctor(args).await,
         Command::Tools(args) => handle_tools(args, &config_path).await,
         Command::Config(args) => handle_config(args, &config_path),
         Command::Export(args) => handle_export(args).await,
@@ -601,6 +614,98 @@ fn handle_health(config_path: &Path) -> Result<()> {
     println!("  discovery: {YELLOW}unknown{RESET}");
     println!("  agent: {YELLOW}unknown{RESET}");
     Ok(())
+}
+
+async fn handle_doctor(args: DoctorArgs) -> Result<()> {
+    if !args.fleet {
+        println!("{GREEN}✓ ForgeFleet doctor{RESET}");
+        println!("  Run with --fleet to show installation status for every node.");
+        return Ok(());
+    }
+
+    let gateway = std::env::var("FF_ORCHESTRATOR_URL")
+        .or_else(|_| std::env::var("FF_GATEWAY_URL"))
+        .unwrap_or_else(|_| "http://192.168.5.100:51002".to_string());
+    let url = format!("{}/api/pulses/recent", gateway.trim_end_matches('/'));
+    let response = reqwest::Client::new().get(&url).send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!("Gateway returned {} for {url}", response.status());
+    }
+
+    let payload: serde_json::Value = response.json().await?;
+    let rows = fleet_install_rows(&payload, args.verbose);
+
+    println!("{GREEN}✓ Fleet Install Status{RESET}");
+    println!(
+        "  {CYAN}{:<20} {:<10} {}{RESET}",
+        "NODE", "INSTALLED", "MISSING"
+    );
+    if rows.is_empty() {
+        println!("  {YELLOW}No recent install status reported{RESET}");
+    } else {
+        for (node, installed, missing) in rows {
+            println!("  {node:<20} {installed:<10} {missing}");
+        }
+    }
+    Ok(())
+}
+
+fn fleet_install_rows(payload: &serde_json::Value, verbose: bool) -> Vec<(String, String, String)> {
+    let pulses = payload
+        .as_array()
+        .or_else(|| payload.get("pulses").and_then(serde_json::Value::as_array))
+        .or_else(|| payload.get("beats").and_then(serde_json::Value::as_array))
+        .or_else(|| payload.get("nodes").and_then(serde_json::Value::as_array));
+
+    let mut rows = pulses
+        .into_iter()
+        .flatten()
+        .filter_map(|pulse| {
+            let diff = pulse.get("install_diff")?;
+            let node = ["computer_name", "node_name", "worker_name", "name"]
+                .into_iter()
+                .find_map(|key| pulse.get(key).and_then(serde_json::Value::as_str))
+                .unwrap_or("?")
+                .to_string();
+            let installed = software_names(diff.get("installed"));
+            let missing = software_names(diff.get("missing"));
+            Some((
+                node,
+                render_software(&installed, verbose),
+                render_software(&missing, verbose),
+            ))
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
+fn software_names(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            item.as_str().map(str::to_owned).or_else(|| {
+                ["name", "software", "id"]
+                    .into_iter()
+                    .find_map(|key| item.get(key).and_then(serde_json::Value::as_str))
+                    .map(str::to_owned)
+            })
+        })
+        .collect()
+}
+
+fn render_software(items: &[String], verbose: bool) -> String {
+    if verbose {
+        if items.is_empty() {
+            "—".to_string()
+        } else {
+            items.join(", ")
+        }
+    } else {
+        items.len().to_string()
+    }
 }
 
 async fn handle_tools(args: ToolsArgs, _config_path: &Path) -> Result<()> {
