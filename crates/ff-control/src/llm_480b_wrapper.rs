@@ -4,6 +4,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -12,6 +13,7 @@ use tokio::time;
 use tracing::{info, warn};
 
 use crate::errors::{ControlError, Result};
+use crate::escalation_logger::{EscalationReason, log_escalation};
 
 const DEFAULT_PARALLELISM: usize = 2;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -194,6 +196,32 @@ impl Llm480bHttpWrapper {
             .next()
             .map(|choice| choice.message)
             .ok_or(Llm480bError::EmptyResponse)
+    }
+
+    /// Dispatch a Lane-1.5 escalation and capture its input/output pair for
+    /// future training. Interaction logging is best-effort.
+    pub async fn generate_escalated(
+        &self,
+        pool: &ff_db::PgPool,
+        request: &Llm480bRequest,
+        reason: EscalationReason,
+    ) -> std::result::Result<Llm480bResponse, Llm480bError> {
+        let started = Instant::now();
+        info!(
+            reason = reason.as_str(),
+            model = "qwen3-coder-480b",
+            "routing task to Lane-1.5"
+        );
+        let response = self.generate(request).await?;
+        log_escalation(
+            pool,
+            reason,
+            &request.prompt,
+            &response.content,
+            started.elapsed(),
+        )
+        .await;
+        Ok(response)
     }
 
     pub fn available_permits(&self) -> usize {
