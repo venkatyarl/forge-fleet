@@ -11689,6 +11689,22 @@ ALTER TABLE fabric_pairs
     ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE;
 "#;
 
+/// Latest health result for each local SLM endpoint.
+pub const SCHEMA_V219_SLM_HEALTH_MONITOR: &str = r#"
+CREATE TABLE IF NOT EXISTS slm_health_status (
+    computer_id UUID NOT NULL,
+    endpoint TEXT NOT NULL,
+    healthy BOOLEAN NOT NULL,
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    latency_ms BIGINT NOT NULL,
+    error TEXT,
+    PRIMARY KEY (computer_id, endpoint)
+);
+
+CREATE INDEX IF NOT EXISTS idx_slm_health_status_checked_at
+    ON slm_health_status (checked_at DESC);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

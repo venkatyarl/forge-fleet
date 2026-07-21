@@ -91,3 +91,24 @@ pub async fn publish_member_status_transition(name: &str, prev: &str, new: &str)
         debug!(%subject, error = %e, "ff-pulse: NATS publish failed (non-fatal)");
     }
 }
+
+/// Publish an unhealthy local SLM transition. Best-effort, like pulse events.
+pub async fn publish_slm_unhealthy(computer_id: uuid::Uuid, endpoint: &str, error: &str) {
+    let Some(client) = get_or_init_nats().await else {
+        return;
+    };
+    let subject = "fleet.events.slm_unhealthy";
+    let payload = serde_json::json!({
+        "event_type": "slm_unhealthy",
+        "computer_id": computer_id,
+        "endpoint": endpoint,
+        "error": error,
+        "ts": chrono::Utc::now().to_rfc3339(),
+    });
+    let Ok(bytes) = serde_json::to_vec(&payload) else {
+        return;
+    };
+    if let Err(e) = client.publish(subject, bytes.into()).await {
+        debug!(error = %e, "ff-pulse: slm_unhealthy publish failed (non-fatal)");
+    }
+}
