@@ -36,6 +36,24 @@ use crate::types::{Role, Runtime, Tier};
 
 // ─── Config structs (mirror fleet.toml) ──────────────────────────────────────
 
+/// Configuration for running autonomously while disconnected from the fleet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfflineAutonomyConfig {
+    pub enabled: bool,
+    pub min_ram_mb: u64,
+    pub model_quantization: String,
+}
+
+impl Default for OfflineAutonomyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_ram_mb: 4096,
+            model_quantization: "Q4_0".into(),
+        }
+    }
+}
+
 /// Top-level fleet configuration.
 ///
 /// Matches the production `~/.forgefleet/fleet.toml` format.
