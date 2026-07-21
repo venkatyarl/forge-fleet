@@ -1121,6 +1121,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "computers_primary_ip_upsert_key",
         sql: schema::SCHEMA_V227_COMPUTERS_PRIMARY_IP_UPSERT_KEY,
     },
+    PgMigration {
+        version: 228,
+        name: "model_server_metrics",
+        sql: schema::SCHEMA_V228_MODEL_SERVER_METRICS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

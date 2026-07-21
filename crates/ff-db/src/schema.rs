@@ -11990,6 +11990,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS computers_primary_ip_upsert_key
     WHERE btrim(primary_ip) <> '';
 "#;
 
+/// V228 — Partitioned model-server metrics, rollups, errors, and retention.
+pub const SCHEMA_V228_MODEL_SERVER_METRICS: &str =
+    include_str!("migrations/20260719120000_create_model_server_metrics.sql");
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
