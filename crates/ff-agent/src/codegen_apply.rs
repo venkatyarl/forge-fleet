@@ -34,12 +34,20 @@ pub async fn codegen_apply(
 
     for round in 1..=max_rounds {
         rounds = round;
-        let prompt = build_prompt(
-            repo_path,
-            task,
-            last_edits.as_deref(),
-            last_error.as_deref(),
-        )?;
+        let rp = repo_path.to_path_buf();
+        let task = task.to_string();
+        let previous_edits = last_edits.clone();
+        let previous_error = last_error.clone();
+        let prompt = tokio::task::spawn_blocking(move || {
+            build_prompt(
+                &rp,
+                &task,
+                previous_edits.as_deref(),
+                previous_error.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| anyhow!("build prompt task panicked: {e}"))??;
         info!(
             round,
             max_rounds, "requesting codegen edits from fleet model"
@@ -73,12 +81,20 @@ pub async fn codegen_apply(
         };
         let edit_summary = format_edit_summary(&edits);
 
-        let snapshots = match apply_edits(repo_path, &edits) {
+        let rp = repo_path.to_path_buf();
+        let edits_to_apply = edits.clone();
+        let snapshots = match tokio::task::spawn_blocking(move || apply_edits(&rp, &edits_to_apply))
+            .await
+            .map_err(|e| anyhow!("apply edits task panicked: {e}"))?
+        {
             Ok(snapshots) => snapshots,
             Err(e) => {
                 let err = e.to_string();
                 warn!(round, error = %err, "codegen edits failed to apply");
-                clean_worktree(repo_path)?;
+                let rp = repo_path.to_path_buf();
+                tokio::task::spawn_blocking(move || clean_worktree(&rp))
+                    .await
+                    .map_err(|e| anyhow!("clean worktree task panicked: {e}"))??;
                 last_edits = Some(edit_summary);
                 last_error = Some(err);
                 continue;
@@ -89,13 +105,18 @@ pub async fn codegen_apply(
         // text (or edits that otherwise change nothing) would pass apply + cargo
         // check and be reported applied:true while the working tree is UNCHANGED
         // (live-observed false-success on a 183K file). Require a real diff.
-        let unchanged = Command::new("git")
-            .arg("-C")
-            .arg(repo_path)
-            .args(["status", "--porcelain"])
-            .output()
-            .map(|o| o.stdout.is_empty())
-            .unwrap_or(false);
+        let rp = repo_path.to_path_buf();
+        let unchanged = tokio::task::spawn_blocking(move || {
+            Command::new("git")
+                .arg("-C")
+                .arg(rp)
+                .args(["status", "--porcelain"])
+                .output()
+                .map(|o| o.stdout.is_empty())
+                .unwrap_or(false)
+        })
+        .await
+        .map_err(|e| anyhow!("git status task panicked: {e}"))?;
         if unchanged {
             let err = "edits applied but produced NO change (no-op SEARCH/REPLACE)".to_string();
             warn!(round, "{}", err);
@@ -104,10 +125,17 @@ pub async fn codegen_apply(
             continue;
         }
 
-        let changed_packages = changed_crate_packages(repo_path, &edits)
-            .into_iter()
-            .collect::<Vec<_>>();
-        if let Some((program, args)) = verify_command(repo_path, &changed_packages) {
+        let rp = repo_path.to_path_buf();
+        let edits_for_verify = edits.clone();
+        let verify = tokio::task::spawn_blocking(move || {
+            let changed_packages = changed_crate_packages(&rp, &edits_for_verify)
+                .into_iter()
+                .collect::<Vec<_>>();
+            verify_command(&rp, &changed_packages)
+        })
+        .await
+        .map_err(|e| anyhow!("select verify command task panicked: {e}"))?;
+        if let Some((program, args)) = verify {
             let check_name = format_command(&program, &args);
             // Run the verify subprocess OFF the async runtime. It can take MINUTES
             // (cargo check/build on the changed crates); a blocking
@@ -128,8 +156,13 @@ pub async fn codegen_apply(
             if !check.status.success() {
                 let err = command_error(&check_name, &check);
                 warn!(round, error = %err, "codegen edits failed verification");
-                restore_snapshots(&snapshots)?;
-                clean_worktree(repo_path)?;
+                tokio::task::spawn_blocking(move || restore_snapshots(&snapshots))
+                    .await
+                    .map_err(|e| anyhow!("restore snapshots task panicked: {e}"))??;
+                let rp = repo_path.to_path_buf();
+                tokio::task::spawn_blocking(move || clean_worktree(&rp))
+                    .await
+                    .map_err(|e| anyhow!("clean worktree task panicked: {e}"))??;
                 last_edits = Some(edit_summary);
                 last_error = Some(err);
                 continue;
