@@ -11743,6 +11743,16 @@ CREATE INDEX IF NOT EXISTS idx_service_connectivity_status_checked_at
     ON service_connectivity_status (checked_at DESC);
 "#;
 
+// ─── V222: retire code-review-graph after the Cortex migration ─────────────
+//
+// Repository hooks and MCP configuration now use Cortex exclusively. Remove
+// the legacy catalog entry so fleet-wide tool drift and install workflows do
+// not continue provisioning code-review-graph. The external-tools foreign key
+// cascades this deletion to per-computer install state.
+pub const SCHEMA_V222_RETIRE_CODE_REVIEW_GRAPH: &str = r#"
+DELETE FROM external_tools WHERE id = 'code-review-graph';
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

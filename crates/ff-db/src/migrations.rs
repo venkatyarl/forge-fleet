@@ -1091,6 +1091,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "service_connectivity_status",
         sql: schema::SCHEMA_V221_SERVICE_CONNECTIVITY_STATUS,
     },
+    PgMigration {
+        version: 222,
+        name: "retire_code_review_graph",
+        sql: schema::SCHEMA_V222_RETIRE_CODE_REVIEW_GRAPH,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
