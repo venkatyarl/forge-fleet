@@ -12001,6 +12001,13 @@ ALTER TABLE model_metrics
     ADD COLUMN IF NOT EXISTS is_stale BOOLEAN NOT NULL DEFAULT FALSE;
 "#;
 
+/// V230 — Restrict model log classifier output to its stable event taxonomy.
+pub const SCHEMA_V230_MODEL_ERROR_CLASSES: &str = r#"
+ALTER TABLE model_error_events
+    ADD CONSTRAINT model_error_events_class_check
+    CHECK (error_class IN ('startup_failure', 'load_error', 'crash', 'oom'));
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

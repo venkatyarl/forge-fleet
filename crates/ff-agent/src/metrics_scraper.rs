@@ -83,6 +83,7 @@ struct ScrapeTarget {
     id: uuid::Uuid,
     port: i32,
     runtime: String,
+    catalog_id: Option<String>,
     parallel_slots: Option<i32>,
     previous_prompt_tokens: Option<f64>,
     previous_predicted_tokens: Option<f64>,
@@ -133,7 +134,7 @@ impl MetricsScraper {
     /// pgcat-transaction-mode-safe transaction.
     pub async fn scrape_once(&self) -> Result<ScrapeReport, ScrapeError> {
         let targets: Vec<ScrapeTarget> = sqlx::query_as(
-            "SELECT d.id, d.port, d.runtime, d.parallel_slots, \
+            "SELECT d.id, d.port, d.runtime, d.catalog_id, d.parallel_slots, \
                     prev.prompt_tokens_total AS previous_prompt_tokens, \
                     prev.predicted_tokens_total AS previous_predicted_tokens, \
                     prev.inference_seconds_total AS previous_inference_seconds \
@@ -159,6 +160,25 @@ impl MetricsScraper {
 
         let mut samples = Vec::with_capacity(targets.len());
         for target in targets {
+            let requests = if target.runtime == "llama.cpp" {
+                let (requests, error_lines) = consume_llama_log(target.port);
+                for line in error_lines {
+                    if let Err(error) = ff_observability::classify_and_write(
+                        &self.pg,
+                        &self.my_name,
+                        Some(target.port),
+                        target.catalog_id.as_deref(),
+                        &line,
+                    )
+                    .await
+                    {
+                        warn!(port = target.port, %error, "failed to persist model log error");
+                    }
+                }
+                requests
+            } else {
+                HashMap::new()
+            };
             let url = format!("http://127.0.0.1:{}/metrics", target.port);
             let body = match self.http.get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => resp.text().await.unwrap_or_default(),
@@ -173,13 +193,7 @@ impl MetricsScraper {
                     continue;
                 }
             };
-
             let metrics = parse_prometheus(&body);
-            let requests = if target.runtime == "llama.cpp" {
-                consume_llama_log(target.port)
-            } else {
-                HashMap::new()
-            };
             let request_count: u64 = requests.values().sum();
             let inference_delta = counter_delta(
                 metrics.inference_seconds_total,
@@ -351,7 +365,7 @@ fn counter_delta(current: Option<f64>, previous: Option<f64>) -> Option<f64> {
 /// Consume llama-server's text stream after `/metrics` has captured its useful
 /// counters. Completion lines become bounded endpoint counts; startup/errors
 /// are retained in a small events log; verbose slot dumps are discarded.
-fn consume_llama_log(port: i32) -> HashMap<String, u64> {
+fn consume_llama_log(port: i32) -> (HashMap<String, u64>, Vec<String>) {
     const READ_MAX: u64 = 16 * 1024 * 1024;
     const EVENTS_MAX: u64 = 10 * 1024 * 1024;
 
@@ -364,22 +378,22 @@ fn consume_llama_log(port: i32) -> HashMap<String, u64> {
     if crate::model_runtime::cap_model_log(&raw_path, crate::model_runtime::MODEL_LOG_MAX_BYTES)
         .is_err()
     {
-        return counts;
+        return (counts, Vec::new());
     }
     let Ok(mut raw) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(&raw_path)
     else {
-        return counts;
+        return (counts, Vec::new());
     };
     let len = raw.metadata().map(|m| m.len()).unwrap_or(0);
     if len > READ_MAX && raw.seek(std::io::SeekFrom::Start(len - READ_MAX)).is_err() {
-        return counts;
+        return (counts, Vec::new());
     }
     let mut text = String::new();
     if raw.read_to_string(&mut text).is_err() {
-        return counts;
+        return (counts, Vec::new());
     }
 
     let (counts, retained) = parse_llama_log(&text);
@@ -392,13 +406,17 @@ fn consume_llama_log(port: i32) -> HashMap<String, u64> {
         let _ = crate::model_runtime::cap_model_log(&events_path, EVENTS_MAX);
     }
     let _ = raw.set_len(0);
-    counts
+    let error_lines = retained.lines().map(str::to_owned).collect();
+    (counts, error_lines)
 }
 
 fn parse_llama_log(text: &str) -> (HashMap<String, u64>, String) {
     let mut counts = HashMap::new();
     let mut retained = String::new();
     for line in text.lines() {
+        if ff_observability::is_slot_dump(line) {
+            continue;
+        }
         if let Some(rest) = line.split("done request:").nth(1) {
             let mut fields = rest.split_whitespace();
             let _method = fields.next();
@@ -408,7 +426,8 @@ fn parse_llama_log(text: &str) -> (HashMap<String, u64>, String) {
             }
         } else {
             let lower = line.to_ascii_lowercase();
-            if lower.contains("error")
+            if ff_observability::classify(line).is_some()
+                || lower.contains("error")
                 || lower.contains("warn")
                 || lower.contains("failed")
                 || lower.contains("listening")

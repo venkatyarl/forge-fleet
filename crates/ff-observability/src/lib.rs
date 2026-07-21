@@ -13,6 +13,7 @@
 pub mod alerting;
 pub mod alerts;
 pub mod dashboard;
+pub mod error_classifier;
 pub mod events;
 pub mod file_logger;
 pub mod log_ingest;
@@ -26,6 +27,9 @@ pub mod work_queue;
 pub use alerting::{Alert, AlertEngine, AlertRule, AlertSeverity};
 pub use alerts::{AlertDedupState, AlertDeduplicationState};
 pub use dashboard::{DashboardState, FleetSnapshot, ModelSummary, NodeSummary};
+pub use error_classifier::{
+    ModelErrorClass, ModelErrorEvent, classify, classify_and_write, is_slot_dump,
+};
 pub use events::{EventRecord, EventSink, FleetEvent, InMemoryEventSink};
 pub use file_logger::FileLogConfig;
 pub use log_ingest::{LogBuffer, LogEntry, LogIngestor, LogLevel};

@@ -1131,6 +1131,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_metric_boot_staleness",
         sql: schema::SCHEMA_V229_MODEL_METRIC_BOOT_STALENESS,
     },
+    PgMigration {
+        version: 230,
+        name: "model_error_classes",
+        sql: schema::SCHEMA_V230_MODEL_ERROR_CLASSES,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
