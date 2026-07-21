@@ -10,8 +10,8 @@
 //! know which backends are *usable* on a given node — not just present.
 //!
 //! ff-council (codex+kimi) guard: `command -v` is NOT sufficient. A backend is
-//! only dispatchable after a **non-interactive authenticated health check** that
-//! FAILS CLOSED on login prompts, expired/invalid credentials, or timeouts.
+//! only loses its authenticated state after a **definitive** authentication
+//! rejection. Transient probe failures must preserve the last known state.
 
 use serde::Serialize;
 use std::time::Duration;
@@ -181,6 +181,18 @@ pub fn probe_indicates_unauthenticated(reason: &str) -> bool {
     UNAUTH_SIGNATURES.iter().any(|s| lower.contains(s))
 }
 
+/// Translate a probe result into a persisted authentication-state update.
+/// `None` means the probe was inconclusive and the previous state must be kept.
+fn authenticated_update_for_probe(ok: bool, reason: &str) -> Option<bool> {
+    if ok {
+        Some(true)
+    } else if probe_indicates_unauthenticated(reason) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Detect every backend's availability on THIS node. When `probe_auth` is true,
 /// each installed backend additionally gets a tiny non-interactive request to
 /// verify it's authenticated (slower — a real CLI invocation per backend).
@@ -206,34 +218,14 @@ pub async fn detect_backends(probe_auth: bool, timeout: Duration) -> Vec<Backend
 
         let (authenticated, detail) = if probe_auth {
             let (ok, reason) = probe_auth_once(cfg.name, timeout).await;
-            if ok {
-                (Some(true), reason)
-            } else if probe_indicates_broken_binary(&reason) {
-                // The probe didn't just fail auth — the CLI CRASHED on run (e.g.
-                // a missing native/optional npm dep from a half-finished install:
-                // "Missing optional dependency @openai/codex-linux-x64"). The
-                // binary is on PATH and creds may exist, but it CANNOT execute a
-                // dispatch. Fail closed regardless of cred presence (the
-                // cred-file fallback below must NOT mask a broken install — that
-                // is exactly how a dead codex read as "authenticated" and every
-                // dispatch to it failed with the opaque "no dispatchable backend").
-                (Some(false), format!("installed but NOT runnable: {reason}"))
-            } else if probe_indicates_config_error(&reason) {
-                // The CLI runs but has no usable model configured (e.g. kimi exits
-                // "LLM not set"). It can't serve a dispatch; fail closed regardless
-                // of creds so the router stops picking a backend that fails every
-                // time — same rationale as the broken-binary case.
-                (
-                    Some(false),
-                    format!("installed but MISCONFIGURED: {reason}"),
-                )
-            } else if probe_indicates_unauthenticated(&reason) {
+            let authenticated = authenticated_update_for_probe(ok, &reason);
+            if authenticated == Some(false) {
                 // A DEFINITIVE auth failure — the CLI itself reported an
                 // expired/revoked/absent credential (e.g. claude "401 Invalid
                 // authentication credentials", kimi "not logged in"). Unlike a
                 // flaky probe (timeout, transient 5xx) this 401s on EVERY
                 // dispatch, so fail CLOSED regardless of cred-FILE presence. The
-                // cred_present fallback below used to MASK this: a stale token
+                // A credential-file fallback used to MASK this: a stale token
                 // left the backend marked "authenticated", so the dispatch
                 // picker kept routing to it and burned every attempt on a 401
                 // (observed live on duncan — claude+kimi green in the DB, both
@@ -241,25 +233,22 @@ pub async fn detect_backends(probe_auth: bool, timeout: Duration) -> Vec<Backend
                 // picker skip it (→ codex, the working backend) and surfaces in
                 // `ff` that this node needs a fresh `ff oauth` / re-distribution.
                 (
-                    Some(false),
+                    authenticated,
                     format!("installed but UNAUTHENTICATED: {reason}"),
                 )
-            } else if cred_present(cfg.name) {
-                // The live probe can be flaky on the fleet (slow cold-start,
-                // sandbox quirks, transient 5xx) and would leave a genuinely
-                // authenticated backend marked unusable — so the router never
-                // routes to it and dispatch has no fail-over target. If the
-                // vendor cred FILE is present, treat the backend as
-                // authenticated (cred-based). Safe: a DEFINITIVE 401 is caught
-                // by the unauthenticated branch above and fails closed; only a
-                // non-definitive probe blip reaches here and gets the benefit of
-                // the doubt.
-                (
-                    Some(true),
-                    format!("authenticated (cred file present; probe: {reason})"),
-                )
+            } else if authenticated == Some(true) {
+                (authenticated, reason)
             } else {
-                (Some(false), reason)
+                // Timeout, exec error, empty output, broken binary, config error,
+                // and network/service failures are not proof that credentials
+                // became invalid. Persist the diagnostic but preserve the last
+                // known authentication state.
+                let cred_hint = if cred_present(cfg.name) {
+                    "credential file present; "
+                } else {
+                    ""
+                };
+                (None, format!("probe inconclusive ({cred_hint}{reason})"))
             }
         } else {
             (None, "installed (auth not probed)".to_string())
@@ -280,8 +269,8 @@ pub async fn detect_backends(probe_auth: bool, timeout: Duration) -> Vec<Backend
 
 /// True if the vendor CLI's OAuth credential file is present + non-empty on
 /// this node (or, for claude on macOS, the Keychain entry exists). Mirrors the
-/// paths `oauth_distributor` writes to. Used as an auth fallback when the live
-/// probe is flaky.
+/// paths `oauth_distributor` writes to. Used only as diagnostic context when a
+/// live probe is inconclusive; it never changes the authentication verdict.
 fn cred_present(backend: &str) -> bool {
     let home = match dirs::home_dir() {
         Some(h) => h,
@@ -378,7 +367,7 @@ pub async fn detect_and_persist(
             computer_id,
             s.name,
             s.installed,
-            s.authenticated.unwrap_or(false),
+            s.authenticated,
             s.version.as_deref(),
             s.path.as_deref(),
             &s.detail,
@@ -524,10 +513,11 @@ mod tests {
     }
 
     #[test]
-    fn auth_classify_fails_closed_on_timeout() {
+    fn timeout_is_inconclusive_and_does_not_flip_authenticated() {
         let (ok, why) = classify_auth(true, false, "", "");
         assert!(!ok);
         assert!(why.contains("timed out"));
+        assert_eq!(authenticated_update_for_probe(ok, &why), None);
     }
 
     #[test]

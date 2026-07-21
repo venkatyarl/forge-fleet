@@ -8791,14 +8791,15 @@ pub async fn pg_canonical_github_alias(pool: &PgPool) -> Result<Option<(String, 
 /// Upsert one node's availability for an LLM-CLI backend (capability A2). Called
 /// by the per-node detector tick from `backend_detect::detect_backends`.
 /// `last_auth_ok_at` advances only on a passing auth probe; `last_checked_at`
-/// always advances so the picker can tell fresh rows from stale ones.
+/// always advances so the picker can tell fresh rows from stale ones. `None`
+/// preserves an existing authentication state after an inconclusive probe.
 #[allow(clippy::too_many_arguments)]
 pub async fn pg_upsert_computer_backend(
     pool: &PgPool,
     computer_id: uuid::Uuid,
     backend: &str,
     installed: bool,
-    authenticated: bool,
+    authenticated: Option<bool>,
     version: Option<&str>,
     path: Option<&str>,
     detail: &str,
@@ -8807,14 +8808,14 @@ pub async fn pg_upsert_computer_backend(
         "INSERT INTO computer_backends
              (computer_id, backend, installed, authenticated, version, path,
               last_auth_ok_at, last_checked_at, detail)
-         VALUES ($1, $2, $3, $4, $5, $7,
-                 CASE WHEN $4 THEN NOW() ELSE NULL END, NOW(), $6)
+         VALUES ($1, $2, $3, COALESCE($4, FALSE), $5, $7,
+                 CASE WHEN $4 IS TRUE THEN NOW() ELSE NULL END, NOW(), $6)
          ON CONFLICT (computer_id, backend) DO UPDATE SET
              installed       = EXCLUDED.installed,
-             authenticated   = EXCLUDED.authenticated,
+             authenticated   = COALESCE($4, computer_backends.authenticated),
              version         = EXCLUDED.version,
              path            = EXCLUDED.path,
-             last_auth_ok_at = CASE WHEN EXCLUDED.authenticated
+             last_auth_ok_at = CASE WHEN $4 IS TRUE
                                     THEN NOW()
                                     ELSE computer_backends.last_auth_ok_at END,
              last_checked_at = NOW(),
