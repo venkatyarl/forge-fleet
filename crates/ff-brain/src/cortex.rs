@@ -120,6 +120,7 @@ pub mod security;
 pub mod spi;
 #[path = "cortex/storage.rs"]
 pub mod storage;
+pub mod storage_falkordb;
 #[path = "cortex/extractors/types.rs"]
 pub mod types;
 #[path = "cortex/extractors/work_item_context.rs"]
