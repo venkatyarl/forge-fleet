@@ -246,7 +246,9 @@ fn repo_structure_context(repo_path: &Path, identifiers: &[String]) -> Option<St
         .iter()
         .filter(|f| {
             let fl = f.to_lowercase();
-            ids_lower.iter().any(|id| id.len() >= 3 && fl.contains(id.as_str()))
+            ids_lower
+                .iter()
+                .any(|id| id.len() >= 3 && fl.contains(id.as_str()))
         })
         .copied()
         .take(MAX_RELEVANT_FILES)

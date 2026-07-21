@@ -67,3 +67,8 @@ tags:
   noloadbalance: false
   clonefrom: false
   nosync: false
+
+mirror:
+  mirror_enabled: false
+  mirror_endpoint: ""
+  mirror_update_interval: 300
