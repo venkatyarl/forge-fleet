@@ -2,4 +2,5 @@
 
 pub mod basic_memory;
 pub mod bug_signature;
+pub mod software;
 pub mod state;
