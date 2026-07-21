@@ -101,6 +101,7 @@ impl ToolRegistry {
         self.register(Self::pm_claim());
         self.register(Self::pm_create());
         self.register(Self::pm_list());
+        self.register(Self::pm_ready());
 
         // ── Virtual Brain tools ─────────────────────────────────────────
         self.register(Self::brain_search());
@@ -281,6 +282,30 @@ impl ToolRegistry {
                     "task_group_id": { "type": "string", "description": "Task-group identifier" },
                     "label": { "type": "string", "description": "Required label" }
                 },
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn pm_ready() -> ToolDefinition {
+        ToolDefinition {
+            name: "pm_ready".to_string(),
+            description: "Flag a project-management work item ready for fleet scheduling. Repeated calls are idempotent.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "work_item_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Work item UUID to flag ready"
+                    },
+                    "on": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Optional computer to pin execution to"
+                    }
+                },
+                "required": ["work_item_id"],
                 "additionalProperties": false
             }),
         }
@@ -1926,6 +1951,7 @@ mod tests {
             "pm_claim",
             "pm_create",
             "pm_list",
+            "pm_ready",
             // Virtual Brain
             "brain_search",
             "brain_vault_read",

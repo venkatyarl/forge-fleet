@@ -4,3 +4,4 @@ pub mod pm_board;
 pub mod pm_claim;
 pub mod pm_create;
 pub mod pm_list;
+pub mod pm_ready;
