@@ -30,7 +30,11 @@ pub struct CodegenOutcome {
 /// completion phrase AND a no-change phrase to avoid false positives on genuine failures.
 fn response_reports_already_done(text: &str) -> bool {
     // Explicit sentinel the prompt now asks for.
-    if text.trim_start().to_lowercase().starts_with("already_implemented:") {
+    if text
+        .trim_start()
+        .to_lowercase()
+        .starts_with("already_implemented:")
+    {
         return true;
     }
     let t = text.to_lowercase();
@@ -304,7 +308,9 @@ fn repo_structure_context(repo_path: &Path, identifiers: &[String]) -> Option<St
         .iter()
         .filter(|f| {
             let fl = f.to_lowercase();
-            ids_lower.iter().any(|id| id.len() >= 3 && fl.contains(id.as_str()))
+            ids_lower
+                .iter()
+                .any(|id| id.len() >= 3 && fl.contains(id.as_str()))
         })
         .copied()
         .take(MAX_RELEVANT_FILES)

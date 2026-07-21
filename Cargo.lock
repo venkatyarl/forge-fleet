@@ -1272,6 +1272,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "ff-agent",
+ "ff-core",
  "ff-db",
  "futures",
  "notify",
