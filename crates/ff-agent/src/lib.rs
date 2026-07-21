@@ -52,6 +52,7 @@ pub mod config;
 pub mod config_distributor;
 pub mod conformance;
 pub mod consensus;
+pub mod coordinator;
 pub mod coverage_guard;
 pub mod daemon;
 pub mod db_integrity;

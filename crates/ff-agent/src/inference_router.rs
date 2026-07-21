@@ -148,6 +148,19 @@ impl InferenceRouter {
         self.active_url_min_ctx(false, 0).await
     }
 
+    /// Return the best healthy endpoint on this computer only.
+    ///
+    /// Unlike [`Self::active_url`], this never falls back to another fleet
+    /// node, so it is safe to use while fleet connectivity is degraded.
+    pub async fn active_local_url(&self) -> Option<String> {
+        let state = self.failures.lock().await;
+        self.endpoints
+            .iter()
+            .filter(|endpoint| endpoint.is_local)
+            .find(|endpoint| !state.is_cooling_down(&endpoint.url, self.cooldown))
+            .map(|endpoint| endpoint.url.clone())
+    }
+
     /// Back-compat: tool-preference selection with no context floor.
     pub async fn active_url_filtered(&self, require_tools: bool) -> Option<String> {
         self.active_url_min_ctx(require_tools, 0).await
