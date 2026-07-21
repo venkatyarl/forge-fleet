@@ -3005,12 +3005,22 @@ async fn run_ff_dispatch(
         let otherwise_dispatchable = ff_db::pg_dispatchable_backends(pg, item.computer_id, 5400)
             .await
             .unwrap_or_default();
+        // The router excluded every backend (headroom/freshness/rank filters), but authenticated
+        // backends ARE dispatchable and cloud budget is open. Rather than bail "exhausted" (a false
+        // signal that killed items while cloud sat at 60-66% weekly usage), FALL BACK to those
+        // dispatchable backends. The per-backend cloud-error nervous system below still handles a
+        // genuinely quota-blocked backend by failing over / classifying — so real exhaustion is
+        // still caught at call time, not pre-emptively guessed here.
         if !otherwise_dispatchable.is_empty() {
-            anyhow::bail!(
-                "all authenticated cloud backends are exhausted or circuit-breaker blocked"
+            warn!(
+                work_item_id = %item.work_item_id,
+                backends = ?otherwise_dispatchable,
+                "work_item_dispatch: router returned no backends; falling back to dispatchable cloud backends (was: bail exhausted)"
             );
+            otherwise_dispatchable
+        } else {
+            vec!["claude".to_string()]
         }
-        vec!["claude".to_string()]
     } else {
         routed
     };
