@@ -245,6 +245,7 @@ pub(crate) const PLAN_MODE_READ_ONLY_TOOLS: &[&str] = &[
     "ToolSearch",
     "TaskList",
     "TaskGet",
+    "list_work_items",
     "fleet_status",
     "fleet_nodes_db",
     "fleet_models_db",

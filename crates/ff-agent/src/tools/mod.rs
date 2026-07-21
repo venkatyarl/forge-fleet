@@ -59,6 +59,7 @@ pub mod utility_ext;
 pub mod version_mgmt;
 pub mod web_fetch;
 pub mod web_search;
+pub mod work_item_tool;
 pub mod worktree;
 
 use std::collections::HashMap;
@@ -250,6 +251,7 @@ pub fn core_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(orchestrate::OrchestrateTool),
         Box::new(tool_search::ToolSearchTool),
         Box::new(training_tool::TrainingTool),
+        Box::new(work_item_tool::ListWorkItemsTool),
     ]
 }
 
@@ -279,6 +281,7 @@ pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(task_tools::TaskListTool),
         Box::new(task_tools::TaskStopTool),
         Box::new(task_tools::TaskOutputTool),
+        Box::new(work_item_tool::ListWorkItemsTool),
         // Web tools
         Box::new(web_fetch::WebFetchTool::default()),
         Box::new(web_search::WebSearchTool::default()),
