@@ -233,6 +233,7 @@ fn node_from_config(name: &str, node: &NodeConfig) -> Node {
         role: node.role,
         election_priority: node.priority(),
         status: NodeStatus::Online,
+        is_offline_autonomy_enabled: node.is_offline_autonomy_enabled,
         hardware: Hardware {
             os,
             cpu_model: "unknown".to_string(),

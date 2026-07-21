@@ -438,6 +438,7 @@ mod tests {
             role: Role::Worker,
             election_priority: 10,
             status,
+            is_offline_autonomy_enabled: false,
             hardware: Hardware {
                 os: OsType::MacOs,
                 cpu_model: "Apple M4 Max".into(),

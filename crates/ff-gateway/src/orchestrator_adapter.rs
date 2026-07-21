@@ -104,6 +104,7 @@ fn beat_to_node(beat: &PulseBeatV2) -> CoreNode {
         },
         election_priority: beat.election_priority.max(0) as u32,
         status,
+        is_offline_autonomy_enabled: false,
         hardware: Hardware {
             os: OsType::Linux,
             cpu_model: "unknown".to_string(),

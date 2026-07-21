@@ -23,6 +23,7 @@ pub mod crew;
 pub mod decomposer;
 pub mod leader;
 pub mod merge_train;
+pub mod node_manager;
 pub mod parallel;
 pub mod placement;
 pub mod planner;
@@ -47,6 +48,7 @@ pub use leader::{
     SubmissionResult, TickResult,
 };
 pub use merge_train::MergeTrainConfig;
+pub use node_manager::NodeManager;
 pub use parallel::{ExecutionResult, ParallelExecutor, SubTaskResult};
 pub use placement::{AntiAffinityRule, NodeWorkloadPreference, PlacementEngine, PlacementPolicy};
 pub use planner::{ExecutionPlan, PlanNode, PlanStage};

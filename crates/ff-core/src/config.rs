@@ -358,6 +358,10 @@ pub struct NodeConfig {
     #[serde(default)]
     pub role: Role,
 
+    /// Let this node retain local state without orchestrator sync pressure.
+    #[serde(default)]
+    pub is_offline_autonomy_enabled: bool,
+
     /// Alternative IP addresses for this node.
     #[serde(default)]
     pub alt_ips: Vec<String>,

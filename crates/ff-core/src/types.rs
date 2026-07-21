@@ -370,6 +370,9 @@ pub struct Node {
     pub election_priority: u32,
     /// Current status
     pub status: NodeStatus,
+    /// Whether the node should keep operating from local state while disconnected.
+    #[serde(default)]
+    pub is_offline_autonomy_enabled: bool,
     /// Hardware profile
     pub hardware: Hardware,
     /// Models loaded on this node
