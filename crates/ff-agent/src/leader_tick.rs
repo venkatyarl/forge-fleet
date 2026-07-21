@@ -14,10 +14,9 @@
 //!   `fleet_leader_state` is the durable singleton used for the race.
 //!
 //! ## Election rule (inlined)
-//! Among candidates that are **both** registered in `fleet_members` and
-//! alive in Pulse (not `going_offline`), the node with the **lowest**
-//! `election_priority` wins. Ties broken by alphabetical `member_name`
-//! for determinism.
+//! Candidates need at least 48GB RAM. Among live candidates, a node that does
+//! not host the Postgres primary wins, then soft eligibility and the lowest
+//! `election_priority`; ties use alphabetical `member_name` for determinism.
 //!
 //! Note: `ff_core::leader::elect_leader` operates over a `FleetConfig`
 //! struct; here we work straight from Postgres rows, so we inline an
@@ -62,6 +61,9 @@ const STALE_THRESHOLD_SECS: i64 = 45;
 /// even when Postgres heartbeat is fresh. Two back-to-back tick-pass
 /// observations (15 s + 15 s) cheaply filter transient Redis partitions.
 const MIN_PULSE_SILENT_SECS: u64 = 30;
+const MIN_LEADER_RAM_GB: i32 = 48;
+const MIN_LEADERLESS_WAIT_SECS: u64 = 5 * 60;
+const LEADERLESS_JITTER_SECS: u64 = 5 * 60;
 
 /// Errors returned by [`LeaderTick::tick`].
 #[derive(Debug, thiserror::Error)]
@@ -131,6 +133,10 @@ pub struct LeaderTick {
     /// the leader name changes. Used to gate [`pg_claim_leader_pulse_silent`]
     /// via [`MIN_PULSE_SILENT_SECS`] — closes #91.
     leader_pulse_silent_since: tokio::sync::Mutex<Option<(String, std::time::Instant)>>,
+    /// A leaderless fleet waits before claiming. This prevents a transient DB
+    /// view from moving the control plane and gives a stable leader time to
+    /// reconnect. The per-node deterministic jitter spreads claim attempts.
+    leaderless_since: tokio::sync::Mutex<Option<std::time::Instant>>,
 
     /// HA Phase 1 voluntary step-down. Shared with the HeartbeatV2 publisher
     /// (via [`with_yield_flag`](Self::with_yield_flag)); each tick we read the
@@ -189,6 +195,7 @@ impl LeaderTick {
             pg_failover_manager: None,
             error_tracker: crate::ha::error_tracker::ErrorTracker::default(),
             leader_pulse_silent_since: tokio::sync::Mutex::new(None),
+            leaderless_since: tokio::sync::Mutex::new(None),
             yield_flag: None,
             self_heal_state: std::sync::Mutex::new(SelfHealState::new()),
         }
@@ -459,7 +466,17 @@ impl LeaderTick {
         //    Phase 1 voluntary step-down): a yielding node is alive but must
         //    not be elected, so it is excluded from the candidate pool exactly
         //    like an unhealthy one.
-        let health = self.pulse.computer_health_for_election().await?;
+        let health = match self.pulse.computer_health_for_election().await {
+            Ok(health) => health,
+            Err(error) => {
+                // A travelling operator node may be isolated from the stable
+                // leader's Redis. Postgres remains the election synchronizer,
+                // so keep only self locally alive and defer to any fresh DB
+                // leader below.
+                tracing::warn!(node = %self.my_name, %error, "pulse unavailable; isolated election view");
+                Vec::new()
+            }
+        };
         let mut alive: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
         let mut yielding: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (name, healthy, is_yielding) in health {
@@ -468,6 +485,7 @@ impl LeaderTick {
             }
             alive.insert(name, healthy);
         }
+        alive.entry(self.my_name.clone()).or_insert(true);
 
         // 1b) HA Phase 1: drive our own step-down from the `leader_yield_request`
         //     fleet_secret. Publish the flag for peers (via the shared handle)
@@ -507,9 +525,22 @@ impl LeaderTick {
 
         let current = pg_get_current_leader(&self.pg).await?;
 
+        if current.is_some() {
+            *self.leaderless_since.lock().await = None;
+        }
+
+        let (redis_url, nats_url) = advertised_endpoints(&self.pg, self.my_computer_id).await?;
+
         match (current, best_alive) {
             // No durable leader yet → try to claim.
             (None, Some(best)) if best.member_name == self.my_name => {
+                let mut since = self.leaderless_since.lock().await;
+                let started = since.get_or_insert_with(std::time::Instant::now);
+                if started.elapsed() < leaderless_wait(self.my_computer_id) {
+                    self.update_leader_cache(false, LeaderInfo::default()).await;
+                    return Ok(TickOutcome::NoOp);
+                }
+                drop(since);
                 let new_epoch = self.next_epoch(None);
                 let claimed = pg_claim_leader_initial(
                     &self.pg,
@@ -517,6 +548,8 @@ impl LeaderTick {
                     &self.my_name,
                     new_epoch,
                     "initial",
+                    redis_url.as_deref(),
+                    nats_url.as_deref(),
                 )
                 .await?;
                 if claimed {
@@ -539,7 +572,7 @@ impl LeaderTick {
 
             // Leader row exists and it's us.
             (Some(cur), Some(best)) if cur.member_name == self.my_name => {
-                if best.member_name != self.my_name {
+                if prefer.is_some() && best.member_name != self.my_name {
                     // A more-preferred peer is alive → yield.
                     let yielded = pg_yield_leader(&self.pg, &self.my_name).await?;
                     if yielded {
@@ -552,7 +585,13 @@ impl LeaderTick {
                     }
                 } else {
                     // We remain best → just refresh our heartbeat.
-                    let refreshed = pg_refresh_leader_heartbeat(&self.pg, &self.my_name).await?;
+                    let refreshed = pg_refresh_leader_heartbeat(
+                        &self.pg,
+                        &self.my_name,
+                        redis_url.as_deref(),
+                        nats_url.as_deref(),
+                    )
+                    .await?;
                     if refreshed {
                         // Keep our in-memory epoch aligned with the row.
                         self.observe_epoch(cur.epoch);
@@ -570,7 +609,13 @@ impl LeaderTick {
             // Leader row exists and it's us, but no one is alive — still
             // refresh (we're the only node left).
             (Some(cur), None) if cur.member_name == self.my_name => {
-                let refreshed = pg_refresh_leader_heartbeat(&self.pg, &self.my_name).await?;
+                let refreshed = pg_refresh_leader_heartbeat(
+                    &self.pg,
+                    &self.my_name,
+                    redis_url.as_deref(),
+                    nats_url.as_deref(),
+                )
+                .await?;
                 if refreshed {
                     self.observe_epoch(cur.epoch);
                     self.update_leader_cache(true, LeaderInfo::from(&cur)).await;
@@ -605,6 +650,8 @@ impl LeaderTick {
                         new_epoch,
                         &displaced_name,
                         STALE_THRESHOLD_SECS,
+                        redis_url.as_deref(),
+                        nats_url.as_deref(),
                     )
                     .await?;
                     if took {
@@ -641,6 +688,8 @@ impl LeaderTick {
                         &self.my_name,
                         new_epoch,
                         &displaced_name,
+                        redis_url.as_deref(),
+                        nats_url.as_deref(),
                     )
                     .await?;
                     if took {
@@ -1292,18 +1341,17 @@ struct Candidate {
     #[allow(dead_code)]
     computer_id: Uuid,
     election_priority: i32,
+    eligibility_rank: i32,
+    hosts_postgres_primary: bool,
 }
 
 /// Load the full candidate pool from Postgres. Any `fleet_members` row
 /// whose `computers.name` is present is a candidate — Pulse decides
 /// which of them is currently alive.
 async fn load_candidates(pool: &PgPool) -> Result<Vec<Candidate>, sqlx::Error> {
-    // Filter out computers explicitly marked `never_leader` (V49).
-    // Laptops that travel off-LAN should never be promoted — if they
-    // win and then drop wifi, the whole fleet's leader-gated subsystems
-    // (auto-upgrade, sub-agent reaper, task
-    // watchdog) freeze until the laptop returns. Reads through
-    // COALESCE so legacy rows (NULL eligibility) still count.
+    // 48GB is the sole hard eligibility floor. `never_leader` is deliberately
+    // a last-resort rank, and a Postgres primary is penalized so the two Sparks
+    // do not normally concentrate both failure domains on one box.
     // Read worker rows + their election_priority directly from
     // `fleet_workers` (canonical post-V83). Joined to `computers` for the
     // eligibility filter on the human-physical-machine side. The previous
@@ -1312,11 +1360,23 @@ async fn load_candidates(pool: &PgPool) -> Result<Vec<Candidate>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT c.id   AS computer_id,
                 fw.name AS member_name,
-                fw.election_priority AS election_priority
+                fw.election_priority AS election_priority,
+                CASE COALESCE(c.election_eligibility, 'eligible')
+                    WHEN 'preferred' THEN 0
+                    WHEN 'never_leader' THEN 2
+                    ELSE 1
+                END AS eligibility_rank,
+                EXISTS (
+                    SELECT 1 FROM database_replicas dr
+                    WHERE dr.computer_id = c.id
+                      AND dr.database_kind = 'postgres'
+                      AND dr.role = 'primary'
+                ) AS hosts_postgres_primary
          FROM fleet_workers fw
          JOIN computers c ON c.name = fw.name
-         WHERE COALESCE(c.election_eligibility, 'eligible') <> 'never_leader'",
+         WHERE COALESCE(c.total_ram_gb, fw.ram_gb, 0) >= $1",
     )
+    .bind(MIN_LEADER_RAM_GB)
     .fetch_all(pool)
     .await?;
 
@@ -1326,6 +1386,8 @@ async fn load_candidates(pool: &PgPool) -> Result<Vec<Candidate>, sqlx::Error> {
             computer_id: r.get("computer_id"),
             member_name: r.get("member_name"),
             election_priority: r.get("election_priority"),
+            eligibility_rank: r.get("eligibility_rank"),
+            hosts_postgres_primary: r.get("hosts_postgres_primary"),
         })
         .collect())
 }
@@ -1367,10 +1429,39 @@ fn pick_best_candidate<'a>(
         return Some(c);
     }
     candidates.iter().filter(|c| eligible(c)).min_by(|a, b| {
-        a.election_priority
-            .cmp(&b.election_priority)
+        a.hosts_postgres_primary
+            .cmp(&b.hosts_postgres_primary)
+            .then_with(|| a.eligibility_rank.cmp(&b.eligibility_rank))
+            .then_with(|| a.election_priority.cmp(&b.election_priority))
             .then_with(|| a.member_name.cmp(&b.member_name))
     })
+}
+
+fn leaderless_wait(computer_id: Uuid) -> Duration {
+    let hash = computer_id
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    Duration::from_secs(MIN_LEADERLESS_WAIT_SECS + hash % LEADERLESS_JITTER_SECS)
+}
+
+async fn advertised_endpoints(
+    pool: &PgPool,
+    computer_id: Uuid,
+) -> Result<(Option<String>, Option<String>), sqlx::Error> {
+    let ip: Option<String> = sqlx::query_scalar("SELECT primary_ip FROM computers WHERE id = $1")
+        .bind(computer_id)
+        .fetch_optional(pool)
+        .await?;
+    let redis = std::env::var("FORGEFLEET_REDIS_URL")
+        .ok()
+        .or_else(|| ip.as_ref().map(|ip| format!("redis://{ip}:56379")));
+    let nats = std::env::var("FORGEFLEET_NATS_URL")
+        .ok()
+        .or_else(|| ip.map(|ip| format!("nats://{ip}:54222")));
+    Ok((redis, nats))
 }
 
 #[cfg(test)]
@@ -1388,6 +1479,8 @@ mod tests {
             elected_at: Utc::now() - ChronoDuration::seconds(heartbeat_age_secs),
             reason: None,
             heartbeat_at: Utc::now() - ChronoDuration::seconds(heartbeat_age_secs),
+            redis_url: None,
+            nats_url: None,
         }
     }
 
@@ -1432,7 +1525,47 @@ mod tests {
             member_name: name.to_string(),
             computer_id: Uuid::nil(),
             election_priority: prio,
+            eligibility_rank: 1,
+            hosts_postgres_primary: false,
         }
+    }
+
+    #[test]
+    fn candidate_ranking_splits_leader_from_primary_and_softens_never() {
+        let mut primary = cand("shakira", 0);
+        primary.hosts_postgres_primary = true;
+        let follower = cand("taylor", 50);
+        let candidates = vec![primary, follower];
+        let alive = alive_all(&["shakira", "taylor"]);
+        assert_eq!(
+            pick_best_candidate(&candidates, &alive, &Default::default(), None)
+                .unwrap()
+                .member_name,
+            "taylor"
+        );
+
+        let mut last_resort = cand("laptop", 0);
+        last_resort.eligibility_rank = 2;
+        assert_eq!(
+            pick_best_candidate(
+                &[last_resort],
+                &alive_all(&["laptop"]),
+                &Default::default(),
+                None
+            )
+            .unwrap()
+            .member_name,
+            "laptop"
+        );
+    }
+
+    #[test]
+    fn leaderless_claim_delay_is_stable_and_between_five_and_ten_minutes() {
+        let id = Uuid::from_u128(42);
+        let wait = leaderless_wait(id);
+        assert_eq!(wait, leaderless_wait(id));
+        assert!(wait >= Duration::from_secs(300));
+        assert!(wait < Duration::from_secs(600));
     }
 
     fn alive_all(names: &[&str]) -> std::collections::HashMap<String, bool> {

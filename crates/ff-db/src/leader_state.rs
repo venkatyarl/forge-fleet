@@ -25,12 +25,21 @@ pub struct LeaderState {
     pub elected_at: DateTime<Utc>,
     pub reason: Option<String>,
     pub heartbeat_at: DateTime<Utc>,
+    pub redis_url: Option<String>,
+    pub nats_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LeaderEndpoints {
+    pub redis_url: Option<String>,
+    pub nats_url: Option<String>,
 }
 
 /// Read the current leader, if any.
 pub async fn pg_get_current_leader(pool: &PgPool) -> Result<Option<LeaderState>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT computer_id, member_name, epoch, elected_at, reason, heartbeat_at
+        "SELECT computer_id, member_name, epoch, elected_at, reason, heartbeat_at,
+                redis_url, nats_url
          FROM fleet_leader_state
          WHERE singleton_key = 'current'",
     )
@@ -44,7 +53,27 @@ pub async fn pg_get_current_leader(pool: &PgPool) -> Result<Option<LeaderState>,
         elected_at: r.get("elected_at"),
         reason: r.get("reason"),
         heartbeat_at: r.get("heartbeat_at"),
+        redis_url: r.get("redis_url"),
+        nats_url: r.get("nats_url"),
     }))
+}
+
+/// Resolve ephemeral control-plane endpoints from the current leader lease.
+/// Environment variables remain a bootstrap concern; connected clients use
+/// this row so a leader move does not require config redistribution.
+pub async fn pg_get_leader_endpoints(pool: &PgPool) -> Result<LeaderEndpoints, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT redis_url, nats_url FROM fleet_leader_state
+         WHERE singleton_key = 'current'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(
+        row.map_or_else(LeaderEndpoints::default, |r| LeaderEndpoints {
+            redis_url: r.get("redis_url"),
+            nats_url: r.get("nats_url"),
+        }),
+    )
 }
 
 /// INSERT the singleton row (first claim). Returns `true` if this call
@@ -55,16 +84,21 @@ pub async fn pg_claim_leader_initial(
     member_name: &str,
     epoch: i64,
     reason: &str,
+    redis_url: Option<&str>,
+    nats_url: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
-        "INSERT INTO fleet_leader_state (singleton_key, computer_id, member_name, epoch, reason)
-         VALUES ('current', $1, $2, $3, $4)
+        "INSERT INTO fleet_leader_state
+             (singleton_key, computer_id, member_name, epoch, reason, redis_url, nats_url)
+         VALUES ('current', $1, $2, $3, $4, $5, $6)
          ON CONFLICT (singleton_key) DO NOTHING",
     )
     .bind(computer_id)
     .bind(member_name)
     .bind(epoch)
     .bind(reason)
+    .bind(redis_url)
+    .bind(nats_url)
     .execute(pool)
     .await?;
 
@@ -83,6 +117,8 @@ pub async fn pg_claim_leader_takeover(
     new_epoch: i64,
     old_leader_name: &str,
     stale_threshold_secs: i64,
+    redis_url: Option<&str>,
+    nats_url: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE fleet_leader_state
@@ -91,7 +127,9 @@ pub async fn pg_claim_leader_takeover(
              epoch        = $3,
              elected_at   = NOW(),
              reason       = 'takeover',
-             heartbeat_at = NOW()
+             heartbeat_at = NOW(),
+             redis_url     = $6,
+             nats_url      = $7
          WHERE singleton_key = 'current'
            AND member_name = $4
            AND epoch < $3
@@ -102,6 +140,8 @@ pub async fn pg_claim_leader_takeover(
     .bind(new_epoch)
     .bind(old_leader_name)
     .bind(stale_threshold_secs.max(0) as f64)
+    .bind(redis_url)
+    .bind(nats_url)
     .execute(pool)
     .await?;
 
@@ -132,6 +172,8 @@ pub async fn pg_claim_leader_pulse_silent(
     my_name: &str,
     new_epoch: i64,
     old_leader_name: &str,
+    redis_url: Option<&str>,
+    nats_url: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE fleet_leader_state
@@ -140,7 +182,9 @@ pub async fn pg_claim_leader_pulse_silent(
              epoch        = $3,
              elected_at   = NOW(),
              reason       = 'pulse_silent_challenge',
-             heartbeat_at = NOW()
+             heartbeat_at = NOW(),
+             redis_url     = $5,
+             nats_url      = $6
          WHERE singleton_key = 'current'
            AND member_name = $4
            AND epoch < $3",
@@ -149,6 +193,8 @@ pub async fn pg_claim_leader_pulse_silent(
     .bind(my_name)
     .bind(new_epoch)
     .bind(old_leader_name)
+    .bind(redis_url)
+    .bind(nats_url)
     .execute(pool)
     .await?;
 
@@ -160,14 +206,18 @@ pub async fn pg_claim_leader_pulse_silent(
 pub async fn pg_refresh_leader_heartbeat(
     pool: &PgPool,
     my_name: &str,
+    redis_url: Option<&str>,
+    nats_url: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE fleet_leader_state
-         SET heartbeat_at = NOW()
+         SET heartbeat_at = NOW(), redis_url = $2, nats_url = $3
          WHERE singleton_key = 'current'
            AND member_name  = $1",
     )
     .bind(my_name)
+    .bind(redis_url)
+    .bind(nats_url)
     .execute(pool)
     .await?;
 

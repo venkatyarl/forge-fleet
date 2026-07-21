@@ -70,6 +70,15 @@ pub async fn check_services(
     http: &reqwest::Client,
     timeout: Duration,
 ) -> Vec<ConnectivityCheck> {
+    check_services_with_leader(config, http, timeout, None).await
+}
+
+async fn check_services_with_leader(
+    config: &FleetConfig,
+    http: &reqwest::Client,
+    timeout: Duration,
+    leader: Option<&ff_db::leader_state::LeaderEndpoints>,
+) -> Vec<ConnectivityCheck> {
     let op_configured =
         first_env(&["OP_SERVICE_ACCOUNT_TOKEN", "OP_CONNECT_TOKEN", "OP_SESSION"]).is_some();
     let op = if op_configured {
@@ -127,8 +136,10 @@ pub async fn check_services(
         .await
     };
 
-    let redis_url =
-        first_env(&["FORGEFLEET_REDIS_URL"]).unwrap_or_else(|| config.redis.url.clone());
+    let redis_url = leader
+        .and_then(|e| e.redis_url.clone())
+        .or_else(|| first_env(&["FORGEFLEET_REDIS_URL"]))
+        .unwrap_or_else(|| config.redis.url.clone());
     let redis = if redis_url.trim().is_empty() {
         ConnectivityCheck::unconfigured("redis")
     } else {
@@ -147,7 +158,10 @@ pub async fn check_services(
         .await
     };
 
-    let nats_url = crate::nats_client::resolve_nats_url();
+    let nats_url = leader
+        .and_then(|e| e.nats_url.clone())
+        .or_else(|| first_env(&["FORGEFLEET_NATS_URL"]))
+        .unwrap_or_else(crate::nats_client::resolve_nats_url);
     let nats = bounded("nats".into(), timeout, async {
         let Ok(client) = async_nats::connect(nats_url).await else {
             return false;
@@ -194,7 +208,8 @@ pub async fn check_and_persist(
     http: &reqwest::Client,
     timeout: Duration,
 ) -> Result<usize, sqlx::Error> {
-    let checks = check_services(config, http, timeout).await;
+    let leader = ff_db::leader_state::pg_get_leader_endpoints(pg).await?;
+    let checks = check_services_with_leader(config, http, timeout, Some(&leader)).await;
     let mut tx = pg.begin().await?;
     let mut written = 0;
 

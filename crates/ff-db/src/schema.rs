@@ -11887,6 +11887,15 @@ ON CONFLICT (provider) DO UPDATE SET
     updated_at = NOW();
 "#;
 
+/// Make fleet leadership a movable control-plane lease.  Redis and NATS move
+/// with the leader and are intentionally stored on the lease rather than on
+/// the Postgres-primary record.
+pub const SCHEMA_V225_MOVABLE_LEADER_LEASE: &str = r#"
+ALTER TABLE fleet_leader_state
+    ADD COLUMN IF NOT EXISTS redis_url TEXT,
+    ADD COLUMN IF NOT EXISTS nats_url TEXT;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

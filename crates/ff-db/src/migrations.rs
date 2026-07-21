@@ -1106,6 +1106,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "cloud_budget_bucket_seeds",
         sql: schema::SCHEMA_V224_CLOUD_BUDGET_BUCKET_SEEDS,
     },
+    PgMigration {
+        version: 225,
+        name: "movable_leader_lease",
+        sql: schema::SCHEMA_V225_MOVABLE_LEADER_LEASE,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
