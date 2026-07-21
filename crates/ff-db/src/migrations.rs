@@ -1111,6 +1111,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "movable_leader_lease",
         sql: schema::SCHEMA_V225_MOVABLE_LEADER_LEASE,
     },
+    PgMigration {
+        version: 226,
+        name: "registry_hygiene",
+        sql: schema::SCHEMA_V226_REGISTRY_HYGIENE,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

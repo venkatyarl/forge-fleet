@@ -11896,6 +11896,92 @@ ALTER TABLE fleet_leader_state
     ADD COLUMN IF NOT EXISTS nats_url TEXT;
 "#;
 
+/// Keep the legacy fleet roster projection aligned with its canonical sources.
+/// `computers` owns connection identity; enabled `sub_agents` rows own worker
+/// capacity. Slot 99 is the per-host manager and is not dispatch capacity.
+pub const SCHEMA_V226_REGISTRY_HYGIENE: &str = r#"
+UPDATE fleet_workers fw
+   SET ip = c.primary_ip,
+       ssh_user = c.ssh_user,
+       updated_at = NOW()
+  FROM computers c
+ WHERE LOWER(c.name) = LOWER(fw.name)
+   AND (fw.ip IS DISTINCT FROM c.primary_ip
+        OR fw.ssh_user IS DISTINCT FROM c.ssh_user);
+
+CREATE OR REPLACE FUNCTION sync_fleet_worker_connection_identity()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE fleet_workers
+       SET ip = NEW.primary_ip,
+           ssh_user = NEW.ssh_user,
+           updated_at = NOW()
+     WHERE LOWER(name) = LOWER(NEW.name)
+       AND (ip IS DISTINCT FROM NEW.primary_ip
+            OR ssh_user IS DISTINCT FROM NEW.ssh_user);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_sync_fleet_worker_connection_identity ON computers;
+CREATE TRIGGER trg_sync_fleet_worker_connection_identity
+AFTER INSERT OR UPDATE OF name, primary_ip, ssh_user ON computers
+FOR EACH ROW EXECUTE FUNCTION sync_fleet_worker_connection_identity();
+
+UPDATE fleet_workers fw
+   SET sub_agent_count = (
+       SELECT COUNT(*)::integer
+         FROM computers c
+         JOIN sub_agents sa ON sa.computer_id = c.id
+        WHERE LOWER(c.name) = LOWER(fw.name)
+          AND sa.slot BETWEEN 0 AND 98
+          AND sa.status <> 'disabled'
+   ),
+       updated_at = NOW();
+
+CREATE OR REPLACE FUNCTION sync_fleet_worker_sub_agent_count()
+RETURNS TRIGGER AS $$
+DECLARE
+    old_delta integer := 0;
+    new_delta integer := 0;
+BEGIN
+    IF TG_OP <> 'INSERT'
+       AND OLD.slot BETWEEN 0 AND 98
+       AND OLD.status <> 'disabled' THEN
+        old_delta := 1;
+    END IF;
+    IF TG_OP <> 'DELETE'
+       AND NEW.slot BETWEEN 0 AND 98
+       AND NEW.status <> 'disabled' THEN
+        new_delta := 1;
+    END IF;
+
+    IF TG_OP <> 'INSERT' AND old_delta <> 0 THEN
+        UPDATE fleet_workers fw
+           SET sub_agent_count = GREATEST(fw.sub_agent_count - old_delta, 0),
+               updated_at = NOW()
+          FROM computers c
+         WHERE c.id = OLD.computer_id
+           AND LOWER(fw.name) = LOWER(c.name);
+    END IF;
+    IF TG_OP <> 'DELETE' AND new_delta <> 0 THEN
+        UPDATE fleet_workers fw
+           SET sub_agent_count = fw.sub_agent_count + new_delta,
+               updated_at = NOW()
+          FROM computers c
+         WHERE c.id = NEW.computer_id
+           AND LOWER(fw.name) = LOWER(c.name);
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_sync_fleet_worker_sub_agent_count ON sub_agents;
+CREATE TRIGGER trg_sync_fleet_worker_sub_agent_count
+AFTER INSERT OR DELETE OR UPDATE OF computer_id, slot, status ON sub_agents
+FOR EACH ROW EXECUTE FUNCTION sync_fleet_worker_sub_agent_count();
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
