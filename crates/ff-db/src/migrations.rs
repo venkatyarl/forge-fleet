@@ -1096,6 +1096,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "retire_code_review_graph",
         sql: schema::SCHEMA_V222_RETIRE_CODE_REVIEW_GRAPH,
     },
+    PgMigration {
+        version: 223,
+        name: "real_sized_model_catalog",
+        sql: schema::SCHEMA_V223_REAL_SIZED_MODEL_CATALOG,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

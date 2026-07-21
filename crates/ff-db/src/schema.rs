@@ -11753,6 +11753,64 @@ pub const SCHEMA_V222_RETIRE_CODE_REVIEW_GRAPH: &str = r#"
 DELETE FROM external_tools WHERE id = 'code-review-graph';
 "#;
 
+/// Real, sized local model choices and explicit placement constraints for
+/// models that cannot fit on a single 122-123 GB unified-memory node.
+pub const SCHEMA_V223_REAL_SIZED_MODEL_CATALOG: &str = r#"
+INSERT INTO fleet_model_catalog
+    (id, name, family, parameters, tier, description, gated,
+     preferred_workloads, variants, tool_calling)
+VALUES
+  ('qwen3-4b-instruct-2507', 'Qwen3-4B-Instruct-2507', 'qwen', '4B', 1,
+   '2.5 GB SLM floor for fast local instruction following.', false,
+   '["chat","slm","tool_calling"]'::jsonb,
+   '[{"runtime":"llama.cpp","quant":"Q4_K_M","hf_repo":"Qwen/Qwen3-4B-Instruct-2507-GGUF","size_gb":2.5}]'::jsonb, true),
+  ('qwen3-coder-30b', 'Qwen3-Coder-30B-A3B-Instruct', 'qwen', '30B-A3B', 2,
+   '17.7 GB local coding workhorse (3B active MoE).', false,
+   '["code","coding","reasoning","tool_calling"]'::jsonb,
+   '[{"runtime":"llama.cpp","quant":"Q4_K_M","hf_repo":"Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF","size_gb":17.7}]'::jsonb, true),
+  ('gpt-oss-20b', 'gpt-oss-20b', 'gpt-oss', '20B', 2,
+   '14 GB agentic floor for local tool-using workloads.', false,
+   '["agentic","code","reasoning","tool_calling"]'::jsonb,
+   '[{"runtime":"llama.cpp","quant":"MXFP4","hf_repo":"openai/gpt-oss-20b","size_gb":14.0}]'::jsonb, true),
+  ('gpt-oss-120b', 'gpt-oss-120b', 'gpt-oss', '120B', 3,
+   '58 GB large local agentic model.', false,
+   '["agentic","code","reasoning","tool_calling"]'::jsonb,
+   '[{"runtime":"llama.cpp","quant":"MXFP4","hf_repo":"openai/gpt-oss-120b","size_gb":58.0}]'::jsonb, true),
+  ('glm-4.5-air', 'GLM-4.5-Air', 'glm', '106B-A12B', 3,
+   'Approximately 65 GB; local sweet spot for 122 GB unified-memory nodes.', false,
+   '["agentic","code","reasoning","tool_calling"]'::jsonb,
+   '[{"runtime":"llama.cpp","quant":"Q4_K_M","hf_repo":"zai-org/GLM-4.5-Air-GGUF","size_gb":65.0}]'::jsonb, true),
+  ('glm-5.2', 'GLM-5.2', 'glm', 'watch', 4,
+   'WATCH/ADOPT candidate; size and deployable artifact must be verified before placement.', true,
+   '["watch","adopt","reasoning","code"]'::jsonb, '[]'::jsonb, true),
+  ('deepseek-v4-flash', 'DeepSeek-V4-Flash', 'deepseek', 'watch', 4,
+   'WATCH/ADOPT candidate; size and deployable artifact must be verified before placement.', true,
+   '["watch","adopt","reasoning","code"]'::jsonb, '[]'::jsonb, true),
+  ('kimi-k2-thinking', 'Kimi-K2-Thinking', 'kimi', '1T-A32B', 4,
+   'OFFLOAD-ONLY or multi-node-ring-only: 247 GB at 1.8-bit exceeds every single 122-123 GB node.', false,
+   '["reasoning","architecture","offload_only","multi_node_ring_only"]'::jsonb,
+   '[{"runtime":"llama.cpp","quant":"UD-TQ1_0","hf_repo":"unsloth/Kimi-K2-Thinking-GGUF","size_gb":247.0,"placement":"offload_or_multi_node_ring"}]'::jsonb, true),
+  ('kimi-k3', 'Kimi-K3', 'kimi', '2.8T', 4,
+   'OFFLOAD-ONLY or multi-node-ring-only: 2.8T parameters cannot fit on a single fleet node.', true,
+   '["reasoning","architecture","offload_only","multi_node_ring_only","watch","adopt"]'::jsonb,
+   '[]'::jsonb, true),
+  ('qwen3-coder-480b', 'Qwen3-Coder-480B-A35B-Instruct', 'qwen', '480B-A35B', 4,
+   'OFFLOAD-ONLY or multi-node-ring-only: 180 GB Q2 exceeds every single 122-123 GB node.', false,
+   '["coding","agentic","tool_calling","offload_only","multi_node_ring_only"]'::jsonb,
+   '[{"runtime":"llama.cpp","quant":"Q2_K","hf_repo":"unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF","size_gb":180.0,"placement":"offload_or_multi_node_ring"}]'::jsonb, true)
+ON CONFLICT (id) DO UPDATE SET
+  name = EXCLUDED.name,
+  family = EXCLUDED.family,
+  parameters = EXCLUDED.parameters,
+  tier = EXCLUDED.tier,
+  description = EXCLUDED.description,
+  gated = EXCLUDED.gated,
+  preferred_workloads = EXCLUDED.preferred_workloads,
+  variants = EXCLUDED.variants,
+  tool_calling = EXCLUDED.tool_calling,
+  updated_at = NOW();
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
