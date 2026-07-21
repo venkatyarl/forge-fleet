@@ -12041,6 +12041,10 @@ VALUES
 ON CONFLICT (name) DO NOTHING;
 "#;
 
+/// V235 — Structured project config (paths/repos/targets/vault_realm/status).
+pub const SCHEMA_V235_PROJECTS_CONFIG: &str =
+    include_str!("migrations/20260721000000_add_projects_config.sql");
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
