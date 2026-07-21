@@ -1012,6 +1012,10 @@ enum FabricCommand {
         #[arg(long, default_value = "1")]
         streams: u32,
     },
+    /// Print the current fabric ring: every configured `fabric_pairs`
+    /// edge with its state (verified / pending / dead), plus a summary
+    /// of the pending cables that have not yet been verified end-to-end.
+    Topology,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -4700,6 +4704,7 @@ async fn main() -> Result<()> {
                 FabricCommand::BenchmarkAll { duration, streams } => {
                     fabric_cmd::handle_fabric_benchmark_all(&pool, duration, streams).await
                 }
+                FabricCommand::Topology => fabric_cmd::handle_fabric_topology(&pool).await,
             }
         }
         Some(Command::Tasks { command }) => {
