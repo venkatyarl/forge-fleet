@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use ff_core::schema::bug_signature::is_terminal_self_heal_status;
 use sqlx::{PgPool, Row};
 
 /// Default cooldown before a processed self-heal signature is eligible for
@@ -132,7 +133,7 @@ pub async fn signature_should_rearm(
     let completed_at: Option<DateTime<Utc>> = row.try_get("completed_at")?;
     let created_at: DateTime<Utc> = row.try_get("created_at")?;
 
-    let terminal = matches!(status.as_str(), "completed" | "failed" | "cancelled");
+    let terminal = is_terminal_self_heal_status(&status);
     let terminal_at = completed_at.unwrap_or(created_at);
     let cooldown_secs = i64::try_from(cooldown.as_secs()).unwrap_or(i64::MAX);
     let cutoff = Utc::now() - chrono::Duration::seconds(cooldown_secs);
@@ -165,7 +166,7 @@ pub async fn rearm_self_heal_task(
         return Ok(false);
     }
 
-    let terminal_statuses = ["completed", "failed", "cancelled"];
+    let terminal_statuses = ff_core::schema::bug_signature::TERMINAL_SELF_HEAL_STATUSES;
     let updated = sqlx::query(
         "UPDATE fleet_tasks
             SET status = $4,
