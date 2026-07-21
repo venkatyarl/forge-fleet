@@ -1136,6 +1136,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_error_classes",
         sql: schema::SCHEMA_V230_MODEL_ERROR_CLASSES,
     },
+    PgMigration {
+        version: 231,
+        name: "fabric_pair_model_invariants",
+        sql: schema::SCHEMA_V231_FABRIC_PAIR_MODEL_INVARIANTS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

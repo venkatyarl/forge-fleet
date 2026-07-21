@@ -14,3 +14,28 @@ pub struct FabricPair {
     pub status: String,
     pub verified: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn represents_ring_one_pairs() {
+        for (source_node, target_node, cidr) in [
+            ("shakira", "rihanna", "10.42.0.0/30"),
+            ("rihanna", "beyonce", "10.43.0.0/30"),
+        ] {
+            let pair = FabricPair {
+                id: Uuid::nil(),
+                source_node: source_node.into(),
+                target_node: target_node.into(),
+                cidr: cidr.into(),
+                status: "pending".into(),
+                verified: false,
+            };
+
+            assert_eq!(pair.source_node, source_node);
+            assert_eq!(pair.target_node, target_node);
+        }
+    }
+}

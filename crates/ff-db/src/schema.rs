@@ -12008,6 +12008,18 @@ ALTER TABLE model_error_events
     CHECK (error_class IN ('startup_failure', 'load_error', 'crash', 'oom'));
 "#;
 
+/// Require usable endpoint names and lifecycle state in the model projection.
+pub const SCHEMA_V231_FABRIC_PAIR_MODEL_INVARIANTS: &str = r#"
+ALTER TABLE fabric_pairs
+    ADD CONSTRAINT fabric_pairs_model_values_valid
+    CHECK (
+        btrim(source_node) <> ''
+        AND btrim(target_node) <> ''
+        AND source_node <> target_node
+        AND btrim(status) <> ''
+    );
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
