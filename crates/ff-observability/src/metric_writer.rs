@@ -4,10 +4,11 @@
 //! statement cache, so it is safe behind PgCat transaction pooling.
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use sqlx::{PgPool, Postgres, QueryBuilder};
 
 /// One row normalized to the supply-side `model_metrics` schema.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NormalizedMetricRow {
     pub recorded_at: DateTime<Utc>,
     pub node: String,

@@ -18,6 +18,7 @@ serde_json.workspace = true
 
 # Web / HTTP (dashboard APIs)
 axum.workspace = true
+reqwest.workspace = true
 
 # Error handling
 anyhow.workspace = true
