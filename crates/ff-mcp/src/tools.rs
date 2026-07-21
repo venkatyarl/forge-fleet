@@ -97,6 +97,7 @@ impl ToolRegistry {
         self.register(Self::fleet_agents());
         self.register(Self::work_item_context());
         self.register(Self::fabric_topology());
+        self.register(Self::pm_board());
 
         // ── Virtual Brain tools ─────────────────────────────────────────
         self.register(Self::brain_search());
@@ -178,6 +179,25 @@ impl ToolRegistry {
             input_schema: json!({
                 "type": "object",
                 "properties": {},
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn pm_board() -> ToolDefinition {
+        ToolDefinition {
+            name: "pm_board".to_string(),
+            description: "Retrieve the fleet project-management board, including status totals and current work items.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 500,
+                        "default": 100
+                    }
+                },
                 "additionalProperties": false
             }),
         }
@@ -1819,6 +1839,7 @@ mod tests {
             "fleet_agents",
             "work_item_context",
             "fabric_topology",
+            "pm_board",
             // Virtual Brain
             "brain_search",
             "brain_vault_read",
