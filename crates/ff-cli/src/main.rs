@@ -28,6 +28,18 @@ struct Cli {
     #[arg(long)]
     config: Option<PathBuf>,
 
+    /// Path to a local GGUF small-language model
+    #[arg(long, global = true)]
+    slm_model: Option<PathBuf>,
+
+    /// Number of llama.cpp threads to use for the local SLM
+    #[arg(long, global = true)]
+    slm_threads: Option<usize>,
+
+    /// Maximum RAM available to the local SLM, in MiB
+    #[arg(long, global = true)]
+    slm_mem_budget_mb: Option<u64>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -193,6 +205,12 @@ enum ConfigCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct FleetConfig {
     #[serde(default)]
+    slm_model: Option<PathBuf>,
+    #[serde(default)]
+    slm_threads: Option<usize>,
+    #[serde(default)]
+    slm_mem_budget_mb: Option<u64>,
+    #[serde(default)]
     general: BTreeMap<String, toml::Value>,
     #[serde(default)]
     nodes: BTreeMap<String, toml::Value>,
@@ -206,6 +224,13 @@ struct FleetConfig {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = resolve_config_path(cli.config)?;
+
+    configure_slm(
+        &config_path,
+        cli.slm_model,
+        cli.slm_threads,
+        cli.slm_mem_budget_mb,
+    )?;
 
     match cli.command {
         Command::Start(args) => handle_start(args, &config_path),
@@ -227,6 +252,40 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn configure_slm(
+    config_path: &Path,
+    model: Option<PathBuf>,
+    threads: Option<usize>,
+    mem_budget_mb: Option<u64>,
+) -> Result<()> {
+    let cfg = load_config(config_path)?;
+    let model = model.or(cfg.slm_model);
+    let threads = threads.or(cfg.slm_threads);
+    let mem_budget_mb = mem_budget_mb.or(cfg.slm_mem_budget_mb);
+
+    if threads == Some(0) {
+        anyhow::bail!("--slm-threads must be greater than zero");
+    }
+    if let Some(budget) = mem_budget_mb {
+        ff_agent::slm::validate_memory_budget_mb(budget).map_err(anyhow::Error::msg)?;
+    }
+
+    // SAFETY: configuration is applied during startup, before this process
+    // creates any worker tasks that could concurrently access the environment.
+    unsafe {
+        if let Some(model) = model {
+            std::env::set_var("FORGEFLEET_SLM_MODEL", model);
+        }
+        if let Some(threads) = threads {
+            std::env::set_var("FORGEFLEET_SLM_THREADS", threads.to_string());
+        }
+        if let Some(budget) = mem_budget_mb {
+            std::env::set_var("FORGEFLEET_SLM_MEM_BUDGET_MB", budget.to_string());
+        }
+    }
+    Ok(())
 }
 
 async fn handle_chat(args: ChatArgs) -> Result<()> {

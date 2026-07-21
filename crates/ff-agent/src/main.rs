@@ -27,6 +27,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let mut config = AgentConfig::from_env();
+    if let Some(mem_budget_mb) = config.slm_mem_budget_mb {
+        ff_agent::slm::validate_memory_budget_mb(mem_budget_mb).map_err(anyhow::Error::msg)?;
+    }
     info!(node_id = %config.node_id, "starting ff-agent daemon");
 
     let hardware = detect_hardware_profile();

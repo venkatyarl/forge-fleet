@@ -18,6 +18,9 @@ pub struct AgentConfig {
     pub max_build_duration_secs: u64,
     /// How often the build timeout monitor scans running builds.
     pub build_monitor_poll_secs: u64,
+    pub slm_model: Option<PathBuf>,
+    pub slm_threads: Option<usize>,
+    pub slm_mem_budget_mb: Option<u64>,
     pub log_monitor: LogMonitoringConfig,
 }
 
@@ -57,6 +60,13 @@ impl AgentConfig {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(10),
+            slm_model: std::env::var_os("FORGEFLEET_SLM_MODEL").map(PathBuf::from),
+            slm_threads: std::env::var("FORGEFLEET_SLM_THREADS")
+                .ok()
+                .and_then(|value| value.parse().ok()),
+            slm_mem_budget_mb: std::env::var("FORGEFLEET_SLM_MEM_BUDGET_MB")
+                .ok()
+                .and_then(|value| value.parse().ok()),
             log_monitor: LogMonitoringConfig::from_env(),
         }
     }

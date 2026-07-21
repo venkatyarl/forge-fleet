@@ -30,6 +30,26 @@ pub fn predict(text: &str) -> String {
     }
 }
 
+/// Reject SLM budgets that could consume more than half of currently
+/// available system RAM.
+pub fn validate_memory_budget_mb(mem_budget_mb: u64) -> Result<(), String> {
+    let available_mb = available_ram_bytes() / (1024 * 1024);
+    validate_memory_budget_mb_against_available(mem_budget_mb, available_mb)
+}
+
+fn validate_memory_budget_mb_against_available(
+    mem_budget_mb: u64,
+    available_mb: u64,
+) -> Result<(), String> {
+    let maximum_mb = available_mb / 2;
+    if mem_budget_mb > maximum_mb {
+        return Err(format!(
+            "SLM memory budget {mem_budget_mb} MiB exceeds half of available RAM ({maximum_mb} MiB)"
+        ));
+    }
+    Ok(())
+}
+
 fn predict_inner(text: &str) -> Result<String, String> {
     if text.trim().is_empty() {
         return Err("prediction text is empty".into());
@@ -39,6 +59,13 @@ fn predict_inner(text: &str) -> Result<String, String> {
         .map(PathBuf::from)
         .ok_or_else(|| "FORGEFLEET_SLM_MODEL is not set".to_string())?;
     validate_model(&model)?;
+
+    if let Some(mem_budget_mb) = std::env::var("FORGEFLEET_SLM_MEM_BUDGET_MB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        validate_memory_budget_mb(mem_budget_mb)?;
+    }
 
     let available_ram = available_ram_bytes();
     let model_bytes = model
@@ -67,6 +94,12 @@ fn predict_inner(text: &str) -> Result<String, String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(threads) = std::env::var("FORGEFLEET_SLM_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        command.args(["--threads", &threads.to_string()]);
+    }
 
     #[cfg(unix)]
     {
@@ -236,6 +269,12 @@ mod tests {
         for quant in ["Q4_K_L", "Q5_K_M", "Q6_K", "Q8_0", "F16"] {
             assert!(!supported_quantization(quant), "{quant}");
         }
+    }
+
+    #[test]
+    fn memory_budget_may_use_at_most_half_of_available_ram() {
+        assert!(validate_memory_budget_mb_against_available(512, 1024).is_ok());
+        assert!(validate_memory_budget_mb_against_available(513, 1024).is_err());
     }
 
     #[test]
