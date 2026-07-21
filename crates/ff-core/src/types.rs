@@ -516,6 +516,7 @@ mod tests {
             models: vec!["qwen3-32b".into()],
             last_heartbeat: None,
             registered_at: chrono::Utc::now(),
+            is_offline_autonomy_enabled: false,
         };
         let json = serde_json::to_string_pretty(&node).unwrap();
         let rt: Node = serde_json::from_str(&json).unwrap();
@@ -547,6 +548,7 @@ mod tests {
             models: vec![],
             last_heartbeat: Some(chrono::Utc::now()),
             registered_at: chrono::Utc::now(),
+            is_offline_autonomy_enabled: false,
         };
         assert!(node.is_alive(30));
 

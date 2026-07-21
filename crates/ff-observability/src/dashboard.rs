@@ -343,6 +343,7 @@ mod tests {
 
         state.upsert_node(Node {
             id: Uuid::new_v4(),
+            is_offline_autonomy_enabled: false,
             name: "taylor".into(),
             host: "192.168.5.100".into(),
             port: 51800,

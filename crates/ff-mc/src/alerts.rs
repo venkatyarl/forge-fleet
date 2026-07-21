@@ -157,6 +157,7 @@ mod tests {
     ) -> Alert {
         Alert {
             id: Uuid::new_v4(),
+            last_sent: None,
             rule_id: rule_id.into(),
             severity,
             message: message.into(),
