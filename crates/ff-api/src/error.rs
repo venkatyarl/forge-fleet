@@ -11,6 +11,8 @@ use crate::types::{ErrorBody, ErrorEnvelope};
 pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("not found: {0}")]
+    NotFound(String),
     #[error("backend unavailable: {0}")]
     BackendUnavailable(String),
     #[error("upstream request failed: {0}")]
@@ -29,6 +31,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, kind, message) = match self {
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, "bad_request", message),
+            Self::NotFound(message) => (StatusCode::NOT_FOUND, "not_found", message),
             Self::BackendUnavailable(message) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "backend_unavailable",
@@ -62,5 +65,11 @@ impl From<reqwest::Error> for ApiError {
 impl From<serde_json::Error> for ApiError {
     fn from(error: serde_json::Error) -> Self {
         Self::BadRequest(error.to_string())
+    }
+}
+
+impl From<ff_db::DbError> for ApiError {
+    fn from(error: ff_db::DbError) -> Self {
+        Self::Internal(error.to_string())
     }
 }
