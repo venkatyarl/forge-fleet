@@ -669,18 +669,11 @@ async fn local_pool_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, S
 /// a weaker fallback model must not be mistaken for a 480B verdict.
 const REVIEWER_480B_HINT: &str = "480b";
 
-/// Cap 480B review concurrency at 1: the ring is a single instance, and the
-/// drain is serial anyway — the gate makes that explicit for any future caller
-/// that reviews outside the drain loop.
-static REVIEW_480B_GATE: std::sync::LazyLock<tokio::sync::Semaphore> =
-    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(1));
-
 /// Primary PR review on the 480B ring. `Err` means the ring is unavailable
 /// (routing failed, timed out, or `fleet_oneshot` failed over to some other
 /// model) — the caller falls back to the cloud review path.
 async fn review_via_480b(pg: &PgPool, prompt: &str) -> Result<(bool, String)> {
-    let _permit = REVIEW_480B_GATE
-        .acquire()
+    let _permit = crate::dispatch_concurrency::acquire_480b_permit()
         .await
         .expect("480b review gate is never closed");
     let resp = crate::fleet_oneshot::fleet_oneshot(

@@ -8,14 +8,12 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::process::Command;
-use tokio::sync::Semaphore;
 
 use super::{AgentTool, AgentToolContext, AgentToolResult, truncate_output};
 
@@ -393,8 +391,6 @@ fn build_review_prompt(
 
 const REVIEWER_480B_HINT: &str = "480b";
 
-static REVIEW_480B_GATE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
-
 async fn generate_verdict(
     prompt: &str,
     cwd: &Path,
@@ -420,8 +416,7 @@ async fn generate_verdict(
 }
 
 async fn review_via_480b(pool: &PgPool, prompt: &str) -> Result<(bool, String), String> {
-    let _permit = REVIEW_480B_GATE
-        .acquire()
+    let _permit = crate::dispatch_concurrency::acquire_480b_permit()
         .await
         .map_err(|e| format!("480b review gate closed: {e}"))?;
 
