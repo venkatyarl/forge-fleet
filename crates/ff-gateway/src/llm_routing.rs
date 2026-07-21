@@ -329,6 +329,7 @@ pub struct PulseLlmRouter {
     upstream_timeout: Duration,
     session_cache: Option<Arc<SessionAffinityCache>>,
     circuit_breaker: Option<Arc<CircuitBreaker>>,
+    capacity_shadow: Arc<crate::capacity_router::CapacityRouter>,
 }
 
 impl PulseLlmRouter {
@@ -362,6 +363,7 @@ impl PulseLlmRouter {
             upstream_timeout: Duration::from_secs(120),
             session_cache: None,
             circuit_breaker: None,
+            capacity_shadow: Arc::new(crate::capacity_router::CapacityRouter::new()),
         })
     }
 
@@ -656,7 +658,15 @@ impl PulseLlmRouter {
         mut body: Value,
         cache: Option<&LlmRoutingCache>,
         pg: Option<&sqlx::PgPool>,
-    ) -> Result<(RoutedServer, String, Value), LlmRoutingError> {
+    ) -> Result<
+        (
+            RoutedServer,
+            String,
+            Value,
+            Option<crate::capacity_router::CapacityDecision>,
+        ),
+        LlmRoutingError,
+    > {
         let requested_model = body
             .get("model")
             .and_then(|v| v.as_str())
@@ -764,7 +774,34 @@ impl PulseLlmRouter {
             queue_depth: server.queue_depth,
         };
 
-        Ok((routed, url, body))
+        let shadow_decision = match pg {
+            Some(pool) => match crate::capacity_router::evaluate_capacity(
+                &self.capacity_shadow,
+                pool,
+                &routed.model_id,
+                &routed.computer,
+            )
+            .await
+            {
+                Ok(decision) => {
+                    tracing::info!(
+                        actual_computer = %decision.actual_computer,
+                        shadow_computer = decision.recommended_computer.as_deref().unwrap_or("unknown"),
+                        agrees = decision.agrees_with_actual(),
+                        reason = ?decision.reason,
+                        "capacity shadow routing decision"
+                    );
+                    Some(decision)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "capacity shadow evaluation failed");
+                    None
+                }
+            },
+            None => None,
+        };
+
+        Ok((routed, url, body, shadow_decision))
     }
 
     /// Record (or refresh) a session→node affinity mapping after a
@@ -792,6 +829,16 @@ impl PulseLlmRouter {
             ff_observability::metrics::PULSE_CIRCUIT_BREAKER_TRIPS_TOTAL
                 .with_label_values(&[computer])
                 .inc();
+        }
+    }
+
+    fn record_capacity_outcome(
+        &self,
+        decision: Option<&crate::capacity_router::CapacityDecision>,
+        success: bool,
+    ) {
+        if let Some(decision) = decision {
+            self.capacity_shadow.record_outcome(decision, success);
         }
     }
 
@@ -831,7 +878,7 @@ impl PulseLlmRouter {
         }
 
         let session_key = extract_session_key(&body);
-        let (routed, url, body) = self.resolve_target(body, cache, pg).await?;
+        let (routed, url, body, shadow) = self.resolve_target(body, cache, pg).await?;
         tracing::debug!(computer = %routed.computer, "GW.2 rcc: post-resolve_target");
         self.record_affinity(session_key, &routed);
 
@@ -849,6 +896,7 @@ impl PulseLlmRouter {
         let resp = match tokio::time::timeout(self.upstream_timeout, fut).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
+                self.record_capacity_outcome(shadow.as_ref(), false);
                 self.record_failure(&routed.computer);
                 ff_observability::metrics::PULSE_ROUTER_REQUESTS_TOTAL
                     .with_label_values(&[&routed.model_id, &routed.computer, "upstream_error"])
@@ -856,6 +904,7 @@ impl PulseLlmRouter {
                 return Err(e.into());
             }
             Err(_) => {
+                self.record_capacity_outcome(shadow.as_ref(), false);
                 self.record_failure(&routed.computer);
                 ff_observability::metrics::PULSE_ROUTER_REQUESTS_TOTAL
                     .with_label_values(&[&routed.model_id, &routed.computer, "timeout"])
@@ -886,6 +935,7 @@ impl PulseLlmRouter {
         } else {
             "upstream_error"
         };
+        self.record_capacity_outcome(shadow.as_ref(), status.is_success());
         ff_observability::metrics::PULSE_ROUTER_REQUESTS_TOTAL
             .with_label_values(&[&routed.model_id, &routed.computer, result_label])
             .inc();
@@ -914,7 +964,7 @@ impl PulseLlmRouter {
 
         let body = body.clone();
         let session_key = extract_session_key(&body);
-        let (routed, url, body) = self.resolve_target(body, cache, pg).await?;
+        let (routed, url, body, shadow) = self.resolve_target(body, cache, pg).await?;
         self.record_affinity(session_key, &routed);
 
         tracing::debug!(
@@ -931,6 +981,7 @@ impl PulseLlmRouter {
         let upstream = match tokio::time::timeout(self.upstream_timeout, fut).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
+                self.record_capacity_outcome(shadow.as_ref(), false);
                 self.record_failure(&routed.computer);
                 ff_observability::metrics::PULSE_ROUTER_REQUESTS_TOTAL
                     .with_label_values(&[&routed.model_id, &routed.computer, "upstream_error"])
@@ -938,6 +989,7 @@ impl PulseLlmRouter {
                 return Err(e.into());
             }
             Err(_) => {
+                self.record_capacity_outcome(shadow.as_ref(), false);
                 self.record_failure(&routed.computer);
                 ff_observability::metrics::PULSE_ROUTER_REQUESTS_TOTAL
                     .with_label_values(&[&routed.model_id, &routed.computer, "timeout"])
@@ -956,6 +1008,7 @@ impl PulseLlmRouter {
         } else {
             "upstream_error"
         };
+        self.record_capacity_outcome(shadow.as_ref(), status.is_success());
         ff_observability::metrics::PULSE_ROUTER_REQUESTS_TOTAL
             .with_label_values(&[&routed.model_id, &routed.computer, result_label])
             .inc();
