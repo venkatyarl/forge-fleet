@@ -1101,6 +1101,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "real_sized_model_catalog",
         sql: schema::SCHEMA_V223_REAL_SIZED_MODEL_CATALOG,
     },
+    PgMigration {
+        version: 224,
+        name: "cloud_budget_bucket_seeds",
+        sql: schema::SCHEMA_V224_CLOUD_BUDGET_BUCKET_SEEDS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

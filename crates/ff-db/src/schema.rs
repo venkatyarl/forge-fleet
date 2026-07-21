@@ -11811,6 +11811,82 @@ ON CONFLICT (id) DO UPDATE SET
   updated_at = NOW();
 "#;
 
+/// Current operator-console cloud budget windows and hard-stop policy.
+pub const SCHEMA_V224_CLOUD_BUDGET_BUCKET_SEEDS: &str = r#"
+CREATE TABLE IF NOT EXISTS cloud_budget_buckets (
+    provider                TEXT PRIMARY KEY,
+    window_exhausted_until  TIMESTAMPTZ,
+    weekly_pct              SMALLINT,
+    weekly_reset_at         TIMESTAMPTZ,
+    monthly_pct             SMALLINT,
+    monthly_reset_at        TIMESTAMPTZ,
+    credit_pool_spent_usd   NUMERIC DEFAULT 0,
+    last_error_at           TIMESTAMPTZ,
+    last_success_at         TIMESTAMPTZ,
+    source                  TEXT,
+    updated_at              TIMESTAMPTZ DEFAULT NOW()
+);
+
+INSERT INTO cloud_budget_buckets (
+    provider,
+    window_exhausted_until,
+    weekly_pct,
+    weekly_reset_at,
+    monthly_pct,
+    monthly_reset_at,
+    credit_pool_spent_usd,
+    last_success_at,
+    source,
+    updated_at
+) VALUES
+    (
+        'kimi',
+        NULL,
+        64,
+        '2026-07-21 16:23:00-04'::timestamptz,
+        19,
+        '2026-08-03 00:00:00-04'::timestamptz,
+        0,
+        '2026-07-20 05:23:00-04'::timestamptz,
+        'operator console 2026-07-20 05:23 ET; 5h 0.97% used, just reset and healthy; 7day 64.12% used; monthly 19.18% used; extra-usage disabled (hard stop)',
+        NOW()
+    ),
+    (
+        'codex',
+        NULL,
+        16,
+        '2026-07-24 23:30:00-04'::timestamptz,
+        NULL,
+        NULL,
+        0,
+        '2026-07-20 05:23:00-04'::timestamptz,
+        'operator console 2026-07-20 05:2x ET; OpenAI shared Codex/Work/Agents weekly 16% used (84% remaining); rolling 5h window recovered',
+        NOW()
+    ),
+    (
+        'claude',
+        NULL,
+        66,
+        '2026-07-23 02:00:00-04'::timestamptz,
+        NULL,
+        NULL,
+        0,
+        NULL,
+        'operator console 2026-07-20 05:2x ET; Anthropic session 20% used, resets in ~2h; all-models weekly 66% used, resets Thu 02:00 ET; automation uses Sonnet; Fable tier 100% in this operator session on credits; Claude Code +50% boost through 2026-08-19; usage credits on (overflow bills, no hard block)',
+        NOW()
+    )
+ON CONFLICT (provider) DO UPDATE SET
+    window_exhausted_until = EXCLUDED.window_exhausted_until,
+    weekly_pct = EXCLUDED.weekly_pct,
+    weekly_reset_at = EXCLUDED.weekly_reset_at,
+    monthly_pct = EXCLUDED.monthly_pct,
+    monthly_reset_at = EXCLUDED.monthly_reset_at,
+    credit_pool_spent_usd = EXCLUDED.credit_pool_spent_usd,
+    last_success_at = EXCLUDED.last_success_at,
+    source = EXCLUDED.source,
+    updated_at = NOW();
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
