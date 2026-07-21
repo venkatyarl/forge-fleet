@@ -13,6 +13,7 @@ ff-runtime = { path = "../ff-runtime" }
 ff-orchestrator = { path = "../ff-orchestrator" }
 ff-cron = { path = "../ff-cron" }
 ff-deploy = { path = "../ff-deploy" }
+ff-db = { path = "../ff-db" }
 
 chrono.workspace = true
 libc = "0.2"

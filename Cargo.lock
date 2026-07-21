@@ -1339,6 +1339,7 @@ dependencies = [
  "chrono",
  "ff-core",
  "ff-cron",
+ "ff-db",
  "ff-deploy",
  "ff-discovery",
  "ff-orchestrator",
