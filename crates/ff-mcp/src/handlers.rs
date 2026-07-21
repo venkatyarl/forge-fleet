@@ -2788,6 +2788,7 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "pm_board" => crate::verbs::pm_board::pm_board(params).await,
         "pm_claim" => crate::verbs::pm_claim::pm_claim(params).await,
         "pm_create" => crate::verbs::pm_create::pm_create(params).await,
+        "pm_list" => crate::verbs::pm_list::pm_list(params).await,
         // Virtual Brain
         // Scratchpad (agent working memory)
         "memory_get" => crate::memory_tools::memory_get(params).await,

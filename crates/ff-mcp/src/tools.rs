@@ -100,6 +100,7 @@ impl ToolRegistry {
         self.register(Self::pm_board());
         self.register(Self::pm_claim());
         self.register(Self::pm_create());
+        self.register(Self::pm_list());
 
         // ── Virtual Brain tools ─────────────────────────────────────────
         self.register(Self::brain_search());
@@ -261,6 +262,25 @@ impl ToolRegistry {
                     }
                 },
                 "required": ["title"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn pm_list() -> ToolDefinition {
+        ToolDefinition {
+            name: "pm_list".to_string(),
+            description: "List Mission Control project-management work items, optionally filtered by backlog fields.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string", "description": "Work-item status" },
+                    "assignee": { "type": "string", "description": "Assigned agent or operator" },
+                    "epic_id": { "type": "string", "description": "Epic identifier" },
+                    "sprint_id": { "type": "string", "description": "Sprint identifier" },
+                    "task_group_id": { "type": "string", "description": "Task-group identifier" },
+                    "label": { "type": "string", "description": "Required label" }
+                },
                 "additionalProperties": false
             }),
         }
@@ -1905,6 +1925,7 @@ mod tests {
             "pm_board",
             "pm_claim",
             "pm_create",
+            "pm_list",
             // Virtual Brain
             "brain_search",
             "brain_vault_read",
