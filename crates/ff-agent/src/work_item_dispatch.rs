@@ -1981,20 +1981,20 @@ const MAX_DISPATCH_ATTEMPTS: i32 = 3;
 /// and go straight to the cloud/CLI backstop, which is more capable. Below this,
 /// try cheap-local-first.
 ///
-/// Set to 1 (was 2) because the LOCAL lane starves the dispatch heartbeat and gets
-/// reaped at ~190s (#62 — codegen_apply blocks the async runtime), so a SECOND
-/// local attempt just burns another ~190s + slot cycle for a task that keeps
-/// hanging the same way, before finally reaching cloud. The CLOUD lane does NOT
-/// starve the heartbeat (verified: cloud attempts run 900s+ with no stale-reap).
+/// The local lane was heartbeat-starving (#62 — codegen_apply blocked the async
+/// runtime, so a local attempt got reaped at ~190s), which is why this used to
+/// permit only ONE local try before escalating to cloud. #62/#792 fixed the root
+/// cause (codegen_apply moved blocking git/fs/verify off the async runtime via
+/// spawn_blocking), so `use_local_lane` now delegates to
+/// `ff_routing_policy::use_local_30b`, which permits up to
+/// `ff_routing_policy::LOCAL_LANE_MAX_TRIES` local attempts before escalating.
 /// Mechanical and moderate tasks use the local lane; complex or multi-file-heavy
-/// tasks already `prefers_cloud_lane`, so this narrows the local exposure to ONE
-/// cheap try then the reliable cloud lane — unblocking the backlog with no
-/// heartbeat rearchitecture.
+/// tasks already `prefers_cloud_lane` and skip it entirely.
 /// Whether to try the cheap LOCAL codegen lane for this dispatch: only while UNDER
 /// the cloud-escalation threshold, the node's local-codegen breaker is closed, and
 /// the task isn't complexity-routed to cloud. Pure so the routing is testable —
-/// the `ESCALATE_TO_CLOUD_AT = 1` value means a mechanical task gets ONE local try
-/// then goes cloud (#62: the local lane starves the heartbeat; cloud does not).
+/// see `ff_routing_policy::LOCAL_LANE_MAX_TRIES` for the current try budget before
+/// a mechanical task goes cloud.
 fn use_local_lane(attempts: i32, breaker_open: bool, prefers_cloud: bool) -> bool {
     let requirements = ff_routing_policy::TaskRequirements {
         prior_failure_count: attempts.max(0) as u32,
@@ -4859,19 +4859,21 @@ mod tests {
     }
 
     #[test]
-    fn use_local_lane_gives_mechanical_one_try_then_cloud() {
-        // Mechanical (prefers_cloud=false), breaker closed: local ONLY on attempt 0;
-        // attempt 1+ escalates to cloud (#62 — the local lane starves the heartbeat,
-        // a 2nd local try just burns another ~190s reap).
+    fn use_local_lane_gives_mechanical_several_tries_then_cloud() {
+        // Mechanical (prefers_cloud=false), breaker closed: local lane stays available
+        // for ff_routing_policy::LOCAL_LANE_MAX_TRIES attempts (#62/#792 fixed the
+        // heartbeat-starving local lane, so the old one-try-then-cloud bias is gone),
+        // then escalates to cloud past that budget.
+        for attempt in 0..ff_routing_policy::LOCAL_LANE_MAX_TRIES as i32 {
+            assert!(
+                use_local_lane(attempt, false, false),
+                "attempt {attempt} should still try cheap local"
+            );
+        }
         assert!(
-            use_local_lane(0, false, false),
-            "first attempt tries cheap local"
+            !use_local_lane(ff_routing_policy::LOCAL_LANE_MAX_TRIES as i32, false, false),
+            "attempt at the local-try budget escalates to cloud"
         );
-        assert!(
-            !use_local_lane(1, false, false),
-            "#62: 2nd attempt goes cloud"
-        );
-        assert!(!use_local_lane(2, false, false));
         // A complexity-routed (complex or multi-file-heavy) task never touches the local lane.
         assert!(!use_local_lane(0, false, true));
         // Open local-codegen breaker → skip local even on attempt 0.
