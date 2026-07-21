@@ -12020,6 +12020,14 @@ ALTER TABLE fabric_pairs
     );
 "#;
 
+/// Allow one-sided fabric discovery rows to leave the derived CIDR unset.
+pub const SCHEMA_V232_FABRIC_PAIR_EMPTY_IP: &str = r#"
+ALTER TABLE fabric_pairs
+    DROP COLUMN cidr,
+    ADD COLUMN cidr TEXT
+        GENERATED ALWAYS AS (set_masklen(NULLIF(a_ip, '')::inet, 30)::cidr::text) STORED;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
