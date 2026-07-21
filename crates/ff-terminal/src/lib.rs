@@ -13,6 +13,7 @@ pub mod api_client;
 pub mod app;
 pub mod data_cmd;
 pub mod input;
+pub mod jira_types;
 pub mod messages;
 pub mod render;
 pub mod theme;
