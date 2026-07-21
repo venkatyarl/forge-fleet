@@ -13,6 +13,7 @@ pub mod log_monitor;
 pub mod manager;
 pub mod mirror_service;
 pub mod node_info;
+pub mod offline_mode;
 pub mod periodic;
 pub mod pg_failover;
 pub mod repair;
