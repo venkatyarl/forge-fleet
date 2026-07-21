@@ -2037,8 +2037,22 @@ const LANE1_STALE_MARGIN_SECS: u64 = 30;
 const _: () = assert!(LANE1_TIMEOUT_SECS < crate::work_item_scheduler::LEASE_STALE_SECS as u64);
 
 const LANE15_480B_MODEL_HINT: &str = "local:qwen3-coder-480b";
+const LANE15_480B_PROVIDER: &str = "local_480b";
 const LANE15_480B_PERMITS: usize = 2;
 const LANE15_480B_PERMIT_WAIT_MS: u64 = 750;
+
+async fn lane15_enabled(pg: &PgPool) -> bool {
+    matches!(
+        ff_db::pg_read_gate_value(pg, "work_item_lane15_mode", "on", "on")
+            .await
+            .as_deref(),
+        Ok("on") | Ok("true") | Ok("1")
+    )
+}
+
+fn should_attempt_lane15(lane1_failed: bool, enabled: bool, breaker_open: bool) -> bool {
+    lane1_failed && enabled && !breaker_open
+}
 
 async fn try_acquire_lane15_480b_permit(
     sem: &Semaphore,
@@ -2697,6 +2711,11 @@ async fn run_ff_dispatch(
         crate::circuit_breaker::is_provider_open(pg, item.computer_id, LOCAL_CODEGEN_PROVIDER)
             .await
             .unwrap_or(false);
+    let lane15_enabled = lane15_enabled(pg).await;
+    let lane15_breaker_open =
+        crate::circuit_breaker::is_provider_open(pg, item.computer_id, LANE15_480B_PROVIDER)
+            .await
+            .unwrap_or(false);
 
     // Lane 1: local codegen harness — but skip it once we've escalated to cloud
     // (stage 2, after ESCALATE_TO_CLOUD_AT local failures it has failed the same
@@ -2795,7 +2814,11 @@ async fn run_ff_dispatch(
     // Lane 1.5: one bounded escalation round on the shared 480B coder ring. The
     // ring has one 11 tok/s instance with --parallel 2, so cap concurrency
     // process-wide and skip instead of queueing when both slots are busy.
-    if lane1_failed_or_timed_out {
+    if should_attempt_lane15(
+        lane1_failed_or_timed_out,
+        lane15_enabled,
+        lane15_breaker_open,
+    ) {
         match try_acquire_lane15_480b_permit(
             &LANE15_480B_SEMAPHORE,
             Duration::from_millis(LANE15_480B_PERMIT_WAIT_MS),
@@ -2804,6 +2827,12 @@ async fn run_ff_dispatch(
         {
             Some(_permit) => {
                 mark_lease_endpoint(pg, item, "lane1.5:local:qwen3-coder-480b").await;
+                info!(
+                    work_item_id = %item.work_item_id,
+                    stage = "lane1.5",
+                    provider = LANE15_480B_PROVIDER,
+                    "work_item_dispatch: starting Lane-1.5 480B codegen"
+                );
                 let lane15 = tokio::time::timeout(
                     Duration::from_secs(LANE1_TIMEOUT_SECS),
                     crate::codegen_apply::codegen_apply(
@@ -2817,8 +2846,15 @@ async fn run_ff_dispatch(
                 .await;
                 match lane15 {
                     Ok(Ok(outcome)) if outcome.applied => {
+                        let _ = crate::circuit_breaker::record_provider_success(
+                            pg,
+                            item.computer_id,
+                            LANE15_480B_PROVIDER,
+                        )
+                        .await;
                         info!(
                             work_item_id = %item.work_item_id,
+                            stage = "lane1.5",
                             rounds = outcome.rounds,
                             "work_item_dispatch: Lane-1.5 480B codegen landed the change"
                         );
@@ -2830,22 +2866,46 @@ async fn run_ff_dispatch(
                         ));
                     }
                     Ok(Ok(outcome)) => {
+                        let _ = crate::circuit_breaker::record_provider_failure(
+                            pg,
+                            item.computer_id,
+                            LANE15_480B_PROVIDER,
+                            "local_codegen_unavailable",
+                        )
+                        .await;
                         info!(
                             work_item_id = %item.work_item_id,
+                            stage = "lane1.5",
                             error = ?outcome.error,
                             "work_item_dispatch: Lane-1.5 480B codegen didn't land; backstop to cloud"
                         );
                     }
                     Ok(Err(e)) => {
+                        let _ = crate::circuit_breaker::record_provider_failure(
+                            pg,
+                            item.computer_id,
+                            LANE15_480B_PROVIDER,
+                            "local_codegen_unavailable",
+                        )
+                        .await;
                         warn!(
                             work_item_id = %item.work_item_id,
+                            stage = "lane1.5",
                             error = format!("{e:#}"),
                             "work_item_dispatch: Lane-1.5 480B codegen errored; backstop to cloud"
                         );
                     }
                     Err(_) => {
+                        let _ = crate::circuit_breaker::record_provider_failure(
+                            pg,
+                            item.computer_id,
+                            LANE15_480B_PROVIDER,
+                            "timeout",
+                        )
+                        .await;
                         warn!(
                             work_item_id = %item.work_item_id,
+                            stage = "lane1.5",
                             timeout_secs = LANE1_TIMEOUT_SECS,
                             "work_item_dispatch: Lane-1.5 480B codegen TIMED OUT; backstop to cloud"
                         );
@@ -2855,12 +2915,25 @@ async fn run_ff_dispatch(
             None => {
                 info!(
                     work_item_id = %item.work_item_id,
+                    stage = "lane1.5",
                     permits = LANE15_480B_PERMITS,
                     wait_ms = LANE15_480B_PERMIT_WAIT_MS,
                     "work_item_dispatch: Lane-1.5 480B ring busy; skipping to cloud backstop"
                 );
             }
         }
+    } else if lane1_failed_or_timed_out && !lane15_enabled {
+        info!(
+            work_item_id = %item.work_item_id,
+            stage = "lane1.5",
+            "work_item_dispatch: Lane-1.5 disabled by work_item_lane15_mode; skipping to cloud backstop"
+        );
+    } else if lane1_failed_or_timed_out && lane15_breaker_open {
+        info!(
+            work_item_id = %item.work_item_id,
+            stage = "lane1.5",
+            "work_item_dispatch: local_480b breaker OPEN on this node; skipping Lane-1.5 to cloud backstop"
+        );
     }
 
     // Lane 2: dispatch to an AVAILABLE backend (capability A4/A5) with the full
@@ -4605,8 +4678,8 @@ mod tests {
         order_cloud_reviewers, parse_cli_tokens, primary_or_default_backend,
         quick_empty_success_is_provider_failure, repo_cache_path, repo_slug,
         retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
-        status_output_is_clean, task_failed_alert_text, task_prefers_cloud_lane,
-        try_acquire_lane15_480b_permit, use_local_lane,
+        should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
+        task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
     };
     use std::path::PathBuf;
     use std::time::Duration;
@@ -4624,6 +4697,14 @@ mod tests {
         assert!(!builder_excludes_480b("codex"));
         assert!(!builder_excludes_480b("claude"));
         assert!(!builder_excludes_480b("kimi"));
+    }
+
+    #[test]
+    fn lane15_requires_failure_enabled_gate_and_closed_breaker() {
+        assert!(should_attempt_lane15(true, true, false));
+        assert!(!should_attempt_lane15(false, true, false));
+        assert!(!should_attempt_lane15(true, false, false));
+        assert!(!should_attempt_lane15(true, true, true));
     }
 
     #[test]
