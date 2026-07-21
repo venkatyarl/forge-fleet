@@ -483,6 +483,7 @@ mod tests {
     fn mock_beat() -> PulseBeatV2 {
         PulseBeatV2 {
             pulse_protocol_version: 2,
+            install_diff: Vec::new(),
             computer_id: Some(Uuid::new_v4()),
             computer_name: "test-node".to_string(),
             timestamp: Utc::now(),

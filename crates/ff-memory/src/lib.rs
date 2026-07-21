@@ -14,6 +14,8 @@ pub mod rag;
 pub mod retrieval;
 pub mod session;
 pub mod store;
+pub mod types;
+pub mod user_model;
 pub mod workspace;
 
 pub use cache::{ContextCache, WorkItemContextCache};
@@ -24,6 +26,8 @@ pub use session::{SessionClosureResult, SessionMemoryItem, SessionMemoryManager}
 pub use store::{
     Memory, MemorySource, MemoryStore, MemoryStoreError, NewMemory, SearchMemoriesParams,
 };
+pub use types::{EdgeType, NodeId, Realm, RealmId};
+pub use user_model::{UserModel, UserModelContext, UserModelNode};
 pub use workspace::{
     WorkspaceMemoryManager, WorkspaceProfile, WorkspaceScopedStore, WorkspaceSearchHit,
 };

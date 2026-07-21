@@ -17,7 +17,9 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{Semaphore, SemaphorePermit, watch};
+use tokio::sync::watch;
+#[cfg(test)]
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -57,11 +59,6 @@ pub(crate) const MAX_DISPATCH_PER_TICK: i64 = 3;
 /// Recent-failure count at/above which the host throttles back to a single
 /// dispatch per tick (backpressure — stop feeding a host that's failing).
 const BACKPRESSURE_FAILURE_THRESHOLD: usize = 3;
-
-/// The 480B coder ring is a single shared deployment launched with `--parallel 2`.
-/// Never let dispatches queue behind it: if both slots are busy, Lane-1.5 skips
-/// straight to the cloud backstop.
-static LANE15_480B_SEMAPHORE: Semaphore = Semaphore::const_new(LANE15_480B_PERMITS);
 
 /// Capacity-aware per-tick dispatch budget for one host: dispatch up to as many
 /// items as it has free slots, capped at [`MAX_DISPATCH_PER_TICK`]. If the host
@@ -2038,7 +2035,7 @@ const _: () = assert!(LANE1_TIMEOUT_SECS < crate::work_item_scheduler::LEASE_STA
 
 const LANE15_480B_MODEL_HINT: &str = "local:qwen3-coder-480b";
 const LANE15_480B_PROVIDER: &str = "local_480b";
-const LANE15_480B_PERMITS: usize = 2;
+const LANE15_480B_PERMITS: usize = crate::dispatch_concurrency::MAX_480B_CONCURRENCY;
 const LANE15_480B_PERMIT_WAIT_MS: u64 = 750;
 
 async fn lane15_enabled(pg: &PgPool) -> bool {
@@ -2054,6 +2051,7 @@ fn should_attempt_lane15(lane1_failed: bool, enabled: bool, breaker_open: bool) 
     lane1_failed && enabled && !breaker_open
 }
 
+#[cfg(test)]
 async fn try_acquire_lane15_480b_permit(
     sem: &Semaphore,
     wait: Duration,
@@ -2819,11 +2817,13 @@ async fn run_ff_dispatch(
         lane15_enabled,
         lane15_breaker_open,
     ) {
-        match try_acquire_lane15_480b_permit(
-            &LANE15_480B_SEMAPHORE,
+        match tokio::time::timeout(
             Duration::from_millis(LANE15_480B_PERMIT_WAIT_MS),
+            crate::dispatch_concurrency::acquire_480b_permit(),
         )
         .await
+        .ok()
+        .and_then(Result::ok)
         {
             Some(_permit) => {
                 mark_lease_endpoint(pg, item, "lane1.5:local:qwen3-coder-480b").await;
