@@ -14,7 +14,7 @@
 //!   - `FF_LOG_ANALYSIS_MIN_RECURRENCE` minimum occurrences before creating a work_item (default 3)
 //!   - `FF_LOG_ANALYSIS_TAIL_LINES` lines read from the tail of each file per tick (default 1000)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -190,6 +190,12 @@ impl LogAnalysisWorker {
             .collect();
         report.patterns_found = recurring.len();
 
+        // Verification is stricter than creation: even one fresh occurrence
+        // means the original signal has not cleared, while new items still use
+        // the configured recurrence threshold to avoid noisy one-offs.
+        let active_signatures: HashSet<String> = grouped.keys().cloned().collect();
+        self.verify_completed_signals(&active_signatures).await?;
+
         if !recurring.is_empty() {
             self.ensure_project().await?;
             let created = self.create_work_items(&recurring).await?;
@@ -256,7 +262,7 @@ impl LogAnalysisWorker {
             let existing: Option<(uuid::Uuid,)> = sqlx::query_as(
                 "SELECT id FROM work_items \
                  WHERE project_id = $1 \
-                   AND status IN ('open', 'ready', 'in_progress') \
+                   AND status IN ('idea', 'decomposed', 'ready', 'claimed', 'building', 'in_progress', 'in_review') \
                    AND metadata->>'log_signature' = $2 \
                  LIMIT 1",
             )
@@ -269,6 +275,16 @@ impl LogAnalysisWorker {
                 debug!(signature = %pattern.signature, "log_analysis_worker: pattern already tracked");
                 continue;
             }
+
+            let prior_id: Option<uuid::Uuid> = sqlx::query_scalar(
+                "SELECT id FROM work_items \
+                 WHERE project_id = $1 AND original_signal->>'signature' = $2 \
+                 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(&self.config.project_id)
+            .bind(&pattern.signature)
+            .fetch_optional(&self.pg)
+            .await?;
 
             let title = truncate(&pattern.normalized, 120);
             let description = format!(
@@ -288,10 +304,44 @@ impl LogAnalysisWorker {
                 "detected_by": &self.my_name,
             });
 
+            // Persist the evidence and discovery hints in the canonical context
+            // field. Builders receive this verbatim at dispatch, while Cortex can
+            // enrich the same row asynchronously without replacing the trigger.
+            let context = serde_json::json!({
+                "trigger": {
+                    "kind": "recurring_log",
+                    "signature": pattern.signature,
+                    "excerpt": pattern.example,
+                    "normalized": pattern.normalized,
+                    "source": pattern.last_path.display().to_string(),
+                    "occurrence_count": pattern.count,
+                },
+                "relevant_files": [pattern.last_path.display().to_string()],
+                "related_work_items": prior_id.into_iter().collect::<Vec<_>>(),
+                "brain_search_terms": [pattern.normalized.clone()],
+            });
+            let pre_work = serde_json::json!([
+                "Confirm the triggering signal and reproduce it before editing",
+                "Inspect the attached Cortex/file context and related work items"
+            ]);
+            let work = serde_json::json!([
+                "Fix the root cause; decompose into non-overlapping leaf children when the scope is multi-file"
+            ]);
+            let post_work = serde_json::json!([
+                "Run focused tests and the repository verification gate",
+                "Remove temporary artifacts and report whether the original signal is cleared"
+            ]);
+            let original_signal = serde_json::json!({
+                "kind": "recurring_log",
+                "signature": pattern.signature,
+                "source": pattern.last_path.display().to_string(),
+            });
+
             let id: uuid::Uuid = sqlx::query_scalar(
                 "INSERT INTO work_items \
-                    (project_id, kind, title, description, status, priority, created_by, metadata) \
-                 VALUES ($1, 'log_pattern', $2, $3, 'ready', 'normal', $4, $5) \
+                    (project_id, kind, title, description, status, priority, created_by, metadata, \
+                     context, pre_work, work, post_work, original_signal, refiled_from) \
+                 VALUES ($1, 'bug', $2, $3, 'idea', 'normal', $4, $5, $6, $7, $8, $9, $10, $11) \
                  RETURNING id",
             )
             .bind(&self.config.project_id)
@@ -299,6 +349,12 @@ impl LogAnalysisWorker {
             .bind(&description)
             .bind(&self.my_name)
             .bind(&metadata)
+            .bind(&context)
+            .bind(&pre_work)
+            .bind(&work)
+            .bind(&post_work)
+            .bind(&original_signal)
+            .bind(prior_id)
             .fetch_one(&self.pg)
             .await?;
 
@@ -312,6 +368,28 @@ impl LogAnalysisWorker {
         }
 
         Ok(created)
+    }
+
+    /// Close the loop for completed detector-authored items. A cleared signal is
+    /// recorded; a still-active signal is marked false so `create_work_items`
+    /// can re-file it with `refiled_from` and fresh evidence.
+    async fn verify_completed_signals(&self, active: &HashSet<String>) -> Result<()> {
+        let signatures: Vec<&str> = active.iter().map(String::as_str).collect();
+        sqlx::query(
+            "UPDATE work_items SET \
+                 signal_cleared = NOT (original_signal->>'signature' = ANY($2::text[])), \
+                 signal_verified_at = NOW(), \
+                 cleanup_complete = CASE \
+                     WHEN original_signal->>'signature' = ANY($2::text[]) THEN cleanup_complete \
+                     ELSE TRUE END \
+             WHERE project_id = $1 AND status = 'done' \
+               AND original_signal->>'kind' = 'recurring_log'",
+        )
+        .bind(&self.config.project_id)
+        .bind(&signatures)
+        .execute(&self.pg)
+        .await?;
+        Ok(())
     }
 
     /// Spawn the background loop. Safe to start on every daemon; the tick is

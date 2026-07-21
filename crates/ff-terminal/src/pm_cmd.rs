@@ -1396,8 +1396,12 @@ async fn insert_decomposed_work_item(
 
 fn decomposed_work_item_insert_sql() -> &'static str {
     "INSERT INTO work_items \
-        (project_id, kind, title, description, priority, created_by, parent_id, repo_id, repo_url, repo_path, predicted_paths, complexity) \
-     VALUES ($1, 'task', $2, $3, 'normal', $4, $5, $6, $7, $8, $9, $10) RETURNING id"
+        (project_id, kind, title, description, priority, created_by, parent_id, repo_id, repo_url, repo_path, predicted_paths, complexity, context, pre_work, work, post_work) \
+     VALUES ($1, 'task', $2, $3, 'normal', $4, $5, $6, $7, $8, $9, $10, \
+        COALESCE((SELECT context FROM work_items WHERE id = $5), '{}'::jsonb), \
+        COALESCE((SELECT pre_work FROM work_items WHERE id = $5), '[]'::jsonb), \
+        COALESCE((SELECT work FROM work_items WHERE id = $5), '[]'::jsonb), \
+        COALESCE((SELECT post_work FROM work_items WHERE id = $5), '[]'::jsonb)) RETURNING id"
 }
 
 /// A single task as parsed from a Claude Code session transcript.

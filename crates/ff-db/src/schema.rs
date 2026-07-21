@@ -11705,6 +11705,29 @@ CREATE INDEX IF NOT EXISTS idx_slm_health_status_checked_at
     ON slm_health_status (checked_at DESC);
 "#;
 
+/// Structured lifecycle and verification state for autonomously detected work.
+pub const SCHEMA_V220_AUTONOMOUS_WORK_ITEM_LOOP: &str = r#"
+ALTER TABLE work_items
+    ADD COLUMN IF NOT EXISTS pre_work JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS work JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS post_work JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS cleanup_complete BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS original_signal JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS signal_cleared BOOLEAN,
+    ADD COLUMN IF NOT EXISTS signal_verified_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS refiled_from UUID REFERENCES work_items(id) ON DELETE SET NULL;
+
+ALTER TABLE work_items
+    ADD CONSTRAINT work_items_pre_work_array CHECK (jsonb_typeof(pre_work) = 'array'),
+    ADD CONSTRAINT work_items_work_array CHECK (jsonb_typeof(work) = 'array'),
+    ADD CONSTRAINT work_items_post_work_array CHECK (jsonb_typeof(post_work) = 'array'),
+    ADD CONSTRAINT work_items_original_signal_object CHECK (jsonb_typeof(original_signal) = 'object');
+
+CREATE INDEX IF NOT EXISTS idx_work_items_open_signal
+    ON work_items ((original_signal->>'signature'))
+    WHERE signal_cleared IS NOT TRUE;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

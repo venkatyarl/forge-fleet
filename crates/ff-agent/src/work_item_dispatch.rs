@@ -119,6 +119,12 @@ struct AssignedWorkItem {
     /// Precomputed file paths stored on the `work_items` row, companion to
     /// `brain_node_ids`.
     touched_paths: Vec<String>,
+    /// Detector-authored evidence plus Cortex/brain discovery hints.
+    context: serde_json::Value,
+    /// Ordered lifecycle steps. The agent executes these around the leaf work.
+    pre_work: Vec<String>,
+    work: Vec<String>,
+    post_work: Vec<String>,
 }
 
 impl AssignedWorkItem {
@@ -441,6 +447,10 @@ async fn assigned_work_items(
             COALESCE(jsonb_array_length(w.predicted_paths), 0) AS predicted_paths_count,
             COALESCE(w.brain_node_ids, '[]'::jsonb) AS brain_node_ids,
             COALESCE(w.touched_paths, '[]'::jsonb) AS touched_paths,
+            COALESCE(w.context, '{}'::jsonb) AS context,
+            COALESCE(w.pre_work, '[]'::jsonb) AS pre_work,
+            COALESCE(w.work, '[]'::jsonb) AS work,
+            COALESCE(w.post_work, '[]'::jsonb) AS post_work,
             COALESCE(NULLIF(w.repo_url, ''), NULLIF(wr.github_url, '')) AS repo_url,
             NULLIF(w.repo_path, '') AS bound_repo_path,
             NULLIF(w.metadata->>'repo_path', '') AS metadata_repo_path,
@@ -565,6 +575,12 @@ async fn assigned_work_items(
                 predicted_paths_count: r.try_get("predicted_paths_count").unwrap_or(0),
                 brain_node_ids: jsonb_string_array(&r, "brain_node_ids"),
                 touched_paths: jsonb_string_array(&r, "touched_paths"),
+                context: r
+                    .try_get("context")
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                pre_work: jsonb_string_array(&r, "pre_work"),
+                work: jsonb_string_array(&r, "work"),
+                post_work: jsonb_string_array(&r, "post_work"),
             })
         })
         .collect()
@@ -1415,7 +1431,8 @@ async fn mark_ready_for_review(
         "UPDATE work_items
             SET status = 'in_review',
                 branch_name = $2,
-                pr_url = $3
+                pr_url = $3,
+                cleanup_complete = TRUE
           WHERE id = $1",
     )
     .bind(item.work_item_id)
@@ -2510,12 +2527,38 @@ fn dispatch_prompt(item: &AssignedWorkItem) -> String {
         ),
         _ => String::new(),
     };
+    let phase = |name: &str, steps: &[String]| {
+        if steps.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n{name}:\n{}",
+                steps
+                    .iter()
+                    .map(|s| format!("- {s}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        }
+    };
+    let context = if item.context.as_object().is_some_and(|v| !v.is_empty()) {
+        format!(
+            "\n\nAttached context (treat triggering evidence as authoritative):\n{}",
+            item.context
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "Target repo:\n- project_id: {}\n- repo_url: {}\n- checkout: {}\n\n{}{}{}",
+        "Target repo:\n- project_id: {}\n- repo_url: {}\n- checkout: {}\n\n{}{}{}{}{}{}{}",
         item.project_id,
         item.repo_url.as_deref().unwrap_or("unknown"),
         item.repo_path.display(),
         task,
+        context,
+        phase("PRE_WORK — complete before editing", &item.pre_work),
+        phase("WORK — execute in order", &item.work),
+        phase("POST_WORK — complete after implementation", &item.post_work),
         retry_context,
         DISPATCH_HOUSE_RULES,
     )
@@ -4558,10 +4601,11 @@ mod tests {
         AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS, ReviewerStat,
         affected_crate_manifests, agent_output_tail, backend_failed_without_output,
         builder_excludes_480b, classify_dispatch_outcome, command_display, default_clone_path,
-        dispatch_budget_for_host, expand_home, is_build_timeout, order_cloud_reviewers,
-        parse_cli_tokens, primary_or_default_backend, quick_empty_success_is_provider_failure,
-        repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
-        same_model_family, status_output_is_clean, task_failed_alert_text, task_prefers_cloud_lane,
+        dispatch_budget_for_host, dispatch_prompt, expand_home, is_build_timeout,
+        order_cloud_reviewers, parse_cli_tokens, primary_or_default_backend,
+        quick_empty_success_is_provider_failure, repo_cache_path, repo_slug,
+        retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
+        status_output_is_clean, task_failed_alert_text, task_prefers_cloud_lane,
         try_acquire_lane15_480b_permit, use_local_lane,
     };
     use std::path::PathBuf;
@@ -5186,6 +5230,10 @@ mod tests {
             predicted_paths_count: 1,
             brain_node_ids: Vec::new(),
             touched_paths: Vec::new(),
+            context: serde_json::json!({"trigger": {"signature": "abc"}}),
+            pre_work: vec!["reproduce".into()],
+            work: vec!["fix root cause".into()],
+            post_work: vec!["verify signal cleared".into()],
         };
 
         let alert = task_failed_alert_text(&item, "branch: raw-name\nstderr: compile failed");
@@ -5196,6 +5244,14 @@ mod tests {
             alert.find("Last error (diagnostic)").unwrap()
                 < alert.find("IDs (diagnostic)").unwrap()
         );
+
+        let prompt = dispatch_prompt(&item);
+        assert!(prompt.contains("PRE_WORK — complete before editing:\n- reproduce"));
+        assert!(prompt.contains("WORK — execute in order:\n- fix root cause"));
+        assert!(
+            prompt.contains("POST_WORK — complete after implementation:\n- verify signal cleared")
+        );
+        assert!(prompt.contains("\"signature\":\"abc\""));
     }
 
     #[test]

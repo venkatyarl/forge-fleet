@@ -1081,6 +1081,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "slm_health_monitor",
         sql: schema::SCHEMA_V219_SLM_HEALTH_MONITOR,
     },
+    PgMigration {
+        version: 220,
+        name: "autonomous_work_item_loop",
+        sql: schema::SCHEMA_V220_AUTONOMOUS_WORK_ITEM_LOOP,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
