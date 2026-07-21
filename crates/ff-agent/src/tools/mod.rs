@@ -19,6 +19,7 @@ pub mod diff_tool;
 pub mod doc_gen;
 pub mod docker_manage;
 pub mod env_info;
+pub mod fabric_daemon;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;

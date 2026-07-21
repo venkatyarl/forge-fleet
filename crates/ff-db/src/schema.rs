@@ -12028,6 +12028,19 @@ ALTER TABLE fabric_pairs
         GENERATED ALWAYS AS (set_masklen(NULLIF(a_ip, '')::inet, 30)::cidr::text) STORED;
 "#;
 
+/// Alert policy used by the agent fabric daemon when a peer stops answering.
+pub const SCHEMA_V233_FABRIC_LINK_DEAD_ALERT: &str = r#"
+INSERT INTO alert_policies
+    (name, description, metric, scope, condition,
+     duration_secs, severity, cooldown_secs, channel, enabled)
+VALUES
+  ('fabric_link_dead',
+   'A point-to-point fabric peer did not answer its ping probe',
+   'fabric_link_dead', 'any_computer', '> 0',
+   0, 'critical', 3600, 'telegram', true)
+ON CONFLICT (name) DO NOTHING;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

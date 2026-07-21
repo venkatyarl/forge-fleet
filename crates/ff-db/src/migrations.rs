@@ -1146,6 +1146,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "fabric_pair_empty_ip",
         sql: schema::SCHEMA_V232_FABRIC_PAIR_EMPTY_IP,
     },
+    PgMigration {
+        version: 233,
+        name: "fabric_link_dead_alert",
+        sql: schema::SCHEMA_V233_FABRIC_LINK_DEAD_ALERT,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
