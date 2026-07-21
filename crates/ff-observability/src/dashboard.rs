@@ -349,6 +349,7 @@ mod tests {
             role: Role::Leader,
             election_priority: 1,
             status: NodeStatus::Online,
+            is_offline_autonomy_enabled: false,
             hardware: Hardware {
                 os: ff_core::OsType::MacOs,
                 cpu_model: "Apple M4 Max".into(),
