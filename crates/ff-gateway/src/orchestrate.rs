@@ -398,6 +398,7 @@ mod tests {
     fn mock_beat() -> PulseBeatV2 {
         PulseBeatV2 {
             pulse_protocol_version: 2,
+            install_diff: Vec::new(),
             computer_id: Some(Uuid::new_v4()),
             computer_name: "test-node".to_string(),
             timestamp: Utc::now(),
@@ -555,6 +556,7 @@ mod tests {
 
         let nodes = vec![CoreNode {
             id: Uuid::new_v4(),
+            is_offline_autonomy_enabled: false,
             name: "good-node".to_string(),
             host: "192.168.1.101".to_string(),
             port: 55000,

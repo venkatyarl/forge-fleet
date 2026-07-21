@@ -79,6 +79,7 @@ mod tests {
     fn alert(node: &str) -> Alert {
         Alert {
             id: Uuid::new_v4(),
+            last_sent: None,
             rule_id: "node-down".into(),
             severity: AlertSeverity::Critical,
             message: "node is unavailable".into(),
