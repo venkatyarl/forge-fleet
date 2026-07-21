@@ -49,6 +49,7 @@ pub mod send_message;
 pub mod skill_builder;
 pub mod sleep_tool;
 pub mod software_detect;
+pub mod software_upgrade;
 pub mod task_tools;
 pub mod tool_builder;
 pub mod tool_search;
