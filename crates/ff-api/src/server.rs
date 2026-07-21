@@ -22,7 +22,10 @@ use crate::{
     quality_tracker::QualityTracker,
     registry::BackendRegistry,
     router::{ModelRouter, TierRouter},
-    routes::work_queue::{self, WorkQueue},
+    routes::{
+        slm,
+        work_queue::{self, WorkQueue},
+    },
     types::{
         ChatCompletionRequest, ChatMessage, CompletionRequest, HealthResponse, ModelInfo,
         ModelListResponse,
@@ -90,6 +93,7 @@ impl RequestMetrics {
 pub fn build_http_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/slm/status", get(slm::status))
         .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))

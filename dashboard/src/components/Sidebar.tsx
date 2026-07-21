@@ -65,6 +65,7 @@ const mainSections: NavSection[] = [
     items: [
       { to: '/model-hub', label: 'Model Hub', icon: '🏗️' },
       { to: '/models', label: 'Inventory', icon: '📋' },
+      { to: '/slm-status', label: 'SLM Status', icon: '🧠' },
       { to: '/tools', label: 'Tool Inventory', icon: '🛠️' },
       { to: '/llm-proxy', label: 'LLM Proxy', icon: '🔀' },
     ],

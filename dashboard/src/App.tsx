@@ -30,6 +30,7 @@ const Topology = lazyNamed(() => import('./pages/Topology'), 'Topology')
 const MeshStatus = lazyNamed(() => import('./pages/MeshStatus'), 'MeshStatus')
 const ModelHub = lazyNamed(() => import('./pages/ModelHub'), 'ModelHub')
 const ModelInventory = lazyNamed(() => import('./pages/ModelInventory'), 'ModelInventory')
+const SlmStatus = lazyNamed(() => import('./pages/slm-status'), 'SlmStatus')
 const ToolInventory = lazyNamed(() => import('./pages/ToolInventory'), 'ToolInventory')
 const Metrics = lazyNamed(() => import('./pages/Metrics'), 'Metrics')
 const Alerts = lazyNamed(() => import('./pages/Alerts'), 'Alerts')
@@ -123,6 +124,7 @@ const ROUTE_TITLES: Record<string, string> = {
   '/topology': 'Topology',
   '/model-hub': 'Model Hub',
   '/models': 'Model Inventory',
+  '/slm-status': 'SLM Status',
   '/tools': 'Tool Inventory',
   '/metrics': 'Metrics',
   '/alerts': 'Alerts',
@@ -184,6 +186,7 @@ export default function App() {
         <Route path="topology" element={page(Topology)} handle={{ title: 'Topology' }} />
         <Route path="model-hub" element={page(ModelHub)} handle={{ title: 'Model Hub' }} />
         <Route path="models" element={page(ModelInventory)} handle={{ title: 'Model Inventory' }} />
+        <Route path="slm-status" element={page(SlmStatus)} handle={{ title: 'SLM Status' }} />
         <Route path="tools" element={page(ToolInventory)} handle={{ title: 'Tool Inventory' }} />
         <Route path="metrics" element={page(Metrics)} handle={{ title: 'Metrics' }} />
         <Route path="alerts" element={page(Alerts)} handle={{ title: 'Alerts' }} />
