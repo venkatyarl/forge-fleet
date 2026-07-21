@@ -870,6 +870,9 @@ pub async fn secret_peek(
         "anthropic.oauth_token",
         "openai.oauth_token",
         "moonshot.oauth_token",
+        "anthropic.oauth_token.credentials",
+        "openai.oauth_token.credentials",
+        "moonshot.oauth_token.credentials",
     ];
     if !allowed.contains(&q.key.as_str()) {
         return Err((

@@ -461,23 +461,26 @@ if ! run_as_user bash -lc 'command -v kimi >/dev/null 2>&1'; then
   run_as_user bash -lc 'uv tool install kimi-cli' || die "Kimi CLI install failed"
 fi
 
-CLAUDE_TOKEN="$(peek_secret anthropic.oauth_token)"
-CODEX_TOKEN="$(peek_secret openai.oauth_token)"
-KIMI_TOKEN="$(peek_secret moonshot.oauth_token)"
+CLAUDE_CREDENTIALS="$(peek_secret anthropic.oauth_token.credentials)"
+CODEX_CREDENTIALS="$(peek_secret openai.oauth_token.credentials)"
+KIMI_CREDENTIALS="$(peek_secret moonshot.oauth_token.credentials)"
 run_as_user mkdir -p "$USER_HOME/.claude" "$USER_HOME/.codex" "$USER_HOME/.kimi/credentials"
-if [ -n "$CLAUDE_TOKEN" ]; then
-  printf '%s' "$CLAUDE_TOKEN" | python3 -c 'import json,sys; print(json.dumps({"claudeAiOauth":{"accessToken":sys.stdin.read()}}))' \
-    | run_as_user tee "$USER_HOME/.claude/.credentials.json" >/dev/null
+if [ -n "$CLAUDE_CREDENTIALS" ]; then
+  printf '%s' "$CLAUDE_CREDENTIALS" | python3 -m json.tool \
+    | run_as_user tee "$USER_HOME/.claude/.credentials.json" >/dev/null \
+    || die "invalid Claude credentials from fleet_secrets"
   run_as_user chmod 600 "$USER_HOME/.claude/.credentials.json"
 fi
-if [ -n "$CODEX_TOKEN" ]; then
-  printf '%s' "$CODEX_TOKEN" | python3 -c 'import json,sys; print(json.dumps({"tokens":{"access_token":sys.stdin.read()}}))' \
-    | run_as_user tee "$USER_HOME/.codex/auth.json" >/dev/null
+if [ -n "$CODEX_CREDENTIALS" ]; then
+  printf '%s' "$CODEX_CREDENTIALS" | python3 -m json.tool \
+    | run_as_user tee "$USER_HOME/.codex/auth.json" >/dev/null \
+    || die "invalid Codex credentials from fleet_secrets"
   run_as_user chmod 600 "$USER_HOME/.codex/auth.json"
 fi
-if [ -n "$KIMI_TOKEN" ]; then
-  printf '%s' "$KIMI_TOKEN" | python3 -c 'import json,sys; print(json.dumps({"access_token":sys.stdin.read()}))' \
-    | run_as_user tee "$USER_HOME/.kimi/credentials/kimi-code.json" >/dev/null
+if [ -n "$KIMI_CREDENTIALS" ]; then
+  printf '%s' "$KIMI_CREDENTIALS" | python3 -m json.tool \
+    | run_as_user tee "$USER_HOME/.kimi/credentials/kimi-code.json" >/dev/null \
+    || die "invalid Kimi credentials from fleet_secrets"
   run_as_user chmod 600 "$USER_HOME/.kimi/credentials/kimi-code.json"
 fi
 report "cloud_clis" ok "claude, codex, kimi"

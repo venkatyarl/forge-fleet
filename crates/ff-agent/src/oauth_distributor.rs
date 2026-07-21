@@ -277,6 +277,26 @@ pub async fn import_token(pool: &PgPool, provider: &OauthProvider) -> Result<()>
     .await
     .context("write token to fleet_secrets")?;
 
+    // Enrollment needs the complete vendor-owned document (refresh token,
+    // expiry, account metadata, etc.), not a guessed token-only JSON shape.
+    // Keep it beside the extracted bearer token so bootstrap can pull it via
+    // the enrollment-token allowlist without an ad-hoc file copy.
+    let credentials_key = format!("{}.credentials", provider.secret_key);
+    let credentials = std::str::from_utf8(&bytes)
+        .with_context(|| format!("credential document for {} is not UTF-8", provider.name))?;
+    ff_db::pg_set_secret(
+        pool,
+        &credentials_key,
+        credentials,
+        Some(&format!(
+            "Complete OAuth credential document for {} onboarding",
+            provider.name
+        )),
+        Some("ff oauth import"),
+    )
+    .await
+    .context("write credential document to fleet_secrets")?;
+
     info!(
         provider = provider.name,
         "imported OAuth token to fleet_secrets"
