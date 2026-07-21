@@ -1017,10 +1017,61 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
             "work_item_dispatch: self-verify gate rejected the build before PR"
         );
         if self_fix_attempts >= MAX_SELF_FIX_ATTEMPTS {
+            // Final escalation: the primary backend couldn't repair it. Hand the failure to the
+            // idle 480B (the local "intense" tier) before giving up — instead of dying on the
+            // exhausted cloud backstop. Reuses the Lane-1.5 480B permit so ring concurrency stays
+            // bounded. This is the "route self-verify failures to the strongest local coder" fix.
+            if let Some(_permit) = tokio::time::timeout(
+                Duration::from_millis(LANE15_480B_PERMIT_WAIT_MS),
+                crate::dispatch_concurrency::acquire_480b_permit(),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            {
+                info!(
+                    work_item_id = %item.work_item_id,
+                    "work_item_dispatch: self-verify — escalating final repair to the 480B"
+                );
+                let fix_prompt = format!(
+                    "A prior implementation failed the mandatory pre-PR verification gate:\n\n{reason}\n\nFix the failure in this repo now, scoped strictly to the original work item, and leave all edits uncommitted."
+                );
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(LANE1_TIMEOUT_SECS),
+                    crate::codegen_apply::codegen_apply(
+                        &pg,
+                        &worktree.worktree_path,
+                        &fix_prompt,
+                        Some(LANE15_480B_MODEL_HINT),
+                        2,
+                    ),
+                )
+                .await;
+                commit_worktree_changes(
+                    &worktree.worktree_path,
+                    &item.title,
+                    &git_name,
+                    &git_email,
+                )?;
+                if self_verify_worktree(&worktree.worktree_path, &worktree.base_branch)
+                    .await
+                    .is_ok()
+                {
+                    info!(
+                        work_item_id = %item.work_item_id,
+                        "work_item_dispatch: 480B self-verify rescue PASSED — proceeding to PR"
+                    );
+                    break;
+                }
+                warn!(
+                    work_item_id = %item.work_item_id,
+                    "work_item_dispatch: 480B self-verify rescue did not pass — failing"
+                );
+            }
             requeue_or_fail(
                 &pg,
                 &item,
-                &format!("self-verify failed before opening PR after {self_fix_attempts} self-fix attempt(s): {reason}"),
+                &format!("self-verify failed before opening PR after {self_fix_attempts} self-fix attempt(s) + 480B rescue: {reason}"),
             )
             .await?;
             remove_worktree(&item.repo_path, &worktree.worktree_path)?;
