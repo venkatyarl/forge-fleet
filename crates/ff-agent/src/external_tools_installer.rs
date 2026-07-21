@@ -55,8 +55,12 @@ pub struct InstallPlan {
 /// (`"<os_family>-<source>"` / `"<os_family>"` / `"linux"` / `"all"` …).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactCacheSpec {
+    /// Stable key used to find verified copies in `artifact_cache_index`.
+    #[serde(default)]
+    pub artifact_key: Option<String>,
     /// rsync source spec, e.g. `ff@sophie:/srv/ff-artifacts/kimi/kimi-linux-x86_64`.
-    pub source: String,
+    #[serde(default)]
+    pub source: Option<String>,
     /// Expected SHA256 (lowercase hex) of the fetched artifact.
     pub sha256: String,
     /// Install command run after validation; the validated local artifact
@@ -198,6 +202,10 @@ pub async fn resolve_install_plans(
                 // entry for this target, wrap the playbook command so the
                 // WAN download only runs when the cache misses.
                 let cache_spec = resolve_artifact_cache(&metadata, &candidates);
+                let cache_spec = match cache_spec {
+                    Some(spec) => resolve_indexed_cache_source(pool, &name, spec).await,
+                    None => None,
+                };
                 let (command, artifact_cache) = match &cache_spec {
                     Some(spec) => (wrap_with_artifact_cache(tool_id, spec, &command), true),
                     None => (command, false),
@@ -362,7 +370,8 @@ fn resolve_artifact_cache(
         let Some(entry) = cache.get(key) else {
             continue;
         };
-        let (Some(source), Some(sha256), Some(install_cmd)) = (
+        let (artifact_key, source, Some(sha256), Some(install_cmd)) = (
+            entry.get("artifact_key").and_then(|v| v.as_str()),
             entry.get("source").and_then(|v| v.as_str()),
             entry.get("sha256").and_then(|v| v.as_str()),
             entry.get("install_cmd").and_then(|v| v.as_str()),
@@ -370,7 +379,7 @@ fn resolve_artifact_cache(
             continue;
         };
         let sha = sha256.trim().to_ascii_lowercase();
-        if source.is_empty()
+        if (artifact_key.is_none_or(str::is_empty) && source.is_none_or(str::is_empty))
             || install_cmd.is_empty()
             || sha.len() != 64
             || !sha.chars().all(|c| c.is_ascii_hexdigit())
@@ -378,12 +387,50 @@ fn resolve_artifact_cache(
             continue;
         }
         return Some(ArtifactCacheSpec {
-            source: source.to_string(),
+            artifact_key: artifact_key.map(str::to_string),
+            source: source.map(str::to_string),
             sha256: sha,
             install_cmd: install_cmd.to_string(),
         });
     }
     None
+}
+
+/// Resolve the cache source from the fleet index. Prefer a verified path on
+/// the target itself, then another holder over rsync. Lookup failures and
+/// stale/missing entries retain the configured source (if any), allowing the
+/// caller's WAN playbook to remain the final fallback.
+async fn resolve_indexed_cache_source(
+    pool: &PgPool,
+    target: &str,
+    mut spec: ArtifactCacheSpec,
+) -> Option<ArtifactCacheSpec> {
+    if let Some(key) = spec.artifact_key.as_deref() {
+        match ff_db::pg_list_artifact_cache_holders(pool, key, &spec.sha256, None).await {
+            Ok(holders) => {
+                spec.source = indexed_source(target, &holders).or(spec.source);
+            }
+            Err(error) => tracing::warn!(
+                artifact_key = key,
+                %error,
+                "external tool artifact-cache lookup failed; using configured fallback"
+            ),
+        }
+    }
+    spec.source.as_ref()?;
+    Some(spec)
+}
+
+fn indexed_source(target: &str, holders: &[ff_db::ArtifactCacheHolderRow]) -> Option<String> {
+    let holder = holders
+        .iter()
+        .find(|holder| holder.computer.eq_ignore_ascii_case(target))
+        .or_else(|| holders.first())?;
+    Some(if holder.computer.eq_ignore_ascii_case(target) {
+        holder.file_path.clone()
+    } else {
+        format!("{}:{}", holder.computer, holder.file_path)
+    })
 }
 
 /// Wrap a playbook command cache-first. POSIX sh (the defer worker runs
@@ -394,8 +441,8 @@ fn resolve_artifact_cache(
 /// the fetched file and falls back to the original WAN command.
 fn wrap_with_artifact_cache(tool_id: &str, spec: &ArtifactCacheSpec, wan_command: &str) -> String {
     // Basename of the rsync source ("user@host:/a/b/tool.tar.gz" → "tool.tar.gz").
-    let file_name = spec
-        .source
+    let source = spec.source.as_deref().expect("resolved cache source");
+    let file_name = source
         .rsplit('/')
         .next()
         .and_then(|s| s.rsplit(':').next())
@@ -403,7 +450,7 @@ fn wrap_with_artifact_cache(tool_id: &str, spec: &ArtifactCacheSpec, wan_command
         .unwrap_or("artifact");
     let sha = &spec.sha256;
     let q_tool = shell_quote(tool_id);
-    let q_src = shell_quote(&spec.source);
+    let q_src = shell_quote(source);
     let q_file = shell_quote(file_name);
     let hit_msg = shell_quote(&format!(
         "[ff] {tool_id}: artifact cache hit (sha256 ok); installing from cache"
@@ -454,7 +501,8 @@ mod tests {
 
     fn spec() -> ArtifactCacheSpec {
         ArtifactCacheSpec {
-            source: "ff@sophie:/srv/ff-artifacts/crg/crg-linux-x86_64".into(),
+            artifact_key: None,
+            source: Some("ff@sophie:/srv/ff-artifacts/crg/crg-linux-x86_64".into()),
             sha256: "a".repeat(64),
             install_cmd: "install -m 755 \"$FF_ARTIFACT\" ~/.local/bin/crg".into(),
         }
@@ -502,7 +550,7 @@ mod tests {
             "all".to_string(),
         ];
         let got = resolve_artifact_cache(&meta, &candidates).expect("resolves");
-        assert_eq!(got.source, "ff@sophie:/srv/a/tool-linux");
+        assert_eq!(got.source.as_deref(), Some("ff@sophie:/srv/a/tool-linux"));
         assert_eq!(got.sha256, "b".repeat(64));
     }
 
@@ -531,6 +579,47 @@ mod tests {
     }
 
     #[test]
+    fn cache_metadata_accepts_index_key_without_static_source() {
+        let metadata = json!({
+            "artifact_cache": { "all": {
+                "artifact_key": "crg/1.0/linux-x86_64",
+                "sha256": "a".repeat(64),
+                "install_cmd": "install -m 755 \"$FF_ARTIFACT\" ~/.local/bin/crg",
+            } }
+        });
+        let resolved = resolve_artifact_cache(&metadata, &["all".to_string()]).unwrap();
+        assert_eq!(
+            resolved.artifact_key.as_deref(),
+            Some("crg/1.0/linux-x86_64")
+        );
+        assert_eq!(resolved.source, None);
+    }
+
+    #[test]
+    fn indexed_cache_prefers_target_local_copy_then_lan_peer() {
+        let holder = |computer: &str, path: &str| ff_db::ArtifactCacheHolderRow {
+            artifact_key: "crg/1.0/linux-x86_64".into(),
+            computer: computer.into(),
+            file_path: path.into(),
+            size_bytes: 10,
+            checksum: "a".repeat(64),
+        };
+        let holders = vec![
+            holder("sophie", "/cache/crg"),
+            holder("logan", "/local/cache/crg"),
+        ];
+
+        assert_eq!(
+            indexed_source("LOGAN", &holders).as_deref(),
+            Some("/local/cache/crg")
+        );
+        assert_eq!(
+            indexed_source("taylor", &holders).as_deref(),
+            Some("sophie:/cache/crg")
+        );
+    }
+
+    #[test]
     fn wrapped_command_embeds_cache_check_and_wan_fallback() {
         let wrapped = wrap_with_artifact_cache("crg", &spec(), "cargo install crg");
         assert!(wrapped.contains("rsync -a --partial"));
@@ -550,7 +639,7 @@ mod tests {
         let mut s = spec();
         // Local nonexistent source: rsync fails (or rsync itself is
         // missing) → either way the wrapper must take the WAN branch.
-        s.source = cache.path().join("no-such-artifact").display().to_string();
+        s.source = Some(cache.path().join("no-such-artifact").display().to_string());
         s.install_cmd = "echo CACHE_INSTALL_RAN".into();
         let wrapped = wrap_with_artifact_cache("crg", &s, "echo WAN_INSTALL_RAN");
         let out = run_sh(&wrapped, cache.path());
@@ -570,7 +659,7 @@ mod tests {
         std::fs::write(&src, b"artifact-payload").expect("write src");
         let installed = cache.path().join("installed-bin");
         let mut s = spec();
-        s.source = src.display().to_string();
+        s.source = Some(src.display().to_string());
         // sha256 of b"artifact-payload" (printf 'artifact-payload' | sha256sum)
         s.sha256 = "5c6fd60a6ad0ce3fffdf2f2c61fbf1e9677f780c64a1ee33563bb2a40f29ef80".into();
         s.install_cmd = format!(
@@ -597,7 +686,7 @@ mod tests {
         let src = cache.path().join("tool-bin");
         std::fs::write(&src, b"tampered-payload").expect("write src");
         let mut s = spec();
-        s.source = src.display().to_string();
+        s.source = Some(src.display().to_string());
         s.sha256 = "0".repeat(64); // wrong on purpose
         s.install_cmd = "echo CACHE_INSTALL_RAN".into();
         let wrapped = wrap_with_artifact_cache("crg", &s, "echo WAN_INSTALL_RAN");
