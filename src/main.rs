@@ -3375,6 +3375,27 @@ async fn start_pulse_v2_subsystems(
         .with_pg_failover(pg_failover_manager)
         .with_yield_flag(yield_handle);
         handles.push(leader_tick.spawn(15, shutdown_rx.clone()));
+
+        match (
+            std::env::var("FORGEFLEET_GIT_MIRROR_UPSTREAM_URL").ok(),
+            std::env::var("FORGEFLEET_GIT_MIRROR_PATH").ok(),
+        ) {
+            (Some(upstream), Some(path)) if !upstream.is_empty() && !path.is_empty() => {
+                let mirror = ff_agent::ha::mirror_service::MirrorFetchService::new(
+                    ff_agent::ha::mirror_service::MirrorFetchConfig::new(upstream, path),
+                );
+                handles.push(mirror.spawn_on_leader(
+                    pg_pool.clone(),
+                    computer_id,
+                    shutdown_rx.clone(),
+                ));
+                info!("starting subsystem: HA leader git mirror");
+            }
+            (None, None) => {}
+            _ => warn!(
+                "git mirror disabled: set both FORGEFLEET_GIT_MIRROR_UPSTREAM_URL and FORGEFLEET_GIT_MIRROR_PATH"
+            ),
+        }
     } else {
         info!(
             node = %worker_name,

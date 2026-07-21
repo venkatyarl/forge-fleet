@@ -19,8 +19,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use tokio::process::Command;
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, RwLock, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -340,6 +341,20 @@ pub enum MirrorSyncOutcome {
     Fetched,
 }
 
+/// In-process health snapshot for the bare mirror maintenance loop.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MirrorFetchStatus {
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+}
+
+impl MirrorFetchStatus {
+    pub fn is_healthy(&self) -> bool {
+        self.last_success_at.is_some() && self.last_error.is_none()
+    }
+}
+
 /// Cloneable handle that lets a webhook endpoint request an immediate mirror
 /// refresh without waiting for the next periodic tick.
 ///
@@ -368,6 +383,7 @@ impl MirrorFetchTrigger {
 pub struct MirrorFetchService {
     config: MirrorFetchConfig,
     trigger: Arc<Notify>,
+    status: Arc<RwLock<MirrorFetchStatus>>,
 }
 
 impl MirrorFetchService {
@@ -375,6 +391,7 @@ impl MirrorFetchService {
         Self {
             config,
             trigger: Arc::new(Notify::new()),
+            status: Arc::new(RwLock::new(MirrorFetchStatus::default())),
         }
     }
 
@@ -389,8 +406,27 @@ impl MirrorFetchService {
         self.config.mirror_path.join("HEAD").is_file()
     }
 
+    /// Return the latest sync attempt, success, and error state.
+    pub async fn status(&self) -> MirrorFetchStatus {
+        self.status.read().await.clone()
+    }
+
     /// Create the mirror if missing, otherwise fetch all refs from upstream.
     pub async fn sync_once(&self) -> Result<MirrorSyncOutcome> {
+        self.status.write().await.last_attempt_at = Some(Utc::now());
+        let result = self.sync_once_inner().await;
+        let mut status = self.status.write().await;
+        match &result {
+            Ok(_) => {
+                status.last_success_at = Some(Utc::now());
+                status.last_error = None;
+            }
+            Err(error) => status.last_error = Some(error.to_string()),
+        }
+        result
+    }
+
+    async fn sync_once_inner(&self) -> Result<MirrorSyncOutcome> {
         if !self.mirror_exists() {
             self.clone_mirror().await?;
             return Ok(MirrorSyncOutcome::Cloned);
@@ -497,6 +533,52 @@ impl MirrorFetchService {
                             "mirror_service: mirror sync failed"
                         );
                     }
+                }
+            }
+        })
+    }
+
+    /// Spawn the loop, syncing only while this computer owns the authoritative
+    /// fleet leader lease. Leadership is checked immediately before each sync.
+    pub fn spawn_on_leader(
+        self,
+        pg: sqlx::PgPool,
+        computer_id: uuid::Uuid,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(self.config.fetch_interval.max(Duration::from_secs(1)));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = self.trigger.notified() => ticker.reset(),
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() { break; }
+                        continue;
+                    }
+                }
+
+                match ff_db::leader_state::pg_get_current_leader(&pg).await {
+                    Ok(Some(leader)) if leader.computer_id == computer_id => {
+                        if let Err(error) = self.sync_once().await {
+                            warn!(
+                                mirror = %self.config.mirror_path.display(),
+                                error = %error,
+                                "mirror_service: leader mirror sync failed"
+                            );
+                        }
+                    }
+                    Ok(_) => tracing::debug!(
+                        mirror = %self.config.mirror_path.display(),
+                        "mirror_service: skipping sync on follower"
+                    ),
+                    Err(error) => warn!(
+                        error = %error,
+                        "mirror_service: could not verify leader; skipping sync"
+                    ),
                 }
             }
         })
@@ -648,6 +730,12 @@ mod tests {
 
         let outcome = rt.block_on(service.sync_once()).expect("fetch pass");
         assert_eq!(outcome, MirrorSyncOutcome::Fetched);
+
+        let status = rt.block_on(service.status());
+        assert!(status.is_healthy());
+        assert!(status.last_attempt_at.is_some());
+        assert!(status.last_success_at.is_some());
+        assert!(status.last_error.is_none());
 
         let head_of = |repo: &Path| -> String {
             let out = std::process::Command::new("git")
