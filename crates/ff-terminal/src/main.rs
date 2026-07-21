@@ -5983,14 +5983,13 @@ async fn run_tui(config: AgentSessionConfig) -> Result<()> {
     // Async fleet health check on startup
     check_fleet_health(&mut app).await;
 
-    // Pre-load three-brain memory context
-    let brain_ctx = ff_agent::brain::BrainLoader::load_for_dir(&config.working_dir).await;
-    app.brain_status = Some(ff_agent::brain::BrainLoadedStatus::from(&brain_ctx));
-
-    // Initialize Hive Mind
+    // Sync Hive Mind before loading memory so the first prompt sees the latest
+    // shared learnings. Offline and unconfigured installs remain non-blocking.
     let hive = ff_agent::hive_sync::HiveSync::new();
     hive.ensure_initialized().await;
     let sync_result = hive.pull().await;
+    let brain_ctx = ff_agent::brain::BrainLoader::load_for_dir(&config.working_dir).await;
+    app.brain_status = Some(ff_agent::brain::BrainLoadedStatus::from(&brain_ctx));
     if let Some(status) = &mut app.brain_status {
         status.hive_synced_at = sync_result.last_sync_at;
     }

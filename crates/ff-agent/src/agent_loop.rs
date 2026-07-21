@@ -466,6 +466,9 @@ impl AgentSession {
 
         // Load three-brain memory and inject into system prompt (first turn only)
         if self.turn_count == 0 {
+            let hive = crate::hive_sync::HiveSync::new();
+            hive.ensure_initialized().await;
+            hive.pull().await;
             let brain_ctx = crate::brain::BrainLoader::load_for_dir(&self.config.working_dir).await;
             let injection = crate::brain::BrainLoader::build_injection(&brain_ctx, 3000);
             if !injection.is_empty()

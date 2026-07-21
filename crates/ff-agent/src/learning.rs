@@ -408,6 +408,9 @@ async fn write_to_hive(entry: &MemoryEntry) -> anyhow::Result<()> {
 }
 
 async fn write_entry(path: &Path, entry: &MemoryEntry) -> anyhow::Result<()> {
+    static WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = WRITE_LOCK.lock().await;
+
     // Ensure parent dir exists
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
@@ -436,7 +439,9 @@ async fn write_entry(path: &Path, entry: &MemoryEntry) -> anyhow::Result<()> {
 
     // Write back
     let json = serde_json::to_string_pretty(&entries)?;
-    fs::write(path, json).await?;
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, json).await?;
+    fs::rename(tmp_path, path).await?;
     Ok(())
 }
 

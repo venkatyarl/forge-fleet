@@ -8,7 +8,9 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use tokio::fs;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+const HIVE_REMOTE_ENV: &str = "FORGEFLEET_HIVE_REMOTE_URL";
 
 /// Result of a hive sync operation.
 #[derive(Debug, Clone, Default)]
@@ -41,10 +43,6 @@ impl HiveSync {
 
     /// Ensure hive directory exists with starter files.
     pub async fn ensure_initialized(&self) {
-        if self.local_path.exists() {
-            return;
-        }
-
         let _ = fs::create_dir_all(&self.local_path).await;
 
         // Create starter HIVE.md
@@ -77,6 +75,30 @@ impl HiveSync {
                 .status()
                 .await;
             debug!(path = %self.local_path.display(), "initialized hive git repo");
+        }
+
+        // A remote is optional so offline/single-node installs continue to work.
+        // When configured, also repair old stub directories that were created
+        // without an origin.
+        if let Ok(remote_url) = std::env::var(HIVE_REMOTE_ENV)
+            && !remote_url.trim().is_empty()
+        {
+            let has_origin = tokio::process::Command::new("git")
+                .args(["remote", "get-url", "origin"])
+                .current_dir(&self.local_path)
+                .output()
+                .await
+                .is_ok_and(|output| output.status.success());
+            if !has_origin {
+                let result = tokio::process::Command::new("git")
+                    .args(["remote", "add", "origin", remote_url.trim()])
+                    .current_dir(&self.local_path)
+                    .output()
+                    .await;
+                if !result.is_ok_and(|output| output.status.success()) {
+                    warn!("failed to configure Hive Mind origin from {HIVE_REMOTE_ENV}");
+                }
+            }
         }
 
         info!("hive mind initialized at {}", self.local_path.display());
@@ -151,18 +173,29 @@ impl HiveSync {
         }
 
         // Stage, commit, push
-        let _ = tokio::process::Command::new("git")
+        let staged = tokio::process::Command::new("git")
             .args(["add", "."])
             .current_dir(&self.local_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
-            .await;
+            .await
+            .is_ok_and(|status| status.success());
+        if !staged {
+            return false;
+        }
 
-        let _ = tokio::process::Command::new("git")
+        let committed = tokio::process::Command::new("git")
             .args(["commit", "-m", "hive: auto-sync learnings"])
             .current_dir(&self.local_path)
             .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
-            .await;
+            .await
+            .is_ok_and(|status| status.success());
+        if !committed {
+            return false;
+        }
 
         let result = tokio::process::Command::new("git")
             .args(["push", "origin", "main"])
@@ -182,13 +215,18 @@ impl HiveSync {
     /// Auto-sync: pull then push if there are local changes.
     /// Called after learning extraction adds new hive entries.
     pub async fn auto_sync(&self) -> SyncResult {
+        self.ensure_initialized().await;
+
         // Pull first to get latest
         let pull_result = self.pull().await;
 
         // Check if there are local changes to push
         if self.has_local_changes().await {
-            self.push().await;
-            info!("hive mind auto-synced (pushed local learnings)");
+            if self.push().await {
+                info!("hive mind auto-synced (pushed local learnings)");
+            } else {
+                debug!("hive mind has local learnings that could not be pushed");
+            }
         }
 
         pull_result
@@ -205,5 +243,31 @@ impl HiveSync {
             Ok(output) => !output.stdout.is_empty(),
             Err(_) => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initialization_repairs_an_existing_empty_stub_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_path = temp.path().join("hive");
+        fs::create_dir(&local_path).await.unwrap();
+        let hive = HiveSync {
+            local_path: local_path.clone(),
+        };
+
+        hive.ensure_initialized().await;
+
+        assert!(local_path.join("HIVE.md").is_file());
+        assert_eq!(
+            fs::read_to_string(local_path.join("learnings.json"))
+                .await
+                .unwrap(),
+            "[]"
+        );
+        assert!(local_path.join(".git").is_dir());
     }
 }
