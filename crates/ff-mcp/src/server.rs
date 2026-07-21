@@ -345,6 +345,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tools_list_includes_pm_tools() {
+        let server = McpServer::new();
+        let req = make_request("tools/list", None);
+        let resp = server.handle_request(req).await.unwrap();
+        let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+        let names: Vec<_> = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+
+        for name in ["pm_board", "pm_claim", "pm_create", "pm_list", "pm_ready"] {
+            assert!(names.contains(&name), "missing PM MCP tool: {name}");
+        }
+    }
+
+    #[tokio::test]
     async fn affected_flows_dispatches_to_cortex_handler() {
         let server = McpServer::new();
         let req = make_request(
