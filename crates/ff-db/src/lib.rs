@@ -8,9 +8,6 @@
 //! - **runtime_registry** — Postgres runtime node + enrollment tables
 //! - **operational_store** — Postgres operational tables
 
-use chrono::{DateTime, NaiveDate, Utc};
-use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 pub mod dsn_of_record;
@@ -30,6 +27,7 @@ pub use leader_state::*;
 
 pub use metrics_partitions::{pg_drop_expired_metrics_partitions, pg_ensure_metrics_partitions};
 pub use migrations::run_postgres_migrations;
+pub use models::WorkItem;
 pub use operational_store::OperationalStore;
 pub use queries::{
     AgentReadinessRow,
@@ -333,46 +331,6 @@ pub mod error {
 }
 
 pub use error::Result;
-
-/// Typed representation of a canonical `work_items` row.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct WorkItem {
-    pub id: Uuid,
-    pub project_id: String,
-    pub milestone_id: Option<Uuid>,
-    pub parent_id: Option<Uuid>,
-    pub kind: String,
-    pub title: String,
-    pub description: Option<String>,
-    pub labels: JsonValue,
-    pub status: String,
-    pub priority: String,
-    pub assigned_to: Option<String>,
-    pub assigned_computer: Option<String>,
-    pub branch_name: Option<String>,
-    pub pr_url: Option<String>,
-    pub brain_node_ids: JsonValue,
-    pub created_at: DateTime<Utc>,
-    pub created_by: String,
-    pub started_at: Option<DateTime<Utc>>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub due_date: Option<NaiveDate>,
-    pub estimated_hours: Option<f64>,
-    pub metadata: JsonValue,
-    pub required_capabilities: JsonValue,
-    pub complexity: String,
-    pub predicted_paths: JsonValue,
-    pub touched_paths: JsonValue,
-    pub base_branch: Option<String>,
-    pub base_sha: Option<String>,
-    pub integration_branch: Option<String>,
-    pub merge_rank: Option<i32>,
-    pub risk_score: f32,
-    pub reviewer_required: bool,
-    pub attempts: i32,
-    pub last_error: Option<String>,
-    pub context: JsonValue,
-}
 
 /// Lightweight Postgres client for `work_items` access patterns.
 #[derive(Debug, Clone)]
