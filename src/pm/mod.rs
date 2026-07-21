@@ -82,6 +82,10 @@ pub struct WorkItem {
     pub created_at: DateTime<Utc>,
     pub blocked_by_count: usize,
     pub required_capabilities: HashSet<String>,
+    pub eisenhower_quadrant: Quadrant,
+    pub numeric_priority: i32,
+    pub pick_score: f64,
+    pub capability_tags: HashSet<String>,
     /// Self-improvement tracking: coarse project health/status bucket the item
     /// belongs to (e.g. "green", "yellow", "red"). Optional so legacy items
     /// without a status still deserialize.
@@ -246,6 +250,10 @@ mod tests {
             created_at: Utc::now() - Duration::hours(age_hours),
             blocked_by_count: blockers,
             required_capabilities: caps.iter().map(|s| s.to_string()).collect(),
+            eisenhower_quadrant: quadrant,
+            numeric_priority: priority,
+            pick_score: 0.0,
+            capability_tags: caps.iter().map(|s| s.to_string()).collect(),
             project_status: None,
             improvement_count: 0,
             performance_score: None,
