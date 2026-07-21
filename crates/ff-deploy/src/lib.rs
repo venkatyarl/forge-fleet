@@ -11,6 +11,8 @@
 pub mod config;
 pub mod daemon;
 pub mod deploy;
+#[cfg(test)]
+mod deploy_tests;
 pub mod deployer;
 pub mod git_utils;
 pub mod health_gate;
