@@ -1,0 +1,24 @@
+name: Schema Compatibility
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  schema_compat:
+    name: Verify PulseBeatV2 schema compatibility
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Run workspace tests
+        run: cargo test --workspace
