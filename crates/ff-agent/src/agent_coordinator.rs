@@ -27,7 +27,8 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -100,6 +101,142 @@ pub struct WorkerSlot {
     pub slot: i32,
 }
 
+/// Fleet connectivity as observed by the coordinator. Drives the
+/// auto-degrade state machine: on [`ConnectionState::Degraded`] or
+/// [`ConnectionState::Offline`] the coordinator flips into
+/// [`CoordinatorMode::Local`] — LLM calls route to the [`LocalLlmRouter`]
+/// (a node-local inference server) and outbound actions are buffered in the
+/// [`LocalOutbox`] instead of hitting the (unreachable) fleet control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    Online,
+    Degraded,
+    Offline,
+}
+
+impl ConnectionState {
+    /// True when connectivity is insufficient for normal fleet dispatch and
+    /// the coordinator must fall back to node-local operation.
+    fn is_impaired(self) -> bool {
+        matches!(self, ConnectionState::Degraded | ConnectionState::Offline)
+    }
+}
+
+/// Operating mode of the coordinator. `Normal` = full fleet dispatch (pick a
+/// remote slot, discover a remote LLM via Pulse). `Local` = degraded/offline
+/// fallback: route LLM calls to the node-local [`LocalLlmRouter`] and defer
+/// fleet-bound actions to the [`LocalOutbox`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinatorMode {
+    Normal,
+    Local,
+}
+
+impl CoordinatorMode {
+    fn as_u8(self) -> u8 {
+        match self {
+            CoordinatorMode::Normal => 0,
+            CoordinatorMode::Local => 1,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => CoordinatorMode::Local,
+            _ => CoordinatorMode::Normal,
+        }
+    }
+}
+
+/// Pure transition rule: which mode a given connectivity state implies.
+/// Kept free-standing so the state machine's core decision is unit-testable
+/// without a live `PgPool`/`PulseReader`.
+fn target_mode_for(state: ConnectionState) -> CoordinatorMode {
+    if state.is_impaired() {
+        CoordinatorMode::Local
+    } else {
+        CoordinatorMode::Normal
+    }
+}
+
+/// An action that could not be delivered to the fleet while impaired.
+/// Buffered in the [`LocalOutbox`] and handed back for replay onto the fleet
+/// once connectivity returns.
+#[derive(Debug, Clone)]
+pub struct PendingAction {
+    pub work_item_id: Uuid,
+    pub prompt: String,
+    pub queued_at: chrono::DateTime<Utc>,
+}
+
+/// In-memory buffer of actions deferred while the coordinator is running in
+/// [`CoordinatorMode::Local`]. FIFO: [`LocalOutbox::drain`] returns actions
+/// oldest-first so a recovery replay preserves submission order.
+#[derive(Debug, Default)]
+pub struct LocalOutbox {
+    pending: Mutex<Vec<PendingAction>>,
+}
+
+impl LocalOutbox {
+    /// Buffer one action.
+    pub fn push(&self, action: PendingAction) {
+        if let Ok(mut q) = self.pending.lock() {
+            q.push(action);
+        }
+    }
+
+    /// Number of buffered actions.
+    pub fn len(&self) -> usize {
+        self.pending.lock().map(|q| q.len()).unwrap_or(0)
+    }
+
+    /// True when nothing is buffered.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Remove and return all buffered actions (oldest first).
+    pub fn drain(&self) -> Vec<PendingAction> {
+        self.pending
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default()
+    }
+}
+
+/// Routes LLM calls to a node-local inference server while the coordinator is
+/// degraded/offline. Unlike the fleet path (which discovers a remote server
+/// via Pulse beats in [`AgentCoordinator::pick_llm_server_for`]), this always
+/// targets a loopback endpoint on the current machine so work can continue
+/// without the fleet control plane.
+#[derive(Debug, Clone)]
+pub struct LocalLlmRouter {
+    endpoint: String,
+}
+
+impl LocalLlmRouter {
+    /// Default loopback endpoint (the local `llama-server` / `mlx_lm.server`
+    /// port convention used elsewhere in ff-agent's model runtime).
+    pub const DEFAULT_ENDPOINT: &'static str = "http://127.0.0.1:51001/v1/chat/completions";
+
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+        }
+    }
+
+    /// The chat-completions endpoint LLM calls route to while impaired.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+}
+
+impl Default for LocalLlmRouter {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_ENDPOINT)
+    }
+}
+
 /// Fleet-wide agent coordinator. Cheap to clone (holds `Arc`s).
 #[derive(Clone)]
 pub struct AgentCoordinator {
@@ -107,6 +244,13 @@ pub struct AgentCoordinator {
     pulse: Arc<PulseReader>,
     http: reqwest::Client,
     upstream_timeout: Duration,
+    /// Auto-degrade state machine state (shared across clones). `mode` holds a
+    /// [`CoordinatorMode`] encoded via [`CoordinatorMode::as_u8`].
+    mode: Arc<AtomicU8>,
+    /// Node-local LLM router used while in [`CoordinatorMode::Local`].
+    local_router: Arc<LocalLlmRouter>,
+    /// Buffer for fleet-bound actions deferred while impaired.
+    outbox: Arc<LocalOutbox>,
 }
 
 impl AgentCoordinator {
@@ -123,7 +267,76 @@ impl AgentCoordinator {
             pulse,
             http,
             upstream_timeout: Duration::from_secs(120),
+            mode: Arc::new(AtomicU8::new(CoordinatorMode::Normal.as_u8())),
+            local_router: Arc::new(LocalLlmRouter::default()),
+            outbox: Arc::new(LocalOutbox::default()),
         }
+    }
+
+    /// Current coordinator mode (cheap, lock-free read).
+    pub fn mode(&self) -> CoordinatorMode {
+        CoordinatorMode::from_u8(self.mode.load(Ordering::Acquire))
+    }
+
+    /// True when the coordinator is running degraded/offline (local mode).
+    pub fn is_local_mode(&self) -> bool {
+        self.mode() == CoordinatorMode::Local
+    }
+
+    /// The node-local LLM router used while impaired.
+    pub fn local_router(&self) -> &LocalLlmRouter {
+        &self.local_router
+    }
+
+    /// The outbox buffering fleet-bound actions deferred while impaired.
+    pub fn outbox(&self) -> &LocalOutbox {
+        &self.outbox
+    }
+
+    /// React to a fleet connectivity change. This is the single entry point
+    /// for the auto-degrade state machine; wire a `ConnectionState` watcher to
+    /// call it on every transition.
+    ///
+    /// * `Degraded` / `Offline` → switch to [`CoordinatorMode::Local`]:
+    ///   subsequent LLM calls route to the [`LocalLlmRouter`] (see
+    ///   [`AgentCoordinator::run_and_persist`]) and callers should push
+    ///   fleet-bound work to the [`LocalOutbox`] via
+    ///   [`AgentCoordinator::defer_action`].
+    /// * `Online` → switch back to [`CoordinatorMode::Normal`] and drain the
+    ///   outbox so the caller can replay buffered actions onto the fleet.
+    ///
+    /// Returns the mode after applying the transition plus any actions drained
+    /// from the outbox on recovery (empty unless we just came back online with
+    /// buffered work). Idempotent: re-notifying the same state is a no-op.
+    pub fn on_connection_state_change(
+        &self,
+        state: ConnectionState,
+    ) -> (CoordinatorMode, Vec<PendingAction>) {
+        let target = target_mode_for(state);
+        let prev = CoordinatorMode::from_u8(self.mode.swap(target.as_u8(), Ordering::AcqRel));
+        if prev != target {
+            tracing::warn!(
+                ?state,
+                from = ?prev,
+                to = ?target,
+                outbox_depth = self.outbox.len(),
+                "agent_coordinator: connection state change → mode transition"
+            );
+        }
+        // On recovery (Local → Normal), hand back buffered work for replay.
+        let drained = if target == CoordinatorMode::Normal && prev == CoordinatorMode::Local {
+            self.outbox.drain()
+        } else {
+            Vec::new()
+        };
+        (target, drained)
+    }
+
+    /// Buffer a fleet-bound action to the local outbox (used while impaired,
+    /// when the fleet is unreachable). Returns the outbox depth after the push.
+    pub fn defer_action(&self, action: PendingAction) -> usize {
+        self.outbox.push(action);
+        self.outbox.len()
     }
 
     /// Find an idle `sub_agents` row. If `target` is `Some(name)`, only
@@ -348,8 +561,18 @@ impl AgentCoordinator {
         prompt: &str,
     ) -> Result<DispatchReceipt, CoordError> {
         // Look up the computer's primary IP + an active LLM server from
-        // Pulse. We pick the server with lowest queue_depth.
-        let (endpoint, model_id) = self.pick_llm_server_for(&slot.computer_name).await?;
+        // Pulse. We pick the server with lowest queue_depth. When the
+        // auto-degrade state machine has flipped us into local mode
+        // (fleet Degraded/Offline), bypass fleet discovery entirely and
+        // route the call to the node-local inference server instead.
+        let (endpoint, model_id) = if self.is_local_mode() {
+            (
+                self.local_router.endpoint().to_string(),
+                "local".to_string(),
+            )
+        } else {
+            self.pick_llm_server_for(&slot.computer_name).await?
+        };
 
         // POST /v1/chat/completions with a minimal OpenAI-shape request.
         let url = ff_core::url::normalize_chat_completions_url(&endpoint);
@@ -840,6 +1063,74 @@ pub async fn list_sub_agents(pool: &PgPool) -> Result<Vec<SubAgentListRow>, Coor
 #[cfg(test)]
 mod tests {
     use super::CoordError;
+    use super::{
+        ConnectionState, CoordinatorMode, LocalLlmRouter, LocalOutbox, PendingAction,
+        target_mode_for,
+    };
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    #[test]
+    fn impaired_states_map_to_local_mode() {
+        assert!(!ConnectionState::Online.is_impaired());
+        assert!(ConnectionState::Degraded.is_impaired());
+        assert!(ConnectionState::Offline.is_impaired());
+
+        assert_eq!(
+            target_mode_for(ConnectionState::Online),
+            CoordinatorMode::Normal
+        );
+        assert_eq!(
+            target_mode_for(ConnectionState::Degraded),
+            CoordinatorMode::Local
+        );
+        assert_eq!(
+            target_mode_for(ConnectionState::Offline),
+            CoordinatorMode::Local
+        );
+    }
+
+    #[test]
+    fn coordinator_mode_u8_roundtrips() {
+        for m in [CoordinatorMode::Normal, CoordinatorMode::Local] {
+            assert_eq!(CoordinatorMode::from_u8(m.as_u8()), m);
+        }
+        // Unknown encodings degrade safely to Normal.
+        assert_eq!(CoordinatorMode::from_u8(7), CoordinatorMode::Normal);
+    }
+
+    #[test]
+    fn local_outbox_buffers_and_drains_fifo() {
+        let ob = LocalOutbox::default();
+        assert!(ob.is_empty());
+        for i in 0..3 {
+            ob.push(PendingAction {
+                work_item_id: Uuid::nil(),
+                prompt: format!("p{i}"),
+                queued_at: Utc::now(),
+            });
+        }
+        assert_eq!(ob.len(), 3);
+
+        let drained = ob.drain();
+        assert_eq!(drained.len(), 3);
+        assert_eq!(drained[0].prompt, "p0");
+        assert_eq!(drained[2].prompt, "p2");
+        // Draining empties the buffer.
+        assert!(ob.is_empty());
+        assert!(ob.drain().is_empty());
+    }
+
+    #[test]
+    fn local_router_defaults_to_loopback() {
+        let r = LocalLlmRouter::default();
+        assert!(r.endpoint().starts_with("http://127.0.0.1"));
+        let custom = LocalLlmRouter::new("http://127.0.0.1:9999/v1/chat/completions");
+        assert_eq!(
+            custom.endpoint(),
+            "http://127.0.0.1:9999/v1/chat/completions"
+        );
+    }
 
     #[test]
     fn transient_errors_are_retryable() {
