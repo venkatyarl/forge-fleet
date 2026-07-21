@@ -1123,7 +1123,7 @@ async fn record_pr_provenance(
                         THEN 'cloud' ELSE 'local' END,
                    $4, NOW(), $5
               FROM work_item_leases l WHERE l.work_item_id = $1
-              ORDER BY l.assigned_at DESC LIMIT 1
+              ORDER BY l.created_at DESC LIMIT 1
             ON CONFLICT (work_item_id) DO UPDATE SET
               builder_model = EXCLUDED.builder_model,
               builder_computer = EXCLUDED.builder_computer,
@@ -1488,7 +1488,7 @@ async fn mark_ready_for_review(
                    CASE WHEN $4 LIKE 'local:%' THEN 'local' ELSE 'cloud' END,
                    $5, NOW(), $6, NOW()
               FROM work_item_leases l WHERE l.work_item_id = $1
-              ORDER BY l.assigned_at DESC LIMIT 1
+              ORDER BY l.created_at DESC LIMIT 1
             ON CONFLICT (work_item_id) DO UPDATE SET
               builder_model = EXCLUDED.builder_model,
               builder_computer = EXCLUDED.builder_computer,
