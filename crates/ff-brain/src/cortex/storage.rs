@@ -795,6 +795,7 @@ impl CortexGraphStore for FalkorCortexGraphStore {
             "{match_clause} {connector} n.project = {project} AND n.node_type STARTS WITH 'code:'{kind_clause} \
              OPTIONAL MATCH (file:CortexNode {{node_type: 'content:file'}})-[:contains*1..]->(n) \
              OPTIONAL MATCH (:CortexNode)-[incoming:calls]->(n) \
+             WHERE incoming.valid_until IS NULL AND incoming.tx_until IS NULL \
              RETURN n.id, n.title, n.node_type, n.start_line, file.path, count(DISTINCT incoming), {score_expr} \
              ORDER BY {score_expr} DESC, count(DISTINCT incoming) DESC, n.title LIMIT {limit}",
             project = cypher_string(corpus_slug),
@@ -830,7 +831,7 @@ impl CortexGraphStore for FalkorCortexGraphStore {
         min_confidence: f32,
     ) -> Result<Vec<SymbolRef>> {
         let cypher = format!(
-            "MATCH (target:CortexNode)<-[e:calls]-(n:CortexNode) WHERE {} AND e.confidence >= {} OPTIONAL MATCH (file:CortexNode {{node_type: 'content:file'}})-[:contains*1..]->(n) RETURN DISTINCT n.id, n.title, n.node_type, n.start_line, file.path ORDER BY n.title",
+            "MATCH (target:CortexNode)<-[e:calls]-(n:CortexNode) WHERE {} AND e.confidence >= {} AND e.valid_until IS NULL AND e.tx_until IS NULL OPTIONAL MATCH (file:CortexNode {{node_type: 'content:file'}})-[:contains*1..]->(n) RETURN DISTINCT n.id, n.title, n.node_type, n.start_line, file.path ORDER BY n.title",
             selector_predicate("target", corpus_slug, symbol),
             min_confidence
         );
@@ -848,7 +849,7 @@ impl CortexGraphStore for FalkorCortexGraphStore {
         min_confidence: f32,
     ) -> Result<Vec<SymbolRef>> {
         let cypher = format!(
-            "MATCH (source:CortexNode)-[e:calls]->(n:CortexNode) WHERE {} AND e.confidence >= {} OPTIONAL MATCH (file:CortexNode {{node_type: 'content:file'}})-[:contains*1..]->(n) RETURN DISTINCT n.id, n.title, n.node_type, n.start_line, file.path ORDER BY n.title",
+            "MATCH (source:CortexNode)-[e:calls]->(n:CortexNode) WHERE {} AND e.confidence >= {} AND e.valid_until IS NULL AND e.tx_until IS NULL OPTIONAL MATCH (file:CortexNode {{node_type: 'content:file'}})-[:contains*1..]->(n) RETURN DISTINCT n.id, n.title, n.node_type, n.start_line, file.path ORDER BY n.title",
             selector_predicate("source", corpus_slug, symbol),
             min_confidence
         );
@@ -868,7 +869,7 @@ impl CortexGraphStore for FalkorCortexGraphStore {
     ) -> Result<Vec<SymbolRef>> {
         let depth = max_depth.clamp(1, 20);
         let cypher = format!(
-            "MATCH p=(target:CortexNode)<-[:calls*1..{depth}]-(n:CortexNode) WHERE {} AND all(e IN relationships(p) WHERE e.confidence >= {}) OPTIONAL MATCH (file:CortexNode {{node_type: 'content:file'}})-[:contains*1..]->(n) RETURN DISTINCT n.id, n.title, n.node_type, n.start_line, file.path ORDER BY n.title",
+            "MATCH p=(target:CortexNode)<-[:calls*1..{depth}]-(n:CortexNode) WHERE {} AND all(e IN relationships(p) WHERE e.confidence >= {} AND e.valid_until IS NULL AND e.tx_until IS NULL) OPTIONAL MATCH (file:CortexNode {{node_type: 'content:file'}})-[:contains*1..]->(n) RETURN DISTINCT n.id, n.title, n.node_type, n.start_line, file.path ORDER BY n.title",
             selector_predicate("target", corpus_slug, symbol),
             min_confidence
         );
@@ -889,7 +890,7 @@ impl CortexGraphStore for FalkorCortexGraphStore {
     ) -> Result<Option<Vec<SymbolRef>>> {
         let depth = max_depth.clamp(1, 20);
         let cypher = format!(
-            "MATCH p=shortestPath((source:CortexNode)-[:calls*1..{depth}]->(target:CortexNode)) WHERE {} AND {} AND all(e IN relationships(p) WHERE e.confidence >= {}) UNWIND nodes(p) AS n OPTIONAL MATCH (file:CortexNode {{node_type: 'content:file'}})-[:contains*1..]->(n) RETURN n.id, n.title, n.node_type, n.start_line, file.path",
+            "MATCH p=shortestPath((source:CortexNode)-[:calls*1..{depth}]->(target:CortexNode)) WHERE {} AND {} AND all(e IN relationships(p) WHERE e.confidence >= {} AND e.valid_until IS NULL AND e.tx_until IS NULL) UNWIND nodes(p) AS n OPTIONAL MATCH (file:CortexNode {{node_type: 'content:file'}})-[:contains*1..]->(n) RETURN n.id, n.title, n.node_type, n.start_line, file.path",
             selector_predicate("source", corpus_slug, from),
             selector_predicate("target", corpus_slug, to),
             min_confidence
@@ -914,7 +915,7 @@ impl CortexGraphStore for FalkorCortexGraphStore {
     ) -> Result<Vec<TestHit>> {
         let depth = max_depth.clamp(1, 20);
         let cypher = format!(
-            "MATCH p=(target:CortexNode)<-[:calls*1..{depth}]-(n:CortexNode) WHERE {} AND n.node_type = 'code:function' AND all(e IN relationships(p) WHERE e.confidence >= {}) OPTIONAL MATCH (file:CortexNode {{node_type: 'content:file'}})-[:contains*1..]->(n) RETURN n.id, n.title, n.start_line, file.path, min(length(p)) ORDER BY min(length(p)), n.title",
+            "MATCH p=(target:CortexNode)<-[:calls*1..{depth}]-(n:CortexNode) WHERE {} AND n.node_type = 'code:function' AND all(e IN relationships(p) WHERE e.confidence >= {} AND e.valid_until IS NULL AND e.tx_until IS NULL) OPTIONAL MATCH (file:CortexNode {{node_type: 'content:file'}})-[:contains*1..]->(n) RETURN n.id, n.title, n.start_line, file.path, min(length(p)) ORDER BY min(length(p)), n.title",
             selector_predicate("target", corpus_slug, symbol),
             min_confidence
         );
@@ -984,7 +985,7 @@ impl CortexGraphStore for FalkorCortexGraphStore {
             .unwrap_or_default();
         let suffix = format!("/{file}");
         let cypher = format!(
-            "MATCH (f:CortexNode)-[:contains*1..]->(n:CortexNode) WHERE f.project = {} AND f.node_type = 'content:file' AND (f.path = {} OR f.path ENDS WITH {}) AND n.node_type STARTS WITH 'code:'{} OPTIONAL MATCH (:CortexNode)-[incoming:calls]->(n) RETURN f.path, n.title, n.node_type, n.start_line, n.end_line, count(DISTINCT incoming) ORDER BY n.start_line, n.title",
+            "MATCH (f:CortexNode)-[:contains*1..]->(n:CortexNode) WHERE f.project = {} AND f.node_type = 'content:file' AND (f.path = {} OR f.path ENDS WITH {}) AND n.node_type STARTS WITH 'code:'{} OPTIONAL MATCH (:CortexNode)-[incoming:calls]->(n) WHERE incoming.valid_until IS NULL AND incoming.tx_until IS NULL RETURN f.path, n.title, n.node_type, n.start_line, n.end_line, count(DISTINCT incoming) ORDER BY n.start_line, n.title",
             cypher_string(corpus_slug),
             cypher_string(file),
             cypher_string(&suffix),

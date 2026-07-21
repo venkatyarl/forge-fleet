@@ -195,11 +195,20 @@ pub fn rank_inference_deployments(
     deployments
 }
 
-/// Whether dispatch should try its 30B local lane before escalating.
+/// Whether dispatch should try its local coder lane before escalating to cloud.
+/// Local lane is heartbeat-safe since #62/#792 (codegen_apply moved blocking git/fs/verify
+/// off the async runtime via spawn_blocking), so the old "one try then cloud" cloud-bias is
+/// obsolete: keep capable local coders (Devstral) working for up to LOCAL_LANE_MAX_TRIES
+/// attempts before overflowing to rate-limited cloud. Cloud stays the backstop for tasks
+/// explicitly complexity-routed to it (prefers_cloud capability tag) and for the tail beyond this.
 pub fn use_local_30b(requirements: &TaskRequirements, config: &PolicyConfig) -> bool {
-    requirements.prior_failure_count == 0
+    requirements.prior_failure_count < LOCAL_LANE_MAX_TRIES
         && tier_allowed(RoutingTier::Local30B, requirements, config)
 }
+
+/// Number of local-coder attempts before dispatch escalates to the cloud lane. Was implicitly 1
+/// (`== 0`) as a workaround for the local lane starving the async heartbeat (#62) — now fixed.
+pub const LOCAL_LANE_MAX_TRIES: u32 = 3;
 
 /// Rank cloud CLI backends using the council-approved score.
 pub fn rank_cloud_backends(
@@ -518,11 +527,18 @@ mod tests {
         let config = PolicyConfig::default();
         let first = TaskRequirements::default();
         assert!(use_local_30b(&first, &config));
-        let retry = TaskRequirements {
+        // local lane is heartbeat-safe now (#62/#792): stays local for LOCAL_LANE_MAX_TRIES...
+        let one_retry = TaskRequirements {
             prior_failure_count: 1,
-            ..first
+            ..TaskRequirements::default()
         };
-        assert!(!use_local_30b(&retry, &config));
+        assert!(use_local_30b(&one_retry, &config));
+        // ...then escalates to cloud past the local-try budget.
+        let exhausted = TaskRequirements {
+            prior_failure_count: LOCAL_LANE_MAX_TRIES,
+            ..TaskRequirements::default()
+        };
+        assert!(!use_local_30b(&exhausted, &config));
     }
 
     #[test]
