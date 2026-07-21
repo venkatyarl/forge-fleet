@@ -82,6 +82,12 @@ impl TickRegistry {
                 runner: run_metrics_scraper_tick,
             },
             TickDefinition {
+                name: "service_connectivity",
+                interval: Duration::from_secs(300),
+                scope: TickScope::EveryNode,
+                runner: run_service_connectivity_tick,
+            },
+            TickDefinition {
                 name: "session_transcript_export",
                 interval: Duration::from_secs(300),
                 scope: TickScope::EveryNode,
@@ -256,6 +262,32 @@ fn run_metrics_scraper_tick(pg: PgPool, worker_name: String) -> BoxFuture<'stati
             .await
             .map(|_| ())
             .map_err(anyhow::Error::from)
+    })
+}
+
+fn run_service_connectivity_tick(
+    pg: PgPool,
+    worker_name: String,
+) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        static HTTP: std::sync::LazyLock<reqwest::Client> =
+            std::sync::LazyLock::new(reqwest::Client::new);
+        let config = dirs::home_dir()
+            .map(|home| home.join(".forgefleet/fleet.toml"))
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|contents| toml::from_str(&contents).ok())
+            .unwrap_or_default();
+
+        crate::service_connectivity::check_and_persist(
+            &pg,
+            &worker_name,
+            &config,
+            &HTTP,
+            Duration::from_secs(3),
+        )
+        .await
+        .map(|_| ())
+        .map_err(anyhow::Error::from)
     })
 }
 

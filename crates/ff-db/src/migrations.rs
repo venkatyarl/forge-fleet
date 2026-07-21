@@ -1086,6 +1086,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "autonomous_work_item_loop",
         sql: schema::SCHEMA_V220_AUTONOMOUS_WORK_ITEM_LOOP,
     },
+    PgMigration {
+        version: 221,
+        name: "service_connectivity_status",
+        sql: schema::SCHEMA_V221_SERVICE_CONNECTIVITY_STATUS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

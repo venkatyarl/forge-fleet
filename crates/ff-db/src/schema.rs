@@ -11728,6 +11728,21 @@ CREATE INDEX IF NOT EXISTS idx_work_items_open_signal
     WHERE signal_cleared IS NOT TRUE;
 "#;
 
+/// Latest bounded dependency probe reported by each fleet computer.
+pub const SCHEMA_V221_SERVICE_CONNECTIVITY_STATUS: &str = r#"
+CREATE TABLE IF NOT EXISTS service_connectivity_status (
+    computer_id UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    service TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('healthy', 'unavailable', 'unconfigured')),
+    latency_ms BIGINT,
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (computer_id, service)
+);
+
+CREATE INDEX IF NOT EXISTS idx_service_connectivity_status_checked_at
+    ON service_connectivity_status (checked_at DESC);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

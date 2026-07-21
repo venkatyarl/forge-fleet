@@ -3,6 +3,7 @@
 use ff_core::config::FleetConfig;
 use futures::future::join_all;
 use serde::Serialize;
+use sqlx::PgPool;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -11,6 +12,16 @@ pub enum ConnectivityStatus {
     Healthy,
     Unavailable,
     Unconfigured,
+}
+
+impl ConnectivityStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Unavailable => "unavailable",
+            Self::Unconfigured => "unconfigured",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -136,17 +147,14 @@ pub async fn check_services(
         .await
     };
 
-    let nats = if let Some(url) = first_env(&["FORGEFLEET_NATS_URL"]) {
-        bounded("nats".into(), timeout, async {
-            let Ok(client) = async_nats::connect(url).await else {
-                return false;
-            };
-            client.flush().await.is_ok()
-        })
-        .await
-    } else {
-        ConnectivityCheck::unconfigured("nats")
-    };
+    let nats_url = crate::nats_client::resolve_nats_url();
+    let nats = bounded("nats".into(), timeout, async {
+        let Ok(client) = async_nats::connect(nats_url).await else {
+            return false;
+        };
+        client.flush().await.is_ok()
+    })
+    .await;
 
     let llms = join_all(config.llm.ports.iter().copied().map(|port| async move {
         let service = format!("llm:{port}");
@@ -178,6 +186,45 @@ pub async fn check_services(
     checks
 }
 
+/// Run this node's probes and retain one current, sanitized result per service.
+pub async fn check_and_persist(
+    pg: &PgPool,
+    worker_name: &str,
+    config: &FleetConfig,
+    http: &reqwest::Client,
+    timeout: Duration,
+) -> Result<usize, sqlx::Error> {
+    let checks = check_services(config, http, timeout).await;
+    let mut tx = pg.begin().await?;
+    let mut written = 0;
+
+    for check in checks {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO service_connectivity_status
+                (computer_id, service, status, latency_ms, checked_at)
+            SELECT id, $2, $3, $4, NOW()
+              FROM computers
+             WHERE LOWER(name) = LOWER($1)
+            ON CONFLICT (computer_id, service) DO UPDATE SET
+                status = EXCLUDED.status,
+                latency_ms = EXCLUDED.latency_ms,
+                checked_at = EXCLUDED.checked_at
+            "#,
+        )
+        .bind(worker_name)
+        .bind(&check.service)
+        .bind(check.status.as_str())
+        .bind(check.latency_ms.map(|value| value as i64))
+        .execute(&mut *tx)
+        .await?;
+        written += result.rows_affected() as usize;
+    }
+
+    tx.commit().await?;
+    Ok(written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +234,7 @@ mod tests {
         let check = ConnectivityCheck::unconfigured("github");
         assert_eq!(check.status, ConnectivityStatus::Unconfigured);
         assert_eq!(check.latency_ms, None);
+        assert_eq!(check.status.as_str(), "unconfigured");
     }
 
     #[tokio::test]
