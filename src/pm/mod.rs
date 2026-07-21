@@ -6,34 +6,10 @@
 //! load `WorkItem` / `Slot` rows and pass them to [`scheduler_tick`].
 
 use chrono::{DateTime, Utc};
+pub use ff_core::schema::work_items::Quadrant;
 use std::collections::HashSet;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
-
-/// Eisenhower-style quadrant used for coarse scheduling priority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Quadrant {
-    /// Urgent + important: do first.
-    Q1,
-    /// Important but not urgent: plan.
-    Q2,
-    /// Urgent but not important: delegate if possible.
-    Q3,
-    /// Neither urgent nor important: defer.
-    Q4,
-}
-
-impl Quadrant {
-    /// Base score contribution; higher is picked sooner.
-    pub fn base_score(&self) -> f64 {
-        match self {
-            Self::Q1 => 1000.0,
-            Self::Q2 => 750.0,
-            Self::Q3 => 500.0,
-            Self::Q4 => 250.0,
-        }
-    }
-}
 
 /// Priority level 1 (critical) through 5 (minimal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
