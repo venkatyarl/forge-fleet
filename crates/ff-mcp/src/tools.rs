@@ -99,6 +99,7 @@ impl ToolRegistry {
         self.register(Self::fabric_topology());
         self.register(Self::pm_board());
         self.register(Self::pm_claim());
+        self.register(Self::pm_create());
 
         // ── Virtual Brain tools ─────────────────────────────────────────
         self.register(Self::brain_search());
@@ -230,6 +231,36 @@ impl ToolRegistry {
                     }
                 },
                 "required": ["work_item_id", "agent"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn pm_create() -> ToolDefinition {
+        ToolDefinition {
+            name: "pm_create".to_string(),
+            description: "Create a Mission Control project-management work item.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Work item title"
+                    },
+                    "description": {
+                        "type": "string",
+                        "default": "",
+                        "description": "Detailed work item description"
+                    },
+                    "priority": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5,
+                        "description": "Priority from 1 (critical) to 5 (low); defaults to 3"
+                    }
+                },
+                "required": ["title"],
                 "additionalProperties": false
             }),
         }
@@ -1873,6 +1904,7 @@ mod tests {
             "fabric_topology",
             "pm_board",
             "pm_claim",
+            "pm_create",
             // Virtual Brain
             "brain_search",
             "brain_vault_read",
