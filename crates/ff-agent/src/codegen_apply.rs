@@ -19,6 +19,42 @@ pub struct CodegenOutcome {
     pub rounds: u32,
     pub final_diff: Option<String>,
     pub error: Option<String>,
+    /// The model reported the task is ALREADY implemented / no change needed (it inspected the
+    /// repo, often ran the tests, and produced no edits on purpose). The caller should mark the
+    /// work_item done — NOT fail-retry — so an already-satisfied task drains instead of thrashing.
+    pub already_done: bool,
+}
+
+/// Heuristic: a no-edit-blocks model response that AFFIRMATIVELY states the work is already
+/// present / needs no change (as opposed to a confused/empty response). Deliberately requires a
+/// completion phrase AND a no-change phrase to avoid false positives on genuine failures.
+fn response_reports_already_done(text: &str) -> bool {
+    let t = text.to_lowercase();
+    let completion = [
+        "already implemented",
+        "already fully implemented",
+        "already exists",
+        "already present",
+        "already landed",
+        "no changes needed",
+        "no change needed",
+        "no changes are needed",
+        "nothing to commit",
+        "already done",
+        "already satisfied",
+    ];
+    let corroborating = [
+        "working tree",
+        "tests pass",
+        "test pass",
+        "cargo check",
+        "already an ancestor",
+        "no edits",
+        "no changes were made",
+        "out of scope",
+        "commit ",
+    ];
+    completion.iter().any(|p| t.contains(p)) && corroborating.iter().any(|p| t.contains(p))
 }
 
 pub async fn codegen_apply(
@@ -65,6 +101,22 @@ pub async fn codegen_apply(
         let edits = match parse_edit_blocks(&response.text) {
             Ok(edits) if !edits.is_empty() => edits,
             Ok(_) => {
+                // No edit blocks. If the model affirmatively reports the task is ALREADY done
+                // (feature exists, tests pass, nothing to commit), that's a legitimate terminal
+                // success — mark done so the caller drains it, instead of retrying to no end.
+                if response_reports_already_done(&response.text) {
+                    info!(
+                        round,
+                        "codegen: model reports task already implemented — no changes needed (marking done)"
+                    );
+                    return Ok(CodegenOutcome {
+                        applied: false,
+                        rounds,
+                        final_diff: None,
+                        error: None,
+                        already_done: true,
+                    });
+                }
                 let err = "model response did not contain any edit blocks".to_string();
                 warn!(round, error = %err, "codegen response rejected");
                 last_edits = None;
@@ -180,6 +232,7 @@ pub async fn codegen_apply(
             rounds,
             final_diff: Some(edit_summary),
             error: None,
+            already_done: false,
         });
     }
 
@@ -188,6 +241,7 @@ pub async fn codegen_apply(
         rounds,
         final_diff: None,
         error: last_error,
+        already_done: false,
     })
 }
 

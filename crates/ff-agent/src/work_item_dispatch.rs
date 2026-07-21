@@ -2244,7 +2244,8 @@ async fn requeue_or_fail(pg: &PgPool, item: &AssignedWorkItem, error: &str) -> R
             SET status = 'ready',
                 attempts = COALESCE(attempts, 0) + 1,
                 last_error = $2
-          WHERE id = $1",
+          WHERE id = $1
+            AND status NOT IN ('done', 'merged', 'cancelled')",
     )
     .bind(item.work_item_id)
     .bind(truncate_for_db(&format!(
@@ -2280,7 +2281,8 @@ async fn mark_failed_and_release(pg: &PgPool, item: &AssignedWorkItem, error: &s
         "UPDATE work_items
             SET status = 'failed',
                 last_error = $2
-          WHERE id = $1",
+          WHERE id = $1
+            AND status NOT IN ('done', 'merged', 'cancelled')",
     )
     .bind(item.work_item_id)
     .bind(truncate_for_db(error))
@@ -2800,6 +2802,32 @@ async fn run_ff_dispatch(
             }
         };
         match lane1 {
+            Ok(Ok(outcome)) if outcome.already_done => {
+                // The model inspected the repo and reports the task is ALREADY implemented
+                // (feature exists, tests pass, nothing to commit). Mark the work_item done —
+                // NOT failed — so an already-satisfied task drains instead of thrashing every
+                // lane. Terminal 'done' is protected from later requeue_or_fail by its status guard.
+                let _ = crate::circuit_breaker::record_provider_success(
+                    pg,
+                    item.computer_id,
+                    LOCAL_CODEGEN_PROVIDER,
+                )
+                .await;
+                info!(
+                    work_item_id = %item.work_item_id,
+                    "work_item_dispatch: task already implemented per model — marking work_item done"
+                );
+                let _ = sqlx::query(
+                    "UPDATE work_items SET status = 'done', completed_at = NOW(), \
+                        last_error = 'already implemented (model verified: feature exists + tests pass)' \
+                      WHERE id = $1 AND status NOT IN ('merged')",
+                )
+                .bind(item.work_item_id)
+                .execute(pg)
+                .await;
+                let _ = remove_worktree(&item.repo_path, &worktree.worktree_path);
+                anyhow::bail!("already-implemented — work_item marked done, no PR needed");
+            }
             Ok(Ok(outcome)) if outcome.applied => {
                 let _ = crate::circuit_breaker::record_provider_success(
                     pg,
