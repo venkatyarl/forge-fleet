@@ -14,8 +14,10 @@
 //!   - `>= N`, `<= N`, `== N` — numeric comparisons
 //!   - `== 'str'` or `!= 'str'` — string comparisons (for `computer_status`)
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
+use ff_observability::alerts::AlertDeduplicationState;
 use sqlx::{PgPool, Row};
 
 use crate::notifications::SHARED_HTTP;
@@ -264,6 +266,15 @@ fn parse_alert_metric_node(message: &str) -> Option<(String, String)> {
     Some((metric?, node?))
 }
 
+const TELEGRAM_ALERT_DEDUP_TTL: Duration = Duration::from_secs(3600);
+
+static TELEGRAM_ALERT_DEDUP: LazyLock<AlertDeduplicationState> =
+    LazyLock::new(|| AlertDeduplicationState::new(TELEGRAM_ALERT_DEDUP_TTL));
+
+fn telegram_alert_signature(metric: &str, node: &str) -> String {
+    format!("alert:{}:{metric}:{}:{node}", metric.len(), node.len())
+}
+
 /// Atomically claim the hourly send slot for an alert key. A zero result means
 /// this occurrence was collapsed; a positive result is the number of identical
 /// occurrences represented by the alert that should now be delivered.
@@ -272,7 +283,7 @@ async fn claim_telegram_alert(
     metric: &str,
     node: &str,
 ) -> Result<(String, i64), sqlx::Error> {
-    let signature = format!("alert:{}:{metric}:{}:{node}", metric.len(), node.len());
+    let signature = telegram_alert_signature(metric, node);
     let count = sqlx::query_scalar(
         "INSERT INTO operator_notify_dedup
              (signature, last_sent, suppressed_count, send_count)
@@ -314,6 +325,18 @@ async fn release_telegram_alert_claim(pg: &PgPool, signature: &str, occurrence_c
     {
         tracing::warn!(%error, %signature, "failed to release Telegram alert dedup claim");
     }
+}
+
+async fn increment_telegram_alert_repeat(pg: &PgPool, signature: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE operator_notify_dedup
+         SET suppressed_count = suppressed_count + 1
+         WHERE signature = $1",
+    )
+    .bind(signature)
+    .execute(pg)
+    .await?;
+    Ok(())
 }
 
 pub struct AlertEvaluator {
@@ -830,7 +853,17 @@ pub async fn dispatch_alert(pg: &PgPool, channel: &str, severity: &str, message:
 
             let mut occurrence_count = 1;
             let mut dedup_signature = None;
+            let mut observability_signature = None;
             if let Some((metric, node)) = parse_alert_metric_node(message) {
+                let signature = telegram_alert_signature(&metric, &node);
+                if TELEGRAM_ALERT_DEDUP.is_duplicate(&signature) {
+                    if let Err(error) = increment_telegram_alert_repeat(pg, &signature).await {
+                        tracing::warn!(%error, %metric, %node, "telegram alert repeat counter update failed");
+                    }
+                    tracing::debug!(%metric, %node, "telegram alert suppressed by observability dedup state");
+                    return "throttled".to_string();
+                }
+                observability_signature = Some(signature);
                 match claim_telegram_alert(pg, &metric, &node).await {
                     Ok((_, 0)) => {
                         tracing::debug!(%metric, %node, "telegram alert collapsed into hourly metric/node summary");
@@ -866,7 +899,12 @@ pub async fn dispatch_alert(pg: &PgPool, channel: &str, severity: &str, message:
                 .send()
                 .await
             {
-                Ok(resp) if resp.status().is_success() => return "sent".into(),
+                Ok(resp) if resp.status().is_success() => {
+                    if let Some(signature) = observability_signature.as_deref() {
+                        TELEGRAM_ALERT_DEDUP.record(signature);
+                    }
+                    return "sent".into();
+                }
                 Ok(resp) => {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
@@ -1103,5 +1141,18 @@ mod tests {
         assert!(parse_alert_metric_node("metric=cpu_pct value=95").is_none());
         assert!(parse_alert_metric_node("computer=taylor value=95").is_none());
         assert!(parse_alert_metric_node("plain message").is_none());
+    }
+
+    #[test]
+    fn telegram_alert_dedup_uses_stable_independent_keys() {
+        let dedup = AlertDeduplicationState::new(Duration::from_secs(60));
+        let taylor_cpu = telegram_alert_signature("cpu_pct", "taylor");
+        let james_cpu = telegram_alert_signature("cpu_pct", "james");
+
+        assert!(!dedup.is_duplicate(&taylor_cpu));
+        dedup.record(&taylor_cpu);
+        assert!(dedup.is_duplicate(&taylor_cpu));
+        assert!(!dedup.is_duplicate(&james_cpu));
+        assert_ne!(taylor_cpu, james_cpu);
     }
 }

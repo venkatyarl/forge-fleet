@@ -1190,6 +1190,7 @@ dependencies = [
  "ff-cron",
  "ff-db",
  "ff-discovery",
+ "ff-observability",
  "ff-orchestrator",
  "ff-pipeline",
  "ff-pulse",
