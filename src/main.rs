@@ -2454,8 +2454,18 @@ fn start_gateway_subsystem(
     operational_store: OperationalStore,
     runtime_registry: RuntimeRegistryStore,
 ) -> JoinHandle<()> {
+    let gateway_host = if std::env::var("FF_GATEWAY_TRUSTED_LAN").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    }) {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    };
     let gateway_config = GatewayConfig {
-        bind_addr: format!("0.0.0.0:{}", config.fleet.api_port.saturating_add(2)), // Web UI on api_port + 2 (51002)
+        bind_addr: format!("{gateway_host}:{}", config.fleet.api_port.saturating_add(2)), // Web UI on api_port + 2 (51002)
         fleet_config: Some(config.clone()),
         config_path: Some(config_path),
         backend_registry: Some(backend_registry),

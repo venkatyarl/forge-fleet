@@ -53,3 +53,6 @@ futures = "0.3"
 tokio-stream = "0.1"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 jsonwebtoken = "9"
+
+[dev-dependencies]
+tower.workspace = true

@@ -170,14 +170,14 @@ fn required_rank(path: &str, is_mutating: bool) -> u8 {
 }
 
 /// Public routes that do NOT require authentication.
-/// All other routes mandate a valid JWT when FF_JWT_SECRET is set.
+/// All other routes mandate authentication unless trusted-LAN mode is
+/// explicitly enabled.
 const PUBLIC_ROUTES: &[&str] = &[
     "/health",
     "/.well-known/forgefleet.json",
     "/api/webhook",
     "/api/github/webhook",
-    "/metrics",
-    "/ws",
+    "/api/webhooks/github",
     // Enrollment endpoints: an enrolling node has no fleet credentials YET by
     // definition, and each of these enforces its own shared-secret policy
     // (EnrollmentConfig / onboard.rs) — gating them behind fleet auth made
@@ -189,17 +189,25 @@ const PUBLIC_ROUTES: &[&str] = &[
 ];
 
 fn is_public_route(path: &str) -> bool {
-    PUBLIC_ROUTES
-        .iter()
-        .any(|p| path == *p || path.starts_with(&format!("{p}/")))
+    PUBLIC_ROUTES.contains(&path) || path.starts_with("/onboard/")
+}
+
+fn trusted_lan_enabled() -> bool {
+    std::env::var("FF_GATEWAY_TRUSTED_LAN").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
 }
 
 /// Axum middleware that validates `Authorization: Bearer <token>`.
 ///
 /// - When `FF_JWT_SECRET` is **set**: all routes except `PUBLIC_ROUTES` require
 ///   a valid Bearer token with standard claims (exp, iat).
-/// - When `FF_JWT_SECRET` is **unset**: mutating routes (`POST`, `PUT`, `PATCH`,
-///   `DELETE`) still reject with 401. Read-only public routes pass through.
+/// - When `FF_JWT_SECRET` is **unset**: only `PUBLIC_ROUTES` pass by default.
+/// - `FF_GATEWAY_TRUSTED_LAN=1` explicitly restores anonymous reads and LLM
+///   dispatch for deployments whose network boundary is trusted.
 pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response<Body> {
     let path = request.uri().path().to_string();
     let method = request.method().clone();
@@ -211,22 +219,8 @@ pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response
             | axum::http::Method::DELETE
     );
 
-    // OpenAI-compatible LLM endpoints (chat completions, completions,
-    // embeddings, rerank) are inherently LLM dispatch — they don't mutate
-    // fleet state in the same sense as the admin/control routes the JWT
-    // gate is intended to protect. Without this carve-out, internal fleet
-    // callers (ff-pipeline, fleet_crew, the cascade) get 401'd when
-    // FF_JWT_SECRET is unset (the common dev/lan-only deploy). With the
-    // carve-out: callers can POST to /v1/chat/completions on the loopback
-    // gateway without authenticating. When the operator DOES set
-    // FF_JWT_SECRET (production deploy behind a reverse proxy), the
-    // full JWT check still applies — the carve-out only kicks in when
-    // no secret is configured.
-    // `/api/jarvis/ask` is JARVIS's query endpoint: it reads fleet state or
-    // dispatches the prompt to a local LLM — same spirit as the /v1 LLM routes,
-    // and the loopback JARVIS HUD calls it unauthenticated. Carve it out so the
-    // LAN deploy (no FF_JWT_SECRET) works; a production deploy that sets the
-    // secret still gates it.
+    // These cost-bearing routes are allowed without JWT only in the explicit
+    // trusted-LAN compatibility mode.
     let is_llm_endpoint = matches!(
         path.as_str(),
         "/v1/chat/completions"
@@ -237,18 +231,21 @@ pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response
     );
 
     let secret = match std::env::var("FF_JWT_SECRET") {
-        Ok(s) if !s.is_empty() => s,
+        Ok(s) if !s.trim().is_empty() => s,
         _ => {
-            // No JWT secret configured — still block mutating routes,
-            // except for LLM-dispatch endpoints (see comment above).
-            if is_mutating && !is_public_route(&path) && !is_llm_endpoint {
-                return json_error(
-                    StatusCode::UNAUTHORIZED,
-                    "authentication required for mutating requests",
-                )
-                .into_response();
+            if is_public_route(&path) {
+                return next.run(request).await;
             }
-            return next.run(request).await;
+
+            if trusted_lan_enabled() && (!is_mutating || is_llm_endpoint) {
+                return next.run(request).await;
+            }
+
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "gateway authentication is not configured",
+            )
+            .into_response();
         }
     };
 
@@ -318,6 +315,7 @@ fn error_type_for_status(status: StatusCode) -> &'static str {
         StatusCode::BAD_REQUEST => "bad_request",
         StatusCode::UNAUTHORIZED => "unauthorized",
         StatusCode::FORBIDDEN => "forbidden",
+        StatusCode::SERVICE_UNAVAILABLE => "service_unavailable",
         StatusCode::TOO_MANY_REQUESTS => "rate_limited",
         StatusCode::INTERNAL_SERVER_ERROR => "internal_error",
         _ => "unknown_error",
@@ -381,5 +379,144 @@ mod rbac_tests {
         // no-role token: reads ok, mutations denied
         assert!(allowed(None, "/api/fleet/status", false));
         assert!(!allowed(None, "/api/tasks", true));
+    }
+}
+
+#[cfg(test)]
+mod router_auth_tests {
+    use std::{
+        sync::Mutex,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode},
+        middleware,
+        routing::{get, post},
+    };
+    use jsonwebtoken::{EncodingKey, Header, encode};
+    use tower::ServiceExt;
+
+    use super::{JwtClaims, jwt_auth_middleware};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn set_env(name: &str, value: Option<&str>) {
+        // SAFETY: this test serializes all mutations of these process globals.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    fn test_router() -> Router {
+        Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route("/api/fleet/self-enroll", post(|| async { StatusCode::OK }))
+            .route("/api/webhooks/github", post(|| async { StatusCode::OK }))
+            .route("/api/fleet/status", get(|| async { StatusCode::OK }))
+            .route("/v1/chat/completions", post(|| async { StatusCode::OK }))
+            .route("/api/config", post(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn(jwt_auth_middleware))
+    }
+
+    async fn status(router: &Router, method: &str, path: &str, token: Option<&str>) -> StatusCode {
+        let mut request = Request::builder().method(method).uri(path);
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        router
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn router_fails_closed_without_secret_and_enforces_jwt_when_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_secret = std::env::var("FF_JWT_SECRET").ok();
+        let old_trusted_lan = std::env::var("FF_GATEWAY_TRUSTED_LAN").ok();
+        let router = test_router();
+
+        set_env("FF_JWT_SECRET", None);
+        set_env("FF_GATEWAY_TRUSTED_LAN", None);
+        assert_eq!(
+            status(&router, "GET", "/health", None).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&router, "GET", "/health/private", None).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status(&router, "POST", "/api/fleet/self-enroll", None).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&router, "POST", "/api/webhooks/github", None).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&router, "GET", "/api/fleet/status", None).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status(&router, "POST", "/v1/chat/completions", None).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        set_env("FF_GATEWAY_TRUSTED_LAN", Some("1"));
+        assert_eq!(
+            status(&router, "GET", "/api/fleet/status", None).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&router, "POST", "/v1/chat/completions", None).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&router, "POST", "/api/config", None).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let secret = "router-test-secret";
+        set_env("FF_JWT_SECRET", Some(secret));
+        set_env("FF_GATEWAY_TRUSTED_LAN", None);
+        assert_eq!(
+            status(&router, "GET", "/api/fleet/status", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize;
+        let token = encode(
+            &Header::default(),
+            &JwtClaims {
+                sub: "router-test".into(),
+                exp: Some(now + 60),
+                iat: Some(now),
+                role: Some("admin".into()),
+            },
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+        assert_eq!(
+            status(&router, "GET", "/api/fleet/status", Some(&token)).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&router, "POST", "/v1/chat/completions", Some(&token)).await,
+            StatusCode::OK
+        );
+
+        set_env("FF_JWT_SECRET", old_secret.as_deref());
+        set_env("FF_GATEWAY_TRUSTED_LAN", old_trusted_lan.as_deref());
     }
 }

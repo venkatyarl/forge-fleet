@@ -75,7 +75,7 @@ pub struct GatewayConfig {
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
-            bind_addr: "0.0.0.0:8787".to_string(),
+            bind_addr: "127.0.0.1:8787".to_string(),
             bot_aliases: vec!["forgefleet".to_string(), "taylor".to_string()],
             command_prefixes: vec!['/', '!'],
             fleet_config: None,

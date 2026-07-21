@@ -105,9 +105,10 @@ def get_embedding(text: str, model: str = "qwen3-embedding-8b") -> list[float]:
     return resp.json()["data"][0]["embedding"]
 ```
 
-### 4. Optional JWT auth
+### 4. Gateway authentication
 
-If the fleet operator sets `FF_JWT_SECRET`, include a Bearer token:
+The gateway binds to loopback and fails closed when `FF_JWT_SECRET` is unset.
+Set `FF_JWT_SECRET` and include a Bearer token for remote clients:
 
 ```python
 import jwt
@@ -317,6 +318,12 @@ systemctl --user restart forgefleetd.service
 launchctl unload ~/Library/LaunchAgents/com.forgefleet.forgefleetd.plist
 launchctl load ~/Library/LaunchAgents/com.forgefleet.forgefleetd.plist
 ```
+
+For a network-isolated, trusted LAN only, setting
+`FF_GATEWAY_TRUSTED_LAN=1` opts into a wildcard listener and permits anonymous
+reads and LLM dispatch when `FF_JWT_SECRET` is unset. Do not enable this mode on
+an untrusted network or an Internet-reachable host; JWT remains recommended on
+trusted LANs as well.
 
 ### Deploy a new model
 
