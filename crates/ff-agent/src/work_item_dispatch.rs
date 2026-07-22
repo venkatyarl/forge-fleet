@@ -1778,9 +1778,16 @@ async fn run_in_place_review(
     // The fleet inventory is the routing source of truth. This deliberately
     // avoids a compiled-in provider list/model hint and follows newly enrolled
     // authenticated cloud CLIs without a daemon rebuild.
+    //
+    // Operator directive (2026-07-22): the in-place REVIEWER must never be claude
+    // — review runs on the local 480B ring (tried first, above) or the codex/kimi
+    // cloud CLIs. The shared claude OAuth account is scarce (rotating refresh
+    // tokens churn under concurrency) and is reserved for BUILDING, a separate
+    // dispatch path. Excluding it here (not via computer_backends.authenticated)
+    // keeps claude available as a builder while removing it from review.
     let backends: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT backend FROM computer_backends \
-          WHERE installed AND authenticated ORDER BY backend",
+          WHERE installed AND authenticated AND backend <> 'claude' ORDER BY backend",
     )
     .fetch_all(pg)
     .await
