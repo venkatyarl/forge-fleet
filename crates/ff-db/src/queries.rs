@@ -4503,12 +4503,162 @@ pub async fn pg_delete_artifact_index(
     Ok(result.rows_affected() > 0)
 }
 
+/// A type-inferred SQL `NULL` bind parameter.
+///
+/// Binding a `NULL` through a concrete Rust type (e.g. `Option::<String>::None`)
+/// pins the parameter's Postgres type to that column type — `text` — so Postgres
+/// rejects it against a nullable column of any *other* type (`int`, `uuid`,
+/// `timestamptz`, …) with a type mismatch. Declaring the parameter with OID `0`
+/// instead leaves the type unspecified so Postgres infers it from the statement,
+/// letting the same `NULL` bind safely to a nullable column of ANY type.
+struct InferredNull;
+
+impl sqlx::Type<sqlx::Postgres> for InferredNull {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        sqlx::postgres::PgTypeInfo::with_oid(sqlx::postgres::types::Oid(0))
+    }
+}
+
+impl sqlx::Encode<'_, sqlx::Postgres> for InferredNull {
+    fn encode_by_ref(
+        &self,
+        _buf: &mut sqlx::postgres::PgArgumentBuffer,
+    ) -> std::result::Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        // No bytes are written for a NULL; only the declared OID (0) matters.
+        Ok(sqlx::encode::IsNull::Yes)
+    }
+}
+
+/// Execute a parameterized non-SELECT statement (INSERT/UPDATE/DELETE/DDL) with
+/// positionally-bound parameters, returning the number of affected rows.
+///
+/// Write-side companion to the read-only `ff db query` path
+/// ([`ff_terminal::db_cmd`]'s `query`). It mirrors that path's connection
+/// handling: acquisition is via a borrowed `&PgPool` (the signature every helper
+/// in this module uses — ff-db is upstream of `ff-agent`, so it cannot call
+/// `get_fleet_pool`), and the statement runs *inside a transaction* just as
+/// `query` does. The only difference is direction: where `query` uses a
+/// `READ ONLY` transaction that it rolls back, `db_exec` uses a writable
+/// transaction that it commits, so the write lands atomically. Only the
+/// write/exec capability is added; the [`Result`] error type is unchanged.
+///
+/// Parameters are bound positionally (`$1`, `$2`, …) so values are never
+/// interpolated into the SQL — there is no injection surface from the bound
+/// values. Each [`JsonValue`] binds to its natural Postgres type (bool → `bool`,
+/// integer → `int8`, float → `float8`, string → `text`, object/array → `jsonb`);
+/// a JSON `null` binds as a type-inferred SQL `NULL` (see [`InferredNull`]) so it
+/// is safe against nullable columns of any type.
+pub async fn db_exec(pool: &PgPool, sql: &str, params: Vec<JsonValue>) -> Result<u64> {
+    let mut q = sqlx::query(sql);
+    for p in params {
+        q = match p {
+            JsonValue::Null => q.bind(InferredNull),
+            JsonValue::Bool(b) => q.bind(b),
+            JsonValue::Number(n) => match n.as_i64() {
+                Some(i) => q.bind(i),
+                None => q.bind(n.as_f64().unwrap_or(0.0)),
+            },
+            JsonValue::String(s) => q.bind(s),
+            // Objects and arrays go across the wire as jsonb.
+            other @ (JsonValue::Array(_) | JsonValue::Object(_)) => q.bind(other),
+        };
+    }
+
+    // Transaction-wrapped execution mirrors the `ff db query` read path (which
+    // runs inside a READ ONLY transaction); here the transaction is writable and
+    // committed so the write persists atomically.
+    let mut tx = pool.begin().await?;
+    let result = q.execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(result.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::env;
 
     use sqlx::postgres::PgPoolOptions;
+
+    /// Round-trips `db_exec` through a scratch table: insert/update/delete return
+    /// the affected-row count, the write is committed (visible on a fresh pool
+    /// connection), and a JSON `null` binds as a type-inferred SQL NULL — proven
+    /// against a NULLABLE INT column, which a text-typed NULL would reject.
+    ///
+    /// Early-returns (no panic) when neither FORGEFLEET_POSTGRES_URL nor
+    /// FORGEFLEET_DATABASE_URL is set — `temp_db_urls` yields `None` — so CI's
+    /// database-less `cargo test --lib` skips it cleanly.
+    #[tokio::test]
+    async fn db_exec_commits_and_binds_typed_params() {
+        let Some((admin_url, db_url, db_name)) = temp_db_urls("ff_db_exec") else {
+            return;
+        };
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("connect admin db");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create temp db");
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&db_url)
+            .await
+            .expect("connect temp db");
+        sqlx::raw_sql("CREATE TABLE t (id INT PRIMARY KEY, qty INT, meta JSONB)")
+            .execute(&pool)
+            .await
+            .expect("create scratch table");
+
+        // INSERT two rows; the NULLABLE INT column `qty` takes a JSON null on one
+        // row — a text-typed NULL would be rejected against an INT column here.
+        let inserted = db_exec(
+            &pool,
+            "INSERT INTO t (id, qty, meta) VALUES ($1, $2, $3), ($4, $5, $6)",
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(7),
+                serde_json::json!({"k": 1}),
+                serde_json::json!(2),
+                JsonValue::Null,
+                serde_json::json!([1, 2, 3]),
+            ],
+        )
+        .await
+        .expect("insert");
+        assert_eq!(inserted, 2);
+
+        // The transaction committed: a fresh pool connection sees both rows.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 2);
+
+        // UPDATE only the NULL-qty row → 1 affected row.
+        let updated = db_exec(
+            &pool,
+            "UPDATE t SET qty = $1 WHERE qty IS NULL",
+            vec![serde_json::json!(3)],
+        )
+        .await
+        .expect("update");
+        assert_eq!(updated, 1);
+
+        // DELETE by bound id → 1 affected row.
+        let deleted = db_exec(
+            &pool,
+            "DELETE FROM t WHERE id = $1",
+            vec![serde_json::json!(1)],
+        )
+        .await
+        .expect("delete");
+        assert_eq!(deleted, 1);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
 
     #[test]
     fn test_classify_collision_buckets() {
