@@ -12117,6 +12117,24 @@ ALTER TABLE sub_agents
     ADD COLUMN IF NOT EXISTS ram_gb       INT;
 "#;
 
+/// User/operator-facing notifications. `is_sticky` notifications stay visible
+/// until explicitly dismissed (`is_dismissed`); non-sticky ones are meant to
+/// auto-expire in the UI layer.
+pub const SCHEMA_V245_NOTIFICATIONS: &str = r#"
+CREATE TABLE IF NOT EXISTS notifications (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    type         TEXT NOT NULL,
+    message      TEXT NOT NULL,
+    is_sticky    BOOLEAN NOT NULL DEFAULT false,
+    is_dismissed BOOLEAN NOT NULL DEFAULT false,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_undismissed
+    ON notifications (created_at) WHERE NOT is_dismissed;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

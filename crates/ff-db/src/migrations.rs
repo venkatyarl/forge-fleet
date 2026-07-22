@@ -1176,6 +1176,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "sub_agents_capabilities",
         sql: schema::SCHEMA_V244_SUB_AGENTS_CAPABILITIES,
     },
+    PgMigration {
+        version: 245,
+        name: "notifications",
+        sql: schema::SCHEMA_V245_NOTIFICATIONS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
