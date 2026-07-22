@@ -17,11 +17,45 @@
 //! artifact. [`ArtifactCacheManager::ensure_artifact`] chains all three.
 
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{info, warn};
+
+/// Blobs strictly larger than this are routed to the MinIO backend on save
+/// instead of the local cache tree (1 MiB).
+pub const MINIO_ROUTE_THRESHOLD_BYTES: u64 = 1024 * 1024;
+
+/// Object-storage backend for large artifact blobs (MinIO / any
+/// S3-compatible store). Keys are content-addressed by the caller, so a
+/// `put_object` for an already-present key may be a no-op.
+#[async_trait]
+pub trait MinioBackend: Send + Sync {
+    /// Upload `bytes` under `key`.
+    async fn put_object(&self, key: &str, bytes: &[u8]) -> Result<()>;
+}
+
+/// Where a saved artifact's blob ended up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredBlob {
+    /// Small blob written into the local cache tree.
+    LocalPath(PathBuf),
+    /// Large blob uploaded to MinIO under this content-addressed object key.
+    MinioKey(String),
+}
+
+/// Metadata record for one saved artifact blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactRecord {
+    pub artifact: String,
+    pub version: String,
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub location: StoredBlob,
+}
 
 /// Where a fetched artifact ultimately came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,6 +321,57 @@ impl ArtifactCacheManager {
             peers.len()
         )
     }
+
+    /// Save an artifact blob, routing by size: blobs over
+    /// [`MINIO_ROUTE_THRESHOLD_BYTES`] are uploaded to `minio` under a
+    /// content-addressed key and the returned metadata record carries that
+    /// key instead of a local path; smaller blobs are written into the local
+    /// cache tree (via a `.part` temp file and atomic rename, like the fetch
+    /// paths) and the record carries the on-disk path.
+    pub async fn save_artifact(
+        &self,
+        artifact: &str,
+        version: &str,
+        file_name: &str,
+        bytes: &[u8],
+        minio: &dyn MinioBackend,
+    ) -> Result<ArtifactRecord> {
+        let size_bytes = bytes.len() as u64;
+        let sha256 = hex_encode(&Sha256::digest(bytes));
+
+        let location = if size_bytes > MINIO_ROUTE_THRESHOLD_BYTES {
+            let key = format!("artifacts/{sha256}/{file_name}");
+            minio
+                .put_object(&key, bytes)
+                .await
+                .with_context(|| format!("upload artifact {artifact}/{version} to MinIO"))?;
+            info!(
+                artifact,
+                version,
+                object_key = %key,
+                bytes = size_bytes,
+                "artifact_fetch: large artifact routed to MinIO"
+            );
+            StoredBlob::MinioKey(key)
+        } else {
+            let dest = self.artifact_path(artifact, version, file_name);
+            let tmp = part_path(&dest);
+            prepare_dest_dir(&dest)?;
+            std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+            std::fs::rename(&tmp, &dest)
+                .with_context(|| format!("rename {} -> {}", tmp.display(), dest.display()))?;
+            StoredBlob::LocalPath(dest)
+        };
+
+        Ok(ArtifactRecord {
+            artifact: artifact.to_string(),
+            version: version.to_string(),
+            file_name: file_name.to_string(),
+            size_bytes,
+            sha256,
+            location,
+        })
+    }
 }
 
 /// Canonical local artifact-cache root.
@@ -517,6 +602,78 @@ mod tests {
             .unwrap();
         assert_eq!(got, path);
         assert_eq!(source, FetchSource::Cache);
+    }
+
+    /// Records uploads instead of talking to a real MinIO.
+    #[derive(Default)]
+    struct MockMinio {
+        uploads: std::sync::Mutex<Vec<(String, usize)>>,
+    }
+
+    #[async_trait]
+    impl MinioBackend for MockMinio {
+        async fn put_object(&self, key: &str, bytes: &[u8]) -> Result<()> {
+            self.uploads
+                .lock()
+                .unwrap()
+                .push((key.to_string(), bytes.len()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn save_artifact_small_blob_stays_local() {
+        let (_dir, mgr) = manager();
+        let minio = MockMinio::default();
+
+        let record = mgr
+            .save_artifact("a", "v1", "bin", b"payload", &minio)
+            .await
+            .unwrap();
+
+        let path = mgr.artifact_path("a", "v1", "bin");
+        assert_eq!(record.location, StoredBlob::LocalPath(path.clone()));
+        assert_eq!(record.size_bytes, 7);
+        assert_eq!(record.sha256, sha256_bytes(b"payload"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+        assert!(minio.uploads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn save_artifact_at_threshold_stays_local() {
+        let (_dir, mgr) = manager();
+        let minio = MockMinio::default();
+        let blob = vec![0u8; MINIO_ROUTE_THRESHOLD_BYTES as usize];
+
+        let record = mgr
+            .save_artifact("a", "v1", "bin", &blob, &minio)
+            .await
+            .unwrap();
+
+        assert!(matches!(record.location, StoredBlob::LocalPath(_)));
+        assert!(minio.uploads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn save_artifact_large_blob_routes_to_minio() {
+        let (_dir, mgr) = manager();
+        let minio = MockMinio::default();
+        let blob = vec![0u8; MINIO_ROUTE_THRESHOLD_BYTES as usize + 1];
+
+        let record = mgr
+            .save_artifact("a", "v1", "bin", &blob, &minio)
+            .await
+            .unwrap();
+
+        let expected_key = format!("artifacts/{}/bin", sha256_bytes(&blob));
+        assert_eq!(record.location, StoredBlob::MinioKey(expected_key.clone()));
+        assert_eq!(record.size_bytes, blob.len() as u64);
+        // The blob went to MinIO, not the local cache tree.
+        assert!(!mgr.artifact_path("a", "v1", "bin").exists());
+        assert_eq!(
+            *minio.uploads.lock().unwrap(),
+            vec![(expected_key, blob.len())]
+        );
     }
 
     #[tokio::test]
