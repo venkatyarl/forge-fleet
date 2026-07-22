@@ -1231,6 +1231,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "ff-db",
+ "ff-memory",
  "ff-security",
  "futures",
  "reqwest",
