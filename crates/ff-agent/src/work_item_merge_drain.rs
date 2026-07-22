@@ -1034,9 +1034,30 @@ fn update_branch_api_path(pr_url: &str) -> Option<String> {
     }
 }
 
-/// Inspect a PR's checks via `gh pr checks <url> --json state`. No checks yet
-/// (or gh transient error) is treated as Pending so we never merge prematurely.
+/// `gh pr view <url> --json mergeStateStatus`, returning the raw status
+/// string. Any gh/parse error yields `None`, which falls back to per-check
+/// inspection in [`pr_ci_state`] rather than wrongly reporting CI as green.
+async fn fetch_merge_state_status(pr_url: &str) -> Option<String> {
+    let mut cmd = gh_cmd().await;
+    cmd.args(["pr", "view", pr_url, "--json", "mergeStateStatus"]);
+    let out = cmd.output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .ok()?
+        .get("mergeStateStatus")
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
+}
+
+/// Inspect a PR's CI state, combining GitHub's `mergeStateStatus` (from
+/// `gh pr view`) with its per-check states (from
+/// `gh pr checks <url> --json state,detailsUrl`). No checks yet (or a gh
+/// transient error) is treated as Pending so we never merge prematurely.
 async fn pr_ci_state(pr_url: &str) -> CiState {
+    let merge_state_status = fetch_merge_state_status(pr_url).await;
+
     let mut cmd = gh_cmd().await;
     cmd.args(["pr", "checks", pr_url, "--json", "state,detailsUrl"]);
     let out = match cmd.output().await {
@@ -1051,14 +1072,31 @@ async fn pr_ci_state(pr_url: &str) -> CiState {
     let stdout = String::from_utf8_lossy(&out.stdout);
     // gh exits non-zero when checks are failing OR still pending; rely on the
     // JSON states rather than the exit code.
-    let states: Vec<String> = serde_json::from_str::<serde_json::Value>(&stdout)
-        .ok()
-        .and_then(|v| {
-            v.as_array().map(|a| {
-                a.iter()
-                    .filter_map(|c| c.get("state").and_then(|s| s.as_str()).map(str::to_string))
-                    .collect()
-            })
+    let checks: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_default();
+    ci_state_from_signals(merge_state_status.as_deref(), &checks)
+}
+
+/// Pure decision logic for a PR's CI state given GitHub's `mergeStateStatus`
+/// and its `gh pr checks --json state,detailsUrl` output.
+///
+/// `mergeStateStatus == CLEAN` means GitHub has already confirmed every
+/// *required* check passed and the PR is mergeable — trust that verdict
+/// outright. Otherwise a non-required check stuck pending (or never
+/// scheduled) forever would head-block the whole serial merge queue even
+/// though nothing is actually blocking the merge. Only when GitHub reports
+/// anything other than CLEAN (still computing, blocked, unstable, dirty,
+/// ...) do we fall back to inspecting each individual check.
+fn ci_state_from_signals(merge_state_status: Option<&str>, checks: &serde_json::Value) -> CiState {
+    if merge_state_status == Some("CLEAN") {
+        return CiState::Success;
+    }
+
+    let states: Vec<String> = checks
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c.get("state").and_then(|s| s.as_str()).map(str::to_string))
+                .collect()
         })
         .unwrap_or_default();
 
@@ -1069,8 +1107,7 @@ async fn pr_ci_state(pr_url: &str) -> CiState {
         .iter()
         .any(|s| matches!(s.as_str(), "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT"))
     {
-        let value = serde_json::from_str::<serde_json::Value>(&stdout).unwrap_or_default();
-        let mut run_ids = value
+        let mut run_ids = checks
             .as_array()
             .into_iter()
             .flatten()
@@ -1503,8 +1540,9 @@ async fn db_confirms_leader(pg: &PgPool, worker_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        PrReviewVerdict, github_actions_run_id, is_semantic_merge_compile_failure,
-        parse_review_response, parse_review_verdict, served_by_480b, update_branch_api_path,
+        CiState, PrReviewVerdict, ci_state_from_signals, github_actions_run_id,
+        is_semantic_merge_compile_failure, parse_review_response, parse_review_verdict,
+        served_by_480b, update_branch_api_path,
     };
 
     #[test]
@@ -1619,6 +1657,42 @@ mod tests {
         ] {
             assert_eq!(parse_review_verdict(&v), PrReviewVerdict::None, "{v}");
         }
+    }
+
+    #[test]
+    fn clean_merge_state_passes_ci_despite_pending_non_required_checks() {
+        // A non-required check ("lint-optional") stuck PENDING forever must
+        // not head-block the merge queue when GitHub itself reports the PR
+        // as CLEAN (all required checks passed, mergeable).
+        let checks = serde_json::json!([
+            {"state": "SUCCESS", "detailsUrl": "https://github.com/o/r/actions/runs/1/job/1"},
+            {"state": "PENDING", "detailsUrl": "https://github.com/o/r/actions/runs/2/job/2"},
+        ]);
+        assert!(matches!(
+            ci_state_from_signals(Some("CLEAN"), &checks),
+            CiState::Success
+        ));
+    }
+
+    #[test]
+    fn non_clean_merge_state_falls_back_to_per_check_inspection() {
+        let pending = serde_json::json!([{"state": "PENDING", "detailsUrl": ""}]);
+        assert!(matches!(
+            ci_state_from_signals(Some("BLOCKED"), &pending),
+            CiState::Pending
+        ));
+        assert!(matches!(
+            ci_state_from_signals(None, &serde_json::Value::Null),
+            CiState::Pending
+        ));
+
+        let failing = serde_json::json!([
+            {"state": "FAILURE", "detailsUrl": "https://github.com/o/r/actions/runs/9/job/9"}
+        ]);
+        assert!(matches!(
+            ci_state_from_signals(Some("DIRTY"), &failing),
+            CiState::Failed { .. }
+        ));
     }
 
     #[test]
