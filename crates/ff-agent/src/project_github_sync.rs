@@ -331,7 +331,8 @@ async fn attach_pr(pool: &PgPool, project_id: &str, pr: &PullInfo) -> Result<boo
 // ─── HTTP fetches ────────────────────────────────────────────────────────
 
 /// Parse `https://github.com/owner/repo[.git]` → `(owner, repo)`.
-/// Also handles URLs without a scheme and trailing slashes.
+/// Also handles URLs without a scheme, trailing slashes, and scp-style URLs
+/// with a per-key host alias (`git@github.com-venkat:owner/repo.git`).
 pub fn parse_owner_repo(url: &str) -> Option<(String, String)> {
     let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
     // Strip any known prefix; we only care about the last two path segments.
@@ -340,6 +341,14 @@ pub fn parse_owner_repo(url: &str) -> Option<(String, String)> {
         .or_else(|| trimmed.strip_prefix("http://github.com/"))
         .or_else(|| trimmed.strip_prefix("git@github.com:"))
         .or_else(|| trimmed.strip_prefix("github.com/"))
+        .or_else(|| {
+            // scp-style with any `user@host:` prefix, e.g. the fleet's
+            // canonical ssh alias `git@github.com-venkat:owner/repo`.
+            trimmed
+                .split_once('@')
+                .and_then(|(_, rest)| rest.split_once(':'))
+                .map(|(_, path)| path)
+        })
         .unwrap_or(trimmed);
 
     let mut parts = path.split('/');
@@ -528,6 +537,13 @@ mod tests {
         let (o, r) = parse_owner_repo("git@github.com:venkatyarl/hireflow360.git").unwrap();
         assert_eq!(o, "venkatyarl");
         assert_eq!(r, "hireflow360");
+    }
+
+    #[test]
+    fn parses_ssh_host_alias_form() {
+        let (o, r) = parse_owner_repo("git@github.com-venkat:venkatyarl/forge-fleet.git").unwrap();
+        assert_eq!(o, "venkatyarl");
+        assert_eq!(r, "forge-fleet");
     }
 
     #[test]

@@ -3613,9 +3613,12 @@ fn synthetic_output(summary: &str) -> Output {
     }
 }
 
-/// Environment variable holding an optional LAN git mirror URL. When set, fetches
-/// are routed through this mirror while pushes continue to target the canonical
-/// GitHub origin (`git remote set-url --push`).
+/// Environment variable holding an optional LAN git mirror URL PREFIX in
+/// `insteadOf` style, e.g. `https://git-mirror.local/` or `git@git-mirror.local:`
+/// — NOT a complete repo URL. The fetch URL is the prefix plus the GitHub
+/// `owner/repo` path (same convention as `ha::mirror_service::fetch_mirror_sha`).
+/// When set, fetches are routed through the mirror while pushes continue to
+/// target the canonical GitHub origin (`git remote set-url --push`).
 const LAN_MIRROR_URL_ENV: &str = "FORGEFLEET_LAN_MIRROR_URL";
 
 /// Max attempts for each fetch phase (mirror and direct fallback).
@@ -3635,6 +3638,16 @@ fn fetch_jitter(max_ms: u64) -> Duration {
     Duration::from_millis(jitter_ms)
 }
 
+/// Build the full mirror repo URL for a slot's repo: the configured mirror
+/// PREFIX plus the `owner/repo` path derived from the canonical GitHub URL
+/// (which may use an ssh host alias like `git@github.com-venkat:owner/repo`).
+/// Returns `None` when owner/repo cannot be derived — the caller then skips
+/// the mirror and fetches directly from GitHub.
+fn mirror_repo_url(mirror_prefix: &str, github_url: &str) -> Option<String> {
+    let (owner, repo) = crate::project_github_sync::parse_owner_repo(github_url)?;
+    Some(format!("{mirror_prefix}{owner}/{repo}"))
+}
+
 /// Prepare the slot's clone for a fresh build attempt. Fetch origin/<base>
 /// (same no-stale-base contract as ever: fail rather than branch from a stale
 /// ref), then a FULL clean — `reset --hard` + `clean -fd` — so leftovers from
@@ -3644,17 +3657,22 @@ fn fetch_jitter(max_ms: u64) -> Duration {
 /// without any worktree bookkeeping.
 ///
 /// LAN mirror: if `FORGEFLEET_LAN_MIRROR_URL` is set, origin's fetch URL is
-/// pointed at the mirror and `--push` is pointed at the canonical GitHub URL.
+/// pointed at the mirror prefix + this repo's `owner/repo` path and `--push`
+/// is pointed at the canonical GitHub URL.
 /// Mirror fetches are retried with exponential backoff + jitter; if they all
 /// fail we transparently fall back to a direct GitHub fetch.
 fn checkout_clone_for_build(repo_path: &Path, base_branch: &str, task_branch: &str) -> Result<()> {
     let base_ref = format!("origin/{base_branch}");
 
     // Remember the canonical GitHub origin so we can restore it on fallback
-    // and configure --push correctly when a mirror is in play.
+    // and configure --push correctly when a mirror is in play. Read the PUSH
+    // URL: it always stays on GitHub (only the fetch URL is ever pointed at
+    // the mirror, and git falls back to the fetch URL when no push URL is
+    // set), so this recovers the canonical URL even when a prior run died
+    // with origin's fetch URL still pointing at the mirror.
     let github_url = run_git(
         repo_path,
-        ["remote", "get-url", "origin"],
+        ["remote", "get-url", "--push", "origin"],
         Duration::from_secs(30),
     )
     .ok()
@@ -3664,7 +3682,25 @@ fn checkout_clone_for_build(repo_path: &Path, base_branch: &str, task_branch: &s
     });
 
     // Optionally configure the LAN mirror: fetch from mirror, push to GitHub.
-    let mirror_url = std::env::var(LAN_MIRROR_URL_ENV).ok();
+    // The env value is a URL PREFIX shared by every repo the mirror serves;
+    // the per-repo fetch URL appends this repo's `owner/repo` path.
+    let mirror_url = std::env::var(LAN_MIRROR_URL_ENV)
+        .ok()
+        .filter(|prefix| !prefix.trim().is_empty())
+        .and_then(|prefix| match &github_url {
+            Some(github) => {
+                let url = mirror_repo_url(&prefix, github);
+                if url.is_none() {
+                    warn!(
+                        mirror_prefix = %prefix,
+                        github_url = %github,
+                        "checkout_clone_for_build: cannot derive owner/repo for LAN mirror; fetching directly from GitHub"
+                    );
+                }
+                url
+            }
+            None => None,
+        });
     let mirror_configured = match (&mirror_url, &github_url) {
         (Some(mirror), Some(github)) if mirror != github => {
             run_git(
@@ -4809,10 +4845,10 @@ mod tests {
         affected_crate_manifests, agent_output_tail, backend_failed_without_output,
         builder_excludes_480b, classify_dispatch_outcome, command_display,
         complexity_at_least_moderate, default_clone_path, dispatch_budget_for_host,
-        dispatch_prompt, expand_home, is_build_timeout, order_cloud_reviewers, parse_cli_tokens,
-        primary_or_default_backend, quick_empty_success_is_provider_failure, repo_cache_path,
-        repo_slug, retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
-        should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
+        dispatch_prompt, expand_home, is_build_timeout, mirror_repo_url, order_cloud_reviewers,
+        parse_cli_tokens, primary_or_default_backend, quick_empty_success_is_provider_failure,
+        repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
+        same_model_family, should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
         task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
     };
     use std::path::PathBuf;
@@ -4831,6 +4867,34 @@ mod tests {
         assert!(!builder_excludes_480b("codex"));
         assert!(!builder_excludes_480b("claude"));
         assert!(!builder_excludes_480b("kimi"));
+    }
+
+    #[test]
+    fn mirror_repo_url_appends_owner_repo_to_prefix() {
+        // https-style prefix (trailing slash) + https GitHub URL.
+        assert_eq!(
+            mirror_repo_url(
+                "https://git-mirror.local/",
+                "https://github.com/venkatyarl/forge-fleet.git"
+            )
+            .as_deref(),
+            Some("https://git-mirror.local/venkatyarl/forge-fleet")
+        );
+        // scp-style prefix (trailing colon) + ssh host-alias GitHub URL — the
+        // shape every fleet slot actually has as its origin.
+        assert_eq!(
+            mirror_repo_url(
+                "git@git-mirror.local:",
+                "git@github.com-venkat:venkatyarl/forge-fleet.git"
+            )
+            .as_deref(),
+            Some("git@git-mirror.local:venkatyarl/forge-fleet")
+        );
+        // Unparseable GitHub URL → no mirror URL (caller falls back to direct).
+        assert_eq!(
+            mirror_repo_url("https://git-mirror.local/", "not a url"),
+            None
+        );
     }
 
     #[test]
