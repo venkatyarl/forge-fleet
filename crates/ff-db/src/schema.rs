@@ -12055,6 +12055,10 @@ CREATE TABLE IF NOT EXISTS code_rulesets (
 CREATE INDEX IF NOT EXISTS idx_code_rulesets_parent ON code_rulesets (parent_id);
 "#;
 
+/// Work-item scheduling enrichment and per-slot capability declarations.
+pub const SCHEMA_V236_WORK_ITEM_ENRICHMENT: &str =
+    include_str!("migrations/20260722000000_add_work_item_enrichment.sql");
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
