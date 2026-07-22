@@ -1166,6 +1166,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "work_item_lease_project_tracking",
         sql: schema::SCHEMA_V239_WORK_ITEM_LEASE_PROJECT_TRACKING,
     },
+    PgMigration {
+        version: 243,
+        name: "fleet_model_catalog_rich_fields",
+        sql: schema::SCHEMA_V243_FLEET_MODEL_CATALOG_RICH_FIELDS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -2147,6 +2152,51 @@ mod tests {
         .await
         .expect("count Jira monitor tables");
         assert_eq!(tables, 6);
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v243_adds_fleet_model_catalog_rich_fields() {
+        // CI commonly has no Postgres; the helper checks both supported URL vars.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on a fresh database");
+
+        let row: crate::models::FleetModelCatalog = sqlx::query_as(
+            "INSERT INTO fleet_model_catalog
+                (id, name, family, parameters, tier, gated, preferred_workloads, variants,
+                 tool_calling, display_name, tasks, modalities, benchmarks, license, lifecycle)
+             VALUES
+                ('v243-test', 'V243 Test', 'test', '1B', 1, false, '[]', '[]', false,
+                 'V243 Test Model', '[\"chat\"]', '[\"text\"]', '{\"mmlu\": 80.0}',
+                 'apache-2.0', 'preview')
+             RETURNING id, name, family, parameters, tier, description, gated,
+                       preferred_workloads, variants, tool_calling, updated_at,
+                       display_name, tasks, modalities, benchmarks, license, lifecycle",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert + read row with rich fields");
+
+        assert_eq!(row.display_name.as_deref(), Some("V243 Test Model"));
+        assert_eq!(row.license.as_deref(), Some("apache-2.0"));
+        assert_eq!(row.lifecycle.as_deref(), Some("preview"));
+        assert!(row.tasks.is_some());
+        assert!(row.modalities.is_some());
+        assert!(row.benchmarks.is_some());
+
+        let existing_row_defaults: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT display_name, lifecycle FROM fleet_model_catalog
+              WHERE id = 'qwen3-4b-instruct-2507'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read pre-existing seeded row");
+        assert_eq!(existing_row_defaults, (None, None));
+
         drop_temp_db(admin, pool, &db_name).await;
     }
 }
