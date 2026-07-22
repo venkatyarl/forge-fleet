@@ -94,6 +94,7 @@ impl ToolRegistry {
         self.register(Self::fleet_models_library());
         self.register(Self::fleet_models_deployments());
         self.register(Self::fleet_models_disk_usage());
+        self.register(Self::fleet_models());
         self.register(Self::fleet_agents());
         self.register(Self::work_item_context());
         self.register(Self::fabric_topology());
@@ -983,6 +984,27 @@ impl ToolRegistry {
             input_schema: json!({
                 "type": "object",
                 "properties": {},
+                "required": []
+            }),
+        }
+    }
+
+    fn fleet_models() -> ToolDefinition {
+        ToolDefinition {
+            name: "fleet_models".to_string(),
+            description: "Canonical, real-time model info — joins fleet_model_deployments with fleet_model_catalog, grouped per catalog model. Returns catalog fields (parameters, tier, family, gated, tool_calling) plus each model's live deployment locations (worker_name, port, runtime, health_status). Optionally filter by catalog_id or node.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "catalog_id": {
+                        "type": "string",
+                        "description": "Optional catalog id to show a single model"
+                    },
+                    "node": {
+                        "type": "string",
+                        "description": "Optional node name — only include models with a live deployment on this node"
+                    }
+                },
                 "required": []
             }),
         }
@@ -1944,6 +1966,7 @@ mod tests {
             "fleet_models_library",
             "fleet_models_deployments",
             "fleet_models_disk_usage",
+            "fleet_models",
             "fleet_agents",
             "work_item_context",
             "fabric_topology",
