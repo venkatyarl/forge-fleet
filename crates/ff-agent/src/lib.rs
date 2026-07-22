@@ -162,6 +162,7 @@ pub mod supervisor;
 pub mod system_prompt;
 pub mod target_cleanup;
 pub mod task_coverage_seed;
+pub mod task_dedup;
 pub mod task_retention;
 pub mod task_runner;
 pub mod telegram;
