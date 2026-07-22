@@ -27,7 +27,10 @@ pub use store::{
     Memory, MemorySource, MemoryStore, MemoryStoreError, NewMemory, SearchMemoriesParams,
 };
 pub use types::{EdgeType, NodeId, Realm, RealmId};
-pub use user_model::{UserModel, UserModelContext, UserModelNode};
+pub use user_model::{
+    CrossRealmEdge, CrossRealmEdgeError, UserModel, UserModelContext, UserModelNode,
+    validate_cross_realm,
+};
 pub use workspace::{
     WorkspaceMemoryManager, WorkspaceProfile, WorkspaceScopedStore, WorkspaceSearchHit,
 };

@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::FromRow;
 
-use crate::{MemoryStore, MemoryStoreError, NodeId, Realm, RealmId};
+use crate::{EdgeType, MemoryStore, MemoryStoreError, NodeId, Realm, RealmId};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserModelNode {
@@ -82,6 +82,85 @@ impl MemoryStore {
     }
 }
 
+/// An `operates_on` edge whose endpoints may live in different realms.
+///
+/// Unlike a raw `(source, target)` pair, a `CrossRealmEdge` records the realm of
+/// each endpoint so downstream serialization can tag `realm_source` and
+/// `realm_target`. It is only constructed after [`validate_cross_realm`] confirms
+/// both endpoints exist in the global node scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossRealmEdge {
+    pub source: NodeId,
+    pub target: NodeId,
+    pub realm_source: RealmId,
+    pub realm_target: RealmId,
+    pub edge_type: EdgeType,
+}
+
+/// Reasons a cross-realm edge fails validation against the global node scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrossRealmEdgeError {
+    /// The source endpoint is not present in the global node scope.
+    MissingSource(NodeId),
+    /// The target endpoint is not present in the global node scope.
+    MissingTarget(NodeId),
+    /// The edge points a node at itself.
+    SelfLoop(NodeId),
+}
+
+impl CrossRealmEdge {
+    /// Builds an `operates_on` cross-realm edge, tagging each endpoint's realm.
+    ///
+    /// Returns an error if [`validate_cross_realm`] rejects the endpoints.
+    pub fn operates_on(
+        source: NodeId,
+        target: NodeId,
+        nodes_by_id: &HashMap<NodeId, UserModelNode>,
+    ) -> Result<Self, CrossRealmEdgeError> {
+        validate_cross_realm(source, target, nodes_by_id)?;
+        Ok(Self {
+            source,
+            target,
+            realm_source: nodes_by_id[&source].realm_id,
+            realm_target: nodes_by_id[&target].realm_id,
+            edge_type: EdgeType::OperatesOn,
+        })
+    }
+
+    /// Serializes the edge, tagging the realm of each endpoint.
+    pub fn to_serialized(&self) -> Value {
+        json!({
+            "edge_type": self.edge_type,
+            "source": self.source,
+            "target": self.target,
+            "realm_source": self.realm_source,
+            "realm_target": self.realm_target,
+        })
+    }
+}
+
+/// Validates that both endpoints of a cross-realm edge exist in the global node
+/// scope and that the edge is not a self-loop.
+///
+/// Same-realm edges are permitted; the "cross-realm" name reflects that endpoints
+/// *may* span realms, not that they must.
+pub fn validate_cross_realm(
+    source: NodeId,
+    target: NodeId,
+    nodes_by_id: &HashMap<NodeId, UserModelNode>,
+) -> Result<(), CrossRealmEdgeError> {
+    if source == target {
+        return Err(CrossRealmEdgeError::SelfLoop(source));
+    }
+    if !nodes_by_id.contains_key(&source) {
+        return Err(CrossRealmEdgeError::MissingSource(source));
+    }
+    if !nodes_by_id.contains_key(&target) {
+        return Err(CrossRealmEdgeError::MissingTarget(target));
+    }
+    Ok(())
+}
+
 fn merge_user_model(
     realms: Vec<Realm>,
     nodes: Vec<UserModelNode>,
@@ -103,10 +182,7 @@ fn merge_user_model(
         .map(|id| (id, HashSet::new()))
         .collect();
     for (source, target) in operates_on {
-        if source == target
-            || !nodes_by_id.contains_key(&source)
-            || !nodes_by_id.contains_key(&target)
-        {
+        if validate_cross_realm(source, target, &nodes_by_id).is_err() {
             continue;
         }
         adjacency.entry(source).or_default().insert(target);
@@ -219,6 +295,56 @@ mod tests {
         assert_eq!(model.contexts[0].node_ids, vec![node_a, node_b]);
         assert_eq!(model.contexts[0].realm_ids, vec![realm_a, realm_b]);
         assert_eq!(model.contexts[1].node_ids, vec![node_c]);
+    }
+
+    #[test]
+    fn creates_and_validates_cross_realm_operates_on_edge() {
+        let realm_a = RealmId(id(1));
+        let realm_b = RealmId(id(2));
+        let node_a = NodeId(id(10));
+        let node_b = NodeId(id(11));
+        let missing = NodeId(id(99));
+
+        let mut nodes_by_id = HashMap::new();
+        nodes_by_id.insert(
+            node_a,
+            UserModelNode {
+                id: node_a,
+                realm_id: realm_a,
+                content: json!({"a": 1}),
+            },
+        );
+        nodes_by_id.insert(
+            node_b,
+            UserModelNode {
+                id: node_b,
+                realm_id: realm_b,
+                content: json!({"b": 2}),
+            },
+        );
+
+        // Creation tags each endpoint's realm and the serializer surfaces both.
+        let edge = CrossRealmEdge::operates_on(node_a, node_b, &nodes_by_id).unwrap();
+        assert_eq!(edge.edge_type, EdgeType::OperatesOn);
+        assert_eq!(edge.realm_source, realm_a);
+        assert_eq!(edge.realm_target, realm_b);
+        let serialized = edge.to_serialized();
+        assert_eq!(serialized["realm_source"], json!(realm_a));
+        assert_eq!(serialized["realm_target"], json!(realm_b));
+
+        // Validation rejects self-loops and endpoints outside the global scope.
+        assert_eq!(
+            CrossRealmEdge::operates_on(node_a, node_a, &nodes_by_id),
+            Err(CrossRealmEdgeError::SelfLoop(node_a))
+        );
+        assert_eq!(
+            CrossRealmEdge::operates_on(node_a, missing, &nodes_by_id),
+            Err(CrossRealmEdgeError::MissingTarget(missing))
+        );
+        assert_eq!(
+            CrossRealmEdge::operates_on(missing, node_b, &nodes_by_id),
+            Err(CrossRealmEdgeError::MissingSource(missing))
+        );
     }
 
     #[test]
