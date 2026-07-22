@@ -16,6 +16,7 @@ pub mod session;
 pub mod store;
 pub mod types;
 pub mod user_model;
+pub mod user_model_registry;
 pub mod workspace;
 
 pub use cache::{ContextCache, WorkItemContextCache};
@@ -27,7 +28,8 @@ pub use store::{
     Memory, MemorySource, MemoryStore, MemoryStoreError, NewMemory, SearchMemoriesParams,
 };
 pub use types::{EdgeType, NodeId, Realm, RealmId};
-pub use user_model::{UserModel, UserModelContext, UserModelNode};
+pub use user_model::{GlobalUserModel, UserModel, UserModelContext, UserModelNode};
+pub use user_model_registry::{GlobalUserEntry, GlobalUserKey, GlobalUserRegistry};
 pub use workspace::{
     WorkspaceMemoryManager, WorkspaceProfile, WorkspaceScopedStore, WorkspaceSearchHit,
 };
