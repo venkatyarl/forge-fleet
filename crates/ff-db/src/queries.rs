@@ -5109,6 +5109,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reset_busy_slots_on_startup_only_touches_named_computer() {
+        let Some((admin, pool, db_name)) = create_slot_reconcile_db().await else {
+            return;
+        };
+
+        let this_computer = uuid::Uuid::new_v4();
+        let other_computer = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'thisbox'), ($2, 'otherbox')")
+            .bind(this_computer)
+            .bind(other_computer)
+            .execute(&pool)
+            .await
+            .expect("insert computers");
+
+        let wi = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO work_items (id, status) VALUES ($1, 'claimed')")
+            .bind(wi)
+            .execute(&pool)
+            .await
+            .expect("insert work_item");
+
+        // this computer: one busy slot (orphaned build) and one idle slot.
+        // other computer: one busy slot that must survive untouched.
+        for (computer, slot, status, item) in [
+            (this_computer, 0, "busy", Some(wi)),
+            (this_computer, 1, "idle", None),
+            (other_computer, 0, "busy", Some(wi)),
+        ] {
+            sqlx::query(
+                "INSERT INTO sub_agents (id, computer_id, slot, status, current_work_item_id, started_at)
+                 VALUES ($1, $2, $3, $4, $5, NOW())",
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(computer)
+            .bind(slot)
+            .bind(status)
+            .bind(item)
+            .execute(&pool)
+            .await
+            .expect("insert sub_agent");
+        }
+
+        let reset = pg_reset_busy_slots_on_startup(&pool, "ThisBox")
+            .await
+            .expect("reset busy slots");
+        assert_eq!(reset, 1, "only the busy slot on this computer is reset");
+
+        let rows: Vec<(uuid::Uuid, String, Option<uuid::Uuid>)> = sqlx::query_as(
+            "SELECT sa.computer_id, sa.status, sa.current_work_item_id
+               FROM sub_agents sa ORDER BY sa.computer_id, sa.slot",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read slots back");
+
+        for (computer_id, status, item) in rows {
+            if computer_id == other_computer {
+                assert_eq!(status, "busy", "other computer's busy slot untouched");
+                assert_eq!(item, Some(wi));
+            }
+        }
+
+        let this_box_statuses: Vec<String> = sqlx::query_scalar(
+            "SELECT status FROM sub_agents WHERE computer_id = $1 ORDER BY slot",
+        )
+        .bind(this_computer)
+        .fetch_all(&pool)
+        .await
+        .expect("read this box slots");
+        assert_eq!(this_box_statuses, vec!["idle", "idle"]);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
     async fn deferred_fold_backfills_view_and_claims_from_fleet_tasks() {
         let Some((admin, pool, db_name)) = create_temp_db().await else {
             return;
@@ -8743,6 +8818,35 @@ pub async fn pg_reconcile_sub_agent_slots(pool: &PgPool) -> Result<(u64, u64)> {
     .rows_affected();
 
     Ok((relinked, freed))
+}
+
+/// Reset every `'busy'` `sub_agents` row for a single computer back to
+/// `'idle'`, unconditionally. Meant to run once at daemon startup: a process
+/// restart means whatever build a slot was tracking is gone, so — unlike the
+/// periodic stuck-slot reaper's staleness ceiling (`sub_agent_reaper.rs`,
+/// which must protect long-running builds still in flight on a live daemon)
+/// — every `'busy'` slot on THIS computer is orphaned by definition. Scoped
+/// to `computer_name` only: other nodes' daemons are separate processes that
+/// may still be legitimately busy. `'disabled'`/`'error'`/`'idle'` slots are
+/// left alone. Returns the number of slots reset.
+pub async fn pg_reset_busy_slots_on_startup(pool: &PgPool, computer_name: &str) -> Result<u64> {
+    let rows_affected = sqlx::query(
+        "UPDATE sub_agents sa
+            SET status = 'idle',
+                current_work_item_id = NULL,
+                started_at = NULL,
+                last_heartbeat_at = NOW()
+           FROM computers c
+          WHERE sa.computer_id = c.id
+            AND LOWER(c.name) = LOWER($1)
+            AND sa.status = 'busy'",
+    )
+    .bind(computer_name)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected)
 }
 
 /// Computer ids that currently host a LIVE, agent-capable model deployment:

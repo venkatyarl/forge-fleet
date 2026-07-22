@@ -221,6 +221,21 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
             .await
             .context("postgres fleet-config migrations failed")?;
 
+        // ─── Stale slot reaper (startup) ──────────────────────────────────
+        // A daemon restart means any 'busy' sub_agents row for THIS computer
+        // is tracking a build that died with the old process — reset it to
+        // 'idle' immediately so the dispatch queue can reuse the slot instead
+        // of waiting on the periodic reaper's staleness ceiling
+        // (`SubAgentReaper`, up to 60min, and leader-gated). Scoped to this
+        // computer only: other nodes' daemons are separate processes.
+        match ff_db::queries::pg_reset_busy_slots_on_startup(pg_pool, &worker_name).await {
+            Ok(reset) if reset > 0 => {
+                info!(reset, computer = %worker_name, "reset orphaned busy sub-agent slots on startup")
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "startup stale slot reaper failed"),
+        }
+
         // Only seed if Postgres fleet_workers table is empty (first boot)
         let existing = ff_db::pg_list_nodes(pg_pool).await.unwrap_or_default();
         if existing.is_empty() {
