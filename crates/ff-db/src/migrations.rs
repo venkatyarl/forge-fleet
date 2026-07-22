@@ -1156,6 +1156,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "code_rulesets",
         sql: schema::SCHEMA_V235_CODE_RULESETS,
     },
+    PgMigration {
+        version: 236,
+        name: "work_item_enrichment",
+        sql: schema::SCHEMA_V236_WORK_ITEM_ENRICHMENT,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
