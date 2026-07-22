@@ -113,6 +113,29 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         )
     })
     .collect();
+    // Active projects fleet-wide (by currently-leased work_items), used below
+    // to cap each project's fair share of this tick's slot capacity. Distinct
+    // from `interleave_by_project`, which only reorders THIS tick's ready set —
+    // a project already holding a disproportionate share of ACTIVE leases must
+    // be deprioritized even if its ready backlog looks the same size as a
+    // less-active project's.
+    let active_by_project: HashMap<Option<String>, usize> = sqlx::query(
+        "SELECT w.project_id, COUNT(*)::bigint AS active \
+           FROM work_item_leases l \
+           JOIN work_items w ON w.id = l.work_item_id \
+          WHERE l.released_at IS NULL \
+          GROUP BY w.project_id",
+    )
+    .fetch_all(pg)
+    .await?
+    .into_iter()
+    .map(|row| {
+        (
+            row.get("project_id"),
+            row.get::<i64, _>("active").max(0) as usize,
+        )
+    })
+    .collect();
     let mut global_free = ff_db::pg_free_slots(pg, None, MAX_ASSIGN_PER_TICK).await?;
     let now = Utc::now();
     let dispatch_live: HashSet<uuid::Uuid> =
@@ -153,48 +176,65 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
     let mut pool: Vec<ff_db::FreeSlot> = global_free;
     let mut assigned = 0usize;
     let mut fallback_assigns = 0usize;
-    for item in interleave_by_project(ready) {
-        // Honor a host pin by re-querying that host's free slots; else take from
-        // the shared pool, preferring an agent-viable computer.
-        let slot = if let Some(host) = item.assigned_computer.as_deref() {
-            match ff_db::pg_free_slots(pg, Some(host), 1).await {
-                Ok(mut v) => v
-                    .pop()
-                    .filter(|slot| dispatch_live.contains(&slot.computer_id))
-                    .filter(|slot| dispatch_capacity_left(&active_by_computer, slot.computer_id)),
-                Err(e) => {
-                    warn!(host, error = %e, "work_item_scheduler: pinned-slot lookup failed");
-                    None
-                }
-            }
-        } else {
-            pop_slot(&mut pool, &viable, &mut fallback_assigns)
-        };
-        let Some(slot) = slot else { continue };
 
-        match ff_db::pg_assign_work_item(
+    let interleaved = interleave_by_project(ready);
+    let distinct_projects: HashSet<&Option<String>> = active_by_project
+        .keys()
+        .chain(interleaved.iter().map(|i| &i.project_id))
+        .collect();
+    let total_capacity = active_by_project.values().sum::<usize>() + pool.len();
+    let fair_share = project_fair_share(distinct_projects.len(), total_capacity);
+
+    // Two passes so fair-share stays work-conserving: first give every project
+    // first refusal up to `fair_share`; anything a project couldn't take because
+    // it was already at/over share (`deferred`) gets a second shot once every
+    // project has been through pass one, so free slots never sit idle just
+    // because the projects that could use them were momentarily capped.
+    let mut assigned_this_tick: HashMap<Option<String>, usize> = HashMap::new();
+    let mut deferred: Vec<ff_db::ReadyWorkItem> = Vec::new();
+    for item in interleaved {
+        if project_at_fair_share(
+            &item.project_id,
+            &active_by_project,
+            &assigned_this_tick,
+            fair_share,
+        ) {
+            deferred.push(item);
+            continue;
+        }
+        if try_assign_item(
             pg,
-            item.id,
-            slot.sub_agent_id,
-            slot.computer_id,
-            LEASE_GRANT_SECS,
+            &item,
+            &mut pool,
+            &mut active_by_computer,
+            &dispatch_live,
+            &viable,
+            &mut fallback_assigns,
         )
         .await
         {
-            Ok(true) => {
-                assigned += 1;
-                *active_by_computer.entry(slot.computer_id).or_default() += 1;
-                spawn_claim_heartbeat(pg.clone(), item.id);
-                // Keep the shared pool consistent if a pinned assignment consumed
-                // a slot that also sat in `pool`, and remove the rest of this
-                // computer's slots as soon as its dispatch capacity is full.
-                pool.retain(|s| {
-                    s.sub_agent_id != slot.sub_agent_id
-                        && dispatch_capacity_left(&active_by_computer, s.computer_id)
-                });
-            }
-            Ok(false) => { /* lost the race / already leased — skip */ }
-            Err(e) => warn!(item = %item.id, error = %e, "work_item_scheduler: assign failed"),
+            assigned += 1;
+            *assigned_this_tick
+                .entry(item.project_id.clone())
+                .or_default() += 1;
+        }
+    }
+    for item in deferred {
+        if try_assign_item(
+            pg,
+            &item,
+            &mut pool,
+            &mut active_by_computer,
+            &dispatch_live,
+            &viable,
+            &mut fallback_assigns,
+        )
+        .await
+        {
+            assigned += 1;
+            *assigned_this_tick
+                .entry(item.project_id.clone())
+                .or_default() += 1;
         }
     }
 
@@ -219,6 +259,97 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
 
 fn dispatch_tick_is_fresh(tick_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
     tick_at.is_some_and(|tick| tick >= now - chrono::Duration::seconds(DISPATCH_TICK_STALE_SECS))
+}
+
+/// Attempt to assign one ready work_item to a free slot, updating the shared
+/// pool / dispatch-capacity bookkeeping on success. Extracted so the fair-share
+/// two-pass loop in `evaluate_work_items` (first pass: projects under their
+/// share, second pass: work-conserving overflow) shares one assignment path
+/// instead of forking it.
+#[allow(clippy::too_many_arguments)]
+async fn try_assign_item(
+    pg: &PgPool,
+    item: &ff_db::ReadyWorkItem,
+    pool: &mut Vec<ff_db::FreeSlot>,
+    active_by_computer: &mut HashMap<uuid::Uuid, usize>,
+    dispatch_live: &HashSet<uuid::Uuid>,
+    viable: &HashSet<uuid::Uuid>,
+    fallback_assigns: &mut usize,
+) -> bool {
+    // Honor a host pin by re-querying that host's free slots; else take from
+    // the shared pool, preferring an agent-viable computer.
+    let slot = if let Some(host) = item.assigned_computer.as_deref() {
+        match ff_db::pg_free_slots(pg, Some(host), 1).await {
+            Ok(mut v) => v
+                .pop()
+                .filter(|slot| dispatch_live.contains(&slot.computer_id))
+                .filter(|slot| dispatch_capacity_left(active_by_computer, slot.computer_id)),
+            Err(e) => {
+                warn!(host, error = %e, "work_item_scheduler: pinned-slot lookup failed");
+                None
+            }
+        }
+    } else {
+        pop_slot(pool, viable, fallback_assigns)
+    };
+    let Some(slot) = slot else { return false };
+
+    match ff_db::pg_assign_work_item(
+        pg,
+        item.id,
+        slot.sub_agent_id,
+        slot.computer_id,
+        LEASE_GRANT_SECS,
+    )
+    .await
+    {
+        Ok(true) => {
+            *active_by_computer.entry(slot.computer_id).or_default() += 1;
+            spawn_claim_heartbeat(pg.clone(), item.id);
+            // Keep the shared pool consistent if a pinned assignment consumed
+            // a slot that also sat in `pool`, and remove the rest of this
+            // computer's slots as soon as its dispatch capacity is full.
+            pool.retain(|s| {
+                s.sub_agent_id != slot.sub_agent_id
+                    && dispatch_capacity_left(active_by_computer, s.computer_id)
+            });
+            true
+        }
+        Ok(false) => false, // lost the race / already leased
+        Err(e) => {
+            warn!(item = %item.id, error = %e, "work_item_scheduler: assign failed");
+            false
+        }
+    }
+}
+
+/// Each project's fair share of this tick's total slot capacity (pre-existing
+/// active leases + still-free slots), split evenly across every project that
+/// is either currently active or has ready work. Ceil-divided so a remainder
+/// favors filling slots over under-assigning. Pure so fair-share sizing is
+/// testable without a database.
+fn project_fair_share(distinct_projects: usize, total_capacity: usize) -> usize {
+    if distinct_projects == 0 {
+        return total_capacity;
+    }
+    total_capacity.div_ceil(distinct_projects)
+}
+
+/// True once `project_id` has reached (or exceeded) its fair share of slot
+/// capacity, counting both its pre-existing active leases and whatever this
+/// tick has already assigned it. The scheduler defers items past this point to
+/// a work-conserving second pass instead of dropping them, so a capped project
+/// still gets surplus capacity once every project has had first refusal. Pure
+/// so the skip rule is testable without a database.
+fn project_at_fair_share(
+    project_id: &Option<String>,
+    active_by_project: &HashMap<Option<String>, usize>,
+    assigned_this_tick: &HashMap<Option<String>, usize>,
+    fair_share: usize,
+) -> bool {
+    let active = active_by_project.get(project_id).copied().unwrap_or(0);
+    let assigned_now = assigned_this_tick.get(project_id).copied().unwrap_or(0);
+    active + assigned_now >= fair_share
 }
 
 /// Keep a newly-created lease alive while it waits for the owning host's
@@ -503,6 +634,47 @@ mod tests {
         assert!(
             LEASE_STALE_SECS >= 2 * cadence,
             "LEASE_STALE_SECS ({LEASE_STALE_SECS}) must be >= 2x the dispatch heartbeat ({cadence})"
+        );
+    }
+
+    /// Capacity splits evenly (ceil-divided) across every distinct project so a
+    /// remainder favors filling slots over under-assigning.
+    #[test]
+    fn project_fair_share_splits_capacity_evenly() {
+        assert_eq!(project_fair_share(3, 9), 3);
+        assert_eq!(project_fair_share(3, 10), 4, "remainder rounds up");
+        assert_eq!(
+            project_fair_share(0, 5),
+            5,
+            "no projects: share is the whole pool"
+        );
+    }
+
+    /// A project with no pre-existing active leases and nothing assigned yet
+    /// this tick is under its share; once its active-plus-this-tick count
+    /// reaches the share it must be skipped (deferred), not assigned further.
+    #[test]
+    fn project_at_fair_share_counts_active_and_this_tick_assignments() {
+        let alpha = Some("alpha".to_string());
+        let mut active = HashMap::new();
+        active.insert(alpha.clone(), 2usize);
+        let mut assigned_this_tick = HashMap::new();
+
+        assert!(
+            !project_at_fair_share(&alpha, &active, &assigned_this_tick, 3),
+            "2 active < share of 3"
+        );
+
+        assigned_this_tick.insert(alpha.clone(), 1);
+        assert!(
+            project_at_fair_share(&alpha, &active, &assigned_this_tick, 3),
+            "2 active + 1 this tick reaches the share of 3"
+        );
+
+        let beta = Some("beta".to_string());
+        assert!(
+            !project_at_fair_share(&beta, &active, &assigned_this_tick, 3),
+            "an untracked project has 0 active and 0 assigned so it is under share"
         );
     }
 
