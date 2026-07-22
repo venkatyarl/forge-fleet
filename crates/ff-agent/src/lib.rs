@@ -94,6 +94,7 @@ pub mod lease_takeover;
 pub mod legacy_daemon_reaper;
 pub mod llm_attribution;
 pub mod local_healer;
+pub mod local_llm_member;
 pub mod log_analysis_worker;
 pub mod log_rotate;
 pub mod log_signature;

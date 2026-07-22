@@ -9,9 +9,11 @@
 //! blending disagreement away. Every dispatch is logged to `ff_interactions`
 //! (audit + training data).
 //!
-//! A member is either a VENDOR CLI (codex/kimi/claude — via cli_executor) or a
-//! LOCAL FLEET model (`local` / `local:<model>` — via fleet_oneshot), so one
-//! roster can mix cloud + local tiers: `--members codex,local:qwen36-35b,kimi`.
+//! A member is either a VENDOR CLI (codex/kimi/claude — via cli_executor), a
+//! LOCAL FLEET model (`local` / `local:<model>` — via fleet_oneshot), or an
+//! explicit fleet ENDPOINT (`http://host:port[#model]` — via LocalLlmMember,
+//! streamed), so one roster can mix cloud + local tiers:
+//! `--members codex,local:qwen36-35b,kimi`.
 //! `--no-synthesis` preserves the v1 print-only behavior. Design:
 //! `.forgefleet/plans/llm-council.md`.
 
@@ -407,14 +409,51 @@ pub async fn handle_council(
     Ok(())
 }
 
-/// Dispatch one member: a `local`/`local:<model>` fleet model via fleet_oneshot,
-/// or a vendor CLI via cli_executor. Normalizes both into a [`MemberRaw`].
+/// Dispatch one member: an explicit `http(s)://host:port[#model]` fleet
+/// endpoint via `LocalLlmMember` (streaming, no DB routing), a
+/// `local`/`local:<model>` fleet model via fleet_oneshot, or a vendor CLI via
+/// cli_executor. Normalizes all three into a [`MemberRaw`].
 async fn dispatch_member(
     member: &str,
     prompt: &str,
     pool: Option<&PgPool>,
     timeout: Option<Duration>,
 ) -> MemberRaw {
+    // Direct-endpoint fleet member: council against one explicit deployment.
+    // The response is already parsed to the council schema; re-serialize it so
+    // `parse_member_answer` round-trips confidence/evidence unchanged.
+    if member.starts_with("http://") || member.starts_with("https://") {
+        let (endpoint, model) = match member.split_once('#') {
+            Some((endpoint, model)) if !model.is_empty() => (endpoint, model),
+            _ => (member, "local"),
+        };
+        let mut llm =
+            ff_agent::local_llm_member::LocalLlmMember::new(endpoint, model).streaming(true);
+        if let Some(timeout) = timeout {
+            llm = llm.with_timeout(timeout);
+        }
+        return match llm.respond(prompt).await {
+            Ok(r) => MemberRaw {
+                answer: Some(
+                    serde_json::json!({
+                        "answer": r.answer,
+                        "confidence": r.confidence,
+                        "evidence": r.evidence,
+                    })
+                    .to_string(),
+                ),
+                error: None,
+                latency_ms: i32::try_from(r.latency_ms).ok(),
+                endpoint: Some(format!("{} ({})", r.endpoint, r.model)),
+                worker_name: None,
+                tokens_in: r.tokens_in,
+                tokens_out: r.tokens_out,
+                engine: Some(ff_agent::llm_attribution::engine_label(&r.model)),
+            },
+            Err(e) => MemberRaw::fail(e.to_string()),
+        };
+    }
+
     // Local fleet member: `local` (any healthy model) or `local:<model>` (biased).
     if member == "local" || member.starts_with("local:") {
         let model_hint = member.strip_prefix("local:").filter(|s| !s.is_empty());

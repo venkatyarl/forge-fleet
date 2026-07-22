@@ -431,7 +431,7 @@ fn rank_candidates<'a>(
 /// into `i32` for the `ff_interactions` columns. Reuses the canonical
 /// `research::parse_completion_usage` walk (no forked JSON parsing); a server
 /// that omits `usage`, or absurd values, degrade to `0`/`i32::MAX`. Pure.
-fn usage_tokens_i32(payload: &Value) -> (i32, i32) {
+pub(crate) fn usage_tokens_i32(payload: &Value) -> (i32, i32) {
     let (pt, ct) = crate::research::parse_completion_usage(payload);
     let clamp = |n: u64| i32::try_from(n).unwrap_or(i32::MAX);
     (clamp(pt), clamp(ct))
@@ -453,7 +453,7 @@ fn model_name_present(catalog_id: Option<&str>, catalog_name: Option<&str>) -> b
 
 /// Pull the assistant text out of an OpenAI-shape chat-completion payload,
 /// tolerating both `message.content` and the legacy `text` field.
-fn extract_completion_text(payload: &Value) -> Option<String> {
+pub(crate) fn extract_completion_text(payload: &Value) -> Option<String> {
     let choice = payload.get("choices")?.as_array()?.first()?;
     if let Some(content) = choice
         .get("message")
@@ -471,7 +471,7 @@ fn extract_completion_text(payload: &Value) -> Option<String> {
 
 /// Strip a leading `<think>…</think>` reasoning block some local models emit so
 /// the council sees only the answer.
-fn strip_think_block(s: &str) -> String {
+pub(crate) fn strip_think_block(s: &str) -> String {
     let t = s.trim_start();
     if let Some(rest) = t.strip_prefix("<think>")
         && let Some(end) = rest.find("</think>")
