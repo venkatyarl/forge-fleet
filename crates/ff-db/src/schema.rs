@@ -12099,6 +12099,24 @@ ALTER TABLE fleet_model_catalog
     ADD COLUMN IF NOT EXISTS lifecycle    TEXT;
 "#;
 
+/// Capability data for `sub_agents` slots, so the dispatcher can match a
+/// slot against a work item's `required_capabilities` before assigning it:
+///   - `capabilities` — flat explicit tags (e.g. `"gpu"`, a repo override),
+///     mirroring the flat-tag shape already used by
+///     `work_items.required_capabilities`.
+///   - `skill` — flat tags for what the slot's assigned agent/model is
+///     good at (e.g. `"rust"`, `"frontend"`, `"code-review"`).
+///   - `ram_gb` — RAM available to this slot's computer, in GB. Nullable:
+///     existing rows predate this column and are backfilled lazily by the
+///     daemon that seeds slots per computer. Unlike the tag fields, RAM
+///     requirements are matched numerically (>=), not by exact tag match.
+pub const SCHEMA_V244_SUB_AGENTS_CAPABILITIES: &str = r#"
+ALTER TABLE sub_agents
+    ADD COLUMN IF NOT EXISTS capabilities JSONB NOT NULL DEFAULT '[]',
+    ADD COLUMN IF NOT EXISTS skill        JSONB NOT NULL DEFAULT '[]',
+    ADD COLUMN IF NOT EXISTS ram_gb       INT;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
