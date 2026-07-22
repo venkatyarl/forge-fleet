@@ -1171,6 +1171,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "fleet_model_catalog_rich_fields",
         sql: schema::SCHEMA_V243_FLEET_MODEL_CATALOG_RICH_FIELDS,
     },
+    PgMigration {
+        version: 244,
+        name: "sub_agents_capabilities",
+        sql: schema::SCHEMA_V244_SUB_AGENTS_CAPABILITIES,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -2196,6 +2201,68 @@ mod tests {
         .await
         .expect("read pre-existing seeded row");
         assert_eq!(existing_row_defaults, (None, None));
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v244_adds_sub_agents_capability_columns() {
+        // CI commonly has no Postgres; the helper checks both supported URL vars.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on a fresh database");
+
+        let computer_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'v244-testbox')")
+            .bind(computer_id)
+            .execute(&pool)
+            .await
+            .expect("insert computers row");
+
+        let row: crate::models::Slot = sqlx::query_as(
+            "INSERT INTO sub_agents
+                (id, computer_id, slot, workspace_dir, capabilities, skill, ram_gb)
+             VALUES
+                ($1, $2, 0, '/tmp/v244-test', '[\"gpu\"]', '[\"rust\"]', 64)
+             RETURNING id, computer_id, slot, status, current_work_item_id, started_at,
+                       workspace_dir, model_preference, last_heartbeat_at, metadata, kind,
+                       capabilities, skill, ram_gb",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(computer_id)
+        .fetch_one(&pool)
+        .await
+        .expect("insert + read row with capability columns");
+
+        assert_eq!(row.capabilities, serde_json::json!(["gpu"]));
+        assert_eq!(row.skill, serde_json::json!(["rust"]));
+        assert_eq!(row.ram_gb, Some(64));
+
+        // Pre-existing rows (created before V244) get the tag columns'
+        // defaults and a NULL ram_gb rather than failing to read.
+        sqlx::query(
+            "INSERT INTO sub_agents (id, computer_id, slot, workspace_dir)
+             VALUES ($1, $2, 1, '/tmp/v244-test-defaults')",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(computer_id)
+        .execute(&pool)
+        .await
+        .expect("insert row without capability columns set");
+
+        let defaults: (serde_json::Value, serde_json::Value, Option<i32>) = sqlx::query_as(
+            "SELECT capabilities, skill, ram_gb FROM sub_agents WHERE computer_id = $1 AND slot = 1",
+        )
+        .bind(computer_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read back defaulted row");
+        assert_eq!(defaults.0, serde_json::json!([]));
+        assert_eq!(defaults.1, serde_json::json!([]));
+        assert_eq!(defaults.2, None);
 
         drop_temp_db(admin, pool, &db_name).await;
     }
