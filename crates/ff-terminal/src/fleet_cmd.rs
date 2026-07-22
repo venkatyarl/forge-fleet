@@ -521,7 +521,22 @@ pub async fn handle_fleet_db(pool: &sqlx::PgPool, cmd: FleetDbCommand) -> Result
             target_db,
             physical,
             yes,
+            // Some(_) is intercepted pool-free in handle_fleet before we get
+            // here; the catalog path below never needs these.
+            from_file: _,
+            identity,
         } => {
+            // clap `requires` can silently no-op in arg shapes like this one
+            // — enforce the dependency in code.
+            if identity.is_some() {
+                anyhow::bail!("--identity only applies with --from-file");
+            }
+            let backup_id = backup_id.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing backup id — pass a `backups` UUID, or use \
+                     --from-file <path> for the DB-free DR path"
+                )
+            })?;
             handle_fleet_db_restore(pool, &backup_id, to.as_deref(), &target_db, yes, physical)
                 .await?;
         }
@@ -1317,6 +1332,195 @@ async fn count_fleet_workers_live(pool: &sqlx::PgPool) -> Result<i64> {
         .fetch_one(pool)
         .await?;
     Ok(n)
+}
+
+/// Env var consulted by `--from-file` restores when `--identity` isn't
+/// passed. Holds either the `AGE-SECRET-KEY-…` string itself or a path to
+/// an identity file containing one.
+const BACKUP_IDENTITY_ENV: &str = "FORGEFLEET_BACKUP_IDENTITY";
+
+/// Expand a leading `~/` against `$HOME` for paths we open from Rust
+/// (unlike [`expand_home`], which targets double-quoted shell strings).
+fn expand_home_fs(raw: &str) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(raw)
+}
+
+/// Pull the first age X25519 secret key out of an identity-file body —
+/// `age-keygen` output carries `# created:` / `# public key:` comment
+/// lines before the key itself.
+fn extract_age_secret_key(contents: &str) -> Option<String> {
+    contents
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("AGE-SECRET-KEY-"))
+        .map(str::to_string)
+}
+
+/// Resolve the age identity for a `--from-file` decrypt: `--identity <path>`
+/// first, then `$FORGEFLEET_BACKUP_IDENTITY` (key string or path). Never
+/// touches the database.
+async fn resolve_backup_identity(identity_flag: Option<&str>) -> Result<String> {
+    async fn read_identity_file(raw: &str) -> Result<String> {
+        let path = expand_home_fs(raw);
+        let contents = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| anyhow::anyhow!("read identity file {}: {e}", path.display()))?;
+        extract_age_secret_key(&contents)
+            .ok_or_else(|| anyhow::anyhow!("no AGE-SECRET-KEY-… line found in {}", path.display()))
+    }
+    if let Some(raw) = identity_flag {
+        return read_identity_file(raw).await;
+    }
+    if let Ok(v) = std::env::var(BACKUP_IDENTITY_ENV) {
+        let v = v.trim().to_string();
+        if v.starts_with("AGE-SECRET-KEY-") {
+            return Ok(v);
+        }
+        if !v.is_empty() {
+            return read_identity_file(&v).await;
+        }
+    }
+    anyhow::bail!(
+        "no decryption identity: pass --identity <file> or set \
+         ${BACKUP_IDENTITY_ENV}. On a DR box, recover the fleet identity \
+         from the escrow next to the backups: \
+         age -d -i <operator-key> {} > identity.txt",
+        ff_agent::ha::backup::BACKUP_IDENTITY_ESCROW_FILE
+    )
+}
+
+/// `ff fleet db restore --from-file <path> --physical --yes` — the DB-free
+/// DR bootstrap. Runs BEFORE any Postgres pool exists (see the intercept in
+/// [`handle_fleet`]): on a fresh box the `backups` catalog and
+/// `fleet_secrets` live inside the very database being restored, so this
+/// path takes the archive straight off disk, decrypts `.age` ciphertext
+/// with an operator-supplied identity, and hands the plaintext to the same
+/// [`restore_physical_pg_basebackup`] the catalog path uses.
+pub async fn handle_fleet_db_restore_from_file(
+    file: &str,
+    identity: Option<&str>,
+    to: Option<&str>,
+    physical: bool,
+    yes: bool,
+) -> Result<()> {
+    if let Some(target) = to {
+        anyhow::bail!(
+            "--from-file is a local DR bootstrap and can't verify node names \
+             without a database; ssh to '{target}' and run it there instead \
+             of --to"
+        );
+    }
+    if !physical {
+        anyhow::bail!(
+            "--from-file is the DB-free physical DR path — pass --physical. \
+             (Logical restores need the `backups` catalog; once Postgres is \
+             up, use `ff fleet db restore <backup-id>`.)"
+        );
+    }
+    if !yes {
+        eprintln!(
+            "{YELLOW}Physical restore DESTROYS the local forgefleet-postgres \
+             PGDATA directory and replaces it with the backup archive. \
+             Re-run with --yes to proceed.{RESET}"
+        );
+        std::process::exit(2);
+    }
+
+    let src = expand_home_fs(file);
+    println!("{CYAN}▶ restore --from-file{RESET}  {}", src.display());
+    let meta = tokio::fs::metadata(&src)
+        .await
+        .map_err(|e| anyhow::anyhow!("backup file {}: {e}", src.display()))?;
+    if meta.len() == 0 {
+        anyhow::bail!(
+            "backup file {} is 0 bytes — producer never wrote ciphertext",
+            src.display()
+        );
+    }
+
+    let file_name = src
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    // Unique 0700 tempdir, deleted on drop — the decrypted cluster snapshot
+    // must not linger at a predictable shared /tmp path.
+    let mut _tmp_guard: Option<tempfile::TempDir> = None;
+    let plaintext_path = if let Some(stem) = file_name.strip_suffix(".age") {
+        let identity_str = resolve_backup_identity(identity).await?;
+        let tmp_dir = tempfile::Builder::new()
+            .prefix("ff-restore-")
+            .tempdir()
+            .map_err(|e| anyhow::anyhow!("create decrypt tempdir: {e}"))?;
+        let dest = tmp_dir.path().join(stem);
+        _tmp_guard = Some(tmp_dir);
+        ff_agent::ha::backup::decrypt_backup_file_with_identity(&identity_str, &src, &dest)
+            .await
+            .map_err(|e| anyhow::anyhow!("decrypt failed: {e}"))?;
+        println!(
+            "{GREEN}✓{RESET} decrypted → {} ({} bytes)",
+            dest.display(),
+            tokio::fs::metadata(&dest).await?.len()
+        );
+        dest
+    } else {
+        src.clone()
+    };
+
+    // Same physical-archive shape gate the catalog path applies.
+    let ext = plaintext_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let is_physical_archive = (ext == "gz" || ext == "tgz")
+        && !plaintext_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|n| n.ends_with(".sql.gz"))
+            .unwrap_or(false);
+    if !is_physical_archive {
+        anyhow::bail!(
+            "--physical only makes sense for pg_basebackup tar.gz archives, \
+             not this file ({})",
+            plaintext_path.display()
+        );
+    }
+    restore_physical_pg_basebackup(&plaintext_path).await
+}
+
+#[cfg(test)]
+mod restore_from_file_tests {
+    use super::*;
+
+    #[test]
+    fn extract_age_secret_key_skips_keygen_comments() {
+        let body = "# created: 2026-07-22T00:00:00Z\n\
+                    # public key: age1abcdef\n\
+                    AGE-SECRET-KEY-1EXAMPLEEXAMPLE\n";
+        assert_eq!(
+            extract_age_secret_key(body).as_deref(),
+            Some("AGE-SECRET-KEY-1EXAMPLEEXAMPLE")
+        );
+        assert_eq!(extract_age_secret_key("# comments only\n"), None);
+        assert_eq!(extract_age_secret_key(""), None);
+    }
+
+    #[test]
+    fn expand_home_fs_expands_only_leading_tilde_slash() {
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(
+                expand_home_fs("~/backups/pg.tar.gz.age"),
+                PathBuf::from(home).join("backups/pg.tar.gz.age")
+            );
+        }
+        assert_eq!(expand_home_fs("/abs/path"), PathBuf::from("/abs/path"));
+        assert_eq!(expand_home_fs("rel/path"), PathBuf::from("rel/path"));
+    }
 }
 
 /// State of the local `forgefleet-postgres` container discovered via
@@ -3438,6 +3642,33 @@ pub async fn handle_fleet_gossip() -> Result<()> {
 }
 
 pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
+    // DB-free DR bootstrap: `db restore --from-file` must work when Postgres
+    // is down or doesn't exist yet — that's the whole point of the verb. It
+    // has to run BEFORE the pool connect + migrations below, which would
+    // otherwise fail on a fresh box (or initialize an empty schema we're
+    // about to overwrite anyway).
+    if let FleetCommand::Db {
+        command:
+            FleetDbCommand::Restore {
+                from_file: Some(file),
+                identity,
+                to,
+                physical,
+                yes,
+                ..
+            },
+    } = &cmd
+    {
+        return handle_fleet_db_restore_from_file(
+            file,
+            identity.as_deref(),
+            to.as_deref(),
+            *physical,
+            *yes,
+        )
+        .await;
+    }
+
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
         .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;

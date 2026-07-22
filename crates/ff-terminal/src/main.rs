@@ -2188,9 +2188,18 @@ pub enum FleetDbCommand {
     ///
     /// Never overwrites the live `forgefleet` database unless `--physical`
     /// is passed.
+    ///
+    /// DR bootstrap (`--from-file`): on a FRESH box the `backups` catalog and
+    /// `fleet_secrets` live inside the very database being restored, so the
+    /// catalog path above is circular. `--from-file <path> --physical --yes`
+    /// restores straight from an archive on disk WITHOUT any database
+    /// connection, decrypting `.age` ciphertext with `--identity` /
+    /// `$FORGEFLEET_BACKUP_IDENTITY` instead of `fleet_secrets`.
     Restore {
-        /// Backup ID (UUID) from the `backups` table.
-        backup_id: String,
+        /// Backup ID (UUID) from the `backups` table. Optional when
+        /// `--from-file` supplies the archive directly.
+        #[arg(required_unless_present = "from_file")]
+        backup_id: Option<String>,
         /// Target computer name (reserved for future SSH hand-off;
         /// currently only local restore is supported — anything else
         /// prints a TODO and exits).
@@ -2210,6 +2219,18 @@ pub enum FleetDbCommand {
         /// replaces PGDATA).
         #[arg(long, default_value_t = false)]
         yes: bool,
+        /// DB-free DR bootstrap: restore straight from this backup file
+        /// (encrypted `.age` or plaintext `.tar.gz`) instead of a `backups`
+        /// row. Never connects to Postgres. Requires `--physical`.
+        #[arg(long = "from-file", value_name = "PATH")]
+        from_file: Option<String>,
+        /// Path to an age identity file (a line starting `AGE-SECRET-KEY-`,
+        /// e.g. recovered via `age -d -i <operator-key>
+        /// backup_age_identity.age`). Only used with `--from-file`; falls
+        /// back to `$FORGEFLEET_BACKUP_IDENTITY` (the key itself or a path
+        /// to one).
+        #[arg(long, value_name = "PATH")]
+        identity: Option<String>,
     },
     /// Audit every recent backup: size, checksum, decryptability.
     ///
