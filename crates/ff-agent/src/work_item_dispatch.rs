@@ -3126,10 +3126,26 @@ async fn run_ff_dispatch(
     } else {
         routed
     };
-    // Claude is the fast build backstop; loaded nodes can make codex exceed a
-    // short probe even though it succeeds given time.
+    // Spread builds across the cloud trio instead of always fronting claude.
+    // The old hardcoded `preferred_cloud_backstop = "claude"` meant codex/kimi
+    // only ever built when claude ERRORED — kimi had 0 lifetime builds while
+    // claude carried 117 attempts/24h on one shared OAuth account (operator
+    // asked "why aren't you using kimi?", 2026-07-22). Deterministic rotation
+    // by work_item id gives each authenticated backend ~equal build share while
+    // keeping per-item stability (same item → same preferred backend across
+    // retries on this attempt tier); the failover loop below still walks the
+    // rest of the list on error, and falls back to claude when the rotation
+    // pick isn't in this node's dispatchable set.
     let mut policy = ff_routing_policy::PolicyConfig::default();
-    policy.preferred_cloud_backstop = Some("claude".to_string());
+    const BUILDER_ROTATION: [&str; 3] = ["claude", "codex", "kimi"];
+    let pick = BUILDER_ROTATION
+        [(item.work_item_id.as_u128() % BUILDER_ROTATION.len() as u128) as usize];
+    let preferred = if backends.iter().any(|b| b == pick) {
+        pick
+    } else {
+        "claude"
+    };
+    policy.preferred_cloud_backstop = Some(preferred.to_string());
     ff_routing_policy::promote_cloud_backstop(&mut backends, &policy);
     let computer_id = item.computer_id;
     let forced_backend = primary_or_default_backend(&backends);
