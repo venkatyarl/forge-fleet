@@ -20,6 +20,7 @@ pub mod executor;
 pub mod ha_coordinator;
 pub mod health;
 pub mod llm_480b_wrapper;
+pub mod slot_allocation;
 pub mod task_processor;
 pub mod timeout;
 
@@ -58,4 +59,5 @@ pub use llm_480b_wrapper::{
     CodegenResult, Llm480bError, Llm480bHttpWrapper, Llm480bRequest, Llm480bResponse,
     Llm480bWrapper,
 };
+pub use slot_allocation::{SlotAllocationConfig, allocate_slots};
 pub use task_processor::{ComplexityFlag, TaskComplexity, TaskProcessor};

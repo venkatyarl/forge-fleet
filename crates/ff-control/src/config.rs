@@ -174,6 +174,10 @@ pub struct ControlConfig {
     /// 480B escalation settings — `[control.escalation]`.
     #[serde(default)]
     pub escalation: EscalationConfig,
+
+    /// Per-project slot allocation settings — `[control.slot_allocation]`.
+    #[serde(default)]
+    pub slot_allocation: crate::slot_allocation::SlotAllocationConfig,
 }
 
 impl ControlConfig {
@@ -189,6 +193,7 @@ impl Default for ControlConfig {
             max_build_duration_secs: default_max_build_duration_secs(),
             alerts: AlertConfig::default(),
             escalation: EscalationConfig::default(),
+            slot_allocation: crate::slot_allocation::SlotAllocationConfig::default(),
         }
     }
 }
