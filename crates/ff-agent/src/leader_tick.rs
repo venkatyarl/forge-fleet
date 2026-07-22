@@ -40,6 +40,7 @@ use ff_db::leader_state::{
 };
 use ff_pulse::reader::{PulseError, PulseReader};
 
+use crate::ha::mirror_service::{MirrorFetchConfig, MirrorFetchService};
 use crate::ha::pg_failover::{FailoverOutcome, PostgresFailoverManager};
 use crate::ha::self_heal::{SelfHealState, rearm_self_heal_task, scan_daemon_logs_for_self_heal};
 #[cfg(test)]
@@ -124,6 +125,10 @@ pub struct LeaderTick {
     /// primary and promote the local replica if we host one.
     pg_failover_manager: Option<Arc<PostgresFailoverManager>>,
 
+    /// Optional git mirror service, owned by the leader lifecycle. The loop is
+    /// started only while this node holds the authoritative leader lease.
+    mirror_fetch_config: Option<MirrorFetchConfig>,
+
     /// In-process deduplication for novel error Telegram alerts.
     error_tracker: crate::ha::error_tracker::ErrorTracker,
 
@@ -193,6 +198,7 @@ impl LeaderTick {
             on_became_leader: Arc::new(|_| {}),
             on_lost_leader: Arc::new(|_| {}),
             pg_failover_manager: None,
+            mirror_fetch_config: None,
             error_tracker: crate::ha::error_tracker::ErrorTracker::default(),
             leader_pulse_silent_since: tokio::sync::Mutex::new(None),
             leaderless_since: tokio::sync::Mutex::new(None),
@@ -271,6 +277,12 @@ impl LeaderTick {
         self
     }
 
+    /// Attach a git mirror service that runs only while this node is leader.
+    pub fn with_mirror_service(mut self, config: MirrorFetchConfig) -> Self {
+        self.mirror_fetch_config = Some(config);
+        self
+    }
+
     fn self_leader_info(&self, epoch: i64, reason: &'static str) -> LeaderInfo {
         let now = Utc::now();
         LeaderInfo {
@@ -295,6 +307,7 @@ impl LeaderTick {
     pub fn spawn(self, interval_secs: u64, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
         let period = Duration::from_secs(interval_secs.max(1));
         tokio::spawn(async move {
+            let mut mirror_runtime: Option<MirrorRuntime> = None;
             let mut ticker = tokio::time::interval(period);
             // Prevent a burst when several ticks are missed.
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -308,12 +321,29 @@ impl LeaderTick {
             // waiting). Run one election tick up front so leadership is
             // confirmed and the cache warmed before anything else runs.
             // Idempotent with the loop's first tick (heartbeat refresh only).
-            if let Err(err) = self.tick().await {
-                tracing::warn!(
-                    node = %self.my_name,
-                    error = %err,
-                    "initial leader-cache warm tick failed"
-                );
+            match self.tick().await {
+                Ok(_) => {
+                    reconcile_mirror_service(
+                        self.mirror_fetch_config.as_ref(),
+                        LeaderCache::global().is_current_leader(),
+                        &mut mirror_runtime,
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    self.update_leader_cache(false, LeaderInfo::default()).await;
+                    reconcile_mirror_service(
+                        self.mirror_fetch_config.as_ref(),
+                        false,
+                        &mut mirror_runtime,
+                    )
+                    .await;
+                    tracing::warn!(
+                        node = %self.my_name,
+                        error = %err,
+                        "initial leader-cache warm tick failed"
+                    );
+                }
             }
 
             loop {
@@ -321,6 +351,12 @@ impl LeaderTick {
                     _ = ticker.tick() => {
                         match self.tick().await {
                             Ok(outcome) => {
+                                reconcile_mirror_service(
+                                    self.mirror_fetch_config.as_ref(),
+                                    LeaderCache::global().is_current_leader(),
+                                    &mut mirror_runtime,
+                                )
+                                .await;
                                 tracing::debug!(
                                     node = %self.my_name,
                                     ?outcome,
@@ -439,6 +475,12 @@ impl LeaderTick {
                             }
                             Err(err) => {
                                 self.update_leader_cache(false, LeaderInfo::default()).await;
+                                reconcile_mirror_service(
+                                    self.mirror_fetch_config.as_ref(),
+                                    false,
+                                    &mut mirror_runtime,
+                                )
+                                .await;
                                 tracing::warn!(
                                     node = %self.my_name,
                                     error = %err,
@@ -449,6 +491,7 @@ impl LeaderTick {
                     }
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() {
+                            stop_mirror_service(&mut mirror_runtime).await;
                             tracing::info!(node = %self.my_name, "leader tick shutting down");
                             break;
                         }
@@ -1332,6 +1375,45 @@ impl LeaderTick {
     }
 }
 
+async fn reconcile_mirror_service(
+    config: Option<&MirrorFetchConfig>,
+    is_leader: bool,
+    runtime: &mut Option<MirrorRuntime>,
+) {
+    if is_leader
+        && runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.task.is_finished())
+    {
+        stop_mirror_service(runtime).await;
+    }
+
+    match (is_leader, config, runtime.is_some()) {
+        (true, Some(config), false) => {
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let task = MirrorFetchService::new(config.clone()).spawn(shutdown_rx);
+            *runtime = Some(MirrorRuntime { shutdown, task });
+            tracing::info!("leader mirror service started");
+        }
+        (false, _, true) => stop_mirror_service(runtime).await,
+        _ => {}
+    }
+}
+
+struct MirrorRuntime {
+    shutdown: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+async fn stop_mirror_service(runtime: &mut Option<MirrorRuntime>) {
+    if let Some(runtime) = runtime.take() {
+        let _ = runtime.shutdown.send(true);
+        runtime.task.abort();
+        let _ = runtime.task.await;
+        tracing::info!("leader mirror service stopped");
+    }
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
 /// One row from the candidate-pool query.
@@ -1470,6 +1552,22 @@ mod tests {
     use chrono::Duration as ChronoDuration;
     use sqlx::postgres::PgPoolOptions;
     use std::env;
+
+    #[tokio::test]
+    async fn mirror_service_starts_and_stops_with_leadership() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = MirrorFetchConfig::new(
+            "https://example.invalid/forge-fleet.git",
+            temp.path().join("forge-fleet.git"),
+        );
+        let mut runtime = None;
+
+        reconcile_mirror_service(Some(&config), true, &mut runtime).await;
+        assert!(runtime.is_some());
+
+        reconcile_mirror_service(Some(&config), false, &mut runtime).await;
+        assert!(runtime.is_none());
+    }
 
     fn fake_leader(name: &str, heartbeat_age_secs: i64, epoch: i64) -> LeaderState {
         LeaderState {
