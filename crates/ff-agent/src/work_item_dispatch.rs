@@ -2102,8 +2102,23 @@ async fn lane15_enabled(pg: &PgPool) -> bool {
     )
 }
 
-fn should_attempt_lane15(lane1_failed: bool, enabled: bool, breaker_open: bool) -> bool {
-    lane1_failed && enabled && !breaker_open
+fn should_attempt_lane15(
+    lane1_failed: bool,
+    complexity_at_least_moderate: bool,
+    enabled: bool,
+    breaker_open: bool,
+) -> bool {
+    (lane1_failed || complexity_at_least_moderate) && enabled && !breaker_open
+}
+
+/// Whether the task's decomposer-assigned complexity (`mechanical` |
+/// `moderate` | `complex`) is high enough to warrant the Lane-1.5 480B
+/// escalation BEFORE the cloud backstop, even when Lane 1 was never attempted
+/// (e.g. `moderate`/`complex` tasks that already skip Lane 1 via
+/// `prefers_cloud_lane`). Mechanical tasks only reach Lane 1.5 on an actual
+/// Lane-1 failure.
+fn complexity_at_least_moderate(complexity: &str) -> bool {
+    matches!(complexity, "moderate" | "complex")
 }
 
 #[cfg(test)]
@@ -2720,6 +2735,128 @@ async fn record_dispatch_interaction(
     }
 }
 
+/// Lane 1.5 route: acquire a permit on the shared process-wide 480B semaphore
+/// and run one bounded round on the local 480B codegen endpoint. Mirrors the
+/// Lane-1 dispatch pattern (bounded timeout, breaker bookkeeping, synthetic
+/// Output on success) but gated on the shared ring's concurrency instead of
+/// Lane 1's per-node breaker. Returns `Some((backend, output))` when the
+/// change lands; `None` when the caller should pass through to the Lane 2
+/// cloud backstop (ring busy, no-op, error, or timeout).
+async fn dispatch_to_480b(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    worktree: &WorktreeRecord,
+    prompt: &str,
+) -> Option<(String, Output)> {
+    let _permit = match tokio::time::timeout(
+        Duration::from_millis(LANE15_480B_PERMIT_WAIT_MS),
+        crate::dispatch_concurrency::acquire_480b_permit(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    {
+        Some(permit) => permit,
+        None => {
+            info!(
+                work_item_id = %item.work_item_id,
+                stage = "lane1.5",
+                permits = LANE15_480B_PERMITS,
+                wait_ms = LANE15_480B_PERMIT_WAIT_MS,
+                "work_item_dispatch: Lane-1.5 480B ring busy; skipping to cloud backstop"
+            );
+            return None;
+        }
+    };
+
+    mark_lease_endpoint(pg, item, "lane1.5:local:qwen3-coder-480b").await;
+    info!(
+        work_item_id = %item.work_item_id,
+        stage = "lane1.5",
+        provider = LANE15_480B_PROVIDER,
+        "work_item_dispatch: starting Lane-1.5 480B codegen"
+    );
+    let lane15 = tokio::time::timeout(
+        Duration::from_secs(LANE1_TIMEOUT_SECS),
+        crate::codegen_apply::codegen_apply(
+            pg,
+            &worktree.worktree_path,
+            prompt,
+            Some(LANE15_480B_MODEL_HINT),
+            1,
+        ),
+    )
+    .await;
+    match lane15 {
+        Ok(Ok(outcome)) if outcome.applied => {
+            let _ = crate::circuit_breaker::record_provider_success(
+                pg,
+                item.computer_id,
+                LANE15_480B_PROVIDER,
+            )
+            .await;
+            info!(
+                work_item_id = %item.work_item_id,
+                stage = "lane1.5",
+                rounds = outcome.rounds,
+                "work_item_dispatch: Lane-1.5 480B codegen landed the change"
+            );
+            Some((
+                "local-480b".to_string(),
+                synthetic_output(&outcome.final_diff.unwrap_or_else(|| "applied".into())),
+            ))
+        }
+        Ok(Ok(outcome)) => {
+            let _ = crate::circuit_breaker::record_provider_failure(
+                pg,
+                item.computer_id,
+                LANE15_480B_PROVIDER,
+                "local_codegen_unavailable",
+            )
+            .await;
+            info!(
+                work_item_id = %item.work_item_id,
+                stage = "lane1.5",
+                error = ?outcome.error,
+                "work_item_dispatch: Lane-1.5 480B codegen didn't land; backstop to cloud"
+            );
+            None
+        }
+        Ok(Err(e)) => {
+            let _ = crate::circuit_breaker::record_provider_failure(
+                pg,
+                item.computer_id,
+                LANE15_480B_PROVIDER,
+                "local_codegen_unavailable",
+            )
+            .await;
+            warn!(
+                work_item_id = %item.work_item_id,
+                stage = "lane1.5",
+                error = format!("{e:#}"),
+                "work_item_dispatch: Lane-1.5 480B codegen errored; backstop to cloud"
+            );
+            None
+        }
+        Err(_) => {
+            let _ = crate::circuit_breaker::record_provider_failure(
+                pg,
+                item.computer_id,
+                LANE15_480B_PROVIDER,
+                "timeout",
+            )
+            .await;
+            warn!(
+                work_item_id = %item.work_item_id,
+                stage = "lane1.5",
+                timeout_secs = LANE1_TIMEOUT_SECS,
+                "work_item_dispatch: Lane-1.5 480B codegen TIMED OUT; backstop to cloud"
+            );
+            None
+        }
+    }
+}
+
 /// Edit the worktree to satisfy the work_item. Two lanes, self-healing:
 ///   Lane 1 (cheap, LOCAL): the `codegen_apply` harness — a local fleet coder
 ///     emits SEARCH/REPLACE edits, applied + `cargo check`ed + verified-non-empty
@@ -2895,123 +3032,27 @@ async fn run_ff_dispatch(
     // Lane 1.5: one bounded escalation round on the shared 480B coder ring. The
     // ring has one 11 tok/s instance with --parallel 2, so cap concurrency
     // process-wide and skip instead of queueing when both slots are busy.
+    // Triggered either by a Lane-1 failure OR by the task's own complexity
+    // (moderate/complex tasks that skip Lane 1 entirely via
+    // `prefers_cloud_lane` still get one local-480b shot before cloud).
+    let lane15_trigger =
+        lane1_failed_or_timed_out || complexity_at_least_moderate(&item.complexity);
     if should_attempt_lane15(
         lane1_failed_or_timed_out,
+        complexity_at_least_moderate(&item.complexity),
         lane15_enabled,
         lane15_breaker_open,
     ) {
-        match tokio::time::timeout(
-            Duration::from_millis(LANE15_480B_PERMIT_WAIT_MS),
-            crate::dispatch_concurrency::acquire_480b_permit(),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok)
-        {
-            Some(_permit) => {
-                mark_lease_endpoint(pg, item, "lane1.5:local:qwen3-coder-480b").await;
-                info!(
-                    work_item_id = %item.work_item_id,
-                    stage = "lane1.5",
-                    provider = LANE15_480B_PROVIDER,
-                    "work_item_dispatch: starting Lane-1.5 480B codegen"
-                );
-                let lane15 = tokio::time::timeout(
-                    Duration::from_secs(LANE1_TIMEOUT_SECS),
-                    crate::codegen_apply::codegen_apply(
-                        pg,
-                        &worktree.worktree_path,
-                        &prompt,
-                        Some(LANE15_480B_MODEL_HINT),
-                        1,
-                    ),
-                )
-                .await;
-                match lane15 {
-                    Ok(Ok(outcome)) if outcome.applied => {
-                        let _ = crate::circuit_breaker::record_provider_success(
-                            pg,
-                            item.computer_id,
-                            LANE15_480B_PROVIDER,
-                        )
-                        .await;
-                        info!(
-                            work_item_id = %item.work_item_id,
-                            stage = "lane1.5",
-                            rounds = outcome.rounds,
-                            "work_item_dispatch: Lane-1.5 480B codegen landed the change"
-                        );
-                        return Ok((
-                            "local-480b".to_string(),
-                            synthetic_output(
-                                &outcome.final_diff.unwrap_or_else(|| "applied".into()),
-                            ),
-                        ));
-                    }
-                    Ok(Ok(outcome)) => {
-                        let _ = crate::circuit_breaker::record_provider_failure(
-                            pg,
-                            item.computer_id,
-                            LANE15_480B_PROVIDER,
-                            "local_codegen_unavailable",
-                        )
-                        .await;
-                        info!(
-                            work_item_id = %item.work_item_id,
-                            stage = "lane1.5",
-                            error = ?outcome.error,
-                            "work_item_dispatch: Lane-1.5 480B codegen didn't land; backstop to cloud"
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        let _ = crate::circuit_breaker::record_provider_failure(
-                            pg,
-                            item.computer_id,
-                            LANE15_480B_PROVIDER,
-                            "local_codegen_unavailable",
-                        )
-                        .await;
-                        warn!(
-                            work_item_id = %item.work_item_id,
-                            stage = "lane1.5",
-                            error = format!("{e:#}"),
-                            "work_item_dispatch: Lane-1.5 480B codegen errored; backstop to cloud"
-                        );
-                    }
-                    Err(_) => {
-                        let _ = crate::circuit_breaker::record_provider_failure(
-                            pg,
-                            item.computer_id,
-                            LANE15_480B_PROVIDER,
-                            "timeout",
-                        )
-                        .await;
-                        warn!(
-                            work_item_id = %item.work_item_id,
-                            stage = "lane1.5",
-                            timeout_secs = LANE1_TIMEOUT_SECS,
-                            "work_item_dispatch: Lane-1.5 480B codegen TIMED OUT; backstop to cloud"
-                        );
-                    }
-                }
-            }
-            None => {
-                info!(
-                    work_item_id = %item.work_item_id,
-                    stage = "lane1.5",
-                    permits = LANE15_480B_PERMITS,
-                    wait_ms = LANE15_480B_PERMIT_WAIT_MS,
-                    "work_item_dispatch: Lane-1.5 480B ring busy; skipping to cloud backstop"
-                );
-            }
+        if let Some((backend, output)) = dispatch_to_480b(pg, item, worktree, &prompt).await {
+            return Ok((backend, output));
         }
-    } else if lane1_failed_or_timed_out && !lane15_enabled {
+    } else if lane15_trigger && !lane15_enabled {
         info!(
             work_item_id = %item.work_item_id,
             stage = "lane1.5",
             "work_item_dispatch: Lane-1.5 disabled by work_item_lane15_mode; skipping to cloud backstop"
         );
-    } else if lane1_failed_or_timed_out && lane15_breaker_open {
+    } else if lane15_trigger && lane15_breaker_open {
         info!(
             work_item_id = %item.work_item_id,
             stage = "lane1.5",
@@ -4766,11 +4807,11 @@ mod tests {
     use super::{
         AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS, ReviewerStat,
         affected_crate_manifests, agent_output_tail, backend_failed_without_output,
-        builder_excludes_480b, classify_dispatch_outcome, command_display, default_clone_path,
-        dispatch_budget_for_host, dispatch_prompt, expand_home, is_build_timeout,
-        order_cloud_reviewers, parse_cli_tokens, primary_or_default_backend,
-        quick_empty_success_is_provider_failure, repo_cache_path, repo_slug,
-        retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
+        builder_excludes_480b, classify_dispatch_outcome, command_display,
+        complexity_at_least_moderate, default_clone_path, dispatch_budget_for_host,
+        dispatch_prompt, expand_home, is_build_timeout, order_cloud_reviewers, parse_cli_tokens,
+        primary_or_default_backend, quick_empty_success_is_provider_failure, repo_cache_path,
+        repo_slug, retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
         should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
         task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
     };
@@ -4794,10 +4835,29 @@ mod tests {
 
     #[test]
     fn lane15_requires_failure_enabled_gate_and_closed_breaker() {
-        assert!(should_attempt_lane15(true, true, false));
-        assert!(!should_attempt_lane15(false, true, false));
-        assert!(!should_attempt_lane15(true, false, false));
-        assert!(!should_attempt_lane15(true, true, true));
+        assert!(should_attempt_lane15(true, false, true, false));
+        assert!(!should_attempt_lane15(false, false, true, false));
+        assert!(!should_attempt_lane15(true, false, false, false));
+        assert!(!should_attempt_lane15(true, false, true, true));
+    }
+
+    #[test]
+    fn lane15_also_triggers_on_moderate_or_complex_even_without_lane1_failure() {
+        // A moderate/complex task that never touched Lane 1 (e.g. it already
+        // routed straight to cloud via prefers_cloud_lane) still gets one
+        // Lane-1.5 480B shot before the cloud backstop.
+        assert!(should_attempt_lane15(false, true, true, false));
+        // Disabled gate or open breaker still block it, same as the failure path.
+        assert!(!should_attempt_lane15(false, true, false, false));
+        assert!(!should_attempt_lane15(false, true, true, true));
+    }
+
+    #[test]
+    fn complexity_at_least_moderate_covers_moderate_and_complex_only() {
+        assert!(!complexity_at_least_moderate("mechanical"));
+        assert!(!complexity_at_least_moderate(""));
+        assert!(complexity_at_least_moderate("moderate"));
+        assert!(complexity_at_least_moderate("complex"));
     }
 
     #[test]
