@@ -35,6 +35,30 @@ pub struct FleetSnapshot {
     pub total_tokens_per_sec: f64,
 }
 
+impl FleetSnapshot {
+    /// Build a snapshot from freshly collected node metrics.
+    ///
+    /// Computes the fleet-wide aggregates in a single pass over `nodes`
+    /// (instead of one `.iter().sum()` per aggregate) and takes ownership
+    /// of the vector rather than cloning it into the snapshot.
+    pub fn from_nodes(nodes: Vec<NodeMetrics>, timestamp: DateTime<Utc>) -> Self {
+        let online_count = nodes.len();
+        let (total_ram_gb, total_tokens_per_sec) = nodes
+            .iter()
+            .fold((0.0_f64, 0.0_f64), |(ram, tokens), node| {
+                (ram + node.ram_total_gb, tokens + node.tokens_per_sec)
+            });
+
+        Self {
+            timestamp,
+            nodes,
+            online_count,
+            total_ram_gb,
+            total_tokens_per_sec,
+        }
+    }
+}
+
 /// A discrete fleet event published via pub/sub.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PulseEvent {
