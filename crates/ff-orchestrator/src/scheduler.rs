@@ -11,7 +11,7 @@
 //! 4. If no node qualifies, queue the task or preempt a lower-priority one
 //! 5. Round-robin across projects when multiple tasks share the same priority
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -473,6 +473,24 @@ impl Scheduler {
     /// 4. If no node fits, attempt preemption (Critical → Background only)
     /// 5. If preemption fails, return Queue decision
     pub fn schedule_task(&mut self, task: &ScheduledTask) -> ScheduleDecision {
+        self.schedule_task_excluding(task, &HashSet::new())
+    }
+
+    /// Like [`schedule_task`](Self::schedule_task), but treats every node
+    /// named in `excluded` as unable to fit the task, regardless of its
+    /// actual capacity.
+    ///
+    /// Callers scheduling several tasks in one pass (e.g. the leader's tick
+    /// loop) use this to keep at most one *unconfirmed* assignment
+    /// outstanding per worker at a time — a worker's dispatch-tick contract
+    /// only returns a single new assignment per heartbeat, so handing it a
+    /// second one before the first is confirmed would leave it stranded in
+    /// the queue until reaped.
+    pub fn schedule_task_excluding(
+        &mut self,
+        task: &ScheduledTask,
+        excluded: &HashSet<String>,
+    ) -> ScheduleDecision {
         let req = &task.requirements;
 
         // Step 1: Filter eligible nodes and score them
@@ -480,7 +498,7 @@ impl Scheduler {
         let mut candidates: Vec<(String, f64)> = self
             .nodes
             .iter()
-            .filter(|(_, cap)| cap.can_fit(req))
+            .filter(|(name, cap)| !excluded.contains(*name) && cap.can_fit(req))
             .map(|(name, cap)| {
                 let score = self.placement.score_node(task, cap);
                 (name.clone(), score)
@@ -517,7 +535,7 @@ impl Scheduler {
 
         // Step 5: Try preemption for Critical tasks
         if task.priority == TaskPriority::Critical {
-            if let Some(decision) = self.try_preemption(task) {
+            if let Some(decision) = self.try_preemption(task, excluded) {
                 return decision;
             }
         }
@@ -578,7 +596,11 @@ impl Scheduler {
     }
 
     /// Attempt to preempt a Background task for a Critical task.
-    fn try_preemption(&mut self, task: &ScheduledTask) -> Option<ScheduleDecision> {
+    fn try_preemption(
+        &mut self,
+        task: &ScheduledTask,
+        excluded: &HashSet<String>,
+    ) -> Option<ScheduleDecision> {
         let req = &task.requirements;
 
         // Find nodes with preemptable (Background) tasks whose resources
@@ -586,7 +608,7 @@ impl Scheduler {
         let mut preempt_candidates: Vec<(String, Uuid, f64)> = Vec::new();
 
         for (name, cap) in &self.nodes {
-            if !cap.online || cap.dispatch_tick_is_stale() {
+            if excluded.contains(name) || !cap.online || cap.dispatch_tick_is_stale() {
                 continue;
             }
             // GPU check
