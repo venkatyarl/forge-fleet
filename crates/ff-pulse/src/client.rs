@@ -92,16 +92,7 @@ impl PulseClient {
             }
         }
 
-        let total_ram_gb: f64 = nodes.iter().map(|n| n.ram_total_gb).sum();
-        let total_tokens_per_sec: f64 = nodes.iter().map(|n| n.tokens_per_sec).sum();
-
-        Ok(FleetSnapshot {
-            timestamp: Utc::now(),
-            nodes: nodes.clone(),
-            online_count: nodes.len(),
-            total_ram_gb,
-            total_tokens_per_sec,
-        })
+        Ok(FleetSnapshot::from_nodes(nodes, Utc::now()))
     }
 
     /// Check whether a node is alive (its metrics key exists and hasn't expired).
