@@ -12,6 +12,7 @@ use axum::{
 };
 use chrono::Utc;
 use dashmap::DashMap;
+use ff_memory::MemoryStore;
 use ff_security::auth::{ApiKey, ApiKeyStore, Scope, extract_api_key_from_headers};
 use serde::Serialize;
 use tower_http::{
@@ -28,7 +29,7 @@ use crate::{
     registry::BackendRegistry,
     router::{ModelRouter, TierRouter},
     routes::{
-        slm,
+        memory, slm,
         work_queue::{self, WorkQueue},
     },
     types::{
@@ -45,6 +46,7 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub request_metrics: Arc<RequestMetrics>,
     pub work_queue: Arc<WorkQueue>,
+    pub memory_store: Option<Arc<MemoryStore>>,
     api_keys: Arc<ApiKeyStore>,
 }
 
@@ -77,8 +79,15 @@ impl AppState {
             http_client,
             request_metrics: Arc::new(RequestMetrics::default()),
             work_queue: Arc::new(WorkQueue::new()),
+            memory_store: None,
             api_keys: Arc::new(api_key_store),
         })
+    }
+
+    /// Attach a memory store, enabling the `/memory/*` routes.
+    pub fn with_memory_store(mut self, store: Arc<MemoryStore>) -> Self {
+        self.memory_store = Some(store);
+        self
     }
 }
 
@@ -107,6 +116,9 @@ pub fn build_http_router(state: Arc<AppState>, allowed_origins: &[String]) -> Ro
         .route("/health", get(health))
         .route("/metrics", get(metrics));
     let read_only = Router::new()
+        .route("/memory/realms", get(memory::list_realms))
+        .route("/memory/nodes", get(memory::list_nodes))
+        .route("/memory/user_model", get(memory::user_model))
         .route("/slm/status", get(slm::status))
         .route("/v1/models", get(list_models))
         .route("/v1/work-queue/items", get(work_queue::list_work_items))
