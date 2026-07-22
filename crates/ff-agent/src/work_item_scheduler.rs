@@ -47,8 +47,15 @@ const ORPHAN_MIN_AGE_SECS: i64 = 3600;
 /// Failure-convergence ceiling: after this many stalled/reaped attempts a
 /// work_item is marked `failed` (with context) instead of re-queued forever.
 /// A task the swarm genuinely can't build must STOP thrashing and surface for a
-/// human or a retry-with-error-context — 3 tries is enough signal.
-const MAX_BUILD_ATTEMPTS: i32 = 3;
+/// human or a retry-with-error-context.
+///
+/// MUST stay STRICTLY ABOVE `ff_routing_policy::LOCAL_LANE_MAX_TRIES` (=3): the
+/// escalation ladder keeps a build on the local Devstral lane for the first
+/// LOCAL_LANE_MAX_TRIES attempts, then escalates to cloud (claude/codex). If this
+/// cap equals LOCAL_LANE_MAX_TRIES the item dies on the LAST local attempt and
+/// cloud NEVER gets a try (root cause of the 2026-07-22 "53 items failed after 3
+/// stalled attempts, zero cloud escalation" freeze). 5 = 3 local + 2 cloud tries.
+const MAX_BUILD_ATTEMPTS: i32 = 5;
 /// Four missed 15-second dispatch passes makes a host ineligible. General
 /// Pulse beats may still be fresh when this subsystem clock is stale.
 const DISPATCH_TICK_STALE_SECS: i64 = 60;

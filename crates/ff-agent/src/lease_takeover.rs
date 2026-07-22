@@ -20,8 +20,11 @@ const STALE_HEARTBEAT_SECS: i64 = crate::work_item_scheduler::LEASE_STALE_SECS;
 const MAX_LEASE_DURATION_SECS: i64 = 45 * 60;
 /// Failure-convergence ceiling — must match `work_item_scheduler::MAX_BUILD_ATTEMPTS`.
 /// After this many reaped attempts the reaper marks the item `failed` instead of
-/// re-queuing it forever (the escalation ladder takes over from there).
-const MAX_BUILD_ATTEMPTS: i32 = 3;
+/// re-queuing it forever. MUST stay strictly above
+/// `ff_routing_policy::LOCAL_LANE_MAX_TRIES` (=3) so the escalation ladder gets
+/// cloud attempts (3 local + 2 cloud) before the hard fail — see the detailed
+/// note on `work_item_scheduler::MAX_BUILD_ATTEMPTS`.
+const MAX_BUILD_ATTEMPTS: i32 = 5;
 
 pub async fn evaluate_lease_takeover(pg: &PgPool, _worker_name: &str) -> Result<usize> {
     if !crate::leader_cache::is_current_leader() {
