@@ -1181,6 +1181,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "notifications",
         sql: schema::SCHEMA_V245_NOTIFICATIONS,
     },
+    PgMigration {
+        version: 246,
+        name: "fleet_tasks_embedding",
+        sql: schema::SCHEMA_V246_FLEET_TASKS_EMBEDDING,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
