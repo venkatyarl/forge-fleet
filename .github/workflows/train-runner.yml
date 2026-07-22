@@ -1,0 +1,73 @@
+name: Train Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: "Number of queued PRs to include in this train batch"
+        required: false
+        default: "3"
+        type: string
+      max_wait_minutes:
+        description: "Maximum minutes to wait for the train branch's CI to complete"
+        required: false
+        default: "15"
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+concurrency: { group: "train-${{ github.run_id }}" }
+
+jobs:
+  train:
+    name: Build, validate, and land a merge train
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ fromJSON(inputs.max_wait_minutes) }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Select PR batch and build train branch
+        id: build
+        run: |
+          set -euo pipefail
+          mapfile -t prs < <(scripts/pr-queue.sh | head -n "${{ inputs.batch_size }}")
+          if [[ ${#prs[@]} -eq 0 ]]; then
+            echo "no PRs queued — nothing to train"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "prs=${prs[*]}" >> "$GITHUB_OUTPUT"
+          ref="$(scripts/build-train-branch.sh "${prs[@]}")"
+          echo "branch=${ref#refs/heads/}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for train branch CI
+        id: wait
+        if: steps.build.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          branch="${{ steps.build.outputs.branch }}"
+          deadline=$(( $(date +%s) + ${{ inputs.max_wait_minutes }} * 60 ))
+          run_id=""
+          while [[ -z "$run_id" ]]; do
+            run_id="$(gh run list --branch "$branch" --workflow validate-train.yml --json databaseId --jq '.[0].databaseId // empty')"
+            if [[ -z "$run_id" ]]; then
+              if (( $(date +%s) >= deadline )); then
+                echo "timed out waiting for validate-train.yml to start on $branch"
+                exit 1
+              fi
+              sleep 10
+            fi
+          done
+          gh run watch "$run_id" --exit-status
+
+      - name: Land train batch
+        if: steps.build.outputs.skip != 'true'
+        env:
+          TRAIN_BRANCH: ${{ steps.build.outputs.branch }}
+        run: scripts/merge-train-success.sh ${{ steps.build.outputs.prs }}
