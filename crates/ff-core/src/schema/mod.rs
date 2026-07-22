@@ -4,4 +4,5 @@ pub mod basic_memory;
 pub mod bug_signature;
 pub mod software;
 pub mod state;
+pub mod work_item;
 pub mod work_items;
