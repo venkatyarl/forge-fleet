@@ -283,12 +283,44 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
                         "work_item_dispatch: dispatch failed"
                     );
                 }
-                if let Err(cleanup) = requeue_or_fail(&pg, &item, &e.to_string()).await {
+                let error_text = e.to_string();
+                if let Err(cleanup) = requeue_or_fail(&pg, &item, &error_text).await {
                     warn!(
                         work_item_id = %item.work_item_id,
                         error = %cleanup,
                         "work_item_dispatch: failure cleanup failed"
                     );
+                }
+                // Self-heal integration: a transient failure (rate limit, overload,
+                // timeout, network) on this item may be a recurring fleet-wide
+                // issue worth tracking, not just retried in place. Report it to
+                // the same self-heal queue fed by `scan_daemon_logs_for_self_heal`
+                // / `LeaderTick::scan_interaction_errors`, leader-gated so only one
+                // node reports/re-arms per signature.
+                if crate::leader_cache::is_current_leader()
+                    && crate::cloud_error::classify("", None, &error_text).is_transient()
+                {
+                    let signature = format!(
+                        "work_item_dispatch:{}",
+                        crate::log_analysis_worker::compute_signature(
+                            &crate::log_analysis_worker::replace_tokens(&error_text)
+                        )
+                    );
+                    match crate::ha::self_heal::enqueue_or_rearm_self_heal(&pg, &signature, "T2", 1)
+                        .await
+                    {
+                        Ok(true) => info!(
+                            work_item_id = %item.work_item_id,
+                            signature = %signature,
+                            "work_item_dispatch: transient failure reported to self-heal queue"
+                        ),
+                        Ok(false) => {}
+                        Err(err) => warn!(
+                            work_item_id = %item.work_item_id,
+                            error = %err,
+                            "work_item_dispatch: self-heal enqueue failed"
+                        ),
+                    }
                 }
             }
         });
