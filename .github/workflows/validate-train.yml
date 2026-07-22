@@ -1,0 +1,35 @@
+name: Validate Train Branch
+
+on:
+  push:
+    branches:
+      - 'train/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: cargo test --workspace --lib
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Run library tests
+        run: cargo test --workspace --lib 2>&1 | tee test-output.log
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: validate-train-test-results
+          path: test-output.log

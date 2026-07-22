@@ -16,7 +16,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::{info, warn};
 
 /// Lease heartbeat deadline: a slot must heartbeat within this window or its
@@ -153,7 +153,7 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
     let mut pool: Vec<ff_db::FreeSlot> = global_free;
     let mut assigned = 0usize;
     let mut fallback_assigns = 0usize;
-    for item in ready {
+    for item in interleave_by_project(ready) {
         // Honor a host pin by re-querying that host's free slots; else take from
         // the shared pool, preferring an agent-viable computer.
         let slot = if let Some(host) = item.assigned_computer.as_deref() {
@@ -274,6 +274,37 @@ fn pop_slot(
     slot
 }
 
+/// Round-robin the ready list across projects, preserving each project's
+/// internal (risk/age) order, so assignment order gives every project a fair
+/// share of this tick's free slots. `pg_ready_work_items` already ranks
+/// per-project BEFORE its LIMIT so no project can monopolize the fetched set;
+/// this pass enforces the same guarantee on selection order locally, so the
+/// scheduler stays fair even if the fetch ordering regresses. Work-conserving:
+/// no item is dropped — once smaller projects drain, surplus slots go to
+/// whatever remains. A NULL project_id is its own bucket. Pure so fair-share
+/// enforcement is testable without a database.
+fn interleave_by_project(items: Vec<ff_db::ReadyWorkItem>) -> Vec<ff_db::ReadyWorkItem> {
+    // Vec-of-buckets (not HashMap) keeps project order = first appearance,
+    // which the fetch query already sorted by top-item priority.
+    let mut buckets: Vec<(Option<String>, VecDeque<ff_db::ReadyWorkItem>)> = Vec::new();
+    for item in items {
+        match buckets.iter_mut().find(|(p, _)| *p == item.project_id) {
+            Some((_, q)) => q.push_back(item),
+            None => buckets.push((item.project_id.clone(), VecDeque::from([item]))),
+        }
+    }
+    let total: usize = buckets.iter().map(|(_, q)| q.len()).sum();
+    let mut out = Vec::with_capacity(total);
+    while out.len() < total {
+        for (_, q) in buckets.iter_mut() {
+            if let Some(item) = q.pop_front() {
+                out.push(item);
+            }
+        }
+    }
+    out
+}
+
 /// Spawn the leader-gated scheduler loop. The skip path reads the process-local
 /// leader cache instead of probing Postgres.
 pub fn spawn_work_item_scheduler(
@@ -314,6 +345,108 @@ mod tests {
             sub_agent_id: uuid::Uuid::new_v4(),
             computer_id: computer,
         }
+    }
+
+    fn ready(project: Option<&str>) -> ff_db::ReadyWorkItem {
+        ff_db::ReadyWorkItem {
+            id: uuid::Uuid::new_v4(),
+            assigned_computer: None,
+            project_id: project.map(str::to_owned),
+        }
+    }
+
+    /// Fair-share enforcement: even a worst-case fetched set where one project's
+    /// items arrive as a contiguous block ahead of everyone else's (the attempt-1
+    /// monopoly failure) must be reordered so every ready project appears within
+    /// the first `distinct_projects` picks. While every project still has items
+    /// queued, no project may hold more than `k` of the first
+    /// `k * distinct_projects` picks.
+    #[test]
+    fn fair_share_stops_one_project_monopolizing_selection() {
+        let mut items: Vec<_> = (0..6).map(|_| ready(Some("alpha"))).collect();
+        items.extend([
+            ready(Some("beta")),
+            ready(Some("beta")),
+            ready(Some("gamma")),
+        ]);
+        let out = interleave_by_project(items);
+
+        let projects_in_prefix: HashSet<_> =
+            out[..3].iter().map(|i| i.project_id.clone()).collect();
+        assert_eq!(
+            projects_in_prefix.len(),
+            3,
+            "first 3 picks must cover all 3 ready projects"
+        );
+
+        // Equal backlogs (3 projects x 3 items, alpha's block first): the k-cap
+        // invariant holds for every round because no bucket drains early.
+        let mut even: Vec<_> = (0..3).map(|_| ready(Some("alpha"))).collect();
+        even.extend((0..3).map(|_| ready(Some("beta"))));
+        even.extend((0..3).map(|_| ready(Some("gamma"))));
+        let out = interleave_by_project(even);
+        for k in 1..=3 {
+            for project in ["alpha", "beta", "gamma"] {
+                let share = out[..k * 3]
+                    .iter()
+                    .filter(|i| i.project_id.as_deref() == Some(project))
+                    .count();
+                assert_eq!(
+                    share,
+                    k,
+                    "{project} took {share} of the first {} picks (fair share is {k})",
+                    k * 3
+                );
+            }
+        }
+    }
+
+    /// Work-conserving: interleaving reorders but never drops items — once the
+    /// smaller projects drain, the surplus project fills the remaining picks,
+    /// and each project's internal (risk/age) order is preserved.
+    #[test]
+    fn fair_share_is_work_conserving_and_order_stable() {
+        let alpha: Vec<_> = (0..4).map(|_| ready(Some("alpha"))).collect();
+        let beta = vec![ready(Some("beta"))];
+        let alpha_ids: Vec<_> = alpha.iter().map(|i| i.id).collect();
+        let mut items = alpha;
+        items.extend(beta);
+        let out = interleave_by_project(items);
+
+        assert_eq!(out.len(), 5, "no item may be dropped");
+        assert!(
+            out[2..]
+                .iter()
+                .all(|i| i.project_id.as_deref() == Some("alpha")),
+            "surplus picks must fall to the remaining project, not go unused"
+        );
+        let alpha_out: Vec<_> = out
+            .iter()
+            .filter(|i| i.project_id.as_deref() == Some("alpha"))
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(
+            alpha_out, alpha_ids,
+            "within-project order must be preserved"
+        );
+    }
+
+    /// Items with no project_id form their own fair-share bucket rather than
+    /// being merged into another project or starved.
+    #[test]
+    fn fair_share_treats_null_project_as_own_bucket() {
+        let items = vec![
+            ready(Some("alpha")),
+            ready(Some("alpha")),
+            ready(None),
+            ready(None),
+        ];
+        let out = interleave_by_project(items);
+        assert!(
+            out[..2].iter().any(|i| i.project_id.is_none()),
+            "project-less items must get a fair-share pick too"
+        );
+        assert_eq!(out.len(), 4);
     }
 
     #[test]

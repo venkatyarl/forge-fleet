@@ -8147,6 +8147,7 @@ pub async fn pg_memory_record_eviction(
 pub struct ReadyWorkItem {
     pub id: uuid::Uuid,
     pub assigned_computer: Option<String>,
+    pub project_id: Option<String>,
 }
 
 /// A free fleet slot (no active lease / not running a work_item).
@@ -8601,21 +8602,36 @@ pub async fn pg_maintain_computer_metrics_history(pool: &PgPool) -> Result<(u64,
 /// no active lease, and every blocking dependency (work_item_relations
 /// relation_type='blocks', from_id blocks to_id) is 'merged'. The dep clause is
 /// vacuously satisfied while work_item_relations is empty.
+///
+/// Project fair share is enforced HERE, before the LIMIT: rows are ranked
+/// per-project (`ROW_NUMBER() PARTITION BY project_id`) and ordered by that
+/// rank first, so every ready project lands rows inside the LIMIT window. A
+/// plain risk/age ORDER BY let one deep-backlog project fill the entire
+/// fetched set and monopolize scheduling while other ready projects were
+/// excluded. NULL project_id groups as its own bucket.
 pub async fn pg_ready_work_items(pool: &PgPool, limit: i64) -> Result<Vec<ReadyWorkItem>> {
     let rows = sqlx::query(
-        "SELECT w.id, w.assigned_computer
-           FROM work_items w
-          WHERE w.status = 'ready'
-            AND w.kind = 'task'
-            AND NOT EXISTS (
-                SELECT 1 FROM work_item_leases l
-                 WHERE l.work_item_id = w.id AND l.released_at IS NULL)
-            AND NOT EXISTS (
-                SELECT 1 FROM work_item_relations r
-                  JOIN work_items dep ON dep.id = r.from_id
-                 WHERE r.to_id = w.id AND r.relation_type = 'blocks'
-                   AND dep.status <> 'merged')
-          ORDER BY w.risk_score DESC, w.created_at ASC
+        "SELECT id, assigned_computer, project_id
+           FROM (
+                SELECT w.id, w.assigned_computer, w.project_id,
+                       w.risk_score, w.created_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY w.project_id
+                           ORDER BY w.risk_score DESC, w.created_at ASC
+                       ) AS project_rank
+                  FROM work_items w
+                 WHERE w.status = 'ready'
+                   AND w.kind = 'task'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM work_item_leases l
+                        WHERE l.work_item_id = w.id AND l.released_at IS NULL)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM work_item_relations r
+                         JOIN work_items dep ON dep.id = r.from_id
+                        WHERE r.to_id = w.id AND r.relation_type = 'blocks'
+                          AND dep.status <> 'merged')
+                ) ranked
+          ORDER BY project_rank ASC, risk_score DESC, created_at ASC
           LIMIT $1",
     )
     .bind(limit)
@@ -8630,6 +8646,7 @@ pub async fn pg_ready_work_items(pool: &PgPool, limit: i64) -> Result<Vec<ReadyW
         .map(|r| ReadyWorkItem {
             id: r.get("id"),
             assigned_computer: r.try_get("assigned_computer").ok().flatten(),
+            project_id: r.try_get("project_id").ok().flatten(),
         })
         .collect();
     if !items.is_empty() {
