@@ -160,6 +160,12 @@ pub fn wsjf_match_score(item: &WorkItem, slot: &Slot, now: DateTime<Utc>) -> Opt
 ///
 /// Returns the list of assignments made this tick.  Items that cannot be
 /// matched to a capable slot, or that are not `Ready`, are left unassigned.
+///
+/// This implementation uses the quadrant, priority, age, and blocked_by_count
+/// values to compute the pick score and assign work.
+///
+/// The new logic for pick score uses the same formula but applies the
+/// `blocker_count` as a negative factor.
 pub fn scheduler_tick(items: &[WorkItem], slots: &[Slot], now: DateTime<Utc>) -> Vec<Assignment> {
     let mut ready: Vec<(f64, &WorkItem)> = items
         .iter()
@@ -187,6 +193,11 @@ pub fn scheduler_tick(items: &[WorkItem], slots: &[Slot], now: DateTime<Utc>) ->
     let mut assignments = Vec::new();
 
     for (_, item) in ready {
+        // New logic for pick score: apply blocked_by_count as a negative factor.
+        let age = now.signed_duration_since(item.created_at);
+        let age_hours = age.num_seconds() as f64 / 3600.0;
+        let pick_score = compute_pick_score(item, now);
+
         if let Some(idx) = available
             .iter()
             .position(|slot| slot_can_handle(item, slot))
@@ -195,7 +206,7 @@ pub fn scheduler_tick(items: &[WorkItem], slots: &[Slot], now: DateTime<Utc>) ->
             assignments.push(Assignment {
                 item_id: item.id.clone(),
                 slot_id: slot.id.clone(),
-                pick_score: wsjf_match_score(item, slot, now).unwrap_or(0.0),
+                pick_score: pick_score,
             });
         }
     }
