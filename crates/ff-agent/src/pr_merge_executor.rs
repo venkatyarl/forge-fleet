@@ -11,11 +11,15 @@
 //! failure logs-and-continues rather than aborting the pass.
 
 use anyhow::Result;
+use futures::FutureExt;
 use serde::Deserialize;
+use std::panic::AssertUnwindSafe;
 use std::process::Command;
 use tracing::{info, warn};
 
 use crate::pr_integration::{MergeDecision, pr_merge_decision};
+use crate::tools::pr_review::PrReviewTool;
+use crate::tools::{AgentTool, AgentToolContext};
 
 /// Result of one auto-merge pass.
 #[derive(Debug, Default, Clone)]
@@ -86,12 +90,81 @@ pub fn parse_ci_counts(gh_checks_json: &str) -> CiCounts {
     c
 }
 
+/// Outcome of running the `PRReview` tool gate on a PR the decision core
+/// already cleared for auto-merge.
+enum ReviewGateOutcome {
+    /// Every reviewer signature approved — safe to proceed with the merge.
+    Approved,
+    /// The review completed but was rejected (or a reviewer backend timed
+    /// out, which the tool already folds into an unapproved signature).
+    Rejected(String),
+    /// The gate itself couldn't produce a verdict (tool error or panic).
+    /// Treated as "hold for review", not a hard block — the failure is in
+    /// our tooling, not necessarily the PR.
+    Error(String),
+}
+
+/// Run the `PRReview` tool against `pr_number` and interpret its verdict.
+/// Wrapped in `catch_unwind` so a panic inside the tool (e.g. an unexpected
+/// JSON shape) degrades to [`ReviewGateOutcome::Error`] instead of aborting
+/// the whole merge pass.
+async fn run_review_gate(ctx: &AgentToolContext, pr_number: u64) -> ReviewGateOutcome {
+    let outcome =
+        AssertUnwindSafe(PrReviewTool.execute(serde_json::json!({ "pr_number": pr_number }), ctx))
+            .catch_unwind()
+            .await;
+
+    let result = match outcome {
+        Ok(r) => r,
+        Err(panic) => {
+            let payload = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("non-string panic payload");
+            return ReviewGateOutcome::Error(format!("PRReview tool panicked: {payload}"));
+        }
+    };
+
+    if result.is_error {
+        return ReviewGateOutcome::Error(result.content);
+    }
+
+    match serde_json::from_str::<serde_json::Value>(&result.content) {
+        Ok(v) => {
+            let approved = v.get("approved").and_then(|a| a.as_bool()).unwrap_or(false);
+            if approved {
+                ReviewGateOutcome::Approved
+            } else {
+                let reasoning = v
+                    .get("reasoning")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("review not approved")
+                    .to_string();
+                ReviewGateOutcome::Rejected(reasoning)
+            }
+        }
+        Err(e) => ReviewGateOutcome::Error(format!("failed to parse PRReview result: {e}")),
+    }
+}
+
 /// Run one auto-merge pass over open `wi/` PRs. Merges (squash + delete-branch)
 /// every PR the decision core clears; leaves the rest with a recorded reason.
-/// `pool` is accepted for signature symmetry with other leader-gated passes /
-/// future audit logging; the current implementation drives entirely off `gh`.
-pub async fn run_pr_merge_pass(_pool: &sqlx::PgPool) -> Result<PrMergeReport> {
+/// Every PR cleared by [`pr_merge_decision`] additionally has to pass the
+/// `PRReview` tool gate (multi-LLM review + affected-crate tests) immediately
+/// before the merge executes.
+pub async fn run_pr_merge_pass(pool: &sqlx::PgPool) -> Result<PrMergeReport> {
     let mut report = PrMergeReport::default();
+
+    let review_ctx = AgentToolContext {
+        working_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        session_id: "pr_merge_executor_review_gate".to_string(),
+        shell_state: crate::tools::session_shell_state("pr_merge_executor_review_gate"),
+        edit_lock: crate::tools::checkout_edit_lock(
+            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        ),
+        pg_pool: Some(pool.clone()),
+    };
 
     let list_out = Command::new("gh")
         .args([
@@ -159,6 +232,26 @@ pub async fn run_pr_merge_pass(_pool: &sqlx::PgPool) -> Result<PrMergeReport> {
 
         match decision {
             MergeDecision::AutoMerge => {
+                match run_review_gate(&review_ctx, n).await {
+                    ReviewGateOutcome::Rejected(reason) => {
+                        report.blocked += 1;
+                        report
+                            .details
+                            .push(format!("#{n}: review gate rejected — {reason}"));
+                        warn!(pr = n, reason = %reason, "pr_merge_executor: review gate rejected PR");
+                        continue;
+                    }
+                    ReviewGateOutcome::Error(reason) => {
+                        report.held += 1;
+                        report
+                            .details
+                            .push(format!("#{n}: review gate error — {reason}"));
+                        warn!(pr = n, reason = %reason, "pr_merge_executor: review gate errored");
+                        continue;
+                    }
+                    ReviewGateOutcome::Approved => {}
+                }
+
                 match Command::new("gh")
                     .args(["pr", "merge", &n.to_string(), "--squash", "--delete-branch"])
                     .output()
