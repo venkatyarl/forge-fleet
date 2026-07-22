@@ -34,6 +34,8 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use thiserror::Error;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use ff_pulse::reader::PulseReader;
@@ -837,6 +839,133 @@ pub async fn list_sub_agents(pool: &PgPool) -> Result<Vec<SubAgentListRow>, Coor
         .collect())
 }
 
+/// How often [`spawn_stale_slot_reaper`] scans `sub_agents` for busy slots
+/// with stale heartbeats.
+const REAPER_SCAN_INTERVAL_SECS: u64 = 60;
+
+/// Heartbeat age past which a `'busy'` slot is declared stale. There is no
+/// periodic mid-task heartbeat on `sub_agents` (`last_heartbeat_at` is only
+/// written on claim/release), so this must exceed the longest legitimate task
+/// (cold builds run ~45 min) — a shorter ceiling would reset a live slot
+/// mid-run and let the scheduler oversubscribe it (bug class #589).
+const STALE_HEARTBEAT_SECS: i64 = 3600;
+
+/// One slot reset by [`reap_stale_busy_slots`].
+#[derive(Debug, Clone)]
+pub struct ReapedSlot {
+    pub sub_agent_id: Uuid,
+    /// The work item the slot was tracking when it went stale, if any.
+    pub work_item_id: Option<Uuid>,
+    /// Whether that work item was re-queued (`status = 'ready'`) for another
+    /// dispatch. `false` when the item had already reached a terminal status.
+    pub requeued: bool,
+}
+
+/// Reset every `'busy'` sub_agent whose `last_heartbeat_at` is older than
+/// `stale_after_secs` back to `'idle'`, clear its `current_work_item_id`, and
+/// re-queue the orphaned work item (`status = 'ready'`, assignment cleared) so
+/// the scheduler can dispatch it to another slot. All in ONE atomic statement,
+/// so a crash between "free slot" and "re-queue item" cannot strand the item.
+///
+/// Slots holding an ACTIVE `work_item_leases` row are exempt: the lease
+/// lifecycle owns those (lease takeover reclaims them when the lease dies),
+/// and resetting them here would desync `busy` from the lease table (#1083).
+/// Work items already in a terminal status are not re-queued.
+pub async fn reap_stale_busy_slots(
+    pool: &PgPool,
+    stale_after_secs: i64,
+) -> Result<Vec<ReapedSlot>, CoordError> {
+    let rows: Vec<(Uuid, Option<Uuid>, bool)> = sqlx::query_as(
+        "WITH stale AS ( \
+             SELECT id, current_work_item_id \
+               FROM sub_agents \
+              WHERE status = 'busy' \
+                AND (last_heartbeat_at IS NULL \
+                     OR last_heartbeat_at < NOW() - make_interval(secs => $1)) \
+                AND NOT EXISTS ( \
+                     SELECT 1 FROM work_item_leases l \
+                      WHERE l.sub_agent_id = sub_agents.id \
+                        AND l.released_at IS NULL) \
+                FOR UPDATE SKIP LOCKED \
+         ), reaped AS ( \
+             UPDATE sub_agents s \
+                SET status = 'idle', \
+                    current_work_item_id = NULL, \
+                    started_at = NULL, \
+                    last_heartbeat_at = NOW() \
+               FROM stale \
+              WHERE s.id = stale.id \
+              RETURNING s.id AS sub_agent_id, stale.current_work_item_id AS work_item_id \
+         ), requeued AS ( \
+             UPDATE work_items w \
+                SET status = 'ready', \
+                    assigned_to = NULL, \
+                    assigned_computer = NULL \
+               FROM reaped r \
+              WHERE w.id = r.work_item_id \
+                AND w.status NOT IN ('done', 'failed', 'cancelled') \
+              RETURNING w.id \
+         ) \
+         SELECT r.sub_agent_id, r.work_item_id, \
+                EXISTS (SELECT 1 FROM requeued q WHERE q.id = r.work_item_id) AS requeued \
+           FROM reaped r",
+    )
+    .bind(stale_after_secs as f64)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(sub_agent_id, work_item_id, requeued)| ReapedSlot {
+            sub_agent_id,
+            work_item_id,
+            requeued,
+        })
+        .collect())
+}
+
+/// Spawn the background stale-slot reaper: every [`REAPER_SCAN_INTERVAL_SECS`]
+/// seconds (leader-gated, so exactly one node sweeps the fleet-wide table) it
+/// runs [`reap_stale_busy_slots`] with the [`STALE_HEARTBEAT_SECS`] ceiling.
+/// `forgefleetd` starts this at boot alongside the other subsystem ticks.
+pub fn spawn_stale_slot_reaper(
+    pg: PgPool,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(REAPER_SCAN_INTERVAL_SECS));
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if !crate::leader_cache::is_current_leader() {
+                        continue;
+                    }
+                    match reap_stale_busy_slots(&pg, STALE_HEARTBEAT_SECS).await {
+                        Ok(reaped) => {
+                            for r in &reaped {
+                                tracing::info!(
+                                    sub_agent = %r.sub_agent_id,
+                                    work_item = ?r.work_item_id,
+                                    requeued = r.requeued,
+                                    "stale slot reaper: reset busy slot with stale heartbeat"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "stale slot reaper tick failed");
+                        }
+                    }
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+        tracing::info!("stale slot reaper loop stopped");
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::CoordError;
@@ -856,6 +985,16 @@ mod tests {
         assert!(!CoordError::UnknownComputer("nope".into()).is_transient());
         assert!(!CoordError::Pulse("redis down".into()).is_transient());
         assert!(!CoordError::Internal("bug".into()).is_transient());
+    }
+
+    #[test]
+    fn stale_heartbeat_ceiling_clears_longest_legitimate_task() {
+        // `sub_agents` has no mid-task heartbeat, so the staleness ceiling
+        // must exceed the ~45-min cold-build worst case or the reaper would
+        // reset a LIVE slot mid-run and oversubscribe it (bug class #589).
+        assert!(super::STALE_HEARTBEAT_SECS > 45 * 60);
+        // And the scan cadence is the 60s the daemon wires in.
+        assert_eq!(super::REAPER_SCAN_INTERVAL_SECS, 60);
     }
 
     #[test]
