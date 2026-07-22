@@ -229,6 +229,8 @@ struct FleetConfig {
     nodes: BTreeMap<String, toml::Value>,
     #[serde(default)]
     models: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    minio: ff_cli::MinioConfig,
     #[serde(flatten)]
     extra: BTreeMap<String, toml::Value>,
 }
