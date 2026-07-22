@@ -4308,7 +4308,18 @@ fn affected_crate_manifests(
         if parts.next().is_some_and(|p| p.as_os_str() == "crates") {
             if let Some(crate_dir) = parts.next() {
                 let relative = PathBuf::from("crates").join(crate_dir).join("Cargo.toml");
-                if worktree_path.join(&relative).is_file() && !manifests.contains(&relative) {
+                // `cargo test --lib` errors out on a crate with no library
+                // target (e.g. a bin-only crate like ff-cli), so only queue
+                // crates that actually have one.
+                let has_lib_target = worktree_path
+                    .join("crates")
+                    .join(crate_dir)
+                    .join("src/lib.rs")
+                    .is_file();
+                if has_lib_target
+                    && worktree_path.join(&relative).is_file()
+                    && !manifests.contains(&relative)
+                {
                     manifests.push(relative);
                 }
             }
@@ -5541,6 +5552,44 @@ mod tests {
             affected_crate_manifests(repo, "main").unwrap(),
             vec![PathBuf::from("crates/demo/Cargo.toml")]
         );
+    }
+
+    #[test]
+    fn affected_tests_skip_bin_only_crates_without_lib_target() {
+        // `cargo test --lib` errors out on a crate with no library target
+        // (e.g. ff-cli, which only ships a [[bin]]), so a bin-only crate must
+        // never be queued for the --lib verification step.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        super::run_git(repo, ["init"], Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.name", "Test"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.email", "test@example.com"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        std::fs::write(repo.join("README.md"), "base").unwrap();
+        super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["commit", "-m", "base"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["branch", "-M", "main"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["checkout", "-b", "task"], Duration::from_secs(10)).unwrap();
+        std::fs::create_dir_all(repo.join("crates/binonly/src")).unwrap();
+        std::fs::write(
+            repo.join("crates/binonly/Cargo.toml"),
+            "[package]\nname='binonly'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("crates/binonly/src/main.rs"), "fn main() {}\n").unwrap();
+        super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["commit", "-m", "change"], Duration::from_secs(10)).unwrap();
+
+        assert!(affected_crate_manifests(repo, "main").unwrap().is_empty());
     }
 
     #[test]
