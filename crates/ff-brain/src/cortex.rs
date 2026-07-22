@@ -106,6 +106,8 @@ pub mod ingest_people;
 pub mod ingest_pm;
 #[path = "cortex/maps_to.rs"]
 pub mod maps_to;
+#[path = "cortex/md_extractor.rs"]
+pub mod md_extractor;
 #[path = "cortex/extractors/observ.rs"]
 pub mod observ;
 #[path = "cortex/extractors/owners.rs"]
@@ -125,6 +127,8 @@ pub mod storage_falkordb;
 pub mod types;
 #[path = "cortex/extractors/work_item_context.rs"]
 pub mod work_item_context;
+#[path = "cortex/work_item_deriver.rs"]
+pub mod work_item_deriver;
 
 /// Serialize all Cortex edit passes within a single process. The Postgres
 /// advisory lock prevents cross-process races for the same corpus, but a local

@@ -22,6 +22,10 @@ fn item(
         status: Status::Ready,
         quadrant,
         priority: Priority::new(priority).unwrap(),
+        eisenhower_quadrant: None,
+        numeric_priority: None,
+        pick_score: None,
+        capability_tags: Vec::new(),
         created_at,
         blocked_by_count: blockers,
         required_capabilities: capabilities
