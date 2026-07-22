@@ -878,6 +878,14 @@ mod tests {
             base
         }
 
+        // GNU `touch -d "1 hour ago"` isn't portable to BSD/macOS `touch`, so
+        // backdate the mtime directly via `filetime` instead of shelling out.
+        fn backdate_by_one_hour(path: &std::path::Path) {
+            let one_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+            let ft = filetime::FileTime::from_system_time(one_hour_ago);
+            filetime::set_file_mtime(path, ft).expect("backdate mtime");
+        }
+
         fn init_git(path: &std::path::Path) {
             let p = path.to_string_lossy();
             let out = Command::new("git")
@@ -961,15 +969,7 @@ mod tests {
             let path = tmp_dir();
             init_git(&path);
             // Make the index old enough to pass the interactive-session threshold.
-            let out = Command::new("touch")
-                .args([
-                    "-d",
-                    "1 hour ago",
-                    path.join(".git/index").to_string_lossy().as_ref(),
-                ])
-                .output()
-                .expect("touch");
-            assert!(out.status.success());
+            backdate_by_one_hour(&path.join(".git/index"));
             assert!(is_canonical_workspace_usable(
                 path.to_string_lossy().as_ref(),
                 None
@@ -991,15 +991,7 @@ mod tests {
         fn operator_session_marker_is_unusable() {
             let path = tmp_dir();
             init_git(&path);
-            let out = Command::new("touch")
-                .args([
-                    "-d",
-                    "1 hour ago",
-                    path.join(".git/index").to_string_lossy().as_ref(),
-                ])
-                .output()
-                .expect("touch");
-            assert!(out.status.success());
+            backdate_by_one_hour(&path.join(".git/index"));
             fs::write(path.join(".operator_session"), "").unwrap();
             assert!(!is_canonical_workspace_usable(
                 path.to_string_lossy().as_ref(),
@@ -1011,15 +1003,7 @@ mod tests {
         fn adele_operator_session_marker_is_unusable_only_on_adele() {
             let path = tmp_dir();
             init_git(&path);
-            let out = Command::new("touch")
-                .args([
-                    "-d",
-                    "1 hour ago",
-                    path.join(".git/index").to_string_lossy().as_ref(),
-                ])
-                .output()
-                .expect("touch");
-            assert!(out.status.success());
+            backdate_by_one_hour(&path.join(".git/index"));
             fs::write(path.join(".adele_operator_session"), "").unwrap();
             // Non-adele computer ignores the adele-specific marker.
             assert!(is_canonical_workspace_usable(
