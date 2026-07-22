@@ -10,6 +10,7 @@ description = "ForgeFleet Postgres database adapters, migrations, replication, b
 ff-core = { path = "../ff-core" }
 ff-capacity = { path = "../ff-capacity" }
 ff-routing-policy = { path = "../ff-routing-policy" }
+ff-memory = { path = "../ff-memory" }
 
 # Async runtime
 tokio = { workspace = true, features = ["sync", "time", "fs", "rt"] }
