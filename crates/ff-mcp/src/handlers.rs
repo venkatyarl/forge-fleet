@@ -2782,6 +2782,7 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "fleet_models_library" => fleet_models_library(params).await,
         "fleet_models_deployments" => fleet_models_deployments(params).await,
         "fleet_models_disk_usage" => fleet_models_disk_usage(params).await,
+        "fleet_models" => crate::verbs::fleet_models::fleet_models(params).await,
         "fleet_agents" => fleet_agents(params).await,
         "work_item_context" => crate::verbs::context_retrieval::work_item_context(params).await,
         "fabric_topology" => crate::verbs::fabric_topology::fabric_topology(params).await,
