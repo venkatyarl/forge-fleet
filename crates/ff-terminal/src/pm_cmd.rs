@@ -893,10 +893,18 @@ async fn handle_pm_decompose(
     // the real path is `crates/ff-terminal/src/pm_cmd.rs`). Directory-level (not
     // a full file dump) keeps it context-frugal. Fail-open: no local repo / not
     // a git tree → empty, prompt behaves as before.
-    let dir_block = repo_context
+    let tracked_files = repo_context
         .as_ref()
         .and_then(|ctx| ctx.repo_path.as_deref())
-        .and_then(|p| source_dir_summary(&git_ls_files(p)?, 120))
+        .and_then(git_ls_files);
+    let crate_block = tracked_files
+        .as_deref()
+        .and_then(|files| workspace_crate_hint(files, &goal_text))
+        .map(|s| format!("{s}\n"))
+        .unwrap_or_default();
+    let dir_block = tracked_files
+        .as_deref()
+        .and_then(|files| source_dir_summary(files, 120))
         .map(|s| format!("{s}\n"))
         .unwrap_or_default();
     let prompt = format!(
@@ -911,6 +919,7 @@ async fn handle_pm_decompose(
          make each self-contained (a per-file task that compiles/passes on its \
          own is far better than one big task that a small model half-finishes).\n\n\
          {repo_block}\
+         {crate_block}\
          {dir_block}\
          Output ONLY a JSON array (no prose, no markdown fence) of at most {max} \
          objects, each: {{\"title\": \"<imperative, <70 chars>\", \"description\": \
@@ -1349,6 +1358,38 @@ fn source_dir_summary(ls_files: &str, max_dirs: usize) -> Option<String> {
         s.push_str(&format!("- {dir}/ ({count} files)\n"));
     }
     Some(s)
+}
+
+/// Point the planner at a workspace crate named in the goal. Without an
+/// explicit root, models commonly treat a crate such as `ff-agent` as the
+/// repository root and emit `src/lib.rs` instead of
+/// `crates/ff-agent/src/lib.rs`.
+fn workspace_crate_hint(ls_files: &str, goal: &str) -> Option<String> {
+    let goal = goal.to_ascii_lowercase();
+    let mut crates = std::collections::BTreeSet::new();
+    for file in ls_files.lines() {
+        let Some(rest) = file.strip_prefix("crates/") else {
+            continue;
+        };
+        let Some((crate_name, _)) = rest.split_once('/') else {
+            continue;
+        };
+        if goal.contains(&crate_name.to_ascii_lowercase()) {
+            crates.insert(crate_name);
+        }
+    }
+    if crates.is_empty() {
+        return None;
+    }
+    let roots = crates
+        .into_iter()
+        .map(|name| format!("`{name}` => `crates/{name}/`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "Workspace crate roots named in the goal: {roots}. Keep these full \
+         repo-relative prefixes in every `files` path; never shorten them to `src/...`."
+    ))
 }
 
 /// Normalize an LLM-supplied complexity into the work_items vocabulary
@@ -2617,6 +2658,15 @@ mod tests {
     #[test]
     fn source_dir_summary_none_when_no_source() {
         assert!(source_dir_summary("README.md\nLICENSE\n", 120).is_none());
+    }
+
+    #[test]
+    fn workspace_crate_hint_preserves_ff_agent_prefix() {
+        let ls = "crates/ff-agent/src/lib.rs\ncrates/ff-terminal/src/main.rs\n";
+        let hint = workspace_crate_hint(ls, "Fix task generation for ff-agent crate")
+            .expect("ff-agent is a tracked workspace crate named in the goal");
+        assert!(hint.contains("`ff-agent` => `crates/ff-agent/`"));
+        assert!(hint.contains("never shorten them to `src/...`"));
     }
 
     #[test]
