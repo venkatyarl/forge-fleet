@@ -2044,8 +2044,8 @@ const MAX_DISPATCH_ATTEMPTS: i32 = 3;
 /// Whether to try the cheap LOCAL codegen lane for this dispatch: only while UNDER
 /// the cloud-escalation threshold, the node's local-codegen breaker is closed, and
 /// the task isn't complexity-routed to cloud. Pure so the routing is testable —
-/// the `ESCALATE_TO_CLOUD_AT = 1` value means a mechanical task gets ONE local try
-/// then goes cloud (#62: the local lane starves the heartbeat; cloud does not).
+/// `ff_routing_policy::LOCAL_LANE_MAX_TRIES` bounds how many local tries a
+/// mechanical task gets before it escalates to the cloud backstop.
 fn use_local_lane(attempts: i32, breaker_open: bool, prefers_cloud: bool) -> bool {
     let requirements = ff_routing_policy::TaskRequirements {
         prior_failure_count: attempts.max(0) as u32,
@@ -4948,19 +4948,23 @@ mod tests {
     }
 
     #[test]
-    fn use_local_lane_gives_mechanical_one_try_then_cloud() {
-        // Mechanical (prefers_cloud=false), breaker closed: local ONLY on attempt 0;
-        // attempt 1+ escalates to cloud (#62 — the local lane starves the heartbeat,
-        // a 2nd local try just burns another ~190s reap).
+    fn use_local_lane_keeps_mechanical_local_until_try_budget() {
+        // Mechanical (prefers_cloud=false), breaker closed: the local lane keeps
+        // the task for up to LOCAL_LANE_MAX_TRIES attempts (heartbeat-safe since
+        // #62/#792 moved codegen_apply's blocking work off the async runtime),
+        // then escalates to the cloud backstop. Asserted against the policy
+        // const so a future budget change can't silently strand this test.
+        let budget = ff_routing_policy::LOCAL_LANE_MAX_TRIES as i32;
+        for attempts in 0..budget {
+            assert!(
+                use_local_lane(attempts, false, false),
+                "attempt {attempts} stays on the cheap local lane"
+            );
+        }
         assert!(
-            use_local_lane(0, false, false),
-            "first attempt tries cheap local"
+            !use_local_lane(budget, false, false),
+            "past the local try budget escalates to cloud"
         );
-        assert!(
-            !use_local_lane(1, false, false),
-            "#62: 2nd attempt goes cloud"
-        );
-        assert!(!use_local_lane(2, false, false));
         // A complexity-routed (complex or multi-file-heavy) task never touches the local lane.
         assert!(!use_local_lane(0, false, true));
         // Open local-codegen breaker → skip local even on attempt 0.
