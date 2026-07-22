@@ -143,6 +143,20 @@ fn leader_health(fresh: bool) -> Health {
     if fresh { Health::Pass } else { Health::Fail }
 }
 
+/// Minutes a `'busy'` `sub_agents` slot may run before the stuck-slot reaper
+/// (`sub_agent_reaper::BUSY_STALE_MINS`) assumes it's hung. Kept in lockstep
+/// with that const so this check flags exactly what the reaper is about to
+/// (or already would have) reset.
+const STALE_BUSY_SLOT_MINS: i64 = 60;
+
+/// Busy slots the stuck-slot reaper would reap (no active lease, past
+/// [`STALE_BUSY_SLOT_MINS`]) — the direct symptom of a stuck/hung build, since
+/// the reaper only runs every 10 minutes and a fleet operator wants to see the
+/// count without waiting on that tick.
+fn stale_slot_health(n: i64) -> Health {
+    if n > 0 { Health::Warn } else { Health::Pass }
+}
+
 /// Processes stuck in uninterruptible sleep (`D` state).  A small number is
 /// transient IO; a pileup (especially with idle CPU) is the classic signature
 /// of a hard-mounted NFS peer going dark.
@@ -400,6 +414,31 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
         },
     });
 
+    // 9) Stale busy slots: sub_agents rows stuck 'busy' with no active lease
+    //    past the stuck-slot reaper's threshold — the direct signature of a
+    //    hung/stuck build, surfaced here so an operator doesn't have to wait
+    //    on the reaper's own 10-minute tick to see it.
+    let stale_busy_slots: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sub_agents s
+          WHERE s.status = 'busy'
+            AND NOT EXISTS (
+                 SELECT 1 FROM work_item_leases l
+                  WHERE l.sub_agent_id = s.id AND l.released_at IS NULL)
+            AND (s.started_at IS NULL
+                 OR s.started_at < NOW() - make_interval(mins => $1))",
+    )
+    .bind(STALE_BUSY_SLOT_MINS as i32)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("stale-busy-slot check: {e}"))?;
+    checks.push(DoctorCheck {
+        name: "stale busy slots".into(),
+        status: stale_slot_health(stale_busy_slots),
+        detail: format!(
+            "{stale_busy_slots} busy slots stuck >{STALE_BUSY_SLOT_MINS}min, no active lease"
+        ),
+    });
+
     let overall = overall_health(&checks);
 
     if json {
@@ -577,6 +616,8 @@ mod tests {
         assert_eq!(deployment_health(1), Health::Warn);
         assert_eq!(leader_health(true), Health::Pass);
         assert_eq!(leader_health(false), Health::Fail);
+        assert_eq!(stale_slot_health(0), Health::Pass);
+        assert_eq!(stale_slot_health(2), Health::Warn);
     }
 
     #[test]
