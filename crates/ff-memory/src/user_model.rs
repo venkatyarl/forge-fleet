@@ -26,6 +26,10 @@ pub struct UserModel {
     pub contexts: Vec<UserModelContext>,
 }
 
+/// The deduplicated, cross-realm user model as persisted by
+/// [`crate::user_model_registry::GlobalUserRegistry`].
+pub type GlobalUserModel = UserModel;
+
 #[derive(FromRow)]
 struct RealmRow {
     id: uuid::Uuid,
@@ -82,7 +86,7 @@ impl MemoryStore {
     }
 }
 
-fn merge_user_model(
+pub(crate) fn merge_user_model(
     realms: Vec<Realm>,
     nodes: Vec<UserModelNode>,
     operates_on: Vec<(NodeId, NodeId)>,
