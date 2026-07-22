@@ -4245,13 +4245,23 @@ async fn self_verify_worktree(
         .take(3)
     {
         let manifest_arg = manifest.to_string_lossy().into_owned();
-        run_verification_command(
-            worktree_path,
-            &["test", "--manifest-path", &manifest_arg, "--lib", "--quiet"],
-            &format!("cargo test --manifest-path {manifest_arg} --lib"),
-            Duration::from_secs(300),
-        )
-        .await?;
+        // `--lib` blows up with "no library targets found" on bin-only
+        // crates (e.g. ff-cli, which is `[[bin]]`-only) — only request it
+        // when the crate actually has a src/lib.rs.
+        let has_lib_target = manifest
+            .parent()
+            .is_some_and(|crate_dir| worktree_path.join(crate_dir).join("src/lib.rs").is_file());
+        let mut args = vec!["test", "--manifest-path", &manifest_arg];
+        if has_lib_target {
+            args.push("--lib");
+        }
+        args.push("--quiet");
+        let label = if has_lib_target {
+            format!("cargo test --manifest-path {manifest_arg} --lib")
+        } else {
+            format!("cargo test --manifest-path {manifest_arg}")
+        };
+        run_verification_command(worktree_path, &args, &label, Duration::from_secs(300)).await?;
     }
     Ok(())
 }
