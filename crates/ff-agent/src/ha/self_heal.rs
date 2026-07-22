@@ -270,6 +270,62 @@ pub async fn rearm_self_heal_task(
     Ok(updated.rows_affected() > 0)
 }
 
+/// Report a single observed failure signature to the self-heal queue: insert
+/// a fresh `detected` task if none exists yet, or re-arm it via
+/// [`rearm_self_heal_task`] if a prior attempt for the same signature reached
+/// a terminal state and has cooled down. Single-flight via the unique
+/// `dedup_signature` index — an in-flight (non-terminal) row for this
+/// signature is left untouched.
+///
+/// This is the direct-report counterpart to [`scan_daemon_logs_for_self_heal`]
+/// and `LeaderTick::scan_interaction_errors`: those two discover signatures by
+/// periodically scanning logs/`ff_interactions`, while this is for a caller
+/// that already knows it just hit a specific, classified failure (e.g. a
+/// work_item dispatch failure) and wants to report it immediately.
+///
+/// Returns `true` if a task was newly created or re-armed for this signature.
+pub async fn enqueue_or_rearm_self_heal(
+    pg: &PgPool,
+    bug_signature: &str,
+    tier: &str,
+    report_count: i32,
+) -> Result<bool, sqlx::Error> {
+    let inserted = sqlx::query(
+        "INSERT INTO fleet_tasks \
+            (id, task_type, summary, payload, priority, status, created_at, task_class, dedup_signature) \
+         VALUES ( \
+            gen_random_uuid(), \
+            'self_heal_writer', \
+            format('self_heal_writer: %s', $1), \
+            jsonb_build_object( \
+                'bug_signature', $1, \
+                'tier', $2, \
+                'status', 'detected', \
+                'report_count', $3, \
+                'attempts', 0 \
+            ), \
+            $4, \
+            'pending', \
+            NOW(), \
+            'self_heal', \
+            $1 \
+         ) \
+         ON CONFLICT (dedup_signature) WHERE dedup_signature IS NOT NULL DO NOTHING",
+    )
+    .bind(bug_signature)
+    .bind(tier)
+    .bind(report_count)
+    .bind(self_heal_priority_for_tier(tier))
+    .execute(pg)
+    .await?;
+
+    if inserted.rows_affected() > 0 {
+        return Ok(true);
+    }
+
+    rearm_self_heal_task(pg, bug_signature, tier, report_count, None).await
+}
+
 /// V122+: scan local daemon logs for recurring error/warning patterns and
 /// feed them into the self-heal queue.
 ///
@@ -892,6 +948,97 @@ mod tests {
             .await
             .expect("rearm task");
         assert!(!rearmed);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn enqueue_or_rearm_creates_novel_signature() {
+        if env::var("FORGEFLEET_POSTGRES_URL").is_err()
+            && env::var("FORGEFLEET_DATABASE_URL").is_err()
+        {
+            eprintln!(
+                "skipping enqueue_or_rearm_self_heal DB test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL"
+            );
+            return;
+        }
+        let (admin, pool, db_name) = create_temp_db().await;
+
+        let reported = enqueue_or_rearm_self_heal(&pool, "sig-direct-novel", "T2", 1)
+            .await
+            .expect("enqueue novel signature");
+        assert!(reported);
+
+        let row = sqlx::query(
+            "SELECT status, payload->>'status' AS payload_status, \
+                    payload->>'tier' AS tier, \
+                    (payload->>'report_count')::int AS report_count \
+               FROM fleet_tasks \
+              WHERE task_class = 'self_heal' AND dedup_signature = 'sig-direct-novel'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch enqueued task");
+        assert_eq!(row.get::<String, _>("status"), "pending");
+        assert_eq!(row.get::<String, _>("payload_status"), "detected");
+        assert_eq!(row.get::<String, _>("tier"), "T2");
+        assert_eq!(row.get::<i32, _>("report_count"), 1);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn enqueue_or_rearm_is_single_flight_for_in_flight_signature() {
+        if env::var("FORGEFLEET_POSTGRES_URL").is_err()
+            && env::var("FORGEFLEET_DATABASE_URL").is_err()
+        {
+            eprintln!(
+                "skipping enqueue_or_rearm_self_heal DB test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL"
+            );
+            return;
+        }
+        let (admin, pool, db_name) = create_temp_db().await;
+
+        insert_self_heal_task(&pool, "sig-direct-in-flight", "fixing", None).await;
+
+        let reported = enqueue_or_rearm_self_heal(&pool, "sig-direct-in-flight", "T2", 1)
+            .await
+            .expect("report in-flight signature");
+        assert!(!reported);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn enqueue_or_rearm_rearms_terminal_signature_after_cooldown() {
+        if env::var("FORGEFLEET_POSTGRES_URL").is_err()
+            && env::var("FORGEFLEET_DATABASE_URL").is_err()
+        {
+            eprintln!(
+                "skipping enqueue_or_rearm_self_heal DB test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL"
+            );
+            return;
+        }
+        let (admin, pool, db_name) = create_temp_db().await;
+
+        let completed = Utc::now() - chrono::Duration::hours(1);
+        insert_self_heal_task(&pool, "sig-direct-rearm", "completed", Some(completed)).await;
+
+        let reported = enqueue_or_rearm_self_heal(&pool, "sig-direct-rearm", "T2", 1)
+            .await
+            .expect("rearm terminal signature");
+        assert!(reported);
+
+        let row = sqlx::query(
+            "SELECT status, payload->>'status' AS payload_status \
+               FROM fleet_tasks \
+              WHERE task_class = 'self_heal' AND dedup_signature = 'sig-direct-rearm'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch rearmed task");
+        assert_eq!(row.get::<String, _>("status"), "pending");
+        assert_eq!(row.get::<String, _>("payload_status"), "detected");
 
         drop_temp_db(admin, pool, &db_name).await;
     }
