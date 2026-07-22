@@ -87,6 +87,20 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         );
     }
 
+    // Self-heal: terminally-`failed` items whose last_error was TRANSIENT
+    // infrastructure (backend spawn, provider/network, pool, heartbeat) are
+    // buildable once the condition clears — return a batch to the ready pool
+    // with full redispatch eligibility restored (leases released, assignment
+    // cleared). Best-effort: a sweep failure must never stall assignment.
+    match crate::self_heal::requeue_transient_failures(pg).await {
+        Ok(healed) if healed > 0 => info!(
+            healed,
+            "work_item_scheduler: self-heal requeued transiently-failed work_items"
+        ),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "work_item_scheduler: self-heal requeue sweep failed"),
+    }
+
     // Auto-complete decomposed parents (bug/feature) once all of their task
     // children are terminal. This stops parent rows from lingering in `ready`
     // and cluttering the board after their leaves finish.

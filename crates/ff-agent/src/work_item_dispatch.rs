@@ -2571,44 +2571,11 @@ commit the tree becomes CLEAN and the harness DISCARDS your finished work as a n
 ///
 /// Only actionable errors belong in the retry prompt; injecting infra errors
 /// with "diagnose the root cause" makes the agent waste the attempt trying to
-/// fix e.g. "no dispatchable backend on this node". Signatures are consolidated
-/// from live errors seen in dispatch + an `ff council` (codex+kimi) pass; kept
-/// deliberately unambiguous so a real Rust compile/test error is never matched.
+/// fix e.g. "no dispatchable backend on this node". The signature list lives in
+/// [`crate::self_heal::TRANSIENT_ERROR_SIGNATURES`] — the same infra class the
+/// self-heal sweep requeues — so classification can't drift between the two.
 fn retry_error_is_actionable(err: &str) -> bool {
-    const INFRA_ERROR_SIGNATURES: &[&str] = &[
-        // dispatch / backend spawn + routing
-        "no dispatchable backend",
-        // the surfaced-error bail — suppress it too, else it's re-injected into
-        // the retry prompt AND recursively accumulates the prior attempt's
-        // context, exploding the prompt with nested "diagnose it" garbage.
-        "all backends failed on this node",
-        "spawn \"",
-        "command timed out",
-        "timed out after",
-        // heartbeat / lease lifecycle
-        "stale-heartbeat",
-        "heartbeat takeover",
-        // datastore / pool
-        "pool timed out",
-        "pool timeout",
-        "route deployments",
-        // auth / provider / network (LLM endpoint or gh)
-        "gh auth login",
-        "bad credentials",
-        "rate limit",
-        "service unavailable",
-        "internal server error",
-        "connection refused",
-        "network is unreachable",
-        // host resource exhaustion
-        "no space left",
-        "cannot allocate memory",
-        "too many open files",
-        "resource temporarily unavailable",
-        "worker died",
-    ];
-    let lower = err.to_ascii_lowercase();
-    !INFRA_ERROR_SIGNATURES.iter().any(|sig| lower.contains(sig))
+    !crate::self_heal::error_is_transient(err)
 }
 
 fn dispatch_prompt(item: &AssignedWorkItem) -> String {
