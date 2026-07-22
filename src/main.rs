@@ -3378,7 +3378,7 @@ async fn start_pulse_v2_subsystems(
             ff_agent::ha::pg_failover::DISABLE_ENV
         );
 
-        let leader_tick = ff_agent::leader_tick::LeaderTick::new(
+        let mut leader_tick = ff_agent::leader_tick::LeaderTick::new(
             pg_pool.clone(),
             pulse_reader,
             computer_id,
@@ -3389,28 +3389,23 @@ async fn start_pulse_v2_subsystems(
         .with_on_lost_leader(on_lost)
         .with_pg_failover(pg_failover_manager)
         .with_yield_flag(yield_handle);
-        handles.push(leader_tick.spawn(15, shutdown_rx.clone()));
 
         match (
             std::env::var("FORGEFLEET_GIT_MIRROR_UPSTREAM_URL").ok(),
             std::env::var("FORGEFLEET_GIT_MIRROR_PATH").ok(),
         ) {
             (Some(upstream), Some(path)) if !upstream.is_empty() && !path.is_empty() => {
-                let mirror = ff_agent::ha::mirror_service::MirrorFetchService::new(
+                leader_tick = leader_tick.with_mirror_service(
                     ff_agent::ha::mirror_service::MirrorFetchConfig::new(upstream, path),
                 );
-                handles.push(mirror.spawn_on_leader(
-                    pg_pool.clone(),
-                    computer_id,
-                    shutdown_rx.clone(),
-                ));
-                info!("starting subsystem: HA leader git mirror");
+                info!("configured subsystem: HA leader git mirror");
             }
             (None, None) => {}
             _ => warn!(
                 "git mirror disabled: set both FORGEFLEET_GIT_MIRROR_UPSTREAM_URL and FORGEFLEET_GIT_MIRROR_PATH"
             ),
         }
+        handles.push(leader_tick.spawn(15, shutdown_rx.clone()));
     } else {
         info!(
             node = %worker_name,

@@ -537,52 +537,6 @@ impl MirrorFetchService {
             }
         })
     }
-
-    /// Spawn the loop, syncing only while this computer owns the authoritative
-    /// fleet leader lease. Leadership is checked immediately before each sync.
-    pub fn spawn_on_leader(
-        self,
-        pg: sqlx::PgPool,
-        computer_id: uuid::Uuid,
-        mut shutdown: watch::Receiver<bool>,
-    ) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut ticker =
-                tokio::time::interval(self.config.fetch_interval.max(Duration::from_secs(1)));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {}
-                    _ = self.trigger.notified() => ticker.reset(),
-                    _ = shutdown.changed() => {
-                        if *shutdown.borrow() { break; }
-                        continue;
-                    }
-                }
-
-                match ff_db::leader_state::pg_get_current_leader(&pg).await {
-                    Ok(Some(leader)) if leader.computer_id == computer_id => {
-                        if let Err(error) = self.sync_once().await {
-                            warn!(
-                                mirror = %self.config.mirror_path.display(),
-                                error = %error,
-                                "mirror_service: leader mirror sync failed"
-                            );
-                        }
-                    }
-                    Ok(_) => tracing::debug!(
-                        mirror = %self.config.mirror_path.display(),
-                        "mirror_service: skipping sync on follower"
-                    ),
-                    Err(error) => warn!(
-                        error = %error,
-                        "mirror_service: could not verify leader; skipping sync"
-                    ),
-                }
-            }
-        })
-    }
 }
 
 /// Run a git command with a bounded timeout.
@@ -592,6 +546,7 @@ where
     S: AsRef<std::ffi::OsStr>,
 {
     let mut cmd = Command::new("git");
+    cmd.kill_on_drop(true);
     cmd.current_dir(cwd);
     for arg in args {
         cmd.arg(arg);
