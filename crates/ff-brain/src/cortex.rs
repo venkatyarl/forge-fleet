@@ -125,6 +125,8 @@ pub mod storage_falkordb;
 pub mod types;
 #[path = "cortex/extractors/work_item_context.rs"]
 pub mod work_item_context;
+#[path = "cortex/work_item_deriver.rs"]
+pub mod work_item_deriver;
 
 /// Serialize all Cortex edit passes within a single process. The Postgres
 /// advisory lock prevents cross-process races for the same corpus, but a local
