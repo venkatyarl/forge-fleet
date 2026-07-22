@@ -1370,6 +1370,7 @@ dependencies = [
  "dirs 6.0.0",
  "libc",
  "notify",
+ "redis",
  "reqwest",
  "serde",
  "serde_json",

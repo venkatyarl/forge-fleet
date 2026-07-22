@@ -10,6 +10,9 @@ pub use crate::artifact_fetch::{
 };
 
 pub mod eviction;
+pub mod node_state;
+
+pub use node_state::{NodeLoad, NodeStateCache, SessionBinding};
 
 #[cfg(test)]
 mod tests {

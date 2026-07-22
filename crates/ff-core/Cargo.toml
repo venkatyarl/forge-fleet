@@ -20,6 +20,7 @@ uuid.workspace = true
 sqlx.workspace = true
 sha2.workspace = true
 dashmap.workspace = true
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 reqwest.workspace = true
 dirs.workspace = true
 notify = "7"

@@ -30,6 +30,9 @@ pub enum ForgeFleetError {
     #[error("database migration error: {0}")]
     Migration(#[from] sqlx::migrate::MigrateError),
 
+    #[error("redis error: {0}")]
+    Redis(#[from] redis::RedisError),
+
     // ── IO ───────────────────────────────────────────────────────────
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
