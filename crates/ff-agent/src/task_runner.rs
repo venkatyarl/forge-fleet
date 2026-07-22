@@ -586,6 +586,13 @@ impl TaskRunner {
         // cancellation — `ff tasks cancel <id>` flips status to
         // `cancelled`, and a subsequent late-completing worker won't
         // overwrite that.
+        // Every terminal transition below also RELEASES the row's
+        // `dedup_signature`, freeing the partial unique index for a
+        // future re-enqueue of the same signature (see
+        // [`pg_enqueue_task_dedup`]). Exception: `self_heal` rows keep
+        // theirs — `rearm_self_heal_task` re-arms terminal rows BY
+        // signature after a cooldown, so releasing would break the
+        // single-flight + cooldown design.
         match outcome {
             Ok(result) => {
                 let exit = result.get("exit").and_then(Value::as_i64).unwrap_or(-1);
@@ -595,7 +602,9 @@ impl TaskRunner {
                             SET status        = 'completed',
                                 completed_at  = NOW(),
                                 progress_pct  = 100.0,
-                                result        = $1
+                                result        = $1,
+                                dedup_signature = CASE WHEN task_class = 'self_heal'
+                                                       THEN dedup_signature ELSE NULL END
                           WHERE id = $2 AND status = 'running'",
                     )
                     .bind(&result)
@@ -609,7 +618,9 @@ impl TaskRunner {
                             SET status        = 'failed',
                                 completed_at  = NOW(),
                                 result        = $1,
-                                error         = $2
+                                error         = $2,
+                                dedup_signature = CASE WHEN task_class = 'self_heal'
+                                                       THEN dedup_signature ELSE NULL END
                           WHERE id = $3 AND status = 'running'",
                     )
                     .bind(&result)
@@ -625,7 +636,9 @@ impl TaskRunner {
                     "UPDATE fleet_tasks
                         SET status       = 'failed',
                             completed_at = NOW(),
-                            error        = $1
+                            error        = $1,
+                            dedup_signature = CASE WHEN task_class = 'self_heal'
+                                                   THEN dedup_signature ELSE NULL END
                       WHERE id = $2 AND status = 'running'",
                 )
                 .bind(format!("{e}"))
@@ -780,7 +793,9 @@ pub async fn handoff_stuck_tasks(pg: &PgPool) -> Result<usize, sqlx::Error> {
         UPDATE fleet_tasks AS t
            SET status       = 'failed',
                completed_at = NOW(),
-               error        = 'exceeded MAX_HANDOFFS retries'
+               error        = 'exceeded MAX_HANDOFFS retries',
+               dedup_signature = CASE WHEN t.task_class = 'self_heal'
+                                      THEN t.dedup_signature ELSE NULL END
           FROM exhausted
          WHERE t.id = exhausted.id
         "#,
@@ -809,7 +824,9 @@ pub async fn pg_cancel_task(
         "UPDATE fleet_tasks
             SET status       = 'cancelled',
                 completed_at = COALESCE(completed_at, NOW()),
-                error        = COALESCE(error, $1)
+                error        = COALESCE(error, $1),
+                dedup_signature = CASE WHEN task_class = 'self_heal'
+                                       THEN dedup_signature ELSE NULL END
           WHERE id = $2
             AND status NOT IN ('completed', 'failed', 'cancelled')
         RETURNING (
@@ -1106,6 +1123,175 @@ pub async fn pg_enqueue_shell_task_routed(
     crate::nats_jetstream::publish_task_inserted(id).await;
 
     Ok(id)
+}
+
+/// Outcome of a dedup-aware enqueue ([`pg_enqueue_task_dedup`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupTaskOutcome {
+    /// No active task held the signature — a fresh row was inserted.
+    Created(uuid::Uuid),
+    /// An active task already holds the signature; nothing was inserted
+    /// and the duplicate's id is handed back instead.
+    Existing(uuid::Uuid),
+    /// An active task already holds the signature; the new task was
+    /// inserted anyway, linked under it via `parent_task_id`.
+    LinkedAsChild { id: uuid::Uuid, parent: uuid::Uuid },
+}
+
+/// What [`pg_enqueue_task_dedup`] does when an active duplicate exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnDuplicate {
+    /// Skip the insert and return the duplicate.
+    ReturnExisting,
+    /// Insert anyway, parented under the duplicate.
+    LinkAsChild,
+}
+
+/// Find the ACTIVE task holding `dedup_signature`. Terminal transitions
+/// release the signature (see the completion/handoff/cancel UPDATEs in
+/// this file), so a row still holding one is by definition in flight —
+/// no status filter needed — and the partial unique index
+/// `idx_fleet_tasks_dedup_signature` guarantees at most one match.
+pub async fn pg_find_similar_task(
+    pg: &PgPool,
+    dedup_signature: &str,
+) -> Result<Option<uuid::Uuid>, sqlx::Error> {
+    let mut conn = pg.acquire().await?;
+    find_similar_task_on(&mut conn, dedup_signature).await
+}
+
+async fn find_similar_task_on(
+    conn: &mut sqlx::PgConnection,
+    dedup_signature: &str,
+) -> Result<Option<uuid::Uuid>, sqlx::Error> {
+    sqlx::query_scalar("SELECT id FROM fleet_tasks WHERE dedup_signature = $1")
+        .bind(dedup_signature)
+        .fetch_optional(conn)
+        .await
+}
+
+/// Insert one `fleet_tasks` row, tolerating a dedup-signature collision:
+/// `None` means another row already holds the signature.
+async fn insert_task_row_on(
+    conn: &mut sqlx::PgConnection,
+    task_type: &str,
+    summary: &str,
+    payload: &serde_json::Value,
+    priority: i32,
+    parent_task_id: Option<uuid::Uuid>,
+    dedup_signature: Option<&str>,
+) -> Result<Option<uuid::Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"
+        INSERT INTO fleet_tasks (
+            parent_task_id, task_type, summary, payload, priority, dedup_signature
+        )
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (dedup_signature) WHERE dedup_signature IS NOT NULL DO NOTHING
+        RETURNING id
+        "#,
+    )
+    .bind(parent_task_id)
+    .bind(task_type)
+    .bind(summary)
+    .bind(payload)
+    .bind(priority)
+    .bind(dedup_signature)
+    .fetch_optional(conn)
+    .await
+}
+
+/// Dedup- and parent-aware task create.
+///
+/// When `dedup_signature` is set, the active duplicate is looked up
+/// FIRST ([`pg_find_similar_task`]); if one exists the new task is
+/// either dropped in its favour or inserted as its child, per
+/// `on_duplicate`. Lookup + insert share one transaction and the
+/// insert carries `ON CONFLICT (dedup_signature) DO NOTHING`, so two
+/// racing enqueues of one signature can never both create a
+/// signature-holding row — the loser re-resolves against the winner
+/// and applies the same duplicate policy.
+///
+/// `parent_task_id` seeds the fresh-insert path; on the LinkAsChild
+/// path the duplicate becomes the parent instead, and the child row
+/// carries NO signature — the duplicate keeps the claim until a
+/// terminal transition releases it.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_enqueue_task_dedup(
+    pg: &PgPool,
+    task_type: &str,
+    summary: &str,
+    payload: &serde_json::Value,
+    priority: i32,
+    parent_task_id: Option<uuid::Uuid>,
+    dedup_signature: Option<&str>,
+    on_duplicate: OnDuplicate,
+) -> Result<DedupTaskOutcome, sqlx::Error> {
+    let mut tx = pg.begin().await?;
+
+    let mut attempts = 0;
+    let outcome = loop {
+        attempts += 1;
+        let duplicate = match dedup_signature {
+            Some(sig) => find_similar_task_on(&mut tx, sig).await?,
+            None => None,
+        };
+        match duplicate {
+            Some(existing) => match on_duplicate {
+                OnDuplicate::ReturnExisting => break DedupTaskOutcome::Existing(existing),
+                OnDuplicate::LinkAsChild => {
+                    let id = insert_task_row_on(
+                        &mut tx,
+                        task_type,
+                        summary,
+                        payload,
+                        priority,
+                        Some(existing),
+                        None,
+                    )
+                    .await?
+                    .expect("signature-less insert cannot hit the dedup index");
+                    break DedupTaskOutcome::LinkedAsChild {
+                        id,
+                        parent: existing,
+                    };
+                }
+            },
+            None => {
+                if let Some(id) = insert_task_row_on(
+                    &mut tx,
+                    task_type,
+                    summary,
+                    payload,
+                    priority,
+                    parent_task_id,
+                    dedup_signature,
+                )
+                .await?
+                {
+                    break DedupTaskOutcome::Created(id);
+                }
+                // Insert raced a concurrent enqueue that committed this
+                // signature after our lookup. Go around: the next lookup
+                // reads a fresh snapshot and resolves against the winner.
+                if attempts >= 3 {
+                    return Err(sqlx::Error::Protocol(
+                        "dedup enqueue raced repeatedly without resolving".into(),
+                    ));
+                }
+            }
+        }
+    };
+    tx.commit().await?;
+
+    match outcome {
+        DedupTaskOutcome::Created(id) | DedupTaskOutcome::LinkedAsChild { id, .. } => {
+            // Dual-emission, same as the other enqueue paths.
+            crate::nats_jetstream::publish_task_inserted(id).await;
+        }
+        DedupTaskOutcome::Existing(_) => {}
+    }
+    Ok(outcome)
 }
 
 /// Method passed to [`pg_enqueue_pr_merge_task`].
