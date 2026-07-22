@@ -1,9 +1,8 @@
 //! PRReview tool — check out a pull request, run cargo tests for the affected
-//! crates, and produce an LLM review verdict.
+//! crates, and produce a multi-LLM review verdict.
 //!
-//! Reviewer selection follows the cheapest-capable-first rule: the local 480B
-//! fleet model is tried first, and only if it is unavailable does the tool fall
-//! back to a cloud CLI reviewer (codex → claude → kimi).
+//! Reviewer selection uses multi-LLM approval: `codex` and `kimi` are asked to
+//! review the PR in parallel, and the PR is only approved if both models agree.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -11,8 +10,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::Serialize;
 use serde_json::{Value, json};
-use sqlx::PgPool;
 use tokio::process::Command;
 
 use super::{AgentTool, AgentToolContext, AgentToolResult, truncate_output};
@@ -27,8 +26,8 @@ impl AgentTool for PrReviewTool {
 
     fn description(&self) -> &str {
         "Check out a pull request branch, run cargo tests for the affected crates, \
-         and produce an LLM review verdict. Prefers the cheapest capable reviewer \
-         (local 480B) and falls back to a cloud CLI if needed."
+         and produce a multi-LLM review verdict. Sends parallel review requests to \
+         codex and kimi and only approves when both models agree."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -83,16 +82,12 @@ impl AgentTool for PrReviewTool {
 
         let prompt = build_review_prompt(&info, &affected, &test_results, &diff);
 
-        let (verdict, reason, backend) =
-            match generate_verdict(&prompt, cwd, ctx.pg_pool.as_ref()).await {
-                Ok(v) => v,
-                Err(e) => return AgentToolResult::err(e),
-            };
+        let review = multi_llm_review(&prompt, cwd).await;
 
         let result = json!({
-            "verdict": verdict,
-            "reason": reason,
-            "backend": backend,
+            "approved": review.approved,
+            "reasoning": review.reasoning,
+            "signatures": review.signatures,
             "affected_crates": affected,
             "tests": test_results.iter().map(|t| json!({
                 "crate": t.crate_name,
@@ -386,96 +381,93 @@ fn build_review_prompt(
 }
 
 // ---------------------------------------------------------------------------
-// Reviewer selection: local 480B first, then cloud CLI fallback
+// Multi-LLM approval: parallel codex + kimi review, both must approve
 // ---------------------------------------------------------------------------
 
-const REVIEWER_480B_HINT: &str = "480b";
+const REVIEW_MODELS: [&str; 2] = ["codex", "kimi"];
 
-async fn generate_verdict(
-    prompt: &str,
-    cwd: &Path,
-    pg_pool: Option<&PgPool>,
-) -> Result<(String, String, String), String> {
-    // Try the cheapest reviewer first when we have a Postgres pool to route it.
-    if let Some(pool) = pg_pool {
-        match review_via_480b(pool, prompt).await {
-            Ok((approved, reason)) => {
-                let verdict = if approved { "APPROVE" } else { "REJECT" };
-                return Ok((verdict.to_string(), reason, "480b".to_string()));
-            }
-            Err(e) => {
-                // Fall through to cloud CLI reviewers.
-                tracing::info!(error = %e, "pr_review: 480b unavailable, falling back to cloud CLI");
-            }
-        }
-    }
-
-    let (approved, reason, backend) = cloud_cli_review(prompt, cwd).await?;
-    let verdict = if approved { "APPROVE" } else { "REJECT" };
-    Ok((verdict.to_string(), reason, backend))
+/// A single reviewer model's verdict on a PR.
+#[derive(Debug, Clone, Serialize)]
+struct ModelSignature {
+    model: String,
+    approved: bool,
+    reasoning: String,
 }
 
-async fn review_via_480b(pool: &PgPool, prompt: &str) -> Result<(bool, String), String> {
-    let _permit = crate::dispatch_concurrency::acquire_480b_permit()
-        .await
-        .map_err(|e| format!("480b review gate closed: {e}"))?;
+/// The combined outcome of a multi-LLM review.
+struct ReviewResult {
+    approved: bool,
+    reasoning: String,
+    signatures: Vec<ModelSignature>,
+}
 
-    let resp = crate::fleet_oneshot::fleet_oneshot(
-        pool,
+async fn multi_llm_review(prompt: &str, cwd: &Path) -> ReviewResult {
+    let (codex_sig, kimi_sig) = tokio::join!(
+        review_with_backend(REVIEW_MODELS[0], prompt, cwd),
+        review_with_backend(REVIEW_MODELS[1], prompt, cwd),
+    );
+
+    let signatures = vec![codex_sig, kimi_sig];
+    let (approved, reasoning) = combine_signatures(&signatures);
+    ReviewResult {
+        approved,
+        reasoning,
+        signatures,
+    }
+}
+
+async fn review_with_backend(backend: &str, prompt: &str, cwd: &Path) -> ModelSignature {
+    match crate::cli_executor::execute_cli_in_dir(
+        backend,
         prompt,
-        Some(REVIEWER_480B_HINT),
-        Some(Duration::from_secs(300)),
+        &[],
+        Some(cwd),
+        Some(Duration::from_secs(600)),
     )
     .await
-    .map_err(|e| format!("480b review failed: {e}"))?;
-
-    if !served_by_480b(&resp.model) {
-        return Err(format!(
-            "480b ring unavailable — fleet_oneshot served by {} on {}",
-            resp.model, resp.worker_name
-        ));
-    }
-
-    Ok(parse_review_response(&resp.text))
-}
-
-async fn cloud_cli_review(prompt: &str, cwd: &Path) -> Result<(bool, String, String), String> {
-    let mut last_err = String::new();
-    for backend in ["codex", "claude", "kimi"] {
-        match crate::cli_executor::execute_cli_in_dir(
-            backend,
-            prompt,
-            &[],
-            Some(cwd),
-            Some(Duration::from_secs(600)),
-        )
-        .await
-        {
-            Ok(res) if res.exit_code == 0 && !res.stdout.trim().is_empty() => {
-                let (approved, reason) = parse_review_response(&res.stdout);
-                return Ok((approved, reason, backend.to_string()));
+    {
+        Ok(res) if res.exit_code == 0 && !res.stdout.trim().is_empty() => {
+            let (approved, reasoning) = parse_review_response(&res.stdout);
+            ModelSignature {
+                model: backend.to_string(),
+                approved,
+                reasoning,
             }
-            Ok(res) => {
-                let msg = format!(
-                    "{backend} exited {}: {}",
-                    res.exit_code,
-                    res.stderr.trim().chars().take(300).collect::<String>()
-                );
-                tracing::info!(error = %msg, "pr_review: cloud backend failed");
-                last_err = msg;
+        }
+        Ok(res) => {
+            let reasoning = format!(
+                "{backend} exited {}: {}",
+                res.exit_code,
+                res.stderr.trim().chars().take(300).collect::<String>()
+            );
+            tracing::info!(error = %reasoning, "pr_review: reviewer backend failed");
+            ModelSignature {
+                model: backend.to_string(),
+                approved: false,
+                reasoning,
             }
-            Err(e) => {
-                let msg = format!("{backend} unavailable: {e}");
-                tracing::info!(error = %msg, "pr_review: cloud backend unavailable");
-                last_err = msg;
+        }
+        Err(e) => {
+            let reasoning = format!("{backend} unavailable: {e}");
+            tracing::info!(error = %reasoning, "pr_review: reviewer backend unavailable");
+            ModelSignature {
+                model: backend.to_string(),
+                approved: false,
+                reasoning,
             }
         }
     }
-    Err(format!("no cloud CLI reviewer available: {last_err}"))
 }
 
-fn served_by_480b(model: &str) -> bool {
-    model.to_lowercase().contains(REVIEWER_480B_HINT)
+/// Overall approval requires every reviewer signature to approve.
+fn combine_signatures(signatures: &[ModelSignature]) -> (bool, String) {
+    let approved = !signatures.is_empty() && signatures.iter().all(|s| s.approved);
+    let reasoning = signatures
+        .iter()
+        .map(|s| format!("{}: {}", s.model, s.reasoning))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    (approved, reasoning)
 }
 
 fn parse_review_response(response: &str) -> (bool, String) {
@@ -584,12 +576,39 @@ mod tests {
     }
 
     #[test]
-    fn served_by_480b_matches_the_ring_only() {
-        assert!(served_by_480b("qwen3-coder-480b"));
-        assert!(served_by_480b("Qwen3-Coder-480B-A35B"));
-        assert!(!served_by_480b("qwen3-coder-30b"));
-        assert!(!served_by_480b("local"));
-        assert!(!served_by_480b(""));
+    fn combine_signatures_requires_all_to_approve() {
+        let both_approve = vec![
+            ModelSignature {
+                model: "codex".to_string(),
+                approved: true,
+                reasoning: "looks good".to_string(),
+            },
+            ModelSignature {
+                model: "kimi".to_string(),
+                approved: true,
+                reasoning: "matches intent".to_string(),
+            },
+        ];
+        let (approved, reasoning) = combine_signatures(&both_approve);
+        assert!(approved);
+        assert_eq!(reasoning, "codex: looks good | kimi: matches intent");
+
+        let one_rejects = vec![
+            ModelSignature {
+                model: "codex".to_string(),
+                approved: true,
+                reasoning: "looks good".to_string(),
+            },
+            ModelSignature {
+                model: "kimi".to_string(),
+                approved: false,
+                reasoning: "missing tests".to_string(),
+            },
+        ];
+        let (approved, _) = combine_signatures(&one_rejects);
+        assert!(!approved);
+
+        assert!(!combine_signatures(&[]).0);
     }
 
     #[test]
