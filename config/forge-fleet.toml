@@ -1,0 +1,21 @@
+# Review gate configuration for the multi-LLM code review pipeline
+# (see crates/ff-agent/src/review_pipeline.rs).
+#
+# [review.gate] controls how many independent LLM approvals a review task
+# needs before it clears the gate. [review.llms.*] configures each reviewer
+# backend's API endpoint, model, and per-call timeout.
+
+[review.gate]
+required_approvals = 2
+poll_interval_secs = 15
+overall_timeout_secs = 900
+
+[review.llms.codex]
+api_endpoint = "https://api.openai.com/v1"
+model = "gpt-5-codex"
+timeout_secs = 300
+
+[review.llms.kimi]
+api_endpoint = "https://api.moonshot.ai/v1"
+model = "kimi-k2"
+timeout_secs = 300
