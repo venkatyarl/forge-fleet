@@ -2037,7 +2037,14 @@ async fn record_review_rejection(
 /// Max dispatch attempts before a work_item is escalated to terminal `failed`
 /// instead of being requeued. Each retry re-runs the dispatch with the prior
 /// error appended to the item's `last_error` so the next attempt has context.
-const MAX_DISPATCH_ATTEMPTS: i32 = 3;
+///
+/// MUST stay STRICTLY ABOVE `ff_routing_policy::LOCAL_LANE_MAX_TRIES` (=3),
+/// like `work_item_scheduler::MAX_BUILD_ATTEMPTS`: this cap also gates the
+/// review-rejection retry path (`requeue_or_fail`), and at 3 an item whose
+/// local-lane builds kept getting rejected died WITHOUT a single cloud-builder
+/// attempt (2026-07-22: review-rejected items all failing at attempts=3 while
+/// claude/codex sat idle). 5 = 3 local + 2 cloud tries with reviewer feedback.
+const MAX_DISPATCH_ATTEMPTS: i32 = 5;
 
 /// Escalation ladder: after this many prior attempts, SKIP the local codegen lane
 /// and go straight to the cloud/CLI backstop, which is more capable. Below this,

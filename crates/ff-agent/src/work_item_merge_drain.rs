@@ -78,7 +78,8 @@ pub async fn evaluate_merge_queue(
     // died this way). DIRTY → close this queue row and reset the item for a
     // fresh rebuild against current main; BEHIND → update the PR branch and let
     // CI re-run before merging, so we never squash a stale head.
-    match pr_merge_state(&pr_url).await {
+    let merge_state = pr_merge_state(&pr_url).await;
+    match merge_state {
         PrMergeState::Dirty => {
             warn!(
                 pr = %pr_url,
@@ -158,7 +159,7 @@ pub async fn evaluate_merge_queue(
             );
             return Ok(0);
         }
-        PrMergeState::Other => {}
+        PrMergeState::Clean | PrMergeState::Other => {}
     }
 
     // Past the mergeability gate — this item is computed, so clear any stale
@@ -168,7 +169,22 @@ pub async fn evaluate_merge_queue(
     // Mark that we're watching this PR's CI (idempotent).
     ff_db::pg_mark_merge_ci_running(pg, item.id).await?;
 
-    match pr_ci_state(&pr_url).await {
+    // CLEAN short-circuits the per-check gate entirely: GitHub only reports
+    // CLEAN when the PR is mergeable and every REQUIRED check passes, so
+    // `gh pr checks` (which also sees NON-required checks) must not run at all
+    // — a non-required check stuck pending forever, or a transient checks-
+    // command error, would otherwise report Pending/Failed and head-block the
+    // serial queue behind an actually-mergeable PR (38h freeze, 2026-07-21).
+    let ci_state = if merge_state == PrMergeState::Clean {
+        info!(
+            pr = %pr_url,
+            "merge_drain: mergeStateStatus=CLEAN — required checks pass, skipping per-check gate"
+        );
+        CiState::Success
+    } else {
+        pr_ci_state(&pr_url).await
+    };
+    match ci_state {
         CiState::Pending => {
             // Still running — leave it; we'll re-check next tick.
             Ok(0)
@@ -896,6 +912,7 @@ enum CiState {
 }
 
 /// GitHub's view of how the PR head relates to its base branch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PrMergeState {
     /// Merge-conflicting with the base (GitHub `DIRTY`).
     Dirty,
@@ -905,7 +922,13 @@ enum PrMergeState {
     /// seconds after any sibling merges. Defer this tick rather than racing
     /// past the guard into a doomed `gh pr merge`.
     Unknown,
-    /// Everything else (CLEAN/BLOCKED/UNSTABLE or a gh/API error) — take no
+    /// GitHub `CLEAN`: mergeable AND every REQUIRED check passes. This is
+    /// authoritative — per-check status (`gh pr checks`) must NOT be consulted,
+    /// because a NON-required check stuck `pending` forever would otherwise
+    /// head-block the serial queue indefinitely (root cause of the 38h
+    /// zero-merge freeze, 2026-07-21).
+    Clean,
+    /// Everything else (BLOCKED/UNSTABLE or a gh/API error) — take no
     /// special action; the normal CI→review→merge path decides.
     Other,
 }
@@ -992,10 +1015,17 @@ async fn pr_merge_state(pr_url: &str) -> PrMergeState {
                 .map(str::to_string)
         })
         .unwrap_or_default();
-    match status.as_str() {
+    parse_merge_state(&status)
+}
+
+/// Pure mapping from GitHub's `mergeStateStatus` string to [`PrMergeState`]
+/// (split from [`pr_merge_state`] so it is unit-testable without `gh`).
+fn parse_merge_state(status: &str) -> PrMergeState {
+    match status {
         "DIRTY" => PrMergeState::Dirty,
         "BEHIND" => PrMergeState::Behind,
         "UNKNOWN" => PrMergeState::Unknown,
+        "CLEAN" => PrMergeState::Clean,
         _ => PrMergeState::Other,
     }
 }
@@ -1503,8 +1533,9 @@ async fn db_confirms_leader(pg: &PgPool, worker_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        PrReviewVerdict, github_actions_run_id, is_semantic_merge_compile_failure,
-        parse_review_response, parse_review_verdict, served_by_480b, update_branch_api_path,
+        PrMergeState, PrReviewVerdict, github_actions_run_id,
+        is_semantic_merge_compile_failure, parse_merge_state, parse_review_response,
+        parse_review_verdict, served_by_480b, update_branch_api_path,
     };
 
     #[test]
@@ -1631,6 +1662,21 @@ mod tests {
             "http://github.com/venkatyarl/forge-fleet/pull/930",
         ] {
             assert!(update_branch_api_path(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn merge_state_clean_is_parsed_as_clean() {
+        // CLEAN must map to its own variant (NOT Other): the drain short-
+        // circuits the per-check `gh pr checks` gate on Clean, because CLEAN
+        // already guarantees every REQUIRED check passes — a stuck pending
+        // NON-required check must never head-block the queue.
+        assert_eq!(parse_merge_state("CLEAN"), PrMergeState::Clean);
+        assert_eq!(parse_merge_state("DIRTY"), PrMergeState::Dirty);
+        assert_eq!(parse_merge_state("BEHIND"), PrMergeState::Behind);
+        assert_eq!(parse_merge_state("UNKNOWN"), PrMergeState::Unknown);
+        for other in ["BLOCKED", "UNSTABLE", "HAS_HOOKS", "", "clean"] {
+            assert_eq!(parse_merge_state(other), PrMergeState::Other, "{other}");
         }
     }
 }
