@@ -193,6 +193,20 @@ pub async fn get_hf_token() -> Option<String> {
     fetch_secret("huggingface.token").await
 }
 
+/// Convenience wrapper for the Telegram bot token.
+///
+/// Unlike [`get_hf_token`], this returns a descriptive error instead of
+/// `None` when the token is missing, since callers use it to build a
+/// Telegram API URL and a silent `None` would surface as an opaque HTTP
+/// failure downstream.
+pub async fn get_telegram_bot_token() -> Result<String, String> {
+    fetch_secret("telegram_bot_token").await.ok_or_else(|| {
+        "Telegram bot token not found: set it with `ff secrets set telegram_bot_token <token>` \
+         or export FORGEFLEET_TELEGRAM_BOT_TOKEN"
+            .to_string()
+    })
+}
+
 /// Resolve the ForgeFleet node name for the CURRENT host, in priority order:
 ///   1. `$FORGEFLEET_NODE_NAME` env var (explicit override)
 ///   2. Postgres `fleet_workers` row whose `ip` or `alt_ips` matches any local IPv4 address
@@ -276,6 +290,7 @@ fn env_key_for_secret(key: &str) -> String {
         // Long-lived headless token minted by `claude setup-token`. Claude
         // Code itself reads this exact env var name for non-interactive auth.
         "claude.setup_token" => "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+        "telegram_bot_token" => "FORGEFLEET_TELEGRAM_BOT_TOKEN".to_string(),
         other => other.replace('.', "_").to_uppercase(),
     }
 }
@@ -518,4 +533,21 @@ pub fn cached_fleet_description() -> String {
 at startup to populate this section."
                 .to_string()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telegram_bot_token_env_key_matches_existing_convention() {
+        // `FORGEFLEET_TELEGRAM_BOT_TOKEN` is already the env var read by
+        // ff-core/ff-gateway/main.rs for the Telegram transport; the secrets
+        // fallback must resolve to the same name rather than the generic
+        // `TELEGRAM_BOT_TOKEN` derived from `other.replace('.', "_")`.
+        assert_eq!(
+            env_key_for_secret("telegram_bot_token"),
+            "FORGEFLEET_TELEGRAM_BOT_TOKEN"
+        );
+    }
 }
