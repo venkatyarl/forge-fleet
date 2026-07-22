@@ -58,7 +58,10 @@ pub use artifact_cache_dir::{
     artifact_cache_path, default_cache_root, detect_arch, detect_os_family,
     ensure_artifact_cache_path, ensure_platform_cache_dir, platform_cache_dir,
 };
-pub use artifact_fetch::{ArtifactCacheManager, FetchSource, LanPeer, default_artifact_cache_root};
+pub use artifact_fetch::{
+    ArtifactCacheManager, ArtifactRecord, FetchSource, LanPeer, MINIO_ROUTE_THRESHOLD_BYTES,
+    MinioBackend, StoredBlob, default_artifact_cache_root,
+};
 pub use chaos::{
     ChaosConfig, ChaosEngine, ChaosHooks, Simulation, SimulationId, SimulationState, SimulationType,
 };
