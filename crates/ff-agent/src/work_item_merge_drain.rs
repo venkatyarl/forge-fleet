@@ -1533,9 +1533,9 @@ async fn db_confirms_leader(pg: &PgPool, worker_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        PrMergeState, PrReviewVerdict, github_actions_run_id,
-        is_semantic_merge_compile_failure, parse_merge_state, parse_review_response,
-        parse_review_verdict, served_by_480b, update_branch_api_path,
+        PrMergeState, PrReviewVerdict, github_actions_run_id, is_semantic_merge_compile_failure,
+        parse_merge_state, parse_review_response, parse_review_verdict, served_by_480b,
+        update_branch_api_path,
     };
 
     #[test]
