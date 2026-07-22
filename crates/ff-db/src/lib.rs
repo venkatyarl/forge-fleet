@@ -98,6 +98,7 @@ pub use queries::{
     db_exec,
     load_fleet_config_from_postgres,
     pg_active_deployment_counts,
+    pg_active_lease_counts_by_project,
     pg_advance_intent_cursor,
     pg_agent_readiness,
     pg_agent_viable_computer_ids,

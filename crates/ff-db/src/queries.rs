@@ -9193,8 +9193,9 @@ pub async fn pg_assign_work_item(
     let mut tx = pool.begin().await?;
     let inserted = sqlx::query(
         "INSERT INTO work_item_leases
-            (work_item_id, sub_agent_id, computer_id, lease_state, lease_expires_at)
-         VALUES ($1, $2, $3, 'claimed', NOW() + make_interval(secs => $4))
+            (work_item_id, sub_agent_id, computer_id, project_id, lease_state, lease_expires_at)
+         VALUES ($1, $2, $3, (SELECT project_id FROM work_items WHERE id = $1), 'claimed',
+                 NOW() + make_interval(secs => $4))
          ON CONFLICT DO NOTHING
          RETURNING id",
     )
@@ -9228,6 +9229,29 @@ pub async fn pg_assign_work_item(
     .await?;
     tx.commit().await?;
     Ok(true)
+}
+
+/// Active (unreleased) lease count per project, straight off `work_item_leases`
+/// (no join to `work_items` needed now that leases carry their own
+/// `project_id`). Feeds fair-share ordering in the scheduler: a project already
+/// holding many active leases should yield newly-freed slots to a project
+/// holding fewer. A NULL `project_id` groups as its own bucket, same as
+/// `pg_ready_work_items`'s selection-time fair share.
+pub async fn pg_active_lease_counts_by_project(
+    pool: &PgPool,
+) -> Result<HashMap<Option<String>, i64>> {
+    let rows = sqlx::query(
+        "SELECT project_id, COUNT(*)::bigint AS active
+           FROM work_item_leases
+          WHERE released_at IS NULL
+          GROUP BY project_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.get("project_id"), row.get::<i64, _>("active").max(0)))
+        .collect())
 }
 
 /// Refresh a work_item lease heartbeat so the stale-lease reaper doesn't reclaim

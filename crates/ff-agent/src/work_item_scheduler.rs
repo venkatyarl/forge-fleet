@@ -125,24 +125,14 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
     // from `interleave_by_project`, which only reorders THIS tick's ready set —
     // a project already holding a disproportionate share of ACTIVE leases must
     // be deprioritized even if its ready backlog looks the same size as a
-    // less-active project's.
-    let active_by_project: HashMap<Option<String>, usize> = sqlx::query(
-        "SELECT w.project_id, COUNT(*)::bigint AS active \
-           FROM work_item_leases l \
-           JOIN work_items w ON w.id = l.work_item_id \
-          WHERE l.released_at IS NULL \
-          GROUP BY w.project_id",
-    )
-    .fetch_all(pg)
-    .await?
-    .into_iter()
-    .map(|row| {
-        (
-            row.get("project_id"),
-            row.get::<i64, _>("active").max(0) as usize,
-        )
-    })
-    .collect();
+    // less-active project's. Read straight off `work_item_leases.project_id`
+    // (denormalized at lease-assignment time) instead of joining `work_items`.
+    let active_by_project: HashMap<Option<String>, usize> =
+        ff_db::pg_active_lease_counts_by_project(pg)
+            .await?
+            .into_iter()
+            .map(|(project_id, active)| (project_id, active.max(0) as usize))
+            .collect();
     let mut global_free = ff_db::pg_free_slots(pg, None, MAX_ASSIGN_PER_TICK).await?;
     let now = Utc::now();
     let dispatch_live: HashSet<uuid::Uuid> =
