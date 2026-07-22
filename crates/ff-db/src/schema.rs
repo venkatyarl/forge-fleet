@@ -12055,6 +12055,17 @@ CREATE TABLE IF NOT EXISTS code_rulesets (
 CREATE INDEX IF NOT EXISTS idx_code_rulesets_parent ON code_rulesets (parent_id);
 "#;
 
+/// Attach structured dispatch context and an optional Cortex subgraph to work items.
+///
+/// V236 and V237 are reserved by in-flight branches; the live DB already has
+/// both columns (applied there as v236), so this is a no-op live and
+/// materializes the columns on fresh rebuilds.
+pub const SCHEMA_V238_WORK_ITEM_CONTEXT_AND_CORTEX_SUBGRAPH: &str = r#"
+ALTER TABLE work_items
+    ADD COLUMN IF NOT EXISTS context JSONB NOT NULL DEFAULT '{}',
+    ADD COLUMN IF NOT EXISTS cortex_subgraph_id TEXT;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
