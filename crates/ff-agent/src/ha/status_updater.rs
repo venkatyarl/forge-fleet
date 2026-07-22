@@ -22,8 +22,24 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-/// Default cadence between status updates.
+/// Default cadence between status CHECKS. A check only becomes a Telegram
+/// send when the status line changed (or the unchanged-heartbeat is due) —
+/// see [`should_send`].
 pub const DEFAULT_UPDATE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Re-send cadence for an UNCHANGED status line. With one updater per
+/// concurrent build (~25 fleet-wide), sending every tick regardless of change
+/// flooded the operator with dozens of identical "building X on Y" messages
+/// per hour (operator-reported 2026-07-22). An unchanged status now re-sends
+/// only this often, as a liveness heartbeat; transitions send immediately on
+/// the next tick.
+pub const UNCHANGED_RESEND_INTERVAL: Duration = Duration::from_secs(1800);
+
+/// Pure send decision: send when the status line CHANGED, or when the
+/// unchanged heartbeat is due. Split out for unit testing.
+pub fn should_send(changed: bool, since_last_send: Duration) -> bool {
+    changed || since_last_send >= UNCHANGED_RESEND_INTERVAL
+}
 
 /// Supplies the current status line for a session at send time. Implemented
 /// as a trait (with a blanket impl for `Fn() -> String`) so this module stays
@@ -84,27 +100,49 @@ impl SessionStatusUpdater {
     /// message was actually sent, `None` when Telegram isn't configured
     /// (missing bot token / chat id secrets — not treated as an error).
     pub async fn send_once(&self) -> Result<Option<i64>> {
-        let title = format_title(&self.session_id);
         let body = self.source.status();
-        crate::telegram::send_telegram_recorded(&self.pg, &title, &body, &self.session_id).await
+        self.send_body(&body).await
+    }
+
+    async fn send_body(&self, body: &str) -> Result<Option<i64>> {
+        let title = format_title(&self.session_id);
+        crate::telegram::send_telegram_recorded(&self.pg, &title, body, &self.session_id).await
     }
 
     /// Spawn the periodic send loop. Runs until `shutdown` is set to `true`
-    /// or its sender is dropped.
+    /// or its sender is dropped. Each tick CHECKS the status; it only SENDS on
+    /// a transition (status line changed) or when the unchanged-status
+    /// heartbeat ([`UNCHANGED_RESEND_INTERVAL`]) is due — identical statuses
+    /// must not flood the operator ([`should_send`]).
     pub fn spawn(self, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(self.interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_sent_body: Option<String> = None;
+            let mut last_sent_at = tokio::time::Instant::now();
 
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        match self.send_once().await {
-                            Ok(Some(message_id)) => info!(
+                        let body = self.source.status();
+                        let changed = last_sent_body.as_deref() != Some(body.as_str());
+                        if !should_send(changed, last_sent_at.elapsed().into()) {
+                            debug!(
                                 session_id = %self.session_id,
-                                tg_message_id = message_id,
-                                "session status updater: sent"
-                            ),
+                                "session status updater: unchanged — skipping"
+                            );
+                            continue;
+                        }
+                        match self.send_body(&body).await {
+                            Ok(Some(message_id)) => {
+                                last_sent_body = Some(body);
+                                last_sent_at = tokio::time::Instant::now();
+                                info!(
+                                    session_id = %self.session_id,
+                                    tg_message_id = message_id,
+                                    "session status updater: sent"
+                                )
+                            }
                             Ok(None) => debug!(
                                 session_id = %self.session_id,
                                 "session status updater: telegram not configured; skipping"
@@ -170,5 +208,17 @@ mod tests {
     fn closure_source_reports_status() {
         let source: Arc<dyn SessionStatusSource> = Arc::new(|| "building".to_string());
         assert_eq!(source.status(), "building");
+    }
+
+    #[test]
+    fn unchanged_status_is_suppressed_until_heartbeat() {
+        // A transition always sends.
+        assert!(should_send(true, Duration::from_secs(0)));
+        // Unchanged: silent within the heartbeat window…
+        assert!(!should_send(false, Duration::from_secs(0)));
+        assert!(!should_send(false, UNCHANGED_RESEND_INTERVAL - Duration::from_secs(1)));
+        // …and re-sent once the heartbeat is due.
+        assert!(should_send(false, UNCHANGED_RESEND_INTERVAL));
+        assert!(should_send(false, UNCHANGED_RESEND_INTERVAL + Duration::from_secs(60)));
     }
 }
