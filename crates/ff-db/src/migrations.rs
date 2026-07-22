@@ -1176,6 +1176,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "sub_agents_capabilities",
         sql: schema::SCHEMA_V244_SUB_AGENTS_CAPABILITIES,
     },
+    PgMigration {
+        version: 245,
+        name: "model_catalog_view",
+        sql: schema::SCHEMA_V245_MODEL_CATALOG_VIEW,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -2263,6 +2268,43 @@ mod tests {
         assert_eq!(defaults.0, serde_json::json!([]));
         assert_eq!(defaults.1, serde_json::json!([]));
         assert_eq!(defaults.2, None);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v245_model_catalog_is_a_view_over_fleet_model_catalog() {
+        // CI commonly has no Postgres; the helper checks both supported URL vars.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on a fresh database");
+
+        let table_type: (String,) = sqlx::query_as(
+            "SELECT table_type FROM information_schema.tables
+              WHERE table_schema = 'public' AND table_name = 'model_catalog'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("model_catalog should still be a queryable relation");
+        assert_eq!(table_type.0, "VIEW");
+
+        sqlx::query(
+            "INSERT INTO fleet_model_catalog (id, name, family, parameters, tier)
+             VALUES ('v245-test', 'V245 Test', 'test', '1B', 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert into fleet_model_catalog");
+
+        let via_view: (String,) =
+            sqlx::query_as("SELECT name FROM model_catalog WHERE id = 'v245-test'")
+                .fetch_one(&pool)
+                .await
+                .expect("row inserted into fleet_model_catalog is visible via model_catalog view");
+        assert_eq!(via_view.0, "V245 Test");
 
         drop_temp_db(admin, pool, &db_name).await;
     }

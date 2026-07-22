@@ -12117,6 +12117,11 @@ ALTER TABLE sub_agents
     ADD COLUMN IF NOT EXISTS ram_gb       INT;
 "#;
 
+/// V245 — Replace the stale `model_catalog` table with a compatibility view
+/// over `fleet_model_catalog`, the actively-synced catalog.
+pub const SCHEMA_V245_MODEL_CATALOG_VIEW: &str =
+    include_str!("migrations/20260722120000_create_model_catalog_view.sql");
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
