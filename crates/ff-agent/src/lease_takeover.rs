@@ -17,7 +17,7 @@ const STALE_HEARTBEAT_SECS: i64 = crate::work_item_scheduler::LEASE_STALE_SECS;
 /// the heartbeat fresh (the "building forever with a live heartbeat" wedge —
 /// observed 2026-07-06: 24 min, 0 output). This age cap reclaims it so the slot
 /// self-heals. Set well above a real build (Lane-2 dispatch caps at ~18.5 min).
-const MAX_LEASE_DURATION_SECS: i64 = 25 * 60;
+const MAX_LEASE_DURATION_SECS: i64 = 45 * 60;
 /// Failure-convergence ceiling — must match `work_item_scheduler::MAX_BUILD_ATTEMPTS`.
 /// After this many reaped attempts the reaper marks the item `failed` instead of
 /// re-queuing it forever (the escalation ladder takes over from there).
