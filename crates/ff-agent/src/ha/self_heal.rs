@@ -181,7 +181,8 @@ pub async fn rearm_self_heal_task(
                     'rearmed_at', NOW()::text,
                     'last_attempt_at', NULL,
                     'writer_computer_id', NULL,
-                    'escalated_to_operator_at', NULL
+                    'escalated_to_operator_at', NULL,
+                    'recycle_count', COALESCE((payload->>'recycle_count')::int, 0) + 1
                 )
           WHERE task_class = 'self_heal'
             AND dedup_signature = $1
@@ -196,6 +197,50 @@ pub async fn rearm_self_heal_task(
     .execute(pg)
     .await?;
 
+    Ok(updated.rows_affected() > 0)
+}
+
+/// Number of times a self-heal task for `bug_signature` has already been
+/// re-armed (0 if the task has never recycled, or does not exist).
+///
+/// Used to cap runaway recycling of a bug that keeps flapping between
+/// terminal and detected: once the count reaches the configured
+/// `max_recycles`, the caller should escalate to the operator instead of
+/// re-arming again.
+async fn signature_recycle_count(pg: &PgPool, bug_signature: &str) -> Result<i32, sqlx::Error> {
+    let count: Option<i32> = sqlx::query_scalar(
+        "SELECT (payload->>'recycle_count')::int
+           FROM fleet_tasks
+          WHERE task_class = 'self_heal'
+            AND dedup_signature = $1",
+    )
+    .bind(bug_signature)
+    .fetch_optional(pg)
+    .await?
+    .flatten();
+    Ok(count.unwrap_or(0))
+}
+
+/// Mark a self-heal task as escalated to the operator without re-arming it,
+/// used when a recurring signature has exhausted its recycle budget.
+///
+/// Returns `true` when a matching row was updated.
+async fn escalate_self_heal_signature(
+    pg: &PgPool,
+    bug_signature: &str,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(
+        "UPDATE fleet_tasks
+            SET payload = payload || jsonb_build_object(
+                    'status', 'escalated',
+                    'escalated_to_operator_at', NOW()::text
+                )
+          WHERE task_class = 'self_heal'
+            AND dedup_signature = $1",
+    )
+    .bind(bug_signature)
+    .execute(pg)
+    .await?;
     Ok(updated.rows_affected() > 0)
 }
 
@@ -322,6 +367,40 @@ async fn scan_daemon_logs_with_config(
                 "scan_daemon_logs_for_self_heal: enqueued novel log error signature for self-heal"
             );
         } else {
+            let recycle_count = match signature_recycle_count(pg, &pattern.signature).await {
+                Ok(count) => count,
+                Err(err) => {
+                    tracing::warn!(
+                        node = %my_name,
+                        error_signature = %pattern.signature,
+                        error = %err,
+                        "scan_daemon_logs_for_self_heal: failed to read recycle count"
+                    );
+                    continue;
+                }
+            };
+
+            if recycle_count >= config.max_recycles as i32 {
+                // Recycle budget exhausted: stop re-arming this signature and
+                // alert the operator instead of silently looping forever.
+                match escalate_self_heal_signature(pg, &pattern.signature).await {
+                    Ok(_) => tracing::warn!(
+                        node = %my_name,
+                        error_signature = %pattern.signature,
+                        recycle_count,
+                        max_recycles = config.max_recycles,
+                        "scan_daemon_logs_for_self_heal: recycle limit reached, escalating to operator"
+                    ),
+                    Err(err) => tracing::warn!(
+                        node = %my_name,
+                        error_signature = %pattern.signature,
+                        error = %err,
+                        "scan_daemon_logs_for_self_heal: failed to escalate signature"
+                    ),
+                }
+                continue;
+            }
+
             match rearm_self_heal_task(pg, &pattern.signature, "T2", pattern.count as i32, None)
                 .await
             {
@@ -394,6 +473,9 @@ struct DaemonLogScanConfig {
     min_recurrence: usize,
     tail_lines: usize,
     interval_secs: u64,
+    /// Maximum number of times a recurring signature may be re-armed before
+    /// the scan stops recycling it and escalates to the operator instead.
+    max_recycles: u32,
 }
 
 impl DaemonLogScanConfig {
@@ -422,12 +504,18 @@ impl DaemonLogScanConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(5 * 60);
 
+        let max_recycles = std::env::var("FF_SELF_HEAL_LOG_MAX_RECYCLES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(5);
+
         Self {
             paths,
             patterns,
             min_recurrence,
             tail_lines,
             interval_secs,
+            max_recycles,
         }
     }
 
@@ -851,6 +939,7 @@ mod tests {
             min_recurrence: 3,
             tail_lines: 1000,
             interval_secs: 0,
+            max_recycles: 5,
         };
 
         let enqueued = scan_daemon_logs_with_config(&pool, "test-node", &config)
@@ -908,6 +997,7 @@ mod tests {
             min_recurrence: 3,
             tail_lines: 1000,
             interval_secs: 0,
+            max_recycles: 5,
         };
 
         let enqueued = scan_daemon_logs_with_config(&pool, "test-node", &config)
@@ -952,6 +1042,7 @@ mod tests {
             min_recurrence: 3,
             tail_lines: 1000,
             interval_secs: 0,
+            max_recycles: 5,
         };
 
         // First scan creates the task.
@@ -1013,6 +1104,99 @@ mod tests {
                 .ok()
                 .flatten()
                 .is_none()
+        );
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn scan_daemon_logs_escalates_after_max_recycles_reached() {
+        if env::var("FORGEFLEET_POSTGRES_URL").is_err()
+            && env::var("FORGEFLEET_DATABASE_URL").is_err()
+        {
+            eprintln!("skipping scan_daemon_logs DB test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL");
+            return;
+        }
+        let (admin, pool, db_name) = create_temp_db().await;
+
+        let mut log_file = tempfile::NamedTempFile::new().expect("create temp log");
+        for i in 0..3 {
+            writeln!(
+                log_file,
+                "2026-07-19 12:0{i}:00Z daemon[123{i}]: ERROR connection failed to 10.0.0.{i}:8080"
+            )
+            .unwrap();
+        }
+        let path = log_file.path().to_string_lossy().to_string();
+
+        let config = DaemonLogScanConfig {
+            paths: vec![path],
+            patterns: vec!["ERROR".to_string()],
+            min_recurrence: 3,
+            tail_lines: 1000,
+            interval_secs: 0,
+            max_recycles: 1,
+        };
+
+        // First scan creates the task.
+        let enqueued = scan_daemon_logs_with_config(&pool, "test-node", &config)
+            .await
+            .expect("scan daemon logs");
+        assert_eq!(enqueued, 1);
+
+        let sig: String = sqlx::query_scalar(
+            "SELECT dedup_signature FROM fleet_tasks WHERE task_class = 'self_heal' AND dedup_signature LIKE 'log:%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch signature");
+
+        // Mark it terminal, cooled down, and already at the recycle limit (as
+        // if it had already been re-armed once before).
+        sqlx::query(
+            "UPDATE fleet_tasks \
+             SET status = 'failed', \
+                 completed_at = NOW() - INTERVAL '1 hour', \
+                 payload = payload || jsonb_build_object( \
+                     'status', 'failed', \
+                     'recycle_count', 1 \
+                 ) \
+             WHERE task_class = 'self_heal' AND dedup_signature = $1",
+        )
+        .bind(&sig)
+        .execute(&pool)
+        .await
+        .expect("mark self-heal task terminal at recycle limit");
+
+        // Second scan hits the recycle limit: the task must not be re-armed,
+        // only escalated.
+        let enqueued = scan_daemon_logs_with_config(&pool, "test-node", &config)
+            .await
+            .expect("scan daemon logs again");
+        assert_eq!(enqueued, 0, "recycle limit reached, nothing re-armed");
+
+        let row = sqlx::query(
+            "SELECT status, payload->>'status' AS payload_status, \
+                    payload->>'escalated_to_operator_at' AS escalated_at \
+               FROM fleet_tasks \
+              WHERE task_class = 'self_heal' AND dedup_signature = $1",
+        )
+        .bind(&sig)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch escalated task");
+
+        assert_eq!(
+            row.get::<String, _>("status"),
+            "failed",
+            "left terminal, not re-armed"
+        );
+        assert_eq!(row.get::<String, _>("payload_status"), "escalated");
+        assert!(
+            row.try_get::<Option<String>, _>("escalated_at")
+                .ok()
+                .flatten()
+                .is_some()
         );
 
         drop_temp_db(admin, pool, &db_name).await;
