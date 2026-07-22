@@ -1,0 +1,21 @@
+# Build configuration for fleet build dispatch
+# (loaded by ff_runtime::BuildConfig; see crates/ff-runtime/src/config.rs).
+#
+# Backend names match the vendor CLI backend names in
+# ff_agent::cli_executor::BACKENDS, plus `local` (the local-lane agent loop).
+#
+# `claude` is intentionally NOT listed: it is removed as a default build
+# backend — build work routes through the codex/kimi cloud CLIs or the
+# local lane instead.
+#
+# Inspect with: cargo run --package ff-cli -- build
+
+# Maximum wall-clock seconds a build may run before the timeout watcher
+# kills it (env override: FORGEFLEET_MAX_BUILD_DURATION_SECS).
+max_build_duration = 1800
+
+# Backend used when a build doesn't route one explicitly.
+default_backend = "codex"
+
+# Backends build work may be dispatched to.
+supported_backends = ["codex", "kimi", "local"]
