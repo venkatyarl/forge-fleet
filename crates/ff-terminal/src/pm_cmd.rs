@@ -641,6 +641,18 @@ fn run_git(repo: &std::path::Path, args: &[&str]) -> Result<()> {
     }
 }
 
+/// Each project's fair share of the doctor's reported slot capacity (active
+/// leases + free slots), split evenly across every project that is active or
+/// has ready work. Ceil-divided to mirror the scheduler's `project_fair_share`
+/// so `ff pm doctor` reports the same cap the scheduler enforces. Pure so the
+/// per-project fairness output is testable without a database.
+fn doctor_fair_share(distinct_projects: usize, total_capacity: usize) -> usize {
+    if distinct_projects == 0 {
+        return total_capacity;
+    }
+    total_capacity.div_ceil(distinct_projects)
+}
+
 async fn print_pm_doctor(pool: &sqlx::PgPool) -> Result<()> {
     println!("{CYAN}▶ Pillar-4 work_item pipeline doctor{RESET}");
 
@@ -738,6 +750,65 @@ async fn print_pm_doctor(pool: &sqlx::PgPool) -> Result<()> {
         println!(
             "{YELLOW}⚠ orphaned in_progress{RESET}: {orphaned_in_progress} (no active lease — the scheduler sweep cancels these hourly)"
         );
+    }
+
+    // Project fairness: per-project active (leased) work_items alongside each
+    // project's fair share of this tick's slot capacity, mirroring the
+    // scheduler's `project_fair_share` — total capacity (active leases + free
+    // slots) split evenly across every project that is active or has ready work,
+    // ceil-divided. Surfaces whether the fair-share cap is biting any project.
+    let active_by_project: Vec<(Option<String>, i64)> = sqlx::query_as(
+        "SELECT w.project_id, COUNT(*)::bigint \
+           FROM work_item_leases l \
+           JOIN work_items w ON w.id = l.work_item_id \
+          WHERE l.released_at IS NULL \
+          GROUP BY w.project_id \
+          ORDER BY COUNT(*) DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("doctor per-project active work: {e}"))?;
+
+    let ready_projects: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT DISTINCT project_id \
+           FROM work_items \
+          WHERE status = 'ready' AND kind = 'task'",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("doctor ready projects: {e}"))?;
+
+    let mut distinct_projects: std::collections::HashSet<Option<String>> =
+        active_by_project.iter().map(|(p, _)| p.clone()).collect();
+    distinct_projects.extend(ready_projects);
+
+    let total_capacity = (active_leases + free_slots).max(0) as usize;
+    let fair_share = doctor_fair_share(distinct_projects.len(), total_capacity);
+
+    if distinct_projects.is_empty() {
+        println!("{GREEN}✓ project fairness{RESET}: no active or ready projects");
+    } else {
+        println!(
+            "{GREEN}✓ project fairness{RESET}: fair share {fair_share} slot(s)/project \
+             (capacity {total_capacity} across {} project(s))",
+            distinct_projects.len()
+        );
+        let active_map: std::collections::HashMap<&Option<String>, i64> =
+            active_by_project.iter().map(|(p, n)| (p, *n)).collect();
+        let mut ordered: Vec<&Option<String>> = distinct_projects.iter().collect();
+        ordered.sort_by(|a, b| {
+            let av = active_map.get(a).copied().unwrap_or(0);
+            let bv = active_map.get(b).copied().unwrap_or(0);
+            bv.cmp(&av).then_with(|| a.cmp(b))
+        });
+        for project in ordered {
+            let label = project.as_deref().unwrap_or("(none)");
+            let active = active_map.get(project).copied().unwrap_or(0);
+            let capped = active as usize >= fair_share;
+            let marker = if capped { YELLOW } else { GREEN };
+            let note = if capped { " (at/over fair share)" } else { "" };
+            println!("    {marker}{label}{RESET}: active {active}, fair share {fair_share}{note}");
+        }
     }
 
     println!();
@@ -2271,6 +2342,18 @@ async fn handle_pm_purge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_fair_share_splits_capacity_and_handles_no_projects() {
+        assert_eq!(doctor_fair_share(3, 9), 3);
+        assert_eq!(doctor_fair_share(3, 10), 4, "remainder rounds up");
+        assert_eq!(
+            doctor_fair_share(0, 5),
+            5,
+            "no active/ready projects → whole capacity is the share"
+        );
+        assert_eq!(doctor_fair_share(4, 0), 0);
+    }
 
     #[test]
     fn decomposition_quality_gate_merges_sibling_file_overlap() {
