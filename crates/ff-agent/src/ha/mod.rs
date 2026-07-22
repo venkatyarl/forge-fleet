@@ -21,6 +21,7 @@ pub mod replica_monitor;
 pub mod restore_drill;
 pub mod self_heal;
 pub mod slot_manager;
+pub mod status_updater;
 
 #[cfg(test)]
 mod integration_tests;
