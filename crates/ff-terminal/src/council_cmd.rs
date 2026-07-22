@@ -58,6 +58,63 @@ impl MemberRaw {
     }
 }
 
+/// Greetings and pleasantries that carry no room for members to disagree on.
+const TRIVIAL_GREETINGS: &[&str] = &[
+    "hi",
+    "hello",
+    "hey",
+    "hola",
+    "yo",
+    "sup",
+    "howdy",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "good night",
+    "thanks",
+    "thank you",
+    "ty",
+    "bye",
+    "goodbye",
+    "see ya",
+];
+
+/// Well-known constants/facts that don't need multi-model deliberation to answer.
+const TRIVIAL_KNOWN_CONSTANTS: &[&str] = &[
+    "value of pi",
+    "speed of light",
+    "boiling point of water",
+    "freezing point of water",
+    "avogadro's number",
+    "avogadro number",
+    "gravitational constant",
+    "planck's constant",
+    "planck constant",
+];
+
+/// Heuristically detects trivial prompts (greetings, single-word queries,
+/// well-known constants) that don't warrant convening the full council.
+/// Used by [`handle_council`] to answer directly from one member instead of
+/// dispatching every member + a chairman synthesis, saving compute.
+pub fn should_skip_council(prompt: &str) -> bool {
+    let normalized = prompt
+        .trim()
+        .trim_end_matches(['?', '!', '.'])
+        .to_lowercase();
+    if normalized.is_empty() {
+        return true;
+    }
+    if TRIVIAL_GREETINGS.contains(&normalized.as_str()) {
+        return true;
+    }
+    if normalized.split_whitespace().count() <= 1 {
+        return true;
+    }
+    TRIVIAL_KNOWN_CONSTANTS
+        .iter()
+        .any(|c| normalized.contains(c))
+}
+
 pub async fn handle_council(
     question: String,
     members_csv: String,
@@ -74,12 +131,37 @@ pub async fn handle_council(
         anyhow::bail!("no council members (pass --members codex,kimi,local:<model>)");
     }
     let timeout = timeout_secs.map(Duration::from_secs);
-    let prompt = format!("{MEMBER_PROMPT_PREAMBLE}{question}");
 
     // Best-effort pool: logs every dispatch to ff_interactions AND lets `local:`
     // members route to a fleet deployment. A missing pool never blocks a council
     // (vendor members still run; local members fail gracefully with a clear msg).
     let pool: Option<PgPool> = ff_agent::fleet_info::get_fleet_pool().await.ok();
+
+    // Trivial prompts (greetings, single-word queries, known constants) don't
+    // need N members + a chairman synthesis — answer directly from one member.
+    if should_skip_council(&question) {
+        let member = chairman.unwrap_or_else(|| members[0].clone());
+        eprintln!(
+            "{CYAN}▶ Trivial prompt detected — answering directly via {member}, skipping full \
+             council{RESET}"
+        );
+        let raw = dispatch_member(&member, &question, pool.as_ref(), timeout).await;
+        log_council(pool.as_ref(), &member, "council_trivial", &question, &raw).await;
+        return match raw.answer {
+            Some(answer) => {
+                println!(
+                    "{GREEN}═══════════ DIRECT ANSWER ({member}) ═══════════{RESET}\n{answer}"
+                );
+                Ok(())
+            }
+            None => anyhow::bail!(
+                "trivial prompt but {member} returned no usable answer{}",
+                raw.error.map(|e| format!(": {e}")).unwrap_or_default()
+            ),
+        };
+    }
+
+    let prompt = format!("{MEMBER_PROMPT_PREAMBLE}{question}");
 
     eprintln!(
         "{CYAN}▶ Convening council: {} member(s) [{}]{RESET}",
@@ -319,5 +401,48 @@ async fn log_council(
     };
     if let Err(e) = ff_db::pg_record_interaction(pool, &rec).await {
         eprintln!("{YELLOW}⚠ council: failed to log interaction (non-fatal): {e}{RESET}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_skip_council;
+
+    #[test]
+    fn greetings_are_trivial() {
+        assert!(should_skip_council("hi"));
+        assert!(should_skip_council("Hello!"));
+        assert!(should_skip_council("  good morning  "));
+        assert!(should_skip_council("thanks"));
+    }
+
+    #[test]
+    fn single_word_queries_are_trivial() {
+        assert!(should_skip_council("recursion"));
+        assert!(should_skip_council("kubernetes?"));
+    }
+
+    #[test]
+    fn known_constants_are_trivial() {
+        assert!(should_skip_council("what is the value of pi?"));
+        assert!(should_skip_council(
+            "What's the speed of light in a vacuum?"
+        ));
+    }
+
+    #[test]
+    fn empty_prompt_is_trivial() {
+        assert!(should_skip_council(""));
+        assert!(should_skip_council("   "));
+    }
+
+    #[test]
+    fn substantive_questions_are_not_trivial() {
+        assert!(!should_skip_council(
+            "Should we migrate the scheduler to use FOR UPDATE SKIP LOCKED?"
+        ));
+        assert!(!should_skip_council(
+            "What's the tradeoff between eager and lazy loading for this cache?"
+        ));
     }
 }
