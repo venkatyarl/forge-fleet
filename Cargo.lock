@@ -1318,10 +1318,12 @@ dependencies = [
  "chrono",
  "clap",
  "ff-agent",
+ "ff-db",
  "ff-runtime",
  "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
  "tokio",
  "toml 0.8.23",
 ]

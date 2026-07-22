@@ -12,6 +12,8 @@ use ff_agent::commands::CommandRegistry;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+mod notify_cmd;
+
 const GREEN: &str = "\x1b[32m";
 const CYAN: &str = "\x1b[36m";
 const YELLOW: &str = "\x1b[33m";
@@ -69,6 +71,11 @@ enum Command {
     Pm(PmArgs),
     /// Show the build configuration (backends + timeout) from config/build.toml
     Build(BuildArgs),
+    /// Send fleet notifications and manage operator replies (Telegram)
+    Notify {
+        #[command(subcommand)]
+        command: notify_cmd::NotifyCommand,
+    },
     Version,
 }
 
@@ -271,6 +278,7 @@ async fn main() -> Result<()> {
         Command::Export(args) => handle_export(args).await,
         Command::Pm(args) => handle_pm(args).await,
         Command::Build(args) => handle_build(args),
+        Command::Notify { command } => notify_cmd::handle_notify(command).await,
         Command::Version => {
             println!("forgefleet {}", env!("CARGO_PKG_VERSION"));
             Ok(())
