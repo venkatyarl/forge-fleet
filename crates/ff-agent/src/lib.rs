@@ -168,6 +168,7 @@ pub mod task_retention;
 pub mod task_runner;
 pub mod telegram;
 pub mod telegram_reply_poller;
+pub mod telegram_status_updater;
 pub mod template_registry;
 pub mod thinking;
 pub mod tick_registry;

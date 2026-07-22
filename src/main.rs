@@ -584,6 +584,30 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         info!("subsystem disabled: telegram transport");
     }
 
+    // 7b) telegram status updater — periodic fleet-status digest posted to
+    // the operator's chat via `sendMessage`. Unlike the transport above,
+    // `sendMessage` has no single-consumer restriction, so this runs on
+    // every daemon and leader-gates itself inside the tick (only one digest
+    // goes out per interval).
+    if let Some(pg_pool) = operational_store.pg_pool().cloned()
+        && config
+            .transport
+            .telegram
+            .as_ref()
+            .is_some_and(|telegram| telegram.enabled)
+    {
+        info!("starting subsystem: telegram status updater (leader-gated)");
+        subsystem_tasks.push(
+            ff_agent::telegram_status_updater::spawn_telegram_status_updater_tick(
+                pg_pool,
+                3600,
+                shutdown_rx.clone(),
+            ),
+        );
+    } else {
+        info!("subsystem disabled: telegram status updater");
+    }
+
     // 8) evolution runtime loop
     if config.loops.evolution.enabled {
         info!("starting subsystem: evolution loop");
