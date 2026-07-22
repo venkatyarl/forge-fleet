@@ -3,10 +3,12 @@
 //! Enables running N independent coding agents simultaneously, each on a
 //! different fleet node, with coordination, event streaming, and result aggregation.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -321,6 +323,40 @@ impl EventStream {
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
+
+    /// Content hash of one event's operation payload (session_id + event body,
+    /// NOT the timestamp) — two independently-produced copies of "the same"
+    /// event hash identically even if they were appended at different instants,
+    /// which is what makes [`Self::union_merge`] idempotent.
+    fn event_content_hash(session_id: &str, event: &AgentEvent) -> String {
+        let mut h = Sha256::new();
+        h.update(session_id.as_bytes());
+        h.update(b"\0");
+        if let Ok(json) = serde_json::to_string(event) {
+            h.update(json.as_bytes());
+        }
+        format!("{:x}", h.finalize())
+    }
+
+    /// Merge another append-only event stream into this one as a deduplicated
+    /// UNION: every event present in either partition ends up in the result
+    /// exactly once, identified by content hash rather than timestamp, so the
+    /// same event replayed into two diverged partitions (e.g. two fleet nodes
+    /// that each saw part of a session) collapses to a single entry instead of
+    /// duplicating history. This stream's events are kept first, in order,
+    /// followed by any events from `other` not already present, also in order.
+    pub fn union_merge(&self, other: &EventStream) -> EventStream {
+        let mut seen: HashSet<String> =
+            HashSet::with_capacity(self.events.len() + other.events.len());
+        let mut merged = Vec::with_capacity(self.events.len() + other.events.len());
+        for te in self.events.iter().chain(other.events.iter()) {
+            let hash = Self::event_content_hash(&te.session_id, &te.event);
+            if seen.insert(hash) {
+                merged.push(te.clone());
+            }
+        }
+        EventStream { events: merged }
+    }
 }
 
 /// Test-driven verification pipeline — code on one node, test on another, verify on a third.
@@ -433,4 +469,119 @@ pub struct VerificationResult {
     pub code_output: String,
     pub test_output: String,
     pub verify_output: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(session_id: &str, message: &str) -> TimestampedEvent {
+        TimestampedEvent {
+            timestamp: DateTime::from_timestamp(0, 0).expect("valid epoch timestamp"),
+            session_id: session_id.to_string(),
+            event: AgentEvent::Status {
+                session_id: session_id.to_string(),
+                message: message.to_string(),
+            },
+        }
+    }
+
+    fn event_at(session_id: &str, message: &str, secs: i64) -> TimestampedEvent {
+        TimestampedEvent {
+            timestamp: DateTime::from_timestamp(secs, 0).expect("valid timestamp"),
+            session_id: session_id.to_string(),
+            event: AgentEvent::Status {
+                session_id: session_id.to_string(),
+                message: message.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn union_merge_eliminates_duplicates() {
+        let mut a = EventStream::new();
+        a.events.push(event("s1", "hello"));
+        a.events.push(event("s1", "world"));
+
+        let mut b = EventStream::new();
+        // Same operation payload as `a`'s first event, but appended at a
+        // different instant — must still collapse to one entry.
+        b.events.push(event_at("s1", "hello", 100));
+        b.events.push(event("s1", "world"));
+
+        let merged = a.union_merge(&b);
+        assert_eq!(
+            merged.len(),
+            2,
+            "duplicate operation payloads across partitions must not be double-counted"
+        );
+    }
+
+    #[test]
+    fn union_merge_preserves_all_unique_entries_from_both_partitions() {
+        let mut a = EventStream::new();
+        a.events.push(event("s1", "only-in-a"));
+        a.events.push(event("s1", "shared"));
+
+        let mut b = EventStream::new();
+        b.events.push(event("s1", "shared"));
+        b.events.push(event("s1", "only-in-b"));
+
+        let merged = a.union_merge(&b);
+        let messages: HashSet<String> = merged
+            .events
+            .iter()
+            .map(|te| match &te.event {
+                AgentEvent::Status { message, .. } => message.clone(),
+                _ => panic!("unexpected event variant"),
+            })
+            .collect();
+
+        let expected: HashSet<String> = ["only-in-a", "shared", "only-in-b"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            messages, expected,
+            "union must contain every unique entry from both partitions"
+        );
+    }
+
+    #[test]
+    fn union_merge_is_commutative_as_a_set() {
+        let mut a = EventStream::new();
+        a.events.push(event("s1", "x"));
+        a.events.push(event("s2", "y"));
+
+        let mut b = EventStream::new();
+        b.events.push(event("s2", "y"));
+        b.events.push(event("s3", "z"));
+
+        let ab = a.union_merge(&b);
+        let ba = b.union_merge(&a);
+
+        let hashes = |stream: &EventStream| -> HashSet<String> {
+            stream
+                .events
+                .iter()
+                .map(|te| EventStream::event_content_hash(&te.session_id, &te.event))
+                .collect()
+        };
+        assert_eq!(
+            hashes(&ab),
+            hashes(&ba),
+            "merge order must not change the resulting set"
+        );
+        assert_eq!(ab.len(), 3);
+    }
+
+    #[test]
+    fn union_merge_with_empty_partition_is_identity() {
+        let mut a = EventStream::new();
+        a.events.push(event("s1", "only"));
+        let empty = EventStream::new();
+
+        let merged = a.union_merge(&empty);
+        assert_eq!(merged.len(), 1);
+    }
 }
