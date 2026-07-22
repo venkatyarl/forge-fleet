@@ -877,6 +877,22 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     // mid-finalize as a "stale-heartbeat takeover".
     let _heartbeat_guard = HeartbeatGuard::spawn(item.work_item_id);
 
+    // Periodic Telegram status update for the operator, spanning the same
+    // whole-dispatch window as the heartbeat guard above. Keyed by the
+    // lease's `session_id` (the same id `task_failed_alert_text` reports) so
+    // an operator reply routes back to this build.
+    let status_session_id = item
+        .session_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| item.work_item_id.to_string());
+    let status_title = item.title.clone();
+    let status_computer = item.computer_name.clone();
+    let _session_status_guard = crate::ha::status_updater::SessionStatusGuard::spawn(
+        pg.clone(),
+        status_session_id,
+        Arc::new(move || format!("building \"{status_title}\" on {status_computer}")),
+    );
+
     ensure_repo_checked_out(&pg, &item).await?;
     let worktree = create_worktree_for_item(&pg, &item).await?;
 
