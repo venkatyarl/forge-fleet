@@ -1374,7 +1374,13 @@ fn workspace_crate_hint(ls_files: &str, goal: &str) -> Option<String> {
         let Some((crate_name, _)) = rest.split_once('/') else {
             continue;
         };
-        if goal.contains(&crate_name.to_ascii_lowercase()) {
+        // Goals often name the crate the way Rust code actually references it
+        // (`ff_core::...`, underscored) rather than its Cargo package/directory
+        // name (`ff-core`, hyphenated). Match either spelling so the hint still
+        // fires — otherwise a goal like "fix ff_core task generation" misses
+        // the hint and the planner emits bare `src/...` paths.
+        let underscored = crate_name.replace('-', "_").to_ascii_lowercase();
+        if goal.contains(&crate_name.to_ascii_lowercase()) || goal.contains(&underscored) {
             crates.insert(crate_name);
         }
     }
@@ -2667,6 +2673,26 @@ mod tests {
             .expect("ff-agent is a tracked workspace crate named in the goal");
         assert!(hint.contains("`ff-agent` => `crates/ff-agent/`"));
         assert!(hint.contains("never shorten them to `src/...`"));
+    }
+
+    #[test]
+    fn workspace_crate_hint_matches_underscored_ff_core_reference() {
+        let ls = "crates/ff-core/src/task.rs\ncrates/ff-terminal/src/main.rs\n";
+        // Rust code and prose commonly reference this crate as `ff_core`
+        // (its import name), not `ff-core` (its Cargo directory name).
+        let hint = workspace_crate_hint(ls, "Adjust ff_core task generation").expect(
+            "ff-core is a tracked workspace crate named in the goal via its underscored form",
+        );
+        assert!(hint.contains("`ff-core` => `crates/ff-core/`"));
+        assert!(hint.contains("never shorten them to `src/...`"));
+    }
+
+    #[test]
+    fn workspace_crate_hint_still_matches_hyphenated_ff_core_reference() {
+        let ls = "crates/ff-core/src/task.rs\n";
+        let hint = workspace_crate_hint(ls, "Adjust ff-core task generation")
+            .expect("ff-core is a tracked workspace crate named in the goal");
+        assert!(hint.contains("`ff-core` => `crates/ff-core/`"));
     }
 
     #[test]
