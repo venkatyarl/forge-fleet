@@ -1976,6 +1976,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "dirs 6.0.0",
  "ff-agent",
  "ff-api",
  "ff-brain",

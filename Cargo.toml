@@ -125,6 +125,7 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 toml.workspace = true
 chrono.workspace = true
+dirs.workspace = true
 uuid.workspace = true
 reqwest.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
