@@ -216,9 +216,15 @@ mod tests {
         assert!(should_send(true, Duration::from_secs(0)));
         // Unchanged: silent within the heartbeat window…
         assert!(!should_send(false, Duration::from_secs(0)));
-        assert!(!should_send(false, UNCHANGED_RESEND_INTERVAL - Duration::from_secs(1)));
+        assert!(!should_send(
+            false,
+            UNCHANGED_RESEND_INTERVAL - Duration::from_secs(1)
+        ));
         // …and re-sent once the heartbeat is due.
         assert!(should_send(false, UNCHANGED_RESEND_INTERVAL));
-        assert!(should_send(false, UNCHANGED_RESEND_INTERVAL + Duration::from_secs(60)));
+        assert!(should_send(
+            false,
+            UNCHANGED_RESEND_INTERVAL + Duration::from_secs(60)
+        ));
     }
 }
