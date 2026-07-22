@@ -12041,6 +12041,16 @@ VALUES
 ON CONFLICT (name) DO NOTHING;
 "#;
 
+/// V234 — capability tags on sub-agent slots.
+///
+/// Lets a slot advertise what it can serve (`kind:`, `model:`, `repo:`, `ram:`,
+/// or bare `skill:` tags) so the dispatcher can match a work_item's
+/// `required_capabilities` against a slot before assigning it. Defaults to an
+/// empty array so an unset slot matches only capability-free work items.
+pub const SCHEMA_V234_SUB_AGENTS_CAPABILITIES: &str = r#"
+ALTER TABLE sub_agents ADD COLUMN IF NOT EXISTS capabilities JSONB NOT NULL DEFAULT '[]';
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

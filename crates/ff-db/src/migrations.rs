@@ -1151,6 +1151,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "fabric_link_dead_alert",
         sql: schema::SCHEMA_V233_FABRIC_LINK_DEAD_ALERT,
     },
+    PgMigration {
+        version: 234,
+        name: "sub_agents_capabilities",
+        sql: schema::SCHEMA_V234_SUB_AGENTS_CAPABILITIES,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
