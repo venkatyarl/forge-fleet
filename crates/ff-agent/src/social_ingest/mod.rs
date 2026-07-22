@@ -5,6 +5,9 @@
 //!   2. Fetch media + metadata via yt-dlp / ffmpeg ([`fetcher`]).
 //!   3. Run vision-LLM over images/frames ([`analyzer`]).
 //!   4. Persist to Postgres `social_media_posts` (schema V25).
+//!   5. Send a recorded Telegram notification keyed to the ingesting session
+//!      ([`crate::telegram::send_telegram_recorded`]), so an operator reply to
+//!      it is routed back to that session by the leader's reply poller.
 //!
 //! The [`ingest`] entrypoint inserts a row in state `queued`, returns its
 //! UUID immediately, and kicks off a background `tokio::spawn` that
@@ -63,6 +66,7 @@ pub async fn ingest(pool: PgPool, url: String, ingested_by: Option<String>) -> R
 
     let pool_task = pool.clone();
     let url_task = url.clone();
+    let session_id = notify_session_id(post_id, ingested_by.as_deref());
     tokio::spawn(async move {
         // Acquire backpressure semaphore; if full, pipeline waits.
         let _permit = match INGEST_SEM.acquire().await {
@@ -80,15 +84,31 @@ pub async fn ingest(pool: PgPool, url: String, ingested_by: Option<String>) -> R
             }
         };
 
-        if let Err(e) = run_pipeline(pool_task.clone(), post_id, url_task).await {
-            tracing::error!(post_id = %post_id, error = %e, "social_ingest pipeline failed");
+        let error = run_pipeline(pool_task.clone(), post_id, url_task.clone())
+            .await
+            .err()
+            .map(|e| format!("{e:#}"));
+        if let Some(err) = &error {
+            tracing::error!(post_id = %post_id, error = %err, "social_ingest pipeline failed");
             let _ = sqlx::query(
                 "UPDATE social_media_posts SET status='failed', last_error=$2 WHERE id=$1",
             )
             .bind(post_id)
-            .bind(format!("{e:#}"))
+            .bind(err)
             .execute(&pool_task)
             .await;
+        }
+
+        // Recorded send: stores (chat_id, tg_message_id) → session_id in
+        // `telegram_messages`, so an operator REPLY to this notification is
+        // routed back to the ingesting session by the leader's reply poller.
+        // Best-effort — a Telegram hiccup never fails the ingest, and the send
+        // silently no-ops when Telegram isn't configured.
+        let (title, body) = notification_message(&url_task, post_id, &session_id, error.as_deref());
+        if let Err(e) =
+            crate::telegram::send_telegram_recorded(&pool_task, &title, &body, &session_id).await
+        {
+            tracing::warn!(post_id = %post_id, error = %e, "social_ingest: telegram notify failed (non-fatal)");
         }
     });
 
@@ -182,6 +202,41 @@ async fn run_pipeline(pool: PgPool, post_id: Uuid, url: String) -> Result<()> {
         tracing::warn!(error = %e, "social_ingest: failed to log interaction (non-fatal)");
     }
     Ok(())
+}
+
+/// Session a recorded Telegram notification is keyed to: the ingesting session
+/// when the caller provided one (`ingested_by`), else a per-post fallback so
+/// operator replies about this post still have a routable session.
+fn notify_session_id(post_id: Uuid, ingested_by: Option<&str>) -> String {
+    match ingested_by.map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => format!("social-ingest-{post_id}"),
+    }
+}
+
+/// `(title, body)` for the end-of-pipeline Telegram notification. The session
+/// id is embedded in the body so the operator can see which session a reply to
+/// this message will be routed to.
+fn notification_message(
+    url: &str,
+    post_id: Uuid,
+    session_id: &str,
+    error: Option<&str>,
+) -> (String, String) {
+    let title = if error.is_some() {
+        "Social ingest failed".to_string()
+    } else {
+        "Social ingest done".to_string()
+    };
+    let mut body = format!("{url}\npost: {post_id}\nsession: {session_id}");
+    if let Some(e) = error {
+        // Fetch/vision errors can be multi-KB tool dumps; keep the message sane.
+        let trimmed: String = e.chars().take(500).collect();
+        body.push_str("\nerror: ");
+        body.push_str(&trimmed);
+    }
+    body.push_str("\nReply to this message to reach the session.");
+    (title, body)
 }
 
 async fn update_status(
@@ -455,6 +510,37 @@ mod tests {
         assert!(!model_matches(Some("llama32-vision-11b"), "qwen2-vl-7b"));
         // None never matches
         assert!(!model_matches(None, "qwen3-vl-30b-a3b"));
+    }
+
+    #[test]
+    fn notification_carries_session_id_for_reply_routing() {
+        let post_id = Uuid::nil();
+
+        // Explicit ingesting session wins; blank/missing falls back per-post.
+        assert_eq!(
+            notify_session_id(post_id, Some(" mac-forge-fleet ")),
+            "mac-forge-fleet"
+        );
+        assert_eq!(
+            notify_session_id(post_id, Some("   ")),
+            format!("social-ingest-{post_id}")
+        );
+        assert_eq!(
+            notify_session_id(post_id, None),
+            format!("social-ingest-{post_id}")
+        );
+
+        let url = "https://x.com/user/status/1";
+        let (title, body) = notification_message(url, post_id, "mac-forge-fleet", None);
+        assert_eq!(title, "Social ingest done");
+        assert!(body.contains("session: mac-forge-fleet"));
+        assert!(body.contains(&post_id.to_string()));
+        assert!(body.contains(url));
+
+        let (title, body) = notification_message(url, post_id, "mac-forge-fleet", Some("boom"));
+        assert_eq!(title, "Social ingest failed");
+        assert!(body.contains("error: boom"));
+        assert!(body.contains("session: mac-forge-fleet"));
     }
 
     #[test]
