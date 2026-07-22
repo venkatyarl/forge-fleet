@@ -1791,6 +1791,7 @@ dependencies = [
  "ff-agent",
  "ff-api",
  "ff-brain",
+ "ff-control",
  "ff-core",
  "ff-db",
  "ff-deploy",

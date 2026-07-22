@@ -3,7 +3,134 @@ use crate::{
     trunc_for_status, whoami_tag,
 };
 use anyhow::Result;
+use ff_db::models::FabricPair;
+use sqlx::Row;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+
+fn distributed_load_command(
+    library_id: &str,
+    port: u16,
+    ctx: Option<u32>,
+    parallel: Option<u32>,
+    agent: bool,
+    mmproj: Option<&str>,
+) -> String {
+    let mut command = format!(
+        "~/.local/bin/ff model load {} --port {port}",
+        shell_escape_single(library_id)
+    );
+    if let Some(ctx) = ctx {
+        command.push_str(&format!(" --ctx {ctx}"));
+    }
+    if let Some(parallel) = parallel {
+        command.push_str(&format!(" --parallel {parallel}"));
+    }
+    if agent {
+        command.push_str(" --agent");
+    }
+    if let Some(mmproj) = mmproj {
+        command.push_str(&format!(" --mmproj {}", shell_escape_single(mmproj)));
+    }
+    command
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_distributed_load(
+    pool: &sqlx::PgPool,
+    library_id: &str,
+    port: u16,
+    ctx: Option<u32>,
+    parallel: Option<u32>,
+    agent: bool,
+    mmproj: Option<&str>,
+) -> Result<()> {
+    let libraries = ff_db::pg_list_library(pool, None).await?;
+    let requested = libraries
+        .iter()
+        .find(|library| library.id == library_id)
+        .ok_or_else(|| anyhow::anyhow!("no model library entry with id '{library_id}'"))?;
+
+    let matching: BTreeMap<_, _> = libraries
+        .iter()
+        .filter(|library| {
+            library.catalog_id == requested.catalog_id && library.quant == requested.quant
+        })
+        .map(|library| (library.worker_name.clone(), library))
+        .collect();
+    let available: BTreeSet<_> = matching.keys().cloned().collect();
+
+    let rows = sqlx::query(
+        "SELECT id, source_node, target_node, COALESCE(cidr, '') AS cidr, status, verified \
+         FROM fabric_pairs WHERE verified = TRUE AND status = 'verified'",
+    )
+    .fetch_all(pool)
+    .await?;
+    let pairs: Vec<FabricPair> = rows
+        .into_iter()
+        .map(|row| FabricPair {
+            id: row.get("id"),
+            source_node: row.get("source_node"),
+            target_node: row.get("target_node"),
+            cidr: row.get("cidr"),
+            status: row.get("status"),
+            verified: row.get("verified"),
+        })
+        .filter(|pair| {
+            available.contains(&pair.source_node) && available.contains(&pair.target_node)
+        })
+        .collect();
+    let plan = ff_control::select_hub_and_workers(&pairs).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no live verified fabric link connects nodes holding catalog '{}' ({:?})",
+            requested.catalog_id,
+            requested.quant
+        )
+    })?;
+
+    println!(
+        "{CYAN}▶ Distributed topology: hub={} spokes={}{RESET}",
+        plan.hub,
+        plan.workers.join(",")
+    );
+    let this_node = ff_agent::fleet_info::resolve_this_worker_name().await;
+    let launch_order = plan.workers.iter().chain(std::iter::once(&plan.hub));
+    for node in launch_order {
+        let library = matching
+            .get(node)
+            .expect("topology was restricted to nodes with matching libraries");
+        if node.eq_ignore_ascii_case(&this_node) {
+            let opts = ff_agent::model_runtime::LoadOptions {
+                library_id: library.id.clone(),
+                port,
+                context_size: ctx,
+                parallel,
+                agent_profile: agent,
+                mmproj_path: mmproj.map(str::to_owned),
+            };
+            ff_agent::model_runtime::load_model(pool, opts)
+                .await
+                .map_err(|error| anyhow::anyhow!("load on {node} failed: {error}"))?;
+        } else {
+            let node_row = ff_db::pg_get_node(pool, node)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("fabric node '{node}' not in fleet_workers"))?;
+            let command = distributed_load_command(&library.id, port, ctx, parallel, agent, mmproj);
+            let (code, out, err) =
+                ff_agent::model_transfer::ssh_exec(&node_row.ssh_user, &node_row.ip, &command)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("ssh to {node}: {error}"))?;
+            if !out.trim().is_empty() {
+                print!("{out}");
+            }
+            if code != 0 {
+                anyhow::bail!("remote load on {node} exited {code}: {}", err.trim());
+            }
+        }
+        println!("{CYAN}✓ Loaded distributed member {node}{RESET}");
+    }
+    Ok(())
+}
 
 /// Validate a `--node` filter against the (drift-free) `computers` table so a
 /// typo errors loudly instead of silently returning an empty list that reads
@@ -595,8 +722,14 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             ctx,
             parallel,
             agent,
+            distributed,
             mmproj,
         } => {
+            if distributed {
+                handle_distributed_load(&pool, &id, port, ctx, parallel, agent, mmproj.as_deref())
+                    .await?;
+                return Ok(());
+            }
             let opts = ff_agent::model_runtime::LoadOptions {
                 library_id: id.clone(),
                 port,
@@ -3407,6 +3540,24 @@ fn print_coverage_explain(rows: &[ff_agent::coverage_guard::TaskExplanation]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distributed_child_command_preserves_options_without_recursing() {
+        let command = distributed_load_command(
+            "library id",
+            55000,
+            Some(65536),
+            Some(1),
+            true,
+            Some("/models/mm proj.gguf"),
+        );
+
+        assert_eq!(
+            command,
+            "~/.local/bin/ff model load 'library id' --port 55000 --ctx 65536 --parallel 1 --agent --mmproj '/models/mm proj.gguf'"
+        );
+        assert!(!command.contains("--distributed"));
+    }
 
     #[test]
     fn variant_download_requires_weights_and_half_catalog_size() {

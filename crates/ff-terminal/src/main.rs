@@ -3405,6 +3405,10 @@ pub enum ModelCommand {
         /// pass --parallel N instead to opt out for throughput.
         #[arg(long, default_value_t = false)]
         agent: bool,
+        /// Load matching copies across the live verified fabric, selecting the
+        /// node with the most direct links as the hub.
+        #[arg(long, default_value_t = false)]
+        distributed: bool,
         /// Path to a multimodal projector (`mmproj*.gguf`) for vision models
         /// (llama.cpp `--mmproj`). When omitted, a sibling `mmproj*.gguf` next to
         /// the model file is auto-detected — pass this only to override.

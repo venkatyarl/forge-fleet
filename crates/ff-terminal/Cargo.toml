@@ -19,6 +19,7 @@ ff-agent = { path = "../ff-agent" }
 ff-api = { path = "../ff-api" }
 ff-brain = { path = "../ff-brain" }
 ff-core = { path = "../ff-core" }
+ff-control = { path = "../ff-control" }
 ff-db = { path = "../ff-db" }
 ff-deploy = { path = "../ff-deploy" }
 ff-pulse = { path = "../ff-pulse" }
