@@ -4,8 +4,8 @@ mod scheduler;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use scheduler::{
-    Priority, Quadrant, Slot, Status, WorkItem, compute_pick_score, scheduler_tick,
-    slot_can_handle, wsjf_match_score,
+    Priority, Quadrant, Slot, Status, WorkItem, compute_pick_score, is_capable_of, scheduler_tick,
+    wsjf_match_score,
 };
 use std::collections::HashSet;
 
@@ -81,16 +81,16 @@ fn capability_match_requires_every_tag_and_accepts_slot_supersets() {
     let no_requirements = item("any", Quadrant::Q2, 3, now, 0, &[]);
     let gpu_linux = item("gpu-linux", Quadrant::Q2, 3, now, 0, &["gpu", "linux"]);
 
-    assert!(slot_can_handle(&no_requirements, &slot("empty", &[])));
-    assert!(slot_can_handle(
+    assert!(is_capable_of(&no_requirements, &slot("empty", &[])));
+    assert!(is_capable_of(
         &gpu_linux,
         &slot("superset", &["linux", "gpu", "docker"])
     ));
-    assert!(!slot_can_handle(
+    assert!(!is_capable_of(
         &gpu_linux,
         &slot("missing-gpu", &["linux", "docker"])
     ));
-    assert!(!slot_can_handle(
+    assert!(!is_capable_of(
         &gpu_linux,
         &slot("case-sensitive", &["GPU", "linux"])
     ));
@@ -114,7 +114,7 @@ fn wsjf_orders_equal_delay_by_smallest_capability_set() {
 #[test]
 fn scheduler_picks_in_wsjf_order_and_uses_each_slot_once() {
     let now = now();
-    let items = [
+    let mut items = [
         item("third", Quadrant::Q2, 3, now, 0, &["linux"]),
         item("first", Quadrant::Q1, 1, now, 0, &["gpu"]),
         item("second", Quadrant::Q1, 1, now, 0, &["linux", "gpu"]),
@@ -126,7 +126,7 @@ fn scheduler_picks_in_wsjf_order_and_uses_each_slot_once() {
         slot("linux", &["linux"]),
     ];
 
-    let assignments = scheduler_tick(&items, &slots, now);
+    let assignments = scheduler_tick(&mut items, &slots, now);
     let sequence: Vec<_> = assignments
         .iter()
         .map(|assignment| (assignment.item_id.as_str(), assignment.slot_id.as_str()))

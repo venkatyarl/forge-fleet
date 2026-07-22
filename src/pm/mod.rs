@@ -115,7 +115,7 @@ pub fn compute_pick_score(item: &WorkItem, now: DateTime<Utc>) -> f64 {
 ///
 /// A work item with no required capabilities matches any slot; a slot matches
 /// only when its capability set is a superset of the item's required tags.
-pub fn slot_can_handle(item: &WorkItem, slot: &Slot) -> bool {
+pub fn is_capable_of(item: &WorkItem, slot: &Slot) -> bool {
     item.required_capabilities.is_subset(&slot.capabilities)
 }
 
@@ -143,7 +143,7 @@ pub fn cost_of_delay(item: &WorkItem, now: DateTime<Utc>) -> f64 {
 /// Returns `Some(cost_of_delay / job_size)` when the slot can handle the item,
 /// otherwise `None`.  Higher scores schedule first.
 pub fn wsjf_match_score(item: &WorkItem, slot: &Slot, now: DateTime<Utc>) -> Option<f64> {
-    if !slot_can_handle(item, slot) {
+    if !is_capable_of(item, slot) {
         return None;
     }
     Some(cost_of_delay(item, now) / job_size(item))
@@ -154,44 +154,59 @@ pub fn wsjf_match_score(item: &WorkItem, slot: &Slot, now: DateTime<Utc>) -> Opt
 /// One scheduler pass.
 ///
 /// 1. Filters to [`Status::Ready`] items.
-/// 2. Computes a WSJF match score for each using [`wsjf_match_score`].
-/// 3. Sorts by score descending (ties broken by item id for determinism).
-/// 4. Greedily assigns each ready item to the first capable, unused slot.
+/// 2. Computes a WSJF match score for each using [`wsjf_match_score`] and
+///    persists it onto the item's [`WorkItem::pick_score`], so a DB-backed
+///    caller can flush the recalculated score even for items left unassigned
+///    this tick.
+/// 3. Sorts by pick_score descending (ties broken by item id for determinism).
+/// 4. Filters candidate slots by capability via [`is_capable_of`] and greedily
+///    assigns each ready item, highest score first, to the first compatible,
+///    unused slot.
 ///
 /// Returns the list of assignments made this tick.  Items that cannot be
 /// matched to a capable slot, or that are not `Ready`, are left unassigned.
-pub fn scheduler_tick(items: &[WorkItem], slots: &[Slot], now: DateTime<Utc>) -> Vec<Assignment> {
-    let mut ready: Vec<(f64, &WorkItem)> = items
+pub fn scheduler_tick(
+    items: &mut [WorkItem],
+    slots: &[Slot],
+    now: DateTime<Utc>,
+) -> Vec<Assignment> {
+    let mut ready: Vec<(f64, usize)> = items
         .iter()
-        .filter(|i| i.status == Status::Ready)
-        .map(|i| {
-            // Score each item by its best WSJF match across all slots; items
-            // that no slot can handle receive a score of 0.0 and are skipped.
+        .enumerate()
+        .filter(|(_, i)| i.status == Status::Ready)
+        .map(|(idx, i)| {
+            // Score each item by its best WSJF match across all capable
+            // slots; items that no slot can handle receive a score of 0.0
+            // and are skipped during assignment.
             let best_score = slots
                 .iter()
                 .filter_map(|slot| wsjf_match_score(i, slot, now))
                 .fold(0.0, f64::max);
-            (best_score, i)
+            (best_score, idx)
         })
         .collect();
 
+    // Persist the recalculated pick_score onto every ready item, whether or
+    // not it ends up assigned this tick.
+    for &(score, idx) in &ready {
+        items[idx].pick_score = Some(score);
+    }
+
     // Higher score first; tie-break by id so the output is deterministic.
-    ready.sort_by(|(a_score, a_item), (b_score, b_item)| {
+    ready.sort_by(|(a_score, a_idx), (b_score, b_idx)| {
         b_score
             .partial_cmp(a_score)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a_item.id.cmp(&b_item.id))
+            .then_with(|| items[*a_idx].id.cmp(&items[*b_idx].id))
     });
 
     let mut available: Vec<&Slot> = slots.iter().collect();
     let mut assignments = Vec::new();
 
-    for (_, item) in ready {
-        if let Some(idx) = available
-            .iter()
-            .position(|slot| slot_can_handle(item, slot))
-        {
-            let slot = available.swap_remove(idx);
+    for (_, idx) in ready {
+        let item = &items[idx];
+        if let Some(slot_idx) = available.iter().position(|slot| is_capable_of(item, slot)) {
+            let slot = available.swap_remove(slot_idx);
             assignments.push(Assignment {
                 item_id: item.id.clone(),
                 slot_id: slot.id.clone(),
@@ -275,7 +290,7 @@ mod tests {
         let ready = item("r", Quadrant::Q1, 1, 0, 0, &[]);
 
         let slots = [slot("s1", &[])];
-        let assignments = scheduler_tick(&[not_ready, ready], &slots, now);
+        let assignments = scheduler_tick(&mut [not_ready, ready], &slots, now);
         assert_eq!(assignments.len(), 1);
         assert_eq!(assignments[0].item_id, "r");
     }
@@ -283,9 +298,9 @@ mod tests {
     #[test]
     fn capability_mismatch_prevents_assignment() {
         let now = Utc::now();
-        let items = [item("a", Quadrant::Q1, 1, 0, 0, &["gpu"])];
+        let mut items = [item("a", Quadrant::Q1, 1, 0, 0, &["gpu"])];
         let slots = [slot("s1", &["cpu"])];
-        let assignments = scheduler_tick(&items, &slots, now);
+        let assignments = scheduler_tick(&mut items, &slots, now);
         assert!(assignments.is_empty());
     }
 
@@ -296,7 +311,7 @@ mod tests {
         let low = item("low", Quadrant::Q4, 5, 0, 0, &[]);
         let slots = [slot("only", &[])];
 
-        let assignments = scheduler_tick(&[low.clone(), high.clone()], &slots, now);
+        let assignments = scheduler_tick(&mut [low.clone(), high.clone()], &slots, now);
         assert_eq!(assignments.len(), 1);
         assert_eq!(assignments[0].item_id, "high");
     }
@@ -304,27 +319,43 @@ mod tests {
     #[test]
     fn slots_are_not_reused() {
         let now = Utc::now();
-        let items = [
+        let mut items = [
             item("a", Quadrant::Q1, 1, 0, 0, &[]),
             item("b", Quadrant::Q1, 1, 0, 0, &[]),
         ];
         let slots = [slot("s1", &[])];
-        let assignments = scheduler_tick(&items, &slots, now);
+        let assignments = scheduler_tick(&mut items, &slots, now);
         assert_eq!(assignments.len(), 1);
     }
 
     #[test]
-    fn slot_can_handle_allows_superset() {
-        let item = item("a", Quadrant::Q2, 3, 0, 0, &["cpu"]);
-        let slot = slot("s1", &["cpu", "gpu"]);
-        assert!(slot_can_handle(&item, &slot));
+    fn scheduler_tick_persists_pick_score_on_every_ready_item() {
+        let now = Utc::now();
+        let mut items = [
+            item("a", Quadrant::Q1, 1, 0, 0, &[]),
+            item("b", Quadrant::Q1, 1, 0, 0, &[]),
+        ];
+        let slots = [slot("s1", &[])];
+        scheduler_tick(&mut items, &slots, now);
+
+        // Both ready items get a persisted score, even the one left unassigned
+        // because the single slot was already taken.
+        assert!(items[0].pick_score.is_some());
+        assert!(items[1].pick_score.is_some());
     }
 
     #[test]
-    fn slot_can_handle_rejects_missing_capability() {
+    fn is_capable_of_allows_superset() {
+        let item = item("a", Quadrant::Q2, 3, 0, 0, &["cpu"]);
+        let slot = slot("s1", &["cpu", "gpu"]);
+        assert!(is_capable_of(&item, &slot));
+    }
+
+    #[test]
+    fn is_capable_of_rejects_missing_capability() {
         let item = item("a", Quadrant::Q2, 3, 0, 0, &["gpu"]);
         let slot = slot("s1", &["cpu"]);
-        assert!(!slot_can_handle(&item, &slot));
+        assert!(!is_capable_of(&item, &slot));
     }
 
     #[test]
