@@ -10,6 +10,7 @@
 
 pub mod cache;
 pub mod capture;
+pub mod graph;
 pub mod rag;
 pub mod retrieval;
 pub mod session;
@@ -20,6 +21,7 @@ pub mod workspace;
 
 pub use cache::{ContextCache, WorkItemContextCache};
 pub use capture::{AutoCaptureEngine, CaptureCandidate, CaptureKind, TranscriptTurn};
+pub use graph::{Edge, GraphScope, Subgraph};
 pub use rag::{DocumentKind, IngestReport, RagChunk, RagEngine, RagQuery, RagResult};
 pub use retrieval::{MemoryRetrievalEngine, RetrievalQuery, RetrievalResult};
 pub use session::{SessionClosureResult, SessionMemoryItem, SessionMemoryManager};
