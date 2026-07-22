@@ -12041,6 +12041,20 @@ VALUES
 ON CONFLICT (name) DO NOTHING;
 "#;
 
+/// Code review rulesets, mirroring the jira_rulesets table shape.
+pub const SCHEMA_V235_CODE_RULESETS: &str = r#"
+CREATE TABLE IF NOT EXISTS code_rulesets (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name       TEXT NOT NULL,
+    rules      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    parent_id  UUID REFERENCES code_rulesets(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_rulesets_parent ON code_rulesets (parent_id);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
