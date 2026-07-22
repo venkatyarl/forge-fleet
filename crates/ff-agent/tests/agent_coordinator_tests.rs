@@ -9,6 +9,7 @@
 
 use std::env;
 
+use ff_agent::agent_coordinator::reap_stale_busy_slots;
 use ff_agent::leader_cache::{LeaderCache, LeaderInfo};
 use ff_agent::sub_agent_reaper::SubAgentReaper;
 use sqlx::postgres::PgPoolOptions;
@@ -54,8 +55,10 @@ async fn create_reaper_test_db() -> Option<(PgPool, PgPool, String)> {
              name TEXT NOT NULL
          );
          CREATE TABLE work_items (
-             id     UUID PRIMARY KEY,
-             status TEXT NOT NULL DEFAULT 'ready'
+             id                UUID PRIMARY KEY,
+             status            TEXT NOT NULL DEFAULT 'ready',
+             assigned_to       TEXT,
+             assigned_computer TEXT
          );
          CREATE TABLE sub_agents (
              id                   UUID PRIMARY KEY,
@@ -218,6 +221,151 @@ async fn reaper_resets_stale_busy_slots_with_stale_heartbeats() {
     assert_eq!(
         rows[2].get::<Option<Uuid>, _>("current_work_item_id"),
         Some(leased_work_item)
+    );
+
+    drop_temp_db(admin, pool, &db_name).await;
+}
+
+#[tokio::test]
+async fn stale_slot_reaper_requeues_orphaned_work_item() {
+    let Some((admin, pool, db_name)) = create_reaper_test_db().await else {
+        eprintln!(
+            "skipping stale slot reaper integration test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL"
+        );
+        return;
+    };
+
+    let computer = Uuid::new_v4();
+    sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'testbox')")
+        .bind(computer)
+        .execute(&pool)
+        .await
+        .expect("insert computer");
+
+    // slot 0: busy with a stale heartbeat and an in-flight (non-terminal) work
+    // item — the reaper must free the slot AND re-queue the item as 'ready'.
+    let stale_slot = Uuid::new_v4();
+    let orphaned_item = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO work_items (id, status, assigned_to, assigned_computer)
+         VALUES ($1, 'building', 'sub-agent-testbox:0', 'testbox')",
+    )
+    .bind(orphaned_item)
+    .execute(&pool)
+    .await
+    .expect("insert orphaned work item");
+    sqlx::query(
+        "INSERT INTO sub_agents
+             (id, computer_id, slot, status, current_work_item_id, started_at, last_heartbeat_at)
+         VALUES ($1, $2, 0, 'busy', $3, NOW() - INTERVAL '90 minutes', NOW() - INTERVAL '90 minutes')",
+    )
+    .bind(stale_slot)
+    .bind(computer)
+    .bind(orphaned_item)
+    .execute(&pool)
+    .await
+    .expect("insert stale busy slot");
+
+    // slot 1: busy with a FRESH heartbeat — must not be touched.
+    let fresh_slot = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO sub_agents (id, computer_id, slot, status, started_at, last_heartbeat_at)
+         VALUES ($1, $2, 1, 'busy', NOW() - INTERVAL '2 minutes', NOW() - INTERVAL '2 minutes')",
+    )
+    .bind(fresh_slot)
+    .bind(computer)
+    .execute(&pool)
+    .await
+    .expect("insert fresh busy slot");
+
+    // slot 2: stale heartbeat but an ACTIVE lease — the lease lifecycle owns
+    // it, so the reaper must leave both the slot and its item alone.
+    let leased_slot = Uuid::new_v4();
+    let leased_item = Uuid::new_v4();
+    sqlx::query("INSERT INTO work_items (id, status) VALUES ($1, 'building')")
+        .bind(leased_item)
+        .execute(&pool)
+        .await
+        .expect("insert leased work item");
+    sqlx::query(
+        "INSERT INTO sub_agents
+             (id, computer_id, slot, status, current_work_item_id, started_at, last_heartbeat_at)
+         VALUES ($1, $2, 2, 'busy', $3, NOW() - INTERVAL '90 minutes', NOW() - INTERVAL '90 minutes')",
+    )
+    .bind(leased_slot)
+    .bind(computer)
+    .bind(leased_item)
+    .execute(&pool)
+    .await
+    .expect("insert leased busy slot");
+    sqlx::query(
+        "INSERT INTO work_item_leases (work_item_id, sub_agent_id, computer_id)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(leased_item)
+    .bind(leased_slot)
+    .bind(computer)
+    .execute(&pool)
+    .await
+    .expect("insert active lease");
+
+    // 60-min ceiling, same value the daemon's 60s tick passes.
+    let reaped = reap_stale_busy_slots(&pool, 3600)
+        .await
+        .expect("run stale slot reap");
+    assert_eq!(
+        reaped.len(),
+        1,
+        "exactly the lease-less stale slot: {reaped:?}"
+    );
+    assert_eq!(reaped[0].sub_agent_id, stale_slot);
+    assert_eq!(reaped[0].work_item_id, Some(orphaned_item));
+    assert!(
+        reaped[0].requeued,
+        "in-flight orphaned item must be re-queued"
+    );
+
+    let slot_row = sqlx::query("SELECT status, current_work_item_id FROM sub_agents WHERE id = $1")
+        .bind(stale_slot)
+        .fetch_one(&pool)
+        .await
+        .expect("read reaped slot");
+    assert_eq!(slot_row.get::<String, _>("status"), "idle");
+    assert_eq!(
+        slot_row.get::<Option<Uuid>, _>("current_work_item_id"),
+        None
+    );
+
+    let item_row =
+        sqlx::query("SELECT status, assigned_to, assigned_computer FROM work_items WHERE id = $1")
+            .bind(orphaned_item)
+            .fetch_one(&pool)
+            .await
+            .expect("read requeued item");
+    assert_eq!(item_row.get::<String, _>("status"), "ready");
+    assert_eq!(item_row.get::<Option<String>, _>("assigned_to"), None);
+    assert_eq!(item_row.get::<Option<String>, _>("assigned_computer"), None);
+
+    let fresh_status: String = sqlx::query("SELECT status FROM sub_agents WHERE id = $1")
+        .bind(fresh_slot)
+        .fetch_one(&pool)
+        .await
+        .expect("read fresh slot")
+        .get("status");
+    assert_eq!(
+        fresh_status, "busy",
+        "fresh-heartbeat slot must not be reaped"
+    );
+
+    let leased_status: String = sqlx::query("SELECT status FROM sub_agents WHERE id = $1")
+        .bind(leased_slot)
+        .fetch_one(&pool)
+        .await
+        .expect("read leased slot")
+        .get("status");
+    assert_eq!(
+        leased_status, "busy",
+        "actively-leased slot must not be reaped"
     );
 
     drop_temp_db(admin, pool, &db_name).await;

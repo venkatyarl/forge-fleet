@@ -849,6 +849,19 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 15b.2) Stale sub-agent slot reaper — every 60s, leader-gated.
+    // Complements lease takeover for slots with NO active lease to reclaim
+    // (ad-hoc dispatches, or a worker that died before leasing): resets 'busy'
+    // sub_agents rows whose heartbeat has gone stale back to 'idle', clears
+    // current_work_item_id, and re-queues the orphaned work item as 'ready'.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: stale sub-agent slot reaper (60s, leader-gated)");
+        subsystem_tasks.push(ff_agent::agent_coordinator::spawn_stale_slot_reaper(
+            pg_pool,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 15c) Pillar 4 work_item dispatch — every 15s, PER-HOST (not leader-gated).
     // Each host executes ITS OWN assigned slots: detect current_work_item_id →
     // git worktree → ff cli dispatch → heartbeat lease → PR + merge-queue on done.
