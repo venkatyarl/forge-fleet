@@ -67,3 +67,10 @@ tags:
   noloadbalance: false
   clonefrom: false
   nosync: false
+
+# LAN git mirror (crates/ff-agent/src/ha/mirror_service.rs). Disabled by
+# default; set mirror_endpoint and enable per-deployment to route git
+# fetches through a local mirror instead of GitHub directly.
+mirror_enabled: false
+mirror_endpoint: ""
+mirror_update_interval: 30
