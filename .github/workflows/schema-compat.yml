@@ -21,4 +21,10 @@ jobs:
         uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Run workspace tests
+        # RUST_MIN_STACK: test threads default to a 2 MiB stack; building the (large) clap
+        # Cli::command() tree in free_prompt_command_guard tests overflows it (fine on the 8 MiB
+        # main thread, so the `ff` binary works). 16 MiB gives headroom. Was aborting every PR's
+        # required check -> blocking ALL merges.
+        env:
+          RUST_MIN_STACK: "16777216"
         run: cargo test --workspace
