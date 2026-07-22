@@ -762,6 +762,54 @@ pub struct SchedulingConfig {
     /// Maximum handoffs per task.
     #[serde(default)]
     pub max_handoffs_per_task: Option<u32>,
+    /// Per-project fair-share weights — `[scheduling.project_weights]`.
+    #[serde(default)]
+    pub project_weights: ProjectWeightsConfig,
+}
+
+/// Per-project fair-share weight configuration — `[scheduling.project_weights]`.
+///
+/// By default every project carries the same weight, so the fair-share
+/// calculation splits scheduling capacity evenly. Individual projects can be
+/// boosted or reduced via per-project overrides; a weight of `0` excludes a
+/// project from weighted fair-share entirely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectWeightsConfig {
+    /// Weight applied to any project without an explicit override.
+    #[serde(default = "default_project_weight")]
+    pub default_weight: f64,
+
+    /// Per-project weight overrides, keyed by project id —
+    /// `[scheduling.project_weights.overrides]`.
+    #[serde(default)]
+    pub overrides: HashMap<String, f64>,
+}
+
+impl ProjectWeightsConfig {
+    /// Return the effective fair-share weight for `project_id`.
+    ///
+    /// Falls back to `default_weight` when no override exists. Negative
+    /// values clamp to zero so a bad override cannot invert a share.
+    pub fn weight_for(&self, project_id: &str) -> f64 {
+        self.overrides
+            .get(project_id)
+            .copied()
+            .unwrap_or(self.default_weight)
+            .max(0.0)
+    }
+}
+
+impl Default for ProjectWeightsConfig {
+    fn default() -> Self {
+        Self {
+            default_weight: default_project_weight(),
+            overrides: HashMap::new(),
+        }
+    }
+}
+
+fn default_project_weight() -> f64 {
+    1.0
 }
 
 /// Embedded agent configuration.
@@ -1988,6 +2036,13 @@ canonical_writer = "taylor"
 degraded_coordinator_mode = true
 max_handoffs_per_task = 2
 
+[scheduling.project_weights]
+default_weight = 1.0
+
+[scheduling.project_weights.overrides]
+forge-fleet = 2.0
+hireflow360 = 0.5
+
 [mcp.forgefleet]
 server = true
 client = true
@@ -2155,6 +2210,19 @@ notes = "Setup started."
             config.scheduling.canonical_writer.as_deref(),
             Some("taylor")
         );
+        assert_eq!(config.scheduling.project_weights.default_weight, 1.0);
+        assert_eq!(
+            config.scheduling.project_weights.weight_for("forge-fleet"),
+            2.0
+        );
+        assert_eq!(
+            config.scheduling.project_weights.weight_for("hireflow360"),
+            0.5
+        );
+        assert_eq!(
+            config.scheduling.project_weights.weight_for("unconfigured"),
+            1.0
+        );
 
         // Check MCP.
         let mcp_forgefleet = config.mcp.get("forgefleet").unwrap();
@@ -2257,12 +2325,40 @@ notes = "Setup started."
         assert!(config.loops.evolution.enabled);
         assert!(config.loops.self_heal.enabled);
         assert!(config.nodes.is_empty());
+        assert!(config.scheduling.project_weights.overrides.is_empty());
+        assert_eq!(
+            config.scheduling.project_weights.weight_for("any-project"),
+            1.0
+        );
         assert!(config.models.is_empty());
         assert!(config.transport.telegram.is_none());
         assert!(!config.obsidian_export.enabled);
         assert!(!config.fleet_secrets.distributed_review_mode);
         assert!(config.obsidian_export.target_dir.is_none());
         assert!(config.obsidian_export.model.is_none());
+    }
+
+    #[test]
+    fn test_project_weights_parse_from_toml() {
+        let config: FleetConfig = toml::from_str(
+            r#"
+[scheduling.project_weights]
+default_weight = 2.0
+
+[scheduling.project_weights.overrides]
+boosted = 5.0
+paused = 0.0
+bogus = -3.0
+"#,
+        )
+        .unwrap();
+
+        let weights = &config.scheduling.project_weights;
+        assert_eq!(weights.default_weight, 2.0);
+        assert_eq!(weights.weight_for("boosted"), 5.0);
+        assert_eq!(weights.weight_for("paused"), 0.0);
+        assert_eq!(weights.weight_for("bogus"), 0.0, "negative clamps to zero");
+        assert_eq!(weights.weight_for("other"), 2.0, "falls back to default");
     }
 
     #[test]
