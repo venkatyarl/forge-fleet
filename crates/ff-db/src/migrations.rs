@@ -1161,6 +1161,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "work_item_context_and_cortex_subgraph",
         sql: schema::SCHEMA_V238_WORK_ITEM_CONTEXT_AND_CORTEX_SUBGRAPH,
     },
+    PgMigration {
+        version: 239,
+        name: "work_item_lease_project_tracking",
+        sql: schema::SCHEMA_V239_WORK_ITEM_LEASE_PROJECT_TRACKING,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

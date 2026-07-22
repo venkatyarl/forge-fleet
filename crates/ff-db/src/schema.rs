@@ -12066,6 +12066,25 @@ ALTER TABLE work_items
     ADD COLUMN IF NOT EXISTS cortex_subgraph_id TEXT;
 "#;
 
+/// Denormalize `project_id` onto `work_item_leases` (mirroring the
+/// `work_item_merge_queue.project_id` precedent) so per-project active-lease
+/// counts can be read straight off the lease table instead of joining
+/// `work_items` on every scheduler tick. Backfills existing rows from their
+/// work_item; new leases populate it at insert time (see `pg_assign_work_item`).
+pub const SCHEMA_V239_WORK_ITEM_LEASE_PROJECT_TRACKING: &str = r#"
+ALTER TABLE work_item_leases
+    ADD COLUMN IF NOT EXISTS project_id TEXT REFERENCES projects(id);
+
+UPDATE work_item_leases l
+   SET project_id = w.project_id
+  FROM work_items w
+ WHERE l.work_item_id = w.id
+   AND l.project_id IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_work_item_leases_active_project
+    ON work_item_leases (project_id) WHERE released_at IS NULL;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
