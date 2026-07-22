@@ -12085,6 +12085,20 @@ CREATE INDEX IF NOT EXISTS idx_work_item_leases_active_project
     ON work_item_leases (project_id) WHERE released_at IS NULL;
 "#;
 
+/// Rich catalog metadata for fleet_model_catalog: human display name, the
+/// tasks/modalities a model supports, benchmark scores, its license, and
+/// lifecycle status (e.g. "ga", "preview", "deprecated"). All nullable —
+/// existing rows and the `ff model sync-catalog` writer predate these fields.
+pub const SCHEMA_V243_FLEET_MODEL_CATALOG_RICH_FIELDS: &str = r#"
+ALTER TABLE fleet_model_catalog
+    ADD COLUMN IF NOT EXISTS display_name TEXT,
+    ADD COLUMN IF NOT EXISTS tasks        JSONB,
+    ADD COLUMN IF NOT EXISTS modalities   JSONB,
+    ADD COLUMN IF NOT EXISTS benchmarks   JSONB,
+    ADD COLUMN IF NOT EXISTS license      TEXT,
+    ADD COLUMN IF NOT EXISTS lifecycle    TEXT;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
