@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 ff-agent = { path = "../ff-agent" }
+ff-runtime = { path = "../ff-runtime" }
 
 anyhow.workspace = true
 clap.workspace = true

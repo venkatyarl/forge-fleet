@@ -67,7 +67,16 @@ enum Command {
     Export(ExportArgs),
     /// Project management — KPI digests over work_items
     Pm(PmArgs),
+    /// Show the build configuration (backends + timeout) from config/build.toml
+    Build(BuildArgs),
     Version,
+}
+
+#[derive(Debug, Args)]
+struct BuildArgs {
+    /// Path to the build config file (defaults to ./config/build.toml)
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -261,6 +270,7 @@ async fn main() -> Result<()> {
         Command::Config(args) => handle_config(args, &config_path),
         Command::Export(args) => handle_export(args).await,
         Command::Pm(args) => handle_pm(args).await,
+        Command::Build(args) => handle_build(args),
         Command::Version => {
             println!("forgefleet {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -809,6 +819,39 @@ async fn handle_tools(args: ToolsArgs, _config_path: &Path) -> Result<()> {
             println!("   This command is for manual re-registration if needed.)");
         }
     }
+    Ok(())
+}
+
+fn handle_build(args: BuildArgs) -> Result<()> {
+    let path = args
+        .config
+        .unwrap_or_else(|| PathBuf::from("config/build.toml"));
+
+    let (cfg, source) = if path.exists() {
+        (
+            ff_runtime::BuildConfig::from_file(&path)?,
+            path.display().to_string(),
+        )
+    } else {
+        (
+            ff_runtime::BuildConfig::from_env(),
+            format!("built-in defaults ({} not found)", path.display()),
+        )
+    };
+
+    cfg.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+    println!("{GREEN}✓ Build Configuration{RESET}");
+    println!("  source: {source}");
+    println!(
+        "  max_build_duration: {}s",
+        cfg.max_build_duration().as_secs()
+    );
+    println!("  default_backend: {}", cfg.default_backend);
+    println!(
+        "  supported_backends: {}",
+        cfg.supported_backends.join(", ")
+    );
     Ok(())
 }
 
