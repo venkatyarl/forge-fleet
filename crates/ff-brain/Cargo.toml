@@ -7,6 +7,7 @@ authors.workspace = true
 description = "ForgeFleet Virtual Brain — knowledge graph, context selection, chat, and fact extraction"
 
 [dependencies]
+ff-core = { path = "../ff-core" }
 ff-db = { path = "../ff-db" }
 ff-agent = { path = "../ff-agent" }
 
