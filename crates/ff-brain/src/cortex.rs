@@ -106,6 +106,8 @@ pub mod ingest_people;
 pub mod ingest_pm;
 #[path = "cortex/maps_to.rs"]
 pub mod maps_to;
+#[path = "cortex/md_extractor.rs"]
+pub mod md_extractor;
 #[path = "cortex/extractors/observ.rs"]
 pub mod observ;
 #[path = "cortex/extractors/owners.rs"]
