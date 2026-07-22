@@ -45,7 +45,11 @@ const FF_TIMEOUT_SECS: u64 = 1080;
 /// even while a wedged build is successfully refreshing its lease. Keep the
 /// scheduler's max-lease-age sweep longer as a last-resort recovery path for a
 /// crashed dispatcher.
-const MAX_BUILD_DURATION_SECS: u64 = 20 * 60;
+// 40 min: the dispatch-level build watchdog. Was 20 min (1200s), which killed legitimate
+// multi-round local-model builds + cold Rust compiles on the large workspace (the recurring
+// "max-build-duration exceeded after 1200s" failures). Kept generous since a genuinely hung
+// build is caught earlier by the stalled-attempts + heartbeat reaper.
+const MAX_BUILD_DURATION_SECS: u64 = 40 * 60;
 const _: () =
     assert!(MAX_BUILD_DURATION_SECS < crate::work_item_scheduler::MAX_LEASE_DURATION_SECS as u64);
 const MAX_SELF_FIX_ATTEMPTS: usize = 1;
