@@ -8,17 +8,23 @@
 //! # Coordination model
 //!
 //! 1. Tasks are submitted to the leader's [`PriorityQueue`].
-//! 2. On each `tick`, the leader boosts stale priorities, peeks at the
-//!    highest-priority unreserved task, and asks the scheduler for an
+//! 2. On each `tick`, the leader boosts stale priorities, then walks the
+//!    unreserved tasks in priority order and asks the scheduler for an
 //!    [`Assign`](ScheduleDecision::Assign), [`Queue`](ScheduleDecision::Queue),
-//!    or [`Preempt`](ScheduleDecision::Preempt) decision.
+//!    or [`Preempt`](ScheduleDecision::Preempt) decision for each. A worker
+//!    can receive at most one *unconfirmed* assignment at a time — once
+//!    given one, it is excluded from consideration for the rest of the tick
+//!    (and any following ticks) until its heartbeat confirms the reservation.
+//!    This lets a single tick dispatch to every idle worker at once without
+//!    ever handing one worker two assignments it can't report back on a
+//!    single heartbeat.
 //! 3. Assigned tasks are *reserved* in the queue and recorded as pending
 //!    assignments keyed by worker name.
 //! 4. An agent heartbeat confirms the reservation, removes the task from the
 //!    queue, and returns the assignment to the agent.
 //! 5. Completed or failed tasks release the scheduler's node capacity.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -379,7 +385,9 @@ impl LeaderCoordinator {
     /// If this node is not the leader, the tick is a no-op. Otherwise it:
     /// 1. Reaps stale pending assignments.
     /// 2. Applies timeout-based priority boosts.
-    /// 3. Dequeues tasks and asks the scheduler for placement decisions.
+    /// 3. Walks the queue in priority order and asks the scheduler for a
+    ///    placement decision for each unreserved task, so idle workers can
+    ///    all receive work in the same tick.
     /// 4. Records pending assignments to be confirmed by agent heartbeats.
     pub fn tick(&mut self) -> TickResult {
         if !self.am_i_leader() {
@@ -395,16 +403,37 @@ impl LeaderCoordinator {
             boost_count,
         };
 
-        // Schedule at most one task per tick. Peek (don't dequeue) so the task
-        // stays reserved in the queue until an agent heartbeat confirms it.
-        // This avoids losing the task if the agent is slow to heartbeat.
-        if let Some(task) = self.queue.peek() {
+        // A worker's dispatch-tick contract only returns a single new
+        // assignment per heartbeat, so it may have at most one *unconfirmed*
+        // assignment outstanding at a time. Seed the exclusion set with
+        // workers that already have one pending from a previous tick, then
+        // grow it as this tick hands out more, so multiple different idle
+        // workers can each get a task in one pass without ever double-booking
+        // a single worker.
+        let mut busy_workers: HashSet<String> = self.pending_assignments.keys().cloned().collect();
+
+        // Snapshot unreserved tasks in priority order (peek doesn't dequeue,
+        // so tasks stay reserved in the queue until an agent heartbeat
+        // confirms them — this avoids losing a task if the agent is slow to
+        // heartbeat).
+        let candidates: Vec<QueuedTask> = self
+            .queue
+            .iter()
+            .into_iter()
+            .filter(|t| !t.reserved)
+            .collect();
+
+        for task in candidates {
             let scheduled = ScheduledTask::from_queued(&task);
             let task_id = scheduled.id;
 
-            match self.scheduler.schedule_task(&scheduled) {
+            match self
+                .scheduler
+                .schedule_task_excluding(&scheduled, &busy_workers)
+            {
                 ScheduleDecision::Assign { worker_name, score } => {
                     self.queue.reserve(task_id, &worker_name);
+                    busy_workers.insert(worker_name.clone());
                     self.pending_assignments.insert(
                         worker_name.clone(),
                         PendingAssignment {
@@ -424,6 +453,7 @@ impl LeaderCoordinator {
                     score,
                 } => {
                     self.queue.reserve(task_id, &worker_name);
+                    busy_workers.insert(worker_name.clone());
                     self.pending_assignments.insert(
                         worker_name.clone(),
                         PendingAssignment {
@@ -740,16 +770,21 @@ mod tests {
         let mut coordinator = make_leader("taylor");
         coordinator.register_node(make_node("james", 8, 16, false));
 
-        // Fill the node.
+        // Fill the node. A worker may have only one unconfirmed assignment
+        // outstanding at a time, so each fill task must be confirmed via
+        // heartbeat before the next tick will hand james another one.
+        let mut fill_ids = Vec::new();
         for i in 0..2 {
             let task = make_task(&format!("fill-{i}"), 4, 8);
             coordinator.submit_task(task);
+            let tick = coordinator.tick();
+            assert_eq!(tick.assignments.len(), 1, "fill-{i} should be assigned");
+            fill_ids.push(tick.assignments[0].task_id);
+            coordinator.heartbeat_from_agent("james");
         }
-        coordinator.tick();
 
         // Complete one task.
-        let task_id = coordinator.tick().assignments[0].task_id;
-        assert!(coordinator.complete_task("james", task_id));
+        assert!(coordinator.complete_task("james", fill_ids[0]));
 
         // A new task should now fit.
         let new_task = make_task("new", 4, 8);
@@ -802,6 +837,69 @@ mod tests {
         let tick = coordinator.tick();
         assert_eq!(tick.assignments.len(), 1);
         assert_eq!(tick.assignments[0].task_id, task_id);
+    }
+
+    #[test]
+    fn test_tick_dispatches_to_multiple_idle_workers_at_once() {
+        let mut coordinator = make_leader("taylor");
+        coordinator.register_node(make_node("james", 16, 64, false));
+        coordinator.register_node(make_node("marcus", 16, 64, false));
+
+        let a = make_task("task-a", 4, 8);
+        let b = make_task("task-b", 4, 8);
+        let a_id = a.id;
+        let b_id = b.id;
+        coordinator.submit_task(a);
+        coordinator.submit_task(b);
+
+        // Both idle workers should get an assignment in the same tick.
+        let tick = coordinator.tick();
+        assert_eq!(tick.assignments.len(), 2);
+        let assigned_ids: std::collections::HashSet<Uuid> =
+            tick.assignments.iter().map(|a| a.task_id).collect();
+        assert!(assigned_ids.contains(&a_id));
+        assert!(assigned_ids.contains(&b_id));
+
+        // And each went to a distinct worker.
+        let workers: std::collections::HashSet<String> = tick
+            .assignments
+            .iter()
+            .map(|a| a.worker_name.clone())
+            .collect();
+        assert_eq!(workers.len(), 2);
+    }
+
+    #[test]
+    fn test_tick_never_double_books_one_worker_in_a_single_pass() {
+        // A single node with ample spare capacity for two tasks at once —
+        // the old (buggy) behavior would hand both to the same worker in
+        // one tick, leaving the second stranded since a worker's heartbeat
+        // can only confirm one new assignment at a time.
+        let mut coordinator = make_leader("taylor");
+        coordinator.register_node(make_node("james", 16, 64, false));
+
+        let a = make_task("task-a", 4, 8);
+        let b = make_task("task-b", 4, 8);
+        let a_id = a.id;
+        coordinator.submit_task(a);
+        coordinator.submit_task(b);
+
+        let tick = coordinator.tick();
+        assert_eq!(
+            tick.assignments.len(),
+            1,
+            "only one unconfirmed assignment may be outstanding per worker"
+        );
+        assert_eq!(tick.assignments[0].task_id, a_id);
+
+        // The second task remains queued (unreserved) until james confirms.
+        assert_eq!(coordinator.queue.unreserved_count(), 1);
+
+        // Once james heartbeats and confirms task-a, the next tick can hand
+        // it task-b.
+        coordinator.heartbeat_from_agent("james");
+        let tick = coordinator.tick();
+        assert_eq!(tick.assignments.len(), 1);
     }
 
     #[test]
