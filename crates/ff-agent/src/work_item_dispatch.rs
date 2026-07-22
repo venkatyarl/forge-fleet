@@ -4948,19 +4948,26 @@ mod tests {
     }
 
     #[test]
-    fn use_local_lane_gives_mechanical_one_try_then_cloud() {
-        // Mechanical (prefers_cloud=false), breaker closed: local ONLY on attempt 0;
-        // attempt 1+ escalates to cloud (#62 — the local lane starves the heartbeat,
-        // a 2nd local try just burns another ~190s reap).
+    fn use_local_lane_gives_mechanical_local_lane_max_tries_then_cloud() {
+        // Mechanical (prefers_cloud=false), breaker closed: local for attempts
+        // 0..LOCAL_LANE_MAX_TRIES (#62/#792 fixed the heartbeat-starving local lane via
+        // spawn_blocking, so dispatch keeps working the capable local coder instead of
+        // bailing to cloud after one try); attempt LOCAL_LANE_MAX_TRIES+ escalates to cloud.
+        for attempt in 0..ff_routing_policy::LOCAL_LANE_MAX_TRIES as i32 {
+            assert!(
+                use_local_lane(attempt, false, false),
+                "attempt {attempt} should still try local (< LOCAL_LANE_MAX_TRIES)"
+            );
+        }
         assert!(
-            use_local_lane(0, false, false),
-            "first attempt tries cheap local"
+            !use_local_lane(ff_routing_policy::LOCAL_LANE_MAX_TRIES as i32, false, false),
+            "attempt == LOCAL_LANE_MAX_TRIES escalates to cloud"
         );
-        assert!(
-            !use_local_lane(1, false, false),
-            "#62: 2nd attempt goes cloud"
-        );
-        assert!(!use_local_lane(2, false, false));
+        assert!(!use_local_lane(
+            ff_routing_policy::LOCAL_LANE_MAX_TRIES as i32 + 1,
+            false,
+            false
+        ));
         // A complexity-routed (complex or multi-file-heavy) task never touches the local lane.
         assert!(!use_local_lane(0, false, true));
         // Open local-codegen breaker → skip local even on attempt 0.
