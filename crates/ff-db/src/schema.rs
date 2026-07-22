@@ -12135,6 +12135,26 @@ CREATE INDEX IF NOT EXISTS idx_notifications_undismissed
     ON notifications (created_at) WHERE NOT is_dismissed;
 "#;
 
+// ─── V246: fleet_tasks embedding for similarity dedup ─────────────────────
+// V156 added `dedup_signature` (exact-match hash dedup, unique index) and
+// `parent_task_id` already carries the parent/child relationship (indexed by
+// idx_fleet_tasks_by_parent; children are queried by parent_task_id, matching
+// the same pattern work_items uses — no separate child-id list column).
+// This migration adds the remaining piece: a similarity vector so
+// near-duplicate instructions (not just byte-identical ones) can be detected.
+// Guarded like V78 — a no-op if the pgvector extension isn't installed.
+pub const SCHEMA_V246_FLEET_TASKS_EMBEDDING: &str = r#"
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN
+        ALTER TABLE fleet_tasks ADD COLUMN IF NOT EXISTS embedding vector(1024);
+        CREATE INDEX IF NOT EXISTS idx_fleet_tasks_embedding
+            ON fleet_tasks USING hnsw (embedding vector_cosine_ops)
+            WHERE embedding IS NOT NULL;
+    END IF;
+END $$;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
