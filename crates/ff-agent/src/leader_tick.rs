@@ -152,14 +152,17 @@ pub struct LeaderTick {
     /// still functions; it just can't be told to step down).
     yield_flag: Option<Arc<AtomicBool>>,
 
-    /// In-memory record of bug signatures this leader has already dispatched
-    /// a self-heal writer for, so [`self_heal_scan`](Self::self_heal_scan) can
+    /// Record of bug signatures this leader has already dispatched a
+    /// self-heal writer for, so [`self_heal_scan`](Self::self_heal_scan) can
     /// recognise when a previously-healed signature reappears (as opposed to
     /// a brand-new bug) and log the reactivation distinctly. The durable
     /// reactivation itself (resetting `fleet_tasks.status` back to
     /// `pending`/`detected`) is handled at the DB layer by the aggregation
     /// UPSERT and [`rearm_self_heal_task`]; this is purely a recognition
-    /// signal for operational visibility.
+    /// signal for operational visibility. Persisted to disk (see
+    /// [`SelfHealState::load_from`]) so a leader restart or handoff resumes
+    /// with the same tracked set instead of treating every reactivation as
+    /// brand-new.
     self_heal_state: std::sync::Mutex<SelfHealState>,
 }
 
@@ -203,7 +206,9 @@ impl LeaderTick {
             leader_pulse_silent_since: tokio::sync::Mutex::new(None),
             leaderless_since: tokio::sync::Mutex::new(None),
             yield_flag: None,
-            self_heal_state: std::sync::Mutex::new(SelfHealState::new()),
+            self_heal_state: std::sync::Mutex::new(SelfHealState::load_from(
+                SelfHealState::default_state_path(),
+            )),
         }
     }
 

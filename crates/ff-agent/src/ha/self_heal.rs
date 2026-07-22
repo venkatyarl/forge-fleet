@@ -14,20 +14,91 @@ use sqlx::{PgPool, Row};
 /// re-arming. Prevents thrashing on a bug that flaps every few minutes.
 pub const DEFAULT_REARM_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// In-memory state kept by the leader tick for the self-heal subsystem.
+/// State kept by the leader tick for the self-heal subsystem.
 ///
 /// Tracks bug signatures that have been observed so that a previously
-/// resolved bug can be recognised when it reappears.
+/// resolved bug can be recognised when it reappears. Optionally backed by a
+/// JSON file so the tracked set survives a leader restart/handoff instead of
+/// resetting to empty (which would make every recurring bug look brand-new
+/// again until the DB-layer cooldown independently re-armed it).
 #[derive(Debug, Default, Clone)]
 pub struct SelfHealState {
     /// Bug signatures currently tracked by the leader.
     pub tracked_signatures: HashSet<String>,
+    /// Where to persist `tracked_signatures` after every mutation. `None`
+    /// for pure in-memory instances (e.g. [`SelfHealState::new`], used by
+    /// unit tests), in which case mutations are never written to disk.
+    persist_path: Option<PathBuf>,
 }
 
 impl SelfHealState {
-    /// Create an empty state.
+    /// Create an empty, non-persistent state.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Default on-disk location for the persisted tracked-signature set.
+    pub fn default_state_path() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        PathBuf::from(home)
+            .join(".forgefleet")
+            .join("self_heal_state.json")
+    }
+
+    /// Load previously-tracked signatures from `path` (starting empty if the
+    /// file is missing or unreadable) and configure every subsequent
+    /// mutation to be written back to `path`.
+    pub fn load_from(path: PathBuf) -> Self {
+        let tracked_signatures = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<HashSet<String>>(&raw).ok())
+            .unwrap_or_default();
+        Self {
+            tracked_signatures,
+            persist_path: Some(path),
+        }
+    }
+
+    /// Best-effort write of the current tracked-signature set to
+    /// `persist_path`. A failure is logged but never propagated: losing the
+    /// persisted recognition signal is not fatal, since the DB-layer rearm
+    /// logic in [`signature_should_rearm`] remains correct either way.
+    fn persist(&self) {
+        let Some(path) = &self.persist_path else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match serde_json::to_string(&self.tracked_signatures) {
+            Ok(json) => {
+                if let Err(err) = std::fs::write(path, json) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "self_heal: failed to persist self-heal state"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "self_heal: failed to serialize self-heal state for persistence"
+                );
+            }
+        }
+    }
+
+    /// Apply a mutation to `tracked_signatures` and persist the result.
+    ///
+    /// Every mutating method on `SelfHealState` must go through this helper
+    /// rather than touching `tracked_signatures` directly, so that adding a
+    /// new mutation (e.g. untracking a resolved signature) can never
+    /// accidentally skip persistence.
+    fn mutate<T>(&mut self, f: impl FnOnce(&mut HashSet<String>) -> T) -> T {
+        let result = f(&mut self.tracked_signatures);
+        self.persist();
+        result
     }
 
     /// Start tracking a bug signature.
@@ -35,7 +106,7 @@ impl SelfHealState {
     /// Returns `true` if the signature was newly added, or `false` if it was
     /// already tracked.
     pub fn track(&mut self, signature: &str) -> bool {
-        self.tracked_signatures.insert(signature.to_owned())
+        self.mutate(|set| set.insert(signature.to_owned()))
     }
 
     /// Returns `true` if the signature is currently tracked.
@@ -1053,5 +1124,50 @@ mod tests {
         assert!(!state.record_detected("recurring-sig"));
         assert!(state.is_tracked("recurring-sig"));
         assert!(state.record_detected("recurring-sig"));
+    }
+
+    #[test]
+    fn self_heal_state_load_from_missing_file_starts_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("self_heal_state.json");
+
+        let state = SelfHealState::load_from(path);
+        assert!(state.tracked_signatures.is_empty());
+    }
+
+    #[test]
+    fn self_heal_state_track_persists_across_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("self_heal_state.json");
+
+        let mut state = SelfHealState::load_from(path.clone());
+        state.track("sig-a");
+        state.track("sig-b");
+
+        let reloaded = SelfHealState::load_from(path);
+        assert!(reloaded.is_tracked("sig-a"));
+        assert!(reloaded.is_tracked("sig-b"));
+        assert_eq!(reloaded.tracked_signatures.len(), 2);
+    }
+
+    #[test]
+    fn self_heal_state_record_detected_persists_across_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("self_heal_state.json");
+
+        let mut state = SelfHealState::load_from(path.clone());
+        state.record_detected("recurring-sig");
+
+        let reloaded = SelfHealState::load_from(path);
+        assert!(reloaded.is_tracked("recurring-sig"));
+    }
+
+    #[test]
+    fn self_heal_state_new_does_not_touch_disk() {
+        // Pure in-memory instances (no `load_from` call) must never write to
+        // the default state path as a side effect of mutation.
+        let mut state = SelfHealState::new();
+        state.track("sig-a");
+        assert!(state.is_tracked("sig-a"));
     }
 }
