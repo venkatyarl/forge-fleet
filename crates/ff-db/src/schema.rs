@@ -12041,6 +12041,13 @@ VALUES
 ON CONFLICT (name) DO NOTHING;
 "#;
 
+/// Structured per-project config (attached paths, repos, deploy targets, and
+/// Vault realm) as JSONB, alongside the existing `projects.metadata` column.
+/// See [`crate::models::ProjectConfig`] for the typed shape stored here.
+pub const SCHEMA_V236_PROJECTS_CONFIG: &str = r#"
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS config JSONB NOT NULL DEFAULT '{}';
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

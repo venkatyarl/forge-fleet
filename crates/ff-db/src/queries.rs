@@ -120,6 +120,14 @@ pub struct ProjectGitPolicy {
     pub git_remote: String,
 }
 
+/// Raw `projects.config` JSONB column, keyed by project id. Deserialize the
+/// `config` value into [`crate::models::ProjectConfig`] for the typed shape.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ProjectConfigRow {
+    pub id: String,
+    pub config: serde_json::Value,
+}
+
 /// Runtime heartbeat payload row used to upsert live fleet node state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetNodeRuntimeHeartbeatRow {
@@ -465,6 +473,17 @@ pub async fn pg_get_project_git_policy(
     .fetch_optional(pool)
     .await
     .map_err(Into::into)
+}
+
+pub async fn pg_get_project_config(
+    pool: &PgPool,
+    project_id: &str,
+) -> Result<Option<ProjectConfigRow>> {
+    sqlx::query_as::<_, ProjectConfigRow>("SELECT id, config FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(Into::into)
 }
 
 /// Upsert a fleet node in Postgres.

@@ -27,7 +27,7 @@ pub use leader_state::*;
 
 pub use metrics_partitions::{pg_drop_expired_metrics_partitions, pg_ensure_metrics_partitions};
 pub use migrations::run_postgres_migrations;
-pub use models::WorkItem;
+pub use models::{ProjectConfig, WorkItem};
 pub use operational_store::OperationalStore;
 pub use queries::{
     AgentReadinessRow,
@@ -80,6 +80,7 @@ pub use queries::{
     NodePeerMountRow,
     // Orchestrator P3 — adaptive serving-mix autoscaler
     PlacementCandidate,
+    ProjectConfigRow,
     ProjectGitPolicy,
     ReadyWorkItem,
     ReapableWorktree,
@@ -163,6 +164,7 @@ pub use queries::{
     pg_get_catalog,
     pg_get_deferred,
     pg_get_node,
+    pg_get_project_config,
     pg_get_project_git_policy,
     pg_get_secret,
     pg_get_setting,
