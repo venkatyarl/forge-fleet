@@ -21,6 +21,7 @@ pub mod ha_coordinator;
 pub mod health;
 pub mod llm_480b_wrapper;
 pub mod slot_allocation;
+pub mod subsystem_watchdog;
 pub mod task_processor;
 pub mod timeout;
 
@@ -60,4 +61,7 @@ pub use llm_480b_wrapper::{
     Llm480bWrapper,
 };
 pub use slot_allocation::{SlotAllocationConfig, allocate_slots};
+pub use subsystem_watchdog::{
+    DEFAULT_TRIP_THRESHOLD, SubsystemWatchdog, WatchdogAction, WatchdogEvent,
+};
 pub use task_processor::{ComplexityFlag, TaskComplexity, TaskProcessor};
