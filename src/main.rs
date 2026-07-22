@@ -3316,10 +3316,12 @@ async fn start_pulse_v2_subsystems(
 
         let worker_name_for_became = worker_name.clone();
         let worker_name_for_lost = worker_name.clone();
+        let pg_pool_for_became = pg_pool.clone();
 
         let on_became: ff_agent::leader_tick::OnBecameLeader =
             std::sync::Arc::new(move |prev: Option<String>| {
                 let my_name = worker_name_for_became.clone();
+                let pg = pg_pool_for_became.clone();
                 tokio::spawn(async move {
                     ff_agent::fleet_events_nats::FleetEventBus::publish_leader_change(
                         prev.as_deref(),
@@ -3327,6 +3329,30 @@ async fn start_pulse_v2_subsystems(
                         0,
                     )
                     .await;
+
+                    // Replay any task_notification_outbox events that piled
+                    // up while the fleet was leaderless or the previous
+                    // leader died before relaying them.
+                    match ff_agent::leader_catchup::LeaderCatchup::new(pg)
+                        .replay()
+                        .await
+                    {
+                        Ok(outcome) if outcome.replayed > 0 => {
+                            info!(
+                                node = %my_name,
+                                replayed = outcome.replayed,
+                                "leader catch-up: replayed outbox events to NATS"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            warn!(
+                                node = %my_name,
+                                %error,
+                                "leader catch-up: outbox replay failed"
+                            );
+                        }
+                    }
                 });
             });
 
