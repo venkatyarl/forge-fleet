@@ -241,6 +241,12 @@ pub struct FleetSettings {
     /// Maps to `max_build_duration` in `[general]` (value is in seconds).
     #[serde(default = "default_max_build_duration", rename = "max_build_duration")]
     pub max_build_duration_secs: u64,
+
+    /// Backends that must not be dispatched to (e.g. `["claude"]`).
+    ///
+    /// Empty list (the default) means every backend is allowed.
+    #[serde(default)]
+    pub disabled_backends: Vec<String>,
 }
 
 /// Backward-compatible type alias.
@@ -273,7 +279,17 @@ impl Default for FleetSettings {
             heartbeat_timeout_secs: default_heartbeat_timeout(),
             api_port: default_api_port(),
             max_build_duration_secs: default_max_build_duration(),
+            disabled_backends: Vec::new(),
         }
+    }
+}
+
+impl FleetSettings {
+    /// Whether `backend` is disabled fleet-wide (case-insensitive).
+    pub fn is_backend_disabled(&self, backend: &str) -> bool {
+        self.disabled_backends
+            .iter()
+            .any(|b| b.eq_ignore_ascii_case(backend.trim()))
     }
 }
 
@@ -1936,6 +1952,7 @@ mod tests {
 name = "TestFleet"
 version = "1.0"
 default_repo = "/tmp/test-repo"
+disabled_backends = ["claude"]
 
 [nodes.taylor]
 ip = "192.168.5.100"
@@ -2129,6 +2146,7 @@ notes = "Setup started."
         assert_eq!(config.fleet.name, "TestFleet");
         assert_eq!(config.fleet.version.as_deref(), Some("1.0"));
         assert_eq!(config.fleet.default_repo.as_deref(), Some("/tmp/test-repo"));
+        assert_eq!(config.fleet.disabled_backends, vec!["claude".to_string()]);
         assert_eq!(config.nodes.len(), 2);
 
         let taylor = config.nodes.get("taylor").expect("taylor node");
@@ -2319,6 +2337,7 @@ notes = "Setup started."
         assert_eq!(config.fleet.name, "ForgeFleet");
         assert_eq!(config.fleet.heartbeat_interval_secs, 15);
         assert_eq!(config.fleet.api_port, 51000);
+        assert!(config.fleet.disabled_backends.is_empty());
         assert_eq!(config.leader.preferred, "taylor");
         assert_eq!(config.database.max_connections, 10);
         assert_eq!(config.database.mode, DatabaseMode::PostgresRuntime);
@@ -2359,6 +2378,33 @@ bogus = -3.0
         assert_eq!(weights.weight_for("paused"), 0.0);
         assert_eq!(weights.weight_for("bogus"), 0.0, "negative clamps to zero");
         assert_eq!(weights.weight_for("other"), 2.0, "falls back to default");
+    }
+
+    #[test]
+    fn test_disabled_backends_parse_from_toml() {
+        let config: FleetConfig = toml::from_str(
+            r#"
+[general]
+disabled_backends = ["claude", "kimi"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.fleet.disabled_backends,
+            vec!["claude".to_string(), "kimi".to_string()]
+        );
+        assert!(config.fleet.is_backend_disabled("claude"));
+        assert!(config.fleet.is_backend_disabled("Claude"));
+        assert!(config.fleet.is_backend_disabled(" kimi "));
+        assert!(!config.fleet.is_backend_disabled("codex"));
+    }
+
+    #[test]
+    fn test_disabled_backends_default_allows_all() {
+        let config: FleetConfig = toml::from_str("").unwrap();
+        assert!(config.fleet.disabled_backends.is_empty());
+        assert!(!config.fleet.is_backend_disabled("claude"));
     }
 
     #[test]
