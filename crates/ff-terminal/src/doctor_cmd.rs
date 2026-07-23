@@ -298,6 +298,13 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
         status: dsn_status,
         detail: dsn_detail,
     });
+    let expected_redis_url = crate::resolve_pulse_redis_url();
+    let (gateway_status, gateway_detail) = unit_gateway_env_check(&expected_redis_url);
+    checks.push(DoctorCheck {
+        name: "gateway unit env".into(),
+        status: gateway_status,
+        detail: gateway_detail,
+    });
 
     // 6) Disk quota: latest sample per worker vs its disk_quota_pct. Stale
     //    samples (offline nodes) excluded via sampled_at.
@@ -462,13 +469,49 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
 
 /// Whether service-unit text carries a hardcoded fleet DSN env line — the #44
 /// pattern (`Environment=FORGEFLEET_POSTGRES_URL=…` etc.) that pins a node to
-/// one primary's IP outside fleet.toml. Matches any FORGEFLEET_*_URL variable
-/// on an Environment= line so future DSN vars are covered too. Pure for tests.
+/// one primary's IP outside fleet.toml. Redis is intentionally exempt: the
+/// gateway must receive its fleet.toml-derived Redis URL before it starts.
 fn unit_text_has_dsn_env(text: &str) -> bool {
     text.lines().any(|line| {
         let line = line.trim_start();
-        line.starts_with("Environment=") && line.contains("FORGEFLEET_") && line.contains("_URL=")
+        line.starts_with("Environment=")
+            && line.contains("FORGEFLEET_")
+            && line.contains("_URL=")
+            && !line.contains("FORGEFLEET_REDIS_URL=")
     })
+}
+
+/// Validate the two environment values required by the leader gateway. Handles
+/// both the systemd `Environment=…` spelling and launchd's adjacent key/string
+/// XML representation.
+fn gateway_env_health(text: &str, expected_redis_url: &str) -> (Health, String) {
+    let compact: String = text.split_whitespace().collect();
+    let trusted = text
+        .lines()
+        .any(|line| line.trim() == "Environment=FF_GATEWAY_TRUSTED_LAN=1")
+        || compact.contains("<key>FF_GATEWAY_TRUSTED_LAN</key><string>1</string>");
+    let systemd_redis = format!("Environment=FORGEFLEET_REDIS_URL={expected_redis_url}");
+    let launchd_redis =
+        format!("<key>FORGEFLEET_REDIS_URL</key><string>{expected_redis_url}</string>");
+    let redis =
+        text.lines().any(|line| line.trim() == systemd_redis) || compact.contains(&launchd_redis);
+
+    match (trusted, redis) {
+        (true, true) => (
+            Health::Pass,
+            format!("trusted LAN enabled; Redis matches {expected_redis_url}"),
+        ),
+        (false, _) => (
+            Health::Fail,
+            "missing FF_GATEWAY_TRUSTED_LAN=1 in forgefleetd service environment".into(),
+        ),
+        (_, false) => (
+            Health::Fail,
+            format!(
+                "missing or stale FORGEFLEET_REDIS_URL in forgefleetd service environment (expected {expected_redis_url})"
+            ),
+        ),
+    }
 }
 
 /// Scan the local forgefleetd unit definitions (systemd user + system unit and
@@ -480,7 +523,7 @@ fn unit_dsn_env_lint() -> (Health, String) {
     let mut candidates: Vec<std::path::PathBuf> = vec![
         format!("{home}/.config/systemd/user/forgefleetd.service").into(),
         "/etc/systemd/system/forgefleetd.service".into(),
-        format!("{home}/Library/LaunchAgents/com.forgefleet.daemon.plist").into(),
+        format!("{home}/Library/LaunchAgents/com.forgefleet.forgefleetd.plist").into(),
     ];
     for dropin_dir in [
         format!("{home}/.config/systemd/user/forgefleetd.service.d"),
@@ -507,6 +550,34 @@ fn unit_dsn_env_lint() -> (Health, String) {
             ),
         )
     }
+}
+
+fn unit_gateway_env_check(expected_redis_url: &str) -> (Health, String) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut candidates: Vec<std::path::PathBuf> = vec![
+        format!("{home}/.config/systemd/user/forgefleetd.service").into(),
+        "/etc/systemd/system/forgefleetd.service".into(),
+        format!("{home}/Library/LaunchAgents/com.forgefleet.forgefleetd.plist").into(),
+    ];
+    for dropin_dir in [
+        format!("{home}/.config/systemd/user/forgefleetd.service.d"),
+        "/etc/systemd/system/forgefleetd.service.d".to_string(),
+    ] {
+        if let Ok(entries) = std::fs::read_dir(dropin_dir) {
+            candidates.extend(entries.flatten().map(|entry| entry.path()));
+        }
+    }
+    let installed = candidates
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .collect::<Vec<_>>();
+    if installed.is_empty() {
+        return (
+            Health::Warn,
+            "no local forgefleetd systemd unit or launchd plist found".into(),
+        );
+    }
+    gateway_env_health(&installed.join("\n"), expected_redis_url)
 }
 
 /// Process exit code for an overall verdict: FAIL always fails; WARN fails only
@@ -541,7 +612,7 @@ mod tests {
         assert!(unit_text_has_dsn_env(
             "[Service]\nEnvironment=FORGEFLEET_POSTGRES_URL=postgresql://ff@192.168.5.100:55432/ff\n"
         ));
-        assert!(unit_text_has_dsn_env(
+        assert!(!unit_text_has_dsn_env(
             "  Environment=FORGEFLEET_REDIS_URL=redis://192.168.5.100:56379\n"
         ));
         // Benign env the units legitimately carry must NOT trip the lint.
@@ -556,6 +627,38 @@ mod tests {
         assert!(!unit_text_has_dsn_env(
             "# used to carry FORGEFLEET_POSTGRES_URL=… before #44\n"
         ));
+    }
+
+    #[test]
+    fn gateway_env_health_accepts_systemd_and_launchd() {
+        let redis = "redis://192.168.5.104:56379";
+        let systemd = format!(
+            "[Service]\nEnvironment=FF_GATEWAY_TRUSTED_LAN=1\nEnvironment=FORGEFLEET_REDIS_URL={redis}\n"
+        );
+        assert_eq!(gateway_env_health(&systemd, redis).0, Health::Pass);
+
+        let launchd = format!(
+            "<key>FF_GATEWAY_TRUSTED_LAN</key>\n<string>1</string>\n\
+             <key>FORGEFLEET_REDIS_URL</key>\n<string>{redis}</string>"
+        );
+        assert_eq!(gateway_env_health(&launchd, redis).0, Health::Pass);
+    }
+
+    #[test]
+    fn gateway_env_health_rejects_missing_or_stale_values() {
+        let redis = "redis://192.168.5.104:56379";
+        assert_eq!(
+            gateway_env_health(
+                "Environment=FORGEFLEET_REDIS_URL=redis://localhost:56379",
+                redis
+            )
+            .0,
+            Health::Fail
+        );
+        assert_eq!(
+            gateway_env_health("Environment=FF_GATEWAY_TRUSTED_LAN=1", redis).0,
+            Health::Fail
+        );
     }
 
     #[test]
