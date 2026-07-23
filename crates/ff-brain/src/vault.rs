@@ -9,6 +9,169 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CouncilMemberRecord {
+    pub member: String,
+    pub raw_response: Option<String>,
+    pub answer: Option<String>,
+    pub confidence: Option<f32>,
+    pub evidence: Vec<String>,
+    pub error: Option<String>,
+    pub engine: Option<String>,
+    pub endpoint: Option<String>,
+    pub worker_name: Option<String>,
+    pub latency_ms: Option<i32>,
+    pub tokens_in: i32,
+    pub tokens_out: i32,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CouncilChairmanRecord {
+    pub member: String,
+    pub prompt: String,
+    pub raw_response: Option<String>,
+    pub synthesis: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CouncilOperatorOutput {
+    pub recommendation: String,
+    pub reasoning: String,
+    pub evidence: Vec<String>,
+    pub dissent: Vec<String>,
+    pub risks: Vec<String>,
+    pub next_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CouncilDecision {
+    pub decision_id: uuid::Uuid,
+    pub project_id: String,
+    pub question: String,
+    pub members: Vec<CouncilMemberRecord>,
+    pub chairman: Option<CouncilChairmanRecord>,
+    pub output: CouncilOperatorOutput,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug)]
+pub struct SavedCouncilDecision {
+    pub path: PathBuf,
+    pub interaction_id: Option<uuid::Uuid>,
+}
+
+fn markdown_list(items: &[String]) -> String {
+    if items.is_empty() {
+        "_None._".to_string()
+    } else {
+        items
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+pub fn render_council_decision(decision: &CouncilDecision) -> anyhow::Result<String> {
+    let frontmatter = serde_yaml::to_string(&serde_json::json!({
+        "type": "council-decision",
+        "decision_id": decision.decision_id,
+        "project_id": decision.project_id,
+        "created_at": decision.created_at,
+        "question": decision.question,
+        "tags": ["council", "decision-record"],
+    }))?;
+    let transcript = serde_json::to_string_pretty(&decision.members)?;
+    let chairman = serde_json::to_string_pretty(&decision.chairman)?;
+    Ok(format!(
+        "---\n{frontmatter}---\n\n# Recommendation\n\n{}\n\n# Reasoning\n\n{}\n\n# Evidence\n\n{}\n\n# Dissent\n\n{}\n\n# Risks\n\n{}\n\n# Next Actions\n\n{}\n\n## Full Council Transcript\n\n```json\n{transcript}\n```\n\n## Chairman Synthesis\n\n```json\n{chairman}\n```\n",
+        decision.output.recommendation,
+        decision.output.reasoning,
+        markdown_list(&decision.output.evidence),
+        markdown_list(&decision.output.dissent),
+        markdown_list(&decision.output.risks),
+        markdown_list(&decision.output.next_actions),
+    ))
+}
+
+fn safe_project_id(project_id: &str) -> String {
+    let slug: String = project_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "unknown-project".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+/// Persist a durable council decision record, then best-effort append its aggregate log row.
+pub async fn save_council_decision(
+    pool: Option<&PgPool>,
+    config: &VaultConfig,
+    decision: &CouncilDecision,
+) -> anyhow::Result<SavedCouncilDecision> {
+    let rendered = render_council_decision(decision)?;
+    let dir = config
+        .brain_root()
+        .join("Decisions")
+        .join("Council")
+        .join(safe_project_id(&decision.project_id))
+        .join(decision.created_at.format("%Y").to_string());
+    tokio::fs::create_dir_all(&dir).await?;
+    let filename = format!(
+        "{}-{}.md",
+        decision.created_at.format("%Y-%m-%dT%H%M%SZ"),
+        decision.decision_id
+    );
+    let path = dir.join(filename);
+    let temporary = dir.join(format!(".{}.tmp", decision.decision_id));
+    tokio::fs::write(&temporary, rendered.as_bytes()).await?;
+    tokio::fs::rename(&temporary, &path).await?;
+
+    let interaction_id = if let Some(pool) = pool {
+        let record = ff_db::InteractionRecord {
+            channel: "council_decision".to_string(),
+            request_text: decision.question.clone(),
+            request_meta: serde_json::json!({
+                "decision_id": decision.decision_id,
+                "record_kind": "council-decision",
+                "vault_path": path,
+            }),
+            steps: serde_json::to_value((&decision.members, &decision.chairman))?,
+            response_text: rendered.clone(),
+            outcome: if decision.members.iter().any(|m| m.error.is_some()) {
+                "partial".to_string()
+            } else {
+                "ok".to_string()
+            },
+            ..Default::default()
+        };
+        match ff_db::pg_record_project_interaction(pool, &decision.project_id, &record).await {
+            Ok(id) => Some(id),
+            Err(error) => {
+                warn!(%error, "failed to log durable council decision");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    Ok(SavedCouncilDecision {
+        path,
+        interaction_id,
+    })
+}
+
 /// Configuration for an Obsidian vault to index.
 pub struct VaultConfig {
     /// Root path of the vault on disk, e.g. ~/projects/Yarli_KnowledgeBase
@@ -707,4 +870,83 @@ async fn write_chunks(pool: &PgPool, node_path: &str, chunks: &[VaultChunk]) -> 
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod council_decision_tests {
+    use super::*;
+
+    fn decision(project_id: &str) -> CouncilDecision {
+        CouncilDecision {
+            decision_id: uuid::Uuid::nil(),
+            project_id: project_id.to_string(),
+            question: "Ship it?".to_string(),
+            members: vec![CouncilMemberRecord {
+                member: "codex".to_string(),
+                raw_response: Some("raw transcript".to_string()),
+                answer: Some("Ship it".to_string()),
+                confidence: Some(0.9),
+                evidence: vec!["tests pass".to_string()],
+                error: None,
+                engine: Some("codex".to_string()),
+                endpoint: None,
+                worker_name: None,
+                latency_ms: Some(10),
+                tokens_in: 1,
+                tokens_out: 2,
+            }],
+            chairman: Some(CouncilChairmanRecord {
+                member: "kimi".to_string(),
+                prompt: "synthesize".to_string(),
+                raw_response: Some("raw chairman".to_string()),
+                synthesis: Some("Ship it".to_string()),
+                error: None,
+            }),
+            output: CouncilOperatorOutput {
+                recommendation: "Ship it".to_string(),
+                reasoning: "It is ready".to_string(),
+                evidence: vec!["tests pass".to_string()],
+                dissent: Vec::new(),
+                risks: vec!["rollback".to_string()],
+                next_actions: vec!["deploy".to_string()],
+            },
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        }
+    }
+
+    #[test]
+    fn renders_six_operator_sections_and_full_audit_data() {
+        let rendered = render_council_decision(&decision("forge-fleet")).unwrap();
+        for heading in [
+            "# Recommendation",
+            "# Reasoning",
+            "# Evidence",
+            "# Dissent",
+            "# Risks",
+            "# Next Actions",
+        ] {
+            assert_eq!(rendered.matches(heading).count(), 1);
+        }
+        assert!(rendered.contains("raw transcript"));
+        assert!(rendered.contains("raw chairman"));
+        assert!(rendered.contains("type: council-decision"));
+    }
+
+    #[tokio::test]
+    async fn saves_under_sanitized_project_path() {
+        let root = std::env::temp_dir().join(format!("ff-council-{}", uuid::Uuid::new_v4()));
+        let config = VaultConfig {
+            vault_path: root.clone(),
+            brain_subfolder: String::new(),
+        };
+        let saved = save_council_decision(None, &config, &decision("../../escape"))
+            .await
+            .unwrap();
+        assert!(saved.path.starts_with(&root));
+        assert!(saved.path.to_string_lossy().contains("escape"));
+        assert!(saved.path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

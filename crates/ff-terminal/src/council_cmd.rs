@@ -19,7 +19,9 @@
 
 use crate::{CYAN, GREEN, RESET, YELLOW};
 use anyhow::Result;
+use chrono::Utc;
 use sqlx::PgPool;
+use std::path::PathBuf;
 use std::time::Duration;
 
 const MEMBER_PROMPT_PREAMBLE: &str = "You are a COUNCIL MEMBER. Give your own INDEPENDENT, \
@@ -32,6 +34,7 @@ const MEMBER_PROMPT_PREAMBLE: &str = "You are a COUNCIL MEMBER. Give your own IN
 
 /// Normalized result of one member dispatch (vendor CLI or local fleet model),
 /// holding everything the council needs to print AND to log to `ff_interactions`.
+#[derive(Clone)]
 struct MemberRaw {
     /// `Some(text)` when the member produced a usable answer.
     answer: Option<String>,
@@ -246,6 +249,8 @@ pub async fn handle_council(
     chairman: Option<String>,
     no_synthesis: bool,
 ) -> Result<()> {
+    let decision_id = uuid::Uuid::new_v4();
+    let created_at = Utc::now();
     let members: Vec<String> = members_csv
         .split(',')
         .map(|s| s.trim().to_string())
@@ -271,12 +276,28 @@ pub async fn handle_council(
         );
         let raw = dispatch_member(&member, &question, pool.as_ref(), timeout).await;
         log_council(pool.as_ref(), &member, "council_trivial", &question, &raw).await;
-        return match raw.answer {
+        return match raw.answer.as_ref() {
             Some(answer) => {
                 println!(
                     "{GREEN}═══════════ DIRECT ANSWER ({member}) ═══════════{RESET}\n{answer}"
                 );
-                Ok(())
+                persist_decision(
+                    pool.as_ref(),
+                    decision_id,
+                    created_at,
+                    &question,
+                    vec![member_record(&member, &raw)],
+                    None,
+                    ff_brain::vault::CouncilOperatorOutput {
+                        recommendation: answer.clone(),
+                        reasoning: "Direct answer for a trivial prompt.".to_string(),
+                        evidence: Vec::new(),
+                        dissent: Vec::new(),
+                        risks: Vec::new(),
+                        next_actions: Vec::new(),
+                    },
+                )
+                .await
             }
             None => anyhow::bail!(
                 "trivial prompt but {member} returned no usable answer{}",
@@ -309,6 +330,7 @@ pub async fn handle_council(
     // + log each. Members are asked for JSON (answer/confidence/evidence);
     // `parse_member_answer` falls back gracefully when one doesn't comply.
     let mut answers: Vec<(String, MemberAnswer)> = Vec::with_capacity(members.len());
+    let mut transcript = Vec::with_capacity(members.len());
     for handle in handles {
         let (member, raw) = match handle.await {
             Ok(pair) => pair,
@@ -318,6 +340,7 @@ pub async fn handle_council(
             }
         };
         log_council(pool.as_ref(), &member, "council_member", &prompt, &raw).await;
+        transcript.push(member_record(&member, &raw));
         println!("\n{CYAN}═══════════ {member} ═══════════{RESET}");
         match raw.answer {
             Some(answer) => {
@@ -347,7 +370,17 @@ pub async fn handle_council(
             "\n{CYAN}Synthesize the answers above into a single consensus (note agreements, \
              surface dissent) — the chairman is the strong model that convened this council.{RESET}"
         );
-        return Ok(());
+        let output = output_from_answers(&answers);
+        return persist_decision(
+            pool.as_ref(),
+            decision_id,
+            created_at,
+            &question,
+            transcript,
+            None,
+            output,
+        )
+        .await;
     }
 
     // Automated chairman synthesis. Nothing to synthesize from 0 answers, and a
@@ -360,7 +393,17 @@ pub async fn handle_council(
             "\n{GREEN}═══════════ CONSENSUS (sole answer) ═══════════{RESET}\n{}",
             answers[0].1.answer
         );
-        return Ok(());
+        let output = output_from_answers(&answers);
+        return persist_decision(
+            pool.as_ref(),
+            decision_id,
+            created_at,
+            &question,
+            transcript,
+            None,
+            output,
+        )
+        .await;
     }
 
     // Pick the chairman: the requested one, else the first member (vendor or
@@ -374,7 +417,8 @@ pub async fn handle_council(
     eprintln!("\n{CYAN}▶ Chairman ({chair}) synthesizing {ok} answers…{RESET}");
     let raw = dispatch_member(&chair, &synth, pool.as_ref(), timeout).await;
     log_council(pool.as_ref(), &chair, "council_chairman", &synth, &raw).await;
-    match raw.answer.as_deref().and_then(parse_chairman_synthesis) {
+    let parsed_synthesis = raw.answer.as_deref().and_then(parse_chairman_synthesis);
+    let output = match &parsed_synthesis {
         Some(synthesis) => {
             println!("\n{GREEN}═══════════ CONSENSUS (chairman: {chair}) ═══════════{RESET}");
             println!("{}", synthesis.consensus);
@@ -393,19 +437,153 @@ pub async fn handle_council(
             if !synthesis.rationale.trim().is_empty() {
                 println!("\n{CYAN}─── Rationale ───{RESET}\n{}", synthesis.rationale);
             }
+            ff_brain::vault::CouncilOperatorOutput {
+                recommendation: synthesis.consensus.clone(),
+                reasoning: synthesis.rationale.clone(),
+                evidence: answers
+                    .iter()
+                    .flat_map(|(_, answer)| answer.evidence.clone())
+                    .collect(),
+                dissent: synthesis.disagreements.clone(),
+                risks: Vec::new(),
+                next_actions: synthesis.unique_findings.clone(),
+            }
         }
-        None => match raw.answer {
-            Some(unstructured) => println!(
-                "\n{YELLOW}⚠ chairman {chair} did not return structured JSON — printing raw \
-                 synthesis.{RESET}\n{unstructured}"
-            ),
-            None => eprintln!(
-                "{YELLOW}⚠ chairman {chair} produced no synthesis — falling back to the raw \
-                 answers above.{RESET}{}",
-                raw.error.map(|e| format!("\n{e}")).unwrap_or_default()
-            ),
+        None => match raw.answer.as_ref() {
+            Some(unstructured) => {
+                println!(
+                    "\n{YELLOW}⚠ chairman {chair} did not return structured JSON — printing raw \
+                     synthesis.{RESET}\n{unstructured}"
+                );
+                ff_brain::vault::CouncilOperatorOutput {
+                    recommendation: unstructured.clone(),
+                    ..output_from_answers(&answers)
+                }
+            }
+            None => {
+                eprintln!(
+                    "{YELLOW}⚠ chairman {chair} produced no synthesis — falling back to the raw \
+                     answers above.{RESET}{}",
+                    raw.error
+                        .as_ref()
+                        .map(|e| format!("\n{e}"))
+                        .unwrap_or_default()
+                );
+                output_from_answers(&answers)
+            }
         },
+    };
+    let chairman_record = ff_brain::vault::CouncilChairmanRecord {
+        member: chair,
+        prompt: synth,
+        raw_response: raw.answer,
+        synthesis: parsed_synthesis.map(|s| s.consensus),
+        error: raw.error,
+    };
+    persist_decision(
+        pool.as_ref(),
+        decision_id,
+        created_at,
+        &question,
+        transcript,
+        Some(chairman_record),
+        output,
+    )
+    .await
+}
+
+fn member_record(member: &str, raw: &MemberRaw) -> ff_brain::vault::CouncilMemberRecord {
+    let parsed = raw.answer.as_deref().map(parse_member_answer);
+    ff_brain::vault::CouncilMemberRecord {
+        member: member.to_string(),
+        raw_response: raw.answer.clone(),
+        answer: parsed.as_ref().map(|answer| answer.answer.clone()),
+        confidence: parsed.as_ref().map(|answer| answer.confidence),
+        evidence: parsed.map(|answer| answer.evidence).unwrap_or_default(),
+        error: raw.error.clone(),
+        engine: raw.engine.clone(),
+        endpoint: raw.endpoint.clone(),
+        worker_name: raw.worker_name.clone(),
+        latency_ms: raw.latency_ms,
+        tokens_in: raw.tokens_in,
+        tokens_out: raw.tokens_out,
     }
+}
+
+fn output_from_answers(
+    answers: &[(String, MemberAnswer)],
+) -> ff_brain::vault::CouncilOperatorOutput {
+    ff_brain::vault::CouncilOperatorOutput {
+        recommendation: answers
+            .first()
+            .map(|(_, answer)| answer.answer.clone())
+            .unwrap_or_else(|| "No recommendation was produced.".to_string()),
+        reasoning: if answers.len() > 1 {
+            "No automated chairman synthesis was available; member answers are preserved in the transcript."
+                .to_string()
+        } else {
+            "The sole usable council answer is the consensus.".to_string()
+        },
+        evidence: answers
+            .iter()
+            .flat_map(|(_, answer)| answer.evidence.clone())
+            .collect(),
+        dissent: answers
+            .iter()
+            .skip(1)
+            .map(|(member, answer)| format!("{member}: {}", answer.answer))
+            .collect(),
+        risks: Vec::new(),
+        next_actions: Vec::new(),
+    }
+}
+
+async fn persist_decision(
+    pool: Option<&PgPool>,
+    decision_id: uuid::Uuid,
+    created_at: chrono::DateTime<Utc>,
+    question: &str,
+    members: Vec<ff_brain::vault::CouncilMemberRecord>,
+    chairman: Option<ff_brain::vault::CouncilChairmanRecord>,
+    output: ff_brain::vault::CouncilOperatorOutput,
+) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let project_id = std::env::var("FORGEFLEET_PROJECT_ID").unwrap_or_else(|_| {
+        cwd.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown-project")
+            .to_string()
+    });
+    let vault_path = std::env::var_os("FORGEFLEET_VAULT_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("projects")
+                .join("Yarli_KnowledgeBase")
+        });
+    let decision = ff_brain::vault::CouncilDecision {
+        decision_id,
+        project_id,
+        question: question.to_string(),
+        members,
+        chairman,
+        output,
+        created_at,
+    };
+    let saved = ff_brain::vault::save_council_decision(
+        pool,
+        &ff_brain::vault::VaultConfig {
+            vault_path,
+            brain_subfolder: String::new(),
+        },
+        &decision,
+    )
+    .await?;
+    eprintln!(
+        "{GREEN}✓ Council decision saved to {}{RESET}",
+        saved.path.display()
+    );
     Ok(())
 }
 
