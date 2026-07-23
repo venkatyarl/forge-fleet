@@ -1447,95 +1447,14 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
-    // 20b3) SSH mesh auto-repair tick — every 10min, leader-gated.
-    //
-    // Restores the legacy-only repair dispatcher. The leader finds failed mesh
-    // pairs with repeated failures and enqueues the same repair command an
-    // operator would run by hand.
+    // 20b3) SSH mesh auto-repair tick — leader-gated, with per-edge backoff.
     if let Some(pg_pool) = operational_store.pg_pool().cloned() {
-        info!("starting subsystem: ssh mesh auto-repair tick (10min, leader-gated)");
-        let name = worker_name.clone();
-        let mut shutdown_rx_mesh_repair = shutdown_rx.clone();
-        subsystem_tasks.push(tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = shutdown_rx_mesh_repair.changed() => break,
-                    _ = tick.tick() => {
-                        let is_leader: bool = sqlx::query_scalar(
-                            r#"
-                            SELECT EXISTS (
-                                SELECT 1 FROM fleet_leader_state
-                                WHERE member_name = $1
-                                  AND heartbeat_at > NOW() - INTERVAL '60 seconds'
-                            )
-                            "#,
-                        )
-                        .bind(&name)
-                        .fetch_one(&pg_pool)
-                        .await
-                        .unwrap_or(false);
-                        if !is_leader {
-                            continue;
-                        }
-
-                        let bad: std::result::Result<Option<(String, String, i32)>, _> = sqlx::query_as(
-                            "SELECT src_node, dst_node, attempts
-                               FROM fleet_mesh_status
-                              WHERE status = 'failed'
-                                AND attempts >= 3
-                              ORDER BY attempts DESC, last_checked ASC NULLS FIRST
-                              LIMIT 1",
-                        )
-                        .fetch_optional(&pg_pool)
-                        .await;
-
-                        match bad {
-                            Ok(Some((src, dst, attempts))) => {
-                                info!(
-                                    src = %src,
-                                    dst = %dst,
-                                    attempts,
-                                    "dispatching ssh mesh auto-repair"
-                                );
-                                let command = format!(
-                                    "ff fleet ssh-mesh-check --node {dst} --repair --yes 2>&1 | tail -10"
-                                );
-                                if let Err(e) = ff_agent::task_runner::pg_enqueue_shell_task(
-                                    &pg_pool,
-                                    &format!("auto-mesh-repair: {src} -> {dst}"),
-                                    &command,
-                                    &["ff".to_string()],
-                                    Some(&name),
-                                    None,
-                                    50,
-                                    None,
-                                )
-                                .await
-                                {
-                                    warn!(
-                                        src = %src,
-                                        dst = %dst,
-                                        error = %e,
-                                        "failed to enqueue ssh mesh auto-repair task"
-                                    );
-                                }
-                                let _ = ff_agent::telegram::send_telegram_from_secrets(
-                                    &pg_pool,
-                                    "SSH mesh auto-repair",
-                                    &format!("Repair dispatched: {src} -> {dst} (attempts={attempts})"),
-                                )
-                                .await;
-                            }
-                            Ok(None) => {}
-                            Err(e) => warn!(error = %e, "ssh mesh auto-repair query failed"),
-                        }
-                    }
-                }
-            }
-        }));
+        info!("starting subsystem: ssh mesh auto-repair tick (leader-gated)");
+        subsystem_tasks.push(ff_agent::mesh_check::spawn_mesh_auto_repair_tick(
+            pg_pool,
+            worker_name.clone(),
+            shutdown_rx.clone(),
+        ));
     }
 
     // 20b4) Model library scan tick — every 10min, PER-NODE.
