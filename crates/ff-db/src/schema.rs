@@ -12135,6 +12135,70 @@ CREATE INDEX IF NOT EXISTS idx_notifications_undismissed
     ON notifications (created_at) WHERE NOT is_dismissed;
 "#;
 
+/// OpLog replay engine: the staging area an isolated node's operations land
+/// in once it reconnects, plus the shared, merged entity state and the
+/// per-node/per-entry bookkeeping the replay controller needs to resume after
+/// a partial replay.
+///
+///   - `oplog_entries` — one row per operation recorded by an isolated node,
+///     keyed by `(node_id, sequence)` so a re-ingested batch can't duplicate.
+///   - `oplog_entity_state` — the shared, merged view of each entity, with a
+///     `version` used for last-write-wins comparisons. A `Delete` never
+///     removes the row: it writes a `deleted = true` tombstone that keeps
+///     the row's `version`, so a stale operation replayed later with an
+///     older `op_version` is correctly rejected instead of resurrecting the
+///     entity against an empty/missing row.
+///   - `oplog_replay_state` — per-node replay cursor (`last_applied_sequence`)
+///     so replay can resume after a partial failure instead of re-applying
+///     already-merged entries.
+///   - `oplog_replay_failures` — audit trail of entries that failed to apply,
+///     e.g. a malformed UNION payload.
+pub const SCHEMA_V246_OPLOG_REPLAY: &str = r#"
+CREATE TABLE IF NOT EXISTS oplog_entries (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    node_id     TEXT NOT NULL,
+    sequence    BIGINT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id   TEXT NOT NULL,
+    op_type     TEXT NOT NULL,
+    op_version  BIGINT NOT NULL,
+    payload     JSONB NOT NULL DEFAULT '{}',
+    recorded_at TIMESTAMPTZ NOT NULL,
+    ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (node_id, sequence)
+);
+
+CREATE TABLE IF NOT EXISTS oplog_entity_state (
+    entity_type TEXT NOT NULL,
+    entity_id   TEXT NOT NULL,
+    version     BIGINT NOT NULL DEFAULT 0,
+    data        JSONB,
+    deleted     BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (entity_type, entity_id)
+);
+
+CREATE TABLE IF NOT EXISTS oplog_replay_state (
+    node_id                TEXT PRIMARY KEY,
+    last_applied_sequence  BIGINT NOT NULL DEFAULT 0,
+    status                 TEXT NOT NULL DEFAULT 'idle',
+    last_error             TEXT,
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS oplog_replay_failures (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    entry_id   UUID NOT NULL REFERENCES oplog_entries(id),
+    node_id    TEXT NOT NULL,
+    sequence   BIGINT NOT NULL,
+    error      TEXT NOT NULL,
+    failed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_oplog_entries_node_sequence
+    ON oplog_entries (node_id, sequence);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
