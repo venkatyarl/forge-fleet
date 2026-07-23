@@ -87,26 +87,11 @@ async fn fetch_interaction_need_rows(
     project_id: &str,
     window_hours: i64,
 ) -> anyhow::Result<Vec<InteractionNeedRow>> {
-    if ff_interactions_has_project_id(pg).await? {
+    if ff_db::ff_interactions_has_project_id(pg).await? {
         fetch_interaction_need_rows_by_project_column(pg, project_id, window_hours).await
     } else {
         fetch_interaction_need_rows_by_request_meta(pg, project_id, window_hours).await
     }
-}
-
-async fn ff_interactions_has_project_id(pg: &PgPool) -> anyhow::Result<bool> {
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (
-            SELECT 1
-              FROM information_schema.columns
-             WHERE table_schema = current_schema()
-               AND table_name = 'ff_interactions'
-               AND column_name = 'project_id'
-        )",
-    )
-    .fetch_one(pg)
-    .await
-    .context("check ff_interactions.project_id column")
 }
 
 async fn fetch_interaction_need_rows_by_project_column(

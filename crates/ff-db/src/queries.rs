@@ -7796,6 +7796,68 @@ pub async fn pg_record_interaction(pool: &PgPool, r: &InteractionRecord) -> Resu
     Ok(row.get("id"))
 }
 
+/// True when the live interaction log has the optional dedicated project column.
+pub async fn ff_interactions_has_project_id(pool: &PgPool) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+            SELECT 1
+              FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'ff_interactions'
+               AND column_name = 'project_id'
+        )",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Record a project-scoped interaction across both deployed schema variants.
+pub async fn pg_record_project_interaction(
+    pool: &PgPool,
+    project_id: &str,
+    r: &InteractionRecord,
+) -> Result<uuid::Uuid> {
+    if !ff_interactions_has_project_id(pool).await? {
+        let mut record = r.clone();
+        record.request_meta["project_id"] = serde_json::Value::String(project_id.to_string());
+        return pg_record_interaction(pool, &record).await;
+    }
+
+    let row = sqlx::query(
+        "INSERT INTO ff_interactions
+            (session_id, channel, user_id, request_text, request_meta,
+             route_decision, engine, steps, response_text, tokens_in,
+             tokens_out, cost_usd, latency_ms, outcome, error_text,
+             error_signature, ff_build_sha, model_versions, worker_name, endpoint, project_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+         RETURNING id",
+    )
+    .bind(r.session_id)
+    .bind(&r.channel)
+    .bind(r.user_id)
+    .bind(&r.request_text)
+    .bind(&r.request_meta)
+    .bind(&r.route_decision)
+    .bind(&r.engine)
+    .bind(&r.steps)
+    .bind(&r.response_text)
+    .bind(r.tokens_in)
+    .bind(r.tokens_out)
+    .bind(r.cost_usd)
+    .bind(r.latency_ms)
+    .bind(&r.outcome)
+    .bind(&r.error_text)
+    .bind(&r.error_signature)
+    .bind(&r.ff_build_sha)
+    .bind(&r.model_versions)
+    .bind(&r.worker_name)
+    .bind(&r.endpoint)
+    .bind(project_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("id"))
+}
+
 /// Recent interaction-log rows for the live web console, newest first. Optional
 /// `channel` filter. request/response text is truncated server-side to keep the
 /// payload light for a polling UI. Returns ready-to-serialize JSON objects.
