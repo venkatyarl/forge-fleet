@@ -14,6 +14,7 @@ pub mod manager;
 pub mod mirror_service;
 pub mod node_info;
 pub mod offline_mode;
+pub mod oplog_replay;
 pub mod periodic;
 pub mod pg_failover;
 pub mod pipeline_digest;
