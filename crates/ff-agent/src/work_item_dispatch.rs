@@ -3144,8 +3144,17 @@ async fn run_ff_dispatch(
     // pick isn't in this node's dispatchable set.
     let mut policy = ff_routing_policy::PolicyConfig::default();
     const BUILDER_ROTATION: [&str; 3] = ["claude", "codex", "kimi"];
-    let pick =
-        BUILDER_ROTATION[(item.work_item_id.as_u128() % BUILDER_ROTATION.len() as u128) as usize];
+    // Index by item id PLUS attempts: id-only rotation re-picked the SAME
+    // backend on every retry, so an item whose pick failed success-shaped
+    // (e.g. claude "no diff" — exit 0, so the in-loop error failover never
+    // engages) burned its whole attempt budget on one broken backend (22×
+    // "backend claude produced no diff" on the 2026-07-23 requeue wave).
+    // With attempts in the index, each retry fronts the NEXT backend.
+    let rotation_index = item
+        .work_item_id
+        .as_u128()
+        .wrapping_add(item.attempts.max(0) as u128);
+    let pick = BUILDER_ROTATION[(rotation_index % BUILDER_ROTATION.len() as u128) as usize];
     let preferred = if backends.iter().any(|b| b == pick) {
         pick
     } else {
