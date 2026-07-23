@@ -7,7 +7,7 @@
 //!
 //! This module manages the RPC topology and integrates with ff-mesh for node selection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
@@ -60,6 +60,12 @@ pub struct RpcWorkerConfig {
     pub address: String,
     pub port: u16,
     pub memory_gb: u32,
+    /// Zero-based tensor shard exposed by this RPC worker.
+    pub rpc_shard_id: u32,
+    /// Total number of tensor shards in the RPC cluster.
+    pub rpc_shard_count: u32,
+    /// QSFP ring topology passed through to llama.cpp.
+    pub rpc_ring_topology: String,
 }
 
 /// Manage a distributed inference cluster using llama.cpp RPC.
@@ -88,6 +94,38 @@ impl RpcClusterManager {
         let total_memory: u32 = config.workers.iter().map(|w| w.memory_gb).sum();
         if total_memory == 0 {
             anyhow::bail!("Total worker memory is 0");
+        }
+
+        let expected_shard_count = config.workers.len() as u32;
+        let expected_topology = &config.workers[0].rpc_ring_topology;
+        if expected_topology.trim().is_empty() {
+            anyhow::bail!("RPC ring topology must not be empty");
+        }
+
+        let mut shard_ids = HashSet::with_capacity(config.workers.len());
+        for worker in &config.workers {
+            if worker.rpc_shard_count != expected_shard_count {
+                anyhow::bail!(
+                    "RPC worker '{}' shard count {} does not match worker count {}",
+                    worker.worker_name,
+                    worker.rpc_shard_count,
+                    expected_shard_count
+                );
+            }
+            if worker.rpc_shard_id >= worker.rpc_shard_count {
+                anyhow::bail!(
+                    "RPC worker '{}' shard id {} is out of range for {} shards",
+                    worker.worker_name,
+                    worker.rpc_shard_id,
+                    worker.rpc_shard_count
+                );
+            }
+            if !shard_ids.insert(worker.rpc_shard_id) {
+                anyhow::bail!("Duplicate RPC shard id {}", worker.rpc_shard_id);
+            }
+            if worker.rpc_ring_topology != *expected_topology {
+                anyhow::bail!("All RPC workers must use the same ring topology");
+            }
         }
 
         info!(
@@ -169,6 +207,12 @@ impl RpcClusterManager {
             "0.0.0.0".to_string(),
             "--port".to_string(),
             worker.port.to_string(),
+            "--rpc-shard-id".to_string(),
+            worker.rpc_shard_id.to_string(),
+            "--rpc-shard-count".to_string(),
+            worker.rpc_shard_count.to_string(),
+            "--rpc-ring-topology".to_string(),
+            worker.rpc_ring_topology.clone(),
         ])
     }
 
@@ -195,18 +239,27 @@ impl RpcClusterManager {
                     address: "192.168.5.110".into(),
                     port: 50052,
                     memory_gb: 128,
+                    rpc_shard_id: 0,
+                    rpc_shard_count: 3,
+                    rpc_ring_topology: "adele,rihanna,beyonce".into(),
                 },
                 RpcWorkerConfig {
                     worker_name: "rihanna".into(),
                     address: "192.168.5.112".into(),
                     port: 50052,
                     memory_gb: 128,
+                    rpc_shard_id: 1,
+                    rpc_shard_count: 3,
+                    rpc_ring_topology: "adele,rihanna,beyonce".into(),
                 },
                 RpcWorkerConfig {
                     worker_name: "beyonce".into(),
                     address: "192.168.5.114".into(),
                     port: 50052,
                     memory_gb: 128,
+                    rpc_shard_id: 2,
+                    rpc_shard_count: 3,
+                    rpc_ring_topology: "adele,rihanna,beyonce".into(),
                 },
             ],
             model: "/models/Llama-3.1-405B-Instruct-Q4_K_M.gguf".into(),
@@ -229,18 +282,27 @@ impl RpcClusterManager {
                     address: "192.168.5.120".into(),
                     port: 50052,
                     memory_gb: 128,
+                    rpc_shard_id: 0,
+                    rpc_shard_count: 3,
+                    rpc_ring_topology: "evo2,evo3,evo4".into(),
                 },
                 RpcWorkerConfig {
                     worker_name: "evo3".into(),
                     address: "192.168.5.122".into(),
                     port: 50052,
                     memory_gb: 128,
+                    rpc_shard_id: 1,
+                    rpc_shard_count: 3,
+                    rpc_ring_topology: "evo2,evo3,evo4".into(),
                 },
                 RpcWorkerConfig {
                     worker_name: "evo4".into(),
                     address: "192.168.5.124".into(),
                     port: 50052,
                     memory_gb: 128,
+                    rpc_shard_id: 2,
+                    rpc_shard_count: 3,
+                    rpc_ring_topology: "evo2,evo3,evo4".into(),
                 },
             ],
             model: "/models/Qwen3-235B-A22B-Q4_K_M.gguf".into(),
@@ -253,5 +315,90 @@ impl RpcClusterManager {
 impl Default for RpcClusterManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> RpcClusterConfig {
+        RpcClusterConfig {
+            controller: RpcControllerConfig {
+                worker_name: "controller".into(),
+                bind_port: 51000,
+                gpu_layers: 0,
+            },
+            workers: (0..3)
+                .map(|rpc_shard_id| RpcWorkerConfig {
+                    worker_name: format!("worker-{rpc_shard_id}"),
+                    address: format!("10.0.0.{}", rpc_shard_id + 1),
+                    port: 50052,
+                    memory_gb: 128,
+                    rpc_shard_id,
+                    rpc_shard_count: 3,
+                    rpc_ring_topology: "worker-0,worker-1,worker-2".into(),
+                })
+                .collect(),
+            model: "/models/model.gguf".into(),
+            tensor_split: vec![],
+            context_size: 32768,
+        }
+    }
+
+    #[test]
+    fn worker_command_exposes_tensor_shard_flags() {
+        let mut manager = RpcClusterManager::new();
+        manager.configure(test_config()).unwrap();
+
+        assert_eq!(
+            manager.worker_command("worker-1").unwrap(),
+            vec![
+                "rpc-server",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "50052",
+                "--rpc-shard-id",
+                "1",
+                "--rpc-shard-count",
+                "3",
+                "--rpc-ring-topology",
+                "worker-0,worker-1,worker-2",
+            ]
+        );
+    }
+
+    #[test]
+    fn configure_rejects_invalid_shard_topology() {
+        let mut duplicate = test_config();
+        duplicate.workers[1].rpc_shard_id = 0;
+        assert!(
+            RpcClusterManager::new()
+                .configure(duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("Duplicate RPC shard id")
+        );
+
+        let mut wrong_count = test_config();
+        wrong_count.workers[0].rpc_shard_count = 4;
+        assert!(
+            RpcClusterManager::new()
+                .configure(wrong_count)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match worker count")
+        );
+
+        let mut mismatched_ring = test_config();
+        mismatched_ring.workers[2].rpc_ring_topology = "another-ring".into();
+        assert!(
+            RpcClusterManager::new()
+                .configure(mismatched_ring)
+                .unwrap_err()
+                .to_string()
+                .contains("same ring topology")
+        );
     }
 }
