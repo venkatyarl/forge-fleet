@@ -177,8 +177,12 @@ pub const BACKENDS: &[CliBackend] = &[
         // format defaults to text; a trailing "To resume this session:" line may
         // follow the answer and is stripped downstream.
         default_flags: &["-p"],
-        // `-w/--work-dir <dir>` sets the agent's working directory.
-        cwd_mode: CwdMode::Flag("-w"),
+        // kimi 0.28.x REMOVED `-w/--work-dir` (hard error "unknown option
+        // '-w'", reported by the HireFlow360 session 2026-07-23) — the current
+        // CLI reads the process cwd and takes `--add-dir` to widen workspace
+        // access, same shape as claude. The spawn already sets process cwd to
+        // the target dir, so `--add-dir` is belt-and-braces.
+        cwd_mode: CwdMode::Flag("--add-dir"),
         prompt_is_positional: true,
     },
     CliBackend {
