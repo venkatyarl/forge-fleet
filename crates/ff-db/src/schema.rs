@@ -12135,6 +12135,15 @@ CREATE INDEX IF NOT EXISTS idx_notifications_undismissed
     ON notifications (created_at) WHERE NOT is_dismissed;
 "#;
 
+/// Scheduling inputs and cached output for persisted work items.
+pub const SCHEMA_V246_WORK_ITEM_PICK_SCORE: &str = r#"
+ALTER TABLE work_items
+    ADD COLUMN IF NOT EXISTS eisenhower_quadrant TEXT,
+    ADD COLUMN IF NOT EXISTS numeric_priority INT,
+    ADD COLUMN IF NOT EXISTS pick_score DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS blocked_by_count BIGINT NOT NULL DEFAULT 0;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
