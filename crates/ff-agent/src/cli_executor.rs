@@ -93,7 +93,17 @@ pub const BACKENDS: &[CliBackend] = &[
         port: 51100,
         // `-p` runs in print-mode (non-interactive); `--output-format
         // text` keeps stdout free of the agent-loop JSON envelope.
-        default_flags: &["-p", "--output-format", "text"],
+        //
+        // `--dangerously-skip-permissions` is the claude analogue of codex's
+        // `--sandbox danger-full-access` above, added for the SAME disease: in
+        // headless `-p` mode Claude Code auto-DENIES Edit/Write/Bash tool calls
+        // unless the host happens to have permissive user settings, so on
+        // strict nodes a claude BUILD answered in prose while editing NOTHING —
+        // surfacing as "backend produced no diff (no commits)" (12 anonymous
+        // failures, 2026-07-23). Isolation comes from the per-slot clone under
+        // ~/.forgefleet/sub-agents/, not from permission prompts nobody is
+        // there to answer.
+        default_flags: &["-p", "--output-format", "text", "--dangerously-skip-permissions"],
         // Claude Code reads the process cwd; `--add-dir` widens tool access.
         cwd_mode: CwdMode::Flag("--add-dir"),
         prompt_is_positional: true,
