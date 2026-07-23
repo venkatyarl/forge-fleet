@@ -8,12 +8,13 @@
 use std::time::Duration;
 
 use sqlx::PgPool;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
 use tracing::{info, warn};
 
 use ff_core::config::DatabaseConfig;
 use ff_core::db::read_dsn_cache;
 
+use crate::connection::{connection_failed, failover_connection_failed, parse_options};
 use crate::error::{DbError, Result};
 
 /// Create a Postgres connection pool from fleet config, honouring DSN failover.
@@ -35,7 +36,7 @@ pub async fn create_pool_with_dsn_failover(db_config: &DatabaseConfig) -> Result
     };
 
     if !db_config.dsn_failover {
-        return Err(DbError::Pool(static_err.to_string()));
+        return Err(static_err);
     }
 
     // Static DSN dead + failover opted-in: consult the DSN of record.
@@ -44,11 +45,11 @@ pub async fn create_pool_with_dsn_failover(db_config: &DatabaseConfig) -> Result
             "dsn-failover: static DSN unreachable and no DSN-of-record cache present — \
              returning original error"
         );
-        return Err(DbError::Pool(static_err.to_string()));
+        return Err(static_err);
     };
     if record.trim() == static_url {
         // Nothing new to try.
-        return Err(DbError::Pool(static_err.to_string()));
+        return Err(static_err);
     }
 
     warn!("dsn-failover: static DSN unreachable — retrying against cached DSN of record");
@@ -59,23 +60,25 @@ pub async fn create_pool_with_dsn_failover(db_config: &DatabaseConfig) -> Result
         }
         Err(e) => {
             warn!(error = %e, "dsn-failover: DSN-of-record connect also failed");
-            // Surface the ORIGINAL static error — it's the user's configured DSN.
-            Err(DbError::Pool(static_err.to_string()))
+            Err(failover_connection_failed(
+                static_url,
+                &static_err,
+                record.trim(),
+                &e,
+            ))
         }
     }
 }
 
 /// Create a Postgres connection pool from fleet config (no failover).
 pub async fn create_pool(db_config: &DatabaseConfig) -> Result<PgPool> {
-    connect_url(db_config.url.trim(), db_config.max_connections)
-        .await
-        .map_err(|e| DbError::Pool(e.to_string()))
+    connect_url(db_config.url.trim(), db_config.max_connections).await
 }
 
 /// Shared pool builder used by [`create_pool`] and [`create_pool_with_dsn_failover`]
 /// so both paths produce identically-configured pools.
-async fn connect_url(url: &str, max_connections: u32) -> sqlx::Result<PgPool> {
-    let connect_options: PgConnectOptions = url.parse()?;
+async fn connect_url(url: &str, max_connections: u32) -> Result<PgPool> {
+    let connect_options = parse_options(url)?;
     PgPoolOptions::new()
         .max_connections(max_connections.max(2))
         .min_connections(0)
@@ -83,6 +86,7 @@ async fn connect_url(url: &str, max_connections: u32) -> sqlx::Result<PgPool> {
         .max_lifetime(Some(Duration::from_secs(30 * 60)))
         .connect_with(connect_options)
         .await
+        .map_err(|error| connection_failed(url, error))
 }
 
 /// Check if the database is reachable with a simple query.

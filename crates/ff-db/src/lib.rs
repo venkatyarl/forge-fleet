@@ -10,6 +10,7 @@
 
 use uuid::Uuid;
 
+mod connection;
 pub mod dsn_of_record;
 pub mod leader_state;
 pub mod metrics_partitions;
@@ -309,6 +310,23 @@ pub mod error {
 
         #[error("connection pool error: {0}")]
         Pool(String),
+
+        #[error("invalid database connection URL: {reason}")]
+        InvalidConnectionUrl { reason: String },
+
+        #[error("database connection to {endpoint} failed: {reason}")]
+        ConnectionFailed { endpoint: String, reason: String },
+
+        #[error(
+            "database connection failed for primary {primary_endpoint} ({primary_reason}) and \
+             failover {failover_endpoint} ({failover_reason})"
+        )]
+        FailoverConnectionFailed {
+            primary_endpoint: String,
+            primary_reason: String,
+            failover_endpoint: String,
+            failover_reason: String,
+        },
 
         #[error("Postgres error: {0}")]
         Postgres(#[from] sqlx::Error),
