@@ -301,7 +301,7 @@ async fn try_assign_item(
             }
         }
     } else {
-        pop_slot(pool, viable, fallback_assigns)
+        pop_slot(pool, viable, fallback_assigns, &item.project_locations)
     };
     let Some(slot) = slot else { return false };
 
@@ -404,7 +404,19 @@ fn pop_slot(
     pool: &mut Vec<ff_db::FreeSlot>,
     viable: &std::collections::HashSet<uuid::Uuid>,
     fallback_assigns: &mut usize,
+    project_locations: &[String],
 ) -> Option<ff_db::FreeSlot> {
+    if let Some(idx) = pool.iter().position(|s| {
+        slot_matches_project_locations(s, project_locations) && viable.contains(&s.computer_id)
+    }) {
+        return Some(pool.remove(idx));
+    }
+    if let Some(idx) = pool
+        .iter()
+        .position(|s| slot_matches_project_locations(s, project_locations))
+    {
+        return Some(pool.remove(idx));
+    }
     if let Some(idx) = pool.iter().position(|s| viable.contains(&s.computer_id)) {
         return Some(pool.remove(idx));
     }
@@ -414,6 +426,16 @@ fn pop_slot(
         *fallback_assigns += 1;
     }
     slot
+}
+
+fn slot_matches_project_locations(slot: &ff_db::FreeSlot, project_locations: &[String]) -> bool {
+    project_locations.iter().any(|location| {
+        let location = location.trim();
+        !location.is_empty()
+            && (location == slot.workspace_dir
+                || location == slot.computer_name
+                || slot.workspace_dir.ends_with(location))
+    })
 }
 
 /// Round-robin the ready list across projects, preserving each project's
@@ -486,6 +508,17 @@ mod tests {
         ff_db::FreeSlot {
             sub_agent_id: uuid::Uuid::new_v4(),
             computer_id: computer,
+            computer_name: computer.to_string(),
+            workspace_dir: String::new(),
+        }
+    }
+
+    fn named_slot(computer: uuid::Uuid, name: &str, workspace_dir: &str) -> ff_db::FreeSlot {
+        ff_db::FreeSlot {
+            sub_agent_id: uuid::Uuid::new_v4(),
+            computer_id: computer,
+            computer_name: name.to_string(),
+            workspace_dir: workspace_dir.to_string(),
         }
     }
 
@@ -494,6 +527,8 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             assigned_computer: None,
             project_id: project.map(str::to_owned),
+            project_locations: Vec::new(),
+            vault_realm: None,
         }
     }
 
@@ -613,10 +648,32 @@ mod tests {
         let mut pool = vec![slot(live), slot(dead)];
         let viable: std::collections::HashSet<_> = [live].into_iter().collect();
         let mut fb = 0;
-        let picked = pop_slot(&mut pool, &viable, &mut fb).unwrap();
+        let picked = pop_slot(&mut pool, &viable, &mut fb, &[]).unwrap();
         assert_eq!(picked.computer_id, live, "must pick the live-endpoint node");
         assert_eq!(fb, 0, "a viable pick is not a fallback");
         assert_eq!(pool.len(), 1, "exactly one slot consumed");
+    }
+
+    #[test]
+    fn pop_slot_prefers_project_config_locations() {
+        let generic = uuid::Uuid::new_v4();
+        let project_host = uuid::Uuid::new_v4();
+        let mut pool = vec![
+            named_slot(generic, "generic", "/tmp/other"),
+            named_slot(project_host, "taylor", "/home/sia/projects/forge-fleet"),
+        ];
+        let viable: std::collections::HashSet<_> = [generic, project_host].into_iter().collect();
+        let locations = vec![
+            "git@github.com-venkat:venkatyarl/forge-fleet.git".to_string(),
+            "/home/sia/projects/forge-fleet".to_string(),
+            "taylor".to_string(),
+        ];
+        let mut fb = 0;
+
+        let picked = pop_slot(&mut pool, &viable, &mut fb, &locations).unwrap();
+
+        assert_eq!(picked.computer_id, project_host);
+        assert_eq!(fb, 0);
     }
 
     /// Safety: when NO slot is agent-viable (e.g. rows stale right after a
@@ -628,11 +685,11 @@ mod tests {
         let mut pool = vec![slot(a), slot(b)];
         let viable = std::collections::HashSet::new();
         let mut fb = 0;
-        assert!(pop_slot(&mut pool, &viable, &mut fb).is_some());
+        assert!(pop_slot(&mut pool, &viable, &mut fb, &[]).is_some());
         assert_eq!(fb, 1, "fallback assignment must be counted, not silent");
         // Empty pool yields None without bumping the fallback counter.
         let mut empty: Vec<ff_db::FreeSlot> = vec![];
-        assert!(pop_slot(&mut empty, &viable, &mut fb).is_none());
+        assert!(pop_slot(&mut empty, &viable, &mut fb, &[]).is_none());
         assert_eq!(fb, 1);
     }
 
