@@ -19,7 +19,7 @@ pub const MAX_BUILD_DURATION_ENV: &str = "FORGEFLEET_MAX_BUILD_DURATION_SECS";
 
 /// Default backend used when a build doesn't route one explicitly.
 /// `claude` is intentionally NOT the default build backend.
-pub const DEFAULT_BUILD_BACKEND: &str = "codex";
+pub const DEFAULT_BUILD_BACKEND: &str = "kimi";
 
 /// Backends build work may be dispatched to. Names match
 /// `ff_agent::cli_executor::BACKENDS` plus `local` (the local-lane agent
