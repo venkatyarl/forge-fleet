@@ -106,7 +106,7 @@ export function DockerPanel() {
                   <span className="text-base font-semibold text-zinc-100">
                     {p.project_name}
                   </span>
-                  <span className="rounded bg-zinc-800 px-2 py-0.5 text-[11px] text-zinc-400">
+                  <span className="rounded-sm bg-zinc-800 px-2 py-0.5 text-[11px] text-zinc-400">
                     {p.running_count}/{p.container_count} up
                   </span>
                 </div>

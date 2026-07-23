@@ -240,7 +240,7 @@ function Field({ label, value }: { label: string; value: ReactNode }) {
   return (
     <div className="min-w-0 rounded-lg border border-border bg-surface px-3 py-2">
       <div className="text-xs text-dim">{label}</div>
-      <div className="mt-1 min-w-0 break-words text-sm text-muted">
+      <div className="mt-1 min-w-0 wrap-break-word text-sm text-muted">
         {typeof value === 'string' || value == null ? display : value}
       </div>
     </div>

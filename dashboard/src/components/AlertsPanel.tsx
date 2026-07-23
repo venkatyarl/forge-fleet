@@ -143,7 +143,7 @@ export function AlertsPanel() {
                   </p>
                 </div>
                 {e.channel_result && (
-                  <span className="rounded bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-400">
+                  <span className="rounded-sm bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-400">
                     {e.channel_result}
                   </span>
                 )}

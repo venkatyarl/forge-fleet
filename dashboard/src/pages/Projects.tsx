@@ -101,10 +101,10 @@ const OPERATING_STAGES: OperatingStage[] = [
 ]
 
 const fieldClass =
-  'w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-dim focus:border-primary disabled:cursor-not-allowed disabled:opacity-60'
+  'w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground outline-hidden transition placeholder:text-dim focus:border-primary disabled:cursor-not-allowed disabled:opacity-60'
 
 const compactFieldClass =
-  'rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none transition focus:border-primary'
+  'rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground outline-hidden transition focus:border-primary'
 
 function asStatus(value: string): PortfolioStatus {
   return PORTFOLIO_STATUSES.includes(value as PortfolioStatus) ? (value as PortfolioStatus) : 'active'

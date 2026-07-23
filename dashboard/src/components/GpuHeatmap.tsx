@@ -32,7 +32,7 @@ export const GpuHeatmap: React.FC<GpuHeatmapProps> = ({ nodes }) => {
           return (
             <div
               key={n.name}
-              className="rounded p-2 text-xs text-black font-medium"
+              className="rounded-sm p-2 text-xs text-black font-medium"
               style={{ backgroundColor: heatColor(n.gpu_util) }}
               title={`${n.name}: ${n.gpu_util}% GPU, ${n.vram_used_gb.toFixed(1)}/${n.vram_total_gb}GB VRAM, ${n.temp_c}°C`}
             >

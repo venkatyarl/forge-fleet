@@ -19,5 +19,15 @@ export default defineConfig([
       ecmaVersion: 2020,
       globals: globals.browser,
     },
+    rules: {
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        { argsIgnorePattern: '^_', varsIgnorePattern: '^_', caughtErrorsIgnorePattern: '^_' },
+      ],
+      // react-hooks v7 promotes this React Compiler diagnostic to an error;
+      // the existing fetch-then-setState effects predate it. Keep it visible
+      // as a warning until those effects are migrated to event/query patterns.
+      'react-hooks/set-state-in-effect': 'warn',
+    },
   },
 ])

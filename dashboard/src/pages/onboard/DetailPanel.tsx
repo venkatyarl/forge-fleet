@@ -100,7 +100,7 @@ function renderInline(s: string): React.ReactNode {
       parts.push(
         <code
           key={parts.length}
-          className="rounded bg-elevated px-1 py-0.5 font-mono text-[13px] text-primary"
+          className="rounded-sm bg-elevated px-1 py-0.5 font-mono text-[13px] text-primary"
         >
           {tok.slice(1, -1)}
         </code>

@@ -190,7 +190,7 @@ export function FleetOverview() {
       {errorMessage ? (
         <Card className="border-border bg-panel">
           <div className="flex items-start gap-3 text-sm text-status-crit">
-            <ShieldAlert className="mt-0.5 h-4 w-4 flex-shrink-0" />
+            <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
             <span>{errorMessage}</span>
           </div>
         </Card>
@@ -271,7 +271,7 @@ function FleetNodeCard({ node }: { node: FleetComputer }) {
   const statusTone = toneForNodeStatus(status)
 
   return (
-    <Link to={`/nodes/${nodeId}`} className="group block rounded-xl focus-visible:outline-none">
+    <Link to={`/nodes/${nodeId}`} className="group block rounded-xl focus-visible:outline-hidden">
       <Card className="h-full bg-panel transition group-hover:border-border-subtle group-hover:bg-elevated">
         <CardHeader className="items-start gap-3">
           <div className="min-w-0">
@@ -281,7 +281,7 @@ function FleetNodeCard({ node }: { node: FleetComputer }) {
               <span className="truncate">{node.ip ?? node.hostname ?? 'unknown endpoint'}</span>
             </CardDescription>
           </div>
-          <span className={cn('mt-1 h-2.5 w-2.5 flex-shrink-0 rounded-full bg-current', statusDotClass(statusTone))} />
+          <span className={cn('mt-1 h-2.5 w-2.5 shrink-0 rounded-full bg-current', statusDotClass(statusTone))} />
         </CardHeader>
 
         <div className="flex flex-wrap gap-1.5">
@@ -353,9 +353,9 @@ function EmptyFleetState({ onPrimary }: { onPrimary: () => void }) {
 function MetricSkeleton() {
   return (
     <Card className="bg-panel">
-      <div className="mb-3 h-3 w-24 animate-pulse rounded bg-elevated" />
-      <div className="h-8 w-20 animate-pulse rounded bg-elevated" />
-      <div className="mt-3 h-3 w-32 animate-pulse rounded bg-elevated" />
+      <div className="mb-3 h-3 w-24 animate-pulse rounded-sm bg-elevated" />
+      <div className="h-8 w-20 animate-pulse rounded-sm bg-elevated" />
+      <div className="mt-3 h-3 w-32 animate-pulse rounded-sm bg-elevated" />
     </Card>
   )
 }
@@ -365,16 +365,16 @@ function NodeSkeleton() {
     <Card className="space-y-4 bg-panel">
       <div className="flex justify-between gap-3">
         <div className="space-y-2">
-          <div className="h-4 w-36 animate-pulse rounded bg-elevated" />
-          <div className="h-3 w-28 animate-pulse rounded bg-elevated" />
+          <div className="h-4 w-36 animate-pulse rounded-sm bg-elevated" />
+          <div className="h-3 w-28 animate-pulse rounded-sm bg-elevated" />
         </div>
         <div className="h-2.5 w-2.5 animate-pulse rounded-full bg-elevated" />
       </div>
       <div className="grid grid-cols-2 gap-3">
         {[1, 2, 3, 4].map((item) => (
           <div key={item} className="space-y-2">
-            <div className="h-3 w-16 animate-pulse rounded bg-elevated" />
-            <div className="h-4 w-24 animate-pulse rounded bg-elevated" />
+            <div className="h-3 w-16 animate-pulse rounded-sm bg-elevated" />
+            <div className="h-4 w-24 animate-pulse rounded-sm bg-elevated" />
           </div>
         ))}
       </div>

@@ -326,7 +326,7 @@ function FleetMemberRow({ member, onClick }: { member: FleetComputer; onClick: (
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <span className={cn(
-            'h-2.5 w-2.5 flex-shrink-0 rounded-full',
+            'h-2.5 w-2.5 shrink-0 rounded-full',
             status === 'online' ? 'bg-status-ok' : status === 'degraded' ? 'bg-status-warn' : 'bg-border-subtle'
           )} />
           <div>
@@ -404,7 +404,7 @@ function MemoryTab() {
           <Row label="FORGEFLEET.md" value={p?.has_forgefleet_md ? 'yes' : 'no'} />
           <Row label="context.md" value={p?.has_context_md ? 'yes' : 'no'} />
           <div className="mt-3 text-xs text-muted">
-            Lives at <code className="rounded bg-primary-subtle px-1 text-primary">{'{'}project{'}'}.forgefleet/</code> — committed to git, travels with code.
+            Lives at <code className="rounded-sm bg-primary-subtle px-1 text-primary">{'{'}project{'}'}.forgefleet/</code> — committed to git, travels with code.
           </div>
         </SettingsCard>
 
@@ -417,7 +417,7 @@ function MemoryTab() {
           <Row label="BRAIN.md" value={b?.has_brain_md ? 'yes' : 'no'} />
           <Row label="Entries" value={b?.entries ?? 0} />
           <div className="mt-3 text-xs text-muted">
-            Personal preferences at <code className="rounded bg-primary-subtle px-1 text-primary">~/.forgefleet/brain/</code> — never synced to other fleet members.
+            Personal preferences at <code className="rounded-sm bg-primary-subtle px-1 text-primary">~/.forgefleet/brain/</code> — never synced to other fleet members.
           </div>
         </SettingsCard>
 
@@ -430,7 +430,7 @@ function MemoryTab() {
           <Row label="HIVE.md" value={h?.has_hive_md ? 'yes' : 'no'} />
           <Row label="Entries" value={h?.entries ?? 0} />
           <div className="mt-3 text-xs text-muted">
-            Shared standards at <code className="rounded bg-primary-subtle px-1 text-primary">~/.forgefleet/hive/</code> — synced across all fleet members via git.
+            Shared standards at <code className="rounded-sm bg-primary-subtle px-1 text-primary">~/.forgefleet/hive/</code> — synced across all fleet members via git.
           </div>
         </SettingsCard>
       </div>

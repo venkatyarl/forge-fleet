@@ -22,6 +22,7 @@ const TONES: Record<StatusTone, string> = {
 
 // Map common raw status strings to a tone. Panels may pass an explicit
 // `tone` prop if their mapping differs; otherwise we infer from the label.
+// eslint-disable-next-line react-refresh/only-export-components -- shared helper lives with the badge components; moving it would churn every importer
 export function toneFor(status: string | null | undefined): StatusTone {
   const s = (status ?? '').toLowerCase()
   if (!s) return 'neutral'

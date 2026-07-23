@@ -91,7 +91,7 @@ export function Pulse() {
                     'border-primary/40 bg-primary-subtle text-primary shadow-glow hover:bg-primary-subtle hover:text-primary'
                 )}
               >
-                <Icon className="h-4 w-4 flex-shrink-0" />
+                <Icon className="h-4 w-4 shrink-0" />
                 <span className="min-w-0">
                   <span className="block truncate text-sm font-medium">{t.label}</span>
                   <span className="block truncate text-2xs font-normal text-dim">

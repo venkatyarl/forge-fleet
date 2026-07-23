@@ -116,7 +116,7 @@ function ThreadSidebar({
   }, [threads, searchQuery])
 
   return (
-    <aside className="flex h-full w-72 flex-shrink-0 flex-col border-r border-border bg-surface">
+    <aside className="flex h-full w-72 shrink-0 flex-col border-r border-border bg-surface">
       <div className="border-b border-border p-3">
         <CardHeader className="mb-3">
           <div>
@@ -135,7 +135,7 @@ function ThreadSidebar({
             value={searchQuery}
             onChange={(e) => onSearchChange(e.target.value)}
             placeholder="Search threads..."
-            className="h-9 w-full rounded-lg border border-border bg-panel pl-8 pr-3 text-sm text-foreground placeholder:text-dim outline-none transition focus:border-primary"
+            className="h-9 w-full rounded-lg border border-border bg-panel pl-8 pr-3 text-sm text-foreground placeholder:text-dim outline-hidden transition focus:border-primary"
           />
         </label>
       </div>
@@ -166,10 +166,10 @@ function ThreadSidebar({
                         : 'border-transparent text-muted hover:border-border hover:bg-panel hover:text-foreground',
                     )}
                   >
-                    <MessageSquare className="h-3.5 w-3.5 flex-shrink-0 text-dim" />
+                    <MessageSquare className="h-3.5 w-3.5 shrink-0 text-dim" />
                     <span className="min-w-0 flex-1 truncate text-sm">{t.title}</span>
                     <StatusBadge status={t.status} />
-                    <span className="flex-shrink-0 text-2xs text-dim">
+                    <span className="shrink-0 text-2xs text-dim">
                       {relTime(t.last_message_at)}
                     </span>
                   </button>
@@ -255,7 +255,7 @@ function ChatPanel({
           <div
             key={m.id}
             className={cn(
-              'max-w-[82%] rounded-xl border px-3 py-2 text-sm shadow-sm',
+              'max-w-[82%] rounded-xl border px-3 py-2 text-sm shadow-xs',
               messageTone(m.role),
             )}
           >
@@ -278,7 +278,7 @@ function ChatPanel({
             onKeyDown={onKeyDown}
             placeholder="Send a message..."
             rows={1}
-            className="min-h-9 flex-1 resize-none bg-transparent px-2 py-2 text-sm text-foreground placeholder:text-dim outline-none"
+            className="min-h-9 flex-1 resize-none bg-transparent px-2 py-2 text-sm text-foreground placeholder:text-dim outline-hidden"
           />
           <Button onClick={send} disabled={sending || !input.trim()} className="self-end">
             <Send className="h-4 w-4" />
@@ -325,7 +325,7 @@ function RightPanel({
   }, [project])
 
   return (
-    <aside className="flex h-full w-80 flex-shrink-0 flex-col gap-3 overflow-y-auto border-l border-border bg-surface p-3">
+    <aside className="flex h-full w-80 shrink-0 flex-col gap-3 overflow-y-auto border-l border-border bg-surface p-3">
       <Card className="bg-panel">
         <CardHeader>
           <div>
@@ -346,7 +346,7 @@ function RightPanel({
               return (
                 <li key={i} className="rounded-lg border border-border bg-surface p-2">
                   <div className="flex items-start gap-2 text-sm text-foreground">
-                    <span className="mt-1 h-1.5 w-1.5 flex-shrink-0 rounded-full bg-primary" />
+                    <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />
                     <span className="min-w-0 flex-1 truncate">{it.title}</span>
                   </div>
                   {it.context && <p className="mt-1 truncate text-xs text-dim">{it.context}</p>}
@@ -436,7 +436,7 @@ function FuzzyPicker({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center bg-background/70 pt-[15vh] backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-start justify-center bg-background/70 pt-[15vh] backdrop-blur-xs"
       onClick={onClose}
     >
       <div
@@ -451,7 +451,7 @@ function FuzzyPicker({
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={onKeyDown}
             placeholder="Jump to thread..."
-            className="w-full bg-transparent py-3 pl-10 pr-4 text-sm text-foreground placeholder:text-dim outline-none"
+            className="w-full bg-transparent py-3 pl-10 pr-4 text-sm text-foreground placeholder:text-dim outline-hidden"
           />
         </label>
         <div className="max-h-64 overflow-y-auto">
@@ -461,7 +461,7 @@ function FuzzyPicker({
               onClick={() => onSelect(t.slug)}
               className="flex w-full items-center gap-3 px-4 py-2.5 text-left text-sm text-muted transition hover:bg-surface hover:text-foreground"
             >
-              <MessageSquare className="h-3.5 w-3.5 flex-shrink-0 text-dim" />
+              <MessageSquare className="h-3.5 w-3.5 shrink-0 text-dim" />
               <span className="min-w-0 flex-1 truncate">{t.title}</span>
               <Badge variant="neutral">{t.project}</Badge>
             </button>

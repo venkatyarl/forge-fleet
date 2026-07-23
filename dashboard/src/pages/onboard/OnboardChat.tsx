@@ -123,7 +123,7 @@ export function OnboardChat({ nodeName, osFamily, machineKind }: Props) {
           onKeyDown={onKey}
           rows={2}
           placeholder="Ask a question... (Enter to send, Shift+Enter for newline)"
-          className="w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-dim focus:border-primary"
+          className="w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground outline-hidden transition placeholder:text-dim focus:border-primary"
         />
         <div className="flex justify-end">
           <Button onClick={send} disabled={busy || input.trim() === ''} size="sm">

@@ -76,7 +76,7 @@ const STATUS_FILTERS: Array<{ value: ''; label: 'All statuses' } | { value: Work
 const REVIEW_STATUSES: ReviewStatus[] = ['pending', 'in_progress', 'approved', 'changes_requested']
 
 const fieldClass =
-  'w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-dim focus:border-primary disabled:cursor-not-allowed disabled:opacity-60'
+  'w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground outline-hidden transition placeholder:text-dim focus:border-primary disabled:cursor-not-allowed disabled:opacity-60'
 
 const rowClass = 'rounded-lg border border-border bg-surface'
 

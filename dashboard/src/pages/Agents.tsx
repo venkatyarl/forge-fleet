@@ -99,7 +99,7 @@ export function Agents() {
       try {
         const payload = await getJson<DetailPayload>(`/api/agent/session/${selectedId}/status`)
         if (!cancelled) setDetail(payload)
-      } catch (err) {
+      } catch {
         if (!cancelled) setDetail(null)
       } finally {
         if (!cancelled) setDetailLoading(false)
@@ -421,4 +421,4 @@ function DetailRow({ label, value }: { label: string; value: string }) {
 }
 
 const fieldClass =
-  'min-h-9 w-full rounded-lg border border-border bg-elevated px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-dim focus:border-primary disabled:cursor-not-allowed disabled:opacity-60'
+  'min-h-9 w-full rounded-lg border border-border bg-elevated px-3 py-2 text-sm text-foreground outline-hidden transition placeholder:text-dim focus:border-primary disabled:cursor-not-allowed disabled:opacity-60'

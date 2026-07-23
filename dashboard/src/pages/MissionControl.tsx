@@ -149,7 +149,7 @@ export function MissionControl() {
                     className="flex items-center gap-3 rounded-lg border border-border bg-surface p-3 transition hover:border-border-subtle"
                   >
                     <span
-                      className={`h-2 w-2 flex-shrink-0 rounded-full ${
+                      className={`h-2 w-2 shrink-0 rounded-full ${
                         node.status === 'online' || node.status === 'connected'
                           ? 'bg-status-ok'
                           : 'bg-dim'

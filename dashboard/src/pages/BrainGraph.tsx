@@ -136,8 +136,8 @@ function stepSimulation(
     for (let j = i + 1; j < simNodes.length; j++) {
       const a = simNodes[i]
       const b = simNodes[j]
-      let dx = a.x - b.x
-      let dy = a.y - b.y
+      const dx = a.x - b.x
+      const dy = a.y - b.y
       let dist = Math.sqrt(dx * dx + dy * dy)
       if (dist < 1) dist = 1
       const force = REPULSION / (dist * dist)
@@ -155,8 +155,8 @@ function stepSimulation(
     const a = nodeMap.get(e.src_id)
     const b = nodeMap.get(e.dst_id)
     if (!a || !b) continue
-    let dx = b.x - a.x
-    let dy = b.y - a.y
+    const dx = b.x - a.x
+    const dy = b.y - a.y
     let dist = Math.sqrt(dx * dx + dy * dy)
     if (dist < 1) dist = 1
     const displacement = dist - SPRING_REST
@@ -323,7 +323,7 @@ function DetailPanel({
   }
 
   return (
-    <Card className="absolute inset-x-3 top-3 z-20 max-h-[calc(100%-1.5rem)] overflow-y-auto border-border-subtle bg-panel/95 shadow-xl backdrop-blur sm:left-auto sm:right-4 sm:top-4 sm:w-96">
+    <Card className="absolute inset-x-3 top-3 z-20 max-h-[calc(100%-1.5rem)] overflow-y-auto border-border-subtle bg-panel/95 shadow-xl backdrop-blur-sm sm:left-auto sm:right-4 sm:top-4 sm:w-96">
       <CardHeader className="mb-4 items-start gap-3">
         <div className="min-w-0">
           <CardTitle className="truncate">{node.title}</CardTitle>
@@ -345,7 +345,7 @@ function DetailPanel({
           {community ? (
             <span className="inline-flex min-w-0 items-center gap-2 text-muted">
               <span
-                className="h-2 w-2 flex-shrink-0 rounded-full"
+                className="h-2 w-2 shrink-0 rounded-full"
                 style={{ backgroundColor: community.color }}
               />
               <span className="truncate">{community.label}</span>
@@ -655,7 +655,7 @@ export function BrainGraph() {
                 onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder="Search nodes..."
                 className={cn(
-                  'h-9 w-full rounded-lg border bg-panel px-3 text-sm text-foreground outline-none transition placeholder:text-dim focus:border-primary',
+                  'h-9 w-full rounded-lg border bg-panel px-3 text-sm text-foreground outline-hidden transition placeholder:text-dim focus:border-primary',
                   searchQuery ? 'border-border-subtle' : 'border-border'
                 )}
               />
@@ -689,7 +689,7 @@ export function BrainGraph() {
 
         <div
           ref={containerRef}
-          className="relative min-h-[520px] flex-1 bg-background bg-[radial-gradient(circle_at_1px_1px,var(--color-border)_1px,transparent_0)] [background-size:24px_24px]"
+          className="relative min-h-[520px] flex-1 bg-background bg-[radial-gradient(circle_at_1px_1px,var(--color-border)_1px,transparent_0)] bg-size-[24px_24px]"
         >
           <canvas
             ref={canvasRef}

@@ -347,7 +347,7 @@ export function Metrics() {
             .filter((n) => n.gpu && n.gpu !== 'unknown')
             .map((n) => ({
               name: n.name,
-              gpu_util: n.current_workload?.gpu_util ?? Math.random() * 60,
+              gpu_util: n.current_workload?.gpu_util ?? 0,
               vram_used_gb: n.current_workload?.vram_used_gb ?? 4,
               vram_total_gb: n.current_workload?.vram_total_gb ?? 24,
               temp_c: n.current_workload?.gpu_temp_c ?? 55,

@@ -159,7 +159,7 @@ export function FleetOverviewPanel() {
             return (
               <article
                 key={c.id}
-                className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4 shadow-sm"
+                className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4 shadow-xs"
               >
                 <div className="mb-3 flex items-center justify-between">
                   <div className="flex items-center gap-2">

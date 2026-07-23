@@ -195,7 +195,7 @@ function TopologyNodeCard({ node, emphasis }: { node: FleetComputer; emphasis: '
           <CardTitle className="truncate text-base">{node.name}</CardTitle>
           <CardDescription className="mt-1 truncate">{node.ip ?? node.hostname ?? 'unknown endpoint'}</CardDescription>
         </div>
-        <span className={cn('mt-1 h-2.5 w-2.5 flex-shrink-0 rounded-full', statusDotClass(toneForStatus(status)))} />
+        <span className={cn('mt-1 h-2.5 w-2.5 shrink-0 rounded-full', statusDotClass(toneForStatus(status)))} />
       </CardHeader>
 
       <div className="flex flex-wrap gap-1.5">
@@ -277,8 +277,8 @@ function EmptyState({ message }: { message: string }) {
 function StatSkeleton() {
   return (
     <Card className="bg-panel">
-      <div className="h-3 w-24 animate-pulse rounded bg-elevated" />
-      <div className="mt-3 h-6 w-16 animate-pulse rounded bg-elevated" />
+      <div className="h-3 w-24 animate-pulse rounded-sm bg-elevated" />
+      <div className="mt-3 h-6 w-16 animate-pulse rounded-sm bg-elevated" />
     </Card>
   )
 }
@@ -290,16 +290,16 @@ function TopologySkeleton() {
         <Card key={item} className="space-y-4 bg-panel">
           <div className="flex items-start justify-between gap-3">
             <div className="space-y-2">
-              <div className="h-4 w-36 animate-pulse rounded bg-elevated" />
-              <div className="h-3 w-28 animate-pulse rounded bg-elevated" />
+              <div className="h-4 w-36 animate-pulse rounded-sm bg-elevated" />
+              <div className="h-3 w-28 animate-pulse rounded-sm bg-elevated" />
             </div>
             <div className="h-2.5 w-2.5 animate-pulse rounded-full bg-elevated" />
           </div>
           <div className="grid grid-cols-2 gap-3">
             {[1, 2, 3, 4].map((field) => (
               <div key={field} className="space-y-2">
-                <div className="h-3 w-16 animate-pulse rounded bg-elevated" />
-                <div className="h-4 w-24 animate-pulse rounded bg-elevated" />
+                <div className="h-3 w-16 animate-pulse rounded-sm bg-elevated" />
+                <div className="h-4 w-24 animate-pulse rounded-sm bg-elevated" />
               </div>
             ))}
           </div>

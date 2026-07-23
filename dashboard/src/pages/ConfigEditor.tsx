@@ -158,7 +158,7 @@ export function ConfigEditor() {
         </CardHeader>
         <textarea
           aria-label="fleet.toml contents"
-          className="min-h-[520px] w-full resize-y border-0 bg-background p-4 font-mono text-sm leading-6 text-foreground outline-none placeholder:text-dim focus:ring-2 focus:ring-primary"
+          className="min-h-[520px] w-full resize-y border-0 bg-background p-4 font-mono text-sm leading-6 text-foreground outline-hidden placeholder:text-dim focus:ring-2 focus:ring-primary"
           value={content}
           onChange={(event) => setContent(event.target.value)}
           spellCheck={false}
