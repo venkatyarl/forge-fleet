@@ -474,6 +474,7 @@ impl GatewayServer {
     }
 
     pub async fn run(mut self) -> anyhow::Result<()> {
+        let bridge_handles = crate::cli_bridge::spawn_all_bridges();
         let listener = TcpListener::bind(&self.config.bind_addr)
             .await
             .with_context(|| format!("failed to bind ff-gateway on {}", self.config.bind_addr))?;
@@ -498,6 +499,9 @@ impl GatewayServer {
             let _ = tx.send(true);
         }
         heartbeat_handle.abort();
+        for handle in bridge_handles {
+            handle.abort();
+        }
         if let Some(flush_handle) = self.flush_handle.take() {
             let _ = tokio::time::timeout(Duration::from_secs(5), flush_handle).await;
         }
