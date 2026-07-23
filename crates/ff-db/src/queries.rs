@@ -8215,6 +8215,8 @@ pub struct ReadyWorkItem {
     pub id: uuid::Uuid,
     pub assigned_computer: Option<String>,
     pub project_id: Option<String>,
+    pub project_locations: Vec<String>,
+    pub vault_realm: Option<String>,
 }
 
 /// A free fleet slot (no active lease / not running a work_item).
@@ -8222,6 +8224,8 @@ pub struct ReadyWorkItem {
 pub struct FreeSlot {
     pub sub_agent_id: uuid::Uuid,
     pub computer_id: uuid::Uuid,
+    pub computer_name: String,
+    pub workspace_dir: String,
 }
 
 #[derive(Debug, Clone)]
@@ -8678,15 +8682,17 @@ pub async fn pg_maintain_computer_metrics_history(pool: &PgPool) -> Result<(u64,
 /// excluded. NULL project_id groups as its own bucket.
 pub async fn pg_ready_work_items(pool: &PgPool, limit: i64) -> Result<Vec<ReadyWorkItem>> {
     let rows = sqlx::query(
-        "SELECT id, assigned_computer, project_id
+        "SELECT id, assigned_computer, project_id, config_json
            FROM (
                 SELECT w.id, w.assigned_computer, w.project_id,
+                       COALESCE(p.config, '{}'::jsonb) AS config_json,
                        w.risk_score, w.created_at,
                        ROW_NUMBER() OVER (
                            PARTITION BY w.project_id
                            ORDER BY w.risk_score DESC, w.created_at ASC
                        ) AS project_rank
                   FROM work_items w
+                  LEFT JOIN projects p ON p.id = w.project_id
                  WHERE w.status = 'ready'
                    AND w.kind = 'task'
                    AND NOT EXISTS (
@@ -8714,12 +8720,85 @@ pub async fn pg_ready_work_items(pool: &PgPool, limit: i64) -> Result<Vec<ReadyW
             id: r.get("id"),
             assigned_computer: r.try_get("assigned_computer").ok().flatten(),
             project_id: r.try_get("project_id").ok().flatten(),
+            project_locations: project_locations_from_config_json(
+                &r.try_get("config_json").unwrap_or(serde_json::Value::Null),
+            ),
+            vault_realm: vault_realm_from_config_json(
+                &r.try_get("config_json").unwrap_or(serde_json::Value::Null),
+            ),
         })
         .collect();
     if !items.is_empty() {
         info!(count = items.len(), limit, "fetched ready work_items");
     }
     Ok(items)
+}
+
+fn project_locations_from_config_json(config_json: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    extend_json_string_list(config_json.get("paths"), &["path"], &mut out);
+    extend_json_string_list(
+        config_json.get("repos"),
+        &["repo", "repo_url", "url"],
+        &mut out,
+    );
+    extend_json_string_list(
+        config_json.get("targets"),
+        &["target", "name", "id"],
+        &mut out,
+    );
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn vault_realm_from_config_json(config_json: &serde_json::Value) -> Option<String> {
+    config_json
+        .get("vault_realm")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+fn extend_json_string_list(
+    value: Option<&serde_json::Value>,
+    object_keys: &[&str],
+    out: &mut Vec<String>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                push_json_string(item, object_keys, out);
+            }
+        }
+        other => push_json_string(other, object_keys, out),
+    }
+}
+
+fn push_json_string(value: &serde_json::Value, object_keys: &[&str], out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => push_trimmed(s, out),
+        serde_json::Value::Object(map) => {
+            for key in object_keys {
+                if let Some(s) = map.get(*key).and_then(serde_json::Value::as_str) {
+                    push_trimmed(s, out);
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn push_trimmed(s: &str, out: &mut Vec<String>) {
+    let s = s.trim();
+    if !s.is_empty() {
+        out.push(s.to_owned());
+    }
 }
 
 /// Ready parent items cannot enter the lease scheduler, which intentionally
@@ -8795,7 +8874,7 @@ pub async fn pg_free_slots(
     limit: i64,
 ) -> Result<Vec<FreeSlot>> {
     let rows = sqlx::query(
-        "SELECT sa.id AS sub_agent_id, sa.computer_id
+        "SELECT sa.id AS sub_agent_id, sa.computer_id, c.name AS computer_name, sa.workspace_dir
            FROM sub_agents sa
            JOIN computers c ON c.id = sa.computer_id
           WHERE sa.current_work_item_id IS NULL
@@ -8831,6 +8910,8 @@ pub async fn pg_free_slots(
         .map(|r| FreeSlot {
             sub_agent_id: r.get("sub_agent_id"),
             computer_id: r.get("computer_id"),
+            computer_name: r.get("computer_name"),
+            workspace_dir: r.get("workspace_dir"),
         })
         .collect();
     if !slots.is_empty() {

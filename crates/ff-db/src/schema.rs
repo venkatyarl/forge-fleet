@@ -12135,6 +12135,14 @@ CREATE INDEX IF NOT EXISTS idx_notifications_undismissed
     ON notifications (created_at) WHERE NOT is_dismissed;
 "#;
 
+/// Structured project configuration. This supersedes one-off relational columns
+/// for resolving a project's full footprint while preserving the existing queue
+/// joins and legacy columns for compatibility.
+pub const SCHEMA_V246_PROJECT_CONFIG: &str = r#"
+ALTER TABLE projects
+    ADD COLUMN IF NOT EXISTS config JSONB NOT NULL DEFAULT '{}';
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
