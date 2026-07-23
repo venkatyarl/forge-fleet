@@ -926,7 +926,9 @@ async fn handle_pm_decompose(
          \"<precise instructions: which file, what to add/change, mirror an \
          existing pattern; name the correct test/build command for this repo \
          when useful>\", \"files\": [\"<repo-relative path(s) this task edits — \
-         prefer exactly one>\"], \"complexity\": \"<mechanical|moderate|complex>\"}}. \
+         prefer exactly one; every path MUST be a file that already exists in \
+         the repository (scope new code into existing files)>\"], \
+         \"complexity\": \"<mechanical|moderate|complex>\"}}. \
          `complexity` = mechanical for a one-file localized edit, complex for a \
          cross-cutting change. \
          GOAL:\n{goal_text}"
@@ -967,9 +969,9 @@ async fn handle_pm_decompose(
             // one chance to regenerate with the deterministic findings.
             let retry_prompt = format!(
                 "{prompt}\n\nYour previous decomposition failed deterministic repository checks:\n\
-                 {first_error}\nRegenerate the complete JSON array. Use only tracked files unless the task \
-                 explicitly creates a new file in an existing directory, and do not repeat \
-                 the same file scope in sibling tasks."
+                 {first_error}\nRegenerate the complete JSON array. Reference only files that already \
+                 exist in the repository (scope new code into existing files), and do not \
+                 repeat the same file scope in sibling tasks."
             );
             let retry = ff_agent::fleet_oneshot::fleet_oneshot(
                 pool,
@@ -1080,6 +1082,8 @@ fn quality_gate_decomposition(
         ));
     }
 
+    let repo_path = repo_context.and_then(|ctx| ctx.repo_path.as_deref());
+
     for task in &tasks {
         if autonomous && task.files.is_empty() {
             return Err(anyhow::anyhow!(
@@ -1088,38 +1092,32 @@ fn quality_gate_decomposition(
             ));
         }
         for file in &task.files {
+            // Every referenced file must ALREADY exist — no exemption for
+            // create-flavored tasks; the planner prompt scopes new code into
+            // existing files instead.
             if let Some(tracked) = &tracked
                 && !tracked.contains(file)
             {
-                // A greenfield feature task may legitimately CREATE a new file.
-                // Only reject an untracked reference whose parent directory has NO
-                // tracked files — that indicates a hallucinated path in a
-                // nonexistent module. A new file inside a real, existing directory
-                // is a valid create-target and must be allowed.
-                let dir = std::path::Path::new(file)
-                    .parent()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let parent_has_tracked = dir.is_empty()
-                    || tracked.iter().any(|t| {
-                        std::path::Path::new(t)
-                            .parent()
-                            .map(|tp| tp.to_string_lossy() == dir)
-                            .unwrap_or(false)
-                    });
-                let explicitly_creates = task.description.to_ascii_lowercase().contains("create")
-                    || task.description.to_ascii_lowercase().contains("new file")
-                    || task.title.to_ascii_lowercase().starts_with("add ");
-                if !parent_has_tracked || !explicitly_creates {
-                    return Err(anyhow::anyhow!(
-                        "decomposition quality gate: '{}' references untracked file '{}' without an explicit, valid create-file scope",
-                        task.title,
-                        file
-                    ));
-                }
+                return Err(anyhow::anyhow!(
+                    "decomposition quality gate: '{}' references untracked file '{}'",
+                    task.title,
+                    file
+                ));
+            }
+            // Tracking alone cannot prove existence: `git ls-files` still
+            // lists a file deleted from the working tree, so the path must
+            // also be visible on disk.
+            if let Some(repo_path) = repo_path
+                && !find_file_exists(repo_path, file)
+            {
+                return Err(anyhow::anyhow!(
+                    "decomposition quality gate: '{}' references file '{}' that does not exist in the repository",
+                    task.title,
+                    file
+                ));
             }
         }
-        if let Some(repo_path) = repo_context.and_then(|ctx| ctx.repo_path.as_deref()) {
+        if let Some(repo_path) = repo_path {
             verify_symbol_claims(task, repo_path)?;
         }
     }
@@ -1303,6 +1301,35 @@ async fn strongest_planner_hint(pool: &sqlx::PgPool) -> Option<String> {
     .ok()
     .flatten();
     row.map(|(name,)| name)
+}
+
+/// Verify a referenced path exists in the working tree via `find . -name`.
+/// The basename is the `-name` pattern, but a hit only counts when one of the
+/// printed paths matches the referenced path exactly — a same-named file in
+/// another directory cannot vouch for a hallucinated one. Fail-closed: a
+/// missing basename or a `find` that cannot run means the file does not exist.
+fn find_file_exists(repo_path: &Path, file: &str) -> bool {
+    let Some(name) = Path::new(file)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+    else {
+        return false;
+    };
+    let Ok(out) = std::process::Command::new("find")
+        .arg(".")
+        .arg("-name")
+        .arg(&name)
+        .current_dir(repo_path)
+        .output()
+    else {
+        return false;
+    };
+    // Match on stdout even for a nonzero exit: `find` returns failure on any
+    // unreadable subdirectory while still printing every valid hit.
+    let target = format!("./{}", file.trim_start_matches("./"));
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|line| line == target)
 }
 
 /// Best-effort `git ls-files` for the target repo (newline-joined). Returns
@@ -2331,6 +2358,133 @@ mod tests {
         assert_eq!(gated.len(), 1);
         assert!(gated[0].files.contains(&"a.rs".into()));
         assert!(gated[0].files.contains(&"b.rs".into()));
+    }
+
+    /// Drop guard around a throwaway git repo under the system temp dir.
+    struct ScratchRepo {
+        path: PathBuf,
+    }
+
+    impl Drop for ScratchRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Build a git repo with the given files staged (staged is enough for
+    /// `git ls-files`). Returns None when git isn't available so callers can
+    /// skip instead of panicking.
+    fn scratch_git_repo(
+        tag: &str,
+        files: &[&str],
+    ) -> Option<(ScratchRepo, crate::repo_context::RepoContext)> {
+        let path = std::env::temp_dir().join(format!("ff-gate-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).ok()?;
+        let repo = ScratchRepo { path };
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo.path)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+        };
+        git(&["init", "-q"])?;
+        for file in files {
+            let file_path = repo.path.join(file);
+            std::fs::create_dir_all(file_path.parent()?).ok()?;
+            std::fs::write(&file_path, "// scratch\n").ok()?;
+        }
+        git(&["add", "-A"])?;
+        let ctx = crate::repo_context::RepoContext {
+            repo_id: None,
+            repo_url: None,
+            repo_path: Some(repo.path.clone()),
+            primary_language: "rust".to_string(),
+            build_system: None,
+            key_dirs: Vec::new(),
+        };
+        Some((repo, ctx))
+    }
+
+    fn leaf(title: &str, description: &str, files: &[&str]) -> LeafTask {
+        LeafTask {
+            title: title.into(),
+            description: description.into(),
+            files: files.iter().map(|file| (*file).into()).collect(),
+            complexity: None,
+        }
+    }
+
+    #[test]
+    fn decomposition_quality_gate_accepts_files_present_on_disk() {
+        let Some((_repo, ctx)) = scratch_git_repo("present", &["src/lib.rs", "src/parser.rs"])
+        else {
+            return;
+        };
+        let tasks = vec![leaf(
+            "edit",
+            "change parser",
+            &["src/lib.rs", "src/parser.rs"],
+        )];
+        let gated = quality_gate_decomposition(tasks, Some(&ctx)).unwrap();
+        assert_eq!(gated.len(), 1);
+    }
+
+    #[test]
+    fn decomposition_quality_gate_rejects_tracked_but_deleted_file() {
+        // A deleted file stays in `git ls-files`, so tracking-based validation
+        // alone passes it; the `find`-based disk check must reject it.
+        let Some((repo, ctx)) = scratch_git_repo("deleted", &["src/lib.rs", "src/gone.rs"]) else {
+            return;
+        };
+        std::fs::remove_file(repo.path.join("src/gone.rs")).unwrap();
+        let tasks = vec![leaf("edit gone", "modify the handler", &["src/gone.rs"])];
+        let err = quality_gate_decomposition(tasks, Some(&ctx)).unwrap_err();
+        assert!(
+            err.to_string().contains("does not exist in the repository"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn decomposition_quality_gate_rejects_nonexistent_path() {
+        let Some((_repo, ctx)) = scratch_git_repo("hallucinated", &["src/lib.rs"]) else {
+            return;
+        };
+        let tasks = vec![leaf(
+            "edit",
+            "modify the handler",
+            &["pkg/storage/factory.go"],
+        )];
+        assert!(quality_gate_decomposition(tasks, Some(&ctx)).is_err());
+    }
+
+    #[test]
+    fn decomposition_quality_gate_rejects_create_worded_task_for_missing_file() {
+        // Validation is unconditional: even a task that explicitly says it
+        // CREATES a new file may not reference a path that does not exist.
+        let Some((_repo, ctx)) = scratch_git_repo("create", &["src/lib.rs"]) else {
+            return;
+        };
+        let tasks = vec![leaf(
+            "Add metrics module",
+            "Create a new file with counters",
+            &["src/metrics.rs"],
+        )];
+        assert!(quality_gate_decomposition(tasks, Some(&ctx)).is_err());
+    }
+
+    #[test]
+    fn find_file_exists_requires_exact_path_not_just_basename() {
+        let Some((repo, _ctx)) = scratch_git_repo("find-exact", &["a/mod.rs"]) else {
+            return;
+        };
+        assert!(find_file_exists(&repo.path, "a/mod.rs"));
+        // Same basename elsewhere must not vouch for a nonexistent path.
+        assert!(!find_file_exists(&repo.path, "b/mod.rs"));
     }
 
     #[test]
