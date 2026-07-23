@@ -12135,6 +12135,45 @@ CREATE INDEX IF NOT EXISTS idx_notifications_undismissed
     ON notifications (created_at) WHERE NOT is_dismissed;
 "#;
 
+/// V246 — available-memory telemetry and the safe Devstral GPU context default.
+pub const SCHEMA_V246_MEMORY_ADMISSION: &str = r#"
+ALTER TABLE computer_metrics_history
+    ADD COLUMN IF NOT EXISTS mem_avail_gb DOUBLE PRECISION;
+ALTER TABLE computer_metrics_history_hourly
+    ADD COLUMN IF NOT EXISTS mem_avail_gb DOUBLE PRECISION;
+ALTER TABLE computer_metrics_history_daily
+    ADD COLUMN IF NOT EXISTS mem_avail_gb DOUBLE PRECISION;
+
+CREATE OR REPLACE VIEW computer_metrics_history_retained AS
+SELECT computer_id, recorded_at, 'raw'::TEXT AS resolution, 1::BIGINT AS sample_count,
+       cpu_pct, ram_pct, ram_used_gb, mem_avail_gb, disk_free_gb, gpu_pct,
+       llm_ram_allocated_gb, llm_queue_depth::DOUBLE PRECISION AS llm_queue_depth,
+       llm_active_requests::DOUBLE PRECISION AS llm_active_requests, llm_tokens_per_sec
+  FROM computer_metrics_history
+UNION ALL
+SELECT computer_id, recorded_at, 'hourly'::TEXT, sample_count,
+       cpu_pct, ram_pct, ram_used_gb, mem_avail_gb, disk_free_gb, gpu_pct,
+       llm_ram_allocated_gb, llm_queue_depth, llm_active_requests, llm_tokens_per_sec
+  FROM computer_metrics_history_hourly
+UNION ALL
+SELECT computer_id, recorded_at, 'daily'::TEXT, sample_count,
+       cpu_pct, ram_pct, ram_used_gb, mem_avail_gb, disk_free_gb, gpu_pct,
+       llm_ram_allocated_gb, llm_queue_depth, llm_active_requests, llm_tokens_per_sec
+  FROM computer_metrics_history_daily;
+
+UPDATE fleet_model_catalog
+SET variants = (
+    SELECT jsonb_agg(
+        CASE WHEN value->>'runtime' IN ('llama.cpp', 'vllm')
+             THEN jsonb_set(value, '{context_window}', '49152'::jsonb, true)
+             ELSE value END
+        ORDER BY ordinality
+    )
+    FROM jsonb_array_elements(variants) WITH ORDINALITY
+)
+WHERE id = 'devstral-small-2-24b';
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

@@ -36,6 +36,8 @@ fn port_is_canonical(port: i32) -> bool {
 /// Summary of a reconcile pass.
 #[derive(Debug, Clone, Default)]
 pub struct ReconcileSummary {
+    /// Lowest-tier local model unloaded because OS available RAM fell below 4GB.
+    pub emergency_unloaded: usize,
     /// Existing processes that were newly inserted into the DB.
     pub adopted: usize,
     /// DB rows removed because the process was gone and desired_state='retired'.
@@ -63,6 +65,7 @@ pub struct ReconcileSummary {
 /// Run one reconcile pass. Returns counts for logging.
 pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, String> {
     let worker_name = crate::fleet_info::resolve_this_worker_name().await;
+    let emergency_unloaded = emergency_unload_if_needed(pool, &worker_name).await?;
 
     // 1. Snapshot what's actually running on this host.
     let procs = crate::model_runtime::list_local_processes().await;
@@ -78,7 +81,10 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
         .await
         .map_err(|e| format!("pg_list_library: {e}"))?;
 
-    let mut summary = ReconcileSummary::default();
+    let mut summary = ReconcileSummary {
+        emergency_unloaded,
+        ..Default::default()
+    };
     let mut seen_ports: std::collections::HashSet<i32> = std::collections::HashSet::new();
 
     // ── Pass A — for each live process: adopt, refresh, or enforce port ──
@@ -347,6 +353,54 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
     }
 
     Ok(summary)
+}
+
+const EMERGENCY_AVAILABLE_GB: f64 = 4.0;
+
+fn emergency_memory_pressure(available_gb: Option<f64>) -> bool {
+    available_gb.is_some_and(|gb| gb < EMERGENCY_AVAILABLE_GB)
+}
+
+async fn emergency_unload_if_needed(
+    pool: &sqlx::PgPool,
+    worker_name: &str,
+) -> Result<usize, String> {
+    use sqlx::Row;
+    use sysinfo::System;
+
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let available_gb = sys.available_memory() as f64 / 1_073_741_824.0;
+    if !emergency_memory_pressure(Some(available_gb)) {
+        return Ok(0);
+    }
+
+    let row = sqlx::query(
+        "SELECT d.id::text AS id, d.catalog_id, cat.tier
+           FROM fleet_model_deployments d
+           JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
+          WHERE LOWER(d.worker_name) = LOWER($1)
+            AND d.desired_state = 'active'
+          ORDER BY cat.tier DESC, d.request_count ASC, d.started_at ASC
+          LIMIT 1",
+    )
+    .bind(worker_name)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("select emergency unload candidate: {e}"))?;
+    let Some(row) = row else { return Ok(0) };
+    let deployment_id: String = row.get("id");
+    tracing::warn!(
+        available_gb,
+        deployment = %deployment_id,
+        catalog_id = ?row.try_get::<String, _>("catalog_id").ok(),
+        tier = ?row.try_get::<i32, _>("tier").ok(),
+        "emergency memory pressure: unloading lowest-tier local model"
+    );
+    crate::model_runtime::unload_model(pool, &deployment_id)
+        .await
+        .map_err(|e| format!("emergency unload {deployment_id}: {e}"))?;
+    Ok(1)
 }
 
 /// Whether a dead `active` deployment row needs library recovery before a
@@ -754,4 +808,10 @@ mod tests {
             (None, None)
         );
     }
+}
+#[test]
+fn emergency_unload_triggers_below_four_gb() {
+    assert!(emergency_memory_pressure(Some(3.99)));
+    assert!(!emergency_memory_pressure(Some(4.0)));
+    assert!(!emergency_memory_pressure(None));
 }

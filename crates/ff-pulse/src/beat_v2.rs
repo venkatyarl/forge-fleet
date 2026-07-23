@@ -198,6 +198,9 @@ pub struct MemoryInfo {
     pub ram_total_gb: f64,
     pub ram_used_gb: f64,
     pub ram_free_gb: f64,
+    /// OS "available" memory (free + reclaimable cache), used for admission.
+    #[serde(default)]
+    pub mem_avail_gb: f64,
     pub llm_ram_allocated_gb: f64,
     pub ram_available_for_new_llm_gb: f64,
     pub vram_total_gb: Option<f64>,
@@ -502,6 +505,7 @@ impl PulseBeatV2 {
                 ram_total_gb: 0.0,
                 ram_used_gb: 0.0,
                 ram_free_gb: 0.0,
+                mem_avail_gb: 0.0,
                 llm_ram_allocated_gb: 0.0,
                 ram_available_for_new_llm_gb: 0.0,
                 vram_total_gb: None,

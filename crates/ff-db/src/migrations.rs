@@ -1181,6 +1181,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "notifications",
         sql: schema::SCHEMA_V245_NOTIFICATIONS,
     },
+    PgMigration {
+        version: 246,
+        name: "memory_admission",
+        sql: schema::SCHEMA_V246_MEMORY_ADMISSION,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

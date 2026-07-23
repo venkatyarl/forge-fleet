@@ -238,6 +238,7 @@ impl HeartbeatV2Publisher {
                 // the per-heartbeat hot path if a platform reports otherwise.
                 let ram_free_gb =
                     sys.total_memory().saturating_sub(ram_used_bytes) as f64 / 1_073_741_824.0;
+                let mem_avail_gb = sys.available_memory() as f64 / 1_073_741_824.0;
                 let ram_pct = if sys.total_memory() > 0 {
                     (ram_used_bytes as f64 / sys.total_memory() as f64) * 100.0
                 } else {
@@ -277,6 +278,7 @@ impl HeartbeatV2Publisher {
                     ram_total_gb: ram_total_gb as f64,
                     ram_used_gb,
                     ram_free_gb,
+                    mem_avail_gb,
                     llm_ram_allocated_gb: 0.0, // Phase 7
                     ram_available_for_new_llm_gb: (ram_free_gb - 3.0).max(0.0), // reserve 3GB for OS
                     vram_total_gb: None,

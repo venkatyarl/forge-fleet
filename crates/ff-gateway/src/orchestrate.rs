@@ -433,6 +433,7 @@ mod tests {
                 ram_total_gb: 32.0,
                 ram_used_gb: 12.0,
                 ram_free_gb: 20.0,
+                mem_avail_gb: 20.0,
                 llm_ram_allocated_gb: 8.0,
                 ram_available_for_new_llm_gb: 16.0,
                 vram_total_gb: Some(48.0),

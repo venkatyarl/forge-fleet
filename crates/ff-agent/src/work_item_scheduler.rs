@@ -59,6 +59,7 @@ const MAX_BUILD_ATTEMPTS: i32 = 5;
 /// Four missed 15-second dispatch passes makes a host ineligible. General
 /// Pulse beats may still be fresh when this subsystem clock is stale.
 const DISPATCH_TICK_STALE_SECS: i64 = 60;
+const MIN_BUILD_AVAILABLE_GB: f64 = 8.0;
 
 /// One scheduler pass. Returns the number of work_items assigned this tick.
 pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
@@ -160,7 +161,25 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
                 dispatch_tick_is_fresh(tick, now).then_some(id)
             })
             .collect();
+    let memory_eligible: HashSet<uuid::Uuid> = sqlx::query(
+        "SELECT DISTINCT ON (computer_id) computer_id, mem_avail_gb
+           FROM computer_metrics_history
+          WHERE recorded_at >= NOW() - INTERVAL '5 minutes'
+          ORDER BY computer_id, recorded_at DESC",
+    )
+    .fetch_all(pg)
+    .await?
+    .into_iter()
+    .filter_map(|row| {
+        let id = row.get("computer_id");
+        let available = row.get::<Option<f64>, _>("mem_avail_gb");
+        available
+            .is_some_and(|gb| build_memory_eligible(Some(gb)))
+            .then_some(id)
+    })
+    .collect();
     global_free.retain(|slot| dispatch_live.contains(&slot.computer_id));
+    global_free.retain(|slot| memory_eligible.contains(&slot.computer_id));
     global_free.retain(|slot| dispatch_capacity_left(&active_by_computer, slot.computer_id));
     if global_free.is_empty() {
         info!(
@@ -219,6 +238,7 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
             &mut pool,
             &mut active_by_computer,
             &dispatch_live,
+            &memory_eligible,
             &viable,
             &mut fallback_assigns,
         )
@@ -237,6 +257,7 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
             &mut pool,
             &mut active_by_computer,
             &dispatch_live,
+            &memory_eligible,
             &viable,
             &mut fallback_assigns,
         )
@@ -272,6 +293,10 @@ fn dispatch_tick_is_fresh(tick_at: Option<DateTime<Utc>>, now: DateTime<Utc>) ->
     tick_at.is_some_and(|tick| tick >= now - chrono::Duration::seconds(DISPATCH_TICK_STALE_SECS))
 }
 
+fn build_memory_eligible(mem_avail_gb: Option<f64>) -> bool {
+    mem_avail_gb.is_some_and(|gb| gb >= MIN_BUILD_AVAILABLE_GB)
+}
+
 /// Attempt to assign one ready work_item to a free slot, updating the shared
 /// pool / dispatch-capacity bookkeeping on success. Extracted so the fair-share
 /// two-pass loop in `evaluate_work_items` (first pass: projects under their
@@ -284,6 +309,7 @@ async fn try_assign_item(
     pool: &mut Vec<ff_db::FreeSlot>,
     active_by_computer: &mut HashMap<uuid::Uuid, usize>,
     dispatch_live: &HashSet<uuid::Uuid>,
+    memory_eligible: &HashSet<uuid::Uuid>,
     viable: &HashSet<uuid::Uuid>,
     fallback_assigns: &mut usize,
 ) -> bool {
@@ -294,6 +320,7 @@ async fn try_assign_item(
             Ok(mut v) => v
                 .pop()
                 .filter(|slot| dispatch_live.contains(&slot.computer_id))
+                .filter(|slot| memory_eligible.contains(&slot.computer_id))
                 .filter(|slot| dispatch_capacity_left(active_by_computer, slot.computer_id)),
             Err(e) => {
                 warn!(host, error = %e, "work_item_scheduler: pinned-slot lookup failed");
@@ -702,4 +729,10 @@ mod tests {
             now
         ));
     }
+}
+#[test]
+fn build_assignment_requires_eight_gb_available() {
+    assert!(build_memory_eligible(Some(8.0)));
+    assert!(!build_memory_eligible(Some(7.99)));
+    assert!(!build_memory_eligible(None));
 }
