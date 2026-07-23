@@ -14,11 +14,13 @@
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::project_github_sync::parse_owner_repo;
+use crate::reconciliation_audit::{PgAuditStore, ReconciliationAction, ReconciliationAuditor};
 
 /// Short per-review-backend caps so a dead reviewer cannot stall the serial
 /// merge drain on one PR for minutes at a time.
@@ -62,6 +64,7 @@ const MAX_UNKNOWN_DEFERS: u32 = 3;
 pub async fn evaluate_merge_queue(
     pg: &PgPool,
     unknown_defers: &mut HashMap<Uuid, u32>,
+    auditor: &ReconciliationAuditor,
 ) -> Result<usize> {
     let Some(item) = ff_db::pg_next_merge_queue_item(pg).await? else {
         return Ok(0);
@@ -109,6 +112,18 @@ pub async fn evaluate_merge_queue(
             .bind(item.work_item_id)
             .execute(pg)
             .await?;
+            auditor.record(
+                ReconciliationAction::ConflictResolved,
+                &item.work_item_id.to_string(),
+                "PR conflicted with advanced main — item reset for rebuild",
+                serde_json::json!({
+                    "pr_url": pr_url,
+                    "queue_id": item.id.to_string(),
+                    "work_item_id": item.work_item_id.to_string(),
+                    "conflict": "dirty_vs_main",
+                    "resolution": "reset_for_rebuild",
+                }),
+            );
             unknown_defers.remove(&item.id);
             return Ok(0);
         }
@@ -191,30 +206,76 @@ pub async fn evaluate_merge_queue(
         }
         CiState::Failed { reason, run_ids } => {
             let failed_log = failed_ci_logs(&pr_url, &run_ids).await;
-            if is_semantic_merge_compile_failure(&failed_log)
-                && reset_semantic_merge_failure_once(pg, item.id, item.work_item_id).await?
-            {
-                warn!(
-                    pr = %pr_url,
-                    work_item = %item.work_item_id,
-                    "merge_drain: CI found a semantic merge conflict — resetting item once for rebuild"
-                );
-                return Ok(0);
-            }
-            if !run_ids.is_empty() && claim_ci_rerun(pg, item.id).await? {
-                if let Err(e) = rerun_failed_ci_jobs(&pr_url, &run_ids).await {
-                    release_ci_rerun_claim(pg, item.id).await?;
-                    return Err(e);
+            if is_semantic_merge_compile_failure(&failed_log) {
+                if reset_semantic_merge_failure_once(pg, item.id, item.work_item_id).await? {
+                    warn!(
+                        pr = %pr_url,
+                        work_item = %item.work_item_id,
+                        "merge_drain: CI found a semantic merge conflict — resetting item once for rebuild"
+                    );
+                    auditor.record(
+                        ReconciliationAction::ConflictResolved,
+                        &item.work_item_id.to_string(),
+                        "semantic merge conflict (compile failure after clean merge) — item reset for rebuild",
+                        serde_json::json!({
+                            "pr_url": pr_url,
+                            "queue_id": item.id.to_string(),
+                            "work_item_id": item.work_item_id.to_string(),
+                            "conflict": "semantic_merge_compile_failure",
+                            "resolution": "reset_for_rebuild",
+                        }),
+                    );
+                    return Ok(0);
                 }
-                info!(
-                    pr = %pr_url,
-                    runs = ?run_ids,
-                    "merge_drain: requested one retry of failed CI jobs"
+                // The one-shot reset was already consumed (an earlier pass or
+                // a racing drain claimed `merge_attempts`): the duplicate
+                // reset is skipped and the failure falls through to the
+                // rerun/terminal path below.
+                auditor.record(
+                    ReconciliationAction::DuplicateSkipped,
+                    &item.work_item_id.to_string(),
+                    "semantic-merge reset already claimed for this queue entry — duplicate reset skipped",
+                    serde_json::json!({
+                        "pr_url": pr_url,
+                        "queue_id": item.id.to_string(),
+                        "work_item_id": item.work_item_id.to_string(),
+                        "skipped": "semantic_merge_reset",
+                        "cause": "reset_claim_already_consumed",
+                    }),
                 );
-                // GitHub updates the check rollup asynchronously. Re-evaluate
-                // next tick instead of treating this stale failed snapshot as
-                // the result of the rerun.
-                return Ok(0);
+            }
+            if !run_ids.is_empty() {
+                if claim_ci_rerun(pg, item.id).await? {
+                    if let Err(e) = rerun_failed_ci_jobs(&pr_url, &run_ids).await {
+                        release_ci_rerun_claim(pg, item.id).await?;
+                        return Err(e);
+                    }
+                    info!(
+                        pr = %pr_url,
+                        runs = ?run_ids,
+                        "merge_drain: requested one retry of failed CI jobs"
+                    );
+                    // GitHub updates the check rollup asynchronously. Re-evaluate
+                    // next tick instead of treating this stale failed snapshot as
+                    // the result of the rerun.
+                    return Ok(0);
+                }
+                // Lost the one-shot rerun claim (already spent by an earlier
+                // pass or a racing drain) — the duplicate rerun is skipped and
+                // the failure proceeds to the terminal path.
+                auditor.record(
+                    ReconciliationAction::DuplicateSkipped,
+                    &item.work_item_id.to_string(),
+                    "CI rerun already claimed for this queue entry — duplicate rerun skipped",
+                    serde_json::json!({
+                        "pr_url": pr_url,
+                        "queue_id": item.id.to_string(),
+                        "work_item_id": item.work_item_id.to_string(),
+                        "skipped": "ci_rerun",
+                        "cause": "rerun_claim_already_consumed",
+                        "failed_runs": run_ids,
+                    }),
+                );
             }
             warn!(pr = %pr_url, %reason, "merge_drain: PR CI failed — marking work_item failed");
             ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &reason).await?;
@@ -255,6 +316,17 @@ pub async fn evaluate_merge_queue(
                     .execute(pg)
                     .await?;
                     info!(pr = %pr_url, work_item = %item.work_item_id, "merge_drain: merged");
+                    auditor.record(
+                        ReconciliationAction::MergeCompleted,
+                        &item.work_item_id.to_string(),
+                        "PR squash-merged — work_item marked merged",
+                        serde_json::json!({
+                            "pr_url": pr_url,
+                            "queue_id": item.id.to_string(),
+                            "work_item_id": item.work_item_id.to_string(),
+                            "method": "squash",
+                        }),
+                    );
                     Ok(1)
                 }
                 Err(e) => {
@@ -288,6 +360,18 @@ pub async fn evaluate_merge_queue(
                         .bind(item.work_item_id)
                         .execute(pg)
                         .await?;
+                        auditor.record(
+                            ReconciliationAction::ConflictResolved,
+                            &item.work_item_id.to_string(),
+                            "PR conflicted at merge time (async mergeable race) — item reset for rebuild",
+                            serde_json::json!({
+                                "pr_url": pr_url,
+                                "queue_id": item.id.to_string(),
+                                "work_item_id": item.work_item_id.to_string(),
+                                "conflict": "late_detected_async_mergeable_race",
+                                "resolution": "reset_for_rebuild",
+                            }),
+                        );
                         return Ok(0);
                     }
                     let reason = format!("gh pr merge failed: {e}");
@@ -1385,7 +1469,7 @@ async fn gh_pr_comment(pr_url: &str, body: &str) -> Result<()> {
 /// failure for one PR is logged and skipped — it never aborts the pass. Only
 /// rows that are still `in_review` at UPDATE time are flipped (guards against a
 /// racing drain that already claimed the row).
-async fn reconcile_orphaned_reviews(pg: &PgPool) -> Result<usize> {
+async fn reconcile_orphaned_reviews(pg: &PgPool, auditor: &ReconciliationAuditor) -> Result<usize> {
     let rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
         "SELECT id, pr_url FROM work_items \
          WHERE status = 'in_review' AND pr_url IS NOT NULL AND pr_url LIKE '%github.com%' \
@@ -1439,7 +1523,33 @@ async fn reconcile_orphaned_reviews(pg: &PgPool) -> Result<usize> {
         .rows_affected();
         if affected > 0 {
             info!(work_item = %id, pr = %pr_url, status = new_status, "reconcile: flipped orphaned in_review");
+            auditor.record(
+                ReconciliationAction::StatusReconciled,
+                &id.to_string(),
+                "orphaned in_review work_item reconciled with out-of-band PR state",
+                serde_json::json!({
+                    "pr_url": pr_url,
+                    "work_item_id": id.to_string(),
+                    "new_status": new_status,
+                }),
+            );
             reconciled += 1;
+        } else {
+            // A racing drain (or the merge path itself) already flipped this
+            // row between our SELECT and UPDATE — the duplicate flip was
+            // skipped by the `status = 'in_review'` guard.
+            auditor.record(
+                ReconciliationAction::DuplicateSkipped,
+                &id.to_string(),
+                "work_item already reconciled by a racing drain — duplicate flip skipped",
+                serde_json::json!({
+                    "pr_url": pr_url,
+                    "work_item_id": id.to_string(),
+                    "skipped": "orphaned_review_flip",
+                    "cause": "row_claimed_by_racing_drain",
+                    "intended_status": new_status,
+                }),
+            );
         }
     }
     Ok(reconciled)
@@ -1458,6 +1568,13 @@ pub fn spawn_work_item_merge_drain(
         // Per-head UNKNOWN-defer counts, owned by the loop so they persist across
         // ticks (see MAX_UNKNOWN_DEFERS / evaluate_merge_queue).
         let mut unknown_defers: HashMap<Uuid, u32> = HashMap::new();
+        // Audit trail for every reconciliation action this drain takes.
+        // record() is sync (channel send) so audit persistence can never
+        // block a drain tick; the writer task owns the DB writes.
+        let (auditor, audit_writer) = ReconciliationAuditor::start(Arc::new(PgAuditStore::new(
+            pg.clone(),
+            worker_name.clone(),
+        )));
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -1477,7 +1594,7 @@ pub fn spawn_work_item_merge_drain(
                     {
                         continue;
                     }
-                    if let Err(e) = evaluate_merge_queue(&pg, &mut unknown_defers).await {
+                    if let Err(e) = evaluate_merge_queue(&pg, &mut unknown_defers, &auditor).await {
                         warn!(error = %e, "work_item_merge_drain tick failed");
                     }
                     // Drain-tick heartbeat: a leader-gated loop that goes silent
@@ -1496,7 +1613,7 @@ pub fn spawn_work_item_merge_drain(
                     // (hand-merges) so their work_items don't rot in `in_review`.
                     tick_n = tick_n.wrapping_add(1);
                     if tick_n % 20 == 1 {
-                        match reconcile_orphaned_reviews(&pg).await {
+                        match reconcile_orphaned_reviews(&pg, &auditor).await {
                             Ok(n) if n > 0 => info!(count = n, "work_item_merge_drain: reconciled orphaned in_review items"),
                             Ok(_) => {}
                             Err(e) => warn!(error = %e, "work_item_merge_drain reconcile failed"),
@@ -1509,6 +1626,15 @@ pub fn spawn_work_item_merge_drain(
                     }
                 }
             }
+        }
+        // Dropping the last auditor handle closes the channel; awaiting the
+        // writer flushes every already-recorded event before shutdown.
+        drop(auditor);
+        if tokio::time::timeout(Duration::from_secs(10), audit_writer)
+            .await
+            .is_err()
+        {
+            warn!("work_item_merge_drain: audit writer did not flush within 10s");
         }
         info!("work_item_merge_drain loop stopped");
     })

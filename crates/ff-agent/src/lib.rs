@@ -138,6 +138,7 @@ pub mod pr_verify;
 pub mod project_github_sync;
 pub mod project_registry;
 pub mod project_scope;
+pub mod reconciliation_audit;
 pub mod revive;
 pub mod rpc_inference;
 pub mod scheduler_tick;
