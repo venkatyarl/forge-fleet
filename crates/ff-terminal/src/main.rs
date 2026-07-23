@@ -2021,6 +2021,17 @@ enum FleetCommand {
         /// Emit a per-host results JSON array instead of the summary table.
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Disable target sub-agents and release their claimed work before
+        /// restart. On by default; pass `--graceful=false` to skip the drain.
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            require_equals = true,
+            default_value_t = true,
+            default_missing_value = "true",
+        )]
+        graceful: bool,
     },
     /// Get or set the adaptive serving-mix autoscaler gate (Orchestrator P3).
     ///
@@ -7821,6 +7832,49 @@ mod jira_cli_tests {
             .expect("spawn parser test")
             .join()
             .expect("parser test panicked");
+    }
+}
+
+#[cfg(test)]
+mod fleet_deploy_cli_tests {
+    use super::{Cli, Command, FleetCommand};
+    use clap::Parser;
+
+    fn parse_graceful(args: &'static [&'static str]) -> bool {
+        // 16 MiB stack: the Cli parse tree overflows the default test stack.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let cli = Cli::try_parse_from(args).expect("fleet deploy should parse");
+                match cli.command {
+                    Some(Command::Fleet {
+                        command: FleetCommand::Deploy { graceful, .. },
+                    }) => graceful,
+                    other => panic!("expected fleet deploy, got {other:?}"),
+                }
+            })
+            .expect("spawn parser test")
+            .join()
+            .expect("parser test panicked")
+    }
+
+    #[test]
+    fn fleet_deploy_graceful_defaults_on_and_can_be_disabled() {
+        assert!(parse_graceful(&["ff", "fleet", "deploy", "--all"]));
+        assert!(parse_graceful(&[
+            "ff",
+            "fleet",
+            "deploy",
+            "--all",
+            "--graceful"
+        ]));
+        assert!(!parse_graceful(&[
+            "ff",
+            "fleet",
+            "deploy",
+            "--all",
+            "--graceful=false"
+        ]));
     }
 }
 

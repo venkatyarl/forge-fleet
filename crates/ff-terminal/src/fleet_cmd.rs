@@ -3918,8 +3918,9 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
             node,
             concurrency,
             json,
+            graceful,
         } => {
-            handle_fleet_deploy(&pool, all, node, concurrency, json).await?;
+            handle_fleet_deploy(&pool, all, node, concurrency, json, graceful).await?;
         }
         FleetCommand::Autoscaler { mode } => {
             handle_fleet_autoscaler(&pool, &mode).await?;
@@ -4609,11 +4610,6 @@ struct DeployResult {
 const MEMORY_TIGHT_RAM_GB: i32 = 40;
 const DEPLOY_TIMEOUT_ROOMY_SECS: u64 = 25 * 60;
 const DEPLOY_TIMEOUT_TIGHT_SECS: u64 = 45 * 60;
-/// Maximum time to let work already running on deploy targets finish before
-/// requeueing it attempt-neutrally. Targets are marked drained first, so no
-/// new leases can race the final empty check.
-const DEPLOY_LEASE_DRAIN_TIMEOUT_SECS: u64 = 2 * 60;
-const DEPLOY_LEASE_DRAIN_POLL_SECS: u64 = 2;
 const DEPLOY_LEADER_HANDOFF_TIMEOUT_SECS: u64 = 45;
 const DEPLOY_LEADER_HANDOFF_POLL_SECS: u64 = 2;
 // Covers the longest (45 minute) memory-tight build plus install/restart and
@@ -4723,22 +4719,35 @@ async fn handoff_deploy_leader(
     }
 }
 
-/// Prevent new work-item assignments to deploy targets and wait for their
-/// existing leases to finish. At the deadline, remaining leases are released
-/// through the HA handoff path, which requeues claimed/building items without
-/// incrementing their attempt count.
+struct DeployDrainState {
+    computers: Vec<(uuid::Uuid, String)>,
+    sub_agents: Vec<(uuid::Uuid, String)>,
+}
+
+/// Prevent new work-item assignments to deploy targets, then release their
+/// claimed work attempt-neutrally through the HA handoff path.
 async fn drain_deploy_targets(
     pool: &sqlx::PgPool,
     target_names: &[String],
-) -> Result<Vec<(uuid::Uuid, String)>> {
+) -> Result<DeployDrainState> {
     let mut tx = pool.begin().await?;
-    let previous = sqlx::query_as::<_, (uuid::Uuid, String)>(
+    let computers = sqlx::query_as::<_, (uuid::Uuid, String)>(
         "SELECT id, COALESCE(reservation_state, 'available')
            FROM computers
           WHERE name = ANY($1)
           FOR UPDATE",
     )
     .bind(target_names)
+    .fetch_all(&mut *tx)
+    .await?;
+    let computer_ids: Vec<uuid::Uuid> = computers.iter().map(|(id, _)| *id).collect();
+    let sub_agents = sqlx::query_as::<_, (uuid::Uuid, String)>(
+        "SELECT id, CASE WHEN status = 'busy' THEN 'idle' ELSE status END
+           FROM sub_agents
+          WHERE computer_id = ANY($1)
+          FOR UPDATE",
+    )
+    .bind(&computer_ids)
     .fetch_all(&mut *tx)
     .await?;
     sqlx::query(
@@ -4749,49 +4758,35 @@ async fn drain_deploy_targets(
     .bind(target_names)
     .execute(&mut *tx)
     .await?;
+    sqlx::query(
+        "UPDATE sub_agents
+            SET status = 'disabled'
+          WHERE computer_id = ANY($1)",
+    )
+    .bind(&computer_ids)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
 
-    let computer_ids: Vec<uuid::Uuid> = previous.iter().map(|(id, _)| *id).collect();
-    let drain_result: Result<()> = async {
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(DEPLOY_LEASE_DRAIN_TIMEOUT_SECS);
-        loop {
-            let active: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*)
-                   FROM work_item_leases
-                  WHERE computer_id = ANY($1)
-                    AND released_at IS NULL",
-            )
-            .bind(&computer_ids)
-            .fetch_one(pool)
-            .await?;
-            if active == 0 {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                eprintln!(
-                    "{YELLOW}⚠ deploy drain timed out with {active} active lease(s); requeueing attempt-neutrally{RESET}"
-                );
-                for computer_id in &computer_ids {
-                    ff_agent::ha::drain_work_item_leases(pool, *computer_id).await?;
-                }
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(DEPLOY_LEASE_DRAIN_POLL_SECS)).await;
+    for computer_id in &computer_ids {
+        if let Err(error) = ff_agent::ha::drain_work_item_leases(pool, *computer_id).await {
+            let previous = DeployDrainState {
+                computers,
+                sub_agents,
+            };
+            restore_deploy_targets(pool, &previous).await;
+            return Err(error.into());
         }
-        Ok(())
-    }
-    .await;
-    if let Err(error) = drain_result {
-        restore_deploy_targets(pool, &previous).await;
-        return Err(error);
     }
 
-    Ok(previous)
+    Ok(DeployDrainState {
+        computers,
+        sub_agents,
+    })
 }
 
-async fn restore_deploy_targets(pool: &sqlx::PgPool, previous: &[(uuid::Uuid, String)]) {
-    for (computer_id, reservation_state) in previous {
+async fn restore_deploy_targets(pool: &sqlx::PgPool, previous: &DeployDrainState) {
+    for (computer_id, reservation_state) in &previous.computers {
         if let Err(error) = sqlx::query("UPDATE computers SET reservation_state = $2 WHERE id = $1")
             .bind(computer_id)
             .bind(reservation_state)
@@ -4800,6 +4795,18 @@ async fn restore_deploy_targets(pool: &sqlx::PgPool, previous: &[(uuid::Uuid, St
         {
             eprintln!(
                 "{YELLOW}⚠ failed to restore deploy target reservation {computer_id}: {error}{RESET}"
+            );
+        }
+    }
+    for (sub_agent_id, status) in &previous.sub_agents {
+        if let Err(error) = sqlx::query("UPDATE sub_agents SET status = $2 WHERE id = $1")
+            .bind(sub_agent_id)
+            .bind(status)
+            .execute(pool)
+            .await
+        {
+            eprintln!(
+                "{YELLOW}⚠ failed to restore deploy sub-agent {sub_agent_id}: {error}{RESET}"
             );
         }
     }
@@ -5683,6 +5690,7 @@ async fn handle_fleet_deploy(
     node: Option<String>,
     concurrency: usize,
     json: bool,
+    graceful: bool,
 ) -> Result<()> {
     if !all && node.is_none() {
         anyhow::bail!("pass --all or --node <name> to pick targets");
@@ -5790,116 +5798,138 @@ async fn handle_fleet_deploy(
     }
 
     // Stop new assignments before any build starts, then let in-flight work
-    // finish before a restart can tear down its daemon. A bounded timeout
-    // falls back to the attempt-neutral HA lease handoff.
+    // be requeued attempt-neutrally before a restart can tear down its daemon.
     let target_names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
     handoff_deploy_leader(pool, &target_names).await?;
-    let previous_reservations = drain_deploy_targets(pool, &target_names).await?;
+    let previous_reservations = if graceful {
+        Some(drain_deploy_targets(pool, &target_names).await?)
+    } else {
+        None
+    };
 
-    // Group targets by (os_family, arch). One build per group is executed on a
-    // designated builder; binaries are then scp'd to the remaining receivers.
-    let mut groups: std::collections::HashMap<(String, String), Vec<DeployTarget>> =
-        std::collections::HashMap::new();
-    for t in targets {
-        groups
-            .entry((t.os_family.clone(), t.arch.clone()))
-            .or_default()
-            .push(t);
-    }
-    let mut plans: Vec<GroupPlan> = groups
-        .into_values()
-        .map(|mut hosts| {
-            // Prefer a roomy builder so memory-tight boxes stay available as
-            // receivers (they only run the cheap install+restart path).
-            let builder_idx = hosts
-                .iter()
-                .position(|t| !(t.total_ram_gb > 0 && t.total_ram_gb <= MEMORY_TIGHT_RAM_GB))
-                .unwrap_or(0);
-            let builder = hosts.swap_remove(builder_idx);
-            GroupPlan {
-                builder,
-                receivers: hosts,
-            }
-        })
-        .collect();
-    plans.sort_by(|a, b| a.builder.name.cmp(&b.builder.name));
+    // Every fallible step between the successful drain above and
+    // restore_deploy_targets below runs inside this block: a bare `?` here
+    // would strand target computers 'drained' and their sub-agents 'disabled',
+    // so the block's error is propagated only AFTER the drained targets have
+    // been restored. Guarded by
+    // fleet_deploy_restores_drained_targets_before_any_error_return.
+    let deploy_outcome: Result<Vec<DeployResult>> = async {
+        // Group targets by (os_family, arch). One build per group is executed
+        // on a designated builder; binaries are then scp'd to the remaining
+        // receivers.
+        let mut groups: std::collections::HashMap<(String, String), Vec<DeployTarget>> =
+            std::collections::HashMap::new();
+        for t in targets {
+            groups
+                .entry((t.os_family.clone(), t.arch.clone()))
+                .or_default()
+                .push(t);
+        }
+        let mut plans: Vec<GroupPlan> = groups
+            .into_values()
+            .map(|mut hosts| {
+                // Prefer a roomy builder so memory-tight boxes stay available as
+                // receivers (they only run the cheap install+restart path).
+                let builder_idx = hosts
+                    .iter()
+                    .position(|t| !(t.total_ram_gb > 0 && t.total_ram_gb <= MEMORY_TIGHT_RAM_GB))
+                    .unwrap_or(0);
+                let builder = hosts.swap_remove(builder_idx);
+                GroupPlan {
+                    builder,
+                    receivers: hosts,
+                }
+            })
+            .collect();
+        plans.sort_by(|a, b| a.builder.name.cmp(&b.builder.name));
 
-    if !json {
-        let total_targets = plans.iter().map(|p| 1 + p.receivers.len()).sum::<usize>();
-        eprintln!(
-            "{CYAN}▶ ff fleet deploy{RESET}: {} target(s) across {} group(s), up to {} in parallel",
-            total_targets,
-            plans.len(),
-            concurrency
-        );
-        for p in &plans {
-            let label = format!("{}+{}", p.builder.os_family, p.builder.arch);
+        if !json {
+            let total_targets = plans.iter().map(|p| 1 + p.receivers.len()).sum::<usize>();
             eprintln!(
-                "  group {:<18} builder={:<12} receivers={}",
-                label,
-                p.builder.name,
-                p.receivers.len()
+                "{CYAN}▶ ff fleet deploy{RESET}: {} target(s) across {} group(s), up to {} in parallel",
+                total_targets,
+                plans.len(),
+                concurrency
             );
-        }
-        report_skipped_hosts(&skipped);
-    }
-
-    // Mute presence alerts for the deploy window: every target's forgefleetd
-    // restarts during the rollout, so beat ages legitimately exceed the stale
-    // threshold and the evaluator would spam one member_stale_beat per host
-    // (operator-reported 2026-07-01). 50min covers the worst case (45min
-    // memory-tight build timeout); cleared on completion below, auto-expires
-    // if this process dies mid-deploy.
-    set_alert_mute(pool, 50 * 60).await;
-
-    // Drive deploys with bounded global concurrency. Each group builds once on
-    // its builder, then ships binaries to receivers. Builder failures cause
-    // receivers to fall back to self-build.
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let mut handles: Vec<tokio::task::JoinHandle<Vec<DeployResult>>> = Vec::new();
-    for plan in plans {
-        let s = sem.clone();
-        handles.push(tokio::spawn(async move { deploy_group(plan, s).await }));
-    }
-    let mut results: Vec<DeployResult> = Vec::new();
-    for h in handles {
-        match h.await {
-            Ok(group_results) => {
-                results.extend(group_results);
+            for p in &plans {
+                let label = format!("{}+{}", p.builder.os_family, p.builder.arch);
+                eprintln!(
+                    "  group {:<18} builder={:<12} receivers={}",
+                    label,
+                    p.builder.name,
+                    p.receivers.len()
+                );
             }
-            Err(e) => {
-                eprintln!("{YELLOW}⚠ deploy group task failed: {e}{RESET}");
-                results.push(DeployResult {
-                    name: "?".into(),
-                    ok: false,
-                    sha: "-".into(),
-                    secs: 0.0,
-                    detail: format!("task join error: {e}"),
-                });
+            report_skipped_hosts(&skipped);
+        }
+
+        // Mute presence alerts for the deploy window: every target's forgefleetd
+        // restarts during the rollout, so beat ages legitimately exceed the stale
+        // threshold and the evaluator would spam one member_stale_beat per host
+        // (operator-reported 2026-07-01). 50min covers the worst case (45min
+        // memory-tight build timeout); cleared on completion below, auto-expires
+        // if this process dies mid-deploy.
+        set_alert_mute(pool, 50 * 60).await;
+
+        // Drive deploys with bounded global concurrency. Each group builds once
+        // on its builder, then ships binaries to receivers. Builder failures
+        // cause receivers to fall back to self-build.
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let mut handles: Vec<tokio::task::JoinHandle<Vec<DeployResult>>> = Vec::new();
+        for plan in plans {
+            let s = sem.clone();
+            handles.push(tokio::spawn(async move { deploy_group(plan, s).await }));
+        }
+        let mut results: Vec<DeployResult> = Vec::new();
+        for h in handles {
+            match h.await {
+                Ok(group_results) => {
+                    results.extend(group_results);
+                }
+                Err(e) => {
+                    eprintln!("{YELLOW}⚠ deploy group task failed: {e}{RESET}");
+                    results.push(DeployResult {
+                        name: "?".into(),
+                        ok: false,
+                        sha: "-".into(),
+                        secs: 0.0,
+                        detail: format!("task join error: {e}"),
+                    });
+                }
             }
         }
-    }
-    results.sort_by(|a, b| a.name.cmp(&b.name));
+        results.sort_by(|a, b| a.name.cmp(&b.name));
 
-    // Replay per-host completion lines now that all groups are done.
-    if !json {
-        for r in &results {
-            let mark = if r.ok {
-                format!("{GREEN}✓{RESET}")
-            } else {
-                format!("{RED}✗{RESET}")
-            };
-            eprintln!(
-                "  {mark} {:<12} {:<10} {:>6.0}s  {}",
-                r.name, r.sha, r.secs, r.detail
-            );
+        // Replay per-host completion lines now that all groups are done.
+        if !json {
+            for r in &results {
+                let mark = if r.ok {
+                    format!("{GREEN}✓{RESET}")
+                } else {
+                    format!("{RED}✗{RESET}")
+                };
+                eprintln!(
+                    "  {mark} {:<12} {:<10} {:>6.0}s  {}",
+                    r.name, r.sha, r.secs, r.detail
+                );
+            }
         }
-    }
 
-    // Deploys done (daemons restarted + beating again) — lift the presence-
-    // alert mute rather than letting the 50min stamp ride out.
-    set_alert_mute(pool, 0).await;
-    restore_deploy_targets(pool, &previous_reservations).await;
+        // Deploys done (daemons restarted + beating again) — lift the presence-
+        // alert mute rather than letting the 50min stamp ride out. Not lifted
+        // on the error path: daemons may still be mid-restart, so the mute is
+        // left to auto-expire exactly as if this process had died mid-deploy.
+        set_alert_mute(pool, 0).await;
+        Ok(results)
+    }
+    .await;
+
+    // Restore BEFORE propagating any deploy error, so a failed rollout never
+    // leaves computers out of reservation rotation or sub-agents disabled.
+    if let Some(previous) = &previous_reservations {
+        restore_deploy_targets(pool, previous).await;
+    }
+    let results = deploy_outcome?;
 
     // Convergence target = the most-common SHA among successful hosts.
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -6517,6 +6547,57 @@ mod route_tests {
             .find("leader_refresh_playbook")
             .expect("leader refresh must restart");
         assert!(handoff < drain && drain < restart);
+    }
+
+    #[test]
+    fn fleet_deploy_restores_drained_targets_before_any_error_return() {
+        let source = include_str!("fleet_cmd.rs");
+        let deploy = source
+            .split("async fn handle_fleet_deploy")
+            .nth(1)
+            .expect("fleet deploy handler");
+        let drain = deploy
+            .find("drain_deploy_targets(pool")
+            .expect("deploy must drain target leases");
+        let restore = deploy
+            .find("restore_deploy_targets(pool")
+            .expect("deploy must restore drained targets");
+        assert!(drain < restore);
+        // Skip past the drain call's own `.await?` — a FAILED drain restores
+        // internally. From there to the restore call, no error may propagate:
+        // an early return would strand target computers 'drained' and their
+        // sub-agents 'disabled'.
+        let window = deploy[drain..restore]
+            .split_once(".await?")
+            .map(|(_, rest)| rest)
+            .expect("drain call is awaited");
+        for forbidden in [".await?", "bail!", "return Err", "return Ok"] {
+            assert!(
+                !window.contains(forbidden),
+                "`{forbidden}` between drain and restore would strand drained state"
+            );
+        }
+        // The deploy block's captured error is re-raised only after restore.
+        assert!(
+            deploy[restore..].contains("deploy_outcome?"),
+            "deploy errors must propagate only after restore_deploy_targets"
+        );
+
+        let leader = source
+            .split("async fn refresh_local_leader_if_self")
+            .nth(1)
+            .expect("leader refresh handler");
+        let leader_drain = leader
+            .find("drain_deploy_targets(pool")
+            .expect("leader refresh must drain leases");
+        let leader_restore = leader
+            .find("restore_deploy_targets(pool")
+            .expect("leader refresh must restore");
+        let leader_window = &leader[leader_drain..leader_restore];
+        assert!(
+            !leader_window.contains(".await?") && !leader_window.contains("bail!"),
+            "leader refresh must not error out while its host is drained"
+        );
     }
 
     #[test]
