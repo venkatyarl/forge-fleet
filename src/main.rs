@@ -1481,12 +1481,36 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                             continue;
                         }
 
+                        // Edge selection with EXPONENTIAL BACKOFF + give-up gate.
+                        // The original form (`attempts >= 3 ORDER BY attempts DESC`,
+                        // no recency filter) re-picked the WORST edge every tick
+                        // forever: james->ace reached attempts=153 with a Telegram
+                        // ping each time while ace (a macOS node) was simply asleep
+                        // — and the dead edge starved every other repair (operator-
+                        // reported 2026-07-23; the work_item for this was falsely
+                        // closed "already-implemented" by a builder, so it never
+                        // landed until now).
+                        //   • backoff: retry only after 2^(attempts-3) minutes,
+                        //     capped at 6h (PG: interval '1 min' * power(2, ...)).
+                        //   • give-up: past 10 attempts the edge is only retried
+                        //     when the DST has heartbeated in the last 10 minutes
+                        //     (no point repairing toward a host that is offline).
+                        //   • ORDER BY attempts ASC so fresh failures are repaired
+                        //     first and one dead edge cannot monopolize the slot.
                         let bad: std::result::Result<Option<(String, String, i32)>, _> = sqlx::query_as(
-                            "SELECT src_node, dst_node, attempts
-                               FROM fleet_mesh_status
-                              WHERE status = 'failed'
-                                AND attempts >= 3
-                              ORDER BY attempts DESC, last_checked ASC NULLS FIRST
+                            "SELECT m.src_node, m.dst_node, m.attempts
+                               FROM fleet_mesh_status m
+                              WHERE m.status = 'failed'
+                                AND m.attempts >= 3
+                                AND (m.last_checked IS NULL OR m.last_checked <
+                                     NOW() - LEAST(interval '6 hours',
+                                                   interval '1 minute'
+                                                     * power(2, LEAST(m.attempts - 3, 8))))
+                                AND (m.attempts <= 10 OR EXISTS (
+                                     SELECT 1 FROM computers c
+                                      WHERE c.name = m.dst_node
+                                        AND c.last_seen_at > NOW() - interval '10 minutes'))
+                              ORDER BY m.attempts ASC, m.last_checked ASC NULLS FIRST
                               LIMIT 1",
                         )
                         .fetch_optional(&pg_pool)
@@ -1522,12 +1546,21 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                                         "failed to enqueue ssh mesh auto-repair task"
                                     );
                                 }
-                                let _ = ff_agent::telegram::send_telegram_from_secrets(
-                                    &pg_pool,
-                                    "SSH mesh auto-repair",
-                                    &format!("Repair dispatched: {src} -> {dst} (attempts={attempts})"),
-                                )
-                                .await;
+                                // Notify on the FIRST auto-repair of an edge only
+                                // (attempts==3, the dispatch threshold). Repeats run
+                                // silently under backoff — a repair loop is plumbing,
+                                // not operator news; 150 identical pings taught the
+                                // operator to ignore the channel.
+                                if attempts == 3 {
+                                    let _ = ff_agent::telegram::send_telegram_from_secrets(
+                                        &pg_pool,
+                                        "SSH mesh auto-repair",
+                                        &format!(
+                                            "Repair dispatched: {src} -> {dst} (attempts={attempts}); further retries run silently with backoff"
+                                        ),
+                                    )
+                                    .await;
+                                }
                             }
                             Ok(None) => {}
                             Err(e) => warn!(error = %e, "ssh mesh auto-repair query failed"),
