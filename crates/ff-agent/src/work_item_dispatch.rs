@@ -164,6 +164,11 @@ struct WorktreeRecord {
     task_branch: String,
 }
 
+#[derive(Debug, Default)]
+struct WorkItemDispatchResult {
+    sweep_warnings: Vec<String>,
+}
+
 /// Count this host's recently-failed work_item dispatches (last 15 min), used
 /// as the backpressure signal for [`dispatch_budget_for_host`]. Best-effort —
 /// the caller treats an error as "0 failures" (no backpressure).
@@ -266,6 +271,15 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
                     MAX_BUILD_DURATION_SECS
                 )),
             };
+            if let Ok(outcome) = &result
+                && !outcome.sweep_warnings.is_empty()
+            {
+                warn!(
+                    work_item_id = %item.work_item_id,
+                    sweep_warnings = ?outcome.sweep_warnings,
+                    "work_item_dispatch: POST-phase sweep reported warnings"
+                );
+            }
             if let Err(e) = result {
                 if is_build_timeout(&e) {
                     warn!(
@@ -881,7 +895,11 @@ fn expand_home(path: &str) -> String {
     }
 }
 
-async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -> Result<()> {
+async fn dispatch_one(
+    pg: PgPool,
+    item: AssignedWorkItem,
+    worker_name: String,
+) -> Result<WorkItemDispatchResult> {
     // CLAIM + heartbeat FIRST, before the (possibly slow cold-clone) checkout.
     // dispatch_one now runs CONCURRENTLY with this host's other assigned leases
     // (spawned by evaluate_work_item_dispatch — a serial `.await` here blocked the
@@ -898,7 +916,7 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
             work_item_id = %item.work_item_id,
             "work_item_dispatch: already claimed by a concurrent dispatch — skipping"
         );
-        return Ok(());
+        return Ok(WorkItemDispatchResult::default());
     }
 
     // Keep the lease heartbeat alive for the ENTIRE dispatch — the backend build
@@ -925,6 +943,11 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         Arc::new(move || format!("building \"{status_title}\" on {status_computer}")),
     );
 
+    let mut post_sweep = PostBuildSweep::new(
+        item.work_item_id,
+        item.repo_path.clone(),
+        item.repo_path.clone(),
+    );
     ensure_repo_checked_out(&pg, &item).await?;
     let worktree = create_worktree_for_item(&pg, &item).await?;
 
@@ -969,7 +992,7 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         }
         Err(e) => {
             mark_worktree_failed(&pg, item.work_item_id, &e.to_string()).await?;
-            remove_worktree(&item.repo_path, &worktree.worktree_path)?;
+            post_sweep.run_cleanup();
             return Err(e);
         }
     };
@@ -1045,8 +1068,8 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
             "backend produced no diff (no commits) — required change not applied",
         )
         .await?;
-        remove_worktree(&item.repo_path, &worktree.worktree_path)?;
-        return Ok(());
+        let sweep_warnings = post_sweep.run_cleanup();
+        return Ok(WorkItemDispatchResult { sweep_warnings });
     }
 
     // SELF-VERIFY GATE — catch garbage at the source, before it costs a PR + CI
@@ -1126,8 +1149,8 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
                 &format!("self-verify failed before opening PR after {self_fix_attempts} self-fix attempt(s) + 480B rescue: {reason}"),
             )
             .await?;
-            remove_worktree(&item.repo_path, &worktree.worktree_path)?;
-            return Ok(());
+            let sweep_warnings = post_sweep.run_cleanup();
+            return Ok(WorkItemDispatchResult { sweep_warnings });
         }
 
         self_fix_attempts += 1;
@@ -1178,8 +1201,8 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         Ok(r) => r,
         Err(e) => {
             requeue_or_fail(&pg, &item, &format!("in-place review unavailable: {e:#}")).await?;
-            remove_worktree(&item.repo_path, &worktree.worktree_path)?;
-            return Ok(());
+            let sweep_warnings = post_sweep.run_cleanup();
+            return Ok(WorkItemDispatchResult { sweep_warnings });
         }
     };
     if !review.approved {
@@ -1206,8 +1229,8 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         // Same retry-with-context ladder as a build failure: the reviewer's
         // reason lands in last_error so the next attempt sees what to fix.
         requeue_or_fail(&pg, &item, &reason).await?;
-        remove_worktree(&item.repo_path, &worktree.worktree_path)?;
-        return Ok(());
+        let sweep_warnings = post_sweep.run_cleanup();
+        return Ok(WorkItemDispatchResult { sweep_warnings });
     }
 
     mark_ready_for_review(
@@ -1220,7 +1243,8 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         Some(&review),
     )
     .await?;
-    Ok(())
+    let sweep_warnings = post_sweep.finish_success();
+    Ok(WorkItemDispatchResult { sweep_warnings })
 }
 
 async fn record_pr_provenance(
@@ -1418,6 +1442,10 @@ async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Resul
     // a repo-url-less item bound outside the slot uses that path the same way
     // (it is the only workspace that exists for it).
     let worktree_path = item.repo_path.clone();
+    if let Err(error) = pre_build_checks(&item.repo_path) {
+        mark_worktree_failed(pg, item.work_item_id, &error.to_string()).await?;
+        return Err(error);
+    }
     insert_worktree_creating(pg, item, &worktree_path, &base_branch, &task_branch).await?;
     match checkout_clone_for_build(&item.repo_path, &base_branch, &task_branch) {
         Ok(()) => {
@@ -1442,6 +1470,35 @@ async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Resul
         base_branch,
         task_branch,
     })
+}
+
+const MIN_FREE_DISK_GB_FOR_BUILD: f64 = 2.0;
+
+/// PRE phase: validate staging, the build manifest, and host prerequisites
+/// immediately before checkout mutates the slot clone.
+fn pre_build_checks(repo_path: &Path) -> Result<()> {
+    if !repo_path.is_dir() {
+        bail!(
+            "pre_build_checks: staging check failed — {} is not a directory",
+            repo_path.display()
+        );
+    }
+    let manifest = repo_path.join("Cargo.toml");
+    if !manifest.is_file() {
+        bail!(
+            "pre_build_checks: manifest check failed — no Cargo.toml at {}",
+            manifest.display()
+        );
+    }
+    if let Some((available_gb, _)) = disk_free_for(repo_path)
+        && available_gb < MIN_FREE_DISK_GB_FOR_BUILD
+    {
+        bail!(
+            "pre_build_checks: prereq check failed — only {available_gb:.1} GB free at {} (need >= {MIN_FREE_DISK_GB_FOR_BUILD} GB)",
+            repo_path.display()
+        );
+    }
+    Ok(())
 }
 
 async fn insert_worktree_creating(
@@ -3906,6 +3963,75 @@ fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// POST phase for a dispatch. Explicit calls surface warnings to the caller;
+/// `Drop` supplies finally semantics for cancellation, early errors, and panic.
+struct PostBuildSweep {
+    work_item_id: Uuid,
+    repo_path: PathBuf,
+    worktree_path: PathBuf,
+    armed: bool,
+}
+
+impl PostBuildSweep {
+    fn new(work_item_id: Uuid, repo_path: PathBuf, worktree_path: PathBuf) -> Self {
+        Self {
+            work_item_id,
+            repo_path,
+            worktree_path,
+            armed: true,
+        }
+    }
+
+    fn run_cleanup(&mut self) -> Vec<String> {
+        self.run(true)
+    }
+
+    fn finish_success(&mut self) -> Vec<String> {
+        self.run(false)
+    }
+
+    fn run(&mut self, cleanup_repo: bool) -> Vec<String> {
+        if !self.armed {
+            return Vec::new();
+        }
+        self.armed = false;
+        let mut warnings = Vec::new();
+        collect_leftover_tmp_output(&self.worktree_path, &mut warnings);
+        if cleanup_repo && let Err(error) = remove_worktree(&self.repo_path, &self.worktree_path) {
+            warnings.push(format!("post-build repo cleanup failed: {error:#}"));
+        }
+        for warning in &warnings {
+            warn!(
+                work_item_id = %self.work_item_id,
+                %warning,
+                "work_item_dispatch: POST-phase sweep warning"
+            );
+        }
+        warnings
+    }
+}
+
+impl Drop for PostBuildSweep {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.run(true);
+        }
+    }
+}
+
+fn collect_leftover_tmp_output(worktree_path: &Path, warnings: &mut Vec<String>) {
+    let tmp_dir = worktree_path.join("tmp");
+    let Ok(entries) = std::fs::read_dir(tmp_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            warnings.push(format!("leftover tmp/ output: {}", path.display()));
+        }
+    }
+}
+
 fn reclaim_build_artifacts(path: &Path) -> u64 {
     fn is_reclaimable_dir_name(name: &OsStr) -> bool {
         name == OsStr::new("target")
@@ -4901,12 +5027,13 @@ pub fn spawn_worktree_reaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS, ReviewerStat,
-        affected_crate_manifests, agent_output_tail, backend_failed_without_output,
-        builder_excludes_480b, classify_dispatch_outcome, command_display,
-        complexity_at_least_moderate, default_clone_path, dispatch_budget_for_host,
-        dispatch_prompt, expand_home, is_build_timeout, mirror_repo_url, order_cloud_reviewers,
-        parse_cli_tokens, primary_or_default_backend, quick_empty_success_is_provider_failure,
+        AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS,
+        PostBuildSweep, ReviewerStat, affected_crate_manifests, agent_output_tail,
+        backend_failed_without_output, builder_excludes_480b, classify_dispatch_outcome,
+        collect_leftover_tmp_output, command_display, complexity_at_least_moderate,
+        default_clone_path, dispatch_budget_for_host, dispatch_prompt, expand_home,
+        is_build_timeout, mirror_repo_url, order_cloud_reviewers, parse_cli_tokens,
+        pre_build_checks, primary_or_default_backend, quick_empty_success_is_provider_failure,
         repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
         same_model_family, should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
         task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
@@ -4927,6 +5054,69 @@ mod tests {
         assert!(!builder_excludes_480b("codex"));
         assert!(!builder_excludes_480b("claude"));
         assert!(!builder_excludes_480b("kimi"));
+    }
+
+    #[test]
+    fn pre_build_checks_validate_staging_and_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing");
+        assert!(
+            pre_build_checks(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("staging check failed")
+        );
+        assert!(
+            pre_build_checks(tmp.path())
+                .unwrap_err()
+                .to_string()
+                .contains("manifest check failed")
+        );
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        pre_build_checks(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn post_log_collection_reports_leftover_tmp_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("tmp")).unwrap();
+        let log = tmp.path().join("tmp").join("agent.log");
+        std::fs::write(&log, "diagnostic").unwrap();
+        let mut warnings = Vec::new();
+        collect_leftover_tmp_output(tmp.path(), &mut warnings);
+        assert_eq!(
+            warnings,
+            vec![format!("leftover tmp/ output: {}", log.display())]
+        );
+    }
+
+    #[test]
+    fn post_sweep_drop_restores_repo_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(repo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("Cargo.toml"), "[workspace]\n").unwrap();
+        git(&["add", "Cargo.toml"]);
+        git(&["commit", "-qm", "base"]);
+
+        std::fs::write(repo.join("untracked.txt"), "remove me").unwrap();
+        {
+            let _guard =
+                PostBuildSweep::new(Uuid::new_v4(), repo.to_path_buf(), repo.to_path_buf());
+        }
+        assert!(!repo.join("untracked.txt").exists());
     }
 
     #[test]
