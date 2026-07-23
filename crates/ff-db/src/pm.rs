@@ -48,6 +48,7 @@ pub struct ProjectWithAttachments {
     pub id: String,
     pub display_name: String,
     pub status: String,
+    pub config: serde_json::Value,
     pub repos: Vec<ProjectRepo>,
     pub folders: Vec<ProjectFolder>,
 }
@@ -236,10 +237,11 @@ pub async fn pg_delete_project_folder(pool: &PgPool, id: &str) -> Result<bool> {
 pub async fn pg_list_projects_with_attachments(
     pool: &PgPool,
 ) -> Result<Vec<ProjectWithAttachments>> {
-    let project_rows =
-        sqlx::query("SELECT id, display_name, status FROM projects ORDER BY display_name ASC")
-            .fetch_all(pool)
-            .await?;
+    let project_rows = sqlx::query(
+        "SELECT id, display_name, status, config FROM projects ORDER BY display_name ASC",
+    )
+    .fetch_all(pool)
+    .await?;
 
     let mut out = Vec::with_capacity(project_rows.len());
     for p in &project_rows {
@@ -249,10 +251,34 @@ pub async fn pg_list_projects_with_attachments(
         out.push(ProjectWithAttachments {
             display_name: p.get("display_name"),
             status: p.get("status"),
+            config: p.get("config"),
             id,
             repos,
             folders,
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_with_attachments_serializes_config() {
+        let project = ProjectWithAttachments {
+            id: "forge-fleet".into(),
+            display_name: "ForgeFleet".into(),
+            status: "active".into(),
+            config: serde_json::json!({"paths": ["/workspace/forge-fleet"]}),
+            repos: Vec::new(),
+            folders: Vec::new(),
+        };
+
+        let json = serde_json::to_value(project).expect("project should serialize");
+        assert_eq!(
+            json["config"]["paths"],
+            serde_json::json!(["/workspace/forge-fleet"])
+        );
+    }
 }
