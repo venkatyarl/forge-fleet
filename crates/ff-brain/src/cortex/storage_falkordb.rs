@@ -1,8 +1,10 @@
 //! Authoritative FalkorDB storage backend for Cortex.
 //!
-//! This module is intentionally not wired into Cortex yet.  Unlike the
-//! migration adapter in [`super::storage`], writes made here are FalkorDB-only
-//! and are rejected while either Postgres graph table contains data.
+//! Selected via `CORTEX_GRAPH_BACKEND=falkordb-authoritative` (or the
+//! `cortex.graph_backend` fleet setting) through
+//! [`super::storage::graph_store_from_config`]. Unlike the migration adapter
+//! in [`super::storage`], writes made here are FalkorDB-only and are rejected
+//! while either Postgres graph table contains data.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;

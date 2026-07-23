@@ -1,7 +1,10 @@
 //! Storage backend abstraction for Cortex.
 //!
-//! Postgres remains the production write backend. Cortex reads can opt into a
-//! native FalkorDB graph, with transparent per-operation Postgres fallback.
+//! The active backend is config-driven: `CORTEX_GRAPH_BACKEND` (or the
+//! `cortex.graph_backend` fleet setting) selects between the deprecated
+//! Postgres graph, the FalkorDB migration adapter (reads with per-operation
+//! Postgres fallback), and the authoritative FalkorDB backend, where
+//! configuration and connection errors are hard failures with no fallback.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -157,17 +160,23 @@ pub trait CortexGraphStore: Send + Sync {
 
 /// Existing Postgres/pgvector implementation. This delegates to the current
 /// battle-tested helpers so behavior does not change while the trait lands.
+#[deprecated(
+    note = "the Postgres graph is a legacy migration path; select FalkorDB via \
+            CORTEX_GRAPH_BACKEND / fleet setting cortex.graph_backend"
+)]
 #[derive(Clone)]
 pub struct PostgresCortexGraphStore {
     pool: PgPool,
 }
 
+#[allow(deprecated)]
 impl PostgresCortexGraphStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 }
 
+#[allow(deprecated)]
 #[async_trait]
 impl CortexGraphStore for PostgresCortexGraphStore {
     fn backend_name(&self) -> &'static str {
@@ -1047,12 +1056,14 @@ fn enabled_value(value: &str) -> bool {
     )
 }
 
-async fn connect_falkor(pool: &PgPool) -> Result<FalkorCortexGraphStore> {
+/// Resolve the FalkorDB connection and graph name from `FALKORDB_URL` /
+/// `FALKORDB_GRAPH` or the `falkordb.url` / `falkordb.graph` fleet settings.
+async fn falkor_connection(pool: &PgPool) -> Result<(ConnectionManager, String)> {
     let url = match std::env::var("FALKORDB_URL") {
         Ok(url) => url,
-        Err(_) => fleet_setting(pool, "falkordb.url").await.context(
-            "FalkorDB administration requires FALKORDB_URL or fleet_secrets falkordb.url",
-        )?,
+        Err(_) => fleet_setting(pool, "falkordb.url")
+            .await
+            .context("the FalkorDB backend requires FALKORDB_URL or fleet_secrets falkordb.url")?,
     };
     let graph = std::env::var("FALKORDB_GRAPH")
         .ok()
@@ -1063,7 +1074,79 @@ async fn connect_falkor(pool: &PgPool) -> Result<FalkorCortexGraphStore> {
         .await
         .context("FalkorDB connection timed out")?
         .context("connect to FalkorDB")?;
+    Ok((connection, graph))
+}
+
+async fn connect_falkor(pool: &PgPool) -> Result<FalkorCortexGraphStore> {
+    let (connection, graph) = falkor_connection(pool).await?;
     Ok(FalkorCortexGraphStore::new(connection, graph, pool.clone()))
+}
+
+/// Which graph backend Cortex should use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CortexBackendChoice {
+    /// Deprecated Postgres graph, kept as the migration baseline.
+    Postgres,
+    /// Migration mode: FalkorDB reads with per-operation Postgres fallback.
+    FalkordbMigration,
+    /// Authoritative FalkorDB: config, connect, and read errors are hard
+    /// failures — never silently served from Postgres.
+    Falkordb,
+}
+
+fn parse_backend_choice(raw: Option<&str>) -> Result<CortexBackendChoice> {
+    match raw
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("") | Some("postgres") => Ok(CortexBackendChoice::Postgres),
+        Some("falkordb") => Ok(CortexBackendChoice::FalkordbMigration),
+        Some("falkordb-authoritative") => Ok(CortexBackendChoice::Falkordb),
+        Some(other) => anyhow::bail!(
+            "unknown Cortex graph backend {other:?} (expected \"postgres\", \"falkordb\", or \"falkordb-authoritative\")"
+        ),
+    }
+}
+
+static BACKEND_CHOICE: OnceCell<std::result::Result<CortexBackendChoice, String>> =
+    OnceCell::const_new();
+
+/// Resolve the configured backend once per process: `CORTEX_GRAPH_BACKEND`
+/// wins, then the `cortex.graph_backend` fleet setting, then Postgres.
+pub async fn configured_backend(pool: &PgPool) -> Result<CortexBackendChoice> {
+    BACKEND_CHOICE
+        .get_or_init(|| async {
+            let raw = match std::env::var("CORTEX_GRAPH_BACKEND") {
+                Ok(value) => Some(value),
+                Err(_) => fleet_setting(pool, "cortex.graph_backend").await,
+            };
+            parse_backend_choice(raw.as_deref()).map_err(|error| error.to_string())
+        })
+        .await
+        .clone()
+        .map_err(anyhow::Error::msg)
+}
+
+/// Config-driven backend factory: the single chokepoint that turns fleet
+/// configuration into a concrete [`CortexGraphStore`]. Selecting a FalkorDB
+/// backend that cannot be reached is an error, not a fallback.
+pub async fn graph_store_from_config(pool: &PgPool) -> Result<Box<dyn CortexGraphStore>> {
+    match configured_backend(pool).await? {
+        CortexBackendChoice::Postgres => {
+            #[allow(deprecated)]
+            let store = PostgresCortexGraphStore::new(pool.clone());
+            Ok(Box::new(store))
+        }
+        CortexBackendChoice::FalkordbMigration => Ok(Box::new(connect_falkor(pool).await?)),
+        CortexBackendChoice::Falkordb => {
+            let (connection, graph) = falkor_connection(pool).await?;
+            let backend = super::storage_falkordb::FalkorDBBackend::new(
+                super::storage_falkordb::FalkorDBClient::new(connection, graph),
+                pool.clone(),
+            );
+            Ok(Box::new(backend))
+        }
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -1163,6 +1246,7 @@ fn hit_keys(rows: &[SymbolHit]) -> Vec<(Uuid, String, String, Option<i32>, Optio
 /// Compare both backends directly. This deliberately bypasses
 /// `CortexReadRouter`, because fallback would conceal a FalkorDB read failure.
 pub async fn parity_check_falkordb(pool: &PgPool, sample_limit: i64) -> Result<CortexParityReport> {
+    #[allow(deprecated)]
     let postgres = PostgresCortexGraphStore::new(pool.clone());
     let falkor = connect_falkor(pool).await?;
     let (postgres_nodes, postgres_edges): (i64, i64) = sqlx::query_as(
@@ -1387,64 +1471,59 @@ pub(crate) async fn mirror_embedding(pool: &PgPool, node_id: Uuid, embedding: &[
     .await;
 }
 
-/// Opt-in read router. FalkorDB is attempted only when
-/// `CORTEX_GRAPH_BACKEND=falkordb`, and every failed read is transparently
-/// retried against Postgres.
+/// Config-driven read router. The primary backend comes from
+/// [`graph_store_from_config`]; only migration mode keeps a per-operation
+/// Postgres fallback, while the authoritative FalkorDB backend hard-fails.
 pub struct CortexReadRouter {
-    postgres: PostgresCortexGraphStore,
-    falkor: Option<FalkorCortexGraphStore>,
+    primary: Box<dyn CortexGraphStore>,
+    #[allow(deprecated)]
+    postgres_fallback: Option<PostgresCortexGraphStore>,
 }
 
 impl CortexReadRouter {
-    pub async fn from_env(pool: &PgPool) -> Self {
-        let postgres = PostgresCortexGraphStore::new(pool.clone());
-        if std::env::var("CORTEX_GRAPH_BACKEND").as_deref() != Ok("falkordb") {
-            return Self {
-                postgres,
-                falkor: None,
-            };
-        }
-        let falkor = async {
-            let url = std::env::var("FALKORDB_URL").context(
-                "CORTEX_GRAPH_BACKEND=falkordb requires FALKORDB_URL (for example redis://priya:63379)",
-            )?;
-            let graph = std::env::var("FALKORDB_GRAPH").unwrap_or_else(|_| "cortex".to_string());
-            let client = redis::Client::open(url).context("open FalkorDB Redis client")?;
-            let connection = tokio::time::timeout(FALKOR_TIMEOUT, ConnectionManager::new(client))
-                .await
-                .context("FalkorDB connection timed out")?
-                .context("connect to FalkorDB")?;
-            Ok::<_, anyhow::Error>(FalkorCortexGraphStore::new(connection, graph, pool.clone()))
-        }.await;
-        match falkor {
-            Ok(falkor) => Self {
-                postgres,
-                falkor: Some(falkor),
-            },
-            Err(error) => {
+    /// Build the router from configuration. Selecting the authoritative
+    /// FalkorDB backend propagates configuration and connection errors
+    /// instead of silently reverting to Postgres.
+    pub async fn from_env(pool: &PgPool) -> Result<Self> {
+        let choice = configured_backend(pool).await?;
+        let primary: Box<dyn CortexGraphStore> = match graph_store_from_config(pool).await {
+            Ok(store) => store,
+            Err(error) if choice == CortexBackendChoice::FalkordbMigration => {
                 tracing::warn!(%error, "FalkorDB Cortex read adapter unavailable; using Postgres");
-                Self {
-                    postgres,
-                    falkor: None,
-                }
+                #[allow(deprecated)]
+                let store = PostgresCortexGraphStore::new(pool.clone());
+                Box::new(store)
             }
-        }
+            Err(error) => {
+                return Err(error
+                    .context("selected Cortex graph backend is unavailable; it has no fallback"));
+            }
+        };
+        #[allow(deprecated)]
+        let postgres_fallback = (choice == CortexBackendChoice::FalkordbMigration
+            && primary.backend_name() != "postgres")
+            .then(|| PostgresCortexGraphStore::new(pool.clone()));
+        Ok(Self {
+            primary,
+            postgres_fallback,
+        })
     }
 
-    async fn fallback<T, F, P>(&self, operation: &'static str, falkor: F, postgres: P) -> Result<T>
-    where
-        F: std::future::Future<Output = Result<T>>,
-        P: std::future::Future<Output = Result<T>>,
-    {
-        if self.falkor.is_some() {
-            match falkor.await {
-                Ok(value) => return Ok(value),
-                Err(error) => {
-                    tracing::warn!(%error, operation, "FalkorDB Cortex read failed; falling back to Postgres")
-                }
+    /// In migration mode a failed FalkorDB read is retried against Postgres;
+    /// every other backend surfaces the error unchanged.
+    #[allow(deprecated)]
+    fn migration_fallback(
+        &self,
+        operation: &'static str,
+        error: anyhow::Error,
+    ) -> Result<&PostgresCortexGraphStore> {
+        match &self.postgres_fallback {
+            Some(postgres) => {
+                tracing::warn!(%error, operation, "FalkorDB Cortex read failed; falling back to Postgres");
+                Ok(postgres)
             }
+            None => Err(error),
         }
-        postgres.await
     }
 
     pub async fn find_symbols(
@@ -1455,20 +1534,18 @@ impl CortexReadRouter {
         kind: Option<&str>,
         semantic: bool,
     ) -> Result<Vec<SymbolHit>> {
-        let falkor = async {
-            self.falkor
-                .as_ref()
-                .context("FalkorDB disabled")?
-                .find_symbols(corpus, query, limit, kind, semantic)
-                .await
-        };
-        self.fallback(
-            "find_symbols",
-            falkor,
-            self.postgres
-                .find_symbols(corpus, query, limit, kind, semantic),
-        )
-        .await
+        match self
+            .primary
+            .find_symbols(corpus, query, limit, kind, semantic)
+            .await
+        {
+            Ok(rows) => Ok(rows),
+            Err(error) => {
+                self.migration_fallback("find_symbols", error)?
+                    .find_symbols(corpus, query, limit, kind, semantic)
+                    .await
+            }
+        }
     }
     pub async fn callers(
         &self,
@@ -1476,19 +1553,14 @@ impl CortexReadRouter {
         symbol: &str,
         confidence: f32,
     ) -> Result<Vec<SymbolRef>> {
-        let falkor = async {
-            self.falkor
-                .as_ref()
-                .context("FalkorDB disabled")?
-                .callers(corpus, symbol, confidence)
-                .await
-        };
-        self.fallback(
-            "callers",
-            falkor,
-            self.postgres.callers(corpus, symbol, confidence),
-        )
-        .await
+        match self.primary.callers(corpus, symbol, confidence).await {
+            Ok(rows) => Ok(rows),
+            Err(error) => {
+                self.migration_fallback("callers", error)?
+                    .callers(corpus, symbol, confidence)
+                    .await
+            }
+        }
     }
     pub async fn callees(
         &self,
@@ -1496,19 +1568,14 @@ impl CortexReadRouter {
         symbol: &str,
         confidence: f32,
     ) -> Result<Vec<SymbolRef>> {
-        let falkor = async {
-            self.falkor
-                .as_ref()
-                .context("FalkorDB disabled")?
-                .callees(corpus, symbol, confidence)
-                .await
-        };
-        self.fallback(
-            "callees",
-            falkor,
-            self.postgres.callees(corpus, symbol, confidence),
-        )
-        .await
+        match self.primary.callees(corpus, symbol, confidence).await {
+            Ok(rows) => Ok(rows),
+            Err(error) => {
+                self.migration_fallback("callees", error)?
+                    .callees(corpus, symbol, confidence)
+                    .await
+            }
+        }
     }
     pub async fn impact(
         &self,
@@ -1517,19 +1584,14 @@ impl CortexReadRouter {
         depth: usize,
         confidence: f32,
     ) -> Result<Vec<SymbolRef>> {
-        let falkor = async {
-            self.falkor
-                .as_ref()
-                .context("FalkorDB disabled")?
-                .impact(corpus, symbol, depth, confidence)
-                .await
-        };
-        self.fallback(
-            "impact",
-            falkor,
-            self.postgres.impact(corpus, symbol, depth, confidence),
-        )
-        .await
+        match self.primary.impact(corpus, symbol, depth, confidence).await {
+            Ok(rows) => Ok(rows),
+            Err(error) => {
+                self.migration_fallback("impact", error)?
+                    .impact(corpus, symbol, depth, confidence)
+                    .await
+            }
+        }
     }
     pub async fn call_path(
         &self,
@@ -1539,19 +1601,18 @@ impl CortexReadRouter {
         depth: usize,
         confidence: f32,
     ) -> Result<Option<Vec<SymbolRef>>> {
-        let falkor = async {
-            self.falkor
-                .as_ref()
-                .context("FalkorDB disabled")?
-                .call_path(corpus, from, to, depth, confidence)
-                .await
-        };
-        self.fallback(
-            "call_path",
-            falkor,
-            self.postgres.call_path(corpus, from, to, depth, confidence),
-        )
-        .await
+        match self
+            .primary
+            .call_path(corpus, from, to, depth, confidence)
+            .await
+        {
+            Ok(rows) => Ok(rows),
+            Err(error) => {
+                self.migration_fallback("call_path", error)?
+                    .call_path(corpus, from, to, depth, confidence)
+                    .await
+            }
+        }
     }
     pub async fn tests_for(
         &self,
@@ -1560,19 +1621,18 @@ impl CortexReadRouter {
         depth: usize,
         confidence: f32,
     ) -> Result<Vec<TestHit>> {
-        let falkor = async {
-            self.falkor
-                .as_ref()
-                .context("FalkorDB disabled")?
-                .tests_for(corpus, symbol, depth, confidence)
-                .await
-        };
-        self.fallback(
-            "tests_for",
-            falkor,
-            self.postgres.tests_for(corpus, symbol, depth, confidence),
-        )
-        .await
+        match self
+            .primary
+            .tests_for(corpus, symbol, depth, confidence)
+            .await
+        {
+            Ok(rows) => Ok(rows),
+            Err(error) => {
+                self.migration_fallback("tests_for", error)?
+                    .tests_for(corpus, symbol, depth, confidence)
+                    .await
+            }
+        }
     }
     pub async fn explain_community(
         &self,
@@ -1581,19 +1641,18 @@ impl CortexReadRouter {
         kind: Option<&str>,
         limit: i64,
     ) -> Result<Option<CommunityExplanation>> {
-        let falkor = async {
-            self.falkor
-                .as_ref()
-                .context("FalkorDB disabled")?
-                .explain_community(corpus, symbol, kind, limit)
-                .await
-        };
-        self.fallback(
-            "explain_community",
-            falkor,
-            self.postgres.explain_community(corpus, symbol, kind, limit),
-        )
-        .await
+        match self
+            .primary
+            .explain_community(corpus, symbol, kind, limit)
+            .await
+        {
+            Ok(rows) => Ok(rows),
+            Err(error) => {
+                self.migration_fallback("explain_community", error)?
+                    .explain_community(corpus, symbol, kind, limit)
+                    .await
+            }
+        }
     }
     pub async fn outline_file(
         &self,
@@ -1601,25 +1660,73 @@ impl CortexReadRouter {
         file: &str,
         kind: Option<&str>,
     ) -> Result<Option<FileOutline>> {
-        let falkor = async {
-            self.falkor
-                .as_ref()
-                .context("FalkorDB disabled")?
-                .outline_file(corpus, file, kind)
-                .await
-        };
-        self.fallback(
-            "outline_file",
-            falkor,
-            self.postgres.outline_file(corpus, file, kind),
-        )
-        .await
+        match self.primary.outline_file(corpus, file, kind).await {
+            Ok(rows) => Ok(rows),
+            Err(error) => {
+                self.migration_fallback("outline_file", error)?
+                    .outline_file(corpus, file, kind)
+                    .await
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_switch_parses_config_values() {
+        assert_eq!(
+            parse_backend_choice(None).unwrap(),
+            CortexBackendChoice::Postgres
+        );
+        assert_eq!(
+            parse_backend_choice(Some("")).unwrap(),
+            CortexBackendChoice::Postgres
+        );
+        assert_eq!(
+            parse_backend_choice(Some("postgres")).unwrap(),
+            CortexBackendChoice::Postgres
+        );
+        assert_eq!(
+            parse_backend_choice(Some("falkordb")).unwrap(),
+            CortexBackendChoice::FalkordbMigration
+        );
+        assert_eq!(
+            parse_backend_choice(Some(" FalkorDB-Authoritative ")).unwrap(),
+            CortexBackendChoice::Falkordb
+        );
+        assert!(parse_backend_choice(Some("sqlite")).is_err());
+    }
+
+    #[tokio::test]
+    async fn backend_switch_constructs_configured_store() {
+        // DB-backed stub for the backend switch. CI's `cargo test --lib` has
+        // no database, so it MUST early-return when neither env var is set.
+        let Ok(url) = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+        else {
+            return;
+        };
+        let Ok(pool) = sqlx::PgPool::connect(&url).await else {
+            return;
+        };
+        // Only the default Postgres choice is asserted here: a FalkorDB
+        // choice depends on a reachable FalkorDB, which CI does not have.
+        if configured_backend(&pool).await.ok() != Some(CortexBackendChoice::Postgres) {
+            return;
+        }
+        let store = graph_store_from_config(&pool)
+            .await
+            .expect("default backend must construct without FalkorDB");
+        assert_eq!(store.backend_name(), "postgres");
+        let router = CortexReadRouter::from_env(&pool)
+            .await
+            .expect("default router must construct without FalkorDB");
+        assert_eq!(router.primary.backend_name(), "postgres");
+        assert!(router.postgres_fallback.is_none());
+    }
 
     #[test]
     fn decodes_graph_ro_query_rows() {

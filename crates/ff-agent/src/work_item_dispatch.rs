@@ -3138,8 +3138,8 @@ async fn run_ff_dispatch(
     // pick isn't in this node's dispatchable set.
     let mut policy = ff_routing_policy::PolicyConfig::default();
     const BUILDER_ROTATION: [&str; 3] = ["claude", "codex", "kimi"];
-    let pick = BUILDER_ROTATION
-        [(item.work_item_id.as_u128() % BUILDER_ROTATION.len() as u128) as usize];
+    let pick =
+        BUILDER_ROTATION[(item.work_item_id.as_u128() % BUILDER_ROTATION.len() as u128) as usize];
     let preferred = if backends.iter().any(|b| b == pick) {
         pick
     } else {
