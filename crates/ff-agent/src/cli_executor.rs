@@ -208,6 +208,34 @@ pub fn backend_by_name(name: &str) -> Option<&'static CliBackend> {
     BACKENDS.iter().find(|b| b.name.eq_ignore_ascii_case(name))
 }
 
+/// Backend names an operator has disabled for dispatch, via `FF_DISABLED_BACKENDS`
+/// (comma-separated, case-insensitive). Read fresh on every call — same
+/// no-restart-needed spirit as the rest of this module's env-driven config — so
+/// toggling it fleet-wide is one `ff config`/env change, not a redeploy.
+///
+/// Generalizes the operator directive that used to be hardcoded as a single
+/// `backend <> 'claude'` SQL filter for in-place reviews (`run_in_place_review`
+/// in `work_item_dispatch.rs`); that caller-specific carve-out predates this and
+/// still applies on top of whatever this returns.
+pub fn disabled_backends() -> Vec<String> {
+    std::env::var("FF_DISABLED_BACKENDS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `true` if `name` is in [`disabled_backends`] (case-insensitive).
+pub fn is_backend_disabled(name: &str) -> bool {
+    disabled_backends()
+        .iter()
+        .any(|disabled| disabled.eq_ignore_ascii_case(name))
+}
+
 /// Result of a single CLI invocation.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CliResult {
@@ -259,6 +287,18 @@ pub async fn execute_cli_in_dir(
                 .join(", ")
         )
     })?;
+
+    // Reject a disabled backend before spawning anything. Callers that dispatch
+    // builds/reviews (`run_ff_dispatch`, `run_in_place_review` in
+    // `work_item_dispatch.rs`) already loop over a ranked backend list and
+    // switch to the next candidate on any `Err` here — so disabling e.g. claude
+    // reroutes to codex/kimi through that EXISTING fallback path, not a new one.
+    if is_backend_disabled(cfg.name) {
+        return Err(anyhow!(
+            "backend '{}' is disabled via disabled_backends config (FF_DISABLED_BACKENDS)",
+            cfg.name
+        ));
+    }
 
     // Verify the binary is on PATH before bothering to spawn.
     let bin_path = which_on_path(cfg.binary).ok_or_else(|| {
@@ -510,6 +550,55 @@ mod tests {
     fn backend_by_name_rejects_unknown() {
         assert!(backend_by_name("bogus").is_none());
         assert!(backend_by_name("").is_none());
+    }
+
+    /// Serializes tests that mutate `FF_DISABLED_BACKENDS` — a process-global env
+    /// var — so they don't race each other under the default parallel test runner.
+    static DISABLED_BACKENDS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn disabled_backends_parses_comma_separated_case_insensitively() {
+        let _guard = DISABLED_BACKENDS_ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized by DISABLED_BACKENDS_ENV_LOCK.
+        unsafe { std::env::set_var("FF_DISABLED_BACKENDS", " Claude, KIMI ,,codex") };
+        assert_eq!(
+            disabled_backends(),
+            vec![
+                "claude".to_string(),
+                "kimi".to_string(),
+                "codex".to_string(),
+            ]
+        );
+        assert!(is_backend_disabled("claude"));
+        assert!(is_backend_disabled("CLAUDE"));
+        assert!(!is_backend_disabled("gemini"));
+        // SAFETY: serialized by DISABLED_BACKENDS_ENV_LOCK.
+        unsafe { std::env::remove_var("FF_DISABLED_BACKENDS") };
+    }
+
+    #[test]
+    fn disabled_backends_empty_when_env_unset() {
+        let _guard = DISABLED_BACKENDS_ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized by DISABLED_BACKENDS_ENV_LOCK.
+        unsafe { std::env::remove_var("FF_DISABLED_BACKENDS") };
+        assert!(disabled_backends().is_empty());
+        assert!(!is_backend_disabled("claude"));
+    }
+
+    #[tokio::test]
+    async fn execute_cli_in_dir_rejects_disabled_backend() {
+        let _guard = DISABLED_BACKENDS_ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized by DISABLED_BACKENDS_ENV_LOCK.
+        unsafe { std::env::set_var("FF_DISABLED_BACKENDS", "claude") };
+        let err = execute_cli("claude", "hello", &[], Some(Duration::from_secs(1)))
+            .await
+            .expect_err("disabled backend must not spawn");
+        assert!(
+            err.to_string().contains("disabled"),
+            "unexpected error: {err}"
+        );
+        // SAFETY: serialized by DISABLED_BACKENDS_ENV_LOCK.
+        unsafe { std::env::remove_var("FF_DISABLED_BACKENDS") };
     }
 
     /// `local` is intentionally NOT in `BACKENDS` — it routes through the
