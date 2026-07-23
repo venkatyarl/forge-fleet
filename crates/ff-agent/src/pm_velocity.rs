@@ -17,6 +17,12 @@ use sqlx::PgPool;
 const COMPLETED_STATUSES: &str = "('done','merged')";
 /// Statuses that count as work-in-progress, in pipeline order.
 const WIP_STATUSES: [&str; 4] = ["ready", "claimed", "building", "in_review"];
+/// The in-flight [`WIP_STATUSES`] member the pipeline digest tracks on its
+/// own line (the dispatch loop sets it once a claimed item starts building).
+const BUILDING_STATUS: &str = "building";
+/// Terminal status `work_item_dispatch::mark_failed_and_release` sets after a
+/// work item exhausts its retry attempts.
+const FAILED_STATUS: &str = "failed";
 
 /// Raw KPI numbers behind the digest, split from rendering so the formatter
 /// is unit-testable without a database.
@@ -36,6 +42,43 @@ pub struct VelocityStats {
     pub wip: Vec<(String, i64)>,
     /// Projects with the most completions in the last 7 days (top 5).
     pub top_projects_7d: Vec<(String, i64)>,
+}
+
+/// Point-in-time `work_items` counts for the pipeline digest
+/// ([`crate::ha::pipeline_digest`]). Lives here — not in the digest module —
+/// so the counts share this module's status definitions and can never drift
+/// from what `ff pm velocity` reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PipelineStatusCounts {
+    /// Items in [`COMPLETED_STATUSES`] (`done` or `merged`) — an item counts
+    /// as merged-or-done, never only `merged`.
+    pub completed: i64,
+    /// Items currently [`BUILDING_STATUS`].
+    pub building: i64,
+    /// Items in the terminal [`FAILED_STATUS`].
+    pub failed: i64,
+}
+
+/// Query `work_items` for the current pipeline status counts, using the same
+/// status sets as [`collect_velocity_stats`].
+pub async fn collect_pipeline_status_counts(pool: &PgPool) -> Result<PipelineStatusCounts> {
+    let (completed, building, failed): (i64, i64, i64) = sqlx::query_as(&format!(
+        "SELECT COUNT(*) FILTER (WHERE status IN {COMPLETED_STATUSES}), \
+                COUNT(*) FILTER (WHERE status = $1), \
+                COUNT(*) FILTER (WHERE status = $2) \
+         FROM work_items"
+    ))
+    .bind(BUILDING_STATUS)
+    .bind(FAILED_STATUS)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("pipeline status counts query: {e}"))?;
+
+    Ok(PipelineStatusCounts {
+        completed,
+        building,
+        failed,
+    })
 }
 
 /// Query `work_items` for the velocity KPIs.
@@ -194,6 +237,15 @@ mod tests {
         assert!(text.contains("building 3 · in_review 5"));
         assert!(text.contains("2026-06-29  7"));
         assert!(text.contains("Top projects (7d):   forge-fleet 10"));
+    }
+
+    #[test]
+    fn pipeline_digest_statuses_stay_aligned_with_velocity_sets() {
+        // `completed` must mean the full COMPLETED_STATUSES set (done AND
+        // merged), and `building` must remain a member of the WIP set.
+        assert!(COMPLETED_STATUSES.contains("'done'"));
+        assert!(COMPLETED_STATUSES.contains("'merged'"));
+        assert!(WIP_STATUSES.contains(&BUILDING_STATUS));
     }
 
     #[test]
