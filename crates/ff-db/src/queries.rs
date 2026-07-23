@@ -1453,7 +1453,8 @@ pub struct RouteFilter {
 /// vector.
 const LOAD_METRICS_JOIN: &str = "LEFT JOIN LATERAL (
                  SELECT AVG(m.cpu_pct) AS cpu_pct,
-                        ROUND(AVG(m.llm_active_requests))::int AS llm_active_requests
+                        ROUND(AVG(m.llm_active_requests))::int AS llm_active_requests,
+                        AVG(m.mem_avail_gb) AS mem_avail_gb
                    FROM computer_metrics_history_retained m
                   WHERE m.computer_id = c.id
                     AND m.recorded_at >= NOW() - INTERVAL '15 minutes'
@@ -8595,10 +8596,10 @@ pub async fn pg_maintain_computer_metrics_history(pool: &PgPool) -> Result<(u64,
         r#"
         INSERT INTO computer_metrics_history_hourly
             (computer_id, recorded_at, sample_count, cpu_pct, ram_pct,
-             ram_used_gb, disk_free_gb, gpu_pct, llm_ram_allocated_gb,
+             ram_used_gb, mem_avail_gb, disk_free_gb, gpu_pct, llm_ram_allocated_gb,
              llm_queue_depth, llm_active_requests, llm_tokens_per_sec)
         SELECT computer_id, date_trunc('hour', recorded_at), COUNT(*),
-               AVG(cpu_pct), AVG(ram_pct), AVG(ram_used_gb), MIN(disk_free_gb),
+               AVG(cpu_pct), AVG(ram_pct), AVG(ram_used_gb), AVG(mem_avail_gb), MIN(disk_free_gb),
                AVG(gpu_pct), AVG(llm_ram_allocated_gb), AVG(llm_queue_depth),
                AVG(llm_active_requests), AVG(llm_tokens_per_sec)
           FROM computer_metrics_history
@@ -8622,12 +8623,13 @@ pub async fn pg_maintain_computer_metrics_history(pool: &PgPool) -> Result<(u64,
         r#"
         INSERT INTO computer_metrics_history_daily
             (computer_id, recorded_at, sample_count, cpu_pct, ram_pct,
-             ram_used_gb, disk_free_gb, gpu_pct, llm_ram_allocated_gb,
+             ram_used_gb, mem_avail_gb, disk_free_gb, gpu_pct, llm_ram_allocated_gb,
              llm_queue_depth, llm_active_requests, llm_tokens_per_sec)
         SELECT computer_id, date_trunc('day', recorded_at), SUM(sample_count),
                SUM(cpu_pct * sample_count) / NULLIF(SUM(sample_count) FILTER (WHERE cpu_pct IS NOT NULL), 0),
                SUM(ram_pct * sample_count) / NULLIF(SUM(sample_count) FILTER (WHERE ram_pct IS NOT NULL), 0),
                SUM(ram_used_gb * sample_count) / NULLIF(SUM(sample_count) FILTER (WHERE ram_used_gb IS NOT NULL), 0),
+               SUM(mem_avail_gb * sample_count) / NULLIF(SUM(sample_count) FILTER (WHERE mem_avail_gb IS NOT NULL), 0),
                MIN(disk_free_gb),
                SUM(gpu_pct * sample_count) / NULLIF(SUM(sample_count) FILTER (WHERE gpu_pct IS NOT NULL), 0),
                SUM(llm_ram_allocated_gb * sample_count) / NULLIF(SUM(sample_count) FILTER (WHERE llm_ram_allocated_gb IS NOT NULL), 0),

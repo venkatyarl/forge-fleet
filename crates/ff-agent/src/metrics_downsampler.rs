@@ -164,14 +164,14 @@ impl MetricsDownsampler {
                 r#"
                 INSERT INTO computer_metrics_history (
                     computer_id, recorded_at,
-                    cpu_pct, ram_pct, ram_used_gb, disk_free_gb, gpu_pct,
+                    cpu_pct, ram_pct, ram_used_gb, mem_avail_gb, disk_free_gb, gpu_pct,
                     llm_ram_allocated_gb, llm_queue_depth, llm_active_requests,
                     llm_tokens_per_sec
                 )
                 VALUES (
                     $1, date_trunc('minute', $2::timestamptz),
-                    $3, $4, $5, $6, $7,
-                    $8, $9, $10, $11
+                    $3, $4, $5, $6, $7, $8,
+                    $9, $10, $11, $12
                 )
                 ON CONFLICT (computer_id, recorded_at) DO NOTHING
                 "#,
@@ -181,6 +181,7 @@ impl MetricsDownsampler {
             .bind(beat.load.cpu_pct)
             .bind(beat.load.ram_pct)
             .bind(beat.memory.ram_used_gb)
+            .bind(beat.memory.mem_avail_gb)
             .bind(beat.load.disk_free_gb)
             .bind(beat.load.gpu_pct)
             .bind(llm_ram_allocated_gb)

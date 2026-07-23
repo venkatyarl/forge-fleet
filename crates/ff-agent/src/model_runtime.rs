@@ -42,6 +42,64 @@ pub struct LoadOptions {
 /// Minimum per-slot context window for the agent-capable serving profile —
 /// enough for the tool-schema system prompt + user prompt + reasoning.
 pub const AGENT_MIN_CTX: u32 = 32_768;
+/// Memory ForgeFleet reserves for builds and the node daemon on every host.
+pub const BUILD_MEMORY_RESERVE_GB: f64 = 16.0;
+
+fn local_available_ram_gb() -> Option<f64> {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let bytes = sys.available_memory();
+    (bytes > 0).then_some(bytes as f64 / 1_073_741_824.0)
+}
+
+fn catalog_variant_size_gb(variants: &serde_json::Value, runtime: &str) -> Option<f64> {
+    variants.as_array()?.iter().find_map(|variant| {
+        (variant.get("runtime").and_then(serde_json::Value::as_str) == Some(runtime))
+            .then(|| variant.get("size_gb").and_then(serde_json::Value::as_f64))
+            .flatten()
+    })
+}
+
+fn catalog_variant_context(variants: &serde_json::Value, runtime: &str) -> Option<u32> {
+    variants.as_array()?.iter().find_map(|variant| {
+        (variant.get("runtime").and_then(serde_json::Value::as_str) == Some(runtime))
+            .then(|| {
+                variant
+                    .get("context_window")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+            })
+            .flatten()
+    })
+}
+
+/// Conservative incremental RSS: weights plus context/KV cache.
+fn estimated_model_memory_gb(
+    library_size_bytes: i64,
+    catalog_size_gb: Option<f64>,
+    context_tokens: u32,
+) -> f64 {
+    let weights = if library_size_bytes > 0 {
+        library_size_bytes as f64 / 1_073_741_824.0
+    } else {
+        catalog_size_gb.unwrap_or(0.0)
+    };
+    weights + (context_tokens as f64 / 8192.0) * 0.5
+}
+
+fn memory_admission(available_gb: f64, estimated_model_gb: f64) -> Result<(), String> {
+    let required = estimated_model_gb + BUILD_MEMORY_RESERVE_GB;
+    if available_gb < required {
+        Err(format!(
+            "memory admission rejected: {available_gb:.1}GB available, \
+             model needs ~{estimated_model_gb:.1}GB plus {BUILD_MEMORY_RESERVE_GB:.0}GB build reserve \
+             ({required:.1}GB required)"
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 /// Serving mode derived from the catalog row's `preferred_workloads`. Drives
 /// which llama-server flags get appended on launch — embedders and rerankers
@@ -294,10 +352,10 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
     // the agent-profile default below). Falls back to Chat / non-tool-calling
     // when there's no catalog row or no recognised workload tag — preserves
     // existing behaviour for unknown models.
-    let (mode, tool_calling) = match ff_db::pg_get_catalog(pool, &lib.catalog_id)
+    let catalog = ff_db::pg_get_catalog(pool, &lib.catalog_id)
         .await
-        .map_err(|e| format!("pg_get_catalog({}): {e}", lib.catalog_id))?
-    {
+        .map_err(|e| format!("pg_get_catalog({}): {e}", lib.catalog_id))?;
+    let (mode, tool_calling) = match catalog.as_ref() {
         Some(cat) => (
             serving_mode_from_workloads(&cat.preferred_workloads),
             cat.tool_calling,
@@ -319,18 +377,31 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
     // tool-schema system prompt can't overflow a split per-slot window. We
     // apply it BEFORE the defaults so a too-small explicit `--ctx` is raised to
     // the floor (the profile is the contract; a too-small ctx would defeat it).
+    let catalog_default_ctx = catalog
+        .as_ref()
+        .and_then(|cat| catalog_variant_context(&cat.variants, &lib.runtime));
+    let requested_or_catalog_ctx = opts.context_size.or(catalog_default_ctx);
     let (ctx, parallel) = if agent {
         let ctx = opts
             .context_size
+            .or(catalog_default_ctx)
             .unwrap_or(AGENT_MIN_CTX)
             .max(AGENT_MIN_CTX);
         (ctx, 1u32)
     } else {
         (
-            opts.context_size.unwrap_or(65_536),
+            requested_or_catalog_ctx.unwrap_or(65_536),
             opts.parallel.unwrap_or(2),
         )
     };
+
+    let catalog_size_gb = catalog
+        .as_ref()
+        .and_then(|cat| catalog_variant_size_gb(&cat.variants, &lib.runtime));
+    let estimated_gb = estimated_model_memory_gb(lib.size_bytes, catalog_size_gb, ctx);
+    let available_gb = local_available_ram_gb()
+        .ok_or_else(|| "memory admission rejected: OS available memory is unknown".to_string())?;
+    memory_admission(available_gb, estimated_gb)?;
 
     // Build the launch command per runtime.
     let (program, args, runtime_label) = match lib.runtime.as_str() {
@@ -2098,4 +2169,28 @@ mod tests {
         assert!(pid_is_alive(std::process::id()));
         assert!(!pid_is_alive(u32::MAX));
     }
+}
+#[test]
+fn memory_admission_keeps_sixteen_gb_build_reserve() {
+    assert!(memory_admission(40.0, 24.0).is_ok());
+    assert!(memory_admission(39.9, 24.0).is_err());
+}
+
+#[test]
+fn model_memory_estimate_includes_requested_context() {
+    let eight_gib = 8_i64 * 1_073_741_824;
+    assert_eq!(estimated_model_memory_gb(eight_gib, None, 32_768), 10.0);
+    assert_eq!(estimated_model_memory_gb(0, Some(14.0), 49_152), 17.0);
+}
+
+#[test]
+fn catalog_variant_supplies_devstral_context_default() {
+    let variants = serde_json::json!([
+        {"runtime": "llama.cpp", "size_gb": 14.0, "context_window": 49152}
+    ]);
+    assert_eq!(
+        catalog_variant_context(&variants, "llama.cpp"),
+        Some(49_152)
+    );
+    assert_eq!(catalog_variant_size_gb(&variants, "llama.cpp"), Some(14.0));
 }
