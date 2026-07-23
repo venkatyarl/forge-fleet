@@ -22,7 +22,9 @@ export function useDashboardWebSocket(path = '/ws', onEvent?: WsMessageHandler):
   const reconnectDelay = useRef(INITIAL_RECONNECT_MS)
   const heartbeatTimer = useRef<number | null>(null)
   const handlerRef = useRef(onEvent)
-  handlerRef.current = onEvent
+  useEffect(() => {
+    handlerRef.current = onEvent
+  })
 
   const wsUrl = useMemo(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'

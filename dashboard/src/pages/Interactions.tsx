@@ -111,7 +111,7 @@ export function Interactions() {
             {loading ? <Badge variant="info">loading</Badge> : <Badge variant="ok">live</Badge>}
           </div>
           <p className="mt-1 text-sm text-muted">
-            Request/response corpus logged to <code className="rounded bg-elevated px-1 font-mono text-primary">ff_interactions</code>. Polls every 5s.
+            Request/response corpus logged to <code className="rounded-sm bg-elevated px-1 font-mono text-primary">ff_interactions</code>. Polls every 5s.
           </p>
         </div>
         <Button onClick={() => void load()} disabled={loading} type="button" variant="outline">

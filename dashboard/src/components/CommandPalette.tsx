@@ -43,9 +43,9 @@ export function CommandPalette() {
           <Command.Input
             aria-label="Search commands"
             placeholder="Search commands, pages..."
-            className="flex-1 bg-transparent px-3 py-3 text-sm text-foreground outline-none placeholder:text-dim"
+            className="flex-1 bg-transparent px-3 py-3 text-sm text-foreground outline-hidden placeholder:text-dim"
           />
-          <kbd className="rounded border border-border-subtle bg-panel px-1.5 py-0.5 text-xs text-dim">esc</kbd>
+          <kbd className="rounded-sm border border-border-subtle bg-panel px-1.5 py-0.5 text-xs text-dim">esc</kbd>
         </div>
 
         <Command.List className="max-h-72 overflow-y-auto p-2">

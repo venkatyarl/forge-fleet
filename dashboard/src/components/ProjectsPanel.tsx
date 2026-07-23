@@ -90,7 +90,7 @@ export function ProjectsPanel() {
           {projects.map((p) => (
             <article
               key={p.id}
-              className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4 shadow-sm"
+              className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4 shadow-xs"
             >
               <div className="mb-2 flex items-start justify-between gap-2">
                 <div>

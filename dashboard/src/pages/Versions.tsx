@@ -159,7 +159,7 @@ export function Versions() {
             <Badge variant="info">loading</Badge>
           </CardHeader>
           <div className="space-y-3">
-            <div className="h-4 w-48 animate-pulse rounded bg-elevated" />
+            <div className="h-4 w-48 animate-pulse rounded-sm bg-elevated" />
             <div className="h-24 animate-pulse rounded-lg bg-elevated" />
           </div>
         </Card>
@@ -196,9 +196,9 @@ export function Versions() {
             <Badge variant="neutral">empty</Badge>
           </CardHeader>
           <p className="text-sm text-muted">
-            Run <code className="rounded bg-elevated px-1 text-foreground">ff daemon</code> on
+            Run <code className="rounded-sm bg-elevated px-1 text-foreground">ff daemon</code> on
             each node for ~6 h OR trigger a manual{' '}
-            <code className="rounded bg-elevated px-1 text-foreground">version_check</code> pass.
+            <code className="rounded-sm bg-elevated px-1 text-foreground">version_check</code> pass.
           </p>
         </Card>
       </section>

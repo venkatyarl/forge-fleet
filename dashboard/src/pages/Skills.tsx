@@ -101,7 +101,7 @@ export function Skills() {
             {loading ? <Badge variant="info">loading</Badge> : <Badge variant="ok">live</Badge>}
           </div>
           <p className="mt-1 text-sm text-muted">
-            Loadable SKILL.md capabilities discovered from the <code className="rounded bg-elevated px-1 font-mono text-primary">skills/</code> directory.
+            Loadable SKILL.md capabilities discovered from the <code className="rounded-sm bg-elevated px-1 font-mono text-primary">skills/</code> directory.
           </p>
         </div>
         <Button onClick={() => void load()} disabled={loading} type="button" variant="outline">
@@ -206,4 +206,4 @@ function SummaryCard({ label, value, detail }: { label: string; value: string; d
 }
 
 const fieldClass =
-  'min-h-9 w-full rounded-lg border border-border bg-elevated px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-dim focus:border-primary disabled:cursor-not-allowed disabled:opacity-60'
+  'min-h-9 w-full rounded-lg border border-border bg-elevated px-3 py-2 text-sm text-foreground outline-hidden transition placeholder:text-dim focus:border-primary disabled:cursor-not-allowed disabled:opacity-60'

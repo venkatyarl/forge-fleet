@@ -130,13 +130,13 @@ export function Sidebar({ collapsed: collapsedProp }: SidebarProps) {
 
   return (
     <aside
-      className={`flex h-full flex-shrink-0 flex-col overflow-y-auto border-b border-border bg-elevated/80 transition-all duration-200 md:border-b-0 md:border-r ${
+      className={`flex h-full shrink-0 flex-col overflow-y-auto border-b border-border bg-elevated/80 transition-all duration-200 md:border-b-0 md:border-r ${
         collapsed ? 'md:w-14' : 'w-full md:w-56'
       } p-2`}
     >
       <button
         onClick={toggleSidebar}
-        className="mb-2 hidden w-full rounded p-1 text-xs text-dim hover:bg-panel hover:text-muted md:block"
+        className="mb-2 hidden w-full rounded-sm p-1 text-xs text-dim hover:bg-panel hover:text-muted md:block"
         title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
         aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
       >
@@ -163,7 +163,7 @@ export function Sidebar({ collapsed: collapsedProp }: SidebarProps) {
                   }
                   title={collapsed ? section.title : undefined}
                 >
-                  <span className="flex-shrink-0 text-sm">{section.icon}</span>
+                  <span className="shrink-0 text-sm">{section.icon}</span>
                   {!collapsed && <span className="truncate">{section.title}</span>}
                 </NavLink>
               </div>
@@ -181,7 +181,7 @@ export function Sidebar({ collapsed: collapsedProp }: SidebarProps) {
                 aria-label={section.title}
                 aria-expanded={isExpanded}
               >
-                <span className="flex-shrink-0 text-xs">{section.icon}</span>
+                <span className="shrink-0 text-xs">{section.icon}</span>
                 {!collapsed && (
                   <>
                     <span className="flex-1 text-left">{section.title}</span>
@@ -215,7 +215,7 @@ export function Sidebar({ collapsed: collapsedProp }: SidebarProps) {
                         }
                         title={collapsed ? item.label : undefined}
                       >
-                        <span className="flex-shrink-0 text-sm">{item.icon}</span>
+                        <span className="shrink-0 text-sm">{item.icon}</span>
                         {!collapsed && <span className="truncate">{item.label}</span>}
                       </NavLink>
                     </li>
@@ -239,7 +239,7 @@ export function Sidebar({ collapsed: collapsedProp }: SidebarProps) {
           }
           title={collapsed ? 'Settings' : undefined}
         >
-          <span className="flex-shrink-0 text-sm">⚙️</span>
+          <span className="shrink-0 text-sm">⚙️</span>
           {!collapsed && <span className="truncate">Settings</span>}
         </NavLink>
 

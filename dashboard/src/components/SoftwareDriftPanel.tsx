@@ -149,7 +149,7 @@ export function SoftwareDriftPanel() {
                             </span>
                           )}
                           {cell.drift && cell.latest_version && (
-                            <span className="rounded bg-rose-500/20 px-1 py-0.5 text-[9px] text-rose-300">
+                            <span className="rounded-sm bg-rose-500/20 px-1 py-0.5 text-[9px] text-rose-300">
                               → {cell.latest_version}
                             </span>
                           )}

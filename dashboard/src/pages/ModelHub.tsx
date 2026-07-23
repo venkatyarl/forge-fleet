@@ -446,7 +446,7 @@ export function ModelHub() {
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Search models by name, params, use case..."
               aria-label="Search models"
-              className="min-h-9 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground placeholder:text-dim focus:border-primary focus:outline-none"
+              className="min-h-9 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground placeholder:text-dim focus:border-primary focus:outline-hidden"
             />
           </div>
         </div>
@@ -559,7 +559,7 @@ function Field({
     <label className="block space-y-1 text-sm">
       <span className="text-dim">{label}</span>
       <input
-        className="min-h-9 w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-dim focus:border-primary focus:outline-none"
+        className="min-h-9 w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-dim focus:border-primary focus:outline-hidden"
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
         required={required}

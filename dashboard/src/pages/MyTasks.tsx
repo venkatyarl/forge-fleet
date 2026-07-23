@@ -36,7 +36,7 @@ const STATUS_LABEL: Record<WorkItemStatus, string> = {
 }
 
 const fieldClass =
-  'rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-dim focus:border-primary'
+  'rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground outline-hidden transition placeholder:text-dim focus:border-primary'
 
 function priorityValue(priority: McWorkItem['priority']): number {
   if (typeof priority === 'number') return priority
@@ -442,13 +442,13 @@ export function MyTasks() {
                       className="rounded-lg border border-border bg-surface p-3 transition hover:border-border-subtle"
                     >
                       <div className="flex items-start justify-between gap-2">
-                        <p className="min-w-0 break-words text-sm font-medium text-foreground">
+                        <p className="min-w-0 wrap-break-word text-sm font-medium text-foreground">
                           {item.title}
                         </p>
                         <Badge variant={priorityVariant(priority)}>{priorityLabel(priority)}</Badge>
                       </div>
                       {item.description ? (
-                        <p className="mt-1 break-words text-xs text-muted">{item.description}</p>
+                        <p className="mt-1 wrap-break-word text-xs text-muted">{item.description}</p>
                       ) : null}
 
                       <div className="mt-3 flex flex-wrap items-center gap-1.5 text-xs text-dim">

@@ -28,7 +28,7 @@ export const TaskKanban: React.FC<TaskKanbanProps> = ({ tasks, onMove }) => {
         {COLUMNS.map((col) => (
           <div
             key={col.key}
-            className={`rounded p-2 min-h-[120px] ${col.color} bg-opacity-20`}
+            className={`rounded-sm p-2 min-h-[120px] ${col.color} bg-opacity-20`}
           >
             <div className="text-xs font-bold mb-2 uppercase tracking-wider">
               {col.label}
@@ -38,7 +38,7 @@ export const TaskKanban: React.FC<TaskKanbanProps> = ({ tasks, onMove }) => {
               .map((t) => (
                 <div
                   key={t.id}
-                  className="rounded bg-slate-800 p-2 mb-2 text-xs cursor-move hover:bg-slate-700 transition"
+                  className="rounded-sm bg-slate-800 p-2 mb-2 text-xs cursor-move hover:bg-slate-700 transition"
                   draggable
                   onDragEnd={() => onMove?.(t.id, col.key)}
                 >

@@ -23,7 +23,7 @@ const MACHINE_KINDS: { value: MachineKind; label: string }[] = [
 ]
 
 const fieldClass =
-  'min-h-9 w-full rounded-lg border border-border bg-elevated px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-dim focus:border-primary disabled:cursor-not-allowed disabled:opacity-60'
+  'min-h-9 w-full rounded-lg border border-border bg-elevated px-3 py-2 text-sm text-foreground outline-hidden transition placeholder:text-dim focus:border-primary disabled:cursor-not-allowed disabled:opacity-60'
 const labelClass = 'text-xs font-medium uppercase tracking-wide text-dim'
 
 function runtimeFor(kind: MachineKind): string {
@@ -288,7 +288,7 @@ export function OperatorOnboarding() {
           {token === '' && (
             <div className="mt-3 rounded-lg border border-border-subtle bg-primary-subtle px-3 py-2 text-xs text-status-warn">
               Warning: enrollment token not yet set. Run{' '}
-              <code className="rounded bg-elevated px-1 py-0.5 font-mono text-foreground">
+              <code className="rounded-sm bg-elevated px-1 py-0.5 font-mono text-foreground">
                 ff secrets set enrollment.shared_secret &lt;token&gt;
               </code>{' '}
               on Taylor before running the command above.
@@ -344,7 +344,7 @@ export function OperatorOnboarding() {
                       ? 'text-status-warn'
                       : 'text-status-info'
               return (
-                <div key={i} className={cn('rounded px-2 py-1', color)}>
+                <div key={i} className={cn('rounded-sm px-2 py-1', color)}>
                   [{ev.at.split('T')[1]?.slice(0, 8) || '--'}] {ev.status.padEnd(8)} {ev.step}
                   {ev.detail ? ` - ${ev.detail}` : ''}
                 </div>

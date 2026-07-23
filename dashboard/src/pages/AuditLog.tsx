@@ -337,7 +337,7 @@ export function AuditLog() {
             <select
               value={filterType}
               onChange={(event) => setFilterType(event.target.value)}
-              className="h-9 w-full rounded-lg border border-border bg-elevated px-3 text-sm text-foreground focus:border-primary focus:outline-none"
+              className="h-9 w-full rounded-lg border border-border bg-elevated px-3 text-sm text-foreground focus:border-primary focus:outline-hidden"
             >
               <option value="">All types</option>
               {types.map((type) => (
@@ -353,7 +353,7 @@ export function AuditLog() {
             <select
               value={filterSeverity}
               onChange={(event) => setFilterSeverity(event.target.value)}
-              className="h-9 w-full rounded-lg border border-border bg-elevated px-3 text-sm text-foreground focus:border-primary focus:outline-none"
+              className="h-9 w-full rounded-lg border border-border bg-elevated px-3 text-sm text-foreground focus:border-primary focus:outline-hidden"
             >
               <option value="">All severities</option>
               {severities.map((severity) => (
@@ -371,7 +371,7 @@ export function AuditLog() {
               placeholder="system, operator, node"
               value={filterActor}
               onChange={(event) => setFilterActor(event.target.value)}
-              className="h-9 w-full rounded-lg border border-border bg-elevated px-3 text-sm text-foreground placeholder:text-dim focus:border-primary focus:outline-none"
+              className="h-9 w-full rounded-lg border border-border bg-elevated px-3 text-sm text-foreground placeholder:text-dim focus:border-primary focus:outline-hidden"
             />
           </label>
 
@@ -380,7 +380,7 @@ export function AuditLog() {
             <select
               value={timeRange}
               onChange={(event) => setTimeRange(event.target.value as TimeRange)}
-              className="h-9 w-full rounded-lg border border-border bg-elevated px-3 text-sm text-foreground focus:border-primary focus:outline-none"
+              className="h-9 w-full rounded-lg border border-border bg-elevated px-3 text-sm text-foreground focus:border-primary focus:outline-hidden"
             >
               <option value="all">All time</option>
               <option value="1h">Last hour</option>
@@ -400,7 +400,7 @@ export function AuditLog() {
                   setDateFrom(event.target.value)
                   setTimeRange('custom')
                 }}
-                className="h-9 w-full rounded-lg border border-border bg-elevated px-2 text-sm text-foreground focus:border-primary focus:outline-none"
+                className="h-9 w-full rounded-lg border border-border bg-elevated px-2 text-sm text-foreground focus:border-primary focus:outline-hidden"
               />
             </label>
             <label className="space-y-1">
@@ -412,7 +412,7 @@ export function AuditLog() {
                   setDateTo(event.target.value)
                   setTimeRange('custom')
                 }}
-                className="h-9 w-full rounded-lg border border-border bg-elevated px-2 text-sm text-foreground focus:border-primary focus:outline-none"
+                className="h-9 w-full rounded-lg border border-border bg-elevated px-2 text-sm text-foreground focus:border-primary focus:outline-hidden"
               />
             </label>
           </div>

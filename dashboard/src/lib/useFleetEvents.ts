@@ -20,7 +20,9 @@ export function useFleetEvents(handler: FleetEventHandler): { live: boolean } {
   // Stash the latest handler in a ref so we don't re-subscribe on
   // every render — subscribing once per mount is critical for SSE.
   const handlerRef = useRef(handler)
-  handlerRef.current = handler
+  useEffect(() => {
+    handlerRef.current = handler
+  })
 
   useEffect(() => {
     let es: EventSource | null = null

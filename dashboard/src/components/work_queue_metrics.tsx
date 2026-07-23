@@ -64,8 +64,8 @@ export function WorkQueueMetrics() {
 
       {isLoading ? (
         <div className="space-y-2">
-          <div className="h-4 w-full animate-pulse rounded bg-elevated" />
-          <div className="h-4 w-3/4 animate-pulse rounded bg-elevated" />
+          <div className="h-4 w-full animate-pulse rounded-sm bg-elevated" />
+          <div className="h-4 w-3/4 animate-pulse rounded-sm bg-elevated" />
         </div>
       ) : queueSize === 0 ? (
         <p className="text-sm text-dim">No open work items</p>

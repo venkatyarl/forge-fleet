@@ -108,7 +108,7 @@ export function ToolInventory() {
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           aria-label="Search tools"
-          className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-dim focus:border-primary sm:w-72"
+          className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground outline-hidden transition placeholder:text-dim focus:border-primary sm:w-72"
         />
       </div>
 
@@ -188,7 +188,7 @@ export function ToolInventory() {
               <CardTitle>No tools registered</CardTitle>
               <CardDescription className="mt-2 max-w-md">
                 The live tool registry returned no tools. Agents register tools via{' '}
-                <code className="rounded bg-elevated px-1 font-mono text-primary">/api/tools/register</code>.
+                <code className="rounded-sm bg-elevated px-1 font-mono text-primary">/api/tools/register</code>.
               </CardDescription>
             </Card>
           ) : filtered.length === 0 ? (
@@ -266,7 +266,7 @@ function ToolCard({ tool }: { tool: LiveTool }) {
           <CardDescription className="mt-1 truncate">{tool.worker_name}</CardDescription>
         </div>
         <span
-          className={cn('mt-1 h-2.5 w-2.5 flex-shrink-0 rounded-full bg-current', textToneClass(tone))}
+          className={cn('mt-1 h-2.5 w-2.5 shrink-0 rounded-full bg-current', textToneClass(tone))}
           title={tool.healthy ? 'Healthy' : 'Unhealthy'}
         />
       </CardHeader>
@@ -308,20 +308,20 @@ function ToolSkeleton() {
     <Card className="space-y-4 bg-panel">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0 flex-1 space-y-2">
-          <div className="h-4 w-32 animate-pulse rounded bg-elevated" />
-          <div className="h-3 w-24 animate-pulse rounded bg-elevated" />
+          <div className="h-4 w-32 animate-pulse rounded-sm bg-elevated" />
+          <div className="h-3 w-24 animate-pulse rounded-sm bg-elevated" />
         </div>
         <div className="h-2.5 w-2.5 animate-pulse rounded-full bg-elevated" />
       </div>
       <div className="space-y-2">
-        <div className="h-3 w-full animate-pulse rounded bg-elevated" />
-        <div className="h-3 w-3/4 animate-pulse rounded bg-elevated" />
+        <div className="h-3 w-full animate-pulse rounded-sm bg-elevated" />
+        <div className="h-3 w-3/4 animate-pulse rounded-sm bg-elevated" />
       </div>
       <div className="grid grid-cols-2 gap-3 border-t border-border pt-3">
         {[1, 2].map((item) => (
           <div key={item} className="space-y-2">
-            <div className="h-3 w-14 animate-pulse rounded bg-elevated" />
-            <div className="h-4 w-20 animate-pulse rounded bg-elevated" />
+            <div className="h-3 w-14 animate-pulse rounded-sm bg-elevated" />
+            <div className="h-4 w-20 animate-pulse rounded-sm bg-elevated" />
           </div>
         ))}
       </div>

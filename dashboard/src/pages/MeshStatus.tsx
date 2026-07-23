@@ -231,7 +231,7 @@ export function MeshStatus() {
             <Badge variant="neutral">empty</Badge>
           </CardHeader>
           <p className="text-sm text-muted">
-            Run <code className="rounded bg-elevated px-1.5 py-0.5 text-foreground">ff fleet ssh-mesh-check</code>{' '}
+            Run <code className="rounded-sm bg-elevated px-1.5 py-0.5 text-foreground">ff fleet ssh-mesh-check</code>{' '}
             on taylor to populate the matrix.
           </p>
         </Card>

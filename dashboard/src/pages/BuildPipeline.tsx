@@ -196,7 +196,7 @@ export function BuildPipeline() {
                     className="rounded-lg border border-border bg-surface p-3 transition hover:border-border-subtle"
                   >
                     <div className="flex items-start justify-between gap-2">
-                      <p className="min-w-0 break-words text-sm font-medium text-foreground">
+                      <p className="min-w-0 wrap-break-word text-sm font-medium text-foreground">
                         {item.title}
                       </p>
                       <StatusBadge status={status}>{STATUS_LABEL[status]}</StatusBadge>
@@ -234,7 +234,7 @@ function BuildField({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-start justify-between gap-2">
       <dt className="text-dim">{label}</dt>
-      <dd className="min-w-0 break-words text-right text-muted">{value}</dd>
+      <dd className="min-w-0 wrap-break-word text-right text-muted">{value}</dd>
     </div>
   )
 }
