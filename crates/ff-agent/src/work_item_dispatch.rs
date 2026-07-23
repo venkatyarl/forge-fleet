@@ -3483,12 +3483,13 @@ async fn routed_backends(pg: &PgPool, computer_id: Uuid, fresh_secs: i64) -> Vec
         if let Err(error) = ff_db::pg_record_route_decision(pg, &decision).await {
             tracing::warn!(%error, trace_id = %decision.trace_id, "work_item_dispatch: route decision capture failed");
         }
-        let selected = decision
+        let mut selected = decision
             .candidates
             .iter()
             .filter(|candidate| !candidate.rejected)
             .map(|candidate| candidate.backend.clone())
             .collect::<Vec<_>>();
+        append_bridge_backends(pg, computer_id, fresh_secs, &mut selected).await;
         tracing::info!(
             route_decision = ?serde_json::json!({
                 "source": "capacity_snapshot",
@@ -3527,9 +3528,10 @@ async fn routed_backends(pg: &PgPool, computer_id: Uuid, fresh_secs: i64) -> Vec
         });
     }
 
-    let selected = ff_db::pg_routed_backends(pg, computer_id, fresh_secs)
+    let mut selected = ff_db::pg_routed_backends(pg, computer_id, fresh_secs)
         .await
         .unwrap_or_default();
+    append_bridge_backends(pg, computer_id, fresh_secs, &mut selected).await;
     tracing::info!(
         route_decision = ?serde_json::json!({
             "source": "legacy_pg_fallback",
@@ -3539,6 +3541,38 @@ async fn routed_backends(pg: &PgPool, computer_id: Uuid, fresh_secs: i64) -> Vec
         "work_item_dispatch: backend route decision"
     );
     selected
+}
+
+/// A cloud CLI authenticated on any online peer is usable through that
+/// backend's signed CLI bridge. Keep the local policy order, then add bridged
+/// providers that are not already present.
+async fn append_bridge_backends(
+    pg: &PgPool,
+    computer_id: Uuid,
+    fresh_secs: i64,
+    selected: &mut Vec<String>,
+) {
+    let bridged: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT cb.backend
+           FROM computer_backends cb
+           JOIN computers c ON c.id = cb.computer_id
+          WHERE cb.computer_id <> $1
+            AND cb.installed AND cb.authenticated
+            AND cb.last_auth_ok_at > NOW() - make_interval(secs => $2)
+            AND c.status = 'online'
+          ORDER BY cb.backend",
+    )
+    .bind(computer_id)
+    .bind(fresh_secs as f64)
+    .fetch_all(pg)
+    .await
+    .unwrap_or_default();
+    for backend in bridged {
+        if crate::cli_executor::backend_by_name(&backend).is_some() && !selected.contains(&backend)
+        {
+            selected.push(backend);
+        }
+    }
 }
 
 fn evaluate_cached_backends(

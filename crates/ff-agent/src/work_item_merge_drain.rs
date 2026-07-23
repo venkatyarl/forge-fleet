@@ -63,13 +63,62 @@ pub async fn evaluate_merge_queue(
     pg: &PgPool,
     unknown_defers: &mut HashMap<Uuid, u32>,
 ) -> Result<usize> {
-    let Some(item) = ff_db::pg_next_merge_queue_item(pg).await? else {
-        return Ok(0);
-    };
-    let Some(pr_url) = item.pr_url.clone().filter(|u| !u.trim().is_empty()) else {
-        ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, "merge entry has no PR url")
+    let (item, pr_url) = loop {
+        let Some(item) = ff_db::pg_next_merge_queue_item(pg).await? else {
+            return Ok(0);
+        };
+        let Some(pr_url) = item.pr_url.clone().filter(|u| !u.trim().is_empty()) else {
+            ff_db::pg_mark_merge_failed(
+                pg,
+                item.id,
+                item.work_item_id,
+                "merge entry has no PR url",
+            )
             .await?;
-        return Ok(0);
+            return Ok(0);
+        };
+
+        let terminal_reason = match pr_lifecycle(&pr_url).await {
+            PrLifecycle::Merged => {
+                info!(
+                    pr = %pr_url,
+                    work_item = %item.work_item_id,
+                    "merge_drain: evicting queue entry for already-merged PR"
+                );
+                ff_db::pg_mark_merge_merged(pg, item.id, item.work_item_id).await?;
+                unknown_defers.remove(&item.id);
+                continue;
+            }
+            PrLifecycle::Closed => Some("evicted: PR is already closed"),
+            PrLifecycle::Open | PrLifecycle::Unknown => None,
+        };
+
+        let stale_without_attempt = sqlx::query_scalar::<_, bool>(
+            "SELECT q.enqueued_at < NOW() - INTERVAL '48 hours' AND w.attempts = 0 \
+               FROM work_item_merge_queue q \
+               JOIN work_items w ON w.id = q.work_item_id \
+              WHERE q.id = $1",
+        )
+        .bind(item.id)
+        .fetch_optional(pg)
+        .await?
+        .unwrap_or(false);
+        let eviction_reason = terminal_reason.or_else(|| {
+            stale_without_attempt
+                .then_some("evicted: merge-queue entry is older than 48h with zero attempts")
+        });
+        if let Some(reason) = eviction_reason {
+            warn!(
+                pr = %pr_url,
+                work_item = %item.work_item_id,
+                %reason,
+                "merge_drain: evicting dead queue entry"
+            );
+            ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, reason).await?;
+            unknown_defers.remove(&item.id);
+            continue;
+        }
+        break (item, pr_url);
     };
 
     // Conflict-cascade guard: when several sibling PRs land near-simultaneously,
@@ -933,6 +982,41 @@ enum PrMergeState {
     Other,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PrLifecycle {
+    Open,
+    Closed,
+    Merged,
+    Unknown,
+}
+
+/// Query terminal PR state separately from mergeability so dead queue heads
+/// cannot block every live entry behind them.
+async fn pr_lifecycle(pr_url: &str) -> PrLifecycle {
+    let mut cmd = gh_cmd().await;
+    cmd.args(["pr", "view", pr_url, "--json", "state,mergedAt"]);
+    let out = match cmd.output().await {
+        Ok(o) if o.status.success() => o,
+        _ => return PrLifecycle::Unknown,
+    };
+    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .map(|v| parse_pr_lifecycle(&v))
+        .unwrap_or(PrLifecycle::Unknown)
+}
+
+fn parse_pr_lifecycle(v: &serde_json::Value) -> PrLifecycle {
+    if v.get("mergedAt")
+        .is_some_and(|merged_at| !merged_at.is_null())
+    {
+        return PrLifecycle::Merged;
+    }
+    match v.get("state").and_then(|state| state.as_str()) {
+        Some("OPEN") => PrLifecycle::Open,
+        Some("CLOSED") => PrLifecycle::Closed,
+        _ => PrLifecycle::Unknown,
+    }
+}
+
 /// An existing review verdict on the PR, from GitHub's `reviewDecision`.
 #[derive(Debug, PartialEq, Eq)]
 enum PrReviewVerdict {
@@ -1533,9 +1617,9 @@ async fn db_confirms_leader(pg: &PgPool, worker_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        PrMergeState, PrReviewVerdict, github_actions_run_id, is_semantic_merge_compile_failure,
-        parse_merge_state, parse_review_response, parse_review_verdict, served_by_480b,
-        update_branch_api_path,
+        PrLifecycle, PrMergeState, PrReviewVerdict, github_actions_run_id,
+        is_semantic_merge_compile_failure, parse_merge_state, parse_pr_lifecycle,
+        parse_review_response, parse_review_verdict, served_by_480b, update_branch_api_path,
     };
 
     #[test]
@@ -1678,5 +1762,27 @@ mod tests {
         for other in ["BLOCKED", "UNSTABLE", "HAS_HOOKS", "", "clean"] {
             assert_eq!(parse_merge_state(other), PrMergeState::Other, "{other}");
         }
+    }
+
+    #[test]
+    fn terminal_pr_lifecycle_is_parsed_for_queue_eviction() {
+        assert_eq!(
+            parse_pr_lifecycle(&serde_json::json!({"state": "OPEN", "mergedAt": null})),
+            PrLifecycle::Open
+        );
+        assert_eq!(
+            parse_pr_lifecycle(&serde_json::json!({"state": "CLOSED", "mergedAt": null})),
+            PrLifecycle::Closed
+        );
+        assert_eq!(
+            parse_pr_lifecycle(
+                &serde_json::json!({"state": "CLOSED", "mergedAt": "2026-07-23T12:00:00Z"})
+            ),
+            PrLifecycle::Merged
+        );
+        assert_eq!(
+            parse_pr_lifecycle(&serde_json::json!({})),
+            PrLifecycle::Unknown
+        );
     }
 }

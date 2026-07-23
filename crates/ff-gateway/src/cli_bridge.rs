@@ -24,8 +24,14 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
-use ff_agent::cli_executor::{BACKENDS, CliBackend, execute_cli};
+use axum::{
+    Json, Router,
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::post,
+};
+use ff_agent::cli_executor::{BACKENDS, CliBackend, execute_cli_local_in_dir};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::task::JoinHandle;
@@ -41,7 +47,7 @@ pub fn spawn_all_bridges() -> Vec<JoinHandle<()>> {
         // array-position-derived — that silently cross-wired kimi/gemini when
         // the array order drifted from the seed (deep review conflict #8).
         let port = backend.port;
-        if !is_binary_on_path(backend.binary) {
+        if ff_agent::cli_executor::which_on_path(backend.binary).is_none() {
             tracing::debug!(
                 backend = backend.name,
                 port,
@@ -62,10 +68,16 @@ async fn run_bridge(backend: CliBackend, port: u16) {
     let app = Router::new()
         .route("/v1/chat/completions", post(handle_chat_completions))
         .with_state(backend);
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = ff_agent::http_auth::bind_addr(port)
+        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], port)));
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
-            if let Err(e) = axum::serve(listener, app).await {
+            if let Err(e) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
                 warn!(backend = backend.name, port, error = %e, "cli_bridge stopped");
             }
         }
@@ -84,6 +96,7 @@ struct ChatCompletionsRequest {
     /// (non-standard; only ff clients use it).
     #[serde(default)]
     backend_args: Vec<String>,
+    work_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,8 +137,41 @@ struct Usage {
 
 async fn handle_chat_completions(
     State(backend): State<CliBackend>,
-    Json(req): Json<ChatCompletionsRequest>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: String,
 ) -> impl IntoResponse {
+    if !peer.ip().is_loopback() {
+        let secret = match ff_agent::http_auth::control_plane_secret() {
+            Ok(secret) => secret,
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": error})),
+                )
+                    .into_response();
+            }
+        };
+        if let Err(error) =
+            ff_agent::http_auth::authorize(&secret, "POST", "/v1/chat/completions", &headers, &body)
+        {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": error})),
+            )
+                .into_response();
+        }
+    }
+    let req: ChatCompletionsRequest = match serde_json::from_str(&body) {
+        Ok(req) => req,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid json: {error}")})),
+            )
+                .into_response();
+        }
+    };
     // Build the prompt by concatenating user messages. System messages
     // are prepended as a "[system]" block; this is the simplest
     // translation that preserves intent across vendor CLIs whose
@@ -158,7 +204,9 @@ async fn handle_chat_completions(
     }
 
     let timeout = Some(Duration::from_secs(10 * 60));
-    let result = execute_cli(backend.name, &prompt, &req.backend_args, timeout).await;
+    let work_dir = req.work_dir.as_deref().map(std::path::Path::new);
+    let result =
+        execute_cli_local_in_dir(backend.name, &prompt, &req.backend_args, work_dir, timeout).await;
 
     match result {
         Ok(r) if r.exit_code == 0 => {
@@ -204,16 +252,4 @@ async fn handle_chat_completions(
         )
             .into_response(),
     }
-}
-
-fn is_binary_on_path(bin: &str) -> bool {
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return false;
-    };
-    for dir in std::env::split_paths(&path_var) {
-        if dir.join(bin).is_file() {
-            return true;
-        }
-    }
-    false
 }
