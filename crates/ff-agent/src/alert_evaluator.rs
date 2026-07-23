@@ -193,6 +193,7 @@ pub const COMPUTER_STATUS_VALUES: &[&str] = &["offline", "online", "sdown"];
 pub const IMPERATIVE_METRICS: &[&str] = &[
     "db_index_corruption",
     "fleet_integrity_degraded",
+    "merge_queue_head_age_secs",
     "stale_local_backup_age_secs",
     "backup_restore_drill_failed",
     "upgrade_rollout_halted",
@@ -356,6 +357,8 @@ impl AlertEvaluator {
     /// Run one evaluation pass.
     pub async fn evaluate_once(&self) -> Result<EvalReport, AlertError> {
         let mut report = EvalReport::default();
+
+        evaluate_merge_queue_freeze(&self.pg, &mut report).await?;
 
         let policies = load_enabled_policies(&self.pg).await?;
         report.policies_evaluated = policies.len();
@@ -611,6 +614,180 @@ impl AlertEvaluator {
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────
+
+const MERGE_QUEUE_FROZEN_POLICY: &str = "merge-queue frozen";
+const MERGE_QUEUE_OBSERVATION_PREFIX: &str = "merge_queue_head:";
+
+struct MergeQueueHead {
+    id: Uuid,
+    pr_url: Option<String>,
+    status: String,
+    reason: Option<String>,
+}
+
+fn merge_queue_observation_key(head_id: Uuid) -> String {
+    format!("{MERGE_QUEUE_OBSERVATION_PREFIX}{head_id}")
+}
+
+fn merge_queue_head_reason(head: &MergeQueueHead) -> String {
+    head.reason
+        .as_deref()
+        .filter(|reason| !reason.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| match head.status.as_str() {
+            "ci_running" => "waiting for CI".to_string(),
+            "mergeable" => "waiting for merge".to_string(),
+            _ => "waiting for merge-queue processing".to_string(),
+        })
+}
+
+/// Track the globally oldest active merge-queue head in durable dedup state.
+/// Its observation timestamp survives evaluator restarts and leader failover;
+/// changing the head resolves the old event and starts a fresh two-hour timer.
+async fn evaluate_merge_queue_freeze(
+    pg: &PgPool,
+    report: &mut EvalReport,
+) -> Result<(), sqlx::Error> {
+    let policy: (Uuid, String, String) = sqlx::query_as(
+        r#"
+        INSERT INTO alert_policies
+            (name, description, metric, scope, condition, duration_secs,
+             severity, cooldown_secs, channel)
+        VALUES
+            ($1, 'Merge queue head has not advanced for two hours',
+             'merge_queue_head_age_secs', 'leader_only', '> 7200', 0,
+             'warning', 0, 'telegram')
+        ON CONFLICT (name) DO UPDATE SET
+            description = EXCLUDED.description,
+            metric = EXCLUDED.metric,
+            scope = EXCLUDED.scope,
+            condition = EXCLUDED.condition,
+            duration_secs = EXCLUDED.duration_secs,
+            cooldown_secs = EXCLUDED.cooldown_secs
+        RETURNING id, severity, channel
+        "#,
+    )
+    .bind(MERGE_QUEUE_FROZEN_POLICY)
+    .fetch_one(pg)
+    .await?;
+
+    let head = sqlx::query(
+        r#"
+        SELECT id, pr_url, status,
+               COALESCE(NULLIF(review_reason, ''), NULLIF(failure_reason, '')) AS reason
+          FROM work_item_merge_queue
+         WHERE status IN ('queued', 'ci_running', 'mergeable')
+           AND review_verdict = 'approve'
+         ORDER BY position ASC
+         LIMIT 1
+        "#,
+    )
+    .fetch_optional(pg)
+    .await?
+    .map(|row| MergeQueueHead {
+        id: row.get("id"),
+        pr_url: row.try_get("pr_url").ok().flatten(),
+        status: row.get("status"),
+        reason: row.try_get("reason").ok().flatten(),
+    });
+
+    let current_head = head.as_ref().map(|head| head.id.to_string());
+    let resolved = sqlx::query(
+        "UPDATE alert_events
+            SET resolved_at = NOW()
+          WHERE policy_id = $1
+            AND resolved_at IS NULL
+            AND value_text IS DISTINCT FROM $2",
+    )
+    .bind(policy.0)
+    .bind(current_head.as_deref())
+    .execute(pg)
+    .await?
+    .rows_affected();
+    report.events_resolved += resolved as usize;
+
+    let Some(head) = head else {
+        sqlx::query("DELETE FROM operator_notify_dedup WHERE signature LIKE $1")
+            .bind(format!("{MERGE_QUEUE_OBSERVATION_PREFIX}%"))
+            .execute(pg)
+            .await?;
+        return Ok(());
+    };
+
+    let observation_key = merge_queue_observation_key(head.id);
+    let first_observed: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "INSERT INTO operator_notify_dedup
+             (signature, last_sent, suppressed_count, send_count)
+         VALUES ($1, NOW(), 0, 0)
+         ON CONFLICT (signature) DO UPDATE SET signature = EXCLUDED.signature
+         RETURNING last_sent",
+    )
+    .bind(&observation_key)
+    .fetch_one(pg)
+    .await?;
+
+    sqlx::query(
+        "DELETE FROM operator_notify_dedup
+          WHERE signature LIKE $1 AND signature <> $2",
+    )
+    .bind(format!("{MERGE_QUEUE_OBSERVATION_PREFIX}%"))
+    .bind(&observation_key)
+    .execute(pg)
+    .await?;
+
+    let age_secs = chrono::Utc::now()
+        .signed_duration_since(first_observed)
+        .num_seconds();
+    if age_secs <= 2 * 60 * 60 {
+        return Ok(());
+    }
+
+    let already_firing: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM alert_events
+              WHERE policy_id = $1 AND value_text = $2 AND resolved_at IS NULL
+         )",
+    )
+    .bind(policy.0)
+    .bind(head.id.to_string())
+    .fetch_one(pg)
+    .await?;
+    if already_firing {
+        return Ok(());
+    }
+
+    let pr = head.pr_url.as_deref().unwrap_or("(PR URL unavailable)");
+    let reason = merge_queue_head_reason(&head);
+    let message = format!(
+        "[{}] {MERGE_QUEUE_FROZEN_POLICY}: head PR={pr} unchanged for {}s reason={reason}",
+        policy.1, age_secs
+    );
+    let channel_result = dispatch_alert(pg, &policy.2, &policy.1, &message).await;
+    sqlx::query(
+        "INSERT INTO alert_events
+             (policy_id, value, value_text, message, channel_result)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(policy.0)
+    .bind(age_secs as f64)
+    .bind(head.id.to_string())
+    .bind(&message)
+    .bind(&channel_result)
+    .execute(pg)
+    .await?;
+    report.events_fired += 1;
+
+    tracing::warn!(
+        policy = MERGE_QUEUE_FROZEN_POLICY,
+        head_pr = pr,
+        %reason,
+        age_secs,
+        channel = %policy.2,
+        channel_result = %channel_result,
+        "alert fired"
+    );
+    Ok(())
+}
 
 async fn load_enabled_policies(pg: &PgPool) -> Result<Vec<Policy>, sqlx::Error> {
     let rows = sqlx::query(
@@ -1040,6 +1217,7 @@ mod tests {
             "beat_age_secs",
             "db_index_corruption",
             "fleet_integrity_degraded",
+            "merge_queue_head_age_secs",
             "stale_local_backup_age_secs",
             "secret_expiry_days_remaining",
             "backup_restore_drill_failed",
@@ -1154,5 +1332,31 @@ mod tests {
         assert!(dedup.is_duplicate(&taylor_cpu));
         assert!(!dedup.is_duplicate(&james_cpu));
         assert_ne!(taylor_cpu, james_cpu);
+    }
+
+    #[test]
+    fn merge_queue_freeze_uses_stable_head_key_and_reason() {
+        let head_id = Uuid::new_v4();
+        assert_eq!(
+            merge_queue_observation_key(head_id),
+            format!("{MERGE_QUEUE_OBSERVATION_PREFIX}{head_id}")
+        );
+
+        let waiting_for_ci = MergeQueueHead {
+            id: head_id,
+            pr_url: Some("https://github.com/example/repo/pull/42".to_string()),
+            status: "ci_running".to_string(),
+            reason: None,
+        };
+        assert_eq!(merge_queue_head_reason(&waiting_for_ci), "waiting for CI");
+
+        let deferred = MergeQueueHead {
+            reason: Some("GitHub mergeability is still UNKNOWN".to_string()),
+            ..waiting_for_ci
+        };
+        assert_eq!(
+            merge_queue_head_reason(&deferred),
+            "GitHub mergeability is still UNKNOWN"
+        );
     }
 }

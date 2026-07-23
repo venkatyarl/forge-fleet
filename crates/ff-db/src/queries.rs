@@ -3234,10 +3234,17 @@ pub async fn pg_upsert_mesh_status(
         "INSERT INTO fleet_mesh_status (src_node, dst_node, status, last_checked, last_error, attempts)
          VALUES ($1, $2, $3, NOW(), $4, 1)
          ON CONFLICT (src_node, dst_node) DO UPDATE SET
-            status = EXCLUDED.status,
+            status = CASE
+                WHEN EXCLUDED.status = 'ok' THEN 'ok'
+                WHEN fleet_mesh_status.attempts + 1 >= 10 THEN 'degraded'
+                ELSE EXCLUDED.status
+            END,
             last_checked = NOW(),
             last_error = EXCLUDED.last_error,
-            attempts = fleet_mesh_status.attempts + 1",
+            attempts = CASE
+                WHEN EXCLUDED.status = 'ok' THEN 0
+                ELSE fleet_mesh_status.attempts + 1
+            END",
     )
     .bind(src_node)
     .bind(dst_node)
@@ -3264,9 +3271,17 @@ pub async fn pg_upsert_mesh_probe(
             (src_node, dst_node, status, last_checked, last_error, attempts, ping_ok, ssh_ok)
          VALUES ($1, $2, $3, NOW(), $4, 1, $5, $6)
          ON CONFLICT (src_node, dst_node) DO UPDATE SET
-            status = EXCLUDED.status, last_checked = NOW(),
+            status = CASE
+                WHEN EXCLUDED.status = 'ok' THEN 'ok'
+                WHEN fleet_mesh_status.attempts + 1 >= 10 THEN 'degraded'
+                ELSE EXCLUDED.status
+            END,
+            last_checked = NOW(),
             last_error = EXCLUDED.last_error,
-            attempts = fleet_mesh_status.attempts + 1,
+            attempts = CASE
+                WHEN EXCLUDED.status = 'ok' THEN 0
+                ELSE fleet_mesh_status.attempts + 1
+            END,
             ping_ok = EXCLUDED.ping_ok, ssh_ok = EXCLUDED.ssh_ok",
     )
     .bind(src_node)
