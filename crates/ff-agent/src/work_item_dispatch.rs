@@ -3279,6 +3279,51 @@ async fn run_ff_dispatch(
                 let _ = crate::cloud_budget::record_backend_failure(pg, backend).await;
                 break;
             }
+            // SUCCESS-SHAPED FAILURES: a logged-out claude prints "Failed to
+            // authenticate: OAuth session expired and could not be refreshed"
+            // and EXITS 0 (verified live on james, 2026-07-23) — so the error
+            // path below never runs, the "build" returns success with zero
+            // edits, and the item burns an attempt as "backend produced no
+            // diff" (16 items in one wave, all on non-adele nodes where the
+            // rotating OAuth token had invalidated copied creds). Classify the
+            // output EVEN ON EXIT 0 when there's no diff: an Unauthenticated
+            // verdict is a provider fault → flip the auth flag (so routing
+            // stops offering this backend here) and fail over, exactly like a
+            // non-zero auth error.
+            if out.status.success() && !worktree_has_diff(&worktree.worktree_path) {
+                let combined = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr),
+                );
+                let class = crate::cloud_error::classify(backend, Some(0), &combined);
+                if class == crate::cloud_error::CloudErrorClass::Unauthenticated {
+                    warn!(
+                        backend = %backend,
+                        "run_ff_dispatch: clean exit but output is an AUTH FAILURE — flipping auth flag + switching backend"
+                    );
+                    backend_errors.push(format!(
+                        "{backend}: success-shaped auth failure (exit 0): {}",
+                        combined.trim().chars().take(160).collect::<String>()
+                    ));
+                    let _ = sqlx::query(
+                        "UPDATE computer_backends SET authenticated = false, last_checked_at = NOW() \
+                          WHERE computer_id = $1 AND backend = $2",
+                    )
+                    .bind(computer_id)
+                    .bind(backend)
+                    .execute(pg)
+                    .await;
+                    let _ = crate::circuit_breaker::record_provider_failure(
+                        pg,
+                        computer_id,
+                        backend,
+                        "unauthenticated",
+                    )
+                    .await;
+                    break; // try the next routed backend
+                }
+            }
             if out.status.success() {
                 let _ =
                     crate::circuit_breaker::record_provider_success(pg, computer_id, backend).await;
