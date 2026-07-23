@@ -287,14 +287,21 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
         detail: format!("{stuck_sessions} running/pending >{STUCK_SESSION_HOURS}h"),
     });
 
-    // 5b) Unit DSN-env lint (#44): a forgefleetd unit carrying a hardcoded
-    //     FORGEFLEET_*_URL Environment= line re-arms the stale-DSN time bomb
-    //     on the next reboot/upgrade (the July taylor-death class: 12 nodes
-    //     silently pinned to a dead primary). Nodes must read the DSN from
-    //     ~/.forgefleet/fleet.toml only.
-    let (dsn_status, dsn_detail) = unit_dsn_env_lint();
+    // 5b) Gateway unit environment. Every node can become leader, so its
+    //     supervisor definition must carry both gateway auth opt-in and the
+    //     authoritative Redis endpoint used by the pulse router.
+    let expected_redis_url: Option<String> = sqlx::query_scalar(
+        "SELECT redis_url FROM fleet_leader_state
+          WHERE redis_url IS NOT NULL AND redis_url <> ''
+          ORDER BY heartbeat_at DESC NULLS LAST
+          LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("gateway unit Redis check: {e}"))?;
+    let (dsn_status, dsn_detail) = unit_gateway_env_check(expected_redis_url.as_deref());
     checks.push(DoctorCheck {
-        name: "unit DSN env".into(),
+        name: "gateway unit env".into(),
         status: dsn_status,
         detail: dsn_detail,
     });
@@ -460,26 +467,42 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
     Ok(())
 }
 
-/// Whether service-unit text carries a hardcoded fleet DSN env line — the #44
-/// pattern (`Environment=FORGEFLEET_POSTGRES_URL=…` etc.) that pins a node to
-/// one primary's IP outside fleet.toml. Matches any FORGEFLEET_*_URL variable
-/// on an Environment= line so future DSN vars are covered too. Pure for tests.
-fn unit_text_has_dsn_env(text: &str) -> bool {
-    text.lines().any(|line| {
-        let line = line.trim_start();
-        line.starts_with("Environment=") && line.contains("FORGEFLEET_") && line.contains("_URL=")
-    })
+/// Check a rendered systemd unit / launchd plist for the two settings required
+/// for a node to serve the gateway after leadership moves.
+fn gateway_env_problem(text: &str, expected_redis_url: Option<&str>) -> Option<String> {
+    let trusted_lan = text.contains("Environment=FF_GATEWAY_TRUSTED_LAN=1")
+        || text.contains("<key>FF_GATEWAY_TRUSTED_LAN</key>\n        <string>1</string>");
+    if !trusted_lan {
+        return Some("missing FF_GATEWAY_TRUSTED_LAN=1".into());
+    }
+
+    if text.contains("__REDIS_URL__") {
+        return Some("FORGEFLEET_REDIS_URL token was not rendered".into());
+    }
+    let redis_present = text.contains("Environment=FORGEFLEET_REDIS_URL=redis://")
+        || text.contains("<key>FORGEFLEET_REDIS_URL</key>");
+    if !redis_present {
+        return Some("missing FORGEFLEET_REDIS_URL".into());
+    }
+    if let Some(url) = expected_redis_url {
+        if !text.contains(url) {
+            return Some(format!(
+                "FORGEFLEET_REDIS_URL does not match leader config ({url})"
+            ));
+        }
+    }
+    None
 }
 
-/// Scan the local forgefleetd unit definitions (systemd user + system unit and
-/// their drop-in dirs; the launchd plist on macOS) for hardcoded DSN env lines.
-/// FAIL with the offending path(s) + a strip hint; PASS when clean or when no
-/// unit exists at all (not-yet-onboarded box).
-fn unit_dsn_env_lint() -> (Health, String) {
+/// Scan local forgefleetd supervisor definitions. PASS when no unit exists
+/// (not-yet-onboarded box); otherwise every installed definition must be ready
+/// to host the gateway.
+fn unit_gateway_env_check(expected_redis_url: Option<&str>) -> (Health, String) {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut candidates: Vec<std::path::PathBuf> = vec![
         format!("{home}/.config/systemd/user/forgefleetd.service").into(),
         "/etc/systemd/system/forgefleetd.service".into(),
+        format!("{home}/Library/LaunchAgents/com.forgefleet.forgefleetd.plist").into(),
         format!("{home}/Library/LaunchAgents/com.forgefleet.daemon.plist").into(),
     ];
     for dropin_dir in [
@@ -490,20 +513,37 @@ fn unit_dsn_env_lint() -> (Health, String) {
             candidates.extend(entries.flatten().map(|e| e.path()));
         }
     }
-    let offenders: Vec<String> = candidates
+    let installed: Vec<(std::path::PathBuf, String)> = candidates
         .iter()
         .filter_map(|p| std::fs::read_to_string(p).ok().map(|t| (p, t)))
-        .filter(|(_, text)| unit_text_has_dsn_env(text))
-        .map(|(p, _)| p.display().to_string())
+        .map(|(p, text)| (p.clone(), text))
         .collect();
-    if offenders.is_empty() {
-        (Health::Pass, "no hardcoded FORGEFLEET_*_URL env".into())
+    let combined = installed
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let problem = gateway_env_problem(&combined, expected_redis_url);
+    if problem.is_none() {
+        (
+            Health::Pass,
+            if installed.is_empty() {
+                "no local forgefleetd unit installed".into()
+            } else {
+                "trusted LAN and configured Redis URL present".into()
+            },
+        )
     } else {
+        let paths = installed
+            .iter()
+            .map(|(path, _)| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         (
             Health::Fail,
             format!(
-                "hardcoded DSN env in {} — strip the FORGEFLEET_*_URL Environment= line(s) and `systemctl daemon-reload`; the DSN belongs in ~/.forgefleet/fleet.toml",
-                offenders.join(", ")
+                "{} in {paths} — rerun node onboarding/deploy and reload the supervisor",
+                problem.unwrap()
             ),
         )
     }
@@ -536,26 +576,40 @@ mod tests {
     }
 
     #[test]
-    fn unit_dsn_env_lint_matches_only_dsn_env_lines() {
-        // The #44 pattern: hardcoded primary IP baked into the unit.
-        assert!(unit_text_has_dsn_env(
-            "[Service]\nEnvironment=FORGEFLEET_POSTGRES_URL=postgresql://ff@192.168.5.100:55432/ff\n"
-        ));
-        assert!(unit_text_has_dsn_env(
-            "  Environment=FORGEFLEET_REDIS_URL=redis://192.168.5.100:56379\n"
-        ));
-        // Benign env the units legitimately carry must NOT trip the lint.
-        assert!(!unit_text_has_dsn_env(
-            "[Service]\nEnvironment=RUST_LOG=info\nEnvironment=FORGEFLEET_HOME=%h/.forgefleet\n"
-        ));
-        // Non-URL FORGEFLEET vars (e.g. FORGEFLEET_LEADER_HOST) are allowed.
-        assert!(!unit_text_has_dsn_env(
-            "Environment=FORGEFLEET_LEADER_HOST=192.168.5.104\n"
-        ));
-        // A DSN mentioned outside an Environment= line (comment) is fine.
-        assert!(!unit_text_has_dsn_env(
-            "# used to carry FORGEFLEET_POSTGRES_URL=… before #44\n"
-        ));
+    fn gateway_unit_env_requires_both_values_and_current_redis_url() {
+        let good = "[Service]\nEnvironment=FF_GATEWAY_TRUSTED_LAN=1\n\
+                    Environment=FORGEFLEET_REDIS_URL=redis://192.168.5.104:56379\n";
+        assert_eq!(
+            gateway_env_problem(good, Some("redis://192.168.5.104:56379")),
+            None
+        );
+        assert!(
+            gateway_env_problem(
+                "Environment=FORGEFLEET_REDIS_URL=redis://192.168.5.104:56379",
+                None
+            )
+            .unwrap()
+            .contains("TRUSTED_LAN")
+        );
+        assert!(
+            gateway_env_problem("Environment=FF_GATEWAY_TRUSTED_LAN=1", None)
+                .unwrap()
+                .contains("REDIS_URL")
+        );
+        assert!(
+            gateway_env_problem(good, Some("redis://192.168.5.105:56379"))
+                .unwrap()
+                .contains("does not match")
+        );
+        assert!(
+            gateway_env_problem(
+                "Environment=FF_GATEWAY_TRUSTED_LAN=1\n\
+             Environment=FORGEFLEET_REDIS_URL=__REDIS_URL__",
+                None
+            )
+            .unwrap()
+            .contains("token")
+        );
     }
 
     #[test]

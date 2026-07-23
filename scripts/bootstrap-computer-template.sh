@@ -769,7 +769,8 @@ if [ "$OS_ID" != "macos" ]; then
       systemctl --user "$@"
   }
   run_as_user mkdir -p "$USER_SYSTEMD_DIR" "$USER_HOME/.forgefleet/logs"
-  run_as_user bash -c "sed 's|__COMPUTER_NAME__|$NAME|g' '$REPO_DIR/deploy/systemd/forgefleetd.service' > '$USER_SYSTEMD_DIR/forgefleetd.service'"
+  REDIS_URL="redis://{{LEADER_HOST}}:56379"
+  run_as_user bash -c "sed -e 's|__COMPUTER_NAME__|$NAME|g' -e 's|__REDIS_URL__|$REDIS_URL|g' '$REPO_DIR/deploy/systemd/forgefleetd.service' > '$USER_SYSTEMD_DIR/forgefleetd.service'"
   run_as_user cp "$REPO_DIR/deploy/systemd/forgefleet-mcp.service" "$USER_SYSTEMD_DIR/forgefleet-mcp.service"
   user_systemctl daemon-reload \
     || die "systemctl --user daemon-reload failed for $SUDO_INVOKER"
@@ -805,7 +806,8 @@ else
     GUI_DOMAIN="gui/$USER_UID/com.forgefleet.forgefleetd"
     run_as_user mkdir -p "$PLIST_TARGET_DIR" "$USER_HOME/.forgefleet/logs"
     TG_TOKEN="${TELEGRAM_BOT_TOKEN:-${FORGEFLEET_TELEGRAM_BOT_TOKEN:-}}"
-    run_as_user bash -c "sed -e 's|__USER_HOME__|$USER_HOME|g' -e 's|__COMPUTER_NAME__|$NAME|g' -e 's|__TELEGRAM_BOT_TOKEN__|$TG_TOKEN|g' '$PLIST_TEMPLATE' > '$PLIST_TARGET'"
+    REDIS_URL="redis://{{LEADER_HOST}}:56379"
+    run_as_user bash -c "sed -e 's|__USER_HOME__|$USER_HOME|g' -e 's|__COMPUTER_NAME__|$NAME|g' -e 's|__REDIS_URL__|$REDIS_URL|g' -e 's|__TELEGRAM_BOT_TOKEN__|$TG_TOKEN|g' '$PLIST_TEMPLATE' > '$PLIST_TARGET'"
     # Bootstrap into the GUI domain so live `launchctl kickstart -k` works.
     run_as_user launchctl bootstrap "gui/$USER_UID" "$PLIST_TARGET" 2>/dev/null || true
     run_as_user launchctl enable "$GUI_DOMAIN" 2>/dev/null || true

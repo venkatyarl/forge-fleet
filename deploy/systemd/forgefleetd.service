@@ -1,7 +1,8 @@
 # ForgeFleet unified daemon (forgefleetd) — canonical systemd USER unit.
 #
 # Installed by `scripts/bootstrap-computer-template.sh` on Linux hosts. The
-# `__COMPUTER_NAME__` token is substituted at install time via sed; the
+# `__COMPUTER_NAME__` and `__REDIS_URL__` tokens are substituted at install
+# time from the node name and the fleet config's Redis endpoint; the
 # rendered file lives at ~/.config/systemd/user/forgefleetd.service and is
 # activated with:
 #   loginctl enable-linger <user>          # user manager (+ daemon) at boot
@@ -39,6 +40,8 @@ WorkingDirectory=%h
 # the fleet_workers identity so it never falls back to a hostname guess.
 Environment=RUST_LOG=info
 Environment=FORGEFLEET_NODE_NAME=__COMPUTER_NAME__
+Environment=FF_GATEWAY_TRUSTED_LAN=1
+Environment=FORGEFLEET_REDIS_URL=__REDIS_URL__
 Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/cuda/bin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 
 Restart=on-failure

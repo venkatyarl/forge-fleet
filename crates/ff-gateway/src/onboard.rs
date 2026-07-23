@@ -1140,5 +1140,8 @@ mod bootstrap_lifecycle_tests {
         assert!(SYSTEMD_UNIT.contains("Restart=on-failure"));
         assert!(SYSTEMD_UNIT.contains("[Install]\nWantedBy=default.target"));
         assert!(SYSTEMD_UNIT.contains("ExecStart=%h/.local/bin/forgefleetd start"));
+        assert!(SYSTEMD_UNIT.contains("Environment=FF_GATEWAY_TRUSTED_LAN=1"));
+        assert!(SYSTEMD_UNIT.contains("Environment=FORGEFLEET_REDIS_URL=__REDIS_URL__"));
+        assert!(BOOTSTRAP_TEMPLATE.contains("s|__REDIS_URL__|$REDIS_URL|g"));
     }
 }
