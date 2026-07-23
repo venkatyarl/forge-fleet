@@ -125,6 +125,7 @@ pub mod spi;
 #[path = "cortex/storage.rs"]
 pub mod storage;
 pub mod storage_falkordb;
+pub use storage_falkordb::{FalkorDBBackend, FalkorDBClient};
 #[path = "cortex/extractors/types.rs"]
 pub mod types;
 #[path = "cortex/extractors/work_item_context.rs"]
@@ -1667,8 +1668,9 @@ pub struct SymbolRef {
     pub start_line: Option<i32>,
 }
 
-/// Backend-neutral Cortex reads. Postgres remains the default; when the
-/// FalkorDB adapter is selected each operation falls back to Postgres on error.
+/// Backend-neutral Cortex reads. Postgres remains the default; the FalkorDB
+/// migration adapter falls back to Postgres per operation, while the
+/// authoritative FalkorDB backend surfaces every error unchanged.
 pub async fn callers(
     pool: &PgPool,
     corpus: &str,
@@ -1676,7 +1678,7 @@ pub async fn callers(
     confidence: f32,
 ) -> Result<Vec<SymbolRef>> {
     storage::CortexReadRouter::from_env(pool)
-        .await
+        .await?
         .callers(corpus, symbol, confidence)
         .await
 }
@@ -1688,7 +1690,7 @@ pub async fn callees(
     confidence: f32,
 ) -> Result<Vec<SymbolRef>> {
     storage::CortexReadRouter::from_env(pool)
-        .await
+        .await?
         .callees(corpus, symbol, confidence)
         .await
 }
@@ -1701,7 +1703,7 @@ pub async fn impact(
     confidence: f32,
 ) -> Result<Vec<SymbolRef>> {
     storage::CortexReadRouter::from_env(pool)
-        .await
+        .await?
         .impact(corpus, symbol, depth, confidence)
         .await
 }
@@ -1715,7 +1717,7 @@ pub async fn call_path(
     confidence: f32,
 ) -> Result<Option<Vec<SymbolRef>>> {
     storage::CortexReadRouter::from_env(pool)
-        .await
+        .await?
         .call_path(corpus, from, to, depth, confidence)
         .await
 }
@@ -2656,7 +2658,7 @@ pub async fn tests_for(
     confidence: f32,
 ) -> Result<Vec<TestHit>> {
     storage::CortexReadRouter::from_env(pool)
-        .await
+        .await?
         .tests_for(corpus, symbol, depth, confidence)
         .await
 }
@@ -2860,7 +2862,7 @@ pub async fn find_symbols(
     kind: Option<&str>,
 ) -> Result<Vec<SymbolHit>> {
     storage::CortexReadRouter::from_env(pool)
-        .await
+        .await?
         .find_symbols(corpus, query, limit, kind, false)
         .await
 }
@@ -2873,7 +2875,7 @@ pub async fn find_symbols_semantic(
     kind: Option<&str>,
 ) -> Result<Vec<SymbolHit>> {
     storage::CortexReadRouter::from_env(pool)
-        .await
+        .await?
         .find_symbols(corpus, query, limit, kind, true)
         .await
 }
@@ -3796,7 +3798,7 @@ pub async fn explain_community(
     limit: i64,
 ) -> Result<Option<CommunityExplanation>> {
     storage::CortexReadRouter::from_env(pool)
-        .await
+        .await?
         .explain_community(corpus, symbol, kind, limit)
         .await
 }
@@ -3997,7 +3999,7 @@ pub async fn outline_file(
     kind: Option<&str>,
 ) -> Result<Option<FileOutline>> {
     storage::CortexReadRouter::from_env(pool)
-        .await
+        .await?
         .outline_file(corpus, file, kind)
         .await
 }
