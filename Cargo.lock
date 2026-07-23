@@ -1996,6 +1996,7 @@ dependencies = [
  "ff-pulse",
  "ff-runtime",
  "ff-updater",
+ "libc",
  "redis",
  "reqwest",
  "rusqlite",
