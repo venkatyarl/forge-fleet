@@ -1102,6 +1102,8 @@ mod bootstrap_lifecycle_tests {
     use super::BOOTSTRAP_TEMPLATE;
 
     const SYSTEMD_UNIT: &str = include_str!("../../../deploy/systemd/forgefleetd.service");
+    const LAUNCHD_PLIST: &str =
+        include_str!("../../../deploy/launchd/com.forgefleet.forgefleetd.template.plist");
 
     #[test]
     fn linux_bootstrap_uses_canonical_redis_port() {
@@ -1140,5 +1142,16 @@ mod bootstrap_lifecycle_tests {
         assert!(SYSTEMD_UNIT.contains("Restart=on-failure"));
         assert!(SYSTEMD_UNIT.contains("[Install]\nWantedBy=default.target"));
         assert!(SYSTEMD_UNIT.contains("ExecStart=%h/.local/bin/forgefleetd start"));
+    }
+
+    #[test]
+    fn daemon_templates_receive_required_gateway_environment() {
+        for template in [SYSTEMD_UNIT, LAUNCHD_PLIST] {
+            assert!(template.contains("FF_GATEWAY_TRUSTED_LAN"));
+            assert!(template.contains("FORGEFLEET_REDIS_URL"));
+            assert!(template.contains("__REDIS_URL__"));
+        }
+        assert!(BOOTSTRAP_TEMPLATE.contains("[\"redis\"][\"url\"]"));
+        assert!(BOOTSTRAP_TEMPLATE.contains("s|__REDIS_URL__|$REDIS_URL|g"));
     }
 }

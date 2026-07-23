@@ -39,6 +39,8 @@ WorkingDirectory=%h
 # the fleet_workers identity so it never falls back to a hostname guess.
 Environment=RUST_LOG=info
 Environment=FORGEFLEET_NODE_NAME=__COMPUTER_NAME__
+Environment=FF_GATEWAY_TRUSTED_LAN=1
+Environment=FORGEFLEET_REDIS_URL=__REDIS_URL__
 Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/cuda/bin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 
 Restart=on-failure

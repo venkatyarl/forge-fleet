@@ -714,6 +714,12 @@ EOF"
 else
   report "fleet_toml" ok "already exists"
 fi
+REDIS_URL="$(run_as_user python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["redis"]["url"])' "$FLEET_TOML")" \
+  || die "failed to read redis.url from $FLEET_TOML"
+case "$REDIS_URL" in
+  redis://*) ;;
+  *) die "invalid redis.url in $FLEET_TOML: $REDIS_URL" ;;
+esac
 
 # ─── 11. systemd unit ────────────────────────────────────────────────────
 
@@ -769,7 +775,7 @@ if [ "$OS_ID" != "macos" ]; then
       systemctl --user "$@"
   }
   run_as_user mkdir -p "$USER_SYSTEMD_DIR" "$USER_HOME/.forgefleet/logs"
-  run_as_user bash -c "sed 's|__COMPUTER_NAME__|$NAME|g' '$REPO_DIR/deploy/systemd/forgefleetd.service' > '$USER_SYSTEMD_DIR/forgefleetd.service'"
+  run_as_user bash -c "sed -e 's|__COMPUTER_NAME__|$NAME|g' -e 's|__REDIS_URL__|$REDIS_URL|g' '$REPO_DIR/deploy/systemd/forgefleetd.service' > '$USER_SYSTEMD_DIR/forgefleetd.service'"
   run_as_user cp "$REPO_DIR/deploy/systemd/forgefleet-mcp.service" "$USER_SYSTEMD_DIR/forgefleet-mcp.service"
   user_systemctl daemon-reload \
     || die "systemctl --user daemon-reload failed for $SUDO_INVOKER"
@@ -805,7 +811,7 @@ else
     GUI_DOMAIN="gui/$USER_UID/com.forgefleet.forgefleetd"
     run_as_user mkdir -p "$PLIST_TARGET_DIR" "$USER_HOME/.forgefleet/logs"
     TG_TOKEN="${TELEGRAM_BOT_TOKEN:-${FORGEFLEET_TELEGRAM_BOT_TOKEN:-}}"
-    run_as_user bash -c "sed -e 's|__USER_HOME__|$USER_HOME|g' -e 's|__COMPUTER_NAME__|$NAME|g' -e 's|__TELEGRAM_BOT_TOKEN__|$TG_TOKEN|g' '$PLIST_TEMPLATE' > '$PLIST_TARGET'"
+    run_as_user bash -c "sed -e 's|__USER_HOME__|$USER_HOME|g' -e 's|__COMPUTER_NAME__|$NAME|g' -e 's|__REDIS_URL__|$REDIS_URL|g' -e 's|__TELEGRAM_BOT_TOKEN__|$TG_TOKEN|g' '$PLIST_TEMPLATE' > '$PLIST_TARGET'"
     # Bootstrap into the GUI domain so live `launchctl kickstart -k` works.
     run_as_user launchctl bootstrap "gui/$USER_UID" "$PLIST_TARGET" 2>/dev/null || true
     run_as_user launchctl enable "$GUI_DOMAIN" 2>/dev/null || true

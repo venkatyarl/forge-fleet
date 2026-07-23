@@ -30,6 +30,10 @@
         <string>__USER_HOME__</string>
         <key>PATH</key>
         <string>__USER_HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin</string>
+        <key>FF_GATEWAY_TRUSTED_LAN</key>
+        <string>1</string>
+        <key>FORGEFLEET_REDIS_URL</key>
+        <string>__REDIS_URL__</string>
         <!-- Telegram bot token can be injected here for non-Postgres setups.
              RECOMMENDED: use fleet_secrets instead (see docs/TELEGRAM_SETUP.md).
              Leave empty or remove this key if using fleet_secrets. -->

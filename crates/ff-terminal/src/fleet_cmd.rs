@@ -4886,7 +4886,8 @@ fn deploy_install_restart_playbook(os_family: &str) -> String {
              export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; \
              if command -v systemctl >/dev/null 2>&1 && [ -f deploy/systemd/forgefleetd.service ]; then \
                mkdir -p \"$HOME/.config/systemd/user\"; \
-               sed \"s|__COMPUTER_NAME__|$(hostname -s)|g\" deploy/systemd/forgefleetd.service > \"$HOME/.config/systemd/user/forgefleetd.service\"; \
+               REDIS_URL=$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], \"rb\"))[\"redis\"][\"url\"])' \"$HOME/.forgefleet/fleet.toml\") || exit 1; \
+               sed -e \"s|__COMPUTER_NAME__|$(hostname -s)|g\" -e \"s|__REDIS_URL__|$REDIS_URL|g\" deploy/systemd/forgefleetd.service > \"$HOME/.config/systemd/user/forgefleetd.service\"; \
                cp deploy/systemd/forgefleet-mcp.service \"$HOME/.config/systemd/user/forgefleet-mcp.service\"; \
                systemctl --user daemon-reload 2>/dev/null; systemctl --user enable forgefleetd.service forgefleet-mcp.service 2>/dev/null; \
                systemctl --user restart forgefleet-mcp.service 2>/dev/null; \
@@ -5004,7 +5005,8 @@ fn leader_refresh_playbook(os_family: &str, source_tree_path: &str) -> String {
              export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
              if command -v systemctl >/dev/null 2>&1 && [ -f deploy/systemd/forgefleetd.service ]; then \
                mkdir -p \"$HOME/.config/systemd/user\"; \
-               sed \"s|__COMPUTER_NAME__|$(hostname -s)|g\" deploy/systemd/forgefleetd.service > \"$HOME/.config/systemd/user/forgefleetd.service\"; \
+               REDIS_URL=$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], \"rb\"))[\"redis\"][\"url\"])' \"$HOME/.forgefleet/fleet.toml\") || exit 1; \
+               sed -e \"s|__COMPUTER_NAME__|$(hostname -s)|g\" -e \"s|__REDIS_URL__|$REDIS_URL|g\" deploy/systemd/forgefleetd.service > \"$HOME/.config/systemd/user/forgefleetd.service\"; \
                systemctl --user daemon-reload 2>/dev/null; systemctl --user enable forgefleetd.service 2>/dev/null; \
              fi; \
              ( systemctl --user restart --no-block forgefleetd.service 2>/dev/null ) \
@@ -6525,6 +6527,8 @@ mod route_tests {
         assert!(p.contains("systemctl --user"));
         assert!(p.contains("deploy/systemd/forgefleetd.service"));
         assert!(p.contains("systemctl --user enable forgefleetd.service"));
+        assert!(p.contains("[\"redis\"][\"url\"]"));
+        assert!(p.contains("s|__REDIS_URL__|$REDIS_URL|g"));
         assert!(
             p.find("systemctl --user enable forgefleetd.service")
                 < p.find("nohup \"$HOME/.local/bin/forgefleetd\""),
