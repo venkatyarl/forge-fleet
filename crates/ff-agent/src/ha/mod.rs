@@ -82,7 +82,7 @@ pub async fn drain_work_item_leases(
          ), freed_slots AS (
              UPDATE sub_agents AS sa
                 SET current_work_item_id = NULL,
-                    status = 'idle',
+                    status = CASE WHEN status = 'disabled' THEN 'disabled' ELSE 'idle' END,
                     started_at = NULL,
                     last_heartbeat_at = NOW()
               WHERE EXISTS (
@@ -272,6 +272,26 @@ mod tests {
         assert!(!drain.contains("attempts = attempts + 1"));
         assert!(drain.contains("status = 'ready'"));
         assert!(drain.contains("released_at = NOW()"));
+    }
+
+    #[test]
+    fn restart_drain_keeps_disabled_sub_agents_disabled() {
+        // `fleet deploy --graceful` disables target sub-agents before draining
+        // their leases; the slot cleanup must not flip them back to 'idle'.
+        let source = include_str!("mod.rs");
+        let drain = source
+            .split("pub async fn drain_work_item_leases")
+            .nth(1)
+            .expect("lease drain function")
+            .split("// ─── Pure HA topology model")
+            .next()
+            .expect("lease drain function body");
+
+        assert!(!drain.contains("status = 'idle'"));
+        assert!(
+            drain
+                .contains("status = CASE WHEN status = 'disabled' THEN 'disabled' ELSE 'idle' END")
+        );
     }
 
     fn primary(name: &str) -> ReplicaNode {
