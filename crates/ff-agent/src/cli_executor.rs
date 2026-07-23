@@ -103,7 +103,12 @@ pub const BACKENDS: &[CliBackend] = &[
         // failures, 2026-07-23). Isolation comes from the per-slot clone under
         // ~/.forgefleet/sub-agents/, not from permission prompts nobody is
         // there to answer.
-        default_flags: &["-p", "--output-format", "text", "--dangerously-skip-permissions"],
+        default_flags: &[
+            "-p",
+            "--output-format",
+            "text",
+            "--dangerously-skip-permissions",
+        ],
         // Claude Code reads the process cwd; `--add-dir` widens tool access.
         cwd_mode: CwdMode::Flag("--add-dir"),
         prompt_is_positional: true,
