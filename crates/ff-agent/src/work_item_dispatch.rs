@@ -1039,10 +1039,16 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
             agent_output_tail = %agent_output_tail,
             "work_item_dispatch: backend produced no diff (no commits) — treating as failed no-op, not done"
         );
+        // Name the backend in the persisted error: without it the operator's
+        // failure feed showed 12× anonymous "no diff" rows with no way to tell
+        // whether claude, codex, kimi, or the local lane was the one claiming
+        // success without editing (2026-07-23 triage was blind on this).
         requeue_or_fail(
             &pg,
             &item,
-            "backend produced no diff (no commits) — required change not applied",
+            &format!(
+                "backend {backend_used} produced no diff (no commits) — required change not applied"
+            ),
         )
         .await?;
         remove_worktree(&item.repo_path, &worktree.worktree_path)?;

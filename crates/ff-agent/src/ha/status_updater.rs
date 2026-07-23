@@ -118,7 +118,17 @@ impl SessionStatusUpdater {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(self.interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut last_sent_body: Option<String> = None;
+            // Treat the spawn-time status as already-sent WITHOUT sending it:
+            // tokio's interval fires its first tick IMMEDIATELY, so seeding
+            // None here meant every dispatch attempt fired one "building…"
+            // message at spawn — and a fast-fail retry loop (dispatch dies in
+            // seconds, item requeues, new dispatch, new guard) turned that
+            // into a per-minute per-item flood (operator-reported 2026-07-23,
+            // second spam wave). The operator-facing "what's building" view is
+            // the batched 10-minute digest; this per-session channel only
+            // speaks on a genuine status TRANSITION or the 30-minute
+            // long-build heartbeat.
+            let mut last_sent_body: Option<String> = Some(self.source.status());
             let mut last_sent_at = tokio::time::Instant::now();
 
             loop {
