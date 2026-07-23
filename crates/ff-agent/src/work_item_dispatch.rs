@@ -4003,6 +4003,21 @@ fn commit_worktree_changes(
     author_name: &str,
     author_email: &str,
 ) -> Result<bool> {
+    // No-op guard FIRST, before cargo fmt can touch anything: when the backend
+    // edited no files, the tree must be reported clean so the caller fails the
+    // attempt as "no diff". Running fmt before this check manufactured commits
+    // out of NOTHING — a no-op build + repo-wide `cargo fmt` drift produced
+    // "diff only reformats an unrelated test" PRs that burned all 5 attempts
+    // per item across the 2026-07-22 evening wave (55 items). fmt now runs
+    // only when the backend actually changed something.
+    let pre_fmt_status = run_git(
+        worktree_path,
+        ["status", "--porcelain"],
+        Duration::from_secs(30),
+    )?;
+    if status_output_is_clean(&pre_fmt_status) {
+        return Ok(false); // backend made no edits — nothing to commit
+    }
     // Auto-format BEFORE staging so a fleet-produced Rust PR passes CI
     // `cargo fmt --check` — LLM backends routinely emit un-formatted Rust, which
     // fails the fmt gate and blocks the PR (observed on PR #787). Best-effort +
