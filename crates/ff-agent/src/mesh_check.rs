@@ -20,15 +20,20 @@ fn computer_status_eligible(status: Option<&str>) -> bool {
     !status.is_some_and(|status| SKIPPED_COMPUTER_STATUSES.contains(&status))
 }
 
-fn retry_cap_reached(
-    attempts: impl Iterator<Item = (chrono::DateTime<chrono::Utc>, i32)>,
-    window_start: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    attempts
-        .filter(|(created_at, _)| *created_at >= window_start)
-        .map(|(_, attempts)| attempts.max(1))
-        .sum::<i32>()
-        >= 5
+const MAX_REPAIR_FAILURES: i32 = 10;
+
+/// Delay following each consecutive failed mesh repair.
+///
+/// The first failure is retried after one minute, then 5m, 30m, 2h, and 6h
+/// thereafter. The tenth failure degrades the edge instead of scheduling.
+fn repair_backoff(failures: i32) -> chrono::Duration {
+    match failures {
+        i32::MIN..=1 => chrono::Duration::minutes(1),
+        2 => chrono::Duration::minutes(5),
+        3 => chrono::Duration::minutes(30),
+        4 => chrono::Duration::hours(2),
+        _ => chrono::Duration::hours(6),
+    }
 }
 
 async fn mark_ineligible_pairs_skipped(
@@ -517,7 +522,34 @@ pub async fn fire_mesh_alert(pg: &PgPool) -> Result<(), String> {
 
     let snapshot = load_mesh_alert_snapshot(pg).await?;
     let total = snapshot.failed_edges.len() + snapshot.asymmetric.len();
+    let previous: Option<(f64, String)> = sqlx::query_as(
+        "SELECT value, message
+         FROM alert_events
+         WHERE policy_id = $1
+         ORDER BY fired_at DESC
+         LIMIT 1",
+    )
+    .bind(policy_id)
+    .fetch_optional(pg)
+    .await
+    .map_err(|e| format!("load prior {MESH_ALERT_POLICY} event: {e}"))?;
     if total == 0 {
+        if previous.as_ref().is_some_and(|(value, _)| *value > 0.0) {
+            let message = "SSH mesh repaired: all recently checked edges are healthy";
+            let channel_result =
+                crate::alert_evaluator::dispatch_alert(pg, &channel, &severity, message).await;
+            sqlx::query(
+                "INSERT INTO alert_events
+                    (policy_id, computer_id, value, value_text, message, channel_result)
+                 VALUES ($1, NULL, 0, NULL, $2, $3)",
+            )
+            .bind(policy_id)
+            .bind(message)
+            .bind(channel_result)
+            .execute(pg)
+            .await
+            .map_err(|e| format!("record mesh repaired event: {e}"))?;
+        }
         return Ok(());
     }
 
@@ -561,6 +593,9 @@ pub async fn fire_mesh_alert(pg: &PgPool) -> Result<(), String> {
         total,
         parts.join("; ")
     );
+    if previous.as_ref().is_some_and(|(value, _)| *value > 0.0) {
+        return Ok(());
+    }
 
     let channel_result =
         crate::alert_evaluator::dispatch_alert(pg, &channel, &severity, &message).await;
@@ -749,6 +784,11 @@ fn shell_escape_single(s: &str) -> String {
 /// Re-probe a single (src, dst) pair and upsert the result. Used by the
 /// `mesh_retry` deferred task when an auto-retry fires.
 pub async fn probe_single_pair(pool: &PgPool, src: &str, dst: &str) -> Result<MeshCell, String> {
+    let previous = ff_db::pg_list_mesh_status(pool, Some(dst))
+        .await
+        .map_err(|e| format!("pg_list_mesh_status: {e}"))?
+        .into_iter()
+        .find(|row| row.src_node == src && row.dst_node == dst);
     let nodes = ff_db::pg_list_nodes(pool)
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
@@ -780,7 +820,7 @@ pub async fn probe_single_pair(pool: &PgPool, src: &str, dst: &str) -> Result<Me
         d.ip.clone(),
     )
     .await;
-    let _ = ff_db::pg_upsert_mesh_probe(
+    ff_db::pg_upsert_mesh_probe(
         pool,
         &cell.src,
         &cell.dst,
@@ -789,17 +829,47 @@ pub async fn probe_single_pair(pool: &PgPool, src: &str, dst: &str) -> Result<Me
         cell.ping_ok,
         Some(cell.ssh_ok),
     )
-    .await;
+    .await
+    .map_err(|e| format!("pg_upsert_mesh_probe: {e}"))?;
+    let transition = match (previous.as_ref(), cell.status.as_str()) {
+        (Some(old), "ok") if old.status == "failed" || old.status == "degraded" => Some((
+            "SSH mesh repaired",
+            format!("{src} → {dst} is reachable again"),
+        )),
+        (Some(old), "failed") if old.attempts + 1 >= MAX_REPAIR_FAILURES => Some((
+            "SSH mesh repair gave up",
+            format!(
+                "{src} → {dst} degraded after {MAX_REPAIR_FAILURES} consecutive failures; paused until {dst} heartbeats"
+            ),
+        )),
+        _ => None,
+    };
+    if let Some((title, body)) = transition {
+        if let Err(error) = crate::telegram::send_telegram_from_secrets(pool, title, &body).await {
+            tracing::warn!(%error, %src, %dst, "mesh repair state-change notification failed");
+        }
+    }
     Ok(cell)
 }
 
-/// For every `fleet_mesh_status` row in status='failed' whose last_checked is
-/// older than 10 minutes, enqueue a `mesh_retry` deferred task — de-duplicated
-/// against any active retry for the same (src,dst) pair. Capped at 5 attempts
-/// per 24h across task IDs so a completed task cannot reset the retry budget.
+/// Enqueue due failed mesh edges with per-pair exponential backoff.
+///
+/// Ten consecutive failures leave an edge `degraded` and silent. A heartbeat
+/// from its destination after degradation re-opens it for an immediate probe.
 pub async fn enqueue_retries(pool: &PgPool) -> Result<usize, String> {
-    let cutoff = chrono::Utc::now() - chrono::Duration::minutes(10);
-    let retry_window = chrono::Utc::now() - chrono::Duration::hours(24);
+    sqlx::query(
+        "UPDATE fleet_mesh_status AS mesh
+         SET status = 'failed', attempts = 0, last_checked = NULL
+         FROM computers AS dst
+         WHERE mesh.status = 'degraded'
+           AND dst.name = mesh.dst_node
+           AND dst.last_seen_at > mesh.last_checked",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("re-open degraded mesh edges: {e}"))?;
+
+    let now = chrono::Utc::now();
     let nodes = ff_db::pg_list_nodes(pool)
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
@@ -816,9 +886,12 @@ pub async fn enqueue_retries(pool: &PgPool) -> Result<usize, String> {
         .iter()
         .filter(|r| {
             r.status == "failed"
+                && r.attempts < MAX_REPAIR_FAILURES
                 && eligible.contains(r.src_node.as_str())
                 && eligible.contains(r.dst_node.as_str())
-                && r.last_checked.map(|t| t < cutoff).unwrap_or(true)
+                && r.last_checked
+                    .map(|t| t + repair_backoff(r.attempts) <= now)
+                    .unwrap_or(true)
         })
         .map(|r| (r.src_node.clone(), r.dst_node.clone()))
         .collect();
@@ -844,11 +917,7 @@ pub async fn enqueue_retries(pool: &PgPool) -> Result<usize, String> {
                 "pending" | "dispatchable" | "claimed" | "running"
             )
         });
-        let capped = retry_cap_reached(
-            matching.iter().map(|t| (t.created_at, t.attempts)),
-            retry_window,
-        );
-        if active || capped {
+        if active {
             continue;
         }
         let title = format!("Mesh retry {src} → {dst}");
@@ -988,16 +1057,12 @@ mod tests {
     }
 
     #[test]
-    fn retry_cap_counts_attempts_across_recreated_tasks() {
-        let now = chrono::Utc::now();
-        let recent = now - chrono::Duration::hours(24);
-        assert!(retry_cap_reached(
-            [(now, 2), (now, 2), (now, 1)].into_iter(),
-            recent
-        ));
-        assert!(!retry_cap_reached(
-            [(now, 4), (now - chrono::Duration::hours(25), 20),].into_iter(),
-            recent
-        ));
+    fn mesh_repair_backoff_schedule_is_capped_at_six_hours() {
+        assert_eq!(repair_backoff(1), chrono::Duration::minutes(1));
+        assert_eq!(repair_backoff(2), chrono::Duration::minutes(5));
+        assert_eq!(repair_backoff(3), chrono::Duration::minutes(30));
+        assert_eq!(repair_backoff(4), chrono::Duration::hours(2));
+        assert_eq!(repair_backoff(5), chrono::Duration::hours(6));
+        assert_eq!(repair_backoff(9), chrono::Duration::hours(6));
     }
 }
