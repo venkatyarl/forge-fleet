@@ -1796,7 +1796,16 @@ async fn run_in_place_review(
     builder: &str,
 ) -> Result<ReviewOutcome> {
     let prompt = build_review_prompt(item, worktree).await;
+    run_in_place_review_with_prompt(pg, item, worktree, builder, prompt).await
+}
 
+async fn run_in_place_review_with_prompt(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    worktree: &WorktreeRecord,
+    builder: &str,
+    prompt: String,
+) -> Result<ReviewOutcome> {
     if !builder_excludes_480b(builder) {
         if let Ok(permit) = GATE_480B.try_acquire() {
             let started_at = chrono::Utc::now();
@@ -1895,6 +1904,38 @@ async fn run_in_place_review(
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("no in-place review backend available")))
+}
+
+fn already_done_review_prompt(item: &AssignedWorkItem) -> String {
+    format!(
+        "is this already implemented in the current tree? cite file:line evidence\n\n\
+         Work item title:\n{}\n\n\
+         Work item description:\n{}\n\n\
+         Inspect the current worktree directly. Answer with exactly APPROVE or REJECT on the \
+         first line, followed by concise evidence. APPROVE requires at least one file:line \
+         citation proving the requested behavior exists.",
+        item.title,
+        item.description.as_deref().unwrap_or_default(),
+    )
+}
+
+/// An affirmative verdict without source evidence is still an unverified claim.
+fn already_done_review_is_verified(approved: bool, reason: &str) -> bool {
+    approved
+        && reason.split_whitespace().any(|token| {
+            let token = token.trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '`' | '\'' | '"' | '(' | ')' | '[' | ']' | ',' | '.' | ';'
+                )
+            });
+            let Some((path, line)) = token.rsplit_once(':') else {
+                return false;
+            };
+            !path.is_empty()
+                && line.parse::<usize>().is_ok_and(|line| line > 0)
+                && (path.contains('/') || path.contains('.'))
+        })
 }
 
 /// One 480B ring review. Caller holds a [`GATE_480B`] permit. `Err` means the
@@ -2979,10 +3020,28 @@ async fn run_ff_dispatch(
         };
         match lane1 {
             Ok(Ok(outcome)) if outcome.already_done => {
-                // The model inspected the repo and reports the task is ALREADY implemented
-                // (feature exists, tests pass, nothing to commit). Mark the work_item done —
-                // NOT failed — so an already-satisfied task drains instead of thrashing every
-                // lane. Terminal 'done' is protected from later requeue_or_fail by its status guard.
+                // A builder's ALREADY_IMPLEMENTED claim is not evidence. Verify it with the
+                // independent in-place reviewer before allowing this no-diff path to close.
+                let prompt = already_done_review_prompt(item);
+                let review =
+                    run_in_place_review_with_prompt(pg, item, worktree, "local", prompt).await;
+                let rejection = match review {
+                    Ok(review)
+                        if already_done_review_is_verified(review.approved, &review.reason) =>
+                    {
+                        None
+                    }
+                    Ok(review) => Some(format!(
+                        "already-done verification rejected by {}: {}",
+                        review.reviewer, review.reason
+                    )),
+                    Err(error) => Some(format!("already-done verification unavailable: {error:#}")),
+                };
+                if let Some(reason) = rejection {
+                    requeue_or_fail(pg, item, &reason).await?;
+                    anyhow::bail!("{reason}");
+                }
+
                 let _ = crate::circuit_breaker::record_provider_success(
                     pg,
                     item.computer_id,
@@ -4962,18 +5021,42 @@ pub fn spawn_worktree_reaper(
 mod tests {
     use super::{
         AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS, ReviewerStat,
-        affected_crate_manifests, agent_output_tail, backend_failed_without_output,
-        builder_excludes_480b, classify_dispatch_outcome, command_display,
-        complexity_at_least_moderate, default_clone_path, dispatch_budget_for_host,
-        dispatch_prompt, expand_home, is_build_timeout, mirror_repo_url, order_cloud_reviewers,
-        parse_cli_tokens, primary_or_default_backend, quick_empty_success_is_provider_failure,
-        repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
-        same_model_family, should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
+        affected_crate_manifests, agent_output_tail, already_done_review_is_verified,
+        backend_failed_without_output, builder_excludes_480b, classify_dispatch_outcome,
+        command_display, complexity_at_least_moderate, default_clone_path,
+        dispatch_budget_for_host, dispatch_prompt, expand_home, is_build_timeout, mirror_repo_url,
+        order_cloud_reviewers, parse_cli_tokens, primary_or_default_backend,
+        quick_empty_success_is_provider_failure, repo_cache_path, repo_slug,
+        retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
+        should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
         task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
     };
     use std::path::PathBuf;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn already_done_verification_requires_file_line_evidence() {
+        assert!(already_done_review_is_verified(
+            true,
+            "implemented by crates/ff-agent/src/work_item_dispatch.rs:2981"
+        ));
+        assert!(already_done_review_is_verified(
+            true,
+            "see `src/lib.rs:42`."
+        ));
+        assert!(!already_done_review_is_verified(false, "src/lib.rs:42"));
+        assert!(!already_done_review_is_verified(
+            true,
+            "implemented and tests pass"
+        ));
+        assert!(!already_done_review_is_verified(true, "src/lib.rs:0"));
+        assert!(!already_done_review_is_verified(
+            true,
+            "src/lib.rs:not-a-line"
+        ));
+        assert!(!already_done_review_is_verified(true, ""));
+    }
 
     #[test]
     fn builder_excludes_480b_for_local_builds_only() {
