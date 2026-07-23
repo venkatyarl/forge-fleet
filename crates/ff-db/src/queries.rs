@@ -3232,12 +3232,16 @@ pub async fn pg_upsert_mesh_status(
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO fleet_mesh_status (src_node, dst_node, status, last_checked, last_error, attempts)
-         VALUES ($1, $2, $3, NOW(), $4, 1)
+         VALUES ($1, $2, $3, NOW(), $4, CASE WHEN $3 = 'ok' THEN 0 ELSE 1 END)
          ON CONFLICT (src_node, dst_node) DO UPDATE SET
             status = EXCLUDED.status,
             last_checked = NOW(),
             last_error = EXCLUDED.last_error,
-            attempts = fleet_mesh_status.attempts + 1",
+            attempts = CASE
+                WHEN EXCLUDED.status = 'ok' THEN 0
+                WHEN fleet_mesh_status.status = 'ok' THEN 1
+                ELSE fleet_mesh_status.attempts + 1
+            END",
     )
     .bind(src_node)
     .bind(dst_node)
@@ -3262,11 +3266,15 @@ pub async fn pg_upsert_mesh_probe(
     sqlx::query(
         "INSERT INTO fleet_mesh_status
             (src_node, dst_node, status, last_checked, last_error, attempts, ping_ok, ssh_ok)
-         VALUES ($1, $2, $3, NOW(), $4, 1, $5, $6)
+         VALUES ($1, $2, $3, NOW(), $4, CASE WHEN $3 = 'ok' THEN 0 ELSE 1 END, $5, $6)
          ON CONFLICT (src_node, dst_node) DO UPDATE SET
             status = EXCLUDED.status, last_checked = NOW(),
             last_error = EXCLUDED.last_error,
-            attempts = fleet_mesh_status.attempts + 1,
+            attempts = CASE
+                WHEN EXCLUDED.status = 'ok' THEN 0
+                WHEN fleet_mesh_status.status = 'ok' THEN 1
+                ELSE fleet_mesh_status.attempts + 1
+            END,
             ping_ok = EXCLUDED.ping_ok, ssh_ok = EXCLUDED.ssh_ok",
     )
     .bind(src_node)

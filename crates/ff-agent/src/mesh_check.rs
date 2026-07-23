@@ -6,11 +6,24 @@ use std::time::Duration;
 
 use sqlx::PgPool;
 use tokio::process::Command;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::{error, warn};
 use uuid::Uuid;
 
 const SKIPPED_COMPUTER_STATUSES: [&str; 3] = ["offline", "reserved", "decommissioned"];
+const MESH_REPAIR_FAILURE_CAP: i32 = 10;
+
+fn mesh_repair_backoff(attempts: i32) -> chrono::Duration {
+    match attempts.max(1) {
+        1 => chrono::Duration::minutes(1),
+        2 => chrono::Duration::minutes(5),
+        3 => chrono::Duration::minutes(30),
+        4 => chrono::Duration::hours(2),
+        _ => chrono::Duration::hours(6),
+    }
+}
 
 fn mesh_eligible(node: &ff_db::FleetNodeRow) -> bool {
     computer_status_eligible(node.computer_status.as_deref())
@@ -460,7 +473,7 @@ async fn load_mesh_alert_snapshot(pg: &PgPool) -> Result<MeshAlertSnapshot, Stri
 
     let mut snapshot = MeshAlertSnapshot::default();
     for ((src, dst), (status, last_error)) in &directed {
-        if status == "failed" {
+        if status == "failed" || status == "degraded" {
             snapshot
                 .failed_edges
                 .push((src.clone(), dst.clone(), last_error.clone()));
@@ -517,7 +530,20 @@ pub async fn fire_mesh_alert(pg: &PgPool) -> Result<(), String> {
 
     let snapshot = load_mesh_alert_snapshot(pg).await?;
     let total = snapshot.failed_edges.len() + snapshot.asymmetric.len();
-    if total == 0 {
+    let previous_total: Option<f64> = sqlx::query_scalar(
+        "SELECT value
+           FROM alert_events
+          WHERE policy_id = $1
+          ORDER BY fired_at DESC
+          LIMIT 1",
+    )
+    .bind(policy_id)
+    .fetch_optional(pg)
+    .await
+    .map_err(|e| format!("load prior {MESH_ALERT_POLICY} event: {e}"))?
+    .flatten();
+    let was_unhealthy = previous_total.is_some_and(|value| value > 0.0);
+    if (total == 0 && !was_unhealthy) || (total > 0 && was_unhealthy) {
         return Ok(());
     }
 
@@ -556,11 +582,15 @@ pub async fn fire_mesh_alert(pg: &PgPool) -> Result<(), String> {
         parts.push(format!("asymmetric: {summary}{ellipsis}"));
     }
 
-    let message = format!(
-        "SSH mesh degraded: {} unhealthy pair(s). {}",
-        total,
-        parts.join("; ")
-    );
+    let message = if total == 0 {
+        "SSH mesh repaired: all recently checked pairs are healthy".to_string()
+    } else {
+        format!(
+            "SSH mesh degraded: {} unhealthy pair(s). {}",
+            total,
+            parts.join("; ")
+        )
+    };
 
     let channel_result =
         crate::alert_evaluator::dispatch_alert(pg, &channel, &severity, &message).await;
@@ -874,6 +904,161 @@ pub async fn enqueue_retries(pool: &PgPool) -> Result<usize, String> {
         }
     }
     Ok(created)
+}
+
+/// Spawn the leader-gated SSH mesh auto-repair loop.
+///
+/// Failed directed edges are retried with a per-pair 1m/5m/30m/2h/6h
+/// schedule. Ten consecutive failures transition an edge to `degraded`; it is
+/// re-enabled only after the destination records a newer heartbeat.
+pub fn spawn_mesh_auto_repair_tick(
+    pool: PgPool,
+    worker_name: String,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => break,
+                _ = tick.tick() => {
+                    if let Err(error) = mesh_auto_repair_once(&pool, &worker_name).await {
+                        warn!(%error, "ssh mesh auto-repair tick failed");
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn mesh_auto_repair_once(pool: &PgPool, worker_name: &str) -> Result<(), String> {
+    let is_leader: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM fleet_leader_state
+             WHERE member_name = $1
+               AND heartbeat_at > NOW() - INTERVAL '60 seconds'
+        )",
+    )
+    .bind(worker_name)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("check leader: {e}"))?;
+    if !is_leader {
+        return Ok(());
+    }
+
+    // A heartbeat after degradation is the explicit signal to try this
+    // destination again. Reset the consecutive-failure series.
+    sqlx::query(
+        "UPDATE fleet_mesh_status mesh
+            SET status = 'failed', attempts = 0, last_checked = NOW()
+           FROM computers dst
+          WHERE mesh.status = 'degraded'
+            AND dst.name = mesh.dst_node
+            AND dst.last_seen_at > mesh.last_checked",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("wake degraded mesh edges: {e}"))?;
+
+    let gave_up: Vec<(String, String)> = sqlx::query_as(
+        "UPDATE fleet_mesh_status
+            SET status = 'degraded', last_checked = NOW()
+          WHERE status = 'failed' AND attempts >= $1
+          RETURNING src_node, dst_node",
+    )
+    .bind(MESH_REPAIR_FAILURE_CAP)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("degrade exhausted mesh edges: {e}"))?;
+    for (src, dst) in gave_up {
+        let _ = crate::telegram::send_telegram_from_secrets(
+            pool,
+            "SSH mesh auto-repair",
+            &format!(
+                "Repair gave up: {src} -> {dst} after {MESH_REPAIR_FAILURE_CAP} consecutive failures; waiting for {dst} heartbeat"
+            ),
+        )
+        .await;
+    }
+
+    let candidates: Vec<(String, String, i32, Option<chrono::DateTime<chrono::Utc>>)> =
+        sqlx::query_as(
+            "SELECT src_node, dst_node, attempts, last_checked
+           FROM fleet_mesh_status
+          WHERE status = 'failed' AND attempts < $1
+          ORDER BY last_checked ASC NULLS FIRST",
+        )
+        .bind(MESH_REPAIR_FAILURE_CAP)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("load failed mesh edges: {e}"))?;
+
+    let now = chrono::Utc::now();
+    for (src, dst, attempts, last_checked) in candidates {
+        let due = last_checked
+            .map(|checked| now >= checked + mesh_repair_backoff(attempts))
+            .unwrap_or(true);
+        if !due {
+            continue;
+        }
+        let command =
+            format!("ff fleet ssh-mesh-check --node {dst} --repair --yes 2>&1 | tail -10");
+        ff_agent_task(pool, worker_name, &src, &dst, &command).await?;
+        // Anchor the next per-pair cooldown at dispatch time. The resulting
+        // probe will replace this timestamp and advance the failure count.
+        sqlx::query(
+            "UPDATE fleet_mesh_status
+                SET last_checked = NOW()
+              WHERE src_node = $1 AND dst_node = $2 AND status = 'failed'",
+        )
+        .bind(&src)
+        .bind(&dst)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("record mesh repair dispatch: {e}"))?;
+    }
+    Ok(())
+}
+
+async fn ff_agent_task(
+    pool: &PgPool,
+    worker_name: &str,
+    src: &str,
+    dst: &str,
+    command: &str,
+) -> Result<(), String> {
+    crate::task_runner::pg_enqueue_shell_task(
+        pool,
+        &format!("auto-mesh-repair: {src} -> {dst}"),
+        command,
+        &["ff".to_string()],
+        Some(worker_name),
+        None,
+        50,
+        None,
+    )
+    .await
+    .map_err(|e| format!("enqueue {src}->{dst} mesh repair: {e}"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod mesh_repair_tests {
+    use super::mesh_repair_backoff;
+
+    #[test]
+    fn mesh_repair_backoff_follows_schedule_and_caps_at_six_hours() {
+        let minutes = (1..=12)
+            .map(|attempt| mesh_repair_backoff(attempt).num_minutes())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            minutes,
+            vec![1, 5, 30, 120, 360, 360, 360, 360, 360, 360, 360, 360]
+        );
+    }
 }
 
 pub async fn refresh_stale(pool: &PgPool, max_age: chrono::Duration) -> Result<usize, String> {
