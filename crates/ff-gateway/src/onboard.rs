@@ -26,6 +26,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::cl_config::ensure_claude_config;
 use crate::server::GatewayState;
 
 // ─── Bootstrap script rendering ──────────────────────────────────────────
@@ -546,6 +547,15 @@ pub async fn self_enroll(
     ff_db::pg_upsert_node(pool, &node_row)
         .await
         .map_err(|e| db_err("pg_upsert_node", e))?;
+
+    if let Err(error) = ensure_claude_config(&node_row.ssh_user) {
+        tracing::warn!(
+            node = %name,
+            runtime_user = %node_row.ssh_user,
+            %error,
+            "failed to configure Claude Code after enrollment; continuing"
+        );
+    }
 
     // UPSERT the `computers` row so Pulse v2 has a row to check against on
     // first beat (without this, forgefleetd logs "no computers row for this
