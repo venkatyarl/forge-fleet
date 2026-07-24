@@ -33,6 +33,9 @@ const DEFAULT_MIN_RECURRENCE: usize = 3;
 const DEFAULT_TAIL_LINES: usize = 1000;
 const DEFAULT_PATHS: &[&str] = &["/var/log/**/*.log"];
 const DEFAULT_PATTERNS: &[&str] = &["ERROR", "FATAL", "EXCEPTION", "WARN"];
+/// Hard ceiling on auto-filed `bug` work_items per calendar day (UTC), across
+/// all projects. Keeps a noisy log source from flooding the Pillar-4 queue.
+const MAX_BUG_WORK_ITEMS_PER_DAY: i64 = 3;
 
 /// Summary of one scan pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -254,11 +257,28 @@ impl LogAnalysisWorker {
     }
 
     /// Create one `ready` work_item per recurring pattern, skipping patterns
-    /// already tracked by an open/ready/in_progress work_item.
+    /// already tracked by an open/ready/in_progress work_item, and stopping
+    /// once `MAX_BUG_WORK_ITEMS_PER_DAY` bug work_items have been filed today.
     async fn create_work_items(&self, patterns: &[&RecurringPattern]) -> Result<usize> {
         let mut created = 0usize;
 
+        let filed_today: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_items \
+             WHERE kind = 'bug' AND created_at >= date_trunc('day', NOW())",
+        )
+        .fetch_one(&self.pg)
+        .await?;
+
         for pattern in patterns {
+            if filed_today + created as i64 >= MAX_BUG_WORK_ITEMS_PER_DAY {
+                debug!(
+                    filed_today,
+                    cap = MAX_BUG_WORK_ITEMS_PER_DAY,
+                    "log_analysis_worker: daily bug work_item cap reached, deferring remaining patterns"
+                );
+                break;
+            }
+
             let existing: Option<(uuid::Uuid,)> = sqlx::query_as(
                 "SELECT id FROM work_items \
                  WHERE project_id = $1 \
