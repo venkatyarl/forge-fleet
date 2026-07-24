@@ -17,6 +17,12 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_TIMEOUT: Duration = Duration::from_secs(600);
 const RAM_HEADROOM_PERCENT: u64 = 25;
 
+/// Serializes tests (here and in `ha::offline_mode`) that mutate the
+/// process-global `FORGEFLEET_SLM_*` env vars, since `cargo test` runs unit
+/// tests from both modules in the same process concurrently.
+#[cfg(test)]
+pub(crate) static SLM_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Run a single prediction against the GGUF model in `FORGEFLEET_SLM_MODEL`.
 ///
 /// `FORGEFLEET_SLM_BIN` may override `llama-cli`, and
@@ -289,5 +295,122 @@ mod tests {
         let model = dir.path().join("tiny-Q4_K_M.gguf");
         File::create(&model).unwrap().write_all(b"nope").unwrap();
         assert!(validate_model(&model).unwrap_err().contains("invalid GGUF"));
+    }
+
+    #[test]
+    fn model_validation_accepts_supported_quantization() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = write_valid_model(dir.path(), "tiny-model-Q4_K_M.gguf");
+        assert!(validate_model(&model).is_ok());
+    }
+
+    #[test]
+    fn model_validation_rejects_unsupported_quantization() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = write_valid_model(dir.path(), "tiny-model-Q8_0.gguf");
+        assert!(
+            validate_model(&model)
+                .unwrap_err()
+                .contains("larger than supported Q4_K_M")
+        );
+    }
+
+    fn write_valid_model(dir: &Path, name: &str) -> PathBuf {
+        let model = dir.join(name);
+        let mut file = File::create(&model).unwrap();
+        file.write_all(b"GGUF").unwrap();
+        file.write_all(&[0_u8; 32]).unwrap();
+        model
+    }
+
+    #[cfg(unix)]
+    fn write_mock_llama_cli(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = dir.join("mock-llama-cli.sh");
+        File::create(&bin)
+            .unwrap()
+            .write_all(body.as_bytes())
+            .unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        bin
+    }
+
+    fn restore_env(key: &str, prior: Option<std::ffi::OsString>) {
+        unsafe {
+            match prior {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn predict_initializes_with_supported_quantization_and_runs_sample_task() {
+        let _guard = SLM_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let model = write_valid_model(dir.path(), "tiny-model-Q4_K_M.gguf");
+        let bin = write_mock_llama_cli(dir.path(), "#!/bin/sh\necho 'mock slm response'\n");
+
+        let prior_model = std::env::var_os("FORGEFLEET_SLM_MODEL");
+        let prior_bin = std::env::var_os("FORGEFLEET_SLM_BIN");
+        unsafe {
+            std::env::set_var("FORGEFLEET_SLM_MODEL", &model);
+            std::env::set_var("FORGEFLEET_SLM_BIN", &bin);
+        }
+
+        let output = predict("classify this sample task");
+
+        restore_env("FORGEFLEET_SLM_MODEL", prior_model);
+        restore_env("FORGEFLEET_SLM_BIN", prior_bin);
+
+        assert_eq!(output, "mock slm response");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn predict_reports_error_when_llama_cli_fails() {
+        let _guard = SLM_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let model = write_valid_model(dir.path(), "tiny-model-Q4_K_M.gguf");
+        let bin = write_mock_llama_cli(dir.path(), "#!/bin/sh\necho boom >&2\nexit 1\n");
+
+        let prior_model = std::env::var_os("FORGEFLEET_SLM_MODEL");
+        let prior_bin = std::env::var_os("FORGEFLEET_SLM_BIN");
+        unsafe {
+            std::env::set_var("FORGEFLEET_SLM_MODEL", &model);
+            std::env::set_var("FORGEFLEET_SLM_BIN", &bin);
+        }
+
+        let output = predict("classify this sample task");
+
+        restore_env("FORGEFLEET_SLM_MODEL", prior_model);
+        restore_env("FORGEFLEET_SLM_BIN", prior_bin);
+
+        assert!(output.starts_with("SLM error: "), "{output}");
+    }
+
+    #[test]
+    fn predict_rejects_configured_memory_budget_exceeding_available_ram() {
+        let _guard = SLM_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let model = write_valid_model(dir.path(), "tiny-model-Q4_K_M.gguf");
+
+        let prior_model = std::env::var_os("FORGEFLEET_SLM_MODEL");
+        let prior_budget = std::env::var_os("FORGEFLEET_SLM_MEM_BUDGET_MB");
+        unsafe {
+            std::env::set_var("FORGEFLEET_SLM_MODEL", &model);
+            std::env::set_var("FORGEFLEET_SLM_MEM_BUDGET_MB", (u64::MAX / 2).to_string());
+        }
+
+        let output = predict("classify this sample task");
+
+        restore_env("FORGEFLEET_SLM_MODEL", prior_model);
+        restore_env("FORGEFLEET_SLM_MEM_BUDGET_MB", prior_budget);
+
+        assert!(output.contains("exceeds half of available RAM"), "{output}");
     }
 }
