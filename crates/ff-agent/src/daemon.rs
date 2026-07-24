@@ -82,6 +82,12 @@ impl TickRegistry {
                 runner: run_metrics_scraper_tick,
             },
             TickDefinition {
+                name: "daily_model_right_sizing",
+                interval: Duration::from_secs(60),
+                scope: TickScope::LeaderOnly,
+                runner: run_model_right_sizing_tick,
+            },
+            TickDefinition {
                 name: "service_connectivity",
                 interval: Duration::from_secs(300),
                 scope: TickScope::EveryNode,
@@ -265,6 +271,14 @@ fn run_metrics_scraper_tick(pg: PgPool, worker_name: String) -> BoxFuture<'stati
     })
 }
 
+fn run_model_right_sizing_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::deployment_reconciler::run_daily_right_sizing(&pg)
+            .await
+            .map_err(anyhow::Error::msg)
+    })
+}
+
 fn run_service_connectivity_tick(
     pg: PgPool,
     worker_name: String,
@@ -291,11 +305,9 @@ fn run_service_connectivity_tick(
     })
 }
 
-fn run_session_export_tick(_pg: PgPool, _worker_name: String) -> BoxFuture<'static, Result<()>> {
+fn run_session_export_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'static, Result<()>> {
     Box::pin(async move {
-        tokio::task::spawn_blocking(|| crate::session_export::export_local_sessions(None, false))
-            .await
-            .map_err(anyhow::Error::from)??;
+        crate::session_export::export_local_sessions(Some(&pg), None, false).await?;
         Ok(())
     })
 }

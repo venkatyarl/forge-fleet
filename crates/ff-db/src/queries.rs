@@ -1128,6 +1128,7 @@ pub struct ModelDeploymentRow {
     pub usable_agent_ctx: Option<i32>,
     pub tokens_used: i64,
     pub request_count: i64,
+    pub pinned: bool,
 }
 
 /// List deployments optionally filtered by node.
@@ -1168,6 +1169,7 @@ pub async fn pg_list_deployments(
                 usable_agent_ctx: r.get("usable_agent_ctx"),
                 tokens_used: r.get("tokens_used"),
                 request_count: r.get("request_count"),
+                pinned: r.try_get("pinned").unwrap_or(false),
             }
         })
         .collect())
@@ -7702,6 +7704,69 @@ pub async fn pg_list_reserved_hosts(pool: &PgPool) -> Result<Vec<ArbiterReserved
 }
 
 // ─── Interaction Log (V121 ff_interactions) ─────────────────────────────────
+
+/// A normalized turn in the fleet-wide episodic-memory stream.
+#[derive(Debug, Clone)]
+pub struct FleetEpisodeRecord {
+    pub source_kind: String,
+    pub node: String,
+    pub model: Option<String>,
+    pub session_id: String,
+    pub work_item_id: Option<uuid::Uuid>,
+    pub seq: i32,
+    pub ts: chrono::DateTime<chrono::Utc>,
+    pub role: String,
+    pub content: String,
+    pub tokens: Option<i32>,
+    pub redacted: bool,
+}
+
+/// Insert a turn idempotently by its per-source session sequence.
+pub async fn pg_record_fleet_episode(
+    pool: &PgPool,
+    episode: &FleetEpisodeRecord,
+) -> Result<Option<uuid::Uuid>> {
+    let id = sqlx::query_scalar(
+        "INSERT INTO fleet_episodes
+            (source_kind, node, model, session_id, work_item_id, seq, ts,
+             role, content, tokens, redacted)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (source_kind, node, session_id, seq) DO NOTHING
+         RETURNING id",
+    )
+    .bind(&episode.source_kind)
+    .bind(&episode.node)
+    .bind(&episode.model)
+    .bind(&episode.session_id)
+    .bind(episode.work_item_id)
+    .bind(episode.seq)
+    .bind(episode.ts)
+    .bind(&episode.role)
+    .bind(&episode.content)
+    .bind(episode.tokens)
+    .bind(episode.redacted)
+    .fetch_optional(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Last sequence persisted for one source session on one node.
+pub async fn pg_fleet_episode_high_watermark(
+    pool: &PgPool,
+    source_kind: &str,
+    node: &str,
+    session_id: &str,
+) -> Result<i32> {
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE(MAX(seq), -1) FROM fleet_episodes
+          WHERE source_kind=$1 AND node=$2 AND session_id=$3",
+    )
+    .bind(source_kind)
+    .bind(node)
+    .bind(session_id)
+    .fetch_one(pool)
+    .await?)
+}
 
 /// One row of the unified interaction log — a single ff "turn" across any
 /// channel. Maps 1:1 to the `ff_interactions` table (V121). Columns with DB
