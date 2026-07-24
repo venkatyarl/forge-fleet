@@ -3154,7 +3154,11 @@ async fn run_ff_dispatch(
             // (2026-07-24). Fall back to the full rotation order so codex/kimi get
             // the first shot here too; the per-backend error loop still skips any
             // that genuinely fail at call time.
-            vec!["codex".to_string(), "kimi".to_string(), "claude".to_string()]
+            vec![
+                "codex".to_string(),
+                "kimi".to_string(),
+                "claude".to_string(),
+            ]
         }
     } else {
         routed
