@@ -3151,10 +3151,15 @@ async fn run_ff_dispatch(
             // such build onto claude, the one churning shared-OAuth backend. That
             // is exactly why 30 items showed "backend claude produced no diff"
             // with codex NEVER tried despite codex being authed+fresh on 9 nodes
-            // (2026-07-24). Fall back to the full rotation order so codex/kimi get
-            // the first shot here too; the per-backend error loop still skips any
-            // that genuinely fail at call time.
-            vec!["codex".to_string(), "kimi".to_string(), "claude".to_string()]
+            // (2026-07-24). Fall back to codex/kimi only — claude is now
+            // OPERATOR-RESERVED and must never be a fleet builder: the fleet's
+            // background claude builds share the operator's single OAuth token
+            // store, and each fleet use rotates the refresh token out from under
+            // the operator's interactive Claude Code session (the endless
+            // /login-expiry loop). The fleet has codex (12) + kimi (8) + local
+            // Devstral everywhere; the cost of using claude is the operator's
+            // login stability, so we don't.
+            vec!["codex".to_string(), "kimi".to_string()]
         }
     } else {
         routed
@@ -3175,7 +3180,12 @@ async fn run_ff_dispatch(
     // concurrent use churns (rotating refresh tokens = the operator's endless
     // /login treadmill), while codex has 12 authed nodes and kimi 8. Ladder:
     // local Devstral/GLM → 480B ring → codex/kimi → claude as final backstop.
-    const BUILDER_ROTATION: [&str; 3] = ["codex", "kimi", "claude"];
+    // claude is OPERATOR-RESERVED — excluded from the fleet builder rotation so
+    // background builds never churn the operator's shared OAuth token (the
+    // /login-expiry loop, 2026-07-24). codex (12 nodes) + kimi (8) + the
+    // local-first ladder cover all fleet building; claude stays purely for the
+    // operator's interactive Claude Code session.
+    const BUILDER_ROTATION: [&str; 2] = ["codex", "kimi"];
     // Index by item id PLUS attempts: id-only rotation re-picked the SAME
     // backend on every retry, so an item whose pick failed success-shaped
     // (e.g. claude "no diff" — exit 0, so the in-loop error failover never
