@@ -12135,6 +12135,46 @@ CREATE INDEX IF NOT EXISTS idx_notifications_undismissed
     ON notifications (created_at) WHERE NOT is_dismissed;
 "#;
 
+/// ErrorMiner substrate: recurring fleet-error signatures and a per-node
+/// daily digest of journald warning lines.
+///   - `error_signatures` — one row per normalized error signature (sha256
+///     of the `error_class` token when present, else the normalized text).
+///     `state` tracks the auto-file lifecycle from first detection through
+///     resolution; `work_item_id`/`fix_commit_sha`/`resolved_at` are filled
+///     in once a bug has been filed and fixed.
+///   - `fleet_log_digest` — per (node, day, level, line_class) counts from
+///     `journalctl --user -u forgefleetd -p warning`, deduplicated via the
+///     unique constraint so a re-run upserts rather than double-counts.
+/// Migration + row structs only; no consumers wired yet.
+pub const SCHEMA_V247_ERROR_MINER_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS error_signatures (
+    signature      TEXT PRIMARY KEY,
+    error_class    TEXT,
+    first_seen     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    count_24h      INT NOT NULL DEFAULT 0,
+    count_total    INT NOT NULL DEFAULT 0,
+    sample_text    TEXT,
+    affected_nodes JSONB,
+    state          TEXT NOT NULL DEFAULT 'new'
+                       CHECK (state IN ('new', 'filed', 'fix_merged', 'verifying', 'resolved', 'regressed')),
+    work_item_id   UUID,
+    fix_commit_sha TEXT,
+    resolved_at    TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS fleet_log_digest (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    node       TEXT NOT NULL,
+    day        DATE NOT NULL,
+    level      TEXT NOT NULL,
+    line_class TEXT NOT NULL,
+    count      INT NOT NULL DEFAULT 0,
+    sample     TEXT,
+    UNIQUE (node, day, level, line_class)
+);
+"#;
+
 /// Memory-v2 M2 — episodic tagging for `ff_interactions`. Two nullable
 /// columns turn the flat interaction log into replayable EPISODES (the
 /// reflexion substrate):
