@@ -12193,6 +12193,14 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
     ON ff_interactions (work_item_id, ts) WHERE work_item_id IS NOT NULL;
 "#;
 
+/// V258 — Replace the stale `model_catalog` table with a view over
+/// `fleet_model_catalog`, the table `ff model sync-catalog` actually keeps
+/// current. See the SQL file for why a plain `CREATE VIEW` doesn't work
+/// (the name is already taken by the old table, which other tables still
+/// hold FKs into).
+pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
+    include_str!("migrations/20260724000000_create_model_catalog_view.sql");
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
