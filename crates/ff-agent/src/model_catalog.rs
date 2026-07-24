@@ -1,16 +1,19 @@
-//! Model catalog loader (retired).
+//! Model catalog loader.
 //!
 //! Historically this module parsed `config/model_catalog.toml` into
 //! `ff_db::ModelCatalogRow` rows and upserted them into the legacy
-//! `fleet_model_catalog` Postgres table. That file has been deleted —
-//! the canonical V14 seed now lives in
+//! `fleet_model_catalog` Postgres table. The bulk catalog was retired to
+//! Postgres — the canonical V14 seed lives in
 //! `SCHEMA_V39_RETIRE_MODEL_CATALOG_TOML`, which populates the newer
 //! `model_catalog` table.
 //!
-//! The public API ([`sync_catalog`], [`load_catalog_file`],
-//! [`CatalogFile`], [`CatalogModel`], [`CatalogVariant`]) is kept only
-//! so any callers that predate the retirement keep compiling.
-//! `sync_catalog` is now a no-op that logs once and returns 0.
+//! The TOML lane survives for two purposes: a dev override (point
+//! `$FORGEFLEET_CATALOG` at any file) and the Autopilot-5 **watchlist
+//! seeds** — `config/model_catalog.toml` was re-introduced carrying the
+//! `watchlist = true` entries (mirrored by migration V252) so the
+//! auto-download flag stays visible and editable in source. When the file
+//! is present, [`sync_catalog`] replays it into `fleet_model_catalog`;
+//! when absent it stays a no-op that logs once and returns 0.
 
 use std::path::{Path, PathBuf};
 
@@ -43,6 +46,15 @@ pub struct CatalogModel {
     pub gated: bool,
     #[serde(default)]
     pub preferred_workloads: Vec<String>,
+    /// Autopilot-5: auto-download this model when a node has the disk + RAM
+    /// headroom (gated models are never auto-downloaded even when flagged).
+    #[serde(default)]
+    pub watchlist: bool,
+    /// SPDX-ish license id. The watchlist auto-download gate fails closed:
+    /// a watchlisted entry without an allowlisted license is never fetched
+    /// automatically, so seeds must set this explicitly.
+    #[serde(default)]
+    pub license: Option<String>,
     #[serde(default)]
     pub variants: Vec<CatalogVariant>,
 }
@@ -61,11 +73,19 @@ pub struct CatalogVariant {
 pub const DEFAULT_CATALOG_PATH: &str =
     "/Users/venkat/projects/forge-fleet/config/model_catalog.toml";
 
-/// Resolve catalog path, honoring the `FORGEFLEET_CATALOG` env override.
+/// Resolve catalog path: `FORGEFLEET_CATALOG` env override first, then the
+/// historical absolute default, then the repo-relative
+/// `config/model_catalog.toml` (so the checked-in watchlist seeds load on
+/// nodes where the repo lives somewhere other than the historical Mac path).
 pub fn resolve_catalog_path() -> PathBuf {
-    std::env::var("FORGEFLEET_CATALOG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_CATALOG_PATH))
+    if let Ok(env_path) = std::env::var("FORGEFLEET_CATALOG") {
+        return PathBuf::from(env_path);
+    }
+    let default = PathBuf::from(DEFAULT_CATALOG_PATH);
+    if default.exists() {
+        return default;
+    }
+    PathBuf::from("config/model_catalog.toml")
 }
 
 /// Retired no-op loader. If `path` does not exist (which is the normal
@@ -100,6 +120,8 @@ pub fn load_catalog_file(path: &Path) -> Result<Vec<ModelCatalogRow>, String> {
             preferred_workloads,
             variants,
             tool_calling,
+            watchlist: m.watchlist,
+            license: m.license,
         });
     }
     Ok(rows)
@@ -139,4 +161,61 @@ pub async fn sync_catalog(pool: &PgPool) -> Result<usize, String> {
         synced += 1;
     }
     Ok(synced)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The checked-in Autopilot-5 watchlist seeds must parse and carry the
+    /// flag through to the rows `sync_catalog` upserts (mirrors the V252
+    /// migration seed — keep both in step).
+    #[test]
+    fn watchlist_seeds_file_parses_with_flag_set() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/model_catalog.toml");
+        let rows = load_catalog_file(&path).expect("seeds TOML must parse");
+        for id in ["apriel-1.5-15b", "qwen3-coder-next-80b"] {
+            let row = rows
+                .iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("watchlist seed {id} missing from TOML"));
+            assert!(row.watchlist, "{id} must be flagged watchlist");
+            assert!(
+                !row.gated,
+                "{id} must be ungated (never auto-download gated)"
+            );
+            assert!(
+                row.variants.as_array().is_some_and(|v| !v.is_empty()),
+                "{id} needs at least one variant with a verified hf_repo"
+            );
+            // The auto-download gate fails closed on a missing license, so a
+            // seed without one would be flagged yet never fetched.
+            let license = row
+                .license
+                .as_deref()
+                .unwrap_or_else(|| panic!("watchlist seed {id} must declare its license"));
+            assert!(
+                crate::watchlist_reconciler::license_allows_auto_download(license),
+                "{id} license {license:?} must be in the auto-download allowlist"
+            );
+        }
+    }
+
+    /// `watchlist` defaults to false so pre-existing TOML entries and
+    /// operator overrides keep their old meaning.
+    #[test]
+    fn watchlist_defaults_false_in_toml() {
+        let doc: CatalogFile = toml::from_str(
+            r#"
+            [[models]]
+            id = "plain"
+            name = "Plain"
+            family = "test"
+            parameters = "1B"
+            tier = 1
+            "#,
+        )
+        .unwrap();
+        assert!(!doc.models[0].watchlist);
+    }
 }

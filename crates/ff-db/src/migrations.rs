@@ -1188,6 +1188,13 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "ff_interactions_episodic_tagging",
         sql: schema::SCHEMA_V250_FF_INTERACTIONS_EPISODIC_TAGGING,
     },
+    // 251 is reserved by in-flight branches (Autopilot-4 bandit / memory-v2-m4);
+    // gaps are fine, collisions are not. Live DB is at 250, so this must be > 250.
+    PgMigration {
+        version: 252,
+        name: "model_catalog_watchlist",
+        sql: schema::SCHEMA_V252_MODEL_CATALOG_WATCHLIST,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

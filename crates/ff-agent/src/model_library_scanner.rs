@@ -550,6 +550,8 @@ mod tests {
             preferred_workloads: serde_json::json!([]),
             variants: serde_json::json!([]),
             tool_calling: false,
+            watchlist: false,
+            license: None,
         }
     }
 

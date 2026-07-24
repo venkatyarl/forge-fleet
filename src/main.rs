@@ -1744,6 +1744,65 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         }));
     }
 
+    // 20b5a) Watchlist auto-download tick (Autopilot-5) — every 6h, leader-gated.
+    //
+    // Catalog rows flagged `watchlist = TRUE` and missing from the library
+    // fleet-wide are fetched onto the node with the most free disk + RAM
+    // headroom (est size + build reserve) via a deferred `ff model download`;
+    // the post-download scan registers them cold. Once a cold copy exists and
+    // a same-workload incumbent is serving, the model is registered as an
+    // Autopilot-4 bandit challenger: catalog tier aligned to the incumbent's
+    // (tier + 0) and a deferred `ff model load` on the holding node. Gated /
+    // non-allowlisted-license models are never auto-downloaded.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: watchlist auto-download tick (6h, leader-gated)");
+        let name = worker_name.clone();
+        let mut shutdown_rx_watchlist = shutdown_rx.clone();
+        subsystem_tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx_watchlist.changed() => break,
+                    _ = tick.tick() => {
+                        let is_leader: bool = sqlx::query_scalar(
+                            r#"
+                            SELECT EXISTS (
+                                SELECT 1 FROM fleet_leader_state
+                                WHERE member_name = $1
+                                  AND heartbeat_at > NOW() - INTERVAL '60 seconds'
+                            )
+                            "#,
+                        )
+                        .bind(&name)
+                        .fetch_one(&pg_pool)
+                        .await
+                        .unwrap_or(false);
+                        if !is_leader {
+                            continue;
+                        }
+
+                        match ff_agent::watchlist_reconciler::reconcile_watchlist(&pg_pool).await {
+                            Ok(summary) if !summary.is_noop() => {
+                                info!(
+                                    considered = summary.considered,
+                                    enqueued = summary.enqueued,
+                                    skipped = summary.skipped,
+                                    challengers_registered = summary.challengers_registered,
+                                    challengers_waiting = summary.challengers_waiting,
+                                    "watchlist auto-download pass"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!(error = %e, "watchlist auto-download pass failed"),
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
     // 20b6) Vault re-index tick — every 30min. Leader-gating happens inside
     // the tick (live `fleet_leader_state` check), so spawn unconditionally —
     // every node runs the loop but only the live leader does the work.

@@ -182,6 +182,7 @@ pub mod upgrade_rollout;
 pub mod vault_sync;
 pub mod verify_computer;
 pub mod version_check;
+pub mod watchlist_reconciler;
 pub mod work_item_dispatch;
 pub mod work_item_feeder;
 pub mod work_item_merge_drain;
