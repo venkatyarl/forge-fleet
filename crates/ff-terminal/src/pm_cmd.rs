@@ -86,37 +86,26 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
             description,
             priority,
         } => {
-            // Validate project exists first so we give a clear error instead of an FK violation.
-            let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM projects WHERE id = $1")
-                .bind(&project)
-                .fetch_optional(&pool)
-                .await
-                .map_err(|e| anyhow::anyhow!("query project: {e}"))?;
-            if exists.is_none() {
-                return Err(anyhow::anyhow!(
-                    "unknown project '{project}' — run `ff project seed` or check `ff project list`"
-                ));
-            }
-
             let created_by = ff_agent::fleet_info::resolve_this_worker_name().await;
             let prio = priority.unwrap_or_else(|| "normal".to_string());
-            let row: (uuid::Uuid,) = sqlx::query_as(
-                "INSERT INTO work_items (project_id, kind, title, description, priority, created_by) \
-                 VALUES ($1, $2, $3, $4, $5, $6) \
-                 RETURNING id",
+            let id = ff_db::pg_create_work_item(
+                &pool,
+                ff_db::CreateWorkItem {
+                    project_id: &project,
+                    kind: &kind,
+                    title: &title,
+                    description: description.as_deref(),
+                    priority: Some(&prio),
+                    created_by: &created_by,
+                    risk_score: None,
+                    metadata: None,
+                },
             )
-            .bind(&project)
-            .bind(&kind)
-            .bind(&title)
-            .bind(description.as_deref())
-            .bind(&prio)
-            .bind(&created_by)
-            .fetch_one(&pool)
             .await
             .map_err(|e| anyhow::anyhow!("insert work item: {e}"))?;
 
             println!("{GREEN}✓ Created work item{RESET}");
-            println!("  id:       {}", row.0);
+            println!("  id:       {id}");
             println!("  project:  {project}");
             println!("  kind:     {kind}");
             println!("  title:    {title}");

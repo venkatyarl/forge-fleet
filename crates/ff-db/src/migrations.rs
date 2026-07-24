@@ -1181,8 +1181,13 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "notifications",
         sql: schema::SCHEMA_V245_NOTIFICATIONS,
     },
-    // 246-249 are reserved by in-flight branches (Autopilot / ErrorMiner /
+    // 246, 248-249 are reserved by other in-flight branches (Autopilot /
     // mesh-repair); gaps are fine, collisions are not.
+    PgMigration {
+        version: 247,
+        name: "error_signatures_and_fleet_log_digest",
+        sql: schema::SCHEMA_V247_ERROR_SIGNATURES_AND_FLEET_LOG_DIGEST,
+    },
     PgMigration {
         version: 250,
         name: "ff_interactions_episodic_tagging",

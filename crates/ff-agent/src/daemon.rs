@@ -116,6 +116,17 @@ impl TickRegistry {
                 scope: TickScope::LeaderOnly,
                 runner: run_ssh_mesh_check_tick,
             },
+            TickDefinition {
+                // Aggregation window is 24h but the pass itself is cheap and
+                // idempotent (upserts that recompute the window snapshot each
+                // time), so it runs every 30 min for fresher signal; only the
+                // Telegram digest inside is clock-gated to once/day (see
+                // `error_miner::DIGEST_HOUR_LOCAL`).
+                name: "error_miner",
+                interval: Duration::from_secs(30 * 60),
+                scope: TickScope::LeaderOnly,
+                runner: run_error_miner_tick,
+            },
         ]
         .into_iter()
         .map(|definition| RegisteredTick {
@@ -319,6 +330,10 @@ fn run_ssh_mesh_check_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'stati
             .map(|_| ())
             .map_err(anyhow::Error::msg)
     })
+}
+
+fn run_error_miner_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move { crate::error_miner::run_error_miner_tick(&pg, &worker_name).await })
 }
 
 /// How often the dispatch-tick watchdog wakes up to check liveness.
