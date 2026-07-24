@@ -3844,6 +3844,12 @@ fn build_embedded_agent_config(
         ownership_api_base_url: config.agent.ownership_api_base_url.clone(),
         llm_base_url: std::env::var("FF_PIPELINE_LLM_BASE_URL").ok(),
         llm_model: std::env::var("FF_PIPELINE_LLM_MODEL").ok(),
+        slm_enabled: std::env::var("FORGEFLEET_SLM_ENABLED").is_ok_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        }),
         // InferenceRouter is wired in at the call site (async context).
         inference_router: None,
     }
