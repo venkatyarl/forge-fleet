@@ -32,6 +32,7 @@ pub mod doc_index;
 pub mod embeddings;
 pub mod facts;
 pub mod image_index;
+pub mod local_llm;
 pub mod procedural_memory;
 pub mod stack_backlog;
 pub mod train_conflict;
@@ -70,6 +71,7 @@ pub use embeddings::{
     generate_embedding_with_pool,
 };
 pub use facts::{contains_signal_phrases, extract_candidates};
+pub use local_llm::LocalLlmRouter;
 pub use procedural_memory::{consolidate, spawn_consolidation_loop};
 pub use stack_backlog::{BacklogItem, BrainStateClient, StackItem};
 pub use vault::{
