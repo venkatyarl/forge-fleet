@@ -1181,8 +1181,13 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "notifications",
         sql: schema::SCHEMA_V245_NOTIFICATIONS,
     },
-    // 246-249 are reserved by in-flight branches (Autopilot / ErrorMiner /
+    // 246, 248-249 are reserved by in-flight branches (Autopilot /
     // mesh-repair); gaps are fine, collisions are not.
+    PgMigration {
+        version: 247,
+        name: "error_miner_tables",
+        sql: schema::SCHEMA_V247_ERROR_MINER_TABLES,
+    },
     PgMigration {
         version: 250,
         name: "ff_interactions_episodic_tagging",
@@ -2275,6 +2280,58 @@ mod tests {
         assert_eq!(defaults.0, serde_json::json!([]));
         assert_eq!(defaults.1, serde_json::json!([]));
         assert_eq!(defaults.2, None);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v247_creates_error_miner_tables() {
+        // CI commonly has no Postgres; the helper checks both supported URL vars.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on a fresh database");
+
+        let signature: crate::models::ErrorSignature = sqlx::query_as(
+            "INSERT INTO error_signatures
+                (signature, error_class, count_24h, count_total, sample_text, affected_nodes)
+             VALUES ('v247-test-sig', 'ssh:timeout', 3, 3, 'sample', '[\"node-a\"]')
+             RETURNING signature, error_class, first_seen, last_seen, count_24h, count_total,
+                       sample_text, affected_nodes, state, work_item_id, fix_commit_sha, resolved_at",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert + read error_signatures row");
+
+        assert_eq!(signature.state, "new");
+        assert_eq!(signature.count_24h, 3);
+        assert!(signature.work_item_id.is_none());
+
+        let digest: crate::models::FleetLogDigest = sqlx::query_as(
+            "INSERT INTO fleet_log_digest (node, day, level, line_class, count, sample)
+             VALUES ('node-a', CURRENT_DATE, 'warning', 'connection refused', 5, 'sample line')
+             RETURNING id, node, day, level, line_class, count, sample",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert + read fleet_log_digest row");
+
+        assert_eq!(digest.count, 5);
+
+        let conflict: crate::models::FleetLogDigest = sqlx::query_as(
+            "INSERT INTO fleet_log_digest (node, day, level, line_class, count, sample)
+             VALUES ('node-a', CURRENT_DATE, 'warning', 'connection refused', 2, 'sample line 2')
+             ON CONFLICT (node, day, level, line_class) DO UPDATE SET count = EXCLUDED.count
+             RETURNING id, node, day, level, line_class, count, sample",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("upsert on unique (node, day, level, line_class)");
+
+        assert_eq!(conflict.id, digest.id);
+        assert_eq!(conflict.count, 2);
 
         drop_temp_db(admin, pool, &db_name).await;
     }
