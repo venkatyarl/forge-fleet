@@ -9,6 +9,7 @@ pub mod auto_backlog_feeder;
 pub mod auto_upgrade;
 pub mod autoscaler;
 pub mod backend_detect;
+pub mod bandit_promotion;
 pub mod circuit_breaker;
 pub mod deadlines;
 pub mod defer_worker;

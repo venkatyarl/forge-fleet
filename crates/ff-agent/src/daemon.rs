@@ -102,6 +102,15 @@ impl TickRegistry {
                 runner: run_nightly_digest_tick,
             },
             TickDefinition {
+                // Clock-gated inside the runner (Autopilot-4): runs once per
+                // day at/after 09:00 local; the 60s interval is just the
+                // due-check cadence, same pattern as the nightly digest above.
+                name: "bandit_promotion",
+                interval: Duration::from_secs(60),
+                scope: TickScope::LeaderOnly,
+                runner: run_bandit_promotion_tick,
+            },
+            TickDefinition {
                 // Poll the Kimi coding-plan usage endpoint and refresh the
                 // `kimi` row of `cloud_budget_buckets`. Leader-only so one
                 // fleet-wide poll hits the provider, not one per node.
@@ -302,6 +311,12 @@ fn run_session_export_tick(_pg: PgPool, _worker_name: String) -> BoxFuture<'stat
 
 fn run_nightly_digest_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
     Box::pin(async move { crate::ha::periodic::run_nightly_digest_tick(&pg, &worker_name).await })
+}
+
+fn run_bandit_promotion_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(
+        async move { crate::bandit_promotion::run_bandit_promotion_tick(&pg, &worker_name).await },
+    )
 }
 
 fn run_kimi_usage_poller_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'static, Result<()>> {

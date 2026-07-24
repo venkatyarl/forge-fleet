@@ -12154,6 +12154,50 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
     ON ff_interactions (work_item_id, ts) WHERE work_item_id IS NOT NULL;
 "#;
 
+/// Autopilot-4 bandit A/B reward view: per-(model, workload) build outcomes
+/// over a rolling 48h window, keyed by `fleet_model_catalog.id` AND one entry
+/// of its `preferred_workloads`, one row per pair (`jsonb_array_elements_text`
+/// unnest). The reconciler's daily promote/demote pass reads this and groups
+/// by `(tier, workload)` — NOT tier alone — to compare a challenger against
+/// its tier incumbent, mirroring `ff_db::queries::apply_bandit_epsilon_greedy`
+/// on the routing side: that bandit only ever explores within one requested
+/// `workload`'s same-tier pool (the SQL `WHERE` clause already restricts the
+/// candidate set to one workload before the tier-group scan runs), so a model
+/// tagged `["chat","code"]` at tier 2 never actually competes against a
+/// `["vision"]` tier-2 model for either routing traffic or a promotion
+/// verdict. A prior revision of this view grouped by tier only, which could
+/// promote/demote a model based on an accidental same-tier pairing with a
+/// model it never routes against for any real request — the bug an in-place
+/// review caught (retry #4).
+///
+/// Modeled on the hand-run `v_builder_stats` comparison from the GLM-vs-
+/// Devstral A/B (work_item 8a3ec05e: "extend the builder tag to carry model
+/// id") — `work_item_merge_queue.builder` already carries a `local:<model>`
+/// tag on every path except the primary Lane-1 codegen dispatch (plain
+/// `local`, untagged), so this view only sees `local:<catalog_id>` rows.
+/// Untagged local builds and cloud builders (codex/kimi/claude) are excluded
+/// by design — the bandit only compares same-tier, same-workload LOCAL
+/// deployments.
+pub const SCHEMA_V251_MODEL_UTILIZATION: &str = r#"
+CREATE OR REPLACE VIEW v_model_utilization AS
+SELECT cat.id                                                            AS catalog_id,
+       cat.name                                                          AS catalog_name,
+       cat.tier                                                          AS tier,
+       workload.tag                                                      AS workload,
+       COUNT(*)                                                          AS builds,
+       COUNT(*) FILTER (WHERE q.review_verdict = 'approve')              AS approved,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE q.review_verdict = 'approve')::numeric
+             / NULLIF(COUNT(*), 0)::numeric)                             AS approve_pct,
+       MAX(q.review_completed_at)                                       AS last_build_at
+  FROM work_item_merge_queue q
+  JOIN fleet_model_catalog cat
+    ON cat.id = regexp_replace(q.builder, '^local:', '')
+  CROSS JOIN LATERAL jsonb_array_elements_text(cat.preferred_workloads) AS workload(tag)
+ WHERE q.builder LIKE 'local:%'
+   AND q.review_completed_at >= NOW() - INTERVAL '48 hours'
+ GROUP BY cat.id, cat.name, cat.tier, workload.tag;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
