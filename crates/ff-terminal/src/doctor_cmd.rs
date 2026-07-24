@@ -178,24 +178,67 @@ fn stale_peer_mount_health(count: i64) -> Health {
     }
 }
 
+/// 7-day average context-pack hit-rate (`memory_pack_stats.hit_rate`) vs the
+/// 90%-target research-set bar. `None` (no scored builds yet) passes — there's
+/// nothing to warn about until dispatch has produced data.
+fn pack_hit_rate_health(avg_pct: Option<f64>) -> Health {
+    match avg_pct {
+        None => Health::Pass,
+        Some(pct) if pct >= 90.0 => Health::Pass,
+        Some(pct) if pct >= 70.0 => Health::Warn,
+        Some(_) => Health::Fail,
+    }
+}
+
+/// Share of context packs served in the last 7 days that fell back to a live
+/// Cortex lookup instead of the precomputed store — the direct signal for the
+/// brain_node_ids-empty bug class (the reindex precompute silently not
+/// keeping up, degrading every affected dispatch back to the slow path).
+fn pack_fallback_health(served: i64, fallback: i64) -> Health {
+    let total = served + fallback;
+    if total == 0 {
+        return Health::Pass;
+    }
+    let pct = (fallback as f64 / total as f64) * 100.0;
+    if pct >= 50.0 {
+        Health::Fail
+    } else if pct >= 20.0 {
+        Health::Warn
+    } else {
+        Health::Pass
+    }
+}
+
+fn render_check_row(out: &mut String, c: &DoctorCheck) {
+    let color = match c.status {
+        Health::Pass => GREEN,
+        Health::Warn => YELLOW,
+        Health::Fail => RED,
+    };
+    out.push_str(&format!(
+        "  {color}{} {:<5}{RESET} {:<22} {}\n",
+        c.status.glyph(),
+        c.status.label(),
+        c.name,
+        c.detail
+    ));
+}
+
 /// Render the report. Pure (no I/O / color in the assertions matter) so the
-/// layout is unit-testable.
-fn render_doctor(checks: &[DoctorCheck], overall: Health) -> String {
+/// layout is unit-testable. `memory_checks` render under their own "MEMORY"
+/// header, after the general checks, so the section is visibly distinct
+/// rather than folded anonymously into the flat list.
+fn render_doctor(checks: &[DoctorCheck], memory_checks: &[DoctorCheck], overall: Health) -> String {
     let mut out = String::new();
     out.push_str(&format!("{CYAN}▶ ff doctor — fleet self-check{RESET}\n\n"));
     for c in checks {
-        let color = match c.status {
-            Health::Pass => GREEN,
-            Health::Warn => YELLOW,
-            Health::Fail => RED,
-        };
-        out.push_str(&format!(
-            "  {color}{} {:<5}{RESET} {:<22} {}\n",
-            c.status.glyph(),
-            c.status.label(),
-            c.name,
-            c.detail
-        ));
+        render_check_row(&mut out, c);
+    }
+    if !memory_checks.is_empty() {
+        out.push_str(&format!("\n  {CYAN}MEMORY{RESET}\n"));
+        for c in memory_checks {
+            render_check_row(&mut out, c);
+        }
     }
     let color = match overall {
         Health::Pass => GREEN,
@@ -439,17 +482,60 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
         ),
     });
 
-    let overall = overall_health(&checks);
+    // 10) MEMORY: context-pack hit-rate + fallback ratio over the last 7 days
+    //     (Memory-v2 M4) — this is how we KNOW the Cortex context pack is
+    //     helping builds hit the right files instead of assuming it does, and
+    //     surfaces the brain_node_ids-empty bug class via the fallback share.
+    let (avg_hit_rate, pack_served, pack_fallback): (Option<f64>, i64, i64) = sqlx::query_as(
+        "SELECT
+             AVG(hit_rate) FILTER (WHERE hit_rate IS NOT NULL)::float8,
+             COUNT(*) FILTER (WHERE NOT used_fallback),
+             COUNT(*) FILTER (WHERE used_fallback)
+           FROM memory_pack_stats
+          WHERE created_at > NOW() - INTERVAL '7 days'",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("memory pack-stats check: {e}"))?;
+    let avg_hit_rate_pct = avg_hit_rate.map(|r| r * 100.0);
+    let memory_checks = vec![
+        DoctorCheck {
+            name: "context pack hit-rate".into(),
+            status: pack_hit_rate_health(avg_hit_rate_pct),
+            detail: match avg_hit_rate_pct {
+                Some(pct) => format!("{pct:.0}% 7d avg (target 90%)"),
+                None => "no scored builds in last 7d".into(),
+            },
+        },
+        DoctorCheck {
+            name: "context pack fallback".into(),
+            status: pack_fallback_health(pack_served, pack_fallback),
+            detail: format!(
+                "{pack_fallback}/{} packs fell back to live lookup (7d)",
+                pack_served + pack_fallback
+            ),
+        },
+    ];
+
+    let overall = overall_health(
+        &checks
+            .iter()
+            .cloned()
+            .chain(memory_checks.iter().cloned())
+            .collect::<Vec<_>>(),
+    );
 
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(
-                &serde_json::json!({ "overall": overall, "checks": checks })
-            )?
+            serde_json::to_string_pretty(&serde_json::json!({
+                "overall": overall,
+                "checks": checks,
+                "memory": memory_checks,
+            }))?
         );
     } else {
-        print!("{}", render_doctor(&checks, overall));
+        print!("{}", render_doctor(&checks, &memory_checks, overall));
     }
 
     // Non-zero exit so the loop / scripts / CI can gate on it: always on FAIL,
@@ -643,10 +729,45 @@ mod tests {
                 detail: "no leader heartbeat in 60s".into(),
             },
         ];
-        let out = render_doctor(&checks, overall_health(&checks));
+        let out = render_doctor(&checks, &[], overall_health(&checks));
         assert!(out.contains("ff doctor"));
         assert!(out.contains("deferred failures"));
         assert!(out.contains("leader liveness"));
         assert!(out.contains("Overall: FAIL"));
+        assert!(!out.contains("MEMORY"));
+    }
+
+    #[test]
+    fn render_shows_memory_section_header_with_its_checks() {
+        let checks = vec![DoctorCheck {
+            name: "deferred failures".into(),
+            status: Health::Pass,
+            detail: "0 in last 3h".into(),
+        }];
+        let memory_checks = vec![DoctorCheck {
+            name: "context pack hit-rate".into(),
+            status: Health::Warn,
+            detail: "72% 7d avg (target 90%)".into(),
+        }];
+        let out = render_doctor(&checks, &memory_checks, Health::Warn);
+        assert!(out.contains("MEMORY"));
+        assert!(out.contains("context pack hit-rate"));
+        // The general check still renders, and comes before the section header.
+        let memory_pos = out.find("MEMORY").unwrap();
+        let general_pos = out.find("deferred failures").unwrap();
+        assert!(general_pos < memory_pos);
+    }
+
+    #[test]
+    fn pack_hit_rate_and_fallback_thresholds() {
+        assert_eq!(pack_hit_rate_health(None), Health::Pass);
+        assert_eq!(pack_hit_rate_health(Some(95.0)), Health::Pass);
+        assert_eq!(pack_hit_rate_health(Some(80.0)), Health::Warn);
+        assert_eq!(pack_hit_rate_health(Some(50.0)), Health::Fail);
+
+        assert_eq!(pack_fallback_health(0, 0), Health::Pass);
+        assert_eq!(pack_fallback_health(90, 10), Health::Pass);
+        assert_eq!(pack_fallback_health(70, 30), Health::Warn);
+        assert_eq!(pack_fallback_health(40, 60), Health::Fail);
     }
 }
