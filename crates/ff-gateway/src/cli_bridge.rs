@@ -24,8 +24,15 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
-use ff_agent::cli_executor::{BACKENDS, CliBackend, execute_cli};
+use axum::{
+    Router,
+    body::Bytes,
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::post,
+};
+use ff_agent::cli_executor::{BACKENDS, CliBackend, execute_cli_in_dir_local};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::task::JoinHandle;
@@ -56,16 +63,27 @@ pub fn spawn_all_bridges() -> Vec<JoinHandle<()>> {
     handles
 }
 
-/// One axum server bound to `127.0.0.1:<port>` that translates
+/// One axum server bound to the configured fleet control-plane address that translates
 /// `/v1/chat/completions` to a CLI invocation.
 async fn run_bridge(backend: CliBackend, port: u16) {
     let app = Router::new()
         .route("/v1/chat/completions", post(handle_chat_completions))
         .with_state(backend);
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = match ff_agent::http_auth::bind_addr(port) {
+        Ok(addr) => addr,
+        Err(error) => {
+            warn!(backend = backend.name, port, %error, "cli_bridge invalid bind address");
+            return;
+        }
+    };
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
-            if let Err(e) = axum::serve(listener, app).await {
+            if let Err(e) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
                 warn!(backend = backend.name, port, error = %e, "cli_bridge stopped");
             }
         }
@@ -124,8 +142,37 @@ struct Usage {
 
 async fn handle_chat_completions(
     State(backend): State<CliBackend>,
-    Json(req): Json<ChatCompletionsRequest>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> impl IntoResponse {
+    let body_text = match std::str::from_utf8(&body) {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error":"invalid UTF-8 body"})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(error) = authorize_peer(peer, &headers, body_text) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({"error":error})),
+        )
+            .into_response();
+    }
+    let req: ChatCompletionsRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error":error.to_string()})),
+            )
+                .into_response();
+        }
+    };
     // Build the prompt by concatenating user messages. System messages
     // are prepended as a "[system]" block; this is the simplest
     // translation that preserves intent across vendor CLIs whose
@@ -152,13 +199,14 @@ async fn handle_chat_completions(
     if prompt.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"empty messages"})),
+            axum::Json(serde_json::json!({"error":"empty messages"})),
         )
             .into_response();
     }
 
     let timeout = Some(Duration::from_secs(10 * 60));
-    let result = execute_cli(backend.name, &prompt, &req.backend_args, timeout).await;
+    let result =
+        execute_cli_in_dir_local(backend.name, &prompt, &req.backend_args, None, timeout).await;
 
     match result {
         Ok(r) if r.exit_code == 0 => {
@@ -183,11 +231,15 @@ async fn handle_chat_completions(
                     total_tokens: prompt_tokens + completion_tokens,
                 },
             };
-            (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::to_value(resp).unwrap()),
+            )
+                .into_response()
         }
         Ok(r) => (
             StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
+            axum::Json(serde_json::json!({
                 "error": {
                     "type": "cli_nonzero_exit",
                     "code": r.exit_code,
@@ -198,12 +250,21 @@ async fn handle_chat_completions(
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
+            axum::Json(serde_json::json!({
                 "error": {"type":"cli_spawn_failed","message": e.to_string()}
             })),
         )
             .into_response(),
     }
+}
+
+fn authorize_peer(peer: SocketAddr, headers: &HeaderMap, body: &str) -> Result<(), String> {
+    if peer.ip().is_loopback() {
+        return Ok(());
+    }
+    let secret = ff_agent::http_auth::control_plane_secret()?;
+    ff_agent::http_auth::authorize(&secret, "POST", "/v1/chat/completions", headers, body)
+        .map_err(str::to_string)
 }
 
 fn is_binary_on_path(bin: &str) -> bool {
@@ -216,4 +277,21 @@ fn is_binary_on_path(bin: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_bridge_requests_preserve_legacy_unsigned_access() {
+        let peer = SocketAddr::from(([127, 0, 0, 1], 12345));
+        assert_eq!(authorize_peer(peer, &HeaderMap::new(), "{}"), Ok(()));
+    }
+
+    #[test]
+    fn remote_bridge_requests_fail_closed_without_auth() {
+        let peer = SocketAddr::from(([192, 0, 2, 1], 12345));
+        assert!(authorize_peer(peer, &HeaderMap::new(), "{}").is_err());
+    }
 }

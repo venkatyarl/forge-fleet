@@ -403,7 +403,7 @@ async fn probe_version(binary: &str) -> Option<String> {
 /// Run one tiny non-interactive request through the backend and classify it.
 async fn probe_auth_once(backend: &str, timeout: Duration) -> (bool, String) {
     // A trivial prompt: cheapest possible request that still exercises auth.
-    let res = crate::cli_executor::execute_cli_in_dir(
+    let res = crate::cli_executor::execute_cli_in_dir_local(
         backend,
         "Reply with exactly: OK",
         &[],

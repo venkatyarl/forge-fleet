@@ -3563,7 +3563,7 @@ async fn routed_backends(pg: &PgPool, computer_id: Uuid, fresh_secs: i64) -> Vec
             }),
             "work_item_dispatch: backend route decision"
         );
-        return selected;
+        return append_bridge_backends(pg, selected, fresh_secs).await;
     }
 
     if CAPACITY_LOAD_STARTED
@@ -3603,6 +3603,24 @@ async fn routed_backends(pg: &PgPool, computer_id: Uuid, fresh_secs: i64) -> Vec
         }),
         "work_item_dispatch: backend route decision"
     );
+    append_bridge_backends(pg, selected, fresh_secs).await
+}
+
+async fn append_bridge_backends(
+    pg: &PgPool,
+    mut selected: Vec<String>,
+    fresh_secs: i64,
+) -> Vec<String> {
+    match ff_db::pg_bridge_reachable_backends(pg, fresh_secs).await {
+        Ok(bridged) => {
+            for backend in bridged {
+                if !selected.contains(&backend) {
+                    selected.push(backend);
+                }
+            }
+        }
+        Err(error) => tracing::warn!(%error, "work_item_dispatch: bridge inventory unavailable"),
+    }
     selected
 }
 
