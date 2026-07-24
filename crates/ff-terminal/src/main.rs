@@ -2484,6 +2484,16 @@ enum DbCommand {
         #[arg(long, default_value_t = 200)]
         max_rows: usize,
     },
+    /// Execute a parameterized statement against the fleet Postgres.
+    /// Values are bound to `?` placeholders in positional order. Example:
+    /// `ff db exec "UPDATE fleet_workers SET status = ? WHERE name = ?" active worker-1`
+    Exec {
+        /// The SQL statement to execute, using `?` for bound values.
+        sql: String,
+        /// Values to bind to the statement's `?` placeholders.
+        #[arg(required = true, num_args = 1..)]
+        params: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]

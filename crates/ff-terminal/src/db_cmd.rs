@@ -25,7 +25,82 @@ pub async fn handle_db(cmd: crate::DbCommand) -> Result<()> {
             json,
             max_rows,
         } => query(&sql, json, max_rows).await,
+        crate::DbCommand::Exec { sql, params } => exec(&sql, params).await,
     }
+}
+
+/// Convert CLI `?` placeholders to the numbered placeholders Postgres expects.
+/// Question marks inside SQL string or identifier quotes remain literal.
+fn postgres_placeholders(sql: &str) -> (String, usize) {
+    let mut converted = String::with_capacity(sql.len());
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut count = 0;
+    let mut chars = sql.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if !in_double_quote => {
+                converted.push(ch);
+                if in_single_quote && chars.peek() == Some(&'\'') {
+                    converted.push(chars.next().expect("peeked quote"));
+                } else {
+                    in_single_quote = !in_single_quote;
+                }
+            }
+            '"' if !in_single_quote => {
+                converted.push(ch);
+                if in_double_quote && chars.peek() == Some(&'"') {
+                    converted.push(chars.next().expect("peeked quote"));
+                } else {
+                    in_double_quote = !in_double_quote;
+                }
+            }
+            '?' if !in_single_quote && !in_double_quote => {
+                count += 1;
+                converted.push('$');
+                converted.push_str(&count.to_string());
+            }
+            _ => converted.push(ch),
+        }
+    }
+
+    (converted, count)
+}
+
+fn parse_param(value: String) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Number>(&value)
+        .map(serde_json::Value::Number)
+        .unwrap_or(serde_json::Value::String(value))
+}
+
+async fn exec(raw_sql: &str, raw_params: Vec<String>) -> Result<()> {
+    let trimmed = raw_sql.trim().trim_end_matches(';').trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("empty statement — usage: ff db exec \"UPDATE … SET value = ?\" value");
+    }
+
+    let (sql, placeholder_count) = postgres_placeholders(trimmed);
+    if placeholder_count != raw_params.len() {
+        anyhow::bail!(
+            "statement has {placeholder_count} placeholder(s), but {} parameter(s) were provided",
+            raw_params.len()
+        );
+    }
+
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    let rows = ff_db::db_exec(
+        &pool,
+        &sql,
+        raw_params.into_iter().map(parse_param).collect(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("exec failed: {e}"))?;
+
+    println!("({rows} row{} affected)", if rows == 1 { "" } else { "s" });
+    Ok(())
 }
 
 /// Build the wrapped, row-capped statement. Pure so it can be unit-tested.
@@ -214,5 +289,23 @@ mod tests {
         assert_eq!(cell_str(Some(&json!(true))), "true");
         // objects/arrays render compact
         assert_eq!(cell_str(Some(&json!({"k":1}))), "{\"k\":1}");
+    }
+
+    #[test]
+    fn postgres_placeholders_skips_quoted_question_marks() {
+        let (sql, count) =
+            postgres_placeholders("UPDATE t SET value = ? WHERE note = '?' AND \"?\" = ?");
+        assert_eq!(
+            sql,
+            "UPDATE t SET value = $1 WHERE note = '?' AND \"?\" = $2"
+        );
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn parse_param_preserves_strings_and_parses_numbers() {
+        assert_eq!(parse_param("42".into()), json!(42));
+        assert_eq!(parse_param("-1.5".into()), json!(-1.5));
+        assert_eq!(parse_param("worker-1".into()), json!("worker-1"));
     }
 }
