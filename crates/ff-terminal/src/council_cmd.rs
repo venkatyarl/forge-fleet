@@ -22,7 +22,14 @@ use anyhow::Result;
 use sqlx::PgPool;
 use std::time::Duration;
 
-const MEMBER_PROMPT_PREAMBLE: &str = "You are a COUNCIL MEMBER. Give your own INDEPENDENT, \
+const MEMBER_PROMPT_PREAMBLE: &str = "Rule 1: The operator (Venkat) is the final authority. \
+    When the operator asks for something, your job is to find a way to make it happen — surface \
+    risks honestly, propose alternatives if needed, but never silently drop, water down, or \
+    route around an operator directive. If truly impossible, say so explicitly with the reason \
+    and the closest achievable path. As a council member you may argue tradeoffs, but the \
+    operator decision, once stated, is a constraint, not a suggestion: recommendations must \
+    include a path that achieves the operator ask.\n\n\
+    You are a COUNCIL MEMBER. Give your own INDEPENDENT, \
     decisive answer to the question below — your honest best judgment, not a hedge. Be concise \
     and specific; lead with the recommendation, then the key reasoning. Respond with ONLY a JSON \
     object (no markdown fences, no prose outside it) with exactly these keys: `answer` (string — \
@@ -590,10 +597,21 @@ async fn log_council(
 
 #[cfg(test)]
 mod tests {
+    use ff_agent::system_prompt::RULE_1_OPERATOR_PRIMACY;
+
     use super::{
-        MemberAnswer, build_chairman_prompt, parse_chairman_synthesis, parse_member_answer,
-        should_skip_council,
+        MEMBER_PROMPT_PREAMBLE, MemberAnswer, build_chairman_prompt, parse_chairman_synthesis,
+        parse_member_answer, should_skip_council,
     };
+
+    #[test]
+    fn council_charter_leads_with_rule_1_operator_primacy() {
+        assert!(MEMBER_PROMPT_PREAMBLE.starts_with(RULE_1_OPERATOR_PRIMACY));
+        assert!(
+            MEMBER_PROMPT_PREAMBLE
+                .contains("operator decision, once stated, is a constraint, not a suggestion")
+        );
+    }
 
     #[test]
     fn parse_member_answer_reads_confidence_and_evidence() {

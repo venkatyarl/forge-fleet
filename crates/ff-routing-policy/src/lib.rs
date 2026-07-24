@@ -6,6 +6,103 @@
 use chrono::{DateTime, Utc};
 use ff_capacity::{BackendCapacity, CapacitySnapshot, InferenceDeployment};
 use serde::Serialize;
+use sqlx::{PgPool, Row};
+
+/// One ordered step in a workload's database-configured routing ladder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rung {
+    pub position: i32,
+    pub kind: RungKind,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RungKind {
+    LocalModel,
+    Ring,
+    CloudBackend,
+}
+
+impl RungKind {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "local_model" => Some(Self::LocalModel),
+            "ring" => Some(Self::Ring),
+            "cloud_backend" => Some(Self::CloudBackend),
+            _ => None,
+        }
+    }
+}
+
+/// Load the ordered routing ladder for a workload.
+///
+/// Missing tables, database outages, and malformed rows fail open to an empty
+/// ladder so callers can retain their pre-ladder routing fallback.
+pub async fn load_ladder(pool: &PgPool, workload: &str) -> Vec<Rung> {
+    let Ok(rows) = sqlx::query(
+        "SELECT position, rung_kind, target
+           FROM routing_ladders
+          WHERE workload = $1
+          ORDER BY position",
+    )
+    .bind(workload)
+    .fetch_all(pool)
+    .await
+    else {
+        return Vec::new();
+    };
+
+    rows.into_iter()
+        .filter_map(|row| {
+            let position = row.try_get("position").ok()?;
+            let kind = RungKind::parse(row.try_get::<&str, _>("rung_kind").ok()?)?;
+            let target = row.try_get::<String, _>("target").ok()?;
+            (!target.trim().is_empty()).then_some(Rung {
+                position,
+                kind,
+                target,
+            })
+        })
+        .collect()
+}
+
+/// The ladder rungs relevant to one coding dispatch attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LadderSelection {
+    pub local_model: Option<String>,
+    pub ring: Option<String>,
+    pub cloud_backends: Vec<String>,
+}
+
+/// Select the configured coding route for an attempt.
+///
+/// Local models share the historical three-attempt budget; retries walk the
+/// configured local rows in order and wrap when there are fewer rows than
+/// attempts. Ring and cloud rungs remain ordered fallbacks within the attempt.
+pub fn select_rungs_for_attempt(ladder: &[Rung], attempts: u32) -> LadderSelection {
+    let local_models = ladder
+        .iter()
+        .filter(|rung| rung.kind == RungKind::LocalModel)
+        .map(|rung| rung.target.clone())
+        .collect::<Vec<_>>();
+    let local_model = (attempts < LOCAL_LANE_MAX_TRIES && !local_models.is_empty())
+        .then(|| local_models[attempts as usize % local_models.len()].clone());
+    let ring = ladder
+        .iter()
+        .find(|rung| rung.kind == RungKind::Ring)
+        .map(|rung| rung.target.clone());
+    let cloud_backends = ladder
+        .iter()
+        .filter(|rung| rung.kind == RungKind::CloudBackend)
+        .map(|rung| rung.target.clone())
+        .collect();
+
+    LadderSelection {
+        local_model,
+        ring,
+        cloud_backends,
+    }
+}
 
 /// A routing tier, ordered from cheapest to most expensive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -489,6 +586,65 @@ fn backend_score_with_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ladder_kind_parse_accepts_database_values() {
+        assert_eq!(RungKind::parse("local_model"), Some(RungKind::LocalModel));
+        assert_eq!(RungKind::parse("ring"), Some(RungKind::Ring));
+        assert_eq!(
+            RungKind::parse("cloud_backend"),
+            Some(RungKind::CloudBackend)
+        );
+        assert_eq!(RungKind::parse("unknown"), None);
+    }
+
+    #[test]
+    fn rung_selection_walks_local_attempts_then_preserves_fallback_order() {
+        let ladder = vec![
+            Rung {
+                position: 0,
+                kind: RungKind::LocalModel,
+                target: "devstral".into(),
+            },
+            Rung {
+                position: 1,
+                kind: RungKind::LocalModel,
+                target: "glm".into(),
+            },
+            Rung {
+                position: 2,
+                kind: RungKind::Ring,
+                target: "qwen-480b".into(),
+            },
+            Rung {
+                position: 3,
+                kind: RungKind::CloudBackend,
+                target: "codex".into(),
+            },
+            Rung {
+                position: 4,
+                kind: RungKind::CloudBackend,
+                target: "kimi".into(),
+            },
+        ];
+
+        assert_eq!(
+            select_rungs_for_attempt(&ladder, 0).local_model.as_deref(),
+            Some("devstral")
+        );
+        assert_eq!(
+            select_rungs_for_attempt(&ladder, 1).local_model.as_deref(),
+            Some("glm")
+        );
+        assert_eq!(
+            select_rungs_for_attempt(&ladder, 2).local_model.as_deref(),
+            Some("devstral")
+        );
+        let escalated = select_rungs_for_attempt(&ladder, LOCAL_LANE_MAX_TRIES);
+        assert_eq!(escalated.local_model, None);
+        assert_eq!(escalated.ring.as_deref(), Some("qwen-480b"));
+        assert_eq!(escalated.cloud_backends, ["codex", "kimi"]);
+    }
 
     fn backend(name: &str, now: DateTime<Utc>) -> BackendCapacity {
         BackendCapacity {

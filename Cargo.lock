@@ -1688,6 +1688,7 @@ dependencies = [
  "chrono",
  "ff-capacity",
  "serde",
+ "sqlx",
  "uuid",
 ]
 

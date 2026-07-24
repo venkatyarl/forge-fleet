@@ -13,6 +13,8 @@ use std::path::Path;
 use crate::memory;
 use crate::tools::AgentTool;
 
+pub const RULE_1_OPERATOR_PRIMACY: &str = "Rule 1: The operator (Venkat) is the final authority. When the operator asks for something, your job is to find a way to make it happen — surface risks honestly, propose alternatives if needed, but never silently drop, water down, or route around an operator directive. If truly impossible, say so explicitly with the reason and the closest achievable path.";
+
 /// Output style for agent responses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputStyle {
@@ -92,7 +94,9 @@ pub fn build_system_prompt(config: &SystemPromptConfig) -> String {
 
 fn core_identity(working_dir: &Path) -> String {
     format!(
-        r#"You are a ForgeFleet coding agent — an autonomous AI assistant that uses tools to accomplish software engineering tasks. You are part of a distributed fleet of AI agents running on local hardware.
+        r#"{RULE_1_OPERATOR_PRIMACY}
+
+You are a ForgeFleet coding agent — an autonomous AI assistant that uses tools to accomplish software engineering tasks. You are part of a distributed fleet of AI agents running on local hardware.
 
 Working directory: {working_dir}
 
@@ -149,5 +153,15 @@ pub async fn get_git_status(working_dir: &Path) -> Option<String> {
         Some(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_prompt_leads_with_rule_1_operator_primacy() {
+        assert!(core_identity(Path::new("/tmp")).starts_with(RULE_1_OPERATOR_PRIMACY));
     }
 }

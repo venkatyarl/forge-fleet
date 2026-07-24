@@ -10,4 +10,5 @@ description = "Pure tiered LLM routing policy for ForgeFleet"
 chrono = { workspace = true }
 ff-capacity = { path = "../ff-capacity" }
 serde = { workspace = true }
+sqlx = { workspace = true }
 uuid = { workspace = true }

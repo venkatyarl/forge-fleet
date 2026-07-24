@@ -61,7 +61,10 @@ pub async fn run_auto_backlog_feeder_tick(pg: &PgPool) -> Result<usize> {
                          WHERE id = $1 AND status = 'idea'",
                     )
                     .bind(idea.id)
-                    .bind(format!("auto feeder: {error:#}"))
+                    .bind(crate::error_class::prefix(
+                        crate::error_class::DECOMPOSE_QUALITY_GATE,
+                        format!("auto feeder: {error:#}"),
+                    ))
                     .execute(pg)
                     .await?;
                 }
@@ -125,7 +128,10 @@ async fn rescue_ready_parent(pg: &PgPool) -> Result<usize> {
                  WHERE id = $1 AND status = 'decomposing'",
             )
             .bind(parent.id)
-            .bind(format!("ready parent auto-decompose: {error:#}"))
+            .bind(crate::error_class::prefix(
+                crate::error_class::DECOMPOSE_QUALITY_GATE,
+                format!("ready parent auto-decompose: {error:#}"),
+            ))
             .execute(pg)
             .await?;
             Ok(0)
