@@ -24,6 +24,87 @@ use crate::health::{AggregateHealthStatus, ControlPlaneHealthSnapshot, aggregate
 /// watchdog.
 pub const DEFAULT_TRIP_THRESHOLD: u32 = 3;
 
+/// Long-running daemon loops supervised by the control process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitoredSubsystem {
+    MergeDrain,
+    Scheduler,
+    Reaper,
+    SelfHeal,
+}
+
+impl MonitoredSubsystem {
+    pub const ALL: [Self; 4] = [
+        Self::MergeDrain,
+        Self::Scheduler,
+        Self::Reaper,
+        Self::SelfHeal,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MergeDrain => "merge-drain",
+            Self::Scheduler => "scheduler",
+            Self::Reaper => "reaper",
+            Self::SelfHeal => "self-heal",
+        }
+    }
+}
+
+/// Current liveness observation for a supervised daemon loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubsystemLiveness {
+    pub subsystem: MonitoredSubsystem,
+    pub alive: bool,
+}
+
+/// Audit event emitted after a dead subsystem has been restarted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubsystemRestartEvent {
+    pub subsystem: MonitoredSubsystem,
+    pub restarted_at: DateTime<Utc>,
+}
+
+/// Restart every subsystem observed as dead and return the events that were
+/// logged. The callback keeps process-management policy in the control daemon,
+/// while this function owns the common detection, restart, and audit flow.
+///
+/// Processing stops on the first restart error so a caller can escalate it;
+/// successful restarts before that error have already been logged.
+pub fn restart_dead_subsystems<E>(
+    observations: impl IntoIterator<Item = SubsystemLiveness>,
+    mut restart: impl FnMut(MonitoredSubsystem) -> Result<(), E>,
+) -> Result<Vec<SubsystemRestartEvent>, E> {
+    let mut events = Vec::new();
+
+    for observation in observations {
+        if observation.alive {
+            continue;
+        }
+
+        let subsystem = observation.subsystem;
+        tracing::warn!(
+            subsystem = subsystem.as_str(),
+            "watchdog detected dead subsystem"
+        );
+        restart(subsystem)?;
+
+        let event = SubsystemRestartEvent {
+            subsystem,
+            restarted_at: Utc::now(),
+        };
+        tracing::info!(
+            subsystem = subsystem.as_str(),
+            restarted_at = %event.restarted_at,
+            "watchdog restarted subsystem"
+        );
+        events.push(event);
+    }
+
+    Ok(events)
+}
+
 /// One subsystem's health as observed on a single watchdog tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchdogEvent {
@@ -162,5 +243,59 @@ fn scheduler_status(snapshot: &ControlPlaneHealthSnapshot) -> AggregateHealthSta
         AggregateHealthStatus::Unhealthy
     } else {
         AggregateHealthStatus::Healthy
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restarts_only_dead_subsystems_and_records_events() {
+        let observations = [
+            SubsystemLiveness {
+                subsystem: MonitoredSubsystem::MergeDrain,
+                alive: false,
+            },
+            SubsystemLiveness {
+                subsystem: MonitoredSubsystem::Scheduler,
+                alive: true,
+            },
+            SubsystemLiveness {
+                subsystem: MonitoredSubsystem::Reaper,
+                alive: false,
+            },
+            SubsystemLiveness {
+                subsystem: MonitoredSubsystem::SelfHeal,
+                alive: true,
+            },
+        ];
+        let mut restarted = Vec::new();
+
+        let events = restart_dead_subsystems(observations, |subsystem| {
+            restarted.push(subsystem);
+            Ok::<_, ()>(())
+        })
+        .expect("restarts should succeed");
+
+        assert_eq!(
+            restarted,
+            [MonitoredSubsystem::MergeDrain, MonitoredSubsystem::Reaper]
+        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].subsystem, MonitoredSubsystem::MergeDrain);
+        assert_eq!(events[1].subsystem, MonitoredSubsystem::Reaper);
+    }
+
+    #[test]
+    fn returns_restart_error_without_logging_a_success_event() {
+        let observations = [SubsystemLiveness {
+            subsystem: MonitoredSubsystem::SelfHeal,
+            alive: false,
+        }];
+
+        let result = restart_dead_subsystems(observations, |_| Err::<(), _>("restart unavailable"));
+
+        assert_eq!(result, Err("restart unavailable"));
     }
 }
