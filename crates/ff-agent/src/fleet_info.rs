@@ -98,6 +98,18 @@ pub fn distributed_review_mode_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `backend` is in `[general] disabled_backends` in
+/// `~/.forgefleet/fleet.toml` (case-insensitive; e.g. an operator disabling
+/// `claude` fleet-wide for cost/OAuth-churn reasons).
+///
+/// Returns `false` if the config cannot be loaded, matching the empty-list
+/// default (every backend allowed).
+pub fn is_backend_disabled(backend: &str) -> bool {
+    read_fleet_config()
+        .map(|c| c.fleet.is_backend_disabled(backend))
+        .unwrap_or(false)
+}
+
 async fn build_fleet_pool() -> Result<PgPool, String> {
     let db_url = read_db_url()?;
     PgPoolOptions::new()
@@ -549,5 +561,57 @@ mod tests {
             env_key_for_secret("telegram_bot_token"),
             "FORGEFLEET_TELEGRAM_BOT_TOKEN"
         );
+    }
+
+    // `FORGEFLEET_HOME` is process-global, so tests that override it must not
+    // run concurrently with each other (cargo test threads tests by default).
+    // A dedicated mutex serializes just these two, independent of unrelated
+    // tests in this module.
+    static FORGEFLEET_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn is_backend_disabled_reads_disabled_backends_from_fleet_toml() {
+        let _guard = FORGEFLEET_HOME_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("fleet.toml"),
+            "[general]\ndisabled_backends = [\"claude\"]\n",
+        )
+        .expect("write fleet.toml");
+
+        let prior = std::env::var("FORGEFLEET_HOME").ok();
+        unsafe {
+            std::env::set_var("FORGEFLEET_HOME", dir.path());
+        }
+
+        assert!(is_backend_disabled("claude"));
+        assert!(is_backend_disabled("Claude"));
+        assert!(!is_backend_disabled("codex"));
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("FORGEFLEET_HOME", v),
+                None => std::env::remove_var("FORGEFLEET_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn is_backend_disabled_defaults_false_when_config_missing() {
+        let _guard = FORGEFLEET_HOME_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prior = std::env::var("FORGEFLEET_HOME").ok();
+        unsafe {
+            std::env::set_var("FORGEFLEET_HOME", dir.path());
+        }
+
+        assert!(!is_backend_disabled("claude"));
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("FORGEFLEET_HOME", v),
+                None => std::env::remove_var("FORGEFLEET_HOME"),
+            }
+        }
     }
 }
