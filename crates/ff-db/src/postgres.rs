@@ -35,7 +35,7 @@ pub async fn create_pool_with_dsn_failover(db_config: &DatabaseConfig) -> Result
     };
 
     if !db_config.dsn_failover {
-        return Err(DbError::Pool(static_err.to_string()));
+        return Err(classify_connect_error(static_err));
     }
 
     // Static DSN dead + failover opted-in: consult the DSN of record.
@@ -44,11 +44,11 @@ pub async fn create_pool_with_dsn_failover(db_config: &DatabaseConfig) -> Result
             "dsn-failover: static DSN unreachable and no DSN-of-record cache present — \
              returning original error"
         );
-        return Err(DbError::Pool(static_err.to_string()));
+        return Err(classify_connect_error(static_err));
     };
     if record.trim() == static_url {
         // Nothing new to try.
-        return Err(DbError::Pool(static_err.to_string()));
+        return Err(classify_connect_error(static_err));
     }
 
     warn!("dsn-failover: static DSN unreachable — retrying against cached DSN of record");
@@ -60,7 +60,7 @@ pub async fn create_pool_with_dsn_failover(db_config: &DatabaseConfig) -> Result
         Err(e) => {
             warn!(error = %e, "dsn-failover: DSN-of-record connect also failed");
             // Surface the ORIGINAL static error — it's the user's configured DSN.
-            Err(DbError::Pool(static_err.to_string()))
+            Err(classify_connect_error(static_err))
         }
     }
 }
@@ -69,7 +69,31 @@ pub async fn create_pool_with_dsn_failover(db_config: &DatabaseConfig) -> Result
 pub async fn create_pool(db_config: &DatabaseConfig) -> Result<PgPool> {
     connect_url(db_config.url.trim(), db_config.max_connections)
         .await
-        .map_err(|e| DbError::Pool(e.to_string()))
+        .map_err(classify_connect_error)
+}
+
+/// Classify a raw `sqlx::Error` from a connection attempt into a specific
+/// [`DbError`] variant so callers can distinguish e.g. a bad password from an
+/// unreachable host without parsing error strings.
+fn classify_connect_error(err: sqlx::Error) -> DbError {
+    match &err {
+        sqlx::Error::Configuration(_) => DbError::InvalidConnectionString(err.to_string()),
+        sqlx::Error::Tls(_) => DbError::Tls(err.to_string()),
+        sqlx::Error::PoolTimedOut => DbError::ConnectionTimeout(err.to_string()),
+        sqlx::Error::Io(io_err) => {
+            if io_err.kind() == std::io::ErrorKind::TimedOut {
+                DbError::ConnectionTimeout(err.to_string())
+            } else {
+                DbError::HostUnreachable(err.to_string())
+            }
+        }
+        sqlx::Error::Database(db_err)
+            if matches!(db_err.code().as_deref(), Some("28P01") | Some("28000")) =>
+        {
+            DbError::AuthenticationFailed(err.to_string())
+        }
+        _ => DbError::Pool(err.to_string()),
+    }
 }
 
 /// Shared pool builder used by [`create_pool`] and [`create_pool_with_dsn_failover`]
@@ -105,9 +129,39 @@ pub async fn shutdown_pool(pool: PgPool) {
 mod tests {
     use ff_core::db::{DSN_OF_RECORD_CACHE_FILE, read_dsn_cache};
 
+    use super::classify_connect_error;
+    use crate::error::DbError;
+
     #[test]
     fn dsn_cache_file_constant_matches_ff_core() {
         assert_eq!(DSN_OF_RECORD_CACHE_FILE, "db_dsn_of_record");
+    }
+
+    #[test]
+    fn classifies_io_errors_as_host_unreachable() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let err = classify_connect_error(sqlx::Error::Io(io_err));
+        assert!(matches!(err, DbError::HostUnreachable(_)));
+    }
+
+    #[test]
+    fn classifies_io_timeouts_as_connection_timeout() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+        let err = classify_connect_error(sqlx::Error::Io(io_err));
+        assert!(matches!(err, DbError::ConnectionTimeout(_)));
+    }
+
+    #[test]
+    fn classifies_pool_timeout() {
+        let err = classify_connect_error(sqlx::Error::PoolTimedOut);
+        assert!(matches!(err, DbError::ConnectionTimeout(_)));
+    }
+
+    #[test]
+    fn classifies_bad_url_as_invalid_connection_string() {
+        let parse_err = "not-a-postgres-url".parse::<sqlx::postgres::PgConnectOptions>();
+        let err = classify_connect_error(parse_err.unwrap_err());
+        assert!(matches!(err, DbError::InvalidConnectionString(_)));
     }
 
     #[test]
