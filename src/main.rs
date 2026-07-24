@@ -1015,6 +1015,26 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 16d) Memory-v2 M1 Dreamer nightly consolidation — due-checked every
+    // 5min, leader-gated. Clock-gated inside spawn_dreamer_loop (fires once
+    // per calendar day ~02:00 local, catch-up semantics like the nightly
+    // Telegram digest): distills the last 24h of ff_interactions +
+    // completed/failed work_items + agent_memory_evictions into Brain facts
+    // (Mem0-style dedup via bge embedding similarity) + Hive Mind rules, and
+    // decays facts the pass judges are no longer true. Opt out with
+    // `fleet_secrets.memory_dreamer_mode=off`.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!(
+            "starting subsystem: memory dreamer nightly consolidation (due-checked every 5min, leader-gated, gate=fleet_secrets.memory_dreamer_mode default on)"
+        );
+        subsystem_tasks.push(ff_brain::dreamer::spawn_dreamer_loop(
+            pg_pool,
+            worker_name.clone(),
+            300,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 17) Deferred-task worker — claim + execute tasks from `deferred_tasks`.
     // Historically lived in the separate `ff daemon` CLI; the split caused
     // dispatched tasks to pile up forever when nobody started that process.
