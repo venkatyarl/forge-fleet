@@ -1188,6 +1188,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "ff_interactions_episodic_tagging",
         sql: schema::SCHEMA_V250_FF_INTERACTIONS_EPISODIC_TAGGING,
     },
+    PgMigration {
+        version: 251,
+        name: "research_session_heartbeat",
+        sql: schema::SCHEMA_V251_RESEARCH_SESSION_HEARTBEAT,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
