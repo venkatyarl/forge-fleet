@@ -200,7 +200,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use ff_db::{OperationalStore, queries::TaskRow};
 use ff_orchestrator::{DecomposedSubTask, SubTaskType, TemplateDecomposer};
-use ff_pipeline::{ExecutorConfig, PipelineGraph, Step, StepKind, execute};
+use ff_pipeline::{ExecutorConfig, PipelineGraph, PipelineRunResult, Step, StepKind, execute};
 use ff_security::autonomy_policy::{ActionType, ComplianceLevel, Decision, RiskLevel, decide};
 use serde_json::Value;
 use tokio::sync::watch;
@@ -221,6 +221,8 @@ pub struct EmbeddedAgentConfig {
     pub llm_base_url: Option<String>,
     /// Optional default model for LLM steps.
     pub llm_model: Option<String>,
+    /// Allow local SLM inference when the primary LLM endpoint is unreachable.
+    pub slm_enabled: bool,
     /// Local-first inference router with fleet fallback. When set, LLM steps
     /// use this to pick the best available endpoint automatically.
     pub inference_router: Option<Arc<crate::inference_router::InferenceRouter>>,
@@ -236,6 +238,7 @@ impl EmbeddedAgentConfig {
             ownership_api_base_url: None,
             llm_base_url: None,
             llm_model: None,
+            slm_enabled: false,
             inference_router: None,
         }
     }
@@ -936,21 +939,31 @@ async fn execute_claimed_task(
 
     match execute(&graph, exec_config, None).await {
         Ok(run) => {
-            let mut lines = Vec::new();
-            for step_id in graph.step_ids() {
-                if let Some(result) = run.results.get(step_id) {
-                    lines.push(format!(
-                        "{} [{}]\n{}",
-                        step_id,
-                        format!("{:?}", result.status).to_lowercase(),
-                        result.output.trim()
-                    ));
-                }
+            let primary_output = format_pipeline_output(&graph, &run);
+            if should_fallback_to_slm(config, task, &run) {
+                warn!(
+                    task_id = %task.task_id,
+                    "primary LLM endpoint unreachable after retries; using local SLM fallback"
+                );
+                let prompt = task.summary.clone();
+                let fallback = tokio::task::spawn_blocking(move || crate::slm::predict(&prompt))
+                    .await
+                    .context("local SLM fallback task panicked")?;
+                let fallback_succeeded = !fallback.starts_with("SLM error: ");
+                return Ok(ExecutionOutcome {
+                    success: fallback_succeeded,
+                    output: if fallback_succeeded {
+                        fallback
+                    } else {
+                        format!("{primary_output}\n\nlocal SLM fallback failed: {fallback}")
+                    },
+                    duration_ms: start.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                });
             }
 
             Ok(ExecutionOutcome {
                 success: run.success,
-                output: lines.join("\n\n"),
+                output: primary_output,
                 duration_ms: run.total_duration_ms,
             })
         }
@@ -960,6 +973,70 @@ async fn execute_claimed_task(
             duration_ms: start.elapsed().as_millis().min(u64::MAX as u128) as u64,
         }),
     }
+}
+
+fn format_pipeline_output(graph: &PipelineGraph, run: &PipelineRunResult) -> String {
+    let mut lines = Vec::new();
+    for step_id in graph.step_ids() {
+        if let Some(result) = run.results.get(step_id) {
+            lines.push(format!(
+                "{} [{}]\n{}",
+                step_id,
+                format!("{:?}", result.status).to_lowercase(),
+                result.output.trim()
+            ));
+        }
+    }
+    lines.join("\n\n")
+}
+
+fn should_fallback_to_slm(
+    config: &EmbeddedAgentConfig,
+    task: &ClaimedWorkItem,
+    run: &PipelineRunResult,
+) -> bool {
+    config.slm_enabled
+        && task.kind != WorkExecutionKind::ShellCommand
+        && !run.success
+        && run
+            .results
+            .values()
+            .filter(|result| {
+                matches!(
+                    result.status,
+                    ff_pipeline::StepStatus::Failed | ff_pipeline::StepStatus::TimedOut
+                )
+            })
+            .map(|result| {
+                result.status == ff_pipeline::StepStatus::TimedOut
+                    || result
+                        .error
+                        .as_deref()
+                        .is_some_and(is_unreachable_llm_error)
+            })
+            .reduce(|all_unreachable, unreachable| all_unreachable && unreachable)
+            .unwrap_or(false)
+}
+
+fn is_unreachable_llm_error(error: &str) -> bool {
+    let Some(detail) = error.strip_prefix("llm request failed: ") else {
+        return false;
+    };
+    let detail = detail.to_ascii_lowercase();
+    !detail.starts_with("status ")
+        && [
+            "error sending request",
+            "connection refused",
+            "connection reset",
+            "connection closed",
+            "dns error",
+            "failed to lookup address",
+            "tcp connect error",
+            "timed out",
+            "timeout",
+        ]
+        .iter()
+        .any(|marker| detail.contains(marker))
 }
 
 fn build_pipeline_graph(
@@ -1045,6 +1122,114 @@ fn shell_quote(input: &str) -> String {
         return "''".to_string();
     }
     format!("'{}'", input.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(test)]
+mod slm_fallback_tests {
+    use super::*;
+    use ff_pipeline::{StepId, StepResult};
+    use std::collections::HashMap;
+
+    fn config(slm_enabled: bool) -> EmbeddedAgentConfig {
+        let mut config = EmbeddedAgentConfig::heartbeat_only("test-worker".into());
+        config.slm_enabled = slm_enabled;
+        config
+    }
+
+    fn task(kind: WorkExecutionKind) -> ClaimedWorkItem {
+        ClaimedWorkItem {
+            task_id: "task-1".into(),
+            kind,
+            summary: "classify this".into(),
+            shell_command: None,
+            model: None,
+            max_tokens: None,
+        }
+    }
+
+    fn run(results: Vec<StepResult>) -> PipelineRunResult {
+        PipelineRunResult {
+            success: false,
+            results: results
+                .into_iter()
+                .map(|result| (result.step_id.clone(), result))
+                .collect::<HashMap<_, _>>(),
+            total_duration_ms: 10,
+        }
+    }
+
+    #[test]
+    fn falls_back_only_when_enabled_and_all_primary_failures_are_unreachable() {
+        let result = run(vec![
+            StepResult::failure(
+                StepId::new("one"),
+                "llm request failed: error sending request for url (http://primary)".into(),
+                String::new(),
+                3,
+                5,
+            ),
+            StepResult::timed_out(StepId::new("two"), 1, 5),
+        ]);
+
+        assert!(should_fallback_to_slm(
+            &config(true),
+            &task(WorkExecutionKind::ModelInference),
+            &result
+        ));
+        assert!(!should_fallback_to_slm(
+            &config(false),
+            &task(WorkExecutionKind::ModelInference),
+            &result
+        ));
+    }
+
+    #[test]
+    fn http_parse_and_mixed_failures_do_not_trigger_fallback() {
+        for error in [
+            "llm request failed: status 503: unavailable",
+            "llm response parse failed: invalid JSON response",
+            "step execution error: tool failed",
+        ] {
+            let result = run(vec![StepResult::failure(
+                StepId::new("one"),
+                error.into(),
+                String::new(),
+                3,
+                5,
+            )]);
+            assert!(!should_fallback_to_slm(
+                &config(true),
+                &task(WorkExecutionKind::Generic),
+                &result
+            ));
+        }
+
+        let mixed = run(vec![
+            StepResult::timed_out(StepId::new("one"), 1, 5),
+            StepResult::failure(
+                StepId::new("two"),
+                "llm request failed: status 502: bad gateway".into(),
+                String::new(),
+                3,
+                5,
+            ),
+        ]);
+        assert!(!should_fallback_to_slm(
+            &config(true),
+            &task(WorkExecutionKind::Generic),
+            &mixed
+        ));
+    }
+
+    #[test]
+    fn shell_failures_never_trigger_slm_fallback() {
+        let result = run(vec![StepResult::timed_out(StepId::new("shell"), 1, 5)]);
+        assert!(!should_fallback_to_slm(
+            &config(true),
+            &task(WorkExecutionKind::ShellCommand),
+            &result
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
