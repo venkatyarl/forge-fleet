@@ -6506,6 +6506,38 @@ pub async fn pg_update_brain_candidate_status(
     Ok(())
 }
 
+/// Best-effort telemetry for a user-visible memory/code retrieval result.
+///
+/// Retrieval must remain fail-open while binaries roll out ahead of V259, so
+/// callers intentionally ignore this helper's result.
+pub async fn pg_log_memory_retrieval(
+    pool: &PgPool,
+    caller: &str,
+    query_text: &str,
+    results_count: usize,
+    top_score: Option<f32>,
+) -> Result<()> {
+    let query_text = query_text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if query_text.is_empty() {
+        return Ok(());
+    }
+    let query_text: String = query_text.chars().take(512).collect();
+    let was_miss = results_count == 0 || top_score.is_some_and(|score| score < 0.3);
+    sqlx::query(
+        "INSERT INTO memory_retrieval_log
+            (caller, query_text, results_count, top_score, was_miss)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(caller)
+    .bind(query_text)
+    .bind(results_count as i32)
+    .bind(top_score)
+    .bind(was_miss)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // ── brain_reminders ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Serialize)]

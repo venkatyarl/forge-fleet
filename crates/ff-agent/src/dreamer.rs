@@ -60,6 +60,8 @@ pub const SESSION_SCOPE_IDLE_SECS: i64 = 6 * 3600;
 /// Max session scopes archived per pass — bounds one pass's Brain-insert and
 /// delete work; the 30-min chain drains any backlog across passes.
 pub const MAX_SESSION_SWEEPS_PER_PASS: i64 = 16;
+const KNOWN_UNKNOWN_ROLLUP_DAYS: i32 = 7;
+const MAX_KNOWN_UNKNOWN_CANDIDATES: i64 = 10;
 
 /// fleet_secrets gate: `off`/`false`/`0`/`disabled`/`no` skips the pass body
 /// (the chain keeps ticking so flipping the gate back on needs no re-seed).
@@ -213,6 +215,59 @@ pub async fn run_dreamer_pass(pool: &PgPool) -> Result<serde_json::Value> {
         }
     }
 
+    // 3) Slow lane: once per weekly bucket, turn repeated retrieval misses
+    // into bounded council fuel. The candidate title is the idempotency key,
+    // so every 30-minute pass can safely probe this without duplicate work.
+    let known_unknown_candidates: i64 = sqlx::query_scalar(
+        r#"
+        WITH repeated AS (
+            SELECT caller,
+                   LOWER(REGEXP_REPLACE(TRIM(query_text), '\s+', ' ', 'g')) AS query_class,
+                   COUNT(*) AS misses
+              FROM memory_retrieval_log
+             WHERE was_miss
+               AND ts >= NOW() - make_interval(days => $1)
+             GROUP BY caller, LOWER(REGEXP_REPLACE(TRIM(query_text), '\s+', ' ', 'g'))
+            HAVING COUNT(*) >= 2
+             ORDER BY COUNT(*) DESC
+             LIMIT $2
+        ), inserted AS (
+            INSERT INTO brain_knowledge_candidates
+                (user_id, action, kind, title, body, tags, confidence)
+            SELECT u.id,
+                   'research',
+                   'known-unknown',
+                   CONCAT('known-unknown: ', r.caller, ': ', LEFT(r.query_class, 180)),
+                   CONCAT(r.misses, ' misses in the last ', $1,
+                          ' days for query class: ', r.query_class),
+                   ARRAY['known-unknown', 'self-improvement-council'],
+                   0.9
+              FROM repeated r
+              CROSS JOIN LATERAL (
+                  SELECT id FROM brain_users WHERE name = 'venkat' LIMIT 1
+              ) u
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM brain_knowledge_candidates c
+                  WHERE c.kind = 'known-unknown'
+                    AND c.title = CONCAT(
+                        'known-unknown: ', r.caller, ': ', LEFT(r.query_class, 180)
+                    )
+                    AND c.created_at >= DATE_TRUNC('week', NOW())
+             )
+            RETURNING 1
+        )
+        SELECT COUNT(*) FROM inserted
+        "#,
+    )
+    .bind(KNOWN_UNKNOWN_ROLLUP_DAYS)
+    .bind(MAX_KNOWN_UNKNOWN_CANDIDATES)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|error| {
+        warn!(%error, "dreamer: known-unknown rollup unavailable");
+        0
+    });
+
     if sessions_archived > 0 || scopes_consolidated > 0 {
         info!(
             sessions_archived,
@@ -223,6 +278,7 @@ pub async fn run_dreamer_pass(pool: &PgPool) -> Result<serde_json::Value> {
         "sessions_archived": sessions_archived,
         "blocks_archived": blocks_archived,
         "over_cap_scopes_consolidated": scopes_consolidated,
+        "known_unknown_candidates": known_unknown_candidates,
     }))
 }
 

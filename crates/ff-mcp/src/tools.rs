@@ -1657,7 +1657,7 @@ impl ToolRegistry {
     fn brain_propose_node() -> ToolDefinition {
         ToolDefinition {
             name: "brain_propose_node".to_string(),
-            description: "Propose a new knowledge node to the Virtual Brain. Staged as a candidate for human review in the Inbox.".to_string(),
+            description: "Push knowledge to the Virtual Brain. High-support facts are immediately queryable; other knowledge is staged for review.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1681,6 +1681,16 @@ impl ToolRegistry {
                     "project": {
                         "type": "string",
                         "description": "Optional project this knowledge belongs to"
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "description": "Confidence from 0.0 to 1.0 (default 0.8)",
+                        "default": 0.8
+                    },
+                    "support": {
+                        "type": "integer",
+                        "description": "Number of independent supporting sources. Facts with support >=2 and confidence >=0.8 use the live fast lane.",
+                        "default": 1
                     }
                 },
                 "required": ["kind", "title", "body"]

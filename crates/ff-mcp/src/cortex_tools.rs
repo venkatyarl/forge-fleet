@@ -169,6 +169,22 @@ pub async fn cortex_find(params: Option<Value>) -> HandlerResult {
             .await
             .map_err(|e| format!("find: {e}"))?
     };
+    let top_score = if semantic {
+        hits.first().and_then(|hit| hit.score)
+    } else {
+        None
+    };
+    if let Err(error) = ff_db::queries::pg_log_memory_retrieval(
+        &pool,
+        "cortex_query",
+        &query,
+        hits.len(),
+        top_score,
+    )
+    .await
+    {
+        tracing::debug!(%error, "cortex query retrieval telemetry unavailable");
+    }
     Ok(json!({
         "corpus": corpus_slug,
         "query": query,
@@ -201,6 +217,18 @@ pub async fn cortex_search(params: Option<Value>) -> HandlerResult {
     let hits = ff_brain::cortex_search(&pool, &corpus_slug, &query, limit)
         .await
         .map_err(|e| format!("cortex_search: {e}"))?;
+    let top_score = hits.first().and_then(|hit| hit.score);
+    if let Err(error) = ff_db::queries::pg_log_memory_retrieval(
+        &pool,
+        "cortex_query",
+        &query,
+        hits.len(),
+        top_score,
+    )
+    .await
+    {
+        tracing::debug!(%error, "cortex query retrieval telemetry unavailable");
+    }
     Ok(json!({
         "corpus": corpus_slug,
         "query": query,

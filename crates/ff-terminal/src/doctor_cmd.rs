@@ -178,6 +178,14 @@ fn stale_peer_mount_health(count: i64) -> Health {
     }
 }
 
+fn known_unknown_health(count: i64) -> Health {
+    if count > 0 {
+        Health::Warn
+    } else {
+        Health::Pass
+    }
+}
+
 /// Render the report. Pure (no I/O / color in the assertions matter) so the
 /// layout is unit-testable.
 fn render_doctor(checks: &[DoctorCheck], overall: Health) -> String {
@@ -239,6 +247,24 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
             "{}/{} recent rows missing tokens",
             inter.recent_zero_token, inter.recent
         ),
+    });
+
+    // Memory-v2 M5: retrieval misses are a knowledge-gap signal, not a fleet
+    // failure. Surface the weekly distinct-class count as a MEMORY line.
+    let known_unknowns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT (
+             caller, LOWER(REGEXP_REPLACE(TRIM(query_text), '\\s+', ' ', 'g'))
+         ))
+           FROM memory_retrieval_log
+          WHERE was_miss AND ts >= NOW() - INTERVAL '7 days'",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("memory known-unknown check: {e}"))?;
+    checks.push(DoctorCheck {
+        name: "MEMORY known-unknowns".into(),
+        status: known_unknown_health(known_unknowns),
+        detail: format!("{known_unknowns} miss classes in last 7d"),
     });
 
     // 3) Orphaned work_items (in_progress with no active lease, >1h).
@@ -618,6 +644,8 @@ mod tests {
         assert_eq!(leader_health(false), Health::Fail);
         assert_eq!(stale_slot_health(0), Health::Pass);
         assert_eq!(stale_slot_health(2), Health::Warn);
+        assert_eq!(known_unknown_health(0), Health::Pass);
+        assert_eq!(known_unknown_health(2), Health::Warn);
     }
 
     #[test]

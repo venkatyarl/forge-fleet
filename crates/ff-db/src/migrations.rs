@@ -1200,6 +1200,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
     },
+    PgMigration {
+        version: 259,
+        name: "memory_retrieval_log",
+        sql: schema::SCHEMA_V259_MEMORY_RETRIEVAL_LOG,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1412,6 +1417,11 @@ mod tests {
                 pair[1].name,
             );
         }
+        assert_eq!(
+            PG_MIGRATIONS.last().map(|migration| migration.version),
+            Some(259),
+            "Memory-v2 M5 must remain registered at the build's schema tip"
+        );
     }
 
     fn db_url() -> Option<String> {
@@ -2339,6 +2349,37 @@ mod tests {
 
         assert_eq!(conflict.id, digest.id);
         assert_eq!(conflict.count, 2);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v259_creates_memory_retrieval_log() {
+        // CI commonly has no Postgres; the helper checks both supported URL vars.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on a fresh database");
+
+        crate::queries::pg_log_memory_retrieval(
+            &pool,
+            "brain_search",
+            "missing deployment policy",
+            0,
+            None,
+        )
+        .await
+        .expect("insert retrieval miss");
+        let row: (i32, bool) = sqlx::query_as(
+            "SELECT results_count, was_miss FROM memory_retrieval_log
+              WHERE query_text = 'missing deployment policy'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read retrieval miss");
+        assert_eq!(row, (0, true));
 
         drop_temp_db(admin, pool, &db_name).await;
     }
