@@ -102,6 +102,12 @@ impl TickRegistry {
                 runner: run_nightly_digest_tick,
             },
             TickDefinition {
+                name: "daily_error_miner",
+                interval: Duration::from_secs(60),
+                scope: TickScope::LeaderOnly,
+                runner: run_error_miner_tick,
+            },
+            TickDefinition {
                 // Poll the Kimi coding-plan usage endpoint and refresh the
                 // `kimi` row of `cloud_budget_buckets`. Leader-only so one
                 // fleet-wide poll hits the provider, not one per node.
@@ -302,6 +308,10 @@ fn run_session_export_tick(_pg: PgPool, _worker_name: String) -> BoxFuture<'stat
 
 fn run_nightly_digest_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
     Box::pin(async move { crate::ha::periodic::run_nightly_digest_tick(&pg, &worker_name).await })
+}
+
+fn run_error_miner_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move { crate::error_miner::run_daily_tick(&pg, &worker_name).await })
 }
 
 fn run_kimi_usage_poller_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'static, Result<()>> {
