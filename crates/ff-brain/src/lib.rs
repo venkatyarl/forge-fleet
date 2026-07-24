@@ -29,6 +29,7 @@ pub mod cortex_reindex;
 pub mod data_index;
 pub mod distillation;
 pub mod doc_index;
+pub mod dreamer;
 pub mod embeddings;
 pub mod facts;
 pub mod image_index;
