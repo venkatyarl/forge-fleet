@@ -928,8 +928,26 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     ensure_repo_checked_out(&pg, &item).await?;
     let worktree = create_worktree_for_item(&pg, &item).await?;
 
+    // Build the Cortex context pack once here (not inside run_ff_dispatch) so
+    // its predicted file list survives past dispatch — the build's actual diff
+    // is scored against it below and recorded in memory_pack_stats for `ff
+    // doctor`'s MEMORY section. Prefers the precomputed context stored on the
+    // work_item row; falls back to a live `ff cortex find` lookup only when
+    // nothing is stored. Fail-open.
+    let (pack, predicted_paths, used_fallback) =
+        crate::dispatch_context::context_pack_for_dispatch(
+            &pg,
+            item.brain_node_ids.clone(),
+            item.touched_paths.clone(),
+            item.title.clone(),
+            item.description.clone().unwrap_or_default(),
+            worktree.worktree_path.clone(),
+            8,
+        )
+        .await;
+
     let started = std::time::Instant::now();
-    let dispatch_full = run_ff_dispatch(&pg, &item, &worktree).await;
+    let dispatch_full = run_ff_dispatch(&pg, &item, &worktree, &pack).await;
 
     // Split (backend, output) into the backend used + a plain Result<Output> for
     // the existing consumers. On error, no backend is carried, so use the
@@ -1173,6 +1191,15 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     }
 
     let head_sha = git_head_sha(&worktree.worktree_path)?;
+    record_memory_pack_stats(
+        &pg,
+        item.work_item_id,
+        &worktree.worktree_path,
+        &worktree.base_branch,
+        &predicted_paths,
+        used_fallback,
+    )
+    .await;
     push_branch(&item.repo_path, &worktree.task_branch)?;
     let pr_url = create_pr(&worktree.worktree_path, &item, &worktree).await?;
     record_pr_provenance(&pg, &item, &backend_used, &pr_url).await?;
@@ -2915,23 +2942,12 @@ async fn run_ff_dispatch(
     pg: &PgPool,
     item: &AssignedWorkItem,
     worktree: &WorktreeRecord,
+    pack: &str,
 ) -> Result<(String, Output)> {
     let mut prompt = dispatch_prompt(item);
-    // Prepend a Cortex context pack: the exact existing symbols this task touches,
-    // pulled from the shared code graph, so the agent starts there instead of
-    // grep-storming the whole repo cold (wasted context + the cold-compile explore
-    // phase). Prefer the precomputed context stored on the work_item row; fall back
-    // to a live `ff cortex find` lookup only when nothing is stored. Fail-open.
-    let pack = crate::dispatch_context::context_pack_for_dispatch(
-        pg,
-        item.brain_node_ids.clone(),
-        item.touched_paths.clone(),
-        item.title.clone(),
-        item.description.clone().unwrap_or_default(),
-        worktree.worktree_path.clone(),
-        8,
-    )
-    .await;
+    // Prepend the Cortex context pack the caller already built (the exact
+    // existing symbols this task touches, pulled from the shared code graph)
+    // so the agent starts there instead of grep-storming the whole repo cold.
     if !pack.is_empty() {
         info!(work_item_id = %item.work_item_id, pack_bytes = pack.len(), "run_ff_dispatch: prepended Cortex context pack");
         prompt = format!("{pack}\n{prompt}");
@@ -4164,6 +4180,81 @@ fn commit_worktree_changes(
         return Err(commit_error);
     }
     Ok(true)
+}
+
+/// Score this build's context pack against what it actually touched, and
+/// persist it in `memory_pack_stats` so `ff doctor`'s MEMORY section can
+/// report a real hit-rate + fallback ratio instead of assuming the pack
+/// helped (Memory-v2 M4). `predicted_paths`/`used_fallback` come from
+/// [`crate::dispatch_context::context_pack_for_dispatch`], captured before
+/// dispatch; the actual touched paths are the final diff vs base, taken here
+/// so it also covers any self-fix repair commits. Best-effort: any failure
+/// (including the migration not having landed yet) only warns — this must
+/// never fail a build.
+async fn record_memory_pack_stats(
+    pg: &PgPool,
+    work_item_id: Uuid,
+    worktree_path: &Path,
+    base_branch: &str,
+    predicted_paths: &[String],
+    used_fallback: bool,
+) {
+    let touched_paths = match resolve_base_ref(worktree_path, base_branch).and_then(|base_ref| {
+        run_git(
+            worktree_path,
+            ["diff", "--name-only", &format!("{base_ref}...HEAD")],
+            Duration::from_secs(30),
+        )
+    }) {
+        Ok(out) => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            warn!(
+                work_item_id = %work_item_id, error = %e,
+                "record_memory_pack_stats: git diff failed (non-fatal)"
+            );
+            Vec::new()
+        }
+    };
+
+    let hit_rate = if predicted_paths.is_empty() {
+        None
+    } else {
+        let touched: std::collections::BTreeSet<&str> =
+            touched_paths.iter().map(String::as_str).collect();
+        let hits = predicted_paths
+            .iter()
+            .filter(|p| touched.contains(p.as_str()))
+            .count();
+        Some(hits as f32 / predicted_paths.len() as f32)
+    };
+
+    if let Err(e) = sqlx::query(
+        "INSERT INTO memory_pack_stats
+             (work_item_id, predicted_paths, touched_paths, used_fallback, hit_rate)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (work_item_id) DO UPDATE SET
+             predicted_paths = EXCLUDED.predicted_paths,
+             touched_paths   = EXCLUDED.touched_paths,
+             used_fallback   = EXCLUDED.used_fallback,
+             hit_rate        = EXCLUDED.hit_rate,
+             created_at      = NOW()",
+    )
+    .bind(work_item_id)
+    .bind(serde_json::json!(predicted_paths))
+    .bind(serde_json::json!(touched_paths))
+    .bind(used_fallback)
+    .bind(hit_rate)
+    .execute(pg)
+    .await
+    {
+        warn!(
+            work_item_id = %work_item_id, error = %e,
+            "record_memory_pack_stats: insert failed (non-fatal)"
+        );
+    }
 }
 
 /// Resolve a project's git author identity, DB-driven and per-project:

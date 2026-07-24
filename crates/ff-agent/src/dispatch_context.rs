@@ -260,6 +260,37 @@ pub fn build_context_pack_from_store(
     pack
 }
 
+/// File-level paths a stored context pack predicts the task will touch: the
+/// file half of any `code://file/symbol` brain-node pointer, plus the
+/// precomputed `touched_paths`, deduplicated in the same order the pack itself
+/// renders them. Empty when the pack fell back to a live Cortex lookup, since
+/// that path doesn't carry a structured file list. Used to score pack accuracy
+/// against what a build actually changes (see `memory_pack_stats`).
+pub fn predicted_files_from_store(
+    brain_node_ids: &[String],
+    touched_paths: &[String],
+) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut seen = BTreeSet::new();
+    for path in brain_node_ids.iter().filter(|p| !p.trim().is_empty()) {
+        let Some(rest) = path.strip_prefix("code://") else {
+            continue;
+        };
+        let Some((file, _symbol)) = rest.rsplit_once('/') else {
+            continue;
+        };
+        if seen.insert(file.to_string()) {
+            files.push(file.to_string());
+        }
+    }
+    for path in touched_paths.iter().filter(|p| !p.trim().is_empty()) {
+        if seen.insert(path.clone()) {
+            files.push(path.clone());
+        }
+    }
+    files
+}
+
 /// Query `brain_vault_nodes` for decisions/distilled-facts/gotchas relevant to
 /// this task, ranked by `recency + degree` (plain SQL; PageRank-over-Falkor is a
 /// future upgrade). Relevance is a substring match against each task identifier
@@ -349,6 +380,12 @@ pub async fn build_brain_decisions_pack(pool: &PgPool, title: &str, description:
 /// dispatch fast and consistent across the fleet while remaining compatible with
 /// work items that have not yet been indexed. After the symbol pack, appends
 /// relevant Brain decisions/gotchas (see [`build_brain_decisions_pack`]).
+///
+/// Returns `(pack_text, predicted_paths, used_fallback)`: `predicted_paths` is
+/// the file list the stored pack predicted (empty when `used_fallback` is
+/// true, since the live-lookup path has no structured file list), and the
+/// caller records both against the build's actual diff in `memory_pack_stats`
+/// so `ff doctor` can report a real hit-rate.
 pub async fn context_pack_for_dispatch(
     pool: &PgPool,
     brain_node_ids: Vec<String>,
@@ -357,24 +394,34 @@ pub async fn context_pack_for_dispatch(
     description: String,
     repo_path: std::path::PathBuf,
     max_symbols: usize,
-) -> String {
+) -> (String, Vec<String>, bool) {
     let store_pack = build_context_pack_from_store(&brain_node_ids, &touched_paths, max_symbols);
-    let symbol_pack = if !store_pack.is_empty() {
+    let used_fallback = store_pack.is_empty();
+    let symbol_pack = if !used_fallback {
         store_pack
     } else {
         cortex_context_pack_async(title.clone(), description.clone(), repo_path, max_symbols).await
     };
+    let predicted_paths = if used_fallback {
+        Vec::new()
+    } else {
+        predicted_files_from_store(&brain_node_ids, &touched_paths)
+    };
 
     let decisions_pack = build_brain_decisions_pack(pool, &title, &description).await;
 
-    format!("{symbol_pack}{decisions_pack}")
+    (
+        format!("{symbol_pack}{decisions_pack}"),
+        predicted_paths,
+        used_fallback,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         build_brain_decisions_pack, build_context_pack_from_store, extract_task_identifiers,
-        relativize,
+        predicted_files_from_store, relativize,
     };
 
     #[test]
@@ -449,6 +496,35 @@ mod tests {
         assert!(
             build_context_pack_from_store(&["".to_string()], &["  ".to_string()], 8).is_empty()
         );
+    }
+
+    #[test]
+    fn predicted_files_from_store_extracts_files_dedupes_and_skips_non_code_nodes() {
+        let files = predicted_files_from_store(
+            &[
+                "code://crates/ff-agent/src/work_item_dispatch.rs/run_git".to_string(),
+                "code://crates/ff-agent/src/work_item_dispatch.rs/commit_worktree_changes"
+                    .to_string(),
+                "pm://work_item/82cd7aa9-9942-4774-bdd1-5ac1b3d65c62".to_string(),
+            ],
+            &[
+                "crates/ff-agent/src/dispatch_context.rs".to_string(),
+                "crates/ff-agent/src/work_item_dispatch.rs".to_string(),
+            ],
+        );
+        assert_eq!(
+            files,
+            vec![
+                "crates/ff-agent/src/work_item_dispatch.rs".to_string(),
+                "crates/ff-agent/src/dispatch_context.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn predicted_files_from_store_empty_when_no_context() {
+        assert!(predicted_files_from_store(&[], &[]).is_empty());
+        assert!(predicted_files_from_store(&["".to_string()], &["  ".to_string()]).is_empty());
     }
 
     // -- DB tests: early-return (skip) when no Postgres is configured; CI's

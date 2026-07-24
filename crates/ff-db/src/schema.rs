@@ -12154,6 +12154,27 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
     ON ff_interactions (work_item_id, ts) WHERE work_item_id IS NOT NULL;
 "#;
 
+/// One row per dispatched build: what the Cortex context pack predicted the
+/// task would touch vs what the commit actually touched, so `ff doctor`'s
+/// MEMORY section can report a real hit-rate instead of assuming the pack
+/// helped. `used_fallback` marks builds where no precomputed pack existed
+/// (empty `brain_node_ids`/`touched_paths` on the work_item) and dispatch fell
+/// back to a live Cortex lookup — the signal for the brain_node_ids
+/// under-population bug class.
+pub const SCHEMA_V251_MEMORY_PACK_STATS: &str = r#"
+CREATE TABLE IF NOT EXISTS memory_pack_stats (
+    work_item_id    UUID PRIMARY KEY,
+    predicted_paths JSONB NOT NULL DEFAULT '[]',
+    touched_paths   JSONB NOT NULL DEFAULT '[]',
+    used_fallback   BOOLEAN NOT NULL DEFAULT false,
+    hit_rate        REAL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_pack_stats_created_at
+    ON memory_pack_stats (created_at);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
