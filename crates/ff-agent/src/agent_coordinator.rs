@@ -923,10 +923,381 @@ pub async fn reap_stale_busy_slots(
         .collect())
 }
 
+/// Age past which a `'disabled'` slot row counts as a deploy leftover
+/// (2026-07-23: 34 stale disabled rows, rihanna alone 6). Age is anchored to
+/// the row's last activity (`last_heartbeat_at`, then `started_at`) and falls
+/// back to `created_at` (V251) when the row was never claimed — deploys upsert
+/// disabled rows with NULL activity timestamps, so without the creation
+/// fallback a just-written row would be indistinguishable from a months-old
+/// leftover and could be deleted the moment it appeared.
+const DISABLED_LEFTOVER_AGE_SECS: i64 = 24 * 3600;
+
+/// How long a computer must have been continuously online before its old
+/// `'disabled'` rows are deleted. A freshly-rebooted node gets an hour to
+/// bring its slots up before the registry concludes the rows are leftovers.
+const DISABLED_LEFTOVER_COMPUTER_ONLINE_SECS: i64 = 3600;
+
+/// One `sub_agents` row joined with the lease + computer state the three
+/// slot-registry correction predicates need. Fetched by
+/// [`reconcile_slot_registry`]; also constructible as a plain fixture so the
+/// predicates are unit-testable without a DB.
+#[derive(Debug, Clone)]
+struct SlotSnapshot {
+    sub_agent_id: Uuid,
+    computer: String,
+    slot: i32,
+    status: String,
+    current_work_item_id: Option<Uuid>,
+    last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+    started_at: Option<chrono::DateTime<Utc>>,
+    /// Row creation time (NOT NULL since V251) — the age anchor of last resort
+    /// for rows whose activity timestamps are still NULL. Used only by
+    /// correction (c).
+    created_at: chrono::DateTime<Utc>,
+    /// `work_item_id` of an active (`released_at IS NULL`) lease claiming THIS
+    /// slot, if any.
+    active_lease_work_item: Option<Uuid>,
+    /// Whether an active lease exists on `current_work_item_id` — any holder,
+    /// not just this slot (a re-dispatched item keeps its old slot busy).
+    current_item_has_active_lease: bool,
+    /// `computers.status = 'online'`.
+    computer_online: bool,
+    /// When `computers.status` last changed (online-since, when online).
+    computer_status_changed_at: Option<chrono::DateTime<Utc>>,
+}
+
+/// Correction (a): a `'busy'` slot whose current work item has NO active lease
+/// is drift — the lease was released/expired without the slot being freed —
+/// and is reset EVERY pass, no grace window (a stale `busy` count corrupts
+/// fair-share math and dashboards immediately; 2026-07-23 saw 7 busy vs 11
+/// active leases). Exempt only: slots an active lease still claims directly
+/// (the lease lifecycle owns those, #1083, matching [`reap_stale_busy_slots`]).
+///
+/// Snapshot-side candidate filter ONLY — [`reconcile_slot_registry`] re-asserts
+/// this same predicate inside the corrective write, under a row lock, before
+/// touching anything.
+fn busy_slot_should_reset(row: &SlotSnapshot) -> bool {
+    row.status == "busy"
+        && !row.current_item_has_active_lease
+        && row.active_lease_work_item.is_none()
+}
+
+/// Correction (b): an active lease claims this slot but the row says `'idle'`
+/// — the claim-side write was lost. The row must say `'busy'` or the scheduler
+/// dispatches a second item into a workspace a lease already owns.
+///
+/// Snapshot-side candidate filter ONLY — the corrective write locks the live
+/// lease row and re-reads it before flipping the slot.
+fn idle_slot_should_mark_busy(row: &SlotSnapshot) -> bool {
+    row.status == "idle" && row.active_lease_work_item.is_some()
+}
+
+/// Correction (c): a `'disabled'` row past [`DISABLED_LEFTOVER_AGE_SECS`]
+/// (anchored to last activity, falling back to `created_at` — see the
+/// constant) on a computer that has been online for
+/// [`DISABLED_LEFTOVER_COMPUTER_ONLINE_SECS`] is a deploy leftover — the node
+/// had ample time to re-enable its real slots. Never deletes a row an active
+/// lease still references, and never a row younger than the age floor no
+/// matter which timestamp proves its youth.
+///
+/// Snapshot-side candidate filter ONLY — the delete transaction locks the row
+/// and re-asserts this whole predicate in a fresh snapshot first.
+fn disabled_slot_is_deploy_leftover(row: &SlotSnapshot, now: chrono::DateTime<Utc>) -> bool {
+    if row.status != "disabled" || row.active_lease_work_item.is_some() {
+        return false;
+    }
+    let anchor = row
+        .last_heartbeat_at
+        .or(row.started_at)
+        .unwrap_or(row.created_at);
+    let old_enough = (now - anchor).num_seconds() >= DISABLED_LEFTOVER_AGE_SECS;
+    let online_long_enough = row.computer_online
+        && match row.computer_status_changed_at {
+            Some(t) => (now - t).num_seconds() >= DISABLED_LEFTOVER_COMPUTER_ONLINE_SECS,
+            None => false,
+        };
+    old_enough && online_long_enough
+}
+
+/// Counts from one [`reconcile_slot_registry`] pass.
+#[derive(Debug, Clone, Default)]
+pub struct SlotRegistrySummary {
+    /// (a) busy rows reset to idle (no active lease on their work item).
+    pub reset_to_idle: usize,
+    /// (b) idle rows flipped to busy (an active lease claims them).
+    pub marked_busy: usize,
+    /// (c) stale disabled rows deleted (deploy leftovers).
+    pub deleted_disabled: usize,
+}
+
+impl SlotRegistrySummary {
+    /// Total corrections applied this pass.
+    pub fn corrections(&self) -> usize {
+        self.reset_to_idle + self.marked_busy + self.deleted_disabled
+    }
+
+    /// One-line drift summary for tracing + Telegram.
+    pub fn drift_line(&self) -> String {
+        format!(
+            "slot-registry drift corrected: {} busy→idle (no active lease), \
+             {} idle→busy (active lease), {} stale disabled row(s) deleted",
+            self.reset_to_idle, self.marked_busy, self.deleted_disabled
+        )
+    }
+}
+
+#[allow(clippy::type_complexity)]
+async fn fetch_slot_snapshots(pool: &PgPool) -> Result<Vec<SlotSnapshot>, CoordError> {
+    let rows: Vec<(
+        Uuid,
+        String,
+        i32,
+        String,
+        Option<Uuid>,
+        Option<chrono::DateTime<Utc>>,
+        Option<chrono::DateTime<Utc>>,
+        chrono::DateTime<Utc>,
+        Option<Uuid>,
+        bool,
+        bool,
+        Option<chrono::DateTime<Utc>>,
+    )> = sqlx::query_as(
+        "SELECT sa.id, c.name, sa.slot, sa.status, sa.current_work_item_id, \
+                sa.last_heartbeat_at, sa.started_at, sa.created_at, \
+                (SELECT l.work_item_id FROM work_item_leases l \
+                  WHERE l.sub_agent_id = sa.id AND l.released_at IS NULL \
+                  ORDER BY l.created_at DESC LIMIT 1), \
+                EXISTS (SELECT 1 FROM work_item_leases li \
+                  WHERE li.work_item_id = sa.current_work_item_id \
+                    AND li.released_at IS NULL), \
+                (c.status = 'online'), \
+                c.status_changed_at \
+         FROM sub_agents sa \
+         JOIN computers c ON c.id = sa.computer_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                sub_agent_id,
+                computer,
+                slot,
+                status,
+                current_work_item_id,
+                last_heartbeat_at,
+                started_at,
+                created_at,
+                active_lease_work_item,
+                current_item_has_active_lease,
+                computer_online,
+                computer_status_changed_at,
+            )| SlotSnapshot {
+                sub_agent_id,
+                computer,
+                slot,
+                status,
+                current_work_item_id,
+                last_heartbeat_at,
+                started_at,
+                created_at,
+                active_lease_work_item,
+                current_item_has_active_lease,
+                computer_online,
+                computer_status_changed_at,
+            },
+        )
+        .collect())
+}
+
+/// Slot-registry reconciler (leader-only): make `sub_agents` mirror the live
+/// lease table + node slot config EVERY pass. Applies the three corrections
+/// ((a) busy-without-lease → idle, (b) idle-under-lease → busy, (c) stale
+/// disabled deploy leftovers → deleted). Without this, fair-share math and
+/// dashboards read wrong numbers (2026-07-23: 7 busy vs 11 active leases; 34
+/// stale disabled rows).
+///
+/// Concurrency contract: the snapshot predicates only NOMINATE candidates
+/// (which keeps them pure and fixture-testable) — they never justify a write
+/// on their own, because `status` alone cannot distinguish "same busy slot"
+/// from "re-leased since the snapshot". Each corrective write runs in its own
+/// short transaction that (1) locks the governing row (`FOR UPDATE SKIP
+/// LOCKED`, yielding to any in-flight dispatcher/releaser) and (2) re-asserts
+/// the FULL predicate — lease existence, work-item identity — against a fresh
+/// statement snapshot while the lock is held. Locking the `sub_agents` row also
+/// conflicts with the FK `KEY SHARE` a new `work_item_leases` INSERT must take
+/// on it, so a lease cannot attach to a slot between the re-check and the
+/// write. If the world moved, the re-check misses, zero rows are touched, and a
+/// still-drifted slot is retried next tick — the reconciler can only ever
+/// converge state, never clobber a live claim or resurrect a released one.
+pub async fn reconcile_slot_registry(pool: &PgPool) -> Result<SlotRegistrySummary, CoordError> {
+    let now = Utc::now();
+    let mut summary = SlotRegistrySummary::default();
+
+    for row in &fetch_slot_snapshots(pool).await? {
+        if busy_slot_should_reset(row) {
+            let mut tx = pool.begin().await?;
+            let locked = sqlx::query(
+                "SELECT 1 FROM sub_agents WHERE id = $1 AND status = 'busy' \
+                 FOR UPDATE SKIP LOCKED",
+            )
+            .bind(row.sub_agent_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if locked.is_none() {
+                // Gone, no longer busy, or an in-flight dispatcher holds the
+                // row — skip; next tick re-evaluates from a fresh snapshot.
+                continue;
+            }
+            // Row is locked: no new lease can FK-attach to it, and this UPDATE
+            // re-reads lease/work-item state in a fresh snapshot. A slot
+            // re-dispatched since the snapshot (new lease, or a different
+            // current_work_item_id) fails the re-check → 0 rows, no clobber.
+            let affected = sqlx::query(
+                "UPDATE sub_agents \
+                 SET status = 'idle', current_work_item_id = NULL, started_at = NULL, \
+                     last_heartbeat_at = NOW() \
+                 WHERE id = $1 AND status = 'busy' \
+                   AND current_work_item_id IS NOT DISTINCT FROM $2 \
+                   AND NOT EXISTS (SELECT 1 FROM work_item_leases l \
+                                    WHERE l.sub_agent_id = $1 AND l.released_at IS NULL) \
+                   AND ($2::uuid IS NULL OR NOT EXISTS ( \
+                            SELECT 1 FROM work_item_leases li \
+                             WHERE li.work_item_id = $2 AND li.released_at IS NULL))",
+            )
+            .bind(row.sub_agent_id)
+            .bind(row.current_work_item_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            tx.commit().await?;
+            if affected == 1 {
+                // Counted only — the caller emits the single drift line; the
+                // task contract forbids per-row log spam.
+                summary.reset_to_idle += 1;
+            }
+        } else if idle_slot_should_mark_busy(row) {
+            // Lock the ACTIVE lease row itself before flipping the slot: a
+            // lease released since the snapshot (or one a releaser holds
+            // mid-release) yields no row here, so a dead lease can never leave
+            // the slot falsely busy. While the lock is held the releaser's own
+            // `released_at` write blocks, so it lands after ours and settles
+            // the slot back to idle — the lease lifecycle always has the last
+            // word. The work item comes from the locked lease, not the
+            // snapshot.
+            let mut tx = pool.begin().await?;
+            let lease: Option<(Uuid,)> = sqlx::query_as(
+                "SELECT work_item_id FROM work_item_leases \
+                 WHERE sub_agent_id = $1 AND released_at IS NULL \
+                 ORDER BY created_at DESC LIMIT 1 \
+                 FOR UPDATE SKIP LOCKED",
+            )
+            .bind(row.sub_agent_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some((work_item_id,)) = lease else {
+                continue;
+            };
+            let affected = sqlx::query(
+                "UPDATE sub_agents \
+                 SET status = 'busy', current_work_item_id = $2, \
+                     started_at = COALESCE(started_at, NOW()), last_heartbeat_at = NOW() \
+                 WHERE id = $1 AND status = 'idle'",
+            )
+            .bind(row.sub_agent_id)
+            .bind(work_item_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            tx.commit().await?;
+            if affected == 1 {
+                summary.marked_busy += 1;
+            }
+        } else if disabled_slot_is_deploy_leftover(row, now) {
+            // Lock the row and re-assert the FULL leftover predicate in a fresh
+            // snapshot before touching anything — the snapshot only nominated
+            // the candidate. Once locked, no new lease can FK-attach to the row
+            // (KEY SHARE conflicts with our FOR UPDATE), so "no active lease"
+            // verified here holds through the delete. work_item_leases /
+            // work_item_worktrees FK-reference sub_agents with no ON DELETE
+            // action, so detach the historical references before the delete or
+            // it bounces. Active leases are never detached — the re-check skips
+            // rows they reference. Per-row transaction so one bad row can't
+            // wedge the whole pass.
+            let delete = async {
+                let mut tx = pool.begin().await?;
+                let locked = sqlx::query(
+                    "SELECT 1 FROM sub_agents sa \
+                     JOIN computers c ON c.id = sa.computer_id \
+                     WHERE sa.id = $1 AND sa.status = 'disabled' \
+                       AND NOT EXISTS (SELECT 1 FROM work_item_leases l \
+                                        WHERE l.sub_agent_id = sa.id \
+                                          AND l.released_at IS NULL) \
+                       AND COALESCE(sa.last_heartbeat_at, sa.started_at, sa.created_at) \
+                           <= NOW() - make_interval(secs => $2) \
+                       AND c.status = 'online' \
+                       AND c.status_changed_at <= NOW() - make_interval(secs => $3) \
+                     FOR UPDATE OF sa SKIP LOCKED",
+                )
+                .bind(row.sub_agent_id)
+                .bind(DISABLED_LEFTOVER_AGE_SECS as f64)
+                .bind(DISABLED_LEFTOVER_COMPUTER_ONLINE_SECS as f64)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if locked.is_none() {
+                    return Ok(0);
+                }
+                sqlx::query(
+                    "UPDATE work_item_leases SET sub_agent_id = NULL \
+                     WHERE sub_agent_id = $1 AND released_at IS NOT NULL",
+                )
+                .bind(row.sub_agent_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE work_item_worktrees SET sub_agent_id = NULL WHERE sub_agent_id = $1",
+                )
+                .bind(row.sub_agent_id)
+                .execute(&mut *tx)
+                .await?;
+                let affected =
+                    sqlx::query("DELETE FROM sub_agents WHERE id = $1 AND status = 'disabled'")
+                        .bind(row.sub_agent_id)
+                        .execute(&mut *tx)
+                        .await?
+                        .rows_affected();
+                tx.commit().await?;
+                Ok::<u64, sqlx::Error>(affected)
+            };
+            match delete.await {
+                Ok(1) => {
+                    summary.deleted_disabled += 1;
+                }
+                Ok(_) => {} // locked re-check missed: state moved since the snapshot
+                Err(e) => {
+                    // Failure diagnostics, not drift logging — the drift
+                    // summary itself stays one line in the caller.
+                    tracing::warn!(
+                        computer = %row.computer,
+                        slot = row.slot,
+                        error = %e,
+                        "slot registry: failed to delete stale disabled row"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
 /// Spawn the background stale-slot reaper: every [`REAPER_SCAN_INTERVAL_SECS`]
 /// seconds (leader-gated, so exactly one node sweeps the fleet-wide table) it
-/// runs [`reap_stale_busy_slots`] with the [`STALE_HEARTBEAT_SECS`] ceiling.
-/// `forgefleetd` starts this at boot alongside the other subsystem ticks.
+/// runs [`reap_stale_busy_slots`] with the [`STALE_HEARTBEAT_SECS`] ceiling,
+/// then [`reconcile_slot_registry`] to keep `sub_agents` mirroring the lease
+/// table every pass. `forgefleetd` starts this at boot alongside the other
+/// subsystem ticks.
 pub fn spawn_stale_slot_reaper(
     pg: PgPool,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -952,6 +1323,32 @@ pub fn spawn_stale_slot_reaper(
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "stale slot reaper tick failed");
+                        }
+                    }
+                    match reconcile_slot_registry(&pg).await {
+                        // One-line drift summary only when something was
+                        // corrected — a clean pass every 60s must stay silent.
+                        Ok(summary) if summary.corrections() > 0 => {
+                            let line = summary.drift_line();
+                            tracing::info!(
+                                reset_to_idle = summary.reset_to_idle,
+                                marked_busy = summary.marked_busy,
+                                deleted_disabled = summary.deleted_disabled,
+                                "{line}"
+                            );
+                            if let Err(e) = crate::telegram::send_telegram_from_secrets(
+                                &pg,
+                                "ForgeFleet slot registry",
+                                &line,
+                            )
+                            .await
+                            {
+                                tracing::warn!(error = %e, "slot registry: telegram drift notice failed");
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "slot registry reconcile tick failed");
                         }
                     }
                 }
@@ -995,6 +1392,140 @@ mod tests {
         assert!(super::STALE_HEARTBEAT_SECS > 45 * 60);
         // And the scan cadence is the 60s the daemon wires in.
         assert_eq!(super::REAPER_SCAN_INTERVAL_SECS, 60);
+    }
+
+    mod slot_registry {
+        use chrono::{DateTime, Duration, Utc};
+        use uuid::Uuid;
+
+        use super::super::{
+            DISABLED_LEFTOVER_AGE_SECS, DISABLED_LEFTOVER_COMPUTER_ONLINE_SECS, SlotSnapshot,
+            busy_slot_should_reset, disabled_slot_is_deploy_leftover, idle_slot_should_mark_busy,
+        };
+
+        fn ago(now: DateTime<Utc>, secs: i64) -> Option<DateTime<Utc>> {
+            Some(now - Duration::seconds(secs))
+        }
+
+        /// Fixture: a slot on an online-for-2h computer, no lease anywhere,
+        /// activity timestamps unset, row created 30 days ago. Tests override
+        /// the fields under scrutiny.
+        fn snap(now: DateTime<Utc>, status: &str) -> SlotSnapshot {
+            SlotSnapshot {
+                sub_agent_id: Uuid::new_v4(),
+                computer: "rihanna".to_string(),
+                slot: 0,
+                status: status.to_string(),
+                current_work_item_id: None,
+                last_heartbeat_at: None,
+                started_at: None,
+                created_at: now - Duration::days(30),
+                active_lease_work_item: None,
+                current_item_has_active_lease: false,
+                computer_online: true,
+                computer_status_changed_at: ago(now, 2 * 3600),
+            }
+        }
+
+        #[test]
+        fn busy_without_active_lease_resets_every_pass() {
+            let now = Utc::now();
+            let mut row = snap(now, "busy");
+            row.current_work_item_id = Some(Uuid::new_v4());
+            // Busy, no active lease on the item, no lease on the slot → drift,
+            // reset — and NO grace: even a slot claimed one second ago resets
+            // (the reviewer-required every-pass correction; a stale busy count
+            // corrupts fair-share math immediately).
+            assert!(busy_slot_should_reset(&row));
+            row.last_heartbeat_at = ago(now, 1);
+            assert!(busy_slot_should_reset(&row));
+            row.last_heartbeat_at = ago(now, DISABLED_LEFTOVER_AGE_SECS);
+            assert!(busy_slot_should_reset(&row));
+            // current_work_item_id NULL (busy with nothing to show) is still
+            // drift — there is trivially no active lease on it.
+            row.current_work_item_id = None;
+            assert!(busy_slot_should_reset(&row));
+        }
+
+        #[test]
+        fn busy_with_active_lease_is_never_reset() {
+            let now = Utc::now();
+            let item = Uuid::new_v4();
+            let mut row = snap(now, "busy");
+            row.current_work_item_id = Some(item);
+            // An active lease on the current work item → in sync, keep busy.
+            row.current_item_has_active_lease = true;
+            assert!(!busy_slot_should_reset(&row));
+            // A lease claiming the slot directly (even for another item) is
+            // owned by the lease lifecycle (#1083) — never reset here.
+            row.current_item_has_active_lease = false;
+            row.active_lease_work_item = Some(Uuid::new_v4());
+            assert!(!busy_slot_should_reset(&row));
+            // Only 'busy' rows are candidates.
+            row.active_lease_work_item = None;
+            row.status = "idle".to_string();
+            assert!(!busy_slot_should_reset(&row));
+        }
+
+        #[test]
+        fn idle_under_active_lease_marks_busy() {
+            let now = Utc::now();
+            let mut row = snap(now, "idle");
+            // Idle with no lease → in sync, leave alone.
+            assert!(!idle_slot_should_mark_busy(&row));
+            // An active lease claims the slot but the row says idle → flip to
+            // busy or the scheduler double-books the workspace.
+            row.active_lease_work_item = Some(Uuid::new_v4());
+            assert!(idle_slot_should_mark_busy(&row));
+            // Non-idle rows are not this correction's business.
+            row.status = "busy".to_string();
+            assert!(!idle_slot_should_mark_busy(&row));
+            row.status = "disabled".to_string();
+            assert!(!idle_slot_should_mark_busy(&row));
+        }
+
+        #[test]
+        fn disabled_leftover_needs_age_and_online_computer() {
+            let now = Utc::now();
+            // Deploy leftover shape: disabled, NULL activity timestamps (never
+            // active since it was written), row itself old, computer online
+            // past the settle window.
+            let row = snap(now, "disabled");
+            assert!(disabled_slot_is_deploy_leftover(&row, now));
+            // A JUST-CREATED disabled row with NULL activity timestamps is NOT
+            // a leftover — created_at proves its youth. (Without the created_at
+            // fallback this exact shape was wrongly deletable.)
+            let mut newborn = snap(now, "disabled");
+            newborn.created_at = now - Duration::seconds(60);
+            assert!(!disabled_slot_is_deploy_leftover(&newborn, now));
+            // A recorded heartbeat older than 24h is equally a leftover.
+            let mut old = snap(now, "disabled");
+            old.last_heartbeat_at = ago(now, DISABLED_LEFTOVER_AGE_SECS + 1);
+            assert!(disabled_slot_is_deploy_leftover(&old, now));
+            // Recent activity (< 24h) → could be a deliberate fresh disable;
+            // keep, even though the row itself is old.
+            let mut fresh = snap(now, "disabled");
+            fresh.last_heartbeat_at = ago(now, 3600);
+            assert!(!disabled_slot_is_deploy_leftover(&fresh, now));
+            // Computer offline → the node never got a chance to re-enable.
+            let mut offline = snap(now, "disabled");
+            offline.computer_online = false;
+            assert!(!disabled_slot_is_deploy_leftover(&offline, now));
+            // Online but only briefly (or unknown since-when) → wait.
+            let mut recent = snap(now, "disabled");
+            recent.computer_status_changed_at =
+                ago(now, DISABLED_LEFTOVER_COMPUTER_ONLINE_SECS - 60);
+            assert!(!disabled_slot_is_deploy_leftover(&recent, now));
+            recent.computer_status_changed_at = None;
+            assert!(!disabled_slot_is_deploy_leftover(&recent, now));
+            // An active lease referencing the row blocks deletion outright.
+            let mut leased = snap(now, "disabled");
+            leased.active_lease_work_item = Some(Uuid::new_v4());
+            assert!(!disabled_slot_is_deploy_leftover(&leased, now));
+            // Only 'disabled' rows are candidates.
+            let idle = snap(now, "idle");
+            assert!(!disabled_slot_is_deploy_leftover(&idle, now));
+        }
     }
 
     #[test]

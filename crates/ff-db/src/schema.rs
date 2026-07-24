@@ -12154,6 +12154,19 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
     ON ff_interactions (work_item_id, ts) WHERE work_item_id IS NOT NULL;
 "#;
 
+/// Row-creation timestamp for `sub_agents`. `started_at`/`last_heartbeat_at`
+/// stay NULL until a slot's first claim, so before this column an untouched
+/// disabled row carried no age signal at all — the slot-registry reconciler
+/// (correction (c)) could not tell a freshly-written disabled row from a
+/// months-old deploy leftover and could delete it the moment it appeared.
+/// `created_at` is the age anchor of last resort. Existing rows backfill to
+/// the migration moment (a conservative lower bound: they become eligible for
+/// leftover cleanup 24h later, never sooner).
+pub const SCHEMA_V251_SUB_AGENTS_CREATED_AT: &str = r#"
+ALTER TABLE sub_agents
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
