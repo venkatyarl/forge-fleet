@@ -3637,6 +3637,8 @@ mod tests {
             preferred_workloads: serde_json::json!(["tool_calling", "code"]),
             variants: serde_json::json!([{"runtime": "llama.cpp", "quant": "Q4"}]),
             tool_calling: true,
+            watchlist: false,
+            license: None,
         };
         let v = catalog_json_row(&row);
         assert_eq!(v["id"], "qwen3-coder-30b");

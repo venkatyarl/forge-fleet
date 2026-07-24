@@ -334,22 +334,37 @@ mod tests {
 
         let store = Arc::new(RecordingStore::default());
         let (auditor, writer) = ReconciliationAuditor::start(store);
-        let trace_id = tracing::subscriber::with_default(subscriber, || {
-            auditor.record(
-                ReconciliationAction::ConflictResolved,
-                "wi-42",
-                "PR conflicted with advanced main — item reset for rebuild",
-                serde_json::json!({"queue_id": "q-1"}),
-            )
-        });
+        let dispatch = tracing::Dispatch::new(subscriber);
+        // Sibling tests call `record` concurrently with no subscriber installed;
+        // if one of them races the first-ever registration of `record`'s info!
+        // callsite, tracing-core can cache the callsite as never-enabled even
+        // though this thread's subscriber is active, and the event is skipped.
+        // Rebuilding the interest cache under our dispatcher (and retrying while
+        // a racing registration is still in flight) makes the capture reliable.
+        let mut trace_id = Uuid::nil();
+        for _ in 0..10 {
+            trace_id = tracing::dispatcher::with_default(&dispatch, || {
+                tracing::callsite::rebuild_interest_cache();
+                auditor.record(
+                    ReconciliationAction::ConflictResolved,
+                    "wi-42",
+                    "PR conflicted with advanced main — item reset for rebuild",
+                    serde_json::json!({"queue_id": "q-1"}),
+                )
+            });
+            if !buf.0.lock().unwrap().is_empty() {
+                break;
+            }
+        }
         drop(auditor);
         writer.await.unwrap();
 
         let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         let line = logged
             .lines()
-            .find(|l| l.contains("reconciliation_audit"))
+            .find(|l| l.contains(&trace_id.to_string()))
             .expect("record must emit a reconciliation_audit tracing line");
+        assert!(line.contains("reconciliation_audit"));
         let v: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(v["fields"]["trace_id"], trace_id.to_string());
         assert_eq!(

@@ -1,0 +1,75 @@
+# ForgeFleet Model Catalog — Autopilot-5 watchlist seeds
+#
+# The bulk catalog was retired to Postgres in V39; this file is the
+# dev-override lane that `ff_agent::model_catalog::sync_catalog` still
+# replays into `fleet_model_catalog` when present (path override via
+# $FORGEFLEET_CATALOG). It now carries the Autopilot-5 auto-download
+# watchlist seeds so the flag is visible + editable in source, mirroring
+# the V252 migration seed exactly.
+#
+# `watchlist = true` marks a model the fleet wants on disk without operator
+# action: the leader's watchlist tick downloads it to the node with the most
+# free disk + RAM headroom, the library scan registers it cold, and — once
+# the Autopilot-4 bandit layer is present — it is loaded as a challenger at
+# the same-workload incumbent's tier (tier + 0). Models with `gated = true`
+# are NEVER auto-downloaded, watchlisted or not, and the download gate fails
+# closed on a missing/unknown `license` — every watchlist entry must declare
+# a license from the model-scout allowlist or it will be skipped.
+#
+# Both HuggingFace repos below were verified live and ungated on 2026-07-23:
+#   - ServiceNow-AI/Apriel-1.5-15b-Thinker (MIT). NOTE: the canonical repo id
+#     is lower-case "15b-Thinker" — "ServiceNow-AI/Apriel-1.5-15B" does NOT
+#     exist. GGUF: bartowski/ServiceNow-AI_Apriel-1.5-15b-Thinker-GGUF.
+#   - Qwen/Qwen3-Coder-Next (apache-2.0, 79.7B params), official GGUF at
+#     Qwen/Qwen3-Coder-Next-GGUF.
+
+schema_version = "3"
+updated = "2026-07-24"
+
+[[models]]
+id = "apriel-1.5-15b"
+name = "Apriel 1.5 15B Thinker"
+family = "apriel"
+parameters = "15B"
+tier = 2
+description = "ServiceNow Apriel-1.5-15b-Thinker (MIT). Autopilot-5 watchlist seed."
+gated = false
+watchlist = true
+license = "mit"
+preferred_workloads = ["code", "reasoning", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/ServiceNow-AI_Apriel-1.5-15b-Thinker-GGUF"
+  size_gb = 8.8
+
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "bf16"
+  hf_repo = "ServiceNow-AI/Apriel-1.5-15b-Thinker"
+  size_gb = 30.0
+
+[[models]]
+id = "qwen3-coder-next-80b"
+name = "Qwen3 Coder Next 80B"
+family = "qwen"
+parameters = "80B"
+tier = 3
+description = "Qwen3-Coder-Next (apache-2.0). Autopilot-5 watchlist seed."
+gated = false
+watchlist = true
+license = "apache-2.0"
+preferred_workloads = ["code", "coding", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "Qwen/Qwen3-Coder-Next-GGUF"
+  size_gb = 48.4
+
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "bf16"
+  hf_repo = "Qwen/Qwen3-Coder-Next"
+  size_gb = 160.0

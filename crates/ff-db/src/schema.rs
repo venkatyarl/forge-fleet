@@ -12154,6 +12154,33 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
     ON ff_interactions (work_item_id, ts) WHERE work_item_id IS NOT NULL;
 "#;
 
+pub const SCHEMA_V252_MODEL_CATALOG_WATCHLIST: &str = r#"
+ALTER TABLE fleet_model_catalog
+    ADD COLUMN IF NOT EXISTS watchlist BOOLEAN NOT NULL DEFAULT FALSE;
+
+INSERT INTO fleet_model_catalog
+    (id, name, family, parameters, tier, description, gated,
+     preferred_workloads, variants, tool_calling, watchlist, license, updated_at)
+VALUES
+    ('apriel-1.5-15b', 'Apriel 1.5 15B Thinker', 'apriel', '15B', 2,
+     'ServiceNow Apriel-1.5-15b-Thinker (MIT). Autopilot-5 watchlist seed.',
+     FALSE,
+     '["code", "reasoning", "tool_calling"]'::jsonb,
+     '[{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "bartowski/ServiceNow-AI_Apriel-1.5-15b-Thinker-GGUF", "size_gb": 8.8},
+       {"runtime": "vllm", "quant": "bf16", "hf_repo": "ServiceNow-AI/Apriel-1.5-15b-Thinker", "size_gb": 30.0}]'::jsonb,
+     TRUE, TRUE, 'mit', NOW()),
+    ('qwen3-coder-next-80b', 'Qwen3 Coder Next 80B', 'qwen', '80B', 3,
+     'Qwen3-Coder-Next (apache-2.0). Autopilot-5 watchlist seed.',
+     FALSE,
+     '["code", "coding", "tool_calling"]'::jsonb,
+     '[{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "Qwen/Qwen3-Coder-Next-GGUF", "size_gb": 48.4},
+       {"runtime": "vllm", "quant": "bf16", "hf_repo": "Qwen/Qwen3-Coder-Next", "size_gb": 160.0}]'::jsonb,
+     TRUE, TRUE, 'apache-2.0', NOW())
+ON CONFLICT (id) DO UPDATE SET
+    watchlist = TRUE,
+    license = COALESCE(fleet_model_catalog.license, EXCLUDED.license);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

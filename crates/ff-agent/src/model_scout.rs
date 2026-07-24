@@ -37,8 +37,10 @@ const HF_LIMIT_PER_TASK: usize = 10;
 const MAX_CANDIDATE_SIZE_GB: f64 = 100.0;
 
 /// Licenses we're willing to auto-promote to `candidate`. Anything else
-/// gets filtered out — an operator can still add manually.
-const ALLOWED_LICENSES: &[&str] = &[
+/// gets filtered out — an operator can still add manually. Shared with the
+/// Autopilot-5 watchlist reconciler, which applies the same allowlist before
+/// auto-downloading.
+pub(crate) const ALLOWED_LICENSES: &[&str] = &[
     "apache-2.0",
     "mit",
     "openrail",
