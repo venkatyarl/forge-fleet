@@ -1193,6 +1193,13 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "ff_interactions_episodic_tagging",
         sql: schema::SCHEMA_V250_FF_INTERACTIONS_EPISODIC_TAGGING,
     },
+    // 251-257 are reserved by in-flight branches; gaps are fine, collisions
+    // are not.
+    PgMigration {
+        version: 258,
+        name: "model_catalog_view",
+        sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
