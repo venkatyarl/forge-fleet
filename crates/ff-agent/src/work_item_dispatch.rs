@@ -3143,7 +3143,12 @@ async fn run_ff_dispatch(
     // rest of the list on error, and falls back to claude when the rotation
     // pick isn't in this node's dispatchable set.
     let mut policy = ff_routing_policy::PolicyConfig::default();
-    const BUILDER_ROTATION: [&str; 3] = ["claude", "codex", "kimi"];
+    // Order matters: codex/kimi front the rotation, claude LAST (operator
+    // directive 2026-07-23) — claude runs on ONE shared OAuth login that every
+    // concurrent use churns (rotating refresh tokens = the operator's endless
+    // /login treadmill), while codex has 12 authed nodes and kimi 8. Ladder:
+    // local Devstral/GLM → 480B ring → codex/kimi → claude as final backstop.
+    const BUILDER_ROTATION: [&str; 3] = ["codex", "kimi", "claude"];
     // Index by item id PLUS attempts: id-only rotation re-picked the SAME
     // backend on every retry, so an item whose pick failed success-shaped
     // (e.g. claude "no diff" — exit 0, so the in-loop error failover never
