@@ -12154,6 +12154,21 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
     ON ff_interactions (work_item_id, ts) WHERE work_item_id IS NOT NULL;
 "#;
 
+/// Track research orchestrator liveness independently of session age.
+pub const SCHEMA_V251_RESEARCH_SESSION_HEARTBEAT: &str = r#"
+ALTER TABLE research_sessions
+    ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMPTZ;
+
+UPDATE research_sessions
+   SET last_heartbeat_at = COALESCE(started_at, created_at)
+ WHERE status NOT IN ('done', 'failed')
+   AND last_heartbeat_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_research_sessions_active_heartbeat
+    ON research_sessions (last_heartbeat_at)
+    WHERE status NOT IN ('done', 'failed');
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

@@ -40,6 +40,47 @@ use uuid::Uuid;
 
 use crate::multi_agent::{AgentTaskResult, OrchestratorEvent, TaskStatus};
 
+const RESEARCH_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+struct ResearchHeartbeat {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ResearchHeartbeat {
+    fn spawn(pool: PgPool, session_id: Uuid) -> Self {
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(RESEARCH_HEARTBEAT_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                match sqlx::query(
+                    "UPDATE research_sessions
+                        SET last_heartbeat_at = NOW()
+                      WHERE id = $1
+                        AND status NOT IN ('done', 'failed')",
+                )
+                .bind(session_id)
+                .execute(&pool)
+                .await
+                {
+                    Ok(result) if result.rows_affected() == 0 => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(session = %session_id, %error, "research heartbeat failed");
+                    }
+                }
+            }
+        });
+        Self { task }
+    }
+}
+
+impl Drop for ResearchHeartbeat {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 // ─── Public types ───────────────────────────────────────────────────────────
 
 /// Configuration for one research run.
@@ -298,8 +339,9 @@ impl ResearchSession {
         sqlx::query(
             "INSERT INTO research_sessions
                 (id, query, status, depth, parallel, output_path, initiated_by,
-                 planner_model, synth_model, started_at, metadata)
+                 planner_model, synth_model, started_at, last_heartbeat_at, metadata)
              VALUES ($1, $2, $10, $3, $4, $5, $6, $7, $7,
+                     CASE WHEN $10 = 'queued' THEN NULL ELSE NOW() END,
                      CASE WHEN $10 = 'queued' THEN NULL ELSE NOW() END,
                      jsonb_build_object('gateway_url', $8::text,
                                         'subagent_model', $9::text,
@@ -349,7 +391,7 @@ impl ResearchSession {
     pub async fn claim_next_queued(pool: PgPool) -> Result<Option<Self>> {
         let row = sqlx::query(
             "UPDATE research_sessions
-                SET status = 'planning', started_at = NOW()
+                SET status = 'planning', started_at = NOW(), last_heartbeat_at = NOW()
               WHERE id = (
                   SELECT id FROM research_sessions
                    WHERE status = 'queued'
@@ -431,6 +473,7 @@ impl ResearchSession {
         &self,
         progress: Option<mpsc::Sender<ResearchProgress>>,
     ) -> Result<ResearchReport> {
+        let _heartbeat = ResearchHeartbeat::spawn(self.pool.clone(), self.session_id);
         let start = Instant::now();
         if let Some(tx) = &progress {
             let _ = tx
@@ -1354,7 +1397,16 @@ pub async fn auto_recover_stale(
             AND EXISTS (
                 SELECT 1 FROM research_subtasks st
                  WHERE st.session_id = s.id
+                   AND st.status IN ('done', 'max_turns')
                    AND COALESCE(st.output_markdown, '') <> ''
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM research_subtasks st
+                 WHERE st.session_id = s.id
+                   AND (
+                       st.status NOT IN ('done', 'max_turns')
+                       OR COALESCE(st.output_markdown, '') = ''
+                   )
             )
           ORDER BY s.created_at
           LIMIT $2",
