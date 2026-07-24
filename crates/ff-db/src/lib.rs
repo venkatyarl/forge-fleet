@@ -310,6 +310,21 @@ pub mod error {
         #[error("connection pool error: {0}")]
         Pool(String),
 
+        #[error("connection timed out: {0}")]
+        ConnectionTimeout(String),
+
+        #[error("database authentication failed: {0}")]
+        AuthenticationFailed(String),
+
+        #[error("database host unreachable: {0}")]
+        HostUnreachable(String),
+
+        #[error("invalid connection string: {0}")]
+        InvalidConnectionString(String),
+
+        #[error("TLS error establishing database connection: {0}")]
+        Tls(String),
+
         #[error("Postgres error: {0}")]
         Postgres(#[from] sqlx::Error),
 
