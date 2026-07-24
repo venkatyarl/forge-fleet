@@ -33,6 +33,9 @@ const DEFAULT_MIN_RECURRENCE: usize = 3;
 const DEFAULT_TAIL_LINES: usize = 1000;
 const DEFAULT_PATHS: &[&str] = &["/var/log/**/*.log"];
 const DEFAULT_PATTERNS: &[&str] = &["ERROR", "FATAL", "EXCEPTION", "WARN"];
+/// Hard ceiling on auto-filed `bug` work_items per calendar day (UTC), across
+/// all projects. Keeps a noisy log source from flooding the Pillar-4 queue.
+const MAX_BUG_WORK_ITEMS_PER_DAY: i64 = 3;
 
 /// Summary of one scan pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -254,11 +257,28 @@ impl LogAnalysisWorker {
     }
 
     /// Create one `ready` work_item per recurring pattern, skipping patterns
-    /// already tracked by an open/ready/in_progress work_item.
+    /// already tracked by an open/ready/in_progress work_item, and stopping
+    /// once `MAX_BUG_WORK_ITEMS_PER_DAY` bug work_items have been filed today.
     async fn create_work_items(&self, patterns: &[&RecurringPattern]) -> Result<usize> {
         let mut created = 0usize;
 
+        let filed_today: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_items \
+             WHERE kind = 'bug' AND created_at >= date_trunc('day', NOW())",
+        )
+        .fetch_one(&self.pg)
+        .await?;
+
         for pattern in patterns {
+            if filed_today + created as i64 >= MAX_BUG_WORK_ITEMS_PER_DAY {
+                debug!(
+                    filed_today,
+                    cap = MAX_BUG_WORK_ITEMS_PER_DAY,
+                    "log_analysis_worker: daily bug work_item cap reached, deferring remaining patterns"
+                );
+                break;
+            }
+
             let existing: Option<(uuid::Uuid,)> = sqlx::query_as(
                 "SELECT id FROM work_items \
                  WHERE project_id = $1 \
@@ -666,5 +686,176 @@ mod tests {
         }
         let got = parse_csv_env("FF_LOG_ANALYSIS_PATHS_TEST_EXPLICIT", DEFAULT_PATHS);
         assert_eq!(got, vec!["/a", "/b", "/c"]);
+    }
+
+    #[test]
+    fn daily_bug_cap_is_deliberately_bounded() {
+        assert_eq!(MAX_BUG_WORK_ITEMS_PER_DAY, 3);
+    }
+
+    // -- DB tests: early-return (skip) when no Postgres is configured; CI's
+    //    `cargo test --lib` has no database and must never panic here.
+
+    fn temp_db_urls(label: &str) -> Option<(String, String, String)> {
+        let base_url = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()?;
+        let (prefix, _) = base_url.rsplit_once('/')?;
+        let db_name = format!("ff_log_analysis_{label}_{}", uuid::Uuid::new_v4().simple());
+        Some((
+            format!("{prefix}/postgres"),
+            format!("{prefix}/{db_name}"),
+            db_name,
+        ))
+    }
+
+    async fn create_temp_db(label: &str) -> Option<(PgPool, PgPool, String)> {
+        let (admin_url, db_url, db_name) = temp_db_urls(label)?;
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("connect admin db");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create temp db");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&db_url)
+            .await
+            .expect("connect temp db");
+        // Minimal slice of the live schema: only the columns
+        // `create_work_items`/`bugs_filed_today` touch.
+        sqlx::raw_sql(
+            "CREATE EXTENSION IF NOT EXISTS pgcrypto;
+             CREATE TABLE work_items (
+                 id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 project_id       TEXT NOT NULL,
+                 kind             TEXT NOT NULL,
+                 title            TEXT NOT NULL,
+                 description      TEXT,
+                 status           TEXT NOT NULL DEFAULT 'idea',
+                 priority         TEXT NOT NULL DEFAULT 'normal',
+                 created_by       TEXT NOT NULL DEFAULT 'system',
+                 metadata         JSONB NOT NULL DEFAULT '{}',
+                 context          JSONB NOT NULL DEFAULT '{}',
+                 pre_work         JSONB NOT NULL DEFAULT '[]',
+                 work             JSONB NOT NULL DEFAULT '[]',
+                 post_work        JSONB NOT NULL DEFAULT '[]',
+                 original_signal  JSONB NOT NULL DEFAULT '{}',
+                 refiled_from     UUID,
+                 created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );",
+        )
+        .execute(&pool)
+        .await
+        .expect("create minimal work_items schema");
+        Some((admin, pool, db_name))
+    }
+
+    async fn drop_temp_db(admin: PgPool, pool: PgPool, db_name: &str) {
+        pool.close().await;
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid)
+               FROM pg_stat_activity
+              WHERE datname = $1
+                AND pid <> pg_backend_pid()",
+        )
+        .bind(db_name)
+        .execute(&admin)
+        .await
+        .ok();
+        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .ok();
+        admin.close().await;
+    }
+
+    fn test_worker(pg: PgPool, project_id: &str) -> LogAnalysisWorker {
+        LogAnalysisWorker {
+            pg,
+            my_name: "test-node".to_string(),
+            config: LogAnalysisConfig {
+                interval: DEFAULT_INTERVAL,
+                project_id: project_id.to_string(),
+                log_paths: DEFAULT_PATHS.iter().map(|s| s.to_string()).collect(),
+                patterns: DEFAULT_PATTERNS.iter().map(|s| s.to_string()).collect(),
+                min_recurrence: DEFAULT_MIN_RECURRENCE,
+                tail_lines: DEFAULT_TAIL_LINES,
+            },
+        }
+    }
+
+    fn test_pattern(signature: &str, normalized: &str) -> RecurringPattern {
+        RecurringPattern {
+            signature: signature.to_string(),
+            normalized: normalized.to_string(),
+            example: normalized.to_string(),
+            count: 5,
+            last_path: PathBuf::from("/tmp/log-analysis-test.log"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_work_items_stops_at_daily_cap() {
+        let Some((admin, pool, db_name)) = create_temp_db("cap").await else {
+            eprintln!("skipping: FORGEFLEET_POSTGRES_URL/FORGEFLEET_DATABASE_URL not set");
+            return;
+        };
+
+        let worker = test_worker(pool.clone(), "cap-test-project");
+        let patterns: Vec<RecurringPattern> = (0..5)
+            .map(|i| test_pattern(&format!("sig-{i}"), &format!("ERROR pattern {i}")))
+            .collect();
+        let refs: Vec<&RecurringPattern> = patterns.iter().collect();
+
+        let created = worker
+            .create_work_items(&refs)
+            .await
+            .expect("create work items");
+        assert_eq!(created, MAX_BUG_WORK_ITEMS_PER_DAY as usize);
+
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_items WHERE kind = 'bug'")
+            .fetch_one(&pool)
+            .await
+            .expect("count work_items");
+        assert_eq!(total, MAX_BUG_WORK_ITEMS_PER_DAY);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn create_work_items_is_idempotent_for_tracked_signature() {
+        let Some((admin, pool, db_name)) = create_temp_db("idem").await else {
+            eprintln!("skipping: FORGEFLEET_POSTGRES_URL/FORGEFLEET_DATABASE_URL not set");
+            return;
+        };
+
+        let worker = test_worker(pool.clone(), "idem-test-project");
+        let pattern = test_pattern("sig-dup", "ERROR duplicate pattern");
+
+        let first = worker
+            .create_work_items(&[&pattern])
+            .await
+            .expect("first pass");
+        assert_eq!(first, 1);
+
+        // Re-scanning the same still-open signature must neither create a
+        // second work_item nor consume another slot of the daily cap.
+        let second = worker
+            .create_work_items(&[&pattern])
+            .await
+            .expect("second pass");
+        assert_eq!(second, 0);
+
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_items WHERE kind = 'bug'")
+            .fetch_one(&pool)
+            .await
+            .expect("count work_items");
+        assert_eq!(total, 1);
+
+        drop_temp_db(admin, pool, &db_name).await;
     }
 }
