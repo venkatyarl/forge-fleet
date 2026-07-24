@@ -6,6 +6,43 @@
 use chrono::{DateTime, Utc};
 use ff_capacity::{BackendCapacity, CapacitySnapshot, InferenceDeployment};
 use serde::Serialize;
+use sqlx::PgPool;
+
+/// One ordered step in a workload's database-backed routing ladder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rung {
+    LocalModel(String),
+    Ring(String),
+    CloudBackend(String),
+}
+
+fn parse_rung(kind: &str, target: String) -> Result<Rung, sqlx::Error> {
+    match kind {
+        "local_model" => Ok(Rung::LocalModel(target)),
+        "ring" => Ok(Rung::Ring(target)),
+        "cloud_backend" => Ok(Rung::CloudBackend(target)),
+        other => Err(sqlx::Error::Protocol(format!(
+            "unknown routing ladder rung_kind {other:?}"
+        ))),
+    }
+}
+
+/// Load one workload's routing ladder in operator-defined order.
+pub async fn load_ladder(pool: &PgPool, workload: &str) -> Result<Vec<Rung>, sqlx::Error> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT rung_kind, target
+           FROM routing_ladders
+          WHERE workload = $1
+          ORDER BY position",
+    )
+    .bind(workload)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|(kind, target)| parse_rung(&kind, target))
+        .collect()
+}
 
 /// A routing tier, ordered from cheapest to most expensive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -489,6 +526,23 @@ fn backend_score_with_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_ladder_rung_kinds() {
+        assert_eq!(
+            parse_rung("local_model", "devstral".into()).unwrap(),
+            Rung::LocalModel("devstral".into())
+        );
+        assert_eq!(
+            parse_rung("ring", "qwen-480b".into()).unwrap(),
+            Rung::Ring("qwen-480b".into())
+        );
+        assert_eq!(
+            parse_rung("cloud_backend", "codex".into()).unwrap(),
+            Rung::CloudBackend("codex".into())
+        );
+        assert!(parse_rung("unknown", "target".into()).is_err());
+    }
 
     fn backend(name: &str, now: DateTime<Utc>) -> BackendCapacity {
         BackendCapacity {

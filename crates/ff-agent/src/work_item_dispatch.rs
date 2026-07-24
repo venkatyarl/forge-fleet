@@ -2125,7 +2125,26 @@ const MAX_DISPATCH_ATTEMPTS: i32 = 5;
 /// the task isn't complexity-routed to cloud. Pure so the routing is testable —
 /// the `ESCALATE_TO_CLOUD_AT = 1` value means a mechanical task gets ONE local try
 /// then goes cloud (#62: the local lane starves the heartbeat; cloud does not).
-fn use_local_lane(attempts: i32, breaker_open: bool, prefers_cloud: bool) -> bool {
+fn local_model_for_attempt(ladder: &[ff_routing_policy::Rung], attempts: i32) -> Option<&str> {
+    if attempts < 0 || attempts as u32 >= ff_routing_policy::LOCAL_LANE_MAX_TRIES {
+        return None;
+    }
+    let local = ladder
+        .iter()
+        .filter_map(|rung| match rung {
+            ff_routing_policy::Rung::LocalModel(target) => Some(target.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    (!local.is_empty()).then(|| local[attempts as usize % local.len()])
+}
+
+fn use_local_lane(
+    ladder: &[ff_routing_policy::Rung],
+    attempts: i32,
+    breaker_open: bool,
+    prefers_cloud: bool,
+) -> bool {
     let requirements = ff_routing_policy::TaskRequirements {
         prior_failure_count: attempts.max(0) as u32,
         capability_tags: if prefers_cloud {
@@ -2135,8 +2154,41 @@ fn use_local_lane(attempts: i32, breaker_open: bool, prefers_cloud: bool) -> boo
         },
         ..Default::default()
     };
-    ff_routing_policy::use_local_30b(&requirements, &ff_routing_policy::PolicyConfig::default())
+    local_model_for_attempt(ladder, attempts).is_some()
+        && ff_routing_policy::use_local_30b(
+            &requirements,
+            &ff_routing_policy::PolicyConfig::default(),
+        )
         && !breaker_open
+}
+
+fn ladder_has_ring(ladder: &[ff_routing_policy::Rung]) -> bool {
+    ladder
+        .iter()
+        .any(|rung| matches!(rung, ff_routing_policy::Rung::Ring(_)))
+}
+
+fn order_cloud_backends_from_ladder(
+    backends: &mut Vec<String>,
+    ladder: &[ff_routing_policy::Rung],
+) -> bool {
+    let cloud = ladder
+        .iter()
+        .filter_map(|rung| match rung {
+            ff_routing_policy::Rung::CloudBackend(target) => Some(target),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if cloud.is_empty() {
+        return false;
+    }
+    backends.sort_by_key(|backend| {
+        cloud
+            .iter()
+            .position(|target| target.as_str() == backend)
+            .unwrap_or(cloud.len())
+    });
+    true
 }
 
 /// Hard ceiling on the Lane-1 LOCAL codegen harness — kept STRICTLY BELOW the
@@ -2342,11 +2394,11 @@ async fn requeue_or_fail(pg: &PgPool, item: &AssignedWorkItem, error: &str) -> R
             AND status NOT IN ('done', 'merged', 'cancelled')",
     )
     .bind(item.work_item_id)
-    .bind(truncate_for_db(&format!(
+    .bind(truncate_for_db(&crate::error_class::classify(format!(
         "[attempt {}] {}",
         attempts + 1,
         error
-    )))
+    ))))
     .execute(&mut *tx)
     .await?;
     // Clear the failed worktree row so a fresh one is created next attempt.
@@ -2370,6 +2422,7 @@ async fn requeue_or_fail(pg: &PgPool, item: &AssignedWorkItem, error: &str) -> R
 }
 
 async fn mark_failed_and_release(pg: &PgPool, item: &AssignedWorkItem, error: &str) -> Result<()> {
+    let error = crate::error_class::classify(error);
     let mut tx = pg.begin().await?;
     sqlx::query(
         "UPDATE work_items
@@ -2379,7 +2432,7 @@ async fn mark_failed_and_release(pg: &PgPool, item: &AssignedWorkItem, error: &s
             AND status NOT IN ('done', 'merged', 'cancelled')",
     )
     .bind(item.work_item_id)
-    .bind(truncate_for_db(error))
+    .bind(truncate_for_db(&error))
     .execute(&mut *tx)
     .await?;
     sqlx::query(
@@ -2396,7 +2449,7 @@ async fn mark_failed_and_release(pg: &PgPool, item: &AssignedWorkItem, error: &s
     // Escalation ladder stage 3: the fleet (local + cloud) couldn't build this
     // after the full retry budget — tell the operator. Best-effort; a notify
     // failure never fails the dispatch.
-    notify_operator_task_failed(pg, item, error).await;
+    notify_operator_task_failed(pg, item, &error).await;
     Ok(())
 }
 
@@ -2568,6 +2621,7 @@ async fn release_slot_and_lease_tx(
 }
 
 async fn mark_worktree_failed(pg: &PgPool, work_item_id: Uuid, error: &str) -> Result<()> {
+    let error = crate::error_class::classify(error);
     sqlx::query(
         "UPDATE work_item_worktrees
             SET status = 'failed'
@@ -2584,7 +2638,7 @@ async fn mark_worktree_failed(pg: &PgPool, work_item_id: Uuid, error: &str) -> R
           WHERE id = $1",
     )
     .bind(work_item_id)
-    .bind(truncate_for_db(error))
+    .bind(truncate_for_db(&error))
     .execute(pg)
     .await?;
     Ok(())
@@ -2732,7 +2786,12 @@ async fn record_dispatch_interaction(
             "error".to_string(),
             // Full anyhow chain ({:#}) so the real cause is captured, not just
             // the top-level wrapper (e.g. "fleet_oneshot round 1").
-            Some(format!("{e:#}").chars().take(2000).collect::<String>()),
+            Some(
+                crate::error_class::classify(format!("{e:#}"))
+                    .chars()
+                    .take(2000)
+                    .collect::<String>(),
+            ),
             0,
             0,
             false,
@@ -2916,6 +2975,18 @@ async fn run_ff_dispatch(
     item: &AssignedWorkItem,
     worktree: &WorktreeRecord,
 ) -> Result<(String, Output)> {
+    let ladder = match ff_routing_policy::load_ladder(pg, "coding").await {
+        Ok(ladder) if !ladder.is_empty() => ladder,
+        Ok(_) => {
+            warn!("run_ff_dispatch: coding ladder empty; using legacy routing");
+            Vec::new()
+        }
+        Err(error) => {
+            warn!(%error, "run_ff_dispatch: failed to load coding ladder; using legacy routing");
+            Vec::new()
+        }
+    };
+    let ladder_configured = !ladder.is_empty();
     let mut prompt = dispatch_prompt(item);
     // Prepend a Cortex context pack: the exact existing symbols this task touches,
     // pulled from the shared code graph, so the agent starts there instead of
@@ -2963,7 +3034,21 @@ async fn run_ff_dispatch(
     // straight to the capable cloud CLI from attempt 0 instead of burning a
     // wedge-prone local attempt first.
     let mut lane1_failed_or_timed_out = false;
-    if use_local_lane(item.attempts, lane1_breaker_open, item.prefers_cloud_lane()) {
+    if (!ladder_configured
+        && use_local_lane(
+            &[ff_routing_policy::Rung::LocalModel("legacy".into())],
+            item.attempts,
+            lane1_breaker_open,
+            item.prefers_cloud_lane(),
+        ))
+        || (ladder_configured
+            && use_local_lane(
+                &ladder,
+                item.attempts,
+                lane1_breaker_open,
+                item.prefers_cloud_lane(),
+            ))
+    {
         // Bound Lane 1 with a hard timeout so a hung local codegen harness fails
         // OVER to the cloud backstop instead of wedging the slot forever (see
         // LANE1_TIMEOUT_SECS). Without this, a hang here stalls the build while
@@ -2974,7 +3059,9 @@ async fn run_ff_dispatch(
                 pg,
                 &worktree.worktree_path,
                 &prompt,
-                None,
+                ladder_configured
+                    .then(|| local_model_for_attempt(&ladder, item.attempts))
+                    .flatten(),
                 4,
                 Some(item.work_item_id),
             ),
@@ -3013,7 +3100,7 @@ async fn run_ff_dispatch(
                 );
                 let _ = sqlx::query(
                     "UPDATE work_items SET status = 'done', completed_at = NOW(), \
-                        last_error = 'already implemented (model verified: feature exists + tests pass)' \
+                        last_error = 'class=already_implemented: already implemented (model verified: feature exists + tests pass)' \
                       WHERE id = $1 AND status NOT IN ('merged')",
                 )
                 .bind(item.work_item_id)
@@ -3090,12 +3177,14 @@ async fn run_ff_dispatch(
     // `prefers_cloud_lane` still get one local-480b shot before cloud).
     let lane15_trigger =
         lane1_failed_or_timed_out || complexity_at_least_moderate(&item.complexity);
-    if should_attempt_lane15(
-        lane1_failed_or_timed_out,
-        complexity_at_least_moderate(&item.complexity),
-        lane15_enabled,
-        lane15_breaker_open,
-    ) {
+    if (!ladder_configured || ladder_has_ring(&ladder))
+        && should_attempt_lane15(
+            lane1_failed_or_timed_out,
+            complexity_at_least_moderate(&item.complexity),
+            lane15_enabled,
+            lane15_breaker_open,
+        )
+    {
         if let Some((backend, output)) = dispatch_to_480b(pg, item, worktree, &prompt).await {
             return Ok((backend, output));
         }
@@ -3160,6 +3249,8 @@ async fn run_ff_dispatch(
     // retries on this attempt tier); the failover loop below still walks the
     // rest of the list on error, and falls back to claude when the rotation
     // pick isn't in this node's dispatchable set.
+    let ladder_ordered =
+        ladder_configured && order_cloud_backends_from_ladder(&mut backends, &ladder);
     let mut policy = ff_routing_policy::PolicyConfig::default();
     // Order matters: codex/kimi front the rotation, claude LAST (operator
     // directive 2026-07-23) — claude runs on ONE shared OAuth login that every
@@ -3173,18 +3264,20 @@ async fn run_ff_dispatch(
     // engages) burned its whole attempt budget on one broken backend (22×
     // "backend claude produced no diff" on the 2026-07-23 requeue wave).
     // With attempts in the index, each retry fronts the NEXT backend.
-    let rotation_index = item
-        .work_item_id
-        .as_u128()
-        .wrapping_add(item.attempts.max(0) as u128);
-    let pick = BUILDER_ROTATION[(rotation_index % BUILDER_ROTATION.len() as u128) as usize];
-    let preferred = if backends.iter().any(|b| b == pick) {
-        pick
-    } else {
-        "claude"
-    };
-    policy.preferred_cloud_backstop = Some(preferred.to_string());
-    ff_routing_policy::promote_cloud_backstop(&mut backends, &policy);
+    if !ladder_ordered {
+        let rotation_index = item
+            .work_item_id
+            .as_u128()
+            .wrapping_add(item.attempts.max(0) as u128);
+        let pick = BUILDER_ROTATION[(rotation_index % BUILDER_ROTATION.len() as u128) as usize];
+        let preferred = if backends.iter().any(|b| b == pick) {
+            pick
+        } else {
+            "claude"
+        };
+        policy.preferred_cloud_backstop = Some(preferred.to_string());
+        ff_routing_policy::promote_cloud_backstop(&mut backends, &policy);
+    }
     let computer_id = item.computer_id;
     let forced_backend = primary_or_default_backend(&backends);
     let mut attempted_backend = false;
@@ -4988,10 +5081,11 @@ mod tests {
         affected_crate_manifests, agent_output_tail, backend_failed_without_output,
         builder_excludes_480b, classify_dispatch_outcome, command_display,
         complexity_at_least_moderate, default_clone_path, dispatch_budget_for_host,
-        dispatch_prompt, expand_home, is_build_timeout, mirror_repo_url, order_cloud_reviewers,
-        parse_cli_tokens, primary_or_default_backend, quick_empty_success_is_provider_failure,
-        repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
-        same_model_family, should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
+        dispatch_prompt, expand_home, is_build_timeout, local_model_for_attempt, mirror_repo_url,
+        order_cloud_backends_from_ladder, order_cloud_reviewers, parse_cli_tokens,
+        primary_or_default_backend, quick_empty_success_is_provider_failure, repo_cache_path,
+        repo_slug, retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
+        should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
         task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
     };
     use std::path::PathBuf;
@@ -5220,23 +5314,45 @@ mod tests {
 
     #[test]
     fn use_local_lane_gives_mechanical_local_tries_then_cloud() {
+        let ladder = [
+            ff_routing_policy::Rung::LocalModel("devstral".into()),
+            ff_routing_policy::Rung::LocalModel("glm".into()),
+            ff_routing_policy::Rung::Ring("qwen-480b".into()),
+            ff_routing_policy::Rung::CloudBackend("codex".into()),
+            ff_routing_policy::Rung::CloudBackend("kimi".into()),
+            ff_routing_policy::Rung::CloudBackend("claude".into()),
+        ];
         // Mechanical (prefers_cloud=false), breaker closed: local lane is heartbeat-safe now
         // (#62/#792 moved blocking work off the async runtime), so it stays local for
         // LOCAL_LANE_MAX_TRIES=3 attempts before escalating to cloud.
         assert!(
-            use_local_lane(0, false, false),
+            use_local_lane(&ladder, 0, false, false),
             "first attempt tries cheap local"
         );
-        assert!(use_local_lane(1, false, false), "2nd attempt still local");
-        assert!(use_local_lane(2, false, false), "3rd attempt still local");
         assert!(
-            !use_local_lane(3, false, false),
+            use_local_lane(&ladder, 1, false, false),
+            "2nd attempt still local"
+        );
+        assert!(
+            use_local_lane(&ladder, 2, false, false),
+            "3rd attempt still local"
+        );
+        assert!(
+            !use_local_lane(&ladder, 3, false, false),
             "past LOCAL_LANE_MAX_TRIES → cloud"
         );
         // A complexity-routed (complex or multi-file-heavy) task never touches the local lane.
-        assert!(!use_local_lane(0, false, true));
+        assert_eq!(local_model_for_attempt(&ladder, 0), Some("devstral"));
+        assert_eq!(local_model_for_attempt(&ladder, 1), Some("glm"));
+        assert_eq!(local_model_for_attempt(&ladder, 2), Some("devstral"));
+        assert_eq!(local_model_for_attempt(&ladder, 3), None);
+        assert!(!use_local_lane(&ladder, 0, false, true));
         // Open local-codegen breaker → skip local even on attempt 0.
-        assert!(!use_local_lane(0, true, false));
+        assert!(!use_local_lane(&ladder, 0, true, false));
+
+        let mut backends = vec!["claude".into(), "codex".into(), "kimi".into()];
+        assert!(order_cloud_backends_from_ladder(&mut backends, &ladder));
+        assert_eq!(backends, ["codex", "kimi", "claude"]);
     }
 
     #[tokio::test]

@@ -405,6 +405,26 @@ impl LeaderTick {
                                         );
                                     }
 
+                                    // Evidence-driven recursive improvement loop.
+                                    // The module's durable daily claim keeps this
+                                    // cheap on the 15-second election cadence.
+                                    let self_improve_pool = self.pg.clone();
+                                    let self_improve_node = self.my_name.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(err) = crate::self_improve::tick(
+                                            &self_improve_pool,
+                                            &self_improve_node,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                node = %self_improve_node,
+                                                error = %err,
+                                                "self_improve tick failed"
+                                            );
+                                        }
+                                    });
+
                                     // V122+: feed daemon log errors into the
                                     // self-heal queue so recurring runtime
                                     // patterns are not lost in rotated log files.

@@ -253,7 +253,7 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
                 engine: Some(engine),
                 response_text,
                 outcome: new_status.to_string(),
-                error_text: task_error.clone(),
+                error_text: task_error.as_deref().map(crate::error_class::classify),
                 ..Default::default()
             };
             if let Err(e) = ff_db::pg_record_interaction(pool, &rec).await {

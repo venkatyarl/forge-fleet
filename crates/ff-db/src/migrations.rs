@@ -1188,6 +1188,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "ff_interactions_episodic_tagging",
         sql: schema::SCHEMA_V250_FF_INTERACTIONS_EPISODIC_TAGGING,
     },
+    PgMigration {
+        version: 251,
+        name: "routing_ladders",
+        sql: schema::SCHEMA_V251_ROUTING_LADDERS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -2275,6 +2280,87 @@ mod tests {
         assert_eq!(defaults.0, serde_json::json!([]));
         assert_eq!(defaults.1, serde_json::json!([]));
         assert_eq!(defaults.2, None);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v251_creates_and_seeds_routing_ladders() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on a fresh database");
+
+        let rows: Vec<(String, i32, String, String)> = sqlx::query_as(
+            "SELECT workload, position, rung_kind, target
+               FROM routing_ladders
+              ORDER BY CASE workload
+                         WHEN 'coding' THEN 1
+                         WHEN 'research' THEN 2
+                         WHEN 'vision' THEN 3
+                         WHEN 'embedding' THEN 4
+                       END,
+                       position",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read seeded routing ladders");
+
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "coding".into(),
+                    1,
+                    "local_model".into(),
+                    "devstral-small-2-24b".into()
+                ),
+                (
+                    "coding".into(),
+                    2,
+                    "local_model".into(),
+                    "glm-4.5-air".into()
+                ),
+                ("coding".into(), 3, "ring".into(), "qwen3-coder-480b".into()),
+                ("coding".into(), 4, "cloud_backend".into(), "codex".into()),
+                ("coding".into(), 5, "cloud_backend".into(), "kimi".into()),
+                ("coding".into(), 6, "cloud_backend".into(), "claude".into()),
+                (
+                    "research".into(),
+                    1,
+                    "local_model".into(),
+                    "lucy-1-7b".into()
+                ),
+                (
+                    "research".into(),
+                    2,
+                    "local_model".into(),
+                    "deepseek-v3".into()
+                ),
+                (
+                    "research".into(),
+                    3,
+                    "local_model".into(),
+                    "qwen36-35b-a3b".into()
+                ),
+                ("research".into(), 4, "cloud_backend".into(), "codex".into()),
+                (
+                    "vision".into(),
+                    1,
+                    "local_model".into(),
+                    "smolvlm2-500m-video".into()
+                ),
+                (
+                    "vision".into(),
+                    2,
+                    "local_model".into(),
+                    "qwen3-vl-30b-a3b".into()
+                ),
+                ("embedding".into(), 1, "local_model".into(), "bge-m3".into()),
+            ]
+        );
 
         drop_temp_db(admin, pool, &db_name).await;
     }
