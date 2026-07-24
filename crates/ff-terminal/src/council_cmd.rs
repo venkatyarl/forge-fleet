@@ -565,6 +565,7 @@ async fn log_council(
     let cost_usd = ff_agent::llm_attribution::cost_usd(&engine, tokens_in, tokens_out);
     let rec = ff_db::InteractionRecord {
         channel: channel.to_string(),
+        purpose: Some("council".to_string()),
         request_text: request.chars().take(16000).collect(),
         request_meta: serde_json::json!({ "tokens_estimated": tokens_estimated }),
         engine: Some(engine),

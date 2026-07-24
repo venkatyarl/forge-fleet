@@ -1181,6 +1181,13 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "notifications",
         sql: schema::SCHEMA_V245_NOTIFICATIONS,
     },
+    // 246-249 are reserved by in-flight branches (Autopilot / ErrorMiner /
+    // mesh-repair); gaps are fine, collisions are not.
+    PgMigration {
+        version: 250,
+        name: "ff_interactions_episodic_tagging",
+        sql: schema::SCHEMA_V250_FF_INTERACTIONS_EPISODIC_TAGGING,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

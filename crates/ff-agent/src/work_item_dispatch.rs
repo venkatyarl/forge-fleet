@@ -1102,6 +1102,7 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
                         &fix_prompt,
                         Some(LANE15_480B_MODEL_HINT),
                         2,
+                        Some(item.work_item_id),
                     ),
                 )
                 .await;
@@ -1800,7 +1801,7 @@ async fn run_in_place_review(
     if !builder_excludes_480b(builder) {
         if let Ok(permit) = GATE_480B.try_acquire() {
             let started_at = chrono::Utc::now();
-            let verdict = review_via_480b_inplace(pg, &prompt).await;
+            let verdict = review_via_480b_inplace(pg, item.work_item_id, &prompt).await;
             drop(permit);
             match verdict {
                 Ok((approved, reason, reviewer_computer, reviewer_port)) => {
@@ -1861,6 +1862,7 @@ async fn run_in_place_review(
             Ok(res) if res.exit_code == 0 && !res.stdout.trim().is_empty() => {
                 record_review_interaction(
                     pg,
+                    item.work_item_id,
                     &backend,
                     &prompt,
                     &res.stdout,
@@ -1902,6 +1904,7 @@ async fn run_in_place_review(
 /// failed over to a weaker model — never trusted as a 480B verdict).
 async fn review_via_480b_inplace(
     pg: &PgPool,
+    work_item_id: Uuid,
     prompt: &str,
 ) -> Result<(bool, String, String, Option<i32>)> {
     let resp =
@@ -1917,6 +1920,7 @@ async fn review_via_480b_inplace(
     }
     record_review_interaction(
         pg,
+        work_item_id,
         &resp.model,
         prompt,
         &resp.text,
@@ -1997,6 +2001,7 @@ async fn run_workspace_cargo_test(worktree_path: &Path) -> String {
 /// data — the point of routing review through ff). Never fails the dispatch.
 async fn record_review_interaction(
     pg: &PgPool,
+    work_item_id: Uuid,
     engine: &str,
     prompt: &str,
     response: &str,
@@ -2009,6 +2014,8 @@ async fn record_review_interaction(
         response_text: response.chars().take(16000).collect(),
         latency_ms,
         outcome: "success".to_string(),
+        work_item_id: Some(work_item_id),
+        purpose: Some("review".to_string()),
         ..Default::default()
     };
     if let Err(e) = ff_db::pg_record_interaction(pg, &rec).await {
@@ -2763,6 +2770,8 @@ async fn record_dispatch_interaction(
         error_signature,
         worker_name: Some(worker_name.to_string()),
         endpoint: Some(format!("ff cli {backend}")),
+        work_item_id: Some(item.work_item_id),
+        purpose: Some("build".to_string()),
         ..Default::default()
     };
     if let Err(e) = ff_db::pg_record_interaction(pg, &rec).await {
@@ -2819,6 +2828,7 @@ async fn dispatch_to_480b(
             prompt,
             Some(LANE15_480B_MODEL_HINT),
             1,
+            Some(item.work_item_id),
         ),
     )
     .await;
@@ -2959,7 +2969,14 @@ async fn run_ff_dispatch(
         // the outer heartbeat keeps the lease alive — unrecoverable.
         let lane1 = tokio::time::timeout(
             Duration::from_secs(LANE1_TIMEOUT_SECS),
-            crate::codegen_apply::codegen_apply(pg, &worktree.worktree_path, &prompt, None, 4),
+            crate::codegen_apply::codegen_apply(
+                pg,
+                &worktree.worktree_path,
+                &prompt,
+                None,
+                4,
+                Some(item.work_item_id),
+            ),
         )
         .await;
         // Feed every Lane-1 outcome back into the breaker so it opens after a run

@@ -7,6 +7,12 @@
 //! the assistant text plus the endpoint/worker/model that served it (so callers
 //! can attribute the turn in `ff_interactions`).
 //!
+//! Execution-only: this module never inserts into `ff_interactions` itself.
+//! Callers holding the semantic context do the logging — and callers with a
+//! work item in scope stamp the V250 episodic tags (`work_item_id`, `purpose`)
+//! on the row (see `codegen_apply::round_interaction`,
+//! `work_item_dispatch::record_review_interaction`).
+//!
 //! Council verdict 2026-06-19 (codex decisive): put the shared primitive in
 //! ff-agent (the right dependency direction — ff-terminal & ff-mcp both depend on
 //! it) rather than forking an inline POST or making ff-terminal depend on ff-mcp.

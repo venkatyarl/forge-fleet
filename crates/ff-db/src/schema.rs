@@ -12135,6 +12135,25 @@ CREATE INDEX IF NOT EXISTS idx_notifications_undismissed
     ON notifications (created_at) WHERE NOT is_dismissed;
 "#;
 
+/// Memory-v2 M2 — episodic tagging for `ff_interactions`. Two nullable
+/// columns turn the flat interaction log into replayable EPISODES (the
+/// reflexion substrate):
+///   - `work_item_id` — the work item this turn served, when the caller had
+///     one in scope (dispatch builds, PR reviews). No FK: interactions must
+///     outlive work-item deletion, and ff-mc owns that table anyway.
+///   - `purpose` — coarse tag for what the turn was FOR (build | review |
+///     decompose | research | council | dreamer | ...), orthogonal to
+///     `channel` (which records WHERE the turn came from).
+/// Backfill is intentionally not required — old rows stay NULL.
+pub const SCHEMA_V250_FF_INTERACTIONS_EPISODIC_TAGGING: &str = r#"
+ALTER TABLE ff_interactions
+    ADD COLUMN IF NOT EXISTS work_item_id UUID,
+    ADD COLUMN IF NOT EXISTS purpose      TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
+    ON ff_interactions (work_item_id, ts) WHERE work_item_id IS NOT NULL;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

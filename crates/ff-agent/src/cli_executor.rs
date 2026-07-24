@@ -17,6 +17,12 @@
 //! call (~1-3s) and lossy structured output (each CLI's JSON shape is
 //! different; we return raw text by default and let callers parse).
 //!
+//! Execution-only: this module never inserts into `ff_interactions` itself.
+//! Callers holding the semantic context do the logging — and callers with a
+//! work item in scope stamp the V250 episodic tags (`work_item_id`, `purpose`)
+//! on the row (see `work_item_dispatch::record_dispatch_interaction`,
+//! `work_item_merge_drain::record_review_interaction`).
+//!
 //! Authentication is handled by the CLI itself, reading
 //! `~/.<vendor>/credentials.json` etc. Layer 4 (PR-A2's
 //! `oauth_distributor`) ensures every member has the centralized cred

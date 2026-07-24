@@ -619,6 +619,7 @@ impl ResearchSession {
             // log (#447) can't capture. Best-effort; never fails the run.
             let rec = ff_db::InteractionRecord {
                 channel: "research_subtask".to_string(),
+                purpose: Some("research".to_string()),
                 request_text: row.sub_question.chars().take(16000).collect(),
                 engine: Some(crate::llm_attribution::engine_label(&row.assigned_model)),
                 response_text: result.output.chars().take(16000).collect(),
@@ -679,6 +680,7 @@ impl ResearchSession {
         };
         let rec = ff_db::InteractionRecord {
             channel: "research".to_string(),
+            purpose: Some("research".to_string()),
             request_text: self.config.query.chars().take(16000).collect(),
             engine: Some(crate::llm_attribution::engine_label(
                 &self.config.planner_model,
@@ -906,6 +908,7 @@ impl ResearchSession {
         };
         let rec = ff_db::InteractionRecord {
             channel: "research".to_string(),
+            purpose: Some("research".to_string()),
             request_text: query.chars().take(16000).collect(),
             engine: Some(crate::llm_attribution::engine_label(
                 &session.config.planner_model,
