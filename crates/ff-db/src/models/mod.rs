@@ -1,3 +1,4 @@
+pub mod error_miner;
 pub mod fabric_pairs;
 pub mod fleet_node;
 pub mod memory;
@@ -7,6 +8,7 @@ pub mod software;
 pub mod task;
 pub mod work_item;
 
+pub use error_miner::{ErrorSignature, FleetLogDigest};
 pub use fabric_pairs::FabricPair;
 pub use fleet_node::FleetNode;
 pub use memory::{MemoryEdge, MemoryNode};
