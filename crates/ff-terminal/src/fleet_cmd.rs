@@ -204,6 +204,49 @@ pub async fn handle_fleet_unquarantine(
     Ok(())
 }
 
+/// `ff fleet drain <computer>` — take a computer out of the sub-agent work
+/// rotation without stopping its daemon.
+///
+/// Unlike `quarantine` (which stops daemons over SSH and excludes the node
+/// from leader election / LLM routing), drain only touches `sub_agents` and
+/// in-flight `work_items`: it disables every sub-agent slot on the computer
+/// via [`ff_agent::ha::node_drain::drain_node`] so the scheduler stops
+/// assigning it new work, and releases anything it currently has
+/// claimed/building back to `ready` attempt-neutrally.
+pub async fn handle_fleet_drain(pool: &sqlx::PgPool, computer: &str, yes: bool) -> Result<()> {
+    if !yes {
+        eprintln!(
+            "{YELLOW}⚠ drain will disable all sub-agent slots on '{computer}' and release its in-flight work items back to 'ready'.{RESET}"
+        );
+        eprintln!("  Pass --yes to proceed.");
+        std::process::exit(1);
+    }
+
+    let computer_id: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT id FROM computers WHERE LOWER(name) = LOWER($1)")
+            .bind(computer)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("look up computer '{computer}': {e}"))?;
+    let computer_id =
+        computer_id.ok_or_else(|| anyhow::anyhow!("no computer named '{computer}'"))?;
+
+    println!("{CYAN}▶ ff fleet drain {computer}{RESET}");
+    let result = ff_agent::ha::node_drain::drain_node(pool, computer_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("drain: {e}"))?;
+
+    println!(
+        "  {GREEN}✓{RESET} disabled {} sub-agent slot(s)",
+        result.sub_agents_disabled
+    );
+    println!(
+        "  {GREEN}✓{RESET} released {} in-flight work item(s) back to 'ready'",
+        result.work_items_released
+    );
+    Ok(())
+}
+
 /// `ff fleet upgrade <software_id>` — dispatch the software's upgrade_playbook
 /// across the fleet via the deferred task queue.
 ///
@@ -3868,6 +3911,9 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         }
         FleetCommand::Unquarantine { computer, yes } => {
             handle_fleet_unquarantine(&pool, &computer, yes).await?;
+        }
+        FleetCommand::Drain { computer, yes } => {
+            handle_fleet_drain(&pool, &computer, yes).await?;
         }
         FleetCommand::Upgrade {
             software_id,

@@ -1918,6 +1918,20 @@ enum FleetCommand {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
+    /// Take a computer out of the sub-agent work rotation without stopping
+    /// its daemon or affecting leader election / LLM routing.
+    ///
+    /// Disables every `sub_agents` slot on the computer (so scheduler claim
+    /// queries stop assigning it new work items) and releases any work item
+    /// it currently has claimed/building back to `ready`, attempt-neutrally,
+    /// so another node picks it up immediately. Idempotent — draining an
+    /// already-drained node is a no-op.
+    Drain {
+        /// Computer name (e.g. "sophie").
+        computer: String,
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
     /// Upgrade a software entry across the fleet using its upgrade_playbook.
     ///
     /// Looks up every (computer, software_id) row in computer_software,
