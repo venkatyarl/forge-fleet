@@ -406,6 +406,14 @@ enum Command {
         /// drives this council, e.g. Claude).
         #[arg(long)]
         no_synthesis: bool,
+        /// Run a second, adversarial deliberation round: each member
+        /// critiques the others' round-1 answers (identities blinded to
+        /// "Member A"/"Member B"/…), critiques are distributed back to the
+        /// critiqued member (still blinded) for a counter-argument, and the
+        /// chairman synthesizes from the counter-arguments where given.
+        /// Needs 2+ members to have answered; otherwise it's skipped.
+        #[arg(long)]
+        adversarial_mode: bool,
     },
     /// Run with supervisor — auto-detect failures, fix, and retry
     Supervise {
@@ -4201,6 +4209,7 @@ async fn main() -> Result<()> {
             timeout,
             chairman,
             no_synthesis,
+            adversarial_mode,
         }) => {
             return council_cmd::handle_council(
                 question.clone(),
@@ -4208,6 +4217,7 @@ async fn main() -> Result<()> {
                 *timeout,
                 chairman.clone(),
                 *no_synthesis,
+                *adversarial_mode,
             )
             .await;
         }

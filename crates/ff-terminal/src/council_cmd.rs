@@ -114,6 +114,243 @@ fn parse_member_answer(raw: &str) -> MemberAnswer {
     }
 }
 
+/// One member's adversarial critique of another (blinded) member's round-1
+/// answer, as returned inside a [`CritiqueResponse`].
+#[derive(Debug, Clone, serde::Deserialize)]
+struct CritiqueEntry {
+    /// The anonymized label of the answer being critiqued, e.g. "Member A".
+    member: String,
+    critique: String,
+}
+
+/// One member's full set of critiques against the other members' blinded
+/// round-1 answers.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct CritiqueResponse {
+    #[serde(default)]
+    critiques: Vec<CritiqueEntry>,
+}
+
+/// Parses a member's critique-round response. Returns an empty list (rather
+/// than falling back to raw text, unlike [`parse_member_answer`]) when the
+/// member didn't return valid structured critiques — a critique free-text
+/// blob can't be attributed back to the member it targets, so it's dropped.
+fn parse_critique_response(raw: &str) -> Vec<CritiqueEntry> {
+    extract_json_object(raw)
+        .and_then(|json| serde_json::from_str::<CritiqueResponse>(json).ok())
+        .map(|parsed| parsed.critiques)
+        .unwrap_or_default()
+}
+
+/// Full record of an adversarial council session's second round: the blind
+/// label assigned to each member, the critiques each member raised against
+/// the others' (blinded) round-1 answers, and the counter-argument each
+/// critiqued member gave in response. This is the "council state" the
+/// adversarial round tracks — printed to the operator and logged to
+/// `ff_interactions` alongside round 1.
+struct AdversarialRoundState {
+    /// `member name -> blind label` (e.g. "codex" -> "Member A").
+    blind_labels: Vec<(String, String)>,
+    /// `critiquing member -> critiques they raised` (targets named by blind label).
+    critiques: Vec<(String, Vec<CritiqueEntry>)>,
+    /// `member name -> counter-argument`, present only for members who received
+    /// at least one critique.
+    counter_arguments: Vec<(String, MemberAnswer)>,
+}
+
+/// Assigns a deterministic blind label ("Member A", "Member B", …) to the
+/// member at `index` in round-1 answer order, so the critique round judges
+/// arguments without knowing which vendor/model produced them.
+fn blind_label(index: usize) -> String {
+    format!("Member {}", (b'A' + (index % 26) as u8) as char)
+}
+
+/// Builds one member's critique-round prompt: the question plus every OTHER
+/// member's round-1 answer under its blind label (the member's own answer is
+/// excluded — critiquing yourself isn't useful, and revealing which label is
+/// "you" would partially deblind the round).
+fn build_critique_prompt(
+    question: &str,
+    member: &str,
+    answers: &[(String, MemberAnswer)],
+    blind_labels: &[(String, String)],
+) -> String {
+    let mut prompt = "You are a COUNCIL MEMBER in an ADVERSARIAL CRITIQUE round. Below are the \
+         other members' answers to the question, anonymized — you are not told which model or \
+         vendor gave which answer, and your own answer is excluded. Critique each one adversarially: \
+         call out weaknesses, unstated assumptions, gaps, or errors. Respond with ONLY a JSON object \
+         (no markdown fences, no prose outside it) with exactly this key: `critiques` (array of \
+         objects, each with `member` — the exact anonymized label being critiqued, e.g. \"Member \
+         A\" — and `critique` — your adversarial critique of that answer).\n\n"
+        .to_string();
+    prompt.push_str(&format!("=== QUESTION ===\n{question}\n"));
+    for (other_member, ans) in answers {
+        if other_member == member {
+            continue;
+        }
+        let label = blind_labels
+            .iter()
+            .find(|(m, _)| m == other_member)
+            .map(|(_, l)| l.as_str())
+            .unwrap_or("Member ?");
+        prompt.push_str(&format!("\n=== {label} ===\n{}\n", ans.answer));
+    }
+    prompt
+}
+
+/// Builds the counter-argument prompt distributed back to a critiqued member:
+/// their own original answer plus the (still-anonymized — critiquer identity
+/// withheld) critiques raised against it, asking them to defend or revise.
+fn build_counter_prompt(question: &str, own_answer: &MemberAnswer, critiques: &[String]) -> String {
+    let mut prompt = format!(
+        "You are a COUNCIL MEMBER responding to ADVERSARIAL CRITIQUES of your own round-1 answer. \
+         Other council members raised the critiques below against your answer — their identities are \
+         hidden from you, just as yours was hidden from them. Defend your position where the critique \
+         doesn't hold, concede and revise where it does — give your honest, updated answer. Respond \
+         with ONLY a JSON object (no markdown fences, no prose outside it) with exactly these keys: \
+         `answer` (string — your revised or defended recommendation and reasoning), `confidence` \
+         (number 0.0-1.0), `evidence` (array of strings).\n\n\
+         === QUESTION ===\n{question}\n\n=== YOUR ROUND-1 ANSWER ===\n{}\n\n\
+         === CRITIQUES OF YOUR ANSWER ===\n",
+        own_answer.answer
+    );
+    if critiques.is_empty() {
+        prompt.push_str("(no critiques were raised)\n");
+    } else {
+        for c in critiques {
+            prompt.push_str(&format!("- {c}\n"));
+        }
+    }
+    prompt
+}
+
+/// Runs the adversarial second round: every member critiques the others'
+/// blinded round-1 answers in parallel, then every critiqued member gets its
+/// (still blinded) critiques back and produces a counter-argument in
+/// parallel. Requires 2+ round-1 answers — a single answer has nothing to be
+/// critiqued against. Every dispatch is printed and logged via
+/// [`log_council`] just like round 1.
+async fn run_adversarial_round(
+    question: &str,
+    answers: &[(String, MemberAnswer)],
+    pool: Option<&PgPool>,
+    timeout: Option<Duration>,
+) -> AdversarialRoundState {
+    let blind_labels: Vec<(String, String)> = answers
+        .iter()
+        .enumerate()
+        .map(|(i, (member, _))| (member.clone(), blind_label(i)))
+        .collect();
+
+    eprintln!(
+        "\n{CYAN}▶ Adversarial round: {} member(s) critiquing blinded answers…{RESET}",
+        answers.len()
+    );
+
+    let mut handles = Vec::with_capacity(answers.len());
+    for (member, _) in answers {
+        let member = member.clone();
+        let prompt = build_critique_prompt(question, &member, answers, &blind_labels);
+        let pool = pool.cloned();
+        handles.push(tokio::spawn(async move {
+            let raw = dispatch_member(&member, &prompt, pool.as_ref(), timeout).await;
+            (member, prompt, raw)
+        }));
+    }
+
+    let mut critiques: Vec<(String, Vec<CritiqueEntry>)> = Vec::with_capacity(answers.len());
+    for handle in handles {
+        let (member, prompt, raw) = match handle.await {
+            Ok(triple) => triple,
+            Err(e) => {
+                eprintln!("{YELLOW}⚠ a critique-round task panicked: {e}{RESET}");
+                continue;
+            }
+        };
+        log_council(pool, &member, "council_critique", &prompt, &raw).await;
+        match raw.answer {
+            Some(answer) => {
+                let entries = parse_critique_response(&answer);
+                println!(
+                    "\n{CYAN}═══════════ {member} critiques ═══════════{RESET}\n{}",
+                    if entries.is_empty() {
+                        "(no structured critiques returned)".to_string()
+                    } else {
+                        entries
+                            .iter()
+                            .map(|e| format!("[{}] {}", e.member, e.critique))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                );
+                critiques.push((member, entries));
+            }
+            None => eprintln!(
+                "{YELLOW}⚠ {member} returned no critique{RESET}{}",
+                raw.error.map(|e| format!("\n{e}")).unwrap_or_default()
+            ),
+        }
+    }
+
+    // Distribute critiques back to the critiqued member (by blind label) for
+    // a counter-argument. Skip members nobody critiqued — nothing to answer.
+    eprintln!("\n{CYAN}▶ Distributing critiques back for counter-arguments…{RESET}");
+    let mut counter_handles = Vec::with_capacity(answers.len());
+    for (member, own_answer) in answers {
+        let Some((_, label)) = blind_labels.iter().find(|(m, _)| m == member) else {
+            continue;
+        };
+        let targeted: Vec<String> = critiques
+            .iter()
+            .flat_map(|(_, entries)| entries.iter())
+            .filter(|e| &e.member == label)
+            .map(|e| e.critique.clone())
+            .collect();
+        if targeted.is_empty() {
+            continue;
+        }
+        let member = member.clone();
+        let prompt = build_counter_prompt(question, own_answer, &targeted);
+        let pool = pool.cloned();
+        counter_handles.push(tokio::spawn(async move {
+            let raw = dispatch_member(&member, &prompt, pool.as_ref(), timeout).await;
+            (member, prompt, raw)
+        }));
+    }
+
+    let mut counter_arguments: Vec<(String, MemberAnswer)> = Vec::new();
+    for handle in counter_handles {
+        let (member, prompt, raw) = match handle.await {
+            Ok(triple) => triple,
+            Err(e) => {
+                eprintln!("{YELLOW}⚠ a counter-argument task panicked: {e}{RESET}");
+                continue;
+            }
+        };
+        log_council(pool, &member, "council_counter", &prompt, &raw).await;
+        match raw.answer {
+            Some(answer) => {
+                let parsed = parse_member_answer(&answer);
+                println!(
+                    "\n{CYAN}═══════════ {member} counter-argument ═══════════{RESET}\n{}\n{CYAN}(confidence: {:.2}){RESET}",
+                    parsed.answer, parsed.confidence
+                );
+                counter_arguments.push((member, parsed));
+            }
+            None => eprintln!(
+                "{YELLOW}⚠ {member} returned no counter-argument{RESET}{}",
+                raw.error.map(|e| format!("\n{e}")).unwrap_or_default()
+            ),
+        }
+    }
+
+    AdversarialRoundState {
+        blind_labels,
+        critiques,
+        counter_arguments,
+    }
+}
+
 /// The chairman's structured verdict: a decisive consensus plus explicit,
 /// attributable disagreements and unique findings rather than a blended
 /// summary.
@@ -245,6 +482,7 @@ pub async fn handle_council(
     timeout_secs: Option<u64>,
     chairman: Option<String>,
     no_synthesis: bool,
+    adversarial_mode: bool,
 ) -> Result<()> {
     let members: Vec<String> = members_csv
         .split(',')
@@ -341,6 +579,42 @@ pub async fn handle_council(
         members.len()
     );
 
+    // Adversarial second round: members critique each other's blinded round-1
+    // answers, critiques are distributed back to the critiqued member (still
+    // blinded) for a counter-argument, and the counter-argument (where given)
+    // replaces that member's round-1 answer for everything downstream —
+    // synthesis judges the deliberated position, not the first draft. Needs
+    // 2+ answers; a lone answer has nothing to be critiqued against.
+    let mut final_answers = answers.clone();
+    if adversarial_mode {
+        if ok < 2 {
+            eprintln!(
+                "{YELLOW}⚠ adversarial mode needs 2+ answering members — skipping (only {ok}).{RESET}"
+            );
+        } else {
+            let state = run_adversarial_round(&question, &answers, pool.as_ref(), timeout).await;
+            eprintln!(
+                "\n{GREEN}✓ adversarial round complete: {} critique set(s), {} counter-argument(s).{RESET}",
+                state.critiques.len(),
+                state.counter_arguments.len()
+            );
+            eprintln!("{CYAN}  blind labels: {}{RESET}", {
+                let mut labels: Vec<String> = state
+                    .blind_labels
+                    .iter()
+                    .map(|(member, label)| format!("{label}={member}"))
+                    .collect();
+                labels.sort();
+                labels.join(", ")
+            });
+            for (member, counter) in state.counter_arguments {
+                if let Some(slot) = final_answers.iter_mut().find(|(m, _)| *m == member) {
+                    slot.1 = counter;
+                }
+            }
+        }
+    }
+
     // v1 behavior: print + let the caller synthesize.
     if no_synthesis {
         println!(
@@ -358,7 +632,7 @@ pub async fn handle_council(
     if ok == 1 {
         println!(
             "\n{GREEN}═══════════ CONSENSUS (sole answer) ═══════════{RESET}\n{}",
-            answers[0].1.answer
+            final_answers[0].1.answer
         );
         return Ok(());
     }
@@ -369,7 +643,7 @@ pub async fn handle_council(
     // verdict, weighing higher-confidence members more heavily instead of
     // blending every answer as equally reliable.
     let chair = chairman.unwrap_or_else(|| members[0].clone());
-    let synth = build_chairman_prompt(&question, &answers);
+    let synth = build_chairman_prompt(&question, &final_answers);
 
     eprintln!("\n{CYAN}▶ Chairman ({chair}) synthesizing {ok} answers…{RESET}");
     let raw = dispatch_member(&chair, &synth, pool.as_ref(), timeout).await;
@@ -591,8 +865,9 @@ async fn log_council(
 #[cfg(test)]
 mod tests {
     use super::{
-        MemberAnswer, build_chairman_prompt, parse_chairman_synthesis, parse_member_answer,
-        should_skip_council,
+        MemberAnswer, blind_label, build_chairman_prompt, build_counter_prompt,
+        build_critique_prompt, parse_chairman_synthesis, parse_critique_response,
+        parse_member_answer, should_skip_council,
     };
 
     #[test]
@@ -716,5 +991,89 @@ mod tests {
         assert!(!should_skip_council(
             "What's the tradeoff between eager and lazy loading for this cache?"
         ));
+    }
+
+    #[test]
+    fn blind_label_is_deterministic_and_distinct() {
+        assert_eq!(blind_label(0), "Member A");
+        assert_eq!(blind_label(1), "Member B");
+        assert_eq!(blind_label(25), "Member Z");
+    }
+
+    #[test]
+    fn build_critique_prompt_blinds_identities_and_excludes_self() {
+        let answers = vec![
+            (
+                "codex".to_string(),
+                MemberAnswer {
+                    answer: "use FOR UPDATE SKIP LOCKED".to_string(),
+                    confidence: 0.9,
+                    evidence: vec![],
+                },
+            ),
+            (
+                "kimi".to_string(),
+                MemberAnswer {
+                    answer: "use advisory locks instead".to_string(),
+                    confidence: 0.6,
+                    evidence: vec![],
+                },
+            ),
+        ];
+        let blind_labels = vec![
+            ("codex".to_string(), "Member A".to_string()),
+            ("kimi".to_string(), "Member B".to_string()),
+        ];
+        let prompt = build_critique_prompt("how to dequeue?", "codex", &answers, &blind_labels);
+        // codex must not see its own vendor name or its own answer text...
+        assert!(!prompt.contains("codex"));
+        assert!(!prompt.contains("use FOR UPDATE SKIP LOCKED"));
+        // ...but must see kimi's answer under its blind label, not "kimi".
+        assert!(prompt.contains("Member B"));
+        assert!(prompt.contains("use advisory locks instead"));
+        assert!(!prompt.contains("kimi"));
+    }
+
+    #[test]
+    fn parse_critique_response_reads_structured_critiques() {
+        let raw = r#"{"critiques": [{"member": "Member A", "critique": "ignores lock contention under high concurrency"}]}"#;
+        let entries = parse_critique_response(raw);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].member, "Member A");
+        assert_eq!(
+            entries[0].critique,
+            "ignores lock contention under high concurrency"
+        );
+    }
+
+    #[test]
+    fn parse_critique_response_empty_on_unstructured_text() {
+        assert!(parse_critique_response("just prose, no json here").is_empty());
+    }
+
+    #[test]
+    fn build_counter_prompt_includes_own_answer_and_critiques_but_not_critiquer_identity() {
+        let own = MemberAnswer {
+            answer: "use FOR UPDATE SKIP LOCKED".to_string(),
+            confidence: 0.9,
+            evidence: vec![],
+        };
+        let critiques = vec!["ignores lock contention under high concurrency".to_string()];
+        let prompt = build_counter_prompt("how to dequeue?", &own, &critiques);
+        assert!(prompt.contains("use FOR UPDATE SKIP LOCKED"));
+        assert!(prompt.contains("ignores lock contention under high concurrency"));
+        // The counter-round prompt never names which member raised the critique.
+        assert!(!prompt.to_lowercase().contains("member a"));
+    }
+
+    #[test]
+    fn build_counter_prompt_notes_no_critiques() {
+        let own = MemberAnswer {
+            answer: "x".to_string(),
+            confidence: 0.5,
+            evidence: vec![],
+        };
+        let prompt = build_counter_prompt("q?", &own, &[]);
+        assert!(prompt.contains("no critiques were raised"));
     }
 }
