@@ -65,12 +65,49 @@ fn response_reports_already_done(text: &str) -> bool {
     completion.iter().any(|p| t.contains(p)) && corroborating.iter().any(|p| t.contains(p))
 }
 
+/// One coder round as an `ff_interactions` row, tagged with the work item it
+/// served (V250 episodic tagging) so the flat log replays as per-work-item
+/// episodes. Pure record construction — the caller does the best-effort insert.
+fn round_interaction(
+    work_item_id: Option<uuid::Uuid>,
+    round: u32,
+    prompt: &str,
+    resp: &crate::fleet_oneshot::FleetOneshot,
+) -> ff_db::InteractionRecord {
+    let engine = crate::llm_attribution::engine_label(&resp.model);
+    let (tokens_in, tokens_out, tokens_estimated) = crate::llm_attribution::tokens_or_estimate(
+        resp.tokens_in,
+        resp.tokens_out,
+        prompt,
+        &resp.text,
+    );
+    let cost_usd = crate::llm_attribution::cost_usd(&engine, tokens_in, tokens_out);
+    ff_db::InteractionRecord {
+        channel: "codegen_apply".to_string(),
+        request_text: prompt.chars().take(16000).collect(),
+        request_meta: serde_json::json!({ "round": round, "tokens_estimated": tokens_estimated }),
+        engine: Some(engine),
+        response_text: resp.text.chars().take(16000).collect(),
+        tokens_in,
+        tokens_out,
+        cost_usd,
+        latency_ms: i32::try_from(resp.latency_ms).ok(),
+        outcome: "success".to_string(),
+        worker_name: Some(resp.worker_name.clone()),
+        endpoint: Some(resp.endpoint.clone()),
+        work_item_id,
+        purpose: Some("build".to_string()),
+        ..Default::default()
+    }
+}
+
 pub async fn codegen_apply(
     pool: &PgPool,
     repo_path: &Path,
     task: &str,
     model_hint: Option<&str>,
     max_rounds: u32,
+    work_item_id: Option<uuid::Uuid>,
 ) -> Result<CodegenOutcome> {
     let mut last_edits: Option<String> = None;
     let mut last_error: Option<String> = None;
@@ -105,6 +142,16 @@ pub async fn codegen_apply(
         )
         .await
         .with_context(|| format!("fleet_oneshot round {round}"))?;
+
+        // Per-round episode capture (V250 episodic tagging): `fleet_oneshot`
+        // never inserts into `ff_interactions` itself — it returns the
+        // attribution for THIS caller to log. Without this, local-lane coder
+        // turns only exist as the dispatch-level summary row, which can't
+        // attribute individual rounds. Best-effort — never fails codegen.
+        let rec = round_interaction(work_item_id, round, &prompt, &response);
+        if let Err(e) = ff_db::pg_record_interaction(pool, &rec).await {
+            warn!(round, error = %e, "codegen: interaction capture failed (non-fatal)");
+        }
 
         let edits = match parse_edit_blocks(&response.text) {
             Ok(edits) if !edits.is_empty() => edits,
@@ -1060,6 +1107,36 @@ fn format_command(program: &str, args: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn round_interaction_carries_episodic_tags() {
+        let work_item_id = uuid::Uuid::new_v4();
+        let resp = crate::fleet_oneshot::FleetOneshot {
+            text: "*** FILE: src/lib.rs".to_string(),
+            endpoint: "http://192.168.5.103:55000".to_string(),
+            worker_name: "worker-a".to_string(),
+            model: "qwen3-coder-30b".to_string(),
+            latency_ms: 1234,
+            tokens_in: 100,
+            tokens_out: 50,
+        };
+
+        let rec = round_interaction(Some(work_item_id), 2, "do the task", &resp);
+
+        assert_eq!(rec.channel, "codegen_apply");
+        assert_eq!(rec.work_item_id, Some(work_item_id));
+        assert_eq!(rec.purpose.as_deref(), Some("build"));
+        assert_eq!(rec.request_meta["round"], 2);
+        assert_eq!(rec.worker_name.as_deref(), Some("worker-a"));
+        assert_eq!(rec.endpoint.as_deref(), Some("http://192.168.5.103:55000"));
+        assert_eq!(rec.latency_ms, Some(1234));
+
+        // No work item in scope (e.g. `ff codegen` from the CLI) → the row
+        // still lands, just untagged.
+        let rec = round_interaction(None, 1, "do the task", &resp);
+        assert_eq!(rec.work_item_id, None);
+        assert_eq!(rec.purpose.as_deref(), Some("build"));
+    }
 
     #[test]
     fn parses_multiple_edit_blocks() {

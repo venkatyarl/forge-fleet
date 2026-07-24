@@ -406,9 +406,9 @@ async fn run_pr_review(
 
     if review_ladder_mode(pg).await != "cost_optimal" {
         let prompt = build_pr_review_prompt(pr_url, &title, description.as_deref()).await?;
-        return legacy_review_ladder(pg, pr_url, &prompt).await;
+        return legacy_review_ladder(pg, work_item_id, pr_url, &prompt).await;
     }
-    review_ladder(pg, pr_url, &title, description.as_deref()).await
+    review_ladder(pg, work_item_id, pr_url, &title, description.as_deref()).await
 }
 
 async fn build_pr_review_prompt(
@@ -456,8 +456,13 @@ async fn build_pr_review_prompt(
 /// local 30B pool or a cloud CLI so one local misjudgement cannot fail a good
 /// PR. If the 480B ring is unavailable, the same local-to-cloud fallback keeps
 /// the drain moving; exhausting the ladder returns an error for manual review.
-async fn legacy_review_ladder(pg: &PgPool, pr_url: &str, prompt: &str) -> Result<(bool, String)> {
-    match review_via_480b(pg, prompt).await {
+async fn legacy_review_ladder(
+    pg: &PgPool,
+    work_item_id: uuid::Uuid,
+    pr_url: &str,
+    prompt: &str,
+) -> Result<(bool, String)> {
+    match review_via_480b(pg, work_item_id, prompt).await {
         Ok((true, reason)) => Ok((true, format!("480b: {reason}"))),
         Ok((false, reason_480b)) => {
             info!(
@@ -465,7 +470,7 @@ async fn legacy_review_ladder(pg: &PgPool, pr_url: &str, prompt: &str) -> Result
                 reason = %reason_480b,
                 "merge_drain: 480b rejected — confirming with another reviewer before failing"
             );
-            let (approved, reason, backend) = fallback_review(pg, prompt)
+            let (approved, reason, backend) = fallback_review(pg, work_item_id, prompt)
                 .await
                 .context("confirm 480b rejection")?;
             if approved {
@@ -486,7 +491,7 @@ async fn legacy_review_ladder(pg: &PgPool, pr_url: &str, prompt: &str) -> Result
                 error = %e,
                 "merge_drain: 480b reviewer unavailable — falling back to another reviewer"
             );
-            let (approved, reason, backend) = fallback_review(pg, prompt)
+            let (approved, reason, backend) = fallback_review(pg, work_item_id, prompt)
                 .await
                 .context("fallback PR review")?;
             Ok((approved, format!("{backend}: {reason}")))
@@ -499,6 +504,7 @@ async fn legacy_review_ladder(pg: &PgPool, pr_url: &str, prompt: &str) -> Result
 /// a local coder repairs the PR head and the refreshed diff is reviewed again.
 async fn review_ladder(
     pg: &PgPool,
+    work_item_id: uuid::Uuid,
     pr_url: &str,
     title: &str,
     description: Option<&str>,
@@ -506,11 +512,14 @@ async fn review_ladder(
     let mut fix_attempt = 0;
     loop {
         let prompt = build_pr_review_prompt(pr_url, title, description).await?;
-        let (approved, reason, reviewer, strong) = match review_via_480b(pg, &prompt).await {
+        let (approved, reason, reviewer, strong) = match review_via_480b(pg, work_item_id, &prompt)
+            .await
+        {
             Ok((approved, reason)) => (approved, reason, "480b".to_string(), true),
             Err(e) => {
                 warn!(pr = %pr_url, error = %e, "merge_drain: 480b unavailable — reviewing with local 30b");
-                let (approved, reason, model) = local_pool_review(pg, &prompt).await?;
+                let (approved, reason, model) =
+                    local_pool_review(pg, work_item_id, &prompt).await?;
                 (approved, reason, format!("local:{model}"), false)
             }
         };
@@ -519,9 +528,10 @@ async fn review_ladder(
             return Ok((true, format!("{reviewer}: {reason}")));
         } else if approved {
             info!(pr = %pr_url, reviewer = %reviewer, "merge_drain: weak local approval — requesting one cloud confirmation");
-            let (confirmed, cloud_reason, backend) = cloud_cli_review(pg, &prompt, "cloud_confirm")
-                .await
-                .context("cloud confirmation of local approval")?;
+            let (confirmed, cloud_reason, backend) =
+                cloud_cli_review(pg, work_item_id, &prompt, "cloud_confirm")
+                    .await
+                    .context("cloud confirmation of local approval")?;
             if confirmed {
                 return Ok((
                     true,
@@ -540,7 +550,16 @@ async fn review_ladder(
             ));
         }
         fix_attempt += 1;
-        if let Err(e) = local_fix_pr(pg, pr_url, title, description, &rejection, fix_attempt).await
+        if let Err(e) = local_fix_pr(
+            pg,
+            work_item_id,
+            pr_url,
+            title,
+            description,
+            &rejection,
+            fix_attempt,
+        )
+        .await
         {
             warn!(pr = %pr_url, attempt = fix_attempt, error = %e, "merge_drain: local PR fix attempt failed");
             if fix_attempt >= REVIEW_LOCAL_FIX_ATTEMPTS {
@@ -565,8 +584,10 @@ async fn review_ladder_mode(pg: &PgPool) -> String {
 /// Repair the PR head in an isolated checkout. The original builder slot is
 /// released when the PR enters the queue and may already contain another
 /// task, so it is never safe for the merge drain to mutate that path.
+#[allow(clippy::too_many_arguments)]
 async fn local_fix_pr(
     pg: &PgPool,
+    work_item_id: uuid::Uuid,
     pr_url: &str,
     title: &str,
     description: Option<&str>,
@@ -613,11 +634,17 @@ async fn local_fix_pr(
              Reviewer rejection: {rejection}",
             description.unwrap_or_default()
         );
-        let outcome =
-            crate::codegen_apply::codegen_apply(pg, &checkout, &task, Some("qwen3-coder"), 1)
-                .await
-                .context("local coder PR repair")?;
-        record_fix_interaction(pg, &task, &outcome, attempt).await;
+        let outcome = crate::codegen_apply::codegen_apply(
+            pg,
+            &checkout,
+            &task,
+            Some("qwen3-coder"),
+            1,
+            Some(work_item_id),
+        )
+        .await
+        .context("local coder PR repair")?;
+        record_fix_interaction(pg, work_item_id, &task, &outcome, attempt).await;
         if !outcome.applied {
             anyhow::bail!(
                 "local coder did not produce a verified fix: {}",
@@ -687,12 +714,15 @@ async fn run_fix_command(
 
 async fn record_fix_interaction(
     pg: &PgPool,
+    work_item_id: uuid::Uuid,
     prompt: &str,
     outcome: &crate::codegen_apply::CodegenOutcome,
     attempt: u32,
 ) {
     let rec = ff_db::InteractionRecord {
         channel: "merge_drain_review".to_string(),
+        work_item_id: Some(work_item_id),
+        purpose: Some("build".to_string()),
         request_text: prompt.chars().take(16000).collect(),
         request_meta: serde_json::json!({ "stage": "local_fix", "attempt": attempt }),
         engine: Some("local:qwen3-coder".to_string()),
@@ -719,8 +749,12 @@ async fn record_fix_interaction(
 /// Fallback review ladder after the primary 480B reviewer: try the local 30B
 /// pool first, then cloud CLIs. A working local review beats burning the whole
 /// tick on cloud backends while a healthy on-fleet coder sits idle.
-async fn fallback_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, String)> {
-    match local_pool_review(pg, prompt).await {
+async fn fallback_review(
+    pg: &PgPool,
+    work_item_id: uuid::Uuid,
+    prompt: &str,
+) -> Result<(bool, String, String)> {
+    match local_pool_review(pg, work_item_id, prompt).await {
         Ok((approved, reason, model)) => return Ok((approved, reason, format!("local:{model}"))),
         Err(local_err) => {
             warn!(
@@ -729,14 +763,19 @@ async fn fallback_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, Str
             );
         }
     }
-    let (approved, reason, backend) = cloud_cli_review(pg, prompt, "legacy_cloud_review").await?;
+    let (approved, reason, backend) =
+        cloud_cli_review(pg, work_item_id, prompt, "legacy_cloud_review").await?;
     Ok((approved, reason, backend))
 }
 
 /// PR review on ANY healthy local model (typically the 30B coder pool).
 /// Routes via `fleet_oneshot` with a coder hint; a short timeout keeps a slow
 /// node from stalling the drain.
-async fn local_pool_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, String)> {
+async fn local_pool_review(
+    pg: &PgPool,
+    work_item_id: uuid::Uuid,
+    prompt: &str,
+) -> Result<(bool, String, String)> {
     let resp = crate::fleet_oneshot::fleet_oneshot(
         pg,
         prompt,
@@ -747,6 +786,7 @@ async fn local_pool_review(pg: &PgPool, prompt: &str) -> Result<(bool, String, S
     .context("local pool PR review")?;
     record_review_interaction(
         pg,
+        work_item_id,
         "local_review_30b",
         &resp.model,
         prompt,
@@ -772,7 +812,11 @@ const REVIEWER_480B_HINT: &str = "480b";
 /// Primary PR review on the 480B ring. `Err` means the ring is unavailable
 /// (routing failed, timed out, or `fleet_oneshot` failed over to some other
 /// model) — the caller falls back to the cloud review path.
-async fn review_via_480b(pg: &PgPool, prompt: &str) -> Result<(bool, String)> {
+async fn review_via_480b(
+    pg: &PgPool,
+    work_item_id: uuid::Uuid,
+    prompt: &str,
+) -> Result<(bool, String)> {
     let _permit = crate::dispatch_concurrency::acquire_480b_permit()
         .await
         .expect("480b review gate is never closed");
@@ -793,6 +837,7 @@ async fn review_via_480b(pg: &PgPool, prompt: &str) -> Result<(bool, String)> {
     }
     record_review_interaction(
         pg,
+        work_item_id,
         "local_review_480b",
         &resp.model,
         prompt,
@@ -819,6 +864,7 @@ pub(crate) fn served_by_480b(model: &str) -> bool {
 /// `(approved, reason, backend)`.
 async fn cloud_cli_review(
     pg: &PgPool,
+    work_item_id: uuid::Uuid,
     prompt: &str,
     stage: &str,
 ) -> Result<(bool, String, String)> {
@@ -856,6 +902,7 @@ async fn cloud_cli_review(
                 ));
                 record_review_interaction(
                     pg,
+                    work_item_id,
                     stage,
                     &backend,
                     prompt,
@@ -894,6 +941,7 @@ async fn cloud_cli_review(
 #[allow(clippy::too_many_arguments)]
 async fn record_review_interaction(
     pg: &PgPool,
+    work_item_id: uuid::Uuid,
     stage: &str,
     engine: &str,
     prompt: &str,
@@ -912,6 +960,8 @@ async fn record_review_interaction(
     let cost_usd = crate::llm_attribution::cost_usd(&engine, tokens_in, tokens_out);
     let rec = ff_db::InteractionRecord {
         channel: "merge_drain_review".to_string(),
+        work_item_id: Some(work_item_id),
+        purpose: Some("review".to_string()),
         request_text: prompt.chars().take(16000).collect(),
         request_meta: serde_json::json!({
             "stage": stage,

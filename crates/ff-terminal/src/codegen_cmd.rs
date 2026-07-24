@@ -22,9 +22,15 @@ pub async fn handle_codegen(
         None => std::env::current_dir().context("resolve current dir")?,
     };
 
-    let outcome =
-        ff_agent::codegen_apply::codegen_apply(&pool, &repo_path, &task, model.as_deref(), rounds)
-            .await?;
+    let outcome = ff_agent::codegen_apply::codegen_apply(
+        &pool,
+        &repo_path,
+        &task,
+        model.as_deref(),
+        rounds,
+        None,
+    )
+    .await?;
 
     if outcome.applied {
         print_outcome(&outcome);

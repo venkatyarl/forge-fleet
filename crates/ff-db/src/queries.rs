@@ -7731,6 +7731,12 @@ pub struct InteractionRecord {
     /// from `ff_interactions`. Both nullable — populated when the route is known.
     pub worker_name: Option<String>,
     pub endpoint: Option<String>,
+    /// Episodic tagging (V250): which work item this turn served and what the
+    /// turn was FOR (build|review|decompose|research|council|dreamer|...), so
+    /// the log replays as per-work-item episodes. Both nullable — populated
+    /// when the caller has the context.
+    pub work_item_id: Option<uuid::Uuid>,
+    pub purpose: Option<String>,
 }
 
 impl Default for InteractionRecord {
@@ -7756,6 +7762,8 @@ impl Default for InteractionRecord {
             model_versions: serde_json::json!({}),
             worker_name: None,
             endpoint: None,
+            work_item_id: None,
+            purpose: None,
         }
     }
 }
@@ -7767,8 +7775,10 @@ pub async fn pg_record_interaction(pool: &PgPool, r: &InteractionRecord) -> Resu
             (session_id, channel, user_id, request_text, request_meta,
              route_decision, engine, steps, response_text, tokens_in,
              tokens_out, cost_usd, latency_ms, outcome, error_text,
-             error_signature, ff_build_sha, model_versions, worker_name, endpoint)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+             error_signature, ff_build_sha, model_versions, worker_name, endpoint,
+             work_item_id, purpose)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+                 $21,$22)
          RETURNING id",
     )
     .bind(r.session_id)
@@ -7791,6 +7801,8 @@ pub async fn pg_record_interaction(pool: &PgPool, r: &InteractionRecord) -> Resu
     .bind(&r.model_versions)
     .bind(&r.worker_name)
     .bind(&r.endpoint)
+    .bind(r.work_item_id)
+    .bind(&r.purpose)
     .fetch_one(pool)
     .await?;
     Ok(row.get("id"))
