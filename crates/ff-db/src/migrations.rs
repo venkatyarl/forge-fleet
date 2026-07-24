@@ -2182,6 +2182,38 @@ mod tests {
             .await
             .expect("migrations should apply on a fresh database");
 
+        let nullable_columns: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name
+               FROM information_schema.columns
+              WHERE table_schema = 'public'
+                AND table_name = 'fleet_model_catalog'
+                AND column_name = ANY($1)
+                AND is_nullable = 'YES'
+              ORDER BY column_name",
+        )
+        .bind(&[
+            "benchmarks",
+            "display_name",
+            "lifecycle",
+            "license",
+            "modalities",
+            "tasks",
+        ])
+        .fetch_all(&pool)
+        .await
+        .expect("inspect rich catalog columns");
+        assert_eq!(
+            nullable_columns,
+            [
+                "benchmarks",
+                "display_name",
+                "lifecycle",
+                "license",
+                "modalities",
+                "tasks",
+            ]
+        );
+
         let row: crate::models::FleetModelCatalog = sqlx::query_as(
             "INSERT INTO fleet_model_catalog
                 (id, name, family, parameters, tier, gated, preferred_workloads, variants,
