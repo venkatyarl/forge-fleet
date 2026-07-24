@@ -34,6 +34,10 @@ pub use deployer::{DeploymentAdapter, DeploymentOrchestrator, DeploymentReport, 
 pub use health_gate::{
     HealthGate, HealthGateConfig, HealthGateEvaluation, HealthGateStatus, HealthSnapshot,
 };
+pub use node::batch::{
+    BatchUpdateConfig, BatchUpdateReport, NodeUpdateOutcome, NodeUpdateResult,
+    probe_forgefleetd_health, restart_node_local, run_batched_update, update_node_checkout,
+};
 pub use node::{
     drain_active_work_item_leases, forgefleetd_restart_command, requeue_claimed_items,
     restart_forgefleetd_local, restart_forgefleetd_local_with_drain,
