@@ -2923,6 +2923,7 @@ async fn run_ff_dispatch(
     // phase). Prefer the precomputed context stored on the work_item row; fall back
     // to a live `ff cortex find` lookup only when nothing is stored. Fail-open.
     let pack = crate::dispatch_context::context_pack_for_dispatch(
+        pg,
         item.brain_node_ids.clone(),
         item.touched_paths.clone(),
         item.title.clone(),

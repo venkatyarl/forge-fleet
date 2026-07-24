@@ -14,10 +14,22 @@
 //! recomputes the symbol set on every build. If the row has no stored context,
 //! the legacy SUBSTRING path over `ff cortex find` is used as a fail-open fallback.
 
+use sqlx::{PgPool, Row};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
+
+/// Node types eligible for the "known decisions and gotchas" pack.
+const BRAIN_NODE_TYPES: &[&str] = &["decision", "distilled_fact", "gotcha"];
+
+/// Byte cap for the decisions/gotchas pack (separate from the symbol pack's
+/// `max_symbols` cap — this one is measured in bytes since node titles vary
+/// widely in length).
+const BRAIN_PACK_MAX_BYTES: usize = 1200;
+
+/// Max nodes surfaced in the decisions/gotchas pack, regardless of byte budget.
+const BRAIN_PACK_MAX_NODES: usize = 5;
 
 /// Tokens too generic to be worth a graph lookup even if they look like idents.
 const STOPWORDS: &[&str] = &[
@@ -248,11 +260,97 @@ pub fn build_context_pack_from_store(
     pack
 }
 
+/// Query `brain_vault_nodes` for decisions/distilled-facts/gotchas relevant to
+/// this task, ranked by `recency + degree` (plain SQL; PageRank-over-Falkor is a
+/// future upgrade). Relevance is a substring match against each task identifier
+/// (same tokens as [`extract_task_identifiers`]) over the node's `title`/`path` —
+/// there's no dedicated body column on `brain_vault_nodes` today, and title/path
+/// already carry the meaningful slug (see `ff-brain::vault::parse_vault_file`).
+/// Degree is in+out edge count from `brain_vault_edges`. Fail-open: any DB error
+/// (including a not-yet-migrated table) yields an empty pack, never an error.
+pub async fn build_brain_decisions_pack(pool: &PgPool, title: &str, description: &str) -> String {
+    let idents = extract_task_identifiers(title, description);
+    if idents.is_empty() {
+        return String::new();
+    }
+    let patterns: Vec<String> = idents.iter().map(|id| format!("%{id}%")).collect();
+
+    let rows = match sqlx::query(
+        r#"
+        WITH edge_degree AS (
+            SELECT node_id, COUNT(*) AS degree
+            FROM (
+                SELECT src_id AS node_id FROM brain_vault_edges
+                UNION ALL
+                SELECT dst_id AS node_id FROM brain_vault_edges
+            ) e
+            GROUP BY node_id
+        )
+        SELECT n.title, n.path, n.node_type,
+               COALESCE(d.degree, 0) AS degree
+          FROM brain_vault_nodes n
+          LEFT JOIN edge_degree d ON d.node_id = n.id
+         WHERE n.node_type = ANY($1)
+           AND n.valid_until IS NULL
+           AND EXISTS (
+               SELECT 1 FROM unnest($2::text[]) AS pat
+                WHERE n.title ILIKE pat OR n.path ILIKE pat
+           )
+         ORDER BY (
+             COALESCE(d.degree, 0)::double precision
+             + 1.0 / (1.0 + EXTRACT(EPOCH FROM (NOW() - n.updated_at)) / 86400.0)
+         ) DESC
+         LIMIT $3
+        "#,
+    )
+    .bind(BRAIN_NODE_TYPES)
+    .bind(&patterns)
+    .bind(BRAIN_PACK_MAX_NODES as i64)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::debug!(error = %err, "build_brain_decisions_pack: query failed, skipping");
+            return String::new();
+        }
+    };
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    let mut pack = String::from(
+        "## Known decisions and gotchas relevant to this task\n\
+         These are prior decisions/facts from Brain that bear on this task:\n\n",
+    );
+    let mut node_count = 0usize;
+    for row in &rows {
+        let node_title: String = row.get("title");
+        let path: String = row.get("path");
+        let node_type: String = row.get("node_type");
+        let line = format!("- **{node_type}**: {node_title} ({path})\n");
+        if pack.len() + line.len() > BRAIN_PACK_MAX_BYTES {
+            break;
+        }
+        pack.push_str(&line);
+        node_count += 1;
+    }
+    pack.push('\n');
+    tracing::info!(
+        pack_bytes = pack.len(),
+        node_count,
+        "build_brain_decisions_pack: built decisions/gotchas pack"
+    );
+    pack
+}
+
 /// Build a context pack for dispatch, preferring the precomputed DB context and
 /// falling back to a live Cortex lookup only when nothing is stored. This keeps
 /// dispatch fast and consistent across the fleet while remaining compatible with
-/// work items that have not yet been indexed.
+/// work items that have not yet been indexed. After the symbol pack, appends
+/// relevant Brain decisions/gotchas (see [`build_brain_decisions_pack`]).
 pub async fn context_pack_for_dispatch(
+    pool: &PgPool,
     brain_node_ids: Vec<String>,
     touched_paths: Vec<String>,
     title: String,
@@ -261,15 +359,23 @@ pub async fn context_pack_for_dispatch(
     max_symbols: usize,
 ) -> String {
     let store_pack = build_context_pack_from_store(&brain_node_ids, &touched_paths, max_symbols);
-    if !store_pack.is_empty() {
-        return store_pack;
-    }
-    cortex_context_pack_async(title, description, repo_path, max_symbols).await
+    let symbol_pack = if !store_pack.is_empty() {
+        store_pack
+    } else {
+        cortex_context_pack_async(title.clone(), description.clone(), repo_path, max_symbols).await
+    };
+
+    let decisions_pack = build_brain_decisions_pack(pool, &title, &description).await;
+
+    format!("{symbol_pack}{decisions_pack}")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_context_pack_from_store, extract_task_identifiers, relativize};
+    use super::{
+        build_brain_decisions_pack, build_context_pack_from_store, extract_task_identifiers,
+        relativize,
+    };
 
     #[test]
     fn extracts_camel_and_snake_idents_skips_plain_words() {
@@ -343,5 +449,174 @@ mod tests {
         assert!(
             build_context_pack_from_store(&["".to_string()], &["  ".to_string()], 8).is_empty()
         );
+    }
+
+    // -- DB tests: early-return (skip) when no Postgres is configured; CI's
+    //    `cargo test --lib` has no database and must never panic here.
+
+    fn temp_db_urls() -> Option<(String, String, String)> {
+        let base_url = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()?;
+        let (prefix, _) = base_url.rsplit_once('/')?;
+        let db_name = format!("ff_dispatch_context_{}", uuid::Uuid::new_v4().simple());
+        Some((
+            format!("{prefix}/postgres"),
+            format!("{prefix}/{db_name}"),
+            db_name,
+        ))
+    }
+
+    async fn create_temp_db() -> Option<(sqlx::PgPool, sqlx::PgPool, String)> {
+        let (admin_url, db_url, db_name) = temp_db_urls()?;
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("connect admin db");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create temp db");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&db_url)
+            .await
+            .expect("connect temp db");
+        // Minimal slice of the live brain_vault schema: only the columns
+        // build_brain_decisions_pack's query touches.
+        sqlx::raw_sql(
+            "CREATE EXTENSION IF NOT EXISTS pgcrypto;
+             CREATE TABLE brain_vault_nodes (
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 path TEXT NOT NULL,
+                 title TEXT NOT NULL,
+                 node_type TEXT NOT NULL,
+                 valid_until TIMESTAMPTZ,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );
+             CREATE TABLE brain_vault_edges (
+                 src_id UUID NOT NULL,
+                 dst_id UUID NOT NULL,
+                 edge_type TEXT NOT NULL DEFAULT 'link'
+             );",
+        )
+        .execute(&pool)
+        .await
+        .expect("create minimal brain_vault schema");
+        Some((admin, pool, db_name))
+    }
+
+    async fn drop_temp_db(admin: sqlx::PgPool, pool: sqlx::PgPool, db_name: &str) {
+        pool.close().await;
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid)
+               FROM pg_stat_activity
+              WHERE datname = $1
+                AND pid <> pg_backend_pid()",
+        )
+        .bind(db_name)
+        .execute(&admin)
+        .await
+        .ok();
+        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .ok();
+        admin.close().await;
+    }
+
+    #[tokio::test]
+    async fn build_brain_decisions_pack_ranks_by_recency_and_degree_and_excludes_stale() {
+        let Some((admin, pool, db_name)) = create_temp_db().await else {
+            eprintln!("skipping: FORGEFLEET_POSTGRES_URL/FORGEFLEET_DATABASE_URL not set");
+            return;
+        };
+
+        // High-degree decision: matches, 5 edges, 30 days old.
+        let high_degree: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO brain_vault_nodes (path, title, node_type, updated_at)
+             VALUES ('decisions/wave_dispatcher.md', 'decision_wave_dispatcher_owns_slots',
+                     'decision', NOW() - INTERVAL '30 days')
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        for _ in 0..5 {
+            let other: uuid::Uuid = sqlx::query_scalar(
+                "INSERT INTO brain_vault_nodes (path, title, node_type, updated_at)
+                 VALUES ('code://x', 'x', 'code:function', NOW()) RETURNING id",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO brain_vault_edges (src_id, dst_id, edge_type) VALUES ($1, $2, 'link')",
+            )
+            .bind(high_degree)
+            .bind(other)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // Zero-degree gotcha: matches, no edges, fresh.
+        sqlx::query(
+            "INSERT INTO brain_vault_nodes (path, title, node_type, updated_at)
+             VALUES ('gotchas/wave_dispatcher_timing.md', 'gotcha_wave_dispatcher_timing',
+                     'gotcha', NOW())",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Matches on title but superseded (valid_until set) -- must be excluded.
+        sqlx::query(
+            "INSERT INTO brain_vault_nodes (path, title, node_type, updated_at, valid_until)
+             VALUES ('decisions/wave_dispatcher_old.md', 'decision_wave_dispatcher_old',
+                     'decision', NOW(), NOW())",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // No identifier match -- must be excluded.
+        sqlx::query(
+            "INSERT INTO brain_vault_nodes (path, title, node_type, updated_at)
+             VALUES ('decisions/unrelated.md', 'decision_unrelated_topic', 'decision', NOW())",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let pack = build_brain_decisions_pack(
+            &pool,
+            "Fix wave_dispatcher self-kill race",
+            "The wave_dispatcher must not kill its own worker.",
+        )
+        .await;
+
+        assert!(pack.contains("Known decisions and gotchas relevant to this task"));
+        assert!(pack.contains("decision_wave_dispatcher_owns_slots"));
+        assert!(pack.contains("gotcha_wave_dispatcher_timing"));
+        assert!(!pack.contains("decision_wave_dispatcher_old"));
+        assert!(!pack.contains("decision_unrelated_topic"));
+        let high_degree_pos = pack.find("decision_wave_dispatcher_owns_slots").unwrap();
+        let gotcha_pos = pack.find("gotcha_wave_dispatcher_timing").unwrap();
+        assert!(
+            high_degree_pos < gotcha_pos,
+            "higher-degree node should rank first: {pack}"
+        );
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn build_brain_decisions_pack_empty_when_no_identifiers() {
+        let Some((admin, pool, db_name)) = create_temp_db().await else {
+            eprintln!("skipping: FORGEFLEET_POSTGRES_URL/FORGEFLEET_DATABASE_URL not set");
+            return;
+        };
+        let pack = build_brain_decisions_pack(&pool, "fix the bug", "please fix it").await;
+        assert!(pack.is_empty());
+        drop_temp_db(admin, pool, &db_name).await;
     }
 }
