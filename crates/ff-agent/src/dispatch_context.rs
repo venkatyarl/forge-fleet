@@ -367,7 +367,16 @@ pub async fn context_pack_for_dispatch(
 
     let decisions_pack = build_brain_decisions_pack(pool, &title, &description).await;
 
-    format!("{symbol_pack}{decisions_pack}")
+    let pack = format!("{symbol_pack}{decisions_pack}");
+    let result_count =
+        usize::from(!symbol_pack.is_empty()) + usize::from(!decisions_pack.is_empty());
+    if let Err(error) =
+        ff_db::queries::pg_log_memory_retrieval(pool, "dispatch_pack", &title, result_count, None)
+            .await
+    {
+        tracing::debug!(%error, "dispatch context retrieval telemetry unavailable");
+    }
+    pack
 }
 
 #[cfg(test)]

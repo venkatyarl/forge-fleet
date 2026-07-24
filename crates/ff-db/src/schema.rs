@@ -12201,6 +12201,24 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// Memory-v2 M5 — retrieval telemetry for known-unknown discovery.
+pub const SCHEMA_V259_MEMORY_RETRIEVAL_LOG: &str = r#"
+CREATE TABLE IF NOT EXISTS memory_retrieval_log (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    ts            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    caller        TEXT NOT NULL CHECK (
+        caller IN ('dispatch_pack', 'brain_search', 'cortex_query', 'scratchpad')
+    ),
+    query_text    TEXT NOT NULL,
+    results_count INT NOT NULL CHECK (results_count >= 0),
+    top_score     REAL,
+    was_miss      BOOLEAN NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_retrieval_log_misses
+    ON memory_retrieval_log (ts DESC) WHERE was_miss;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

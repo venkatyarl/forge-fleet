@@ -70,6 +70,12 @@ pub async fn brain_search(params: Option<Value>) -> HandlerResult {
     if let Some(ref tag_list) = tags {
         nodes.retain(|n| tag_list.iter().any(|t| n.tags.contains(t)));
     }
+    if let Err(error) =
+        ff_db::queries::pg_log_memory_retrieval(&pool, "brain_search", query, nodes.len(), None)
+            .await
+    {
+        tracing::debug!(%error, "brain search retrieval telemetry unavailable");
+    }
 
     Ok(json!({
         "count": nodes.len(),
@@ -255,6 +261,12 @@ pub async fn brain_propose_node(params: Option<Value>) -> HandlerResult {
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
     let project = p.get("project").and_then(|v| v.as_str());
+    let confidence = p
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.8)
+        .clamp(0.0, 1.0) as f32;
+    let support = p.get("support").and_then(|v| v.as_u64()).unwrap_or(1);
 
     let pool = get_pool().await?;
     let user_id = resolve_default_user(&pool).await?;
@@ -269,19 +281,54 @@ pub async fn brain_propose_node(params: Option<Value>) -> HandlerResult {
         Some(body),
         &tags,
         project,
-        None,      // target_path
-        None,      // from_thread
-        Some(0.8), // default confidence for MCP proposals
+        None, // target_path
+        None, // from_thread
+        Some(confidence),
     )
     .await
     .map_err(|e| format!("insert candidate: {e}"))?;
 
-    info!(id = %candidate_id, title, "brain: proposed new knowledge node");
+    // The attach/push path is the fast lane: independently high-support facts
+    // become visible immediately; the Dreamer remains the slow consolidation
+    // and decay lane for everything else.
+    let immediately_promoted = kind == "fact" && support >= 2 && confidence >= 0.8;
+    if immediately_promoted {
+        let path = format!(
+            "push/{}/{}",
+            project.unwrap_or("shared"),
+            candidate_id.simple()
+        );
+        ff_db::pg_upsert_brain_vault_node(
+            &pool,
+            &path,
+            title,
+            Some(kind),
+            project,
+            &tags,
+            None,
+            &[],
+            Some("attached-push"),
+            Some(confidence),
+            &candidate_id.to_string(),
+        )
+        .await
+        .map_err(|e| format!("immediate fact promotion: {e}"))?;
+        ff_db::pg_update_brain_candidate_status(&pool, candidate_id, "promoted")
+            .await
+            .map_err(|e| format!("mark promoted candidate: {e}"))?;
+    }
+
+    info!(id = %candidate_id, title, immediately_promoted, "brain: accepted knowledge push");
 
     Ok(json!({
-        "status": "staged",
+        "status": if immediately_promoted { "promoted" } else { "staged" },
         "candidate_id": candidate_id.to_string(),
-        "message": "Proposal staged for human review. Use 'ff brain inbox' to approve/reject.",
+        "immediately_queryable": immediately_promoted,
+        "message": if immediately_promoted {
+            "High-support fact promoted immediately to the live Brain."
+        } else {
+            "Proposal staged for human review. Use 'ff brain inbox' to approve/reject."
+        },
     }))
 }
 
