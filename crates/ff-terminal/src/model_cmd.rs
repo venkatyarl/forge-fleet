@@ -68,6 +68,25 @@ fn unload_err_is_missing_row(err: &str) -> bool {
     err.contains("no deployment '")
 }
 
+async fn set_deployment_pin(pool: &sqlx::PgPool, id: &str, pinned: bool) -> Result<()> {
+    let uuid = sqlx::types::Uuid::parse_str(id)
+        .map_err(|e| anyhow::anyhow!("bad deployment uuid '{id}': {e}"))?;
+    let changed = sqlx::query("UPDATE fleet_model_deployments SET pinned=$2 WHERE id=$1")
+        .bind(uuid)
+        .bind(pinned)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    if changed == 0 {
+        anyhow::bail!("no deployment with id '{id}'");
+    }
+    println!(
+        "{} deployment {id}",
+        if pinned { "Pinned" } else { "Unpinned" }
+    );
+    Ok(())
+}
+
 /// Reprofile a running deployment into the agent-capable serving profile
 /// (`--parallel 1 --ctx >= 32768`) so it becomes agent-router-visible. Runs on
 /// the host that owns the deployment, SSHing there if it lives elsewhere.
@@ -729,6 +748,8 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 Err(e) => anyhow::bail!("unload failed: {e}"),
             }
         }
+        crate::ModelCommand::Pin { id } => set_deployment_pin(&pool, &id, true).await?,
+        crate::ModelCommand::Unpin { id } => set_deployment_pin(&pool, &id, false).await?,
         crate::ModelCommand::Reprofile {
             id,
             ctx,
