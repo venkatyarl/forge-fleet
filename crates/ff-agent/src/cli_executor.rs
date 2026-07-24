@@ -21,7 +21,7 @@
 //! Callers holding the semantic context do the logging — and callers with a
 //! work item in scope stamp the V250 episodic tags (`work_item_id`, `purpose`)
 //! on the row (see `work_item_dispatch::record_dispatch_interaction`,
-//! `work_item_merge_drain::record_review_interaction`).
+//! `work_item_dispatch::record_review_interaction`).
 //!
 //! Authentication is handled by the CLI itself, reading
 //! `~/.<vendor>/credentials.json` etc. Layer 4 (PR-A2's
