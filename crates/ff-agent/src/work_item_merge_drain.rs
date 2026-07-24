@@ -28,8 +28,8 @@ const REVIEW_480B_TIMEOUT: Duration = Duration::from_secs(60);
 const REVIEW_LOCAL_POOL_TIMEOUT: Duration = Duration::from_secs(60);
 const REVIEW_CLOUD_TIMEOUT: Duration = Duration::from_secs(75);
 const REVIEW_LOCAL_FIX_ATTEMPTS: u32 = 2;
-const SEMANTIC_MERGE_RESET_MARKER: &str =
-    "semantic merge conflict (compile failure after clean merge) — auto-reset for rebuild";
+const SEMANTIC_MERGE_RESET_MARKER: &str = "class=merge_conflict: semantic merge conflict \
+    (compile failure after clean merge) — auto-reset for rebuild";
 
 /// Build a `gh` invocation with the fleet GitHub token injected as `GH_TOKEN`.
 ///
@@ -70,8 +70,16 @@ pub async fn evaluate_merge_queue(
         return Ok(0);
     };
     let Some(pr_url) = item.pr_url.clone().filter(|u| !u.trim().is_empty()) else {
-        ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, "merge entry has no PR url")
-            .await?;
+        ff_db::pg_mark_merge_failed(
+            pg,
+            item.id,
+            item.work_item_id,
+            &crate::error_class::prefix(
+                crate::error_class::MISSING_PR_URL,
+                "merge entry has no PR url",
+            ),
+        )
+        .await?;
         return Ok(0);
     };
 
@@ -93,7 +101,10 @@ pub async fn evaluate_merge_queue(
                 pg,
                 item.id,
                 item.work_item_id,
-                "PR conflicted with advanced main — auto-reset for rebuild",
+                &crate::error_class::prefix(
+                    crate::error_class::MERGE_CONFLICT,
+                    "PR conflicted with advanced main — auto-reset for rebuild",
+                ),
             )
             .await?;
             // Preserve the dispatch lane on the reset: this item already BUILT
@@ -278,6 +289,7 @@ pub async fn evaluate_merge_queue(
                 );
             }
             warn!(pr = %pr_url, %reason, "merge_drain: PR CI failed — marking work_item failed");
+            let reason = crate::error_class::prefix(crate::error_class::MERGE_FAILED, &reason);
             ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &reason).await?;
             Ok(0)
         }
@@ -347,7 +359,10 @@ pub async fn evaluate_merge_queue(
                             pg,
                             item.id,
                             item.work_item_id,
-                            "PR conflicted at merge time (async mergeable race) — auto-reset for rebuild",
+                            &crate::error_class::prefix(
+                                crate::error_class::MERGE_CONFLICT,
+                                "PR conflicted at merge time (async mergeable race) — auto-reset for rebuild",
+                            ),
                         )
                         .await?;
                         // Same lane-preservation rule as the DIRTY reset above.
@@ -374,7 +389,10 @@ pub async fn evaluate_merge_queue(
                         );
                         return Ok(0);
                     }
-                    let reason = format!("gh pr merge failed: {e}");
+                    let reason = crate::error_class::prefix(
+                        crate::error_class::MERGE_FAILED,
+                        format!("gh pr merge failed: {e}"),
+                    );
                     warn!(pr = %pr_url, %reason, "merge_drain: merge failed");
                     ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &reason).await?;
                     Ok(0)
