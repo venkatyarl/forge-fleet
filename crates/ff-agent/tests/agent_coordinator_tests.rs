@@ -8,10 +8,12 @@
 //! run has no database available.
 
 use std::env;
+use std::time::Duration;
 
 use ff_agent::agent_coordinator::reap_stale_busy_slots;
 use ff_agent::leader_cache::{LeaderCache, LeaderInfo};
 use ff_agent::sub_agent_reaper::SubAgentReaper;
+use ff_agent::work_item_dispatch::run_git;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -81,6 +83,19 @@ async fn create_reaper_test_db() -> Option<(PgPool, PgPool, String)> {
              created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
              released_at      TIMESTAMPTZ,
              release_reason   TEXT
+         );
+         CREATE TABLE work_item_worktrees (
+             id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+             work_item_id  UUID NOT NULL REFERENCES work_items(id),
+             computer_id   UUID NOT NULL REFERENCES computers(id),
+             sub_agent_id  UUID REFERENCES sub_agents(id),
+             repo_path     TEXT NOT NULL,
+             worktree_path TEXT NOT NULL,
+             base_branch   TEXT NOT NULL,
+             task_branch   TEXT NOT NULL,
+             status        TEXT NOT NULL DEFAULT 'creating',
+             created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+             cleaned_at    TIMESTAMPTZ
          );",
     )
     .execute(&pool)
@@ -367,6 +382,221 @@ async fn stale_slot_reaper_requeues_orphaned_work_item() {
         leased_status, "busy",
         "actively-leased slot must not be reaped"
     );
+
+    drop_temp_db(admin, pool, &db_name).await;
+}
+
+/// Sets up a minimal real git repo with `main` checked out and committed,
+/// then branches off `task_branch` with an uncommitted change — mimicking a
+/// clone-direct slot clone left mid-build by a hung/crashed task.
+fn init_clone_direct_repo(repo: &std::path::Path, task_branch: &str) {
+    run_git(repo, ["init"], Duration::from_secs(10)).unwrap();
+    run_git(
+        repo,
+        ["config", "user.name", "Test"],
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    run_git(
+        repo,
+        ["config", "user.email", "test@example.com"],
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    std::fs::write(repo.join("README.md"), "base").unwrap();
+    run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
+    run_git(repo, ["commit", "-m", "base"], Duration::from_secs(10)).unwrap();
+    run_git(repo, ["branch", "-M", "main"], Duration::from_secs(10)).unwrap();
+    run_git(
+        repo,
+        ["checkout", "-b", task_branch],
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    std::fs::write(repo.join("scratch.txt"), "half-finished build output").unwrap();
+}
+
+#[tokio::test]
+async fn stale_slot_reaper_resets_orphaned_clone_direct_worktree() {
+    let Some((admin, pool, db_name)) = create_reaper_test_db().await else {
+        eprintln!(
+            "skipping stale slot worktree cleanup test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL"
+        );
+        return;
+    };
+
+    let computer = Uuid::new_v4();
+    sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'testbox')")
+        .bind(computer)
+        .execute(&pool)
+        .await
+        .expect("insert computer");
+
+    let stale_slot = Uuid::new_v4();
+    let orphaned_item = Uuid::new_v4();
+    sqlx::query("INSERT INTO work_items (id, status) VALUES ($1, 'building')")
+        .bind(orphaned_item)
+        .execute(&pool)
+        .await
+        .expect("insert orphaned work item");
+    sqlx::query(
+        "INSERT INTO sub_agents
+             (id, computer_id, slot, status, current_work_item_id, started_at, last_heartbeat_at)
+         VALUES ($1, $2, 0, 'busy', $3, NOW() - INTERVAL '90 minutes', NOW() - INTERVAL '90 minutes')",
+    )
+    .bind(stale_slot)
+    .bind(computer)
+    .bind(orphaned_item)
+    .execute(&pool)
+    .await
+    .expect("insert stale busy slot");
+
+    let repo_tmp = tempfile::tempdir().unwrap();
+    let repo_path = repo_tmp.path();
+    let task_branch = "feature/orphaned-task-abcd";
+    init_clone_direct_repo(repo_path, task_branch);
+    let repo_path_str = repo_path.to_string_lossy().to_string();
+
+    let worktree_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO work_item_worktrees
+             (id, work_item_id, computer_id, sub_agent_id, repo_path, worktree_path,
+              base_branch, task_branch, status)
+         VALUES ($1, $2, $3, $4, $5, $5, 'main', $6, 'active')",
+    )
+    .bind(worktree_id)
+    .bind(orphaned_item)
+    .bind(computer)
+    .bind(stale_slot)
+    .bind(&repo_path_str)
+    .bind(task_branch)
+    .execute(&pool)
+    .await
+    .expect("insert clone-direct worktree row");
+
+    let reaped = reap_stale_busy_slots(&pool, 3600)
+        .await
+        .expect("run stale slot reap");
+    assert_eq!(reaped.len(), 1);
+    assert_eq!(reaped[0].sub_agent_id, stale_slot);
+
+    // Clone-direct: the slot's persistent clone is reset in place, never deleted.
+    assert!(
+        repo_path.exists(),
+        "clone-direct repo directory must be preserved for reuse"
+    );
+    let branches = run_git(
+        repo_path,
+        ["branch", "--list", task_branch],
+        Duration::from_secs(10),
+    )
+    .expect("list branches");
+    assert!(
+        String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+        "abandoned task branch must be deleted from the slot's clone"
+    );
+
+    let worktree_row =
+        sqlx::query("SELECT status, cleaned_at FROM work_item_worktrees WHERE id = $1")
+            .bind(worktree_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read worktree row");
+    assert_eq!(worktree_row.get::<String, _>("status"), "cleaned");
+    assert!(
+        worktree_row
+            .get::<Option<chrono::DateTime<chrono::Utc>>, _>("cleaned_at")
+            .is_some(),
+        "cleaned_at must be stamped"
+    );
+
+    drop_temp_db(admin, pool, &db_name).await;
+}
+
+#[tokio::test]
+async fn stale_slot_reaper_removes_legacy_worktree_and_build_artifacts() {
+    let Some((admin, pool, db_name)) = create_reaper_test_db().await else {
+        eprintln!(
+            "skipping stale slot legacy worktree cleanup test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL"
+        );
+        return;
+    };
+
+    let computer = Uuid::new_v4();
+    sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'testbox')")
+        .bind(computer)
+        .execute(&pool)
+        .await
+        .expect("insert computer");
+
+    let stale_slot = Uuid::new_v4();
+    let orphaned_item = Uuid::new_v4();
+    sqlx::query("INSERT INTO work_items (id, status) VALUES ($1, 'building')")
+        .bind(orphaned_item)
+        .execute(&pool)
+        .await
+        .expect("insert orphaned work item");
+    sqlx::query(
+        "INSERT INTO sub_agents
+             (id, computer_id, slot, status, current_work_item_id, started_at, last_heartbeat_at)
+         VALUES ($1, $2, 0, 'busy', $3, NOW() - INTERVAL '90 minutes', NOW() - INTERVAL '90 minutes')",
+    )
+    .bind(stale_slot)
+    .bind(computer)
+    .bind(orphaned_item)
+    .execute(&pool)
+    .await
+    .expect("insert stale busy slot");
+
+    // Legacy pre-clone-direct layout: a detached worktree dir sitting inside
+    // the shared repo clone, left with a leftover `target/` build artifact.
+    let repo_tmp = tempfile::tempdir().unwrap();
+    let repo_path = repo_tmp.path();
+    let task_branch = "feature/legacy-orphan-abcd";
+    init_clone_direct_repo(repo_path, task_branch);
+    // Roll the shared clone back to main; the "worktree" below stands in for
+    // the separate detached-worktree directory from the legacy layout.
+    run_git(repo_path, ["checkout", "main"], Duration::from_secs(10)).unwrap();
+
+    let worktree_dir = repo_tmp.path().join("legacy-worktree");
+    std::fs::create_dir_all(worktree_dir.join("target")).unwrap();
+    std::fs::write(worktree_dir.join("target").join("build.bin"), "junk").unwrap();
+    std::fs::write(worktree_dir.join("scratch.txt"), "leftover").unwrap();
+
+    let worktree_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO work_item_worktrees
+             (id, work_item_id, computer_id, sub_agent_id, repo_path, worktree_path,
+              base_branch, task_branch, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'main', $7, 'active')",
+    )
+    .bind(worktree_id)
+    .bind(orphaned_item)
+    .bind(computer)
+    .bind(stale_slot)
+    .bind(repo_path.to_string_lossy().to_string())
+    .bind(worktree_dir.to_string_lossy().to_string())
+    .bind(task_branch)
+    .execute(&pool)
+    .await
+    .expect("insert legacy worktree row");
+
+    let reaped = reap_stale_busy_slots(&pool, 3600)
+        .await
+        .expect("run stale slot reap");
+    assert_eq!(reaped.len(), 1);
+
+    assert!(
+        !worktree_dir.exists(),
+        "legacy detached worktree directory (and its build artifacts) must be removed"
+    );
+
+    let worktree_row = sqlx::query("SELECT status FROM work_item_worktrees WHERE id = $1")
+        .bind(worktree_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read worktree row");
+    assert_eq!(worktree_row.get::<String, _>("status"), "cleaned");
 
     drop_temp_db(admin, pool, &db_name).await;
 }

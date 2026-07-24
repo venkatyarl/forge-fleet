@@ -3942,7 +3942,7 @@ fn checkout_clone_for_build(repo_path: &Path, base_branch: &str, task_branch: &s
     Ok(())
 }
 
-fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
+pub(crate) fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
     // Stage-2 clone-direct workspace: the "worktree" IS the clone. Never
     // remove the directory — park HEAD on detached origin HEAD and full-clean
     // so the next dispatch starts pristine. (`checkout -B` on the next attempt
@@ -3971,7 +3971,7 @@ fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn reclaim_build_artifacts(path: &Path) -> u64 {
+pub(crate) fn reclaim_build_artifacts(path: &Path) -> u64 {
     fn is_reclaimable_dir_name(name: &OsStr) -> bool {
         name == OsStr::new("target")
             || name == OsStr::new("node_modules")
