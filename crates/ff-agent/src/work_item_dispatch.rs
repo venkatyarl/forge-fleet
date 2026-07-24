@@ -1899,6 +1899,127 @@ async fn run_in_place_review(
     Err(last_err.unwrap_or_else(|| anyhow!("no in-place review backend available")))
 }
 
+/// Verdict on an `already_done` claim: whether an independent reviewer both
+/// approved AND backed it with a concrete `file:line` citation.
+struct AlreadyDoneVerification {
+    verified: bool,
+    reviewer: String,
+    reason: String,
+}
+
+/// Verify a builder's `already_done` claim before trusting it (2026-07-23
+/// incident: a builder closed 'SSH mesh auto-repair needs exponential
+/// backoff' as ALREADY_IMPLEMENTED with zero verification — the fix did not
+/// exist and dispatch kept re-closing it every attempt while the operator
+/// got attempt-153 spam). Runs the work item's description through the same
+/// in-place reviewer pool as [`run_in_place_review`] (never the builder
+/// itself), asking it to cite `file:line` evidence. Only an APPROVE verdict
+/// that ALSO contains a `path:line`-shaped citation is trusted; a bare
+/// assertion without evidence is treated as unverified.
+async fn verify_already_done_claim(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    worktree: &WorktreeRecord,
+    builder: &str,
+) -> Result<AlreadyDoneVerification> {
+    let prompt = format!(
+        "A coding agent claims the following work item is ALREADY IMPLEMENTED in the \
+         current tree (nothing left to commit). Verify this claim independently by \
+         inspecting the actual repository contents — do not trust the claim on its face.\n\n\
+         Work item title:\n{title}\n\n\
+         Work item description:\n{description}\n\n\
+         Is this already implemented in the current tree? Cite file:line evidence.\n\n\
+         Answer with exactly APPROVE or REJECT on the first line. APPROVE only if you can \
+         point to the specific file(s) and line(s) that already satisfy this work item; \
+         REJECT if you cannot find such evidence. On the following line(s), cite the \
+         file:line evidence (e.g. `src/foo.rs:42`) that supports your verdict.",
+        title = item.title,
+        description = item.description.as_deref().unwrap_or_default(),
+    );
+
+    let stats = cloud_reviewer_stats(pg).await.unwrap_or_default();
+    let backends: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT backend FROM computer_backends \
+          WHERE installed AND authenticated AND backend <> 'claude' ORDER BY backend",
+    )
+    .fetch_all(pg)
+    .await
+    .context("load authenticated review backends")?;
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for backend in order_cloud_reviewers(builder, &stats, &backends) {
+        match crate::cli_executor::execute_cli_in_dir(
+            &backend,
+            &prompt,
+            &[],
+            Some(&worktree.worktree_path),
+            Some(REVIEW_CLOUD_TIMEOUT),
+        )
+        .await
+        {
+            Ok(res) if res.exit_code == 0 && !res.stdout.trim().is_empty() => {
+                record_review_interaction(
+                    pg,
+                    item.work_item_id,
+                    &backend,
+                    &prompt,
+                    &res.stdout,
+                    i32::try_from(res.duration_ms).ok(),
+                )
+                .await;
+                let (approved, reason) =
+                    crate::work_item_merge_drain::parse_review_response(&res.stdout);
+                let cited = contains_file_line_citation(&res.stdout);
+                return Ok(AlreadyDoneVerification {
+                    verified: approved && cited,
+                    reviewer: backend,
+                    reason: if approved && !cited {
+                        format!("{reason} (no file:line citation found — not trusted)")
+                    } else {
+                        reason
+                    },
+                });
+            }
+            Ok(res) => {
+                let e = anyhow!(
+                    "{backend} exited {}: {}",
+                    res.exit_code,
+                    err_tail(&res.stderr)
+                );
+                warn!(backend = %backend, error = %e, "work_item_dispatch: already_done verification backend failed — trying next");
+                last_err = Some(e);
+            }
+            Err(e) => {
+                warn!(backend = %backend, error = format!("{e:#}"), "work_item_dispatch: already_done verification backend unavailable — trying next");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        anyhow!("no in-place review backend available to verify already_done claim")
+    }))
+}
+
+/// True if `text` contains at least one `path:line`-shaped citation, e.g.
+/// `crates/ff-agent/src/foo.rs:42`. Deliberately simple (no regex dependency):
+/// require a dotted path segment before the colon and an all-digit line
+/// number after it. Pure so the verification gate is testable without a
+/// reviewer backend.
+fn contains_file_line_citation(text: &str) -> bool {
+    text.split_whitespace().any(|raw| {
+        let tok = raw.trim_end_matches(|c: char| !c.is_alphanumeric());
+        match tok.rsplit_once(':') {
+            Some((path, line)) => {
+                !path.is_empty()
+                    && path.contains('.')
+                    && !line.is_empty()
+                    && line.chars().all(|c| c.is_ascii_digit())
+            }
+            None => false,
+        }
+    })
+}
+
 /// One 480B ring review. Caller holds a [`GATE_480B`] permit. `Err` means the
 /// ring didn't serve the call (routing failed, timed out, or `fleet_oneshot`
 /// failed over to a weaker model — never trusted as a 480B verdict).
@@ -2997,30 +3118,65 @@ async fn run_ff_dispatch(
         };
         match lane1 {
             Ok(Ok(outcome)) if outcome.already_done => {
-                // The model inspected the repo and reports the task is ALREADY implemented
-                // (feature exists, tests pass, nothing to commit). Mark the work_item done —
-                // NOT failed — so an already-satisfied task drains instead of thrashing every
-                // lane. Terminal 'done' is protected from later requeue_or_fail by its status guard.
-                let _ = crate::circuit_breaker::record_provider_success(
-                    pg,
-                    item.computer_id,
-                    LOCAL_CODEGEN_PROVIDER,
-                )
-                .await;
-                info!(
-                    work_item_id = %item.work_item_id,
-                    "work_item_dispatch: task already implemented per model — marking work_item done"
-                );
-                let _ = sqlx::query(
-                    "UPDATE work_items SET status = 'done', completed_at = NOW(), \
-                        last_error = 'already implemented (model verified: feature exists + tests pass)' \
-                      WHERE id = $1 AND status NOT IN ('merged')",
-                )
-                .bind(item.work_item_id)
-                .execute(pg)
-                .await;
-                let _ = remove_worktree(&item.repo_path, &worktree.worktree_path);
-                anyhow::bail!("already-implemented — work_item marked done, no PR needed");
+                // The model claims the task is ALREADY implemented (feature exists, tests
+                // pass, nothing to commit). Do NOT trust that claim on its face — a
+                // 2026-07-23 incident closed a work_item as ALREADY_IMPLEMENTED with zero
+                // verification when the fix did not actually exist, and dispatch kept
+                // re-closing it every attempt. Run the claim through an independent
+                // in-place reviewer (never the builder) and require an APPROVE verdict
+                // backed by a concrete file:line citation before marking it done.
+                match verify_already_done_claim(pg, item, worktree, "local").await {
+                    Ok(v) if v.verified => {
+                        // Terminal 'done' is protected from later requeue_or_fail by its
+                        // status guard.
+                        let _ = crate::circuit_breaker::record_provider_success(
+                            pg,
+                            item.computer_id,
+                            LOCAL_CODEGEN_PROVIDER,
+                        )
+                        .await;
+                        info!(
+                            work_item_id = %item.work_item_id,
+                            reviewer = %v.reviewer,
+                            "work_item_dispatch: already_done claim VERIFIED with citations — marking work_item done"
+                        );
+                        let _ = sqlx::query(
+                            "UPDATE work_items SET status = 'done', completed_at = NOW(), \
+                                last_error = $2 \
+                              WHERE id = $1 AND status NOT IN ('merged')",
+                        )
+                        .bind(item.work_item_id)
+                        .bind(truncate_for_db(&format!(
+                            "already implemented (verified by {}: {})",
+                            v.reviewer, v.reason
+                        )))
+                        .execute(pg)
+                        .await;
+                        let _ = remove_worktree(&item.repo_path, &worktree.worktree_path);
+                        anyhow::bail!("already-implemented — work_item marked done, no PR needed");
+                    }
+                    Ok(v) => {
+                        warn!(
+                            work_item_id = %item.work_item_id,
+                            reviewer = %v.reviewer,
+                            reason = %v.reason,
+                            "work_item_dispatch: already_done claim FAILED verification — treating as failed attempt"
+                        );
+                        anyhow::bail!(
+                            "already_done claim rejected by verifier {}: {}",
+                            v.reviewer,
+                            v.reason
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            work_item_id = %item.work_item_id,
+                            error = format!("{e:#}"),
+                            "work_item_dispatch: could not verify already_done claim — treating as failed attempt"
+                        );
+                        anyhow::bail!("already_done claim could not be verified: {e:#}");
+                    }
+                }
             }
             Ok(Ok(outcome)) if outcome.applied => {
                 let _ = crate::circuit_breaker::record_provider_success(
@@ -5006,16 +5162,38 @@ mod tests {
         AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS, ReviewerStat,
         affected_crate_manifests, agent_output_tail, backend_failed_without_output,
         builder_excludes_480b, classify_dispatch_outcome, command_display,
-        complexity_at_least_moderate, default_clone_path, dispatch_budget_for_host,
-        dispatch_prompt, expand_home, is_build_timeout, mirror_repo_url, order_cloud_reviewers,
-        parse_cli_tokens, primary_or_default_backend, quick_empty_success_is_provider_failure,
-        repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
-        same_model_family, should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
+        complexity_at_least_moderate, contains_file_line_citation, default_clone_path,
+        dispatch_budget_for_host, dispatch_prompt, expand_home, is_build_timeout, mirror_repo_url,
+        order_cloud_reviewers, parse_cli_tokens, primary_or_default_backend,
+        quick_empty_success_is_provider_failure, repo_cache_path, repo_slug,
+        retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
+        should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
         task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
     };
     use std::path::PathBuf;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn contains_file_line_citation_requires_dotted_path_and_digit_line() {
+        // Real citations, plain or wrapped in punctuation/backticks a reviewer
+        // might use in prose.
+        assert!(contains_file_line_citation(
+            "APPROVE\nSee crates/ff-agent/src/foo.rs:42 for the existing handler."
+        ));
+        assert!(contains_file_line_citation("`src/lib.rs:7`"));
+        assert!(contains_file_line_citation("(work_item_dispatch.rs:2999)"));
+        // A bare assertion with no evidence must NOT count as a citation —
+        // this is the exact failure mode of the 2026-07-23 incident (a
+        // builder's unverified "already implemented" claim).
+        assert!(!contains_file_line_citation(
+            "APPROVE\nThis is already implemented and tests pass."
+        ));
+        assert!(!contains_file_line_citation("REJECT\nno evidence found"));
+        // A colon with no digits after it, or no dot before it, isn't a citation.
+        assert!(!contains_file_line_citation("see: the config"));
+        assert!(!contains_file_line_citation("ratio:42"));
+    }
 
     #[test]
     fn builder_excludes_480b_for_local_builds_only() {
