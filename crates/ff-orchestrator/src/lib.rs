@@ -14,6 +14,7 @@
 //! - [`agent_team`] — Composable agent team management with tier-aware templates
 //! - [`task_decomposer`] — Template-based task decomposition (build/fix/review patterns)
 //! - [`confidence`] — Confidence-based escalation and trend tracking
+//! - [`deploy`] — Graceful fleet-deploy orchestration (health-gated batched rollout)
 
 pub mod agent_team;
 pub mod alerts;
@@ -21,6 +22,7 @@ pub mod cascade_strategy;
 pub mod confidence;
 pub mod crew;
 pub mod decomposer;
+pub mod deploy;
 pub mod leader;
 pub mod merge_train;
 pub mod node_manager;
@@ -43,6 +45,10 @@ pub use confidence::{
 };
 pub use crew::{AgentRole, CrewAssignment, CrewDefinition};
 pub use decomposer::{SubTask, SubTaskType, TaskDecomposition};
+pub use deploy::{
+    BatchHealth, GracefulDeployConfig, GracefulDeployOps, GracefulDeployOrchestrator,
+    GracefulDeployRun,
+};
 pub use leader::{
     AgentHeartbeatResult, AgentTask, LeaderCoordinator, Preemption, SubmissionAction,
     SubmissionResult, TickResult,

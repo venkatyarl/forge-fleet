@@ -1787,6 +1787,7 @@ version = "2026.4.7"
 dependencies = [
  "anyhow",
  "async-nats",
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "clap",
@@ -1798,6 +1799,7 @@ dependencies = [
  "ff-core",
  "ff-db",
  "ff-deploy",
+ "ff-orchestrator",
  "ff-pulse",
  "ff-voice",
  "futures",

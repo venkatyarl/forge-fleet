@@ -5917,31 +5917,47 @@ async fn handle_fleet_deploy(
         // if this process dies mid-deploy.
         set_alert_mute(pool, 50 * 60).await;
 
-        // Drive deploys with bounded global concurrency. Each group builds once
-        // on its builder, then ships binaries to receivers. Builder failures
-        // cause receivers to fall back to self-build.
+        // Drive the batched, health-gated update+restart phase through the
+        // graceful-deploy orchestrator (ff-orchestrator). Each (os_family, arch)
+        // group is one health-gated wave: the orchestrator updates+restarts a
+        // wave of groups via `deploy_group` (real SSH build/ship/restart), runs
+        // the post-restart convergence health check, and — because this is a
+        // graceful deploy — halts the rollout if a wave comes back unhealthy
+        // rather than pushing a possibly-bad build across the rest of the fleet.
+        // Bounded global concurrency still gates the builds via the shared
+        // semaphore. This run is bracketed by the real drain (above) and
+        // re-enable (below), completing the drain → update → restart → re-enable
+        // sequence.
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
-        let mut handles: Vec<tokio::task::JoinHandle<Vec<DeployResult>>> = Vec::new();
-        for plan in plans {
-            let s = sem.clone();
-            handles.push(tokio::spawn(async move { deploy_group(plan, s).await }));
+        let ops = FleetDeployOps { sem };
+        let orchestrator = ff_orchestrator::deploy::GracefulDeployOrchestrator::new(
+            ff_orchestrator::deploy::GracefulDeployConfig {
+                batch_size: 1,
+                abort_on_unhealthy: true,
+            },
+        );
+        let run = orchestrator.run(&ops, plans).await;
+        let mut results: Vec<DeployResult> = run.outcomes;
+        if let Some(reason) = &run.aborted {
+            eprintln!(
+                "{YELLOW}⚠ graceful deploy halted: {reason}; {} group(s) left on the old build{RESET}",
+                run.skipped.len()
+            );
         }
-        let mut results: Vec<DeployResult> = Vec::new();
-        for h in handles {
-            match h.await {
-                Ok(group_results) => {
-                    results.extend(group_results);
-                }
-                Err(e) => {
-                    eprintln!("{YELLOW}⚠ deploy group task failed: {e}{RESET}");
-                    results.push(DeployResult {
-                        name: "?".into(),
-                        ok: false,
-                        sha: "-".into(),
-                        secs: 0.0,
-                        detail: format!("task join error: {e}"),
-                    });
-                }
+        // Surface every host in a skipped group as not-converged so the
+        // convergence summary and exit code reflect that the rollout stopped
+        // early instead of reporting full-fleet coverage.
+        for plan in run.skipped {
+            let mut hosts = vec![plan.builder];
+            hosts.extend(plan.receivers);
+            for h in hosts {
+                results.push(DeployResult {
+                    name: h.name,
+                    ok: false,
+                    sha: "-".into(),
+                    secs: 0.0,
+                    detail: "skipped: graceful rollout halted after an unhealthy batch".into(),
+                });
             }
         }
         results.sort_by(|a, b| a.name.cmp(&b.name));
@@ -6083,6 +6099,76 @@ async fn handle_fleet_deploy(
     // coverage while offline/reserved hosts were silently left behind.
     report_skipped_hosts(&skipped);
     Ok(())
+}
+
+/// Adapter that lets `ff_orchestrator::deploy::GracefulDeployOrchestrator` drive
+/// `ff fleet deploy`'s real per-wave update+restart (`deploy_group`, over SSH)
+/// and post-restart health check (per-host convergence). Constructed inside
+/// `handle_fleet_deploy` between the drain and re-enable phases, so the
+/// orchestrator sequences the middle of drain → update → restart → re-enable
+/// against live operations. See the module docs on `ff_orchestrator::deploy`.
+struct FleetDeployOps {
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl ff_orchestrator::deploy::GracefulDeployOps for FleetDeployOps {
+    type Unit = GroupPlan;
+    type Outcome = DeployResult;
+
+    async fn deploy_batch(&self, batch: Vec<GroupPlan>) -> Vec<DeployResult> {
+        // Update + restart each group in this wave concurrently, bounded by the
+        // shared semaphore (one build per group on its builder, then ship to
+        // receivers; builder failure falls back to self-build inside
+        // `deploy_group`).
+        let mut handles: Vec<tokio::task::JoinHandle<Vec<DeployResult>>> = Vec::new();
+        for plan in batch {
+            let s = self.sem.clone();
+            handles.push(tokio::spawn(async move { deploy_group(plan, s).await }));
+        }
+        let mut results: Vec<DeployResult> = Vec::new();
+        for h in handles {
+            match h.await {
+                Ok(group_results) => results.extend(group_results),
+                Err(e) => {
+                    eprintln!("{YELLOW}⚠ deploy group task failed: {e}{RESET}");
+                    results.push(DeployResult {
+                        name: "?".into(),
+                        ok: false,
+                        sha: "-".into(),
+                        secs: 0.0,
+                        detail: format!("task join error: {e}"),
+                    });
+                }
+            }
+        }
+        results
+    }
+
+    async fn health_check(
+        &self,
+        outcomes: &[DeployResult],
+    ) -> ff_orchestrator::deploy::BatchHealth {
+        // `DeployResult.ok` is set from each host's post-restart version probe /
+        // convergence check, so a wave is healthy iff every host came back up on
+        // a parseable new build.
+        let failed: Vec<&str> = outcomes
+            .iter()
+            .filter(|r| !r.ok)
+            .map(|r| r.name.as_str())
+            .collect();
+        if failed.is_empty() {
+            ff_orchestrator::deploy::BatchHealth::Healthy
+        } else {
+            ff_orchestrator::deploy::BatchHealth::Unhealthy {
+                reason: format!(
+                    "{} host(s) did not converge: {}",
+                    failed.len(),
+                    failed.join(", ")
+                ),
+            }
+        }
+    }
 }
 
 /// Print the non-leader hosts `--all` excluded (offline or reserved) with the
