@@ -51,6 +51,8 @@ pub struct App {
 
     /// Gateway API client for real-time dashboard data.
     pub gateway: GatewayClient,
+    /// Best-effort leader Postgres connection for first-class TUI episodes.
+    episode_pool: Option<sqlx::PgPool>,
 }
 
 /// Interactive model picker overlay shown when user runs `/model` with no args.
@@ -143,6 +145,8 @@ pub struct SessionTab {
     pub tokens_used: usize,
     pub tokens_total: usize,
     pub turn: u32,
+    /// Monotonic persistence sequence for the normalized episode stream.
+    pub episode_seq: u32,
     pub tracker: ConversationTracker,
     /// Message queued while agent is running — sent automatically when agent finishes.
     pub queued_message: Option<String>,
@@ -202,7 +206,7 @@ impl SessionTab {
         Self {
             name: name.to_string(),
             session: None,
-            session_id: String::new(),
+            session_id: uuid::Uuid::new_v4().to_string(),
             messages: Vec::new(),
             input: InputState::new(),
             is_running: false,
@@ -214,6 +218,7 @@ impl SessionTab {
             tokens_used: 0,
             tokens_total: 32_768,
             turn: 0,
+            episode_seq: 0,
             tracker: ConversationTracker::new(),
             queued_message: None,
             running_since: None,
@@ -305,6 +310,7 @@ impl App {
     pub async fn new(config: AgentSessionConfig) -> Self {
         let working_dir = config.working_dir.clone();
         let current_project = detect_project(&working_dir);
+        let episode_pool = fleet_pool_from_config().await;
 
         let first_tab = SessionTab::new("Session 1");
 
@@ -322,6 +328,7 @@ impl App {
             picker: None,
             task_queue: Vec::new(),
             gateway: GatewayClient::default(),
+            episode_pool,
         }
     }
 
@@ -372,6 +379,7 @@ impl App {
 
     /// Process an agent event and update active tab.
     pub fn handle_event(&mut self, event: AgentEvent) {
+        let episode_pool = self.episode_pool.clone();
         let tab = &mut self.tabs[self.active_tab];
 
         if let Some(display) = crate::messages::event_to_display(&event) {
@@ -423,8 +431,11 @@ impl App {
                 let mark = if *is_error { "✗" } else { "✓" };
                 tab.last_activity = format!("{mark} {tool_name} ({duration_ms} ms)");
             }
-            AgentEvent::AssistantText { .. } => {
+            AgentEvent::AssistantText { text, .. } => {
                 tab.last_activity = "Assistant replied".into();
+                let seq = tab.episode_seq;
+                tab.episode_seq = tab.episode_seq.saturating_add(1);
+                persist_tui_episode(episode_pool, tab, seq, "assistant", text);
             }
             AgentEvent::Compaction {
                 messages_before,
@@ -438,12 +449,16 @@ impl App {
 
     /// Submit user input from active tab.
     pub fn submit_input(&mut self) {
+        let episode_pool = self.episode_pool.clone();
         let tab = &mut self.tabs[self.active_tab];
         let text = tab.input.submit();
         if text.is_empty() {
             return;
         }
         tab.messages.push(render_user_message(&text));
+        let seq = tab.episode_seq;
+        tab.episode_seq = tab.episode_seq.saturating_add(1);
+        persist_tui_episode(episode_pool, tab, seq, "user", &text);
         tab.is_running = true;
         tab.status = "Thinking...".into();
         tab.running_since = Some(Instant::now());
@@ -465,6 +480,36 @@ impl App {
     pub fn tab_count(&self) -> usize {
         self.tabs.len()
     }
+}
+
+fn persist_tui_episode(
+    pool: Option<sqlx::PgPool>,
+    tab: &SessionTab,
+    seq: u32,
+    role: &str,
+    content: &str,
+) {
+    let Some(pool) = pool else {
+        return;
+    };
+    let episode = ff_db::queries::FleetEpisodeRecord {
+        source_kind: "ff_tui".into(),
+        node: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()),
+        model: Some(tab.current_model.clone()),
+        session_id: tab.session_id.clone(),
+        work_item_id: None,
+        seq: i32::try_from(seq).unwrap_or(i32::MAX),
+        ts: chrono::Utc::now(),
+        role: role.into(),
+        content: ff_agent::session_export::redact(content),
+        tokens: None,
+        redacted: true,
+    };
+    tokio::spawn(async move {
+        if let Err(error) = ff_db::queries::pg_record_fleet_episode(&pool, &episode).await {
+            tracing::warn!(error = %error, "TUI episode persistence failed");
+        }
+    });
 }
 
 /// Detect project from working directory (check for FORGEFLEET.md, Cargo.toml, package.json).
@@ -799,4 +844,16 @@ async fn fleet_nodes_from_db() -> Vec<FleetComputer> {
             }
         })
         .collect()
+}
+
+async fn fleet_pool_from_config() -> Option<sqlx::PgPool> {
+    let home = dirs::home_dir()?;
+    let config = std::fs::read_to_string(home.join(".forgefleet/fleet.toml")).ok()?;
+    let config = toml::from_str::<ff_core::config::FleetConfig>(&config).ok()?;
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(3))
+        .connect(config.database.url.trim())
+        .await
+        .ok()
 }
