@@ -25,7 +25,8 @@
 //! preference slot and is only usable when the tree is clean and no interactive
 //! operator session owns it.
 
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -913,14 +914,119 @@ pub async fn reap_stale_busy_slots(
     .bind(stale_after_secs as f64)
     .fetch_all(pool)
     .await?;
-    Ok(rows
+    let reaped: Vec<ReapedSlot> = rows
         .into_iter()
         .map(|(sub_agent_id, work_item_id, requeued)| ReapedSlot {
             sub_agent_id,
             work_item_id,
             requeued,
         })
-        .collect())
+        .collect();
+    // The slot is free to dispatch again immediately (the SQL above already
+    // committed that), but its on-disk clone/worktree from the crashed/hung
+    // task is still sitting there — clean it up best-effort so it can't leak
+    // across dispatches. A cleanup failure must never undo the slot reset.
+    for slot in &reaped {
+        cleanup_stale_slot_worktree(pool, slot.sub_agent_id).await;
+    }
+    Ok(reaped)
+}
+
+/// An on-disk worktree/clone row still associated with a slot that
+/// [`reap_stale_busy_slots`] just reset, found via `sub_agent_id` rather than
+/// `work_item_id` because the DB reset already cleared the slot's
+/// `current_work_item_id`.
+struct StaleSlotWorktree {
+    id: Uuid,
+    repo_path: String,
+    worktree_path: String,
+    task_branch: String,
+}
+
+async fn fetch_stale_slot_worktree(
+    pool: &PgPool,
+    sub_agent_id: Uuid,
+) -> Result<Option<StaleSlotWorktree>, CoordError> {
+    let row: Option<(Uuid, String, String, String)> = sqlx::query_as(
+        "SELECT id, repo_path, worktree_path, task_branch \
+           FROM work_item_worktrees \
+          WHERE sub_agent_id = $1 AND status <> 'cleaned' \
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(sub_agent_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(
+        |(id, repo_path, worktree_path, task_branch)| StaleSlotWorktree {
+            id,
+            repo_path,
+            worktree_path,
+            task_branch,
+        },
+    ))
+}
+
+/// Clean up the orphaned worktree left behind by a slot [`reap_stale_busy_slots`]
+/// just reset to idle. Mirrors the terminal-state worktree reaper
+/// (`work_item_dispatch::evaluate_worktree_reaper`): the clone-direct clone is
+/// reset in place rather than deleted (it's the slot's persistent checkout,
+/// reused by the next dispatch), while a legacy detached worktree dir is
+/// removed outright and has its stray `target`/`node_modules`/`.venv` build
+/// artifacts reclaimed. The abandoned task branch is dropped either way, and
+/// the row is marked `cleaned` so this reaper doesn't retry it every tick.
+/// Best-effort throughout: a failure here must not block the slot from being
+/// dispatched to again — it only leaves bytes for the disk-pressure reaper.
+async fn cleanup_stale_slot_worktree(pool: &PgPool, sub_agent_id: Uuid) {
+    let worktree = match fetch_stale_slot_worktree(pool, sub_agent_id).await {
+        Ok(Some(worktree)) => worktree,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
+                error = %e, %sub_agent_id,
+                "stale slot reaper: failed to look up orphaned worktree"
+            );
+            return;
+        }
+    };
+
+    let repo_path = PathBuf::from(&worktree.repo_path);
+    let worktree_path = PathBuf::from(&worktree.worktree_path);
+    if let Err(e) = crate::work_item_dispatch::remove_worktree(&repo_path, &worktree_path) {
+        tracing::warn!(
+            error = %e, %sub_agent_id, worktree = %worktree.worktree_path,
+            "stale slot reaper: failed to reset orphaned worktree"
+        );
+    }
+    if worktree_path != repo_path {
+        let reclaimed = crate::work_item_dispatch::reclaim_build_artifacts(&worktree_path);
+        if reclaimed > 0 {
+            tracing::info!(
+                %sub_agent_id, reclaimed_bytes = reclaimed,
+                "stale slot reaper: reclaimed orphaned build artifacts"
+            );
+        }
+    }
+    let _ = crate::work_item_dispatch::run_git(
+        &repo_path,
+        [
+            OsStr::new("branch"),
+            OsStr::new("-D"),
+            OsStr::new(&worktree.task_branch),
+        ],
+        Duration::from_secs(30),
+    );
+    if let Err(e) = sqlx::query(
+        "UPDATE work_item_worktrees SET status = 'cleaned', cleaned_at = NOW() WHERE id = $1",
+    )
+    .bind(worktree.id)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(
+            error = %e, %sub_agent_id,
+            "stale slot reaper: failed to mark orphaned worktree cleaned"
+        );
+    }
 }
 
 /// Spawn the background stale-slot reaper: every [`REAPER_SCAN_INTERVAL_SECS`]
