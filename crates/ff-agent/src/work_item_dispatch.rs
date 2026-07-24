@@ -2139,6 +2139,12 @@ fn use_local_lane(attempts: i32, breaker_open: bool, prefers_cloud: bool) -> boo
         && !breaker_open
 }
 
+fn local_builder_label(model: Option<&str>) -> String {
+    model
+        .map(crate::llm_attribution::engine_label)
+        .unwrap_or_else(|| "local".to_string())
+}
+
 /// Hard ceiling on the Lane-1 LOCAL codegen harness — kept STRICTLY BELOW the
 /// lease heartbeat-staleness window (`LEASE_STALE_SECS`) so a slow/hung local
 /// lane always fails over to the cloud backstop BEFORE the scheduler's
@@ -3035,7 +3041,7 @@ async fn run_ff_dispatch(
                     "work_item_dispatch: local codegen harness landed the change"
                 );
                 return Ok((
-                    "local".to_string(),
+                    local_builder_label(outcome.model.as_deref()),
                     synthetic_output(&outcome.final_diff.unwrap_or_else(|| "applied".into())),
                 ));
             }
@@ -4988,10 +4994,11 @@ mod tests {
         affected_crate_manifests, agent_output_tail, backend_failed_without_output,
         builder_excludes_480b, classify_dispatch_outcome, command_display,
         complexity_at_least_moderate, default_clone_path, dispatch_budget_for_host,
-        dispatch_prompt, expand_home, is_build_timeout, mirror_repo_url, order_cloud_reviewers,
-        parse_cli_tokens, primary_or_default_backend, quick_empty_success_is_provider_failure,
-        repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
-        same_model_family, should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
+        dispatch_prompt, expand_home, is_build_timeout, local_builder_label, mirror_repo_url,
+        order_cloud_reviewers, parse_cli_tokens, primary_or_default_backend,
+        quick_empty_success_is_provider_failure, repo_cache_path, repo_slug,
+        retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
+        should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
         task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
     };
     use std::path::PathBuf;
@@ -5010,6 +5017,20 @@ mod tests {
         assert!(!builder_excludes_480b("codex"));
         assert!(!builder_excludes_480b("claude"));
         assert!(!builder_excludes_480b("kimi"));
+    }
+
+    #[test]
+    fn local_builder_label_carries_the_serving_model() {
+        assert_eq!(
+            local_builder_label(Some("glm-4.5-air")),
+            "local:glm-4.5-air"
+        );
+        assert_eq!(
+            local_builder_label(Some("devstral-small-2-24b")),
+            "local:devstral-small-2-24b"
+        );
+        assert_eq!(local_builder_label(None), "local");
+        assert_eq!(local_builder_label(Some("")), "local");
     }
 
     #[test]
