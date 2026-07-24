@@ -266,6 +266,19 @@ pub async fn execute_cli_in_dir(
         )
     })?;
 
+    // Fleet-wide operator override: `[general] disabled_backends` in
+    // fleet.toml. Reject BEFORE spawning so every caller's existing failover
+    // loop (the build-dispatch backend rotation in `work_item_dispatch`, the
+    // in-place reviewer loop) treats this exactly like any other backend
+    // failure and moves on to the next candidate (codex/kimi/local) — no new
+    // routing logic needed here, just refuse to dispatch to the disabled one.
+    if crate::fleet_info::is_backend_disabled(cfg.name) {
+        return Err(anyhow!(
+            "backend '{}' is disabled via fleet.toml [general] disabled_backends",
+            cfg.name
+        ));
+    }
+
     // Verify the binary is on PATH before bothering to spawn.
     let bin_path = which_on_path(cfg.binary).ok_or_else(|| {
         anyhow!(
