@@ -3145,7 +3145,16 @@ async fn run_ff_dispatch(
             );
             otherwise_dispatchable
         } else {
-            vec!["claude".to_string()]
+            // Last-resort fallback when the node has NO dispatchable backend rows
+            // at all (freshness/auth all stale). Was hardcoded vec!["claude"] —
+            // which silently OVERRODE the codex-first rotation and forced every
+            // such build onto claude, the one churning shared-OAuth backend. That
+            // is exactly why 30 items showed "backend claude produced no diff"
+            // with codex NEVER tried despite codex being authed+fresh on 9 nodes
+            // (2026-07-24). Fall back to the full rotation order so codex/kimi get
+            // the first shot here too; the per-backend error loop still skips any
+            // that genuinely fail at call time.
+            vec!["codex".to_string(), "kimi".to_string(), "claude".to_string()]
         }
     } else {
         routed
