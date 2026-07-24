@@ -5797,21 +5797,17 @@ async fn handle_fleet_deploy(
         }
     }
 
-    // Stop new assignments before any build starts, then let in-flight work
-    // be requeued attempt-neutrally before a restart can tear down its daemon.
+    // A targeted leader hands off leadership BEFORE anything drains or
+    // restarts. The graceful drain itself (stop new assignments, requeue
+    // in-flight work attempt-neutrally) is the first step of the orchestrated
+    // rollout below, so it is NOT run here.
     let target_names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
     handoff_deploy_leader(pool, &target_names).await?;
-    let previous_reservations = if graceful {
-        Some(drain_deploy_targets(pool, &target_names).await?)
-    } else {
-        None
-    };
 
-    // Every fallible step between the successful drain above and
-    // restore_deploy_targets below runs inside this block: a bare `?` here
-    // would strand target computers 'drained' and their sub-agents 'disabled',
-    // so the block's error is propagated only AFTER the drained targets have
-    // been restored. Guarded by
+    // The graceful path drains inside the orchestrator and ALWAYS re-enables
+    // once the drain has succeeded (only a failed drain — which restores
+    // internally — propagates an error), so no `?` below can strand target
+    // computers 'drained' or their sub-agents 'disabled'. Guarded by
     // fleet_deploy_restores_drained_targets_before_any_error_return.
     let deploy_outcome: Result<Vec<DeployResult>> = async {
         // Group targets by (os_family, arch). One build per group is executed
@@ -5871,33 +5867,43 @@ async fn handle_fleet_deploy(
         // if this process dies mid-deploy.
         set_alert_mute(pool, 50 * 60).await;
 
-        // Drive deploys with bounded global concurrency. Each group builds once
-        // on its builder, then ships binaries to receivers. Builder failures
-        // cause receivers to fall back to self-build.
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
-        let mut handles: Vec<tokio::task::JoinHandle<Vec<DeployResult>>> = Vec::new();
-        for plan in plans {
-            let s = sem.clone();
-            handles.push(tokio::spawn(async move { deploy_group(plan, s).await }));
-        }
-        let mut results: Vec<DeployResult> = Vec::new();
-        for h in handles {
-            match h.await {
-                Ok(group_results) => {
-                    results.extend(group_results);
-                }
-                Err(e) => {
-                    eprintln!("{YELLOW}⚠ deploy group task failed: {e}{RESET}");
-                    results.push(DeployResult {
-                        name: "?".into(),
-                        ok: false,
-                        sha: "-".into(),
-                        secs: 0.0,
-                        detail: format!("task join error: {e}"),
-                    });
+        // Drive the rollout. `--graceful` (the default) runs the full
+        // drain → batched update/restart → health-gate → re-enable sequence
+        // through ff-orchestrator: the group builders form the canary batch,
+        // receivers follow in `concurrency`-sized batches, and a batch that
+        // fails its health gate halts the batches after it. `--graceful=false`
+        // is the legacy path: groups fan out concurrently with no drain and
+        // no health gating. Builder failures cause receivers to fall back to
+        // self-build on both paths.
+        let mut results: Vec<DeployResult> = if graceful {
+            run_graceful_fleet_deploy(pool, &plans, concurrency, json).await?
+        } else {
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+            let mut handles: Vec<tokio::task::JoinHandle<Vec<DeployResult>>> = Vec::new();
+            for plan in plans {
+                let s = sem.clone();
+                handles.push(tokio::spawn(async move { deploy_group(plan, s).await }));
+            }
+            let mut results: Vec<DeployResult> = Vec::new();
+            for h in handles {
+                match h.await {
+                    Ok(group_results) => {
+                        results.extend(group_results);
+                    }
+                    Err(e) => {
+                        eprintln!("{YELLOW}⚠ deploy group task failed: {e}{RESET}");
+                        results.push(DeployResult {
+                            name: "?".into(),
+                            ok: false,
+                            sha: "-".into(),
+                            secs: 0.0,
+                            detail: format!("task join error: {e}"),
+                        });
+                    }
                 }
             }
-        }
+            results
+        };
         results.sort_by(|a, b| a.name.cmp(&b.name));
 
         // Replay per-host completion lines now that all groups are done.
@@ -5924,11 +5930,6 @@ async fn handle_fleet_deploy(
     }
     .await;
 
-    // Restore BEFORE propagating any deploy error, so a failed rollout never
-    // leaves computers out of reservation rotation or sub-agents disabled.
-    if let Some(previous) = &previous_reservations {
-        restore_deploy_targets(pool, previous).await;
-    }
     let results = deploy_outcome?;
 
     // Convergence target = the most-common SHA among successful hosts.
@@ -6037,6 +6038,244 @@ async fn handle_fleet_deploy(
     // coverage while offline/reserved hosts were silently left behind.
     report_skipped_hosts(&skipped);
     Ok(())
+}
+
+/// `--graceful` rollout: run the full drain → update → restart → re-enable
+/// sequence through [`ff_orchestrator::deploy::run_graceful_deploy`], with the
+/// group builders as the canary batch and receivers following in
+/// `concurrency`-sized batches. Returns one [`DeployResult`] per planned host,
+/// including hosts skipped because an earlier batch failed its health gate.
+///
+/// Only a failed initial drain propagates as `Err` (and `drain_deploy_targets`
+/// restores internally on its own failure); after the drain succeeds, per-host
+/// failures become outcomes and the executor's `re_enable` restores the
+/// drained reservation states in every path — the orchestrator guarantees the
+/// sequencing (see ff-orchestrator's deploy tests).
+async fn run_graceful_fleet_deploy(
+    pool: &sqlx::PgPool,
+    plans: &[GroupPlan],
+    concurrency: usize,
+    json: bool,
+) -> Result<Vec<DeployResult>> {
+    use ff_orchestrator::deploy::NodeStatus;
+
+    let builders: Vec<String> = plans.iter().map(|p| p.builder.name.clone()).collect();
+    let receivers: Vec<String> = plans
+        .iter()
+        .flat_map(|p| p.receivers.iter().map(|r| r.name.clone()))
+        .collect();
+    let batches = ff_orchestrator::deploy::plan_batches(builders, receivers, concurrency);
+
+    let mut targets_by_name = std::collections::HashMap::new();
+    let mut builder_of = std::collections::HashMap::new();
+    for p in plans {
+        targets_by_name.insert(p.builder.name.clone(), p.builder.clone());
+        for r in &p.receivers {
+            targets_by_name.insert(r.name.clone(), r.clone());
+            builder_of.insert(r.name.clone(), p.builder.name.clone());
+        }
+    }
+    if !json {
+        eprintln!(
+            "  graceful rollout: {} batch(es) (builders first), halting when a batch \
+             fails its health gate",
+            batches.len()
+        );
+    }
+
+    let executor = FleetDeployExecutor {
+        pool: pool.clone(),
+        targets: targets_by_name,
+        builder_of,
+        builder_ok: std::sync::Mutex::new(std::collections::HashMap::new()),
+        restarted_at: std::sync::Mutex::new(std::collections::HashMap::new()),
+        results: std::sync::Mutex::new(Vec::new()),
+        drained: std::sync::Mutex::new(Vec::new()),
+    };
+    let config = ff_orchestrator::deploy::GracefulDeployConfig {
+        max_in_flight: concurrency,
+        ..Default::default()
+    };
+    let rollout =
+        ff_orchestrator::deploy::run_graceful_deploy(&executor, &batches, &config).await?;
+
+    if let Some(err) = &rollout.re_enable_error {
+        eprintln!("{YELLOW}⚠ failed to re-enable drained targets: {err}{RESET}");
+    }
+    if let Some(batch) = rollout.halted_after_batch {
+        eprintln!(
+            "{YELLOW}⚠ rollout halted: batch {} failed its health gate; later batches \
+             were skipped{RESET}",
+            batch + 1
+        );
+    }
+
+    // Merge the executor's per-host reports with the orchestrator's verdicts:
+    // skipped hosts get a synthetic row, a failed health gate demotes an
+    // otherwise-ok restart, and update failures that never produced a report
+    // (e.g. unknown target) still surface in the summary.
+    let mut results = executor
+        .results
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for outcome in &rollout.outcomes {
+        match &outcome.status {
+            NodeStatus::Healthy => {}
+            NodeStatus::Skipped(reason) => results.push(DeployResult {
+                name: outcome.node.clone(),
+                ok: false,
+                sha: "-".into(),
+                secs: 0.0,
+                detail: format!("skipped: {reason}"),
+            }),
+            NodeStatus::Unhealthy(reason) => {
+                if let Some(r) = results.iter_mut().find(|r| r.name == outcome.node) {
+                    r.ok = false;
+                    r.detail = format!("{}; health gate failed: {reason}", r.detail);
+                }
+            }
+            NodeStatus::UpdateFailed(reason) => {
+                if !results.iter().any(|r| r.name == outcome.node) {
+                    results.push(DeployResult {
+                        name: outcome.node.clone(),
+                        ok: false,
+                        sha: "-".into(),
+                        secs: 0.0,
+                        detail: reason.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(results)
+}
+
+/// The real [`ff_orchestrator::deploy::FleetExecutor`] behind
+/// `ff fleet deploy --graceful`: drains via the Postgres reservation state +
+/// bounded lease wait (`drain_deploy_targets`), updates hosts over SSH (full
+/// build on the group builder via `deploy_one_host`, binary ship to receivers
+/// via `deploy_receiver`, self-build fallback when the builder failed),
+/// health-gates on the host's daemon heartbeating AFTER its restart, and
+/// re-enables by restoring the captured reservation states.
+struct FleetDeployExecutor {
+    pool: sqlx::PgPool,
+    /// Every planned host, by name.
+    targets: std::collections::HashMap<String, DeployTarget>,
+    /// Receiver name → its group's builder name (builders are absent).
+    builder_of: std::collections::HashMap<String, String>,
+    /// Builder name → whether its build+restart succeeded. Receivers whose
+    /// builder failed fall back to a full self-build.
+    builder_ok: std::sync::Mutex<std::collections::HashMap<String, bool>>,
+    /// Restart-completion stamps (DB clock). The health gate requires a
+    /// heartbeat NEWER than this, so a fresh PRE-restart beat can't pass it.
+    restarted_at:
+        std::sync::Mutex<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>>,
+    /// Per-host reports, in completion order, for the convergence summary.
+    results: std::sync::Mutex<Vec<DeployResult>>,
+    /// Reservation states captured by `drain`, restored by `re_enable`.
+    drained: std::sync::Mutex<Vec<(uuid::Uuid, String)>>,
+}
+
+#[ff_orchestrator::deploy::async_trait]
+impl ff_orchestrator::deploy::FleetExecutor for FleetDeployExecutor {
+    async fn drain(&self, nodes: &[String]) -> Result<()> {
+        // Reservation drain + bounded lease wait. It restores internally when
+        // the wait fails, so an `Err` here never strands drained state.
+        let previous = drain_deploy_targets(&self.pool, nodes).await?;
+        *self.drained.lock().unwrap() = previous;
+        Ok(())
+    }
+
+    async fn update_and_restart(&self, node: &str) -> Result<()> {
+        let target = self
+            .targets
+            .get(node)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown deploy target '{node}'"))?;
+        let result = match self.builder_of.get(node) {
+            // Group builder: full build + install + restart, then record
+            // whether its receivers can ship binaries from it.
+            None => {
+                let r = deploy_one_host(target).await;
+                self.builder_ok
+                    .lock()
+                    .unwrap()
+                    .insert(node.to_string(), r.ok);
+                r
+            }
+            Some(builder_name) => {
+                let builder_built = self
+                    .builder_ok
+                    .lock()
+                    .unwrap()
+                    .get(builder_name)
+                    .copied()
+                    .unwrap_or(false);
+                match self.targets.get(builder_name) {
+                    Some(builder) if builder_built => {
+                        deploy_receiver(target, builder.clone()).await
+                    }
+                    // Builder failed (or vanished): full self-build.
+                    _ => deploy_one_host(target).await,
+                }
+            }
+        };
+
+        // Stamp restart completion from the DB clock so the health gate's
+        // "beat after restart" comparison can't trip on local clock skew.
+        let restarted: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or_else(|_| chrono::Utc::now());
+        self.restarted_at
+            .lock()
+            .unwrap()
+            .insert(node.to_string(), restarted);
+
+        let ok = result.ok;
+        let detail = result.detail.clone();
+        self.results.lock().unwrap().push(result);
+        if ok {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(detail))
+        }
+    }
+
+    async fn health_check(&self, node: &str) -> Result<()> {
+        let restarted = self
+            .restarted_at
+            .lock()
+            .unwrap()
+            .get(node)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("no restart stamp recorded for '{node}'"))?;
+        // The daemon must have heartbeaten AFTER its restart — however fresh
+        // a PRE-restart `last_seen_at` is, it proves nothing about the new
+        // process. The orchestrator retries this probe across the gate window.
+        let beating: Option<bool> = sqlx::query_scalar(
+            "SELECT COALESCE(last_seen_at >= $2, false)
+               FROM computers
+              WHERE name = $1",
+        )
+        .bind(node)
+        .bind(restarted)
+        .fetch_optional(&self.pool)
+        .await?;
+        if beating.unwrap_or(false) {
+            Ok(())
+        } else {
+            anyhow::bail!("'{node}' has not heartbeaten since its restart")
+        }
+    }
+
+    async fn re_enable(&self, _nodes: &[String]) -> Result<()> {
+        // Restore the exact pre-deploy reservation states captured by drain
+        // (best-effort per host; failures are logged inside).
+        let previous = std::mem::take(&mut *self.drained.lock().unwrap());
+        restore_deploy_targets(&self.pool, &previous).await;
+        Ok(())
+    }
 }
 
 /// Print the non-leader hosts `--all` excluded (offline or reserved) with the
@@ -6493,14 +6732,30 @@ mod route_tests {
             .split("async fn handle_fleet_deploy")
             .nth(1)
             .expect("fleet deploy handler");
-        let drain = deploy
-            .find("drain_deploy_targets(pool")
-            .expect("deploy must drain target leases");
-        let run = deploy
-            .find("deploy_group(plan")
-            .expect("deploy must run grouped restarts");
-        assert!(drain < run, "lease drain must precede daemon restarts");
-        assert!(deploy.contains("restore_deploy_targets(pool"));
+        // The graceful (default) path routes through ff-orchestrator's
+        // run_graceful_deploy, whose drain-before-any-restart sequencing is
+        // unit-tested in ff_orchestrator::deploy. Pin the WIRING here: the
+        // executor's drain/update/re-enable really are the reservation drain,
+        // the SSH host deploys, and the reservation restore.
+        assert!(
+            deploy.contains("run_graceful_fleet_deploy(pool"),
+            "--graceful must route through the graceful rollout orchestrator"
+        );
+        let executor = source
+            .split("impl ff_orchestrator::deploy::FleetExecutor for FleetDeployExecutor")
+            .nth(1)
+            .expect("real fleet executor impl");
+        let drain = executor
+            .find("drain_deploy_targets(")
+            .expect("executor drain must drain target leases");
+        let update = executor
+            .find("deploy_one_host(")
+            .expect("executor update must run host restarts");
+        assert!(drain < update, "lease drain must precede daemon restarts");
+        assert!(executor.contains("deploy_receiver("));
+        assert!(executor.contains("restore_deploy_targets("));
+        // Legacy (--graceful=false) path still restarts via grouped deploys.
+        assert!(deploy.contains("deploy_group(plan"));
 
         let leader = source
             .split("async fn refresh_local_leader_if_self")
@@ -6525,13 +6780,15 @@ mod route_tests {
         let handoff = deploy
             .find("handoff_deploy_leader(pool")
             .expect("deploy must hand off a targeted leader");
-        let drain = deploy
-            .find("drain_deploy_targets(pool")
-            .expect("deploy must drain target leases");
-        let restart = deploy
+        // The drain now happens inside the orchestrated rollout, so handing
+        // off leadership must precede BOTH rollout entry points.
+        let graceful_run = deploy
+            .find("run_graceful_fleet_deploy(pool")
+            .expect("deploy must run the graceful rollout");
+        let legacy_run = deploy
             .find("deploy_group(plan")
             .expect("deploy must run grouped restarts");
-        assert!(handoff < drain && drain < restart);
+        assert!(handoff < graceful_run && handoff < legacy_run);
 
         let leader = source
             .split("async fn refresh_local_leader_if_self")
@@ -6552,36 +6809,38 @@ mod route_tests {
     #[test]
     fn fleet_deploy_restores_drained_targets_before_any_error_return() {
         let source = include_str!("fleet_cmd.rs");
-        let deploy = source
-            .split("async fn handle_fleet_deploy")
+        // The drain/restore pairing now lives in the orchestrated rollout:
+        // ff_orchestrator::deploy::run_graceful_deploy only propagates an
+        // error from the initial drain (which restores internally on its own
+        // failure) and ALWAYS calls the executor's re_enable once the drain
+        // has succeeded — even when batches fail or the rollout halts. That
+        // sequencing is unit-tested in ff-orchestrator; pin the WIRING here.
+        let helper = source
+            .split("async fn run_graceful_fleet_deploy")
             .nth(1)
-            .expect("fleet deploy handler");
-        let drain = deploy
-            .find("drain_deploy_targets(pool")
-            .expect("deploy must drain target leases");
-        let restore = deploy
-            .find("restore_deploy_targets(pool")
-            .expect("deploy must restore drained targets");
-        assert!(drain < restore);
-        // Skip past the drain call's own `.await?` — a FAILED drain restores
-        // internally. From there to the restore call, no error may propagate:
-        // an early return would strand target computers 'drained' and their
-        // sub-agents 'disabled'.
-        let window = deploy[drain..restore]
-            .split_once(".await?")
-            .map(|(_, rest)| rest)
-            .expect("drain call is awaited");
-        for forbidden in [".await?", "bail!", "return Err", "return Ok"] {
-            assert!(
-                !window.contains(forbidden),
-                "`{forbidden}` between drain and restore would strand drained state"
-            );
-        }
-        // The deploy block's captured error is re-raised only after restore.
-        assert!(
-            deploy[restore..].contains("deploy_outcome?"),
-            "deploy errors must propagate only after restore_deploy_targets"
+            .expect("graceful rollout helper");
+        let helper = helper.split("\n}\n").next().expect("helper body");
+        // The helper's ONLY fallible await is the orchestrator run itself, so
+        // no other `?` can fire while targets sit drained.
+        assert_eq!(
+            helper.matches(".await?").count(),
+            1,
+            "run_graceful_fleet_deploy may only propagate the orchestrator's error"
         );
+        assert!(helper.contains("run_graceful_deploy(&executor"));
+        // And the executor's drain/re_enable really are the reservation
+        // drain + restore.
+        let executor = source
+            .split("impl ff_orchestrator::deploy::FleetExecutor for FleetDeployExecutor")
+            .nth(1)
+            .expect("real fleet executor impl");
+        let drain = executor
+            .find("drain_deploy_targets(")
+            .expect("executor drain must drain target leases");
+        let restore = executor
+            .find("restore_deploy_targets(")
+            .expect("executor re_enable must restore drained targets");
+        assert!(drain < restore);
 
         let leader = source
             .split("async fn refresh_local_leader_if_self")

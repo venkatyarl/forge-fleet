@@ -21,6 +21,7 @@ ff-brain = { path = "../ff-brain" }
 ff-core = { path = "../ff-core" }
 ff-db = { path = "../ff-db" }
 ff-deploy = { path = "../ff-deploy" }
+ff-orchestrator = { path = "../ff-orchestrator" }
 ff-pulse = { path = "../ff-pulse" }
 ff-voice = { path = "../ff-voice" }
 sqlx = { workspace = true }
