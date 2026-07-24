@@ -1188,6 +1188,22 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "ff_interactions_episodic_tagging",
         sql: schema::SCHEMA_V250_FF_INTERACTIONS_EPISODIC_TAGGING,
     },
+    // V251 is Autopilot-2a routing_ladders (lands before this branch).
+    PgMigration {
+        version: 252,
+        name: "deployment_pinned",
+        sql: schema::SCHEMA_V252_DEPLOYMENT_PINNED,
+    },
+    PgMigration {
+        version: 253,
+        name: "fleet_episodes",
+        sql: schema::SCHEMA_V253_FLEET_EPISODES,
+    },
+    PgMigration {
+        version: 254,
+        name: "brain_vault_node_body",
+        sql: schema::SCHEMA_V254_BRAIN_VAULT_NODE_BODY,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

@@ -12154,6 +12154,48 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
     ON ff_interactions (work_item_id, ts) WHERE work_item_id IS NOT NULL;
 "#;
 
+/// Autopilot-3: operator-pinned deployments are excluded from automatic
+/// right-sizing unloads.
+pub const SCHEMA_V252_DEPLOYMENT_PINNED: &str = r#"
+ALTER TABLE fleet_model_deployments
+    ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE;
+"#;
+
+/// Memory-v2 M7 — one normalized episodic stream for every human and
+/// fleet-routed LLM session on every node.
+pub const SCHEMA_V253_FLEET_EPISODES: &str = r#"
+CREATE TABLE IF NOT EXISTS fleet_episodes (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_kind  TEXT NOT NULL CHECK (source_kind IN (
+        'claude_cli', 'codex_cli', 'kimi_cli', 'ff_tui',
+        'ff_interaction', 'research', 'council'
+    )),
+    node         TEXT NOT NULL,
+    model        TEXT,
+    session_id   TEXT NOT NULL,
+    work_item_id UUID,
+    seq          INT NOT NULL,
+    ts           TIMESTAMPTZ NOT NULL,
+    role         TEXT NOT NULL,
+    content      TEXT NOT NULL,
+    tokens       INT,
+    redacted     BOOLEAN NOT NULL DEFAULT TRUE,
+    UNIQUE (source_kind, node, session_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_episodes_ts
+    ON fleet_episodes (ts DESC);
+CREATE INDEX IF NOT EXISTS idx_fleet_episodes_work_item
+    ON fleet_episodes (work_item_id, ts) WHERE work_item_id IS NOT NULL;
+"#;
+
+/// Compaction-to-episodic memory needs the compacted summary itself available
+/// to the Dreamer; metadata-only vault nodes cannot be consolidated.
+pub const SCHEMA_V254_BRAIN_VAULT_NODE_BODY: &str = r#"
+ALTER TABLE brain_vault_nodes
+    ADD COLUMN IF NOT EXISTS body TEXT;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

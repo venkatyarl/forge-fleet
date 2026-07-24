@@ -3461,6 +3461,10 @@ pub enum ModelCommand {
         #[arg(long)]
         port: Option<i32>,
     },
+    /// Protect a deployment from automatic right-sizing.
+    Pin { id: String },
+    /// Allow automatic right-sizing of a deployment.
+    Unpin { id: String },
     /// Reprofile a running deployment into the agent-capable serving profile:
     /// unload it, then reload the SAME model on the SAME port with `--parallel 1
     /// --ctx >= 32768` so a tool-using agent's full context fits on one slot and
@@ -4898,8 +4902,13 @@ async fn main() -> Result<()> {
         }
         Some(Command::Session { command }) => {
             if let SessionCommand::Export { vault, force } = &command {
-                let summary =
-                    ff_agent::session_export::export_local_sessions(vault.as_deref(), *force)?;
+                let pool = ff_agent::fleet_info::get_fleet_pool().await.ok();
+                let summary = ff_agent::session_export::export_local_sessions(
+                    pool.as_ref(),
+                    vault.as_deref(),
+                    *force,
+                )
+                .await?;
                 println!(
                     "{GREEN}✓{RESET} scanned {}, exported {}, unchanged {}",
                     summary.scanned, summary.exported, summary.skipped

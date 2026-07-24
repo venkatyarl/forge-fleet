@@ -15,8 +15,230 @@
 //! "the operator wanted this LLM up" was forgotten. After V90, `desired_state`
 //! survives a missing process and this reconciler reads it.
 
+use sqlx::Row;
 use std::collections::HashMap;
 use std::path::Path;
+
+/// Run at most once per UTC day across the fleet. The daemon's leader gate
+/// avoids competing actuators; this durable claim also covers restarts.
+pub async fn run_daily_right_sizing(pool: &sqlx::PgPool) -> Result<(), String> {
+    let already_ran = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM fleet_settings
+          WHERE key='model_right_sizing_last_day'
+            AND value #>> '{}' = CURRENT_DATE::text)",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("check right-sizing pass: {e}"))?
+    .unwrap_or(false);
+    if already_ran {
+        return Ok(());
+    }
+
+    // LIMIT 1 is the per-pass unload cap. The overlap predicate proves another
+    // healthy deployment covers at least one preferred workload.
+    if let Some(row) = sqlx::query(
+        "SELECT d.id::text,d.worker_name,d.port,d.library_id::text,d.catalog_id
+           FROM fleet_model_deployments d
+           JOIN v_model_utilization u ON u.catalog_id=d.catalog_id
+           JOIN fleet_model_catalog c ON c.id=d.catalog_id
+          WHERE COALESCE(u.calls_7d,0)+COALESCE(u.builds_7d,0)<5
+            AND NOT d.pinned AND d.desired_state='active'
+            AND EXISTS (
+                SELECT 1 FROM fleet_model_deployments x
+                JOIN fleet_model_catalog xc ON xc.id=x.catalog_id
+                WHERE x.id<>d.id AND x.health_status='healthy'
+                  AND x.desired_state='active'
+                  AND xc.preferred_workloads ?| ARRAY(
+                      SELECT jsonb_array_elements_text(c.preferred_workloads)))
+          ORDER BY COALESCE(u.calls_7d,0)+COALESCE(u.builds_7d,0),d.started_at
+          LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("select unload candidate: {e}"))?
+    {
+        let id: String = row.get(0);
+        let worker: String = row.get(1);
+        let port: i32 = row.get(2);
+        let library: Option<String> = row.get(3);
+        let catalog: Option<String> = row.get(4);
+
+        // Ordering is safety-critical: killing first lets Restart=on-failure
+        // resurrect llama-server.
+        systemctl_disable_now(pool, &worker, port).await?;
+        ff_db::pg_delete_deployment(pool, &id)
+            .await
+            .map_err(|e| format!("delete deployment {id}: {e}"))?;
+        if let Some(library) = library {
+            sqlx::query(
+                "UPDATE fleet_model_library SET state='cold'
+                 WHERE id=$1::uuid AND NOT EXISTS(
+                   SELECT 1 FROM fleet_model_deployments
+                    WHERE library_id=$1::uuid AND desired_state='active')",
+            )
+            .bind(library)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("mark library cold: {e}"))?;
+        }
+        let _ = crate::telegram::send_telegram_from_secrets(
+            pool,
+            "ForgeFleet right-sizing: unload",
+            &format!(
+                "Unloaded {id} ({}) on {worker}:{port}; 7d calls+builds < 5 and another healthy deployment covers its workload.",
+                catalog.unwrap_or_else(|| "unknown".into())
+            ),
+        )
+        .await;
+    }
+
+    // A workload qualifies only when every healthy routed endpoint has samples
+    // across the full pass window and none dips below its parallel slot count.
+    // LIMIT 1 is the per-pass load cap.
+    if let Some(row) = sqlx::query(
+        "WITH workloads AS (
+           SELECT DISTINCT jsonb_array_elements_text(c.preferred_workloads) workload
+           FROM fleet_model_deployments d JOIN fleet_model_catalog c ON c.id=d.catalog_id
+           WHERE d.health_status='healthy' AND d.desired_state='active'
+         ), saturated AS (
+           SELECT workload FROM workloads w WHERE NOT EXISTS(
+             SELECT 1 FROM fleet_model_deployments d
+             JOIN fleet_model_catalog c ON c.id=d.catalog_id
+             WHERE c.preferred_workloads ? w.workload AND d.health_status='healthy'
+               AND (NOT EXISTS(
+                 SELECT 1 FROM computer_metrics_history m JOIN computers n ON n.id=m.computer_id
+                 WHERE LOWER(n.name)=LOWER(d.worker_name)
+                   AND m.recorded_at>=NOW()-INTERVAL '5 minutes')
+                OR EXISTS(
+                 SELECT 1 FROM computer_metrics_history m JOIN computers n ON n.id=m.computer_id
+                 WHERE LOWER(n.name)=LOWER(d.worker_name)
+                   AND m.recorded_at>=NOW()-INTERVAL '5 minutes'
+                   AND COALESCE(m.llm_active_requests,0)
+                       < GREATEST(COALESCE(d.parallel_slots,1),1))))
+         ), candidates AS (
+           SELECT s.workload,l.id::text library_id,l.worker_name,c.id catalog_id,c.tier,
+             COALESCE(n.total_ram_gb,0)-COALESCE(latest.ram_used_gb,0) free_ram_gb,
+             l.size_bytes::float8/1e9 model_gb
+           FROM saturated s JOIN fleet_model_catalog c ON c.preferred_workloads ? s.workload
+           JOIN fleet_model_library l ON l.catalog_id=c.id AND l.state='cold'
+           JOIN computers n ON LOWER(n.name)=LOWER(l.worker_name)
+           LEFT JOIN LATERAL(
+             SELECT m.ram_used_gb FROM computer_metrics_history m
+             WHERE m.computer_id=n.id ORDER BY m.recorded_at DESC LIMIT 1) latest ON true
+         )
+         SELECT workload,library_id,worker_name,catalog_id FROM candidates
+         WHERE free_ram_gb-model_gb >= COALESCE(
+           (SELECT (value #>> '{}')::float8 FROM fleet_settings
+             WHERE key='build_reserve_gb'),8)
+         ORDER BY tier,free_ram_gb DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("select load candidate: {e}"))?
+    {
+        let workload: String = row.get(0);
+        let library: String = row.get(1);
+        let worker: String = row.get(2);
+        let catalog: String = row.get(3);
+        let port = free_model_port(pool, &worker).await?;
+        load_on_worker(pool, &worker, &library, port).await?;
+        let _ = crate::telegram::send_telegram_from_secrets(
+            pool,
+            "ForgeFleet right-sizing: load",
+            &format!(
+                "Loaded {catalog} on {worker}:{port} for sustained saturated workload '{workload}'."
+            ),
+        )
+        .await;
+    }
+
+    sqlx::query(
+        "INSERT INTO fleet_settings(key,value,updated_at)
+         VALUES ('model_right_sizing_last_day',to_jsonb(CURRENT_DATE::text),NOW())
+         ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=NOW()",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("record right-sizing pass: {e}"))?;
+    Ok(())
+}
+
+async fn systemctl_disable_now(pool: &sqlx::PgPool, worker: &str, port: i32) -> Result<(), String> {
+    let local = crate::fleet_info::resolve_this_worker_name().await;
+    if worker.eq_ignore_ascii_case(&local) {
+        let status = tokio::process::Command::new("systemctl")
+            .args(["--user", "disable", "--now", &format!("llama-{port}")])
+            .status()
+            .await
+            .map_err(|e| format!("systemctl llama-{port}: {e}"))?;
+        if !status.success() {
+            return Err(format!("systemctl disable --now llama-{port} failed"));
+        }
+    } else {
+        let node = ff_db::pg_get_node(pool, worker)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("unknown worker {worker}"))?;
+        let command = format!("systemctl --user disable --now llama-{port}");
+        let (code, _, err) = crate::model_transfer::ssh_exec(&node.ssh_user, &node.ip, &command)
+            .await
+            .map_err(|e| e.to_string())?;
+        if code != 0 {
+            return Err(format!("{command}: {}", err.trim()));
+        }
+    }
+    Ok(())
+}
+
+async fn free_model_port(pool: &sqlx::PgPool, worker: &str) -> Result<u16, String> {
+    let used: Vec<i32> =
+        sqlx::query_scalar("SELECT port FROM fleet_model_deployments WHERE worker_name=$1")
+            .bind(worker)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    (CANONICAL_PORT_MIN..=CANONICAL_PORT_MAX)
+        .find(|p| !used.contains(p))
+        .map(|p| p as u16)
+        .ok_or_else(|| format!("no free canonical model port on {worker}"))
+}
+
+async fn load_on_worker(
+    pool: &sqlx::PgPool,
+    worker: &str,
+    library: &str,
+    port: u16,
+) -> Result<(), String> {
+    let local = crate::fleet_info::resolve_this_worker_name().await;
+    if worker.eq_ignore_ascii_case(&local) {
+        crate::model_runtime::load_model(
+            pool,
+            crate::model_runtime::LoadOptions {
+                library_id: library.into(),
+                port,
+                context_size: None,
+                parallel: None,
+                agent_profile: false,
+                mmproj_path: None,
+            },
+        )
+        .await?;
+    } else {
+        let node = ff_db::pg_get_node(pool, worker)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("unknown worker {worker}"))?;
+        let command = format!("~/.local/bin/ff model load '{library}' --port {port}");
+        let (code, _, err) = crate::model_transfer::ssh_exec(&node.ssh_user, &node.ip, &command)
+            .await
+            .map_err(|e| e.to_string())?;
+        if code != 0 {
+            return Err(format!("remote load: {}", err.trim()));
+        }
+    }
+    Ok(())
+}
 
 /// Canonical inference ports per the fleet port registry ([[canonical-ports]]):
 /// llama.cpp / mlx slots are 55000-55010, vllm uses 51001 / 51003, ollama 11434.
