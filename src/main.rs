@@ -3601,6 +3601,17 @@ async fn start_pulse_v2_subsystems(
         ff_agent::research::ResearchRunnerTick::new(pg_pool.clone(), worker_name.clone());
     handles.push(research_runner.spawn(shutdown_rx.clone()));
 
+    // (7e) Evidence-driven self-improvement — hourly check, leader-gated, with
+    // a durable weekly cursor. One subsystem rotates per UTC day; the council
+    // may file at most two operator-vetoable feature work items per pass.
+    info!(
+        node = %worker_name.clone(),
+        "starting subsystem: self-improve council (hourly check, leader-gated)"
+    );
+    handles.push(
+        ff_agent::self_improve::SelfImproveTick::new(pg_pool.clone()).spawn(shutdown_rx.clone()),
+    );
+
     // (8) Auto-upgrade hourly tick — runs on every daemon, internally
     // gated on leader + fleet_secrets.auto_upgrade_enabled. Refreshes
     // upstream versions (npm/pypi/github_release/self_built), flips

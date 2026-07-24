@@ -146,6 +146,7 @@ pub mod scoped_memory;
 pub mod scratchpad;
 pub mod secrets_rotation;
 pub mod self_heal;
+pub mod self_improve;
 pub mod self_improvement;
 pub mod service_connectivity;
 pub mod session_export;
