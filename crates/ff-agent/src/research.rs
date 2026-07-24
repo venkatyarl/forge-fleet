@@ -276,6 +276,45 @@ pub struct ResearchSession {
     session_id: Uuid,
 }
 
+const RESEARCH_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Aborts the background heartbeat as soon as its owning run/recovery exits.
+struct ResearchHeartbeat(tokio::task::JoinHandle<()>);
+
+impl ResearchHeartbeat {
+    fn start(pool: PgPool, session_id: Uuid) -> Self {
+        Self(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(RESEARCH_HEARTBEAT_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                match sqlx::query(
+                    "UPDATE research_sessions
+                        SET last_heartbeat_at = NOW()
+                      WHERE id = $1
+                        AND status NOT IN ('done', 'failed')",
+                )
+                .bind(session_id)
+                .execute(&pool)
+                .await
+                {
+                    Ok(result) if result.rows_affected() == 0 => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(session = %session_id, %error, "research heartbeat failed");
+                    }
+                }
+            }
+        }))
+    }
+}
+
+impl Drop for ResearchHeartbeat {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl ResearchSession {
     pub async fn new(pool: PgPool, mut config: ResearchConfig) -> Result<Self> {
         // Resolve dynamic defaults if the caller left them empty.
@@ -298,8 +337,9 @@ impl ResearchSession {
         sqlx::query(
             "INSERT INTO research_sessions
                 (id, query, status, depth, parallel, output_path, initiated_by,
-                 planner_model, synth_model, started_at, metadata)
+                 planner_model, synth_model, started_at, last_heartbeat_at, metadata)
              VALUES ($1, $2, $10, $3, $4, $5, $6, $7, $7,
+                     CASE WHEN $10 = 'queued' THEN NULL ELSE NOW() END,
                      CASE WHEN $10 = 'queued' THEN NULL ELSE NOW() END,
                      jsonb_build_object('gateway_url', $8::text,
                                         'subagent_model', $9::text,
@@ -349,7 +389,9 @@ impl ResearchSession {
     pub async fn claim_next_queued(pool: PgPool) -> Result<Option<Self>> {
         let row = sqlx::query(
             "UPDATE research_sessions
-                SET status = 'planning', started_at = NOW()
+                SET status = 'planning',
+                    started_at = NOW(),
+                    last_heartbeat_at = NOW()
               WHERE id = (
                   SELECT id FROM research_sessions
                    WHERE status = 'queued'
@@ -432,6 +474,7 @@ impl ResearchSession {
         progress: Option<mpsc::Sender<ResearchProgress>>,
     ) -> Result<ResearchReport> {
         let start = Instant::now();
+        let _heartbeat = ResearchHeartbeat::start(self.pool.clone(), self.session_id);
         if let Some(tx) = &progress {
             let _ = tx
                 .send(ResearchProgress::Planning {
@@ -654,7 +697,8 @@ impl ResearchSession {
                     duration_ms       = $2,
                     total_tokens_in   = $5,
                     total_tokens_out  = $6
-              WHERE id = $7",
+              WHERE id = $7
+                AND status NOT IN ('done', 'failed')",
         )
         .bind(&markdown)
         .bind(duration_ms as i64)
@@ -859,6 +903,18 @@ impl ResearchSession {
         }
 
         // 4. Synthesize ONLY — no sub-agents re-dispatched.
+        sqlx::query(
+            "UPDATE research_sessions
+                SET status = 'synthesizing',
+                    completed_at = NULL,
+                    last_heartbeat_at = NOW()
+              WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .context("recover: claim research_session")?;
+        let _heartbeat = ResearchHeartbeat::start(pool.clone(), session_id);
         let session = ResearchSession {
             pool,
             config,
@@ -885,7 +941,8 @@ impl ResearchSession {
                     completed_at    = NOW(),
                     duration_ms     = COALESCE(duration_ms, $2),
                     error           = NULL
-              WHERE id = $5",
+              WHERE id = $5
+                AND status = 'synthesizing'",
         )
         .bind(&markdown)
         .bind(duration_ms as i64)
@@ -1971,12 +2028,17 @@ fn subtask_status_from_db(s: &str) -> TaskStatus {
 }
 
 async fn update_session_status(pool: &PgPool, session_id: Uuid, status: &str) -> Result<()> {
-    sqlx::query("UPDATE research_sessions SET status = $1 WHERE id = $2")
-        .bind(status)
-        .bind(session_id)
-        .execute(pool)
-        .await
-        .context("update session status")?;
+    sqlx::query(
+        "UPDATE research_sessions
+            SET status = $1
+          WHERE id = $2
+            AND status NOT IN ('done', 'failed')",
+    )
+    .bind(status)
+    .bind(session_id)
+    .execute(pool)
+    .await
+    .context("update session status")?;
     Ok(())
 }
 

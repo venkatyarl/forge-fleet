@@ -9118,6 +9118,58 @@ pub async fn pg_routed_backends(
     )
 }
 
+/// Fleet peers that can serve a CLI backend through its signed HTTP bridge.
+/// Auth freshness is based on the last successful probe, not merely the last
+/// detector tick, so an inconclusive probe cannot revive an expired backend.
+pub async fn pg_cli_bridge_peers(
+    pool: &PgPool,
+    backend: &str,
+    fresh_secs: i64,
+) -> Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT fw.ip
+           FROM computer_backends cb
+           JOIN computers c ON c.id = cb.computer_id
+           JOIN fleet_workers fw ON fw.name = c.name
+          WHERE cb.backend = $1
+            AND cb.installed
+            AND cb.authenticated
+            AND cb.last_auth_ok_at >= NOW() - make_interval(secs => $2::double precision)
+            AND c.status = 'online'
+            AND fw.ip IS NOT NULL
+            AND BTRIM(fw.ip) <> ''
+          ORDER BY cb.last_auth_ok_at DESC",
+    )
+    .bind(backend)
+    .bind(fresh_secs)
+    .fetch_all(pool)
+    .await
+    .map_err(Into::into)
+}
+
+/// Backends available anywhere on a fresh, online bridge peer.
+pub async fn pg_bridge_reachable_backends(pool: &PgPool, fresh_secs: i64) -> Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT cb.backend
+           FROM computer_backends cb
+           JOIN computers c ON c.id = cb.computer_id
+           JOIN fleet_workers fw ON fw.name = c.name
+          WHERE cb.backend IN ('claude', 'kimi')
+            AND cb.installed
+            AND cb.authenticated
+            AND cb.last_auth_ok_at >= NOW() - make_interval(secs => $1::double precision)
+            AND c.status = 'online'
+            AND fw.ip IS NOT NULL
+            AND BTRIM(fw.ip) <> ''
+          GROUP BY cb.backend
+          ORDER BY MIN(CASE cb.backend WHEN 'claude' THEN 0 ELSE 1 END)",
+    )
+    .bind(fresh_secs)
+    .fetch_all(pool)
+    .await
+    .map_err(Into::into)
+}
+
 /// Load one computer's candidates and evaluate them without dispatching. The
 /// caller selects `mode`; `debug` produces a dry-run interaction row.
 pub async fn pg_cloud_route_for_computer(

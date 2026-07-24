@@ -32,11 +32,8 @@ pub struct SweepPolicy {
     pub job_stale_after: Duration,
     /// A deferred task is stale if `claimed_at` is older than this with status=running.
     pub deferred_stale_after: Duration,
-    /// A research session is stale if `created_at` is older than this while its
-    /// status is still non-terminal (`planning`/`dispatching`). Unlike
-    /// `deferred_tasks`, research sub-agents run *inside* the foreground
-    /// `ff research` process — there is no worker to re-claim them — so if that
-    /// process dies the session and its `running` subtasks are orphaned forever.
+    /// A research session is stale when its orchestrator heartbeat has not
+    /// advanced for this long while the session remains non-terminal.
     pub research_stale_after: Duration,
     /// A `healthy` deployment is stale if its `last_health_at` is older than
     /// this. The per-node `deployment_reconciler` refreshes `last_health_at`
@@ -76,13 +73,10 @@ impl Default for SweepPolicy {
             // duplicate multi-GB HF fetch onto the same target. Only once a task
             // has outlived the worker's cap is it genuinely stuck. (Was 30min.)
             deferred_stale_after: Duration::hours(2),
-            // A live `ff research` run (planner + N parallel sub-agents at the
-            // default depth on slow local models) can take a while; 1h is well
-            // past any legitimate run, so only genuinely orphaned sessions
-            // (process killed/crashed) qualify. Aged off `created_at`, so a
-            // session stuck in `planning` because the planner itself died is
-            // recovered too.
-            research_stale_after: Duration::hours(1),
+            // The orchestrator refreshes every 30s. Five minutes tolerates
+            // transient DB trouble without confusing a slow live run with a
+            // dead process.
+            research_stale_after: Duration::minutes(5),
             // 2× the live-dispatch freshness floor (DISPATCH_HEALTH_MAX_AGE_SEC
             // = 300s, PR #332): dispatch stops routing to a stale endpoint
             // first (cheap, reversible, no stored change), and only if it stays
@@ -101,6 +95,17 @@ impl Default for SweepPolicy {
 /// rather than deletes).
 pub fn is_prunable_terminal_status(status: &str) -> bool {
     matches!(status, "completed" | "cancelled" | "failed")
+}
+
+/// Pure heartbeat policy used by the SQL sweeper and its boundary tests.
+/// Legacy NULL heartbeats are deliberately not reaped; the forward migration
+/// gives already-active rows a heartbeat and new runs initialize one.
+pub fn is_research_heartbeat_stale(
+    last_heartbeat_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    stale_after: Duration,
+) -> bool {
+    last_heartbeat_at.is_some_and(|heartbeat| now - heartbeat > stale_after)
 }
 
 /// Max terminal rows deleted per sweep pass — bounds the DELETE so draining a
@@ -226,51 +231,104 @@ pub async fn sweep_stale(
     }
 
     // ── research_sessions / research_subtasks ────────────────────────────
-    // `ff research` decomposes + dispatches + synthesizes all inside ONE
-    // foreground process: the sub-agent loops are not daemon-managed, so if that
-    // process is killed/crashes, the session is left in a non-terminal status
-    // (`planning` if the planner died, `dispatching` after) and its sub-agents'
-    // rows stay `running` forever — no worker ever re-claims them. (Observed:
-    // 25-day-old `planning` sessions accumulating.) Recover both, gated on the
-    // SESSION's `created_at` so never-started `pending` subtasks are covered too.
+    // Research is live while its owning CLI/daemon refreshes last_heartbeat_at.
+    // Wall-clock session age says nothing about process liveness: a legitimate
+    // deep run may be old. NULL is excluded defensively for pre-migration rows.
     let research_cutoff = now - policy.research_stale_after;
-
-    // 1) Fail the orphaned sub-agent rows of stale sessions first, so a
-    //    re-run/inspection sees consistent terminal state.
-    let subtasks = sqlx::query(
-        "UPDATE research_subtasks st
-            SET status = 'failed',
-                completed_at = NOW(),
-                error = COALESCE(st.error, 'reaped by sweeper — research orchestrator process died (stuck running)')
-           FROM research_sessions s
-          WHERE st.session_id = s.id
-            AND st.status = 'running'
-            AND s.status NOT IN ('done', 'failed')
-            AND s.created_at < $1",
-    )
-    .bind(research_cutoff)
-    .execute(pool)
-    .await;
-    match subtasks {
-        Ok(r) => summary.research_subtasks_failed = r.rows_affected() as usize,
-        Err(e) => tracing::warn!("pg sweep research_subtasks: {e}"),
-    }
-
-    // 2) Fail the stale sessions themselves.
-    let sessions = sqlx::query(
-        "UPDATE research_sessions
-            SET status = 'failed',
-                completed_at = NOW(),
-                error = COALESCE(error, 'reaped by sweeper — orchestrator process died before synthesis (stuck in non-terminal status)')
+    let stale_ids = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id
+           FROM research_sessions
           WHERE status NOT IN ('done', 'failed')
-            AND created_at < $1",
+            AND last_heartbeat_at IS NOT NULL
+            AND last_heartbeat_at < $1",
     )
     .bind(research_cutoff)
-    .execute(pool)
-    .await;
-    match sessions {
-        Ok(r) => summary.research_sessions_failed = r.rows_affected() as usize,
-        Err(e) => tracing::warn!("pg sweep research_sessions: {e}"),
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("pg select stale research_sessions: {e}"))?;
+
+    for session_id in stale_ids {
+        let (subtask_count, all_terminal, usable_outputs): (i64, bool, i64) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint,
+                        COALESCE(BOOL_AND(status IN
+                            ('done', 'max_turns', 'failed', 'cancelled')), false),
+                        COUNT(*) FILTER (
+                            WHERE status IN ('done', 'max_turns')
+                              AND COALESCE(output_markdown, '') <> ''
+                        )::bigint
+                   FROM research_subtasks
+                  WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("pg inspect stale research session {session_id}: {e}"))?;
+        let can_recover = subtask_count > 0 && all_terminal && usable_outputs > 0;
+
+        // Compare-and-swap against the same heartbeat cutoff. A heartbeat that
+        // lands after the SELECT wins and the live process is left untouched.
+        let claimed = sqlx::query(
+            "UPDATE research_sessions
+                SET status = 'failed',
+                    completed_at = NOW(),
+                    error = COALESCE(
+                        error,
+                        'reaped by sweeper — stale orchestrator heartbeat')
+              WHERE id = $1
+                AND status NOT IN ('done', 'failed')
+                AND last_heartbeat_at IS NOT NULL
+                AND last_heartbeat_at < $2",
+        )
+        .bind(session_id)
+        .bind(research_cutoff)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("pg claim stale research session {session_id}: {e}"))?;
+        if claimed.rows_affected() == 0 {
+            continue;
+        }
+        summary.research_sessions_failed += 1;
+
+        if can_recover {
+            if let Err(error) =
+                crate::research::ResearchSession::recover(pool.clone(), session_id).await
+            {
+                tracing::warn!(
+                    session = %session_id,
+                    %error,
+                    "research sweeper: automatic recovery synthesis failed"
+                );
+                let _ = sqlx::query(
+                    "UPDATE research_sessions
+                        SET status = 'failed',
+                            completed_at = NOW(),
+                            error = $2
+                      WHERE id = $1
+                        AND status = 'synthesizing'",
+                )
+                .bind(session_id)
+                .bind(format!("automatic recovery synthesis failed: {error}"))
+                .execute(pool)
+                .await;
+            }
+            continue;
+        }
+
+        let subtasks = sqlx::query(
+            "UPDATE research_subtasks
+                SET status = 'failed',
+                    completed_at = NOW(),
+                    error = COALESCE(
+                        error,
+                        'reaped by sweeper — research orchestrator heartbeat stale')
+              WHERE session_id = $1
+                AND status IN ('pending', 'running')",
+        )
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("pg sweep research_subtasks: {e}"))?;
+        summary.research_subtasks_failed += subtasks.rows_affected() as usize;
     }
 
     // ── fleet_model_deployments (stale-healthy → unhealthy) ──────────────
@@ -448,9 +506,8 @@ mod tests {
                 >= crate::defer_worker::DEFAULT_DEFER_MAX_DURATION.as_secs(),
             "deferred sweep must not fire before the worker's max-duration cap"
         );
-        // Research sessions: generous enough not to reap a live `ff research`
-        // run, short enough that orphans (process killed) clear within the hour.
-        assert_eq!(p.research_stale_after, Duration::hours(1));
+        // Research liveness is heartbeat-based; this is ten missed 30s beats.
+        assert_eq!(p.research_stale_after, Duration::minutes(5));
         // Deployment health flip: must stay strictly LONGER than the live
         // dispatch freshness floor (DISPATCH_HEALTH_MAX_AGE_SEC = 300s) so the
         // cheap reversible router skip always fires before the persistent
@@ -482,5 +539,28 @@ mod tests {
     fn sweep_interval_and_leader_window_are_sane() {
         assert_eq!(SWEEP_INTERVAL, std::time::Duration::from_secs(300));
         assert_eq!(LEADER_FRESH_SECS, 60);
+    }
+
+    #[test]
+    fn research_staleness_uses_heartbeat_with_strict_five_minute_boundary() {
+        let now = Utc::now();
+        let threshold = Duration::minutes(5);
+
+        assert!(!is_research_heartbeat_stale(None, now, threshold));
+        assert!(!is_research_heartbeat_stale(
+            Some(now - threshold),
+            now,
+            threshold
+        ));
+        assert!(is_research_heartbeat_stale(
+            Some(now - threshold - Duration::milliseconds(1)),
+            now,
+            threshold
+        ));
+        assert!(!is_research_heartbeat_stale(
+            Some(now - Duration::seconds(30)),
+            now,
+            threshold
+        ));
     }
 }

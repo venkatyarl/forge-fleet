@@ -249,6 +249,38 @@ pub async fn execute_cli_in_dir(
     cwd: Option<&Path>,
     timeout: Option<Duration>,
 ) -> Result<CliResult> {
+    let local = execute_cli_in_dir_local(backend, prompt, passthrough_args, cwd, timeout).await;
+    if !bridge_enabled(backend) || matches!(&local, Ok(result) if result.exit_code == 0) {
+        return local;
+    }
+
+    match execute_cli_via_peer(backend, prompt, passthrough_args, timeout).await {
+        Ok(result) => Ok(result),
+        Err(bridge_error) => match local {
+            Ok(result) => {
+                debug!(backend, %bridge_error, "CLI peer bridge unavailable; returning local result");
+                Ok(result)
+            }
+            Err(local_error) => Err(anyhow!(
+                "local backend failed: {local_error}; peer bridge failed: {bridge_error}"
+            )),
+        },
+    }
+}
+
+fn bridge_enabled(backend: &str) -> bool {
+    matches!(backend, "claude" | "kimi")
+}
+
+/// Strictly local CLI execution. Bridge servers and local-auth probes must use
+/// this entry point so a failed request can never bounce recursively.
+pub async fn execute_cli_in_dir_local(
+    backend: &str,
+    prompt: &str,
+    passthrough_args: &[String],
+    cwd: Option<&Path>,
+    timeout: Option<Duration>,
+) -> Result<CliResult> {
     let cfg = backend_by_name(backend).ok_or_else(|| {
         anyhow!(
             "unknown backend '{backend}'; expected one of: {}",
@@ -400,6 +432,61 @@ pub async fn execute_cli_in_dir(
         stderr,
         duration_ms,
     })
+}
+
+async fn execute_cli_via_peer(
+    backend: &str,
+    prompt: &str,
+    passthrough_args: &[String],
+    timeout: Option<Duration>,
+) -> Result<CliResult> {
+    let cfg = backend_by_name(backend).ok_or_else(|| anyhow!("unknown backend '{backend}'"))?;
+    let pool = crate::fleet_info::get_fleet_pool()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let peers = ff_db::pg_cli_bridge_peers(&pool, backend, 5400).await?;
+    if peers.is_empty() {
+        return Err(anyhow!("no freshly authenticated online peer"));
+    }
+
+    let timeout = timeout.unwrap_or(DEFAULT_TIMEOUT);
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
+    let payload = serde_json::json!({
+        "model": format!("{backend}-cli"),
+        "messages": [{"role": "user", "content": prompt}],
+        "backend_args": passthrough_args,
+    });
+    let started = std::time::Instant::now();
+    let mut failures = Vec::new();
+    for ip in peers {
+        let url = format!("http://{ip}:{}/v1/chat/completions", cfg.port);
+        let response = match crate::http_auth::send_signed_json(&client, &url, &payload).await {
+            Ok(response) => response,
+            Err(error) => {
+                failures.push(format!("{ip}: {error}"));
+                continue;
+            }
+        };
+        if !response.status().is_success() {
+            failures.push(format!("{ip}: HTTP {}", response.status()));
+            continue;
+        }
+        let value: serde_json::Value = response.json().await?;
+        let stdout = value
+            .pointer("/choices/0/message/content")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("peer {ip} returned no completion content"))?
+            .to_string();
+        return Ok(CliResult {
+            backend: backend.to_string(),
+            binary_path: format!("cli_bridge://{ip}:{}", cfg.port),
+            exit_code: 0,
+            stdout,
+            stderr: String::new(),
+            duration_ms: started.elapsed().as_millis(),
+        });
+    }
+    Err(anyhow!("all peer bridges failed: {}", failures.join("; ")))
 }
 
 /// Resolve a binary name through `$PATH`. Returns the absolute path if
