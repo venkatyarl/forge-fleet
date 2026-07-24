@@ -268,7 +268,7 @@ async fn main() -> Result<()> {
         Command::Run(args) => handle_run(args).await,
         Command::Status => handle_status(&config_path),
         Command::Nodes => handle_nodes(&config_path),
-        Command::Models => handle_models(&config_path),
+        Command::Models => handle_models().await,
         Command::Proxy(args) => handle_proxy(args, &config_path),
         Command::Discover(args) => handle_discover(args, &config_path),
         Command::Health => handle_health(&config_path),
@@ -597,19 +597,80 @@ fn handle_nodes(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn handle_models(config_path: &Path) -> Result<()> {
-    let cfg = load_config(config_path)?;
+async fn handle_models() -> Result<()> {
+    let gateway = std::env::var("FF_GATEWAY_URL")
+        .unwrap_or_else(|_| "http://192.168.5.100:51002".to_string());
+    let url = format!("{}/mcp", gateway.trim_end_matches('/'));
+    let response = reqwest::Client::new()
+        .post(&url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "fleet_models",
+                "arguments": {}
+            }
+        }))
+        .send()
+        .await
+        .with_context(|| format!("failed to call canonical fleet_models API at {url}"))?;
+    if !response.status().is_success() {
+        anyhow::bail!("fleet_models API returned {}", response.status());
+    }
+    let response: serde_json::Value = response.json().await?;
+    let models = parse_fleet_models_response(&response)?;
 
     println!("{GREEN}✓ Fleet Models{RESET}");
-    if cfg.models.is_empty() {
-        println!("  {YELLOW}No model groups found in config{RESET}");
+    if models.is_empty() {
+        println!("  {YELLOW}No models found in the fleet catalog{RESET}");
         return Ok(());
     }
 
-    for (name, details) in cfg.models {
-        println!("  - {name}: {details}");
+    for model in models {
+        let id = model["id"].as_str().unwrap_or("?");
+        let name = model["name"].as_str().unwrap_or(id);
+        let family = model["family"].as_str().unwrap_or("unknown");
+        let parameters = model["parameters"].as_str().unwrap_or("unknown");
+        let tier = model["tier"]
+            .as_i64()
+            .map_or_else(|| "?".to_string(), |value| value.to_string());
+        let tool_calling = model["tool_calling"].as_bool().unwrap_or(false);
+        let gated = model["gated"].as_bool().unwrap_or(false);
+        println!("  - {name} ({id})");
+        println!(
+            "    family: {family}  parameters: {parameters}  tier: {tier}  tool-calling: {tool_calling}  gated: {gated}"
+        );
+        if let Some(description) = model["description"].as_str() {
+            println!("    {description}");
+        }
+        for deployment in model["deployments"].as_array().into_iter().flatten() {
+            let node = deployment["worker_name"].as_str().unwrap_or("?");
+            let runtime = deployment["runtime"].as_str().unwrap_or("?");
+            let port = deployment["port"]
+                .as_i64()
+                .map_or_else(|| "?".to_string(), |value| value.to_string());
+            let health = deployment["health_status"].as_str().unwrap_or("unknown");
+            println!("    deployment: {node}:{port}  runtime: {runtime}  health: {health}");
+        }
     }
     Ok(())
+}
+
+fn parse_fleet_models_response(response: &serde_json::Value) -> Result<Vec<serde_json::Value>> {
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("fleet_models API error: {error}");
+    }
+    let text = response
+        .pointer("/result/content/0/text")
+        .and_then(serde_json::Value::as_str)
+        .context("fleet_models API response did not contain result content")?;
+    let result: serde_json::Value =
+        serde_json::from_str(text).context("fleet_models API returned invalid model JSON")?;
+    result["models"]
+        .as_array()
+        .cloned()
+        .context("fleet_models API response did not contain a models array")
 }
 
 fn handle_proxy(args: ProxyArgs, config_path: &Path) -> Result<()> {
@@ -958,4 +1019,40 @@ fn set_dotted_key(cfg: &mut FleetConfig, dotted: &str, value: &str) -> Result<()
 #[allow(dead_code)]
 fn print_error_context(msg: &str) {
     eprintln!("{RED}error:{RESET} {msg}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_canonical_fleet_models_response() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": r#"{"count":1,"models":[{"id":"qwen3","name":"Qwen 3","family":"qwen","parameters":"30B","tier":2,"deployments":[]}]}"#
+                }]
+            }
+        });
+
+        let models = parse_fleet_models_response(&response).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["name"], "Qwen 3");
+        assert_eq!(models[0]["parameters"], "30B");
+    }
+
+    #[test]
+    fn rejects_mcp_error_response() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32603, "message": "database unavailable"}
+        });
+
+        let error = parse_fleet_models_response(&response).unwrap_err();
+        assert!(error.to_string().contains("database unavailable"));
+    }
 }
