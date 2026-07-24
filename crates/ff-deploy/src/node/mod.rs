@@ -16,6 +16,8 @@ use uuid::Uuid;
 use crate::config::DeployConfig;
 use crate::daemon::{ActiveLease, RestartReport, restart_with_lease_drain};
 
+pub mod batch;
+
 /// Release active leases and return their claimed/building work items to `ready`.
 ///
 /// This is used when a deploy forces a daemon restart, so it intentionally does
