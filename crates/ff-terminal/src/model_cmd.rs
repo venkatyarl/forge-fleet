@@ -1352,7 +1352,103 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 }
             }
         }
+        crate::ModelCommand::Stats { json } => handle_model_stats(pool, json).await?,
     }
+    Ok(())
+}
+
+/// `ff model stats` handler — renders `v_model_utilization`, the bandit's
+/// reward signal and right-sizing's trigger, and prints a WARN line for any
+/// model with misconfigured context across its deployments.
+async fn handle_model_stats(pool: sqlx::PgPool, json: bool) -> anyhow::Result<()> {
+    let rows = ff_db::pg_model_utilization(&pool).await?;
+
+    if json {
+        let out: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "model_id": r.model_id,
+                    "calls_7d": r.calls_7d,
+                    "tokens_7d": r.tokens_7d,
+                    "builds_7d": r.builds_7d,
+                    "approve_pct": r.approve_pct,
+                    "instances": r.instances,
+                    "parallel_slots": r.parallel_slots,
+                    "context_window_min": r.context_window_min,
+                    "context_window_max": r.context_window_max,
+                    "usable_agent_ctx_min": r.usable_agent_ctx_min,
+                    "usable_agent_ctx_max": r.usable_agent_ctx_max,
+                    "est_ram_gb": r.est_ram_gb,
+                    "ctx_warn": r.ctx_warn,
+                    "ctx_warn_reason": r.ctx_warn_reason,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!("(no model utilization data — no usage, builds, deployments, or library entries)");
+        return Ok(());
+    }
+
+    println!(
+        "{:<28} {:<8} {:<10} {:<8} {:<10} {:<5} {:<5} {:<14} {:<10}",
+        "MODEL_ID",
+        "CALLS7D",
+        "TOKENS7D",
+        "BUILDS7D",
+        "APPRV%",
+        "INST",
+        "SLOTS",
+        "CTX(min-max)",
+        "RAM_GB"
+    );
+    for r in &rows {
+        let approve = r
+            .approve_pct
+            .map(|p| format!("{p:.1}"))
+            .unwrap_or_else(|| "-".into());
+        let ctx = match (r.usable_agent_ctx_min, r.usable_agent_ctx_max) {
+            (Some(lo), Some(hi)) if lo == hi => lo.to_string(),
+            (Some(lo), Some(hi)) => format!("{lo}-{hi}"),
+            _ => "-".into(),
+        };
+        let ram = r
+            .est_ram_gb
+            .map(|g| format!("{g:.2}"))
+            .unwrap_or_else(|| "-".into());
+        let warn_marker = if r.ctx_warn {
+            format!(" {RED}⚠{RESET}")
+        } else {
+            String::new()
+        };
+        println!(
+            "{:<28} {:<8} {:<10} {:<8} {:<10} {:<5} {:<5} {:<14} {:<10}{warn_marker}",
+            r.model_id,
+            r.calls_7d,
+            r.tokens_7d,
+            r.builds_7d,
+            approve,
+            r.instances,
+            r.parallel_slots,
+            ctx,
+            ram,
+        );
+    }
+
+    let warnings: Vec<&ff_db::ModelUtilizationRow> = rows.iter().filter(|r| r.ctx_warn).collect();
+    if !warnings.is_empty() {
+        println!();
+        println!("{YELLOW}WARN{RESET}: context misconfiguration detected:");
+        for r in &warnings {
+            let reason = r.ctx_warn_reason.as_deref().unwrap_or("misconfigured");
+            println!("  {RED}⚠{RESET} {}: {reason}", r.model_id);
+        }
+    }
+
     Ok(())
 }
 

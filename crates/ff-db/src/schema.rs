@@ -12201,6 +12201,14 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// V260 — `v_model_utilization`: per-model-id rollup (calls/tokens/builds/
+/// approve_pct/instances/parallel_slots/context/est_ram_gb) that the bandit
+/// reads as its reward signal and right-sizing reads as its trigger. Also
+/// flags context-config misconfiguration across a model's deployments (see
+/// the SQL file for the audit that motivated `ctx_warn`).
+pub const SCHEMA_V260_MODEL_UTILIZATION_VIEW: &str =
+    include_str!("migrations/20260724010000_create_model_utilization_view.sql");
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
