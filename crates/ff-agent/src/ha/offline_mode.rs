@@ -204,6 +204,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn deterministic_fallback_executes_direct_argv() {
+        // `run_once` branches on `FORGEFLEET_SLM_MODEL`, which other tests in
+        // this module mutate, so this must serialize on the same lock even
+        // though it doesn't set the var itself.
+        let _guard = crate::slm::SLM_ENV_LOCK.lock().unwrap();
+        let prior_model = std::env::var_os("FORGEFLEET_SLM_MODEL");
+        unsafe {
+            std::env::remove_var("FORGEFLEET_SLM_MODEL");
+        }
+
         let temp = tempfile::tempdir().unwrap();
         let printf = ["/usr/bin/printf", "/bin/printf"]
             .into_iter()
@@ -215,10 +224,141 @@ mod tests {
         )
         .with_resource_minimums(0, 0);
 
+        let result = runner.run_once("unused");
+
+        restore_env("FORGEFLEET_SLM_MODEL", prior_model);
+
         assert_eq!(
-            runner.run_once("unused").unwrap(),
+            result.unwrap(),
             OfflineRunResult::DeterministicScripts(vec!["hello; exit 9".into()])
         );
+    }
+
+    #[cfg(unix)]
+    fn write_mock_llama_cli(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = dir.join("mock-llama-cli.sh");
+        std::fs::write(&bin, body).unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        bin
+    }
+
+    #[cfg(unix)]
+    fn write_valid_model(dir: &Path) -> PathBuf {
+        let model = dir.join("tiny-model-Q4_K_M.gguf");
+        std::fs::write(&model, [b"GGUF".as_slice(), &[0_u8; 32]].concat()).unwrap();
+        model
+    }
+
+    #[cfg(unix)]
+    fn set_env(key: &str, value: &Path) -> Option<std::ffi::OsString> {
+        let prior = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        prior
+    }
+
+    #[cfg(unix)]
+    fn restore_env(key: &str, prior: Option<std::ffi::OsString>) {
+        unsafe {
+            match prior {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    // The SLM env vars are process-global and also touched by `crate::slm`'s
+    // own tests, so both modules share `SLM_ENV_LOCK` to avoid racing.
+    #[cfg(unix)]
+    #[test]
+    fn run_once_uses_local_slm_when_offline_detection_finds_it_available() {
+        let _guard = crate::slm::SLM_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let model = write_valid_model(dir.path());
+        let bin = write_mock_llama_cli(dir.path(), "#!/bin/sh\necho 'sample task result'\n");
+
+        let prior_model = set_env("FORGEFLEET_SLM_MODEL", &model);
+        let prior_bin = set_env("FORGEFLEET_SLM_BIN", &bin);
+
+        // A deterministic command that would only run if the SLM path were
+        // (incorrectly) skipped, so a false fallback fails this assertion.
+        let printf = ["/usr/bin/printf", "/bin/printf"]
+            .into_iter()
+            .find(|path| Path::new(path).exists())
+            .unwrap();
+        let runner = OfflineRunner::new(
+            dir.path(),
+            vec![OfflineCommand::new(printf, ["%s", "should not run"])],
+        )
+        .with_resource_minimums(0, 0);
+
+        let result = runner.run_once("sample task");
+
+        restore_env("FORGEFLEET_SLM_MODEL", prior_model);
+        restore_env("FORGEFLEET_SLM_BIN", prior_bin);
+
+        assert_eq!(
+            result.unwrap(),
+            OfflineRunResult::LocalSlm("sample task result".into())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_once_falls_back_to_deterministic_commands_when_slm_unavailable() {
+        let _guard = crate::slm::SLM_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let model = write_valid_model(dir.path());
+        // Mocks the offline/unreachable case: the configured SLM binary is
+        // present but fails, so `run_once` must fall through.
+        let bin = write_mock_llama_cli(dir.path(), "#!/bin/sh\necho boom >&2\nexit 1\n");
+
+        let prior_model = set_env("FORGEFLEET_SLM_MODEL", &model);
+        let prior_bin = set_env("FORGEFLEET_SLM_BIN", &bin);
+
+        let printf = ["/usr/bin/printf", "/bin/printf"]
+            .into_iter()
+            .find(|path| Path::new(path).exists())
+            .unwrap();
+        let runner = OfflineRunner::new(
+            dir.path(),
+            vec![OfflineCommand::new(
+                printf,
+                ["%s", "deterministic fallback"],
+            )],
+        )
+        .with_resource_minimums(0, 0);
+
+        let result = runner.run_once("sample task");
+
+        restore_env("FORGEFLEET_SLM_MODEL", prior_model);
+        restore_env("FORGEFLEET_SLM_BIN", prior_bin);
+
+        assert_eq!(
+            result.unwrap(),
+            OfflineRunResult::DeterministicScripts(vec!["deterministic fallback".into()])
+        );
+    }
+
+    #[test]
+    fn check_resources_enforces_memory_and_disk_minimums() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner =
+            OfflineRunner::new(temp.path(), Vec::new()).with_resource_minimums(u64::MAX / 2, 0);
+        assert!(
+            runner
+                .check_resources()
+                .unwrap_err()
+                .contains("offline runner needs")
+        );
+
+        let runner = OfflineRunner::new(temp.path(), Vec::new()).with_resource_minimums(0, 0);
+        assert!(runner.check_resources().is_ok());
     }
 
     #[tokio::test]
