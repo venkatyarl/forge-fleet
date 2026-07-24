@@ -188,6 +188,7 @@ mod tests {
             signal_cleared: None,
             signal_verified_at: None,
             refiled_from: None,
+            cortex_subgraph_id: None,
         }
     }
 
