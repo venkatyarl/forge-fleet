@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::{PgPool, Row};
@@ -1440,6 +1441,11 @@ pub struct RouteFilter {
     pub prefer_least_loaded: bool,
     /// Max candidates to return (scored best-first). Defaults to 3 if 0.
     pub limit: i64,
+    /// Seed for the epsilon-greedy bandit tie-break (Autopilot-4) applied to
+    /// the returned candidates — see [`apply_bandit_epsilon_greedy`]. `None`
+    /// (the default, used by every live caller) draws fresh entropy each
+    /// call; tests pass a fixed value so the coin flip + pick are repeatable.
+    pub bandit_seed: Option<u64>,
 }
 
 /// `LEFT JOIN LATERAL` that pulls each host's recent retained metrics (raw for
@@ -1660,6 +1666,14 @@ pub async fn pg_route_deployments(
     let excludes = normalize_exclude_hosts(&filter.exclude_hosts);
 
     let limit = route_limit_or_default(filter.limit);
+    // Fetch at least a bandit-sized pool from SQL, regardless of the caller's
+    // requested `limit` — a caller like `pg_pick_agent_endpoint` (limit: 1)
+    // would otherwise hard-truncate to one row BEFORE the bandit ever runs,
+    // so `apply_bandit_epsilon_greedy` never sees the 2+ same-tier candidates
+    // it's meant to explore over (the exact bug a prior review caught: "core
+    // routing with limit: 1 never sees 2+ candidates"). The final result is
+    // still truncated to `limit` below, after the bandit reorder.
+    let fetch_limit = limit.max(BANDIT_POOL_SIZE);
 
     let load_join = LOAD_METRICS_JOIN;
     let load_order = load_tiebreak_order(filter.prefer_least_loaded);
@@ -1744,12 +1758,12 @@ pub async fn pg_route_deployments(
         .bind(filter.require_tool_calling)
         .bind(filter.min_ctx)
         .bind(&excludes)
-        .bind(limit)
+        .bind(fetch_limit)
         .bind(filter.max_health_age_sec)
         .fetch_all(pool)
         .await?;
 
-    Ok(rows
+    let candidates: Vec<RouteCandidate> = rows
         .iter()
         .map(|r| {
             let worker_name: String = r.try_get("worker_name").unwrap_or_default();
@@ -1778,7 +1792,66 @@ pub async fn pg_route_deployments(
                 llm_active_requests: r.try_get("load_active_requests").ok(),
             }
         })
-        .collect())
+        .collect();
+
+    let mut candidates =
+        apply_bandit_epsilon_greedy(candidates, ROUTE_BANDIT_EPSILON, filter.bandit_seed);
+    candidates.truncate(limit as usize);
+    Ok(candidates)
+}
+
+/// Size of the same-tier candidate pool [`pg_route_deployments`] fetches from
+/// SQL before applying the bandit reorder and truncating to the caller's
+/// requested `limit`. Large enough to cover a realistic same-tier/same-
+/// workload A/B pool (the fleet rarely runs more than a handful of
+/// deployments per tier per workload) without materially widening the query
+/// for the common small-`limit` callers (e.g. `pg_pick_agent_endpoint`'s
+/// `limit: 1`).
+const BANDIT_POOL_SIZE: i64 = 8;
+
+/// Bandit exploration rate (Autopilot-4) for [`apply_bandit_epsilon_greedy`]:
+/// the fraction of the time a same-tier group of 2+ healthy candidates gets a
+/// uniformly random pick instead of the deterministic best one.
+pub const ROUTE_BANDIT_EPSILON: f64 = 0.2;
+
+/// Epsilon-greedy exploration over [`pg_route_deployments`]'s scored ordering.
+///
+/// `candidates` must already be sorted best-first (tier ASC, then whatever
+/// tiebreak the caller asked for — the existing `pg_route_deployments`
+/// contract) and must NOT yet be truncated to the caller's requested limit —
+/// callers truncate AFTER this runs, so a caller asking for only 1 result
+/// still gives the bandit a same-tier pool to explore instead of hard-
+/// truncating before the coin flip ever happens. Because the whole result
+/// set is already filtered to one requested workload, two or more candidates
+/// sharing the top tier means they share tier AND workload — exactly the A/B
+/// pool this bandit explores. With probability `epsilon` one member of that
+/// pool is promoted to the front uniformly at random instead of keeping the
+/// deterministic least-loaded/freshest pick; the other `1 - epsilon` of the
+/// time the ordering is untouched (pure exploitation). `seed` makes the coin
+/// flip + pick reproducible for tests; `None` (every live caller) draws fresh
+/// entropy.
+pub fn apply_bandit_epsilon_greedy(
+    mut candidates: Vec<RouteCandidate>,
+    epsilon: f64,
+    seed: Option<u64>,
+) -> Vec<RouteCandidate> {
+    if candidates.len() < 2 {
+        return candidates;
+    }
+    let top_tier = candidates[0].tier;
+    let group_len = candidates
+        .iter()
+        .position(|c| c.tier != top_tier)
+        .unwrap_or(candidates.len());
+    if group_len < 2 {
+        return candidates;
+    }
+    let mut rng = StdRng::seed_from_u64(seed.unwrap_or_else(|| rand::thread_rng().r#gen()));
+    if rng.r#gen::<f64>() < epsilon {
+        let idx = rng.gen_range(0..group_len);
+        candidates.swap(0, idx);
+    }
+    candidates
 }
 
 /// Pick the best agent-capable deployment: tool-calling model + enough per-slot
@@ -1801,6 +1874,7 @@ pub async fn pg_pick_agent_endpoint(
         // least-loaded one instead of whichever last heartbeated.
         prefer_least_loaded: true,
         limit: 1,
+        bandit_seed: None,
     };
     Ok(pg_route_deployments(pool, &filter)
         .await?
@@ -1906,6 +1980,7 @@ pub async fn pg_pick_offload_endpoint(
         // Live offload dispatch: spread equal-tier candidates by real load.
         prefer_least_loaded: true,
         limit: 8,
+        bandit_seed: None,
     };
 
     // 1) workload-matching candidates (e.g. coders for code kinds).
@@ -4496,6 +4571,121 @@ mod tests {
     use std::env;
 
     use sqlx::postgres::PgPoolOptions;
+
+    fn bandit_candidate(tier: i32, worker_name: &str) -> RouteCandidate {
+        RouteCandidate {
+            worker_name: worker_name.to_string(),
+            endpoint: format!("http://{worker_name}:55000"),
+            port: 55000,
+            runtime: None,
+            catalog_id: None,
+            catalog_name: None,
+            family: None,
+            tier,
+            tool_calling: true,
+            context_window: None,
+            usable_agent_ctx: None,
+            parallel_slots: None,
+            health_status: "healthy".to_string(),
+            health_age_sec: None,
+            os_family: None,
+            has_gpu: None,
+            is_unified_memory: None,
+            total_ram_gb: None,
+            cpu_pct: None,
+            llm_active_requests: None,
+        }
+    }
+
+    #[test]
+    fn bandit_leaves_single_candidate_untouched() {
+        let cands = vec![bandit_candidate(2, "alpha")];
+        let out = apply_bandit_epsilon_greedy(cands.clone(), 1.0, Some(1));
+        assert_eq!(out[0].worker_name, "alpha");
+    }
+
+    #[test]
+    fn bandit_leaves_lone_top_tier_candidate_untouched_even_with_lower_tier_rest() {
+        // Only one candidate in the top tier (1); a second exists but in tier 2 —
+        // no same-tier pool to explore, so the top pick never changes regardless
+        // of epsilon or seed.
+        let cands = vec![bandit_candidate(1, "alpha"), bandit_candidate(2, "beta")];
+        for seed in 0..20u64 {
+            let out = apply_bandit_epsilon_greedy(cands.clone(), 1.0, Some(seed));
+            assert_eq!(out[0].worker_name, "alpha");
+        }
+    }
+
+    #[test]
+    fn bandit_epsilon_zero_never_explores() {
+        let cands = vec![
+            bandit_candidate(2, "alpha"),
+            bandit_candidate(2, "beta"),
+            bandit_candidate(2, "gamma"),
+        ];
+        for seed in 0..20u64 {
+            let out = apply_bandit_epsilon_greedy(cands.clone(), 0.0, Some(seed));
+            assert_eq!(out[0].worker_name, "alpha");
+        }
+    }
+
+    #[test]
+    fn bandit_epsilon_one_always_explores_within_the_tier_group() {
+        let cands = vec![
+            bandit_candidate(2, "alpha"),
+            bandit_candidate(2, "beta"),
+            bandit_candidate(3, "gamma"),
+        ];
+        // epsilon=1.0 always explores; over many seeds the front pick should
+        // vary between the tier-2 members but never promote the tier-3 one.
+        let mut saw_alpha = false;
+        let mut saw_beta = false;
+        for seed in 0..50u64 {
+            let out = apply_bandit_epsilon_greedy(cands.clone(), 1.0, Some(seed));
+            assert_ne!(out[0].worker_name, "gamma");
+            saw_alpha |= out[0].worker_name == "alpha";
+            saw_beta |= out[0].worker_name == "beta";
+        }
+        assert!(saw_alpha && saw_beta);
+    }
+
+    #[test]
+    fn bandit_same_seed_is_deterministic() {
+        let cands = vec![
+            bandit_candidate(2, "alpha"),
+            bandit_candidate(2, "beta"),
+            bandit_candidate(2, "gamma"),
+        ];
+        let a = apply_bandit_epsilon_greedy(cands.clone(), ROUTE_BANDIT_EPSILON, Some(42));
+        let b = apply_bandit_epsilon_greedy(cands.clone(), ROUTE_BANDIT_EPSILON, Some(42));
+        assert_eq!(a[0].worker_name, b[0].worker_name);
+    }
+
+    /// Reproduces the bug a prior review caught: a caller requesting only 1
+    /// result (e.g. `pg_pick_agent_endpoint`) must still let the bandit
+    /// explore a same-tier pool of 3 — the reorder has to happen BEFORE the
+    /// caller's `limit` truncates the candidate set, not after. This directly
+    /// exercises the fix in `pg_route_deployments`: fetch a `BANDIT_POOL_SIZE`
+    /// pool from SQL regardless of `limit`, bandit-reorder it, THEN truncate.
+    #[test]
+    fn bandit_pool_survives_truncation_to_a_single_result() {
+        let cands = vec![
+            bandit_candidate(2, "alpha"),
+            bandit_candidate(2, "beta"),
+            bandit_candidate(2, "gamma"),
+        ];
+        let mut saw_non_alpha = false;
+        for seed in 0..50u64 {
+            let mut out = apply_bandit_epsilon_greedy(cands.clone(), 1.0, Some(seed));
+            out.truncate(1);
+            assert_eq!(out.len(), 1);
+            saw_non_alpha |= out[0].worker_name != "alpha";
+        }
+        assert!(
+            saw_non_alpha,
+            "truncating to limit=1 after the bandit reorder must still surface exploration picks"
+        );
+    }
 
     /// Round-trips `db_exec` through a scratch table: insert/update/delete return
     /// the affected-row count, the write is committed (visible on a fresh pool

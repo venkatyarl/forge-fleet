@@ -205,6 +205,7 @@ async fn resolve_route_candidates(
         // the best-scored top-8 may not include the requested model (e.g. a lower-
         // tier coder deployment), and we'd silently fall back. No hint → top-8.
         limit: if model_hint.is_some() { 64 } else { 8 },
+        bandit_seed: None,
     };
     let all_candidates = pg_route_deployments(pool, &filter)
         .await

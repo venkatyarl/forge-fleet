@@ -1387,6 +1387,7 @@ pub async fn fleet_route(params: Option<Value>) -> HandlerResult {
         // tiebreak is reserved for the dispatch pickers).
         prefer_least_loaded: false,
         limit,
+        bandit_seed: None,
     };
     let rows = ff_db::pg_route_deployments(&pool, &filter)
         .await

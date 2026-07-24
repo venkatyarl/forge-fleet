@@ -1035,6 +1035,7 @@ impl ResearchSession {
             // Generous cap: we want every healthy deployment so the round-robin
             // can spread across as many distinct computers as the fleet has.
             limit: 256,
+            bandit_seed: None,
         };
         let candidates = ff_db::pg_route_deployments(&self.pool, &filter)
             .await
