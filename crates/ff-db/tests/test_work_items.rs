@@ -3,11 +3,15 @@
 mod scheduler;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
+use ff_db::models::slots::Slot as DbSlot;
+use ff_db::models::work_item::WorkItem as DbWorkItem;
 use scheduler::{
     Priority, Quadrant, Slot, Status, WorkItem, compute_pick_score, scheduler_tick,
     slot_can_handle, wsjf_match_score,
 };
+use serde_json::Value;
 use std::collections::HashSet;
+use uuid::Uuid;
 
 fn item(
     id: &str,
@@ -140,11 +144,220 @@ fn scheduler_picks_in_wsjf_order_and_uses_each_slot_once() {
             ("second", "gpu-linux"),
         ]
     );
+    // `Assignment.pick_score` is the raw `compute_pick_score` (Q1/P1 = 1500,
+    // Q2/P3 = 1050), not the WSJF-adjusted score used only to order picks —
+    // "second" requires 2 capabilities so its WSJF score (750) is lower than
+    // "first"'s, but its own compute_pick_score is still 1500 (same quadrant
+    // and priority as "first").
     assert_eq!(
         assignments
             .iter()
             .map(|assignment| assignment.pick_score)
             .collect::<Vec<_>>(),
-        vec![1500.0, 1050.0, 750.0]
+        vec![1500.0, 1050.0, 1500.0]
+    );
+}
+
+// ─── `Slot::is_capable_of` (ff-db persistence models) ───────────────────────
+//
+// These exercise the DB-backed `Slot`/`WorkItem` models (distinct from the
+// pure `scheduler::Slot` above): `is_capable_of` matches a required tag
+// against the union of a slot's `kind`, `skill`, `model_preference`, the repo
+// name derived from `workspace_dir`, and its explicit `capabilities`, with
+// `"ram:<n>"` tags checked numerically against `ram_gb` instead.
+
+fn db_slot(
+    kind: &str,
+    model_preference: Option<&str>,
+    workspace_dir: &str,
+    capabilities: Value,
+    skill: Value,
+    ram_gb: Option<i32>,
+) -> DbSlot {
+    DbSlot {
+        id: Uuid::nil(),
+        computer_id: Uuid::nil(),
+        slot: 0,
+        status: "idle".to_string(),
+        current_work_item_id: None,
+        started_at: None,
+        workspace_dir: workspace_dir.to_string(),
+        model_preference: model_preference.map(str::to_string),
+        last_heartbeat_at: None,
+        metadata: serde_json::json!({}),
+        kind: kind.to_string(),
+        capabilities,
+        skill,
+        ram_gb,
+    }
+}
+
+fn db_item_requiring(required_capabilities: Value) -> DbWorkItem {
+    DbWorkItem {
+        id: Uuid::nil(),
+        project_id: "p".to_string(),
+        milestone_id: None,
+        parent_id: None,
+        kind: "task".to_string(),
+        title: "t".to_string(),
+        description: None,
+        labels: serde_json::json!([]),
+        status: "ready".to_string(),
+        priority: "normal".to_string(),
+        assigned_to: None,
+        assigned_computer: None,
+        branch_name: None,
+        pr_url: None,
+        brain_node_ids: serde_json::json!([]),
+        created_at: Utc::now(),
+        created_by: "test".to_string(),
+        started_at: None,
+        completed_at: None,
+        due_date: None,
+        estimated_hours: None,
+        metadata: serde_json::json!({}),
+        required_capabilities,
+        complexity: "low".to_string(),
+        predicted_paths: serde_json::json!([]),
+        touched_paths: serde_json::json!([]),
+        base_branch: None,
+        base_sha: None,
+        integration_branch: None,
+        merge_rank: None,
+        risk_score: 0.0,
+        reviewer_required: false,
+        attempts: 0,
+        last_error: None,
+        repo_id: None,
+        repo_url: None,
+        repo_path: None,
+        context: serde_json::json!({}),
+        parked: false,
+        pre_work: serde_json::json!({}),
+        work: serde_json::json!({}),
+        post_work: serde_json::json!({}),
+        cleanup_complete: false,
+        original_signal: serde_json::json!({}),
+        signal_cleared: None,
+        signal_verified_at: None,
+        refiled_from: None,
+        cortex_subgraph_id: None,
+    }
+}
+
+#[test]
+fn is_capable_of_matches_no_required_capabilities_regardless_of_slot() {
+    let bare = db_slot(
+        "sub_agent",
+        None,
+        "/tmp/slot",
+        serde_json::json!([]),
+        serde_json::json!([]),
+        None,
+    );
+    assert!(bare.is_capable_of(&db_item_requiring(serde_json::json!([]))));
+}
+
+#[test]
+fn is_capable_of_matches_explicit_capabilities_tag() {
+    let gpu_slot = db_slot(
+        "sub_agent",
+        None,
+        "/tmp/slot",
+        serde_json::json!(["gpu", "rust"]),
+        serde_json::json!([]),
+        None,
+    );
+    assert!(gpu_slot.is_capable_of(&db_item_requiring(serde_json::json!(["gpu"]))));
+    assert!(!gpu_slot.is_capable_of(&db_item_requiring(serde_json::json!(["macos"]))));
+}
+
+#[test]
+fn is_capable_of_matches_kind_and_skill_tags() {
+    let reviewer = db_slot(
+        "reviewer",
+        None,
+        "/tmp/slot",
+        serde_json::json!([]),
+        serde_json::json!(["frontend"]),
+        None,
+    );
+    assert!(reviewer.is_capable_of(&db_item_requiring(serde_json::json!(["reviewer"]))));
+    assert!(reviewer.is_capable_of(&db_item_requiring(serde_json::json!(["frontend"]))));
+    assert!(!reviewer.is_capable_of(&db_item_requiring(serde_json::json!(["backend"]))));
+}
+
+#[test]
+fn is_capable_of_matches_model_preference_and_repo_derived_tags() {
+    let worker = db_slot(
+        "sub_agent",
+        Some("qwen3-coder-30b"),
+        "/home/lily/.forgefleet/sub-agents/sub-agent-0/forge-fleet",
+        serde_json::json!([]),
+        serde_json::json!([]),
+        None,
+    );
+    assert!(worker.is_capable_of(&db_item_requiring(serde_json::json!(["qwen3-coder-30b"]))));
+    assert!(!worker.is_capable_of(&db_item_requiring(serde_json::json!(["llama-70b"]))));
+    assert!(worker.is_capable_of(&db_item_requiring(serde_json::json!(["forge-fleet"]))));
+    assert!(!worker.is_capable_of(&db_item_requiring(serde_json::json!(["other-repo"]))));
+}
+
+#[test]
+fn is_capable_of_checks_ram_tags_numerically_against_ram_gb() {
+    let big_ram = db_slot(
+        "sub_agent",
+        None,
+        "/tmp/slot",
+        serde_json::json!([]),
+        serde_json::json!([]),
+        Some(64),
+    );
+    let small_ram = db_slot(
+        "sub_agent",
+        None,
+        "/tmp/slot",
+        serde_json::json!([]),
+        serde_json::json!([]),
+        Some(16),
+    );
+    let unknown_ram = db_slot(
+        "sub_agent",
+        None,
+        "/tmp/slot",
+        serde_json::json!([]),
+        serde_json::json!([]),
+        None,
+    );
+
+    assert!(big_ram.is_capable_of(&db_item_requiring(serde_json::json!(["ram:32"]))));
+    assert!(big_ram.is_capable_of(&db_item_requiring(serde_json::json!(["ram:64"]))));
+    assert!(!small_ram.is_capable_of(&db_item_requiring(serde_json::json!(["ram:32"]))));
+    assert!(!unknown_ram.is_capable_of(&db_item_requiring(serde_json::json!(["ram:32"]))));
+}
+
+#[test]
+fn is_capable_of_requires_every_tag_across_every_dimension() {
+    let fully_capable = db_slot(
+        "sub_agent",
+        Some("qwen3-30b"),
+        "/tmp/forge-fleet",
+        serde_json::json!(["gpu"]),
+        serde_json::json!(["rust"]),
+        Some(64),
+    );
+
+    assert!(
+        fully_capable.is_capable_of(&db_item_requiring(serde_json::json!([
+            "gpu",
+            "rust",
+            "qwen3-30b",
+            "forge-fleet",
+            "ram:32"
+        ])))
+    );
+    assert!(!fully_capable.is_capable_of(&db_item_requiring(serde_json::json!(["gpu", "macos"]))));
+    assert!(
+        !fully_capable.is_capable_of(&db_item_requiring(serde_json::json!(["gpu", "ram:128"])))
     );
 }
