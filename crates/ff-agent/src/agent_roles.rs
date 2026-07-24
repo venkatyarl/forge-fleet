@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::system_prompt::RULE_1_OPERATOR_PRIMACY;
+
 /// A pre-built agent role template.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRole {
@@ -50,7 +52,7 @@ pub enum ModelPreference {
 
 /// Get all built-in agent roles.
 pub fn builtin_roles() -> Vec<AgentRole> {
-    vec![
+    let mut roles = vec![
         // Core Development
         AgentRole {
             name: "rust-developer".into(), category: RoleCategory::CoreDevelopment,
@@ -188,7 +190,14 @@ pub fn builtin_roles() -> Vec<AgentRole> {
             denied_tools: vec![],
             system_prompt_extension: "You are an API designer. Design clean, RESTful APIs with proper status codes, error handling, and documentation. Consider versioning and backward compatibility.".into(),
         },
-    ]
+    ];
+    for role in &mut roles {
+        role.system_prompt_extension = format!(
+            "{RULE_1_OPERATOR_PRIMACY}\n\n{}",
+            role.system_prompt_extension
+        );
+    }
+    roles
 }
 
 /// Find a role by name.
@@ -207,4 +216,17 @@ pub fn roles_by_category(category: RoleCategory) -> Vec<AgentRole> {
 /// List all role names.
 pub fn role_names() -> Vec<String> {
     builtin_roles().into_iter().map(|r| r.name).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_builtin_role_leads_with_rule_1_operator_primacy() {
+        assert!(builtin_roles().iter().all(|role| {
+            role.system_prompt_extension
+                .starts_with(RULE_1_OPERATOR_PRIMACY)
+        }));
+    }
 }

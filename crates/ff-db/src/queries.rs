@@ -4898,7 +4898,7 @@ mod tests {
         assert_eq!(decision.status, "failed");
         assert_eq!(
             decision.last_error,
-            "failed after 3 stalled attempts (max 3 reached)"
+            "class=lease_stalled: failed after 3 stalled attempts (max 3 reached)"
         );
     }
 
@@ -4907,7 +4907,10 @@ mod tests {
         let decision = stale_lease_attempt_decision(1, 3);
 
         assert_eq!(decision.status, "ready");
-        assert_eq!(decision.last_error, "stale-heartbeat takeover (attempt 2)");
+        assert_eq!(
+            decision.last_error,
+            "class=lease_stalled: stale-heartbeat takeover (attempt 2)"
+        );
     }
 
     fn temp_db_urls(name_prefix: &str) -> Option<(String, String, String)> {
@@ -8257,13 +8260,16 @@ fn stale_lease_attempt_decision(attempts: i32, max_attempts: i32) -> StaleLeaseA
         StaleLeaseAttemptDecision {
             status: "failed",
             last_error: format!(
-                "failed after {next_attempts} stalled attempts (max {max_attempts} reached)"
+                "class=lease_stalled: failed after {next_attempts} stalled attempts \
+                 (max {max_attempts} reached)"
             ),
         }
     } else {
         StaleLeaseAttemptDecision {
             status: "ready",
-            last_error: format!("stale-heartbeat takeover (attempt {next_attempts})"),
+            last_error: format!(
+                "class=lease_stalled: stale-heartbeat takeover (attempt {next_attempts})"
+            ),
         }
     }
 }
@@ -8552,7 +8558,7 @@ pub async fn pg_reap_orphaned_work_items(pool: &PgPool, min_age_secs: i64) -> Re
         "UPDATE work_items
             SET status = 'cancelled',
                 completed_at = NOW(),
-                last_error = 'auto-reaped: in_progress with no active lease'
+                last_error = 'class=lease_stalled: auto-reaped: in_progress with no active lease'
           WHERE status = 'in_progress'
             AND kind = 'task'
             AND created_at < NOW() - make_interval(secs => $1)
@@ -8790,7 +8796,8 @@ pub async fn pg_complete_parent_work_items(pool: &PgPool) -> Result<u64> {
         UPDATE work_items w
            SET status = CASE WHEN e.has_failed_child THEN 'failed' ELSE 'done' END,
                completed_at = NOW(),
-               last_error = CASE WHEN e.has_failed_child THEN 'auto-completed: child failed' ELSE NULL END
+               last_error = CASE WHEN e.has_failed_child \
+                   THEN 'class=child_failed: auto-completed: child failed' ELSE NULL END
           FROM eligible e
          WHERE w.id = e.id",
     )

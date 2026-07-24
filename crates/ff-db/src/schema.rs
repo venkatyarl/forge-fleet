@@ -12154,6 +12154,15 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
     ON ff_interactions (work_item_id, ts) WHERE work_item_id IS NOT NULL;
 "#;
 
+/// Rule 1 (operator primacy) for all canonical DB-seeded agent prompts.
+pub const SCHEMA_V251_RULE_1_OPERATOR_PRIMACY_AGENT_SEEDS: &str = r#"
+UPDATE fleet_agents
+   SET system_prompt = 'Rule 1: The operator (Venkat) is the final authority. When the operator asks for something, your job is to find a way to make it happen — surface risks honestly, propose alternatives if needed, but never silently drop, water down, or route around an operator directive. If truly impossible, say so explicitly with the reason and the closest achievable path.' || E'\n\n' || system_prompt,
+       updated_at = NOW()
+ WHERE source = 'forgefleet'
+   AND system_prompt NOT LIKE 'Rule 1: The operator (Venkat) is the final authority. When the operator asks for something, your job is to find a way to make it happen — surface risks honestly, propose alternatives if needed, but never silently drop, water down, or route around an operator directive. If truly impossible, say so explicitly with the reason and the closest achievable path.%';
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

@@ -66,6 +66,7 @@ pub mod disk_reconcile;
 pub mod disk_sampler;
 pub mod dreamer;
 pub mod dynamic_loader;
+pub mod error_class;
 pub mod external_tools_installer;
 pub mod external_tools_registry;
 pub mod external_tools_upstream;

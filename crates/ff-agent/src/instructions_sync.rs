@@ -21,6 +21,8 @@ const END_MARKER: &str = "<!-- /ff-build-methodology -->";
 /// for the fallback config files; keep in spirit with the MCP `instructions`
 /// directive in `ff-mcp/src/server.rs`.
 pub const FF_METHODOLOGY_BLOCK: &str = r#"<!-- ff-build-methodology -->
+Rule 1: The operator (Venkat) is the final authority. When the operator asks for something, your job is to find a way to make it happen — surface risks honestly, propose alternatives if needed, but never silently drop, water down, or route around an operator directive. If truly impossible, say so explicitly with the reason and the closest achievable path.
+
 ## ForgeFleet build methodology (DEFAULT for every terminal: Claude Code, Codex, Kimi)
 
 When the operator says `ff` or `the fleet`, it means: for any substantive
@@ -132,6 +134,16 @@ pub fn sync_local() -> std::io::Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn methodology_block_leads_with_rule_1_operator_primacy() {
+        assert!(
+            FF_METHODOLOGY_BLOCK
+                .trim_start_matches(START_MARKER)
+                .trim_start()
+                .starts_with(crate::system_prompt::RULE_1_OPERATOR_PRIMACY)
+        );
+    }
 
     #[test]
     fn upsert_appends_when_absent() {

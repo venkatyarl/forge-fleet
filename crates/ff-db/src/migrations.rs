@@ -1188,6 +1188,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "ff_interactions_episodic_tagging",
         sql: schema::SCHEMA_V250_FF_INTERACTIONS_EPISODIC_TAGGING,
     },
+    PgMigration {
+        version: 251,
+        name: "rule_1_operator_primacy_agent_seeds",
+        sql: schema::SCHEMA_V251_RULE_1_OPERATOR_PRIMACY_AGENT_SEEDS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1400,6 +1405,15 @@ mod tests {
                 pair[1].name,
             );
         }
+    }
+
+    #[test]
+    fn rule_1_operator_primacy_migration_is_registered_and_verbatim() {
+        const RULE_1: &str = "Rule 1: The operator (Venkat) is the final authority. When the operator asks for something, your job is to find a way to make it happen — surface risks honestly, propose alternatives if needed, but never silently drop, water down, or route around an operator directive. If truly impossible, say so explicitly with the reason and the closest achievable path.";
+        assert!(schema::SCHEMA_V251_RULE_1_OPERATOR_PRIMACY_AGENT_SEEDS.contains(RULE_1));
+        assert!(PG_MIGRATIONS.iter().any(|migration| {
+            migration.version == 251 && migration.name == "rule_1_operator_primacy_agent_seeds"
+        }));
     }
 
     fn db_url() -> Option<String> {

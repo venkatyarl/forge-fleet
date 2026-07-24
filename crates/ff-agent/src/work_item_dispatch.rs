@@ -2311,6 +2311,7 @@ fn quick_empty_success_is_provider_failure(output: &Output, elapsed: Duration) -
 /// can re-dispatch. Best-effort: on any DB error, falls back to marking failed
 /// so a stuck item can't hold a slot forever.
 async fn requeue_or_fail(pg: &PgPool, item: &AssignedWorkItem, error: &str) -> Result<()> {
+    let error = crate::error_class::classify(error);
     let attempts: i32 =
         sqlx::query_scalar("SELECT COALESCE(attempts, 0) FROM work_items WHERE id = $1")
             .bind(item.work_item_id)
@@ -2327,7 +2328,7 @@ async fn requeue_or_fail(pg: &PgPool, item: &AssignedWorkItem, error: &str) -> R
             max = MAX_DISPATCH_ATTEMPTS,
             "work_item_dispatch: retry budget exhausted — escalating to failed"
         );
-        return mark_failed_and_release(pg, item, error).await;
+        return mark_failed_and_release(pg, item, &error).await;
     }
 
     let mut tx = pg.begin().await?;
@@ -2370,6 +2371,7 @@ async fn requeue_or_fail(pg: &PgPool, item: &AssignedWorkItem, error: &str) -> R
 }
 
 async fn mark_failed_and_release(pg: &PgPool, item: &AssignedWorkItem, error: &str) -> Result<()> {
+    let error = crate::error_class::classify(error);
     let mut tx = pg.begin().await?;
     sqlx::query(
         "UPDATE work_items
@@ -2379,7 +2381,7 @@ async fn mark_failed_and_release(pg: &PgPool, item: &AssignedWorkItem, error: &s
             AND status NOT IN ('done', 'merged', 'cancelled')",
     )
     .bind(item.work_item_id)
-    .bind(truncate_for_db(error))
+    .bind(truncate_for_db(&error))
     .execute(&mut *tx)
     .await?;
     sqlx::query(
@@ -2396,7 +2398,7 @@ async fn mark_failed_and_release(pg: &PgPool, item: &AssignedWorkItem, error: &s
     // Escalation ladder stage 3: the fleet (local + cloud) couldn't build this
     // after the full retry budget — tell the operator. Best-effort; a notify
     // failure never fails the dispatch.
-    notify_operator_task_failed(pg, item, error).await;
+    notify_operator_task_failed(pg, item, &error).await;
     Ok(())
 }
 
@@ -2568,6 +2570,7 @@ async fn release_slot_and_lease_tx(
 }
 
 async fn mark_worktree_failed(pg: &PgPool, work_item_id: Uuid, error: &str) -> Result<()> {
+    let error = crate::error_class::classify(error);
     sqlx::query(
         "UPDATE work_item_worktrees
             SET status = 'failed'
@@ -2584,7 +2587,7 @@ async fn mark_worktree_failed(pg: &PgPool, work_item_id: Uuid, error: &str) -> R
           WHERE id = $1",
     )
     .bind(work_item_id)
-    .bind(truncate_for_db(error))
+    .bind(truncate_for_db(&error))
     .execute(pg)
     .await?;
     Ok(())
@@ -2595,7 +2598,12 @@ async fn mark_worktree_failed(pg: &PgPool, work_item_id: Uuid, error: &str) -> R
 /// doesn't rediscover them per task. Distilled from recurring fleet-build failures
 /// (2026-07-04): DB tests panicking in CI's DB-less job, redundant second
 /// migrations + endless iteration, and edits to historical migration consts.
-const DISPATCH_HOUSE_RULES: &str = "\n\n--- ForgeFleet build rules (apply to EVERY change) ---\n\
+const DISPATCH_HOUSE_RULES: &str = "\n\nRule 1: The operator (Venkat) is the final authority. \
+When the operator asks for something, your job is to find a way to make it happen — surface \
+risks honestly, propose alternatives if needed, but never silently drop, water down, or route \
+around an operator directive. If truly impossible, say so explicitly with the reason and the \
+closest achievable path.\n\
+\n--- ForgeFleet build rules (apply to EVERY change) ---\n\
 - DB TESTS: any test that needs Postgres MUST early-return when neither \
 FORGEFLEET_POSTGRES_URL nor FORGEFLEET_DATABASE_URL is set (CI's `cargo test --lib` \
 has NO database and will PANIC otherwise). Never let a DB test panic in CI.\n\
@@ -2732,7 +2740,12 @@ async fn record_dispatch_interaction(
             "error".to_string(),
             // Full anyhow chain ({:#}) so the real cause is captured, not just
             // the top-level wrapper (e.g. "fleet_oneshot round 1").
-            Some(format!("{e:#}").chars().take(2000).collect::<String>()),
+            Some(
+                crate::error_class::classify(format!("{e:#}"))
+                    .chars()
+                    .take(2000)
+                    .collect::<String>(),
+            ),
             0,
             0,
             false,
@@ -2791,6 +2804,7 @@ async fn dispatch_to_480b(
     item: &AssignedWorkItem,
     worktree: &WorktreeRecord,
     prompt: &str,
+    ring_target: &str,
 ) -> Option<(String, Output)> {
     let _permit = match tokio::time::timeout(
         Duration::from_millis(LANE15_480B_PERMIT_WAIT_MS),
@@ -2813,7 +2827,8 @@ async fn dispatch_to_480b(
         }
     };
 
-    mark_lease_endpoint(pg, item, "lane1.5:local:qwen3-coder-480b").await;
+    let model_hint = format!("local:{ring_target}");
+    mark_lease_endpoint(pg, item, &format!("lane1.5:{model_hint}")).await;
     info!(
         work_item_id = %item.work_item_id,
         stage = "lane1.5",
@@ -2826,7 +2841,7 @@ async fn dispatch_to_480b(
             pg,
             &worktree.worktree_path,
             prompt,
-            Some(LANE15_480B_MODEL_HINT),
+            Some(&model_hint),
             1,
             Some(item.work_item_id),
         ),
@@ -2917,6 +2932,10 @@ async fn run_ff_dispatch(
     worktree: &WorktreeRecord,
 ) -> Result<(String, Output)> {
     let mut prompt = dispatch_prompt(item);
+    let ladder = ff_routing_policy::load_ladder(pg, "coding").await;
+    let ladder_configured = !ladder.is_empty();
+    let ladder_selection =
+        ff_routing_policy::select_rungs_for_attempt(&ladder, item.attempts.max(0) as u32);
     // Prepend a Cortex context pack: the exact existing symbols this task touches,
     // pulled from the shared code graph, so the agent starts there instead of
     // grep-storming the whole repo cold (wasted context + the cold-compile explore
@@ -2963,7 +2982,16 @@ async fn run_ff_dispatch(
     // straight to the capable cloud CLI from attempt 0 instead of burning a
     // wedge-prone local attempt first.
     let mut lane1_failed_or_timed_out = false;
-    if use_local_lane(item.attempts, lane1_breaker_open, item.prefers_cloud_lane()) {
+    let ladder_allows_local = if ladder_configured {
+        ladder_selection.local_model.is_some() && !lane1_breaker_open && !item.prefers_cloud_lane()
+    } else {
+        use_local_lane(item.attempts, lane1_breaker_open, item.prefers_cloud_lane())
+    };
+    if ladder_allows_local {
+        let local_model_hint = ladder_selection
+            .local_model
+            .as_deref()
+            .map(|target| format!("local:{target}"));
         // Bound Lane 1 with a hard timeout so a hung local codegen harness fails
         // OVER to the cloud backstop instead of wedging the slot forever (see
         // LANE1_TIMEOUT_SECS). Without this, a hang here stalls the build while
@@ -2974,7 +3002,7 @@ async fn run_ff_dispatch(
                 pg,
                 &worktree.worktree_path,
                 &prompt,
-                None,
+                local_model_hint.as_deref(),
                 4,
                 Some(item.work_item_id),
             ),
@@ -3013,7 +3041,7 @@ async fn run_ff_dispatch(
                 );
                 let _ = sqlx::query(
                     "UPDATE work_items SET status = 'done', completed_at = NOW(), \
-                        last_error = 'already implemented (model verified: feature exists + tests pass)' \
+                        last_error = 'class=already_implemented: already implemented (model verified: feature exists + tests pass)' \
                       WHERE id = $1 AND status NOT IN ('merged')",
                 )
                 .bind(item.work_item_id)
@@ -3090,13 +3118,22 @@ async fn run_ff_dispatch(
     // `prefers_cloud_lane` still get one local-480b shot before cloud).
     let lane15_trigger =
         lane1_failed_or_timed_out || complexity_at_least_moderate(&item.complexity);
-    if should_attempt_lane15(
-        lane1_failed_or_timed_out,
-        complexity_at_least_moderate(&item.complexity),
-        lane15_enabled,
-        lane15_breaker_open,
-    ) {
-        if let Some((backend, output)) = dispatch_to_480b(pg, item, worktree, &prompt).await {
+    let ring_target = if ladder_configured {
+        ladder_selection.ring.as_deref()
+    } else {
+        Some(LANE15_480B_MODEL_HINT.trim_start_matches("local:"))
+    };
+    if ring_target.is_some()
+        && should_attempt_lane15(
+            lane1_failed_or_timed_out,
+            complexity_at_least_moderate(&item.complexity),
+            lane15_enabled,
+            lane15_breaker_open,
+        )
+    {
+        if let Some((backend, output)) =
+            dispatch_to_480b(pg, item, worktree, &prompt, ring_target.unwrap()).await
+        {
             return Ok((backend, output));
         }
     } else if lane15_trigger && !lane15_enabled {
@@ -3173,11 +3210,27 @@ async fn run_ff_dispatch(
     // engages) burned its whole attempt budget on one broken backend (22×
     // "backend claude produced no diff" on the 2026-07-23 requeue wave).
     // With attempts in the index, each retry fronts the NEXT backend.
+    let configured_cloud = &ladder_selection.cloud_backends;
+    if ladder_configured && !configured_cloud.is_empty() {
+        let available = backends;
+        backends = configured_cloud
+            .iter()
+            .filter(|configured| available.iter().any(|backend| backend == *configured))
+            .cloned()
+            .collect();
+        if backends.is_empty() {
+            backends = available;
+        }
+    }
     let rotation_index = item
         .work_item_id
         .as_u128()
         .wrapping_add(item.attempts.max(0) as u128);
-    let pick = BUILDER_ROTATION[(rotation_index % BUILDER_ROTATION.len() as u128) as usize];
+    let pick = if ladder_configured {
+        backends.first().map(String::as_str).unwrap_or("claude")
+    } else {
+        BUILDER_ROTATION[(rotation_index % BUILDER_ROTATION.len() as u128) as usize]
+    };
     let preferred = if backends.iter().any(|b| b == pick) {
         pick
     } else {
@@ -5172,6 +5225,18 @@ mod tests {
         assert!(
             DISPATCH_HOUSE_RULES.contains("UNCOMMITTED"),
             "house rules must tell the agent to leave edits UNCOMMITTED for the harness"
+        );
+    }
+
+    #[test]
+    fn house_rules_lead_with_rule_1_operator_primacy() {
+        assert_eq!(
+            DISPATCH_HOUSE_RULES
+                .trim_start_matches('\n')
+                .lines()
+                .next()
+                .unwrap_or_default(),
+            crate::system_prompt::RULE_1_OPERATOR_PRIMACY
         );
     }
 
