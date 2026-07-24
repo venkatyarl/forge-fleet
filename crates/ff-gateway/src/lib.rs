@@ -11,6 +11,7 @@
 
 pub mod brain_api;
 pub mod capacity_router;
+pub mod cl_config;
 pub mod cli_bridge;
 pub mod cloud_llm;
 pub mod connection_monitor;
