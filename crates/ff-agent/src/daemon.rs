@@ -116,6 +116,12 @@ impl TickRegistry {
                 scope: TickScope::LeaderOnly,
                 runner: run_ssh_mesh_check_tick,
             },
+            TickDefinition {
+                name: "error_miner",
+                interval: crate::error_miner::DEFAULT_INTERVAL,
+                scope: TickScope::LeaderOnly,
+                runner: run_error_miner_tick,
+            },
         ]
         .into_iter()
         .map(|definition| RegisteredTick {
@@ -318,6 +324,14 @@ fn run_ssh_mesh_check_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'stati
             .await
             .map(|_| ())
             .map_err(anyhow::Error::msg)
+    })
+}
+
+fn run_error_miner_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::error_miner::run_error_miner_tick(&pg, &worker_name)
+            .await
+            .map(|_| ())
     })
 }
 
