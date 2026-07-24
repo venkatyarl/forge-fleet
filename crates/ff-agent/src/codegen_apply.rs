@@ -19,6 +19,8 @@ pub struct CodegenOutcome {
     pub rounds: u32,
     pub final_diff: Option<String>,
     pub error: Option<String>,
+    /// Catalog model name that produced the terminal response, when known.
+    pub model: Option<String>,
     /// The model reported the task is ALREADY implemented / no change needed (it inspected the
     /// repo, often ran the tests, and produced no edits on purpose). The caller should mark the
     /// work_item done — NOT fail-retry — so an already-satisfied task drains instead of thrashing.
@@ -169,6 +171,7 @@ pub async fn codegen_apply(
                         rounds,
                         final_diff: None,
                         error: None,
+                        model: Some(response.model),
                         already_done: true,
                     });
                 }
@@ -287,6 +290,7 @@ pub async fn codegen_apply(
             rounds,
             final_diff: Some(edit_summary),
             error: None,
+            model: Some(response.model),
             already_done: false,
         });
     }
@@ -296,6 +300,7 @@ pub async fn codegen_apply(
         rounds,
         final_diff: None,
         error: last_error,
+        model: None,
         already_done: false,
     })
 }
