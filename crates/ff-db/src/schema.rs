@@ -12154,6 +12154,58 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
     ON ff_interactions (work_item_id, ts) WHERE work_item_id IS NOT NULL;
 "#;
 
+/// ErrorMiner — dedup table for recurring errors mined from
+/// `work_items.last_error` / `ff_interactions.error_text`, and a per-node
+/// digest of classified `journald` warning/error lines.
+///
+///   - `error_signatures.signature` is the dedup key: sha256 of the error
+///     class token when one is present, else of the normalized error text.
+///     `count_24h` is fully recomputed each pass from a live 24h scan (and
+///     zeroed for any signature that drops out of the window), never
+///     accumulated. `count_total` is a true running total across all time,
+///     advanced only by occurrences newer than `last_seen_at` (the
+///     high-water mark of what's already been counted) — never by the
+///     recomputed `count_24h` snapshot, which would double-count the same
+///     occurrences on every overlapping 24h pass. `state` moves `new` ->
+///     `filed` once ErrorMiner auto-files a work_item for it (`work_item_id`
+///     then points at that row).
+///   - `fleet_log_digest` is keyed `(node_name, signature)` where `signature`
+///     is the normalized first-six-words classification of a journald line;
+///     `count_24h` follows the same recompute-and-zero-if-absent rule.
+pub const SCHEMA_V247_ERROR_SIGNATURES_AND_FLEET_LOG_DIGEST: &str = r#"
+CREATE TABLE IF NOT EXISTS error_signatures (
+    signature       TEXT PRIMARY KEY,
+    error_class     TEXT,
+    normalized_text TEXT NOT NULL,
+    sample_texts    JSONB NOT NULL DEFAULT '[]',
+    affected_nodes  JSONB NOT NULL DEFAULT '[]',
+    count_24h       INTEGER NOT NULL DEFAULT 0,
+    count_total     INTEGER NOT NULL DEFAULT 0,
+    state           TEXT NOT NULL DEFAULT 'new',
+    work_item_id    UUID,
+    first_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_error_signatures_count_24h
+    ON error_signatures (count_24h DESC);
+
+CREATE TABLE IF NOT EXISTS fleet_log_digest (
+    id            BIGSERIAL PRIMARY KEY,
+    node_name     TEXT NOT NULL,
+    signature     TEXT NOT NULL,
+    normalized    TEXT NOT NULL,
+    sample_line   TEXT,
+    count_24h     INTEGER NOT NULL DEFAULT 0,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (node_name, signature)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_log_digest_last_seen
+    ON fleet_log_digest (last_seen_at DESC);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

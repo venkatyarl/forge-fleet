@@ -50,6 +50,8 @@ pub use queries::{
     CortexResolutionStats,
     CortexSuspiciousExtern,
     CortexSuspiciousReport,
+    // The `ff pm create` / error_miner shared work_item creation path
+    CreateWorkItem,
     DeferredCount,
     DeferredStats,
     DeferredTaskRow,
@@ -129,6 +131,7 @@ pub use queries::{
     pg_create_schedule,
     pg_create_shared_volume,
     pg_create_training_job,
+    pg_create_work_item,
     // Orchestrator P2 — demand sensing (V116)
     pg_current_demand_vector,
     pg_defer_merge_queue_item_to_back,

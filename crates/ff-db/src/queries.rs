@@ -8321,6 +8321,58 @@ pub async fn pg_rank_computers_by_capacity(pool: &PgPool) -> Result<Vec<HostCapa
         .collect())
 }
 
+/// Inputs for [`pg_create_work_item`]. `risk_score`/`metadata` are optional so
+/// plain `ff pm create` callers can omit them and get the column defaults.
+pub struct CreateWorkItem<'a> {
+    pub project_id: &'a str,
+    pub kind: &'a str,
+    pub title: &'a str,
+    pub description: Option<&'a str>,
+    pub priority: Option<&'a str>,
+    pub created_by: &'a str,
+    pub risk_score: Option<f32>,
+    pub metadata: Option<JsonValue>,
+}
+
+/// The one validated path for creating a `work_items` row: checks `project_id`
+/// resolves to a real `projects` row (a clear error instead of an FK
+/// violation), then inserts. This is `ff pm create`'s own implementation
+/// (`crates/ff-terminal/src/pm_cmd.rs`) — callers that need a work_item
+/// created programmatically (e.g. `error_miner`'s auto-file pass) must go
+/// through this function rather than issuing their own `INSERT INTO
+/// work_items`, so every creation path shares the same validation.
+pub async fn pg_create_work_item(pool: &PgPool, item: CreateWorkItem<'_>) -> Result<uuid::Uuid> {
+    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM projects WHERE id = $1")
+        .bind(item.project_id)
+        .fetch_optional(pool)
+        .await?;
+    if exists.is_none() {
+        return Err(crate::error::DbError::NotFound(format!(
+            "unknown project '{}' — run `ff project seed` or check `ff project list`",
+            item.project_id
+        )));
+    }
+
+    let priority = item.priority.unwrap_or("normal");
+    let row: (uuid::Uuid,) = sqlx::query_as(
+        "INSERT INTO work_items \
+            (project_id, kind, title, description, priority, created_by, risk_score, metadata) \
+         VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 0), COALESCE($8, '{}'::jsonb)) \
+         RETURNING id",
+    )
+    .bind(item.project_id)
+    .bind(item.kind)
+    .bind(item.title)
+    .bind(item.description)
+    .bind(priority)
+    .bind(item.created_by)
+    .bind(item.risk_score)
+    .bind(item.metadata)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
 /// Reap leases whose heartbeat is older than `stale_secs`: release the lease,
 /// free its slot, mark any in-flight worktree stale/failed, and either return
 /// the work_item to 'ready' or fail it once the next attempt reaches the cap.
