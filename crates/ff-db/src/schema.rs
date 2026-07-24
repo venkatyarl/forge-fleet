@@ -12154,6 +12154,33 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
     ON ff_interactions (work_item_id, ts) WHERE work_item_id IS NOT NULL;
 "#;
 
+/// Autopilot-2a — ordered routing ladders for each workload.
+pub const SCHEMA_V251_ROUTING_LADDERS: &str = r#"
+CREATE TABLE IF NOT EXISTS routing_ladders (
+    workload  TEXT,
+    position  INT,
+    rung_kind TEXT CHECK (rung_kind IN ('local_model', 'ring', 'cloud_backend')),
+    target    TEXT,
+    PRIMARY KEY (workload, position)
+);
+
+INSERT INTO routing_ladders (workload, position, rung_kind, target) VALUES
+    ('coding', 1, 'local_model', 'devstral-small-2-24b'),
+    ('coding', 2, 'local_model', 'glm-4.5-air'),
+    ('coding', 3, 'ring', 'qwen3-coder-480b'),
+    ('coding', 4, 'cloud_backend', 'codex'),
+    ('coding', 5, 'cloud_backend', 'kimi'),
+    ('coding', 6, 'cloud_backend', 'claude'),
+    ('research', 1, 'local_model', 'lucy-1-7b'),
+    ('research', 2, 'local_model', 'deepseek-v3'),
+    ('research', 3, 'local_model', 'qwen36-35b-a3b'),
+    ('research', 4, 'cloud_backend', 'codex'),
+    ('vision', 1, 'local_model', 'smolvlm2-500m-video'),
+    ('vision', 2, 'local_model', 'qwen3-vl-30b-a3b'),
+    ('embedding', 1, 'local_model', 'bge-m3')
+ON CONFLICT (workload, position) DO NOTHING;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
