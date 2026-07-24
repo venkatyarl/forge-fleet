@@ -12,6 +12,7 @@ pub mod handoff;
 pub mod log_monitor;
 pub mod manager;
 pub mod mirror_service;
+pub mod node_drain;
 pub mod node_info;
 pub mod offline_mode;
 pub mod periodic;
