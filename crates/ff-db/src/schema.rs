@@ -12201,6 +12201,20 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// Rule 1 operator primacy for every DB-backed agent role.
+pub const SCHEMA_V261_OPERATOR_PRIMACY: &str = r#"
+UPDATE agent_roles
+   SET system_prompt = 'Rule 1: The operator (Venkat) is the final authority. When the operator asks for something, your job is to find a way to make it happen — surface risks honestly, propose alternatives if needed, but never silently drop, water down, or route around an operator directive. If truly impossible, say so explicitly with the reason and the closest achievable path.'
+                       || E'\n\n' || system_prompt
+ WHERE system_prompt NOT LIKE 'Rule 1:%';
+
+UPDATE fleet_agents
+   SET system_prompt = 'Rule 1: The operator (Venkat) is the final authority. When the operator asks for something, your job is to find a way to make it happen — surface risks honestly, propose alternatives if needed, but never silently drop, water down, or route around an operator directive. If truly impossible, say so explicitly with the reason and the closest achievable path.'
+                       || E'\n\n' || system_prompt,
+       updated_at = NOW()
+ WHERE system_prompt NOT LIKE 'Rule 1:%';
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

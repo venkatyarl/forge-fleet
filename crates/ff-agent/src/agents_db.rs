@@ -142,12 +142,14 @@ pub async fn import_repo_agents(
                         .collect(),
                 );
                 let role = a.role.clone().unwrap_or_else(|| a.name.clone());
+                let system_prompt =
+                    format!("{}\n\n{}", crate::system_prompt::RULE_1, a.system_prompt);
                 match ff_db::pg_upsert_agent(
                     pool,
                     &a.name,
                     &role,
                     a.description.as_deref(),
-                    &a.system_prompt,
+                    &system_prompt,
                     &tools,
                     &trig,
                     a.require_tool_calling.unwrap_or(true),

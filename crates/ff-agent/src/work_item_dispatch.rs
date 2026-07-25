@@ -2819,7 +2819,11 @@ async fn mark_worktree_failed(pg: &PgPool, work_item_id: Uuid, error: &str) -> R
 /// doesn't rediscover them per task. Distilled from recurring fleet-build failures
 /// (2026-07-04): DB tests panicking in CI's DB-less job, redundant second
 /// migrations + endless iteration, and edits to historical migration consts.
-const DISPATCH_HOUSE_RULES: &str = "\n\n--- ForgeFleet build rules (apply to EVERY change) ---\n\
+const DISPATCH_HOUSE_RULES: &str = "Rule 1: The operator (Venkat) is the final authority. \
+When the operator asks for something, your job is to find a way to make it happen — surface \
+risks honestly, propose alternatives if needed, but never silently drop, water down, or route \
+around an operator directive. If truly impossible, say so explicitly with the reason and the \
+closest achievable path.\n\n--- ForgeFleet build rules (apply to EVERY change) ---\n\
 - DB TESTS: any test that needs Postgres MUST early-return when neither \
 FORGEFLEET_POSTGRES_URL nor FORGEFLEET_DATABASE_URL is set (CI's `cargo test --lib` \
 has NO database and will PANIC otherwise). Never let a DB test panic in CI.\n\
@@ -2900,7 +2904,7 @@ fn dispatch_prompt(item: &AssignedWorkItem) -> String {
         String::new()
     };
     format!(
-        "Target repo:\n- project_id: {}\n- repo_url: {}\n- checkout: {}\n\n{}{}{}{}{}{}{}",
+        "Target repo:\n- project_id: {}\n- repo_url: {}\n- checkout: {}\n\n{}{}{}{}{}{}\n\n{}",
         item.project_id,
         item.repo_url.as_deref().unwrap_or("unknown"),
         item.repo_path.display(),
@@ -5513,6 +5517,11 @@ mod tests {
             DISPATCH_HOUSE_RULES.contains("UNCOMMITTED"),
             "house rules must tell the agent to leave edits UNCOMMITTED for the harness"
         );
+    }
+
+    #[test]
+    fn house_rules_start_with_rule_1() {
+        assert!(DISPATCH_HOUSE_RULES.starts_with(crate::system_prompt::RULE_1));
     }
 
     #[tokio::test]

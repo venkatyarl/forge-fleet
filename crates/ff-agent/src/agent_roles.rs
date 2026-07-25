@@ -50,7 +50,7 @@ pub enum ModelPreference {
 
 /// Get all built-in agent roles.
 pub fn builtin_roles() -> Vec<AgentRole> {
-    vec![
+    let mut roles = vec![
         // Core Development
         AgentRole {
             name: "rust-developer".into(), category: RoleCategory::CoreDevelopment,
@@ -188,7 +188,15 @@ pub fn builtin_roles() -> Vec<AgentRole> {
             denied_tools: vec![],
             system_prompt_extension: "You are an API designer. Design clean, RESTful APIs with proper status codes, error handling, and documentation. Consider versioning and backward compatibility.".into(),
         },
-    ]
+    ];
+    for role in &mut roles {
+        role.system_prompt_extension = format!(
+            "{}\n\n{}",
+            crate::system_prompt::RULE_1,
+            role.system_prompt_extension
+        );
+    }
+    roles
 }
 
 /// Find a role by name.
