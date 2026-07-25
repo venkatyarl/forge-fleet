@@ -315,26 +315,33 @@ async fn primary_project_repo(pool: &PgPool, project: &str) -> Result<Option<Rep
     .bind(project)
     .fetch_optional(pool)
     .await?;
-    let proj = sqlx::query(
-        "SELECT repo_url, local_path, tech_stack FROM projects WHERE id = $1",
-    )
-    .bind(project)
-    .fetch_optional(pool)
-    .await?;
+    let proj = sqlx::query("SELECT repo_url, local_path, tech_stack FROM projects WHERE id = $1")
+        .bind(project)
+        .fetch_optional(pool)
+        .await?;
 
     let repo_id: Option<Uuid> = repo.as_ref().map(|r| r.get("id"));
     let repo_url: Option<String> = repo
         .as_ref()
         .map(|r| r.get::<String, _>("github_url"))
-        .or_else(|| proj.as_ref().and_then(|p| p.try_get("repo_url").ok().flatten()));
+        .or_else(|| {
+            proj.as_ref()
+                .and_then(|p| p.try_get("repo_url").ok().flatten())
+        });
     let local_path: Option<String> = repo
         .as_ref()
         .and_then(|r| r.try_get("local_path").ok().flatten())
-        .or_else(|| proj.as_ref().and_then(|p| p.try_get("local_path").ok().flatten()));
+        .or_else(|| {
+            proj.as_ref()
+                .and_then(|p| p.try_get("local_path").ok().flatten())
+        });
     let tech_stack: Option<String> = repo
         .as_ref()
         .and_then(|r| r.try_get("tech_stack").ok().flatten())
-        .or_else(|| proj.as_ref().and_then(|p| p.try_get("tech_stack").ok().flatten()));
+        .or_else(|| {
+            proj.as_ref()
+                .and_then(|p| p.try_get("tech_stack").ok().flatten())
+        });
 
     if repo_id.is_none() && repo_url.is_none() && local_path.is_none() {
         return Ok(None);

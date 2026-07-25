@@ -1,0 +1,1 @@
+CREATE PUBLICATION forge_fleet_replica FOR ALL TABLES;
