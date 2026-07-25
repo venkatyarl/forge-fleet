@@ -178,6 +178,30 @@ fn stale_peer_mount_health(count: i64) -> Health {
     }
 }
 
+/// No-diff loop: work items failed with a "no diff"/"no commits"/"no changes"
+/// error — the class the pre-build acceptance gate is supposed to catch (mark
+/// already-done work done instead of failing it). 0 = gate holding; a few is a
+/// warning; a flood means the gate is missing a class and items are thrashing.
+fn nodiff_loop_health(n: i64) -> Health {
+    match n {
+        0 => Health::Pass,
+        1..=3 => Health::Warn,
+        _ => Health::Fail,
+    }
+}
+
+/// Stall loop: work items failed in the stall class (stalled attempts, git
+/// index.lock, "no dispatchable backend") PLUS leases stuck past the stale
+/// heartbeat window. These are what the diagnostic stall-reaper (OQ-4) must
+/// reclaim + re-dispatch; a nonzero count means work is wedged, not moving.
+fn stall_loop_health(n: i64) -> Health {
+    match n {
+        0 => Health::Pass,
+        1..=5 => Health::Warn,
+        _ => Health::Fail,
+    }
+}
+
 /// Render the report. Pure (no I/O / color in the assertions matter) so the
 /// layout is unit-testable.
 fn render_doctor(checks: &[DoctorCheck], overall: Health) -> String {
@@ -397,6 +421,47 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
         detail: format!("{degraded_deployments} active but unhealthy/stale"),
     });
 
+    // 7e) No-diff loop: items failed in the no-diff/no-commits class the
+    //     pre-build acceptance gate is meant to prevent. Auto-surfaced so
+    //     "check on this" always has an ff answer for this failure class.
+    let nodiff_loop: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_items
+          WHERE status = 'failed'
+            AND (last_error ILIKE '%no diff%' OR last_error ILIKE '%no commits%'
+                 OR last_error ILIKE '%no changes%')",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("no-diff-loop check: {e}"))?;
+    checks.push(DoctorCheck {
+        name: "no-diff loop".into(),
+        status: nodiff_loop_health(nodiff_loop),
+        detail: format!("{nodiff_loop} failed with no-diff/no-commits"),
+    });
+
+    // 7f) Stall loop: items failed in the stall class (stalled attempts, git
+    //     index.lock, no-dispatchable-backend) PLUS leases stuck past the stale
+    //     heartbeat window — the wedge class the diagnostic stall-reaper targets.
+    let stall_loop: i64 = sqlx::query_scalar(
+        "SELECT
+             (SELECT COUNT(*) FROM work_items
+               WHERE status = 'failed'
+                 AND (last_error ILIKE '%stalled%' OR last_error ILIKE '%index.lock%'
+                      OR last_error ILIKE '%git%lock%'
+                      OR last_error ILIKE '%no dispatchable backend%'))
+           + (SELECT COUNT(*) FROM work_item_leases
+               WHERE released_at IS NULL
+                 AND heartbeat_at < NOW() - INTERVAL '300 seconds')",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("stall-loop check: {e}"))?;
+    checks.push(DoctorCheck {
+        name: "stall loop".into(),
+        status: stall_loop_health(stall_loop),
+        detail: format!("{stall_loop} stalled/lock/stuck-lease"),
+    });
+
     // 8) Leader liveness (fresh heartbeat within 60s).
     let fresh_leaders: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM fleet_leader_state WHERE heartbeat_at > NOW() - INTERVAL '60 seconds'",
@@ -556,6 +621,18 @@ mod tests {
         assert!(!unit_text_has_dsn_env(
             "# used to carry FORGEFLEET_POSTGRES_URL=… before #44\n"
         ));
+    }
+
+    #[test]
+    fn nodiff_and_stall_loop_thresholds() {
+        // No-diff loop: clean=Pass, a few=Warn, flood=Fail.
+        assert_eq!(nodiff_loop_health(0), Health::Pass);
+        assert_eq!(nodiff_loop_health(2), Health::Warn);
+        assert_eq!(nodiff_loop_health(9), Health::Fail);
+        // Stall loop: clean=Pass, handful=Warn, pileup=Fail.
+        assert_eq!(stall_loop_health(0), Health::Pass);
+        assert_eq!(stall_loop_health(4), Health::Warn);
+        assert_eq!(stall_loop_health(12), Health::Fail);
     }
 
     #[test]
