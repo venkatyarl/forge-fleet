@@ -418,6 +418,16 @@ impl LeaderTick {
                                         );
                                     }
 
+                                    if let Err(err) =
+                                        crate::error_miner::run_fix_lifecycle_pass(&self.pg).await
+                                    {
+                                        tracing::warn!(
+                                            node = %self.my_name,
+                                            error = %err,
+                                            "ErrorMiner fix lifecycle pass failed"
+                                        );
+                                    }
+
                                     // Keep the open-design SKILL.md catalog in
                                     // step with the auto-upgrade pipeline's git
                                     // pulls. No-op unless the leader's checkout

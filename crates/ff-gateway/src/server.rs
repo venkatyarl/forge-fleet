@@ -1434,7 +1434,7 @@ async fn handle_train_completion(
 
     match find_merge_queue_by_pr(pool, &project_id, pr_number).await {
         Ok(Some((id, work_item_id))) => {
-            match queries::pg_mark_merge_merged(pool, id, work_item_id).await {
+            match queries::pg_mark_merge_merged(pool, id, work_item_id, None).await {
                 Ok(()) => (
                     StatusCode::ACCEPTED,
                     Json(json!({

@@ -12201,6 +12201,44 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// V261 — Finish enforcing the SHA-256 constraint introduced as `NOT VALID`
+/// in V202 after existing artifact-cache rows have been cleaned up.
+pub const SCHEMA_V261_VALIDATE_ARTIFACT_CACHE_CHECKSUM: &str = r#"
+ALTER TABLE artifact_cache_index
+    VALIDATE CONSTRAINT artifact_cache_index_sha256_check;
+"#;
+
+/// V262 — Per-node resource telemetry and build-admission state.
+pub const SCHEMA_V262_NODE_HEALTH_MONITOR: &str = r#"
+CREATE TABLE IF NOT EXISTS node_health (
+    id                  BIGSERIAL PRIMARY KEY,
+    worker_name         TEXT NOT NULL,
+    sampled_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    mem_total_bytes     BIGINT NOT NULL,
+    mem_available_bytes BIGINT NOT NULL,
+    swap_total_bytes    BIGINT NOT NULL,
+    swap_free_bytes     BIGINT NOT NULL,
+    cpu_pct             DOUBLE PRECISION NOT NULL,
+    load_1              DOUBLE PRECISION NOT NULL,
+    load_5              DOUBLE PRECISION NOT NULL,
+    load_15             DOUBLE PRECISION NOT NULL,
+    service_rss         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    oom_kills           INTEGER NOT NULL DEFAULT 0,
+    pressure            TEXT NOT NULL CHECK (pressure IN ('healthy', 'pressure', 'critical')),
+    build_reserve_gb    DOUBLE PRECISION NOT NULL,
+    builds_allowed      BOOLEAN NOT NULL,
+    actions             JSONB NOT NULL DEFAULT '[]'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_node_health_worker_sampled
+    ON node_health (worker_name, sampled_at DESC);
+"#;
+
+/// V263 — lifecycle timestamps and rates for ErrorMiner fix verification.
+pub const SCHEMA_V263_ERROR_MINER_METADATA: &str = r#"
+ALTER TABLE error_signatures
+    ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

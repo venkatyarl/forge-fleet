@@ -9302,6 +9302,7 @@ pub struct MergeQueueItem {
     pub project_id: String,
     pub pr_url: Option<String>,
     pub branch_name: String,
+    pub head_sha: Option<String>,
 }
 
 /// Next merge-queue item to act on: lowest-position 'queued' OR 'ci_running'
@@ -9310,7 +9311,7 @@ pub struct MergeQueueItem {
 /// already watching; re-returning it lets the drain re-check its PR CI.)
 pub async fn pg_next_merge_queue_item(pool: &PgPool) -> Result<Option<MergeQueueItem>> {
     let row = sqlx::query(
-        "SELECT id, work_item_id, project_id, pr_url, branch_name
+        "SELECT id, work_item_id, project_id, pr_url, branch_name, head_sha
            FROM work_item_merge_queue q
           WHERE q.status IN ('queued', 'ci_running', 'mergeable')
             AND q.review_verdict = 'approve'
@@ -9330,6 +9331,7 @@ pub async fn pg_next_merge_queue_item(pool: &PgPool) -> Result<Option<MergeQueue
         project_id: r.get("project_id"),
         pr_url: r.try_get("pr_url").ok().flatten(),
         branch_name: r.get("branch_name"),
+        head_sha: r.try_get("head_sha").ok().flatten(),
     }))
 }
 
@@ -9386,6 +9388,7 @@ pub async fn pg_mark_merge_merged(
     pool: &PgPool,
     id: uuid::Uuid,
     work_item_id: uuid::Uuid,
+    head_sha: Option<&str>,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query(
@@ -9400,6 +9403,23 @@ pub async fn pg_mark_merge_merged(
     .bind(work_item_id)
     .execute(&mut *tx)
     .await?;
+    if let Some(head_sha) = head_sha.filter(|sha| !sha.trim().is_empty()) {
+        sqlx::query(
+            "UPDATE error_signatures
+                SET fix_commit_sha = $2, state = 'fix_merged', resolved_at = NULL,
+                    metadata = jsonb_set(
+                        COALESCE(metadata, '{}'::jsonb),
+                        '{fix_merged_at}',
+                        to_jsonb(NOW()),
+                        true
+                    )
+              WHERE work_item_id = $1",
+        )
+        .bind(work_item_id)
+        .bind(head_sha)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
     Ok(())
 }

@@ -117,7 +117,9 @@ async fn build_status_digest(pg: &PgPool) -> Result<String> {
     }
     msg.push('\n');
     if let Some((sha, up, tot)) = deploy {
-        msg.push_str(&format!("📦 Rolling deployment: {sha} · {up}/{tot} nodes\n\n"));
+        msg.push_str(&format!(
+            "📦 Rolling deployment: {sha} · {up}/{tot} nodes\n\n"
+        ));
     }
     msg.push_str(&format!(
         "📊 ready={ready}  failed={failed}  verified={verified}  ⛔blocked-on-you={blocked_op}"
