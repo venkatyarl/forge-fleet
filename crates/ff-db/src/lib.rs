@@ -77,6 +77,8 @@ pub use queries::{
     ModelDeploymentRow,
     ModelJobRow,
     ModelLibraryRow,
+    // Model-selection bandit reward signal + right-sizing trigger (V260)
+    ModelUtilizationRow,
     NodePeerMountRow,
     // Orchestrator P3 — adaptive serving-mix autoscaler
     PlacementCandidate,
@@ -223,6 +225,7 @@ pub use queries::{
     pg_mark_merge_mergeable,
     pg_mark_merge_merged,
     pg_mark_schedule_fired,
+    pg_model_utilization,
     pg_next_merge_queue_item,
     pg_node_free_disk,
     pg_open_disk_move,

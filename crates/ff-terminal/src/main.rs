@@ -3779,6 +3779,18 @@ pub enum ModelCommand {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Per-model utilization telemetry from `v_model_utilization`: recent
+    /// calls/tokens, build/approve rate, live deployment footprint, and
+    /// on-disk size — the reward signal the model-selection bandit reads and
+    /// the trigger autopilot right-sizing acts on. Also prints a WARN for any
+    /// model whose deployments have inconsistent or out-of-bounds context
+    /// config (usable_agent_ctx > context_window, < 8192, or context_window
+    /// disagreeing across the model's own deployments).
+    Stats {
+        /// Emit JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // ─── Phase 12: storage / power / train subcommands ─────────────────────────

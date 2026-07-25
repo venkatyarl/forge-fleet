@@ -221,3 +221,118 @@ async fn v176_merge_train_tables_are_created() {
 
     drop_temp_db(admin, pool, &db_name).await;
 }
+
+/// V260 adds `v_model_utilization`, the bandit's reward signal and
+/// right-sizing's trigger. Smoke-test the view end to end: seed a `local:`
+/// call, build, and two mismatched deployments for the same model id, then
+/// assert the rollup counts and the `ctx_warn` flag it drives.
+#[tokio::test]
+async fn v260_model_utilization_view_rolls_up_and_flags_ctx_mismatch() {
+    let Some((admin, pool, db_name)) = create_temp_db().await else {
+        eprintln!(
+            "skipping v260 model utilization view test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL"
+        );
+        return;
+    };
+
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .expect("run postgres migrations");
+
+    let project_id = "v260-test-project";
+    sqlx::query("INSERT INTO projects (id, display_name, status) VALUES ($1, $2, 'active')")
+        .bind(project_id)
+        .bind("v260 test project")
+        .execute(&pool)
+        .await
+        .expect("insert test project");
+
+    // A local-model interaction within the last 7 days.
+    sqlx::query(
+        "INSERT INTO ff_interactions (engine, tokens_in, tokens_out, ts)
+         VALUES ('local:devstral-small-2-24b', 100, 50, NOW())",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert ff_interactions row");
+
+    // A build attributed to the same model, approved on review.
+    let work_item_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO work_items (project_id, kind, title, created_by)
+         VALUES ($1, 'task', 'v260 test', 'test') RETURNING id",
+    )
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .expect("insert test work item");
+
+    sqlx::query(
+        "INSERT INTO work_item_merge_queue
+             (work_item_id, project_id, branch_name, builder, review_verdict, enqueued_at)
+         VALUES ($1, $2, 'v260-branch', 'local:devstral-small-2-24b', 'approve', NOW())",
+    )
+    .bind(work_item_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .expect("insert test merge queue entry");
+
+    // Two deployments of the same model with disagreeing context config —
+    // mirrors the live audit finding that motivated `ctx_warn`.
+    sqlx::query("INSERT INTO fleet_workers (name, ip) VALUES ('v260-node-a', '10.0.0.1')")
+        .execute(&pool)
+        .await
+        .expect("insert test worker a");
+    sqlx::query("INSERT INTO fleet_workers (name, ip) VALUES ('v260-node-b', '10.0.0.2')")
+        .execute(&pool)
+        .await
+        .expect("insert test worker b");
+
+    sqlx::query(
+        "INSERT INTO fleet_model_deployments
+             (worker_name, catalog_id, runtime, port, context_window, parallel_slots, usable_agent_ctx)
+         VALUES ('v260-node-a', 'devstral-small-2-24b', 'llama.cpp', 55001, 131072, 8, 32000)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert deployment a");
+    sqlx::query(
+        "INSERT INTO fleet_model_deployments
+             (worker_name, catalog_id, runtime, port, context_window, parallel_slots, usable_agent_ctx)
+         VALUES ('v260-node-b', 'devstral-small-2-24b', 'llama.cpp', 55001, 32768, 2, 16384)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert deployment b");
+
+    sqlx::query(
+        "INSERT INTO fleet_model_library (worker_name, catalog_id, runtime, file_path, size_bytes)
+         VALUES ('v260-node-a', 'devstral-small-2-24b', 'llama.cpp', '/models/devstral.gguf', 24000000000)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert library row");
+
+    let rows = ff_db::pg_model_utilization(&pool)
+        .await
+        .expect("query v_model_utilization");
+    let row = rows
+        .iter()
+        .find(|r| r.model_id == "devstral-small-2-24b")
+        .expect("devstral row present in v_model_utilization");
+
+    assert_eq!(row.calls_7d, 1);
+    assert_eq!(row.tokens_7d, 150);
+    assert_eq!(row.builds_7d, 1);
+    assert_eq!(row.approve_pct, Some(100.0));
+    assert_eq!(row.instances, 2);
+    assert_eq!(row.parallel_slots, 10);
+    assert!(row.est_ram_gb.unwrap_or(0.0) > 0.0);
+    assert!(
+        row.ctx_warn,
+        "expected ctx_warn for mismatched context_window/usable_agent_ctx across deployments"
+    );
+    assert!(row.ctx_warn_reason.is_some());
+
+    drop_temp_db(admin, pool, &db_name).await;
+}

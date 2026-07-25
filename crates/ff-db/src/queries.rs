@@ -2312,6 +2312,59 @@ pub async fn pg_agent_readiness(
         .collect())
 }
 
+/// One row of `v_model_utilization` — see the view's SQL
+/// (`migrations/20260724010000_create_model_utilization_view.sql`) for the
+/// full derivation. This is the reward signal the model-selection bandit
+/// reads and the trigger autopilot right-sizing acts on.
+#[derive(Debug, Clone)]
+pub struct ModelUtilizationRow {
+    pub model_id: String,
+    pub calls_7d: i64,
+    pub tokens_7d: i64,
+    pub builds_7d: i64,
+    pub approve_pct: Option<f64>,
+    pub instances: i64,
+    pub parallel_slots: i64,
+    pub context_window_min: Option<i32>,
+    pub context_window_max: Option<i32>,
+    pub usable_agent_ctx_min: Option<i32>,
+    pub usable_agent_ctx_max: Option<i32>,
+    pub est_ram_gb: Option<f64>,
+    /// True when this model has a deployment whose `usable_agent_ctx` exceeds
+    /// its `context_window`, is below the 8192 agent floor, or whose
+    /// `context_window` disagrees across the model's own deployments.
+    pub ctx_warn: bool,
+    pub ctx_warn_reason: Option<String>,
+}
+
+/// Query `v_model_utilization`, every model id with any recent usage,
+/// deployment, or library footprint. Ordered by model id.
+pub async fn pg_model_utilization(pool: &PgPool) -> Result<Vec<ModelUtilizationRow>> {
+    let rows = sqlx::query("SELECT * FROM v_model_utilization")
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| ModelUtilizationRow {
+            model_id: r.get("model_id"),
+            calls_7d: r.try_get("calls_7d").unwrap_or(0),
+            tokens_7d: r.try_get("tokens_7d").unwrap_or(0),
+            builds_7d: r.try_get("builds_7d").unwrap_or(0),
+            approve_pct: r.try_get("approve_pct").ok(),
+            instances: r.try_get("instances").unwrap_or(0),
+            parallel_slots: r.try_get("parallel_slots").unwrap_or(0),
+            context_window_min: r.try_get("context_window_min").ok(),
+            context_window_max: r.try_get("context_window_max").ok(),
+            usable_agent_ctx_min: r.try_get("usable_agent_ctx_min").ok(),
+            usable_agent_ctx_max: r.try_get("usable_agent_ctx_max").ok(),
+            est_ram_gb: r.try_get("est_ram_gb").ok(),
+            ctx_warn: r.try_get::<bool, _>("ctx_warn").unwrap_or(false),
+            ctx_warn_reason: r.try_get("ctx_warn_reason").ok(),
+        })
+        .collect())
+}
+
 /// A tool-capable deployment that is loaded but stuck in a too-small serving
 /// profile (per-slot agent ctx below the floor, or NULL). It can be relaunched in
 /// the agent profile (`ff model reprofile`) to become agent-router-visible WITHOUT
