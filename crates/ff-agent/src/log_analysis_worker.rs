@@ -31,6 +31,7 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(300);
 const DEFAULT_PROJECT_ID: &str = "ff-log-analysis";
 const DEFAULT_MIN_RECURRENCE: usize = 3;
 const DEFAULT_TAIL_LINES: usize = 1000;
+const MAX_BUG_WORK_ITEMS_PER_DAY: usize = 3;
 const DEFAULT_PATHS: &[&str] = &["/var/log/**/*.log"];
 const DEFAULT_PATTERNS: &[&str] = &["ERROR", "FATAL", "EXCEPTION", "WARN"];
 
@@ -253,12 +254,49 @@ impl LogAnalysisWorker {
         Ok(())
     }
 
-    /// Create one `ready` work_item per recurring pattern, skipping patterns
+    /// Create at most three bug work_items per UTC day, skipping patterns
     /// already tracked by an open/ready/in_progress work_item.
     async fn create_work_items(&self, patterns: &[&RecurringPattern]) -> Result<usize> {
+        let mut tx = self.pg.begin().await?;
+        let lock_key = format!("log-analysis-work-items:{}", self.config.project_id);
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&lock_key)
+            .execute(&mut *tx)
+            .await?;
+
+        let filed_today: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_items \
+             WHERE project_id = $1 \
+               AND kind = 'bug' \
+               AND original_signal->>'kind' = 'recurring_log' \
+               AND (created_at AT TIME ZONE 'UTC')::date = (NOW() AT TIME ZONE 'UTC')::date",
+        )
+        .bind(&self.config.project_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let remaining = MAX_BUG_WORK_ITEMS_PER_DAY.saturating_sub(filed_today as usize);
+        if remaining == 0 {
+            debug!(
+                project_id = %self.config.project_id,
+                "log_analysis_worker: daily bug work_item limit reached"
+            );
+            tx.commit().await?;
+            return Ok(0);
+        }
+
+        let mut patterns = patterns.to_vec();
+        patterns.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| a.signature.cmp(&b.signature))
+        });
         let mut created = 0usize;
 
         for pattern in patterns {
+            if created >= remaining {
+                break;
+            }
+
             let existing: Option<(uuid::Uuid,)> = sqlx::query_as(
                 "SELECT id FROM work_items \
                  WHERE project_id = $1 \
@@ -268,7 +306,7 @@ impl LogAnalysisWorker {
             )
             .bind(&self.config.project_id)
             .bind(&pattern.signature)
-            .fetch_optional(&self.pg)
+            .fetch_optional(&mut *tx)
             .await?;
 
             if existing.is_some() {
@@ -283,7 +321,7 @@ impl LogAnalysisWorker {
             )
             .bind(&self.config.project_id)
             .bind(&pattern.signature)
-            .fetch_optional(&self.pg)
+            .fetch_optional(&mut *tx)
             .await?;
 
             let title = truncate(&pattern.normalized, 120);
@@ -355,7 +393,7 @@ impl LogAnalysisWorker {
             .bind(&post_work)
             .bind(&original_signal)
             .bind(prior_id)
-            .fetch_one(&self.pg)
+            .fetch_one(&mut *tx)
             .await?;
 
             info!(
@@ -367,6 +405,7 @@ impl LogAnalysisWorker {
             created += 1;
         }
 
+        tx.commit().await?;
         Ok(created)
     }
 
@@ -666,5 +705,66 @@ mod tests {
         }
         let got = parse_csv_env("FF_LOG_ANALYSIS_PATHS_TEST_EXPLICIT", DEFAULT_PATHS);
         assert_eq!(got, vec!["/a", "/b", "/c"]);
+    }
+
+    #[tokio::test]
+    async fn create_work_items_is_idempotent_and_limited_to_three_per_utc_day() -> Result<()> {
+        let Some(database_url) = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .ok()
+            .or_else(|| std::env::var("FORGEFLEET_DATABASE_URL").ok())
+        else {
+            return Ok(());
+        };
+
+        let pg = PgPool::connect(&database_url).await?;
+        let project_id = format!("log-analysis-test-{}", uuid::Uuid::new_v4());
+        let worker = LogAnalysisWorker {
+            pg: pg.clone(),
+            my_name: "log-analysis-test".to_string(),
+            config: LogAnalysisConfig {
+                interval: DEFAULT_INTERVAL,
+                project_id: project_id.clone(),
+                log_paths: Vec::new(),
+                patterns: Vec::new(),
+                min_recurrence: DEFAULT_MIN_RECURRENCE,
+                tail_lines: DEFAULT_TAIL_LINES,
+            },
+        };
+        worker.ensure_project().await?;
+
+        let patterns: Vec<RecurringPattern> = (0..5)
+            .map(|index| RecurringPattern {
+                signature: format!("test-signature-{index}"),
+                normalized: format!("ERROR test pattern {index}"),
+                example: format!("ERROR test pattern {index}"),
+                count: 10 - index,
+                last_path: PathBuf::from("/tmp/log-analysis-test.log"),
+            })
+            .collect();
+        let pattern_refs: Vec<&RecurringPattern> = patterns.iter().collect();
+
+        let first_created = worker.create_work_items(&pattern_refs).await?;
+        let second_created = worker.create_work_items(&pattern_refs).await?;
+        let filed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_items \
+             WHERE project_id = $1 AND original_signal->>'kind' = 'recurring_log'",
+        )
+        .bind(&project_id)
+        .fetch_one(&pg)
+        .await?;
+
+        sqlx::query("DELETE FROM work_items WHERE project_id = $1")
+            .bind(&project_id)
+            .execute(&pg)
+            .await?;
+        sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(&project_id)
+            .execute(&pg)
+            .await?;
+
+        assert_eq!(first_created, MAX_BUG_WORK_ITEMS_PER_DAY);
+        assert_eq!(second_created, 0);
+        assert_eq!(filed, MAX_BUG_WORK_ITEMS_PER_DAY as i64);
+        Ok(())
     }
 }
