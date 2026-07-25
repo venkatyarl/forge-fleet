@@ -1,0 +1,26 @@
+fleet:
+  project_id: forge-fleet
+  mesh:
+    provider: tailscale
+    primary_node: priya
+
+tailscale:
+  enabled: true
+  up_flags:
+    - "--accept-routes"
+    - "--hostname=forgefleet-${FORGEFLEET_COMPUTER_NAME:-node}"
+  primary_endpoint: priya.tailnet-name.ts.net
+  subnet_route_fallback: 192.168.5.104
+
+postgres:
+  primary:
+    node: priya
+    host: priya.tailnet-name.ts.net
+    port: 55432
+    url: postgresql://forgefleet:forgefleet@priya.tailnet-name.ts.net:55432/forgefleet
+  replicas: []
+
+database:
+  mode: postgres_runtime
+  url: postgresql://forgefleet:forgefleet@priya.tailnet-name.ts.net:55432/forgefleet
+  max_connections: 10

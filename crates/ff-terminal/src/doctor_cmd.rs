@@ -202,6 +202,17 @@ fn stall_loop_health(n: i64) -> Health {
     }
 }
 
+fn memory_pack_health(packs_served: i64, avg_hit_rate: Option<f64>) -> Health {
+    let Some(avg_hit_rate) = avg_hit_rate else {
+        return Health::Pass;
+    };
+    if packs_served == 0 || avg_hit_rate >= 0.90 {
+        Health::Pass
+    } else {
+        Health::Warn
+    }
+}
+
 /// Render the report. Pure (no I/O / color in the assertions matter) so the
 /// layout is unit-testable.
 fn render_doctor(checks: &[DoctorCheck], overall: Health) -> String {
@@ -263,6 +274,36 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
             "{}/{} recent rows missing tokens",
             inter.recent_zero_token, inter.recent
         ),
+    });
+
+    // 2b) MEMORY: context-pack KPI for build dispatch. Fallback-path rows are
+    //     builds where no precomputed predicted paths were available, the
+    //     brain_node_ids/touched_paths bug class this metric is meant to expose.
+    let memory_stats: (Option<f64>, i64, i64) = sqlx::query_as(
+        "SELECT AVG(hit_rate)::double precision,
+                COUNT(*)::bigint,
+                COUNT(*) FILTER (
+                    WHERE jsonb_array_length(predicted_paths) = 0
+                )::bigint
+           FROM memory_pack_stats
+          WHERE created_at >= NOW() - INTERVAL '7 days'",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("memory-pack check: {e}"))?;
+    let memory_detail = match memory_stats.0 {
+        Some(avg) => format!(
+            "7d avg hit-rate {:.0}% (target 90%); packs served {}; fallback-path {}",
+            avg * 100.0,
+            memory_stats.1,
+            memory_stats.2
+        ),
+        None => "no packs served in last 7d; target 90%".into(),
+    };
+    checks.push(DoctorCheck {
+        name: "MEMORY packs".into(),
+        status: memory_pack_health(memory_stats.1, memory_stats.0),
+        detail: memory_detail,
     });
 
     // 3) Orphaned work_items (in_progress with no active lease, >1h).
@@ -633,6 +674,9 @@ mod tests {
         assert_eq!(stall_loop_health(0), Health::Pass);
         assert_eq!(stall_loop_health(4), Health::Warn);
         assert_eq!(stall_loop_health(12), Health::Fail);
+        assert_eq!(memory_pack_health(0, None), Health::Pass);
+        assert_eq!(memory_pack_health(3, Some(0.90)), Health::Pass);
+        assert_eq!(memory_pack_health(3, Some(0.50)), Health::Warn);
     }
 
     #[test]
@@ -719,11 +763,17 @@ mod tests {
                 status: Health::Fail,
                 detail: "no leader heartbeat in 60s".into(),
             },
+            DoctorCheck {
+                name: "MEMORY packs".into(),
+                status: Health::Pass,
+                detail: "7d avg hit-rate 90% (target 90%); packs served 2; fallback-path 0".into(),
+            },
         ];
         let out = render_doctor(&checks, overall_health(&checks));
         assert!(out.contains("ff doctor"));
         assert!(out.contains("deferred failures"));
         assert!(out.contains("leader liveness"));
+        assert!(out.contains("MEMORY packs"));
         assert!(out.contains("Overall: FAIL"));
     }
 }

@@ -3,6 +3,7 @@
 //! Provides a clean Rust API over raw SQL for Postgres-backed persistence.
 
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -1440,6 +1441,10 @@ pub struct RouteFilter {
     pub prefer_least_loaded: bool,
     /// Max candidates to return (scored best-first). Defaults to 3 if 0.
     pub limit: i64,
+    /// Seed for deterministic epsilon-greedy A/B routing among same-tier,
+    /// workload-matching deployments. `None` uses wall-clock entropy; tests pass
+    /// a fixed seed.
+    pub ab_seed: Option<u64>,
 }
 
 /// `LEFT JOIN LATERAL` that pulls each host's recent retained metrics (raw for
@@ -1473,6 +1478,64 @@ fn load_tiebreak_order(prefer_least_loaded: bool) -> &'static str {
     } else {
         ""
     }
+}
+
+const AUTOPILOT_AB_EPSILON: f64 = 0.2;
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+fn stable_hash_str(input: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for b in input.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn runtime_ab_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+fn apply_epsilon_greedy_route(
+    candidates: &mut [RouteCandidate],
+    workload: Option<&str>,
+    seed: u64,
+    epsilon: f64,
+) {
+    let Some(workload) = workload else {
+        return;
+    };
+    if candidates.len() < 2 || epsilon <= 0.0 {
+        return;
+    }
+
+    let best_tier = candidates[0].tier;
+    let same_tier_len = candidates
+        .iter()
+        .take_while(|c| c.tier == best_tier)
+        .count();
+    if same_tier_len < 2 {
+        return;
+    }
+
+    let mixed = splitmix64(seed ^ stable_hash_str(workload) ^ (best_tier as u64));
+    let roll = (mixed as f64) / (u64::MAX as f64);
+    if roll >= epsilon {
+        return;
+    }
+
+    let pick = (splitmix64(mixed) as usize) % same_tier_len;
+    candidates.swap(0, pick);
 }
 
 /// Freshness predicate mirrored by the staleness clause in [`pg_route_deployments`]
@@ -1749,7 +1812,7 @@ pub async fn pg_route_deployments(
         .fetch_all(pool)
         .await?;
 
-    Ok(rows
+    let mut candidates: Vec<RouteCandidate> = rows
         .iter()
         .map(|r| {
             let worker_name: String = r.try_get("worker_name").unwrap_or_default();
@@ -1778,7 +1841,16 @@ pub async fn pg_route_deployments(
                 llm_active_requests: r.try_get("load_active_requests").ok(),
             }
         })
-        .collect())
+        .collect();
+
+    apply_epsilon_greedy_route(
+        &mut candidates,
+        workload,
+        filter.ab_seed.unwrap_or_else(runtime_ab_seed),
+        AUTOPILOT_AB_EPSILON,
+    );
+
+    Ok(candidates)
 }
 
 /// Pick the best agent-capable deployment: tool-calling model + enough per-slot
@@ -1801,6 +1873,7 @@ pub async fn pg_pick_agent_endpoint(
         // least-loaded one instead of whichever last heartbeated.
         prefer_least_loaded: true,
         limit: 1,
+        ab_seed: None,
     };
     Ok(pg_route_deployments(pool, &filter)
         .await?
@@ -1906,6 +1979,7 @@ pub async fn pg_pick_offload_endpoint(
         // Live offload dispatch: spread equal-tier candidates by real load.
         prefer_least_loaded: true,
         limit: 8,
+        ab_seed: None,
     };
 
     // 1) workload-matching candidates (e.g. coders for code kinds).
@@ -1937,6 +2011,115 @@ pub async fn pg_pick_offload_endpoint(
         .count();
     let pick = rand::Rng::gen_range(&mut rand::thread_rng(), 0..tied_best);
     Ok(cands.into_iter().nth(pick))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelAbRewardStat {
+    pub model_id: String,
+    pub workload: String,
+    pub tier: i32,
+    pub builds: i64,
+    pub approve_pct: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModelAbTierAction {
+    Promote,
+    Demote,
+}
+
+impl ModelAbTierAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Promote => "promote",
+            Self::Demote => "demote",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelAbTierDecision {
+    pub model_id: String,
+    pub workload: String,
+    pub action: ModelAbTierAction,
+    pub old_tier: i32,
+    pub new_tier: i32,
+    pub builds: i64,
+    pub approve_pct: f64,
+    pub incumbent_model_id: String,
+    pub incumbent_builds: i64,
+    pub incumbent_approve_pct: f64,
+}
+
+pub async fn pg_model_ab_reward_stats(pool: &PgPool) -> Result<Vec<ModelAbRewardStat>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT v.model_id,
+               workload.value AS workload,
+               cat.tier,
+               v.builds_7d AS builds,
+               v.approve_pct
+          FROM v_model_utilization v
+          JOIN fleet_model_catalog cat ON cat.id = v.model_id
+          CROSS JOIN LATERAL jsonb_array_elements_text(cat.preferred_workloads) AS workload(value)
+         WHERE v.builds_7d > 0
+           AND workload.value IS NOT NULL
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| ModelAbRewardStat {
+            model_id: r.try_get("model_id").unwrap_or_default(),
+            workload: r.try_get("workload").unwrap_or_default(),
+            tier: r.try_get("tier").unwrap_or(2),
+            builds: r.try_get("builds").unwrap_or(0),
+            approve_pct: r.try_get("approve_pct").ok(),
+        })
+        .collect())
+}
+
+pub async fn pg_apply_model_ab_tier_decision(
+    pool: &PgPool,
+    decision: &ModelAbTierDecision,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE fleet_model_catalog
+            SET tier = $2,
+                updated_at = NOW()
+          WHERE id = $1
+            AND tier = $3",
+    )
+    .bind(&decision.model_id)
+    .bind(decision.new_tier)
+    .bind(decision.old_tier)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO autopilot_model_tier_events
+            (model_id, workload, action, old_tier, new_tier, builds, approve_pct,
+             incumbent_model_id, incumbent_builds, incumbent_approve_pct)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(&decision.model_id)
+    .bind(&decision.workload)
+    .bind(decision.action.as_str())
+    .bind(decision.old_tier)
+    .bind(decision.new_tier)
+    .bind(decision.builds)
+    .bind(decision.approve_pct)
+    .bind(&decision.incumbent_model_id)
+    .bind(decision.incumbent_builds)
+    .bind(decision.incumbent_approve_pct)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
 }
 
 // ─── Orchestrator P2: per-session demand sensing ─────────────────────────────
@@ -4744,6 +4927,45 @@ mod tests {
         let got = normalize_exclude_hosts(&["Taylor".into(), "JAMES".into(), "sia".into()]);
         assert_eq!(got, vec!["taylor", "james", "sia"]);
         assert!(normalize_exclude_hosts(&[]).is_empty());
+    }
+
+    #[test]
+    fn epsilon_greedy_route_is_seed_deterministic_within_best_tier() {
+        let mut selected = None;
+        for seed in 0..10_000 {
+            let mut cands = [
+                route_candidate("least-loaded", 2),
+                route_candidate("challenger", 2),
+                route_candidate("higher-cost", 3),
+            ];
+            apply_epsilon_greedy_route(&mut cands, Some("code-gen"), seed, 1.0);
+            if cands[0].worker_name == "challenger" {
+                selected = Some((seed, cands));
+                break;
+            }
+        }
+
+        let (seed, first_run) = selected.expect("some deterministic seed should pick challenger");
+        let mut second_run = [
+            route_candidate("least-loaded", 2),
+            route_candidate("challenger", 2),
+            route_candidate("higher-cost", 3),
+        ];
+        apply_epsilon_greedy_route(&mut second_run, Some("code-gen"), seed, 1.0);
+
+        assert_eq!(first_run[0].worker_name, second_run[0].worker_name);
+        assert_eq!(first_run[0].worker_name, "challenger");
+        assert_eq!(first_run[2].worker_name, "higher-cost");
+    }
+
+    #[test]
+    fn epsilon_greedy_route_requires_workload_match() {
+        let mut cands = [
+            route_candidate("least-loaded", 2),
+            route_candidate("challenger", 2),
+        ];
+        apply_epsilon_greedy_route(&mut cands, None, 7, 1.0);
+        assert_eq!(cands[0].worker_name, "least-loaded");
     }
 
     #[test]

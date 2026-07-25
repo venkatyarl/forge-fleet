@@ -6,7 +6,9 @@
 //! lease, push a branch, open a PR, enqueue merge, then free the slot.
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde_json::json;
 use sqlx::{PgPool, Row};
+use std::collections::BTreeSet;
 use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
@@ -960,7 +962,8 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     let worktree = create_worktree_for_item(&pg, &item).await?;
 
     let started = std::time::Instant::now();
-    let dispatch_full = run_ff_dispatch(&pg, &item, &worktree).await;
+    let context_pack = dispatch_context_pack_for_item(&pg, &item, &worktree.worktree_path, 8).await;
+    let dispatch_full = run_ff_dispatch(&pg, &item, &worktree, &context_pack.text).await;
 
     // Split (backend, output) into the backend used + a plain Result<Output> for
     // the existing consumers. On error, no backend is carried, so use the
@@ -1011,6 +1014,15 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     let (git_name, git_email) = resolve_git_identity(&pg, &item.project_id).await;
     let dirty =
         commit_worktree_changes(&worktree.worktree_path, &item.title, &git_name, &git_email)?;
+    if dirty {
+        record_memory_pack_stats(
+            &pg,
+            item.work_item_id,
+            &worktree.worktree_path,
+            &context_pack,
+        )
+        .await;
+    }
     info!(
         work_item_id = %item.work_item_id, dirty,
         "work_item_dispatch: committed agent changes (dirty={dirty})"
@@ -3139,6 +3151,7 @@ async fn run_ff_dispatch(
     pg: &PgPool,
     item: &AssignedWorkItem,
     worktree: &WorktreeRecord,
+    context_pack: &str,
 ) -> Result<(String, Output)> {
     let mut prompt = dispatch_prompt(item);
     // Prepend a Cortex context pack: the exact existing symbols this task touches,
@@ -3146,19 +3159,9 @@ async fn run_ff_dispatch(
     // grep-storming the whole repo cold (wasted context + the cold-compile explore
     // phase). Prefer the precomputed context stored on the work_item row; fall back
     // to a live `ff cortex find` lookup only when nothing is stored. Fail-open.
-    let pack = crate::dispatch_context::context_pack_for_dispatch(
-        pg,
-        item.brain_node_ids.clone(),
-        item.touched_paths.clone(),
-        item.title.clone(),
-        item.description.clone().unwrap_or_default(),
-        worktree.worktree_path.clone(),
-        8,
-    )
-    .await;
-    if !pack.is_empty() {
-        info!(work_item_id = %item.work_item_id, pack_bytes = pack.len(), "run_ff_dispatch: prepended Cortex context pack");
-        prompt = format!("{pack}\n{prompt}");
+    if !context_pack.is_empty() {
+        info!(work_item_id = %item.work_item_id, pack_bytes = context_pack.len(), "run_ff_dispatch: prepended Cortex context pack");
+        prompt = format!("{context_pack}\n{prompt}");
     }
 
     // Lane-1 health gate: the local codegen harness needs a local agent-capable
@@ -3855,6 +3858,102 @@ fn primary_or_default_backend(backends: &[String]) -> String {
 /// backend). Best-effort: the first routed backend, else the historical default.
 async fn primary_dispatch_backend(pg: &PgPool, computer_id: Uuid) -> String {
     primary_or_default_backend(&routed_backends(pg, computer_id, 5400).await)
+}
+
+async fn dispatch_context_pack_for_item(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    worktree_path: &Path,
+    max_symbols: usize,
+) -> crate::dispatch_context::DispatchContextPack {
+    crate::dispatch_context::context_pack_for_dispatch(
+        pg,
+        item.brain_node_ids.clone(),
+        item.touched_paths.clone(),
+        item.title.clone(),
+        item.description.clone().unwrap_or_default(),
+        worktree_path.to_path_buf(),
+        max_symbols,
+    )
+    .await
+}
+
+async fn record_memory_pack_stats(
+    pg: &PgPool,
+    work_item_id: Uuid,
+    worktree_path: &Path,
+    context_pack: &crate::dispatch_context::DispatchContextPack,
+) {
+    let touched_paths = match committed_touched_paths(worktree_path) {
+        Ok(paths) => paths,
+        Err(error) => {
+            warn!(
+                work_item_id = %work_item_id,
+                error = %error,
+                "record_memory_pack_stats: failed to read committed diff"
+            );
+            return;
+        }
+    };
+    let hit_rate = memory_pack_hit_rate(&context_pack.predicted_paths, &touched_paths);
+    if let Err(error) = sqlx::query(
+        "INSERT INTO memory_pack_stats
+             (work_item_id, predicted_paths, touched_paths, hit_rate)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (work_item_id) DO UPDATE
+            SET predicted_paths = EXCLUDED.predicted_paths,
+                touched_paths = EXCLUDED.touched_paths,
+                hit_rate = EXCLUDED.hit_rate,
+                created_at = NOW()",
+    )
+    .bind(work_item_id)
+    .bind(json!(context_pack.predicted_paths))
+    .bind(json!(touched_paths))
+    .bind(hit_rate)
+    .execute(pg)
+    .await
+    {
+        warn!(
+            work_item_id = %work_item_id,
+            error = %error,
+            "record_memory_pack_stats: failed to write memory KPI row"
+        );
+    }
+}
+
+fn committed_touched_paths(worktree_path: &Path) -> Result<Vec<String>> {
+    let out = run_git(
+        worktree_path,
+        ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+        Duration::from_secs(30),
+    )?;
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+fn memory_pack_hit_rate(predicted_paths: &[String], touched_paths: &[String]) -> f32 {
+    let predicted: BTreeSet<&str> = predicted_paths
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if predicted.is_empty() {
+        return 0.0;
+    }
+    let touched: BTreeSet<&str> = touched_paths
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let hits = predicted
+        .iter()
+        .filter(|path| touched.contains(**path))
+        .count();
+    hits as f32 / predicted.len() as f32
 }
 
 static CAPACITY_SNAPSHOT: std::sync::OnceLock<ff_capacity::CapacitySnapshot> =
@@ -5306,10 +5405,10 @@ mod tests {
         affected_crate_manifests, agent_output_tail, backend_failed_without_output,
         builder_excludes_480b, classify_dispatch_outcome, command_display,
         complexity_at_least_moderate, contains_file_line_citation, default_clone_path,
-        dispatch_budget_for_host, dispatch_prompt, expand_home, is_build_timeout, mirror_repo_url,
-        order_cloud_reviewers, parse_cli_tokens, primary_or_default_backend,
-        quick_empty_success_is_provider_failure, repo_cache_path, repo_slug,
-        retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
+        dispatch_budget_for_host, dispatch_prompt, expand_home, is_build_timeout,
+        memory_pack_hit_rate, mirror_repo_url, order_cloud_reviewers, parse_cli_tokens,
+        primary_or_default_backend, quick_empty_success_is_provider_failure, repo_cache_path,
+        repo_slug, retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
         should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
         task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
     };
@@ -5959,6 +6058,21 @@ mod tests {
             Duration::from_secs(12),
             false,
         ));
+    }
+
+    #[test]
+    fn memory_pack_hit_rate_counts_predicted_paths_touched_by_commit() {
+        let predicted = vec![
+            "crates/ff-agent/src/work_item_dispatch.rs".to_string(),
+            "crates/ff-db/src/migrations.rs".to_string(),
+            "crates/ff-db/src/migrations.rs".to_string(),
+        ];
+        let touched = vec![
+            "crates/ff-agent/src/work_item_dispatch.rs".to_string(),
+            "crates/ff-terminal/src/doctor_cmd.rs".to_string(),
+        ];
+        assert_eq!(memory_pack_hit_rate(&predicted, &touched), 0.5);
+        assert_eq!(memory_pack_hit_rate(&[], &touched), 0.0);
     }
 
     #[test]

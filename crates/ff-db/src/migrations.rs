@@ -1200,6 +1200,17 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
     },
+    PgMigration {
+        version: 259,
+        name: "memory_pack_stats",
+        sql: schema::SCHEMA_V259_MEMORY_PACK_STATS,
+    },
+    // 260 is reserved/applied in the live fleet; keep the gap and append V261.
+    PgMigration {
+        version: 261,
+        name: "autopilot_model_ab",
+        sql: schema::SCHEMA_V261_AUTOPILOT_MODEL_AB,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

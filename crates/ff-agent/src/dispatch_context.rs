@@ -38,6 +38,13 @@ const STOPWORDS: &[&str] = &[
     "handler", "value", "count", "code", "rows", "run",
 ];
 
+/// Rendered dispatch context plus the file predictions used for memory KPIs.
+#[derive(Debug, Clone, Default)]
+pub struct DispatchContextPack {
+    pub text: String,
+    pub predicted_paths: Vec<String>,
+}
+
 /// Extract candidate code identifiers from a task's title+description: CamelCase
 /// types (`FleetCommand`) and snake_case names (`sub_agent_count`, `fleet_workers`).
 /// Deduped, order-preserving, filtered by length + a small stopword set.
@@ -357,7 +364,12 @@ pub async fn context_pack_for_dispatch(
     description: String,
     repo_path: std::path::PathBuf,
     max_symbols: usize,
-) -> String {
+) -> DispatchContextPack {
+    let predicted_paths = touched_paths
+        .iter()
+        .filter(|p| !p.trim().is_empty())
+        .cloned()
+        .collect();
     let store_pack = build_context_pack_from_store(&brain_node_ids, &touched_paths, max_symbols);
     let symbol_pack = if !store_pack.is_empty() {
         store_pack
@@ -367,7 +379,10 @@ pub async fn context_pack_for_dispatch(
 
     let decisions_pack = build_brain_decisions_pack(pool, &title, &description).await;
 
-    format!("{symbol_pack}{decisions_pack}")
+    DispatchContextPack {
+        text: format!("{symbol_pack}{decisions_pack}"),
+        predicted_paths,
+    }
 }
 
 #[cfg(test)]

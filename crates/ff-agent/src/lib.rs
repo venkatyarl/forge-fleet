@@ -7,6 +7,7 @@ pub mod agent_roles;
 pub mod arbiter;
 pub mod auto_backlog_feeder;
 pub mod auto_upgrade;
+pub mod autopilot_model_ab;
 pub mod autoscaler;
 pub mod backend_detect;
 pub mod circuit_breaker;
