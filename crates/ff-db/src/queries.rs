@@ -6319,6 +6319,42 @@ pub async fn pg_search_brain_vault_nodes(
     Ok(rows.iter().map(row_to_brain_vault_node).collect())
 }
 
+/// Record retrieval quality without putting this diagnostic on the retrieval
+/// transaction's critical path. Callers intentionally treat errors as
+/// best-effort while migrations roll across the fleet.
+pub async fn pg_log_memory_retrieval(
+    pool: &PgPool,
+    caller: &str,
+    query_text: &str,
+    results_count: usize,
+    top_score: Option<f32>,
+    was_miss: bool,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO memory_retrieval_log
+            (caller, query_text, results_count, top_score, was_miss)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(caller)
+    .bind(query_text.trim())
+    .bind(results_count.min(i32::MAX as usize) as i32)
+    .bind(top_score)
+    .bind(was_miss)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn pg_memory_known_unknowns_count(pool: &PgPool) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT lower(regexp_replace(btrim(query_text), '\\s+', ' ', 'g')))
+           FROM memory_retrieval_log
+          WHERE was_miss AND ts >= NOW() - INTERVAL '7 days'",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
 pub async fn pg_bump_vault_node_hits(pool: &PgPool, id: uuid::Uuid) -> Result<()> {
     sqlx::query(
         "UPDATE brain_vault_nodes SET hits = hits + 1, last_accessed = NOW() WHERE id = $1",

@@ -1681,6 +1681,11 @@ impl ToolRegistry {
                     "project": {
                         "type": "string",
                         "description": "Optional project this knowledge belongs to"
+                    },
+                    "support": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Independent support count. Facts with support >= 3 are promoted immediately on the live attach/push lane."
                     }
                 },
                 "required": ["kind", "title", "body"]

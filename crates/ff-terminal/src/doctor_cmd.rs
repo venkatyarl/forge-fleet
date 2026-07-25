@@ -265,6 +265,15 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
         ),
     });
 
+    // Meta-memory is informational: misses are research fuel, not a service
+    // failure. Keep the label stable so `ff doctor` consumers can extract it.
+    let known_unknowns = ff_db::queries::pg_memory_known_unknowns_count(&pool).await?;
+    checks.push(DoctorCheck {
+        name: "MEMORY".into(),
+        status: Health::Pass,
+        detail: format!("{known_unknowns} known-unknown query classes (last 7d)"),
+    });
+
     // 3) Orphaned work_items (in_progress with no active lease, >1h).
     let orphans = ff_db::pg_count_orphaned_work_items(&pool, 3600).await?;
     checks.push(DoctorCheck {

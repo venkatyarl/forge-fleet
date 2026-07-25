@@ -1200,6 +1200,13 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
     },
+    // 259-260 are Memory-v2 M3/M4 and already precede this migration in the
+    // shared series.
+    PgMigration {
+        version: 261,
+        name: "memory_retrieval_log",
+        sql: schema::SCHEMA_V261_MEMORY_RETRIEVAL_LOG,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1412,6 +1419,13 @@ mod tests {
                 pair[1].name,
             );
         }
+    }
+
+    #[test]
+    fn memory_v2_m5_is_latest_migration() {
+        let latest = PG_MIGRATIONS.last().expect("at least one PG migration");
+        assert_eq!(latest.version, 261);
+        assert_eq!(latest.name, "memory_retrieval_log");
     }
 
     fn db_url() -> Option<String> {
