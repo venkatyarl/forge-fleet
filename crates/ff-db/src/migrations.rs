@@ -1200,6 +1200,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
     },
+    PgMigration {
+        version: 261,
+        name: "ff_training_pairs",
+        sql: schema::SCHEMA_V261_FF_TRAINING_PAIRS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -2341,5 +2346,15 @@ mod tests {
         assert_eq!(conflict.count, 2);
 
         drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[test]
+    fn v261_training_pairs_is_immutable_provenance_schema() {
+        let sql = schema::SCHEMA_V261_FF_TRAINING_PAIRS;
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS ff_training_pairs"));
+        assert!(sql.contains("merged_diff"));
+        assert!(sql.contains("interaction_id"));
+        assert!(sql.contains("content_hash"));
+        assert!(sql.contains("UNIQUE (work_item_id, interaction_id, head_sha)"));
     }
 }

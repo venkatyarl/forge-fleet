@@ -8014,6 +8014,93 @@ pub async fn pg_interaction_stats(pool: &PgPool, window_hours: i64) -> Result<In
     })
 }
 
+/// A review-approved, verified-merged SFT pair.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct TrainingPair {
+    pub work_item_id: uuid::Uuid,
+    pub interaction_id: uuid::Uuid,
+    pub prompt: String,
+    pub context_pack: serde_json::Value,
+    pub merged_diff: String,
+    pub head_sha: String,
+    pub review_reason: Option<String>,
+    pub merged_at: chrono::DateTime<chrono::Utc>,
+    pub content_hash: String,
+}
+
+/// Snapshot newly eligible pairs, then return the complete verified corpus.
+///
+/// The approved review prompt is authoritative for the diff: it is generated
+/// from the candidate commit immediately before merge-queue admission. Rows
+/// without an embedded git diff never enter the training corpus.
+pub async fn pg_refresh_training_pairs(pool: &PgPool) -> Result<Vec<TrainingPair>> {
+    sqlx::query(
+        r#"
+        INSERT INTO ff_training_pairs
+            (work_item_id, interaction_id, prompt, context_pack, merged_diff,
+             head_sha, review_reason, merged_at, content_hash)
+        SELECT w.id,
+               review.id,
+               COALESCE(NULLIF(build.request_text, ''), concat_ws(E'\n\n',
+                   w.title, w.description, w.acceptance_check)),
+               jsonb_build_object(
+                   'title', w.title,
+                   'description', w.description,
+                   'acceptance_check', w.acceptance_check,
+                   'work_item_context', COALESCE(w.context, '{}'::jsonb),
+                   'request_meta', COALESCE(build.request_meta, '{}'::jsonb)
+               ),
+               substring(review.request_text FROM position('diff --git' IN review.request_text)),
+               q.head_sha,
+               q.review_reason,
+               q.merged_at,
+               md5(
+                   COALESCE(NULLIF(build.request_text, ''), concat_ws(E'\n\n',
+                       w.title, w.description, w.acceptance_check))
+                   || E'\n--FF-PAIR--\n'
+                   || substring(review.request_text FROM position('diff --git' IN review.request_text))
+               )
+          FROM work_item_merge_queue q
+          JOIN work_items w ON w.id = q.work_item_id
+          JOIN LATERAL (
+              SELECT i.id, i.request_text
+                FROM ff_interactions i
+               WHERE i.work_item_id = w.id
+                 AND i.purpose = 'review'
+                 AND i.response_text LIKE 'APPROVE%'
+                 AND position('diff --git' IN i.request_text) > 0
+               ORDER BY i.ts DESC
+               LIMIT 1
+          ) review ON TRUE
+          LEFT JOIN LATERAL (
+              SELECT i.request_text, i.request_meta
+                FROM ff_interactions i
+               WHERE i.work_item_id = w.id
+                 AND i.purpose = 'build'
+                 AND NULLIF(btrim(i.request_text), '') IS NOT NULL
+               ORDER BY i.ts ASC
+               LIMIT 1
+          ) build ON TRUE
+         WHERE q.status = 'merged'
+           AND q.review_verdict = 'approve'
+           AND q.merged_at IS NOT NULL
+           AND NULLIF(btrim(q.head_sha), '') IS NOT NULL
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(sqlx::query_as(
+        "SELECT work_item_id, interaction_id, prompt, context_pack, merged_diff,
+                head_sha, review_reason, merged_at, content_hash
+           FROM ff_training_pairs
+          ORDER BY merged_at, work_item_id",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
 // ── agent_memory ("Scratchpad") ──────────────────────────────────────────
 // Small, byte-capped, agent-self-editable working memory. ff-db owns the
 // transactional SQL primitives; the consolidate-and-forget driver (which

@@ -1400,6 +1400,12 @@ pub enum InteractionsCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Materialize review-approved merged diffs and export them as SFT JSONL.
+    Export {
+        /// Destination JSONL file.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]

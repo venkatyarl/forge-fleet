@@ -12201,6 +12201,29 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// Adopt-7 dataset substrate: immutable SFT pairs sourced only from a merged
+/// work item whose in-place review approved the exact diff embedded in the
+/// review prompt. Re-running the population query is safe via `content_hash`.
+pub const SCHEMA_V261_FF_TRAINING_PAIRS: &str = r#"
+CREATE TABLE IF NOT EXISTS ff_training_pairs (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    work_item_id          UUID NOT NULL,
+    interaction_id        UUID NOT NULL,
+    prompt                TEXT NOT NULL,
+    context_pack          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    merged_diff           TEXT NOT NULL,
+    head_sha              TEXT NOT NULL,
+    review_reason         TEXT,
+    merged_at             TIMESTAMPTZ NOT NULL,
+    content_hash          TEXT NOT NULL UNIQUE,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (work_item_id, interaction_id, head_sha)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ff_training_pairs_work_item
+    ON ff_training_pairs (work_item_id);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

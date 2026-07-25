@@ -1,4 +1,6 @@
 use anyhow::Result;
+use serde_json::json;
+use tokio::io::AsyncWriteExt;
 
 /// `ff interactions stats` — health snapshot of the `ff_interactions` training
 /// corpus (the dogfooding req+resp+tokens log). Read-only.
@@ -15,8 +17,51 @@ pub async fn handle_interactions(cmd: crate::InteractionsCommand) -> Result<()> 
                 print!("{}", render_interaction_stats(&stats));
             }
         }
+        crate::InteractionsCommand::Export { output } => {
+            let pairs = ff_db::pg_refresh_training_pairs(&pool).await?;
+            let parent = output
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            tokio::fs::create_dir_all(parent).await?;
+            let temp = output.with_extension("jsonl.tmp");
+            let mut file = tokio::fs::File::create(&temp).await?;
+            for pair in &pairs {
+                let row = training_pair_json(pair);
+                file.write_all(serde_json::to_string(&row)?.as_bytes())
+                    .await?;
+                file.write_all(b"\n").await?;
+            }
+            file.flush().await?;
+            file.sync_all().await?;
+            tokio::fs::rename(&temp, &output).await?;
+            println!(
+                "Exported {} verified merged training pair(s) to {}",
+                pairs.len(),
+                output.display()
+            );
+        }
     }
     Ok(())
+}
+
+fn training_pair_json(pair: &ff_db::TrainingPair) -> serde_json::Value {
+    json!({
+        "messages": [
+            {"role": "user", "content": pair.prompt},
+            {"role": "assistant", "content": pair.merged_diff}
+        ],
+        "context": pair.context_pack,
+        "provenance": {
+            "work_item_id": pair.work_item_id,
+            "interaction_id": pair.interaction_id,
+            "head_sha": pair.head_sha,
+            "review_reason": pair.review_reason,
+            "merged_at": pair.merged_at,
+            "content_hash": pair.content_hash,
+            "verified_merged": true
+        }
+    })
 }
 
 /// Render an [`ff_db::InteractionStats`] as a human report (pure; unit-tested).
