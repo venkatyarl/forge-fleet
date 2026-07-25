@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -101,6 +102,48 @@ fn round_interaction(
     }
 }
 
+fn apply_model_interaction(
+    work_item_id: Option<uuid::Uuid>,
+    round: u32,
+    prompt: &str,
+    resp: &crate::fleet_oneshot::FleetOneshot,
+) -> ff_db::InteractionRecord {
+    let mut rec = round_interaction(work_item_id, round, prompt, resp);
+    rec.channel = "codegen_apply_model".to_string();
+    rec.request_meta["stage"] = serde_json::json!("apply");
+    rec
+}
+
+async fn apply_intent_with_dispatcher<F, Fut>(
+    repo_path: &Path,
+    task: &str,
+    intent: &str,
+    previous_error: Option<&str>,
+    dispatch: F,
+) -> Result<(
+    String,
+    crate::fleet_oneshot::FleetOneshot,
+    Vec<Edit>,
+    Vec<FileSnapshot>,
+)>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<crate::fleet_oneshot::FleetOneshot>>,
+{
+    let prompt = build_apply_prompt(repo_path, task, intent, previous_error)?;
+    let response = dispatch(prompt.clone()).await?;
+    let edits = parse_edit_blocks(&response.text)?;
+    if edits.is_empty() {
+        return Err(anyhow!("apply model did not produce any edit blocks"));
+    }
+    let rp = repo_path.to_path_buf();
+    let edits_to_apply = edits.clone();
+    let snapshots = tokio::task::spawn_blocking(move || apply_edits(&rp, &edits_to_apply))
+        .await
+        .map_err(|e| anyhow!("apply edits task panicked: {e}"))??;
+    Ok((prompt, response, edits, snapshots))
+}
+
 pub async fn codegen_apply(
     pool: &PgPool,
     repo_path: &Path,
@@ -117,12 +160,13 @@ pub async fn codegen_apply(
         rounds = round;
         let rp = repo_path.to_path_buf();
         let task = task.to_string();
+        let task_for_prompt = task.clone();
         let previous_edits = last_edits.clone();
         let previous_error = last_error.clone();
         let prompt = tokio::task::spawn_blocking(move || {
-            build_prompt(
+            build_coder_prompt(
                 &rp,
-                &task,
+                &task_for_prompt,
                 previous_edits.as_deref(),
                 previous_error.as_deref(),
             )
@@ -153,60 +197,52 @@ pub async fn codegen_apply(
             warn!(round, error = %e, "codegen: interaction capture failed (non-fatal)");
         }
 
-        let edits = match parse_edit_blocks(&response.text) {
-            Ok(edits) if !edits.is_empty() => edits,
-            Ok(_) => {
-                // No edit blocks. If the model affirmatively reports the task is ALREADY done
-                // (feature exists, tests pass, nothing to commit), that's a legitimate terminal
-                // success — mark done so the caller drains it, instead of retrying to no end.
-                if response_reports_already_done(&response.text) {
-                    info!(
-                        round,
-                        "codegen: model reports task already implemented — no changes needed (marking done)"
-                    );
-                    return Ok(CodegenOutcome {
-                        applied: false,
-                        rounds,
-                        final_diff: None,
-                        error: None,
-                        already_done: true,
-                    });
-                }
-                let err = "model response did not contain any edit blocks".to_string();
-                warn!(round, error = %err, "codegen response rejected");
-                last_edits = None;
-                last_error = Some(err);
-                continue;
-            }
+        if response_reports_already_done(&response.text) {
+            return Ok(CodegenOutcome {
+                applied: false,
+                rounds,
+                final_diff: None,
+                error: None,
+                already_done: true,
+            });
+        }
+        let intent = response.text;
+        let applied = apply_intent_with_dispatcher(
+            repo_path,
+            &task,
+            &intent,
+            last_error.as_deref(),
+            |prompt| async move {
+                crate::fleet_oneshot::fleet_oneshot(
+                    pool,
+                    &prompt,
+                    Some("Lucy"),
+                    Some(Duration::from_secs(120)),
+                )
+                .await
+                .context("local apply-model dispatch")
+            },
+        )
+        .await;
+        let (apply_prompt, apply_response, edits, snapshots) = match applied {
+            Ok(applied) => applied,
             Err(e) => {
                 let err = e.to_string();
-                warn!(round, error = %err, "codegen response rejected");
-                last_edits = Some(response.text);
-                last_error = Some(err);
-                continue;
-            }
-        };
-        let edit_summary = format_edit_summary(&edits);
-
-        let rp = repo_path.to_path_buf();
-        let edits_to_apply = edits.clone();
-        let snapshots = match tokio::task::spawn_blocking(move || apply_edits(&rp, &edits_to_apply))
-            .await
-            .map_err(|e| anyhow!("apply edits task panicked: {e}"))?
-        {
-            Ok(snapshots) => snapshots,
-            Err(e) => {
-                let err = e.to_string();
-                warn!(round, error = %err, "codegen edits failed to apply");
+                warn!(round, error = %err, "apply model failed to produce applicable edits");
                 let rp = repo_path.to_path_buf();
                 tokio::task::spawn_blocking(move || clean_worktree(&rp))
                     .await
                     .map_err(|e| anyhow!("clean worktree task panicked: {e}"))??;
-                last_edits = Some(edit_summary);
+                last_edits = Some(intent);
                 last_error = Some(err);
                 continue;
             }
         };
+        let rec = apply_model_interaction(work_item_id, round, &apply_prompt, &apply_response);
+        if let Err(e) = ff_db::pg_record_interaction(pool, &rec).await {
+            warn!(round, error = %e, "codegen: apply-model interaction capture failed (non-fatal)");
+        }
+        let edit_summary = format_edit_summary(&edits);
 
         // Guard against no-op edits: a SEARCH/REPLACE where REPLACE == the matched
         // text (or edits that otherwise change nothing) would pass apply + cargo
@@ -387,42 +423,32 @@ fn repo_structure_context(repo_path: &Path, identifiers: &[String]) -> Option<St
     Some(out)
 }
 
-fn build_prompt(
+fn build_coder_prompt(
     repo_path: &Path,
     task: &str,
     previous_edits: Option<&str>,
     previous_error: Option<&str>,
 ) -> Result<String> {
-    let mut prompt = format!(
-        "Task:\n{task}\n\n\
-         Output ONLY one or more SEARCH/REPLACE edit blocks. Do not include prose, explanations, markdown fences, or any text outside edit blocks.\n\
-         Each edit block must be EXACTLY in this format:\n\
-         *** FILE: <path relative to repo root>\n\
-         <<<<<<< SEARCH\n\
-         <the exact existing lines to find, copied verbatim from the current file>\n\
-         =======\n\
-         <the replacement lines>\n\
-         >>>>>>> REPLACE\n\n\
-         Rules:\n\
-         - The SEARCH text must match the current file content EXACTLY, including whitespace.\n\
-         - For large files, you are shown only RELEVANT REGIONS with line numbers; SEARCH blocks must match lines shown in those regions EXACTLY.\n\
-         - To create a NEW file, leave the SEARCH section empty.\n\
-         - To append, SEARCH a unique existing snippet and include it in REPLACE plus the new code.\n\
-         - Paths must be relative to the repo root.\n\
-         - You do NOT have a shell or file access. You CANNOT edit files directly. Do not say you \
-           'made the edits', 'left them uncommitted', or 'ran the tests' — you MUST emit the edit \
-           blocks as your entire response; the harness applies them.\n\
-         - If NO change is needed because the task is already implemented, reply with exactly the \
-           single line: ALREADY_IMPLEMENTED: <one-sentence reason>.\n\n\
-         Worked example — a valid response for 'add a greeting fn to src/util.rs':\n\
-         *** FILE: src/util.rs\n\
-         <<<<<<< SEARCH\n\
-         =======\n\
-         pub fn greeting(name: &str) -> String {{\n\
-             format!(\"hello, {{name}}\")\n\
-         }}\n\
-         >>>>>>> REPLACE"
-    );
+    build_prompt_with_instructions(
+        repo_path,
+        task,
+        "Propose the concrete code change in loose form. Name files and symbols, and provide the \
+         intended replacement code without reproducing byte-exact patch context; a separate local \
+         apply model will turn your intent into the actual diff. If no change is needed, reply \
+         with exactly: ALREADY_IMPLEMENTED: <one-sentence reason>.",
+        previous_edits,
+        previous_error,
+    )
+}
+
+fn build_prompt_with_instructions(
+    repo_path: &Path,
+    task: &str,
+    instructions: &str,
+    previous_edits: Option<&str>,
+    previous_error: Option<&str>,
+) -> Result<String> {
+    let mut prompt = format!("Task:\n{task}\n\n{instructions}");
 
     let identifiers = task_identifiers(task);
 
@@ -466,6 +492,25 @@ fn build_prompt(
     }
 
     Ok(prompt)
+}
+
+fn build_apply_prompt(
+    repo_path: &Path,
+    task: &str,
+    intent: &str,
+    previous_error: Option<&str>,
+) -> Result<String> {
+    let apply_task = format!("{task}\n\nCoder's proposed edit intent:\n{intent}");
+    build_prompt_with_instructions(
+        repo_path,
+        &apply_task,
+        "Mechanically apply the coder's intent. Output ONLY SEARCH/REPLACE edit blocks, with no \
+         prose, using exactly:\n*** FILE: <relative path>\n<<<<<<< SEARCH\n<exact existing text>\n\
+         =======\n<replacement text>\n>>>>>>> REPLACE\nSEARCH must match byte-for-byte; use an \
+         empty SEARCH only for a new file.",
+        None,
+        previous_error,
+    )
 }
 
 fn task_identifiers(task: &str) -> Vec<String> {
@@ -1237,6 +1282,66 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs::read_to_string(path).unwrap(), "new\nold\n");
+    }
+
+    #[tokio::test]
+    async fn apply_model_dispatch_turns_loose_intent_into_git_diff() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("src/lib.rs");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "pub fn value() -> u32 {\n    1\n}\n").unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["add", "src/lib.rs"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+
+        let invoked = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&invoked);
+        let loose_intent = "In src/lib.rs, change value() to return 2.";
+        let (_prompt, _response, edits, _snapshots) = apply_intent_with_dispatcher(
+            dir.path(),
+            "update the returned value",
+            loose_intent,
+            None,
+            move |prompt| async move {
+                observed.store(true, Ordering::SeqCst);
+                assert!(prompt.contains(loose_intent));
+                assert!(prompt.contains("Output ONLY SEARCH/REPLACE edit blocks"));
+                Ok(crate::fleet_oneshot::FleetOneshot {
+                    text: "*** FILE: src/lib.rs\n<<<<<<< SEARCH\npub fn value() -> u32 {\n    1\n}\n=======\npub fn value() -> u32 {\n    2\n}\n>>>>>>> REPLACE".to_string(),
+                    endpoint: "http://local-apply-model".to_string(),
+                    worker_name: "test-worker".to_string(),
+                    model: "Lucy-Q4_K_M".to_string(),
+                    latency_ms: 1,
+                    tokens_in: 1,
+                    tokens_out: 1,
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(invoked.load(Ordering::SeqCst));
+        assert_eq!(edits.len(), 1);
+        let diff = Command::new("git")
+            .args(["diff", "--", "src/lib.rs"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let diff = String::from_utf8(diff.stdout).unwrap();
+        assert!(diff.contains("-    1"));
+        assert!(diff.contains("+    2"));
     }
 
     #[test]

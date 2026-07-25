@@ -16,11 +16,123 @@ use anyhow::Context;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use tracing::{error, info, warn};
 
 use crate::config::{FleetConfig, ObsidianExportConfig};
-use crate::schema::basic_memory::BasicMemoryFrontmatter;
+use crate::schema::basic_memory::{BasicMemoryFrontmatter, extract_relations};
+
+const MIN_COMPACTION_BYTES: usize = 500;
+
+/// A hosted-CLI context compaction ready to become durable episodic memory.
+#[derive(Debug, Clone)]
+pub struct CompactionEpisode {
+    pub session_id: String,
+    pub ts: DateTime<Utc>,
+    pub project: String,
+    pub source_path: String,
+    pub content: String,
+}
+
+/// Upsert a compaction summary into the Brain graph. The deterministic path
+/// caps retries at one episode per session per UTC day.
+pub async fn upsert_compaction_episode(
+    pool: &PgPool,
+    episode: &CompactionEpisode,
+) -> anyhow::Result<Option<uuid::Uuid>> {
+    if !is_compaction_episode_large_enough(&episode.content) {
+        return Ok(None);
+    }
+    let day = episode.ts.date_naive();
+    let path = compaction_episode_path(&episode.session_id, day);
+    let title = format!("Compaction episode {}", episode.session_id);
+    let ts = episode.ts.to_rfc3339_opts(SecondsFormat::Secs, true);
+    let tags = vec![
+        "episode".to_string(),
+        "compaction".to_string(),
+        format!("session_id:{}", episode.session_id),
+        format!("ts:{ts}"),
+        format!("day:{day}"),
+        format!("source:{}", episode.source_path),
+    ];
+    let content_hash = format!("{:x}", Sha256::digest(episode.content.as_bytes()));
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin compaction episode upsert")?;
+    let node_id = sqlx::query_scalar::<_, uuid::Uuid>(
+        "INSERT INTO brain_vault_nodes
+            (path, title, node_type, project, tags, from_thread, confidence,
+             content_hash, body, updated_at)
+         VALUES ($1, $2, 'episode', $3, $4, $5, 1.0, $6, $7, NOW())
+         ON CONFLICT (path) DO UPDATE SET
+            title = EXCLUDED.title,
+            node_type = 'episode',
+            project = EXCLUDED.project,
+            tags = EXCLUDED.tags,
+            from_thread = EXCLUDED.from_thread,
+            confidence = EXCLUDED.confidence,
+            content_hash = EXCLUDED.content_hash,
+            body = EXCLUDED.body,
+            updated_at = NOW()
+         RETURNING id",
+    )
+    .bind(&path)
+    .bind(&title)
+    .bind(&episode.project)
+    .bind(&tags)
+    .bind(&episode.session_id)
+    .bind(&content_hash)
+    .bind(&episode.content)
+    .fetch_one(&mut *tx)
+    .await
+    .context("upsert compaction episode node")?;
+    for relation in extract_relations(&episode.content) {
+        if !matches!(relation.relation_type.as_str(), "work_item" | "computer") {
+            continue;
+        }
+        let target = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT id FROM brain_vault_nodes
+              WHERE valid_until IS NULL
+                AND (title = $1 OR path = $1 OR path LIKE ('%/' || $1 || '.md'))
+              ORDER BY CASE WHEN path = $1 THEN 0 WHEN title = $1 THEN 1 ELSE 2 END
+              LIMIT 1",
+        )
+        .bind(&relation.target)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("resolve compaction typed link")?;
+        if let Some(target) = target {
+            sqlx::query(
+                "INSERT INTO brain_vault_edges
+                    (src_id, dst_id, edge_type, confidence, provenance)
+                 VALUES ($1, $2, $3, 1.0, 'compaction-summary')
+                 ON CONFLICT (src_id, dst_id, edge_type) DO UPDATE SET
+                    confidence = EXCLUDED.confidence,
+                    provenance = EXCLUDED.provenance",
+            )
+            .bind(node_id)
+            .bind(target)
+            .bind(format!("mentions_{}", relation.relation_type))
+            .execute(&mut *tx)
+            .await
+            .context("upsert compaction typed link")?;
+        }
+    }
+    tx.commit()
+        .await
+        .context("commit compaction episode upsert")?;
+    Ok(Some(node_id))
+}
+
+fn is_compaction_episode_large_enough(content: &str) -> bool {
+    content.len() > MIN_COMPACTION_BYTES
+}
+
+fn compaction_episode_path(session_id: &str, day: chrono::NaiveDate) -> String {
+    format!("episodes/compactions/{}-{}.md", day, slugify(session_id))
+}
 
 /// A raw session transcript ready to be distilled into an Obsidian note.
 #[derive(Debug, Clone)]
@@ -768,6 +880,21 @@ fn most_common<'a>(items: impl Iterator<Item = &'a str>) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_cap_is_strictly_greater_than_500_bytes() {
+        assert!(!is_compaction_episode_large_enough(&"x".repeat(500)));
+        assert!(is_compaction_episode_large_enough(&"x".repeat(501)));
+    }
+
+    #[test]
+    fn compaction_path_dedupes_by_session_and_utc_day() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 25).unwrap();
+        assert_eq!(
+            compaction_episode_path("Session 42", day),
+            "episodes/compactions/2026-07-25-session-42.md"
+        );
+    }
 
     #[test]
     fn normalize_mcp_endpoint_adds_scheme_and_path() {

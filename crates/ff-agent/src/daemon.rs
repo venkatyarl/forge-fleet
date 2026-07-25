@@ -291,11 +291,16 @@ fn run_service_connectivity_tick(
     })
 }
 
-fn run_session_export_tick(_pg: PgPool, _worker_name: String) -> BoxFuture<'static, Result<()>> {
+fn run_session_export_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'static, Result<()>> {
     Box::pin(async move {
-        tokio::task::spawn_blocking(|| crate::session_export::export_local_sessions(None, false))
-            .await
-            .map_err(anyhow::Error::from)??;
+        let summary = tokio::task::spawn_blocking(|| {
+            crate::session_export::export_local_sessions(None, false)
+        })
+        .await
+        .map_err(anyhow::Error::from)??;
+        for episode in &summary.compaction_episodes {
+            ff_core::obsidian_export::upsert_compaction_episode(&pg, episode).await?;
+        }
         Ok(())
     })
 }
