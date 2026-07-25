@@ -93,6 +93,7 @@ pub use queries::{
     // Phase 12 (V19) — shared volumes / power schedules / training jobs
     SharedVolumeRow,
     TrainingJobRow,
+    TrainingPair,
     WorkIntentRow,
     WorkerSshKeyRow,
     db_exec,
@@ -246,6 +247,7 @@ pub use queries::{
     pg_recent_demand_snapshots,
     pg_record_interaction,
     pg_record_route_decision,
+    pg_refresh_training_pairs,
     pg_reprofile_candidates,
     pg_reserve_host,
     pg_resolve_channel_user,
