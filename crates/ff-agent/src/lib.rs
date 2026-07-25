@@ -47,6 +47,7 @@ pub mod cloud_budget;
 pub mod cloud_error;
 pub mod cloud_llm_registry;
 pub mod codegen_apply;
+pub mod codex_usage_poller;
 pub mod commands;
 pub mod commands_extended;
 pub mod compaction;
