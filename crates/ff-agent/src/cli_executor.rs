@@ -23,16 +23,17 @@
 //! on the row (see `work_item_dispatch::record_dispatch_interaction`,
 //! `work_item_merge_drain::record_review_interaction`).
 //!
-//! Authentication is handled by the CLI itself, reading
-//! `~/.<vendor>/credentials.json` etc. Layer 4 (PR-A2's
-//! `oauth_distributor`) ensures every member has the centralized cred
-//! file when ff drives this path.
+//! Authentication is handled by the CLI itself. When this host has no fresh
+//! passing auth probe, execution may use the same backend's bridge on a fresh
+//! authenticated peer; the peer handler always executes locally to prevent
+//! bridge loops.
 
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use tracing::{debug, info};
+use serde_json::json;
+use tracing::{debug, info, warn};
 
 /// Default per-CLI invocation timeout. The old 10-min value killed real
 /// multi-minute build/codegen runs mid-flight (a verified codex task completing
@@ -255,16 +256,37 @@ pub async fn execute_cli_in_dir(
     cwd: Option<&Path>,
     timeout: Option<Duration>,
 ) -> Result<CliResult> {
-    let cfg = backend_by_name(backend).ok_or_else(|| {
-        anyhow!(
-            "unknown backend '{backend}'; expected one of: {}",
-            BACKENDS
-                .iter()
-                .map(|b| b.name)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    })?;
+    let cfg = backend_by_name(backend).ok_or_else(|| unknown_backend_error(backend))?;
+    if crate::fleet_info::is_backend_disabled(cfg.name) {
+        return Err(anyhow!(
+            "backend '{}' is disabled via fleet.toml [general] disabled_backends",
+            cfg.name
+        ));
+    }
+    if let Some(peer_ip) = fresh_peer_bridge(cfg.name).await {
+        match execute_via_bridge(cfg, &peer_ip, prompt, passthrough_args, cwd, timeout).await {
+            Ok(result) => return Ok(result),
+            Err(error) => warn!(
+                backend = cfg.name,
+                peer_ip,
+                %error,
+                "authenticated peer CLI bridge failed; falling back to local execution"
+            ),
+        }
+    }
+    execute_cli_in_dir_local(backend, prompt, passthrough_args, cwd, timeout).await
+}
+
+/// Execute only on this host. Probe and bridge handlers must use this entrypoint
+/// so a bridged request can never bounce to a second peer.
+pub async fn execute_cli_in_dir_local(
+    backend: &str,
+    prompt: &str,
+    passthrough_args: &[String],
+    cwd: Option<&Path>,
+    timeout: Option<Duration>,
+) -> Result<CliResult> {
+    let cfg = backend_by_name(backend).ok_or_else(|| unknown_backend_error(backend))?;
 
     // Fleet-wide operator override: `[general] disabled_backends` in
     // fleet.toml. Reject BEFORE spawning so every caller's existing failover
@@ -418,6 +440,111 @@ pub async fn execute_cli_in_dir(
         stdout,
         stderr,
         duration_ms,
+    })
+}
+
+fn unknown_backend_error(backend: &str) -> anyhow::Error {
+    anyhow!(
+        "unknown backend '{backend}'; expected one of: {}",
+        BACKENDS
+            .iter()
+            .map(|b| b.name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Return a peer only when this host lacks a fresh passing auth probe and the
+/// peer has one. The DB is advisory: on any lookup failure normal local
+/// execution remains available.
+async fn fresh_peer_bridge(backend: &str) -> Option<String> {
+    let pool = crate::fleet_info::get_fleet_pool().await.ok()?;
+    let this_worker = crate::fleet_info::resolve_this_worker_name().await;
+    let local_fresh: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM computer_backends cb
+               JOIN computers c ON c.id = cb.computer_id
+              WHERE LOWER(c.name) = LOWER($1)
+                AND cb.backend = $2
+                AND cb.installed
+                AND cb.authenticated
+                AND cb.last_auth_ok_at > NOW() - INTERVAL '90 minutes'
+         )",
+    )
+    .bind(&this_worker)
+    .bind(backend)
+    .fetch_one(&pool)
+    .await
+    .ok()?;
+    if local_fresh {
+        return None;
+    }
+    sqlx::query_scalar(
+        "SELECT c.primary_ip
+           FROM computer_backends cb
+           JOIN computers c ON c.id = cb.computer_id
+           LEFT JOIN fleet_backend_health h
+             ON h.computer_id = cb.computer_id AND h.provider = cb.backend
+          WHERE LOWER(c.name) <> LOWER($1)
+            AND cb.backend = $2
+            AND cb.installed
+            AND cb.authenticated
+            AND cb.last_auth_ok_at > NOW() - INTERVAL '90 minutes'
+            AND COALESCE(h.breaker_state, 'closed') = 'closed'
+            AND c.status = 'online'
+          ORDER BY cb.last_auth_ok_at DESC
+          LIMIT 1",
+    )
+    .bind(this_worker)
+    .bind(backend)
+    .fetch_optional(&pool)
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn execute_via_bridge(
+    cfg: &CliBackend,
+    peer_ip: &str,
+    prompt: &str,
+    passthrough_args: &[String],
+    cwd: Option<&Path>,
+    timeout: Option<Duration>,
+) -> Result<CliResult> {
+    let started = std::time::Instant::now();
+    let timeout = timeout.unwrap_or(DEFAULT_TIMEOUT);
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
+    let response = client
+        .post(format!(
+            "http://{}:{}/v1/chat/completions",
+            peer_ip, cfg.port
+        ))
+        .json(&json!({
+            "model": format!("{}-cli-bridge", cfg.name),
+            "messages": [{"role": "user", "content": prompt}],
+            "backend_args": passthrough_args,
+            "cwd": cwd.map(|path| path.to_string_lossy()),
+        }))
+        .send()
+        .await?;
+    let status = response.status();
+    let value: serde_json::Value = response.json().await?;
+    if !status.is_success() {
+        return Err(anyhow!("peer bridge returned {status}: {value}"));
+    }
+    let stdout = value
+        .pointer("/choices/0/message/content")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("peer bridge response omitted assistant content"))?
+        .to_string();
+    Ok(CliResult {
+        backend: cfg.name.to_string(),
+        binary_path: format!("bridge://{peer_ip}:{}", cfg.port),
+        exit_code: 0,
+        stdout,
+        stderr: String::new(),
+        duration_ms: started.elapsed().as_millis(),
     })
 }
 

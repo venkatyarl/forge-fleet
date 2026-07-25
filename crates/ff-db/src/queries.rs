@@ -9143,7 +9143,7 @@ pub async fn pg_cloud_route_for_computer(
                 cb.backend,
                 cb.installed,
                 cb.authenticated,
-                cb.last_checked_at,
+                cb.last_auth_ok_at,
                 u.remaining_pct,
                 COALESCE(h.breaker_state, 'closed') AS breaker_state
            FROM computer_backends cb
@@ -9156,7 +9156,13 @@ pub async fn pg_cloud_route_for_computer(
                  ORDER BY fu.sampled_at DESC
                  LIMIT 1
            ) u ON true
-          WHERE cb.computer_id = $1",
+          WHERE cb.computer_id = $1
+             OR (
+                cb.computer_id <> $1
+                AND cb.installed
+                AND cb.authenticated
+                AND COALESCE(h.breaker_state, 'closed') = 'closed'
+             )",
     )
     .bind(computer_id)
     .fetch_all(pool)
@@ -9181,7 +9187,7 @@ pub async fn pg_dispatchable_backends(
           WHERE computer_id = $1
             AND installed
             AND authenticated
-            AND last_checked_at > NOW() - make_interval(secs => $2)",
+            AND last_auth_ok_at > NOW() - make_interval(secs => $2)",
     )
     .bind(computer_id)
     .bind(fresh_secs as f64)

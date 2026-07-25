@@ -49,7 +49,7 @@ pub struct BackendCapacity {
     pub backend: String,
     pub installed: bool,
     pub authenticated: bool,
-    pub last_checked_at: DateTime<Utc>,
+    pub last_auth_ok_at: Option<DateTime<Utc>>,
     pub remaining_pct: Option<f64>,
     pub breaker_state: String,
 }
@@ -177,14 +177,25 @@ impl CapacitySnapshot {
     /// The caller owns scoring so the policy remains shared with the legacy
     /// database picker during the gated migration.
     pub fn backend_capacity(&self, computer_id: uuid::Uuid) -> Vec<BackendCapacity> {
-        self.inner
-            .data
-            .load()
+        let data = self.inner.data.load();
+        let mut rows = data
             .backends
             .iter()
             .filter(|row| row.computer_id == computer_id)
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        for peer in &data.backends {
+            if peer.computer_id != computer_id
+                && peer.installed
+                && peer.authenticated
+                && peer.breaker_state == "closed"
+            {
+                let mut bridged = peer.clone();
+                bridged.computer_id = computer_id;
+                rows.push(bridged);
+            }
+        }
+        rows
     }
 
     /// Current declarative cloud quota rows. Refresh failures retain the last
@@ -229,7 +240,7 @@ impl CapacitySnapshot {
                    cb.backend,
                    cb.installed,
                    cb.authenticated,
-                   cb.last_checked_at,
+                   cb.last_auth_ok_at,
                    u.remaining_pct,
                    COALESCE(h.breaker_state, 'closed') AS breaker_state
               FROM computer_backends cb
@@ -352,7 +363,7 @@ mod tests {
                 backend TEXT NOT NULL,
                 installed BOOLEAN NOT NULL,
                 authenticated BOOLEAN NOT NULL,
-                last_checked_at TIMESTAMPTZ NOT NULL
+                last_auth_ok_at TIMESTAMPTZ
             );
             CREATE TABLE fleet_backend_health (
                 computer_id UUID NOT NULL,

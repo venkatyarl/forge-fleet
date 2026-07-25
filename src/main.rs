@@ -939,6 +939,30 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 15g) Fleet onboarding step applier — immediately, then every 30min,
+    // PER-HOST. The verify-first applier handles both first enrollment (which
+    // starts forgefleetd) and later desired-state drift without leader SSH.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: fleet onboarding audit (30min, per-host)");
+        let onboarding_worker = worker_name.clone();
+        subsystem_tasks.push(ff_agent::tick_registry::TickRegistry::register(
+            "fleet-onboarding",
+            std::time::Duration::from_secs(30 * 60),
+            shutdown_rx.clone(),
+            move |_run| {
+                let pg_pool = pg_pool.clone();
+                let onboarding_worker = onboarding_worker.clone();
+                async move {
+                    if let Err(error) =
+                        ff_agent::fleet_onboarding::audit(&pg_pool, &onboarding_worker).await
+                    {
+                        warn!(%error, "fleet onboarding audit failed");
+                    }
+                }
+            },
+        ));
+    }
+
     // 16) Procedural memory consolidation — every 6h, leader-gated.
     // Phase 14: scans completed sessions, extracts successful patterns into agent_procedures.
     if let Some(pg_pool) = operational_store.pg_pool().cloned() {

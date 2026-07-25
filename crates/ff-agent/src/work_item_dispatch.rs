@@ -5568,8 +5568,14 @@ mod tests {
             use_local_lane(0, false, false, false),
             "first attempt tries cheap local"
         );
-        assert!(use_local_lane(1, false, false, false), "2nd attempt still local");
-        assert!(use_local_lane(2, false, false, false), "3rd attempt still local");
+        assert!(
+            use_local_lane(1, false, false, false),
+            "2nd attempt still local"
+        );
+        assert!(
+            use_local_lane(2, false, false, false),
+            "3rd attempt still local"
+        );
         assert!(
             !use_local_lane(3, false, false, false),
             "past LOCAL_LANE_MAX_TRIES → cloud"
