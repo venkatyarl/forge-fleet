@@ -901,6 +901,42 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         return Ok(());
     }
 
+    // PRE-BUILD ACCEPTANCE GATE (2026-07-25): if the item already carries a
+    // machine-checkable acceptance_check that PASSES against the live system,
+    // the work is ALREADY DONE — mark it done+verified and skip the build
+    // entirely. Without this, an item whose artifact already exists (e.g.
+    // routing_ladders table already created) was re-dispatched forever: the
+    // backend correctly produces NO DIFF (nothing to create), dispatch counts
+    // it a failure, and after MAX_DISPATCH_ATTEMPTS the item dies as "backend
+    // produced no diff" — a week of recurring false failures on already-done
+    // work (operator-reported). Checking acceptance FIRST turns "no diff on
+    // done work" from a failure into a correct completion.
+    if let Some(true) = acceptance_check_passes(&pg, item.work_item_id).await {
+        info!(
+            work_item_id = %item.work_item_id,
+            "work_item_dispatch: acceptance_check ALREADY PASSES — work is done, skipping build"
+        );
+        let _ = sqlx::query(
+            "UPDATE work_items SET status = 'done', verified = 1, completed_at = NOW(), \
+                    verified_at = NOW(), \
+                    last_error = 'pre-build gate: acceptance_check already passes — work already done, no build needed' \
+              WHERE id = $1 AND status NOT IN ('merged')",
+        )
+        .bind(item.work_item_id)
+        .execute(&pg)
+        .await;
+        // Release the lease/slot so the scheduler stops holding this node for a
+        // build that isn't going to happen.
+        let _ = sqlx::query(
+            "UPDATE work_item_leases SET released_at = NOW(), release_reason = 'pre-build acceptance gate: already done' \
+              WHERE work_item_id = $1 AND released_at IS NULL",
+        )
+        .bind(item.work_item_id)
+        .execute(&pg)
+        .await;
+        return Ok(());
+    }
+
     // Keep the lease heartbeat alive for the ENTIRE dispatch — the backend build
     // AND the commit/push/PR tail — via an RAII guard that stops it when
     // dispatch_one returns on ANY path. Previously the heartbeat stopped the
