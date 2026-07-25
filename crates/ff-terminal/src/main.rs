@@ -44,6 +44,7 @@ mod backends_cmd;
 mod brain_cmd;
 mod build_cmd;
 mod cli_bridge_cmd;
+mod cloud_cmd;
 mod cloud_llm_cmd;
 mod codegen_cmd;
 mod config_cmd;
@@ -784,6 +785,12 @@ enum Command {
     Db {
         #[command(subcommand)]
         command: DbCommand,
+    },
+    /// Cloud budget/usage — per-provider weekly/monthly headroom that the
+    /// usage pollers keep fresh in `cloud_budget_buckets`.
+    Cloud {
+        #[command(subcommand)]
+        command: CloudCommand,
     },
     /// Cloud LLM providers (OpenAI/Anthropic/Moonshot/Google). Gateway
     /// routes `/v1/chat/completions` to these when the requested model
@@ -2491,6 +2498,18 @@ enum DbCommand {
         /// Cap rows returned (default 200); extra rows are noted as truncated.
         #[arg(long, default_value_t = 200)]
         max_rows: usize,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum CloudCommand {
+    /// Per-provider cloud budget headroom (weekly/monthly %, spend, limit)
+    /// from `cloud_budget_buckets` — the live data the usage-weighted cloud
+    /// dispatch preference sorts on.
+    Usage {
+        /// Emit JSON (one object per provider) instead of the human table.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -4373,6 +4392,7 @@ async fn main() -> Result<()> {
         Some(Command::Train { command }) => return train_cmd::handle_train(command.clone()).await,
         Some(Command::Ports { command }) => return ports_cmd::handle_ports(command.clone()).await,
         Some(Command::Db { command }) => return db_cmd::handle_db(command.clone()).await,
+        Some(Command::Cloud { command }) => return cloud_cmd::handle_cloud(command.clone()).await,
         Some(Command::CloudLlm { command }) => {
             return cloud_llm_cmd::handle_cloud_llm(command.clone()).await;
         }
@@ -5422,6 +5442,7 @@ async fn main() -> Result<()> {
         Some(Command::Train { command }) => train_cmd::handle_train(command).await,
         Some(Command::Ports { command }) => ports_cmd::handle_ports(command).await,
         Some(Command::Db { command }) => db_cmd::handle_db(command).await,
+        Some(Command::Cloud { command }) => cloud_cmd::handle_cloud(command).await,
         Some(Command::CloudLlm { command }) => cloud_llm_cmd::handle_cloud_llm(command).await,
         Some(Command::Social { command }) => social_cmd::handle_social(command).await,
         Some(Command::Supervise {
