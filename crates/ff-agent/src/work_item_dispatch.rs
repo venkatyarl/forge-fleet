@@ -1918,7 +1918,9 @@ async fn acceptance_check_passes(pg: &PgPool, work_item_id: Uuid) -> Option<bool
             .await
             .ok()
             .flatten();
-    let sql = sql.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+    let sql = sql
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
     // Read-only guard: only a bare SELECT may run as an acceptance check.
     let lowered = sql.to_lowercase();
     if !lowered.starts_with("select") || lowered.contains(';') {
