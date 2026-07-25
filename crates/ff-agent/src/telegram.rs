@@ -139,6 +139,81 @@ pub async fn send_telegram_photo_from_secrets(
     Ok(())
 }
 
+/// Split `s` into chunks no longer than `max` chars, breaking on line
+/// boundaries so a digest never splits mid-line. A single line longer than
+/// `max` is hard-split by chars as a last resort.
+fn chunk_text(s: &str, max: usize) -> Vec<String> {
+    let max = max.max(1);
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for line in s.lines() {
+        // a single over-long line: flush current, then hard-split the line.
+        if line.chars().count() > max {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            let mut buf = String::new();
+            for ch in line.chars() {
+                if buf.chars().count() + 1 > max {
+                    out.push(std::mem::take(&mut buf));
+                }
+                buf.push(ch);
+            }
+            if !buf.is_empty() {
+                out.push(buf);
+            }
+            continue;
+        }
+        if cur.chars().count() + line.chars().count() + 1 > max && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push('\n');
+        }
+        cur.push_str(line);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Send a digest that NEVER truncates. If a logo is present it's posted as a
+/// photo captioned with just the (short) `title`; the full `body` then follows
+/// as one or more plain-text messages, chunked to Telegram's 4096-char text
+/// limit on line boundaries. Without a logo, `title`+`body` are sent as chunked
+/// text. This fixes the cut-off caused by cramming a long digest into a
+/// 1024-char photo caption.
+pub async fn send_telegram_digest(
+    pool: &PgPool,
+    title: &str,
+    body: &str,
+    photo: Option<&[u8]>,
+) -> Result<()> {
+    if let Some(bytes) = photo.filter(|b| !b.is_empty()) {
+        // Logo photo with a short, cutoff-proof caption (title only).
+        send_telegram_photo_from_secrets(pool, title, "", Some(bytes)).await?;
+        // Full body as chunked text (headerless — the photo already showed the title).
+        for chunk in chunk_text(body, 3800) {
+            if !chunk.trim().is_empty() {
+                send_telegram_from_secrets(pool, &chunk, "").await?;
+            }
+        }
+    } else {
+        let full = if body.is_empty() {
+            title.to_string()
+        } else {
+            format!("{title}\n{body}")
+        };
+        for chunk in chunk_text(&full, 3800) {
+            if !chunk.trim().is_empty() {
+                send_telegram_from_secrets(pool, &chunk, "").await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Shared send path: returns `None` when telegram isn't configured, else
 /// `(chat_id, message_id)` of the delivered message.
 async fn send_returning_id(

@@ -54,8 +54,17 @@ pub async fn ensure_schema(pg: &PgPool) -> Result<()> {
     .execute(pg)
     .await?;
 
-    // Seed a standing digest for every active project (id 'proj:standing').
-    // Title = an emoji + display_name so each project reads distinctly.
+    // `logo_path` links each digest to the project's logo file on disk
+    // (under ~/projects/<project>/...), so ff knows where the source logo is
+    // and can re-render it. `logo_png` caches the rendered/resized bytes sent
+    // to Telegram.
+    sqlx::query("ALTER TABLE project_digest_configs ADD COLUMN IF NOT EXISTS logo_path text")
+        .execute(pg)
+        .await?;
+
+    // Seed a standing PROJECT digest for every active project (id
+    // 'proj:standing'). These report that project's work_items/tasks. Title =
+    // an emoji + display_name so each project reads distinctly.
     sqlx::query(
         "INSERT INTO project_digest_configs (id, project_id, kind, title, interval_secs) \
          SELECT p.id || ':standing', p.id, 'standing', \
@@ -64,6 +73,28 @@ pub async fn ensure_schema(pg: &PgPool) -> Result<()> {
           WHERE p.status = 'active' \
             AND EXISTS (SELECT 1 FROM work_items w WHERE w.project_id = p.id) \
          ON CONFLICT (id) DO NOTHING",
+    )
+    .execute(pg)
+    .await?;
+
+    // Seed the SYSTEM digest ('ff:system'): the status of ForgeFleet-the-
+    // platform ITSELF running — new models discovered, self-improvement, fleet
+    // health, deployments, cloud headroom — as opposed to project work. This is
+    // the distinction the operator drew: "ForgeFleet" = the project & its tasks;
+    // "ff" = the platform's own operational status.
+    sqlx::query(
+        "INSERT INTO project_digest_configs (id, project_id, kind, title, interval_secs) \
+         VALUES ('ff:system', 'ff', 'system', '⚙️ ff — platform status', 900) \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .execute(pg)
+    .await?;
+
+    // Retire the stray internal 'ff-agent-dispatch' project digest — its role
+    // is subsumed by the 'ff' system digest above.
+    sqlx::query(
+        "UPDATE project_digest_configs SET enabled = false, updated_at = now() \
+          WHERE id = 'ff-agent-dispatch:standing'",
     )
     .execute(pg)
     .await?;
@@ -184,8 +215,7 @@ async fn run_once(pg: &PgPool) -> Result<()> {
             }
         };
         if let Err(err) =
-            crate::telegram::send_telegram_photo_from_secrets(pg, &title, &body, logo.as_deref())
-                .await
+            crate::telegram::send_telegram_digest(pg, &title, &body, logo.as_deref()).await
         {
             warn!(project = %project_id, error = %err, "project digest send failed");
             continue;
@@ -206,6 +236,10 @@ async fn run_once(pg: &PgPool) -> Result<()> {
 /// that owns the fleet control plane — the last rolling deployment. Everything
 /// is queried live, so it cannot show fabricated progress.
 pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<String> {
+    // The synthetic 'ff' project = the platform's own status, not project work.
+    if project_id == "ff" {
+        return build_system_digest(pg).await;
+    }
     // Building items for THIS project (join leases → work_items on project).
     let building: Vec<(String, i32, Option<i32>)> = sqlx::query_as(
         "SELECT left(w.title, 34), \
@@ -269,7 +303,131 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
     }
 
     msg.push_str(&format!(
-        "📊 ready={ready}  failed={failed}  verified={verified}  ⛔blocked-on-you={blocked_op}"
+        "📊 Backlog: ready={ready}  failed={failed}  verified={verified}  ⛔blocked-on-you={blocked_op}"
     ));
+
+    // Jira backlog — only for projects that have a Jira config (config_id ==
+    // project_id). Shows tracked issues + how many are waiting on the operator
+    // to reply so ff can move them forward. (Tables empty until the Jira
+    // monitor populates them → reads 0, never errors.)
+    let has_jira: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM jira_configs WHERE name = $1)")
+            .bind(project_id)
+            .fetch_one(pg)
+            .await
+            .unwrap_or(false);
+    if has_jira {
+        let (tracked, waiting_you): (i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT COUNT(*) FROM jira_watch_state WHERE config_id = $1), \
+               (SELECT COUNT(*) FROM jira_watch_state WHERE config_id = $1 \
+                  AND awaiting_party IS NOT NULL \
+                  AND (awaiting_party ILIKE '%operator%' OR awaiting_party ILIKE '%report%' \
+                       OR awaiting_party ILIKE '%owner%' OR awaiting_party ILIKE '%you%'))",
+        )
+        .bind(project_id)
+        .fetch_one(pg)
+        .await
+        .unwrap_or((0, 0));
+        let in_flight: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM jira_issue_leases WHERE config_id = $1")
+                .bind(project_id)
+                .fetch_one(pg)
+                .await
+                .unwrap_or(0);
+        msg.push_str(&format!(
+            "\n🎫 Jira: {tracked} tracked · {in_flight} in-flight · ⛔{waiting_you} waiting-on-you"
+        ));
+    }
+
     Ok(msg)
+}
+
+/// Build the SYSTEM digest — the status of ForgeFleet-the-platform itself:
+/// self-improvement throughput, the local-model catalog, cloud headroom, the
+/// leader, and the last rolling deployment. This answers "what is ff doing
+/// outside the projects?" All queries are defensive (a missing table/column
+/// degrades that one line, never the whole digest).
+pub async fn build_system_digest(pg: &PgPool) -> Result<String> {
+    let mut msg = String::new();
+
+    // Self-improvement: work items ff merged into itself in the last 24h, and
+    // what's building across ALL projects right now.
+    let merged_24h: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM work_items WHERE status='merged' AND completed_at > now() - interval '24 hours'")
+            .fetch_one(pg)
+            .await
+            .unwrap_or(0);
+    let building_now: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM work_item_leases WHERE released_at IS NULL")
+            .fetch_one(pg)
+            .await
+            .unwrap_or(0);
+    msg.push_str(&format!(
+        "🧠 Self-improvement: {merged_24h} merged (24h) · {building_now} building now\n"
+    ));
+
+    // Local model catalog — how many models ff can run locally (local-first).
+    let (catalog, deployed): (i64, i64) = (
+        sqlx::query_scalar("SELECT COUNT(*) FROM fleet_model_catalog")
+            .fetch_one(pg)
+            .await
+            .unwrap_or(0),
+        sqlx::query_scalar("SELECT COUNT(*) FROM fleet_model_deployments")
+            .fetch_one(pg)
+            .await
+            .unwrap_or(0),
+    );
+    msg.push_str(&format!(
+        "🤖 Local models: {catalog} in catalog · {deployed} deployed\n"
+    ));
+
+    // Cloud headroom per provider (weekly_pct used; flag exhausted windows).
+    let providers: Vec<(String, Option<i16>, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
+        "SELECT provider, weekly_pct, window_exhausted_until FROM cloud_budget_buckets ORDER BY provider",
+    )
+    .fetch_all(pg)
+    .await
+    .unwrap_or_default();
+    if !providers.is_empty() {
+        msg.push_str("☁️ Cloud headroom: ");
+        let parts: Vec<String> = providers
+            .iter()
+            .map(|(p, pct, exh)| {
+                let used = pct.unwrap_or(0);
+                let exhausted = exh.map(|t| t > chrono::Utc::now()).unwrap_or(false);
+                if exhausted {
+                    format!("{p}=RATE-LIMITED")
+                } else {
+                    format!("{p}={}%left", 100 - used.min(100))
+                }
+            })
+            .collect();
+        msg.push_str(&parts.join("  "));
+        msg.push('\n');
+    }
+
+    msg.push('\n');
+
+    // Leader + last rolling deployment (fleet operational status).
+    if let Ok(Some((leader, epoch))) =
+        sqlx::query_as::<_, (String, i64)>("SELECT member_name, epoch::bigint FROM fleet_leader_state WHERE singleton_key='current'")
+            .fetch_optional(pg)
+            .await
+    {
+        msg.push_str(&format!("👑 Leader: {leader} (epoch {epoch})\n"));
+    }
+    let deploy: Option<(String, i32, i32)> = sqlx::query_as(
+        "SELECT commit_sha, nodes_updated, nodes_total FROM fleet_deploy_events \
+          ORDER BY deployed_at DESC LIMIT 1",
+    )
+    .fetch_optional(pg)
+    .await
+    .ok()
+    .flatten();
+    if let Some((sha, up, tot)) = deploy {
+        msg.push_str(&format!("📦 Last deploy: {sha} · {up}/{tot} nodes\n"));
+    }
+
+    Ok(msg.trim_end().to_string())
 }
