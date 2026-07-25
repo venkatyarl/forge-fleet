@@ -28,7 +28,7 @@ impl RepoContext {
         } else {
             self.key_dirs.join(", ")
         };
-        format!(
+        let mut block = format!(
             "Target repository context:\n\
              - repo_url: {repo}\n\
              - local_path: {path}\n\
@@ -36,7 +36,17 @@ impl RepoContext {
              - build_system: {build}\n\
              - key_dirs: {dirs}\n",
             self.primary_language
-        )
+        );
+        if self.primary_language != "unknown" {
+            block.push_str(&format!(
+                "IMPORTANT: this is a {} project. Every `files` path MUST be a REAL \
+                 file that already exists in this repo and match this stack — NEVER \
+                 invent paths in another language (e.g. no .py/.yaml paths in a Rust \
+                 repo).\n",
+                self.primary_language
+            ));
+        }
+        block
     }
 }
 
@@ -292,19 +302,48 @@ async fn detect_project_folder(
 }
 
 async fn primary_project_repo(pool: &PgPool, project: &str) -> Result<Option<RepoContext>> {
-    let row = sqlx::query(
-        "SELECT id, github_url FROM project_repos
-          WHERE project_id = $1 AND is_primary = TRUE
-          ORDER BY created_at ASC LIMIT 1",
+    // GROUND the decompose (operator 2026-07-25): always fill repo_path +
+    // primary_language from the DB (project_repos, falling back to the projects
+    // row's local_path + tech_stack). A NULL repo_path here is what let 62 items
+    // decompose ungrounded and hallucinate Python paths in a Rust repo — now the
+    // fail-closed quality gate has a real checkout to validate against, and the
+    // LLM is told the actual language instead of guessing.
+    let repo = sqlx::query(
+        "SELECT id, github_url, local_path, tech_stack FROM project_repos \
+          WHERE project_id = $1 AND is_primary = TRUE ORDER BY created_at ASC LIMIT 1",
     )
     .bind(project)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|r| RepoContext {
-        repo_id: Some(r.get("id")),
-        repo_url: Some(r.get("github_url")),
-        repo_path: None,
-        primary_language: "unknown".to_string(),
+    let proj = sqlx::query(
+        "SELECT repo_url, local_path, tech_stack FROM projects WHERE id = $1",
+    )
+    .bind(project)
+    .fetch_optional(pool)
+    .await?;
+
+    let repo_id: Option<Uuid> = repo.as_ref().map(|r| r.get("id"));
+    let repo_url: Option<String> = repo
+        .as_ref()
+        .map(|r| r.get::<String, _>("github_url"))
+        .or_else(|| proj.as_ref().and_then(|p| p.try_get("repo_url").ok().flatten()));
+    let local_path: Option<String> = repo
+        .as_ref()
+        .and_then(|r| r.try_get("local_path").ok().flatten())
+        .or_else(|| proj.as_ref().and_then(|p| p.try_get("local_path").ok().flatten()));
+    let tech_stack: Option<String> = repo
+        .as_ref()
+        .and_then(|r| r.try_get("tech_stack").ok().flatten())
+        .or_else(|| proj.as_ref().and_then(|p| p.try_get("tech_stack").ok().flatten()));
+
+    if repo_id.is_none() && repo_url.is_none() && local_path.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(RepoContext {
+        repo_id,
+        repo_url,
+        repo_path: local_path.map(PathBuf::from),
+        primary_language: tech_stack.unwrap_or_else(|| "unknown".to_string()),
         build_system: None,
         key_dirs: Vec::new(),
     }))
