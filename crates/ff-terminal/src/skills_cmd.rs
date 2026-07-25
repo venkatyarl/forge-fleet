@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::Subcommand;
 use ff_agent::skills_db;
 use std::path::PathBuf;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum SkillsCommand {
@@ -228,9 +229,18 @@ async fn list_cmd(
 }
 
 async fn show_cmd(pool: &sqlx::PgPool, name: &str, source: &str) -> Result<()> {
+    let started = Instant::now();
     let Some(s) = skills_db::get_by_name_source(pool, name, source).await? else {
         return Err(anyhow!("no skill named '{name}' from source '{source}'"));
     };
+    log_skill_usage(
+        pool,
+        s.id,
+        &format!("{}/{}", s.source, s.name),
+        "show",
+        started,
+    )
+    .await;
     println!("# {} / {}", s.source, s.name);
     println!("id:          {}", s.id);
     println!("version:     {}", s.version);
@@ -247,6 +257,7 @@ async fn show_cmd(pool: &sqlx::PgPool, name: &str, source: &str) -> Result<()> {
 }
 
 async fn sync_cmd(pool: &sqlx::PgPool, prune: bool, dry_run: bool) -> Result<()> {
+    let started = Instant::now();
     let root = skills_db::skills_root();
     if dry_run {
         // Preview only — touch nothing on disk. `materialize_all` would
@@ -278,6 +289,16 @@ async fn sync_cmd(pool: &sqlx::PgPool, prune: bool, dry_run: bool) -> Result<()>
     }
 
     let (written, skipped) = skills_db::materialize_all(pool).await?;
+    for skill in skills_db::list_all(pool).await? {
+        log_skill_usage(
+            pool,
+            skill.id,
+            &format!("{}/{}", skill.source, skill.name),
+            "sync",
+            started,
+        )
+        .await;
+    }
     println!(
         "materialized: {written} skill(s); skipped: {skipped}; root={}",
         root.display()
@@ -309,6 +330,7 @@ async fn import_cmd(
     source_url: Option<&str>,
     family: Option<&str>,
 ) -> Result<()> {
+    let started = Instant::now();
     if !path.exists() {
         return Err(anyhow!("path does not exist: {}", path.display()));
     }
@@ -320,6 +342,20 @@ async fn import_cmd(
 
     // Re-materialize after import so disk reflects the latest DB state.
     let (written, _skipped) = skills_db::materialize_all(pool).await?;
+    for skill in skills_db::list_all(pool)
+        .await?
+        .into_iter()
+        .filter(|s| s.source == source)
+    {
+        log_skill_usage(
+            pool,
+            skill.id,
+            &format!("{}/{}", skill.source, skill.name),
+            "import",
+            started,
+        )
+        .await;
+    }
     println!(
         "materialized: {written} skill(s) under {}",
         skills_db::skills_root().display()
@@ -334,6 +370,7 @@ async fn import_repo_cmd(
     family: Option<&str>,
     git_ref: Option<&str>,
 ) -> Result<()> {
+    let started = Instant::now();
     let source = source
         .map(|s| s.to_string())
         .unwrap_or_else(|| derive_source_from_url(url));
@@ -359,6 +396,20 @@ async fn import_repo_cmd(
     );
 
     let (written, _skipped) = skills_db::materialize_all(pool).await?;
+    for skill in skills_db::list_all(pool)
+        .await?
+        .into_iter()
+        .filter(|s| s.source == source)
+    {
+        log_skill_usage(
+            pool,
+            skill.id,
+            &format!("{}/{}", skill.source, skill.name),
+            "import-repo",
+            started,
+        )
+        .await;
+    }
     println!(
         "materialized: {written} skill(s) under {}",
         skills_db::skills_root().display()
@@ -408,6 +459,42 @@ async fn stats_cmd(pool: &sqlx::PgPool, json: bool) -> Result<()> {
         println!("  {k:<20} {v}");
     }
     Ok(())
+}
+
+async fn log_skill_usage(
+    pool: &sqlx::PgPool,
+    skill_id: uuid::Uuid,
+    skill_name: &str,
+    action: &str,
+    started: Instant,
+) {
+    let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
+    let duration_ms = started.elapsed().as_millis().min(i32::MAX as u128) as i32;
+    if let Err(e) = ff_db::pg_record_skill_invocation(
+        pool,
+        skill_id,
+        Some(&worker),
+        Some(action),
+        "success",
+        Some(duration_ms),
+        Some(0.0),
+    )
+    .await
+    {
+        tracing::warn!(skill = %skill_name, error = %e, "skill invocation telemetry failed");
+    }
+
+    let mut usage = ff_db::FleetToolUsageRecord::new(
+        format!("ff skills {action}"),
+        format!("skill:{skill_name}"),
+        true,
+        worker,
+        "success",
+    );
+    usage.latency_ms = Some(duration_ms);
+    if let Err(e) = ff_db::pg_record_fleet_tool_usage(pool, &usage).await {
+        tracing::warn!(skill = %skill_name, error = %e, "skill usage telemetry failed");
+    }
 }
 
 /// Lean per-skill JSON metadata for `ff skills list --json`. Deliberately

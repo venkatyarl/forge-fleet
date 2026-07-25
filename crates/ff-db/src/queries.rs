@@ -7808,6 +7808,186 @@ pub async fn pg_record_interaction(pool: &PgPool, r: &InteractionRecord) -> Resu
     Ok(row.get("id"))
 }
 
+/// Canonical append-only capability/tool/model usage row. This writes the
+/// legacy registry columns and the V261 normalized columns together so old
+/// inventory screens and new local-vs-cloud rollups read the same call.
+#[derive(Debug, Clone)]
+pub struct FleetToolUsageRecord {
+    pub caller: String,
+    pub capability: String,
+    pub is_local: bool,
+    pub node: String,
+    pub latency_ms: Option<i32>,
+    pub cost_class: String,
+    pub outcome: String,
+    pub input_summary: String,
+    pub tokens_in: i32,
+    pub tokens_out: i32,
+    pub cost_usd: f64,
+}
+
+impl FleetToolUsageRecord {
+    pub fn new(
+        caller: impl Into<String>,
+        capability: impl Into<String>,
+        is_local: bool,
+        node: impl Into<String>,
+        outcome: impl Into<String>,
+    ) -> Self {
+        Self {
+            caller: caller.into(),
+            capability: capability.into(),
+            is_local,
+            node: node.into(),
+            latency_ms: None,
+            cost_class: if is_local { "local" } else { "cloud" }.to_string(),
+            outcome: outcome.into(),
+            input_summary: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: 0.0,
+        }
+    }
+}
+
+pub async fn pg_record_fleet_tool_usage(
+    pool: &PgPool,
+    r: &FleetToolUsageRecord,
+) -> Result<uuid::Uuid> {
+    let node = if r.node.trim().is_empty() {
+        "unknown"
+    } else {
+        r.node.trim()
+    };
+    let caller = if r.caller.trim().is_empty() {
+        "unknown"
+    } else {
+        r.caller.trim()
+    };
+    let capability = if r.capability.trim().is_empty() {
+        "unknown"
+    } else {
+        r.capability.trim()
+    };
+    let outcome = if r.outcome.trim().is_empty() {
+        "unknown"
+    } else {
+        r.outcome.trim()
+    };
+    let row = sqlx::query(
+        "INSERT INTO fleet_tool_usage
+            (tool_name, worker_name, subagent_id, input_summary, completed_at,
+             latency_ms, success, tokens_in, tokens_out, cost_usd, caller,
+             capability, is_local, node, cost_class, outcome, ts)
+         VALUES ($1,$2,$3,$4,NOW(),$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW())
+         RETURNING id",
+    )
+    .bind(capability)
+    .bind(node)
+    .bind(caller)
+    .bind(r.input_summary.chars().take(1024).collect::<String>())
+    .bind(r.latency_ms)
+    .bind(matches!(outcome, "success" | "ok" | "offloaded"))
+    .bind(r.tokens_in)
+    .bind(r.tokens_out)
+    .bind(r.cost_usd as f32)
+    .bind(caller)
+    .bind(capability)
+    .bind(r.is_local)
+    .bind(node)
+    .bind(if r.cost_class.trim().is_empty() {
+        if r.is_local { "local" } else { "cloud" }
+    } else {
+        r.cost_class.trim()
+    })
+    .bind(outcome)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("id"))
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CapabilityUsageStats {
+    pub total_calls: i64,
+    pub local_calls: i64,
+    pub cloud_calls: i64,
+    pub local_percent: f64,
+    pub cloud_percent: f64,
+    pub avg_latency_ms: Option<f64>,
+    pub estimated_cloud_saved_usd: f64,
+}
+
+pub async fn pg_capability_usage_stats(pool: &PgPool, hours: i64) -> Result<CapabilityUsageStats> {
+    let window_hours = hours.max(1);
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS total_calls,
+                COUNT(*) FILTER (WHERE is_local) AS local_calls,
+                COUNT(*) FILTER (WHERE NOT is_local) AS cloud_calls,
+                AVG(latency_ms) AS avg_latency_ms,
+                COALESCE(SUM(
+                    CASE
+                        WHEN is_local THEN GREATEST(
+                            cost_usd::double precision,
+                            ((GREATEST(tokens_in, 0) + GREATEST(tokens_out, 0))::double precision / 1000.0) * 0.01
+                        )
+                        ELSE 0
+                    END
+                ), 0.0) AS estimated_cloud_saved_usd
+           FROM fleet_tool_usage
+          WHERE ts >= NOW() - ($1::text || ' hours')::interval",
+    )
+    .bind(window_hours.to_string())
+    .fetch_one(pool)
+    .await?;
+
+    let total_calls: i64 = row.get("total_calls");
+    let local_calls: i64 = row.get("local_calls");
+    let cloud_calls: i64 = row.get("cloud_calls");
+    let pct = |n: i64| {
+        if total_calls == 0 {
+            0.0
+        } else {
+            (n as f64) * 100.0 / (total_calls as f64)
+        }
+    };
+
+    Ok(CapabilityUsageStats {
+        total_calls,
+        local_calls,
+        cloud_calls,
+        local_percent: pct(local_calls),
+        cloud_percent: pct(cloud_calls),
+        avg_latency_ms: row.get("avg_latency_ms"),
+        estimated_cloud_saved_usd: row.get("estimated_cloud_saved_usd"),
+    })
+}
+
+pub async fn pg_record_skill_invocation(
+    pool: &PgPool,
+    skill_id: uuid::Uuid,
+    computer: Option<&str>,
+    task_summary: Option<&str>,
+    outcome: &str,
+    duration_ms: Option<i32>,
+    cost_usd: Option<f64>,
+) -> Result<i64> {
+    let row = sqlx::query(
+        "INSERT INTO skill_invocations
+            (skill_id, computer, task_summary, outcome, duration_ms, cost_usd)
+         VALUES ($1,$2,$3,$4,$5,$6::double precision::numeric)
+         RETURNING id",
+    )
+    .bind(skill_id)
+    .bind(computer)
+    .bind(task_summary.map(|s| s.chars().take(512).collect::<String>()))
+    .bind(outcome)
+    .bind(duration_ms)
+    .bind(cost_usd)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("id"))
+}
+
 /// Recent interaction-log rows for the live web console, newest first. Optional
 /// `channel` filter. request/response text is truncated server-side to keep the
 /// payload light for a polling UI. Returns ready-to-serialize JSON objects.

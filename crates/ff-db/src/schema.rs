@@ -12201,6 +12201,40 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// V261 — Capability-broker usage telemetry. The legacy `fleet_tool_usage`
+/// table tracked registry-style tool calls, but local-vs-cloud reward/savings
+/// reporting needs a normalized call ledger across tools, skills and model
+/// dispatch. Add nullable/defaulted columns so existing rows and writers keep
+/// working while new writers can use the canonical shape.
+pub const SCHEMA_V261_CAPABILITY_USAGE_TELEMETRY: &str = r#"
+ALTER TABLE fleet_tool_usage
+    ADD COLUMN IF NOT EXISTS caller     TEXT NOT NULL DEFAULT 'unknown',
+    ADD COLUMN IF NOT EXISTS capability TEXT NOT NULL DEFAULT 'unknown',
+    ADD COLUMN IF NOT EXISTS is_local   BOOLEAN NOT NULL DEFAULT true,
+    ADD COLUMN IF NOT EXISTS node       TEXT,
+    ADD COLUMN IF NOT EXISTS cost_class TEXT NOT NULL DEFAULT 'free',
+    ADD COLUMN IF NOT EXISTS outcome    TEXT NOT NULL DEFAULT 'unknown',
+    ADD COLUMN IF NOT EXISTS ts         TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+UPDATE fleet_tool_usage
+   SET caller = COALESCE(NULLIF(caller, ''), NULLIF(subagent_id, ''), 'unknown'),
+       capability = COALESCE(NULLIF(capability, ''), NULLIF(tool_name, ''), 'unknown'),
+       node = COALESCE(NULLIF(node, ''), NULLIF(worker_name, ''), node),
+       outcome = COALESCE(NULLIF(outcome, ''), CASE
+           WHEN success IS TRUE THEN 'success'
+           WHEN success IS FALSE THEN 'failure'
+           ELSE 'unknown'
+       END),
+       ts = COALESCE(ts, started_at, NOW());
+
+CREATE INDEX IF NOT EXISTS idx_fleet_tool_usage_capability_ts
+    ON fleet_tool_usage(capability, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_fleet_tool_usage_local_ts
+    ON fleet_tool_usage(is_local, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_fleet_tool_usage_cost_class_ts
+    ON fleet_tool_usage(cost_class, ts DESC);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

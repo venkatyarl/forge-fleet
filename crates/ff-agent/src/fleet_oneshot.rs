@@ -140,7 +140,7 @@ pub async fn fleet_oneshot(
             continue;
         };
         attempted = true;
-        match dispatch_to_candidate(cand, &client, prompt, model_hint).await {
+        match dispatch_to_candidate(pool, cand, &client, prompt, model_hint).await {
             Ok(ok) => return Ok(ok),
             Err(e) => {
                 tracing::warn!(
@@ -161,7 +161,7 @@ pub async fn fleet_oneshot(
         );
         for cand in &ordered {
             let _guard = InFlightGuard::acquire(&cand.endpoint);
-            match dispatch_to_candidate(cand, &client, prompt, model_hint).await {
+            match dispatch_to_candidate(pool, cand, &client, prompt, model_hint).await {
                 Ok(ok) => return Ok(ok),
                 Err(e) => {
                     tracing::warn!(
@@ -246,6 +246,7 @@ async fn resolve_route_candidates(
 }
 
 async fn dispatch_to_candidate(
+    pool: &PgPool,
     cand: &RouteCandidate,
     client: &reqwest::Client,
     prompt: &str,
@@ -288,6 +289,20 @@ async fn dispatch_to_candidate(
         .filter(|t| !t.trim().is_empty())
         .ok_or_else(|| anyhow!("{worker_name} ({model}) returned an empty completion"))?;
     let (tokens_in, tokens_out) = usage_tokens_i32(&payload);
+    let mut usage = ff_db::FleetToolUsageRecord::new(
+        "fleet_oneshot",
+        "model",
+        true,
+        worker_name.clone(),
+        "success",
+    );
+    usage.latency_ms = i32::try_from(start.elapsed().as_millis()).ok();
+    usage.tokens_in = tokens_in;
+    usage.tokens_out = tokens_out;
+    usage.input_summary = prompt.to_string();
+    if let Err(e) = ff_db::pg_record_fleet_tool_usage(pool, &usage).await {
+        tracing::warn!(worker = %worker_name, error = %e, "fleet_oneshot usage write failed");
+    }
     Ok(FleetOneshot {
         text,
         endpoint: endpoint.clone(),

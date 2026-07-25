@@ -75,6 +75,14 @@ pub async fn log_tool_call(
         Ok(_) => debug!(tool = %tool_name, outcome = %outcome.as_str(), "tool call audited"),
         Err(e) => warn!(tool = %tool_name, error = %e, "failed to write tool audit log"),
     }
+
+    let mut usage =
+        ff_db::FleetToolUsageRecord::new(agent_id, tool_name, true, worker_name, outcome.as_str());
+    usage.latency_ms = duration_ms.and_then(|d| i32::try_from(d).ok());
+    usage.input_summary = params_json.to_string();
+    if let Err(e) = ff_db::pg_record_fleet_tool_usage(pg, &usage).await {
+        warn!(tool = %tool_name, error = %e, "failed to write fleet tool usage");
+    }
 }
 
 /// Check whether a tool is in the step's allow-list.

@@ -5,6 +5,7 @@
 //! and wrapping results in proper JSON-RPC responses.
 
 use std::collections::HashSet;
+use std::time::Instant;
 
 use ff_core::config;
 use serde_json::{Value, json};
@@ -226,13 +227,24 @@ impl McpServer {
 
         // Extract the arguments for the tool
         let arguments = params.and_then(|p| p.get("arguments").cloned());
+        let audit_args = arguments.clone().unwrap_or_else(|| json!({}));
+        let started = Instant::now();
+        let known_locally = self.registry.contains(&tool_name);
 
-        let result = if self.registry.contains(&tool_name) {
+        let result = if known_locally {
             handlers::dispatch(&tool_name, arguments.clone()).await
         } else {
             self.try_federated_tool_call(&tool_name, arguments.clone())
                 .await
         };
+        audit_mcp_tool_call(
+            &tool_name,
+            &audit_args,
+            known_locally,
+            started,
+            result.as_ref().map(|_| ()).map_err(|e| e.as_str()),
+        )
+        .await;
 
         match result {
             Ok(result) => JsonRpcResponse::success(
@@ -263,11 +275,21 @@ impl McpServer {
         params: Option<Value>,
     ) -> JsonRpcResponse {
         let known_locally = self.registry.contains(method);
+        let audit_args = params.clone().unwrap_or_else(|| json!({}));
+        let started = Instant::now();
         let result = if known_locally {
             handlers::dispatch(method, params.clone()).await
         } else {
             self.try_federated_tool_call(method, params.clone()).await
         };
+        audit_mcp_tool_call(
+            method,
+            &audit_args,
+            known_locally,
+            started,
+            result.as_ref().map(|_| ()).map_err(|e| e.as_str()),
+        )
+        .await;
 
         match result {
             Ok(result) => JsonRpcResponse::success(id, result),
@@ -297,6 +319,50 @@ impl McpServer {
         };
 
         federation::call_federated_tool(&cfg, tool_name, arguments, 5).await
+    }
+}
+
+async fn audit_mcp_tool_call(
+    tool_name: &str,
+    params_json: &Value,
+    known_locally: bool,
+    started: Instant,
+    result: Result<(), &str>,
+) {
+    let Ok(pool) = ff_agent::fleet_info::get_fleet_pool().await else {
+        return;
+    };
+    let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
+    let duration_ms = started.elapsed().as_millis().min(i32::MAX as u128) as i32;
+    let (outcome, error) = match result {
+        Ok(()) => ("success", None),
+        Err(e) => ("failure", Some(e)),
+    };
+
+    let mut usage =
+        ff_db::FleetToolUsageRecord::new("mcp", tool_name, known_locally, &worker, outcome);
+    usage.latency_ms = Some(duration_ms);
+    usage.cost_class = if known_locally { "local" } else { "remote" }.to_string();
+    usage.input_summary = params_json.to_string();
+    if let Err(e) = ff_db::pg_record_fleet_tool_usage(&pool, &usage).await {
+        warn!(tool = %tool_name, error = %e, "failed to write MCP fleet usage");
+    }
+
+    if let Err(e) = sqlx::query(
+        "INSERT INTO tool_audit_log
+            (agent_id, tool_name, params_json, outcome, error, duration_ms, worker_name)
+         VALUES ('mcp', $1, $2, $3, $4, $5, $6)",
+    )
+    .bind(tool_name)
+    .bind(params_json)
+    .bind(outcome)
+    .bind(error)
+    .bind(duration_ms)
+    .bind(&worker)
+    .execute(&pool)
+    .await
+    {
+        warn!(tool = %tool_name, error = %e, "failed to write MCP tool audit");
     }
 }
 
