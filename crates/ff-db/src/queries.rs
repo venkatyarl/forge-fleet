@@ -5039,8 +5039,10 @@ mod tests {
         sqlx::raw_sql(
             "CREATE EXTENSION IF NOT EXISTS pgcrypto;
              CREATE TABLE computers (
-                 id   UUID PRIMARY KEY,
-                 name TEXT NOT NULL
+                 id                UUID PRIMARY KEY,
+                 name              TEXT NOT NULL,
+                 status            TEXT NOT NULL DEFAULT 'online',
+                 status_changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW() - INTERVAL '2 hours'
              );
              CREATE TABLE work_items (
                  id     UUID PRIMARY KEY,
@@ -5146,11 +5148,11 @@ mod tests {
             .expect("insert lease");
         }
 
-        let (relinked, freed) = pg_reconcile_sub_agent_slots(&pool)
+        let summary = pg_reconcile_sub_agent_slots(&pool)
             .await
             .expect("reconcile slots");
-        assert_eq!(relinked, 1, "only the wiped-but-leased slot is relinked");
-        assert_eq!(freed, 1, "only the missed-release busy slot is freed");
+        assert_eq!(summary.relinked, 1);
+        assert_eq!(summary.freed, 2);
 
         let rows: Vec<(uuid::Uuid, String, Option<uuid::Uuid>)> =
             sqlx::query_as("SELECT id, status, current_work_item_id FROM sub_agents ORDER BY slot")
@@ -5161,16 +5163,16 @@ mod tests {
         assert_eq!(rows[0].2, Some(wi[0])); // relinked to its active lease
         assert_eq!(rows[1].1, "idle");
         assert_eq!(rows[1].2, None); // freed after the missed release
-        assert_eq!(rows[2].1, "busy");
-        assert_eq!(rows[2].2, Some(wi[2])); // coordinator claim untouched
+        assert_eq!(rows[2].1, "idle");
+        assert_eq!(rows[2].2, None); // no active lease, so the stale claim is freed
         assert_eq!(rows[3].1, "disabled");
         assert_eq!(rows[3].2, None); // quarantine untouched
 
         // Idempotent: a second pass finds nothing to fix.
-        let (relinked2, freed2) = pg_reconcile_sub_agent_slots(&pool)
+        let summary2 = pg_reconcile_sub_agent_slots(&pool)
             .await
             .expect("reconcile slots again");
-        assert_eq!((relinked2, freed2), (0, 0));
+        assert_eq!(summary2.corrections(), 0);
 
         drop_temp_db(admin, pool, &db_name).await;
     }
@@ -8864,15 +8866,34 @@ pub async fn pg_free_slots(
 /// `WHERE current_work_item_id = $2`, HA drain, cancel) can miss the slot
 /// update. Two directions, returns `(relinked, freed)`:
 ///
-/// 1. relink — a slot holding an ACTIVE lease must read `busy` with that
-///    lease's work_item (newest lease wins if several). `'disabled'` slots are
-///    left alone: that status is an operator quarantine, not lifecycle state.
-/// 2. free — a `busy` slot with NO active lease whose recorded work_item's
-///    lease on this slot was RELEASED is a missed release; reset it to idle.
-///    The released-lease guard keeps this from clobbering the agent
-///    coordinator's non-lease claims (`fleet_run` dispatch never writes lease
-///    rows), which stay owned by the stuck-slot reaper's age ceiling.
-pub async fn pg_reconcile_sub_agent_slots(pool: &PgPool) -> Result<(u64, u64)> {
+/// 1. relink — a slot holding an unexpired ACTIVE lease must read `busy` with
+///    that lease's work_item (newest lease wins if several).
+/// 2. free — a `busy` slot with NO unexpired active lease is reset to idle.
+/// 3. delete — a `disabled` legacy slot older than 24 hours is removed once its
+///    computer has continuously been online for more than an hour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubAgentSlotReconcileSummary {
+    pub relinked: u64,
+    pub freed: u64,
+    pub deleted: u64,
+}
+
+impl SubAgentSlotReconcileSummary {
+    pub fn corrections(self) -> u64 {
+        self.relinked + self.freed + self.deleted
+    }
+}
+
+pub async fn pg_reconcile_sub_agent_slots(pool: &PgPool) -> Result<SubAgentSlotReconcileSummary> {
+    let mut tx = pool.begin().await?;
+    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(733108012)")
+        .fetch_one(&mut *tx)
+        .await?;
+    if !locked {
+        tx.rollback().await?;
+        return Ok(SubAgentSlotReconcileSummary::default());
+    }
+
     let relinked = sqlx::query(
         "UPDATE sub_agents sa
             SET status = 'busy',
@@ -8881,14 +8902,17 @@ pub async fn pg_reconcile_sub_agent_slots(pool: &PgPool) -> Result<(u64, u64)> {
                 last_heartbeat_at = NOW()
            FROM (SELECT DISTINCT ON (sub_agent_id) sub_agent_id, work_item_id, created_at
                    FROM work_item_leases
-                  WHERE released_at IS NULL AND sub_agent_id IS NOT NULL
+                  WHERE released_at IS NULL
+                    AND lease_expires_at > NOW()
+                    AND lease_state IN ('claimed', 'building', 'reviewing')
+                    AND sub_agent_id IS NOT NULL
                   ORDER BY sub_agent_id, created_at DESC) l
           WHERE sa.id = l.sub_agent_id
             AND sa.status <> 'disabled'
             AND (sa.status <> 'busy'
                  OR sa.current_work_item_id IS DISTINCT FROM l.work_item_id)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
 
@@ -8902,18 +8926,41 @@ pub async fn pg_reconcile_sub_agent_slots(pool: &PgPool) -> Result<(u64, u64)> {
             AND sa.current_work_item_id IS NOT NULL
             AND NOT EXISTS (
                 SELECT 1 FROM work_item_leases l
-                 WHERE l.sub_agent_id = sa.id AND l.released_at IS NULL)
-            AND EXISTS (
-                SELECT 1 FROM work_item_leases l
                  WHERE l.sub_agent_id = sa.id
-                   AND l.work_item_id = sa.current_work_item_id
-                   AND l.released_at IS NOT NULL)",
+                   AND l.released_at IS NULL
+                   AND l.lease_expires_at > NOW()
+                   AND l.lease_state IN ('claimed', 'building', 'reviewing'))",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
 
-    Ok((relinked, freed))
+    let deleted = sqlx::query(
+        "DELETE FROM sub_agents sa
+          USING computers c
+          WHERE sa.computer_id = c.id
+            AND sa.status = 'disabled'
+            AND COALESCE(sa.last_heartbeat_at, sa.started_at, '-infinity'::timestamptz)
+                < NOW() - INTERVAL '24 hours'
+            AND c.status = 'online'
+            AND c.status_changed_at < NOW() - INTERVAL '1 hour'
+            AND NOT EXISTS (
+                SELECT 1 FROM work_item_leases l
+                 WHERE l.sub_agent_id = sa.id
+                   AND l.released_at IS NULL
+                   AND l.lease_expires_at > NOW()
+                   AND l.lease_state IN ('claimed', 'building', 'reviewing'))",
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    tx.commit().await?;
+    Ok(SubAgentSlotReconcileSummary {
+        relinked,
+        freed,
+        deleted,
+    })
 }
 
 /// Reset every `'busy'` `sub_agents` row for a single computer back to

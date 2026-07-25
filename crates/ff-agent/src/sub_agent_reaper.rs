@@ -140,17 +140,7 @@ impl SubAgentReaper {
             );
         }
 
-        // Reconcile the mutable slot columns from the lease source of truth:
-        // relink slots whose ACTIVE lease says busy, free slots whose lease was
-        // released without the matching slot update landing.
-        let (relinked, freed) = ff_db::queries::pg_reconcile_sub_agent_slots(&self.pool)
-            .await
-            .context("reconcile sub_agent slots from leases")?;
-        if relinked > 0 || freed > 0 {
-            tracing::info!(relinked, freed, "reconciled sub_agent slots from leases");
-        }
-
-        Ok(rows.len() + relinked as usize + freed as usize)
+        Ok(rows.len())
     }
 
     /// Spawn the 10-minute tick. First tick fires ~120s after spawn so the

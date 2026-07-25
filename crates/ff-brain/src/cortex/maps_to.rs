@@ -431,7 +431,10 @@ async fn add_maps_to_edge(
         r#"
         INSERT INTO brain_vault_edges
             (src_id, dst_id, edge_type, provenance, confidence, method, evidence)
-        VALUES ($1, $2, 'maps_to', $3, $4, $5, $6)
+        SELECT src.id, dst.id, 'maps_to', $3, $4, $5, $6
+          FROM brain_vault_nodes src
+          JOIN brain_vault_nodes dst ON dst.id = $2
+         WHERE src.id = $1
         ON CONFLICT (src_id, dst_id, edge_type) DO UPDATE
           SET confidence = EXCLUDED.confidence,
               provenance = EXCLUDED.provenance,

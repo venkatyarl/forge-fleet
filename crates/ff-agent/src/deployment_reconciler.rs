@@ -349,6 +349,62 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
     Ok(summary)
 }
 
+/// Reconcile the mutable slot registry from active leases and live node state.
+/// Registered by the daemon as a leader-only tick.
+pub async fn reconcile_slot_registry(pool: &sqlx::PgPool) -> Result<u64, String> {
+    let summary = ff_db::queries::pg_reconcile_sub_agent_slots(pool)
+        .await
+        .map_err(|e| format!("reconcile sub-agent slot registry: {e}"))?;
+    let corrections = summary.corrections();
+    if corrections == 0 {
+        return Ok(0);
+    }
+
+    tracing::warn!(
+        corrections,
+        relinked = summary.relinked,
+        freed = summary.freed,
+        deleted = summary.deleted,
+        "sub-agent slot registry drift corrected"
+    );
+    let body = format!(
+        "corrections={corrections} relinked={} freed={} deleted={}",
+        summary.relinked, summary.freed, summary.deleted
+    );
+    if let Err(error) =
+        crate::telegram::send_telegram_from_secrets(pool, "Slot registry drift corrected", &body)
+            .await
+    {
+        tracing::warn!(%error, "failed to send slot registry drift notification");
+    }
+    Ok(corrections)
+}
+
+#[cfg(test)]
+fn should_free_busy(status: &str, has_current_item: bool, active_leases: usize) -> bool {
+    status == "busy" && has_current_item && active_leases == 0
+}
+
+#[cfg(test)]
+fn should_relink_idle(status: &str, active_leases: usize) -> bool {
+    status == "idle" && active_leases > 0
+}
+
+#[cfg(test)]
+fn should_delete_disabled(
+    status: &str,
+    disabled_age_hours: Option<i64>,
+    computer_status: &str,
+    online_age_hours: Option<i64>,
+    active_leases: usize,
+) -> bool {
+    status == "disabled"
+        && disabled_age_hours.is_none_or(|age| age > 24)
+        && computer_status == "online"
+        && online_age_hours.is_some_and(|age| age > 1)
+        && active_leases == 0
+}
+
 /// Whether a dead `active` deployment row needs library recovery before a
 /// respawn can be attempted. A respawn loads `row.library_id`, so a row with no
 /// library_id can't come back as-is — but it may be recoverable from its
@@ -737,6 +793,57 @@ mod tests {
         // A remote row is only retired — its own reconciler completes the
         // evict, so a still-running process is never re-adopted as 'active'.
         assert!(!evict_deletes_row("sia", "duncan"));
+    }
+
+    #[test]
+    fn slot_registry_correction_predicates_use_fixture_rows() {
+        assert!(should_free_busy("busy", true, 0));
+        assert!(!should_free_busy("busy", true, 1));
+        assert!(should_relink_idle("idle", 1));
+        assert!(!should_relink_idle("busy", 1));
+
+        assert!(should_delete_disabled(
+            "disabled",
+            Some(25),
+            "online",
+            Some(2),
+            0
+        ));
+        assert!(should_delete_disabled(
+            "disabled",
+            None,
+            "online",
+            Some(2),
+            0
+        ));
+        assert!(!should_delete_disabled(
+            "disabled",
+            Some(24),
+            "online",
+            Some(2),
+            0
+        ));
+        assert!(!should_delete_disabled(
+            "disabled",
+            Some(25),
+            "offline",
+            Some(2),
+            0
+        ));
+        assert!(!should_delete_disabled(
+            "disabled",
+            Some(25),
+            "online",
+            Some(1),
+            0
+        ));
+        assert!(!should_delete_disabled(
+            "disabled",
+            Some(25),
+            "online",
+            Some(2),
+            1
+        ));
     }
 
     #[test]
