@@ -12201,6 +12201,17 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// Process liveness for research orchestrators. The research sweeper uses this
+/// heartbeat instead of wall-clock session age.
+pub const SCHEMA_V261_RESEARCH_SESSION_HEARTBEAT: &str = r#"
+ALTER TABLE research_sessions
+    ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+CREATE INDEX IF NOT EXISTS idx_research_sessions_live_heartbeat
+    ON research_sessions (last_heartbeat_at)
+    WHERE status NOT IN ('done', 'failed');
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
