@@ -41,6 +41,7 @@ mod agents_cmd;
 mod alert_cmd;
 mod arbiter_cmd;
 mod backends_cmd;
+mod bench_cmd;
 mod brain_cmd;
 mod build_cmd;
 mod cli_bridge_cmd;
@@ -200,6 +201,11 @@ enum Command {
         /// Emit JSON instead of a table.
         #[arg(long)]
         json: bool,
+    },
+    /// Run the fixed, sealed ForgeFleet SWE bug-fix evaluation suite.
+    Bench {
+        #[command(subcommand)]
+        command: bench_cmd::BenchCommand,
     },
     /// Inspect routing candidates and budget rejections without dispatching.
     Route {
@@ -4498,6 +4504,7 @@ async fn main() -> Result<()> {
             timeout,
         }) => backends_cmd::handle_backends(probe_auth, json, timeout).await,
         Some(Command::Usage { json }) => usage_cmd::handle_usage(json).await,
+        Some(Command::Bench { command }) => bench_cmd::run(command).await,
         Some(Command::Nodes { gpu, json }) => helpers::handle_nodes(gpu.as_deref(), json).await,
         Some(Command::Models) => lifecycle_cmd::handle_models(&agent_config).await,
         Some(Command::Health) => health_cmd::handle_health(&agent_config).await,
