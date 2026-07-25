@@ -376,6 +376,7 @@ async fn resolve_summarizer(pool: &PgPool) -> Result<(String, String)> {
         max_health_age_sec: Some(ff_db::queries::DISPATCH_HEALTH_MAX_AGE_SEC),
         prefer_least_loaded: true,
         limit: 8,
+        bandit_seed: None,
     };
     let candidates = ff_db::pg_route_deployments(pool, &filter)
         .await

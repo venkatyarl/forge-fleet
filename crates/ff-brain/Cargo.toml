@@ -10,6 +10,7 @@ description = "ForgeFleet Virtual Brain — knowledge graph, context selection, 
 ff-core = { path = "../ff-core" }
 ff-db = { path = "../ff-db" }
 ff-agent = { path = "../ff-agent" }
+ff-skills = { path = "../ff-skills" }
 
 tokio.workspace = true
 serde.workspace = true

@@ -203,6 +203,32 @@ impl SkillSelector {
     }
 }
 
+/// Deterministic lexical fallback shared by catalog-backed selectors when a
+/// real embedding endpoint is unavailable. This intentionally uses the same
+/// tokenizer as [`SkillSelector`] so degraded semantic lookup does not invent
+/// a second set of matching rules.
+pub fn lexical_relevance(query: &str, name: &str, description: &str) -> f64 {
+    let tokens = tokenize(query);
+    if tokens.is_empty() {
+        return 0.0;
+    }
+    let name = name.to_lowercase();
+    let description = description.to_lowercase();
+    let mut score = 0.0;
+    for token in &tokens {
+        if name.contains(token) {
+            score += 10.0;
+        }
+        if description.contains(token) {
+            score += 3.0;
+        }
+    }
+    if name == tokens.join(" ") {
+        score *= 2.0;
+    }
+    score / (tokens.len() as f64 * 20.0)
+}
+
 // ─── Tokenization ────────────────────────────────────────────────────────────
 
 /// Tokenize a query string into lowercase search tokens.

@@ -43,6 +43,7 @@ mod arbiter_cmd;
 mod backends_cmd;
 mod brain_cmd;
 mod build_cmd;
+mod capability_cmd;
 mod cli_bridge_cmd;
 mod cloud_llm_cmd;
 mod codegen_cmd;
@@ -320,6 +321,18 @@ enum Command {
         /// Target repo URL or project_repos id. Wins over --cwd.
         #[arg(long)]
         repo: Option<String>,
+    },
+    /// Ask the capability broker "do you have X?" before installing or
+    /// inventing a new skill, tool, or model-backed task route.
+    Capability {
+        /// Natural-language capability need.
+        need: String,
+        /// Restrict lookup to one source; omitted searches all sources.
+        #[arg(long, value_parser = ["skill", "tool", "task"])]
+        kind: Option<String>,
+        /// Emit a human-readable summary instead of canonical JSON.
+        #[arg(long)]
+        text: bool,
     },
     /// Credit-saver: offload a heavy, low-architectural-subtlety task to a
     /// WARM tool-capable local LLM on the fleet (bulk codegen, mechanical
@@ -4612,6 +4625,9 @@ async fn main() -> Result<()> {
             project,
             repo,
         }) => build_cmd::handle_build(goal, project, cli.cwd.clone(), repo).await,
+        Some(Command::Capability { need, kind, text }) => {
+            capability_cmd::handle_capability(&need, kind.as_deref(), text).await
+        }
         Some(Command::Offload {
             prompt,
             output,

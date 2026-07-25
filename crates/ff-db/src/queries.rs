@@ -1440,6 +1440,9 @@ pub struct RouteFilter {
     pub prefer_least_loaded: bool,
     /// Max candidates to return (scored best-first). Defaults to 3 if 0.
     pub limit: i64,
+    /// Seed for Autopilot-4's deterministic epsilon-greedy split. `None`
+    /// preserves the historical least-loaded ordering.
+    pub bandit_seed: Option<u64>,
 }
 
 /// `LEFT JOIN LATERAL` that pulls each host's recent retained metrics (raw for
@@ -1633,6 +1636,39 @@ fn offload_sort_key(
     )
 }
 
+/// Fraction of eligible requests used to explore a same-tier sibling.
+pub const BANDIT_EPSILON: f64 = 0.2;
+
+fn bandit_explore_index(tie_count: usize, seed: u64) -> Option<usize> {
+    if tie_count < 2 {
+        return None;
+    }
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    if rng.gen_range(0.0f64..1.0) >= BANDIT_EPSILON {
+        return None;
+    }
+    Some(rng.gen_range(0..tie_count))
+}
+
+fn apply_bandit_split(
+    mut candidates: Vec<RouteCandidate>,
+    bandit_seed: Option<u64>,
+) -> Vec<RouteCandidate> {
+    let Some(seed) = bandit_seed else {
+        return candidates;
+    };
+    let Some(first) = candidates.first() else {
+        return candidates;
+    };
+    let top_tier = first.tier;
+    let tie_count = candidates.iter().take_while(|c| c.tier == top_tier).count();
+    if let Some(index) = bandit_explore_index(tie_count, seed) {
+        candidates.swap(0, index);
+    }
+    candidates
+}
+
 /// The shared scored selector over `fleet_model_deployments JOIN
 /// fleet_model_catalog`. This is the one place the routing scorer lives — the
 /// `fleet_route` MCP tool and the agent-capable router both call it so there's
@@ -1749,7 +1785,7 @@ pub async fn pg_route_deployments(
         .fetch_all(pool)
         .await?;
 
-    Ok(rows
+    let candidates = rows
         .iter()
         .map(|r| {
             let worker_name: String = r.try_get("worker_name").unwrap_or_default();
@@ -1778,7 +1814,8 @@ pub async fn pg_route_deployments(
                 llm_active_requests: r.try_get("load_active_requests").ok(),
             }
         })
-        .collect())
+        .collect();
+    Ok(apply_bandit_split(candidates, filter.bandit_seed))
 }
 
 /// Pick the best agent-capable deployment: tool-calling model + enough per-slot
@@ -1800,7 +1837,8 @@ pub async fn pg_pick_agent_endpoint(
         // Live agent dispatch: among equal-tier capable hosts, land on the
         // least-loaded one instead of whichever last heartbeated.
         prefer_least_loaded: true,
-        limit: 1,
+        limit: 8,
+        bandit_seed: Some(rand::random()),
     };
     Ok(pg_route_deployments(pool, &filter)
         .await?
@@ -1906,6 +1944,7 @@ pub async fn pg_pick_offload_endpoint(
         // Live offload dispatch: spread equal-tier candidates by real load.
         prefer_least_loaded: true,
         limit: 8,
+        bandit_seed: Some(rand::random()),
     };
 
     // 1) workload-matching candidates (e.g. coders for code kinds).
@@ -1937,6 +1976,40 @@ pub async fn pg_pick_offload_endpoint(
         .count();
     let pick = rand::Rng::gen_range(&mut rand::thread_rng(), 0..tied_best);
     Ok(cands.into_iter().nth(pick))
+}
+
+/// Rolling 48-hour reward used by the Autopilot-4 reconciler.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelRewardStats {
+    pub model_id: String,
+    pub builds: i64,
+    pub approve_pct: Option<f64>,
+}
+
+pub async fn pg_model_reward_stats_48h(pool: &PgPool) -> Result<Vec<ModelRewardStats>> {
+    let rows = sqlx::query(
+        "SELECT model_id, builds_48h AS builds, approve_pct_48h AS approve_pct \
+           FROM v_model_utilization",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|row| ModelRewardStats {
+            model_id: row.try_get("model_id").unwrap_or_default(),
+            builds: row.try_get("builds").unwrap_or(0),
+            approve_pct: row.try_get("approve_pct").ok(),
+        })
+        .collect())
+}
+
+pub async fn pg_set_catalog_tier(pool: &PgPool, id: &str, tier: i32) -> Result<()> {
+    sqlx::query("UPDATE fleet_model_catalog SET tier = $1, updated_at = NOW() WHERE id = $2")
+        .bind(tier.max(1))
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 // ─── Orchestrator P2: per-session demand sensing ─────────────────────────────
@@ -4597,6 +4670,48 @@ mod tests {
 
     fn route_candidate(worker: &str, tier: i32) -> RouteCandidate {
         route_candidate_rt(worker, tier, "llama.cpp")
+    }
+
+    #[test]
+    fn bandit_choice_is_deterministic_for_a_seed() {
+        for seed in [0, 1, 42, 999, u64::MAX] {
+            assert_eq!(bandit_explore_index(4, seed), bandit_explore_index(4, seed));
+        }
+    }
+
+    #[test]
+    fn bandit_only_reorders_the_best_tier() {
+        let candidates = vec![
+            route_candidate("incumbent", 1),
+            route_candidate("challenger", 1),
+            route_candidate("worse-tier", 2),
+        ];
+        let mut explored = false;
+        for seed in 0..200 {
+            let output = apply_bandit_split(candidates.clone(), Some(seed));
+            assert_ne!(output[0].worker_name, "worse-tier");
+            explored |= output[0].worker_name == "challenger";
+        }
+        assert!(explored);
+        let unchanged = apply_bandit_split(candidates, None);
+        assert_eq!(
+            unchanged
+                .iter()
+                .map(|candidate| candidate.worker_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["incumbent", "challenger", "worse-tier"],
+            "no seed preserves least-loaded order"
+        );
+    }
+
+    #[test]
+    fn bandit_exploration_rate_tracks_epsilon() {
+        let trials = 5_000;
+        let explored = (0..trials)
+            .filter(|seed| bandit_explore_index(3, *seed).is_some())
+            .count();
+        let rate = explored as f64 / trials as f64;
+        assert!((rate - BANDIT_EPSILON).abs() < 0.03);
     }
 
     #[test]

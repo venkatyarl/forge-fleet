@@ -36,6 +36,7 @@ use tracing::{debug, info, warn};
 use crate::coverage_guard::CoverageGuard;
 use crate::deployment_catalog_reconciler::DeploymentCatalogReconciler;
 use crate::external_tools_upstream::ExternalToolsUpstreamChecker;
+use crate::model_bandit_reconciler::ModelBanditReconciler;
 use crate::model_scout::ModelScout;
 use crate::model_upstream::ModelUpstreamChecker;
 use crate::sub_agent_reaper::SubAgentReaper;
@@ -114,6 +115,25 @@ pub fn spawn_portfolio_maintenance(
                     "model upstream tick"
                 ),
                 Err(e) => warn!(error = %e, "model upstream tick failed"),
+            }
+        },
+    ));
+
+    handles.push(spawn_leader_gated(
+        pool.clone(),
+        worker_name.clone(),
+        "model-bandit-reconciler",
+        Duration::from_secs(2 * MIN),
+        Duration::from_secs(24 * HOUR),
+        shutdown.clone(),
+        |pool| async move {
+            match ModelBanditReconciler::new(pool).daily_pass().await {
+                Ok(report) => info!(
+                    groups = report.groups_evaluated,
+                    actions = report.actions.len(),
+                    "model bandit daily pass complete"
+                ),
+                Err(error) => warn!(%error, "model bandit daily pass failed"),
             }
         },
     ));

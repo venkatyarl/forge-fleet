@@ -12201,6 +12201,11 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// Autopilot-4's rolling 48-hour reward columns. This also materializes the
+/// Autopilot-1 view on databases rebuilt from this branch.
+pub const SCHEMA_V261_MODEL_UTILIZATION_48H_REWARD: &str =
+    include_str!("migrations/20260725010000_model_utilization_48h_reward.sql");
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

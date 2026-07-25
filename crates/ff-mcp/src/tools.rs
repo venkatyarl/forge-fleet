@@ -72,6 +72,7 @@ impl ToolRegistry {
         self.register(Self::fleet_offload());
         self.register(Self::fleet_cascade());
         self.register(Self::fleet_route());
+        self.register(Self::ff_capability_check());
         self.register(Self::fleet_scan());
         self.register(Self::fleet_install_model());
         self.register(Self::fleet_wait());
@@ -576,6 +577,28 @@ impl ToolRegistry {
                     }
                 },
                 "required": ["workload"]
+            }),
+        }
+    }
+
+    fn ff_capability_check() -> ToolDefinition {
+        ToolDefinition {
+            name: "ff_capability_check".to_string(),
+            description: "Check whether ForgeFleet can satisfy a skill, tool, or task need. Searches the shared skill catalog, external-tool registry, or healthy model capability router and returns the best local match when one exists. Use this query surface FIRST before inventing or installing a capability.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "need": {
+                        "type": "string",
+                        "description": "Natural-language capability need, such as \"edit PDFs\", \"terraform\", or \"vision\"."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["skill", "tool", "task"],
+                        "description": "Catalog to resolve against."
+                    }
+                },
+                "required": ["need", "kind"]
             }),
         }
     }
@@ -1944,6 +1967,7 @@ mod tests {
             "fleet_offload",
             "fleet_cascade",
             "fleet_route",
+            "ff_capability_check",
             "fleet_scan",
             "fleet_install_model",
             "fleet_wait",
