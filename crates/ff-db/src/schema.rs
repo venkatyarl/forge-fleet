@@ -12201,6 +12201,43 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+pub const SCHEMA_V261_RESEARCH_SESSION_HEARTBEAT: &str = r#"
+ALTER TABLE research_sessions
+    ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_research_sessions_heartbeat
+    ON research_sessions (last_heartbeat_at)
+    WHERE status NOT IN ('done', 'failed');
+"#;
+
+/// V262 — GLM/Devstral builder A/B attribution and percentage scoreboard.
+pub const SCHEMA_V262_GLM_45_AIR_AB_SCOREBOARD: &str = r#"
+UPDATE fleet_model_catalog SET tier = 2, updated_at = NOW()
+WHERE id = 'glm-4.5-air';
+
+CREATE OR REPLACE VIEW v_builder_stats AS
+SELECT
+    builder,
+    COUNT(*) AS attempts,
+    COUNT(*) FILTER (WHERE review_verdict = 'approve') AS approved,
+    COUNT(*) FILTER (WHERE review_verdict = 'reject') AS rejected,
+    COUNT(*) FILTER (WHERE status = 'merged') AS merged,
+    ROUND(
+        100.0 * COUNT(*) FILTER (WHERE review_verdict = 'approve')
+        / NULLIF(COUNT(*) FILTER (WHERE review_verdict IN ('approve', 'reject')), 0),
+        2
+    ) AS approve_pct,
+    MIN(enqueued_at) AS since,
+    ROUND(
+        100.0 * COUNT(*) FILTER (WHERE status = 'merged')
+        / NULLIF(COUNT(*), 0),
+        2
+    ) AS merge_pct
+FROM work_item_merge_queue
+WHERE builder IS NOT NULL
+GROUP BY builder;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

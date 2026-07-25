@@ -6,6 +6,92 @@
 use chrono::{DateTime, Utc};
 use ff_capacity::{BackendCapacity, CapacitySnapshot, InferenceDeployment};
 use serde::Serialize;
+use sqlx::{PgPool, Row};
+
+/// One ordered step in a workload's database-defined routing ladder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rung {
+    LocalModel(String),
+    Ring(String),
+    CloudBackend(String),
+}
+
+fn parse_rung(kind: &str, target: String) -> Option<Rung> {
+    match kind {
+        "local_model" => Some(Rung::LocalModel(target)),
+        "ring" => Some(Rung::Ring(target)),
+        "cloud_backend" => Some(Rung::CloudBackend(target)),
+        _ => None,
+    }
+}
+
+/// Load a workload ladder in its declared order.
+///
+/// Missing tables and malformed rows fail open to an empty ladder so callers
+/// retain their pre-ladder fallback during rolling deployment.
+pub async fn load_ladder(pool: &PgPool, workload: &str) -> Vec<Rung> {
+    let rows = match sqlx::query(
+        "SELECT rung_kind, target FROM routing_ladders \
+         WHERE workload = $1 ORDER BY position",
+    )
+    .bind(workload)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut ladder = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Ok(kind) = row.try_get::<String, _>("rung_kind") else {
+            return Vec::new();
+        };
+        let Ok(target) = row.try_get::<String, _>("target") else {
+            return Vec::new();
+        };
+        let Some(rung) = parse_rung(&kind, target) else {
+            return Vec::new();
+        };
+        ladder.push(rung);
+    }
+    ladder
+}
+
+/// Pick the local model for a dispatch attempt while retaining one fixed total
+/// local-attempt budget across all configured local rungs.
+pub fn local_rung_for_attempt(ladder: &[Rung], attempts: u32) -> Option<&str> {
+    if attempts >= LOCAL_LANE_MAX_TRIES {
+        return None;
+    }
+    let local: Vec<_> = ladder
+        .iter()
+        .filter_map(|rung| match rung {
+            Rung::LocalModel(target) => Some(target.as_str()),
+            _ => None,
+        })
+        .collect();
+    (!local.is_empty()).then(|| local[attempts as usize % local.len()])
+}
+
+/// Return the ring target, if the workload declares one.
+pub fn ring_rung(ladder: &[Rung]) -> Option<&str> {
+    ladder.iter().find_map(|rung| match rung {
+        Rung::Ring(target) => Some(target.as_str()),
+        _ => None,
+    })
+}
+
+/// Return cloud backends in their declared failover order.
+pub fn cloud_rungs(ladder: &[Rung]) -> Vec<&str> {
+    ladder
+        .iter()
+        .filter_map(|rung| match rung {
+            Rung::CloudBackend(target) => Some(target.as_str()),
+            _ => None,
+        })
+        .collect()
+}
 
 /// A routing tier, ordered from cheapest to most expensive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -507,6 +593,34 @@ mod tests {
         let mut backends = vec!["grok", "claude", "codex", "kimi", "gemini"];
         backends.sort_by_key(|backend| backend_rank(backend));
         assert_eq!(backends, ["codex", "claude", "kimi", "gemini", "grok"]);
+    }
+
+    #[test]
+    fn ladder_parses_rungs_and_selects_by_attempt() {
+        let ladder = [
+            ("local_model", "devstral-small-2-24b"),
+            ("local_model", "glm-4.5-air"),
+            ("ring", "qwen3-coder-480b"),
+            ("cloud_backend", "codex"),
+            ("cloud_backend", "kimi"),
+        ]
+        .into_iter()
+        .map(|(kind, target)| parse_rung(kind, target.into()).unwrap())
+        .collect::<Vec<_>>();
+
+        assert_eq!(parse_rung("unknown", "target".into()), None);
+        assert_eq!(
+            local_rung_for_attempt(&ladder, 0),
+            Some("devstral-small-2-24b")
+        );
+        assert_eq!(local_rung_for_attempt(&ladder, 1), Some("glm-4.5-air"));
+        assert_eq!(
+            local_rung_for_attempt(&ladder, 2),
+            Some("devstral-small-2-24b")
+        );
+        assert_eq!(local_rung_for_attempt(&ladder, 3), None);
+        assert_eq!(ring_rung(&ladder), Some("qwen3-coder-480b"));
+        assert_eq!(cloud_rungs(&ladder), ["codex", "kimi"]);
     }
 
     #[test]
