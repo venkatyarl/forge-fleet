@@ -215,7 +215,9 @@ pub async fn detect_backends(probe_auth: bool, timeout: Duration) -> Vec<Backend
                 path,
                 version: None,
                 authenticated: None,
-                detail: "operator-reserved — not probed (avoids churning the operator's OAuth token)".to_string(),
+                detail:
+                    "operator-reserved — not probed (avoids churning the operator's OAuth token)"
+                        .to_string(),
             });
             continue;
         }

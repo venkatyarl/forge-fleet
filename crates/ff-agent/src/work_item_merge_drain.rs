@@ -24,9 +24,13 @@ use crate::reconciliation_audit::{PgAuditStore, ReconciliationAction, Reconcilia
 
 /// Short per-review-backend caps so a dead reviewer cannot stall the serial
 /// merge drain on one PR for minutes at a time.
+#[allow(dead_code)]
 const REVIEW_480B_TIMEOUT: Duration = Duration::from_secs(60);
+#[allow(dead_code)]
 const REVIEW_LOCAL_POOL_TIMEOUT: Duration = Duration::from_secs(60);
+#[allow(dead_code)]
 const REVIEW_CLOUD_TIMEOUT: Duration = Duration::from_secs(75);
+#[allow(dead_code)]
 const REVIEW_LOCAL_FIX_ATTEMPTS: u32 = 2;
 const SEMANTIC_MERGE_RESET_MARKER: &str =
     "semantic merge conflict (compile failure after clean merge) — auto-reset for rebuild";
@@ -384,6 +388,7 @@ pub async fn evaluate_merge_queue(
     }
 }
 
+#[allow(dead_code)]
 async fn run_pr_review(
     pg: &PgPool,
     pr_url: &str,
@@ -411,6 +416,7 @@ async fn run_pr_review(
     review_ladder(pg, work_item_id, pr_url, &title, description.as_deref()).await
 }
 
+#[allow(dead_code)]
 async fn build_pr_review_prompt(
     pr_url: &str,
     title: &str,
@@ -456,6 +462,7 @@ async fn build_pr_review_prompt(
 /// local 30B pool or a cloud CLI so one local misjudgement cannot fail a good
 /// PR. If the 480B ring is unavailable, the same local-to-cloud fallback keeps
 /// the drain moving; exhausting the ladder returns an error for manual review.
+#[allow(dead_code)]
 async fn legacy_review_ladder(
     pg: &PgPool,
     work_item_id: uuid::Uuid,
@@ -502,6 +509,7 @@ async fn legacy_review_ladder(
 /// Cost-optimal ladder: a strong local approval is final; a weak local
 /// approval gets one cloud confirmation. Rejections never spend cloud money:
 /// a local coder repairs the PR head and the refreshed diff is reviewed again.
+#[allow(dead_code)]
 async fn review_ladder(
     pg: &PgPool,
     work_item_id: uuid::Uuid,
@@ -574,6 +582,7 @@ async fn review_ladder(
     }
 }
 
+#[allow(dead_code)]
 async fn review_ladder_mode(pg: &PgPool) -> String {
     ff_db::pg_read_gate_value(pg, "review_ladder_mode", "cost_optimal", "cost_optimal")
         .await
@@ -585,6 +594,7 @@ async fn review_ladder_mode(pg: &PgPool) -> String {
 /// released when the PR enters the queue and may already contain another
 /// task, so it is never safe for the merge drain to mutate that path.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 async fn local_fix_pr(
     pg: &PgPool,
     work_item_id: uuid::Uuid,
@@ -680,6 +690,7 @@ async fn local_fix_pr(
     result
 }
 
+#[allow(dead_code)]
 async fn run_fix_command(
     program: &str,
     args: &[&str],
@@ -712,6 +723,7 @@ async fn run_fix_command(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn record_fix_interaction(
     pg: &PgPool,
     work_item_id: uuid::Uuid,
@@ -749,6 +761,7 @@ async fn record_fix_interaction(
 /// Fallback review ladder after the primary 480B reviewer: try the local 30B
 /// pool first, then cloud CLIs. A working local review beats burning the whole
 /// tick on cloud backends while a healthy on-fleet coder sits idle.
+#[allow(dead_code)]
 async fn fallback_review(
     pg: &PgPool,
     work_item_id: uuid::Uuid,
@@ -771,6 +784,7 @@ async fn fallback_review(
 /// PR review on ANY healthy local model (typically the 30B coder pool).
 /// Routes via `fleet_oneshot` with a coder hint; a short timeout keeps a slow
 /// node from stalling the drain.
+#[allow(dead_code)]
 async fn local_pool_review(
     pg: &PgPool,
     work_item_id: uuid::Uuid,
@@ -812,6 +826,7 @@ const REVIEWER_480B_HINT: &str = "480b";
 /// Primary PR review on the 480B ring. `Err` means the ring is unavailable
 /// (routing failed, timed out, or `fleet_oneshot` failed over to some other
 /// model) — the caller falls back to the cloud review path.
+#[allow(dead_code)]
 async fn review_via_480b(
     pg: &PgPool,
     work_item_id: uuid::Uuid,
@@ -862,6 +877,7 @@ pub(crate) fn served_by_480b(model: &str) -> bool {
 /// One cloud CLI review pass — first backend that produces output wins, so a
 /// leader node missing one vendor CLI still gets a review. Returns
 /// `(approved, reason, backend)`.
+#[allow(dead_code)]
 async fn cloud_cli_review(
     pg: &PgPool,
     work_item_id: uuid::Uuid,
@@ -939,6 +955,7 @@ async fn cloud_cli_review(
 /// data — part of the point of routing review through the fleet). Never fails
 /// the drain.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 async fn record_review_interaction(
     pg: &PgPool,
     work_item_id: uuid::Uuid,
@@ -1085,6 +1102,7 @@ enum PrReviewVerdict {
 /// `gh pr view <url> --json reviewDecision,latestReviews`. Any gh/parse error
 /// maps to `None` so a hiccup can never fail a healthy item or block the
 /// drain — worst case the drain just runs its own review.
+#[allow(dead_code)]
 async fn pr_review_verdict(pr_url: &str) -> PrReviewVerdict {
     let mut cmd = gh_cmd().await;
     cmd.args([
@@ -1492,6 +1510,7 @@ async fn gh_delete_branch(pr_url: &str) -> Result<()> {
     );
 }
 
+#[allow(dead_code)]
 async fn gh_pr_comment(pr_url: &str, body: &str) -> Result<()> {
     let mut cmd = gh_cmd().await;
     cmd.args(["pr", "comment", pr_url, "--body", body]);

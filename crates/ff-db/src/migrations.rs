@@ -21,6 +21,70 @@ struct PgMigration {
     sql: &'static str,
 }
 
+const PG_V261_FOUNDATIONAL_HAND_BUILT_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS ff_workstreams (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_key       TEXT NOT NULL UNIQUE,
+    git_remote        TEXT,
+    basename          TEXT,
+    aliases           JSONB DEFAULT '[]'::jsonb,
+    goal              TEXT,
+    working_summary   TEXT,
+    status            TEXT DEFAULT 'active',
+    leader_generation INTEGER DEFAULT 0,
+    updated_at        TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS workstream_threads (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workstream_id     UUID NOT NULL REFERENCES ff_workstreams(id),
+    label             TEXT,
+    status            TEXT DEFAULT 'active',
+    opened_by_session TEXT,
+    focus             TEXT,
+    created_at        TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS fleet_episodes (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workstream_id UUID,
+    thread_id     UUID,
+    source_kind   TEXT,
+    node          TEXT,
+    model         TEXT,
+    session_id    TEXT,
+    work_item_id  UUID,
+    seq           BIGINT,
+    ts            TIMESTAMPTZ DEFAULT NOW(),
+    role          TEXT,
+    content       TEXT,
+    redacted      BOOLEAN DEFAULT FALSE
+);
+
+CREATE TABLE IF NOT EXISTS routing_ladders (
+    workload  TEXT NOT NULL,
+    position  INTEGER NOT NULL,
+    rung_kind TEXT,
+    target    TEXT,
+    PRIMARY KEY (workload, position)
+);
+
+CREATE TABLE IF NOT EXISTS error_signatures (
+    signature      TEXT PRIMARY KEY,
+    error_class    TEXT,
+    first_seen     TIMESTAMPTZ DEFAULT NOW(),
+    last_seen      TIMESTAMPTZ DEFAULT NOW(),
+    count_24h      INTEGER DEFAULT 0,
+    count_total    INTEGER DEFAULT 0,
+    sample_text    TEXT,
+    affected_nodes JSONB,
+    state          TEXT DEFAULT 'new',
+    work_item_id   UUID,
+    fix_commit_sha TEXT,
+    resolved_at    TIMESTAMPTZ
+);
+"#;
+
 /// Postgres-only migrations. These run independently from the SQLite migrations
 /// above and use their own version sequence.
 static PG_MIGRATIONS: &[PgMigration] = &[
@@ -1199,6 +1263,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         version: 258,
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
+    },
+    PgMigration {
+        version: 261,
+        name: "foundational_hand_built_tables",
+        sql: PG_V261_FOUNDATIONAL_HAND_BUILT_TABLES,
     },
 ];
 
