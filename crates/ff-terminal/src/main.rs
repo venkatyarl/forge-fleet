@@ -4908,8 +4908,15 @@ async fn main() -> Result<()> {
         }
         Some(Command::Session { command }) => {
             if let SessionCommand::Export { vault, force } = &command {
-                let summary =
-                    ff_agent::session_export::export_local_sessions(vault.as_deref(), *force)?;
+                let pool = ff_agent::fleet_info::get_fleet_pool()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+                let summary = ff_agent::session_export::export_local_sessions(
+                    Some(&pool),
+                    vault.as_deref(),
+                    *force,
+                )
+                .await?;
                 println!(
                     "{GREEN}✓{RESET} scanned {}, exported {}, unchanged {}",
                     summary.scanned, summary.exported, summary.skipped

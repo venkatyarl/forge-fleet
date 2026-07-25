@@ -60,6 +60,8 @@ pub const SESSION_SCOPE_IDLE_SECS: i64 = 6 * 3600;
 /// Max session scopes archived per pass — bounds one pass's Brain-insert and
 /// delete work; the 30-min chain drains any backlog across passes.
 pub const MAX_SESSION_SWEEPS_PER_PASS: i64 = 16;
+/// Max already-persisted compaction episodes exposed as intake per pass.
+pub const MAX_EPISODE_INTAKE_PER_PASS: i64 = 16;
 
 /// fleet_secrets gate: `off`/`false`/`0`/`disabled`/`no` skips the pass body
 /// (the chain keeps ticking so flipping the gate back on needs no re-seed).
@@ -187,7 +189,23 @@ pub async fn run_dreamer_pass(pool: &PgPool) -> Result<serde_json::Value> {
         }
     }
 
-    // 2) Re-enforce caps on durable scopes (no-op unless a cap was lowered or
+    // 2) Episodes are written directly to the knowledge-candidate intake queue
+    //    by the exporters. Surface a bounded pending batch to this pass so the
+    //    Dreamer treats hosted-CLI compactions as first-class intake.
+    let episodes_intaken: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (
+             SELECT 1 FROM brain_knowledge_candidates
+              WHERE kind = 'episode' AND status = 'pending'
+              ORDER BY created_at
+              LIMIT $1
+         ) pending_episodes",
+    )
+    .bind(MAX_EPISODE_INTAKE_PER_PASS)
+    .fetch_one(pool)
+    .await
+    .context("list compaction episode intake")?;
+
+    // 3) Re-enforce caps on durable scopes (no-op unless a cap was lowered or
     //    a previous consolidation crashed mid-way).
     let durable: Vec<(String, String)> = sqlx::query_as(
         "SELECT DISTINCT scope_type, scope_key FROM agent_memory
@@ -213,15 +231,19 @@ pub async fn run_dreamer_pass(pool: &PgPool) -> Result<serde_json::Value> {
         }
     }
 
-    if sessions_archived > 0 || scopes_consolidated > 0 {
+    if sessions_archived > 0 || episodes_intaken > 0 || scopes_consolidated > 0 {
         info!(
             sessions_archived,
-            blocks_archived, scopes_consolidated, "dreamer: consolidation pass did work"
+            blocks_archived,
+            episodes_intaken,
+            scopes_consolidated,
+            "dreamer: consolidation pass did work"
         );
     }
     Ok(serde_json::json!({
         "sessions_archived": sessions_archived,
         "blocks_archived": blocks_archived,
+        "episodes_intaken": episodes_intaken,
         "over_cap_scopes_consolidated": scopes_consolidated,
     }))
 }
@@ -260,5 +282,6 @@ mod tests {
         assert!(DREAMER_INTERVAL_SECS >= MIN_INTERVAL_SECS);
         assert!(SESSION_SCOPE_IDLE_SECS > DREAMER_INTERVAL_SECS);
         assert!(MAX_SESSION_SWEEPS_PER_PASS > 0);
+        assert!(MAX_EPISODE_INTAKE_PER_PASS > 0);
     }
 }
