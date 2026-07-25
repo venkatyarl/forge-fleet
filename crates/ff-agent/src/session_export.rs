@@ -10,11 +10,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Datelike, Local};
+use chrono::{DateTime, Datelike, Local, Utc};
+use ff_core::schema::basic_memory::BasicMemoryFrontmatter;
 use regex::Regex;
 use serde_json::Value;
+use sqlx::PgPool;
 
 const PART_BYTES: usize = 900 * 1024;
+const MIN_EPISODE_BYTES: usize = 500;
 const VAULT_REL: &str = "projects/Yarli_KnowledgeBase/ForgeFleet/sessions";
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -26,7 +29,11 @@ pub struct ExportSummary {
 
 /// Export all locally present Claude Code, Codex, and Kimi JSONL sessions.
 /// Non-Adele nodes stage the exact vault-relative tree and rsync it to Adele.
-pub fn export_local_sessions(vault_override: Option<&Path>, force: bool) -> Result<ExportSummary> {
+pub async fn export_local_sessions(
+    pg: Option<&PgPool>,
+    vault_override: Option<&Path>,
+    force: bool,
+) -> Result<ExportSummary> {
     let home = dirs::home_dir().context("home directory is unavailable")?;
     let computer = computer_name();
     let direct_vault = vault_override
@@ -50,8 +57,29 @@ pub fn export_local_sessions(vault_override: Option<&Path>, force: bool) -> Resu
             summary.skipped += 1;
             continue;
         }
-        let markdown = render_jsonl(&source.path, source.vendor, &computer)?;
+        let (markdown, episodes) = render_jsonl(&source.path, source.vendor, &computer)?;
         write_parts(&target, &markdown)?;
+        if let Some(pg) = pg {
+            for episode in episodes {
+                if let Err(error) = ff_core::obsidian_export::upsert_compaction_episode(
+                    pg,
+                    &episode.session_id,
+                    &episode.project,
+                    &episode.title,
+                    episode.ts,
+                    &episode.body,
+                    true,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        session_id = %episode.session_id,
+                        error = %error,
+                        "session export: compaction episode persistence failed"
+                    );
+                }
+            }
+        }
         summary.exported += 1;
     }
 
@@ -71,6 +99,14 @@ enum Vendor {
 struct Source {
     path: PathBuf,
     vendor: Vendor,
+}
+
+struct EpisodeDraft {
+    session_id: String,
+    ts: DateTime<Utc>,
+    project: String,
+    title: String,
+    body: String,
 }
 
 fn collect_jsonl(dir: &Path, vendor: Vendor, out: &mut Vec<Source>) -> Result<()> {
@@ -198,7 +234,17 @@ fn first_project_from_jsonl(path: &Path) -> Option<String> {
     None
 }
 
-fn render_jsonl(path: &Path, vendor: Vendor, computer: &str) -> Result<String> {
+fn render_jsonl(
+    path: &Path,
+    vendor: Vendor,
+    computer: &str,
+) -> Result<(String, Vec<EpisodeDraft>)> {
+    let fallback_session = first_session_id(path).unwrap_or_else(|| path.display().to_string());
+    let fallback_project = first_project_from_jsonl(path).unwrap_or_else(|| match vendor {
+        Vendor::Claude => "claude".into(),
+        Vendor::Codex => "codex".into(),
+        Vendor::Kimi => "kimi".into(),
+    });
     let mut out = format!(
         "---\nsource: {}\ncomputer: {}\nredacted: true\n---\n\n# Session {}\n\n",
         vendor_name(vendor),
@@ -207,6 +253,7 @@ fn render_jsonl(path: &Path, vendor: Vendor, computer: &str) -> Result<String> {
             .and_then(|s| s.to_str())
             .unwrap_or("unknown")
     );
+    let mut episodes = Vec::new();
     let file = fs::File::open(path)?;
     for line in BufReader::new(file).lines() {
         let line = line?;
@@ -216,9 +263,84 @@ fn render_jsonl(path: &Path, vendor: Vendor, computer: &str) -> Result<String> {
         if is_system_reminder(&value) {
             continue;
         }
+        if let Some(episode) =
+            compaction_episode(&value, &fallback_session, &fallback_project, vendor)
+        {
+            episodes.push(episode);
+        }
         render_value(&value, &mut out);
     }
-    Ok(redact(&out))
+    Ok((redact(&out), episodes))
+}
+
+fn compaction_episode(
+    value: &Value,
+    fallback_session: &str,
+    fallback_project: &str,
+    vendor: Vendor,
+) -> Option<EpisodeDraft> {
+    let content = [
+        "/summary",
+        "/payload/summary",
+        "/message/summary",
+        "/content",
+        "/payload/content",
+        "/message/content",
+    ]
+    .into_iter()
+    .find_map(|pointer| value.pointer(pointer))
+    .map(|content| {
+        let mut text = String::new();
+        flatten_content(content, &mut text);
+        text
+    })?;
+    let marked_by_record = ["/type", "/kind", "/payload/type", "/payload/kind"]
+        .into_iter()
+        .filter_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .any(|kind| {
+            let kind = kind.to_ascii_lowercase();
+            kind.contains("compact") || kind == "summary"
+        });
+    let marked_by_frontmatter = BasicMemoryFrontmatter::parse(&content).is_some_and(|(fm, _)| {
+        matches!(
+            fm.memory_type.trim().to_ascii_lowercase().as_str(),
+            "summary" | "compaction"
+        )
+    });
+    if !marked_by_record && !marked_by_frontmatter {
+        return None;
+    }
+    let body = BasicMemoryFrontmatter::parse(&content)
+        .map(|(_, body)| body)
+        .unwrap_or(content);
+    let body = redact(body.trim());
+    if body.len() <= MIN_EPISODE_BYTES {
+        return None;
+    }
+    let session_id = [
+        "/sessionId",
+        "/session_id",
+        "/payload/session_id",
+        "/payload/id",
+    ]
+    .into_iter()
+    .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+    .filter(|id| !id.is_empty())
+    .unwrap_or(fallback_session)
+    .to_string();
+    let ts = ["/timestamp", "/created_at", "/payload/timestamp"]
+        .into_iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|ts| ts.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now);
+    Some(EpisodeDraft {
+        session_id,
+        ts,
+        project: fallback_project.to_string(),
+        title: format!("{} compaction {}", vendor_name(vendor), ts.date_naive()),
+        body,
+    })
 }
 
 fn render_value(value: &Value, out: &mut String) {
@@ -485,5 +607,38 @@ mod tests {
         assert!(is_system_reminder(
             &serde_json::json!({"content":"<system-reminder>x"})
         ));
+    }
+
+    #[test]
+    fn compaction_episode_requires_more_than_500_bytes() {
+        let at_limit = serde_json::json!({
+            "type": "compaction",
+            "session_id": "session-1",
+            "timestamp": "2026-07-24T01:02:03Z",
+            "summary": "x".repeat(MIN_EPISODE_BYTES),
+        });
+        assert!(compaction_episode(&at_limit, "fallback", "forge-fleet", Vendor::Codex).is_none());
+
+        let over_limit = serde_json::json!({
+            "type": "summary",
+            "session_id": "session-1",
+            "timestamp": "2026-07-24T01:02:03Z",
+            "summary": "x".repeat(MIN_EPISODE_BYTES + 1),
+        });
+        let episode =
+            compaction_episode(&over_limit, "fallback", "forge-fleet", Vendor::Codex).unwrap();
+        assert_eq!(episode.session_id, "session-1");
+        assert_eq!(episode.ts.date_naive().to_string(), "2026-07-24");
+        assert_eq!(episode.body.len(), MIN_EPISODE_BYTES + 1);
+    }
+
+    #[test]
+    fn frontmatter_can_mark_a_compaction_episode() {
+        let note = format!(
+            "---\ntype: compaction\nproject: forge-fleet\n---\n{}",
+            "x".repeat(MIN_EPISODE_BYTES + 1)
+        );
+        let value = serde_json::json!({"content": note});
+        assert!(compaction_episode(&value, "session-2", "forge-fleet", Vendor::Claude).is_some());
     }
 }

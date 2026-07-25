@@ -16,11 +16,177 @@ use anyhow::Context;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use tracing::{error, info, warn};
 
 use crate::config::{FleetConfig, ObsidianExportConfig};
-use crate::schema::basic_memory::BasicMemoryFrontmatter;
+use crate::schema::basic_memory::{BasicMemoryFrontmatter, extract_relations};
+
+const MIN_COMPACTION_EPISODE_BYTES: usize = 500;
+
+/// Persist a hosted-CLI compaction summary as a durable Brain episode.
+///
+/// `marked_compaction` is used for vendor JSON records whose type/kind carries
+/// the marker. Markdown callers may pass false and rely on basic-memory
+/// frontmatter with `type: summary` or `type: compaction`.
+pub async fn upsert_compaction_episode(
+    pg: &PgPool,
+    session_id: &str,
+    project: &str,
+    title: &str,
+    ts: DateTime<Utc>,
+    note_or_body: &str,
+    marked_compaction: bool,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let parsed = BasicMemoryFrontmatter::parse(note_or_body);
+    let frontmatter_marks_compaction = parsed.as_ref().is_some_and(|(fm, _)| {
+        matches!(
+            fm.memory_type.trim().to_ascii_lowercase().as_str(),
+            "summary" | "compaction"
+        )
+    });
+    if !marked_compaction && !frontmatter_marks_compaction {
+        return Ok(false);
+    }
+    let body = parsed
+        .as_ref()
+        .map(|(_, body)| body.as_str())
+        .unwrap_or(note_or_body)
+        .trim();
+    if body.len() <= MIN_COMPACTION_EPISODE_BYTES {
+        return Ok(false);
+    }
+
+    let project = if project.trim().is_empty() {
+        "unknown"
+    } else {
+        project.trim()
+    };
+    let session_id = if session_id.trim().is_empty() {
+        "unknown"
+    } else {
+        session_id.trim()
+    };
+    let path = format!(
+        "episode://{}/{}/{}",
+        slugify(project),
+        slugify(session_id),
+        ts.date_naive()
+    );
+    let tags = vec![
+        "compaction".to_string(),
+        format!("session_id:{session_id}"),
+        format!("ts:{}", ts.to_rfc3339_opts(SecondsFormat::Secs, true)),
+    ];
+    let content_hash = format!("{:x}", Sha256::digest(body.as_bytes()));
+    let episode_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO brain_vault_nodes
+            (path, title, node_type, project, tags, from_thread, confidence,
+             content_hash, valid_from, provenance, updated_at)
+         VALUES ($1, $2, 'episode', $3, $4, $5, 1.0, $6, $7,
+                 'session-compaction', NOW())
+         ON CONFLICT (path) DO UPDATE SET
+            title = EXCLUDED.title, tags = EXCLUDED.tags,
+            content_hash = EXCLUDED.content_hash,
+            valid_from = EXCLUDED.valid_from, valid_until = NULL,
+            provenance = EXCLUDED.provenance, updated_at = NOW()
+         WHERE brain_vault_nodes.valid_from <= EXCLUDED.valid_from
+         RETURNING id",
+    )
+    .bind(&path)
+    .bind(title)
+    .bind(project)
+    .bind(&tags)
+    .bind(session_id)
+    .bind(&content_hash)
+    .bind(ts)
+    .fetch_optional(pg)
+    .await?
+    .unwrap_or_else(uuid::Uuid::nil);
+    if episode_id.is_nil() {
+        return Ok(false);
+    }
+
+    let user_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO brain_users (name, display_name)
+         VALUES ('venkat', 'Venkat')
+         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+         RETURNING id",
+    )
+    .fetch_one(pg)
+    .await?;
+    sqlx::query(
+        "WITH updated AS (
+             UPDATE brain_knowledge_candidates
+                SET title = $3, body = $4, tags = $5, project = $6,
+                    from_thread = $7, confidence = 1.0, status = 'pending',
+                    reviewed_at = NULL, created_at = NOW()
+              WHERE kind = 'episode' AND target_path = $2
+              RETURNING id
+         )
+         INSERT INTO brain_knowledge_candidates
+             (user_id, action, kind, title, body, tags, project, target_path,
+              from_thread, confidence)
+         SELECT $1, 'create', 'episode', $3, $4, $5, $6, $2, $7, 1.0
+          WHERE NOT EXISTS (SELECT 1 FROM updated)",
+    )
+    .bind(user_id)
+    .bind(&path)
+    .bind(title)
+    .bind(body)
+    .bind(&tags)
+    .bind(project)
+    .bind(session_id)
+    .execute(pg)
+    .await?;
+
+    for relation in extract_relations(body) {
+        let (node_type, canonical_path) = match relation.relation_type.as_str() {
+            "work_item" | "work-item" => (
+                "pm:work_item",
+                uuid::Uuid::parse_str(&relation.target)
+                    .ok()
+                    .map(|_| format!("pm://work_item/{}", relation.target)),
+            ),
+            "computer" => (
+                "fleet:computer",
+                Some(format!(
+                    "fleet://computer/{}",
+                    relation.target.to_ascii_lowercase()
+                )),
+            ),
+            _ => continue,
+        };
+        let target_id: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM brain_vault_nodes
+              WHERE valid_until IS NULL AND node_type = $1
+                AND (path = $2 OR lower(title) = lower($3))
+              ORDER BY (path = $2) DESC LIMIT 1",
+        )
+        .bind(node_type)
+        .bind(canonical_path.as_deref().unwrap_or(""))
+        .bind(&relation.target)
+        .fetch_optional(pg)
+        .await?;
+        if let Some(target_id) = target_id {
+            sqlx::query(
+                "INSERT INTO brain_vault_edges
+                    (src_id, dst_id, edge_type, confidence, provenance)
+                 VALUES ($1, $2, $3, 1.0, 'compaction-typed-link')
+                 ON CONFLICT (src_id, dst_id, edge_type) DO UPDATE SET
+                    confidence = EXCLUDED.confidence,
+                    provenance = EXCLUDED.provenance",
+            )
+            .bind(episode_id)
+            .bind(target_id)
+            .bind(&relation.relation_type)
+            .execute(pg)
+            .await?;
+        }
+    }
+    Ok(true)
+}
 
 /// A raw session transcript ready to be distilled into an Obsidian note.
 #[derive(Debug, Clone)]
@@ -354,8 +520,8 @@ pub async fn process_new_sessions(
     for session in &sessions {
         let transcript = session.to_transcript();
 
-        let (title, body) = match distill_session_to_note(config, &transcript).await {
-            Ok(raw) => normalize_distilled_output(&raw, &session.key),
+        let raw = match distill_session_to_note(config, &transcript).await {
+            Ok(raw) => raw,
             Err(e) => {
                 warn!(
                     session_id = %session.key,
@@ -365,10 +531,33 @@ pub async fn process_new_sessions(
                 continue;
             }
         };
+        let (title, body) = normalize_distilled_output(&raw, &session.key);
 
         let frontmatter = session.to_frontmatter(project_id, &title);
         let note = frontmatter.to_note(&body);
         let path = write_session_note(target_path, &session.key, &note)?;
+        let episode_ts = session
+            .rows
+            .last()
+            .map(|row| row.ts)
+            .unwrap_or_else(Utc::now);
+        if let Err(error) = upsert_compaction_episode(
+            pg,
+            &session.key,
+            project_id,
+            &title,
+            episode_ts,
+            &raw,
+            false,
+        )
+        .await
+        {
+            warn!(
+                session_id = %session.key,
+                error = %error,
+                "Obsidian export: compaction episode persistence failed"
+            );
+        }
         exported += 1;
 
         info!(
