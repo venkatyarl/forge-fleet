@@ -12201,6 +12201,33 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// V261 — Autopilot-5 model download watchlist and its verified initial seeds.
+pub const SCHEMA_V261_MODEL_DOWNLOAD_WATCHLIST: &str = r#"
+ALTER TABLE fleet_model_catalog
+    ADD COLUMN IF NOT EXISTS watchlist BOOLEAN NOT NULL DEFAULT FALSE;
+
+INSERT INTO fleet_model_catalog
+    (id, name, family, parameters, tier, description, gated, watchlist,
+     preferred_workloads, variants, tool_calling, license, lifecycle)
+VALUES
+    ('apriel-1.5-15b', 'Apriel 1.5 15B Thinker', 'apriel', '15B', 2,
+     'ServiceNow Apriel 1.5 reasoning model (verified MIT-licensed GGUF conversion).',
+     FALSE, TRUE, '["chat","reasoning","code","tool_calling"]'::jsonb,
+     '[{"runtime":"llama.cpp","quant":"Q4_K_M","hf_repo":"bartowski/ServiceNow-AI_Apriel-1.5-15b-Thinker-GGUF","size_gb":8.79,"allow_patterns":["*Q4_K_M.gguf"]}]'::jsonb,
+     TRUE, 'mit', 'active'),
+    ('qwen3-coder-next-80b', 'Qwen3 Coder Next 80B A3B', 'qwen', '80B', 3,
+     'Official Qwen coding-agent MoE model (80B total, 3B active).',
+     FALSE, TRUE, '["code","tool_calling","reasoning"]'::jsonb,
+     '[{"runtime":"llama.cpp","quant":"Q4_K_M","hf_repo":"Qwen/Qwen3-Coder-Next-GGUF","size_gb":48.4,"allow_patterns":["Qwen3-Coder-Next-Q4_K_M/*"]}]'::jsonb,
+     TRUE, 'apache-2.0', 'active')
+ON CONFLICT (id) DO UPDATE SET
+    watchlist = EXCLUDED.watchlist,
+    variants = EXCLUDED.variants,
+    license = EXCLUDED.license,
+    lifecycle = EXCLUDED.lifecycle,
+    updated_at = NOW();
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

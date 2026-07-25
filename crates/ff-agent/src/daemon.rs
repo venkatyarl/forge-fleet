@@ -88,6 +88,12 @@ impl TickRegistry {
                 runner: run_service_connectivity_tick,
             },
             TickDefinition {
+                name: "model_download_watchlist",
+                interval: Duration::from_secs(60 * 60),
+                scope: TickScope::EveryNode,
+                runner: run_model_download_watchlist_tick,
+            },
+            TickDefinition {
                 name: "session_transcript_export",
                 interval: Duration::from_secs(300),
                 scope: TickScope::EveryNode,
@@ -288,6 +294,18 @@ fn run_service_connectivity_tick(
         .await
         .map(|_| ())
         .map_err(anyhow::Error::from)
+    })
+}
+
+fn run_model_download_watchlist_tick(
+    pg: PgPool,
+    worker_name: String,
+) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::model_watchlist::reconcile(&pg, &worker_name)
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::msg)
     })
 }
 
