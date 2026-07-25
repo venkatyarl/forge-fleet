@@ -724,6 +724,21 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
             if let Ok((cfg2, _)) = load_config_auto() {
                 tokio::spawn(async move {
                     if let Ok(pool) = get_pg_pool(&cfg2).await {
+                        let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
+                        let mut usage = ff_db::FleetToolUsageRecord::new(
+                            "mcp",
+                            "fleet_run",
+                            true,
+                            worker,
+                            "success",
+                        );
+                        usage.latency_ms = Some(latency_ms);
+                        usage.tokens_in = tokens_in;
+                        usage.tokens_out = tokens_out;
+                        usage.input_summary = prompt_owned.chars().take(1024).collect();
+                        if let Err(e) = ff_db::pg_record_fleet_tool_usage(&pool, &usage).await {
+                            tracing::debug!("fleet_run Path-3 usage capture failed: {e}");
+                        }
                         let rec = ff_db::InteractionRecord {
                             channel: "mcp".to_string(),
                             request_text: prompt_owned,
@@ -920,6 +935,7 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                         // `backend.model` is a local deployment's model name /
                         // gguf filename — record the canonical local engine.
                         let engine_owned = ff_agent::llm_attribution::engine_label(&backend.model);
+                        let node_owned = backend.node.clone();
                         let latency_ms = latency.as_millis().min(i32::MAX as u128) as i32;
                         let tokens_in = payload
                             .get("usage")
@@ -934,6 +950,22 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                         let cfg_clone = config.clone();
                         tokio::spawn(async move {
                             if let Ok(pool) = get_pg_pool(&cfg_clone).await {
+                                let mut usage = ff_db::FleetToolUsageRecord::new(
+                                    "mcp",
+                                    "fleet_run",
+                                    true,
+                                    &node_owned,
+                                    "success",
+                                );
+                                usage.latency_ms = Some(latency_ms);
+                                usage.tokens_in = tokens_in;
+                                usage.tokens_out = tokens_out;
+                                usage.input_summary = prompt_owned.chars().take(1024).collect();
+                                if let Err(e) =
+                                    ff_db::pg_record_fleet_tool_usage(&pool, &usage).await
+                                {
+                                    tracing::debug!("fleet_run usage capture failed: {e}");
+                                }
                                 let rec = ff_db::InteractionRecord {
                                     channel: "mcp".to_string(),
                                     request_text: prompt_owned,
@@ -1095,6 +1127,19 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
             .await
             .map_err(|e| warn!(error = %e, "unmet demand signal write failed (mcp_offload)"))
             .is_ok();
+            let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
+            let mut usage = ff_db::FleetToolUsageRecord::new(
+                "mcp",
+                "fleet_offload",
+                false,
+                worker,
+                "do_in_cloud",
+            );
+            usage.cost_class = "cloud_fallback".to_string();
+            usage.input_summary = task.to_string();
+            if let Err(e) = ff_db::pg_record_fleet_tool_usage(&pool, &usage).await {
+                warn!(error = %e, "fleet_offload fallback usage write failed");
+            }
             return Ok(json!({
                 "offloaded": false,
                 "decision": "do_in_cloud",
@@ -1196,6 +1241,30 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
         .await
         .map_err(|e| format!("fleet_offload: failed parsing endpoint JSON: {e}"))?;
     let result = strip_think_block(&extract_completion_text(&payload).unwrap_or_default());
+    let mut usage = ff_db::FleetToolUsageRecord::new(
+        "mcp",
+        "fleet_offload",
+        true,
+        candidate.worker_name.clone(),
+        "success",
+    );
+    usage.latency_ms = Some(latency.as_millis().min(i32::MAX as u128) as i32);
+    usage.input_summary = task.to_string();
+    usage.tokens_in = payload
+        .get("usage")
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(|v| v.as_i64())
+        .and_then(|n| i32::try_from(n).ok())
+        .unwrap_or(0);
+    usage.tokens_out = payload
+        .get("usage")
+        .and_then(|u| u.get("completion_tokens"))
+        .and_then(|v| v.as_i64())
+        .and_then(|n| i32::try_from(n).ok())
+        .unwrap_or(0);
+    if let Err(e) = ff_db::pg_record_fleet_tool_usage(&pool, &usage).await {
+        warn!(error = %e, "fleet_offload usage write failed");
+    }
 
     Ok(json!({
         "offloaded": true,

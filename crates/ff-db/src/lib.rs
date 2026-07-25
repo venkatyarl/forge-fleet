@@ -45,6 +45,8 @@ pub use queries::{
     BrainUserRow,
     BrainVaultEdgeRow,
     BrainVaultNodeRow,
+    // Fleet dispatch outcome feedback (roadmap #8)
+    CapabilityUsageStats,
     ComputerScheduleRow,
     // Cortex recall diagnostic (`ff cortex doctor`)
     CortexResolutionStats,
@@ -55,7 +57,6 @@ pub use queries::{
     DeferredTaskRow,
     // Orchestrator P2 — per-session demand sensing (V116)
     DemandVector,
-    // Fleet dispatch outcome feedback (roadmap #8)
     DispatchOutcomeStat,
     // V178 model-server error events
     ErrorEventInsert,
@@ -65,6 +66,7 @@ pub use queries::{
     FleetModelRow,
     FleetNodeRow,
     FleetSecretRow,
+    FleetToolUsageRecord,
     FreeSlot,
     HostCapacity,
     // Interaction log (V121 ff_interactions)
@@ -114,6 +116,7 @@ pub use queries::{
     pg_bump_vault_node_hits,
     pg_cancel_deferred,
     pg_canonical_github_alias,
+    pg_capability_usage_stats,
     pg_claim_deferred,
     pg_cloud_route_for_computer,
     pg_complete_parent_work_items,
@@ -244,8 +247,10 @@ pub use queries::{
     pg_reap_stale_work_item_leases,
     pg_reapable_worktrees,
     pg_recent_demand_snapshots,
+    pg_record_fleet_tool_usage,
     pg_record_interaction,
     pg_record_route_decision,
+    pg_record_skill_invocation,
     pg_reprofile_candidates,
     pg_reserve_host,
     pg_resolve_channel_user,

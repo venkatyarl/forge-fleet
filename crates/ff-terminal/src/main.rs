@@ -43,6 +43,7 @@ mod arbiter_cmd;
 mod backends_cmd;
 mod brain_cmd;
 mod build_cmd;
+mod capability_cmd;
 mod cli_bridge_cmd;
 mod cloud_llm_cmd;
 mod codegen_cmd;
@@ -570,6 +571,11 @@ enum Command {
     Model {
         #[command(subcommand)]
         command: ModelCommand,
+    },
+    /// Capability telemetry and local-vs-cloud routing stats.
+    Capability {
+        #[command(subcommand)]
+        command: capability_cmd::CapabilityCommand,
     },
     /// Run the deferred task worker loop (scheduler + executor).
     /// Typically run as a background service on the fleet leader.
@@ -4238,6 +4244,12 @@ async fn main() -> Result<()> {
             return route_cmd::handle_route(command.clone()).await;
         }
         Some(Command::Model { command }) => return model_cmd::handle_model(command.clone()).await,
+        Some(Command::Capability { command }) => {
+            let pool = ff_agent::fleet_info::get_fleet_pool()
+                .await
+                .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+            return capability_cmd::handle_capability(&pool, command.clone()).await;
+        }
         Some(Command::DeferWorker {
             as_node,
             interval,
@@ -4639,6 +4651,12 @@ async fn main() -> Result<()> {
         }
         Some(Command::Route { command }) => route_cmd::handle_route(command).await,
         Some(Command::Model { command }) => model_cmd::handle_model(command).await,
+        Some(Command::Capability { command }) => {
+            let pool = ff_agent::fleet_info::get_fleet_pool()
+                .await
+                .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+            capability_cmd::handle_capability(&pool, command).await
+        }
         Some(Command::DeferWorker {
             as_node,
             interval,

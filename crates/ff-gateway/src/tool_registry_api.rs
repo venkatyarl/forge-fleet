@@ -405,21 +405,15 @@ pub async fn record_tool_usage(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    match sqlx::query(
-        r#"
-        INSERT INTO fleet_tool_usage (
-            tool_name, worker_name, success, latency_ms
-        )
-        VALUES ($1, $2, $3, $4)
-        "#,
-    )
-    .bind(&req.tool_name)
-    .bind(&req.worker_name)
-    .bind(req.success)
-    .bind(req.duration_ms)
-    .execute(pool)
-    .await
-    {
+    let mut usage = ff_db::FleetToolUsageRecord::new(
+        "gateway",
+        &req.tool_name,
+        true,
+        &req.worker_name,
+        if req.success { "success" } else { "failure" },
+    );
+    usage.latency_ms = req.duration_ms.and_then(|ms| i32::try_from(ms).ok());
+    match ff_db::pg_record_fleet_tool_usage(pool, &usage).await {
         Ok(_) => {}
         Err(e) => {
             tracing::warn!(error = %e, "fleet_tool_usage insert failed");

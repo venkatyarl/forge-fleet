@@ -1200,6 +1200,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
     },
+    PgMigration {
+        version: 261,
+        name: "capability_usage_telemetry",
+        sql: schema::SCHEMA_V261_CAPABILITY_USAGE_TELEMETRY,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

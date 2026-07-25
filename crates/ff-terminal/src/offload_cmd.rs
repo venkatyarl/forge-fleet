@@ -81,6 +81,19 @@ pub async fn handle_offload(
                  retry later to run it locally. Or warm one now with: \
                  ff model load <library_id> --agent"
             );
+            let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
+            let mut usage = ff_db::FleetToolUsageRecord::new(
+                "ff offload",
+                "fleet_offload",
+                false,
+                worker,
+                "do_in_cloud",
+            );
+            usage.cost_class = "cloud_fallback".to_string();
+            usage.input_summary = prompt.to_string();
+            if let Err(e) = ff_db::pg_record_fleet_tool_usage(&pool, &usage).await {
+                tracing::warn!(error = %e, "offload fallback usage write failed");
+            }
             if json_out {
                 println!(
                     "{}",
@@ -213,6 +226,20 @@ pub async fn handle_offload(
     };
     if let Err(e) = ff_db::pg_record_interaction(&pool, &rec).await {
         tracing::warn!(error = %e, "offload: failed to log interaction (non-fatal)");
+    }
+    let mut usage_rec = ff_db::FleetToolUsageRecord::new(
+        "ff offload",
+        "fleet_offload",
+        true,
+        candidate.worker_name.clone(),
+        "success",
+    );
+    usage_rec.latency_ms = i32::try_from(latency.as_millis()).ok();
+    usage_rec.tokens_in = usage_tok("prompt_tokens");
+    usage_rec.tokens_out = usage_tok("completion_tokens");
+    usage_rec.input_summary = prompt.to_string();
+    if let Err(e) = ff_db::pg_record_fleet_tool_usage(&pool, &usage_rec).await {
+        tracing::warn!(error = %e, "offload usage write failed");
     }
 
     if json_out {
