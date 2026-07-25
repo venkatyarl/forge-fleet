@@ -1200,6 +1200,13 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
     },
+    // 259-266 are reserved by in-flight branches; gaps are fine, collisions
+    // are not.
+    PgMigration {
+        version: 267,
+        name: "fleet_episodes",
+        sql: schema::SCHEMA_V267_FLEET_EPISODES,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

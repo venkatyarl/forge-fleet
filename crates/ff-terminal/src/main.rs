@@ -4907,15 +4907,6 @@ async fn main() -> Result<()> {
             }
         }
         Some(Command::Session { command }) => {
-            if let SessionCommand::Export { vault, force } = &command {
-                let summary =
-                    ff_agent::session_export::export_local_sessions(vault.as_deref(), *force)?;
-                println!(
-                    "{GREEN}✓{RESET} scanned {}, exported {}, unchanged {}",
-                    summary.scanned, summary.exported, summary.skipped
-                );
-                return Ok(());
-            }
             let pool = ff_agent::fleet_info::get_fleet_pool()
                 .await
                 .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
@@ -4923,7 +4914,20 @@ async fn main() -> Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
             match command {
-                SessionCommand::Export { .. } => unreachable!("handled before database setup"),
+                SessionCommand::Export { vault, force } => {
+                    let summary = ff_agent::session_export::export_local_sessions(
+                        &pool,
+                        vault.as_deref(),
+                        force,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("export sessions: {e}"))?;
+                    println!(
+                        "{GREEN}✓{RESET} scanned {}, exported {}, unchanged {}",
+                        summary.scanned, summary.exported, summary.skipped
+                    );
+                    Ok(())
+                }
                 SessionCommand::Spawn { goal, budget } => {
                     let who = ff_agent::fleet_info::resolve_this_worker_name().await;
                     let id = ff_agent::session_runner::create_session(
