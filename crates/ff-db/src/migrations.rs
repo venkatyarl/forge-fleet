@@ -1200,6 +1200,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
     },
+    PgMigration {
+        version: 261,
+        name: "ff_workstreams",
+        sql: schema::SCHEMA_V261_FF_WORKSTREAMS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1414,6 +1419,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn v261_workstreams_is_registered_once() {
+        let matches: Vec<&PgMigration> = PG_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version == 261)
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "ff_workstreams");
+        assert_eq!(matches[0].sql, schema::SCHEMA_V261_FF_WORKSTREAMS);
+    }
+
     fn db_url() -> Option<String> {
         env::var("FORGEFLEET_POSTGRES_URL")
             .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
@@ -1510,6 +1526,74 @@ mod tests {
             .await
             .expect("v161 bootstrap should be recorded in _migrations");
         assert_eq!(row.0 as u32, BOOTSTRAP_BASELINE_VERSION);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v261_workstreams_schema_has_fencing_and_exclusivity() {
+        // Needs Postgres — create_fresh_temp_db returns None (and we early-
+        // return) when neither supported database URL is set.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        // Forward migrations must remain safe if an operator has to recreate
+        // the hand-built artifact before the version row is recorded.
+        sqlx::raw_sql(schema::SCHEMA_V261_FF_WORKSTREAMS)
+            .execute(&pool)
+            .await
+            .expect("v261 should be idempotent");
+
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+               FROM information_schema.tables
+              WHERE table_schema = 'public'
+                AND table_name IN (
+                    'ff_workstreams',
+                    'ff_workstream_events',
+                    'ff_workstream_presence',
+                    'ff_workstream_threads'
+                )",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count v261 tables");
+        assert_eq!(tables, 4);
+
+        let constraints: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+               FROM pg_constraint
+              WHERE conname IN (
+                    'ff_workstreams_writer_lease_check',
+                    'ff_workstreams_sequences_check',
+                    'ff_workstream_events_workstream_id_seq_key',
+                    'ff_workstream_events_workstream_id_idempotency_key_key'
+                )",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count v261 constraints");
+        assert_eq!(constraints, 4);
+
+        let indexes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+               FROM pg_indexes
+              WHERE schemaname = 'public'
+                AND indexname IN (
+                    'idx_ff_workstream_threads_active_thread',
+                    'idx_ff_workstream_threads_active_work_item'
+                )
+                AND indexdef LIKE '%WHERE (status = ''active''::text)%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count v261 partial indexes");
+        assert_eq!(indexes, 2);
 
         drop_temp_db(admin, pool, &db_name).await;
     }
