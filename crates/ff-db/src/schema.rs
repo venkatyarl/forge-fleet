@@ -12201,6 +12201,37 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// Autopilot-2a routing ladders as data. Consumers are intentionally wired in
+/// a later migration/task; this migration only creates and seeds the ladder
+/// table.
+pub const SCHEMA_V261_ROUTING_LADDERS: &str = r#"
+CREATE TABLE IF NOT EXISTS routing_ladders (
+    workload  TEXT NOT NULL,
+    position  INT NOT NULL,
+    rung_kind TEXT NOT NULL CHECK (rung_kind IN ('local_model', 'ring', 'cloud_backend')),
+    target    TEXT NOT NULL,
+    PRIMARY KEY (workload, position)
+);
+
+INSERT INTO routing_ladders (workload, position, rung_kind, target) VALUES
+    ('coding', 1, 'local_model', 'devstral-small-2-24b'),
+    ('coding', 2, 'local_model', 'glm-4.5-air'),
+    ('coding', 3, 'ring', 'qwen3-coder-480b'),
+    ('coding', 4, 'cloud_backend', 'codex'),
+    ('coding', 5, 'cloud_backend', 'kimi'),
+    ('coding', 6, 'cloud_backend', 'claude'),
+    ('research', 1, 'local_model', 'lucy-1-7b'),
+    ('research', 2, 'local_model', 'deepseek-v3'),
+    ('research', 3, 'local_model', 'qwen36-35b-a3b'),
+    ('research', 4, 'cloud_backend', 'codex'),
+    ('vision', 1, 'local_model', 'smolvlm2-500m-video'),
+    ('vision', 2, 'local_model', 'qwen3-vl-30b-a3b'),
+    ('embedding', 1, 'local_model', 'bge-m3')
+ON CONFLICT (workload, position) DO UPDATE
+   SET rung_kind = EXCLUDED.rung_kind,
+       target = EXCLUDED.target;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
