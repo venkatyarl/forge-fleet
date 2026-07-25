@@ -178,6 +178,49 @@ pub async fn fleet_oneshot(
     Err(last_err.unwrap_or_else(|| anyhow!("all fleet candidates failed")))
 }
 
+/// Dispatch only to exact catalog-id matches so benchmark scores cannot
+/// silently include another model through normal family failover.
+pub async fn fleet_oneshot_exact_model(
+    pool: &PgPool,
+    prompt: &str,
+    model_id: &str,
+    timeout: Option<Duration>,
+) -> Result<FleetOneshot> {
+    let candidates: Vec<_> = resolve_route_candidates(pool, Some(model_id))
+        .await?
+        .into_iter()
+        .filter(|candidate| candidate_catalog_id_matches(candidate, model_id))
+        .collect();
+    if candidates.is_empty() {
+        return Err(anyhow!(
+            "no healthy fleet deployment exactly matches model `{model_id}`"
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(timeout.unwrap_or(Duration::from_secs(180)))
+        .build()
+        .map_err(|error| anyhow!("build http client: {error}"))?;
+    let mut last_error = None;
+    for candidate in &candidates {
+        let slots = candidate.parallel_slots.unwrap_or(1).max(1) as u32;
+        let Some(_guard) = InFlightGuard::try_acquire(&candidate.endpoint, slots) else {
+            continue;
+        };
+        match dispatch_to_candidate(candidate, &client, prompt, Some(model_id)).await {
+            Ok(result) => return Ok(result),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    for candidate in &candidates {
+        let _guard = InFlightGuard::acquire(&candidate.endpoint);
+        match dispatch_to_candidate(candidate, &client, prompt, Some(model_id)).await {
+            Ok(result) => return Ok(result),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("all exact-model deployments failed")))
+}
+
 /// Resolve a catalog model hint to the same best-first deployment candidate
 /// ordering used by [`fleet_oneshot`].
 pub async fn resolve_route_candidate(pool: &PgPool, model_hint: &str) -> Result<RouteCandidate> {

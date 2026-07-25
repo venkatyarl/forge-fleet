@@ -1200,6 +1200,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
     },
+    PgMigration {
+        version: 261,
+        name: "ff_bench_results",
+        sql: schema::SCHEMA_V261_FF_BENCH_RESULTS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -2340,6 +2345,31 @@ mod tests {
         assert_eq!(conflict.id, digest.id);
         assert_eq!(conflict.count, 2);
 
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v261_records_model_capability_scores() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool).await.expect("migrate");
+        sqlx::query(
+            "INSERT INTO ff_bench_results
+             (model_id,resolved_tasks,total_tasks,resolve_rate,duration_ms)
+             VALUES('v261-test-model',9,12,0.75,1234)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert score");
+        let score: (f64, f64) = sqlx::query_as(
+            "SELECT bench_resolve_rate,capability_score
+             FROM v_model_utilization WHERE model_id='v261-test-model'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read capability");
+        assert_eq!(score, (0.75, 0.75));
         drop_temp_db(admin, pool, &db_name).await;
     }
 }
