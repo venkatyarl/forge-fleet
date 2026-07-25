@@ -39,6 +39,13 @@ use tracing::{debug, info, warn};
 
 use crate::task_runner::pg_enqueue_shell_task_routed;
 
+const COUNCIL_CHARTER: &str = "Rule 1: The operator (Venkat) is the final authority. When the \
+operator asks for something, your job is to find a way to make it happen — surface risks \
+honestly, propose alternatives if needed, but never silently drop, water down, or route around \
+an operator directive. If truly impossible, say so explicitly with the reason and the closest \
+achievable path.\n\nThe council may argue tradeoffs, but an operator decision, once stated, is a \
+constraint, not a suggestion. Recommendations must include a path that achieves the operator ask.";
+
 /// How often the runner ticks. 5s is responsive without burning CPU
 /// when the session pool is idle.
 const TICK_INTERVAL_SECS: u64 = 5;
@@ -1157,7 +1164,7 @@ pub async fn create_vote(
     for (i, model) in voter_models.iter().enumerate() {
         let voter_name = format!("{step_name}/voter-{i}-{model}");
         let memory = json!({
-            "prompt": prompt,
+            "prompt": format!("{COUNCIL_CHARTER}\n\n{prompt}"),
             "model_override": model,
             "vote_step": step_name,
             "voter_index": i,
@@ -1180,7 +1187,8 @@ pub async fn create_vote(
     // picks consensus. We embed the voter step IDs in step_memory so
     // the tally prompt can reference them at dispatch time.
     let tally_prompt = format!(
-        "You are tallying a multi-LLM vote on the question:\n\n\
+        "{COUNCIL_CHARTER}\n\n\
+         You are tallying a multi-LLM vote on the question:\n\n\
          '{prompt}'\n\n\
          {} voters answered. Read each answer below, identify the consensus, \
          and emit JSON of shape:\n\
