@@ -1200,6 +1200,16 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
     },
+    PgMigration {
+        version: 261,
+        name: "research_session_heartbeat",
+        sql: schema::SCHEMA_V261_RESEARCH_SESSION_HEARTBEAT,
+    },
+    PgMigration {
+        version: 262,
+        name: "glm_45_air_ab_scoreboard",
+        sql: schema::SCHEMA_V262_GLM_45_AIR_AB_SCOREBOARD,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -2339,6 +2349,48 @@ mod tests {
 
         assert_eq!(conflict.id, digest.id);
         assert_eq!(conflict.count, 2);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v262_creates_glm_devstral_ab_scoreboard() {
+        // CI commonly has no Postgres; the helper checks both supported URL vars.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on a fresh database");
+
+        let tier: i32 =
+            sqlx::query_scalar("SELECT tier FROM fleet_model_catalog WHERE id = 'glm-4.5-air'")
+                .fetch_one(&pool)
+                .await
+                .expect("read GLM tier");
+        assert_eq!(tier, 2);
+
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name FROM information_schema.columns
+              WHERE table_schema = 'public' AND table_name = 'v_builder_stats'
+              ORDER BY ordinal_position",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read builder scoreboard columns");
+        assert_eq!(
+            columns,
+            [
+                "builder",
+                "attempts",
+                "approved",
+                "rejected",
+                "merged",
+                "approve_pct",
+                "since",
+                "merge_pct",
+            ]
+        );
 
         drop_temp_db(admin, pool, &db_name).await;
     }

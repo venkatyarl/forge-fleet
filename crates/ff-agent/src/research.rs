@@ -40,6 +40,38 @@ use uuid::Uuid;
 
 use crate::multi_agent::{AgentTaskResult, OrchestratorEvent, TaskStatus};
 
+const RESEARCH_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+struct ResearchHeartbeatGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for ResearchHeartbeatGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn spawn_research_heartbeat(pool: PgPool, session_id: Uuid) -> ResearchHeartbeatGuard {
+    ResearchHeartbeatGuard(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(RESEARCH_HEARTBEAT_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if let Err(error) = sqlx::query(
+                "UPDATE research_sessions
+                    SET last_heartbeat_at = NOW()
+                  WHERE id = $1
+                    AND status IN ('planning', 'dispatching', 'synthesizing', 'recovering')",
+            )
+            .bind(session_id)
+            .execute(&pool)
+            .await
+            {
+                warn!(session = %session_id, %error, "research heartbeat failed");
+            }
+        }
+    }))
+}
+
 // ─── Public types ───────────────────────────────────────────────────────────
 
 /// Configuration for one research run.
@@ -298,8 +330,9 @@ impl ResearchSession {
         sqlx::query(
             "INSERT INTO research_sessions
                 (id, query, status, depth, parallel, output_path, initiated_by,
-                 planner_model, synth_model, started_at, metadata)
+                 planner_model, synth_model, started_at, last_heartbeat_at, metadata)
              VALUES ($1, $2, $10, $3, $4, $5, $6, $7, $7,
+                     CASE WHEN $10 = 'queued' THEN NULL ELSE NOW() END,
                      CASE WHEN $10 = 'queued' THEN NULL ELSE NOW() END,
                      jsonb_build_object('gateway_url', $8::text,
                                         'subagent_model', $9::text,
@@ -349,7 +382,7 @@ impl ResearchSession {
     pub async fn claim_next_queued(pool: PgPool) -> Result<Option<Self>> {
         let row = sqlx::query(
             "UPDATE research_sessions
-                SET status = 'planning', started_at = NOW()
+                SET status = 'planning', started_at = NOW(), last_heartbeat_at = NOW()
               WHERE id = (
                   SELECT id FROM research_sessions
                    WHERE status = 'queued'
@@ -431,6 +464,7 @@ impl ResearchSession {
         &self,
         progress: Option<mpsc::Sender<ResearchProgress>>,
     ) -> Result<ResearchReport> {
+        let _heartbeat = spawn_research_heartbeat(self.pool.clone(), self.session_id);
         let start = Instant::now();
         if let Some(tx) = &progress {
             let _ = tx
@@ -738,6 +772,7 @@ impl ResearchSession {
     /// got past planning (no `planner_output`) or produced zero usable
     /// sub-agent outputs, since there is nothing to synthesize in those cases.
     pub async fn recover(pool: PgPool, session_id: Uuid) -> Result<ResearchReport> {
+        let _heartbeat = spawn_research_heartbeat(pool.clone(), session_id);
         let start = Instant::now();
 
         // 1. Load the session: query + planner config + stored plan + gateway.
@@ -1351,6 +1386,11 @@ pub async fn auto_recover_stale(
             AND s.report_markdown IS NULL
             AND s.planner_output IS NOT NULL
             AND COALESCE((s.metadata->>'auto_recover_attempts')::int, 0) < $1
+            AND NOT EXISTS (
+                SELECT 1 FROM research_subtasks pending
+                 WHERE pending.session_id = s.id
+                   AND pending.status NOT IN ('done', 'failed', 'cancelled', 'max_turns')
+            )
             AND EXISTS (
                 SELECT 1 FROM research_subtasks st
                  WHERE st.session_id = s.id
@@ -1370,22 +1410,28 @@ pub async fn auto_recover_stale(
         // Record the attempt FIRST — if recovery hangs or the process dies
         // mid-synthesis, this session is still counted toward max_attempts and
         // can't be retried forever.
-        if let Err(e) = sqlx::query(
+        let claim = sqlx::query(
             "UPDATE research_sessions
-                SET metadata = jsonb_set(
+                SET status = 'recovering',
+                    last_heartbeat_at = NOW(),
+                    metadata = jsonb_set(
                         metadata,
                         '{auto_recover_attempts}',
                         to_jsonb(COALESCE((metadata->>'auto_recover_attempts')::int, 0) + 1),
                         true)
-              WHERE id = $1",
+              WHERE id = $1 AND status = 'failed'",
         )
         .bind(id)
         .execute(pool)
-        .await
-        {
-            warn!(session = %id, error = %e, "auto_recover: bump attempt counter failed; skipping");
-            continue;
-        }
+        .await;
+        match claim {
+            Ok(result) if result.rows_affected() == 1 => {}
+            Ok(_) => continue,
+            Err(e) => {
+                warn!(session = %id, error = %e, "auto_recover: claim failed; skipping");
+                continue;
+            }
+        };
         summary.attempted += 1;
         match ResearchSession::recover(pool.clone(), id).await {
             Ok(_) => {
@@ -1395,6 +1441,17 @@ pub async fn auto_recover_stale(
             Err(e) => {
                 summary.failed += 1;
                 warn!(session = %id, error = %e, "auto_recover: synthesis failed (retried up to max_attempts)");
+                if let Err(reset_error) = sqlx::query(
+                    "UPDATE research_sessions
+                        SET status = 'failed', last_heartbeat_at = NULL
+                      WHERE id = $1 AND status = 'recovering'",
+                )
+                .bind(id)
+                .execute(pool)
+                .await
+                {
+                    warn!(session = %id, error = %reset_error, "auto_recover: release failed claim");
+                }
             }
         }
     }

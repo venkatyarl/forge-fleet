@@ -3015,6 +3015,7 @@ async fn dispatch_to_480b(
     item: &AssignedWorkItem,
     worktree: &WorktreeRecord,
     prompt: &str,
+    model_hint: &str,
 ) -> Option<(String, Output)> {
     let _permit = match tokio::time::timeout(
         Duration::from_millis(LANE15_480B_PERMIT_WAIT_MS),
@@ -3037,7 +3038,12 @@ async fn dispatch_to_480b(
         }
     };
 
-    mark_lease_endpoint(pg, item, "lane1.5:local:qwen3-coder-480b").await;
+    let model_hint = if model_hint.starts_with("local:") {
+        model_hint.to_string()
+    } else {
+        format!("local:{model_hint}")
+    };
+    mark_lease_endpoint(pg, item, &format!("lane1.5:{model_hint}")).await;
     info!(
         work_item_id = %item.work_item_id,
         stage = "lane1.5",
@@ -3050,7 +3056,7 @@ async fn dispatch_to_480b(
             pg,
             &worktree.worktree_path,
             prompt,
-            Some(LANE15_480B_MODEL_HINT),
+            Some(&model_hint),
             1,
             Some(item.work_item_id),
         ),
@@ -3141,6 +3147,11 @@ async fn run_ff_dispatch(
     worktree: &WorktreeRecord,
 ) -> Result<(String, Output)> {
     let mut prompt = dispatch_prompt(item);
+    let ladder = ff_routing_policy::load_ladder(pg, "coding").await;
+    let ladder_is_empty = ladder.is_empty();
+    let local_model =
+        ff_routing_policy::local_rung_for_attempt(&ladder, item.attempts.max(0) as u32);
+    let ring_model = ff_routing_policy::ring_rung(&ladder);
     // Prepend a Cortex context pack: the exact existing symbols this task touches,
     // pulled from the shared code graph, so the agent starts there instead of
     // grep-storming the whole repo cold (wasted context + the cold-compile explore
@@ -3209,7 +3220,8 @@ async fn run_ff_dispatch(
         lane1_breaker_open,
         item.prefers_cloud_lane(),
         cloud_exhausted,
-    ) {
+    ) && (ladder_is_empty || local_model.is_some())
+    {
         // Bound Lane 1 with a hard timeout so a hung local codegen harness fails
         // OVER to the cloud backstop instead of wedging the slot forever (see
         // LANE1_TIMEOUT_SECS). Without this, a hang here stalls the build while
@@ -3220,7 +3232,7 @@ async fn run_ff_dispatch(
                 pg,
                 &worktree.worktree_path,
                 &prompt,
-                None,
+                local_model,
                 4,
                 Some(item.work_item_id),
             ),
@@ -3315,8 +3327,9 @@ async fn run_ff_dispatch(
                     rounds = outcome.rounds,
                     "work_item_dispatch: local codegen harness landed the change"
                 );
+                let builder = local_builder_tag(outcome.model.as_deref());
                 return Ok((
-                    "local".to_string(),
+                    builder,
                     synthetic_output(&outcome.final_diff.unwrap_or_else(|| "applied".into())),
                 ));
             }
@@ -3371,13 +3384,23 @@ async fn run_ff_dispatch(
     // `prefers_cloud_lane` still get one local-480b shot before cloud).
     let lane15_trigger =
         lane1_failed_or_timed_out || complexity_at_least_moderate(&item.complexity);
-    if should_attempt_lane15(
-        lane1_failed_or_timed_out,
-        complexity_at_least_moderate(&item.complexity),
-        lane15_enabled,
-        lane15_breaker_open,
-    ) {
-        if let Some((backend, output)) = dispatch_to_480b(pg, item, worktree, &prompt).await {
+    if (ladder_is_empty || ring_model.is_some())
+        && should_attempt_lane15(
+            lane1_failed_or_timed_out,
+            complexity_at_least_moderate(&item.complexity),
+            lane15_enabled,
+            lane15_breaker_open,
+        )
+    {
+        if let Some((backend, output)) = dispatch_to_480b(
+            pg,
+            item,
+            worktree,
+            &prompt,
+            ring_model.unwrap_or(LANE15_480B_MODEL_HINT),
+        )
+        .await
+        {
             return Ok((backend, output));
         }
     } else if lane15_trigger && !lane15_enabled {
@@ -3455,6 +3478,15 @@ async fn run_ff_dispatch(
     // retries on this attempt tier); the failover loop below still walks the
     // rest of the list on error, and falls back to claude when the rotation
     // pick isn't in this node's dispatchable set.
+    const BUILDER_ROTATION: [&str; 2] = ["codex", "kimi"];
+    let ladder_cloud = ff_routing_policy::cloud_rungs(&ladder);
+    if !ladder_is_empty {
+        backends = ladder_cloud
+            .iter()
+            .filter(|candidate| backends.iter().any(|backend| backend == **candidate))
+            .map(|candidate| (*candidate).to_string())
+            .collect();
+    }
     let mut policy = ff_routing_policy::PolicyConfig::default();
     // Order matters: codex/kimi front the rotation, claude LAST (operator
     // directive 2026-07-23) — claude runs on ONE shared OAuth login that every
@@ -3485,23 +3517,24 @@ async fn run_ff_dispatch(
     .fetch_all(pg)
     .await
     .unwrap_or_default();
-    let preferred: String = usage_ranked
-        .iter()
-        .find(|p| backends.iter().any(|b| b == *p))
-        .cloned()
-        .unwrap_or_else(|| {
-            // No budget data yet → stable id+attempts rotation so retries still
-            // vary the backend.
-            const FALLBACK: [&str; 2] = ["codex", "kimi"];
-            let idx = item
-                .work_item_id
-                .as_u128()
-                .wrapping_add(item.attempts.max(0) as u128);
-            FALLBACK[(idx % FALLBACK.len() as u128) as usize].to_string()
-        });
-    if backends.iter().any(|b| b == &preferred) {
-        policy.preferred_cloud_backstop = Some(preferred);
-        ff_routing_policy::promote_cloud_backstop(&mut backends, &policy);
+    if ladder_is_empty {
+        let preferred: String = usage_ranked
+            .iter()
+            .find(|p| backends.iter().any(|b| b == *p))
+            .cloned()
+            .unwrap_or_else(|| {
+                // No budget data yet → stable id+attempts rotation so retries still
+                // vary the backend.
+                let idx = item
+                    .work_item_id
+                    .as_u128()
+                    .wrapping_add(item.attempts.max(0) as u128);
+                BUILDER_ROTATION[(idx % BUILDER_ROTATION.len() as u128) as usize].to_string()
+            });
+        if backends.iter().any(|b| b == &preferred) {
+            policy.preferred_cloud_backstop = Some(preferred);
+            ff_routing_policy::promote_cloud_backstop(&mut backends, &policy);
+        }
     }
     let computer_id = item.computer_id;
     let forced_backend = primary_or_default_backend(&backends);
@@ -3841,6 +3874,17 @@ async fn run_ff_dispatch(
             )
         }
     })
+}
+
+fn local_builder_tag(model: Option<&str>) -> String {
+    model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(|model| {
+            let model = model.strip_prefix("local:").unwrap_or(model);
+            format!("local:{}", model.to_ascii_lowercase())
+        })
+        .unwrap_or_else(|| "local".to_string())
 }
 
 fn primary_or_default_backend(backends: &[String]) -> String {
@@ -5306,10 +5350,10 @@ mod tests {
         affected_crate_manifests, agent_output_tail, backend_failed_without_output,
         builder_excludes_480b, classify_dispatch_outcome, command_display,
         complexity_at_least_moderate, contains_file_line_citation, default_clone_path,
-        dispatch_budget_for_host, dispatch_prompt, expand_home, is_build_timeout, mirror_repo_url,
-        order_cloud_reviewers, parse_cli_tokens, primary_or_default_backend,
-        quick_empty_success_is_provider_failure, repo_cache_path, repo_slug,
-        retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
+        dispatch_budget_for_host, dispatch_prompt, expand_home, is_build_timeout,
+        local_builder_tag, mirror_repo_url, order_cloud_reviewers, parse_cli_tokens,
+        primary_or_default_backend, quick_empty_success_is_provider_failure, repo_cache_path,
+        repo_slug, retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
         should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
         task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
     };
@@ -5350,6 +5394,21 @@ mod tests {
         assert!(!builder_excludes_480b("codex"));
         assert!(!builder_excludes_480b("claude"));
         assert!(!builder_excludes_480b("kimi"));
+    }
+
+    #[test]
+    fn local_builder_tag_carries_catalog_model_id() {
+        assert_eq!(local_builder_tag(Some("GLM-4.5-Air")), "local:glm-4.5-air");
+        assert_eq!(
+            local_builder_tag(Some("devstral-small-2-24b")),
+            "local:devstral-small-2-24b"
+        );
+        assert_eq!(
+            local_builder_tag(Some("local:GLM-4.5-Air")),
+            "local:glm-4.5-air"
+        );
+        assert_eq!(local_builder_tag(None), "local");
+        assert_eq!(local_builder_tag(Some("  ")), "local");
     }
 
     #[test]
@@ -5568,8 +5627,14 @@ mod tests {
             use_local_lane(0, false, false, false),
             "first attempt tries cheap local"
         );
-        assert!(use_local_lane(1, false, false, false), "2nd attempt still local");
-        assert!(use_local_lane(2, false, false, false), "3rd attempt still local");
+        assert!(
+            use_local_lane(1, false, false, false),
+            "2nd attempt still local"
+        );
+        assert!(
+            use_local_lane(2, false, false, false),
+            "3rd attempt still local"
+        );
         assert!(
             !use_local_lane(3, false, false, false),
             "past LOCAL_LANE_MAX_TRIES → cloud"

@@ -19,6 +19,8 @@ pub struct CodegenOutcome {
     pub rounds: u32,
     pub final_diff: Option<String>,
     pub error: Option<String>,
+    /// Catalog model used by the decisive (latest) round, for builder attribution.
+    pub model: Option<String>,
     /// The model reported the task is ALREADY implemented / no change needed (it inspected the
     /// repo, often ran the tests, and produced no edits on purpose). The caller should mark the
     /// work_item done — NOT fail-retry — so an already-satisfied task drains instead of thrashing.
@@ -111,6 +113,7 @@ pub async fn codegen_apply(
 ) -> Result<CodegenOutcome> {
     let mut last_edits: Option<String> = None;
     let mut last_error: Option<String> = None;
+    let mut last_model: Option<String> = None;
     let mut rounds = 0;
 
     for round in 1..=max_rounds {
@@ -142,6 +145,7 @@ pub async fn codegen_apply(
         )
         .await
         .with_context(|| format!("fleet_oneshot round {round}"))?;
+        last_model = (!response.model.is_empty()).then(|| response.model.clone());
 
         // Per-round episode capture (V250 episodic tagging): `fleet_oneshot`
         // never inserts into `ff_interactions` itself — it returns the
@@ -169,6 +173,7 @@ pub async fn codegen_apply(
                         rounds,
                         final_diff: None,
                         error: None,
+                        model: last_model,
                         already_done: true,
                     });
                 }
@@ -287,6 +292,7 @@ pub async fn codegen_apply(
             rounds,
             final_diff: Some(edit_summary),
             error: None,
+            model: last_model,
             already_done: false,
         });
     }
@@ -296,6 +302,7 @@ pub async fn codegen_apply(
         rounds,
         final_diff: None,
         error: last_error,
+        model: last_model,
         already_done: false,
     })
 }
