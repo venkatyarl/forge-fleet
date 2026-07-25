@@ -1899,6 +1899,37 @@ async fn run_in_place_review(
     Err(last_err.unwrap_or_else(|| anyhow!("no in-place review backend available")))
 }
 
+/// Run a work item's machine-checkable acceptance assertion, if it has one.
+/// `acceptance_check` is a read-only SQL that must return a single BOOLEAN
+/// TRUE for the item to count as genuinely done (e.g.
+/// `SELECT to_regclass('public.foo') IS NOT NULL`). Returns:
+///   - `None`  → no check configured (fall back to reviewer-only verification)
+///   - `Some(true)`  → the artifact provably exists
+///   - `Some(false)` → check absent-truthy, errored, or not a plain SELECT
+///
+/// This is the un-foolable half of the verification gate: an LLM can hallucinate
+/// a citation, but a table/view/column either exists in the live DB or it does
+/// not. Guarded to SELECT-only so an acceptance_check can never mutate state.
+async fn acceptance_check_passes(pg: &PgPool, work_item_id: Uuid) -> Option<bool> {
+    let sql: Option<String> =
+        sqlx::query_scalar("SELECT acceptance_check FROM work_items WHERE id = $1")
+            .bind(work_item_id)
+            .fetch_optional(pg)
+            .await
+            .ok()
+            .flatten();
+    let sql = sql.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+    // Read-only guard: only a bare SELECT may run as an acceptance check.
+    let lowered = sql.to_lowercase();
+    if !lowered.starts_with("select") || lowered.contains(';') {
+        return Some(false);
+    }
+    match sqlx::query_scalar::<_, bool>(&sql).fetch_optional(pg).await {
+        Ok(Some(v)) => Some(v),
+        _ => Some(false),
+    }
+}
+
 /// Verdict on an `already_done` claim: whether an independent reviewer both
 /// approved AND backed it with a concrete `file:line` citation.
 struct AlreadyDoneVerification {
@@ -1936,6 +1967,23 @@ async fn verify_already_done_claim(
         title = item.title,
         description = item.description.as_deref().unwrap_or_default(),
     );
+
+    // MACHINE-CHECKABLE gate (2026-07-24): the LLM reviewer above can be fooled —
+    // it hallucinated a file:line citation for `routing_ladders` while the table
+    // never existed in the live DB (the verification-gate item itself false-doned
+    // this way). So if the work item carries an `acceptance_check` (a read-only
+    // SQL assertion that must return TRUE — e.g.
+    // `SELECT to_regclass('public.routing_ladders') IS NOT NULL`), we RUN it and
+    // require it to pass IN ADDITION to the reviewer. An artifact either exists in
+    // the live system or it does not; no LLM opinion overrides that.
+    let machine_ok: Option<bool> = acceptance_check_passes(pg, item.work_item_id).await;
+    if machine_ok == Some(false) {
+        return Ok(AlreadyDoneVerification {
+            verified: false,
+            reviewer: "acceptance_check".to_string(),
+            reason: "acceptance_check SQL returned false — the claimed artifact does not exist in the live system (LLM claim overridden)".to_string(),
+        });
+    }
 
     let stats = cloud_reviewer_stats(pg).await.unwrap_or_default();
     let backends: Vec<String> = sqlx::query_scalar(
