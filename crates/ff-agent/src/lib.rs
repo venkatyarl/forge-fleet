@@ -42,6 +42,7 @@ pub mod brain_mirror;
 pub mod calendar_monitor;
 pub mod capability_synthesis;
 pub mod chat_manager;
+pub mod claude_usage_poller;
 pub mod cli_executor;
 pub mod cloud_budget;
 pub mod cloud_error;

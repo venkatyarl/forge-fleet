@@ -407,7 +407,9 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
         .ok()
         .flatten();
         if let Some((sha, up, tot)) = deploy {
-            msg.push_str(&format!("\n📦 Rolling deployment: {sha} · {up}/{tot} nodes\n"));
+            msg.push_str(&format!(
+                "\n📦 Rolling deployment: {sha} · {up}/{tot} nodes\n"
+            ));
         }
     }
 
@@ -458,7 +460,10 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
         let per_hr = merged_24h as f64 / 24.0;
         let hours = to_build as f64 / per_hr;
         if hours >= 48.0 {
-            format!("~{:.0}d at current pace ({merged_24h} merged/24h)", hours / 24.0)
+            format!(
+                "~{:.0}d at current pace ({merged_24h} merged/24h)",
+                hours / 24.0
+            )
         } else {
             format!("~{hours:.0}h at current pace ({merged_24h} merged/24h)")
         }
@@ -583,10 +588,11 @@ pub async fn build_system_digest(pg: &PgPool) -> Result<String> {
     msg.push('\n');
 
     // Leader + last rolling deployment (fleet operational status).
-    if let Ok(Some((leader, epoch))) =
-        sqlx::query_as::<_, (String, i64)>("SELECT member_name, epoch::bigint FROM fleet_leader_state WHERE singleton_key='current'")
-            .fetch_optional(pg)
-            .await
+    if let Ok(Some((leader, epoch))) = sqlx::query_as::<_, (String, i64)>(
+        "SELECT member_name, epoch::bigint FROM fleet_leader_state WHERE singleton_key='current'",
+    )
+    .fetch_optional(pg)
+    .await
     {
         msg.push_str(&format!("👑 Leader: {leader} (epoch {epoch})\n"));
     }

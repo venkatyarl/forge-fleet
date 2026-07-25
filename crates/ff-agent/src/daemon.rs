@@ -111,6 +111,22 @@ impl TickRegistry {
                 runner: run_kimi_usage_poller_tick,
             },
             TickDefinition {
+                // Poll/estimate Codex usage and refresh the `codex` row of
+                // `cloud_budget_buckets`. Leader-only, like the Kimi poller.
+                name: "codex_usage_poller",
+                interval: Duration::from_secs(600),
+                scope: TickScope::LeaderOnly,
+                runner: run_codex_usage_poller_tick,
+            },
+            TickDefinition {
+                // Estimate Claude usage (operator-reserved, but tracked for
+                // visibility) and refresh the `claude` row. Leader-only.
+                name: "claude_usage_poller",
+                interval: Duration::from_secs(600),
+                scope: TickScope::LeaderOnly,
+                runner: run_claude_usage_poller_tick,
+            },
+            TickDefinition {
                 name: "ssh_mesh_check",
                 interval: Duration::from_secs(6 * 60 * 60),
                 scope: TickScope::LeaderOnly,
@@ -307,6 +323,25 @@ fn run_nightly_digest_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static
 fn run_kimi_usage_poller_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'static, Result<()>> {
     Box::pin(async move {
         crate::kimi_usage_poller::poll_kimi_usage_once(&pg)
+            .await
+            .map(|_| ())
+    })
+}
+
+fn run_codex_usage_poller_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::codex_usage_poller::poll_codex_usage_once(&pg)
+            .await
+            .map(|_| ())
+    })
+}
+
+fn run_claude_usage_poller_tick(
+    pg: PgPool,
+    _worker_name: String,
+) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::claude_usage_poller::poll_claude_usage_once(&pg)
             .await
             .map(|_| ())
     })
