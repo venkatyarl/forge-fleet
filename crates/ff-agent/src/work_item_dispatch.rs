@@ -1927,6 +1927,50 @@ async fn run_in_place_review(
             }
         }
     }
+
+    // FLEET-LOCAL REVIEW FALLBACK (operator 2026-07-25): a dead 480B ring +
+    // exhausted/failing cloud must NOT fail the item for "no in-place review
+    // backend available" (4 of the last 12 failures). Route the review through
+    // ANY healthy fleet LLM — fleet_oneshot picks the next available deployment
+    // across ALL nodes, the same fleet-wide local routing the build lane uses.
+    // A local-Devstral review beats failing the item outright.
+    let started_at = chrono::Utc::now();
+    match crate::fleet_oneshot::fleet_oneshot(pg, &prompt, None, Some(REVIEW_CLOUD_TIMEOUT)).await {
+        Ok(resp) if !resp.text.trim().is_empty() => {
+            record_review_interaction(
+                pg,
+                item.work_item_id,
+                &format!("local:{}", resp.worker_name),
+                &prompt,
+                &resp.text,
+                None,
+            )
+            .await;
+            let (approved, reason) =
+                crate::work_item_merge_drain::parse_review_response(&resp.text);
+            info!(
+                work_item_id = %item.work_item_id, reviewer = %resp.worker_name,
+                "work_item_dispatch: in-place review via fleet-local LLM (480b+cloud unavailable)"
+            );
+            return Ok(ReviewOutcome {
+                reviewer: format!("local:{}", resp.worker_name),
+                reviewer_computer: Some(resp.worker_name.clone()),
+                reviewer_port: None,
+                approved,
+                reason,
+                started_at,
+                completed_at: chrono::Utc::now(),
+            });
+        }
+        Ok(_) => warn!(
+            work_item_id = %item.work_item_id,
+            "work_item_dispatch: fleet-local review returned empty"
+        ),
+        Err(e) => warn!(
+            work_item_id = %item.work_item_id, error = format!("{e:#}"),
+            "work_item_dispatch: fleet-local review fallback failed"
+        ),
+    }
     Err(last_err.unwrap_or_else(|| anyhow!("no in-place review backend available")))
 }
 
