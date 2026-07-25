@@ -1194,11 +1194,16 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         sql: schema::SCHEMA_V250_FF_INTERACTIONS_EPISODIC_TAGGING,
     },
     // 251-257 are reserved by in-flight branches; gaps are fine, collisions
-    // are not.
+    // are not. Live Postgres was already at V260 when Autopilot-5 landed.
     PgMigration {
         version: 258,
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
+    },
+    PgMigration {
+        version: 261,
+        name: "model_download_watchlist",
+        sql: schema::SCHEMA_V261_MODEL_DOWNLOAD_WATCHLIST,
     },
 ];
 
