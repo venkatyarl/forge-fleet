@@ -1036,7 +1036,6 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             variants,
             description,
             gated,
-            watchlist: false,
             tool_calling,
             json,
         } => {
