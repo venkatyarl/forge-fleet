@@ -12201,6 +12201,89 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// V261 — Cluster-wide, project-scoped session state.
+///
+/// The table was initially created by hand on the live cluster with
+/// `project_key` as its identity column. Keep that column for rolling
+/// compatibility while adding the operator-specified `project_id` fields.
+pub const SCHEMA_V261_DURABLE_PROJECT_WORKSTREAMS: &str = r#"
+CREATE TABLE IF NOT EXISTS ff_workstreams (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_key       TEXT NOT NULL,
+    project_id        TEXT,
+    root_identity     TEXT,
+    owner_scope       TEXT,
+    git_remote        TEXT,
+    basename          TEXT,
+    aliases           JSONB NOT NULL DEFAULT '{}'::jsonb,
+    goal              TEXT,
+    working_summary   TEXT,
+    focus             TEXT,
+    open_threads      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    status            TEXT NOT NULL DEFAULT 'active',
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    leader_generation INT NOT NULL DEFAULT 0,
+    note_seq          BIGINT NOT NULL DEFAULT 0
+);
+
+ALTER TABLE ff_workstreams
+    ADD COLUMN IF NOT EXISTS project_id TEXT,
+    ADD COLUMN IF NOT EXISTS root_identity TEXT,
+    ADD COLUMN IF NOT EXISTS owner_scope TEXT,
+    ADD COLUMN IF NOT EXISTS focus TEXT,
+    ADD COLUMN IF NOT EXISTS open_threads JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS note_seq BIGINT NOT NULL DEFAULT 0;
+
+UPDATE ff_workstreams
+   SET project_id = COALESCE(project_id, project_key),
+       root_identity = COALESCE(root_identity, 'project:' || lower(regexp_replace(
+           COALESCE(project_id, project_key), '[^a-zA-Z0-9]+', '', 'g'))),
+       owner_scope = COALESCE(owner_scope, 'legacy');
+
+ALTER TABLE ff_workstreams
+    ALTER COLUMN project_id SET NOT NULL,
+    ALTER COLUMN root_identity SET NOT NULL,
+    ALTER COLUMN owner_scope SET NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ff_workstreams_project_id_key
+    ON ff_workstreams (project_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ff_workstreams_root_identity_key
+    ON ff_workstreams (root_identity);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ff_workstreams_git_remote_key
+    ON ff_workstreams (git_remote) WHERE git_remote IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS session_attachments (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workstream_id      UUID NOT NULL REFERENCES ff_workstreams(id) ON DELETE CASCADE,
+    owner_scope        TEXT NOT NULL,
+    thread_id          TEXT NOT NULL,
+    source             TEXT NOT NULL,
+    attached_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    presence_expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '5 minutes',
+    UNIQUE (workstream_id, owner_scope, thread_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS session_attachments_thread_binding
+    ON session_attachments (owner_scope, source, thread_id);
+CREATE INDEX IF NOT EXISTS session_attachments_presence
+    ON session_attachments (workstream_id, presence_expires_at);
+
+CREATE TABLE IF NOT EXISTS workstream_notes (
+    workstream_id UUID NOT NULL REFERENCES ff_workstreams(id) ON DELETE CASCADE,
+    seq           BIGINT NOT NULL,
+    owner_scope   TEXT NOT NULL,
+    note          TEXT NOT NULL,
+    source        TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (workstream_id, seq)
+);
+
+REVOKE ALL ON TABLE ff_workstreams, session_attachments, workstream_notes FROM PUBLIC;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

@@ -88,6 +88,7 @@ mod research_cmd;
 mod route_cmd;
 mod secrets_cmd;
 mod self_heal_cmd;
+mod session_workstream_cmd;
 mod skills_cmd;
 mod social_cmd;
 mod software_cmd;
@@ -1404,6 +1405,15 @@ pub enum InteractionsCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 enum SessionCommand {
+    /// Show the durable workstream for the project containing the current directory.
+    Status,
+    /// Join a project's durable workstream and print its resume packet.
+    Attach {
+        #[arg(long)]
+        project: String,
+    },
+    /// Append a note to the current project's durable working summary.
+    Note { note: String },
     /// Redact and export local Claude Code, Codex, and Kimi transcripts to
     /// the central Obsidian vault (or stage and rsync them to Adele).
     Export {
@@ -4924,6 +4934,15 @@ async fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
             match command {
                 SessionCommand::Export { .. } => unreachable!("handled before database setup"),
+                SessionCommand::Status => {
+                    session_workstream_cmd::status(&pool, &env::current_dir()?).await
+                }
+                SessionCommand::Attach { project } => {
+                    session_workstream_cmd::attach(&pool, &env::current_dir()?, &project).await
+                }
+                SessionCommand::Note { note } => {
+                    session_workstream_cmd::note(&pool, &env::current_dir()?, &note).await
+                }
                 SessionCommand::Spawn { goal, budget } => {
                     let who = ff_agent::fleet_info::resolve_this_worker_name().await;
                     let id = ff_agent::session_runner::create_session(
