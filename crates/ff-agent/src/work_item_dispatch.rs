@@ -2327,7 +2327,30 @@ const MAX_DISPATCH_ATTEMPTS: i32 = 5;
 /// the task isn't complexity-routed to cloud. Pure so the routing is testable —
 /// the `ESCALATE_TO_CLOUD_AT = 1` value means a mechanical task gets ONE local try
 /// then goes cloud (#62: the local lane starves the heartbeat; cloud does not).
-fn use_local_lane(attempts: i32, breaker_open: bool, prefers_cloud: bool) -> bool {
+fn use_local_lane(
+    attempts: i32,
+    breaker_open: bool,
+    prefers_cloud: bool,
+    cloud_exhausted: bool,
+) -> bool {
+    // A tripped local breaker means the local lane has been failing on this node
+    // — never force it, we'd just wedge again.
+    if breaker_open {
+        return false;
+    }
+    // LOCAL-FIRST BACKSTOP (operator 2026-07-25): when the cloud lane can't run
+    // — every cloud backend rate-limited / window-exhausted — force the local
+    // lane ON even for prefers-cloud/complex tasks that would normally skip it.
+    // A healthy local model (Devstral/GLM is `healthy active` fleet-wide) is the
+    // ONLY builder available, and trying it is strictly better than failing
+    // "no dispatchable backend (cloud budget exhausted)" while local sits idle.
+    // This routes the task through the SAME tested Lane-1 success path (commit →
+    // PR → done), so complex tasks build locally instead of dying when codex/
+    // kimi are exhausted. ("the local LLM should build these even if the cloud
+    // LLM isn't working.")
+    if cloud_exhausted {
+        return true;
+    }
     let requirements = ff_routing_policy::TaskRequirements {
         prior_failure_count: attempts.max(0) as u32,
         capability_tags: if prefers_cloud {
@@ -2338,7 +2361,6 @@ fn use_local_lane(attempts: i32, breaker_open: bool, prefers_cloud: bool) -> boo
         ..Default::default()
     };
     ff_routing_policy::use_local_30b(&requirements, &ff_routing_policy::PolicyConfig::default())
-        && !breaker_open
 }
 
 /// Hard ceiling on the Lane-1 LOCAL codegen harness — kept STRICTLY BELOW the
@@ -3164,8 +3186,30 @@ async fn run_ff_dispatch(
     // heavy) — the local lane wedges/half-finishes on those, so we send them
     // straight to the capable cloud CLI from attempt 0 instead of burning a
     // wedge-prone local attempt first.
+    // Is the CLOUD lane currently unrunnable? True when no cloud builder
+    // (codex/kimi) has an open budget window — i.e. every one is rate-limited /
+    // exhausted. In that state, skipping local for a "prefers-cloud" task would
+    // send it straight to a dead cloud lane and fail "cloud budget exhausted"
+    // (exactly the recurring stall on lily/thalia while local sat healthy). When
+    // cloud is exhausted we force the local lane on instead. NULL/absent rows →
+    // treat cloud as available (don't force local off real capacity).
+    let cloud_exhausted: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (\
+            SELECT 1 FROM cloud_budget_buckets \
+             WHERE provider IN ('codex','kimi') \
+               AND (window_exhausted_until IS NULL OR window_exhausted_until < now()))",
+    )
+    .fetch_one(pg)
+    .await
+    .unwrap_or(false);
+
     let mut lane1_failed_or_timed_out = false;
-    if use_local_lane(item.attempts, lane1_breaker_open, item.prefers_cloud_lane()) {
+    if use_local_lane(
+        item.attempts,
+        lane1_breaker_open,
+        item.prefers_cloud_lane(),
+        cloud_exhausted,
+    ) {
         // Bound Lane 1 with a hard timeout so a hung local codegen harness fails
         // OVER to the cloud backstop instead of wedging the slot forever (see
         // LANE1_TIMEOUT_SECS). Without this, a hang here stalls the build while
@@ -5519,20 +5563,38 @@ mod tests {
         // Mechanical (prefers_cloud=false), breaker closed: local lane is heartbeat-safe now
         // (#62/#792 moved blocking work off the async runtime), so it stays local for
         // LOCAL_LANE_MAX_TRIES=3 attempts before escalating to cloud.
+        // cloud_exhausted=false throughout: normal ladder behaviour.
         assert!(
-            use_local_lane(0, false, false),
+            use_local_lane(0, false, false, false),
             "first attempt tries cheap local"
         );
-        assert!(use_local_lane(1, false, false), "2nd attempt still local");
-        assert!(use_local_lane(2, false, false), "3rd attempt still local");
+        assert!(use_local_lane(1, false, false, false), "2nd attempt still local");
+        assert!(use_local_lane(2, false, false, false), "3rd attempt still local");
         assert!(
-            !use_local_lane(3, false, false),
+            !use_local_lane(3, false, false, false),
             "past LOCAL_LANE_MAX_TRIES → cloud"
         );
         // A complexity-routed (complex or multi-file-heavy) task never touches the local lane.
-        assert!(!use_local_lane(0, false, true));
+        assert!(!use_local_lane(0, false, true, false));
         // Open local-codegen breaker → skip local even on attempt 0.
-        assert!(!use_local_lane(0, true, false));
+        assert!(!use_local_lane(0, true, false, false));
+
+        // LOCAL-FIRST BACKSTOP: when cloud is exhausted, force local ON even for
+        // a prefers-cloud/complex task and past the escalation threshold —
+        // local is the only builder left, so it must be tried before failing.
+        assert!(
+            use_local_lane(0, false, true, true),
+            "cloud exhausted → force local for a prefers-cloud task"
+        );
+        assert!(
+            use_local_lane(5, false, true, true),
+            "cloud exhausted → force local even past the escalation threshold"
+        );
+        // ...but a tripped local breaker still wins: don't wedge a failing node.
+        assert!(
+            !use_local_lane(0, true, false, true),
+            "open local breaker overrides the cloud-exhausted force"
+        );
     }
 
     #[tokio::test]
