@@ -2764,6 +2764,20 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "fleet_install_model" => fleet_install_model(params).await,
         "fleet_wait" => fleet_wait(params).await,
         "fleet_crew" => fleet_crew(params).await,
+        "extensions_list" => {
+            let cwd = params
+                .as_ref()
+                .and_then(|p| p.get("cwd"))
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let timeout_secs = params
+                .as_ref()
+                .and_then(|p| p.get("timeout_secs"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5);
+            Ok(crate::extensions::list(&cwd, timeout_secs).await)
+        }
         "mcp_federation_status" => mcp_federation_status(params).await,
         "model_recommend" => model_recommend(params).await,
         "model_stats" => model_stats(params).await,

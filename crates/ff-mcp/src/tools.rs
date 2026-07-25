@@ -76,6 +76,7 @@ impl ToolRegistry {
         self.register(Self::fleet_install_model());
         self.register(Self::fleet_wait());
         self.register(Self::fleet_crew());
+        self.register(Self::extensions_list());
         self.register(Self::mcp_federation_status());
         self.register(Self::model_recommend());
         self.register(Self::model_stats());
@@ -145,6 +146,20 @@ impl ToolRegistry {
         self.register(Self::memory_add());
         self.register(Self::memory_replace());
         self.register(Self::memory_remove());
+    }
+
+    fn extensions_list() -> ToolDefinition {
+        ToolDefinition {
+            name: "extensions_list".to_string(),
+            description: "List every ForgeFleet extension capability through one interface: skills, local and third-party MCP tools, and enabled agents.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "cwd": { "type": "string", "description": "Project directory used for skill discovery" },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "default": 5 }
+                }
+            }),
+        }
     }
 
     // ── Tool definitions ─────────────────────────────────────────────────
@@ -1948,6 +1963,7 @@ mod tests {
             "fleet_install_model",
             "fleet_wait",
             "fleet_crew",
+            "extensions_list",
             "mcp_federation_status",
             "model_recommend",
             "model_stats",
