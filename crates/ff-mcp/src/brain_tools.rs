@@ -7,6 +7,7 @@
 use chrono::Utc;
 use ff_brain::BrainStateClient;
 use serde_json::{Value, json};
+use std::hash::{Hash, Hasher};
 use tracing::info;
 use uuid::Uuid;
 
@@ -70,6 +71,15 @@ pub async fn brain_search(params: Option<Value>) -> HandlerResult {
     if let Some(ref tag_list) = tags {
         nodes.retain(|n| tag_list.iter().any(|t| n.tags.contains(t)));
     }
+    let _ = ff_db::queries::pg_log_memory_retrieval(
+        &pool,
+        "brain_search",
+        query,
+        nodes.len(),
+        None,
+        nodes.is_empty(),
+    )
+    .await;
 
     Ok(json!({
         "count": nodes.len(),
@@ -255,6 +265,7 @@ pub async fn brain_propose_node(params: Option<Value>) -> HandlerResult {
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
     let project = p.get("project").and_then(|v| v.as_str());
+    let support = p.get("support").and_then(|v| v.as_u64()).unwrap_or(1);
 
     let pool = get_pool().await?;
     let user_id = resolve_default_user(&pool).await?;
@@ -275,6 +286,59 @@ pub async fn brain_propose_node(params: Option<Value>) -> HandlerResult {
     )
     .await
     .map_err(|e| format!("insert candidate: {e}"))?;
+
+    // Attach/push is the fast lane: a well-supported fact becomes visible to
+    // every attached client's next retrieval immediately. Dreamer remains the
+    // slow lane for consolidation, deduplication, and decay.
+    if kind == "fact" && support >= 3 {
+        let slug = title
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .split('-')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("-");
+        let path = format!(
+            "live/{}/{}",
+            project.unwrap_or("fleet"),
+            if slug.is_empty() { "fact" } else { &slug }
+        );
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        body.hash(&mut hasher);
+        let content_hash = format!("{:016x}", hasher.finish());
+        ff_db::pg_upsert_brain_vault_node(
+            &pool,
+            &path,
+            title,
+            Some("distilled_fact"),
+            project,
+            &tags,
+            None,
+            &[],
+            None,
+            Some(0.95),
+            &content_hash,
+        )
+        .await
+        .map_err(|e| format!("immediate fact promotion: {e}"))?;
+        ff_db::pg_update_brain_candidate_status(&pool, candidate_id, "approved")
+            .await
+            .map_err(|e| format!("approve promoted fact: {e}"))?;
+        info!(id = %candidate_id, title, support, "brain: immediately promoted supported fact");
+        return Ok(json!({
+            "status": "promoted",
+            "candidate_id": candidate_id.to_string(),
+            "path": path,
+            "message": "High-support fact promoted immediately; Dreamer will consolidate it later.",
+        }));
+    }
 
     info!(id = %candidate_id, title, "brain: proposed new knowledge node");
 

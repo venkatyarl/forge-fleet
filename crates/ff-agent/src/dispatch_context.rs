@@ -367,7 +367,18 @@ pub async fn context_pack_for_dispatch(
 
     let decisions_pack = build_brain_decisions_pack(pool, &title, &description).await;
 
-    format!("{symbol_pack}{decisions_pack}")
+    let pack = format!("{symbol_pack}{decisions_pack}");
+    let query_text = format!("{title}\n{description}");
+    let _ = ff_db::queries::pg_log_memory_retrieval(
+        pool,
+        "dispatch_pack",
+        &query_text,
+        usize::from(!pack.is_empty()),
+        None,
+        pack.is_empty(),
+    )
+    .await;
+    pack
 }
 
 #[cfg(test)]

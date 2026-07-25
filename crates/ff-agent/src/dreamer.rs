@@ -213,6 +213,69 @@ pub async fn run_dreamer_pass(pool: &PgPool) -> Result<serde_json::Value> {
         }
     }
 
+    // 3) Turn repeated retrieval misses into bounded research fuel for the
+    // self-improvement council. Normalization deliberately stays simple and
+    // explainable: case and whitespace variants form one query class.
+    let miss_classes: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT lower(regexp_replace(btrim(query_text), '\\s+', ' ', 'g')) AS query_class,
+                COUNT(*)::bigint AS misses
+           FROM memory_retrieval_log
+          WHERE was_miss AND ts >= NOW() - INTERVAL '7 days'
+          GROUP BY query_class
+         HAVING COUNT(*) > 1
+          ORDER BY misses DESC, query_class
+          LIMIT 10",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let mut known_unknown_candidates = 0usize;
+    if !miss_classes.is_empty() {
+        let user_id = match ff_db::pg_get_brain_user(pool, "venkat").await? {
+            Some(user) => user.id,
+            None => ff_db::pg_create_brain_user(pool, "venkat", Some("Venkat")).await?,
+        };
+        for (query_class, misses) in &miss_classes {
+            let title = format!("Known unknown: {query_class}");
+            let already_pending: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM brain_knowledge_candidates
+                     WHERE status = 'pending' AND title = $1
+                )",
+            )
+            .bind(&title)
+            .fetch_one(pool)
+            .await?;
+            if already_pending {
+                continue;
+            }
+            let body = format!(
+                "Agents missed this retrieval class {misses} times in the last week. \
+                 Send it to the self-improvement council as a research gap."
+            );
+            ff_db::pg_insert_brain_candidate(
+                pool,
+                user_id,
+                None,
+                "create",
+                Some("research_gap"),
+                Some(&title),
+                Some(&body),
+                &[
+                    "known-unknown".to_string(),
+                    "self-improvement-council".to_string(),
+                ],
+                None,
+                None,
+                Some("dreamer"),
+                Some(0.9),
+            )
+            .await?;
+            known_unknown_candidates += 1;
+        }
+    }
+
     if sessions_archived > 0 || scopes_consolidated > 0 {
         info!(
             sessions_archived,
@@ -223,6 +286,8 @@ pub async fn run_dreamer_pass(pool: &PgPool) -> Result<serde_json::Value> {
         "sessions_archived": sessions_archived,
         "blocks_archived": blocks_archived,
         "over_cap_scopes_consolidated": scopes_consolidated,
+        "known_unknown_classes": miss_classes.len(),
+        "known_unknown_candidates": known_unknown_candidates,
     }))
 }
 
