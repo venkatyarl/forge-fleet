@@ -12201,6 +12201,33 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// V269 — Concurrency control for `workstream_threads`, the per-client-attach
+/// layer under a project's single workstream (`ff_workstreams`). Adds:
+///   - `owner_session` / `owner_acquired_at` — the session that currently
+///     holds exclusive (single-writer) authority over the thread.
+///   - `last_seen_at` — presence heartbeat; a stale-past-lease owner can be
+///     reclaimed by another session (see `ff_agent::thread_ownership`).
+///   - `causal_seq` — a monotonic per-thread counter stamped on every
+///     accepted write, so a reclaimed owner's late writes can be detected.
+///   - `redacted_at` / `redacted_reason` — tombstone marker for redaction.
+///
+/// The table itself was created by hand on the live cluster (see
+/// `ff_agent::workstreams`); this migration only adds the new columns, so it
+/// is written as `ADD COLUMN IF NOT EXISTS` rather than `CREATE TABLE`.
+pub const SCHEMA_V269_WORKSTREAM_THREAD_CONCURRENCY: &str = r#"
+ALTER TABLE workstream_threads
+    ADD COLUMN IF NOT EXISTS owner_session     TEXT,
+    ADD COLUMN IF NOT EXISTS owner_acquired_at  TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS last_seen_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS causal_seq         BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS redacted_at        TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS redacted_reason    TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_workstream_threads_owner_stale
+    ON workstream_threads (last_seen_at)
+    WHERE owner_session IS NOT NULL;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

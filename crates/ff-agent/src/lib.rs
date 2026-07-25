@@ -175,6 +175,7 @@ pub mod telegram_reply_poller;
 pub mod telegram_status_updater;
 pub mod template_registry;
 pub mod thinking;
+pub mod thread_ownership;
 pub mod tick_registry;
 pub mod tools;
 pub mod training;
