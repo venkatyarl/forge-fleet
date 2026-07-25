@@ -71,6 +71,74 @@ pub async fn send_telegram_recorded(
     Ok(Some(message_id))
 }
 
+/// Send a Telegram message with an optional inline logo/photo. When
+/// `photo` is `Some(non-empty bytes)` this uploads via `sendPhoto` (multipart)
+/// with `caption = title\n\nbody`; the image renders above the text. When
+/// `photo` is `None`/empty it falls back to the plain `sendMessage` path so a
+/// project without a logo still gets its digest. Silently `Ok(())` when
+/// telegram isn't configured. Used by the per-project digest framework so each
+/// project's update carries its own logo.
+pub async fn send_telegram_photo_from_secrets(
+    pool: &PgPool,
+    title: &str,
+    body: &str,
+    photo: Option<&[u8]>,
+) -> Result<()> {
+    let bytes = match photo {
+        Some(b) if !b.is_empty() => b.to_vec(),
+        _ => return send_telegram_from_secrets(pool, title, body).await,
+    };
+
+    let token = ff_db::pg_get_secret(pool, TELEGRAM_BOT_TOKEN_KEY)
+        .await
+        .context("lookup telegram bot token")?;
+    let chat_id = ff_db::pg_get_secret(pool, TELEGRAM_CHAT_ID_KEY)
+        .await
+        .context("lookup telegram chat id")?;
+    let (Some(token), Some(chat_id)) = (token, chat_id) else {
+        tracing::debug!("telegram not fully configured; skipping photo send");
+        return Ok(());
+    };
+
+    // Telegram photo captions are capped at 1024 chars; keep the header and
+    // trim the body if the combined caption would overflow.
+    let mut caption = if body.is_empty() {
+        title.to_string()
+    } else {
+        format!("{title}\n\n{body}")
+    };
+    if caption.chars().count() > 1024 {
+        caption = caption.chars().take(1021).collect::<String>() + "...";
+    }
+
+    let url = format!("https://api.telegram.org/bot{token}/sendPhoto");
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name("logo.png")
+        .mime_str("image/png")
+        .context("build telegram photo part")?;
+    let form = reqwest::multipart::Form::new()
+        .text("chat_id", chat_id)
+        .text("caption", caption)
+        .part("photo", part);
+
+    let resp = SHARED_HTTP
+        .post(&url)
+        .multipart(form)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .context("POST telegram sendPhoto")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        // Fall back to text so the operator still gets the digest even if the
+        // image upload is rejected (bad bytes, size limit, etc.).
+        tracing::warn!(%status, err = %text.trim(), "telegram sendPhoto failed; falling back to text");
+        return send_telegram_from_secrets(pool, title, body).await;
+    }
+    Ok(())
+}
+
 /// Shared send path: returns `None` when telegram isn't configured, else
 /// `(chat_id, message_id)` of the delivered message.
 async fn send_returning_id(

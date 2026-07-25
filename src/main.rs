@@ -584,28 +584,30 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         info!("subsystem disabled: telegram transport");
     }
 
-    // 7b) telegram status updater — periodic fleet-status digest posted to
-    // the operator's chat via `sendMessage`. Unlike the transport above,
-    // `sendMessage` has no single-consumer restriction, so this runs on
-    // every daemon and leader-gates itself inside the tick (only one digest
-    // goes out per interval).
-    if let Some(pg_pool) = operational_store.pg_pool().cloned()
-        && config
-            .transport
-            .telegram
-            .as_ref()
-            .is_some_and(|telegram| telegram.enabled)
-    {
-        info!("starting subsystem: telegram status updater (leader-gated)");
-        subsystem_tasks.push(
-            ff_agent::telegram_status_updater::spawn_telegram_status_updater_tick(
-                pg_pool,
-                900, // 15-minute operator digest (2026-07-25)
-                shutdown_rx.clone(),
-            ),
-        );
+    // 7b) per-project digest framework — one updatable, logo-bearing digest per
+    // registered project (ForgeFleet, HireFlow360, ...), each scoped to that
+    // project's work_items. Data-driven from `project_digest_configs`, so the
+    // operator edits a row to change what they receive instead of us adding a
+    // new tick per project. Temporary task-digests self-expire 15 min after the
+    // task completes. This REPLACES the old single hardcoded status tick.
+    //
+    // NOT gated on `transport.telegram.enabled`: that flag governs the
+    // *bidirectional poller transport* (single-consumer, one node only). The
+    // digest uses `sendPhoto`/`sendMessage`, which have no single-consumer
+    // restriction and read credentials straight from `fleet_secrets`. The tick
+    // leader-gates itself and no-ops silently when telegram secrets are absent,
+    // so it is safe (and correct) to spawn unconditionally — this is why the
+    // operator never received a native digest: the leader (adele) had no
+    // `[transport.telegram]` config, so the old gate disabled it entirely.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: per-project digest framework (leader-gated)");
+        subsystem_tasks.push(ff_agent::project_digests::spawn_project_digests_tick(
+            pg_pool,
+            60, // wake every 60s; each config's interval_secs drives cadence
+            shutdown_rx.clone(),
+        ));
     } else {
-        info!("subsystem disabled: telegram status updater");
+        info!("subsystem disabled: per-project digest framework (no pg pool)");
     }
 
     // 8) evolution runtime loop
