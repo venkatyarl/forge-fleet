@@ -349,7 +349,10 @@ fn capacity_rejection(
         Some(("not_installed", "backend is not installed".into()))
     } else if !row.authenticated {
         Some(("not_authenticated", "backend is not authenticated".into()))
-    } else if row.last_checked_at <= fresh_after {
+    } else if row
+        .last_auth_ok_at
+        .is_none_or(|last_auth_ok_at| last_auth_ok_at <= fresh_after)
+    {
         Some(("stale", "backend health check is stale".into()))
     } else if row.breaker_state == "open" {
         Some(("breaker_open", "backend circuit breaker is open".into()))
@@ -496,7 +499,7 @@ mod tests {
             backend: name.to_string(),
             installed: true,
             authenticated: true,
-            last_checked_at: now,
+            last_auth_ok_at: Some(now),
             remaining_pct: Some(100.0),
             breaker_state: "closed".to_string(),
         }
