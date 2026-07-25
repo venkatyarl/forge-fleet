@@ -1200,6 +1200,14 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
     },
+    // 259 confirmed free: highest live-applied version is 260 (applied out of
+    // band, no PG_MIGRATIONS entry) and sibling in-flight branches claim
+    // 260-263 — 259 is the only gap-free slot both live and across branches.
+    PgMigration {
+        version: 259,
+        name: "node_version_state",
+        sql: schema::SCHEMA_V259_NODE_VERSION_STATE,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -2339,6 +2347,45 @@ mod tests {
 
         assert_eq!(conflict.id, digest.id);
         assert_eq!(conflict.count, 2);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v259_creates_node_version_state() {
+        // CI commonly has no Postgres; the helper checks both supported URL vars.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on a fresh database");
+
+        let computer_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'v259-node')")
+            .bind(computer_id)
+            .execute(&pool)
+            .await
+            .expect("insert computer");
+
+        let row: (String, String, i32, String, Option<String>) = sqlx::query_as(
+            "INSERT INTO node_version_state
+                (computer_id, node_name, software_id, installed_sha, latest_sha,
+                 commit_lag, status, donor_node_name)
+             VALUES
+                ($1, 'v259-node', 'ff_git', '3b644697cb', '4130b332aa', 2, 'needs_prebuilt', 'donor-node')
+             RETURNING node_name, software_id, commit_lag, status, donor_node_name",
+        )
+        .bind(computer_id)
+        .fetch_one(&pool)
+        .await
+        .expect("insert + read node_version_state row");
+
+        assert_eq!(row.0, "v259-node");
+        assert_eq!(row.1, "ff_git");
+        assert_eq!(row.2, 2);
+        assert_eq!(row.3, "needs_prebuilt");
+        assert_eq!(row.4.as_deref(), Some("donor-node"));
 
         drop_temp_db(admin, pool, &db_name).await;
     }
