@@ -40,6 +40,43 @@ use uuid::Uuid;
 
 use crate::multi_agent::{AgentTaskResult, OrchestratorEvent, TaskStatus};
 
+const RESEARCH_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+struct ResearchHeartbeat {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ResearchHeartbeat {
+    fn spawn(pool: PgPool, session_id: Uuid) -> Self {
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(RESEARCH_HEARTBEAT_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if let Err(error) = sqlx::query(
+                    "UPDATE research_sessions
+                        SET last_heartbeat_at = NOW()
+                      WHERE id = $1
+                        AND status NOT IN ('done', 'failed')",
+                )
+                .bind(session_id)
+                .execute(&pool)
+                .await
+                {
+                    warn!(session = %session_id, %error, "research heartbeat failed");
+                }
+            }
+        });
+        Self { task }
+    }
+}
+
+impl Drop for ResearchHeartbeat {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 // ─── Public types ───────────────────────────────────────────────────────────
 
 /// Configuration for one research run.
@@ -349,7 +386,9 @@ impl ResearchSession {
     pub async fn claim_next_queued(pool: PgPool) -> Result<Option<Self>> {
         let row = sqlx::query(
             "UPDATE research_sessions
-                SET status = 'planning', started_at = NOW()
+                SET status = 'planning',
+                    started_at = NOW(),
+                    last_heartbeat_at = NOW()
               WHERE id = (
                   SELECT id FROM research_sessions
                    WHERE status = 'queued'
@@ -431,6 +470,7 @@ impl ResearchSession {
         &self,
         progress: Option<mpsc::Sender<ResearchProgress>>,
     ) -> Result<ResearchReport> {
+        let _heartbeat = ResearchHeartbeat::spawn(self.pool.clone(), self.session_id);
         let start = Instant::now();
         if let Some(tx) = &progress {
             let _ = tx
@@ -1355,6 +1395,11 @@ pub async fn auto_recover_stale(
                 SELECT 1 FROM research_subtasks st
                  WHERE st.session_id = s.id
                    AND COALESCE(st.output_markdown, '') <> ''
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM research_subtasks st
+                 WHERE st.session_id = s.id
+                   AND st.status NOT IN ('done', 'failed', 'max_turns')
             )
           ORDER BY s.created_at
           LIMIT $2",
