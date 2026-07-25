@@ -497,6 +497,317 @@ async fn seed_auto_install_rows(pool: &PgPool) -> Result<u64> {
     Ok(n)
 }
 
+/// RAM floor below which a node cannot safely self-build the workspace
+/// (empirically: a 3GB node OOM-compiles and then silently rots for days
+/// with nothing flagging it). Below this, reconciliation looks for a
+/// same-OS-family peer that already has the target SHA installed (a binary
+/// donor) rather than dispatching a self-build that will just OOM again.
+const LOW_RAM_CANNOT_SELF_BUILD_GB: i32 = 8;
+
+/// Is this node's RAM tight enough that reconciliation should prefer a
+/// binary donor over dispatching a self-build?
+fn should_prefer_donor(total_ram_gb: Option<i32>) -> bool {
+    total_ram_gb.is_some_and(|gb| gb > 0 && gb <= LOW_RAM_CANNOT_SELF_BUILD_GB)
+}
+
+fn node_version_status(
+    installed: Option<&str>,
+    latest: Option<&str>,
+    computer_status: &str,
+) -> String {
+    if matches!(computer_status, "upgrading" | "failed") {
+        return computer_status.to_string();
+    }
+    let Some(installed) = installed.map(str::trim).filter(|s| !s.is_empty()) else {
+        return "unknown".to_string();
+    };
+    let Some(latest) = latest.map(str::trim).filter(|s| !s.is_empty()) else {
+        return "unknown".to_string();
+    };
+    if ff_core::build_version::is_same_version(installed, latest) {
+        "current".to_string()
+    } else {
+        "drifted".to_string()
+    }
+}
+
+async fn commit_lag(source_tree: Option<&str>, installed: &str, latest: &str) -> Option<i32> {
+    let source_tree = source_tree?;
+    let installed = installed.trim().to_string();
+    let latest = latest.trim().to_string();
+    if installed.is_empty() || latest.is_empty() {
+        return None;
+    }
+    let source_tree = source_tree.to_string();
+    tokio::task::spawn_blocking(move || {
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                &source_tree,
+                "rev-list",
+                "--count",
+                &format!("{installed}..{latest}"),
+            ])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .and_then(|s| s.trim().parse::<i32>().ok())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Find a same-OS-family peer that already has `latest_sha` installed for
+/// `software_id` — a viable binary donor for a RAM-constrained node. Matching
+/// is OS-family-only (there is no persisted per-node arch column); today
+/// every macOS node in the fleet is aarch64 so this is exact in practice, but
+/// a mixed-arch macOS fleet would need an arch column added here too.
+/// Deliberately returns `None` (never a cross-OS donor) — shipping a Linux
+/// binary to a macOS node is the verified ace bug this reconciliation exists
+/// to prevent.
+async fn find_binary_donor(
+    pool: &PgPool,
+    software_id: &str,
+    os_family: &str,
+    latest_sha: &str,
+    exclude_computer_id: uuid::Uuid,
+) -> Option<String> {
+    let base = crate::upgrade_playbooks::base_family(os_family)?;
+    let candidates: Vec<(String, String)> = sqlx::query_as(
+        "SELECT c.name, c.os_family
+           FROM computer_software cs
+           JOIN computers c ON c.id = cs.computer_id
+          WHERE cs.software_id = $1
+            AND cs.installed_version = $2
+            AND cs.status = 'ok'
+            AND c.id <> $3",
+    )
+    .bind(software_id)
+    .bind(latest_sha)
+    .bind(exclude_computer_id)
+    .fetch_all(pool)
+    .await
+    .ok()?;
+    candidates
+        .into_iter()
+        .find(|(_, donor_family)| crate::upgrade_playbooks::base_family(donor_family) == Some(base))
+        .map(|(name, _)| name)
+}
+
+/// Reconcile each node's reported installed fleet SHA against the leader's
+/// upstream target and persist the derived state in `node_version_state`.
+/// Unknown SHAs stay `unknown` instead of dispatching; active `upgrading` /
+/// `failed` rows are observed but not downgraded. Drifted rows are marked
+/// `upgrade_available` in `computer_software`, which lets the existing
+/// continuous rollout / wave path perform the actual update. A drifted,
+/// RAM-constrained node with a same-OS-family donor available is classified
+/// `needs_prebuilt` (informational — actually shipping the binary is still
+/// the operator's `ff fleet deploy` path); a drifted node with NO matching
+/// donor (e.g. a lone macOS node among Linux peers) stays plain `drifted` so
+/// it still converges via the normal self-build wave instead of being
+/// silently skipped.
+async fn reconcile_node_version_state(pool: &PgPool) -> Result<u64> {
+    let source_tree: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT c.source_tree_path
+          FROM fleet_leader_state ls
+          JOIN computers c ON c.id = ls.computer_id
+         WHERE c.source_tree_path IS NOT NULL AND c.source_tree_path <> ''
+         LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .context("read leader source_tree_path for node version reconciliation")?;
+    let source_tree = source_tree.as_deref().map(expand_tilde);
+
+    let rows = sqlx::query(
+        r#"
+        SELECT c.id AS computer_id,
+               c.name AS node_name,
+               c.os_family AS os_family,
+               c.total_ram_gb AS total_ram_gb,
+               cs.software_id AS software_id,
+               cs.installed_version AS installed_sha,
+               sr.latest_version AS latest_sha,
+               cs.status AS computer_status
+          FROM computer_software cs
+          JOIN computers c ON c.id = cs.computer_id
+          JOIN software_registry sr ON sr.id = cs.software_id
+         WHERE cs.software_id IN ('ff_git', 'forgefleetd_git')
+         ORDER BY c.name, cs.software_id
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("select fleet node version rows")?;
+
+    let mut drifted = 0u64;
+    for row in rows {
+        let computer_id: uuid::Uuid = row.get("computer_id");
+        let node_name: String = row.get("node_name");
+        let os_family: Option<String> = row.get("os_family");
+        let total_ram_gb: Option<i32> = row.get("total_ram_gb");
+        let software_id: String = row.get("software_id");
+        let installed_sha: Option<String> = row.get("installed_sha");
+        let latest_sha: Option<String> = row.get("latest_sha");
+        let computer_status: String = row.get("computer_status");
+        let mut status = node_version_status(
+            installed_sha.as_deref(),
+            latest_sha.as_deref(),
+            computer_status.as_str(),
+        );
+
+        let mut donor_node_name: Option<String> = None;
+        if status == "drifted" && should_prefer_donor(total_ram_gb) {
+            if let (Some(fam), Some(latest)) = (os_family.as_deref(), latest_sha.as_deref()) {
+                donor_node_name =
+                    find_binary_donor(pool, &software_id, fam, latest, computer_id).await;
+            }
+            if donor_node_name.is_some() {
+                status = "needs_prebuilt".to_string();
+            }
+            // No donor found (including no donor sharing this node's OS
+            // family): stays "drifted" so the self-build wave still picks it
+            // up rather than leaving it silently unconverged.
+        }
+
+        let lag = match status.as_str() {
+            "current" => Some(0),
+            "drifted" | "needs_prebuilt" => {
+                match (installed_sha.as_deref(), latest_sha.as_deref()) {
+                    (Some(installed), Some(latest)) => {
+                        commit_lag(source_tree.as_deref(), installed, latest).await
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+
+        if status == "drifted" || status == "needs_prebuilt" {
+            drifted += 1;
+            sqlx::query(
+                "UPDATE computer_software
+                    SET status = 'upgrade_available'
+                  WHERE computer_id = $1
+                    AND software_id = $2
+                    AND status IN ('ok', 'upgrade_blocked_dirty')",
+            )
+            .bind(computer_id)
+            .bind(&software_id)
+            .execute(pool)
+            .await
+            .with_context(|| format!("mark {node_name}/{software_id} upgrade_available"))?;
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO node_version_state
+                (computer_id, node_name, software_id, installed_sha, latest_sha,
+                 commit_lag, status, donor_node_name, first_drift_seen_at, last_checked_at, metadata)
+            VALUES
+                ($1, $2, $3, $4, $5, $6, $7, $8,
+                 CASE WHEN $7 IN ('drifted', 'needs_prebuilt') THEN NOW() ELSE NULL END,
+                 NOW(),
+                 jsonb_build_object('computer_software_status', $9, 'source', 'auto_upgrade_reconcile'))
+            ON CONFLICT (computer_id, software_id) DO UPDATE
+               SET node_name = EXCLUDED.node_name,
+                   installed_sha = EXCLUDED.installed_sha,
+                   latest_sha = EXCLUDED.latest_sha,
+                   commit_lag = EXCLUDED.commit_lag,
+                   status = EXCLUDED.status,
+                   donor_node_name = EXCLUDED.donor_node_name,
+                   first_drift_seen_at =
+                       CASE WHEN EXCLUDED.status IN ('drifted', 'needs_prebuilt')
+                            THEN COALESCE(node_version_state.first_drift_seen_at, NOW())
+                            ELSE NULL
+                       END,
+                   last_checked_at = NOW(),
+                   metadata = EXCLUDED.metadata
+            "#,
+        )
+        .bind(computer_id)
+        .bind(&node_name)
+        .bind(&software_id)
+        .bind(&installed_sha)
+        .bind(&latest_sha)
+        .bind(lag)
+        .bind(&status)
+        .bind(&donor_node_name)
+        .bind(&computer_status)
+        .execute(pool)
+        .await
+        .with_context(|| format!("upsert node_version_state for {node_name}/{software_id}"))?;
+    }
+
+    alert_on_stale_node_versions(pool).await;
+    Ok(drifted)
+}
+
+async fn alert_on_stale_node_versions(pool: &PgPool) {
+    let rows = sqlx::query(
+        r#"
+        SELECT node_name, software_id, installed_sha, latest_sha, commit_lag, status, donor_node_name
+          FROM node_version_state
+         WHERE status IN ('drifted', 'needs_prebuilt')
+           AND COALESCE(commit_lag, 0) > 1
+           AND first_drift_seen_at <= NOW() - INTERVAL '1 hour'
+           AND (last_alerted_at IS NULL OR last_alerted_at < NOW() - INTERVAL '6 hours')
+         ORDER BY node_name, software_id
+         LIMIT 20
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    if rows.is_empty() {
+        return;
+    }
+
+    let mut body = String::from("Fleet nodes are more than one commit behind origin/main:\n");
+    for row in &rows {
+        let node: String = row.get("node_name");
+        let software: String = row.get("software_id");
+        let installed: Option<String> = row.get("installed_sha");
+        let latest: Option<String> = row.get("latest_sha");
+        let lag: Option<i32> = row.get("commit_lag");
+        let status: String = row.get("status");
+        let donor: Option<String> = row.get("donor_node_name");
+        let suffix = match (status.as_str(), donor.as_deref()) {
+            ("needs_prebuilt", Some(d)) => format!(" [needs prebuilt binary from {d}]"),
+            _ => String::new(),
+        };
+        body.push_str(&format!(
+            "- {node}/{software}: {} -> {} ({} commits){suffix}\n",
+            installed.unwrap_or_else(|| "?".into()),
+            latest.unwrap_or_else(|| "?".into()),
+            lag.unwrap_or_default()
+        ));
+    }
+
+    match crate::telegram::send_telegram_from_secrets(pool, "ForgeFleet version drift", &body).await
+    {
+        Ok(()) => {
+            let _ = sqlx::query(
+                r#"
+                UPDATE node_version_state
+                   SET last_alerted_at = NOW()
+                 WHERE status IN ('drifted', 'needs_prebuilt')
+                   AND COALESCE(commit_lag, 0) > 1
+                   AND first_drift_seen_at <= NOW() - INTERVAL '1 hour'
+                   AND (last_alerted_at IS NULL OR last_alerted_at < NOW() - INTERVAL '6 hours')
+                "#,
+            )
+            .execute(pool)
+            .await;
+        }
+        Err(e) => tracing::warn!(error = %e, "node version drift telegram alert failed"),
+    }
+}
+
 /// Is this process currently the elected leader?
 pub(crate) async fn is_leader(_pool: &PgPool, _my_name: &str) -> bool {
     crate::leader_cache::is_current_leader()
@@ -823,6 +1134,15 @@ impl AutoUpgradeTick {
         // where installed_version != latest_version and status is currently 'ok'.
         // Generic across all methods.
         let _ = flip_drift_status(&self.pool).await;
+        // Durable version reconciliation for the fleet's own binaries: records
+        // real installed SHA vs origin/main target per node in
+        // `node_version_state`, and OS-aware-classifies RAM-constrained
+        // drifted nodes as needing a same-OS binary donor instead of a
+        // self-build (never a cross-OS donor — that was the verified ace
+        // gap). Best-effort: a failure here must not block the upgrade wave.
+        if let Err(e) = reconcile_node_version_state(&self.pool).await {
+            tracing::warn!(error = %e, "reconcile_node_version_state failed");
+        }
 
         // Leader self-upgrade (closes the leader gap). Runs BEFORE the
         // ids.is_empty() early return below so the leader self-heals on its OWN
@@ -1639,6 +1959,52 @@ mod tests {
                 "{id} wrongly flagged daemon-self"
             );
         }
+    }
+
+    #[test]
+    fn node_version_status_only_drifts_known_different_shas() {
+        assert_eq!(
+            node_version_status(Some("3b644697cb"), Some("3b644697cb71"), "ok"),
+            "current"
+        );
+        assert_eq!(
+            node_version_status(Some("3b644697cb"), Some("4130b332aa"), "ok"),
+            "drifted"
+        );
+        assert_eq!(
+            node_version_status(None, Some("4130b332aa"), "ok"),
+            "unknown"
+        );
+        assert_eq!(
+            node_version_status(Some("3b644697cb"), None, "ok"),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn node_version_status_preserves_active_upgrade_states() {
+        assert_eq!(
+            node_version_status(Some("3b644697cb"), Some("4130b332aa"), "upgrading"),
+            "upgrading"
+        );
+        assert_eq!(
+            node_version_status(Some("3b644697cb"), Some("4130b332aa"), "failed"),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn should_prefer_donor_only_below_the_ram_floor() {
+        // sarah's real case: 3GB OOM-compiles.
+        assert!(should_prefer_donor(Some(3)));
+        assert!(should_prefer_donor(Some(LOW_RAM_CANNOT_SELF_BUILD_GB)));
+        // ace's real case: enough RAM to self-build, must NOT be routed to a donor.
+        assert!(!should_prefer_donor(Some(LOW_RAM_CANNOT_SELF_BUILD_GB + 1)));
+        assert!(!should_prefer_donor(Some(64)));
+        // Unknown/zero RAM is never treated as "too tight to build" — that
+        // would misclassify every node whose hardware probe hasn't run yet.
+        assert!(!should_prefer_donor(None));
+        assert!(!should_prefer_donor(Some(0)));
     }
 
     #[test]

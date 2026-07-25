@@ -3067,18 +3067,24 @@ pub async fn handle_fleet_versions(
         return handle_fleet_versions_live(pool, verbose, json).await;
     }
 
-    // Pull the installed_version cell stored on each (computer, software_id)
-    // pair. ff_git's installed_version is the full 40-char git SHA written
-    // by version_check::collect_current; ff_terminal's regex-extracted
+    // Prefer node_version_state, the leader-reconciled snapshot of each
+    // node's embedded installed SHA versus origin/main. Fall back to the
+    // legacy computer_software cells until every daemon has run the
+    // reconciliation tick after the migration lands. ff_git's
+    // installed_version is the full 40-char git SHA written by
+    // version_check::collect_current; ff_terminal's regex-extracted
     // build_version is what predates the V56 cleanup but rare nodes may
     // still have it cached. Either path falls through code_identity().
     let rows = sqlx::query(
         "SELECT c.name AS name,
-                cs.installed_version AS installed,
-                sr.latest_version AS latest
+                COALESCE(nvs.installed_sha, cs.installed_version) AS installed,
+                COALESCE(nvs.latest_sha, sr.latest_version) AS latest
            FROM computers c
            JOIN computer_software cs ON cs.computer_id = c.id
            JOIN software_registry sr ON sr.id = cs.software_id
+           LEFT JOIN node_version_state nvs
+             ON nvs.computer_id = c.id
+            AND nvs.software_id = cs.software_id
           WHERE cs.software_id = 'ff_git'
           ORDER BY c.name",
     )

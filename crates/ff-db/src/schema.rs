@@ -12201,6 +12201,43 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// Durable per-node view of the fleet's own installed code identity versus the
+/// leader's upstream (origin/main) target. This is a derived snapshot
+/// maintained by the auto-upgrade reconciliation tick; `computer_software`
+/// remains the upgrade dispatch source of truth. `status` is one of
+/// `unknown` | `current` | `drifted` | `needs_prebuilt` | `upgrading` | `failed`
+/// — `needs_prebuilt` marks a drifted node whose RAM is too tight to safely
+/// self-build AND for which a same-OS-family peer already has the target SHA
+/// installed (a viable binary donor); `donor_node_name` names that peer.
+/// A drifted node with no matching donor stays `drifted` so it still
+/// converges via the normal self-build wave instead of being silently
+/// skipped (the verified ace/macOS gap: a Linux-only donor search left a
+/// healthy macOS node stuck with nothing flagged).
+pub const SCHEMA_V259_NODE_VERSION_STATE: &str = r#"
+CREATE TABLE IF NOT EXISTS node_version_state (
+    computer_id          UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    node_name            TEXT NOT NULL,
+    software_id          TEXT NOT NULL REFERENCES software_registry(id) ON DELETE CASCADE,
+    installed_sha        TEXT,
+    latest_sha           TEXT,
+    commit_lag           INT,
+    status               TEXT NOT NULL DEFAULT 'unknown',
+    donor_node_name      TEXT,
+    first_drift_seen_at  TIMESTAMPTZ,
+    last_checked_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_alerted_at      TIMESTAMPTZ,
+    metadata             JSONB NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (computer_id, software_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_version_state_status
+    ON node_version_state (software_id, status, last_checked_at);
+
+CREATE INDEX IF NOT EXISTS idx_node_version_state_drift_alert
+    ON node_version_state (first_drift_seen_at)
+    WHERE status = 'drifted' AND first_drift_seen_at IS NOT NULL;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
