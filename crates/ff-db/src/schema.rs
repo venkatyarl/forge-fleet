@@ -12201,6 +12201,43 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// V259 — Extend the local skill-root registry into the harvester's source
+/// registry and advertise notable remote ecosystems for operator opt-in.
+pub const SCHEMA_V259_REMOTE_SKILL_SOURCES: &str = r#"
+ALTER TABLE skill_sources
+    ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'local_dir'
+        CHECK (kind IN ('local_dir', 'git_repo', 'mcp_registry', 'http_index')),
+    ADD COLUMN IF NOT EXISTS url TEXT,
+    ADD COLUMN IF NOT EXISTS adapter TEXT NOT NULL DEFAULT 'claude'
+        CHECK (adapter IN ('openclaw', 'mcp', 'custom', 'claude')),
+    ADD COLUMN IF NOT EXISTS license TEXT,
+    ADD COLUMN IF NOT EXISTS trust TEXT NOT NULL DEFAULT 'trusted'
+        CHECK (trust IN ('trusted', 'review_required', 'sandbox_only')),
+    ADD COLUMN IF NOT EXISTS last_harvested_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS upstream_ref TEXT;
+
+INSERT INTO skill_sources
+    (id, label, path, priority, enabled, kind, url, adapter, license, trust, upstream_ref)
+VALUES
+    ('openclaw-skills', 'OpenClaw skill registry', '', 40, FALSE, 'git_repo',
+     'https://github.com/openclaw/clawhub.git', 'openclaw', NULL, 'trusted', 'main'),
+    ('goose-extensions', 'Goose extensions', '', 40, FALSE, 'git_repo',
+     'https://github.com/block/goose.git', 'custom', NULL, 'trusted', 'main'),
+    ('crewai-tools', 'CrewAI tools', '', 40, FALSE, 'git_repo',
+     'https://github.com/crewAIInc/crewAI-tools.git', 'custom', NULL, 'trusted', 'main'),
+    ('smolagents', 'smolagents tools', '', 40, FALSE, 'git_repo',
+     'https://github.com/huggingface/smolagents.git', 'custom', NULL, 'trusted', 'main'),
+    ('swe-agent', 'SWE-agent tools', '', 40, FALSE, 'git_repo',
+     'https://github.com/SWE-agent/SWE-agent.git', 'custom', NULL, 'trusted', 'main'),
+    ('mcp-server-registry', 'Public MCP server registry', '', 40, FALSE, 'mcp_registry',
+     'https://registry.modelcontextprotocol.io', 'mcp', NULL, 'review_required', NULL),
+    ('awesome-llm-agents', 'Curated awesome-llm-agents list', '', 40, FALSE, 'http_index',
+     'https://raw.githubusercontent.com/kaushikb11/awesome-llm-agents/main/README.md',
+     'custom', 'MIT',
+     'review_required', 'main')
+ON CONFLICT (id) DO NOTHING;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
