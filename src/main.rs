@@ -3273,6 +3273,14 @@ async fn start_pulse_v2_subsystems(
                         }
                     }
                     _ = tick.tick() => {
+                        // ff fixes the LLM: restart alive-but-unhealthy (503-hung)
+                        // local models so the router gets them back in rotation.
+                        // Gated OFF by default (deployment_autorestart_mode).
+                        let hung_recovered =
+                            ff_agent::deployment_reconciler::restart_hung_local_deployments(&pool).await;
+                        if hung_recovered > 0 {
+                            info!(hung_recovered, "reconciler: recovered hung models (ff self-heal)");
+                        }
                         match ff_agent::deployment_reconciler::reconcile_local(&pool).await {
                             Ok(s) => {
                                 if s.respawned > 0

@@ -61,6 +61,78 @@ pub struct ReconcileSummary {
 }
 
 /// Run one reconcile pass. Returns counts for logging.
+/// Restart LOCAL model deployments that are ALIVE-but-unhealthy (503-hung) — the
+/// gap the base reconciler misses (it respawns DEAD processes, not hung ones, so
+/// a 503-wedged server like the 5.6-day-stuck 480B is never fixed). This is
+/// "ff fixes the LLM": unload + reload (load_model health-waits), returning the
+/// model to rotation once it answers. Runs per-node, so each computer's
+/// orchestrator fixes its OWN models (operator's model 2026-07-25: llm router →
+/// leader → local orchestrator fixes + tests → back in rotation).
+///
+/// SAFETY: gated on the `deployment_autorestart_mode` fleet-secret — default
+/// **OFF** so a fresh fleet-wide deploy can't restart-storm every node at once;
+/// flip to "on" deliberately. Skips the multi-node 480B RING (`%480b%` — it needs
+/// its RPC ring recipe, not a plain reload). `started_at` gives a natural 15-min
+/// cooldown so a freshly-(re)started/loading server isn't restarted again.
+pub async fn restart_hung_local_deployments(pool: &sqlx::PgPool) -> u64 {
+    let enabled = matches!(
+        ff_db::pg_read_gate_value(pool, "deployment_autorestart_mode", "off", "off")
+            .await
+            .as_deref(),
+        Ok("on") | Ok("true") | Ok("1")
+    );
+    if !enabled {
+        return 0;
+    }
+    let node = crate::fleet_info::resolve_this_worker_name().await;
+    let rows: Vec<(String, Option<String>, i32)> = sqlx::query_as(
+        "SELECT id::text, library_id::text, port \
+           FROM fleet_model_deployments \
+          WHERE worker_name = $1 AND desired_state = 'active' \
+            AND health_status = 'unhealthy' \
+            AND catalog_id NOT ILIKE '%480b%' \
+            AND (started_at IS NULL OR started_at < now() - interval '15 minutes')",
+    )
+    .bind(&node)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let mut recovered = 0u64;
+    for (id, library_id, port) in rows {
+        let Some(library_id) = library_id else {
+            tracing::warn!(deployment = %id, "reconciler: hung model has no library_id — cannot reload");
+            continue;
+        };
+        tracing::warn!(deployment = %id, port, node = %node,
+            "reconciler: restarting HUNG (alive-but-unhealthy) model — ff self-heal");
+        if let Err(e) = crate::model_runtime::unload_model(pool, &id).await {
+            tracing::warn!(deployment = %id, error = %e, "reconciler: unload of hung model failed");
+            continue;
+        }
+        match crate::model_runtime::load_model(
+            pool,
+            crate::model_runtime::LoadOptions {
+                library_id,
+                port: port as u16,
+                context_size: None,
+                parallel: None,
+                agent_profile: true,
+                mmproj_path: None,
+            },
+        )
+        .await
+        {
+            Ok(_) => {
+                tracing::info!(deployment = %id, "reconciler: RECOVERED hung model → back in rotation");
+                recovered += 1;
+            }
+            Err(e) => tracing::warn!(deployment = %id, error = %e,
+                "reconciler: reload FAILED — endpoint down until next pass"),
+        }
+    }
+    recovered
+}
+
 pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, String> {
     let worker_name = crate::fleet_info::resolve_this_worker_name().await;
 
