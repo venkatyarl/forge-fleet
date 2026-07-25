@@ -12201,6 +12201,55 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// V267 — Workstream-0 prereq for Memory-v2 M7: `fleet_episodes` is the
+/// shared-Postgres destination for session-transcript export. Replaces
+/// `ff-agent/src/session_export.rs` staging its redacted markdown locally
+/// and rsync'ing it to a single node (`adele`) — a leader-local dependency
+/// that made every non-adele node's exported session state unavailable
+/// whenever adele was unreachable. `fleet_episode_watermarks` tracks each
+/// (source_kind, node, stream) high-watermark so re-scans are incremental.
+/// Schema shared with Memory-v2 M7, which builds the full per-client
+/// collector/adapter framework on top of this table.
+pub const SCHEMA_V267_FLEET_EPISODES: &str = r#"
+CREATE TABLE IF NOT EXISTS fleet_episodes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_kind TEXT NOT NULL CHECK (source_kind IN (
+        'claude_cli', 'codex_cli', 'kimi_cli', 'ff_tui',
+        'ff_interaction', 'research', 'council', 'openclaw'
+    )),
+    node TEXT NOT NULL,
+    model TEXT,
+    session_id TEXT NOT NULL,
+    work_item_id UUID,
+    workstream_id UUID,
+    operator_intent TEXT,
+    seq INT NOT NULL CHECK (seq >= 0),
+    ts TIMESTAMPTZ NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    tokens INT,
+    redacted BOOLEAN NOT NULL DEFAULT TRUE,
+    consolidated_at TIMESTAMPTZ,
+    UNIQUE (source_kind, node, session_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_fleet_episodes_dreamer
+    ON fleet_episodes (ts, id) WHERE consolidated_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_fleet_episodes_work_item
+    ON fleet_episodes (work_item_id, ts) WHERE work_item_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_fleet_episodes_workstream
+    ON fleet_episodes (workstream_id, ts) WHERE workstream_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS fleet_episode_watermarks (
+    source_kind TEXT NOT NULL,
+    node TEXT NOT NULL,
+    stream_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    seq INT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (source_kind, node, stream_id)
+);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

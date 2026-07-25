@@ -62,6 +62,8 @@ pub use queries::{
     ErrorEventRow,
     // Fleet agents catalog (V112)
     FleetAgentRow,
+    // fleet_episodes (Workstream-0 / Memory-v2 M7)
+    FleetEpisodeInsert,
     FleetModelRow,
     FleetNodeRow,
     FleetSecretRow,
@@ -150,6 +152,7 @@ pub use queries::{
     pg_evaluate_cloud_route,
     pg_finish_deferred,
     pg_fire_brain_reminder,
+    pg_fleet_episodes_count,
     pg_force_cancel_deferred,
     pg_free_slots,
     pg_get_agent,
@@ -178,6 +181,7 @@ pub use queries::{
     pg_insert_disk_policy_run,
     pg_insert_disk_usage,
     pg_insert_error_event,
+    pg_insert_fleet_episode,
     pg_insert_node_ssh_key,
     pg_insert_work_intent,
     // Interaction log (V121 ff_interactions)

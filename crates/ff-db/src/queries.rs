@@ -9472,6 +9472,54 @@ pub async fn pg_reapable_worktrees(
         .collect())
 }
 
+// ─── fleet_episodes (Workstream-0 / Memory-v2 M7) ──────────────────────────
+
+/// One turn to insert into `fleet_episodes` — the shared-Postgres
+/// destination that replaces staging session-export markdown locally and
+/// rsync'ing it to a single node.
+#[derive(Debug, Clone)]
+pub struct FleetEpisodeInsert {
+    pub source_kind: String,
+    pub node: String,
+    pub session_id: String,
+    pub seq: i32,
+    pub ts: DateTime<Utc>,
+    pub role: String,
+    pub content: String,
+    pub redacted: bool,
+}
+
+/// Insert one episode row, skipping it if `(source_kind, node, session_id,
+/// seq)` already exists (re-exports of an unchanged transcript are
+/// idempotent). Returns `true` if a new row was inserted.
+pub async fn pg_insert_fleet_episode(pool: &PgPool, episode: &FleetEpisodeInsert) -> Result<bool> {
+    let inserted = sqlx::query(
+        "INSERT INTO fleet_episodes
+            (source_kind, node, session_id, seq, ts, role, content, redacted)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (source_kind, node, session_id, seq) DO NOTHING",
+    )
+    .bind(&episode.source_kind)
+    .bind(&episode.node)
+    .bind(&episode.session_id)
+    .bind(episode.seq)
+    .bind(episode.ts)
+    .bind(&episode.role)
+    .bind(&episode.content)
+    .bind(episode.redacted)
+    .execute(pool)
+    .await?;
+    Ok(inserted.rows_affected() > 0)
+}
+
+/// Row count of `fleet_episodes`, for status/verification tooling.
+pub async fn pg_fleet_episodes_count(pool: &PgPool) -> Result<i64> {
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM fleet_episodes")
+        .fetch_one(pool)
+        .await?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod parent_completion_tests {
     use super::*;
