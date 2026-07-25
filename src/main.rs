@@ -600,7 +600,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         subsystem_tasks.push(
             ff_agent::telegram_status_updater::spawn_telegram_status_updater_tick(
                 pg_pool,
-                3600,
+                900, // 15-minute operator digest (2026-07-25)
                 shutdown_rx.clone(),
             ),
         );
