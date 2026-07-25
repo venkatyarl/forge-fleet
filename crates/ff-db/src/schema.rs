@@ -12201,6 +12201,166 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// V261 — Durable, fenced project workstreams.
+///
+/// The live database may already contain the original `ff_workstreams`
+/// artifact.  The `CREATE` therefore describes a fresh installation while the
+/// following `ALTER` statements upgrade that artifact in place.
+pub const SCHEMA_V261_FF_WORKSTREAMS: &str = r#"
+CREATE TABLE IF NOT EXISTS ff_workstreams (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_key       TEXT NOT NULL UNIQUE REFERENCES projects(id),
+    git_remote        TEXT,
+    basename          TEXT,
+    aliases           JSONB NOT NULL DEFAULT '[]'::jsonb,
+    goal              TEXT,
+    working_summary   TEXT,
+    status            TEXT NOT NULL DEFAULT 'active',
+    leader_generation INT NOT NULL DEFAULT 0,
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE ff_workstreams
+    ADD COLUMN IF NOT EXISTS focus                   TEXT,
+    ADD COLUMN IF NOT EXISTS open_threads            JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS summary_seq             BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS next_event_seq          BIGINT NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS writer_owner            TEXT,
+    ADD COLUMN IF NOT EXISTS writer_token            UUID,
+    ADD COLUMN IF NOT EXISTS writer_lease_expires_at TIMESTAMPTZ;
+
+UPDATE ff_workstreams
+   SET aliases = COALESCE(aliases, '[]'::jsonb),
+       status = COALESCE(status, 'active'),
+       leader_generation = COALESCE(leader_generation, 0),
+       updated_at = COALESCE(updated_at, NOW());
+
+ALTER TABLE ff_workstreams
+    ALTER COLUMN aliases SET DEFAULT '[]'::jsonb,
+    ALTER COLUMN aliases SET NOT NULL,
+    ALTER COLUMN status SET DEFAULT 'active',
+    ALTER COLUMN status SET NOT NULL,
+    ALTER COLUMN leader_generation SET DEFAULT 0,
+    ALTER COLUMN leader_generation SET NOT NULL,
+    ALTER COLUMN updated_at SET DEFAULT NOW(),
+    ALTER COLUMN updated_at SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'ff_workstreams'::regclass
+          AND conname = 'ff_workstreams_project_key_fkey'
+    ) THEN
+        ALTER TABLE ff_workstreams
+            ADD CONSTRAINT ff_workstreams_project_key_fkey
+            FOREIGN KEY (project_key) REFERENCES projects(id);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'ff_workstreams'::regclass
+          AND conname = 'ff_workstreams_status_check'
+    ) THEN
+        ALTER TABLE ff_workstreams
+            ADD CONSTRAINT ff_workstreams_status_check
+            CHECK (status IN ('active', 'paused', 'completed', 'archived'));
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'ff_workstreams'::regclass
+          AND conname = 'ff_workstreams_sequences_check'
+    ) THEN
+        ALTER TABLE ff_workstreams
+            ADD CONSTRAINT ff_workstreams_sequences_check
+            CHECK (summary_seq >= 0 AND next_event_seq > 0);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'ff_workstreams'::regclass
+          AND conname = 'ff_workstreams_json_shapes_check'
+    ) THEN
+        ALTER TABLE ff_workstreams
+            ADD CONSTRAINT ff_workstreams_json_shapes_check
+            CHECK (
+                jsonb_typeof(aliases) = 'array'
+                AND jsonb_typeof(open_threads) = 'array'
+            );
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'ff_workstreams'::regclass
+          AND conname = 'ff_workstreams_writer_lease_check'
+    ) THEN
+        ALTER TABLE ff_workstreams
+            ADD CONSTRAINT ff_workstreams_writer_lease_check
+            CHECK (
+                (writer_owner IS NULL AND writer_token IS NULL AND writer_lease_expires_at IS NULL)
+                OR
+                (writer_owner IS NOT NULL AND writer_token IS NOT NULL
+                    AND writer_lease_expires_at IS NOT NULL)
+            );
+    END IF;
+END
+$$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ff_workstreams_project_key
+    ON ff_workstreams (project_key);
+CREATE INDEX IF NOT EXISTS idx_ff_workstreams_aliases
+    ON ff_workstreams USING GIN (aliases);
+CREATE INDEX IF NOT EXISTS idx_ff_workstreams_writer_lease
+    ON ff_workstreams (writer_lease_expires_at)
+    WHERE writer_token IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS ff_workstream_events (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workstream_id   UUID NOT NULL REFERENCES ff_workstreams(id) ON DELETE CASCADE,
+    seq             BIGINT NOT NULL CHECK (seq > 0),
+    event_type      TEXT NOT NULL,
+    owner_id        TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    payload         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (workstream_id, seq),
+    UNIQUE (workstream_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_ff_workstream_events_recent
+    ON ff_workstream_events (workstream_id, seq DESC);
+
+CREATE TABLE IF NOT EXISTS ff_workstream_presence (
+    workstream_id     UUID NOT NULL REFERENCES ff_workstreams(id) ON DELETE CASCADE,
+    owner_id          TEXT NOT NULL,
+    computer_id       UUID REFERENCES computers(id) ON DELETE SET NULL,
+    provider          TEXT NOT NULL,
+    client_instance_id UUID NOT NULL,
+    last_seen_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at        TIMESTAMPTZ NOT NULL,
+    metadata          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (workstream_id, owner_id),
+    CHECK (expires_at > last_seen_at)
+);
+CREATE INDEX IF NOT EXISTS idx_ff_workstream_presence_expiry
+    ON ff_workstream_presence (expires_at);
+
+CREATE TABLE IF NOT EXISTS ff_workstream_threads (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workstream_id UUID NOT NULL REFERENCES ff_workstreams(id) ON DELETE CASCADE,
+    thread_id     TEXT NOT NULL,
+    work_item_id  UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    owner_id      TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'active'
+                  CHECK (status IN ('active', 'released', 'completed')),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    released_at   TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ff_workstream_threads_active_thread
+    ON ff_workstream_threads (workstream_id, thread_id)
+    WHERE status = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ff_workstream_threads_active_work_item
+    ON ff_workstream_threads (work_item_id)
+    WHERE status = 'active';
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
