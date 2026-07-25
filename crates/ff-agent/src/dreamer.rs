@@ -60,6 +60,7 @@ pub const SESSION_SCOPE_IDLE_SECS: i64 = 6 * 3600;
 /// Max session scopes archived per pass — bounds one pass's Brain-insert and
 /// delete work; the 30-min chain drains any backlog across passes.
 pub const MAX_SESSION_SWEEPS_PER_PASS: i64 = 16;
+const MAX_EPISODE_INTAKE_PER_PASS: i64 = 16;
 
 /// fleet_secrets gate: `off`/`false`/`0`/`disabled`/`no` skips the pass body
 /// (the chain keeps ticking so flipping the gate back on needs no re-seed).
@@ -187,6 +188,59 @@ pub async fn run_dreamer_pass(pool: &PgPool) -> Result<serde_json::Value> {
         }
     }
 
+    // Compaction summaries are already distilled episodes. Intake them through
+    // the same Brain candidate queue M1 uses for later semantic promotion.
+    let episodes: Vec<(
+        String,
+        String,
+        Option<String>,
+        Vec<String>,
+        Option<String>,
+        String,
+    )> = sqlx::query_as(
+        "SELECT n.path, n.title, n.project, n.tags, n.from_thread,
+                    COALESCE(n.body, '')
+           FROM brain_vault_nodes n
+          WHERE n.node_type = 'episode' AND n.valid_until IS NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM brain_knowledge_candidates c
+                 WHERE c.kind = 'compaction-episode'
+                   AND c.target_path = n.path
+            )
+          ORDER BY n.updated_at
+          LIMIT $1",
+    )
+    .bind(MAX_EPISODE_INTAKE_PER_PASS)
+    .fetch_all(pool)
+    .await
+    .context("list compaction episodes awaiting dreamer intake")?;
+    let mut episodes_intaken = 0usize;
+    if !episodes.is_empty() {
+        let user = match ff_db::pg_get_brain_user(pool, "venkat").await? {
+            Some(user) => user.id,
+            None => ff_db::pg_create_brain_user(pool, "venkat", Some("Venkat")).await?,
+        };
+        for (path, title, project, tags, session_id, body) in episodes {
+            ff_db::pg_insert_brain_candidate(
+                pool,
+                user,
+                None,
+                "create",
+                Some("compaction-episode"),
+                Some(&title),
+                Some(&body),
+                &tags,
+                project.as_deref(),
+                Some(&path),
+                session_id.as_deref(),
+                Some(1.0),
+            )
+            .await
+            .context("intake compaction episode")?;
+            episodes_intaken += 1;
+        }
+    }
+
     // 2) Re-enforce caps on durable scopes (no-op unless a cap was lowered or
     //    a previous consolidation crashed mid-way).
     let durable: Vec<(String, String)> = sqlx::query_as(
@@ -213,15 +267,19 @@ pub async fn run_dreamer_pass(pool: &PgPool) -> Result<serde_json::Value> {
         }
     }
 
-    if sessions_archived > 0 || scopes_consolidated > 0 {
+    if sessions_archived > 0 || episodes_intaken > 0 || scopes_consolidated > 0 {
         info!(
             sessions_archived,
-            blocks_archived, scopes_consolidated, "dreamer: consolidation pass did work"
+            blocks_archived,
+            episodes_intaken,
+            scopes_consolidated,
+            "dreamer: consolidation pass did work"
         );
     }
     Ok(serde_json::json!({
         "sessions_archived": sessions_archived,
         "blocks_archived": blocks_archived,
+        "episodes_intaken": episodes_intaken,
         "over_cap_scopes_consolidated": scopes_consolidated,
     }))
 }

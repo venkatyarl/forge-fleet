@@ -10,18 +10,19 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Datelike, Local};
+use chrono::{DateTime, Datelike, Local, SecondsFormat, Utc};
 use regex::Regex;
 use serde_json::Value;
 
 const PART_BYTES: usize = 900 * 1024;
 const VAULT_REL: &str = "projects/Yarli_KnowledgeBase/ForgeFleet/sessions";
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct ExportSummary {
     pub scanned: usize,
     pub exported: usize,
     pub skipped: usize,
+    pub compaction_episodes: Vec<ff_core::obsidian_export::CompactionEpisode>,
 }
 
 /// Export all locally present Claude Code, Codex, and Kimi JSONL sessions.
@@ -46,11 +47,14 @@ pub fn export_local_sessions(vault_override: Option<&Path>, force: bool) -> Resu
     for source in sources {
         summary.scanned += 1;
         let target = target_for(&root, &source.path, source.vendor, &computer)?;
+        let (markdown, episode) = render_jsonl(&source.path, source.vendor, &computer)?;
+        if let Some(episode) = episode {
+            summary.compaction_episodes.push(episode);
+        }
         if !force && output_is_current(&target, &source.path)? {
             summary.skipped += 1;
             continue;
         }
-        let markdown = render_jsonl(&source.path, source.vendor, &computer)?;
         write_parts(&target, &markdown)?;
         summary.exported += 1;
     }
@@ -198,27 +202,113 @@ fn first_project_from_jsonl(path: &Path) -> Option<String> {
     None
 }
 
-fn render_jsonl(path: &Path, vendor: Vendor, computer: &str) -> Result<String> {
-    let mut out = format!(
-        "---\nsource: {}\ncomputer: {}\nredacted: true\n---\n\n# Session {}\n\n",
-        vendor_name(vendor),
-        computer,
-        path.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-    );
+fn render_jsonl(
+    path: &Path,
+    vendor: Vendor,
+    computer: &str,
+) -> Result<(String, Option<ff_core::obsidian_export::CompactionEpisode>)> {
     let file = fs::File::open(path)?;
+    let mut values = Vec::new();
     for line in BufReader::new(file).lines() {
         let line = line?;
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        values.push(value);
+    }
+    let session_id = first_session_id(path).unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_owned()
+    });
+    let ts = session_started_at(path)
+        .map(|ts| ts.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now);
+    let project = first_project_from_jsonl(path).unwrap_or_else(|| vendor_name(vendor).into());
+    let summary_body = compaction_summary(&values);
+    let kind = summary_body
+        .as_ref()
+        .map(|_| "compaction")
+        .unwrap_or("session");
+    let mut out = format!(
+        "---\nsource: {}\ncomputer: {}\nredacted: true\ntype: {kind}\nsession_id: {}\nts: {}\n---\n\n# Session {}\n\n",
+        vendor_name(vendor),
+        computer,
+        session_id,
+        ts.to_rfc3339_opts(SecondsFormat::Secs, true),
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+    );
+    for value in &values {
         if is_system_reminder(&value) {
             continue;
         }
-        render_value(&value, &mut out);
+        render_value(value, &mut out);
     }
-    Ok(redact(&out))
+    let out = redact(&out);
+    let episode = frontmatter_marks_compaction(&out).then(|| {
+        summary_body.map(|content| ff_core::obsidian_export::CompactionEpisode {
+            session_id,
+            ts,
+            project,
+            source_path: path.display().to_string(),
+            content: redact(&content),
+        })
+    });
+    Ok((out, episode.flatten()))
+}
+
+fn frontmatter_marks_compaction(markdown: &str) -> bool {
+    let Some(frontmatter) = markdown
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n").map(|(head, _)| head))
+    else {
+        return false;
+    };
+    frontmatter.lines().any(|line| {
+        let Some((key, value)) = line.split_once(':') else {
+            return false;
+        };
+        matches!(
+            (key.trim(), value.trim().to_ascii_lowercase().as_str()),
+            ("type" | "memory_type", "summary" | "compaction")
+        )
+    })
+}
+
+fn compaction_summary(values: &[Value]) -> Option<String> {
+    let mut parts = Vec::new();
+    for value in values {
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .or_else(|| value.pointer("/payload/type").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !kind.contains("compact") && !kind.contains("summary") {
+            continue;
+        }
+        for pointer in [
+            "/summary",
+            "/payload/summary",
+            "/content",
+            "/payload/content",
+            "/text",
+            "/message/content",
+        ] {
+            if let Some(content) = value.pointer(pointer) {
+                let mut rendered = String::new();
+                flatten_content(content, &mut rendered);
+                if !rendered.trim().is_empty() {
+                    parts.push(rendered.trim().to_owned());
+                    break;
+                }
+            }
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 fn render_value(value: &Value, out: &mut String) {
@@ -484,6 +574,32 @@ mod tests {
         assert_eq!(out, "- Tool call: `Read`\n");
         assert!(is_system_reminder(
             &serde_json::json!({"content":"<system-reminder>x"})
+        ));
+    }
+
+    #[test]
+    fn extracts_only_explicit_compaction_summaries() {
+        let values = vec![
+            serde_json::json!({"type":"assistant","summary":"not a compaction"}),
+            serde_json::json!({"type":"compaction","summary":"kept"}),
+            serde_json::json!({"payload":{"type":"summary","content":"also kept"}}),
+        ];
+        assert_eq!(
+            compaction_summary(&values).as_deref(),
+            Some("kept\n\nalso kept")
+        );
+    }
+
+    #[test]
+    fn frontmatter_must_explicitly_mark_summary_or_compaction() {
+        assert!(frontmatter_marks_compaction(
+            "---\ntype: compaction\n---\nbody"
+        ));
+        assert!(frontmatter_marks_compaction(
+            "---\nmemory_type: summary\n---\nbody"
+        ));
+        assert!(!frontmatter_marks_compaction(
+            "---\ntype: session\n---\nbody"
         ));
     }
 }
