@@ -199,26 +199,6 @@ fn authenticated_update_for_probe(ok: bool, reason: &str) -> Option<bool> {
 pub async fn detect_backends(probe_auth: bool, timeout: Duration) -> Vec<BackendStatus> {
     let mut out = Vec::with_capacity(BACKENDS.len());
     for cfg in BACKENDS {
-        // NEVER auth-probe claude (2026-07-25): claude is OPERATOR-RESERVED — the
-        // fleet doesn't build or review with it — but the probe still ran
-        // `claude` on the operator's node, and EACH probe rotated the shared
-        // ~/.claude OAuth refresh token, expiring the operator's interactive
-        // Claude Code session (the /login-expiry loop we kept "fixing"). The
-        // probe was churning the token purely to check a backend we never use.
-        // Report it un-probed (authenticated=None) so nothing touches the token.
-        if cfg.name == "claude" {
-            let path = which_on_path(cfg.binary);
-            out.push(BackendStatus {
-                name: cfg.name,
-                binary: cfg.binary,
-                installed: path.is_some(),
-                path,
-                version: None,
-                authenticated: None,
-                detail: "operator-reserved — not probed (avoids churning the operator's OAuth token)".to_string(),
-            });
-            continue;
-        }
         let path = which_on_path(cfg.binary);
         let installed = path.is_some();
         if !installed {
@@ -423,7 +403,7 @@ async fn probe_version(binary: &str) -> Option<String> {
 /// Run one tiny non-interactive request through the backend and classify it.
 async fn probe_auth_once(backend: &str, timeout: Duration) -> (bool, String) {
     // A trivial prompt: cheapest possible request that still exercises auth.
-    let res = crate::cli_executor::execute_cli_in_dir(
+    let res = crate::cli_executor::execute_cli_in_dir_local(
         backend,
         "Reply with exactly: OK",
         &[],

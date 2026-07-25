@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
-use ff_agent::cli_executor::{BACKENDS, CliBackend, execute_cli};
+use ff_agent::cli_executor::{BACKENDS, CliBackend, execute_cli_in_dir_local};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::task::JoinHandle;
@@ -56,13 +56,13 @@ pub fn spawn_all_bridges() -> Vec<JoinHandle<()>> {
     handles
 }
 
-/// One axum server bound to `127.0.0.1:<port>` that translates
+/// One axum server bound to the fleet interface that translates
 /// `/v1/chat/completions` to a CLI invocation.
 async fn run_bridge(backend: CliBackend, port: u16) {
     let app = Router::new()
         .route("/v1/chat/completions", post(handle_chat_completions))
         .with_state(backend);
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
             if let Err(e) = axum::serve(listener, app).await {
@@ -84,6 +84,8 @@ struct ChatCompletionsRequest {
     /// (non-standard; only ff clients use it).
     #[serde(default)]
     backend_args: Vec<String>,
+    /// Absolute worktree path shared by fleet sub-agent checkouts.
+    cwd: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,7 +160,14 @@ async fn handle_chat_completions(
     }
 
     let timeout = Some(Duration::from_secs(10 * 60));
-    let result = execute_cli(backend.name, &prompt, &req.backend_args, timeout).await;
+    let result = execute_cli_in_dir_local(
+        backend.name,
+        &prompt,
+        &req.backend_args,
+        req.cwd.as_deref(),
+        timeout,
+    )
+    .await;
 
     match result {
         Ok(r) if r.exit_code == 0 => {
