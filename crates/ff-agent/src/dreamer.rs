@@ -60,6 +60,8 @@ pub const SESSION_SCOPE_IDLE_SECS: i64 = 6 * 3600;
 /// Max session scopes archived per pass — bounds one pass's Brain-insert and
 /// delete work; the 30-min chain drains any backlog across passes.
 pub const MAX_SESSION_SWEEPS_PER_PASS: i64 = 16;
+/// Max compaction episodes admitted to semantic-memory candidates per pass.
+pub const MAX_EPISODE_INTAKE_PER_PASS: i64 = 16;
 
 /// fleet_secrets gate: `off`/`false`/`0`/`disabled`/`no` skips the pass body
 /// (the chain keeps ticking so flipping the gate back on needs no re-seed).
@@ -187,7 +189,11 @@ pub async fn run_dreamer_pass(pool: &PgPool) -> Result<serde_json::Value> {
         }
     }
 
-    // 2) Re-enforce caps on durable scopes (no-op unless a cap was lowered or
+    // 2) Admit compacted-context episodes to semantic-memory intake.
+    let episodes_intaken =
+        intake_compaction_episodes(pool).await? + intake_fleet_episodes(pool).await?;
+
+    // 3) Re-enforce caps on durable scopes (no-op unless a cap was lowered or
     //    a previous consolidation crashed mid-way).
     let durable: Vec<(String, String)> = sqlx::query_as(
         "SELECT DISTINCT scope_type, scope_key FROM agent_memory
@@ -213,17 +219,87 @@ pub async fn run_dreamer_pass(pool: &PgPool) -> Result<serde_json::Value> {
         }
     }
 
-    if sessions_archived > 0 || scopes_consolidated > 0 {
+    if sessions_archived > 0 || episodes_intaken > 0 || scopes_consolidated > 0 {
         info!(
             sessions_archived,
-            blocks_archived, scopes_consolidated, "dreamer: consolidation pass did work"
+            blocks_archived,
+            episodes_intaken,
+            scopes_consolidated,
+            "dreamer: consolidation pass did work"
         );
     }
     Ok(serde_json::json!({
         "sessions_archived": sessions_archived,
         "blocks_archived": blocks_archived,
+        "episodes_intaken": episodes_intaken,
         "over_cap_scopes_consolidated": scopes_consolidated,
     }))
+}
+
+async fn intake_compaction_episodes(pool: &PgPool) -> Result<u64> {
+    let user = match ff_db::pg_get_brain_user(pool, "venkat").await? {
+        Some(user) => user.id,
+        None => ff_db::pg_create_brain_user(pool, "venkat", Some("Venkat")).await?,
+    };
+    let rows: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "INSERT INTO brain_knowledge_candidates
+            (user_id, action, kind, title, body, tags, project, target_path,
+             from_thread, confidence)
+         SELECT $1, 'create', 'episode', n.title, n.body, n.tags, n.project,
+                n.path, n.from_thread, 1.0
+           FROM brain_vault_nodes n
+          WHERE n.node_type = 'episode' AND n.valid_until IS NULL
+            AND n.body IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM brain_knowledge_candidates c
+                 WHERE c.kind = 'episode' AND c.target_path = n.path
+            )
+          ORDER BY n.valid_from
+          LIMIT $2
+         RETURNING id",
+    )
+    .bind(user)
+    .bind(MAX_EPISODE_INTAKE_PER_PASS)
+    .fetch_all(pool)
+    .await
+    .context("admit compaction episodes to dreamer intake")?;
+    Ok(rows.len() as u64)
+}
+
+async fn intake_fleet_episodes(pool: &PgPool) -> Result<u64> {
+    let user = match ff_db::pg_get_brain_user(pool, "venkat").await? {
+        Some(user) => user.id,
+        None => ff_db::pg_create_brain_user(pool, "venkat", Some("Venkat")).await?,
+    };
+    let rows: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "INSERT INTO brain_knowledge_candidates
+            (user_id, action, kind, title, body, tags, project, target_path,
+             from_thread, confidence)
+         SELECT $1, 'create', 'episode',
+                e.source_kind || ' episode on ' || e.node,
+                e.content,
+                ARRAY[e.source_kind, 'node:' || e.node, 'role:' || e.role],
+                NULL,
+                'episode://fleet/' || e.id::text,
+                e.session_id,
+                1.0
+           FROM fleet_episodes e
+          WHERE e.content <> ''
+            AND NOT EXISTS (
+                SELECT 1 FROM brain_knowledge_candidates c
+                 WHERE c.kind = 'episode'
+                   AND c.target_path = 'episode://fleet/' || e.id::text
+            )
+          ORDER BY e.ts
+          LIMIT $2
+         RETURNING id",
+    )
+    .bind(user)
+    .bind(MAX_EPISODE_INTAKE_PER_PASS)
+    .fetch_all(pool)
+    .await
+    .context("admit fleet episodes to dreamer intake")?;
+    Ok(rows.len() as u64)
 }
 
 #[cfg(test)]
@@ -260,5 +336,6 @@ mod tests {
         assert!(DREAMER_INTERVAL_SECS >= MIN_INTERVAL_SECS);
         assert!(SESSION_SCOPE_IDLE_SECS > DREAMER_INTERVAL_SECS);
         assert!(MAX_SESSION_SWEEPS_PER_PASS > 0);
+        assert!(MAX_EPISODE_INTAKE_PER_PASS > 0);
     }
 }
