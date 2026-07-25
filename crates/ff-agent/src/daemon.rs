@@ -291,8 +291,9 @@ fn run_service_connectivity_tick(
     })
 }
 
-fn run_session_export_tick(_pg: PgPool, _worker_name: String) -> BoxFuture<'static, Result<()>> {
+fn run_session_export_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
     Box::pin(async move {
+        crate::session_source::collect_fleet_episodes(&pg, &worker_name).await?;
         tokio::task::spawn_blocking(|| crate::session_export::export_local_sessions(None, false))
             .await
             .map_err(anyhow::Error::from)??;

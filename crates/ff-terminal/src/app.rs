@@ -143,6 +143,8 @@ pub struct SessionTab {
     pub tokens_used: usize,
     pub tokens_total: usize,
     pub turn: u32,
+    /// Monotonic sequence for first-party `ff_tui` episode pushes.
+    pub episode_seq: u32,
     pub tracker: ConversationTracker,
     /// Message queued while agent is running — sent automatically when agent finishes.
     pub queued_message: Option<String>,
@@ -202,7 +204,7 @@ impl SessionTab {
         Self {
             name: name.to_string(),
             session: None,
-            session_id: String::new(),
+            session_id: uuid::Uuid::new_v4().to_string(),
             messages: Vec::new(),
             input: InputState::new(),
             is_running: false,
@@ -214,11 +216,36 @@ impl SessionTab {
             tokens_used: 0,
             tokens_total: 32_768,
             turn: 0,
+            episode_seq: 0,
             tracker: ConversationTracker::new(),
             queued_message: None,
             running_since: None,
             last_activity: String::new(),
         }
+    }
+
+    fn persist_episode(&mut self, role: &str, content: &str) {
+        let seq = i32::try_from(self.episode_seq).unwrap_or(i32::MAX);
+        self.episode_seq = self.episode_seq.saturating_add(1);
+        let mut episode = ff_db::FleetEpisode::new(
+            "ff_tui",
+            std::env::var("FORGEFLEET_COMPUTER_NAME")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "unknown".into()),
+            &self.session_id,
+            seq,
+            role,
+            ff_agent::session_source::redact_episode_content(content),
+        );
+        episode.model = Some(self.current_model.clone());
+        tokio::spawn(async move {
+            if let Ok(pool) = ff_agent::fleet_info::get_fleet_pool().await
+                && let Err(error) = ff_db::ff_session_sync(&pool, &[episode]).await
+            {
+                tracing::warn!(%error, "failed to persist ff-TUI episode");
+            }
+        });
     }
 
     /// Push current topic onto Focus Stack (conversation drifted).
@@ -377,6 +404,9 @@ impl App {
         if let Some(display) = crate::messages::event_to_display(&event) {
             tab.messages.push(display);
         }
+        if let AgentEvent::AssistantText { text, .. } = &event {
+            tab.persist_episode("assistant", text);
+        }
 
         match &event {
             AgentEvent::TurnComplete { turn, .. } => {
@@ -443,6 +473,7 @@ impl App {
         if text.is_empty() {
             return;
         }
+        tab.persist_episode("user", &text);
         tab.messages.push(render_user_message(&text));
         tab.is_running = true;
         tab.status = "Thinking...".into();

@@ -289,7 +289,7 @@ fn is_system_reminder(value: &Value) -> bool {
         || value.get("type").and_then(Value::as_str) == Some("system")
 }
 
-fn redact(input: &str) -> String {
+pub(crate) fn redact(input: &str) -> String {
     static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| {
         [
