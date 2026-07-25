@@ -352,7 +352,20 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
 
     let mut msg = String::new();
 
-    // §1 Building now
+    // §1 Completed since last update (FIRST — operator wants completions up top;
+    // always shown, "(none)" when the window had no completions so the section is
+    // never silently missing).
+    msg.push_str("✅ Completed since last update:\n");
+    if completed.is_empty() {
+        msg.push_str("• (none)\n");
+    } else {
+        for (title, mins) in &completed {
+            msg.push_str(&format!("• {} — took {}\n", title, fmt_mins(*mins as i64)));
+        }
+    }
+    msg.push('\n');
+
+    // §2 Building now
     msg.push_str("🔨 Building now (computer · LLM · duration · heartbeat · eta):\n");
     if building.is_empty() {
         msg.push_str("• (idle)\n");
@@ -372,14 +385,6 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
                 hbs,
                 eta
             ));
-        }
-    }
-
-    // §2 Completed since last update
-    if !completed.is_empty() {
-        msg.push_str("\n✅ Completed since last update:\n");
-        for (title, mins) in &completed {
-            msg.push_str(&format!("• {} — took {}\n", title, fmt_mins(*mins as i64)));
         }
     }
 
