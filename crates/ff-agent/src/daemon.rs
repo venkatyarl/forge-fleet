@@ -82,6 +82,12 @@ impl TickRegistry {
                 runner: run_metrics_scraper_tick,
             },
             TickDefinition {
+                name: "node_health",
+                interval: Duration::from_secs(30),
+                scope: TickScope::EveryNode,
+                runner: run_node_health_tick,
+            },
+            TickDefinition {
                 name: "service_connectivity",
                 interval: Duration::from_secs(300),
                 scope: TickScope::EveryNode,
@@ -263,6 +269,10 @@ fn run_metrics_scraper_tick(pg: PgPool, worker_name: String) -> BoxFuture<'stati
             .map(|_| ())
             .map_err(anyhow::Error::from)
     })
+}
+
+fn run_node_health_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move { crate::node_health::run_node_health_tick(&pg, &worker_name).await })
 }
 
 fn run_service_connectivity_tick(

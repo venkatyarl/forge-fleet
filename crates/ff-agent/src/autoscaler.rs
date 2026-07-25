@@ -68,7 +68,6 @@ const MAX_LOADS_PER_PASS: usize = 1;
 const IDLE_HEALTH_AGE_SECS: i32 = 180;
 /// Conservative per-host RAM headroom kept free (OS + ff + build). A load is
 /// rejected if it would push the host past `total_ram_gb − this`.
-const HOST_RAM_RESERVE_GB: f64 = 4.0;
 /// Hosts kept out of autoscale churn (the leader stays free for orchestration —
 /// same convention as the agent router's exclude_hosts).
 const EXCLUDE_HOSTS: &[&str] = &["taylor"];
@@ -479,7 +478,7 @@ pub fn score_host(
     let pool = usable_pool_gb(host);
     // free_after = usable pool minus already-resident models minus the new load.
     let free_after = pool - host.resident_model_gb - working_set_gb;
-    if free_after < HOST_RAM_RESERVE_GB {
+    if free_after < crate::node_health::build_reserve_gb(total) {
         return None; // THE OOM GUARD: would not fit with headroom.
     }
 

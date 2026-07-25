@@ -1200,6 +1200,23 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
     },
+    // 259-260 are reserved by in-flight branches; gaps are fine, collisions
+    // are not.
+    PgMigration {
+        version: 261,
+        name: "validate_artifact_cache_checksum",
+        sql: schema::SCHEMA_V261_VALIDATE_ARTIFACT_CACHE_CHECKSUM,
+    },
+    PgMigration {
+        version: 262,
+        name: "node_health_monitor",
+        sql: schema::SCHEMA_V262_NODE_HEALTH_MONITOR,
+    },
+    PgMigration {
+        version: 263,
+        name: "error_miner_metadata",
+        sql: schema::SCHEMA_V263_ERROR_MINER_METADATA,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

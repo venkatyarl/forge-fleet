@@ -300,7 +300,13 @@ pub async fn evaluate_merge_queue(
             // verdict, so the leader remains a pure serial train-merger.
             match gh_merge_squash(&pr_url).await {
                 Ok(()) => {
-                    ff_db::pg_mark_merge_merged(pg, item.id, item.work_item_id).await?;
+                    ff_db::pg_mark_merge_merged(
+                        pg,
+                        item.id,
+                        item.work_item_id,
+                        item.head_sha.as_deref(),
+                    )
+                    .await?;
                     let merger = std::env::var("FORGEFLEET_COMPUTER_NAME")
                         .or_else(|_| std::env::var("HOSTNAME"))
                         .unwrap_or_else(|_| "unknown-leader".to_string());

@@ -149,6 +149,24 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
             .collect();
     let mut global_free = ff_db::pg_free_slots(pg, None, MAX_ASSIGN_PER_TICK).await?;
     let now = Utc::now();
+    let memory_healthy: HashSet<uuid::Uuid> = sqlx::query(
+        "SELECT c.id
+           FROM computers c
+           JOIN LATERAL (
+                SELECT sampled_at, builds_allowed
+                  FROM node_health
+                 WHERE worker_name = c.name
+                 ORDER BY sampled_at DESC
+                 LIMIT 1
+           ) nh ON TRUE
+          WHERE nh.sampled_at > NOW() - INTERVAL '90 seconds'
+            AND nh.builds_allowed",
+    )
+    .fetch_all(pg)
+    .await?
+    .into_iter()
+    .map(|row| row.get("id"))
+    .collect();
     let dispatch_live: HashSet<uuid::Uuid> =
         sqlx::query("SELECT id, dispatch_tick_at FROM computers")
             .fetch_all(pg)
@@ -161,6 +179,7 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
             })
             .collect();
     global_free.retain(|slot| dispatch_live.contains(&slot.computer_id));
+    global_free.retain(|slot| memory_healthy.contains(&slot.computer_id));
     global_free.retain(|slot| dispatch_capacity_left(&active_by_computer, slot.computer_id));
     if global_free.is_empty() {
         info!(
