@@ -3443,6 +3443,9 @@ fn short10(s: &str) -> String {
 /// on empty/garbage/missing-field so an unreachable gateway degrades to "?".
 fn extract_health_build_sha(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("status")?.as_str()? != "ok" {
+        return None;
+    }
     v.get("build_sha")?.as_str().map(|s| s.to_string())
 }
 
@@ -5445,45 +5448,59 @@ async fn deploy_receiver(receiver: DeployTarget, builder: DeployTarget) -> Deplo
 /// (not `head -1`) so a leading warning line doesn't hide the version.
 async fn verify_deploy_convergence(t: DeployTarget, start: std::time::Instant) -> DeployResult {
     use ff_core::build_version::BuildVersion;
-    let mut raw = String::new();
+    let mut raw_version = String::new();
+    let mut raw_health = String::new();
     for attempt in 0..3 {
         let (vcode, vout, verr) = deploy_ssh(
             &t,
-            "sleep 3; ~/.local/bin/forgefleetd --version 2>&1 | tail -3",
+            "sleep 3; ~/.local/bin/forgefleetd --version 2>&1 | tail -3; \
+             printf '\\n@@HEALTH@@\\n'; \
+             curl -s --max-time 4 http://localhost:51002/health 2>/dev/null",
             60,
         )
         .await;
         if vcode == 0 {
-            let cleaned = clean_version_line(&vout);
-            if !cleaned.is_empty() {
-                raw = cleaned;
+            let (version, health) = vout.split_once("@@HEALTH@@").unwrap_or((&vout, ""));
+            raw_version = clean_version_line(version);
+            raw_health = health.trim().to_string();
+            if BuildVersion::parse(&raw_version).is_some()
+                && extract_health_build_sha(&raw_health).is_some()
+            {
                 break;
             }
         } else {
-            raw = format!("version-probe exit {vcode}: {}", clean_version_line(&verr));
+            raw_version = format!("health probe exit {vcode}: {}", clean_version_line(&verr));
+            raw_health.clear();
         }
         if attempt < 2 {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
     }
-    match BuildVersion::parse(&raw) {
-        Some(v) => DeployResult {
+    match (
+        BuildVersion::parse(&raw_version),
+        extract_health_build_sha(&raw_health),
+    ) {
+        (Some(v), Some(running_sha)) => DeployResult {
             name: t.name,
             ok: true,
-            sha: v.short_sha().to_string(),
+            sha: short10(&running_sha),
             secs: start.elapsed().as_secs_f64(),
             detail: format!("{} ({})", v.date, v.state),
         },
-        None => {
-            // Built + restarted fine but we couldn't parse a SHA — report the
-            // raw snippet and mark it not-converged so the operator looks.
-            let snippet: String = raw.chars().take(40).collect();
+        _ => {
+            // Installed binary metadata alone is insufficient: the restarted
+            // daemon must also answer /health before this batch can be enabled.
+            let snippet: String = if raw_health.is_empty() {
+                raw_version.chars().take(40).collect()
+            } else {
+                raw_health.chars().take(40).collect()
+            };
             DeployResult {
                 name: t.name,
                 ok: false,
                 sha: "?".into(),
                 secs: start.elapsed().as_secs_f64(),
-                detail: format!("restarted but version unparsable: {snippet}"),
+                detail: format!("restarted but health check failed: {snippet}"),
             }
         }
     }
@@ -5730,6 +5747,138 @@ async fn resolve_deploy_target(pool: &sqlx::PgPool, node: &str) -> Result<Deploy
     .map_err(|e| anyhow::anyhow!("resolve deploy target '{node}': {e}"))
 }
 
+async fn deploy_target_batch(
+    pool: &sqlx::PgPool,
+    targets: Vec<DeployTarget>,
+    concurrency: usize,
+    json: bool,
+    skipped: &[(String, String, String)],
+) -> Result<Vec<DeployResult>> {
+    let mut groups: std::collections::HashMap<(String, String), Vec<DeployTarget>> =
+        std::collections::HashMap::new();
+    for target in targets {
+        groups
+            .entry((target.os_family.clone(), target.arch.clone()))
+            .or_default()
+            .push(target);
+    }
+    let mut plans: Vec<GroupPlan> = groups
+        .into_values()
+        .map(|mut hosts| {
+            let builder_idx = hosts
+                .iter()
+                .position(|target| {
+                    !(target.total_ram_gb > 0 && target.total_ram_gb <= MEMORY_TIGHT_RAM_GB)
+                })
+                .unwrap_or(0);
+            let builder = hosts.swap_remove(builder_idx);
+            GroupPlan {
+                builder,
+                receivers: hosts,
+            }
+        })
+        .collect();
+    plans.sort_by(|a, b| a.builder.name.cmp(&b.builder.name));
+
+    if !json {
+        let total_targets = plans
+            .iter()
+            .map(|plan| 1 + plan.receivers.len())
+            .sum::<usize>();
+        eprintln!(
+            "{CYAN}▶ ff fleet deploy{RESET}: {} target(s) across {} group(s), up to {} in parallel",
+            total_targets,
+            plans.len(),
+            concurrency
+        );
+        for plan in &plans {
+            let label = format!("{}+{}", plan.builder.os_family, plan.builder.arch);
+            eprintln!(
+                "  group {:<18} builder={:<12} receivers={}",
+                label,
+                plan.builder.name,
+                plan.receivers.len()
+            );
+        }
+        report_skipped_hosts(skipped);
+    }
+
+    set_alert_mute(pool, 50 * 60).await;
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut handles: Vec<tokio::task::JoinHandle<Vec<DeployResult>>> = Vec::new();
+    for plan in plans {
+        let sem = sem.clone();
+        handles.push(tokio::spawn(async move { deploy_group(plan, sem).await }));
+    }
+    let mut results = Vec::new();
+    for handle in handles {
+        match handle.await {
+            Ok(group_results) => results.extend(group_results),
+            Err(error) => results.push(DeployResult {
+                name: "?".into(),
+                ok: false,
+                sha: "-".into(),
+                secs: 0.0,
+                detail: format!("task join error: {error}"),
+            }),
+        }
+    }
+    results.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if !json {
+        for result in &results {
+            let mark = if result.ok {
+                format!("{GREEN}✓{RESET}")
+            } else {
+                format!("{RED}✗{RESET}")
+            };
+            eprintln!(
+                "  {mark} {:<12} {:<10} {:>6.0}s  {}",
+                result.name, result.sha, result.secs, result.detail
+            );
+        }
+    }
+    set_alert_mute(pool, 0).await;
+    Ok(results)
+}
+
+struct FleetDeployHooks<'a> {
+    pool: &'a sqlx::PgPool,
+    concurrency: usize,
+    json: bool,
+    skipped: &'a [(String, String, String)],
+    drained: Option<DeployDrainState>,
+}
+
+#[async_trait::async_trait]
+impl ff_orchestrator::deploy::GracefulDeployHooks<DeployTarget, DeployResult>
+    for FleetDeployHooks<'_>
+{
+    async fn drain(&mut self, batch: &[DeployTarget]) -> Result<()> {
+        let names = batch
+            .iter()
+            .map(|target| target.name.clone())
+            .collect::<Vec<_>>();
+        self.drained = Some(drain_deploy_targets(self.pool, &names).await?);
+        Ok(())
+    }
+
+    async fn update_and_restart(&mut self, batch: Vec<DeployTarget>) -> Result<Vec<DeployResult>> {
+        deploy_target_batch(self.pool, batch, self.concurrency, self.json, self.skipped).await
+    }
+
+    async fn health_check(&mut self, results: &[DeployResult]) -> Result<bool> {
+        Ok(!results.is_empty() && results.iter().all(|result| result.ok))
+    }
+
+    async fn reenable(&mut self, _batch: &[DeployTarget]) -> Result<()> {
+        if let Some(previous) = self.drained.take() {
+            restore_deploy_targets(self.pool, &previous).await;
+        }
+        Ok(())
+    }
+}
+
 async fn handle_fleet_deploy(
     pool: &sqlx::PgPool,
     all: bool,
@@ -5843,139 +5992,29 @@ async fn handle_fleet_deploy(
         }
     }
 
-    // Stop new assignments before any build starts, then let in-flight work
-    // be requeued attempt-neutrally before a restart can tear down its daemon.
+    // Hand leadership away before any target can be drained or restarted.
     let target_names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
     handoff_deploy_leader(pool, &target_names).await?;
-    let previous_reservations = if graceful {
-        Some(drain_deploy_targets(pool, &target_names).await?)
-    } else {
-        None
-    };
 
-    // Every fallible step between the successful drain above and
-    // restore_deploy_targets below runs inside this block: a bare `?` here
-    // would strand target computers 'drained' and their sub-agents 'disabled',
-    // so the block's error is propagated only AFTER the drained targets have
-    // been restored. Guarded by
-    // fleet_deploy_restores_drained_targets_before_any_error_return.
-    let deploy_outcome: Result<Vec<DeployResult>> = async {
-        // Group targets by (os_family, arch). One build per group is executed
-        // on a designated builder; binaries are then scp'd to the remaining
-        // receivers.
-        let mut groups: std::collections::HashMap<(String, String), Vec<DeployTarget>> =
-            std::collections::HashMap::new();
-        for t in targets {
-            groups
-                .entry((t.os_family.clone(), t.arch.clone()))
-                .or_default()
-                .push(t);
-        }
-        let mut plans: Vec<GroupPlan> = groups
-            .into_values()
-            .map(|mut hosts| {
-                // Prefer a roomy builder so memory-tight boxes stay available as
-                // receivers (they only run the cheap install+restart path).
-                let builder_idx = hosts
-                    .iter()
-                    .position(|t| !(t.total_ram_gb > 0 && t.total_ram_gb <= MEMORY_TIGHT_RAM_GB))
-                    .unwrap_or(0);
-                let builder = hosts.swap_remove(builder_idx);
-                GroupPlan {
-                    builder,
-                    receivers: hosts,
-                }
-            })
-            .collect();
-        plans.sort_by(|a, b| a.builder.name.cmp(&b.builder.name));
-
-        if !json {
-            let total_targets = plans.iter().map(|p| 1 + p.receivers.len()).sum::<usize>();
+    let results = if graceful {
+        let mut hooks = FleetDeployHooks {
+            pool,
+            concurrency,
+            json,
+            skipped: &skipped,
+            drained: None,
+        };
+        let outcome =
+            ff_orchestrator::deploy::run_graceful_deploy(targets, concurrency, &mut hooks).await?;
+        if outcome.halted && !json {
             eprintln!(
-                "{CYAN}▶ ff fleet deploy{RESET}: {} target(s) across {} group(s), up to {} in parallel",
-                total_targets,
-                plans.len(),
-                concurrency
+                "{YELLOW}⚠ graceful deploy halted after an unhealthy batch; later batches were not started{RESET}"
             );
-            for p in &plans {
-                let label = format!("{}+{}", p.builder.os_family, p.builder.arch);
-                eprintln!(
-                    "  group {:<18} builder={:<12} receivers={}",
-                    label,
-                    p.builder.name,
-                    p.receivers.len()
-                );
-            }
-            report_skipped_hosts(&skipped);
         }
-
-        // Mute presence alerts for the deploy window: every target's forgefleetd
-        // restarts during the rollout, so beat ages legitimately exceed the stale
-        // threshold and the evaluator would spam one member_stale_beat per host
-        // (operator-reported 2026-07-01). 50min covers the worst case (45min
-        // memory-tight build timeout); cleared on completion below, auto-expires
-        // if this process dies mid-deploy.
-        set_alert_mute(pool, 50 * 60).await;
-
-        // Drive deploys with bounded global concurrency. Each group builds once
-        // on its builder, then ships binaries to receivers. Builder failures
-        // cause receivers to fall back to self-build.
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
-        let mut handles: Vec<tokio::task::JoinHandle<Vec<DeployResult>>> = Vec::new();
-        for plan in plans {
-            let s = sem.clone();
-            handles.push(tokio::spawn(async move { deploy_group(plan, s).await }));
-        }
-        let mut results: Vec<DeployResult> = Vec::new();
-        for h in handles {
-            match h.await {
-                Ok(group_results) => {
-                    results.extend(group_results);
-                }
-                Err(e) => {
-                    eprintln!("{YELLOW}⚠ deploy group task failed: {e}{RESET}");
-                    results.push(DeployResult {
-                        name: "?".into(),
-                        ok: false,
-                        sha: "-".into(),
-                        secs: 0.0,
-                        detail: format!("task join error: {e}"),
-                    });
-                }
-            }
-        }
-        results.sort_by(|a, b| a.name.cmp(&b.name));
-
-        // Replay per-host completion lines now that all groups are done.
-        if !json {
-            for r in &results {
-                let mark = if r.ok {
-                    format!("{GREEN}✓{RESET}")
-                } else {
-                    format!("{RED}✗{RESET}")
-                };
-                eprintln!(
-                    "  {mark} {:<12} {:<10} {:>6.0}s  {}",
-                    r.name, r.sha, r.secs, r.detail
-                );
-            }
-        }
-
-        // Deploys done (daemons restarted + beating again) — lift the presence-
-        // alert mute rather than letting the 50min stamp ride out. Not lifted
-        // on the error path: daemons may still be mid-restart, so the mute is
-        // left to auto-expire exactly as if this process had died mid-deploy.
-        set_alert_mute(pool, 0).await;
-        Ok(results)
-    }
-    .await;
-
-    // Restore BEFORE propagating any deploy error, so a failed rollout never
-    // leaves computers out of reservation rotation or sub-agents disabled.
-    if let Some(previous) = &previous_reservations {
-        restore_deploy_targets(pool, previous).await;
-    }
-    let results = deploy_outcome?;
+        outcome.results
+    } else {
+        deploy_target_batch(pool, targets, concurrency, json, &skipped).await?
+    };
 
     // Convergence target = the most-common SHA among successful hosts.
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -6504,6 +6543,10 @@ mod route_tests {
         );
         // Missing field, empty body, and garbage all degrade to None (→ "?").
         assert_eq!(extract_health_build_sha(r#"{"status":"ok"}"#), None);
+        assert_eq!(
+            extract_health_build_sha(r#"{"status":"error","build_sha":"da5b077946"}"#),
+            None
+        );
         assert_eq!(extract_health_build_sha(""), None);
         assert_eq!(extract_health_build_sha("not json"), None);
     }
@@ -6533,20 +6576,21 @@ mod route_tests {
     }
 
     #[test]
-    fn fleet_deploy_drains_before_any_daemon_restart() {
+    fn fleet_deploy_delegates_graceful_batching_to_orchestrator() {
         let source = include_str!("fleet_cmd.rs");
         let deploy = source
             .split("async fn handle_fleet_deploy")
             .nth(1)
             .expect("fleet deploy handler");
-        let drain = deploy
-            .find("drain_deploy_targets(pool")
-            .expect("deploy must drain target leases");
-        let run = deploy
-            .find("deploy_group(plan")
-            .expect("deploy must run grouped restarts");
-        assert!(drain < run, "lease drain must precede daemon restarts");
-        assert!(deploy.contains("restore_deploy_targets(pool"));
+        assert!(deploy.contains("run_graceful_deploy("));
+
+        let hooks = source
+            .split("impl ff_orchestrator::deploy::GracefulDeployHooks")
+            .nth(1)
+            .expect("fleet deploy hooks");
+        assert!(hooks.contains("drain_deploy_targets(self.pool"));
+        assert!(hooks.contains("deploy_target_batch("));
+        assert!(hooks.contains("restore_deploy_targets(self.pool"));
 
         let leader = source
             .split("async fn refresh_local_leader_if_self")
@@ -6571,13 +6615,10 @@ mod route_tests {
         let handoff = deploy
             .find("handoff_deploy_leader(pool")
             .expect("deploy must hand off a targeted leader");
-        let drain = deploy
-            .find("drain_deploy_targets(pool")
-            .expect("deploy must drain target leases");
-        let restart = deploy
-            .find("deploy_group(plan")
-            .expect("deploy must run grouped restarts");
-        assert!(handoff < drain && drain < restart);
+        let graceful = deploy
+            .find("run_graceful_deploy(")
+            .expect("deploy must invoke graceful orchestration");
+        assert!(handoff < graceful);
 
         let leader = source
             .split("async fn refresh_local_leader_if_self")
@@ -6596,38 +6637,19 @@ mod route_tests {
     }
 
     #[test]
-    fn fleet_deploy_restores_drained_targets_before_any_error_return() {
+    fn fleet_deploy_hooks_restore_drained_targets() {
         let source = include_str!("fleet_cmd.rs");
-        let deploy = source
-            .split("async fn handle_fleet_deploy")
+        let hooks = source
+            .split("impl ff_orchestrator::deploy::GracefulDeployHooks")
             .nth(1)
-            .expect("fleet deploy handler");
-        let drain = deploy
-            .find("drain_deploy_targets(pool")
-            .expect("deploy must drain target leases");
-        let restore = deploy
-            .find("restore_deploy_targets(pool")
-            .expect("deploy must restore drained targets");
+            .expect("fleet deploy hooks");
+        let drain = hooks
+            .find("self.drained = Some(drain_deploy_targets")
+            .expect("hooks must retain drain state");
+        let restore = hooks
+            .find("restore_deploy_targets(self.pool")
+            .expect("hooks must restore retained state");
         assert!(drain < restore);
-        // Skip past the drain call's own `.await?` — a FAILED drain restores
-        // internally. From there to the restore call, no error may propagate:
-        // an early return would strand target computers 'drained' and their
-        // sub-agents 'disabled'.
-        let window = deploy[drain..restore]
-            .split_once(".await?")
-            .map(|(_, rest)| rest)
-            .expect("drain call is awaited");
-        for forbidden in [".await?", "bail!", "return Err", "return Ok"] {
-            assert!(
-                !window.contains(forbidden),
-                "`{forbidden}` between drain and restore would strand drained state"
-            );
-        }
-        // The deploy block's captured error is re-raised only after restore.
-        assert!(
-            deploy[restore..].contains("deploy_outcome?"),
-            "deploy errors must propagate only after restore_deploy_targets"
-        );
 
         let leader = source
             .split("async fn refresh_local_leader_if_self")

@@ -21,6 +21,7 @@ pub mod cascade_strategy;
 pub mod confidence;
 pub mod crew;
 pub mod decomposer;
+pub mod deploy;
 pub mod leader;
 pub mod merge_train;
 pub mod node_manager;

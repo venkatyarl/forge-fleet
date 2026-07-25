@@ -59,6 +59,9 @@ const MAX_BUILD_ATTEMPTS: i32 = 5;
 /// Four missed 15-second dispatch passes makes a host ineligible. General
 /// Pulse beats may still be fresh when this subsystem clock is stale.
 const DISPATCH_TICK_STALE_SECS: i64 = 60;
+const FAILED_RETRY_COOLDOWN_SECS: i64 = 20 * 60;
+const MAX_FAILED_RETRIES: i32 = 3;
+const FAILED_RETRY_BATCH: i64 = 16;
 
 /// One scheduler pass. Returns the number of work_items assigned this tick.
 pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
@@ -92,13 +95,13 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
     // buildable once the condition clears — return a batch to the ready pool
     // with full redispatch eligibility restored (leases released, assignment
     // cleared). Best-effort: a sweep failure must never stall assignment.
-    match crate::self_heal::requeue_transient_failures(pg).await {
+    match requeue_failed_work_items(pg).await {
         Ok(healed) if healed > 0 => info!(
             healed,
-            "work_item_scheduler: self-heal requeued transiently-failed work_items"
+            "work_item_scheduler: requeued cooled-down failed work_items at cloud tier"
         ),
         Ok(_) => {}
-        Err(e) => warn!(error = %e, "work_item_scheduler: self-heal requeue sweep failed"),
+        Err(e) => warn!(error = %e, "work_item_scheduler: failed-item retry sweep failed"),
     }
 
     // Auto-complete decomposed parents (bug/feature) once all of their task
@@ -266,6 +269,56 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         );
     }
     Ok(assigned)
+}
+
+async fn requeue_failed_work_items(pg: &PgPool) -> Result<u64> {
+    let mut conn = pg.acquire().await?;
+    requeue_failed_work_items_on(&mut conn).await
+}
+
+async fn requeue_failed_work_items_on(conn: &mut sqlx::PgConnection) -> Result<u64> {
+    let ids = sqlx::query_scalar::<_, uuid::Uuid>(
+        "WITH candidates AS (
+             SELECT w.id FROM work_items w
+              WHERE w.status = 'failed' AND w.kind = 'task'
+                AND w.retry_count < $1
+                AND w.completed_at < NOW() - make_interval(secs => $2)
+                AND upper(COALESCE(w.last_error, '')) NOT LIKE '%BOGUS%'
+                AND upper(COALESCE(w.last_error, '')) NOT LIKE '%QUARANTINE%'
+              ORDER BY w.risk_score DESC, w.completed_at ASC, w.id ASC
+              LIMIT $3 FOR UPDATE SKIP LOCKED
+         ), released_leases AS (
+             UPDATE work_item_leases l
+                SET lease_state = 'released', released_at = NOW(),
+                    release_reason = 'bounded failed-item retry'
+               FROM candidates c
+              WHERE l.work_item_id = c.id AND l.released_at IS NULL
+         ), freed_slots AS (
+             UPDATE sub_agents sa
+                SET current_work_item_id = NULL,
+                    status = CASE WHEN sa.status = 'disabled' THEN 'disabled' ELSE 'idle' END,
+                    started_at = NULL, last_heartbeat_at = NOW()
+               FROM candidates c WHERE sa.current_work_item_id = c.id
+         ), retired_worktrees AS (
+             UPDATE work_item_worktrees wt SET status = 'failed'
+               FROM candidates c
+              WHERE wt.work_item_id = c.id AND wt.status IN ('creating', 'active')
+         )
+         UPDATE work_items w
+            SET status = 'ready', retry_count = w.retry_count + 1,
+                attempts = GREATEST(COALESCE(w.attempts, 0), $4),
+                assigned_to = NULL, assigned_computer = NULL, completed_at = NULL
+           FROM candidates c
+          WHERE w.id = c.id AND w.status = 'failed'
+      RETURNING w.id",
+    )
+    .bind(MAX_FAILED_RETRIES)
+    .bind(FAILED_RETRY_COOLDOWN_SECS as f64)
+    .bind(FAILED_RETRY_BATCH)
+    .bind(ff_routing_policy::LOCAL_LANE_MAX_TRIES as i32)
+    .fetch_all(conn)
+    .await?;
+    Ok(ids.len() as u64)
 }
 
 fn dispatch_tick_is_fresh(tick_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
@@ -481,6 +534,7 @@ pub fn spawn_work_item_scheduler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Connection;
 
     fn slot(computer: uuid::Uuid) -> ff_db::FreeSlot {
         ff_db::FreeSlot {
@@ -686,6 +740,76 @@ mod tests {
         assert!(
             !project_at_fair_share(&beta, &active, &assigned_this_tick, 3),
             "an untracked project has 0 active and 0 assigned so it is under share"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_retry_is_bounded_cooled_down_and_excludes_quarantine() {
+        let Some(url) = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()
+        else {
+            return;
+        };
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TEMP TABLE work_items (
+                 id UUID PRIMARY KEY, status TEXT, kind TEXT, retry_count INT,
+                 completed_at TIMESTAMPTZ, last_error TEXT, risk_score REAL,
+                 attempts INT, assigned_to TEXT, assigned_computer TEXT);
+             CREATE TEMP TABLE work_item_leases (
+                 work_item_id UUID, lease_state TEXT, released_at TIMESTAMPTZ,
+                 release_reason TEXT);
+             CREATE TEMP TABLE sub_agents (
+                 current_work_item_id UUID, status TEXT, started_at TIMESTAMPTZ,
+                 last_heartbeat_at TIMESTAMPTZ);
+             CREATE TEMP TABLE work_item_worktrees (work_item_id UUID, status TEXT);",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let eligible = uuid::Uuid::new_v4();
+        for (id, retry_count, age, error) in [
+            (eligible, 0, 21, "compile failed"),
+            (uuid::Uuid::new_v4(), 0, 19, "compile failed"),
+            (uuid::Uuid::new_v4(), 3, 60, "compile failed"),
+            (uuid::Uuid::new_v4(), 0, 60, "BOGUS: invalid task"),
+            (uuid::Uuid::new_v4(), 0, 60, "QUARANTINE: hold"),
+        ] {
+            sqlx::query(
+                "INSERT INTO work_items
+                 VALUES ($1, 'failed', 'task', $2,
+                         NOW() - make_interval(mins => $3), $4, 1, 1, NULL, NULL)",
+            )
+            .bind(id)
+            .bind(retry_count)
+            .bind(age)
+            .bind(error)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        assert_eq!(requeue_failed_work_items_on(&mut conn).await.unwrap(), 1);
+        let row: (String, i32, i32) =
+            sqlx::query_as("SELECT status, retry_count, attempts FROM work_items WHERE id = $1")
+                .bind(eligible)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            row,
+            (
+                "ready".into(),
+                1,
+                ff_routing_policy::LOCAL_LANE_MAX_TRIES as i32
+            )
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM work_items WHERE status = 'failed'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap(),
+            4
         );
     }
 
