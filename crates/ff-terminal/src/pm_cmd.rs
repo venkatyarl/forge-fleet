@@ -1066,7 +1066,6 @@ fn quality_gate_decomposition(
     tasks: Vec<LeafTask>,
     repo_context: Option<&crate::repo_context::RepoContext>,
 ) -> Result<Vec<LeafTask>> {
-    let autonomous = std::env::var_os("FORGEFLEET_AUTO_FEEDER").is_some();
     let tracked = repo_context
         .and_then(|ctx| ctx.repo_path.as_deref())
         .and_then(git_ls_files)
@@ -1076,16 +1075,25 @@ fn quality_gate_decomposition(
                 .map(str::to_owned)
                 .collect::<std::collections::HashSet<_>>()
         });
-    if autonomous && tracked.is_none() {
+    // FAIL-CLOSED (operator 2026-07-25): an UNGROUNDED decomposition (no local
+    // repo to validate against) produced 64 backlog items with hallucinated
+    // Python paths in a Rust repo — items that can NEVER build and churned the
+    // pipeline. Require a resolved repo for EVERY decomposition (previously only
+    // `autonomous` ones), so predicted paths are ALWAYS checked against real
+    // tracked files. Better to refuse an ungrounded decompose loudly than to
+    // emit unbuildable garbage.
+    if tracked.is_none() {
         return Err(anyhow::anyhow!(
-            "decomposition quality gate needs a local git repo for file validation"
+            "decomposition quality gate: no local git repo resolved for path validation — \
+             refusing an ungrounded decomposition (the source of the mis-decomposed backlog). \
+             Resolve the project's repo checkout before decomposing."
         ));
     }
 
     let repo_path = repo_context.and_then(|ctx| ctx.repo_path.as_deref());
 
     for task in &tasks {
-        if autonomous && task.files.is_empty() {
+        if task.files.is_empty() {
             return Err(anyhow::anyhow!(
                 "decomposition quality gate: '{}' has no file references",
                 task.title
@@ -2321,7 +2329,9 @@ mod tests {
                 complexity: Some("moderate".into()),
             },
         ];
-        let gated = quality_gate_decomposition(tasks, None).unwrap();
+        // Tests the sibling-merge logic directly (the gate now fails-closed on a
+        // None repo context, so exercise the merge function itself).
+        let gated = merge_overlapping_siblings(tasks);
         assert_eq!(gated.len(), 1);
         assert_eq!(gated[0].files, ["src/lib.rs", "src/tests.rs"]);
         assert!(gated[0].description.contains("add parser test"));
@@ -2346,15 +2356,11 @@ mod tests {
             files: files.iter().map(|file| (*file).into()).collect(),
             complexity: None,
         };
-        let gated = quality_gate_decomposition(
-            vec![
-                task("first", &["a.rs"]),
-                task("second", &["b.rs"]),
-                task("bridge", &["a.rs", "b.rs"]),
-            ],
-            None,
-        )
-        .unwrap();
+        let gated = merge_overlapping_siblings(vec![
+            task("first", &["a.rs"]),
+            task("second", &["b.rs"]),
+            task("bridge", &["a.rs", "b.rs"]),
+        ]);
         assert_eq!(gated.len(), 1);
         assert!(gated[0].files.contains(&"a.rs".into()));
         assert!(gated[0].files.contains(&"b.rs".into()));
