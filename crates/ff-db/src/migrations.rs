@@ -1200,6 +1200,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
     },
+    PgMigration {
+        version: 259,
+        name: "remote_skill_sources",
+        sql: schema::SCHEMA_V259_REMOTE_SKILL_SOURCES,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1412,6 +1417,44 @@ mod tests {
                 pair[1].name,
             );
         }
+    }
+
+    #[test]
+    fn v259_registers_remote_skill_ecosystems_disabled() {
+        let sql = schema::SCHEMA_V259_REMOTE_SKILL_SOURCES;
+
+        for column in [
+            "kind",
+            "url",
+            "adapter",
+            "license",
+            "trust",
+            "last_harvested_at",
+            "upstream_ref",
+        ] {
+            assert!(sql.contains(&format!("ADD COLUMN IF NOT EXISTS {column}")));
+        }
+        for value in ["local_dir", "git_repo", "mcp_registry", "http_index"] {
+            assert!(sql.contains(value));
+        }
+        for value in ["openclaw", "mcp", "custom", "claude"] {
+            assert!(sql.contains(value));
+        }
+        for value in ["trusted", "review_required", "sandbox_only"] {
+            assert!(sql.contains(value));
+        }
+        for source in [
+            "openclaw-skills",
+            "goose-extensions",
+            "crewai-tools",
+            "smolagents",
+            "swe-agent",
+            "mcp-server-registry",
+            "awesome-llm-agents",
+        ] {
+            assert!(sql.contains(source));
+        }
+        assert!(sql.contains("ON CONFLICT (id) DO NOTHING"));
     }
 
     fn db_url() -> Option<String> {
