@@ -2493,18 +2493,21 @@ fn backend_failed_without_output(
 }
 
 /// Classify a dispatch result into the [`DispatchOutcome`] contract. Pure +
-/// unit-testable. `worktree_has_diff` is the caller's git-status check on the
-/// worktree after the run. A timeout/kill error that nonetheless left a diff is
+/// unit-testable. `has_deliverable_change` is the caller's check for either a
+/// worktree diff or a commit ahead of the base branch. A timeout/kill error that
+/// nonetheless left a change is
 /// `TimeoutSalvaged`; any other error with a diff is `FailedWithDiff`; an error
-/// with no diff is `FailedNoDiff` (the only retryable class); `Ok` is `Success`.
+/// with no diff is `FailedNoDiff` (the only retryable class). A clean CLI exit
+/// is also `FailedNoDiff` unless it produced a deliverable change.
 pub fn classify_dispatch_outcome(
     result: &Result<Output>,
-    worktree_has_diff: bool,
+    has_deliverable_change: bool,
 ) -> DispatchOutcome {
     match result {
-        Ok(_) => DispatchOutcome::Success,
+        Ok(_) if has_deliverable_change => DispatchOutcome::Success,
+        Ok(_) => DispatchOutcome::FailedNoDiff,
         Err(e) => {
-            if worktree_has_diff {
+            if has_deliverable_change {
                 let msg = e.to_string().to_ascii_lowercase();
                 if msg.contains("timed out") || msg.contains("timeout") {
                     DispatchOutcome::TimeoutSalvaged
@@ -3666,6 +3669,23 @@ async fn run_ff_dispatch(
                 }
             }
             if out.status.success() {
+                if !head_has_deliverable_commits(&worktree.worktree_path, &worktree.base_branch)
+                    && !worktree_has_diff(&worktree.worktree_path)
+                {
+                    warn!(backend = %backend, "run_ff_dispatch: backend exited 0 but produced no deliverable change — switching");
+                    backend_errors.push(format!(
+                        "{backend}: exit 0 produced no diff or deliverable commit"
+                    ));
+                    let _ = crate::circuit_breaker::record_provider_failure(
+                        pg,
+                        computer_id,
+                        backend,
+                        "no_diff",
+                    )
+                    .await;
+                    let _ = crate::cloud_budget::record_backend_failure(pg, backend).await;
+                    break;
+                }
                 let _ =
                     crate::circuit_breaker::record_provider_success(pg, computer_id, backend).await;
                 crate::cloud_budget::record_success(
@@ -3775,6 +3795,11 @@ async fn run_ff_dispatch(
                     )
                     .await;
                     bail!("forced backend {forced_backend} exited successfully with empty stdout");
+                }
+                if !worktree_has_diff(&worktree.worktree_path)
+                    && !head_has_deliverable_commits(&worktree.worktree_path, &worktree.base_branch)
+                {
+                    bail!("forced backend {forced_backend} produced no diff or deliverable commit");
                 }
                 if out.status.success() {
                     crate::cloud_budget::record_success(pg, &forced_backend, None).await;
@@ -5871,12 +5896,11 @@ mod tests {
     }
 
     #[test]
-    fn classify_success_on_ok() {
+    fn classify_exit_zero_requires_deliverable_change() {
         assert_eq!(
             classify_dispatch_outcome(&ok_output(), false),
-            DispatchOutcome::Success
+            DispatchOutcome::FailedNoDiff
         );
-        // Ok is Success regardless of diff.
         assert_eq!(
             classify_dispatch_outcome(&ok_output(), true),
             DispatchOutcome::Success
