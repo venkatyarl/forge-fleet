@@ -52,6 +52,12 @@ impl TickRegistry {
                 runner: run_project_scheduler_tick,
             },
             TickDefinition {
+                name: "slot_registry_reconciler",
+                interval: Duration::from_secs(15),
+                scope: TickScope::LeaderOnly,
+                runner: run_slot_registry_reconciler_tick,
+            },
+            TickDefinition {
                 name: "work_item_scheduler",
                 interval: Duration::from_secs(15),
                 scope: TickScope::LeaderOnly,
@@ -223,6 +229,18 @@ fn run_work_item_scheduler_tick(
         crate::work_item_scheduler::evaluate_work_items(&pg)
             .await
             .map(|_| ())
+    })
+}
+
+fn run_slot_registry_reconciler_tick(
+    pg: PgPool,
+    _worker_name: String,
+) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::deployment_reconciler::reconcile_slot_registry(&pg)
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::msg)
     })
 }
 

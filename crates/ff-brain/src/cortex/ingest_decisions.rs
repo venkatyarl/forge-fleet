@@ -410,7 +410,10 @@ async fn add_edge(pool: &PgPool, src: Uuid, dst: Uuid, evidence: &MatchEvidence)
         r#"
         INSERT INTO brain_vault_edges
             (src_id, dst_id, edge_type, provenance, confidence, method, evidence)
-        VALUES ($1, $2, 'documented_by', $3, $4, $5, $6)
+        SELECT src.id, dst.id, 'documented_by', $3, $4, $5, $6
+          FROM brain_vault_nodes src
+          JOIN brain_vault_nodes dst ON dst.id = $2
+         WHERE src.id = $1
         ON CONFLICT (src_id, dst_id, edge_type) DO UPDATE
           SET confidence = GREATEST(brain_vault_edges.confidence, EXCLUDED.confidence),
               provenance = EXCLUDED.provenance,
@@ -432,6 +435,29 @@ async fn add_edge(pool: &PgPool, src: Uuid, dst: Uuid, evidence: &MatchEvidence)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extractor_edge_inserts_require_both_postgres_endpoints() {
+        let extractors = [
+            include_str!("../data_index.rs"),
+            include_str!("../image_index.rs"),
+            include_str!("maps_to.rs"),
+            include_str!("ingest_decisions.rs"),
+        ];
+
+        for source in extractors {
+            let edge_insert = source
+                .find("INSERT INTO brain_vault_edges")
+                .expect("extractor must contain its edge insert");
+            let guarded_insert = &source[edge_insert..];
+            assert!(
+                guarded_insert.contains("FROM brain_vault_nodes src")
+                    && guarded_insert.contains("JOIN brain_vault_nodes dst ON dst.id = $2")
+                    && guarded_insert.contains("WHERE src.id = $1"),
+                "extractor edges must be inserted only after both PG endpoints exist"
+            );
+        }
+    }
 
     #[test]
     fn symbol_patterns_skip_common_leaves_but_keep_qualified_suffixes() {

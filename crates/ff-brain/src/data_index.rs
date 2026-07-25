@@ -293,7 +293,10 @@ async fn upsert_data_node(
 async fn add_data_edge(pool: &PgPool, src: Uuid, dst: Uuid, edge_type: &str) -> Result<bool> {
     let r = sqlx::query(
         r#"INSERT INTO brain_vault_edges (src_id, dst_id, edge_type, provenance)
-           VALUES ($1, $2, $3, 'cortex-data')
+           SELECT src.id, dst.id, $3, 'cortex-data'
+             FROM brain_vault_nodes src
+             JOIN brain_vault_nodes dst ON dst.id = $2
+            WHERE src.id = $1
            ON CONFLICT (src_id, dst_id, edge_type) DO NOTHING"#,
     )
     .bind(src)
