@@ -19,6 +19,12 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum McpCommand {
+    /// List skills, MCP tools, and enabled agents through one interface.
+    List {
+        /// Emit the complete machine-readable inventory.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Install the forgefleet MCP server into one or more coding-agent
     /// configs (Claude Code, Claude Desktop, Codex, Gemini, Kimi, Cursor, Windsurf,
     /// Goose, Grok).
@@ -97,6 +103,37 @@ call. Only fall back to direct shell/web when no fleet tool fits.
 
 pub async fn handle_mcp(cmd: McpCommand) -> Result<()> {
     match cmd {
+        McpCommand::List { json } => {
+            let cwd = std::env::current_dir().context("cannot determine current directory")?;
+            let inventory = ff_mcp::extensions::list(&cwd, 5).await;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&inventory)?);
+            } else {
+                let counts = &inventory["counts"];
+                println!(
+                    "ForgeFleet MCP extensions: {} skills, {} tools, {} agents",
+                    counts["skills"].as_u64().unwrap_or(0),
+                    counts["tools"].as_u64().unwrap_or(0),
+                    counts["agents"].as_u64().unwrap_or(0),
+                );
+                for item in inventory["extensions"].as_array().into_iter().flatten() {
+                    println!(
+                        "  {:<6} {:<30} {}",
+                        item["kind"].as_str().unwrap_or(""),
+                        item["name"].as_str().unwrap_or(""),
+                        item["source"].as_str().unwrap_or(""),
+                    );
+                }
+                for error in inventory["errors"].as_array().into_iter().flatten() {
+                    eprintln!(
+                        "  ! {}: {}",
+                        error["source"].as_str().unwrap_or("source"),
+                        error["error"].as_str().unwrap_or("unavailable"),
+                    );
+                }
+            }
+            Ok(())
+        }
         McpCommand::Install {
             r#for: client,
             server_url,

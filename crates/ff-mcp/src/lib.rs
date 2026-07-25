@@ -19,6 +19,7 @@
 
 pub mod brain_tools;
 pub mod cortex_tools;
+pub mod extensions;
 pub mod federation;
 pub mod handlers;
 pub mod llm_exec;
