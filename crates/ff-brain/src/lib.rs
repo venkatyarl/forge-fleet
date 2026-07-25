@@ -75,7 +75,9 @@ pub use local_llm::LocalLlmRouter;
 pub use procedural_memory::{consolidate, spawn_consolidation_loop};
 pub use stack_backlog::{BacklogItem, BrainStateClient, StackItem};
 pub use vault::{
-    IndexReport, ParsedNode, VaultChunk, VaultConfig, chunk_markdown, extract_wikilinks,
-    index_changed_files, index_vault, parse_frontmatter, parse_vault_file, spawn_vault_index_tick,
+    CouncilCounterArgument, CouncilCritiqueEntry, CouncilDecision, CouncilDecisionRecord,
+    CouncilMemberEntry, CouncilSynthesisEntry, IndexReport, ParsedNode, VaultChunk, VaultConfig,
+    chunk_markdown, extract_wikilinks, index_changed_files, index_vault, parse_frontmatter,
+    parse_vault_file, save_council_decision, spawn_vault_index_tick,
 };
 pub use vector_search::{VaultNode, hybrid_search, vector_search};
