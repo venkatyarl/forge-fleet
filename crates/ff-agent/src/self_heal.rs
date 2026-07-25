@@ -55,6 +55,16 @@ pub const TRANSIENT_ERROR_SIGNATURES: &[&str] = &[
     "too many open files",
     "resource temporarily unavailable",
     "worker died",
+    // build-OUTCOME transient (operator 2026-07-25: "why isn't ff working on the
+    // failed items?"). These are retryable NOW that dispatch is local-first: a
+    // different/local backend, a healthy reviewer, or a cleared stall/lock lets
+    // the SAME task land on a later attempt. Bounded by MAX_SELF_HEAL_ATTEMPTS so
+    // a genuinely-impossible task still stops after its retries.
+    "in-place review unavailable", // reviewer (480b/cloud) was down — retry when back
+    "produced no diff",            // backend made no change — local-first may succeed
+    "stalled attempts",            // stall/lock class — retry after the reaper clears it
+    "git reset",                   // dirty worktree — a fresh worktree clears it
+    "could not fetch origin",      // transient git/network fetch failure
 ];
 
 /// Whether a stored `last_error` matches a [`TRANSIENT_ERROR_SIGNATURES`]
@@ -192,6 +202,12 @@ mod tests {
             "stale-heartbeat takeover (attempt 3)",
             "pool timed out while waiting for an open connection",
             "No space left on device (os error 28)",
+            // build-outcome transient (retryable with local-first)
+            "in-place review unavailable: no in-place review backend available",
+            "backend kimi produced no diff (no commits) — required change not applied",
+            "failed after 7 stalled attempts (max 5 reached)",
+            "command failed: git reset --hard",
+            "checkout_clone_for_build: could not fetch origin/main",
         ] {
             assert!(error_is_transient(transient), "{transient:?}");
         }
