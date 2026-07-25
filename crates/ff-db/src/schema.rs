@@ -12201,6 +12201,104 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+pub const SCHEMA_V259_MEMORY_PACK_STATS: &str =
+    include_str!("migrations/20260725000000_create_memory_pack_stats.sql");
+
+/// V261 — Autopilot-4 model A/B reward substrate.
+///
+/// The view shape is kept compatible with the live Autopilot-1 view while the
+/// build reward window is tightened to the requested rolling 48h. Tier changes
+/// are logged append-only; the catalog row remains the routing source of truth.
+pub const SCHEMA_V261_AUTOPILOT_MODEL_AB: &str = r#"
+CREATE TABLE IF NOT EXISTS autopilot_model_tier_events (
+    id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    model_id               TEXT NOT NULL,
+    workload               TEXT NOT NULL,
+    action                 TEXT NOT NULL CHECK (action IN ('promote', 'demote')),
+    old_tier               INT NOT NULL,
+    new_tier               INT NOT NULL,
+    builds                 BIGINT NOT NULL,
+    approve_pct            DOUBLE PRECISION NOT NULL,
+    incumbent_model_id     TEXT NOT NULL,
+    incumbent_builds       BIGINT NOT NULL,
+    incumbent_approve_pct  DOUBLE PRECISION NOT NULL,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_autopilot_model_tier_events_created
+    ON autopilot_model_tier_events (created_at DESC);
+
+CREATE OR REPLACE VIEW v_model_utilization AS
+WITH interaction_stats AS (
+    SELECT replace(SUBSTRING(engine FROM 7), ' ', '-') AS model_id,
+           count(*) AS calls_7d,
+           COALESCE(sum(tokens_in), 0::bigint) + COALESCE(sum(tokens_out), 0::bigint) AS tokens_7d
+      FROM ff_interactions
+     WHERE engine LIKE 'local:%'
+       AND ts >= NOW() - INTERVAL '7 days'
+     GROUP BY replace(SUBSTRING(engine FROM 7), ' ', '-')
+), build_stats AS (
+    SELECT replace(SUBSTRING(q.builder FROM 7), ' ', '-') AS model_id,
+           count(*) AS builds_7d,
+           round(
+               100.0 * count(*) FILTER (WHERE q.review_verdict = 'approve')::numeric
+               / NULLIF(count(*) FILTER (WHERE q.review_verdict = ANY (ARRAY['approve','reject'])), 0)::numeric,
+               1
+           )::double precision AS approve_pct
+      FROM work_item_merge_queue q
+      JOIN work_items w ON w.id = q.work_item_id
+     WHERE q.builder LIKE 'local:%'
+       AND q.enqueued_at >= NOW() - INTERVAL '48 hours'
+     GROUP BY replace(SUBSTRING(q.builder FROM 7), ' ', '-')
+), deployment_stats AS (
+    SELECT catalog_id AS model_id,
+           count(*) AS instances,
+           COALESCE(sum(parallel_slots), 0::bigint) AS parallel_slots,
+           min(context_window) AS context_window_min,
+           max(context_window) AS context_window_max,
+           min(usable_agent_ctx) AS usable_agent_ctx_min,
+           max(usable_agent_ctx) AS usable_agent_ctx_max,
+           bool_or(usable_agent_ctx > context_window OR usable_agent_ctx < 8192) AS ctx_row_warn,
+           count(DISTINCT context_window) > 1 AS ctx_window_inconsistent
+      FROM fleet_model_deployments
+     WHERE catalog_id IS NOT NULL
+     GROUP BY catalog_id
+), library_stats AS (
+    SELECT catalog_id AS model_id,
+           round(sum(size_bytes) / (1024 * 1024 * 1024)::numeric, 2)::double precision AS est_ram_gb
+      FROM fleet_model_library
+     GROUP BY catalog_id
+)
+SELECT COALESCE(i.model_id, b.model_id, d.model_id, l.model_id) AS model_id,
+       COALESCE(i.calls_7d, 0::bigint) AS calls_7d,
+       COALESCE(i.tokens_7d, 0::bigint) AS tokens_7d,
+       COALESCE(b.builds_7d, 0::bigint) AS builds_7d,
+       b.approve_pct,
+       COALESCE(d.instances, 0::bigint) AS instances,
+       COALESCE(d.parallel_slots, 0::bigint) AS parallel_slots,
+       d.context_window_min,
+       d.context_window_max,
+       d.usable_agent_ctx_min,
+       d.usable_agent_ctx_max,
+       l.est_ram_gb,
+       COALESCE(d.ctx_row_warn, false) OR COALESCE(d.ctx_window_inconsistent, false) AS ctx_warn,
+       CASE
+           WHEN d.model_id IS NULL THEN NULL::text
+           WHEN COALESCE(d.ctx_row_warn, false) AND COALESCE(d.ctx_window_inconsistent, false)
+               THEN 'usable_agent_ctx out of bounds on at least one deployment AND context_window inconsistent across deployments'::text
+           WHEN COALESCE(d.ctx_row_warn, false)
+               THEN 'usable_agent_ctx > context_window or < 8192 on at least one deployment'::text
+           WHEN COALESCE(d.ctx_window_inconsistent, false)
+               THEN 'context_window inconsistent across deployments of this model'::text
+           ELSE NULL::text
+       END AS ctx_warn_reason
+  FROM interaction_stats i
+  FULL JOIN build_stats b ON b.model_id = i.model_id
+  FULL JOIN deployment_stats d ON d.model_id = COALESCE(i.model_id, b.model_id)
+  FULL JOIN library_stats l ON l.model_id = COALESCE(i.model_id, b.model_id, d.model_id)
+ ORDER BY COALESCE(i.model_id, b.model_id, d.model_id, l.model_id);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

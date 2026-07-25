@@ -33,6 +33,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::autopilot_model_ab::reconcile_model_ab_once;
 use crate::coverage_guard::CoverageGuard;
 use crate::deployment_catalog_reconciler::DeploymentCatalogReconciler;
 use crate::external_tools_upstream::ExternalToolsUpstreamChecker;
@@ -216,6 +217,30 @@ pub fn spawn_portfolio_maintenance(
                     "coverage guard tick: portfolio gaps detected"
                 ),
                 Err(e) => warn!(error = %e, "coverage guard tick failed"),
+            }
+        },
+    ));
+
+    // Autopilot-4 model A/B — daily tier promote/demote pass based on the
+    // rolling reward view. Routing exploration lives in ff-db; this tick only
+    // applies decisions after enough reviewed builds exist.
+    handles.push(spawn_leader_gated(
+        pool.clone(),
+        worker_name.clone(),
+        "autopilot-model-ab",
+        Duration::from_secs(10 * MIN),
+        Duration::from_secs(24 * HOUR),
+        shutdown.clone(),
+        |pool| async move {
+            match reconcile_model_ab_once(&pool).await {
+                Ok(decisions) if decisions.is_empty() => {
+                    debug!("autopilot model A/B tick (no tier changes)")
+                }
+                Ok(decisions) => info!(
+                    decisions = decisions.len(),
+                    "autopilot model A/B tick applied tier changes"
+                ),
+                Err(e) => warn!(error = %e, "autopilot model A/B tick failed"),
             }
         },
     ));
