@@ -1200,6 +1200,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
     },
+    PgMigration {
+        version: 261,
+        name: "memory_pack_stats",
+        sql: schema::SCHEMA_V261_MEMORY_PACK_STATS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1510,6 +1515,39 @@ mod tests {
             .await
             .expect("v161 bootstrap should be recorded in _migrations");
         assert_eq!(row.0 as u32, BOOTSTRAP_BASELINE_VERSION);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v261_creates_memory_pack_stats() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name
+               FROM information_schema.columns
+              WHERE table_name = 'memory_pack_stats'
+              ORDER BY ordinal_position",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read memory_pack_stats columns");
+        assert_eq!(
+            columns,
+            [
+                "work_item_id",
+                "predicted_paths",
+                "touched_paths",
+                "hit_rate",
+                "created_at",
+            ]
+        );
 
         drop_temp_db(admin, pool, &db_name).await;
     }

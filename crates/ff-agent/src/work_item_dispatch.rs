@@ -965,7 +965,8 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     let worktree = create_worktree_for_item(&pg, &item).await?;
 
     let started = std::time::Instant::now();
-    let dispatch_full = run_ff_dispatch(&pg, &item, &worktree).await;
+    let mut predicted_paths = Vec::new();
+    let dispatch_full = run_ff_dispatch(&pg, &item, &worktree, &mut predicted_paths).await;
 
     // Split (backend, output) into the backend used + a plain Result<Output> for
     // the existing consumers. On error, no backend is carried, so use the
@@ -1206,6 +1207,22 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         // Preserve and verify any repair diff even if the backend exited
         // non-zero after editing (commonly its own final test command failing).
         commit_worktree_changes(&worktree.worktree_path, &item.title, &git_name, &git_email)?;
+    }
+
+    if let Err(error) = record_memory_pack_stats(
+        &pg,
+        item.work_item_id,
+        &predicted_paths,
+        &worktree.worktree_path,
+        &worktree.base_branch,
+    )
+    .await
+    {
+        warn!(
+            work_item_id = %item.work_item_id,
+            %error,
+            "work_item_dispatch: failed to record context-pack hit rate (non-fatal)"
+        );
     }
 
     let head_sha = git_head_sha(&worktree.worktree_path)?;
@@ -3122,6 +3139,7 @@ async fn run_ff_dispatch(
     pg: &PgPool,
     item: &AssignedWorkItem,
     worktree: &WorktreeRecord,
+    predicted_paths: &mut Vec<String>,
 ) -> Result<(String, Output)> {
     let mut prompt = dispatch_prompt(item);
     // Prepend a Cortex context pack: the exact existing symbols this task touches,
@@ -3139,9 +3157,10 @@ async fn run_ff_dispatch(
         8,
     )
     .await;
-    if !pack.is_empty() {
-        info!(work_item_id = %item.work_item_id, pack_bytes = pack.len(), "run_ff_dispatch: prepended Cortex context pack");
-        prompt = format!("{pack}\n{prompt}");
+    *predicted_paths = pack.predicted_paths;
+    if !pack.text.is_empty() {
+        info!(work_item_id = %item.work_item_id, pack_bytes = pack.text.len(), "run_ff_dispatch: prepended Cortex context pack");
+        prompt = format!("{}\n{prompt}", pack.text);
     }
 
     // Lane-1 health gate: the local codegen harness needs a local agent-capable
@@ -4443,6 +4462,69 @@ fn commit_worktree_changes(
         return Err(commit_error);
     }
     Ok(true)
+}
+
+fn committed_paths(worktree_path: &Path, base_branch: &str) -> Result<Vec<String>> {
+    let output = run_git(
+        worktree_path,
+        ["diff", "--name-only", &format!("{base_branch}...HEAD")],
+        Duration::from_secs(30),
+    )?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn memory_pack_hit_rate(predicted_paths: &[String], touched_paths: &[String]) -> f32 {
+    let predicted: std::collections::BTreeSet<&str> = predicted_paths
+        .iter()
+        .map(String::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .collect();
+    let touched: std::collections::BTreeSet<&str> = touched_paths
+        .iter()
+        .map(String::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .collect();
+    if touched.is_empty() {
+        return 0.0;
+    }
+    touched
+        .iter()
+        .filter(|path| predicted.contains(**path))
+        .count() as f32
+        / touched.len() as f32
+}
+
+async fn record_memory_pack_stats(
+    pg: &PgPool,
+    work_item_id: Uuid,
+    predicted_paths: &[String],
+    worktree_path: &Path,
+    base_branch: &str,
+) -> Result<()> {
+    let touched_paths = committed_paths(worktree_path, base_branch)?;
+    let hit_rate = memory_pack_hit_rate(predicted_paths, &touched_paths);
+    sqlx::query(
+        "INSERT INTO memory_pack_stats
+             (work_item_id, predicted_paths, touched_paths, hit_rate)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (work_item_id) DO UPDATE SET
+             predicted_paths = EXCLUDED.predicted_paths,
+             touched_paths = EXCLUDED.touched_paths,
+             hit_rate = EXCLUDED.hit_rate,
+             created_at = NOW()",
+    )
+    .bind(work_item_id)
+    .bind(serde_json::json!(predicted_paths))
+    .bind(serde_json::json!(touched_paths))
+    .bind(hit_rate)
+    .execute(pg)
+    .await?;
+    Ok(())
 }
 
 /// Resolve a project's git author identity, DB-driven and per-project:
@@ -6284,5 +6366,13 @@ mod tests {
         assert!(repo.join("committed.txt").exists());
         assert!(repo.join("dirty.txt").exists());
         assert!(!super::worktree_has_diff(repo));
+    }
+
+    #[test]
+    fn memory_pack_hit_rate_measures_touched_file_recall() {
+        let predicted = vec!["a.rs".into(), "b.rs".into(), "b.rs".into()];
+        let touched = vec!["b.rs".into(), "c.rs".into()];
+        assert_eq!(super::memory_pack_hit_rate(&predicted, &touched), 0.5);
+        assert_eq!(super::memory_pack_hit_rate(&predicted, &[]), 0.0);
     }
 }

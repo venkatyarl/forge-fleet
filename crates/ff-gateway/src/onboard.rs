@@ -673,6 +673,24 @@ pub async fn self_enroll(
     // Best-effort: announce the new node via Redis so the dashboard sees it live.
     let _ = ff_agent::fleet_events::publish_node_online(&name).await;
 
+    // Enrollment should converge immediately; the leader-only periodic audit
+    // remains the durable catch-up path if this best-effort trigger cannot SSH
+    // the node yet.
+    let onboarding_pool = pool.clone();
+    let onboarding_name = name.clone();
+    tokio::spawn(async move {
+        if let Err(error) =
+            ff_agent::onboarding_applier::audit_enrolled_node(&onboarding_pool, &onboarding_name)
+                .await
+        {
+            tracing::warn!(
+                node = %onboarding_name,
+                error = %error,
+                "post-enrollment onboarding audit failed; periodic audit will retry"
+            );
+        }
+    });
+
     Ok(Json(SelfEnrollResponse {
         assigned_name: name,
         peer_ssh_identities: peers,

@@ -1,4 +1,4 @@
-package internal/events
+package events
 
 import (
 	"context"
@@ -11,6 +11,7 @@ import (
 
 	"github.com/nats-io/go-nats"
 	"github.com/nats-io/go-nats/jetstream"
+	"github.com/venkatyarl/forge-fleet/internal/observability"
 	"github.com/venkatyarl/forge-fleet/pkg/ffdb"
 	"github.com/venkatyarl/forge-fleet/pkg/ffdb/ff_tasks"
 )
@@ -115,6 +116,7 @@ func RunSchedulerConsumer(ctx context.Context, natsConn nats.Conn, dbPool *ffdb.
 		if err != nil {
 			logger.Warn("failed to get authoritative state: %v", err)
 		} else {
+			observability.LogShadowParity(msgBody, authoritative)
 			logger.Trace("authoritative state: %v", authoritative)
 		}
 
