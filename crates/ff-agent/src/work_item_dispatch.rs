@@ -25,6 +25,18 @@ use uuid::Uuid;
 
 use crate::sub_agents::ensure_workspaces;
 
+const LOCAL_FAILURE_DIAGNOSIS_START: &str = "<local-failure-diagnosis>";
+const LOCAL_FAILURE_DIAGNOSIS_END: &str = "</local-failure-diagnosis>";
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct LocalFailureDiagnosis {
+    failure_class: String,
+    summary: String,
+    evidence: Vec<String>,
+    recommended_change: String,
+    missing_context: Option<String>,
+}
+
 /// How often the dispatch loop bumps a work_item lease's `heartbeat_at` while a
 /// build runs. The lease reapers (`lease_takeover`, `work_item_scheduler`) MUST
 /// use a stale window comfortably larger than this, or they'd reclaim a live
@@ -2914,6 +2926,151 @@ fn dispatch_prompt(item: &AssignedWorkItem) -> String {
     )
 }
 
+fn parse_local_failure_diagnosis(output: &[u8]) -> Option<LocalFailureDiagnosis> {
+    let text = String::from_utf8_lossy(output);
+    let start = text.find(LOCAL_FAILURE_DIAGNOSIS_START)? + LOCAL_FAILURE_DIAGNOSIS_START.len();
+    let end = text[start..].find(LOCAL_FAILURE_DIAGNOSIS_END)? + start;
+    let diagnosis: LocalFailureDiagnosis = serde_json::from_str(text[start..end].trim()).ok()?;
+    if !matches!(
+        diagnosis.failure_class.as_str(),
+        "context_gap" | "prompt_gap" | "capability_limit"
+    ) || diagnosis.summary.trim().is_empty()
+        || diagnosis.evidence.is_empty()
+        || diagnosis.recommended_change.trim().is_empty()
+    {
+        return None;
+    }
+    Some(diagnosis)
+}
+
+/// Persist a diagnosis authored by the cloud model that actually rescued the
+/// item, then feed it into a concrete improvement sink. This deliberately does
+/// not infer a class from `last_error`: the previous retry-3 implementation did
+/// that and merely stored a routing string, so local never learned.
+async fn record_cloud_rescue_diagnosis(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    backend: &str,
+    output: &Output,
+) {
+    if item.attempts < 3 {
+        return;
+    }
+    let Some(diagnosis) = parse_local_failure_diagnosis(&output.stdout) else {
+        warn!(
+            work_item_id = %item.work_item_id,
+            backend,
+            "cloud rescue omitted a valid structured local-failure diagnosis"
+        );
+        return;
+    };
+    let sink = if diagnosis.failure_class == "capability_limit" {
+        "fine_tune"
+    } else {
+        "brain_context_pack"
+    };
+    let raw = match serde_json::to_value(&diagnosis) {
+        Ok(raw) => raw,
+        Err(e) => {
+            warn!(error = %e, "failed to serialize local-failure diagnosis");
+            return;
+        }
+    };
+    let inserted: Result<Uuid, sqlx::Error> = sqlx::query_scalar(
+        "INSERT INTO local_failure_diagnoses
+             (work_item_id, project_id, local_attempts, cloud_backend,
+              failure_class, summary, evidence, recommended_change,
+              missing_context, raw_diagnosis, improvement_sink)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (work_item_id, local_attempts) DO UPDATE SET
+             cloud_backend = EXCLUDED.cloud_backend,
+             failure_class = EXCLUDED.failure_class,
+             summary = EXCLUDED.summary,
+             evidence = EXCLUDED.evidence,
+             recommended_change = EXCLUDED.recommended_change,
+             missing_context = EXCLUDED.missing_context,
+             raw_diagnosis = EXCLUDED.raw_diagnosis,
+             improvement_sink = EXCLUDED.improvement_sink
+         RETURNING id",
+    )
+    .bind(item.work_item_id)
+    .bind(&item.project_id)
+    .bind(item.attempts)
+    .bind(backend)
+    .bind(&diagnosis.failure_class)
+    .bind(&diagnosis.summary)
+    .bind(serde_json::json!(&diagnosis.evidence))
+    .bind(&diagnosis.recommended_change)
+    .bind(&diagnosis.missing_context)
+    .bind(&raw)
+    .bind(sink)
+    .fetch_one(pg)
+    .await;
+    let diagnosis_id = match inserted {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(error = %e, "failed to persist local-failure diagnosis");
+            return;
+        }
+    };
+
+    let routed = if sink == "brain_context_pack" {
+        let body = format!(
+            "Cloud rescue diagnosis for work item {} after {} local failures.\n\
+             Class: {}\nSummary: {}\nEvidence: {}\nMissing context: {}\n\
+             Recommended context/prompt change: {}",
+            item.work_item_id,
+            item.attempts,
+            diagnosis.failure_class,
+            diagnosis.summary,
+            diagnosis.evidence.join("; "),
+            diagnosis
+                .missing_context
+                .as_deref()
+                .unwrap_or("unspecified"),
+            diagnosis.recommended_change
+        );
+        crate::scratchpad::push_to_brain(
+            pg,
+            "project",
+            &item.project_id,
+            "local-failure-diagnosis",
+            &body,
+        )
+        .await
+        .is_some()
+    } else {
+        sqlx::query(
+            "INSERT INTO local_failure_training_candidates
+                 (diagnosis_id, work_item_id, project_id, task_prompt,
+                  local_failure, cloud_diagnosis)
+             VALUES ($1,$2,$3,$4,$5,$6)
+             ON CONFLICT (diagnosis_id) DO NOTHING",
+        )
+        .bind(diagnosis_id)
+        .bind(item.work_item_id)
+        .bind(&item.project_id)
+        .bind(dispatch_prompt(item))
+        .bind(item.last_error.as_deref().unwrap_or("local attempt failed"))
+        .bind(&raw)
+        .execute(pg)
+        .await
+        .is_ok()
+    };
+    if routed {
+        let _ = sqlx::query("UPDATE local_failure_diagnoses SET routed_at = NOW() WHERE id = $1")
+            .bind(diagnosis_id)
+            .execute(pg)
+            .await;
+    } else {
+        warn!(
+            work_item_id = %item.work_item_id,
+            sink,
+            "local-failure diagnosis persisted but improvement routing failed"
+        );
+    }
+}
+
 /// Parse the token count a vendor CLI reports in its output so the training
 /// corpus captures token economics, not just content. codex prints
 /// `tokens used\n9,332`; kimi/others print variants like `Tokens: 1234` or
@@ -3394,6 +3551,26 @@ async fn run_ff_dispatch(
         );
     }
 
+    // Once local exhaustion sends the item to cloud, require the rescuer to
+    // explain why local failed using evidence from both the old failure and the
+    // successful fix. The machine-readable final block is persisted and routed
+    // by `record_cloud_rescue_diagnosis`; classification is authored by cloud,
+    // never guessed from the error string.
+    if item.attempts >= 3 {
+        prompt.push_str(
+            "\n\nLOCAL-FAILURE LEARNING (required): after completing and verifying the fix, \
+             end your final response with exactly one JSON object between \
+             <local-failure-diagnosis> and </local-failure-diagnosis>. Use this schema: \
+             {\"failure_class\":\"context_gap|prompt_gap|capability_limit\",\
+             \"summary\":\"root cause local got wrong\",\
+             \"evidence\":[\"specific failed behavior\", \"specific successful-fix evidence\"],\
+             \"recommended_change\":\"concrete improvement for the next local attempt\",\
+             \"missing_context\":\"what was missing, or null\"}. \
+             Diagnose from the actual failed attempt and your successful fix; do not infer from \
+             keywords or merely restate the error.\n",
+        );
+    }
+
     // Lane 2: dispatch to an AVAILABLE backend (capability A4/A5) with the full
     // cloud-error nervous system wired in. The router returns this node's
     // dispatchable backends headroom/rank-ordered. For each, we run `ff cli
@@ -3681,6 +3858,7 @@ async fn run_ff_dispatch(
                 if attempt > 0 || backend != &backends[0] {
                     info!(backend = %backend, attempt, "run_ff_dispatch: recovered via auto-continue/failover");
                 }
+                record_cloud_rescue_diagnosis(pg, item, backend, &out).await;
                 return Ok((backend.clone(), out));
             }
             // A `--require-change` no-op (exit 3) is a task-level failure, not a
@@ -3778,6 +3956,7 @@ async fn run_ff_dispatch(
                 }
                 if out.status.success() {
                     crate::cloud_budget::record_success(pg, &forced_backend, None).await;
+                    record_cloud_rescue_diagnosis(pg, item, &forced_backend, &out).await;
                 }
                 return Ok((forced_backend, out));
             }
@@ -5307,15 +5486,40 @@ mod tests {
         builder_excludes_480b, classify_dispatch_outcome, command_display,
         complexity_at_least_moderate, contains_file_line_citation, default_clone_path,
         dispatch_budget_for_host, dispatch_prompt, expand_home, is_build_timeout, mirror_repo_url,
-        order_cloud_reviewers, parse_cli_tokens, primary_or_default_backend,
-        quick_empty_success_is_provider_failure, repo_cache_path, repo_slug,
-        retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
+        order_cloud_reviewers, parse_cli_tokens, parse_local_failure_diagnosis,
+        primary_or_default_backend, quick_empty_success_is_provider_failure, repo_cache_path,
+        repo_slug, retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
         should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
         task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
     };
     use std::path::PathBuf;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn parses_cloud_authored_local_failure_diagnosis() {
+        let output = br#"work completed
+<local-failure-diagnosis>
+{"failure_class":"context_gap","summary":"local edited the stale adapter","evidence":["failure touched old.rs","cloud fixed owner.rs"],"recommended_change":"include the owning Cortex symbol","missing_context":"owner.rs"}
+</local-failure-diagnosis>"#;
+        let diagnosis = parse_local_failure_diagnosis(output).expect("valid diagnosis");
+        assert_eq!(diagnosis.failure_class, "context_gap");
+        assert_eq!(diagnosis.evidence.len(), 2);
+        assert_eq!(diagnosis.missing_context.as_deref(), Some("owner.rs"));
+    }
+
+    #[test]
+    fn rejects_unstructured_or_heuristic_diagnosis() {
+        assert!(parse_local_failure_diagnosis(b"context_gap: probably missing context").is_none());
+        assert!(
+            parse_local_failure_diagnosis(
+                br#"<local-failure-diagnosis>
+{"failure_class":"context_gap","summary":"guess","evidence":[],"recommended_change":"retry","missing_context":null}
+</local-failure-diagnosis>"#
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn contains_file_line_citation_requires_dotted_path_and_digit_line() {

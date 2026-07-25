@@ -12201,6 +12201,47 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// Cloud-rescue learning loop. The diagnosis is authored by the rescuing cloud
+/// model from the failed-local context and its successful fix; it is not an
+/// error-string classifier. Context/prompt gaps are promoted to Brain, while
+/// genuine capability limits are copied into the fine-tune intake table.
+pub const SCHEMA_V261_LOCAL_FAILURE_DIAGNOSES: &str = r#"
+CREATE TABLE IF NOT EXISTS local_failure_diagnoses (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    work_item_id        UUID NOT NULL,
+    project_id          TEXT NOT NULL,
+    local_attempts      INT NOT NULL CHECK (local_attempts >= 3),
+    cloud_backend       TEXT NOT NULL,
+    failure_class       TEXT NOT NULL
+                        CHECK (failure_class IN ('context_gap', 'prompt_gap', 'capability_limit')),
+    summary             TEXT NOT NULL,
+    evidence            JSONB NOT NULL DEFAULT '[]',
+    recommended_change  TEXT NOT NULL,
+    missing_context     TEXT,
+    raw_diagnosis       JSONB NOT NULL,
+    improvement_sink    TEXT NOT NULL
+                        CHECK (improvement_sink IN ('brain_context_pack', 'fine_tune')),
+    routed_at           TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (work_item_id, local_attempts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_failure_diagnoses_unrouted
+    ON local_failure_diagnoses (created_at) WHERE routed_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS local_failure_training_candidates (
+    diagnosis_id       UUID PRIMARY KEY REFERENCES local_failure_diagnoses(id) ON DELETE CASCADE,
+    work_item_id       UUID NOT NULL,
+    project_id         TEXT NOT NULL,
+    task_prompt        TEXT NOT NULL,
+    local_failure      TEXT NOT NULL,
+    cloud_diagnosis    JSONB NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'pending'
+                       CHECK (status IN ('pending', 'accepted', 'rejected', 'exported')),
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

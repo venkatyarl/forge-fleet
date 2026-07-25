@@ -433,6 +433,80 @@ async fn add_edge(pool: &PgPool, src: Uuid, dst: Uuid, evidence: &MatchEvidence)
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn pg_ingest_decisions_inserts_no_dangling_edges() {
+        let Ok(url) = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+        else {
+            return;
+        };
+        let Ok(pool) = PgPool::connect(&url).await else {
+            return;
+        };
+
+        // A specific, uncommon symbol so it survives is_specific_symbol's
+        // filtering and won't accidentally collide with real fleet data.
+        let suffix = Uuid::new_v4().simple().to_string();
+        let symbol = format!("process_widget_batch_{suffix}");
+        let project = format!("fk-decisions-{suffix}");
+        let code_path = format!("rust://{project}/src/lib.rs#{symbol}");
+        let doc_path = format!("vault://{project}/notes/{symbol}.md");
+
+        sqlx::query(
+            "INSERT INTO brain_vault_nodes (path, title, node_type, project, content_hash)
+             VALUES ($1, $2, 'code:function', $3, $1)",
+        )
+        .bind(&code_path)
+        .bind(&symbol)
+        .bind(&project)
+        .execute(&pool)
+        .await
+        .expect("insert code node");
+
+        // The doc's title alone (folded into doc_text) is enough to trigger a
+        // text-match against the symbol above.
+        sqlx::query(
+            "INSERT INTO brain_vault_nodes (path, title, node_type, project, content_hash)
+             VALUES ($1, $2, 'content:note', $3, $1)",
+        )
+        .bind(&doc_path)
+        .bind(format!("notes on {symbol}"))
+        .bind(&project)
+        .execute(&pool)
+        .await
+        .expect("insert doc node");
+
+        ingest_decisions(&pool)
+            .await
+            .expect("ingest_decisions must not violate edge endpoint FKs");
+
+        let matched: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::bigint
+              FROM brain_vault_edges edge
+              JOIN brain_vault_nodes src ON src.id = edge.src_id
+              JOIN brain_vault_nodes dst ON dst.id = edge.dst_id
+             WHERE edge.edge_type = 'documented_by'
+               AND edge.provenance = $1
+               AND src.path = $2
+               AND dst.path = $3
+            "#,
+        )
+        .bind(PROVENANCE)
+        .bind(&code_path)
+        .bind(&doc_path)
+        .fetch_one(&pool)
+        .await
+        .expect("query the expected edge");
+        assert_eq!(matched, 1);
+
+        sqlx::query("DELETE FROM brain_vault_nodes WHERE project = $1")
+            .bind(&project)
+            .execute(&pool)
+            .await
+            .expect("delete test nodes");
+    }
+
     #[test]
     fn symbol_patterns_skip_common_leaves_but_keep_qualified_suffixes() {
         let patterns = symbol_patterns("ff::cortex::Config::new");

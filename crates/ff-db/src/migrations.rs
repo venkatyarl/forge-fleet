@@ -1200,6 +1200,12 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
     },
+    // 259-260 are already allocated on fleet branches/live DB.
+    PgMigration {
+        version: 261,
+        name: "local_failure_diagnoses",
+        sql: schema::SCHEMA_V261_LOCAL_FAILURE_DIAGNOSES,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

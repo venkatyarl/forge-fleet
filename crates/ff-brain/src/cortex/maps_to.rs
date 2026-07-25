@@ -482,6 +482,79 @@ fn stable_digest(value: &str) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn pg_map_corpora_inserts_no_dangling_edges() {
+        let Ok(url) = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+        else {
+            return;
+        };
+        let Ok(pool) = PgPool::connect(&url).await else {
+            return;
+        };
+
+        let suffix = Uuid::new_v4();
+        let old_slug = format!("fk-maps-old-{suffix}");
+        let new_slug = format!("fk-maps-new-{suffix}");
+
+        // A table present in both corpora — exercises the matched path, where
+        // the edge's dst_id points at an already-existing node.
+        for (slug, tag) in [(&old_slug, "old"), (&new_slug, "new")] {
+            sqlx::query(
+                "INSERT INTO brain_vault_nodes (path, title, node_type, project, content_hash)
+                 VALUES ($1, 'widgets', 'db:table', $2, $1)",
+            )
+            .bind(format!("db://{slug}/widgets-{tag}"))
+            .bind(slug)
+            .execute(&pool)
+            .await
+            .expect("insert matched table node");
+        }
+        // A table only in the old corpus — exercises the unmapped-marker path,
+        // where the edge's dst_id points at a node created moments earlier.
+        sqlx::query(
+            "INSERT INTO brain_vault_nodes (path, title, node_type, project, content_hash)
+             VALUES ($1, 'gadgets', 'db:table', $2, $1)",
+        )
+        .bind(format!("db://{old_slug}/gadgets"))
+        .bind(&old_slug)
+        .execute(&pool)
+        .await
+        .expect("insert unmatched table node");
+
+        let processed = map_corpora(&pool, &old_slug, &new_slug)
+            .await
+            .expect("map_corpora must not violate edge endpoint FKs");
+        assert_eq!(processed, 2);
+
+        let dangling: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::bigint
+              FROM brain_vault_edges edge
+              LEFT JOIN brain_vault_nodes src ON src.id = edge.src_id
+              LEFT JOIN brain_vault_nodes dst ON dst.id = edge.dst_id
+             WHERE edge.edge_type = 'maps_to'
+               AND edge.provenance = $1
+               AND (src.project = $2 OR dst.project = $3)
+               AND (src.id IS NULL OR dst.id IS NULL)
+            "#,
+        )
+        .bind(PROVENANCE)
+        .bind(&old_slug)
+        .bind(&new_slug)
+        .fetch_one(&pool)
+        .await
+        .expect("query edge endpoints");
+        assert_eq!(dangling, 0);
+
+        sqlx::query("DELETE FROM brain_vault_nodes WHERE project = $1 OR project = $2")
+            .bind(&old_slug)
+            .bind(&new_slug)
+            .execute(&pool)
+            .await
+            .expect("delete test nodes");
+    }
+
     #[test]
     fn leaf_name_handles_code_and_columns() {
         assert_eq!(leaf_name("a::b::load"), "load");

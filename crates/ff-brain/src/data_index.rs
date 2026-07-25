@@ -443,6 +443,63 @@ fn sha256_hex(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn pg_index_inserts_column_nodes_before_contains_edges() {
+        let Ok(url) = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+        else {
+            return;
+        };
+        let Ok(pool) = PgPool::connect(&url).await else {
+            return;
+        };
+
+        let suffix = Uuid::new_v4();
+        let slug = format!("fk-order-{suffix}");
+        let root = std::env::temp_dir().join(format!("ff-data-index-{suffix}"));
+        std::fs::create_dir(&root).expect("create data-index test directory");
+        std::fs::write(root.join("sample.csv"), "id,name\n1,Ada\n")
+            .expect("write data-index fixture");
+        sqlx::query("INSERT INTO brain_corpora (slug, title) VALUES ($1, $1)")
+            .bind(&slug)
+            .execute(&pool)
+            .await
+            .expect("insert test corpus");
+
+        let stats = index_data(&pool, &slug, &root, false)
+            .await
+            .expect("PG data index must not violate edge endpoint FKs");
+        assert_eq!(stats.edges, 2);
+        let dangling: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::bigint
+              FROM brain_vault_edges edge
+              LEFT JOIN brain_vault_nodes src ON src.id = edge.src_id
+              LEFT JOIN brain_vault_nodes dst ON dst.id = edge.dst_id
+             WHERE edge.provenance = 'cortex-data'
+               AND (src.project = $1 OR dst.project = $1)
+               AND (src.id IS NULL OR dst.id IS NULL)
+            "#,
+        )
+        .bind(&slug)
+        .fetch_one(&pool)
+        .await
+        .expect("query edge endpoints");
+        assert_eq!(dangling, 0);
+
+        sqlx::query("DELETE FROM brain_vault_nodes WHERE project = $1")
+            .bind(&slug)
+            .execute(&pool)
+            .await
+            .expect("delete test nodes");
+        sqlx::query("DELETE FROM brain_corpora WHERE slug = $1")
+            .bind(&slug)
+            .execute(&pool)
+            .await
+            .expect("delete test corpus");
+        std::fs::remove_dir_all(&root).expect("delete data-index test directory");
+    }
+
     #[test]
     fn parses_csv_header_and_counts_rows() {
         let src = "id,name,amount\n1,Acme,100\n2,Globex,200\n3,Initech,300\n";

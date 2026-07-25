@@ -391,7 +391,7 @@ async fn resolve_summarizer(pool: &PgPool) -> Result<(String, String)> {
 /// Push evicted full content into Brain as a candidate. Best-effort: returns
 /// the candidate id on success, `None` (logged) on any failure — the eviction
 /// audit row is the durable record regardless.
-async fn push_to_brain(
+pub(crate) async fn push_to_brain(
     pool: &PgPool,
     scope_type: &str,
     scope_key: &str,
