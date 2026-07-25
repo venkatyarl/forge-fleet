@@ -116,6 +116,7 @@ pub mod model_runtime;
 pub mod model_scout;
 pub mod model_transfer;
 pub mod model_upstream;
+pub mod model_watchlist;
 pub mod multi_agent;
 pub mod nats_client;
 pub mod nats_jetstream;
