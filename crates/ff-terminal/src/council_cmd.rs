@@ -582,10 +582,15 @@ pub async fn handle_council(
     // Adversarial second round: members critique each other's blinded round-1
     // answers, critiques are distributed back to the critiqued member (still
     // blinded) for a counter-argument, and the counter-argument (where given)
-    // replaces that member's round-1 answer for everything downstream —
-    // synthesis judges the deliberated position, not the first draft. Needs
+    // replaces that member's round-1 answer in `final_answers` for everything
+    // downstream — synthesis judges the deliberated position, not the first
+    // draft. `answers` (round-1) and `counter_arguments` are kept alongside,
+    // UNCHANGED, so a persisted decision record can show both instead of
+    // losing the original answer once a counter-argument supersedes it. Needs
     // 2+ answers; a lone answer has nothing to be critiqued against.
     let mut final_answers = answers.clone();
+    let mut critique_entries: Vec<ff_brain::CouncilCritiqueEntry> = Vec::new();
+    let mut counter_arguments: Vec<(String, MemberAnswer)> = Vec::new();
     if adversarial_mode {
         if ok < 2 {
             eprintln!(
@@ -607,9 +612,19 @@ pub async fn handle_council(
                 labels.sort();
                 labels.join(", ")
             });
-            for (member, counter) in state.counter_arguments {
-                if let Some(slot) = final_answers.iter_mut().find(|(m, _)| *m == member) {
-                    slot.1 = counter;
+            for (critic, entries) in &state.critiques {
+                for entry in entries {
+                    critique_entries.push(ff_brain::CouncilCritiqueEntry {
+                        critic: critic.clone(),
+                        target_label: entry.member.clone(),
+                        critique: entry.critique.clone(),
+                    });
+                }
+            }
+            counter_arguments = state.counter_arguments;
+            for (member, counter) in &counter_arguments {
+                if let Some(slot) = final_answers.iter_mut().find(|(m, _)| m == member) {
+                    slot.1 = counter.clone();
                 }
             }
         }
@@ -634,6 +649,16 @@ pub async fn handle_council(
             "\n{GREEN}═══════════ CONSENSUS (sole answer) ═══════════{RESET}\n{}",
             final_answers[0].1.answer
         );
+        persist_council_decision(
+            pool.as_ref(),
+            &question,
+            &answers,
+            &counter_arguments,
+            &critique_entries,
+            None,
+            &final_answers[0].1.answer,
+        )
+        .await;
         return Ok(());
     }
 
@@ -667,20 +692,125 @@ pub async fn handle_council(
             if !synthesis.rationale.trim().is_empty() {
                 println!("\n{CYAN}─── Rationale ───{RESET}\n{}", synthesis.rationale);
             }
+            let consensus = synthesis.consensus.clone();
+            persist_council_decision(
+                pool.as_ref(),
+                &question,
+                &answers,
+                &counter_arguments,
+                &critique_entries,
+                Some(ff_brain::CouncilSynthesisEntry {
+                    chairman: chair.clone(),
+                    consensus: synthesis.consensus,
+                    disagreements: synthesis.disagreements,
+                    unique_findings: synthesis.unique_findings,
+                    rationale: synthesis.rationale,
+                }),
+                &consensus,
+            )
+            .await;
         }
-        None => match raw.answer {
-            Some(unstructured) => println!(
-                "\n{YELLOW}⚠ chairman {chair} did not return structured JSON — printing raw \
-                 synthesis.{RESET}\n{unstructured}"
-            ),
-            None => eprintln!(
-                "{YELLOW}⚠ chairman {chair} produced no synthesis — falling back to the raw \
-                 answers above.{RESET}{}",
-                raw.error.map(|e| format!("\n{e}")).unwrap_or_default()
-            ),
-        },
+        None => {
+            // The chairman produced no usable output at all here (neither
+            // structured JSON nor raw text) — that must NOT skip persistence:
+            // the deliberated transcript is still worth keeping in the audit
+            // trail, so fall back to the highest-confidence deliberated
+            // answer as the recorded final output.
+            let fallback = match &raw.answer {
+                Some(unstructured) => {
+                    println!(
+                        "\n{YELLOW}⚠ chairman {chair} did not return structured JSON — printing \
+                         raw synthesis.{RESET}\n{unstructured}"
+                    );
+                    unstructured.clone()
+                }
+                None => {
+                    eprintln!(
+                        "{YELLOW}⚠ chairman {chair} produced no synthesis — falling back to the \
+                         raw answers above.{RESET}{}",
+                        raw.error.map(|e| format!("\n{e}")).unwrap_or_default()
+                    );
+                    final_answers
+                        .iter()
+                        .max_by(|a, b| {
+                            a.1.confidence
+                                .partial_cmp(&b.1.confidence)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(_, a)| a.answer.clone())
+                        .unwrap_or_default()
+                }
+            };
+            persist_council_decision(
+                pool.as_ref(),
+                &question,
+                &answers,
+                &counter_arguments,
+                &critique_entries,
+                None,
+                &fallback,
+            )
+            .await;
+        }
     }
     Ok(())
+}
+
+/// Persist a completed council deliberation as a decision record (best-effort
+/// — mirrors [`log_council`]: a DB hiccup here must never fail the council
+/// that already ran). No-ops when the fleet DB pool is unavailable. `answers`
+/// must be the untouched round-1 answers (NOT `final_answers`, which the
+/// adversarial round overwrites in place) so every member's original position
+/// survives in the transcript; `counter_arguments` attaches each member's
+/// revision alongside it instead of replacing it.
+async fn persist_council_decision(
+    pool: Option<&PgPool>,
+    question: &str,
+    answers: &[(String, MemberAnswer)],
+    counter_arguments: &[(String, MemberAnswer)],
+    critiques: &[ff_brain::CouncilCritiqueEntry],
+    synthesis: Option<ff_brain::CouncilSynthesisEntry>,
+    final_output: &str,
+) {
+    let Some(pool) = pool else { return };
+    let members = answers
+        .iter()
+        .map(|(member, answer)| ff_brain::CouncilMemberEntry {
+            member: member.clone(),
+            answer: answer.answer.clone(),
+            confidence: answer.confidence,
+            evidence: answer.evidence.clone(),
+            counter_argument: counter_arguments.iter().find(|(m, _)| m == member).map(
+                |(_, counter)| ff_brain::CouncilCounterArgument {
+                    answer: counter.answer.clone(),
+                    confidence: counter.confidence,
+                    evidence: counter.evidence.clone(),
+                },
+            ),
+        })
+        .collect();
+    let decision = ff_brain::CouncilDecision {
+        question: question.to_string(),
+        members,
+        critiques: critiques
+            .iter()
+            .map(|c| ff_brain::CouncilCritiqueEntry {
+                critic: c.critic.clone(),
+                target_label: c.target_label.clone(),
+                critique: c.critique.clone(),
+            })
+            .collect(),
+        synthesis,
+        final_output: final_output.to_string(),
+        session_id: None,
+    };
+    match ff_brain::save_council_decision(pool, &decision).await {
+        Ok(record) => eprintln!(
+            "{CYAN}  ↳ decision record saved: {}{RESET}",
+            record.vault_path
+        ),
+        Err(e) => eprintln!("{YELLOW}⚠ failed to persist council decision record: {e}{RESET}"),
+    }
 }
 
 /// Dispatch one member: an explicit `http(s)://host:port[#model]` fleet

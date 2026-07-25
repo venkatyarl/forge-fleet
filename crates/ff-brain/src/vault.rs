@@ -382,6 +382,292 @@ fn heading_level(line: &str) -> Option<usize> {
     }
 }
 
+// ── Council decision records ────────────────────────────────────────────
+
+/// A member's revised position after the adversarial critique round —
+/// recorded ALONGSIDE its round-1 [`CouncilMemberEntry::answer`], never in
+/// place of it, so a persisted transcript still shows what the member
+/// originally said even when a counter-argument superseded it downstream.
+pub struct CouncilCounterArgument {
+    pub answer: String,
+    pub confidence: f32,
+    pub evidence: Vec<String>,
+}
+
+/// One council member's round-1 answer, as captured for a persisted decision
+/// record, plus its adversarial-round counter-argument when one was given.
+pub struct CouncilMemberEntry {
+    pub member: String,
+    pub answer: String,
+    pub confidence: f32,
+    pub evidence: Vec<String>,
+    pub counter_argument: Option<CouncilCounterArgument>,
+}
+
+/// One critique raised during a council's adversarial round, attributed to
+/// the critiquing member and the (blinded) label it targeted.
+pub struct CouncilCritiqueEntry {
+    pub critic: String,
+    pub target_label: String,
+    pub critique: String,
+}
+
+/// The chairman's structured synthesis of a council's answers.
+pub struct CouncilSynthesisEntry {
+    pub chairman: String,
+    pub consensus: String,
+    pub disagreements: Vec<String>,
+    pub unique_findings: Vec<String>,
+    pub rationale: String,
+}
+
+/// Full record of one `ff council` deliberation, ready to persist as a
+/// decision record. `members` always carries every round-1 answer — an
+/// adversarial counter-argument is attached to its member's entry, not
+/// substituted in — so the transcript stays complete regardless of how the
+/// council concluded (including when [`CouncilDecision::synthesis`] is
+/// `None`, e.g. the chairman produced no usable output).
+pub struct CouncilDecision {
+    pub question: String,
+    pub members: Vec<CouncilMemberEntry>,
+    pub critiques: Vec<CouncilCritiqueEntry>,
+    pub synthesis: Option<CouncilSynthesisEntry>,
+    pub final_output: String,
+    pub session_id: Option<uuid::Uuid>,
+}
+
+/// Where a persisted council decision landed.
+pub struct CouncilDecisionRecord {
+    pub vault_path: String,
+    pub vault_node_id: uuid::Uuid,
+    pub interaction_id: uuid::Uuid,
+}
+
+/// Persist a completed `ff council` deliberation as a decision record: the
+/// full transcript (every member's round-1 answer plus any adversarial
+/// counter-argument), the chairman's synthesis (when there is one), and the
+/// final output are rendered into the six-section operator template
+/// (Question / Council Transcript / Adversarial Critique Round / Chairman
+/// Synthesis / Final Decision / Metadata), upserted into the vault graph
+/// (`brain_vault_nodes` + `rag_chunks`, so it's searchable via
+/// `brain_search`), and appended to `ff_interactions` so the deliberation
+/// shows up in the same audit trail as every other ff dispatch.
+///
+/// Callers should always call this once the council has run, even when the
+/// chairman produced no synthesis at all — the transcript is worth
+/// persisting on its own, and skipping the call would silently drop the
+/// deliberation from the audit trail. Treat a returned `Err` as non-fatal
+/// (mirrors the `log_council` best-effort pattern in `ff-terminal`) — a DB
+/// hiccup here should never fail the council itself.
+pub async fn save_council_decision(
+    pool: &PgPool,
+    decision: &CouncilDecision,
+) -> Result<CouncilDecisionRecord, String> {
+    let now = chrono::Utc::now();
+    let path = format!(
+        "decisions/council/{}-{}.md",
+        now.format("%Y%m%d%H%M%S"),
+        slugify_question(&decision.question)
+    );
+    let title = format!("Council decision: {}", truncate_title(&decision.question));
+    let body = render_decision_record(decision, now);
+
+    let mut hasher = Sha256::new();
+    hasher.update(body.as_bytes());
+    let content_hash = format!("{:x}", hasher.finalize());
+
+    let confidence = decision.synthesis.as_ref().map(|_| 1.0);
+    let tags = vec!["council".to_string(), "decision".to_string()];
+    let vault_node_id = ff_db::pg_upsert_brain_vault_node(
+        pool,
+        &path,
+        &title,
+        Some("decision:council"),
+        None,
+        &tags,
+        None,
+        &[],
+        None,
+        confidence,
+        &content_hash,
+    )
+    .await
+    .map_err(|e| format!("DB error upserting decision node '{path}': {e}"))?;
+
+    let chunks = chunk_markdown(&body, &path);
+    write_chunks(pool, &path, &chunks).await?;
+
+    let members: Vec<&str> = decision.members.iter().map(|m| m.member.as_str()).collect();
+    let rec = ff_db::InteractionRecord {
+        session_id: decision.session_id,
+        channel: "council_decision".to_string(),
+        purpose: Some("council".to_string()),
+        request_text: decision.question.chars().take(16000).collect(),
+        request_meta: serde_json::json!({
+            "members": members,
+            "vault_path": path,
+            "adversarial": !decision.critiques.is_empty(),
+        }),
+        engine: decision.synthesis.as_ref().map(|s| s.chairman.clone()),
+        response_text: body.chars().take(16000).collect(),
+        outcome: "success".to_string(),
+        ..Default::default()
+    };
+    let interaction_id = ff_db::pg_record_interaction(pool, &rec)
+        .await
+        .map_err(|e| format!("DB error logging council decision interaction: {e}"))?;
+
+    Ok(CouncilDecisionRecord {
+        vault_path: path,
+        vault_node_id,
+        interaction_id,
+    })
+}
+
+/// Render a [`CouncilDecision`] into the six-section operator output
+/// template used for persisted decision records.
+fn render_decision_record(decision: &CouncilDecision, ts: chrono::DateTime<chrono::Utc>) -> String {
+    let mut out = String::new();
+
+    out.push_str("## 1. Question\n\n");
+    out.push_str(decision.question.trim());
+    out.push_str("\n\n");
+
+    out.push_str("## 2. Council Transcript\n\n");
+    if decision.members.is_empty() {
+        out.push_str("(no member answered)\n\n");
+    } else {
+        for m in &decision.members {
+            out.push_str(&format!(
+                "### {} (confidence: {:.2})\n\n{}\n\n",
+                m.member,
+                m.confidence,
+                m.answer.trim()
+            ));
+            if !m.evidence.is_empty() {
+                out.push_str("Evidence:\n");
+                for e in &m.evidence {
+                    out.push_str(&format!("- {e}\n"));
+                }
+                out.push('\n');
+            }
+            if let Some(counter) = &m.counter_argument {
+                out.push_str(&format!(
+                    "**Revised after adversarial critique** (confidence: {:.2}):\n\n{}\n\n",
+                    counter.confidence,
+                    counter.answer.trim()
+                ));
+                if !counter.evidence.is_empty() {
+                    out.push_str("Evidence:\n");
+                    for e in &counter.evidence {
+                        out.push_str(&format!("- {e}\n"));
+                    }
+                    out.push('\n');
+                }
+            }
+        }
+    }
+
+    out.push_str("## 3. Adversarial Critique Round\n\n");
+    if decision.critiques.is_empty() {
+        out.push_str("(adversarial round not run, or no critiques were raised)\n\n");
+    } else {
+        for c in &decision.critiques {
+            out.push_str(&format!(
+                "- **{}** on {}: {}\n",
+                c.critic, c.target_label, c.critique
+            ));
+        }
+        out.push('\n');
+    }
+
+    out.push_str("## 4. Chairman Synthesis\n\n");
+    match &decision.synthesis {
+        Some(s) => {
+            out.push_str(&format!("Chairman: {}\n\n", s.chairman));
+            out.push_str(&format!("**Consensus:** {}\n\n", s.consensus.trim()));
+            if !s.disagreements.is_empty() {
+                out.push_str("**Disagreements:**\n");
+                for d in &s.disagreements {
+                    out.push_str(&format!("- {d}\n"));
+                }
+                out.push('\n');
+            }
+            if !s.unique_findings.is_empty() {
+                out.push_str("**Unique findings:**\n");
+                for f in &s.unique_findings {
+                    out.push_str(&format!("- {f}\n"));
+                }
+                out.push('\n');
+            }
+            if !s.rationale.trim().is_empty() {
+                out.push_str(&format!("**Rationale:** {}\n\n", s.rationale.trim()));
+            }
+        }
+        None => out.push_str(
+            "(no chairman synthesis — sole answer, deliberation ended without \
+            one, or the chairman produced no usable output)\n\n",
+        ),
+    }
+
+    out.push_str("## 5. Final Decision\n\n");
+    out.push_str(decision.final_output.trim());
+    out.push_str("\n\n");
+
+    out.push_str("## 6. Metadata\n\n");
+    out.push_str(&format!("- Timestamp: {}\n", ts.to_rfc3339()));
+    out.push_str(&format!(
+        "- Members: {}\n",
+        decision
+            .members
+            .iter()
+            .map(|m| m.member.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    if let Some(s) = &decision.synthesis {
+        out.push_str(&format!("- Chairman: {}\n", s.chairman));
+    }
+    out.push_str(&format!(
+        "- Adversarial round: {}\n",
+        if decision.critiques.is_empty() {
+            "no"
+        } else {
+            "yes"
+        }
+    ));
+
+    out
+}
+
+/// Slugify a council question into a filesystem-safe vault path component.
+fn slugify_question(s: &str) -> String {
+    let mut out = String::with_capacity(s.len().min(60));
+    for ch in s.chars().take(60) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "untitled".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Truncate a question to a readable note title.
+fn truncate_title(s: &str) -> String {
+    let t = s.trim();
+    if t.chars().count() > 80 {
+        format!("{}…", t.chars().take(80).collect::<String>())
+    } else {
+        t.to_string()
+    }
+}
+
 /// Full index pass: walk the vault, parse every .md file, upsert brain_vault_nodes
 /// + brain_vault_edges, chunk and write to rag_chunks. Incremental: only processes
 ///   files whose content_hash changed since last run.
@@ -707,4 +993,155 @@ async fn write_chunks(pool: &PgPool, node_path: &str, chunks: &[VaultChunk]) -> 
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod council_decision_tests {
+    use super::*;
+
+    fn sample_decision() -> CouncilDecision {
+        CouncilDecision {
+            question: "Should we retire the legacy ff daemon?".to_string(),
+            members: vec![
+                CouncilMemberEntry {
+                    member: "codex".to_string(),
+                    answer: "Yes, phase it out.".to_string(),
+                    confidence: 0.9,
+                    evidence: vec!["reaper already SIGTERMs stale procs".to_string()],
+                    counter_argument: Some(CouncilCounterArgument {
+                        answer: "Yes, but migrate the legacy-only ticks first.".to_string(),
+                        confidence: 0.85,
+                        evidence: vec!["kimi flagged the SSH mesh-repair tick".to_string()],
+                    }),
+                },
+                CouncilMemberEntry {
+                    member: "kimi".to_string(),
+                    answer: "Yes, but move the legacy-only ticks first.".to_string(),
+                    confidence: 0.8,
+                    evidence: vec![],
+                    counter_argument: None,
+                },
+            ],
+            critiques: vec![CouncilCritiqueEntry {
+                critic: "kimi".to_string(),
+                target_label: "Member A".to_string(),
+                critique: "ignores ticks that only exist in the legacy daemon".to_string(),
+            }],
+            synthesis: Some(CouncilSynthesisEntry {
+                chairman: "codex".to_string(),
+                consensus: "Retire in phases, migrate ticks first.".to_string(),
+                disagreements: vec!["codex vs kimi on rollout speed".to_string()],
+                unique_findings: vec!["kimi flagged the SSH mesh-repair tick".to_string()],
+                rationale: "phased rollout avoids stranding legacy-only ticks".to_string(),
+            }),
+            final_output: "Retire in phases, migrate ticks first.".to_string(),
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn render_decision_record_has_all_six_sections_in_order() {
+        let decision = sample_decision();
+        let body = render_decision_record(&decision, chrono::Utc::now());
+        let sections = [
+            "## 1. Question",
+            "## 2. Council Transcript",
+            "## 3. Adversarial Critique Round",
+            "## 4. Chairman Synthesis",
+            "## 5. Final Decision",
+            "## 6. Metadata",
+        ];
+        let mut last_pos = 0;
+        for section in sections {
+            let pos = body
+                .find(section)
+                .unwrap_or_else(|| panic!("missing section: {section}"));
+            assert!(pos >= last_pos, "sections out of order at {section}");
+            last_pos = pos;
+        }
+    }
+
+    #[test]
+    fn render_decision_record_includes_member_and_synthesis_content() {
+        let decision = sample_decision();
+        let body = render_decision_record(&decision, chrono::Utc::now());
+        assert!(body.contains("Should we retire the legacy ff daemon?"));
+        assert!(body.contains("codex"));
+        assert!(body.contains("Yes, but move the legacy-only ticks first."));
+        assert!(body.contains("ignores ticks that only exist in the legacy daemon"));
+        assert!(body.contains("Retire in phases, migrate ticks first."));
+        assert!(body.contains("codex vs kimi on rollout speed"));
+        assert!(body.contains("kimi flagged the SSH mesh-repair tick"));
+    }
+
+    /// The root-cause regression test: an adversarial counter-argument must
+    /// be recorded ALONGSIDE the member's round-1 answer, never in place of
+    /// it — a persisted transcript that shows only the revised position has
+    /// silently lost what the member originally said.
+    #[test]
+    fn render_decision_record_preserves_round1_answer_next_to_counter_argument() {
+        let decision = sample_decision();
+        let body = render_decision_record(&decision, chrono::Utc::now());
+        assert!(
+            body.contains("Yes, phase it out."),
+            "round-1 answer must survive even though codex also gave a counter-argument"
+        );
+        assert!(
+            body.contains("Yes, but migrate the legacy-only ticks first."),
+            "counter-argument must also be present"
+        );
+        let round1_pos = body.find("Yes, phase it out.").unwrap();
+        let counter_pos = body.find("Revised after adversarial critique").unwrap();
+        assert!(
+            round1_pos < counter_pos,
+            "round-1 answer should be rendered before the counter-argument that revised it"
+        );
+    }
+
+    #[test]
+    fn render_decision_record_notes_missing_synthesis_and_critiques() {
+        let mut decision = sample_decision();
+        decision.synthesis = None;
+        decision.critiques.clear();
+        for m in &mut decision.members {
+            m.counter_argument = None;
+        }
+        let body = render_decision_record(&decision, chrono::Utc::now());
+        assert!(body.contains("no chairman synthesis"));
+        assert!(body.contains("adversarial round not run"));
+        assert!(body.contains("- Adversarial round: no\n"));
+    }
+
+    /// A council whose chairman produced neither structured nor raw output
+    /// still has a synthesis of `None`, but the transcript and final_output
+    /// fallback must still render — this is what a caller persists so the
+    /// deliberation isn't silently dropped from the audit trail.
+    #[test]
+    fn render_decision_record_still_renders_transcript_when_chairman_failed_entirely() {
+        let mut decision = sample_decision();
+        decision.synthesis = None;
+        decision.final_output = "Yes, phase it out.".to_string();
+        let body = render_decision_record(&decision, chrono::Utc::now());
+        assert!(body.contains("chairman produced no usable output"));
+        assert!(body.contains("Yes, phase it out."));
+        assert!(body.contains("codex"));
+        assert!(body.contains("kimi"));
+    }
+
+    #[test]
+    fn slugify_question_produces_filesystem_safe_slug() {
+        assert_eq!(
+            slugify_question("Should we retire `ff daemon`?!"),
+            "should-we-retire-ff-daemon"
+        );
+        assert_eq!(slugify_question(""), "untitled");
+    }
+
+    #[test]
+    fn truncate_title_shortens_long_questions() {
+        let long = "x".repeat(200);
+        let title = truncate_title(&long);
+        assert!(title.chars().count() <= 81);
+        assert!(title.ends_with('…'));
+    }
 }
