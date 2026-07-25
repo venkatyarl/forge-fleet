@@ -491,18 +491,31 @@ pub async fn build_system_digest(pg: &PgPool) -> Result<String> {
 
     // Self-improvement: work items ff merged into itself in the last 24h, and
     // what's building across ALL projects right now.
-    let merged_24h: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM work_items WHERE status='merged' AND completed_at > now() - interval '24 hours'")
-            .fetch_one(pg)
-            .await
-            .unwrap_or(0);
+    // Window = SINCE THE LAST ff:system digest (operator: "self-improvement only
+    // since last message"), matching the project digests. NULL (first send) →
+    // 24h fallback.
+    let since: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT last_sent_at FROM project_digest_configs WHERE id = 'ff:system'",
+    )
+    .fetch_optional(pg)
+    .await
+    .ok()
+    .flatten();
+    let merged_since: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_items WHERE status='merged' \
+           AND completed_at > coalesce($1, now() - interval '24 hours')",
+    )
+    .bind(since)
+    .fetch_one(pg)
+    .await
+    .unwrap_or(0);
     let building_now: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM work_item_leases WHERE released_at IS NULL")
             .fetch_one(pg)
             .await
             .unwrap_or(0);
     msg.push_str(&format!(
-        "🧠 Self-improvement: {merged_24h} merged (24h) · {building_now} building now\n"
+        "🧠 Self-improvement: {merged_since} merged (since last update) · {building_now} building now\n"
     ));
 
     // Local model catalog — how many models ff can run locally (local-first).
