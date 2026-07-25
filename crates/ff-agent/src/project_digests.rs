@@ -167,6 +167,14 @@ pub fn spawn_project_digests_tick(
 /// One pass: age temporary digests toward expiry, disable expired ones, then
 /// send every enabled config that is due.
 async fn run_once(pg: &PgPool) -> Result<()> {
+    // Keep the per-project session-of-record ("workstream") seeded — one row per
+    // active project. Leader-gated (we're inside the leader-only tick), idempotent
+    // and cheap. This is the foundation for ff-owns-the-session: clients attach to
+    // their project's workstream while ff does the backend work.
+    if let Err(err) = crate::workstreams::ensure_all_workstreams(pg).await {
+        warn!(error = %err, "workstreams: ensure_all failed");
+    }
+
     // 1) Start the death-clock: a temporary digest whose tracked task has
     //    completed and that has no expiry yet gets `expires_at = now() +
     //    linger`. It keeps sending until then, so the operator sees the

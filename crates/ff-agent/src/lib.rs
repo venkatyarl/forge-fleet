@@ -188,6 +188,7 @@ pub mod work_item_dispatch;
 pub mod work_item_feeder;
 pub mod work_item_merge_drain;
 pub mod work_item_scheduler;
+pub mod workstreams;
 // work_stealer (V75) retired 2026-07-03 with batch_manager (dead fleet_work_items).
 
 pub use alert_policy_seed::{AlertSeedReport, seed_from_toml as seed_alert_policies_from_toml};
