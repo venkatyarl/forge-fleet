@@ -235,8 +235,11 @@ async fn run_once(pg: &PgPool) -> Result<()> {
 /// Empty endpoint (not yet dispatched to a backend) → "pending".
 fn llm_from_endpoint(ep: &str) -> String {
     let ep = ep.trim();
+    // Empty endpoint = a local Lane-1 codegen build that didn't record its exact
+    // model on the lease (telemetry gap). The item IS building locally — label it
+    // "local", not "pending" (which read as stuck).
     if ep.is_empty() {
-        return "pending".to_string();
+        return "local".to_string();
     }
     ep.rsplit(':').next().unwrap_or(ep).to_string()
 }
@@ -282,16 +285,32 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
     .await
     .unwrap_or_default();
 
-    // Recently completed (last 24h) with how long each took.
+    // Window = SINCE THE LAST DIGEST (operator: "only show what completed since
+    // the last update"). The config's last_sent_at still holds the PREVIOUS send
+    // time during this build (run_once updates it only after sending). First send
+    // (NULL) falls back to a 24h window.
+    let since: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT last_sent_at FROM project_digest_configs \
+          WHERE project_id = $1 ORDER BY last_sent_at DESC NULLS LAST LIMIT 1",
+    )
+    .bind(project_id)
+    .fetch_optional(pg)
+    .await
+    .ok()
+    .flatten();
+
+    // Completed since the last digest, with how long each took.
     let completed: Vec<(String, i32)> = sqlx::query_as(
         "SELECT left(title, 32), \
                 round(EXTRACT(EPOCH FROM (completed_at - started_at)) / 60)::int \
            FROM work_items \
           WHERE project_id = $1 AND status IN ('done','merged') \
-            AND completed_at > now() - interval '24 hours' AND started_at IS NOT NULL \
+            AND completed_at > coalesce($2, now() - interval '24 hours') \
+            AND started_at IS NOT NULL \
           ORDER BY completed_at DESC LIMIT 8",
     )
     .bind(project_id)
+    .bind(since)
     .fetch_all(pg)
     .await
     .unwrap_or_default();
@@ -356,9 +375,9 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
         }
     }
 
-    // §2 Completed (24h)
+    // §2 Completed since last update
     if !completed.is_empty() {
-        msg.push_str("\n✅ Completed (24h):\n");
+        msg.push_str("\n✅ Completed since last update:\n");
         for (title, mins) in &completed {
             msg.push_str(&format!("• {} — took {}\n", title, fmt_mins(*mins as i64)));
         }
@@ -479,8 +498,56 @@ pub async fn build_system_digest(pg: &PgPool) -> Result<String> {
             .await
             .unwrap_or(0),
     );
+    let stale_deploys: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fleet_model_deployments \
+          WHERE desired_state='active' AND health_status IS DISTINCT FROM 'healthy'",
+    )
+    .fetch_one(pg)
+    .await
+    .unwrap_or(0);
     msg.push_str(&format!(
-        "🤖 Local models: {catalog} in catalog · {deployed} deployed\n"
+        "🤖 Local models: {catalog} in catalog · {deployed} deployed{}\n",
+        if stale_deploys > 0 {
+            format!(" · ⚠{stale_deploys} unhealthy")
+        } else {
+            String::new()
+        }
+    ));
+
+    // Self-heal: fix tasks ff completed for its own errors (last 24h) — the
+    // self-improvement loop (scan_interaction_errors → self_heal_writer).
+    let self_heal_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fleet_tasks \
+          WHERE task_type = 'self_heal_writer' AND status = 'completed' \
+            AND completed_at > now() - interval '24 hours'",
+    )
+    .fetch_one(pg)
+    .await
+    .unwrap_or(0);
+
+    // Health at a glance: the no-diff + stall failure classes ff doctor tracks,
+    // plus nodes over disk quota. So the platform digest surfaces the problems ff
+    // is (or should be) fixing, not just throughput.
+    let (nodiff, stall, disk_over): (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+           (SELECT COUNT(*) FROM work_items WHERE status='failed' \
+              AND (last_error ILIKE '%no diff%' OR last_error ILIKE '%no commits%')), \
+           (SELECT COUNT(*) FROM work_items WHERE status='failed' \
+              AND (last_error ILIKE '%stalled%' OR last_error ILIKE '%no dispatchable backend%' \
+                   OR last_error ILIKE '%index.lock%')) \
+           + (SELECT COUNT(*) FROM work_item_leases WHERE released_at IS NULL \
+                AND heartbeat_at < now() - interval '300 seconds'), \
+           (SELECT COUNT(*) FROM fleet_workers w \
+              JOIN (SELECT DISTINCT ON (worker_name) worker_name, used_bytes, total_bytes \
+                      FROM fleet_disk_usage WHERE sampled_at > now()-interval '24h' \
+                     ORDER BY worker_name, sampled_at DESC) l ON l.worker_name = w.name \
+             WHERE l.total_bytes > 0 AND l.used_bytes*100.0/l.total_bytes >= w.disk_quota_pct)",
+    )
+    .fetch_one(pg)
+    .await
+    .unwrap_or((0, 0, 0));
+    msg.push_str(&format!(
+        "🩺 Health: {nodiff} no-diff · {stall} stalled · {disk_over} over-disk · 🔧 {self_heal_24h} self-heal fixes (24h)\n"
     ));
 
     // Cloud headroom per provider (weekly_pct used; flag exhausted windows).

@@ -2338,26 +2338,26 @@ fn use_local_lane(
     if breaker_open {
         return false;
     }
-    // LOCAL-FIRST BACKSTOP (operator 2026-07-25): when the cloud lane can't run
-    // — every cloud backend rate-limited / window-exhausted — force the local
-    // lane ON even for prefers-cloud/complex tasks that would normally skip it.
-    // A healthy local model (Devstral/GLM is `healthy active` fleet-wide) is the
-    // ONLY builder available, and trying it is strictly better than failing
-    // "no dispatchable backend (cloud budget exhausted)" while local sits idle.
-    // This routes the task through the SAME tested Lane-1 success path (commit →
-    // PR → done), so complex tasks build locally instead of dying when codex/
-    // kimi are exhausted. ("the local LLM should build these even if the cloud
-    // LLM isn't working.")
+    // When the cloud lane can't run (every cloud backend rate-limited /
+    // window-exhausted), force local — it's the only builder left.
     if cloud_exhausted {
         return true;
     }
+    // LOCAL-FIRST (operator 2026-07-25: "ff should be using local first, not as a
+    // last resort"). EVERY task gets a local attempt before cloud — including
+    // complex / multi-file (`prefers_cloud`) tasks, which used to skip local
+    // entirely. The local codegen lane is heartbeat-bounded (LANE1_TIMEOUT_SECS
+    // self-aborts before the reaper), so the cost of a local-first try on a task
+    // local can't handle is ONE bounded attempt, then it escalates to cloud on
+    // the next attempt — "it's ok for a couple tickets to skip rungs and find
+    // the next available LLM, so we're not stuck." prefers_cloud now only means
+    // "escalate FAST": exactly one local try (attempt 0) before cloud; ordinary
+    // tasks keep the fuller local-lane budget.
+    if prefers_cloud {
+        return attempts == 0;
+    }
     let requirements = ff_routing_policy::TaskRequirements {
         prior_failure_count: attempts.max(0) as u32,
-        capability_tags: if prefers_cloud {
-            vec!["cloud".to_string()]
-        } else {
-            Vec::new()
-        },
         ..Default::default()
     };
     ff_routing_policy::use_local_30b(&requirements, &ff_routing_policy::PolicyConfig::default())
@@ -5574,8 +5574,16 @@ mod tests {
             !use_local_lane(3, false, false, false),
             "past LOCAL_LANE_MAX_TRIES → cloud"
         );
-        // A complexity-routed (complex or multi-file-heavy) task never touches the local lane.
-        assert!(!use_local_lane(0, false, true, false));
+        // LOCAL-FIRST: a complex / multi-file (prefers_cloud) task now gets ONE
+        // local try on attempt 0, then escalates to cloud on later attempts.
+        assert!(
+            use_local_lane(0, false, true, false),
+            "prefers-cloud task still tries local ONCE first (local-first)"
+        );
+        assert!(
+            !use_local_lane(1, false, true, false),
+            "prefers-cloud task escalates to cloud after its one local try"
+        );
         // Open local-codegen breaker → skip local even on attempt 0.
         assert!(!use_local_lane(0, true, false, false));
 
