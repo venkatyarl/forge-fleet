@@ -8472,7 +8472,8 @@ pub async fn pg_reap_stale_work_item_leases(
                     SET status = $2,
                         attempts = attempts + 1,
                         assigned_computer = NULL,
-                        last_error = $3
+                        last_error = $3,
+                        completed_at = CASE WHEN $2 = 'failed' THEN NOW() ELSE NULL END
                   WHERE id = $1",
             )
             .bind(wi)
@@ -8693,10 +8694,11 @@ pub async fn pg_ready_work_items(pool: &PgPool, limit: i64) -> Result<Vec<ReadyW
         "SELECT id, assigned_computer, project_id
            FROM (
                 SELECT w.id, w.assigned_computer, w.project_id,
-                       w.risk_score, w.created_at,
+                       w.risk_score, w.retry_count, w.created_at,
                        ROW_NUMBER() OVER (
                            PARTITION BY w.project_id
-                           ORDER BY w.risk_score DESC, w.created_at ASC
+                           ORDER BY w.risk_score DESC, w.retry_count DESC,
+                                    w.created_at ASC, w.id ASC
                        ) AS project_rank
                   FROM work_items w
                  WHERE w.status = 'ready'
@@ -8710,7 +8712,8 @@ pub async fn pg_ready_work_items(pool: &PgPool, limit: i64) -> Result<Vec<ReadyW
                         WHERE r.to_id = w.id AND r.relation_type = 'blocks'
                           AND dep.status <> 'merged')
                 ) ranked
-          ORDER BY project_rank ASC, risk_score DESC, created_at ASC
+          ORDER BY project_rank ASC, risk_score DESC, retry_count DESC,
+                   created_at ASC, id ASC
           LIMIT $1",
     )
     .bind(limit)

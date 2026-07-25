@@ -157,6 +157,34 @@ fn task_prefers_cloud_lane(complexity: &str, predicted_paths_count: i32) -> bool
     matches!(complexity, "complex") || predicted_paths_count > PREDICTED_PATHS_CLOUD_THRESHOLD
 }
 
+fn is_cloud_builder_backend(backend: &str) -> bool {
+    let normalized = backend.to_ascii_lowercase();
+    let name = normalized
+        .split_once(':')
+        .map(|(name, _)| name)
+        .unwrap_or(&normalized);
+    matches!(name, "codex" | "claude" | "kimi" | "gemini" | "grok")
+}
+
+fn local_failure_diagnosis_route(last_error: Option<&str>) -> (&'static str, &'static str) {
+    let error = last_error.unwrap_or_default().to_ascii_lowercase();
+    if error.contains("no diff")
+        || error.contains("acceptance_check")
+        || error.contains("not found")
+        || error.contains("no such file")
+    {
+        ("context_gap", "context_pack")
+    } else if error.contains("prompt") || error.contains("instruction") {
+        ("prompt_gap", "dreamer_fact")
+    } else if error.contains("timed out") || error.contains("killed") {
+        ("runtime_limit", "fine_tune_model_ab")
+    } else if error.contains("failed") || error.contains("cannot") {
+        ("capability_limit", "fine_tune_model_ab")
+    } else {
+        ("unknown", "context_pack")
+    }
+}
+
 #[derive(Debug, Clone)]
 struct WorktreeRecord {
     worktree_path: PathBuf,
@@ -1258,7 +1286,62 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         Some(&review),
     )
     .await?;
+    record_local_failure_diagnosis_if_cloud_rescue(&pg, &item, &backend_used).await;
     Ok(())
+}
+
+async fn record_local_failure_diagnosis_if_cloud_rescue(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    backend: &str,
+) {
+    if item.attempts < ff_routing_policy::LOCAL_LANE_MAX_TRIES as i32
+        || !is_cloud_builder_backend(backend)
+    {
+        return;
+    }
+    let (failure_class, improvement_target) =
+        local_failure_diagnosis_route(item.last_error.as_deref());
+    let diagnosis = serde_json::json!({
+        "summary": "cloud produced a reviewed build after local retry exhaustion",
+        "local_attempts": item.attempts,
+        "local_error": item.last_error.as_deref().unwrap_or_default(),
+        "cloud_backend": backend,
+        "failure_class": failure_class,
+        "improvement_target": improvement_target,
+    });
+    if let Err(error) = sqlx::query(
+        "INSERT INTO local_failure_diagnoses
+            (work_item_id, project_id, local_attempts, cloud_backend, failure_class,
+             improvement_target, diagnosis, prior_error)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (work_item_id) DO UPDATE SET
+            local_attempts = EXCLUDED.local_attempts,
+            cloud_backend = EXCLUDED.cloud_backend,
+            failure_class = EXCLUDED.failure_class,
+            improvement_target = EXCLUDED.improvement_target,
+            diagnosis = EXCLUDED.diagnosis,
+            prior_error = EXCLUDED.prior_error,
+            local_retest_status = 'awaiting_deployment',
+            updated_at = NOW()",
+    )
+    .bind(item.work_item_id)
+    .bind(&item.project_id)
+    .bind(item.attempts)
+    .bind(backend)
+    .bind(failure_class)
+    .bind(improvement_target)
+    .bind(diagnosis)
+    .bind(item.last_error.as_deref().map(truncate_for_db))
+    .execute(pg)
+    .await
+    {
+        warn!(
+            work_item_id = %item.work_item_id,
+            %error,
+            "work_item_dispatch: local-failure diagnosis persistence failed (non-fatal)"
+        );
+    }
 }
 
 async fn record_pr_provenance(
@@ -2561,7 +2644,8 @@ async fn requeue_or_fail(pg: &PgPool, item: &AssignedWorkItem, error: &str) -> R
         "UPDATE work_items
             SET status = 'ready',
                 attempts = COALESCE(attempts, 0) + 1,
-                last_error = $2
+                last_error = $2,
+                completed_at = NOW()
           WHERE id = $1
             AND status NOT IN ('done', 'merged', 'cancelled')",
     )
@@ -5756,6 +5840,27 @@ mod tests {
         assert!(task_prefers_cloud_lane("mechanical", 4));
         // Unknown/empty complexity is treated as mechanical (safe default).
         assert!(!task_prefers_cloud_lane("", 1));
+    }
+
+    #[test]
+    fn cloud_rescue_diagnosis_routes_local_failures() {
+        assert!(super::is_cloud_builder_backend("codex"));
+        assert!(super::is_cloud_builder_backend("kimi:latest"));
+        assert!(!super::is_cloud_builder_backend("local"));
+        assert_eq!(
+            super::local_failure_diagnosis_route(Some(
+                "VERIFY-SWEEP: acceptance_check FAILED (artifact missing)"
+            )),
+            ("context_gap", "context_pack")
+        );
+        assert_eq!(
+            super::local_failure_diagnosis_route(Some("command timed out")),
+            ("runtime_limit", "fine_tune_model_ab")
+        );
+        assert_eq!(
+            super::local_failure_diagnosis_route(Some("cargo test failed")),
+            ("capability_limit", "fine_tune_model_ab")
+        );
     }
 
     #[test]

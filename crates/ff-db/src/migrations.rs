@@ -1200,6 +1200,16 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
     },
+    PgMigration {
+        version: 271,
+        name: "local_failure_diagnoses",
+        sql: schema::SCHEMA_V271_LOCAL_FAILURE_DIAGNOSES,
+    },
+    PgMigration {
+        version: 272,
+        name: "work_item_retry_count",
+        sql: schema::SCHEMA_V272_WORK_ITEM_RETRY_COUNT,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1412,6 +1422,21 @@ mod tests {
                 pair[1].name,
             );
         }
+    }
+
+    #[test]
+    fn v272_registers_work_item_retry_count_once() {
+        let matches = PG_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version == 272)
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "work_item_retry_count");
+        assert!(
+            matches[0]
+                .sql
+                .contains("ADD COLUMN IF NOT EXISTS retry_count")
+        );
     }
 
     fn db_url() -> Option<String> {
@@ -2341,5 +2366,21 @@ mod tests {
         assert_eq!(conflict.count, 2);
 
         drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[test]
+    fn v271_local_failure_diagnoses_schema_is_registered() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 271)
+            .expect("V271 migration must be registered");
+        assert_eq!(migration.name, "local_failure_diagnoses");
+        assert!(
+            migration
+                .sql
+                .contains("CREATE TABLE IF NOT EXISTS local_failure_diagnoses")
+        );
+        assert!(migration.sql.contains("local_retest_status"));
+        assert!(migration.sql.contains("improvement_target"));
     }
 }

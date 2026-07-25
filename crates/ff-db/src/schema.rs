@@ -12201,6 +12201,46 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+pub const SCHEMA_V272_WORK_ITEM_RETRY_COUNT: &str = r#"
+ALTER TABLE work_items
+    ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_work_items_failed_retry
+    ON work_items (completed_at, retry_count)
+    WHERE status = 'failed';
+"#;
+
+/// V271 — durable cloud-fixes-local learning-loop artifact.
+pub const SCHEMA_V271_LOCAL_FAILURE_DIAGNOSES: &str = r#"
+CREATE TABLE IF NOT EXISTS local_failure_diagnoses (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    work_item_id        UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    project_id          TEXT REFERENCES projects(id),
+    local_attempts      INT NOT NULL,
+    cloud_backend       TEXT NOT NULL,
+    failure_class       TEXT NOT NULL CHECK (
+        failure_class IN ('context_gap', 'prompt_gap', 'capability_limit', 'runtime_limit', 'unknown')
+    ),
+    improvement_target  TEXT NOT NULL CHECK (
+        improvement_target IN ('context_pack', 'dreamer_fact', 'fine_tune_model_ab')
+    ),
+    diagnosis           JSONB NOT NULL,
+    prior_error         TEXT,
+    local_retest_status TEXT NOT NULL DEFAULT 'awaiting_deployment' CHECK (
+        local_retest_status IN ('awaiting_deployment', 'queued', 'passed', 'failed')
+    ),
+    local_retest_count  INT NOT NULL DEFAULT 0,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (work_item_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_failure_diagnoses_target
+    ON local_failure_diagnoses (improvement_target, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_local_failure_diagnoses_retest
+    ON local_failure_diagnoses (local_retest_status, updated_at);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
