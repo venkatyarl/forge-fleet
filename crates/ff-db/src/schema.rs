@@ -12201,6 +12201,15 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// V261 — Durable content for Brain episode nodes.
+///
+/// Session compaction summaries are graph nodes, but Dreamer also needs their
+/// text. Keeping it on the node makes the session/day upsert self-contained.
+pub const SCHEMA_V261_BRAIN_VAULT_EPISODE_BODY: &str = r#"
+ALTER TABLE brain_vault_nodes
+    ADD COLUMN IF NOT EXISTS body TEXT;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
