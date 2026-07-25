@@ -349,6 +349,11 @@ pub async fn build_brain_decisions_pack(pool: &PgPool, title: &str, description:
 /// dispatch fast and consistent across the fleet while remaining compatible with
 /// work items that have not yet been indexed. After the symbol pack, appends
 /// relevant Brain decisions/gotchas (see [`build_brain_decisions_pack`]).
+pub struct DispatchContextPack {
+    pub text: String,
+    pub predicted_paths: Vec<String>,
+}
+
 pub async fn context_pack_for_dispatch(
     pool: &PgPool,
     brain_node_ids: Vec<String>,
@@ -357,7 +362,8 @@ pub async fn context_pack_for_dispatch(
     description: String,
     repo_path: std::path::PathBuf,
     max_symbols: usize,
-) -> String {
+) -> DispatchContextPack {
+    let predicted_paths = touched_paths.clone();
     let store_pack = build_context_pack_from_store(&brain_node_ids, &touched_paths, max_symbols);
     let symbol_pack = if !store_pack.is_empty() {
         store_pack
@@ -367,7 +373,10 @@ pub async fn context_pack_for_dispatch(
 
     let decisions_pack = build_brain_decisions_pack(pool, &title, &description).await;
 
-    format!("{symbol_pack}{decisions_pack}")
+    DispatchContextPack {
+        text: format!("{symbol_pack}{decisions_pack}"),
+        predicted_paths,
+    }
 }
 
 #[cfg(test)]

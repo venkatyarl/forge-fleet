@@ -12201,6 +12201,21 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// Memory-v2 M4 — measure whether dispatch context packs predict the files a
+/// build actually changes.
+pub const SCHEMA_V261_MEMORY_PACK_STATS: &str = r#"
+CREATE TABLE IF NOT EXISTS memory_pack_stats (
+    work_item_id   UUID PRIMARY KEY,
+    predicted_paths JSONB NOT NULL DEFAULT '[]'::jsonb,
+    touched_paths JSONB NOT NULL DEFAULT '[]'::jsonb,
+    hit_rate      REAL NOT NULL CHECK (hit_rate BETWEEN 0.0 AND 1.0),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_pack_stats_created_at
+    ON memory_pack_stats (created_at DESC);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

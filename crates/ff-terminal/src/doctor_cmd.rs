@@ -178,6 +178,15 @@ fn stale_peer_mount_health(count: i64) -> Health {
     }
 }
 
+const MEMORY_HIT_RATE_TARGET: f64 = 0.90;
+
+fn memory_hit_rate_health(avg_hit_rate: Option<f64>) -> Health {
+    match avg_hit_rate {
+        Some(rate) if rate < MEMORY_HIT_RATE_TARGET => Health::Warn,
+        _ => Health::Pass,
+    }
+}
+
 /// Render the report. Pure (no I/O / color in the assertions matter) so the
 /// layout is unit-testable.
 fn render_doctor(checks: &[DoctorCheck], overall: Health) -> String {
@@ -239,6 +248,33 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
             "{}/{} recent rows missing tokens",
             inter.recent_zero_token, inter.recent
         ),
+    });
+
+    // Memory-v2 M4: prove that context packs predict the files builds touch.
+    // Empty predicted_paths are the fallback-path class, including regressions
+    // where brain_node_ids/touched_paths were not populated on work_items.
+    let (memory_avg, packs_served, fallback_paths): (Option<f64>, i64, i64) = sqlx::query_as(
+        "SELECT AVG(hit_rate)::double precision,
+                    COUNT(*) FILTER (WHERE jsonb_array_length(predicted_paths) > 0),
+                    COUNT(*) FILTER (WHERE jsonb_array_length(predicted_paths) = 0)
+               FROM memory_pack_stats
+              WHERE created_at >= NOW() - INTERVAL '7 days'",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("memory-pack check: {e}"))?;
+    checks.push(DoctorCheck {
+        name: "MEMORY".into(),
+        status: memory_hit_rate_health(memory_avg),
+        detail: match memory_avg {
+            Some(rate) => format!(
+                "7d avg hit-rate {:.1}% (target 90%); {packs_served} packs served / {fallback_paths} fallback-path",
+                rate * 100.0
+            ),
+            None => format!(
+                "no builds in 7d (target 90%); {packs_served} packs served / {fallback_paths} fallback-path"
+            ),
+        },
     });
 
     // 3) Orphaned work_items (in_progress with no active lease, >1h).
@@ -627,6 +663,13 @@ mod tests {
         assert_eq!(dstate_health(10), Health::Fail);
         assert_eq!(stale_peer_mount_health(0), Health::Pass);
         assert_eq!(stale_peer_mount_health(1), Health::Warn);
+    }
+
+    #[test]
+    fn memory_hit_rate_targets_ninety_percent() {
+        assert_eq!(memory_hit_rate_health(None), Health::Pass);
+        assert_eq!(memory_hit_rate_health(Some(0.90)), Health::Pass);
+        assert_eq!(memory_hit_rate_health(Some(0.899)), Health::Warn);
     }
 
     #[test]

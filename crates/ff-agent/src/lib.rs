@@ -122,6 +122,7 @@ pub mod nats_jetstream;
 pub mod nats_log_layer;
 pub mod notifications;
 pub mod oauth_distributor;
+pub mod onboarding_applier;
 pub mod openai_bridge;
 pub mod orchestrator_agent;
 pub mod orphan_reaper;

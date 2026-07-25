@@ -116,11 +116,23 @@ impl TickRegistry {
                 scope: TickScope::LeaderOnly,
                 runner: run_ssh_mesh_check_tick,
             },
+            TickDefinition {
+                name: "fleet_onboarding_audit",
+                interval: Duration::from_secs(60),
+                scope: TickScope::LeaderOnly,
+                runner: run_fleet_onboarding_audit_tick,
+            },
         ]
         .into_iter()
         .map(|definition| RegisteredTick {
             state: TickState {
-                next_run_at: now + definition.interval,
+                // Audit once at daemon start so a freshly enrolled node does
+                // not wait a full interval for its onboarding convergence.
+                next_run_at: if definition.name == "fleet_onboarding_audit" {
+                    now
+                } else {
+                    now + definition.interval
+                },
             },
             definition,
         })
@@ -318,6 +330,17 @@ fn run_ssh_mesh_check_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'stati
             .await
             .map(|_| ())
             .map_err(anyhow::Error::msg)
+    })
+}
+
+fn run_fleet_onboarding_audit_tick(
+    pg: PgPool,
+    _worker_name: String,
+) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::onboarding_applier::audit_fleet_onboarding(&pg)
+            .await
+            .map(|_| ())
     })
 }
 
