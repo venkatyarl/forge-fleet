@@ -268,7 +268,7 @@ async fn main() -> Result<()> {
         Command::Run(args) => handle_run(args).await,
         Command::Status => handle_status(&config_path),
         Command::Nodes => handle_nodes(&config_path),
-        Command::Models => handle_models(&config_path),
+        Command::Models => handle_models().await,
         Command::Proxy(args) => handle_proxy(args, &config_path),
         Command::Discover(args) => handle_discover(args, &config_path),
         Command::Health => handle_health(&config_path),
@@ -597,19 +597,68 @@ fn handle_nodes(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn handle_models(config_path: &Path) -> Result<()> {
-    let cfg = load_config(config_path)?;
+async fn handle_models() -> Result<()> {
+    let payload = ff_mcp::verbs::fleet_models::fleet_models(None)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let models = payload
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .context("fleet_models returned an invalid response")?;
 
     println!("{GREEN}✓ Fleet Models{RESET}");
-    if cfg.models.is_empty() {
-        println!("  {YELLOW}No model groups found in config{RESET}");
+    if models.is_empty() {
+        println!("  {YELLOW}No models found in the fleet catalog{RESET}");
         return Ok(());
     }
 
-    for (name, details) in cfg.models {
-        println!("  - {name}: {details}");
-    }
+    render_models(models);
     Ok(())
+}
+
+fn render_models(models: &[serde_json::Value]) {
+    for model in models {
+        let id = model["id"].as_str().unwrap_or("?");
+        let name = model["name"].as_str().unwrap_or(id);
+        let family = model["family"].as_str().unwrap_or("unknown");
+        let parameters = model["parameters"].as_str().unwrap_or("unknown");
+        let tier = model["tier"]
+            .as_u64()
+            .map(|tier| format!("T{tier}"))
+            .unwrap_or_else(|| "T?".to_string());
+        let gated = model["gated"].as_bool().unwrap_or(false);
+        let tool_calling = model["tool_calling"].as_bool().unwrap_or(false);
+        let deployments = model["deployments"]
+            .as_array()
+            .map_or(&[][..], Vec::as_slice);
+
+        println!("  - {name} ({id})");
+        println!(
+            "      {family} · {parameters} · {tier} · {} · {}",
+            if gated { "gated" } else { "open" },
+            if tool_calling {
+                "tool calling"
+            } else {
+                "no tool calling"
+            }
+        );
+        if let Some(description) = model["description"].as_str() {
+            println!("      {description}");
+        }
+        for deployment in deployments {
+            let worker = deployment["worker_name"].as_str().unwrap_or("?");
+            let runtime = deployment["runtime"].as_str().unwrap_or("unknown");
+            let health = deployment["health_status"].as_str().unwrap_or("unknown");
+            let port = deployment["port"]
+                .as_u64()
+                .map(|port| format!(":{port}"))
+                .unwrap_or_default();
+            println!("      {CYAN}↳{RESET} {worker}{port} · {runtime} · {health}");
+        }
+        if deployments.is_empty() {
+            println!("      {YELLOW}not deployed{RESET}");
+        }
+    }
 }
 
 fn handle_proxy(args: ProxyArgs, config_path: &Path) -> Result<()> {

@@ -1319,6 +1319,7 @@ dependencies = [
  "clap",
  "ff-agent",
  "ff-db",
+ "ff-mcp",
  "ff-runtime",
  "reqwest",
  "serde",
