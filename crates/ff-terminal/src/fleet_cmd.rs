@@ -4349,6 +4349,7 @@ async fn handle_fleet_route(
         // Opt-in via `--least-loaded` to preview the dispatch ordering.
         prefer_least_loaded: least_loaded,
         limit,
+        bandit_seed: None,
     };
     let rows = ff_db::pg_route_deployments(pool, &filter)
         .await

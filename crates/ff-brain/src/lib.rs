@@ -18,6 +18,7 @@
 //! - **embeddings**: Local MLX embedding client (stub until server deployed)
 //! - **communities**: Leiden community detection on the vault graph (connected-components fallback)
 
+pub mod capability;
 pub mod chat;
 pub mod communities;
 pub mod community_summary;
@@ -39,6 +40,10 @@ pub mod train_conflict;
 pub mod vault;
 pub mod vector_search;
 
+pub use capability::{
+    CapabilityKind, CapabilityMatch, CapabilityResult, EstCostClass, capability_check,
+    capability_check_all,
+};
 pub use chat::{
     ThreadSummary, attach_thread, create_thread, get_attached_thread, list_threads,
     receive_message, resolve_user,

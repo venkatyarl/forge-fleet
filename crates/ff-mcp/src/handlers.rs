@@ -1387,6 +1387,7 @@ pub async fn fleet_route(params: Option<Value>) -> HandlerResult {
         // tiebreak is reserved for the dispatch pickers).
         prefer_least_loaded: false,
         limit,
+        bandit_seed: None,
     };
     let rows = ff_db::pg_route_deployments(&pool, &filter)
         .await
@@ -1460,6 +1461,24 @@ pub async fn fleet_route(params: Option<Value>) -> HandlerResult {
         "decision": decision,
         "candidates": candidates,
     }))
+}
+
+/// Canonical "do we have X?" query surface shared with `ff capability`.
+pub async fn ff_capability_check(params: Option<Value>) -> HandlerResult {
+    let need = params
+        .as_ref()
+        .and_then(|p| p.get("need"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "ff_capability_check requires 'need'".to_string())?;
+    let kind = params
+        .as_ref()
+        .and_then(|p| p.get("kind"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "ff_capability_check requires 'kind'".to_string())
+        .and_then(ff_brain::CapabilityKind::parse)?;
+    let pool = crate::pool::shared_pg_pool().await?;
+    let result = ff_brain::capability_check(&pool, need, kind).await?;
+    serde_json::to_value(result).map_err(|e| format!("serialize capability result: {e}"))
 }
 
 // ─── Fleet Scan ──────────────────────────────────────────────────────────────
@@ -2760,6 +2779,7 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "fleet_offload" => fleet_offload(params).await,
         "fleet_cascade" => fleet_cascade(params).await,
         "fleet_route" => fleet_route(params).await,
+        "ff_capability_check" => ff_capability_check(params).await,
         "fleet_scan" => fleet_scan(params).await,
         "fleet_install_model" => fleet_install_model(params).await,
         "fleet_wait" => fleet_wait(params).await,
