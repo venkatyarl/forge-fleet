@@ -32,11 +32,8 @@ pub struct SweepPolicy {
     pub job_stale_after: Duration,
     /// A deferred task is stale if `claimed_at` is older than this with status=running.
     pub deferred_stale_after: Duration,
-    /// A research session is stale if `created_at` is older than this while its
-    /// status is still non-terminal (`planning`/`dispatching`). Unlike
-    /// `deferred_tasks`, research sub-agents run *inside* the foreground
-    /// `ff research` process — there is no worker to re-claim them — so if that
-    /// process dies the session and its `running` subtasks are orphaned forever.
+    /// A research session is stale if its orchestrator heartbeat is older than
+    /// this while its status is still non-terminal.
     pub research_stale_after: Duration,
     /// A `healthy` deployment is stale if its `last_health_at` is older than
     /// this. The per-node `deployment_reconciler` refreshes `last_health_at`
@@ -76,13 +73,10 @@ impl Default for SweepPolicy {
             // duplicate multi-GB HF fetch onto the same target. Only once a task
             // has outlived the worker's cap is it genuinely stuck. (Was 30min.)
             deferred_stale_after: Duration::hours(2),
-            // A live `ff research` run (planner + N parallel sub-agents at the
-            // default depth on slow local models) can take a while; 1h is well
-            // past any legitimate run, so only genuinely orphaned sessions
-            // (process killed/crashed) qualify. Aged off `created_at`, so a
-            // session stuck in `planning` because the planner itself died is
-            // recovered too.
-            research_stale_after: Duration::hours(1),
+            // Orchestrators refresh every 30s. Five minutes tolerates transient
+            // DB trouble while detecting a dead process without imposing a
+            // wall-clock limit on legitimate slow research.
+            research_stale_after: Duration::minutes(5),
             // 2× the live-dispatch freshness floor (DISPATCH_HEALTH_MAX_AGE_SEC
             // = 300s, PR #332): dispatch stops routing to a stale endpoint
             // first (cheap, reversible, no stored change), and only if it stays
@@ -101,6 +95,14 @@ impl Default for SweepPolicy {
 /// rather than deletes).
 pub fn is_prunable_terminal_status(status: &str) -> bool {
     matches!(status, "completed" | "cancelled" | "failed")
+}
+
+pub fn is_research_heartbeat_stale(
+    last_heartbeat_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    stale_after: Duration,
+) -> bool {
+    last_heartbeat_at < now - stale_after
 }
 
 /// Max terminal rows deleted per sweep pass — bounds the DELETE so draining a
@@ -226,30 +228,41 @@ pub async fn sweep_stale(
     }
 
     // ── research_sessions / research_subtasks ────────────────────────────
-    // `ff research` decomposes + dispatches + synthesizes all inside ONE
-    // foreground process: the sub-agent loops are not daemon-managed, so if that
-    // process is killed/crashes, the session is left in a non-terminal status
-    // (`planning` if the planner died, `dispatching` after) and its sub-agents'
-    // rows stay `running` forever — no worker ever re-claims them. (Observed:
-    // 25-day-old `planning` sessions accumulating.) Recover both, gated on the
-    // SESSION's `created_at` so never-started `pending` subtasks are covered too.
+    // If the orchestrator process dies, its session and subtasks stay
+    // non-terminal forever. Recover them based on the process heartbeat rather
+    // than total run age: slow-but-live research must never be reaped.
     let research_cutoff = now - policy.research_stale_after;
 
-    // 1) Fail the orphaned sub-agent rows of stale sessions first, so a
-    //    re-run/inspection sees consistent terminal state.
+    // Lock stale sessions before changing their subtasks. A concurrent
+    // heartbeat either lands first (making the row ineligible) or waits for
+    // this transaction and then sees the terminal status predicate fail.
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| format!("begin research sweep: {e}"))?;
+    let stale_session_ids = sqlx::query_scalar::<_, sqlx::types::Uuid>(
+        "SELECT id FROM research_sessions
+          WHERE status NOT IN ('done', 'failed')
+            AND last_heartbeat_at < $1
+          FOR UPDATE",
+    )
+    .bind(research_cutoff)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| format!("lock stale research_sessions: {e}"))?;
+
+    // 1) Fail every orphaned non-terminal subtask first, so auto-recovery only
+    // sees a consistent all-terminal set.
     let subtasks = sqlx::query(
         "UPDATE research_subtasks st
             SET status = 'failed',
                 completed_at = NOW(),
                 error = COALESCE(st.error, 'reaped by sweeper — research orchestrator process died (stuck running)')
-           FROM research_sessions s
-          WHERE st.session_id = s.id
-            AND st.status = 'running'
-            AND s.status NOT IN ('done', 'failed')
-            AND s.created_at < $1",
+          WHERE st.session_id = ANY($1)
+            AND st.status NOT IN ('done', 'failed', 'max_turns')",
     )
-    .bind(research_cutoff)
-    .execute(pool)
+    .bind(&stale_session_ids)
+    .execute(&mut *tx)
     .await;
     match subtasks {
         Ok(r) => summary.research_subtasks_failed = r.rows_affected() as usize,
@@ -263,15 +276,20 @@ pub async fn sweep_stale(
                 completed_at = NOW(),
                 error = COALESCE(error, 'reaped by sweeper — orchestrator process died before synthesis (stuck in non-terminal status)')
           WHERE status NOT IN ('done', 'failed')
-            AND created_at < $1",
+            AND id = ANY($1)
+            AND last_heartbeat_at < $2",
     )
+    .bind(&stale_session_ids)
     .bind(research_cutoff)
-    .execute(pool)
+    .execute(&mut *tx)
     .await;
     match sessions {
         Ok(r) => summary.research_sessions_failed = r.rows_affected() as usize,
         Err(e) => tracing::warn!("pg sweep research_sessions: {e}"),
     }
+    tx.commit()
+        .await
+        .map_err(|e| format!("commit research sweep: {e}"))?;
 
     // ── fleet_model_deployments (stale-healthy → unhealthy) ──────────────
     // A wedged/offline node's per-node reconciler stops refreshing
@@ -448,9 +466,7 @@ mod tests {
                 >= crate::defer_worker::DEFAULT_DEFER_MAX_DURATION.as_secs(),
             "deferred sweep must not fire before the worker's max-duration cap"
         );
-        // Research sessions: generous enough not to reap a live `ff research`
-        // run, short enough that orphans (process killed) clear within the hour.
-        assert_eq!(p.research_stale_after, Duration::hours(1));
+        assert_eq!(p.research_stale_after, Duration::minutes(5));
         // Deployment health flip: must stay strictly LONGER than the live
         // dispatch freshness floor (DISPATCH_HEALTH_MAX_AGE_SEC = 300s) so the
         // cheap reversible router skip always fires before the persistent
@@ -482,5 +498,22 @@ mod tests {
     fn sweep_interval_and_leader_window_are_sane() {
         assert_eq!(SWEEP_INTERVAL, std::time::Duration::from_secs(300));
         assert_eq!(LEADER_FRESH_SECS, 60);
+    }
+
+    #[test]
+    fn research_staleness_uses_heartbeat_with_strict_five_minute_boundary() {
+        let now = Utc::now();
+        let threshold = Duration::minutes(5);
+        assert!(!is_research_heartbeat_stale(now, now, threshold));
+        assert!(!is_research_heartbeat_stale(
+            now - threshold,
+            now,
+            threshold
+        ));
+        assert!(is_research_heartbeat_stale(
+            now - threshold - Duration::milliseconds(1),
+            now,
+            threshold
+        ));
     }
 }
