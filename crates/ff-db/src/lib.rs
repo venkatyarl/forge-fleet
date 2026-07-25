@@ -11,6 +11,7 @@
 use uuid::Uuid;
 
 pub mod dsn_of_record;
+pub mod episodes;
 pub mod leader_state;
 pub mod metrics_partitions;
 pub mod migrations;
@@ -23,6 +24,7 @@ pub mod runtime_registry;
 pub mod schema;
 pub mod work_queue;
 
+pub use episodes::{FleetEpisode, ff_session_sync, pg_append_episode, pg_append_episode_batch};
 pub use leader_state::*;
 
 pub use metrics_partitions::{pg_drop_expired_metrics_partitions, pg_ensure_metrics_partitions};

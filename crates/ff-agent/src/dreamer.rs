@@ -39,6 +39,7 @@
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 /// Deferred-task title the defer worker dispatches on (`kind='internal'`).
 pub const DREAMER_TASK_TITLE: &str = "memory-dreamer";
@@ -60,6 +61,7 @@ pub const SESSION_SCOPE_IDLE_SECS: i64 = 6 * 3600;
 /// Max session scopes archived per pass — bounds one pass's Brain-insert and
 /// delete work; the 30-min chain drains any backlog across passes.
 pub const MAX_SESSION_SWEEPS_PER_PASS: i64 = 16;
+pub const MAX_EPISODES_PER_PASS: i64 = 64;
 
 /// fleet_secrets gate: `off`/`false`/`0`/`disabled`/`no` skips the pass body
 /// (the chain keeps ticking so flipping the gate back on needs no re-seed).
@@ -213,17 +215,85 @@ pub async fn run_dreamer_pass(pool: &PgPool) -> Result<serde_json::Value> {
         }
     }
 
-    if sessions_archived > 0 || scopes_consolidated > 0 {
+    let episodes_distilled = distill_episode_batch(pool).await?;
+
+    if sessions_archived > 0 || scopes_consolidated > 0 || episodes_distilled > 0 {
         info!(
             sessions_archived,
-            blocks_archived, scopes_consolidated, "dreamer: consolidation pass did work"
+            blocks_archived,
+            scopes_consolidated,
+            episodes_distilled,
+            "dreamer: consolidation pass did work"
         );
     }
     Ok(serde_json::json!({
         "sessions_archived": sessions_archived,
         "blocks_archived": blocks_archived,
         "over_cap_scopes_consolidated": scopes_consolidated,
+        "episodes_distilled": episodes_distilled,
     }))
+}
+
+#[derive(sqlx::FromRow)]
+struct EpisodeForDreamer {
+    id: Uuid,
+    source_kind: String,
+    node: String,
+    session_id: String,
+    role: String,
+    content: String,
+}
+
+async fn distill_episode_batch(pool: &PgPool) -> Result<usize> {
+    let user = match ff_db::pg_get_brain_user(pool, "venkat").await? {
+        Some(user) => user.id,
+        None => ff_db::pg_create_brain_user(pool, "venkat", Some("Venkat")).await?,
+    };
+    let mut tx = pool.begin().await?;
+    let episodes: Vec<EpisodeForDreamer> = sqlx::query_as(
+        "SELECT id, source_kind, node, session_id, role, content
+           FROM fleet_episodes WHERE consolidated_at IS NULL
+          ORDER BY ts, id FOR UPDATE SKIP LOCKED LIMIT $1",
+    )
+    .bind(MAX_EPISODES_PER_PASS)
+    .fetch_all(&mut *tx)
+    .await
+    .context("claim unconsolidated fleet episodes")?;
+    for episode in &episodes {
+        let title = format!(
+            "fleet episode: {} / {} / {}",
+            episode.source_kind, episode.node, episode.session_id
+        );
+        let tags = vec![
+            "fleet-episode".to_string(),
+            episode.source_kind.clone(),
+            episode.role.clone(),
+            episode.node.clone(),
+        ];
+        sqlx::query(
+            "INSERT INTO brain_knowledge_candidates
+                (user_id, action, kind, title, body, tags, from_thread, confidence)
+             VALUES ($1, 'create', 'fleet-episode', $2, $3, $4, $5, 0.5)",
+        )
+        .bind(user)
+        .bind(title)
+        .bind(&episode.content)
+        .bind(tags)
+        .bind(&episode.session_id)
+        .execute(&mut *tx)
+        .await
+        .context("promote fleet episode to Brain candidate")?;
+    }
+    if !episodes.is_empty() {
+        let ids: Vec<Uuid> = episodes.iter().map(|episode| episode.id).collect();
+        sqlx::query("UPDATE fleet_episodes SET consolidated_at = NOW() WHERE id = ANY($1)")
+            .bind(ids)
+            .execute(&mut *tx)
+            .await
+            .context("mark fleet episodes consolidated")?;
+    }
+    tx.commit().await?;
+    Ok(episodes.len())
 }
 
 #[cfg(test)]
@@ -260,5 +330,6 @@ mod tests {
         assert!(DREAMER_INTERVAL_SECS >= MIN_INTERVAL_SECS);
         assert!(SESSION_SCOPE_IDLE_SECS > DREAMER_INTERVAL_SECS);
         assert!(MAX_SESSION_SWEEPS_PER_PASS > 0);
+        assert!(MAX_EPISODES_PER_PASS > 0);
     }
 }
