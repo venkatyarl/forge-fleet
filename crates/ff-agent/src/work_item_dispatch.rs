@@ -3389,25 +3389,43 @@ async fn run_ff_dispatch(
     // /login-expiry loop, 2026-07-24). codex (12 nodes) + kimi (8) + the
     // local-first ladder cover all fleet building; claude stays purely for the
     // operator's interactive Claude Code session.
-    const BUILDER_ROTATION: [&str; 2] = ["codex", "kimi"];
-    // Index by item id PLUS attempts: id-only rotation re-picked the SAME
-    // backend on every retry, so an item whose pick failed success-shaped
-    // (e.g. claude "no diff" — exit 0, so the in-loop error failover never
-    // engages) burned its whole attempt budget on one broken backend (22×
-    // "backend claude produced no diff" on the 2026-07-23 requeue wave).
-    // With attempts in the index, each retry fronts the NEXT backend.
-    let rotation_index = item
-        .work_item_id
-        .as_u128()
-        .wrapping_add(item.attempts.max(0) as u128);
-    let pick = BUILDER_ROTATION[(rotation_index % BUILDER_ROTATION.len() as u128) as usize];
-    let preferred = if backends.iter().any(|b| b == pick) {
-        pick
-    } else {
-        "claude"
-    };
-    policy.preferred_cloud_backstop = Some(preferred.to_string());
-    ff_routing_policy::promote_cloud_backstop(&mut backends, &policy);
+    // USAGE-WEIGHTED cloud preference (operator 2026-07-24): don't hardcode
+    // codex-then-kimi. Among the authenticated cloud backends, prefer the one
+    // with the MOST usage remaining (least-consumed weekly budget) so we spend
+    // down whichever provider has the most headroom first — and preference is
+    // NOT exclusivity: the per-backend failover loop below still tries the
+    // others. claude is excluded (operator-reserved). `weekly_pct` is populated
+    // by the usage pollers (kimi live; codex/claude pollers still to build — a
+    // NULL pct sorts as 0 = treated as fully-available so an un-polled backend
+    // isn't unfairly deprioritized). Falls back to a stable id+attempts rotation
+    // only when no budget rows exist yet.
+    let usage_ranked: Vec<String> = sqlx::query_scalar(
+        "SELECT provider FROM cloud_budget_buckets \
+          WHERE provider IN ('codex','kimi') \
+            AND (window_exhausted_until IS NULL OR window_exhausted_until < NOW()) \
+          ORDER BY COALESCE(weekly_pct, 0) ASC, COALESCE(monthly_pct, 0) ASC, provider",
+    )
+    .fetch_all(pg)
+    .await
+    .unwrap_or_default();
+    let preferred: String = usage_ranked
+        .iter()
+        .find(|p| backends.iter().any(|b| b == *p))
+        .cloned()
+        .unwrap_or_else(|| {
+            // No budget data yet → stable id+attempts rotation so retries still
+            // vary the backend.
+            const FALLBACK: [&str; 2] = ["codex", "kimi"];
+            let idx = item
+                .work_item_id
+                .as_u128()
+                .wrapping_add(item.attempts.max(0) as u128);
+            FALLBACK[(idx % FALLBACK.len() as u128) as usize].to_string()
+        });
+    if backends.iter().any(|b| b == &preferred) {
+        policy.preferred_cloud_backstop = Some(preferred);
+        ff_routing_policy::promote_cloud_backstop(&mut backends, &policy);
+    }
     let computer_id = item.computer_id;
     let forced_backend = primary_or_default_backend(&backends);
     let mut attempted_backend = false;
