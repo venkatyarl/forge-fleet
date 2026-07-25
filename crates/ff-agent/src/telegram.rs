@@ -191,6 +191,16 @@ pub async fn send_telegram_digest(
     photo: Option<&[u8]>,
 ) -> Result<()> {
     if let Some(bytes) = photo.filter(|b| !b.is_empty()) {
+        // ONE MESSAGE when it fits: if logo + name + full status is within
+        // Telegram's 1024-char photo-caption limit, send it as a single photo
+        // message (logo, project name, and the whole status together) instead of
+        // splitting the logo from the body. Longer digests still fall back to a
+        // photo (title caption) + chunked text below (until inline custom-emoji
+        // logos land, which remove the caption limit entirely).
+        let combined_len = title.chars().count() + 2 + body.chars().count();
+        if combined_len <= 1024 {
+            return send_telegram_photo_from_secrets(pool, title, body, Some(bytes)).await;
+        }
         // Logo photo with a short, cutoff-proof caption (title only).
         send_telegram_photo_from_secrets(pool, title, "", Some(bytes)).await?;
         // Full body as chunked text (headerless — the photo already showed the title).

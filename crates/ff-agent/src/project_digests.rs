@@ -230,24 +230,78 @@ async fn run_once(pg: &PgPool) -> Result<()> {
     Ok(())
 }
 
+/// Extract a human LLM/backend name from a lease endpoint like
+/// "lane1.5:local:qwen3-coder-480b" → "qwen3-coder-480b", "codex" → "codex".
+/// Empty endpoint (not yet dispatched to a backend) → "pending".
+fn llm_from_endpoint(ep: &str) -> String {
+    let ep = ep.trim();
+    if ep.is_empty() {
+        return "pending".to_string();
+    }
+    ep.rsplit(':').next().unwrap_or(ep).to_string()
+}
+
+/// Compact minutes → "Xm" / "Yh" / "Yh Zm" for readable durations.
+fn fmt_mins(m: i64) -> String {
+    let m = m.max(0);
+    if m < 60 {
+        format!("{m}m")
+    } else if m % 60 == 0 {
+        format!("{}h", m / 60)
+    } else {
+        format!("{}h {}m", m / 60, m % 60)
+    }
+}
+
 /// Build one project's digest body, scoped to that project's `work_items`.
-/// Sections: what's building now (duration · heartbeat · eta, STUCK flag),
-/// backlog/failed/verified counts, blocked-on-operator, and — for the project
-/// that owns the fleet control plane — the last rolling deployment. Everything
-/// is queried live, so it cannot show fabricated progress.
+/// Sections (blank-line separated): building now (computer · LLM · duration ·
+/// heartbeat · eta, STUCK flag), recently completed (with build time), recent
+/// failures (with reason), rolling deployment (fleet only), backlog counts +
+/// items-still-to-build, Jira (if configured), and a final ETA to clear the
+/// backlog at the current merge pace. Everything is queried live.
 pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<String> {
     // The synthetic 'ff' project = the platform's own status, not project work.
     if project_id == "ff" {
         return build_system_digest(pg).await;
     }
-    // Building items for THIS project (join leases → work_items on project).
-    let building: Vec<(String, i32, Option<i32>)> = sqlx::query_as(
-        "SELECT left(w.title, 34), \
+
+    // Building now — with the COMPUTER (assigned_computer) and the LLM (parsed
+    // from the lease endpoint) building each item.
+    let building: Vec<(String, String, String, i32, Option<i32>)> = sqlx::query_as(
+        "SELECT left(w.title, 30), \
+                coalesce(w.assigned_computer, ''), \
+                coalesce(l.endpoint, ''), \
                 (EXTRACT(EPOCH FROM (now() - l.created_at)) / 60)::int, \
                 (EXTRACT(EPOCH FROM (now() - l.heartbeat_at)))::int \
            FROM work_item_leases l JOIN work_items w ON w.id = l.work_item_id \
           WHERE l.released_at IS NULL AND w.project_id = $1 \
           ORDER BY l.created_at",
+    )
+    .bind(project_id)
+    .fetch_all(pg)
+    .await
+    .unwrap_or_default();
+
+    // Recently completed (last 24h) with how long each took.
+    let completed: Vec<(String, i32)> = sqlx::query_as(
+        "SELECT left(title, 32), \
+                round(EXTRACT(EPOCH FROM (completed_at - started_at)) / 60)::int \
+           FROM work_items \
+          WHERE project_id = $1 AND status IN ('done','merged') \
+            AND completed_at > now() - interval '24 hours' AND started_at IS NOT NULL \
+          ORDER BY completed_at DESC LIMIT 8",
+    )
+    .bind(project_id)
+    .fetch_all(pg)
+    .await
+    .unwrap_or_default();
+
+    // Recent failures with the reason.
+    let failures: Vec<(String, String)> = sqlx::query_as(
+        "SELECT left(title, 28), left(coalesce(last_error, 'unknown'), 52) \
+           FROM work_items \
+          WHERE project_id = $1 AND status = 'failed' \
+          ORDER BY completed_at DESC NULLS LAST LIMIT 5",
     )
     .bind(project_id)
     .fetch_all(pg)
@@ -266,28 +320,59 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
     .await
     .unwrap_or((0, 0, 0, 0));
 
+    // Merge throughput (last 24h) → ETA to clear the backlog at current pace.
+    let merged_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_items \
+          WHERE project_id = $1 AND status='merged' \
+            AND completed_at > now() - interval '24 hours'",
+    )
+    .bind(project_id)
+    .fetch_one(pg)
+    .await
+    .unwrap_or(0);
+
     let mut msg = String::new();
-    msg.push_str("🔨 Building now (duration · heartbeat · eta):\n");
+
+    // §1 Building now
+    msg.push_str("🔨 Building now (computer · LLM · duration · heartbeat · eta):\n");
     if building.is_empty() {
         msg.push_str("• (idle)\n");
     } else {
-        for (title, mins, hb) in &building {
+        for (title, computer, endpoint, mins, hb) in &building {
             let stuck = hb.map(|h| h > 300).unwrap_or(false);
             let eta = (15 - mins).max(1);
             let hbs = hb.map(|h| h.to_string()).unwrap_or_else(|| "?".into());
+            let comp = if computer.is_empty() { "?" } else { computer };
             msg.push_str(&format!(
-                "• {}{} — {}m in, hb {}s (eta~{}m)\n",
+                "• {}{} — {} · {} — {}m in, hb {}s (eta~{}m)\n",
                 if stuck { "⚠STUCK " } else { "" },
                 title,
+                comp,
+                llm_from_endpoint(endpoint),
                 mins,
                 hbs,
                 eta
             ));
         }
     }
-    msg.push('\n');
 
-    // Rolling deployment only makes sense for the fleet's own control plane.
+    // §2 Completed (24h)
+    if !completed.is_empty() {
+        msg.push_str("\n✅ Completed (24h):\n");
+        for (title, mins) in &completed {
+            msg.push_str(&format!("• {} — took {}\n", title, fmt_mins(*mins as i64)));
+        }
+    }
+
+    // §3 Failures
+    if !failures.is_empty() {
+        msg.push_str("\n❌ Failed (reason):\n");
+        for (title, reason) in &failures {
+            msg.push_str(&format!("• {} — {}\n", title, reason));
+        }
+    }
+
+    // §4 Rolling deployment (fleet control plane only)
     if project_id == "forge-fleet" {
         let deploy: Option<(String, i32, i32)> = sqlx::query_as(
             "SELECT commit_sha, nodes_updated, nodes_total FROM fleet_deploy_events \
@@ -298,18 +383,18 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
         .ok()
         .flatten();
         if let Some((sha, up, tot)) = deploy {
-            msg.push_str(&format!("📦 Rolling deployment: {sha} · {up}/{tot} nodes\n\n"));
+            msg.push_str(&format!("\n📦 Rolling deployment: {sha} · {up}/{tot} nodes\n"));
         }
     }
 
+    // §5 Backlog counts + items still to build
+    let to_build = ready + building.len() as i64;
     msg.push_str(&format!(
-        "📊 Backlog: ready={ready}  failed={failed}  verified={verified}  ⛔blocked-on-you={blocked_op}"
+        "\n📊 Backlog: {to_build} still to build ({ready} ready · {} building) · {failed} failed · {verified} verified · ⛔{blocked_op} blocked-on-you",
+        building.len()
     ));
 
-    // Jira backlog — only for projects that have a Jira config (config_id ==
-    // project_id). Shows tracked issues + how many are waiting on the operator
-    // to reply so ff can move them forward. (Tables empty until the Jira
-    // monitor populates them → reads 0, never errors.)
+    // §6 Jira (only for projects with a jira_config: config_id == project_id)
     let has_jira: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM jira_configs WHERE name = $1)")
             .bind(project_id)
@@ -339,6 +424,22 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
             "\n🎫 Jira: {tracked} tracked · {in_flight} in-flight · ⛔{waiting_you} waiting-on-you"
         ));
     }
+
+    // §7 ETA to clear the backlog at the current merge pace
+    let eta = if to_build == 0 {
+        "backlog clear ✅".to_string()
+    } else if merged_24h == 0 {
+        "n/a (no merges in 24h — pace unknown)".to_string()
+    } else {
+        let per_hr = merged_24h as f64 / 24.0;
+        let hours = to_build as f64 / per_hr;
+        if hours >= 48.0 {
+            format!("~{:.0}d at current pace ({merged_24h} merged/24h)", hours / 24.0)
+        } else {
+            format!("~{hours:.0}h at current pace ({merged_24h} merged/24h)")
+        }
+    };
+    msg.push_str(&format!("\n\n⏱ ETA to clear backlog: {eta}"));
 
     Ok(msg)
 }
