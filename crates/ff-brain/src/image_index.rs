@@ -542,6 +542,93 @@ fn image_unchanged(prior_hash: Option<&str>, current_hash: &str) -> bool {
 mod tests {
     use super::*;
 
+    // Exercises the same node-then-edge call sequence index_images() uses for
+    // its `tagged` edges, without depending on the (network-unreachable-in-CI)
+    // vision endpoint that gates when that sequence actually runs.
+    #[tokio::test]
+    async fn pg_index_inserts_tag_nodes_before_tagged_edges() {
+        let Ok(url) = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+        else {
+            return;
+        };
+        let Ok(pool) = PgPool::connect(&url).await else {
+            return;
+        };
+
+        let suffix = Uuid::new_v4();
+        let slug = format!("fk-order-image-{suffix}");
+        sqlx::query("INSERT INTO brain_corpora (slug, title) VALUES ($1, $1)")
+            .bind(&slug)
+            .execute(&pool)
+            .await
+            .expect("insert test corpus");
+        let corpus_id: Uuid = sqlx::query_scalar("SELECT id FROM brain_corpora WHERE slug = $1")
+            .bind(&slug)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch test corpus id");
+
+        let facet_id = upsert_modality_image_facet(&pool, corpus_id)
+            .await
+            .expect("facet upsert must not violate FKs");
+        let file_id = upsert_image_node(
+            &pool,
+            &format!("image://{slug}/sample.png"),
+            "sample.png",
+            "image:file",
+            &slug,
+            "hash-file",
+        )
+        .await
+        .expect("file node insert must not violate FKs");
+        tag_facet(&pool, corpus_id, file_id, facet_id)
+            .await
+            .expect("tag_facet must not violate FKs");
+        let tag_id = upsert_image_node(
+            &pool,
+            &format!("image://{slug}/tag=cat"),
+            "cat",
+            "image:tag",
+            &slug,
+            "hash-tag",
+        )
+        .await
+        .expect("tag node insert must not violate FKs");
+        let inserted = add_image_edge(&pool, file_id, tag_id, "tagged")
+            .await
+            .expect("tagged edge insert must not violate endpoint FKs");
+        assert!(inserted);
+
+        let dangling: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::bigint
+              FROM brain_vault_edges edge
+              LEFT JOIN brain_vault_nodes src ON src.id = edge.src_id
+              LEFT JOIN brain_vault_nodes dst ON dst.id = edge.dst_id
+             WHERE edge.provenance = 'cortex-image'
+               AND (src.project = $1 OR dst.project = $1)
+               AND (src.id IS NULL OR dst.id IS NULL)
+            "#,
+        )
+        .bind(&slug)
+        .fetch_one(&pool)
+        .await
+        .expect("query edge endpoints");
+        assert_eq!(dangling, 0);
+
+        sqlx::query("DELETE FROM brain_vault_nodes WHERE project = $1")
+            .bind(&slug)
+            .execute(&pool)
+            .await
+            .expect("delete test nodes");
+        sqlx::query("DELETE FROM brain_corpora WHERE slug = $1")
+            .bind(&slug)
+            .execute(&pool)
+            .await
+            .expect("delete test corpus");
+    }
+
     #[test]
     fn extracts_tags_from_tags_line() {
         let tags = extract_tags(" diagram, architecture, fleet , #cortex, diagram");

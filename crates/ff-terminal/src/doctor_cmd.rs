@@ -7,6 +7,7 @@
 
 use crate::{CYAN, GREEN, RED, RESET, YELLOW};
 use anyhow::Result;
+use sqlx::Row;
 
 /// A check's health. Ordered so `max` gives the worst (overall) verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
@@ -39,6 +40,173 @@ struct DoctorCheck {
     name: String,
     status: Health,
     detail: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ErrorStateCount {
+    state: String,
+    count: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct OpenErrorSignature {
+    signature: String,
+    count_24h: i32,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ErrorKpis {
+    by_state: Vec<ErrorStateCount>,
+    resolution_rate: Option<f64>,
+    mttr_seconds: Option<f64>,
+    top_open: Vec<OpenErrorSignature>,
+    verdict: ErrorKpiVerdict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ErrorKpiVerdict {
+    Improving,
+    Flat,
+    Regressing,
+}
+
+impl ErrorKpiVerdict {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Improving => "IMPROVING",
+            Self::Flat => "FLAT",
+            Self::Regressing => "REGRESSING",
+        }
+    }
+}
+
+fn error_kpi_verdict(
+    current_week_mttr: Option<f64>,
+    prior_week_mttr: Option<f64>,
+) -> ErrorKpiVerdict {
+    match (current_week_mttr, prior_week_mttr) {
+        (Some(current), Some(prior)) if current < prior => ErrorKpiVerdict::Improving,
+        (Some(current), Some(prior)) if current > prior => ErrorKpiVerdict::Regressing,
+        _ => ErrorKpiVerdict::Flat,
+    }
+}
+
+fn format_duration(seconds: Option<f64>) -> String {
+    let Some(seconds) = seconds else {
+        return "N/A".into();
+    };
+    if seconds < 60.0 {
+        format!("{seconds:.0}s")
+    } else if seconds < 3600.0 {
+        format!("{:.1}m", seconds / 60.0)
+    } else if seconds < 86_400.0 {
+        format!("{:.1}h", seconds / 3600.0)
+    } else {
+        format!("{:.1}d", seconds / 86_400.0)
+    }
+}
+
+fn render_error_kpis(errors: &ErrorKpis) -> String {
+    let mut out = format!("\n{CYAN}ERRORS{RESET}\n");
+    if errors.by_state.is_empty() {
+        out.push_str("  states              no signatures\n");
+    } else {
+        for state in &errors.by_state {
+            out.push_str(&format!("  {:<19} {}\n", state.state, state.count));
+        }
+    }
+    let rate = errors
+        .resolution_rate
+        .map(|rate| format!("{:.1}%", rate * 100.0))
+        .unwrap_or_else(|| "N/A".into());
+    out.push_str(&format!("  resolution rate     {rate} (last 30d)\n"));
+    out.push_str(&format!(
+        "  MTTR                {} (resolved last 30d)\n",
+        format_duration(errors.mttr_seconds)
+    ));
+    if errors.top_open.is_empty() {
+        out.push_str("  top open            none\n");
+    } else {
+        for (index, signature) in errors.top_open.iter().enumerate() {
+            out.push_str(&format!(
+                "  top open #{}         {} ({} in 24h)\n",
+                index + 1,
+                signature.signature,
+                signature.count_24h
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "  KPI verdict         {}\n",
+        errors.verdict.label()
+    ));
+    out
+}
+
+async fn load_error_kpis(pool: &sqlx::PgPool) -> Result<ErrorKpis> {
+    let by_state = sqlx::query(
+        "SELECT state, COUNT(*)::bigint AS count
+           FROM error_signatures GROUP BY state ORDER BY state",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("error-signature state counts: {e}"))?
+    .into_iter()
+    .map(|row| ErrorStateCount {
+        state: row.get("state"),
+        count: row.get("count"),
+    })
+    .collect();
+
+    let metrics = sqlx::query(
+        "WITH clock AS (SELECT NOW() AS at)
+         SELECT
+           COUNT(*) FILTER (WHERE state = 'resolved'
+             AND first_seen >= clock.at - INTERVAL '30 days')::double precision
+             / NULLIF(COUNT(*) FILTER (WHERE state IN ('resolved', 'regressed', 'filed')
+               AND first_seen >= clock.at - INTERVAL '30 days'), 0)::double precision
+               AS resolution_rate,
+           (AVG(EXTRACT(EPOCH FROM (resolved_at - first_seen))) FILTER
+             (WHERE state = 'resolved' AND resolved_at >= clock.at - INTERVAL '30 days'
+               AND resolved_at >= first_seen))::double precision AS mttr_seconds,
+           (AVG(EXTRACT(EPOCH FROM (resolved_at - first_seen))) FILTER
+             (WHERE state = 'resolved' AND resolved_at >= clock.at - INTERVAL '7 days'
+               AND resolved_at >= first_seen))::double precision AS current_week_mttr,
+           (AVG(EXTRACT(EPOCH FROM (resolved_at - first_seen))) FILTER
+             (WHERE state = 'resolved' AND resolved_at >= clock.at - INTERVAL '14 days'
+               AND resolved_at < clock.at - INTERVAL '7 days'
+               AND resolved_at >= first_seen))::double precision AS prior_week_mttr
+         FROM error_signatures CROSS JOIN clock",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("error-signature KPI query: {e}"))?;
+    let current: Option<f64> = metrics.try_get("current_week_mttr")?;
+    let prior: Option<f64> = metrics.try_get("prior_week_mttr")?;
+
+    let top_open = sqlx::query(
+        "SELECT signature, count_24h FROM error_signatures
+          WHERE state <> 'resolved'
+          ORDER BY count_24h DESC, signature LIMIT 3",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("top open error signatures: {e}"))?
+    .into_iter()
+    .map(|row| OpenErrorSignature {
+        signature: row.get("signature"),
+        count_24h: row.get("count_24h"),
+    })
+    .collect();
+
+    Ok(ErrorKpis {
+        by_state,
+        resolution_rate: metrics.try_get("resolution_rate")?,
+        mttr_seconds: metrics.try_get("mttr_seconds")?,
+        top_open,
+        verdict: error_kpi_verdict(current, prior),
+    })
 }
 
 /// Worst-of: FAIL if any check failed, else WARN if any warned, else PASS. Pure.
@@ -180,7 +348,7 @@ fn stale_peer_mount_health(count: i64) -> Health {
 
 /// Render the report. Pure (no I/O / color in the assertions matter) so the
 /// layout is unit-testable.
-fn render_doctor(checks: &[DoctorCheck], overall: Health) -> String {
+fn render_doctor(checks: &[DoctorCheck], errors: &ErrorKpis, overall: Health) -> String {
     let mut out = String::new();
     out.push_str(&format!("{CYAN}▶ ff doctor — fleet self-check{RESET}\n\n"));
     for c in checks {
@@ -202,6 +370,7 @@ fn render_doctor(checks: &[DoctorCheck], overall: Health) -> String {
         Health::Warn => YELLOW,
         Health::Fail => RED,
     };
+    out.push_str(&render_error_kpis(errors));
     out.push_str(&format!(
         "\n{color}{} Overall: {}{RESET}\n",
         overall.glyph(),
@@ -440,16 +609,17 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
     });
 
     let overall = overall_health(&checks);
+    let errors = load_error_kpis(&pool).await?;
 
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &serde_json::json!({ "overall": overall, "checks": checks })
+                &serde_json::json!({ "overall": overall, "checks": checks, "errors": errors })
             )?
         );
     } else {
-        print!("{}", render_doctor(&checks, overall));
+        print!("{}", render_doctor(&checks, &errors, overall));
     }
 
     // Non-zero exit so the loop / scripts / CI can gate on it: always on FAIL,
@@ -643,10 +813,45 @@ mod tests {
                 detail: "no leader heartbeat in 60s".into(),
             },
         ];
-        let out = render_doctor(&checks, overall_health(&checks));
+        let errors = ErrorKpis {
+            by_state: vec![ErrorStateCount {
+                state: "filed".into(),
+                count: 2,
+            }],
+            resolution_rate: Some(0.5),
+            mttr_seconds: Some(7200.0),
+            top_open: vec![OpenErrorSignature {
+                signature: "ssh:timeout".into(),
+                count_24h: 4,
+            }],
+            verdict: ErrorKpiVerdict::Improving,
+        };
+        let out = render_doctor(&checks, &errors, overall_health(&checks));
         assert!(out.contains("ff doctor"));
         assert!(out.contains("deferred failures"));
         assert!(out.contains("leader liveness"));
         assert!(out.contains("Overall: FAIL"));
+        assert!(out.contains("ERRORS"));
+        assert!(out.contains("resolution rate     50.0% (last 30d)"));
+        assert!(out.contains("MTTR                2.0h (resolved last 30d)"));
+        assert!(out.contains("ssh:timeout (4 in 24h)"));
+        assert!(out.contains("KPI verdict         IMPROVING"));
+    }
+
+    #[test]
+    fn error_kpi_verdict_compares_weekly_mttr() {
+        assert_eq!(
+            error_kpi_verdict(Some(60.0), Some(120.0)),
+            ErrorKpiVerdict::Improving
+        );
+        assert_eq!(
+            error_kpi_verdict(Some(120.0), Some(60.0)),
+            ErrorKpiVerdict::Regressing
+        );
+        assert_eq!(
+            error_kpi_verdict(Some(60.0), Some(60.0)),
+            ErrorKpiVerdict::Flat
+        );
+        assert_eq!(error_kpi_verdict(None, Some(60.0)), ErrorKpiVerdict::Flat);
     }
 }
