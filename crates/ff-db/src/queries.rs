@@ -843,6 +843,8 @@ pub struct ModelCatalogRow {
     pub tier: i32,
     pub description: Option<String>,
     pub gated: bool,
+    /// Autopilot-5: proactively materialize one cold fleet copy when capacity permits.
+    pub watchlist: bool,
     pub preferred_workloads: JsonValue,
     pub variants: JsonValue,
     /// V111: first-class tool-calling capability. The agent router filters on
@@ -867,8 +869,8 @@ pub async fn pg_upsert_catalog(pool: &PgPool, row: &ModelCatalogRow) -> Result<S
     let tool_calling = row.tool_calling || workloads_have_tool_calling(&row.preferred_workloads);
     sqlx::query(
         "INSERT INTO fleet_model_catalog
-            (id, name, family, parameters, tier, description, gated, preferred_workloads, variants, tool_calling, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+            (id, name, family, parameters, tier, description, gated, watchlist, preferred_workloads, variants, tool_calling, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
          ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
             family = EXCLUDED.family,
@@ -876,6 +878,7 @@ pub async fn pg_upsert_catalog(pool: &PgPool, row: &ModelCatalogRow) -> Result<S
             tier = EXCLUDED.tier,
             description = EXCLUDED.description,
             gated = EXCLUDED.gated,
+            watchlist = EXCLUDED.watchlist,
             preferred_workloads = EXCLUDED.preferred_workloads,
             variants = EXCLUDED.variants,
             tool_calling = EXCLUDED.tool_calling,
@@ -888,6 +891,7 @@ pub async fn pg_upsert_catalog(pool: &PgPool, row: &ModelCatalogRow) -> Result<S
     .bind(row.tier)
     .bind(&row.description)
     .bind(row.gated)
+    .bind(row.watchlist)
     .bind(&row.preferred_workloads)
     .bind(&row.variants)
     .bind(tool_calling)
@@ -899,7 +903,7 @@ pub async fn pg_upsert_catalog(pool: &PgPool, row: &ModelCatalogRow) -> Result<S
 /// List catalog entries sorted by tier (desc) then name (asc).
 pub async fn pg_list_catalog(pool: &PgPool) -> Result<Vec<ModelCatalogRow>> {
     let rows = sqlx::query(
-        "SELECT id, name, family, parameters, tier, description, gated, preferred_workloads, variants, tool_calling
+        "SELECT id, name, family, parameters, tier, description, gated, watchlist, preferred_workloads, variants, tool_calling
            FROM fleet_model_catalog
           ORDER BY tier DESC, name ASC
          LIMIT 100",
@@ -916,6 +920,7 @@ pub async fn pg_list_catalog(pool: &PgPool) -> Result<Vec<ModelCatalogRow>> {
             tier: r.get("tier"),
             description: r.get("description"),
             gated: r.get("gated"),
+            watchlist: r.get("watchlist"),
             preferred_workloads: r.get("preferred_workloads"),
             variants: r.get("variants"),
             tool_calling: r.get("tool_calling"),
@@ -927,7 +932,7 @@ pub async fn pg_list_catalog(pool: &PgPool) -> Result<Vec<ModelCatalogRow>> {
 pub async fn pg_search_catalog(pool: &PgPool, query: &str) -> Result<Vec<ModelCatalogRow>> {
     let pattern = format!("%{}%", query.to_lowercase());
     let rows = sqlx::query(
-        "SELECT id, name, family, parameters, tier, description, gated, preferred_workloads, variants, tool_calling
+        "SELECT id, name, family, parameters, tier, description, gated, watchlist, preferred_workloads, variants, tool_calling
            FROM fleet_model_catalog
           WHERE LOWER(id) LIKE $1 OR LOWER(name) LIKE $1 OR LOWER(family) LIKE $1
           ORDER BY tier DESC, name ASC
@@ -946,6 +951,7 @@ pub async fn pg_search_catalog(pool: &PgPool, query: &str) -> Result<Vec<ModelCa
             tier: r.get("tier"),
             description: r.get("description"),
             gated: r.get("gated"),
+            watchlist: r.get("watchlist"),
             preferred_workloads: r.get("preferred_workloads"),
             variants: r.get("variants"),
             tool_calling: r.get("tool_calling"),
@@ -956,7 +962,7 @@ pub async fn pg_search_catalog(pool: &PgPool, query: &str) -> Result<Vec<ModelCa
 /// Fetch one catalog entry by id.
 pub async fn pg_get_catalog(pool: &PgPool, id: &str) -> Result<Option<ModelCatalogRow>> {
     let row = sqlx::query(
-        "SELECT id, name, family, parameters, tier, description, gated, preferred_workloads, variants, tool_calling
+        "SELECT id, name, family, parameters, tier, description, gated, watchlist, preferred_workloads, variants, tool_calling
            FROM fleet_model_catalog WHERE id = $1",
     )
     .bind(id)
@@ -970,6 +976,7 @@ pub async fn pg_get_catalog(pool: &PgPool, id: &str) -> Result<Option<ModelCatal
         tier: r.get("tier"),
         description: r.get("description"),
         gated: r.get("gated"),
+        watchlist: r.get("watchlist"),
         preferred_workloads: r.get("preferred_workloads"),
         variants: r.get("variants"),
         tool_calling: r.get("tool_calling"),

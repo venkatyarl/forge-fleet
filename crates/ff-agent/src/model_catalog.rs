@@ -25,6 +25,8 @@ pub struct CatalogFile {
     pub schema_version: Option<String>,
     #[serde(default)]
     pub updated: Option<String>,
+    #[serde(default = "default_build_reserve_gb")]
+    pub build_reserve_gb: f64,
     #[serde(default)]
     pub models: Vec<CatalogModel>,
 }
@@ -42,6 +44,8 @@ pub struct CatalogModel {
     #[serde(default)]
     pub gated: bool,
     #[serde(default)]
+    pub watchlist: bool,
+    #[serde(default)]
     pub preferred_workloads: Vec<String>,
     #[serde(default)]
     pub variants: Vec<CatalogVariant>,
@@ -55,17 +59,29 @@ pub struct CatalogVariant {
     pub hf_repo: String,
     #[serde(default)]
     pub size_gb: f64,
+    #[serde(default)]
+    pub allow_patterns: Vec<String>,
 }
 
 /// Default path to the catalog TOML, relative to the repository root.
-pub const DEFAULT_CATALOG_PATH: &str =
-    "/Users/venkat/projects/forge-fleet/config/model_catalog.toml";
+pub const DEFAULT_CATALOG_PATH: &str = "config/model_catalog.toml";
+
+fn default_build_reserve_gb() -> f64 {
+    5.0
+}
 
 /// Resolve catalog path, honoring the `FORGEFLEET_CATALOG` env override.
 pub fn resolve_catalog_path() -> PathBuf {
     std::env::var("FORGEFLEET_CATALOG")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_CATALOG_PATH))
+        .unwrap_or_else(|_| {
+            let relative = PathBuf::from(DEFAULT_CATALOG_PATH);
+            if relative.exists() {
+                relative
+            } else {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/model_catalog.toml")
+            }
+        })
 }
 
 /// Retired no-op loader. If `path` does not exist (which is the normal
@@ -97,6 +113,7 @@ pub fn load_catalog_file(path: &Path) -> Result<Vec<ModelCatalogRow>, String> {
             tier: m.tier,
             description: m.description,
             gated: m.gated,
+            watchlist: m.watchlist,
             preferred_workloads,
             variants,
             tool_calling,

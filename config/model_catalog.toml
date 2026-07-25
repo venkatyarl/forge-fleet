@@ -1,0 +1,38 @@
+# Optional operator-maintained catalog overlay. Postgres remains canonical.
+schema_version = "3"
+updated = "2026-07-25"
+build_reserve_gb = 5
+
+[[models]]
+id = "apriel-1.5-15b"
+name = "Apriel 1.5 15B Thinker"
+family = "apriel"
+parameters = "15B"
+tier = 2
+gated = false
+watchlist = true
+preferred_workloads = ["chat", "reasoning", "code", "tool_calling"]
+
+[[models.variants]]
+runtime = "llama.cpp"
+quant = "Q4_K_M"
+hf_repo = "bartowski/ServiceNow-AI_Apriel-1.5-15b-Thinker-GGUF"
+size_gb = 8.79
+allow_patterns = ["*Q4_K_M.gguf"]
+
+[[models]]
+id = "qwen3-coder-next-80b"
+name = "Qwen3 Coder Next 80B A3B"
+family = "qwen"
+parameters = "80B"
+tier = 3
+gated = false
+watchlist = true
+preferred_workloads = ["code", "tool_calling", "reasoning"]
+
+[[models.variants]]
+runtime = "llama.cpp"
+quant = "Q4_K_M"
+hf_repo = "Qwen/Qwen3-Coder-Next-GGUF"
+size_gb = 48.4
+allow_patterns = ["Qwen3-Coder-Next-Q4_K_M/*"]

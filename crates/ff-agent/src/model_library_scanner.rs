@@ -547,6 +547,7 @@ mod tests {
             tier: 0,
             description: None,
             gated: false,
+            watchlist: false,
             preferred_workloads: serde_json::json!([]),
             variants: serde_json::json!([]),
             tool_calling: false,
