@@ -1342,6 +1342,15 @@ async fn dispatch_one(
         return Ok(WorkItemDispatchResult { sweep_warnings });
     }
 
+    if let Err(e) = record_cloud_rescue_local_failure_diagnosis(&pg, &item, &backend_used).await {
+        warn!(
+            work_item_id = %item.work_item_id,
+            builder = %backend_used,
+            error = %e,
+            "work_item_dispatch: failed to record cloud-rescue local failure diagnosis"
+        );
+    }
+
     mark_ready_for_review(
         &pg,
         &item,
@@ -1354,6 +1363,130 @@ async fn dispatch_one(
     .await?;
     let sweep_warnings = post_phase.finish_without_cleanup();
     Ok(WorkItemDispatchResult { sweep_warnings })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalFailureDiagnosis {
+    rescue_attempt: i32,
+    local_failure_summary: String,
+    cloud_backend: String,
+    cloud_diagnosis: String,
+    cause_class: &'static str,
+    improvement_route: &'static str,
+}
+
+fn normalized_cloud_backend(builder: &str) -> Option<String> {
+    let lower = builder.trim().to_ascii_lowercase();
+    let backend = lower
+        .strip_prefix("cloud:")
+        .unwrap_or(&lower)
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim();
+    match backend {
+        "codex" | "kimi" | "claude" | "gemini" | "grok" => Some(backend.to_string()),
+        _ => None,
+    }
+}
+
+fn local_failure_diagnosis_for(
+    item: &AssignedWorkItem,
+    builder: &str,
+) -> Option<LocalFailureDiagnosis> {
+    let cloud_backend = normalized_cloud_backend(builder)?;
+    if item.attempts < ff_routing_policy::LOCAL_LANE_MAX_TRIES as i32 {
+        return None;
+    }
+
+    let summary = item
+        .last_error
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("local lane exhausted before cloud rescue")
+        .chars()
+        .take(1200)
+        .collect::<String>();
+    let lower = summary.to_ascii_lowercase();
+    let capability_hint = item.prefers_cloud_lane()
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("hung")
+        || lower.contains("stalled")
+        || lower.contains("oom")
+        || lower.contains("max-build-duration")
+        || lower.contains("local_codegen_unavailable")
+        || lower.contains("capability");
+    let context_hint = retry_error_is_actionable(&summary)
+        || lower.contains("missing context")
+        || lower.contains("wrong file")
+        || lower.contains("prompt")
+        || lower.contains("produced no diff")
+        || lower.contains("no commits")
+        || lower.contains("required change not applied");
+    let (cause_class, improvement_route) = if capability_hint {
+        ("capability_limit", "fine_tune_model_ab")
+    } else if context_hint {
+        ("context_prompt_gap", "dreamer_context_pack")
+    } else {
+        ("unknown", "manual_triage")
+    };
+
+    Some(LocalFailureDiagnosis {
+        rescue_attempt: item.attempts + 1,
+        local_failure_summary: summary,
+        cloud_backend: cloud_backend.clone(),
+        cloud_diagnosis: format!(
+            "cloud backend {cloud_backend} produced an approved build after {tries} local-lane attempt(s); route the local failure evidence so the same class is rebuilt locally first after remediation",
+            tries = item.attempts
+        ),
+        cause_class,
+        improvement_route,
+    })
+}
+
+async fn record_cloud_rescue_local_failure_diagnosis(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    builder: &str,
+) -> Result<()> {
+    let Some(diagnosis) = local_failure_diagnosis_for(item, builder) else {
+        return Ok(());
+    };
+
+    sqlx::query(
+        r#"
+        INSERT INTO local_failure_diagnoses
+            (work_item_id, rescue_attempt, local_failure_summary, cloud_backend,
+             cloud_diagnosis, cause_class, improvement_route, remediation_status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'diagnosed')
+        ON CONFLICT (work_item_id, rescue_attempt) DO UPDATE
+            SET local_failure_summary = EXCLUDED.local_failure_summary,
+                cloud_backend = EXCLUDED.cloud_backend,
+                cloud_diagnosis = EXCLUDED.cloud_diagnosis,
+                cause_class = EXCLUDED.cause_class,
+                improvement_route = EXCLUDED.improvement_route,
+                remediation_status = CASE
+                    WHEN local_failure_diagnoses.remediation_status IN
+                         ('diagnosed', 'local_retest_failed')
+                    THEN EXCLUDED.remediation_status
+                    ELSE local_failure_diagnoses.remediation_status
+                END,
+                updated_at = NOW()
+        "#,
+    )
+    .bind(item.work_item_id)
+    .bind(diagnosis.rescue_attempt)
+    .bind(&diagnosis.local_failure_summary)
+    .bind(&diagnosis.cloud_backend)
+    .bind(&diagnosis.cloud_diagnosis)
+    .bind(diagnosis.cause_class)
+    .bind(diagnosis.improvement_route)
+    .execute(pg)
+    .await?;
+
+    Ok(())
 }
 
 async fn record_pr_provenance(
@@ -5668,16 +5801,48 @@ mod tests {
         builder_excludes_480b, check_dispatch_prerequisites, classify_dispatch_outcome,
         collect_leftover_tmp_output, command_display, complexity_at_least_moderate,
         contains_file_line_citation, default_clone_path, dispatch_budget_for_host, dispatch_prompt,
-        expand_home, is_build_timeout, mirror_repo_url, order_cloud_reviewers, parse_cli_tokens,
-        primary_or_default_backend, quick_empty_success_is_provider_failure, repo_cache_path,
-        repo_slug, retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
+        expand_home, is_build_timeout, local_failure_diagnosis_for, mirror_repo_url,
+        normalized_cloud_backend, order_cloud_reviewers, parse_cli_tokens,
+        primary_or_default_backend, quick_empty_success_is_provider_failure,
+        record_cloud_rescue_local_failure_diagnosis, repo_cache_path, repo_slug,
+        retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
         should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
         task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
         validate_manifest_fields,
     };
+    use sqlx::Row;
     use std::path::PathBuf;
     use std::time::Duration;
     use uuid::Uuid;
+
+    fn test_item(attempts: i32, last_error: Option<&str>, complexity: &str) -> AssignedWorkItem {
+        AssignedWorkItem {
+            work_item_id: Uuid::new_v4(),
+            project_id: "forge-fleet".to_string(),
+            title: "test cloud rescue".to_string(),
+            description: None,
+            base_branch: Some("main".to_string()),
+            repo_id: None,
+            repo_url: None,
+            repo_path: PathBuf::from("/tmp/forge-fleet"),
+            sub_agent_id: Uuid::new_v4(),
+            computer_id: Uuid::new_v4(),
+            computer_name: "test-node".to_string(),
+            session_id: None,
+            slot: 0,
+            kind: "sub_agent".to_string(),
+            attempts,
+            last_error: last_error.map(str::to_string),
+            complexity: complexity.to_string(),
+            predicted_paths_count: 1,
+            brain_node_ids: Vec::new(),
+            touched_paths: Vec::new(),
+            context: serde_json::json!({}),
+            pre_work: Vec::new(),
+            work: Vec::new(),
+            post_work: Vec::new(),
+        }
+    }
 
     #[test]
     fn pre_phase_rejects_invalid_manifest_and_non_git_staging() {
@@ -6002,6 +6167,114 @@ mod tests {
             !use_local_lane(0, true, false, true),
             "open local breaker overrides the cloud-exhausted force"
         );
+    }
+
+    #[test]
+    fn cloud_rescue_diagnosis_only_records_after_local_exhaustion() {
+        assert_eq!(normalized_cloud_backend("codex").as_deref(), Some("codex"));
+        assert_eq!(
+            normalized_cloud_backend("cloud:kimi:latest").as_deref(),
+            Some("kimi")
+        );
+        assert!(normalized_cloud_backend("local:glm-4.5-air").is_none());
+
+        let early = test_item(2, Some("error[E0433]: missing import"), "mechanical");
+        assert!(local_failure_diagnosis_for(&early, "codex").is_none());
+
+        let local = test_item(3, Some("error[E0433]: missing import"), "mechanical");
+        assert!(local_failure_diagnosis_for(&local, "local").is_none());
+
+        let rescued = local_failure_diagnosis_for(&local, "codex").expect("cloud rescue");
+        assert_eq!(rescued.rescue_attempt, 4);
+        assert_eq!(rescued.cloud_backend, "codex");
+        assert_eq!(rescued.cause_class, "context_prompt_gap");
+        assert_eq!(rescued.improvement_route, "dreamer_context_pack");
+        assert!(rescued.cloud_diagnosis.contains("approved build"));
+    }
+
+    #[test]
+    fn cloud_rescue_diagnosis_routes_capability_limits_to_model_ab() {
+        let item = test_item(
+            3,
+            Some("local codegen timed out after max-build-duration"),
+            "complex",
+        );
+        let diagnosis = local_failure_diagnosis_for(&item, "cloud:kimi").expect("diagnosis");
+        assert_eq!(diagnosis.cause_class, "capability_limit");
+        assert_eq!(diagnosis.improvement_route, "fine_tune_model_ab");
+    }
+
+    #[tokio::test]
+    async fn cloud_rescue_diagnosis_insert_is_db_gated_and_idempotent() {
+        let url = match std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+        {
+            Ok(url) => url,
+            Err(_) => {
+                eprintln!(
+                    "skipping cloud rescue diagnosis DB test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL"
+                );
+                return;
+            }
+        };
+        let pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("skipping cloud rescue diagnosis DB test: database unavailable: {e}");
+                return;
+            }
+        };
+        ff_db::run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should create local_failure_diagnoses");
+
+        let mut item = test_item(
+            3,
+            Some("backend local produced no diff (no commits)"),
+            "mechanical",
+        );
+        item.work_item_id = Uuid::new_v4();
+        sqlx::query("DELETE FROM local_failure_diagnoses WHERE work_item_id = $1")
+            .bind(item.work_item_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup before test");
+
+        record_cloud_rescue_local_failure_diagnosis(&pool, &item, "codex")
+            .await
+            .expect("insert diagnosis");
+        item.last_error = Some("error[E0433]: failed to resolve module".to_string());
+        record_cloud_rescue_local_failure_diagnosis(&pool, &item, "cloud:codex")
+            .await
+            .expect("upsert diagnosis");
+
+        let row = sqlx::query(
+            "SELECT rescue_attempt, cloud_backend, cause_class, improvement_route, remediation_status
+               FROM local_failure_diagnoses
+              WHERE work_item_id = $1",
+        )
+        .bind(item.work_item_id)
+        .fetch_one(&pool)
+        .await
+        .expect("diagnosis row should exist");
+        assert_eq!(row.get::<i32, _>("rescue_attempt"), 4);
+        assert_eq!(row.get::<String, _>("cloud_backend"), "codex");
+        assert_eq!(row.get::<String, _>("cause_class"), "context_prompt_gap");
+        assert_eq!(
+            row.get::<String, _>("improvement_route"),
+            "dreamer_context_pack"
+        );
+        assert_eq!(row.get::<String, _>("remediation_status"), "diagnosed");
+
+        sqlx::query("DELETE FROM local_failure_diagnoses WHERE work_item_id = $1")
+            .bind(item.work_item_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup after test");
     }
 
     #[tokio::test]
