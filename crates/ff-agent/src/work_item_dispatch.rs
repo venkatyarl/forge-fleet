@@ -1685,7 +1685,15 @@ async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Resul
     // (it is the only workspace that exists for it).
     let worktree_path = item.repo_path.clone();
     insert_worktree_creating(pg, item, &worktree_path, &base_branch, &task_branch).await?;
-    match checkout_clone_for_build(&item.repo_path, &base_branch, &task_branch) {
+    // Read the fleet GitHub PAT so a node whose SSH remote is unusable can still
+    // fetch via HTTPS (the portable, works-from-any-node path). Fail-open (None).
+    let gh_token = crate::fleet_info::fetch_secret("github_gh_token").await;
+    match checkout_clone_for_build(
+        &item.repo_path,
+        &base_branch,
+        &task_branch,
+        gh_token.as_deref(),
+    ) {
         Ok(()) => {
             sqlx::query(
                 "UPDATE work_item_worktrees
@@ -4467,7 +4475,41 @@ fn mirror_repo_url(mirror_prefix: &str, github_url: &str) -> Option<String> {
 /// is pointed at the canonical GitHub URL.
 /// Mirror fetches are retried with exponential backoff + jitter; if they all
 /// fail we transparently fall back to a direct GitHub fetch.
-fn checkout_clone_for_build(repo_path: &Path, base_branch: &str, task_branch: &str) -> Result<()> {
+/// Build an HTTPS-with-PAT fetch URL (`https://x-access-token:<pat>@github.com/
+/// owner/repo.git`) from any GitHub remote form — the SSH host-alias
+/// (`git@github.com-venkat:owner/repo.git`), plain SSH (`git@github.com:...`), or
+/// HTTPS. Returns None if we can't parse owner/repo. This lets a node fetch via
+/// the fleet PAT (portable — works from ANY node) when its SSH key/host-alias
+/// isn't set up (the priya failure: SSH remote needs a per-node key priya lacked,
+/// but the PAT works everywhere over HTTPS).
+fn https_pat_url(remote: &str, pat: &str) -> Option<String> {
+    let r = remote.trim().trim_end_matches(".git");
+    // Extract "owner/repo" from the various forms.
+    let owner_repo = if let Some(rest) = r.split_once(':').map(|(_, b)| b).filter(|_| {
+        r.starts_with("git@") // git@github.com[-alias]:owner/repo
+    }) {
+        rest.to_string()
+    } else if let Some(idx) = r.find("github.com") {
+        // https://github.com/owner/repo  OR  ssh://git@github.com/owner/repo
+        r[idx + "github.com".len()..]
+            .trim_start_matches('/')
+            .to_string()
+    } else {
+        return None;
+    };
+    let owner_repo = owner_repo.trim_matches('/');
+    if owner_repo.is_empty() || !owner_repo.contains('/') {
+        return None;
+    }
+    Some(format!("https://x-access-token:{pat}@github.com/{owner_repo}.git"))
+}
+
+fn checkout_clone_for_build(
+    repo_path: &Path,
+    base_branch: &str,
+    task_branch: &str,
+    gh_token: Option<&str>,
+) -> Result<()> {
     let base_ref = format!("origin/{base_branch}");
 
     // Remember the canonical GitHub origin so we can restore it on fallback
@@ -4607,6 +4649,51 @@ fn checkout_clone_for_build(repo_path: &Path, base_branch: &str, task_branch: &s
                         "checkout_clone_for_build: direct fetch failed; retrying"
                     )
                 }
+            }
+        }
+    }
+
+    // Phase 2.5: HTTPS-with-PAT fetch (portable across ALL nodes). The SSH remote
+    // (git@github.com-venkat:...) needs a per-node SSH key/host-alias; a node that
+    // lacks it (priya) fails both prior phases even though it has network to
+    // GitHub. The fleet PAT works over HTTPS from any node — so fetch a temporary
+    // HTTPS URL WITHOUT persisting it to the remote (a one-shot `git fetch <url>`),
+    // keeping the canonical SSH origin for push. This is the durable fix for the
+    // "could not fetch origin/main — refusing to build" terminal failures.
+    if !fetched
+        && let (Some(token), Some(github)) = (gh_token, &github_url)
+        && let Some(https) = https_pat_url(github, token)
+    {
+        for attempt in 0..FETCH_ATTEMPTS {
+            if attempt > 0 {
+                let backoff =
+                    Duration::from_millis(FETCH_BACKOFF_BASE_MS * (1u64 << (attempt - 1)));
+                std::thread::sleep(backoff + fetch_jitter(200));
+            }
+            // Fetch the base into a local ref we can check out from. `git fetch
+            // <url> <branch>` writes FETCH_HEAD; also update the tracking ref so
+            // `origin/<base>` resolves for the checkout below.
+            match run_git(
+                repo_path,
+                [
+                    "fetch",
+                    &https,
+                    &format!("{base_branch}:refs/remotes/origin/{base_branch}"),
+                ],
+                Duration::from_secs(120),
+            ) {
+                Ok(_) => {
+                    info!(
+                        base_branch,
+                        "checkout_clone_for_build: fetched via HTTPS PAT fallback (SSH remote unusable on this node)"
+                    );
+                    fetched = true;
+                    break;
+                }
+                Err(e) => warn!(
+                    base_branch, attempt, error = %e,
+                    "checkout_clone_for_build: HTTPS PAT fetch failed; retrying"
+                ),
             }
         }
     }
