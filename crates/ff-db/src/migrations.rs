@@ -1230,6 +1230,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "glm_45_air_ab_scoreboard",
         sql: schema::SCHEMA_V276_GLM_45_AIR_AB_SCOREBOARD,
     },
+    PgMigration {
+        version: 277,
+        name: "node_health",
+        sql: schema::SCHEMA_V277_NODE_HEALTH,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1551,6 +1556,24 @@ mod tests {
                 .contains("CREATE OR REPLACE VIEW v_builder_stats")
         );
         assert!(migration.sql.contains("parallel_slots = 4"));
+    }
+
+    #[test]
+    fn v277_defines_node_health_table() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 277)
+            .expect("V277 must be registered");
+        assert_eq!(migration.name, "node_health");
+        assert!(
+            migration
+                .sql
+                .contains("CREATE TABLE IF NOT EXISTS node_health")
+        );
+        assert!(migration.sql.contains("mem_available_kb"));
+        assert!(migration.sql.contains("oom_kills_json"));
+        assert!(migration.sql.contains("pressure_state"));
+        assert!(migration.sql.contains("idx_node_health_latest"));
     }
 
     fn db_url() -> Option<String> {

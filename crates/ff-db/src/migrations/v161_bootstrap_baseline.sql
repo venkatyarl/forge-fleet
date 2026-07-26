@@ -253,6 +253,34 @@ CREATE TABLE IF NOT EXISTS fleet_disk_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_disk_usage_latest ON fleet_disk_usage (worker_name, sampled_at DESC);
 
+-- Node health snapshots: sampled on every node by the local orchestrator.
+-- One row per tick; pressure_state is the local sampler's own verdict.
+CREATE TABLE IF NOT EXISTS node_health (
+    worker_name          TEXT NOT NULL REFERENCES fleet_workers(name) ON DELETE CASCADE,
+    sampled_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    mem_total_kb         BIGINT NOT NULL,
+    mem_available_kb     BIGINT NOT NULL,
+    mem_available_gb     DOUBLE PRECISION NOT NULL,
+    swap_total_kb        BIGINT NOT NULL DEFAULT 0,
+    swap_free_kb         BIGINT NOT NULL DEFAULT 0,
+    load_avg_1m          DOUBLE PRECISION,
+    load_avg_5m          DOUBLE PRECISION,
+    load_avg_15m         DOUBLE PRECISION,
+    service_rss_json     JSONB NOT NULL DEFAULT '[]'::jsonb,
+    oom_kills_json       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    dmesg_cursor         TEXT,
+    pressure_state       TEXT NOT NULL DEFAULT 'healthy'
+        CHECK (pressure_state IN ('healthy', 'build_paused', 'critical')),
+    build_reserve_gb     DOUBLE PRECISION NOT NULL DEFAULT 4.0,
+    PRIMARY KEY (worker_name, sampled_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_health_latest
+    ON node_health (worker_name, sampled_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_node_health_pressure
+    ON node_health (pressure_state, sampled_at DESC);
+
 
 -- V12: onboarding_foundation
 

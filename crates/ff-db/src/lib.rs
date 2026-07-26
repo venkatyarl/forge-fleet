@@ -178,6 +178,7 @@ pub use queries::{
     pg_insert_disk_policy_run,
     pg_insert_disk_usage,
     pg_insert_error_event,
+    pg_insert_node_health,
     pg_insert_node_ssh_key,
     pg_insert_work_intent,
     // Interaction log (V121 ff_interactions)
