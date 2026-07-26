@@ -1769,7 +1769,10 @@ pub(crate) async fn reap_orphan_llama_unit(port: u16) {
         .args(["--user", "daemon-reload"])
         .output()
         .await;
-    tracing::warn!(port, "reconciler: reaped ORPHAN llama systemd unit (no active deployment on this port)");
+    tracing::warn!(
+        port,
+        "reconciler: reaped ORPHAN llama systemd unit (no active deployment on this port)"
+    );
 }
 
 /// Start (restart) the `llama-<port>.service` systemd user unit and return its
