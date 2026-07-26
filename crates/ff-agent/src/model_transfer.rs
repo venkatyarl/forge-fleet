@@ -133,11 +133,28 @@ pub async fn transfer_model(
         .map_err(|e| format!("pg_get_node({}): {e}", opts.target_node))?
         .ok_or_else(|| format!("target node {} not found", opts.target_node))?;
 
-    // 3. Runtime must match.
-    if src_node.runtime != dst_node.runtime {
+    // 3. Runtime compatibility keys off the MODEL's format, not the nodes'
+    // *default* runtime labels. A llama.cpp/gguf model (the file the library row
+    // points at) runs on ANY fleet node — every node has llama.cpp — so a node
+    // labelled `vllm` can still both hold and serve a gguf via llama-server
+    // (indeed adele does). Only for non-gguf formats (vllm safetensors, mlx),
+    // where the target must have that exact runtime to load it, do we require a
+    // node-runtime match. Without this, valid gguf transfers to llama.cpp nodes
+    // were rejected as a spurious "runtime mismatch" (observed: adele→beyonce,
+    // adele→GMKtec for glm-4.5-air).
+    let model_rt = src_lib.runtime.to_ascii_lowercase();
+    let fpath_lc = src_lib.file_path.to_ascii_lowercase();
+    let is_gguf = model_rt.contains("llama")
+        || model_rt.contains("gguf")
+        || fpath_lc.contains("llama-cpp")
+        || fpath_lc.contains("llama.cpp")
+        || fpath_lc.ends_with(".gguf")
+        || fpath_lc.contains("gguf");
+    if !is_gguf && src_node.runtime != dst_node.runtime {
         return Err(format!(
-            "runtime mismatch: source {} is {}, target {} is {} — cannot transfer across runtimes",
-            src_node.name, src_node.runtime, dst_node.name, dst_node.runtime
+            "runtime mismatch: source {} is {}, target {} is {} — {} is not a portable \
+             gguf model, so the target must have the source's runtime",
+            src_node.name, src_node.runtime, dst_node.name, dst_node.runtime, src_lib.catalog_id
         ));
     }
 
