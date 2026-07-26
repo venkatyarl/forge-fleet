@@ -172,6 +172,11 @@ struct WorktreeRecord {
     task_branch: String,
 }
 
+#[derive(Debug, Default)]
+struct WorkItemDispatchResult {
+    sweep_warnings: Vec<String>,
+}
+
 /// Count this host's recently-failed work_item dispatches (last 15 min), used
 /// as the backpressure signal for [`dispatch_budget_for_host`]. Best-effort —
 /// the caller treats an error as "0 failures" (no backpressure).
@@ -268,7 +273,17 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
             )
             .await
             {
-                Ok(result) => result,
+                Ok(Ok(outcome)) => {
+                    if !outcome.sweep_warnings.is_empty() {
+                        warn!(
+                            work_item_id = %item.work_item_id,
+                            sweep_warnings = ?outcome.sweep_warnings,
+                            "work_item_dispatch: POST sweep produced warnings"
+                        );
+                    }
+                    Ok(())
+                }
+                Ok(Err(error)) => Err(error),
                 Err(_) => Err(anyhow!(
                     "max-build-duration exceeded after {}s; build cancelled",
                     MAX_BUILD_DURATION_SECS
@@ -906,7 +921,51 @@ fn expand_home(path: &str) -> String {
     }
 }
 
-async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -> Result<()> {
+fn validate_dispatch_manifest(item: &AssignedWorkItem) -> Result<()> {
+    validate_manifest_fields(
+        &item.project_id,
+        &item.title,
+        &item.pre_work,
+        &item.work,
+        &item.post_work,
+    )
+}
+
+fn validate_manifest_fields(
+    project_id: &str,
+    title: &str,
+    pre_work: &[String],
+    work: &[String],
+    post_work: &[String],
+) -> Result<()> {
+    if project_id.trim().is_empty() || title.trim().is_empty() {
+        bail!("work item manifest requires non-empty project_id and title");
+    }
+    for (phase, steps) in [("PRE", pre_work), ("WORK", work), ("POST", post_work)] {
+        if steps.iter().any(|step| step.trim().is_empty()) {
+            bail!("work item manifest contains an empty {phase} step");
+        }
+    }
+    Ok(())
+}
+
+fn check_dispatch_prerequisites(repo_path: &Path) -> Result<()> {
+    if !repo_path.join(".git").exists() {
+        bail!("staged checkout {} is not a git clone", repo_path.display());
+    }
+    run_git(
+        repo_path,
+        ["rev-parse", "--git-dir"],
+        Duration::from_secs(30),
+    )?;
+    Ok(())
+}
+
+async fn dispatch_one(
+    pg: PgPool,
+    item: AssignedWorkItem,
+    worker_name: String,
+) -> Result<WorkItemDispatchResult> {
     // CLAIM + heartbeat FIRST, before the (possibly slow cold-clone) checkout.
     // dispatch_one now runs CONCURRENTLY with this host's other assigned leases
     // (spawned by evaluate_work_item_dispatch — a serial `.await` here blocked the
@@ -923,7 +982,7 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
             work_item_id = %item.work_item_id,
             "work_item_dispatch: already claimed by a concurrent dispatch — skipping"
         );
-        return Ok(());
+        return Ok(WorkItemDispatchResult::default());
     }
 
     // PRE-BUILD ACCEPTANCE GATE (2026-07-25): if the item already carries a
@@ -959,7 +1018,7 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         .bind(item.work_item_id)
         .execute(&pg)
         .await;
-        return Ok(());
+        return Ok(WorkItemDispatchResult::default());
     }
 
     // Keep the lease heartbeat alive for the ENTIRE dispatch — the backend build
@@ -981,8 +1040,17 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     // repeated). Re-enable only if a single build needs its own reply thread.
     let _ = &item.session_id;
 
+    // PRE: stage the clone, validate the lifecycle manifest, and verify local
+    // prerequisites before checkout/reset and before agent execution.
     ensure_repo_checked_out(&pg, &item).await?;
+    validate_dispatch_manifest(&item)?;
+    check_dispatch_prerequisites(&item.repo_path)?;
     let worktree = create_worktree_for_item(&pg, &item).await?;
+    let mut post_phase = PostPhaseGuard::new(
+        item.work_item_id,
+        item.repo_path.clone(),
+        worktree.worktree_path.clone(),
+    );
 
     let started = std::time::Instant::now();
     let dispatch_full = run_ff_dispatch(&pg, &item, &worktree).await;
@@ -1024,11 +1092,12 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
             agent_output_tail(&output, 1500)
         }
         Err(e) => {
+            post_phase.set_log_tail(format!("dispatch failed before producing output: {e:#}"));
             mark_worktree_failed(&pg, item.work_item_id, &e.to_string()).await?;
-            remove_worktree(&item.repo_path, &worktree.worktree_path)?;
             return Err(e);
         }
     };
+    post_phase.set_log_tail(agent_output_tail.clone());
 
     // codex (and most CLI agents) EDIT files but don't `git commit`. Commit any
     // changes it made in the worktree so they can become a PR. A clean worktree
@@ -1107,8 +1176,8 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
             ),
         )
         .await?;
-        remove_worktree(&item.repo_path, &worktree.worktree_path)?;
-        return Ok(());
+        let sweep_warnings = post_phase.finish();
+        return Ok(WorkItemDispatchResult { sweep_warnings });
     }
 
     // SELF-VERIFY GATE — catch garbage at the source, before it costs a PR + CI
@@ -1189,8 +1258,8 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
                 &format!("self-verify failed before opening PR after {self_fix_attempts} self-fix attempt(s) + 480B rescue: {reason}"),
             )
             .await?;
-            remove_worktree(&item.repo_path, &worktree.worktree_path)?;
-            return Ok(());
+            let sweep_warnings = post_phase.finish();
+            return Ok(WorkItemDispatchResult { sweep_warnings });
         }
 
         self_fix_attempts += 1;
@@ -1241,8 +1310,8 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         Ok(r) => r,
         Err(e) => {
             requeue_or_fail(&pg, &item, &format!("in-place review unavailable: {e:#}")).await?;
-            remove_worktree(&item.repo_path, &worktree.worktree_path)?;
-            return Ok(());
+            let sweep_warnings = post_phase.finish();
+            return Ok(WorkItemDispatchResult { sweep_warnings });
         }
     };
     if !review.approved {
@@ -1269,8 +1338,8 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         // Same retry-with-context ladder as a build failure: the reviewer's
         // reason lands in last_error so the next attempt sees what to fix.
         requeue_or_fail(&pg, &item, &reason).await?;
-        remove_worktree(&item.repo_path, &worktree.worktree_path)?;
-        return Ok(());
+        let sweep_warnings = post_phase.finish();
+        return Ok(WorkItemDispatchResult { sweep_warnings });
     }
 
     mark_ready_for_review(
@@ -1283,7 +1352,8 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         Some(&review),
     )
     .await?;
-    Ok(())
+    let sweep_warnings = post_phase.finish_without_cleanup();
+    Ok(WorkItemDispatchResult { sweep_warnings })
 }
 
 async fn record_pr_provenance(
@@ -4409,6 +4479,100 @@ fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Finally-style POST phase. Diagnostics are collected before the existing
+/// reset/clean path runs, and cleanup failures remain warnings so they cannot
+/// replace the primary agent error.
+struct PostPhaseGuard {
+    work_item_id: Uuid,
+    repo_path: PathBuf,
+    worktree_path: PathBuf,
+    log_tail: Option<String>,
+    armed: bool,
+}
+
+impl PostPhaseGuard {
+    fn new(work_item_id: Uuid, repo_path: PathBuf, worktree_path: PathBuf) -> Self {
+        Self {
+            work_item_id,
+            repo_path,
+            worktree_path,
+            log_tail: None,
+            armed: true,
+        }
+    }
+
+    fn set_log_tail(&mut self, log_tail: String) {
+        self.log_tail = Some(log_tail);
+    }
+
+    fn collect_logs(&mut self, warnings: &mut Vec<String>) {
+        if let Some(log_tail) = self.log_tail.take() {
+            info!(
+                work_item_id = %self.work_item_id,
+                agent_output_tail = %log_tail,
+                "work_item_dispatch: POST phase collected agent output"
+            );
+        }
+        collect_leftover_tmp_output(&self.worktree_path, warnings);
+    }
+
+    fn run(&mut self, cleanup: bool) -> Vec<String> {
+        if !self.armed {
+            return Vec::new();
+        }
+        self.armed = false;
+        let mut warnings = Vec::new();
+        self.collect_logs(&mut warnings);
+        if cleanup {
+            if let Err(error) = remove_worktree(&self.repo_path, &self.worktree_path) {
+                warnings.push(format!("POST repo cleanup failed: {error:#}"));
+            }
+        } else if let Err(error) = run_git(
+            &self.worktree_path,
+            ["status", "--porcelain"],
+            Duration::from_secs(30),
+        ) {
+            warnings.push(format!("POST worktree inspection failed: {error:#}"));
+        }
+        warnings
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        self.run(true)
+    }
+
+    fn finish_without_cleanup(mut self) -> Vec<String> {
+        self.run(false)
+    }
+}
+
+impl Drop for PostPhaseGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for warning in self.run(true) {
+            warn!(
+                work_item_id = %self.work_item_id,
+                warning,
+                "work_item_dispatch: POST phase Drop sweep warning"
+            );
+        }
+    }
+}
+
+fn collect_leftover_tmp_output(worktree_path: &Path, warnings: &mut Vec<String>) {
+    let tmp_dir = worktree_path.join("tmp");
+    if let Ok(entries) = std::fs::read_dir(&tmp_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                warnings.push(format!("leftover tmp output: {}", path.display()));
+            }
+        }
+    }
+}
+
 fn reclaim_build_artifacts(path: &Path) -> u64 {
     fn is_reclaimable_dir_name(name: &OsStr) -> bool {
         name == OsStr::new("target")
@@ -5406,18 +5570,50 @@ mod tests {
     use super::{
         AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS, ReviewerStat,
         affected_crate_manifests, agent_output_tail, backend_failed_without_output,
-        builder_excludes_480b, classify_dispatch_outcome, command_display,
-        complexity_at_least_moderate, contains_file_line_citation, default_clone_path,
-        dispatch_budget_for_host, dispatch_prompt, expand_home, is_build_timeout, mirror_repo_url,
-        order_cloud_reviewers, parse_cli_tokens, primary_or_default_backend,
-        quick_empty_success_is_provider_failure, repo_cache_path, repo_slug,
-        retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
+        builder_excludes_480b, check_dispatch_prerequisites, classify_dispatch_outcome,
+        collect_leftover_tmp_output, command_display, complexity_at_least_moderate,
+        contains_file_line_citation, default_clone_path, dispatch_budget_for_host, dispatch_prompt,
+        expand_home, is_build_timeout, mirror_repo_url, order_cloud_reviewers, parse_cli_tokens,
+        primary_or_default_backend, quick_empty_success_is_provider_failure, repo_cache_path,
+        repo_slug, retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
         should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
         task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
+        validate_manifest_fields,
     };
     use std::path::PathBuf;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn pre_phase_rejects_invalid_manifest_and_non_git_staging() {
+        let empty = String::new();
+        let error = validate_manifest_fields("", "title", &[], &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("project_id"), "{error}");
+        let error =
+            validate_manifest_fields("project", "title", std::slice::from_ref(&empty), &[], &[])
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("empty PRE step"), "{error}");
+
+        let temp = tempfile::tempdir().unwrap();
+        let error = check_dispatch_prerequisites(temp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a git clone"), "{error}");
+    }
+
+    #[test]
+    fn post_phase_reports_leftover_tmp_logs() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("tmp")).unwrap();
+        std::fs::write(temp.path().join("tmp/agent.log"), "diagnostic").unwrap();
+        let mut warnings = Vec::new();
+        collect_leftover_tmp_output(temp.path(), &mut warnings);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("agent.log"));
+    }
 
     #[test]
     fn contains_file_line_citation_requires_dotted_path_and_digit_line() {
