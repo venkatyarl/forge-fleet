@@ -439,6 +439,12 @@ enum Command {
         /// Repeatable: `--verify-no-placeholder TBD --verify-no-placeholder XXX`.
         #[arg(long = "verify-no-placeholder")]
         verify_no_placeholder: Vec<String>,
+        /// Require the git work tree to actually change for success. A "done"
+        /// verdict with an unchanged tree is a false positive → retry, then
+        /// escalate. On by default (coding tasks); pass --require-change=false to
+        /// allow no-op success (e.g. a pure research/answer task). HireFlow360 #6.
+        #[arg(long = "require-change", default_value_t = true, action = clap::ArgAction::Set)]
+        require_change: bool,
         /// Restrict the agent's tool belt to these tools only (comma-separated).
         /// Forbid Read on pure-create tasks to prevent Read-loops:
         /// `--allowed-tools Write,Bash`. When unset, all core tools are exposed.
@@ -5485,6 +5491,7 @@ async fn main() -> Result<()> {
             max_attempts,
             verify_files,
             verify_no_placeholder,
+            require_change,
             allowed_tools,
             backend,
             backend_args,
@@ -5579,6 +5586,7 @@ async fn main() -> Result<()> {
                 max_attempts,
                 verify_files: verify_files.clone(),
                 verify_no_placeholder: verify_no_placeholder.clone(),
+                require_change,
                 ..Default::default()
             };
             if !allowed_tools.is_empty() {

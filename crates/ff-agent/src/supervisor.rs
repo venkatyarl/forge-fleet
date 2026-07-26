@@ -36,6 +36,15 @@ pub struct SupervisorConfig {
     /// is found, the attempt is treated as missing_deliverable and the
     /// retry prompt is augmented with the offending file + pattern.
     pub verify_no_placeholder: Vec<String>,
+    /// Require the working tree to actually CHANGE for a coding task to count as
+    /// success. When true, a "done" verdict with an unchanged git tree (no diff,
+    /// no new files) is a FALSE POSITIVE → treated as a failure and retried, then
+    /// escalated. Closes HireFlow360 #6: ff supervise printed "✓ Task completed"
+    /// on runs that produced NOTHING (a local model failed a big-file write, an
+    /// ApiProperties merge left the repo untouched) because with no verify_files
+    /// set, NoFailure short-circuits straight to success. Defaults to ON for
+    /// coding tasks (the CLI sets it); a non-coding task can leave it off.
+    pub require_change: bool,
 }
 
 impl Default for SupervisorConfig {
@@ -47,7 +56,26 @@ impl Default for SupervisorConfig {
             early_stop_min_tools: 1,
             verify_files: Vec::new(),
             verify_no_placeholder: Vec::new(),
+            require_change: false,
         }
+    }
+}
+
+/// Whether `dir` is a git work tree with UNCOMMITTED changes (modified/added/
+/// deleted/untracked). `git status --porcelain` prints one line per change and
+/// nothing when the tree is clean — so empty stdout = no change. Fail-open
+/// (returns true = "there is a change") if git can't run, so a non-git task or a
+/// git error never turns a real success into a false failure.
+async fn work_tree_changed(dir: &std::path::Path) -> bool {
+    match tokio::process::Command::new("git")
+        .args(["-C"])
+        .arg(dir)
+        .args(["status", "--porcelain"])
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => !out.stdout.iter().all(|b| b.is_ascii_whitespace()),
+        _ => true, // not a git repo / git unavailable → don't block success
     }
 }
 
@@ -235,6 +263,49 @@ pub async fn supervise(
                         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                         continue;
                     }
+                }
+                // REQUIRE-CHANGE gate (HireFlow360 #6): a coding task that
+                // declared "done" but left the git tree UNCHANGED produced
+                // nothing — it's a false-positive success. Treat as a failure and
+                // retry with a stern directive; if the last attempt still made no
+                // change, fall through to success=false so the caller ESCALATES
+                // (e.g. to a cloud CLI) instead of recording a bogus completion.
+                if sup_config.require_change
+                    && !work_tree_changed(&agent_config.working_dir).await
+                {
+                    let evidence =
+                        "agent declared done but the git work tree is UNCHANGED (no diff, no new \
+                         files) — the task produced nothing"
+                            .to_string();
+                    warn!(attempt, "{}", evidence);
+                    diagnoses.push(FailureDiagnosis {
+                        attempt,
+                        failure_type: "no_change".into(),
+                        evidence,
+                        fix_applied: "Prepending must-edit directive on retry; escalate if final"
+                            .into(),
+                    });
+                    if attempt + 1 < sup_config.max_attempts {
+                        let reminder =
+                            "CRITICAL: your previous attempt made NO changes to any file. A task \
+                             is not complete until you have actually edited the code with the \
+                             Write/Edit tools. Make the required change now, then verify with \
+                             `git status` before declaring done.\n\n"
+                                .to_string();
+                        let existing = agent_config.system_prompt.take().unwrap_or_default();
+                        agent_config.system_prompt = Some(format!("{reminder}\n{existing}"));
+                        let delay = sup_config.retry_delay_ms * (1u64 << attempt);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        continue;
+                    }
+                    // Out of attempts with no change → NOT a success. Let the
+                    // caller escalate rather than record a false completion.
+                    return SupervisorResult {
+                        success: false,
+                        attempts: attempt,
+                        final_output: last_output,
+                        diagnoses,
+                    };
                 }
                 info!(attempt, "supervisor: task completed successfully");
                 return SupervisorResult {
