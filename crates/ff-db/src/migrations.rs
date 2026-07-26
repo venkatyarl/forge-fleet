@@ -1210,6 +1210,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "work_item_retry_count",
         sql: schema::SCHEMA_V272_WORK_ITEM_RETRY_COUNT,
     },
+    PgMigration {
+        version: 273,
+        name: "cloud_backends",
+        sql: schema::SCHEMA_V273_CLOUD_BACKENDS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1456,6 +1461,20 @@ mod tests {
         assert!(migration.sql.contains("NOT NULL DEFAULT 0"));
     }
 
+    #[test]
+    fn v273_defines_single_refresher_cloud_backends() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 273)
+            .expect("V273 must be registered");
+        assert_eq!(migration.name, "cloud_backends");
+        assert!(migration.sql.contains("backend        TEXT PRIMARY KEY"));
+        assert!(migration.sql.contains("refresher_node TEXT NOT NULL"));
+        for backend in ["claude", "codex", "kimi"] {
+            assert!(migration.sql.contains(&format!("('{backend}',")));
+        }
+    }
+
     fn db_url() -> Option<String> {
         env::var("FORGEFLEET_POSTGRES_URL")
             .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
@@ -1552,6 +1571,36 @@ mod tests {
             .await
             .expect("v161 bootstrap should be recorded in _migrations");
         assert_eq!(row.0 as u32, BOOTSTRAP_BASELINE_VERSION);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v273_assigns_one_non_null_refresher_per_cloud_backend() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT backend, refresher_node
+               FROM cloud_backends
+              ORDER BY backend",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("cloud backend ownership should be queryable");
+        assert_eq!(
+            rows,
+            vec![
+                ("claude".to_string(), "ace".to_string()),
+                ("codex".to_string(), "ace".to_string()),
+                ("kimi".to_string(), "sarah".to_string()),
+            ]
+        );
 
         drop_temp_db(admin, pool, &db_name).await;
     }

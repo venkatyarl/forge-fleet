@@ -12240,6 +12240,20 @@ ALTER TABLE work_items
     ADD COLUMN IF NOT EXISTS retry_count INT NOT NULL DEFAULT 0;
 "#;
 
+/// One authoritative node refreshes each cloud CLI's shared authentication.
+pub const SCHEMA_V273_CLOUD_BACKENDS: &str = r#"
+CREATE TABLE IF NOT EXISTS cloud_backends (
+    backend        TEXT PRIMARY KEY,
+    refresher_node TEXT NOT NULL
+);
+
+INSERT INTO cloud_backends (backend, refresher_node) VALUES
+    ('claude', 'ace'),
+    ('codex',  'ace'),
+    ('kimi',   'sarah')
+ON CONFLICT (backend) DO NOTHING;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
