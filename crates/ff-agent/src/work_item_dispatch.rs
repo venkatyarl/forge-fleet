@@ -5462,10 +5462,9 @@ pub async fn evaluate_worktree_reaper(pg: &PgPool, worker_name: &str) -> Result<
         let tree = PathBuf::from(&wt.worktree_path);
         let worktree_removed =
             remove_worktree(&repo, &tree).is_ok() && (tree == repo || !tree.exists());
-        // Clone-direct rows: the "worktree" is the slot's long-lived clone —
-        // reclaiming would delete its target/node_modules out from under the
-        // next build. Only legacy detached worktree dirs are reclaimed.
-        if tree != repo {
+        // A stale slot has no live build and must be scrubbed before it can be
+        // dispatched again. Terminal clone-direct rows keep their warm cache.
+        if tree != repo || wt.stale_slot {
             reclaimed_bytes = reclaimed_bytes.saturating_add(reclaim_build_artifacts(&tree));
         }
         let branch_deleted = run_git(
@@ -5514,11 +5513,23 @@ pub async fn evaluate_worktree_reaper(pg: &PgPool, worker_name: &str) -> Result<
         sqlx::query(
             "UPDATE sub_agents SET current_work_item_id = NULL, status = 'idle', \
                     started_at = NULL, last_heartbeat_at = NOW() \
-              WHERE current_work_item_id = $1",
+              WHERE current_work_item_id = $1 \
+                AND ($2 = FALSE OR status = 'cleanup_pending')",
         )
         .bind(wt.work_item_id)
+        .bind(wt.stale_slot)
         .execute(&mut *tx)
         .await?;
+        if wt.stale_slot {
+            sqlx::query(
+                "UPDATE work_items SET status = 'ready', assigned_to = NULL, \
+                        assigned_computer = NULL \
+                  WHERE id = $1 AND status NOT IN ('done', 'failed', 'cancelled')",
+            )
+            .bind(wt.work_item_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         reaped += 1;
     }

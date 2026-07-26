@@ -856,16 +856,16 @@ pub struct ReapedSlot {
     pub sub_agent_id: Uuid,
     /// The work item the slot was tracking when it went stale, if any.
     pub work_item_id: Option<Uuid>,
-    /// Whether that work item was re-queued (`status = 'ready'`) for another
-    /// dispatch. `false` when the item had already reached a terminal status.
+    /// Whether that work item was re-queued immediately. Stale slots with a
+    /// recorded worktree remain pending until the owning host cleans it.
     pub requeued: bool,
 }
 
 /// Reset every `'busy'` sub_agent whose `last_heartbeat_at` is older than
-/// `stale_after_secs` back to `'idle'`, clear its `current_work_item_id`, and
-/// re-queue the orphaned work item (`status = 'ready'`, assignment cleared) so
-/// the scheduler can dispatch it to another slot. All in ONE atomic statement,
-/// so a crash between "free slot" and "re-queue item" cannot strand the item.
+/// `stale_after_secs`. Slots with a recorded worktree move to
+/// `'cleanup_pending'`; the owning host's worktree reaper scrubs the checkout
+/// before it frees the slot and re-queues the item. Slots without a worktree
+/// are freed and re-queued immediately. All state changes are atomic.
 ///
 /// Slots holding an ACTIVE `work_item_leases` row are exempt: the lease
 /// lifecycle owns those (lease takeover reclaims them when the lease dies),
@@ -887,10 +887,23 @@ pub async fn reap_stale_busy_slots(
                       WHERE l.sub_agent_id = sub_agents.id \
                         AND l.released_at IS NULL) \
                 FOR UPDATE SKIP LOCKED \
+         ), pending_cleanup AS ( \
+             UPDATE work_item_worktrees wt \
+                SET status = 'stale' \
+               FROM stale \
+              WHERE wt.work_item_id = stale.current_work_item_id \
+                AND wt.status <> 'cleaned' \
+              RETURNING wt.work_item_id \
          ), reaped AS ( \
              UPDATE sub_agents s \
-                SET status = 'idle', \
-                    current_work_item_id = NULL, \
+                SET status = CASE \
+                       WHEN EXISTS (SELECT 1 FROM pending_cleanup p \
+                                    WHERE p.work_item_id = stale.current_work_item_id) \
+                       THEN 'cleanup_pending' ELSE 'idle' END, \
+                    current_work_item_id = CASE \
+                       WHEN EXISTS (SELECT 1 FROM pending_cleanup p \
+                                    WHERE p.work_item_id = stale.current_work_item_id) \
+                       THEN stale.current_work_item_id ELSE NULL END, \
                     started_at = NULL, \
                     last_heartbeat_at = NOW() \
                FROM stale \
@@ -903,6 +916,7 @@ pub async fn reap_stale_busy_slots(
                     assigned_computer = NULL \
                FROM reaped r \
               WHERE w.id = r.work_item_id \
+                AND NOT EXISTS (SELECT 1 FROM pending_cleanup p WHERE p.work_item_id = w.id) \
                 AND w.status NOT IN ('done', 'failed', 'cancelled') \
               RETURNING w.id \
          ) \

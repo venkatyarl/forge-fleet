@@ -83,7 +83,6 @@ mod ports_cmd;
 mod power_cmd;
 mod project_cmd;
 mod queue_cmd;
-mod workstream_cmd;
 mod repo_context;
 mod research_cmd;
 mod route_cmd;
@@ -105,6 +104,7 @@ mod usage_cmd;
 mod utils;
 mod versions_cmd;
 mod voice_cmd;
+mod workstream_cmd;
 
 pub use utils::{
     CYAN, GREEN, RED, RESET, YELLOW, expand_tilde, human_bytes, human_bytes_i64, load_config,
