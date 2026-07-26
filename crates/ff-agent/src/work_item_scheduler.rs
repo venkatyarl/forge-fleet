@@ -59,6 +59,47 @@ const MAX_BUILD_ATTEMPTS: i32 = 5;
 /// Four missed 15-second dispatch passes makes a host ineligible. General
 /// Pulse beats may still be fresh when this subsystem clock is stale.
 const DISPATCH_TICK_STALE_SECS: i64 = 60;
+const FAILED_RETRY_COOLDOWN_MINUTES: i64 = 20;
+const MAX_FAILED_RETRIES: i32 = 3;
+
+const AUTO_REQUEUE_FAILED_SQL: &str = r#"
+WITH eligible AS (
+    SELECT w.id
+      FROM work_items w
+     WHERE w.status = 'failed'
+       AND w.kind = 'task'
+       AND w.retry_count < $1
+       AND w.completed_at <= NOW() - make_interval(mins => $2)
+       AND COALESCE(w.last_error, '') !~* '(^|[^A-Z])(BOGUS|QUARANTINE)([^A-Z]|$)'
+       AND NOT EXISTS (
+           SELECT 1 FROM work_item_leases l
+            WHERE l.work_item_id = w.id AND l.released_at IS NULL
+       )
+     ORDER BY w.completed_at ASC, w.id ASC
+     FOR UPDATE SKIP LOCKED
+     LIMIT $3
+)
+UPDATE work_items w
+   SET status = 'ready',
+       retry_count = w.retry_count + 1,
+       attempts = GREATEST(w.attempts, $4),
+       assigned_to = NULL,
+       assigned_computer = NULL,
+       completed_at = NULL
+  FROM eligible
+ WHERE w.id = eligible.id
+"#;
+
+async fn auto_requeue_failed_work_items(pg: &PgPool) -> Result<u64> {
+    Ok(sqlx::query(AUTO_REQUEUE_FAILED_SQL)
+        .bind(MAX_FAILED_RETRIES)
+        .bind(FAILED_RETRY_COOLDOWN_MINUTES as i32)
+        .bind(MAX_ASSIGN_PER_TICK)
+        .bind(ff_routing_policy::LOCAL_LANE_MAX_TRIES as i32)
+        .execute(pg)
+        .await?
+        .rows_affected())
+}
 
 /// One scheduler pass. Returns the number of work_items assigned this tick.
 pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
@@ -84,6 +125,16 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         warn!(
             orphans,
             "work_item_scheduler: cancelled orphaned in_progress work_items (no active lease)"
+        );
+    }
+
+    let retried = auto_requeue_failed_work_items(pg).await?;
+    if retried > 0 {
+        info!(
+            retried,
+            cooldown_minutes = FAILED_RETRY_COOLDOWN_MINUTES,
+            max_retries = MAX_FAILED_RETRIES,
+            "work_item_scheduler: requeued failed work_items at cloud attempt tier"
         );
     }
 
@@ -481,6 +532,18 @@ pub fn spawn_work_item_scheduler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_retry_query_is_bounded_atomic_and_excludes_terminal_markers() {
+        assert!(AUTO_REQUEUE_FAILED_SQL.contains("w.retry_count < $1"));
+        assert!(AUTO_REQUEUE_FAILED_SQL.contains("make_interval(mins => $2)"));
+        assert!(AUTO_REQUEUE_FAILED_SQL.contains("FOR UPDATE SKIP LOCKED"));
+        assert!(AUTO_REQUEUE_FAILED_SQL.contains("retry_count = w.retry_count + 1"));
+        assert!(AUTO_REQUEUE_FAILED_SQL.contains("BOGUS|QUARANTINE"));
+        assert!(AUTO_REQUEUE_FAILED_SQL.contains("l.released_at IS NULL"));
+        assert_eq!(MAX_FAILED_RETRIES, 3);
+        assert_eq!(FAILED_RETRY_COOLDOWN_MINUTES, 20);
+    }
 
     fn slot(computer: uuid::Uuid) -> ff_db::FreeSlot {
         ff_db::FreeSlot {

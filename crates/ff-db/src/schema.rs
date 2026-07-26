@@ -12201,6 +12201,45 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// Cloud-fixes-local learning loop. A row is written when a cloud builder
+/// succeeds after the local retry budget was exhausted.
+pub const SCHEMA_V271_LOCAL_FAILURE_DIAGNOSES: &str = r#"
+CREATE TABLE IF NOT EXISTS local_failure_diagnoses (
+    id                        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    work_item_id              UUID NOT NULL,
+    rescue_attempt            INT NOT NULL,
+    local_failure_summary     TEXT NOT NULL,
+    cloud_backend             TEXT NOT NULL,
+    cloud_diagnosis           TEXT NOT NULL,
+    cause_class               TEXT NOT NULL
+        CHECK (cause_class IN ('context_prompt_gap', 'capability_limit', 'unknown')),
+    improvement_route         TEXT NOT NULL
+        CHECK (improvement_route IN ('dreamer_context_pack', 'fine_tune_model_ab', 'manual_triage')),
+    remediation_status        TEXT NOT NULL DEFAULT 'diagnosed'
+        CHECK (remediation_status IN
+            ('diagnosed', 'deploy_pending', 'deployed', 'local_retest_running',
+             'local_retest_passed', 'local_retest_failed')),
+    remediation_commit_sha    TEXT,
+    deployed_at               TIMESTAMPTZ,
+    local_retest_started_at   TIMESTAMPTZ,
+    local_retest_completed_at TIMESTAMPTZ,
+    local_retest_error        TEXT,
+    created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (work_item_id, rescue_attempt)
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_failure_diagnoses_route
+    ON local_failure_diagnoses (improvement_route, remediation_status, created_at);
+"#;
+
+/// Bounded scheduler retries for terminal work-item failures. Kept separate
+/// from `attempts`, which controls the local-to-cloud dispatch ladder.
+pub const SCHEMA_V272_WORK_ITEM_RETRY_COUNT: &str = r#"
+ALTER TABLE work_items
+    ADD COLUMN IF NOT EXISTS retry_count INT NOT NULL DEFAULT 0;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
