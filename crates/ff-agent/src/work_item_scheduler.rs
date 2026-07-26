@@ -70,7 +70,7 @@ WITH eligible AS (
        AND w.kind = 'task'
        AND w.retry_count < $1
        AND w.completed_at <= NOW() - make_interval(mins => $2)
-       AND COALESCE(w.last_error, '') !~* '(^|[^A-Z])(BOGUS|QUARANTINE)([^A-Z]|$)'
+       AND COALESCE(w.last_error, '') !~* '(^|[^A-Z])(BOGUS|QUARANTINE|CANCELLED)([^A-Z]|$)'
        AND NOT EXISTS (
            SELECT 1 FROM work_item_leases l
             WHERE l.work_item_id = w.id AND l.released_at IS NULL
@@ -539,7 +539,7 @@ mod tests {
         assert!(AUTO_REQUEUE_FAILED_SQL.contains("make_interval(mins => $2)"));
         assert!(AUTO_REQUEUE_FAILED_SQL.contains("FOR UPDATE SKIP LOCKED"));
         assert!(AUTO_REQUEUE_FAILED_SQL.contains("retry_count = w.retry_count + 1"));
-        assert!(AUTO_REQUEUE_FAILED_SQL.contains("BOGUS|QUARANTINE"));
+        assert!(AUTO_REQUEUE_FAILED_SQL.contains("BOGUS|QUARANTINE|CANCELLED"));
         assert!(AUTO_REQUEUE_FAILED_SQL.contains("l.released_at IS NULL"));
         assert_eq!(MAX_FAILED_RETRIES, 3);
         assert_eq!(FAILED_RETRY_COOLDOWN_MINUTES, 20);
