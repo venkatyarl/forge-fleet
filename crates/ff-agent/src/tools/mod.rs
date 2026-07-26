@@ -31,6 +31,7 @@ pub mod glob_tool;
 pub mod grep_tool;
 pub mod http_request;
 pub mod intelligence;
+pub mod jira_transition;
 pub mod json_query;
 pub mod lint_fix;
 pub mod media;
@@ -283,6 +284,7 @@ pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(task_tools::TaskStopTool),
         Box::new(task_tools::TaskOutputTool),
         Box::new(work_item_tool::ListWorkItemsTool),
+        Box::new(jira_transition::JiraTransitionTool::default()),
         // Web tools
         Box::new(web_fetch::WebFetchTool::default()),
         Box::new(web_search::WebSearchTool::default()),
