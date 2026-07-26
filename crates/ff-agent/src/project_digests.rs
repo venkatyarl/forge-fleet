@@ -241,6 +241,7 @@ async fn run_once(pg: &PgPool) -> Result<()> {
 /// Extract a human LLM/backend name from a lease endpoint like
 /// "lane1.5:local:qwen3-coder-480b" → "qwen3-coder-480b", "codex" → "codex".
 /// Empty endpoint (not yet dispatched to a backend) → "pending".
+#[allow(dead_code)] // superseded by the in-query {node}:{model} resolution
 fn llm_from_endpoint(ep: &str) -> String {
     let ep = ep.trim();
     // Empty endpoint = a local Lane-1 codegen build that didn't record its exact
@@ -278,10 +279,26 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
 
     // Building now — with the COMPUTER (assigned_computer) and the LLM (parsed
     // from the lease endpoint) building each item.
+    // The LLM label is {serving-node}:{model} — the build runs in a slot on
+    // `assigned_computer`, but the router may serve it from a DIFFERENT node's
+    // model (a slot on lily can build via glm on adele). Resolve the lease's
+    // endpoint (http://IP:port) to that node+model via fleet_model_deployments,
+    // so the digest shows `lily:glm-4.5-air` / `cloud:codex`, not a bare "local"
+    // or a port number (operator 2026-07-26). Empty endpoint = local codegen that
+    // didn't record its model (telemetry gap) → "local:building".
     let building: Vec<(String, String, String, i32, Option<i32>)> = sqlx::query_as(
         "SELECT left(w.title, 30), \
                 coalesce(w.assigned_computer, ''), \
-                coalesce(l.endpoint, ''), \
+                coalesce( \
+                  (SELECT w2.name || ':' || d.catalog_id \
+                     FROM fleet_model_deployments d \
+                     JOIN fleet_workers w2 ON w2.name = d.worker_name \
+                    WHERE l.endpoint <> '' \
+                      AND l.endpoint LIKE '%' || w2.ip || ':' || d.port || '%' \
+                    LIMIT 1), \
+                  CASE WHEN coalesce(l.endpoint,'') = '' THEN 'local:building' \
+                       ELSE 'cloud:' || split_part(l.endpoint, '/', 1) END \
+                ), \
                 (EXTRACT(EPOCH FROM (now() - l.created_at)) / 60)::int, \
                 (EXTRACT(EPOCH FROM (now() - l.heartbeat_at)))::int \
            FROM work_item_leases l JOIN work_items w ON w.id = l.work_item_id \
@@ -378,7 +395,7 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
     if building.is_empty() {
         msg.push_str("• (idle)\n");
     } else {
-        for (title, computer, endpoint, mins, hb) in &building {
+        for (title, computer, llm_label, mins, hb) in &building {
             let stuck = hb.map(|h| h > 300).unwrap_or(false);
             let eta = (15 - mins).max(1);
             let hbs = hb.map(|h| h.to_string()).unwrap_or_else(|| "?".into());
@@ -388,7 +405,7 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
                 if stuck { "⚠STUCK " } else { "" },
                 title,
                 comp,
-                llm_from_endpoint(endpoint),
+                llm_label,
                 mins,
                 hbs,
                 eta
