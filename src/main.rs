@@ -106,6 +106,10 @@ struct StartArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    execute(cli).await
+}
+
+async fn execute(cli: Cli) -> Result<()> {
     let command = cli.command.as_ref().unwrap_or(&Command::Start(StartArgs {
         leader: false,
         disable_pulse_v2: false,
@@ -121,6 +125,10 @@ async fn main() -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "cli/verbs/test_integration.rs"]
+mod test_integration;
 
 async fn run_mcp(args: &McpArgs) -> Result<()> {
     let server = ff_mcp::McpServer::new();
