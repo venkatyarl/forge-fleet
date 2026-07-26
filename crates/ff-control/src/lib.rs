@@ -62,6 +62,7 @@ pub use llm_480b_wrapper::{
 };
 pub use slot_allocation::{SlotAllocationConfig, allocate_slots};
 pub use subsystem_watchdog::{
-    DEFAULT_TRIP_THRESHOLD, SubsystemWatchdog, WatchdogAction, WatchdogEvent,
+    DEFAULT_TRIP_THRESHOLD, RestartOutcome, SubsystemObservation, SubsystemRestarter,
+    SubsystemWatchdog, SubsystemWatchdogEvent, WatchdogAction, WatchdogEvent, WatchdogSubsystem,
 };
 pub use task_processor::{ComplexityFlag, TaskComplexity, TaskProcessor};
