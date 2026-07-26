@@ -1486,6 +1486,32 @@ mod tests {
     }
 
     #[test]
+    fn v274_adds_project_workstream_digest_fields() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 274)
+            .expect("V274 must be registered");
+        assert_eq!(migration.name, "project_digest_fields");
+        assert!(
+            migration
+                .sql
+                .contains("ADD COLUMN IF NOT EXISTS workstream_id TEXT")
+        );
+        assert!(
+            migration
+                .sql
+                .contains("ADD COLUMN IF NOT EXISTS digest_template_id JSONB")
+        );
+        assert!(
+            migration
+                .sql
+                .contains("ADD COLUMN IF NOT EXISTS logo_url TEXT")
+        );
+        assert!(migration.sql.contains("idx_projects_workstream_id"));
+        assert!(migration.sql.contains("Rollback:"));
+    }
+
+    #[test]
     fn v275_defines_capability_store_and_skill_backfill() {
         let migration = PG_MIGRATIONS
             .iter()

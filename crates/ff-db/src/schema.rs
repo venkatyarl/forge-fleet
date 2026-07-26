@@ -12256,12 +12256,8 @@ ON CONFLICT (backend) DO NOTHING;
 
 /// Optional project metadata used to attach projects to workstreams and create
 /// their initial digest configuration.
-pub const SCHEMA_V274_PROJECT_DIGEST_FIELDS: &str = r#"
-ALTER TABLE projects
-    ADD COLUMN IF NOT EXISTS workstream_id TEXT,
-    ADD COLUMN IF NOT EXISTS digest_template_id TEXT,
-    ADD COLUMN IF NOT EXISTS logo_url TEXT;
-"#;
+pub const SCHEMA_V274_PROJECT_DIGEST_FIELDS: &str =
+    include_str!("migrations/20260725000000_add_workstream_digest_fields.sql");
 
 /// First-class capability store. Skills are copied, not moved, so existing
 /// consumers remain compatible while capability-aware consumers gain one
