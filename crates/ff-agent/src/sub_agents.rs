@@ -47,6 +47,32 @@ pub async fn reconcile_capacity(pool: &sqlx::PgPool, worker_name: &str) -> Resul
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("computer row not found for {worker_name}"))?;
     let computer_id: sqlx::types::Uuid = row.get("id");
+
+    // Respect operator quarantine (operator 2026-07-26): a node set
+    // `reservation_state='drained'` must NOT have its slots re-enabled — this
+    // per-node capacity reconcile flipping `disabled`→`idle` every 60s is exactly
+    // why a manually-quarantined broken node (lily's recurring worktree failures)
+    // kept getting work redispatched to it. When drained, force all slots
+    // disabled and stop.
+    let drained: bool = sqlx::query_scalar::<_, bool>(
+        "SELECT reservation_state = 'drained' FROM computers WHERE id = $1",
+    )
+    .bind(computer_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap_or(false);
+    if drained {
+        let _ = sqlx::query(
+            "UPDATE sub_agents SET status = 'disabled' \
+              WHERE computer_id = $1 AND current_work_item_id IS NULL AND status <> 'busy'",
+        )
+        .bind(computer_id)
+        .execute(&mut *tx)
+        .await;
+        tx.commit().await.map_err(|e| e.to_string())?;
+        return Ok(0);
+    }
+
     let parent = workspaces_root().join("sub-agents");
     for slot in 0..desired as i32 {
         let workspace = parent
