@@ -1558,11 +1558,20 @@ pub struct RouteCandidate {
 /// Clusters must list only TRULY bidirectional synonyms — if A is a safe
 /// substitute for B but not vice-versa, do not cluster them.
 const WORKLOAD_SYNONYM_CLUSTERS: &[&[&str]] = &[
-    &["embedding", "embeddings"],
+    &["embedding", "embeddings", "feature-extraction"],
     &["rerank", "reranking"],
-    &["code", "code-gen"],
-    &["agent", "tool_calling"],
-    &["multimodal", "vision"],
+    // "code" is the catalog tag glm-4.5-air / devstral declare in
+    // preferred_workloads. Callers ask for it under many spellings — the CLI
+    // `ff fleet route codegen`, skills routing to "coder", pipelines passing
+    // "code-generation". Without every spelling here, `ff fleet route codegen`
+    // returned "no healthy deployment" while a whole glm coder fleet was up
+    // (HireFlow360 gap #3, 2026-07-26). Keep this list == the spellings any
+    // caller uses, all mapping to the single catalog tag "code".
+    &["code", "code-gen", "codegen", "coder", "coding", "code-generation"],
+    &["agent", "tool_calling", "agentic"],
+    &["reason", "reasoning", "thinking", "chain-of-thought"],
+    &["chat", "general", "text-generation", "default-chat"],
+    &["multimodal", "vision", "image-text-to-text"],
 ];
 
 /// All interchangeable tags for `workload` (including itself), or `[workload]`
