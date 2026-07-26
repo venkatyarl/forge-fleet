@@ -240,6 +240,82 @@ pub async fn report(
     Ok(ws)
 }
 
+/// Auto-derive each project's workstream `working_summary` from live work_item
+/// activity — so a project's session-of-record reflects reality WITHOUT any
+/// session manually calling `ff workstream report`. Runs on the leader tick.
+///
+/// Precedence: a LIVE session owns the narrative. If any attached client
+/// reported within the last 15 min, we leave that workstream's summary alone
+/// (the session's semantic report beats a mechanical one). Only for UNATTENDED
+/// projects (no fresh client report) do we overwrite with the derived status.
+/// Returns how many workstreams were auto-updated.
+pub async fn derive_working_summaries(pg: &PgPool) -> Result<u64> {
+    ensure_client_schema(pg).await?;
+    let projects = sqlx::query_scalar::<_, String>(
+        "SELECT project_key FROM ff_workstreams WHERE status = 'active'",
+    )
+    .fetch_all(pg)
+    .await?;
+
+    let mut updated = 0u64;
+    for project in projects {
+        // Skip if a live session reported recently — it owns the summary.
+        let has_live: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM workstream_clients c \
+                JOIN ff_workstreams w ON w.id = c.workstream_id \
+               WHERE w.project_key = $1 AND c.last_report_at > now() - interval '15 minutes')",
+        )
+        .bind(&project)
+        .fetch_one(pg)
+        .await
+        .unwrap_or(false);
+        if has_live {
+            continue;
+        }
+
+        // Mechanical status from work_items + provenance (fail-open on any miss).
+        let row: Option<(i64, i64, i64, Option<String>)> = sqlx::query_as(
+            "SELECT \
+               (SELECT count(*) FROM work_items WHERE project_id = $1 AND status = 'building'), \
+               (SELECT count(*) FROM work_item_provenance p JOIN work_items w ON w.id = p.work_item_id \
+                 WHERE w.project_id = $1 AND p.merged_at > now() - interval '1 hour'), \
+               (SELECT count(*) FROM work_items WHERE project_id = $1 AND status = 'failed'), \
+               (SELECT left(title, 48) FROM work_items WHERE project_id = $1 AND status = 'building' \
+                 ORDER BY updated_at DESC NULLS LAST LIMIT 1)",
+        )
+        .bind(&project)
+        .fetch_optional(pg)
+        .await
+        .ok()
+        .flatten();
+
+        let Some((building, merged_1h, failed, latest)) = row else {
+            continue;
+        };
+        // Nothing happening + nothing to report → leave a prior summary intact.
+        if building == 0 && merged_1h == 0 && failed == 0 {
+            continue;
+        }
+        let mut summary = format!("{building} building · {merged_1h} merged/1h · {failed} failed");
+        if let Some(t) = latest.filter(|t| !t.trim().is_empty()) {
+            summary.push_str(&format!(" · latest: {t}"));
+        }
+        summary.push_str(" (auto)");
+
+        let n = sqlx::query(
+            "UPDATE ff_workstreams SET working_summary = $2, updated_at = now() \
+              WHERE project_key = $1",
+        )
+        .bind(&project)
+        .bind(&summary)
+        .execute(pg)
+        .await?
+        .rows_affected();
+        updated += n;
+    }
+    Ok(updated)
+}
+
 /// Lightweight liveness ping from an attached session — bumps `last_report_at`
 /// WITHOUT touching the shared summary/focus. Called from a session Stop hook so
 /// the workstream knows the client is still alive even between substantive

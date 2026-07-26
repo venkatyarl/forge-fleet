@@ -174,6 +174,14 @@ async fn run_once(pg: &PgPool) -> Result<()> {
     if let Err(err) = crate::workstreams::ensure_all_workstreams(pg).await {
         warn!(error = %err, "workstreams: ensure_all failed");
     }
+    // Auto-derive each UNATTENDED project's working_summary from live work_item
+    // activity, so the session-of-record reflects reality without a session
+    // manually reporting. A live session's own report (last 15 min) always wins.
+    match crate::workstreams::derive_working_summaries(pg).await {
+        Ok(n) if n > 0 => info!(updated = n, "workstreams: auto-derived working summaries"),
+        Ok(_) => {}
+        Err(err) => warn!(error = %err, "workstreams: derive summaries failed"),
+    }
 
     // 1) Start the death-clock: a temporary digest whose tracked task has
     //    completed and that has no expiry yet gets `expires_at = now() +
