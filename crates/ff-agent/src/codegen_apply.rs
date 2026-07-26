@@ -807,6 +807,62 @@ fn strip_one_leading_newline(input: &str) -> &str {
         .unwrap_or(input)
 }
 
+/// Whitespace-tolerant search: find the byte span in `content` whose lines match
+/// `search`'s lines after trimming each line's leading/trailing whitespace and
+/// ignoring fully-blank lines. Returns `(start_byte, len_bytes)` of the matched
+/// span in the ORIGINAL content (so the real bytes are replaced), or None.
+/// Conservative — requires ALL non-blank search lines to match consecutively.
+fn fuzzy_find_block(content: &str, search: &str) -> Option<(usize, usize)> {
+    let needle: Vec<&str> = search
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if needle.is_empty() {
+        return None;
+    }
+    // Byte offset of the start of each content line.
+    let mut line_starts: Vec<usize> = vec![0];
+    for (i, b) in content.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    // Slide over content lines; at each start, match needle skipping blank
+    // content lines too.
+    for start in 0..lines.len() {
+        let mut ci = start; // content line index
+        let mut ni = 0; // needle index
+        let mut last_matched = start;
+        while ni < needle.len() && ci < lines.len() {
+            let cl = lines[ci].trim();
+            if cl.is_empty() {
+                ci += 1;
+                continue; // skip blank content lines
+            }
+            if cl == needle[ni] {
+                last_matched = ci;
+                ci += 1;
+                ni += 1;
+            } else {
+                break;
+            }
+        }
+        if ni == needle.len() {
+            let start_byte = line_starts[start];
+            // End byte = end of the last matched line (include its trailing \n if present).
+            let end_byte = if last_matched + 1 < line_starts.len() {
+                line_starts[last_matched + 1]
+            } else {
+                content.len()
+            };
+            return Some((start_byte, end_byte - start_byte));
+        }
+    }
+    None
+}
+
 fn apply_edits(repo_path: &Path, edits: &[Edit]) -> Result<Vec<FileSnapshot>> {
     let mut snapshots = Vec::new();
     let mut snapshotted = HashSet::new();
@@ -843,13 +899,28 @@ fn apply_one_edit(
     }
 
     let content = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let Some(pos) = content.find(&edit.search) else {
-        return Err(anyhow!("SEARCH block not found in {}", edit.path));
+    // Exact match first; if that fails, a WHITESPACE-TOLERANT match (operator
+    // 2026-07-26). Local coders (devstral) and cloud CLIs frequently emit SEARCH
+    // blocks that differ only in leading/trailing whitespace or blank lines —
+    // an exact `content.find` then fails with "SEARCH block not found", the whole
+    // build produces no diff, and the item churns 4 rounds × many attempts (the
+    // #1 completion-rate killer). The fuzzy fallback matches the search block's
+    // non-whitespace content line-by-line and replaces the real byte span, so a
+    // trivially-misindented edit lands instead of failing the build.
+    let (pos, matched_len) = match content.find(&edit.search) {
+        Some(pos) => (pos, edit.search.len()),
+        None => match fuzzy_find_block(&content, &edit.search) {
+            Some((pos, len)) => {
+                info!(path = %edit.path, "codegen: SEARCH matched via whitespace-tolerant fallback");
+                (pos, len)
+            }
+            None => return Err(anyhow!("SEARCH block not found in {}", edit.path)),
+        },
     };
-    let mut updated = String::with_capacity(content.len() - edit.search.len() + edit.replace.len());
+    let mut updated = String::with_capacity(content.len() - matched_len + edit.replace.len());
     updated.push_str(&content[..pos]);
     updated.push_str(&edit.replace);
-    updated.push_str(&content[pos + edit.search.len()..]);
+    updated.push_str(&content[pos + matched_len..]);
     fs::write(&path, updated).with_context(|| format!("write {}", path.display()))?;
 
     Ok(())
