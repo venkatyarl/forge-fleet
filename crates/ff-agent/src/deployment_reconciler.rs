@@ -390,18 +390,38 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
                         }
                         row_for_respawn.library_id = Some(lib_id);
                         summary.recovered += 1;
-                    } else {
-                        // Truly un-respawnable: no library_id and no catalog match.
-                        // Reap it (a phantom 'unhealthy' row would otherwise sit in
-                        // the router's candidate set forever), but at WARN with full
-                        // context — a vanished agent endpoint must never disappear
-                        // silently. Operator must `ff model load` to restore it.
+                    } else if row.catalog_id.as_deref().is_some_and(|c| !c.is_empty()) {
+                        // Has a catalog_id but no library match RIGHT NOW. This is
+                        // almost always TRANSIENT: right after a `forgefleetd`
+                        // restart (every deploy triggers one) the library scanner
+                        // hasn't re-registered this node's models yet, so the
+                        // lookup misses for a tick or two. DELETING the row here was
+                        // the real cause of the glm instability — a deploy restart
+                        // killed the glm process, the next tick found the row dead +
+                        // library-not-yet-scanned, and PERMANENTLY reaped the active
+                        // glm deployment, so glm silently vanished until re-seeded by
+                        // hand (observed fleet-wide 2026-07-26). KEEP the row and
+                        // retry next tick — once the scan lands, recover_library_id
+                        // succeeds and it respawns. Never destroy an operator-desired
+                        // (desired_state='active') endpoint for a transient miss.
                         tracing::warn!(
                             port = row.port,
                             deployment = %row.id,
                             catalog_id = ?row.catalog_id,
-                            "reaping dead active deployment — no library_id and no catalog match; \
-                             agent endpoint permanently removed (restore with `ff model load <library_id>`)"
+                            "dead active deployment with catalog_id but no library match yet — \
+                             KEEPING (library scan likely pending post-restart); will retry next tick"
+                        );
+                        continue;
+                    } else {
+                        // Truly orphaned: no library_id AND no catalog_id — nothing
+                        // to ever respawn from. Reap it (a phantom 'unhealthy' row
+                        // would otherwise sit in the router's candidate set forever),
+                        // but at WARN with full context.
+                        tracing::warn!(
+                            port = row.port,
+                            deployment = %row.id,
+                            "reaping dead active deployment — no library_id AND no catalog_id; \
+                             nothing to respawn from (restore with `ff model load <library_id>`)"
                         );
                         if let Err(e) = ff_db::pg_delete_deployment(pool, &row.id).await {
                             tracing::warn!("delete un-respawnable deployment {}: {e}", row.id);
