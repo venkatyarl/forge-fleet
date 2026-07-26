@@ -429,6 +429,30 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
         }
     }
 
+    // ── Pass C — reap ORPHAN systemd units ─────────────────────────────────
+    // A `llama-<port>.service` unit file whose port has NO active deployment row
+    // is a leftover from a retired model. Its `Restart=` directive keeps
+    // respawning that old model, which competes for memory with the model this
+    // node SHOULD run — the root cause of the glm "flapping" (a killed glm's
+    // memory got eaten by a stale devstral/qwen unit respawning, so glm never
+    // stayed healthy). DB rows + live processes are handled above; the unit FILE
+    // is the durable respawner that neither touches. Canonical ports with an
+    // active row are left alone (that's the model we want running).
+    #[cfg(target_os = "linux")]
+    {
+        let active_ports: std::collections::HashSet<i32> = db_rows
+            .iter()
+            .filter(|r| r.desired_state == "active")
+            .map(|r| r.port)
+            .collect();
+        for port in crate::model_runtime::list_llama_unit_ports() {
+            if !active_ports.contains(&(port as i32)) {
+                crate::model_runtime::reap_orphan_llama_unit(port).await;
+                summary.port_violations += 1;
+            }
+        }
+    }
+
     Ok(summary)
 }
 

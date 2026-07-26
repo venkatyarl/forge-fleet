@@ -1722,6 +1722,56 @@ pub(crate) async fn stop_systemd_unit(port: u16) {
     }
 }
 
+/// List the ports of all `llama-<port>.service` systemd user unit FILES on this
+/// host (whether running or not). Reads `~/.config/systemd/user/` directly — a
+/// unit file persists across reboots and keeps `Restart`-respawning its model
+/// even after the DB deployment row is gone. Returns the parsed ports.
+#[cfg(target_os = "linux")]
+pub(crate) fn list_llama_unit_ports() -> Vec<u16> {
+    let Ok(home) = std::env::var("HOME") else {
+        return Vec::new();
+    };
+    let dir = std::path::PathBuf::from(home).join(".config/systemd/user");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut ports = Vec::new();
+    for e in entries.flatten() {
+        if let Some(name) = e.file_name().to_str()
+            && let Some(rest) = name.strip_prefix("llama-")
+            && let Some(port_str) = rest.strip_suffix(".service")
+            && let Ok(port) = port_str.parse::<u16>()
+        {
+            ports.push(port);
+        }
+    }
+    ports
+}
+
+/// Reap an ORPHAN `llama-<port>.service`: stop+disable the unit AND delete its
+/// unit file, so a retired model's systemd unit can't keep `Restart`-respawning
+/// it and competing for memory with the model that SHOULD be on this node. This
+/// is the durable fix for the DGX/GMKtec glm "flapping": nodes accumulated stale
+/// llama-*.service units (devstral/qwen/deepseek on old ports) that respawned
+/// their models the instant the reconciler killed the process — starving glm of
+/// memory so it never stayed healthy (root-caused 2026-07-26: lily had 7 such
+/// units, duncan 5, shakira a live devstral unit on 55000).
+#[cfg(target_os = "linux")]
+pub(crate) async fn reap_orphan_llama_unit(port: u16) {
+    stop_systemd_unit(port).await; // stop + disable (existing helper)
+    if let Ok(home) = std::env::var("HOME") {
+        let path = std::path::PathBuf::from(home)
+            .join(".config/systemd/user")
+            .join(format!("llama-{port}.service"));
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+    let _ = tokio::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .output()
+        .await;
+    tracing::warn!(port, "reconciler: reaped ORPHAN llama systemd unit (no active deployment on this port)");
+}
+
 /// Start (restart) the `llama-<port>.service` systemd user unit and return its
 /// `MainPID`. Used on Linux so the inference server is owned by systemd
 /// (persistent `user.slice` cgroup) instead of a manual setsid child that
