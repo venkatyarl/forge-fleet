@@ -29,7 +29,7 @@ use crate::{
     registry::BackendRegistry,
     router::{ModelRouter, TierRouter},
     routes::{
-        memory, slm,
+        memory, models, slm,
         work_queue::{self, WorkQueue},
     },
     types::{
@@ -47,6 +47,7 @@ pub struct AppState {
     pub request_metrics: Arc<RequestMetrics>,
     pub work_queue: Arc<WorkQueue>,
     pub memory_store: Option<Arc<MemoryStore>>,
+    pub db_pool: Option<sqlx::PgPool>,
     api_keys: Arc<ApiKeyStore>,
 }
 
@@ -80,6 +81,7 @@ impl AppState {
             request_metrics: Arc::new(RequestMetrics::default()),
             work_queue: Arc::new(WorkQueue::new()),
             memory_store: None,
+            db_pool: None,
             api_keys: Arc::new(api_key_store),
         })
     }
@@ -87,6 +89,12 @@ impl AppState {
     /// Attach a memory store, enabling the `/memory/*` routes.
     pub fn with_memory_store(mut self, store: Arc<MemoryStore>) -> Self {
         self.memory_store = Some(store);
+        self
+    }
+
+    /// Attach the canonical ForgeFleet database, enabling database-backed routes.
+    pub fn with_db_pool(mut self, pool: sqlx::PgPool) -> Self {
+        self.db_pool = Some(pool);
         self
     }
 }
@@ -121,6 +129,7 @@ pub fn build_http_router(state: Arc<AppState>, allowed_origins: &[String]) -> Ro
         .route("/memory/user_model", get(memory::user_model))
         .route("/slm/status", get(slm::status))
         .route("/v1/models", get(list_models))
+        .route("/v1/models/available", get(models::available))
         .route("/v1/work-queue/items", get(work_queue::list_work_items))
         .route(
             "/v1/work-queue/items/next",
