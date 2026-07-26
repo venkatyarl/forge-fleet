@@ -252,7 +252,7 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
     // SPAWN each dispatch so a multi-minute build doesn't BLOCK this tick — the
     // handler awaits evaluate_work_item_dispatch, so a serial `.await` per item
     // froze the whole dispatch loop for the FIRST build's duration while every
-    // OTHER assigned lease on this host stale-reaped at LEASE_STALE_SECS (#72:
+    // OTHER assigned lease on this host stale-reaped at the stale-heartbeat window (#72:
     // duncan got 3 leases, ran 1, the other 2 reaped). Each spawned dispatch
     // claims 'building' first (see dispatch_one), so the next tick's
     // assigned_work_items excludes in-flight items → no double-dispatch; the
@@ -2456,7 +2456,7 @@ fn use_local_lane(
 }
 
 /// Hard ceiling on the Lane-1 LOCAL codegen harness — kept STRICTLY BELOW the
-/// lease heartbeat-staleness window (`LEASE_STALE_SECS`) so a slow/hung local
+/// minimum lease heartbeat-staleness window (`MIN_LEASE_STALE_SECS`) so a slow/hung local
 /// lane always fails over to the cloud backstop BEFORE the scheduler's
 /// stale-lease reaper can reclaim the lease.
 ///
@@ -2464,20 +2464,20 @@ fn use_local_lane(
 /// codegen takes MINUTES per round and often emits invalid SEARCH/REPLACE blocks
 /// ("SEARCH block not found"). With the old 7-min ceiling, a run that starved the
 /// dispatch's own heartbeat (the local model blocking the runtime) was reaped at
-/// `LEASE_STALE_SECS` (180s) and KILLED mid-flight — so the `lane1_failed` breaker
+/// the stale heartbeat window and KILLED mid-flight — so the `lane1_failed` breaker
 /// signal below never recorded, the local-codegen breaker never opened to skip the
 /// wasteful lane, and the task re-queued and starved again (→ "3 stalled attempts"
 /// → failed). A sub-stale ceiling makes the local lane lose the race to the cloud
 /// backstop (codex, ~8s here), not to the reaper: it self-aborts, records the
 /// breaker failure, and codex lands the change within the same lease.
 const LANE1_TIMEOUT_SECS: u64 =
-    crate::work_item_scheduler::LEASE_STALE_SECS as u64 - LANE1_STALE_MARGIN_SECS;
+    crate::work_item_scheduler::MIN_LEASE_STALE_SECS as u64 - LANE1_STALE_MARGIN_SECS;
 /// Margin kept between the Lane-1 ceiling and the lease-staleness window so the
 /// `tokio::time::timeout` fires + cleanup + breaker-record all complete before the
 /// reaper's next tick.
 const LANE1_STALE_MARGIN_SECS: u64 = 30;
 // Compile-time invariant: Lane-1 must self-abort strictly before the reaper.
-const _: () = assert!(LANE1_TIMEOUT_SECS < crate::work_item_scheduler::LEASE_STALE_SECS as u64);
+const _: () = assert!(LANE1_TIMEOUT_SECS < crate::work_item_scheduler::MIN_LEASE_STALE_SECS as u64);
 
 const LANE15_480B_MODEL_HINT: &str = "local:qwen3-coder-480b";
 const LANE15_480B_PROVIDER: &str = "local_480b";
@@ -5646,17 +5646,17 @@ mod tests {
     }
 
     #[test]
-    fn lane1_timeout_is_strictly_below_the_lease_stale_window() {
+    fn lane1_timeout_is_strictly_below_the_lease_stale_window_floor() {
         // The Lane-1 local codegen MUST self-abort + fail over to the cloud
         // backstop before the stale-lease reaper can kill the lease mid-flight
         // (else the local-codegen breaker never learns and the task thrashes —
         // the beyonce/DGX "3 stalled attempts" failure). Guards against a future
         // edit that bumps either constant past the other.
         let lane1 = super::LANE1_TIMEOUT_SECS;
-        let stale = crate::work_item_scheduler::LEASE_STALE_SECS as u64;
+        let stale = crate::work_item_scheduler::MIN_LEASE_STALE_SECS as u64;
         assert!(
             lane1 < stale,
-            "LANE1_TIMEOUT_SECS ({lane1}) must be < LEASE_STALE_SECS ({stale})",
+            "LANE1_TIMEOUT_SECS ({lane1}) must be < MIN_LEASE_STALE_SECS ({stale})",
         );
     }
 
