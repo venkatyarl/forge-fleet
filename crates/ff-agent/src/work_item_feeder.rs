@@ -77,7 +77,10 @@ async fn feed_once(pg: &PgPool) -> Result<()> {
                 info!(work_item_id = %id, "work item feeder promoted task");
             }
         }
-        "bug" | "feature" => decompose(id).await?,
+        // epics decompose exactly like bugs/features — a parent goal broken into
+        // buildable leaf tasks (operator 2026-07-26: epics were being SKIPPED,
+        // starving the fleet of the priority work).
+        "bug" | "feature" | "epic" => decompose(id).await?,
         other => {
             warn!(work_item_id = %id, kind = other, "work item feeder skipped unsupported kind")
         }
