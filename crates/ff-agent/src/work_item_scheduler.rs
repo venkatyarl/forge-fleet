@@ -66,6 +66,18 @@ const DISPATCH_TICK_STALE_SECS: i64 = 60;
 const FAILED_RETRY_COOLDOWN_MINUTES: i64 = 20;
 const MAX_FAILED_RETRIES: i32 = 3;
 
+const LEASE_STALE_SAMPLE_SQL: &str = r#"
+SELECT COUNT(*)::bigint AS sample_count,
+       percentile_cont(0.99) WITHIN GROUP (
+           ORDER BY EXTRACT(EPOCH FROM (released_at - created_at))
+       ) AS p99_secs
+  FROM work_item_leases
+ WHERE release_reason = 'ready for review'
+   AND released_at > created_at
+   AND released_at <= NOW()
+   AND released_at >= NOW() - make_interval(days => $1)
+"#;
+
 const AUTO_REQUEUE_FAILED_SQL: &str = r#"
 WITH eligible AS (
     SELECT w.id
@@ -112,19 +124,10 @@ fn lease_stale_secs_from_success_p99(sample_count: i64, p99_secs: Option<f64>) -
 }
 
 pub(crate) async fn lease_stale_secs(pg: &PgPool) -> i64 {
-    let row = sqlx::query(
-        "SELECT COUNT(*)::bigint AS sample_count,
-                percentile_cont(0.99) WITHIN GROUP (
-                    ORDER BY EXTRACT(EPOCH FROM (released_at - created_at))
-                ) AS p99_secs
-           FROM work_item_leases
-          WHERE released_at IS NOT NULL
-            AND created_at >= NOW() - make_interval(days => $1)
-            AND release_reason = 'ready for review'",
-    )
-    .bind(LEASE_STALE_SAMPLE_DAYS as i32)
-    .fetch_one(pg)
-    .await;
+    let row = sqlx::query(LEASE_STALE_SAMPLE_SQL)
+        .bind(LEASE_STALE_SAMPLE_DAYS as i32)
+        .fetch_one(pg)
+        .await;
 
     match row {
         Ok(row) => {
@@ -801,6 +804,14 @@ mod tests {
             lease_stale_secs_from_success_p99(LEASE_STALE_MIN_SAMPLES, Some(10_000.0)),
             MAX_LEASE_STALE_SECS
         );
+    }
+
+    #[test]
+    fn lease_stale_samples_are_valid_recent_successful_completions() {
+        assert!(LEASE_STALE_SAMPLE_SQL.contains("release_reason = 'ready for review'"));
+        assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at > created_at"));
+        assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at <= NOW()"));
+        assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at >= NOW() - make_interval"));
     }
 
     /// Capacity splits evenly (ceil-divided) across every distinct project so a
