@@ -12263,6 +12263,67 @@ ALTER TABLE projects
     ADD COLUMN IF NOT EXISTS logo_url TEXT;
 "#;
 
+/// First-class capability store. Skills are copied, not moved, so existing
+/// consumers remain compatible while capability-aware consumers gain one
+/// stable, extensible registry.
+pub const SCHEMA_V275_FF_CAPABILITIES: &str = r#"
+CREATE TABLE IF NOT EXISTS ff_capabilities (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    kind        TEXT NOT NULL,
+    source      TEXT NOT NULL,
+    source_id   UUID NOT NULL,
+    name        TEXT NOT NULL,
+    version     TEXT NOT NULL,
+    description TEXT,
+    status      TEXT NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('active', 'disabled', 'retired')),
+    spec        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (kind, source, source_id)
+);
+
+CREATE INDEX IF NOT EXISTS ff_capabilities_kind_status_idx
+    ON ff_capabilities (kind, status);
+CREATE INDEX IF NOT EXISTS ff_capabilities_name_idx
+    ON ff_capabilities (name);
+
+INSERT INTO ff_capabilities
+    (kind, source, source_id, name, version, description, status, spec,
+     created_at, updated_at)
+SELECT
+    'skill',
+    source,
+    id,
+    name,
+    version,
+    description,
+    CASE WHEN superseded_by IS NULL THEN 'active' ELSE 'retired' END,
+    jsonb_build_object(
+        'source_url', source_url,
+        'family', family,
+        'when_to_invoke', when_to_invoke,
+        'tools', tools,
+        'body_md', body_md,
+        'body_sha256', body_sha256,
+        'risk_level', risk_level,
+        'security_scan', security_scan,
+        'canonical_skill_id', canonical_skill_id,
+        'superseded_by', superseded_by,
+        'combines', combines
+    ),
+    installed_at,
+    updated_at
+FROM skills
+ON CONFLICT (kind, source, source_id) DO UPDATE SET
+    name = EXCLUDED.name,
+    version = EXCLUDED.version,
+    description = EXCLUDED.description,
+    status = EXCLUDED.status,
+    spec = EXCLUDED.spec,
+    updated_at = EXCLUDED.updated_at;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
