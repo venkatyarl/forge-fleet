@@ -3230,6 +3230,15 @@ pub enum ProjectCommand {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Detect a source directory's tech stack and record it on project_repos.
+    Scan {
+        /// Source directory to scan. Defaults to cwd.
+        #[arg(default_value = ".")]
+        path: String,
+        /// Project id whose matching Git origin should be updated.
+        #[arg(long)]
+        project: String,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
