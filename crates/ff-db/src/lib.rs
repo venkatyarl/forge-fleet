@@ -27,7 +27,7 @@ pub use leader_state::*;
 
 pub use metrics_partitions::{pg_drop_expired_metrics_partitions, pg_ensure_metrics_partitions};
 pub use migrations::run_postgres_migrations;
-pub use models::WorkItem;
+pub use models::{Project, WorkItem};
 pub use operational_store::OperationalStore;
 pub use queries::{
     AgentReadinessRow,
