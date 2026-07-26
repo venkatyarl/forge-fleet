@@ -240,6 +240,22 @@ pub async fn report(
     Ok(ws)
 }
 
+/// Lightweight liveness ping from an attached session — bumps `last_report_at`
+/// WITHOUT touching the shared summary/focus. Called from a session Stop hook so
+/// the workstream knows the client is still alive even between substantive
+/// `report` calls. Silent no-op if the session isn't attached (the SessionStart
+/// hook attaches; a Stop firing before attach shouldn't error).
+pub async fn heartbeat(pg: &PgPool, session_id: &str) -> Result<bool> {
+    let n = sqlx::query(
+        "UPDATE workstream_clients SET last_report_at = now() WHERE session_id = $1",
+    )
+    .bind(session_id)
+    .execute(pg)
+    .await?
+    .rows_affected();
+    Ok(n > 0)
+}
+
 /// An attached client, for status display.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AttachedClient {
