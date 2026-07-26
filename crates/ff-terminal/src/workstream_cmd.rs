@@ -169,15 +169,68 @@ fn install_workstream_hooks(which: &str, dry_run: bool) -> Result<()> {
     };
     for tool in targets {
         match tool {
+            // Claude Code has deterministic SessionStart/Stop lifecycle hooks.
             "claude" => install_claude_hooks(&home, dry_run)?,
-            // codex/kimi hook formats differ; wire claude first (this session),
-            // extend to the others once their hook schema is confirmed.
-            "codex" | "kimi" => {
-                println!("  ⏭  {tool}: hook install not yet implemented (claude first)");
-            }
+            // Codex + Kimi hooks are TOOL-CALL/command lifecycle (fire around
+            // tool use), NOT session-start — so there's no clean "on session
+            // start" hook like Claude's. The cross-CLI mechanism that works today
+            // is their AGENTS.md global-instructions file (both read it): a
+            // directive telling the agent to attach on start + report as it works.
+            // Instruction-based (relies on model compliance) rather than a
+            // deterministic hook — honest tradeoff until an MCP-side auto-attach
+            // (CLI-agnostic, deterministic) is built.
+            "codex" => install_agents_md_directive(&home.join(".codex").join("AGENTS.md"), "codex", dry_run)?,
+            "kimi" => install_agents_md_directive(&home.join(".kimi").join("AGENTS.md"), "kimi", dry_run)?,
             other => println!("  ⚠ unknown tool '{other}' — skipping"),
         }
     }
+    Ok(())
+}
+
+/// Append (idempotently) a ForgeFleet-workstream directive to a CLI's AGENTS.md
+/// global-instructions file. Both codex and kimi read AGENTS.md; the directive
+/// tells the agent to attach to its project workstream at session start and
+/// report as it works. Delimited by markers so re-running replaces (not
+/// duplicates) the block and never touches the operator's own instructions.
+fn install_agents_md_directive(path: &std::path::Path, tool: &str, dry_run: bool) -> Result<()> {
+    const BEGIN: &str = "<!-- ff-workstream:begin -->";
+    const END: &str = "<!-- ff-workstream:end -->";
+    let block = format!(
+        "{BEGIN}\n\
+         ## ForgeFleet workstream (session-of-record)\n\
+         At the START of every session, run:\n\
+         `ff workstream attach --tool {tool} --goal \"<what you're here to do>\"`\n\
+         — this binds your session to the project's shared workstream (ff owns the\n\
+         session across claude/codex/kimi). As you work, report progress with\n\
+         `ff workstream report --tool {tool} --summary \"…\" --note \"…\"` so the\n\
+         record reflects reality. Check `ff workstream status` to resume after a\n\
+         crash. Do this WITHOUT being asked — it's standing policy.\n\
+         {END}"
+    );
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    // Strip any prior ff block, then append the fresh one.
+    let cleaned = match (existing.find(BEGIN), existing.find(END)) {
+        (Some(b), Some(e)) if e > b => {
+            let mut s = existing.clone();
+            s.replace_range(b..e + END.len(), "");
+            s.trim_end().to_string()
+        }
+        _ => existing.trim_end().to_string(),
+    };
+    let joined = if cleaned.is_empty() {
+        block
+    } else {
+        format!("{cleaned}\n\n{block}")
+    };
+    if dry_run {
+        println!("  [dry-run] would append ff-workstream directive to {}", path.display());
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(path, format!("{joined}\n")).with_context(|| format!("write {}", path.display()))?;
+    println!("  ✓ {tool}: workstream directive → {} (instruction-based)", path.display());
     Ok(())
 }
 
