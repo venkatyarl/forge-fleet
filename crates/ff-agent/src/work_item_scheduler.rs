@@ -69,11 +69,12 @@ const MAX_FAILED_RETRIES: i32 = 3;
 const LEASE_STALE_SAMPLE_SQL: &str = r#"
 SELECT COUNT(*)::bigint AS sample_count,
        percentile_cont(0.99) WITHIN GROUP (
-           ORDER BY EXTRACT(EPOCH FROM (released_at - created_at))
+           ORDER BY EXTRACT(EPOCH FROM (released_at - dispatch_tick_at))
        ) AS p99_secs
   FROM work_item_leases
  WHERE release_reason = 'ready for review'
-   AND released_at > created_at
+   AND dispatch_tick_at IS NOT NULL
+   AND released_at > dispatch_tick_at
    AND released_at <= NOW()
    AND released_at >= NOW() - make_interval(days => $1)
 "#;
@@ -779,7 +780,10 @@ mod tests {
 
     #[test]
     fn lease_stale_window_uses_successful_build_p99_with_margin() {
-        assert_eq!(lease_stale_secs_from_success_p99(393, Some(1357.0)), 1697);
+        assert_eq!(
+            lease_stale_secs_from_success_p99(135, Some(517.57952862)),
+            647
+        );
     }
 
     #[test]
@@ -809,7 +813,10 @@ mod tests {
     #[test]
     fn lease_stale_samples_are_valid_recent_successful_completions() {
         assert!(LEASE_STALE_SAMPLE_SQL.contains("release_reason = 'ready for review'"));
-        assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at > created_at"));
+        assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at - dispatch_tick_at"));
+        assert!(LEASE_STALE_SAMPLE_SQL.contains("dispatch_tick_at IS NOT NULL"));
+        assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at > dispatch_tick_at"));
+        assert!(!LEASE_STALE_SAMPLE_SQL.contains("released_at - created_at"));
         assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at <= NOW()"));
         assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at >= NOW() - make_interval"));
     }
