@@ -29,6 +29,9 @@ pub mod status_updater;
 mod integration_tests;
 
 #[cfg(test)]
+mod health;
+
+#[cfg(test)]
 mod self_heal_tests;
 
 /// Gracefully release this computer's active work-item leases before an agent
