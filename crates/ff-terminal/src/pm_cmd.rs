@@ -1100,23 +1100,38 @@ fn quality_gate_decomposition(
             ));
         }
         for file in &task.files {
-            // Every referenced file must ALREADY exist — no exemption for
-            // create-flavored tasks; the planner prompt scopes new code into
-            // existing files instead.
+            // A referenced file must either ALREADY exist, OR be a legitimate NEW
+            // file whose PARENT DIRECTORY exists in the repo (operator 2026-07-25:
+            // ff must be able to build NEW features = new modules, e.g.
+            // `crates/ff-core/src/slots.rs` in the existing `crates/ff-core/src`).
+            // A path whose parent dir does NOT exist is a cross-language / wrong-
+            // structure hallucination (e.g. `mcp/service.py`, `src/usage_pollers/`
+            // in a Rust repo) and is still rejected — this is what kept the
+            // polluted backlog out while unblocking real feature work.
+            let parent_dir_exists = repo_path
+                .map(|rp| {
+                    std::path::Path::new(file)
+                        .parent()
+                        .map(|p| p.as_os_str().is_empty() || rp.join(p).is_dir())
+                        .unwrap_or(true)
+                })
+                .unwrap_or(false);
+
             if let Some(tracked) = &tracked
                 && !tracked.contains(file)
+                && !parent_dir_exists
             {
                 return Err(anyhow::anyhow!(
-                    "decomposition quality gate: '{}' references untracked file '{}'",
+                    "decomposition quality gate: '{}' references '{}' — neither an existing tracked file nor a new file in an existing directory (likely a wrong-structure hallucination)",
                     task.title,
                     file
                 ));
             }
-            // Tracking alone cannot prove existence: `git ls-files` still
-            // lists a file deleted from the working tree, so the path must
-            // also be visible on disk.
+            // Existing-but-vanished (git ls-files still lists a deleted file) is a
+            // hard error; a new file whose parent dir exists is allowed.
             if let Some(repo_path) = repo_path
                 && !find_file_exists(repo_path, file)
+                && !parent_dir_exists
             {
                 return Err(anyhow::anyhow!(
                     "decomposition quality gate: '{}' references file '{}' that does not exist in the repository",
