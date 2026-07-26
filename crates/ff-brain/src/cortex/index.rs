@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ff_core::schema::work_item::{WorkItem, WorkItemStatus};
+use ff_core::schema::work_item::{EisenhowerQuadrant, WorkItem, WorkItemStatus};
 
 use super::md_extractor::extract_candidates;
 use super::work_item_deriver::derive_work_items;
@@ -85,6 +85,8 @@ fn to_schema_work_item(item: super::work_item_deriver::WorkItem) -> WorkItem {
         status: WorkItemStatus::Backlog,
         source_ref: item.source,
         derived_at: item.created_at,
+        priority_score: None,
+        quadrant: EisenhowerQuadrant::Neither,
     }
 }
 
