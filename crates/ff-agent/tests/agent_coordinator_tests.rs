@@ -81,6 +81,10 @@ async fn create_reaper_test_db() -> Option<(PgPool, PgPool, String)> {
              created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
              released_at      TIMESTAMPTZ,
              release_reason   TEXT
+         );
+         CREATE TABLE work_item_worktrees (
+             work_item_id UUID PRIMARY KEY REFERENCES work_items(id),
+             status       TEXT NOT NULL DEFAULT 'active'
          );",
     )
     .execute(&pool)
@@ -136,7 +140,6 @@ async fn reaper_resets_stale_busy_slots_with_stale_heartbeats() {
     .execute(&pool)
     .await
     .expect("insert stale busy slot");
-
     // slot 1: 'busy' but still well within the ceiling — a legitimately
     // running task that must NOT be reaped mid-run.
     let fresh_slot = Uuid::new_v4();
@@ -265,6 +268,11 @@ async fn stale_slot_reaper_requeues_orphaned_work_item() {
     .execute(&pool)
     .await
     .expect("insert stale busy slot");
+    sqlx::query("INSERT INTO work_item_worktrees (work_item_id, status) VALUES ($1, 'active')")
+        .bind(orphaned_item)
+        .execute(&pool)
+        .await
+        .expect("insert orphaned worktree");
 
     // slot 1: busy with a FRESH heartbeat — must not be touched.
     let fresh_slot = Uuid::new_v4();
@@ -321,8 +329,8 @@ async fn stale_slot_reaper_requeues_orphaned_work_item() {
     assert_eq!(reaped[0].sub_agent_id, stale_slot);
     assert_eq!(reaped[0].work_item_id, Some(orphaned_item));
     assert!(
-        reaped[0].requeued,
-        "in-flight orphaned item must be re-queued"
+        !reaped[0].requeued,
+        "item must wait for its owning host to clean the stale worktree"
     );
 
     let slot_row = sqlx::query("SELECT status, current_work_item_id FROM sub_agents WHERE id = $1")
@@ -330,10 +338,14 @@ async fn stale_slot_reaper_requeues_orphaned_work_item() {
         .fetch_one(&pool)
         .await
         .expect("read reaped slot");
-    assert_eq!(slot_row.get::<String, _>("status"), "idle");
+    assert_eq!(
+        slot_row.get::<String, _>("status"),
+        "cleanup_pending",
+        "slot must not be reusable until its worktree is scrubbed"
+    );
     assert_eq!(
         slot_row.get::<Option<Uuid>, _>("current_work_item_id"),
-        None
+        Some(orphaned_item)
     );
 
     let item_row =
@@ -342,9 +354,17 @@ async fn stale_slot_reaper_requeues_orphaned_work_item() {
             .fetch_one(&pool)
             .await
             .expect("read requeued item");
-    assert_eq!(item_row.get::<String, _>("status"), "ready");
-    assert_eq!(item_row.get::<Option<String>, _>("assigned_to"), None);
-    assert_eq!(item_row.get::<Option<String>, _>("assigned_computer"), None);
+    assert_eq!(item_row.get::<String, _>("status"), "building");
+    assert_eq!(
+        item_row.get::<Option<String>, _>("assigned_to").as_deref(),
+        Some("sub-agent-testbox:0")
+    );
+    assert_eq!(
+        item_row
+            .get::<Option<String>, _>("assigned_computer")
+            .as_deref(),
+        Some("testbox")
+    );
 
     let fresh_status: String = sqlx::query("SELECT status FROM sub_agents WHERE id = $1")
         .bind(fresh_slot)

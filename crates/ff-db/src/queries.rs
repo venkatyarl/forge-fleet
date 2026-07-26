@@ -9458,31 +9458,35 @@ pub async fn pg_mark_merge_failed(
     Ok(())
 }
 
-/// A worktree on this host that can be reaped (its work_item is terminal but the
-/// worktree row isn't yet 'cleaned'). Pillar 4 worktree-reaper input.
+/// A worktree on this host that can be reaped because its work item is terminal
+/// or its slot heartbeat went stale. Pillar 4 worktree-reaper input.
 #[derive(Debug, Clone)]
 pub struct ReapableWorktree {
     pub work_item_id: uuid::Uuid,
     pub repo_path: String,
     pub worktree_path: String,
     pub task_branch: String,
+    pub stale_slot: bool,
 }
 
 /// Worktrees on `worker_name`'s host whose work_item reached a terminal state
-/// (cancelled/merged/failed/done) but whose worktree row is not yet 'cleaned'.
+/// (cancelled/merged/failed/done), or whose slot heartbeat went stale, but whose
+/// worktree row is not yet 'cleaned'.
 /// NOTE: excludes 'in_review' items — their PR is still open / awaiting merge.
 pub async fn pg_reapable_worktrees(
     pool: &PgPool,
     worker_name: &str,
 ) -> Result<Vec<ReapableWorktree>> {
     let rows = sqlx::query(
-        "SELECT wt.work_item_id, wt.repo_path, wt.worktree_path, wt.task_branch \
+        "SELECT wt.work_item_id, wt.repo_path, wt.worktree_path, wt.task_branch, \
+                wt.status = 'stale' AS stale_slot \
            FROM work_item_worktrees wt \
            JOIN work_items w ON w.id = wt.work_item_id \
            JOIN computers c ON c.id = wt.computer_id \
           WHERE c.name = $1 \
             AND wt.status <> 'cleaned' \
-            AND w.status IN ('cancelled', 'merged', 'failed', 'done') \
+            AND (w.status IN ('cancelled', 'merged', 'failed', 'done') \
+                 OR wt.status = 'stale') \
           LIMIT 32",
     )
     .bind(worker_name)
@@ -9495,6 +9499,7 @@ pub async fn pg_reapable_worktrees(
             repo_path: r.get("repo_path"),
             worktree_path: r.get("worktree_path"),
             task_branch: r.get("task_branch"),
+            stale_slot: r.get("stale_slot"),
         })
         .collect())
 }
