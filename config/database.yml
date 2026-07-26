@@ -1,0 +1,15 @@
+priya: &priya
+  adapter: postgresql
+  url: <%= ENV.fetch("FORGEFLEET_DATABASE_URL") %>
+  pool: 10
+  connect_timeout: 5
+  checkout_timeout: 5
+
+replica:
+  <<: *priya
+  url: <%= ENV.fetch("SUPABASE_REPLICA_URL") %>
+  pool: 4
+  connect_timeout: 15
+  checkout_timeout: 15
+  variables:
+    default_transaction_read_only: "on"
