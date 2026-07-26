@@ -150,11 +150,19 @@ impl AssignedWorkItem {
 const PREDICTED_PATHS_CLOUD_THRESHOLD: i32 = 3;
 
 /// Pure routing predicate (unit-testable): a task skips the local Lane-1 codegen
-/// harness for the cloud CLI when it's `complex` OR predicted to touch more than
-/// [`PREDICTED_PATHS_CLOUD_THRESHOLD`] files. Mechanical and moderate tasks that
-/// are not multi-file-heavy stay on the cheap local lane.
+/// harness for the cloud CLI when it's `complex`/`moderate` OR predicted to touch
+/// more than [`PREDICTED_PATHS_CLOUD_THRESHOLD`] files. Only truly `mechanical`
+/// single/double-file edits stay local-first.
+///
+/// `moderate` added 2026-07-26: with cloud (codex gpt-5.6 / kimi K3) authenticated
+/// fleet-wide, moderate tasks that took ~12min on local devstral (and often
+/// re-attempted) build far faster on cloud. Local stays the default for
+/// mechanical work (plentiful, cheap, fast enough); moderate/complex go cloud-
+/// first to lift the completion RATE toward draining the backlog. The local lane
+/// is still the fallback when cloud is unavailable (cloud_exhausted forces it on).
 fn task_prefers_cloud_lane(complexity: &str, predicted_paths_count: i32) -> bool {
-    matches!(complexity, "complex") || predicted_paths_count > PREDICTED_PATHS_CLOUD_THRESHOLD
+    matches!(complexity, "complex" | "moderate")
+        || predicted_paths_count > PREDICTED_PATHS_CLOUD_THRESHOLD
 }
 
 #[derive(Debug, Clone)]
@@ -5824,9 +5832,10 @@ mod tests {
         // Mechanical single-file → cheap local lane.
         assert!(!task_prefers_cloud_lane("mechanical", 1));
         assert!(!task_prefers_cloud_lane("mechanical", 0));
-        // Moderate tasks that are not multi-file-heavy try local first.
-        assert!(!task_prefers_cloud_lane("moderate", 1));
-        assert!(!task_prefers_cloud_lane("moderate", 3));
+        // Moderate tasks now go cloud-first (2026-07-26): with cloud authed
+        // fleet-wide they build far faster there than ~12min on local devstral.
+        assert!(task_prefers_cloud_lane("moderate", 1));
+        assert!(task_prefers_cloud_lane("moderate", 3));
         // Complex tasks bypass the local lane regardless of file count.
         assert!(task_prefers_cloud_lane("complex", 0));
         // Multi-file-heavy tasks (above the threshold) go cloud even if mechanical.
