@@ -1220,6 +1220,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "project_digest_fields",
         sql: schema::SCHEMA_V274_PROJECT_DIGEST_FIELDS,
     },
+    PgMigration {
+        version: 275,
+        name: "ff_capabilities",
+        sql: schema::SCHEMA_V275_FF_CAPABILITIES,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1480,6 +1485,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn v275_defines_capability_store_and_skill_backfill() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 275)
+            .expect("V275 must be registered");
+        assert_eq!(migration.name, "ff_capabilities");
+        assert!(
+            migration
+                .sql
+                .contains("CREATE TABLE IF NOT EXISTS ff_capabilities")
+        );
+        assert!(migration.sql.contains("FROM skills"));
+        assert!(
+            migration
+                .sql
+                .contains("ON CONFLICT (kind, source, source_id) DO UPDATE")
+        );
+    }
+
     fn db_url() -> Option<String> {
         env::var("FORGEFLEET_POSTGRES_URL")
             .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
@@ -1606,6 +1631,52 @@ mod tests {
                 ("kimi".to_string(), "sarah".to_string()),
             ]
         );
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v275_backfills_skills_idempotently() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on fresh DB");
+
+        let skill_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO skills
+                (id, name, source, version, description, tools, body_md, body_sha256)
+             VALUES ($1, 'v275-test', 'test', '1.0.0', 'test skill',
+                     '[\"shell\"]', '# test', 'test-sha')",
+        )
+        .bind(skill_id)
+        .execute(&pool)
+        .await
+        .expect("insert test skill");
+
+        for _ in 0..2 {
+            sqlx::query(schema::SCHEMA_V275_FF_CAPABILITIES)
+                .execute(&pool)
+                .await
+                .expect("capability backfill is rerunnable");
+        }
+
+        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT status, spec
+               FROM ff_capabilities
+              WHERE kind = 'skill' AND source = 'test' AND source_id = $1",
+        )
+        .bind(skill_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read backfilled capability");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "active");
+        assert_eq!(rows[0].1["body_md"], "# test");
+        assert_eq!(rows[0].1["tools"], serde_json::json!(["shell"]));
 
         drop_temp_db(admin, pool, &db_name).await;
     }
