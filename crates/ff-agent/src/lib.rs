@@ -121,6 +121,7 @@ pub mod multi_agent;
 pub mod nats_client;
 pub mod nats_jetstream;
 pub mod nats_log_layer;
+pub mod node_health_sampler;
 pub mod notifications;
 pub mod oauth_distributor;
 pub mod openai_bridge;

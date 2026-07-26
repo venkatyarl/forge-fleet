@@ -88,6 +88,12 @@ impl TickRegistry {
                 runner: run_service_connectivity_tick,
             },
             TickDefinition {
+                name: "node_health_sampler",
+                interval: crate::node_health_sampler::DEFAULT_INTERVAL,
+                scope: TickScope::EveryNode,
+                runner: run_node_health_sampler_tick,
+            },
+            TickDefinition {
                 name: "session_transcript_export",
                 interval: Duration::from_secs(300),
                 scope: TickScope::EveryNode,
@@ -288,6 +294,18 @@ fn run_service_connectivity_tick(
         .await
         .map(|_| ())
         .map_err(anyhow::Error::from)
+    })
+}
+
+fn run_node_health_sampler_tick(
+    pg: PgPool,
+    _worker_name: String,
+) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::node_health_sampler::sample_local_node_health(&pg)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("node_health_sampler tick failed: {e}"))
     })
 }
 

@@ -2779,6 +2779,51 @@ pub async fn pg_insert_disk_usage(
     Ok(())
 }
 
+/// Insert one node-health snapshot written by the local orchestrator tick.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_insert_node_health(
+    pool: &PgPool,
+    worker_name: &str,
+    mem_total_kb: i64,
+    mem_available_kb: i64,
+    mem_available_gb: f64,
+    swap_total_kb: i64,
+    swap_free_kb: i64,
+    load_avg_1m: Option<f64>,
+    load_avg_5m: Option<f64>,
+    load_avg_15m: Option<f64>,
+    service_rss_json: &JsonValue,
+    oom_kills_json: &JsonValue,
+    dmesg_cursor: Option<&str>,
+    pressure_state: &str,
+    build_reserve_gb: f64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO node_health
+             (worker_name, mem_total_kb, mem_available_kb, mem_available_gb,
+              swap_total_kb, swap_free_kb, load_avg_1m, load_avg_5m, load_avg_15m,
+              service_rss_json, oom_kills_json, dmesg_cursor, pressure_state, build_reserve_gb)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+    )
+    .bind(worker_name)
+    .bind(mem_total_kb)
+    .bind(mem_available_kb)
+    .bind(mem_available_gb)
+    .bind(swap_total_kb)
+    .bind(swap_free_kb)
+    .bind(load_avg_1m)
+    .bind(load_avg_5m)
+    .bind(load_avg_15m)
+    .bind(service_rss_json)
+    .bind(oom_kills_json)
+    .bind(dmesg_cursor)
+    .bind(pressure_state)
+    .bind(build_reserve_gb)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // ─── V118: disk-management resource + observability helpers ─────────────────
 
 /// Latest free/total bytes for ONE node from `fleet_disk_usage`, plus how stale
