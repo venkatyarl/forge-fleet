@@ -533,6 +533,13 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         .try_clone()
         .map_err(|e| format!("clone log handle: {e}"))?;
 
+    // IDEMPOTENT-SPAWN GUARD: reap any inference server already on this port
+    // (listening OR still loading) before we launch. Without this, a reconcile
+    // tick / second load firing during a big model's multi-minute load window
+    // stacks a second server loading the SAME model → dual mmap storm → neither
+    // finishes → 503 forever and the node can wedge (the DGX-Spark glm flap).
+    let _ = reap_stale_launchers_on_port(port).await;
+
     let mut cmd = std::process::Command::new(&program);
     cmd.args(&args)
         .stdout(log_file)
@@ -1546,6 +1553,44 @@ async fn pids_listening_on_port(port: u16) -> Vec<u32> {
     }
 
     pids
+}
+
+/// Reap any inference server (llama.cpp / mlx / vllm) already carrying
+/// `--port <port>` in its argv — whether it's LISTENING or still mmap-loading a
+/// large model and not yet bound. Unlike [`pids_listening_on_port`] (which only
+/// finds bound sockets), this uses [`list_local_processes`] argv parsing, so it
+/// also catches a server that's mid-load. Returns the PIDs it killed.
+///
+/// This is the idempotent-spawn guard: a large model (e.g. glm-4.5-air, ~73 GB,
+/// 2-3 min to load) stays UNHEALTHY for the whole load window, so a reconcile
+/// tick or a second `ff model load` that fires before it binds the port would
+/// stack a SECOND llama-server loading the SAME model. On a unified-memory DGX
+/// two concurrent 73 GB mmap loads storm the disk/page-cache and neither
+/// finishes — the endpoint sticks at 503 and the box can wedge (observed on the
+/// DGX Spark units 2026-07-26). Killing any pre-existing launcher on the port
+/// before we spawn guarantees at most ONE server per port, from any caller.
+/// Signals numeric PIDs only (never `pkill -f`), so it can't self-kill.
+async fn reap_stale_launchers_on_port(port: u16) -> Vec<u32> {
+    let procs = list_local_processes().await;
+    let mut killed = Vec::new();
+    for p in procs {
+        if p.port == Some(port) && pid_is_alive(p.pid) {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &p.pid.to_string()])
+                .output();
+            killed.push(p.pid);
+        }
+    }
+    if !killed.is_empty() {
+        tracing::warn!(
+            port,
+            pids = ?killed,
+            "idempotent-spawn guard: reaped pre-existing inference server(s) on this port before relaunch"
+        );
+        // Give the kernel a moment to release the mmap + port before we bind.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    }
+    killed
 }
 
 /// Stop whatever is actually LISTENING on `port`: resolve the live PID(s) via
