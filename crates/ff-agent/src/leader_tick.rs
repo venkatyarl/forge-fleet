@@ -643,6 +643,21 @@ impl LeaderTick {
                     if refreshed {
                         // Keep our in-memory epoch aligned with the row.
                         self.observe_epoch(cur.epoch);
+                        // Keep `fleet_workers.role` in sync with the LIVE leader.
+                        // `ff fleet deploy` reads role='leader' to EXCLUDE the
+                        // leader from --all; a stale/missing role let it treat the
+                        // live leader as a deploy target and abort mid-handoff
+                        // (the 2026-07-25 convergence failure). Best-effort — never
+                        // blocks the tick.
+                        let _ = sqlx::query(
+                            "UPDATE fleet_workers SET role = CASE \
+                                WHEN name = $1 THEN 'leader' \
+                                WHEN role = 'leader' THEN 'worker' ELSE role END \
+                              WHERE name = $1 OR role = 'leader'",
+                        )
+                        .bind(&self.my_name)
+                        .execute(&self.pg)
+                        .await;
                         self.update_leader_cache(true, LeaderInfo::from(&cur)).await;
                         Ok(TickOutcome::StillLeader)
                     } else {
