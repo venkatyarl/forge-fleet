@@ -35,6 +35,8 @@ pub struct FleetOneshot {
     /// Base endpoint that served the call (e.g. `http://192.168.5.103:55000`).
     pub endpoint: String,
     pub worker_name: String,
+    /// Stable fleet catalog id that served the call (e.g. `glm-4.5-air`).
+    pub catalog_id: Option<String>,
     /// The catalog model name that answered (best-effort).
     pub model: String,
     pub latency_ms: u128,
@@ -253,6 +255,7 @@ async fn dispatch_to_candidate(
 ) -> anyhow::Result<FleetOneshot> {
     let worker_name = cand.worker_name.clone();
     let endpoint = cand.endpoint.clone();
+    let catalog_id = cand.catalog_id.clone();
     let model = cand
         .catalog_name
         .clone()
@@ -292,6 +295,7 @@ async fn dispatch_to_candidate(
         text,
         endpoint: endpoint.clone(),
         worker_name: worker_name.clone(),
+        catalog_id,
         model: model.clone(),
         latency_ms: start.elapsed().as_millis(),
         tokens_in,

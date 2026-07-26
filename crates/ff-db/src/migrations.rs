@@ -1225,6 +1225,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "ff_capabilities",
         sql: schema::SCHEMA_V275_FF_CAPABILITIES,
     },
+    PgMigration {
+        version: 276,
+        name: "glm_45_air_ab_scoreboard",
+        sql: schema::SCHEMA_V276_GLM_45_AIR_AB_SCOREBOARD,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1529,6 +1534,23 @@ mod tests {
                 .sql
                 .contains("ON CONFLICT (kind, source, source_id) DO UPDATE")
         );
+    }
+
+    #[test]
+    fn v276_defines_glm_devstral_ab_scoreboard() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 276)
+            .expect("V276 must be registered");
+        assert_eq!(migration.name, "glm_45_air_ab_scoreboard");
+        assert!(migration.sql.contains("'glm-4.5-air'"));
+        assert!(migration.sql.contains("'devstral-small-2-24b'"));
+        assert!(
+            migration
+                .sql
+                .contains("CREATE OR REPLACE VIEW v_builder_stats")
+        );
+        assert!(migration.sql.contains("parallel_slots = 4"));
     }
 
     fn db_url() -> Option<String> {

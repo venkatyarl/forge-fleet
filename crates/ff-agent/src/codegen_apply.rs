@@ -19,6 +19,8 @@ pub struct CodegenOutcome {
     pub rounds: u32,
     pub final_diff: Option<String>,
     pub error: Option<String>,
+    /// Stable catalog id of the local fleet model that produced the terminal response.
+    pub builder_catalog_id: Option<String>,
     /// The model reported the task is ALREADY implemented / no change needed (it inspected the
     /// repo, often ran the tests, and produced no edits on purpose). The caller should mark the
     /// work_item done — NOT fail-retry — so an already-satisfied task drains instead of thrashing.
@@ -74,7 +76,7 @@ fn round_interaction(
     prompt: &str,
     resp: &crate::fleet_oneshot::FleetOneshot,
 ) -> ff_db::InteractionRecord {
-    let engine = crate::llm_attribution::engine_label(&resp.model);
+    let engine = builder_engine(resp);
     let (tokens_in, tokens_out, tokens_estimated) = crate::llm_attribution::tokens_or_estimate(
         resp.tokens_in,
         resp.tokens_out,
@@ -99,6 +101,16 @@ fn round_interaction(
         purpose: Some("build".to_string()),
         ..Default::default()
     }
+}
+
+fn builder_engine(resp: &crate::fleet_oneshot::FleetOneshot) -> String {
+    let label = resp
+        .catalog_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| format!("local:{}", id.trim()))
+        .unwrap_or_else(|| resp.model.clone());
+    crate::llm_attribution::engine_label(&label)
 }
 
 pub async fn codegen_apply(
@@ -169,6 +181,7 @@ pub async fn codegen_apply(
                         rounds,
                         final_diff: None,
                         error: None,
+                        builder_catalog_id: response.catalog_id.clone(),
                         already_done: true,
                     });
                 }
@@ -287,6 +300,7 @@ pub async fn codegen_apply(
             rounds,
             final_diff: Some(edit_summary),
             error: None,
+            builder_catalog_id: response.catalog_id.clone(),
             already_done: false,
         });
     }
@@ -296,6 +310,7 @@ pub async fn codegen_apply(
         rounds,
         final_diff: None,
         error: last_error,
+        builder_catalog_id: None,
         already_done: false,
     })
 }
@@ -1186,6 +1201,7 @@ mod tests {
             text: "*** FILE: src/lib.rs".to_string(),
             endpoint: "http://192.168.5.103:55000".to_string(),
             worker_name: "worker-a".to_string(),
+            catalog_id: Some("glm-4.5-air".to_string()),
             model: "qwen3-coder-30b".to_string(),
             latency_ms: 1234,
             tokens_in: 100,
@@ -1200,6 +1216,7 @@ mod tests {
         assert_eq!(rec.request_meta["round"], 2);
         assert_eq!(rec.worker_name.as_deref(), Some("worker-a"));
         assert_eq!(rec.endpoint.as_deref(), Some("http://192.168.5.103:55000"));
+        assert_eq!(rec.engine.as_deref(), Some("local:glm-4.5-air"));
         assert_eq!(rec.latency_ms, Some(1234));
 
         // No work item in scope (e.g. `ff codegen` from the CLI) → the row

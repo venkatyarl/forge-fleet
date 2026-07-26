@@ -12320,6 +12320,54 @@ ON CONFLICT (kind, source, source_id) DO UPDATE SET
     updated_at = EXCLUDED.updated_at;
 "#;
 
+/// GLM-4.5-Air vs Devstral A/B: keep both models at tier 2, register thalia's
+/// four-slot deployment profile, and expose model-aware builder outcome rates.
+pub const SCHEMA_V276_GLM_45_AIR_AB_SCOREBOARD: &str = r#"
+UPDATE fleet_model_catalog
+SET tier = 2, updated_at = NOW()
+WHERE id IN ('glm-4.5-air', 'devstral-small-2-24b');
+
+UPDATE fleet_model_deployments
+SET catalog_id = 'glm-4.5-air',
+    runtime = 'llama.cpp',
+    context_window = 49152,
+    parallel_slots = 4,
+    usable_agent_ctx = 12288,
+    desired_state = 'active',
+    last_health_at = NOW()
+WHERE LOWER(worker_name) = 'thalia' AND port = 55008;
+
+CREATE OR REPLACE VIEW v_builder_stats AS
+WITH builder_work_items AS (
+    SELECT
+        engine AS builder,
+        work_item_id,
+        MIN(ts) AS first_build_at,
+        MAX(ts) AS last_build_at
+    FROM ff_interactions
+    WHERE purpose = 'build'
+      AND work_item_id IS NOT NULL
+      AND engine IS NOT NULL
+      AND btrim(engine) <> ''
+    GROUP BY engine, work_item_id
+)
+SELECT
+    b.builder,
+    COUNT(*) AS builds,
+    COUNT(*) FILTER (WHERE q.review_verdict = 'approve') AS approvals,
+    COUNT(*) FILTER (WHERE q.status = 'merged' OR w.status = 'merged') AS merges,
+    ROUND(COUNT(*) FILTER (WHERE q.review_verdict = 'approve')::numeric
+          / GREATEST(COUNT(*), 1), 4) AS approve_rate,
+    ROUND(COUNT(*) FILTER (WHERE q.status = 'merged' OR w.status = 'merged')::numeric
+          / GREATEST(COUNT(*), 1), 4) AS merge_rate,
+    MIN(b.first_build_at) AS first_build_at,
+    MAX(b.last_build_at) AS last_build_at
+FROM builder_work_items b
+LEFT JOIN work_item_merge_queue q ON q.work_item_id = b.work_item_id
+LEFT JOIN work_items w ON w.id = b.work_item_id
+GROUP BY b.builder;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
