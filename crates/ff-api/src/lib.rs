@@ -23,16 +23,15 @@ use config::ApiConfig;
 use registry::BackendRegistry;
 use server::{AppState, build_http_router};
 
-/// Connect the ff-memory store when a Postgres URL is configured; the
-/// `/memory/*` routes return 503 without one.
-async fn connect_memory_store() -> Option<Arc<ff_memory::MemoryStore>> {
+/// Connect database-backed routes when a Postgres URL is configured.
+async fn connect_db_pool() -> Option<sqlx::PgPool> {
     let url = std::env::var("FORGEFLEET_POSTGRES_URL")
         .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
         .ok()?;
     match sqlx::PgPool::connect(&url).await {
-        Ok(pool) => Some(Arc::new(ff_memory::MemoryStore::new(pool))),
+        Ok(pool) => Some(pool),
         Err(error) => {
-            warn!(%error, "memory routes disabled: failed to connect to Postgres");
+            warn!(%error, "database routes disabled: failed to connect to Postgres");
             None
         }
     }
@@ -42,8 +41,10 @@ pub async fn run(config: ApiConfig) -> anyhow::Result<()> {
     let bind_addr = config.bind_addr();
     let registry = Arc::new(BackendRegistry::new(config.backends));
     let mut state = AppState::new(registry, config.api_keys)?;
-    if let Some(store) = connect_memory_store().await {
-        state = state.with_memory_store(store);
+    if let Some(pool) = connect_db_pool().await {
+        state = state
+            .with_memory_store(Arc::new(ff_memory::MemoryStore::new(pool.clone())))
+            .with_db_pool(pool);
     }
     let state = Arc::new(state);
 
