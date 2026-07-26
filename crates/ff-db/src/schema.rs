@@ -5,6 +5,77 @@
 
 /// SQL to create all ForgeFleet tables.
 /// Applied as migration version 1 — the initial schema.
+pub const SCHEMA_V278_DURABLE_PROJECT_WORKSTREAMS: &str = r#"
+CREATE TABLE IF NOT EXISTS ff_workstreams (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id TEXT NOT NULL,
+    project_key TEXT NOT NULL,
+    git_remote TEXT,
+    basename TEXT,
+    aliases JSONB NOT NULL DEFAULT '{}'::jsonb,
+    goal TEXT,
+    working_summary TEXT,
+    focus TEXT,
+    open_threads JSONB NOT NULL DEFAULT '[]'::jsonb,
+    status TEXT NOT NULL DEFAULT 'active',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    leader_generation INTEGER NOT NULL DEFAULT 0,
+    owner_identity TEXT NOT NULL DEFAULT 'operator:fleet',
+    next_seq BIGINT NOT NULL DEFAULT 0
+);
+ALTER TABLE ff_workstreams
+    ADD COLUMN IF NOT EXISTS project_id TEXT,
+    ADD COLUMN IF NOT EXISTS project_key TEXT,
+    ADD COLUMN IF NOT EXISTS git_remote TEXT,
+    ADD COLUMN IF NOT EXISTS basename TEXT,
+    ADD COLUMN IF NOT EXISTS aliases JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS owner_identity TEXT NOT NULL DEFAULT 'operator:fleet',
+    ADD COLUMN IF NOT EXISTS next_seq BIGINT NOT NULL DEFAULT 0;
+UPDATE ff_workstreams SET project_id = project_key
+ WHERE project_id IS NULL AND project_key IS NOT NULL;
+UPDATE ff_workstreams SET project_key = project_id
+ WHERE project_key IS NULL AND project_id IS NOT NULL;
+UPDATE ff_workstreams SET aliases = '{}'::jsonb
+ WHERE aliases IS NULL OR jsonb_typeof(aliases) <> 'object';
+ALTER TABLE ff_workstreams
+    ALTER COLUMN project_id SET NOT NULL,
+    ALTER COLUMN project_key SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ff_workstreams_project_id_uidx
+    ON ff_workstreams(project_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ff_workstreams_project_key_uidx
+    ON ff_workstreams(project_key);
+CREATE TABLE IF NOT EXISTS session_attachments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workstream_id UUID NOT NULL REFERENCES ff_workstreams(id) ON DELETE CASCADE,
+    operator_identity TEXT NOT NULL,
+    attached_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(workstream_id, operator_identity)
+);
+CREATE TABLE IF NOT EXISTS workstream_notes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workstream_id UUID NOT NULL REFERENCES ff_workstreams(id) ON DELETE CASCADE,
+    seq BIGINT NOT NULL,
+    note TEXT NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(workstream_id, seq)
+);
+CREATE TABLE IF NOT EXISTS workstream_threads (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workstream_id UUID NOT NULL REFERENCES ff_workstreams(id) ON DELETE CASCADE,
+    work_item_id UUID,
+    label TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    claimed_by TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS workstream_one_thread_per_item
+    ON workstream_threads(work_item_id) WHERE work_item_id IS NOT NULL;
+REVOKE ALL ON session_attachments, workstream_notes FROM PUBLIC;
+"#;
+
 pub const SCHEMA_V1: &str = r#"
 -- ─── Nodes ─────────────────────────────────────────────────────────────────
 -- Every fleet node (taylor, james, marcus, etc.)
@@ -12366,6 +12437,12 @@ FROM builder_work_items b
 LEFT JOIN work_item_merge_queue q ON q.work_item_id = b.work_item_id
 LEFT JOIN work_items w ON w.id = b.work_item_id
 GROUP BY b.builder;
+"#;
+
+/// Immutable start of actual execution for data-derived lease timeouts.
+pub const SCHEMA_V277_WORK_ITEM_LEASE_BUILD_STARTED_AT: &str = r#"
+ALTER TABLE work_item_leases
+    ADD COLUMN IF NOT EXISTS build_started_at TIMESTAMPTZ;
 "#;
 
 /// Squashed Postgres bootstrap through migration v161.

@@ -36,14 +36,15 @@ pub async fn ensure_all_workstreams(pg: &PgPool) -> Result<u64> {
     ensure_schema(pg).await?;
     let n = sqlx::query(
         "INSERT INTO ff_workstreams \
-            (id, project_key, git_remote, basename, aliases, goal, status, leader_generation, updated_at) \
-         SELECT gen_random_uuid(), p.id, coalesce(p.repo_url, ''), \
-                coalesce(nullif(p.display_name, ''), p.id), '[]'::jsonb, \
+            (id, project_id, project_key, git_remote, basename, aliases, goal, status, leader_generation, updated_at) \
+         SELECT gen_random_uuid(), p.id, p.id, coalesce(p.repo_url, ''), \
+                coalesce(nullif(p.display_name, ''), p.id), '{}'::jsonb, \
                 coalesce(nullif(p.display_name, ''), p.id) || ' — project session-of-record', \
                 'active', 0, now() \
            FROM projects p \
           WHERE p.status = 'active' \
          ON CONFLICT (project_key) DO UPDATE SET \
+                project_id = EXCLUDED.project_id, \
                 git_remote = EXCLUDED.git_remote, \
                 basename   = EXCLUDED.basename, \
                 updated_at = now()",
@@ -322,13 +323,12 @@ pub async fn derive_working_summaries(pg: &PgPool) -> Result<u64> {
 /// `report` calls. Silent no-op if the session isn't attached (the SessionStart
 /// hook attaches; a Stop firing before attach shouldn't error).
 pub async fn heartbeat(pg: &PgPool, session_id: &str) -> Result<bool> {
-    let n = sqlx::query(
-        "UPDATE workstream_clients SET last_report_at = now() WHERE session_id = $1",
-    )
-    .bind(session_id)
-    .execute(pg)
-    .await?
-    .rows_affected();
+    let n =
+        sqlx::query("UPDATE workstream_clients SET last_report_at = now() WHERE session_id = $1")
+            .bind(session_id)
+            .execute(pg)
+            .await?
+            .rows_affected();
     Ok(n > 0)
 }
 

@@ -1776,7 +1776,9 @@ async fn mark_building(pg: &PgPool, item: &AssignedWorkItem) -> Result<bool> {
     }
     sqlx::query(
         "UPDATE work_item_leases
-            SET lease_state = 'building', heartbeat_at = NOW(),
+            SET lease_state = 'building',
+                build_started_at = COALESCE(build_started_at, NOW()),
+                heartbeat_at = NOW(),
                 lease_expires_at = GREATEST(lease_expires_at, NOW() + make_interval(secs => $3))
           WHERE work_item_id = $1
             AND sub_agent_id = $2
@@ -4501,7 +4503,9 @@ fn https_pat_url(remote: &str, pat: &str) -> Option<String> {
     if owner_repo.is_empty() || !owner_repo.contains('/') {
         return None;
     }
-    Some(format!("https://x-access-token:{pat}@github.com/{owner_repo}.git"))
+    Some(format!(
+        "https://x-access-token:{pat}@github.com/{owner_repo}.git"
+    ))
 }
 
 fn checkout_clone_for_build(

@@ -1418,6 +1418,27 @@ pub enum InteractionsCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 enum SessionCommand {
+    /// Show the durable session-of-record for the current project.
+    Status {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Join a durable project workstream and print its resume packet.
+    Attach {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Rejoin a durable workstream after a client or leader restart.
+    Resume {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Append a note to the current project's durable workstream.
+    Note {
+        text: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Redact and export local Claude Code, Codex, and Kimi transcripts to
     /// the central Obsidian vault (or stage and rsync them to Adele).
     Export {
@@ -5003,6 +5024,88 @@ async fn main() -> Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
             match command {
+                SessionCommand::Status { project } => {
+                    let dir = cli
+                        .cwd
+                        .as_deref()
+                        .unwrap_or_else(|| std::path::Path::new("."));
+                    let ws = match project {
+                        Some(project) => {
+                            ff_agent::workstreams::workstream_for_project(&pool, &project).await?
+                        }
+                        None => ff_agent::workstreams::workstream_for_dir(&pool, dir).await?,
+                    }
+                    .ok_or_else(|| anyhow::anyhow!("no workstream resolves for this project"))?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "project_id": ws.project_key,
+                            "git_remote": ws.git_remote,
+                            "basename": ws.basename,
+                            "working_summary": ws.working_summary,
+                            "status": ws.status,
+                        }))?
+                    );
+                    Ok(())
+                }
+                SessionCommand::Attach { project } | SessionCommand::Resume { project } => {
+                    let dir = cli
+                        .cwd
+                        .as_deref()
+                        .unwrap_or_else(|| std::path::Path::new("."));
+                    let ws = match project {
+                        Some(project) => {
+                            ff_agent::workstreams::workstream_for_project(&pool, &project).await?
+                        }
+                        None => ff_agent::workstreams::workstream_for_dir(&pool, dir).await?,
+                    }
+                    .ok_or_else(|| anyhow::anyhow!("no workstream resolves for this project"))?;
+                    let operator = ff_agent::fleet_info::resolve_this_worker_name().await;
+                    let session_id = ff_agent::workstreams::attach(
+                        &pool,
+                        &ws,
+                        &operator,
+                        "operator",
+                        &dir.display().to_string(),
+                        None,
+                    )
+                    .await?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "project_id": ws.project_key,
+                            "git_remote": ws.git_remote,
+                            "basename": ws.basename,
+                            "working_summary": ws.working_summary,
+                            "status": ws.status,
+                            "session_id": session_id,
+                        }))?
+                    );
+                    Ok(())
+                }
+                SessionCommand::Note { text, project } => {
+                    let dir = cli
+                        .cwd
+                        .as_deref()
+                        .unwrap_or_else(|| std::path::Path::new("."));
+                    let ws = match project {
+                        Some(project) => {
+                            ff_agent::workstreams::workstream_for_project(&pool, &project).await?
+                        }
+                        None => ff_agent::workstreams::workstream_for_dir(&pool, dir).await?,
+                    }
+                    .ok_or_else(|| anyhow::anyhow!("no workstream resolves for this project"))?;
+                    let operator = ff_agent::fleet_info::resolve_this_worker_name().await;
+                    let session_id = ff_agent::workstreams::session_id_for(
+                        &operator,
+                        &ws.project_key,
+                        "operator",
+                    );
+                    ff_agent::workstreams::report(&pool, &session_id, None, None, Some(&text))
+                        .await?;
+                    println!("{GREEN}✓{RESET} note appended");
+                    Ok(())
+                }
                 SessionCommand::Export { .. } => unreachable!("handled before database setup"),
                 SessionCommand::Spawn { goal, budget } => {
                     let who = ff_agent::fleet_info::resolve_this_worker_name().await;
