@@ -2462,12 +2462,17 @@ mod tests {
             return;
         };
         std::fs::remove_file(repo.path.join("src/gone.rs")).unwrap();
+        // A deleted file whose PARENT DIR still exists is now ALLOWED (recreation
+        // in an existing module is legitimate feature work). Rejection now
+        // requires the parent dir to be missing too — so this task passes.
         let tasks = vec![leaf("edit gone", "modify the handler", &["src/gone.rs"])];
-        let err = quality_gate_decomposition(tasks, Some(&ctx)).unwrap_err();
         assert!(
-            err.to_string().contains("does not exist in the repository"),
-            "unexpected error: {err}"
+            quality_gate_decomposition(tasks, Some(&ctx)).is_ok(),
+            "recreating a file in an existing dir should be allowed"
         );
+        // But a file whose parent dir does NOT exist is still rejected.
+        let tasks = vec![leaf("bad", "x", &["nonexistent_dir/thing.rs"])];
+        assert!(quality_gate_decomposition(tasks, Some(&ctx)).is_err());
     }
 
     #[test]
@@ -2485,17 +2490,26 @@ mod tests {
 
     #[test]
     fn decomposition_quality_gate_rejects_create_worded_task_for_missing_file() {
-        // Validation is unconditional: even a task that explicitly says it
-        // CREATES a new file may not reference a path that does not exist.
+        // NEW policy (2026-07-25): a new file whose PARENT DIR exists is ALLOWED
+        // (real feature work = new module in an existing dir); a new file whose
+        // parent dir does NOT exist is rejected (cross-language/wrong-structure
+        // hallucination, e.g. `mcp/service.py` in a Rust repo).
         let Some((_repo, ctx)) = scratch_git_repo("create", &["src/lib.rs"]) else {
             return;
         };
-        let tasks = vec![leaf(
+        // src/ exists → new module allowed.
+        let ok = vec![leaf(
             "Add metrics module",
             "Create a new file with counters",
             &["src/metrics.rs"],
         )];
-        assert!(quality_gate_decomposition(tasks, Some(&ctx)).is_err());
+        assert!(
+            quality_gate_decomposition(ok, Some(&ctx)).is_ok(),
+            "new file in an existing dir should be allowed"
+        );
+        // mcp/ does not exist → rejected as wrong-structure.
+        let bad = vec![leaf("Add py service", "create it", &["mcp/service.py"])];
+        assert!(quality_gate_decomposition(bad, Some(&ctx)).is_err());
     }
 
     #[test]
