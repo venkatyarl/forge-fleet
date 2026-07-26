@@ -83,6 +83,7 @@ mod ports_cmd;
 mod power_cmd;
 mod project_cmd;
 mod queue_cmd;
+mod workstream_cmd;
 mod repo_context;
 mod research_cmd;
 mod route_cmd;
@@ -839,6 +840,13 @@ enum Command {
     Session {
         #[command(subcommand)]
         command: SessionCommand,
+    },
+    /// Project session-of-record: attach a CLI session to its project's
+    /// workstream and report working state into the shared record (ff owns the
+    /// session across Claude/Codex/Kimi + TUI/web).
+    Workstream {
+        #[command(subcommand)]
+        command: WorkstreamCommand,
     },
     /// OAuth subscription credentials — harvest from a vendor CLI's local
     /// cred file on the leader, distribute to fleet members. Powers
@@ -2558,6 +2566,42 @@ pub enum SocialCommand {
     /// Pre-flight this host's ingest dependencies (yt-dlp + ffmpeg) — reports
     /// what's installed before you ingest, instead of failing mid-pipeline.
     Check,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum WorkstreamCommand {
+    /// Attach this CLI session to the workstream for the current project
+    /// (resolved from cwd, git-remote-first). Idempotent — re-attach refreshes.
+    Attach {
+        /// Which CLI is attaching (claude|codex|kimi|tui|web).
+        #[arg(long, default_value = "claude")]
+        tool: String,
+        /// One-line goal for this session (what you're here to do).
+        #[arg(long)]
+        goal: Option<String>,
+    },
+    /// Report working state into the project's workstream: update the shared
+    /// summary/focus and append a timestamped note to the activity log.
+    Report {
+        #[arg(long, default_value = "claude")]
+        tool: String,
+        /// Replace the shared "what's happening now" summary.
+        #[arg(long)]
+        summary: Option<String>,
+        /// Replace the current focus (the one thing in flight).
+        #[arg(long)]
+        focus: Option<String>,
+        /// Append a timestamped note to the running activity log.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Show the current project's workstream: summary, focus, attached clients.
+    Status {
+        #[arg(long, default_value = "claude")]
+        tool: String,
+    },
+    /// List all active project workstreams.
+    List,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -4914,6 +4958,9 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
             }
+        }
+        Some(Command::Workstream { command }) => {
+            workstream_cmd::handle_workstream(command, cli.cwd.clone()).await
         }
         Some(Command::Session { command }) => {
             if let SessionCommand::Export { vault, force } = &command {
