@@ -719,13 +719,19 @@ async fn record_fix_interaction(
     outcome: &crate::codegen_apply::CodegenOutcome,
     attempt: u32,
 ) {
+    let engine = outcome
+        .builder_catalog_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| format!("local:{}", id.trim()))
+        .unwrap_or_else(|| "local:qwen3-coder".to_string());
     let rec = ff_db::InteractionRecord {
         channel: "merge_drain_review".to_string(),
         work_item_id: Some(work_item_id),
         purpose: Some("build".to_string()),
         request_text: prompt.chars().take(16000).collect(),
         request_meta: serde_json::json!({ "stage": "local_fix", "attempt": attempt }),
-        engine: Some("local:qwen3-coder".to_string()),
+        engine: Some(crate::llm_attribution::engine_label(&engine)),
         response_text: format!(
             "applied={} rounds={} error={}",
             outcome.applied,
