@@ -11,7 +11,6 @@ use sqlx::PgPool;
 use std::time::Duration;
 use tracing::{info, warn};
 
-const STALE_HEARTBEAT_SECS: i64 = crate::work_item_scheduler::LEASE_STALE_SECS;
 /// Hard ceiling on how long a single lease may be HELD regardless of heartbeat.
 /// The stale-heartbeat reaper cannot reclaim a wedged dispatch whose daemon keeps
 /// the heartbeat fresh (the "building forever with a live heartbeat" wedge —
@@ -31,9 +30,10 @@ pub async fn evaluate_lease_takeover(pg: &PgPool, _worker_name: &str) -> Result<
         return Ok(0);
     }
 
+    let stale_heartbeat_secs = crate::work_item_scheduler::lease_stale_secs(pg).await;
     let reclaimed = ff_db::pg_reap_stale_work_item_leases(
         pg,
-        STALE_HEARTBEAT_SECS,
+        stale_heartbeat_secs,
         MAX_LEASE_DURATION_SECS,
         MAX_BUILD_ATTEMPTS,
     )
@@ -75,25 +75,16 @@ pub fn spawn_lease_takeover(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    /// REGRESSION GUARD (reaper bug class #589/#590): the lease reaper reclaims
-    /// a work_item lease whose `heartbeat_at` is older than STALE_HEARTBEAT_SECS.
-    /// The dispatch loop bumps that heartbeat every
-    /// `work_item_dispatch::HEARTBEAT_SECS`, so the window MUST clear at least
-    /// two beats or a live build (which heartbeats fine) gets its lease yanked
-    /// and re-leased — a duplicate build. Couple the consts.
+    /// REGRESSION GUARD (reaper bug class #589/#590): the measured lease reaper
+    /// floor must clear at least two dispatch heartbeats. The runtime window may
+    /// grow above this from successful build data, but it must never shrink below
+    /// a live build's normal heartbeat cadence.
     #[test]
-    fn stale_window_clears_two_heartbeats() {
+    fn stale_window_floor_clears_two_heartbeats() {
         let cadence = crate::work_item_dispatch::HEARTBEAT_SECS as i64;
-        assert_eq!(
-            STALE_HEARTBEAT_SECS,
-            crate::work_item_scheduler::LEASE_STALE_SECS,
-            "all work_item lease reapers must share one stale-heartbeat cutoff"
-        );
         assert!(
-            STALE_HEARTBEAT_SECS >= 2 * cadence,
-            "STALE_HEARTBEAT_SECS ({STALE_HEARTBEAT_SECS}) must be >= 2x the dispatch heartbeat ({cadence})"
+            crate::work_item_scheduler::MIN_LEASE_STALE_SECS >= 2 * cadence,
+            "MIN_LEASE_STALE_SECS must be >= 2x the dispatch heartbeat ({cadence})"
         );
     }
 }

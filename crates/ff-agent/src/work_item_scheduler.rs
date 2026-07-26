@@ -19,18 +19,22 @@ use sqlx::{PgPool, Row};
 use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::{info, warn};
 
-/// Lease heartbeat deadline: a slot must heartbeat within this window or its
-/// lease is reaped and the work_item re-queued. `pub(crate)` so the dispatch
-/// path can keep the Lane-1 local-codegen timeout STRICTLY BELOW it (see
-/// `work_item_dispatch::LANE1_TIMEOUT_SECS`) — a slow local lane must fail over
-/// to the cloud backstop before this reaper can reclaim the lease.
+/// Lower bound for the heartbeat-stale lease window. The actual scheduler value
+/// is measured from recent successful build leases by [`lease_stale_secs`].
 ///
-/// 480 (was 180): with a 45s heartbeat cadence, 180s tolerated only ~3 missed
-/// beats — under wave-burst load daemons routinely missed that window and
-/// healthy builds were reaped as "stalled" (2026-07-19: 100+ takeovers in 2h
-/// fleet-wide, most of the night's stall-class failures). 480s tolerates ~10
-/// missed beats while MAX_LEASE_DURATION_SECS still bounds true wedges.
-pub(crate) const LEASE_STALE_SECS: i64 = 480;
+/// The floor also gives `work_item_dispatch::LANE1_TIMEOUT_SECS` a compile-time
+/// bound: Lane-1 local codegen must self-abort before even the smallest reaper
+/// window can reclaim a live lease.
+pub(crate) const MIN_LEASE_STALE_SECS: i64 = 480;
+/// Upper bound for the data-derived heartbeat-stale lease window. This stays
+/// below [`MAX_LEASE_DURATION_SECS`], which remains the separate hard age cap
+/// for leases whose heartbeat keeps refreshing while the build is wedged.
+const MAX_LEASE_STALE_SECS: i64 = 2400;
+const LEASE_STALE_MIN_SAMPLES: i64 = 20;
+const LEASE_STALE_SAMPLE_DAYS: i64 = 30;
+/// Safety margin over the measured p99 successful build duration.
+const LEASE_STALE_P99_MARGIN_NUMERATOR: i64 = 5;
+const LEASE_STALE_P99_MARGIN_DENOMINATOR: i64 = 4;
 /// Hard ceiling on lease HOLD time regardless of heartbeat — reclaims a wedged
 /// dispatch that keeps its heartbeat fresh but makes no progress (the
 /// "building forever, live heartbeat" wedge). Above a real build's Lane-2 cap
@@ -90,6 +94,64 @@ UPDATE work_items w
  WHERE w.id = eligible.id
 "#;
 
+fn lease_stale_secs_from_success_p99(sample_count: i64, p99_secs: Option<f64>) -> i64 {
+    if sample_count < LEASE_STALE_MIN_SAMPLES {
+        return MIN_LEASE_STALE_SECS;
+    }
+    let Some(p99_secs) = p99_secs else {
+        return MIN_LEASE_STALE_SECS;
+    };
+    if !p99_secs.is_finite() || p99_secs <= 0.0 {
+        return MIN_LEASE_STALE_SECS;
+    }
+
+    let with_margin = (p99_secs * LEASE_STALE_P99_MARGIN_NUMERATOR as f64
+        / LEASE_STALE_P99_MARGIN_DENOMINATOR as f64)
+        .ceil() as i64;
+    with_margin.clamp(MIN_LEASE_STALE_SECS, MAX_LEASE_STALE_SECS)
+}
+
+pub(crate) async fn lease_stale_secs(pg: &PgPool) -> i64 {
+    let row = sqlx::query(
+        "SELECT COUNT(*)::bigint AS sample_count,
+                percentile_cont(0.99) WITHIN GROUP (
+                    ORDER BY EXTRACT(EPOCH FROM (released_at - created_at))
+                ) AS p99_secs
+           FROM work_item_leases
+          WHERE released_at IS NOT NULL
+            AND created_at >= NOW() - make_interval(days => $1)
+            AND release_reason = 'ready for review'",
+    )
+    .bind(LEASE_STALE_SAMPLE_DAYS as i32)
+    .fetch_one(pg)
+    .await;
+
+    match row {
+        Ok(row) => {
+            let sample_count: i64 = row.get("sample_count");
+            let p99_secs: Option<f64> = row.try_get("p99_secs").ok().flatten();
+            let stale_secs = lease_stale_secs_from_success_p99(sample_count, p99_secs);
+            info!(
+                sample_count,
+                p99_secs,
+                stale_secs,
+                min_samples = LEASE_STALE_MIN_SAMPLES,
+                sample_days = LEASE_STALE_SAMPLE_DAYS,
+                "work_item_scheduler: measured lease-stale heartbeat window"
+            );
+            stale_secs
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                fallback_secs = MIN_LEASE_STALE_SECS,
+                "work_item_scheduler: failed to measure lease-stale window; using floor"
+            );
+            MIN_LEASE_STALE_SECS
+        }
+    }
+}
+
 async fn auto_requeue_failed_work_items(pg: &PgPool) -> Result<u64> {
     Ok(sqlx::query(AUTO_REQUEUE_FAILED_SQL)
         .bind(MAX_FAILED_RETRIES)
@@ -103,9 +165,10 @@ async fn auto_requeue_failed_work_items(pg: &PgPool) -> Result<u64> {
 
 /// One scheduler pass. Returns the number of work_items assigned this tick.
 pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
+    let stale_secs = lease_stale_secs(pg).await;
     let reaped = ff_db::pg_reap_stale_work_item_leases(
         pg,
-        LEASE_STALE_SECS,
+        stale_secs,
         MAX_LEASE_DURATION_SECS,
         MAX_BUILD_ATTEMPTS,
     )
@@ -703,11 +766,40 @@ mod tests {
     /// `lease_takeover` — the scheduler's own lease-reap window must clear at
     /// least two dispatch heartbeats so a live build's lease is never reclaimed.
     #[test]
-    fn lease_stale_window_clears_two_heartbeats() {
+    fn lease_stale_window_floor_clears_two_heartbeats() {
         let cadence = crate::work_item_dispatch::HEARTBEAT_SECS as i64;
         assert!(
-            LEASE_STALE_SECS >= 2 * cadence,
-            "LEASE_STALE_SECS ({LEASE_STALE_SECS}) must be >= 2x the dispatch heartbeat ({cadence})"
+            MIN_LEASE_STALE_SECS >= 2 * cadence,
+            "MIN_LEASE_STALE_SECS ({MIN_LEASE_STALE_SECS}) must be >= 2x the dispatch heartbeat ({cadence})"
+        );
+    }
+
+    #[test]
+    fn lease_stale_window_uses_successful_build_p99_with_margin() {
+        assert_eq!(lease_stale_secs_from_success_p99(393, Some(1357.0)), 1697);
+    }
+
+    #[test]
+    fn lease_stale_window_falls_back_without_enough_samples() {
+        assert_eq!(
+            lease_stale_secs_from_success_p99(LEASE_STALE_MIN_SAMPLES - 1, Some(1357.0)),
+            MIN_LEASE_STALE_SECS
+        );
+        assert_eq!(
+            lease_stale_secs_from_success_p99(LEASE_STALE_MIN_SAMPLES, None),
+            MIN_LEASE_STALE_SECS
+        );
+    }
+
+    #[test]
+    fn lease_stale_window_clamps_extreme_measurements() {
+        assert_eq!(
+            lease_stale_secs_from_success_p99(LEASE_STALE_MIN_SAMPLES, Some(60.0)),
+            MIN_LEASE_STALE_SECS
+        );
+        assert_eq!(
+            lease_stale_secs_from_success_p99(LEASE_STALE_MIN_SAMPLES, Some(10_000.0)),
+            MAX_LEASE_STALE_SECS
         );
     }
 
