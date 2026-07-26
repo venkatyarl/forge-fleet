@@ -24,6 +24,8 @@ pub struct ProjectRepo {
     pub default_branch: String,
     pub role: Option<String>,
     pub is_primary: bool,
+    pub tech_stack: Option<String>,
+    pub local_path: Option<String>,
     pub created_at: String,
 }
 
@@ -65,6 +67,8 @@ fn repo_from_row(r: &sqlx::postgres::PgRow) -> ProjectRepo {
         default_branch: r.get("default_branch"),
         role: r.try_get("role").ok(),
         is_primary: r.get("is_primary"),
+        tech_stack: r.try_get("tech_stack").ok(),
+        local_path: r.try_get("local_path").ok(),
         created_at: fmt_ts(r.get("created_at")),
     }
 }
@@ -91,7 +95,8 @@ fn folder_from_row(r: &sqlx::postgres::PgRow) -> ProjectFolder {
 /// All GitHub locations for a project, primary first.
 pub async fn pg_list_project_repos(pool: &PgPool, project_id: &str) -> Result<Vec<ProjectRepo>> {
     let rows = sqlx::query(
-        "SELECT id, project_id, github_url, name, default_branch, role, is_primary, created_at \
+        "SELECT id, project_id, github_url, name, default_branch, role, is_primary, \
+                tech_stack, local_path, created_at \
            FROM project_repos WHERE project_id = $1 \
           ORDER BY is_primary DESC, created_at ASC",
     )
@@ -127,7 +132,8 @@ pub async fn pg_add_project_repo(
          ON CONFLICT (project_id, github_url) DO UPDATE SET \
              name = EXCLUDED.name, default_branch = EXCLUDED.default_branch, \
              role = EXCLUDED.role, is_primary = EXCLUDED.is_primary \
-         RETURNING id, project_id, github_url, name, default_branch, role, is_primary, created_at",
+         RETURNING id, project_id, github_url, name, default_branch, role, is_primary, \
+                   tech_stack, local_path, created_at",
     )
     .bind(project_id)
     .bind(github_url)
@@ -139,6 +145,30 @@ pub async fn pg_add_project_repo(
     .await?;
     tx.commit().await?;
     Ok(repo_from_row(&row))
+}
+
+/// Record source metadata detected from a local checkout.
+pub async fn pg_update_project_repo_scan(
+    pool: &PgPool,
+    project_id: &str,
+    github_url: &str,
+    tech_stack: &str,
+    local_path: &str,
+) -> Result<Option<ProjectRepo>> {
+    let row = sqlx::query(
+        "UPDATE project_repos \
+            SET tech_stack = $3, local_path = $4 \
+          WHERE project_id = $1 AND github_url = $2 \
+          RETURNING id, project_id, github_url, name, default_branch, role, is_primary, \
+                    tech_stack, local_path, created_at",
+    )
+    .bind(project_id)
+    .bind(github_url)
+    .bind(tech_stack)
+    .bind(local_path)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(repo_from_row))
 }
 
 /// Detach a GitHub location by id. Returns whether a row was removed.
