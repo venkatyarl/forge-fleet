@@ -3386,6 +3386,14 @@ async fn run_ff_dispatch(
         // Tier-aware: complex/moderate tasks prefer a capable fleet coder
         // (glm-4.5-air/qwen36-35b) instead of landing on a 24B that wedges.
         let hint = local_model_hint(pg, &item.complexity).await;
+        // Record which local MODEL is serving this build on the lease, so the
+        // digest shows `local:glm-4.5-air` (and provenance knows the builder)
+        // instead of a bare "local". Lane 1.5 already does this; Lane 1 didn't,
+        // which is why every in-flight local build read "local" with no model
+        // (operator 2026-07-26). The exact serving NODE is chosen inside
+        // fleet_oneshot per round; the model hint is the stable, useful label.
+        let lane1_label = format!("local:{}", hint.as_deref().unwrap_or("fleet-coder"));
+        mark_lease_endpoint(pg, item, &lane1_label).await;
         let lane1 = tokio::time::timeout(
             Duration::from_secs(LANE1_TIMEOUT_SECS),
             crate::codegen_apply::codegen_apply(

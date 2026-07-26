@@ -290,14 +290,17 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
         "SELECT left(w.title, 30), \
                 coalesce(w.assigned_computer, ''), \
                 coalesce( \
+                  -- an http://IP:port endpoint → resolve to {serving-node}:{model}
                   (SELECT w2.name || ':' || d.catalog_id \
                      FROM fleet_model_deployments d \
                      JOIN fleet_workers w2 ON w2.name = d.worker_name \
-                    WHERE l.endpoint <> '' \
+                    WHERE l.endpoint LIKE 'http%' \
                       AND l.endpoint LIKE '%' || w2.ip || ':' || d.port || '%' \
                     LIMIT 1), \
-                  CASE WHEN coalesce(l.endpoint,'') = '' THEN 'local:building' \
-                       ELSE 'cloud:' || split_part(l.endpoint, '/', 1) END \
+                  -- a 'local:model' / 'lane1.5:local:model' / 'cloud:backend' label
+                  -- recorded by the dispatcher → use it verbatim; empty → 'local'
+                  CASE WHEN coalesce(l.endpoint,'') = '' THEN 'local' \
+                       ELSE l.endpoint END \
                 ), \
                 (EXTRACT(EPOCH FROM (now() - l.created_at)) / 60)::int, \
                 (EXTRACT(EPOCH FROM (now() - l.heartbeat_at)))::int \
