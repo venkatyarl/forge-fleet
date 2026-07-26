@@ -34,6 +34,9 @@ pub mod scheduler;
 pub mod task_decomposer;
 pub mod train_branch;
 
+#[cfg(test)]
+mod tests;
+
 // Re-export primary types at crate root for ergonomic use.
 pub use agent_team::{AgentAssignment, ModelPreference, TeamConfig, TeamTemplates};
 pub use alerts::{AlertForwarder, AlertSink};
