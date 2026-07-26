@@ -1567,7 +1567,21 @@ const WORKLOAD_SYNONYM_CLUSTERS: &[&[&str]] = &[
     // returned "no healthy deployment" while a whole glm coder fleet was up
     // (HireFlow360 gap #3, 2026-07-26). Keep this list == the spellings any
     // caller uses, all mapping to the single catalog tag "code".
-    &["code", "code-gen", "codegen", "coder", "coding", "code-generation"],
+    &[
+        "code",
+        "code-gen",
+        "codegen",
+        "coder",
+        "coding",
+        "code-generation",
+        // Code-review is code work — route it to the same coder models (glm/devstral)
+        // that declare "code". `ff fleet route review` returned "no healthy
+        // deployment" otherwise (HireFlow360, 2026-07-26). The review-GATE also
+        // asks the router for a "review"/"reviewer" model.
+        "review",
+        "code-review",
+        "reviewer",
+    ],
     &["agent", "tool_calling", "agentic"],
     &["reason", "reasoning", "thinking", "chain-of-thought"],
     &["chat", "general", "text-generation", "default-chat"],
