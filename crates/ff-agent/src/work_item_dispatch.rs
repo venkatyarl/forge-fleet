@@ -585,12 +585,29 @@ async fn assigned_work_items(
                         .unwrap_or_else(|| PathBuf::from(&fallback_repo_path))
                 })
             } else {
+                // NODE-SAFE path resolution (operator 2026-07-26 — the "cloning to
+                // /home/lily on logan" defect): a stored absolute `/home/<other>/`
+                // path from a PRIOR run on a DIFFERENT node must NEVER be reused
+                // here — it points at a home dir that doesn't exist on THIS node,
+                // so `git clone`/`create repo parent` fails. `default_clone_path`
+                // (built from THIS node's own home via dirs::home_dir) always wins
+                // for repo-url items; the bound/metadata fallbacks are only used
+                // when they belong to THIS node's home (or are relative).
+                let my_home = dirs::home_dir();
+                let is_for_this_node = |p: &PathBuf| -> bool {
+                    match my_home.as_ref() {
+                        // Accept if under this node's home, or not an absolute
+                        // /home/<x>/ path at all (relative / project-local).
+                        Some(h) => p.starts_with(h) || !p.starts_with("/home/"),
+                        None => !p.starts_with("/home/"),
+                    }
+                };
                 repo_url
                     .as_deref()
                     .map(|url| default_clone_path(r.get::<i32, _>("slot"), url))
-                    .or(local_bound_path)
-                    .or(metadata_repo_path)
-                    .or(bound_repo_path)
+                    .or_else(|| local_bound_path.filter(&is_for_this_node))
+                    .or_else(|| metadata_repo_path.filter(&is_for_this_node))
+                    .or_else(|| bound_repo_path.filter(&is_for_this_node))
                     .unwrap_or_else(|| PathBuf::from(fallback_repo_path))
             };
             Ok(AssignedWorkItem {
