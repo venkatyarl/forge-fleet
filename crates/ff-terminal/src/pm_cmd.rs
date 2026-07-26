@@ -642,6 +642,8 @@ fn run_git(repo: &std::path::Path, args: &[&str]) -> Result<()> {
 }
 
 async fn print_pm_doctor(pool: &sqlx::PgPool) -> Result<()> {
+    const MAX_ASSIGN_PER_TICK: i64 = 64;
+
     println!("{CYAN}▶ Pillar-4 work_item pipeline doctor{RESET}");
 
     let fresh_leaders: Vec<String> = sqlx::query_scalar(
@@ -690,6 +692,55 @@ async fn print_pm_doctor(pool: &sqlx::PgPool) -> Result<()> {
     .await
     .map_err(|e| anyhow::anyhow!("doctor free slots: {e}"))?;
 
+    let active_by_project = ff_db::pg_active_lease_counts_by_project(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("doctor active work by project: {e}"))?;
+    let ready = ff_db::pg_ready_work_items(pool, MAX_ASSIGN_PER_TICK)
+        .await
+        .map_err(|e| anyhow::anyhow!("doctor ready work by project: {e}"))?;
+    let mut project_active: std::collections::BTreeMap<Option<String>, i64> =
+        active_by_project.into_iter().collect();
+    for item in ready {
+        project_active.entry(item.project_id).or_default();
+    }
+
+    let active_by_computer: std::collections::HashMap<uuid::Uuid, i64> = sqlx::query_as(
+        "SELECT computer_id, COUNT(*)::bigint
+               FROM work_item_leases
+              WHERE released_at IS NULL
+              GROUP BY computer_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("doctor active work by computer: {e}"))?
+    .into_iter()
+    .collect();
+    let dispatch_fresh: std::collections::HashSet<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT id FROM computers
+              WHERE dispatch_tick_at > NOW() - INTERVAL '60 seconds'",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("doctor dispatch freshness: {e}"))?
+    .into_iter()
+    .collect();
+    let schedulable_free_slots = ff_db::pg_free_slots(pool, None, MAX_ASSIGN_PER_TICK)
+        .await
+        .map_err(|e| anyhow::anyhow!("doctor schedulable free slots: {e}"))?
+        .into_iter()
+        .filter(|slot| {
+            dispatch_fresh.contains(&slot.computer_id)
+                && active_by_computer
+                    .get(&slot.computer_id)
+                    .copied()
+                    .unwrap_or(0)
+                    < 3
+        })
+        .count() as i64;
+    let fair_share =
+        project_fair_share(project_active.len(), active_leases + schedulable_free_slots);
+    let project_active: Vec<_> = project_active.into_iter().collect();
+
     // Orphaned `in_progress` work_items with NO active lease — invisible to the
     // lease-based reaper, so they sit forever. The scheduler's orphan sweep
     // cancels them after an hour; surface any here so "healthy" isn't a lie.
@@ -716,6 +767,7 @@ async fn print_pm_doctor(pool: &sqlx::PgPool) -> Result<()> {
     println!("{GREEN}✓ work_items by status{RESET}: {status_detail}");
 
     println!("{GREEN}✓ active leases{RESET}: {active_leases}");
+    print!("{}", render_project_fairness(&project_active, fair_share));
 
     let stale_ok = stale_leases == 0;
     if stale_ok {
@@ -748,6 +800,34 @@ async fn print_pm_doctor(pool: &sqlx::PgPool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn project_fair_share(project_count: usize, total_capacity: i64) -> i64 {
+    if project_count == 0 {
+        return total_capacity;
+    }
+    let project_count = project_count as i64;
+    (total_capacity + project_count - 1) / project_count
+}
+
+fn render_project_fairness(project_active: &[(Option<String>, i64)], fair_share: i64) -> String {
+    if project_active.is_empty() {
+        return format!("{GREEN}✓ project fairness{RESET}: no active or ready projects\n");
+    }
+
+    let mut output = format!(
+        "{GREEN}✓ project fairness{RESET}:\n  {:<24} {:>11} {:>11}\n",
+        "PROJECT", "ACTIVE WORK", "FAIR SHARE"
+    );
+    for (project, active) in project_active {
+        output.push_str(&format!(
+            "  {:<24} {:>11} {:>11}\n",
+            project.as_deref().unwrap_or("<unassigned>"),
+            active,
+            fair_share
+        ));
+    }
+    output
 }
 
 /// One-line fleet-wide rollup for `ff pm board`: work_items by status, live
@@ -2955,6 +3035,31 @@ mod tests {
         let out = render_pm_stats(&s);
         assert!(out.contains("by status:\n    (none)"));
         assert!(out.contains("oldest pending (ready): (none) ✓"));
+    }
+
+    #[test]
+    fn project_fairness_uses_scheduler_capacity_formula() {
+        assert_eq!(project_fair_share(3, 10), 4);
+        assert_eq!(project_fair_share(3, 9), 3);
+        assert_eq!(project_fair_share(0, 7), 7);
+    }
+
+    #[test]
+    fn project_fairness_renders_active_work_and_allocation() {
+        let projects = vec![
+            (Some("forge-fleet".to_string()), 5),
+            (Some("hireflow360".to_string()), 1),
+            (None, 2),
+        ];
+        let out = render_project_fairness(&projects, 4);
+
+        assert!(out.contains("PROJECT"));
+        assert!(out.contains("ACTIVE WORK"));
+        assert!(out.contains("FAIR SHARE"));
+        assert!(out.contains("forge-fleet"));
+        assert!(out.contains("hireflow360"));
+        assert!(out.contains("<unassigned>"));
+        assert_eq!(out.matches('4').count(), 3);
     }
 
     #[test]
