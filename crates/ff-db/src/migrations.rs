@@ -1200,6 +1200,16 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
     },
+    PgMigration {
+        version: 271,
+        name: "local_failure_diagnoses",
+        sql: schema::SCHEMA_V271_LOCAL_FAILURE_DIAGNOSES,
+    },
+    PgMigration {
+        version: 272,
+        name: "work_item_retry_count",
+        sql: schema::SCHEMA_V272_WORK_ITEM_RETRY_COUNT,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1412,6 +1422,38 @@ mod tests {
                 pair[1].name,
             );
         }
+    }
+
+    #[test]
+    fn v271_has_cloud_fixes_local_acceptance_artifact() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 271)
+            .expect("V271 must be registered");
+        assert_eq!(migration.name, "local_failure_diagnoses");
+        assert!(
+            migration
+                .sql
+                .contains("CREATE TABLE IF NOT EXISTS local_failure_diagnoses")
+        );
+        assert!(migration.sql.contains("local_retest_passed"));
+        assert!(migration.sql.contains("dreamer_context_pack"));
+        assert!(migration.sql.contains("fine_tune_model_ab"));
+    }
+
+    #[test]
+    fn v272_adds_work_item_retry_count() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 272)
+            .expect("V272 must be registered");
+        assert_eq!(migration.name, "work_item_retry_count");
+        assert!(
+            migration
+                .sql
+                .contains("ADD COLUMN IF NOT EXISTS retry_count")
+        );
+        assert!(migration.sql.contains("NOT NULL DEFAULT 0"));
     }
 
     fn db_url() -> Option<String> {
