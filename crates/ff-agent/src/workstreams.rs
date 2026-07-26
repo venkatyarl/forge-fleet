@@ -133,7 +133,10 @@ pub async fn workstream_for_dir(pg: &PgPool, cwd: &std::path::Path) -> Result<Op
     if let Some(id) = resolved.as_deref()
         && let Some(want) = canon(id)
     {
-        if let Some(ws) = all.iter().find(|w| canon(&w.git_remote).as_deref() == Some(&want)) {
+        if let Some(ws) = all
+            .iter()
+            .find(|w| canon(&w.git_remote).as_deref() == Some(&want))
+        {
             return Ok(Some(ws.clone()));
         }
     }
@@ -210,7 +213,9 @@ pub async fn report(
     .bind(session_id)
     .fetch_optional(pg)
     .await?
-    .ok_or_else(|| anyhow::anyhow!("session '{session_id}' is not attached — run `ff workstream attach` first"))?;
+    .ok_or_else(|| {
+        anyhow::anyhow!("session '{session_id}' is not attached — run `ff workstream attach` first")
+    })?;
 
     // COALESCE keeps prior values when a field is omitted; the note is appended
     // to the open_threads jsonb array with a server timestamp + the session id.
@@ -247,7 +252,10 @@ pub struct AttachedClient {
 }
 
 /// List the sessions attached to a workstream, most-recently-active first.
-pub async fn attached_clients(pg: &PgPool, workstream_id: uuid::Uuid) -> Result<Vec<AttachedClient>> {
+pub async fn attached_clients(
+    pg: &PgPool,
+    workstream_id: uuid::Uuid,
+) -> Result<Vec<AttachedClient>> {
     ensure_client_schema(pg).await?;
     let rows = sqlx::query_as::<_, AttachedClient>(
         "SELECT session_id, worker_name, tool, goal, status, last_report_at \
