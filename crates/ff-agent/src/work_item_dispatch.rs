@@ -3930,7 +3930,54 @@ async fn run_ff_dispatch(
     }
     if !attempted_backend {
         if quota_skipped_backend {
-            bail!("run_ff_dispatch: no dispatchable backend on this node (cloud budget exhausted)");
+            // CLOUD EXHAUSTED → FALL BACK TO THE LOCAL LLM ROUTER, don't bail.
+            // Every cloud backend was quota-skipped (rate/budget window). Failing
+            // here strands the item as "no dispatchable backend (cloud budget
+            // exhausted)" even though a whole local glm/devstral fleet is up and
+            // free. Operator rule (2026-07-26): if cloud is genuinely exhausted,
+            // route to ANOTHER model from the LLM router — never fail the item for
+            // lack of cloud. codegen_apply → fleet_oneshot picks any healthy local
+            // deployment across the fleet (tier-aware: glm-4.5-air for capable).
+            warn!(
+                work_item = %item.work_item_id,
+                "run_ff_dispatch: all cloud backends quota-skipped — falling back to LOCAL fleet router (fleet_oneshot) instead of failing"
+            );
+            let hint = local_model_hint(pg, &item.complexity).await;
+            match crate::codegen_apply::codegen_apply(
+                pg,
+                &worktree.worktree_path,
+                &prompt,
+                hint.as_deref(),
+                4,
+                Some(item.work_item_id),
+            )
+            .await
+            {
+                Ok(outcome) if outcome.applied || outcome.already_done => {
+                    let _ = crate::circuit_breaker::record_provider_success(
+                        pg,
+                        computer_id,
+                        LOCAL_CODEGEN_PROVIDER,
+                    )
+                    .await;
+                    return Ok((
+                        format!("local:{}", hint.as_deref().unwrap_or("fleet")),
+                        synthetic_output(
+                            "cloud exhausted — built on local fleet router (glm/devstral)",
+                        ),
+                    ));
+                }
+                Ok(outcome) => {
+                    bail!(
+                        "cloud exhausted and local-router fallback produced no diff after {} rounds: {}",
+                        outcome.rounds,
+                        outcome.error.as_deref().unwrap_or("no edits applied")
+                    );
+                }
+                Err(e) => {
+                    bail!("cloud exhausted and local-router fallback failed: {e}");
+                }
+            }
         }
         warn!(
             backend = %forced_backend,
