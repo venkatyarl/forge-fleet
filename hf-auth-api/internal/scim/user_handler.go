@@ -21,8 +21,8 @@ type User struct {
 }
 
 type UserService interface {
-	CreateUser(context.Context, *UserAttributes) (*User, error)
-	UpdateUser(context.Context, string, *UserAttributes) (*User, error)
+	CreateUser(context.Context, *User) (*User, error)
+	UpdateUser(context.Context, string, *User) (*User, error)
 }
 
 type UserHandler struct {
@@ -70,7 +70,7 @@ func (h *UserHandler) HandleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, user)
 }
 
-func attributesFromRequest(w http.ResponseWriter, r *http.Request) (*UserAttributes, bool) {
+func attributesFromRequest(w http.ResponseWriter, r *http.Request) (*User, bool) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeSCIMError(w, http.StatusBadRequest, "scim: read request body")
