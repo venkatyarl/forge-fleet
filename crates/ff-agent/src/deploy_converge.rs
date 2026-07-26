@@ -184,6 +184,32 @@ async fn run_once(pg: &PgPool) -> Result<()> {
             .bind(&head)
             .execute(pg)
             .await;
+
+            // AUTO-REQUEUE ON DEPLOY (operator 2026-07-26: "no human requeuing
+            // should ever be needed"). A new commit shipped fleet-wide may fix
+            // the exact failure class that killed items (e.g. today's
+            // review-fallback fixed the "in-place review unavailable" backlog).
+            // So on every successful deploy, give FIXABLE-class failures a FRESH
+            // retry (attempts=0 → ready) so they build against the new code — no
+            // manual requeue. Terminal classes are excluded: `review rejected`
+            // (the diff is genuinely wrong) and `max-build-duration` (too big —
+            // needs decomposition, not retry). Self-limiting: if the new code
+            // doesn't fix it, it fails again and re-exhausts, and it only fires
+            // when the SHA actually changed (once per deploy).
+            let requeued = sqlx::query(
+                "UPDATE work_items SET status='ready', attempts=0, \
+                        last_error='auto-requeued after deploy of new code' \
+                  WHERE status='failed' \
+                    AND coalesce(last_error,'') NOT ILIKE '%review rejected%' \
+                    AND coalesce(last_error,'') NOT ILIKE '%max-build-duration%'",
+            )
+            .execute(pg)
+            .await
+            .map(|r| r.rows_affected())
+            .unwrap_or(0);
+            if requeued > 0 {
+                info!(requeued, head = %head, "deploy-converge: auto-requeued fixable failures for the new code");
+            }
         }
         Ok(o) => warn!(
             head = %head, code = ?o.status.code(),
