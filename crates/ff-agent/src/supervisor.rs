@@ -270,8 +270,7 @@ pub async fn supervise(
                 // retry with a stern directive; if the last attempt still made no
                 // change, fall through to success=false so the caller ESCALATES
                 // (e.g. to a cloud CLI) instead of recording a bogus completion.
-                if sup_config.require_change
-                    && !work_tree_changed(&agent_config.working_dir).await
+                if sup_config.require_change && !work_tree_changed(&agent_config.working_dir).await
                 {
                     let evidence =
                         "agent declared done but the git work tree is UNCHANGED (no diff, no new \
