@@ -77,6 +77,35 @@ async fn mode_enabled(pg: &PgPool) -> bool {
 /// One pass: if a new commit is on `origin/main` and we're not already at it,
 /// run the native `ff fleet deploy --all` (build-once-per-profile + ship).
 async fn run_once(pg: &PgPool) -> Result<()> {
+    // SAFETY NET (operator 2026-07-25): a deploy that fails/crashes mid-flight
+    // leaves its targets stuck `reservation_state='drained'` — and drained nodes
+    // have disabled sub-agents, so the WHOLE FLEET silently stops building (0
+    // merges) AND every later deploy sees "no eligible targets" and false-
+    // succeeds. This happened live: 16 nodes stranded drained. Restore any node
+    // drained longer than a deploy could possibly take (no deploy drains a node
+    // for 30+ min), independent of the deploy gate below. Never touches taylor
+    // (operator-reserved) or the leader.
+    let restored = sqlx::query(
+        "UPDATE computers SET reservation_state='available', reserved_reason=NULL, \
+                reservation_owner=NULL, reservation_expires_at=NULL \
+          WHERE reservation_state='drained' \
+            AND coalesce(reserved_at, now() - interval '1 hour') < now() - interval '30 minutes' \
+            AND lower(name) <> 'taylor'",
+    )
+    .execute(pg)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    if restored > 0 {
+        warn!(restored, "deploy-converge: restored stale-drained nodes (orphaned by a failed deploy) — re-enabling their slots");
+        let _ = sqlx::query(
+            "UPDATE sub_agents SET status='idle' WHERE status='disabled' \
+              AND computer_id IN (SELECT id FROM computers WHERE reservation_state='available')",
+        )
+        .execute(pg)
+        .await;
+    }
+
     if !mode_enabled(pg).await {
         return Ok(());
     }
