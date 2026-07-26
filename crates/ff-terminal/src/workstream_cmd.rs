@@ -142,6 +142,110 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
                 println!("  • {base}  ({key})  {remote}");
             }
         }
+        crate::WorkstreamCommand::Heartbeat { tool } => {
+            // Best-effort liveness — never error a session's Stop hook. If the dir
+            // isn't a known project or the session isn't attached, silently no-op.
+            let dir = effective_cwd(cwd)?;
+            if let Ok(Some(ws)) = workstreams::workstream_for_dir(&pg, &dir).await {
+                let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
+                let sid = workstreams::session_id_for(&worker, &ws.project_key, &tool);
+                let _ = workstreams::heartbeat(&pg, &sid).await;
+            }
+        }
+        crate::WorkstreamCommand::InstallHooks { r#for, dry_run } => {
+            install_workstream_hooks(&r#for, dry_run)?;
+        }
     }
+    Ok(())
+}
+
+/// Write SessionStart auto-attach + Stop heartbeat hooks into each CLI's config
+/// so a session in a project folder binds to its workstream with no manual step.
+fn install_workstream_hooks(which: &str, dry_run: bool) -> Result<()> {
+    let home = dirs::home_dir().context("resolve home directory")?;
+    let targets: Vec<&str> = match which {
+        "all" => vec!["claude", "codex", "kimi"],
+        one => vec![one],
+    };
+    for tool in targets {
+        match tool {
+            "claude" => install_claude_hooks(&home, dry_run)?,
+            // codex/kimi hook formats differ; wire claude first (this session),
+            // extend to the others once their hook schema is confirmed.
+            "codex" | "kimi" => {
+                println!("  ⏭  {tool}: hook install not yet implemented (claude first)");
+            }
+            other => println!("  ⚠ unknown tool '{other}' — skipping"),
+        }
+    }
+    Ok(())
+}
+
+/// Add SessionStart (`ff workstream attach`) + Stop (`ff workstream heartbeat`)
+/// hooks to `~/.claude/settings.json`, preserving every other key. Idempotent —
+/// re-running replaces the ff hook entries without duplicating them.
+fn install_claude_hooks(home: &std::path::Path, dry_run: bool) -> Result<()> {
+    use serde_json::{Value, json};
+    let path = home.join(".claude").join("settings.json");
+    let mut doc: Value = if path.exists() {
+        let s = std::fs::read_to_string(&path)?;
+        if s.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&s).with_context(|| format!("parse {}", path.display()))?
+        }
+    } else {
+        json!({})
+    };
+
+    // Marker so we can find + replace only OUR hook entries on re-install.
+    let attach_cmd = "ff workstream attach --tool claude >/dev/null 2>&1 || true";
+    let beat_cmd = "ff workstream heartbeat --tool claude >/dev/null 2>&1 || true";
+    let ff_entry = |cmd: &str| {
+        json!({ "hooks": [ { "type": "command", "command": cmd } ] })
+    };
+
+    let obj = doc
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
+    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+    let hooks = hooks
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("hooks is not an object"))?;
+
+    // For each event, drop any prior ff entry (identified by our command string)
+    // then append the fresh one — keeps the operator's own hooks untouched.
+    for (event, cmd) in [("SessionStart", attach_cmd), ("Stop", beat_cmd)] {
+        let arr = hooks.entry(event).or_insert_with(|| json!([]));
+        if let Some(list) = arr.as_array_mut() {
+            list.retain(|group| {
+                !group
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|h| {
+                        h.iter().any(|e| {
+                            e.get("command").and_then(|c| c.as_str()).is_some_and(|c| {
+                                c.contains("ff workstream attach")
+                                    || c.contains("ff workstream heartbeat")
+                            })
+                        })
+                    })
+                    .unwrap_or(false)
+            });
+            list.push(ff_entry(cmd));
+        }
+    }
+
+    let pretty = serde_json::to_string_pretty(&doc)?;
+    if dry_run {
+        println!("  [dry-run] would write {}:\n{pretty}", path.display());
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&path, pretty).with_context(|| format!("write {}", path.display()))?;
+    println!("  ✓ claude: SessionStart auto-attach + Stop heartbeat → {}", path.display());
+    println!("    (new sessions in a project folder now auto-attach to its workstream)");
     Ok(())
 }

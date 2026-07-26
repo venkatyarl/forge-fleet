@@ -2608,6 +2608,24 @@ pub enum WorkstreamCommand {
     },
     /// List all active project workstreams.
     List,
+    /// Liveness ping — bump this session's last_report_at without changing the
+    /// shared summary. Called automatically by the session Stop hook.
+    Heartbeat {
+        #[arg(long, default_value = "claude")]
+        tool: String,
+    },
+    /// Install SessionStart auto-attach + Stop heartbeat hooks into a CLI's
+    /// config, so every session in a project folder binds to its workstream with
+    /// NO manual `ff workstream attach`. This is what makes the workstream a live
+    /// session-of-record instead of a hand-poked table.
+    InstallHooks {
+        /// Which CLI to wire (claude|codex|kimi|all).
+        #[arg(long, default_value = "all")]
+        r#for: String,
+        /// Print what would be written without modifying any config.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
