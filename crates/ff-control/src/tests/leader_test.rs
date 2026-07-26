@@ -7,7 +7,28 @@ use ff_runtime::EngineStatus;
 
 use crate::bootstrap::{BootstrapOptions, StartupSubsystem};
 use crate::control_plane::ControlPlane;
+use crate::health::AggregateHealthStatus;
+use crate::subsystem_watchdog::{
+    RestartOutcome, SubsystemObservation, SubsystemRestarter, WatchdogSubsystem,
+};
 use crate::subsystem_watchdog::{SubsystemWatchdog, WatchdogAction};
+
+#[derive(Default)]
+struct RecordingRestarter {
+    restarted: Vec<WatchdogSubsystem>,
+    fail: bool,
+}
+
+impl SubsystemRestarter for RecordingRestarter {
+    fn restart(&mut self, subsystem: WatchdogSubsystem) -> Result<(), String> {
+        self.restarted.push(subsystem);
+        if self.fail {
+            Err("supervisor unavailable".to_string())
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// A control plane with no nodes/models configured — enough to exercise
 /// health aggregation without a live fleet.
@@ -159,4 +180,110 @@ fn recovering_subsystem_resets_the_consecutive_counter() {
         actions.is_empty(),
         "counter must have reset on recovery, so one more unhealthy tick shouldn't trip it"
     );
+}
+
+#[test]
+fn managed_subsystem_restarts_after_dead_threshold() {
+    let mut watchdog = SubsystemWatchdog::new().with_trip_threshold(2);
+    let mut restarter = RecordingRestarter::default();
+
+    let first = watchdog.restart_dead_subsystems(
+        [SubsystemObservation::dead(
+            WatchdogSubsystem::MergeDrain,
+            "join handle finished",
+        )],
+        true,
+        &mut restarter,
+    );
+    assert!(first[0].restart.is_none());
+
+    let second = watchdog.restart_dead_subsystems(
+        [SubsystemObservation::dead(
+            WatchdogSubsystem::MergeDrain,
+            "join handle finished",
+        )],
+        true,
+        &mut restarter,
+    );
+
+    assert_eq!(restarter.restarted, vec![WatchdogSubsystem::MergeDrain]);
+    assert!(matches!(second[0].restart, Some(RestartOutcome::Restarted)));
+    assert_eq!(watchdog.subsystem_events().len(), 2);
+}
+
+#[test]
+fn managed_subsystem_non_leader_does_not_restart() {
+    let mut watchdog = SubsystemWatchdog::new().with_trip_threshold(1);
+    let mut restarter = RecordingRestarter::default();
+
+    let events = watchdog.restart_dead_subsystems(
+        [SubsystemObservation::dead(
+            WatchdogSubsystem::SelfHeal,
+            "stale heartbeat",
+        )],
+        false,
+        &mut restarter,
+    );
+
+    assert!(events.is_empty());
+    assert!(restarter.restarted.is_empty());
+    assert!(watchdog.subsystem_events().is_empty());
+}
+
+#[test]
+fn managed_subsystem_recovery_resets_dead_counter() {
+    let mut watchdog = SubsystemWatchdog::new().with_trip_threshold(2);
+    let mut restarter = RecordingRestarter::default();
+
+    watchdog.restart_dead_subsystems(
+        [SubsystemObservation::dead(
+            WatchdogSubsystem::Reaper,
+            "missed heartbeat",
+        )],
+        true,
+        &mut restarter,
+    );
+    watchdog.restart_dead_subsystems(
+        [SubsystemObservation::alive(WatchdogSubsystem::Reaper)],
+        true,
+        &mut restarter,
+    );
+    let events = watchdog.restart_dead_subsystems(
+        [SubsystemObservation::dead(
+            WatchdogSubsystem::Reaper,
+            "missed heartbeat",
+        )],
+        true,
+        &mut restarter,
+    );
+
+    assert_eq!(events[0].consecutive_unhealthy, 1);
+    assert!(events[0].restart.is_none());
+    assert!(restarter.restarted.is_empty());
+}
+
+#[test]
+fn managed_subsystem_records_restart_failure() {
+    let mut watchdog = SubsystemWatchdog::new().with_trip_threshold(1);
+    let mut restarter = RecordingRestarter {
+        restarted: Vec::new(),
+        fail: true,
+    };
+
+    let events = watchdog.restart_dead_subsystems(
+        [SubsystemObservation {
+            subsystem: WatchdogSubsystem::Scheduler,
+            status: AggregateHealthStatus::Unhealthy,
+            reason: Some("task exited".to_string()),
+            observed_at: chrono::Utc::now(),
+        }],
+        true,
+        &mut restarter,
+    );
+
+    assert!(matches!(
+        events[0].restart,
+        Some(RestartOutcome::Failed { .. })
+    ));
+    assert_eq!(restarter.restarted, vec![WatchdogSubsystem::Scheduler]);
 }
