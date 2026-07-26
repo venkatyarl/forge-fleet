@@ -179,8 +179,14 @@ fn install_workstream_hooks(which: &str, dry_run: bool) -> Result<()> {
             // Instruction-based (relies on model compliance) rather than a
             // deterministic hook — honest tradeoff until an MCP-side auto-attach
             // (CLI-agnostic, deterministic) is built.
-            "codex" => install_agents_md_directive(&home.join(".codex").join("AGENTS.md"), "codex", dry_run)?,
-            "kimi" => install_agents_md_directive(&home.join(".kimi").join("AGENTS.md"), "kimi", dry_run)?,
+            "codex" => install_agents_md_directive(
+                &home.join(".codex").join("AGENTS.md"),
+                "codex",
+                dry_run,
+            )?,
+            "kimi" => {
+                install_agents_md_directive(&home.join(".kimi").join("AGENTS.md"), "kimi", dry_run)?
+            }
             other => println!("  ⚠ unknown tool '{other}' — skipping"),
         }
     }
@@ -223,14 +229,21 @@ fn install_agents_md_directive(path: &std::path::Path, tool: &str, dry_run: bool
         format!("{cleaned}\n\n{block}")
     };
     if dry_run {
-        println!("  [dry-run] would append ff-workstream directive to {}", path.display());
+        println!(
+            "  [dry-run] would append ff-workstream directive to {}",
+            path.display()
+        );
         return Ok(());
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    std::fs::write(path, format!("{joined}\n")).with_context(|| format!("write {}", path.display()))?;
-    println!("  ✓ {tool}: workstream directive → {} (instruction-based)", path.display());
+    std::fs::write(path, format!("{joined}\n"))
+        .with_context(|| format!("write {}", path.display()))?;
+    println!(
+        "  ✓ {tool}: workstream directive → {} (instruction-based)",
+        path.display()
+    );
     Ok(())
 }
 
@@ -254,9 +267,7 @@ fn install_claude_hooks(home: &std::path::Path, dry_run: bool) -> Result<()> {
     // Marker so we can find + replace only OUR hook entries on re-install.
     let attach_cmd = "ff workstream attach --tool claude >/dev/null 2>&1 || true";
     let beat_cmd = "ff workstream heartbeat --tool claude >/dev/null 2>&1 || true";
-    let ff_entry = |cmd: &str| {
-        json!({ "hooks": [ { "type": "command", "command": cmd } ] })
-    };
+    let ff_entry = |cmd: &str| json!({ "hooks": [ { "type": "command", "command": cmd } ] });
 
     let obj = doc
         .as_object_mut()
@@ -298,7 +309,10 @@ fn install_claude_hooks(home: &std::path::Path, dry_run: bool) -> Result<()> {
         std::fs::create_dir_all(parent).ok();
     }
     std::fs::write(&path, pretty).with_context(|| format!("write {}", path.display()))?;
-    println!("  ✓ claude: SessionStart auto-attach + Stop heartbeat → {}", path.display());
+    println!(
+        "  ✓ claude: SessionStart auto-attach + Stop heartbeat → {}",
+        path.display()
+    );
     println!("    (new sessions in a project folder now auto-attach to its workstream)");
     Ok(())
 }

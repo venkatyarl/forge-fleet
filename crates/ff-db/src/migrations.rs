@@ -1230,6 +1230,16 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "glm_45_air_ab_scoreboard",
         sql: schema::SCHEMA_V276_GLM_45_AIR_AB_SCOREBOARD,
     },
+    PgMigration {
+        version: 277,
+        name: "work_item_lease_build_started_at",
+        sql: schema::SCHEMA_V277_WORK_ITEM_LEASE_BUILD_STARTED_AT,
+    },
+    PgMigration {
+        version: 278,
+        name: "durable_project_workstreams",
+        sql: schema::SCHEMA_V278_DURABLE_PROJECT_WORKSTREAMS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1551,6 +1561,42 @@ mod tests {
                 .contains("CREATE OR REPLACE VIEW v_builder_stats")
         );
         assert!(migration.sql.contains("parallel_slots = 4"));
+    }
+
+    #[test]
+    fn v278_defines_durable_project_workstreams() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 278)
+            .expect("V278 must be registered");
+        assert_eq!(migration.name, "durable_project_workstreams");
+        for artifact in [
+            "ff_workstreams",
+            "project_id",
+            "aliases",
+            "session_attachments",
+            "last_seen_at",
+            "workstream_notes",
+            "workstream_threads",
+            "workstream_one_thread_per_item",
+            "leader_generation",
+            "next_seq",
+            "owner_identity",
+        ] {
+            assert!(migration.sql.contains(artifact), "missing {artifact}");
+        }
+    }
+
+    #[tokio::test]
+    async fn v278_applies_when_postgres_is_available() {
+        let Some(database_url) = db_url() else {
+            return;
+        };
+        let pool = PgPool::connect(&database_url).await.unwrap();
+        sqlx::raw_sql(schema::SCHEMA_V278_DURABLE_PROJECT_WORKSTREAMS)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     fn db_url() -> Option<String> {
