@@ -4479,10 +4479,39 @@ fn checkout_clone_for_build(repo_path: &Path, base_branch: &str, task_branch: &s
     }
 
     if !fetched {
-        bail!(
-            "checkout_clone_for_build: could not fetch origin/{base_branch} in {FETCH_ATTEMPTS} tries — \
-             refusing to build from a possibly-stale base"
-        );
+        // GRACEFUL DEGRADATION (operator 2026-07-26): both the LAN mirror and
+        // direct GitHub fetch failed — usually because THIS node is network-
+        // isolated from GitHub (e.g. priya, the DB primary, has no GitHub route
+        // and no mirror). Hard-failing here threw away a perfectly good local
+        // checkout and terminal-failed the work_item ("refusing to build from a
+        // possibly-stale base"). But the worktree ALREADY HAS an `origin/<base>`
+        // ref from when it was cloned — at most one sync-cycle stale. Building
+        // from that produces a real PR, which the merge-drain REBASES onto fresh
+        // main + runs CI on before merging anyway, so a stale base can't land bad
+        // code. A slightly-stale base that yields a PR beats a terminal failure.
+        // Only truly bail when there is NO local base ref at all (nothing to
+        // build from). This also stops the self-heal requeue loop that kept
+        // landing the item back on the same isolated node until max retries.
+        let have_local_base = run_git(
+            repo_path,
+            ["rev-parse", "--verify", "--quiet", &base_ref],
+            Duration::from_secs(30),
+        )
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+        if have_local_base {
+            warn!(
+                base_branch,
+                "checkout_clone_for_build: could not fetch origin/{base_branch} ({FETCH_ATTEMPTS} tries) \
+                 — building from the EXISTING local base ref (node likely GitHub-isolated); \
+                 merge-drain will rebase onto fresh main + run CI before merge"
+            );
+        } else {
+            bail!(
+                "checkout_clone_for_build: could not fetch origin/{base_branch} in {FETCH_ATTEMPTS} tries \
+                 AND no local {base_ref} ref exists — nothing to build from on this node"
+            );
+        }
     }
     run_git(repo_path, ["reset", "--hard"], Duration::from_secs(120))?;
     // `tmp/` is the slot's harvest boundary: a killed agent may have useful,
