@@ -1071,6 +1071,21 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         );
     }
 
+    // 18b') Rolling-deployment convergence tick — leader-gated, gate
+    // `rolling_deploy_mode` (off|on, DEFAULT off). When a new commit lands on
+    // origin/main, runs the native `ff fleet deploy --all` (build-once-per-profile
+    // [linux-x86_64 / linux-aarch64-DGX / macos-aarch64 / windows] + ship + drain).
+    // The durable native replacement for the shell version_reconciler — makes
+    // every fix reach all nodes automatically. See `ff_agent::deploy_converge`.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: rolling-deployment convergence tick (leader-gated, gated off by default)");
+        subsystem_tasks.push(ff_agent::deploy_converge::spawn_deploy_converge_tick(
+            pg_pool,
+            300, // check every 5 min for a new commit to converge on
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 18c) Fleet-integrity verify tick — every 15min, leader-gated, gate
     // `fleet_secrets.fleet_integrity_mode` (off|report, DEFAULT off).
     // `revive_scan` already repairs DEAD nodes; this covers the blind spot of an

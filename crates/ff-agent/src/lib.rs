@@ -136,6 +136,7 @@ pub mod pr_integration;
 pub mod pr_integration_branch;
 pub mod pr_merge_executor;
 pub mod pr_verify;
+pub mod deploy_converge;
 pub mod project_digests;
 pub mod project_github_sync;
 pub mod project_registry;
