@@ -49,6 +49,8 @@ pub mod types;
 pub mod url;
 pub mod verifier;
 
+use serde::{Deserialize, Serialize};
+
 // Re-export the most commonly used items at crate root.
 pub use activity::{ActivitySignals, ActivityState, YieldMode};
 pub use artifact_cache::{
@@ -94,6 +96,17 @@ pub use verifier::{
 
 /// Crate version from Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Target platform a deployment artifact is built for.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentProfile {
+    #[default]
+    LinuxX86,
+    LinuxAarch64Dgx,
+    MacosAarch64,
+    Windows,
+}
 
 /// Returns true if `s` is empty or contains only whitespace characters.
 pub fn is_blank(s: &str) -> bool {
