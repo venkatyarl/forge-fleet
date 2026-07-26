@@ -58,7 +58,7 @@ pub const TRANSIENT_ERROR_SIGNATURES: &[&str] = &[
     // build-OUTCOME transient (operator 2026-07-25: "why isn't ff working on the
     // failed items?"). These are retryable NOW that dispatch is local-first: a
     // different/local backend, a healthy reviewer, or a cleared stall/lock lets
-    // the SAME task land on a later attempt. Bounded by MAX_SELF_HEAL_ATTEMPTS so
+    // the SAME task land on a later attempt. Bounded by MAX_SELF_HEAL_RETRIES so
     // a genuinely-impossible task still stops after its retries.
     "in-place review unavailable", // reviewer (480b/cloud) was down — retry when back
     "produced no diff",            // backend made no change — local-first may succeed
@@ -84,13 +84,10 @@ pub fn error_is_transient(err: &str) -> bool {
         .any(|sig| lower.contains(sig))
 }
 
-/// Total-attempt ceiling for self-heal requeues. MUST stay STRICTLY ABOVE the
-/// dispatch/scheduler failure caps (`work_item_dispatch::MAX_DISPATCH_ATTEMPTS`
-/// = `work_item_scheduler::MAX_BUILD_ATTEMPTS` = 5): a transiently-failed item
-/// usually lands on `failed` AT that cap, so a ceiling at or below it would
-/// never requeue anything. 8 = the 5 regular attempts + 3 self-heal retries;
-/// past that the item stays terminally `failed` for a human.
-pub const MAX_SELF_HEAL_ATTEMPTS: i32 = 8;
+/// Failed-item retry budget. This is deliberately the same cap as the general
+/// scheduler retry path; transient classification must not create an
+/// independent, unbounded retry budget.
+pub const MAX_SELF_HEAL_RETRIES: i32 = 3;
 
 /// Max items returned to the ready pool per sweep (back-pressure: a fleet-wide
 /// outage can terminally fail a large backlog at once; re-admit it gradually).
@@ -100,13 +97,13 @@ pub const SELF_HEAL_REQUEUE_BATCH: i64 = 16;
 /// condition that failed them (dead creds, offline node, rate limit) rarely
 /// clears in seconds, and the scheduler ticks every ~15s — without a cooldown
 /// an item would burn its whole self-heal budget inside a single outage.
-pub const SELF_HEAL_COOLDOWN_SECS: i64 = 600;
+pub const SELF_HEAL_COOLDOWN_SECS: i64 = 20 * 60;
 
 /// One self-heal sweep with the default knobs; called from the scheduler tick.
 pub async fn requeue_transient_failures(pg: &PgPool) -> Result<u64> {
     requeue_transient_failures_with(
         pg,
-        MAX_SELF_HEAL_ATTEMPTS,
+        MAX_SELF_HEAL_RETRIES,
         SELF_HEAL_REQUEUE_BATCH,
         SELF_HEAL_COOLDOWN_SECS,
     )
@@ -115,11 +112,11 @@ pub async fn requeue_transient_failures(pg: &PgPool) -> Result<u64> {
 
 /// Requeue up to `batch` terminally-`failed` task work_items whose `last_error`
 /// is transient (see [`TRANSIENT_ERROR_SIGNATURES`]) and whose `attempts` is
-/// still under `max_attempts`, restoring full redispatch eligibility in one
+/// still under `max_retries`, restoring full redispatch eligibility in one
 /// transaction-equivalent statement. Returns the number of items requeued.
 pub async fn requeue_transient_failures_with(
     pg: &PgPool,
-    max_attempts: i32,
+    max_retries: i32,
     batch: i64,
     cooldown_secs: i64,
 ) -> Result<u64> {
@@ -135,18 +132,15 @@ pub async fn requeue_transient_failures_with(
                FROM work_items w
               WHERE w.status = 'failed'
                 AND w.kind = 'task'
-                AND COALESCE(w.attempts, 0) < $1
+                AND w.retry_count < $1
                 -- Transient classification MUST sit here, BEFORE the LIMIT: a
                 -- LIMIT over all failed items with classification applied
                 -- afterwards lets a page of older non-transient failures starve
                 -- every transient one behind it, forever.
                 AND lower(COALESCE(w.last_error, '')) LIKE ANY($2)
-                -- Cooldown: the most recent lease release approximates when the
-                -- item failed (work_items has no failed-at stamp).
-                AND NOT EXISTS (
-                    SELECT 1 FROM work_item_leases lc
-                     WHERE lc.work_item_id = w.id
-                       AND lc.released_at > NOW() - make_interval(secs => $4))
+                AND w.completed_at <= NOW() - make_interval(secs => $4)
+                AND COALESCE(w.last_error, '') !~*
+                    '(^|[^A-Z])(BOGUS|QUARANTINE|CANCELLED)([^A-Z]|$)'
               ORDER BY w.created_at ASC
               LIMIT $3
                 FOR UPDATE SKIP LOCKED
@@ -173,24 +167,30 @@ pub async fn requeue_transient_failures_with(
          )
          UPDATE work_items w
             SET status = 'ready',
-                attempts = COALESCE(w.attempts, 0) + 1,
+                retry_count = w.retry_count + 1,
+                attempts = GREATEST(
+                    COALESCE(w.attempts, 0),
+                    $5
+                ),
                 assigned_to = NULL,
-                assigned_computer = NULL
+                assigned_computer = NULL,
+                completed_at = NULL
            FROM candidates c
           WHERE w.id = c.id
       RETURNING w.id",
     )
-    .bind(max_attempts)
+    .bind(max_retries)
     .bind(&patterns)
     .bind(batch)
     .bind(cooldown_secs as f64)
+    .bind(ff_routing_policy::LOCAL_LANE_MAX_TRIES as i32)
     .fetch_all(pg)
     .await?;
 
     if !rows.is_empty() {
         info!(
             requeued = rows.len(),
-            max_attempts, batch, "self-heal: requeued transiently-failed work_items"
+            max_retries, batch, "self-heal: requeued transiently-failed work_items"
         );
     }
     Ok(rows.len() as u64)
@@ -325,8 +325,10 @@ mod tests {
     ) -> uuid::Uuid {
         sqlx::query_scalar(
             "INSERT INTO work_items
-                 (kind, status, attempts, last_error, assigned_to, assigned_computer, created_at)
+                 (kind, status, attempts, last_error, assigned_to, assigned_computer,
+                  created_at, completed_at)
              VALUES ('task', 'failed', $1, $2, 'slot-1', 'computer-1',
+                     NOW() - make_interval(secs => $3),
                      NOW() - make_interval(secs => $3))
           RETURNING id",
         )
@@ -348,8 +350,13 @@ mod tests {
         let transient =
             insert_failed_item(&pool, "dispatch: connection refused by endpoint", 5, 3600).await;
         let task_level = insert_failed_item(&pool, "error[E0308]: mismatched types", 5, 3600).await;
-        let exhausted =
-            insert_failed_item(&pool, "rate limit exceeded", MAX_SELF_HEAL_ATTEMPTS, 3600).await;
+        let exhausted = insert_failed_item(&pool, "rate limit exceeded", 5, 3600).await;
+        sqlx::query("UPDATE work_items SET retry_count = $2 WHERE id = $1")
+            .bind(exhausted)
+            .bind(MAX_SELF_HEAL_RETRIES)
+            .execute(&pool)
+            .await
+            .unwrap();
         let cooling = insert_failed_item(&pool, "service unavailable", 5, 3600).await;
 
         // Live residue on the transient item: an unreleased lease (blocks both
@@ -373,10 +380,9 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        // A lease released moments ago puts `cooling` inside the cooldown window.
+        // A recent failure timestamp puts `cooling` inside the cooldown window.
         sqlx::query(
-            "INSERT INTO work_item_leases (work_item_id, lease_state, released_at)
-             VALUES ($1, 'failed', NOW() - INTERVAL '10 seconds')",
+            "UPDATE work_items SET completed_at = NOW() - INTERVAL '10 seconds' WHERE id = $1",
         )
         .bind(cooling)
         .execute(&pool)
@@ -387,7 +393,7 @@ mod tests {
         assert_eq!(requeued, 1);
 
         let row = sqlx::query(
-            "SELECT status, attempts, assigned_to, assigned_computer
+            "SELECT status, attempts, retry_count, assigned_to, assigned_computer
                FROM work_items WHERE id = $1",
         )
         .bind(transient)
@@ -395,7 +401,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(row.get::<String, _>("status"), "ready");
-        assert_eq!(row.get::<i32, _>("attempts"), 6);
+        assert_eq!(row.get::<i32, _>("attempts"), 5);
+        assert_eq!(row.get::<i32, _>("retry_count"), 1);
         assert_eq!(row.get::<Option<String>, _>("assigned_to"), None);
         assert_eq!(row.get::<Option<String>, _>("assigned_computer"), None);
 
@@ -444,7 +451,7 @@ mod tests {
         // Task-level, attempt-exhausted, and cooling-down items stay failed.
         for (id, why) in [
             (task_level, "task-level error"),
-            (exhausted, "attempts at ceiling"),
+            (exhausted, "retry count at ceiling"),
             (cooling, "inside cooldown window"),
         ] {
             let status: String = sqlx::query_scalar("SELECT status FROM work_items WHERE id = $1")
@@ -480,7 +487,7 @@ mod tests {
         }
         let transient = insert_failed_item(&pool, "network is unreachable", 5, 3600).await;
 
-        let requeued = requeue_transient_failures_with(&pool, MAX_SELF_HEAL_ATTEMPTS, batch, 600)
+        let requeued = requeue_transient_failures_with(&pool, MAX_SELF_HEAL_RETRIES, batch, 600)
             .await
             .expect("requeue");
         assert_eq!(requeued, 1);
