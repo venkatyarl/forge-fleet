@@ -9,7 +9,6 @@ import (
 
 var (
 	ErrMissingUserName = errors.New("scim: userName is required")
-	ErrNoEmails        = errors.New("scim: at least one email is required")
 )
 
 type Email struct {
@@ -36,14 +35,6 @@ type ScimToken struct {
 	Active      bool    `json:"active"`
 }
 
-type UserAttributes struct {
-	ExternalID  string
-	Username    string
-	Email       string
-	DisplayName string
-	Active      bool
-}
-
 func ParseScimToken(raw []byte) (*ScimToken, error) {
 	var token ScimToken
 	if err := json.Unmarshal(raw, &token); err != nil {
@@ -58,9 +49,6 @@ func ParseScimToken(raw []byte) (*ScimToken, error) {
 func (t *ScimToken) Validate() error {
 	if t == nil || strings.TrimSpace(t.UserName) == "" {
 		return ErrMissingUserName
-	}
-	if len(t.Emails) == 0 || strings.TrimSpace(t.PrimaryEmail()) == "" {
-		return ErrNoEmails
 	}
 	return nil
 }
@@ -79,7 +67,7 @@ func (t *ScimToken) PrimaryEmail() string {
 	return ""
 }
 
-func (t *ScimToken) MapToUserAttributes() (*UserAttributes, error) {
+func (t *ScimToken) MapToUserAttributes() (*User, error) {
 	if err := t.Validate(); err != nil {
 		return nil, err
 	}
@@ -90,9 +78,9 @@ func (t *ScimToken) MapToUserAttributes() (*UserAttributes, error) {
 	if displayName == "" {
 		displayName = t.UserName
 	}
-	return &UserAttributes{
+	return &User{
 		ExternalID:  t.ExternalID,
-		Username:    t.UserName,
+		UserName:    t.UserName,
 		Email:       t.PrimaryEmail(),
 		DisplayName: displayName,
 		Active:      t.Active,

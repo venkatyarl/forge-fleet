@@ -10,27 +10,27 @@ import (
 )
 
 type mockUserService struct {
-	created *UserAttributes
-	updated *UserAttributes
+	created *User
+	updated *User
 	id      string
 	err     error
 }
 
-func (m *mockUserService) CreateUser(_ context.Context, attributes *UserAttributes) (*User, error) {
+func (m *mockUserService) CreateUser(_ context.Context, attributes *User) (*User, error) {
 	m.created = attributes
 	if m.err != nil {
 		return nil, m.err
 	}
-	return &User{ID: "user-1", UserName: attributes.Username, Active: attributes.Active}, nil
+	return &User{ID: "user-1", UserName: attributes.UserName, Active: attributes.Active}, nil
 }
 
-func (m *mockUserService) UpdateUser(_ context.Context, id string, attributes *UserAttributes) (*User, error) {
+func (m *mockUserService) UpdateUser(_ context.Context, id string, attributes *User) (*User, error) {
 	m.id = id
 	m.updated = attributes
 	if m.err != nil {
 		return nil, m.err
 	}
-	return &User{ID: id, UserName: attributes.Username, Active: attributes.Active}, nil
+	return &User{ID: id, UserName: attributes.UserName, Active: attributes.Active}, nil
 }
 
 func TestHandleCreateUserMapsAttributes(t *testing.T) {
@@ -75,6 +75,23 @@ func TestHandleCreateUserRejectsInvalidSCIM(t *testing.T) {
 	}
 }
 
+func TestHandleCreateUserAllowsMissingEmails(t *testing.T) {
+	service := &mockUserService{}
+	handler := NewUserHandler(service)
+	request := httptest.NewRequest(http.MethodPost, "/Users", strings.NewReader(`{"userName":"ada","active":true}`))
+	response := httptest.NewRecorder()
+	handler.HandleCreateUser(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusCreated, response.Body)
+	}
+	if service.created == nil {
+		t.Fatal("user service was not called")
+	}
+	if service.created.Email != "" {
+		t.Errorf("email = %q, want empty", service.created.Email)
+	}
+}
+
 func TestHandleUpdateUserPropagatesServiceFailure(t *testing.T) {
 	service := &mockUserService{err: errors.New("update failed")}
 	handler := NewUserHandler(service)
@@ -86,13 +103,13 @@ func TestHandleUpdateUserPropagatesServiceFailure(t *testing.T) {
 	}
 }
 
-func assertMappedAttributes(t *testing.T, attributes *UserAttributes) {
+func assertMappedAttributes(t *testing.T, attributes *User) {
 	t.Helper()
 	if attributes == nil {
 		t.Fatal("user service was not called")
 	}
 	if attributes.ExternalID != "external-7" ||
-		attributes.Username != "ada" ||
+		attributes.UserName != "ada" ||
 		attributes.Email != "ada@example.com" ||
 		attributes.DisplayName != "Ada Lovelace" ||
 		!attributes.Active {
