@@ -48,7 +48,10 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
                 goal.as_deref(),
             )
             .await?;
-            println!("✅ attached to workstream '{}' ({})", ws.basename, ws.project_key);
+            println!(
+                "✅ attached to workstream '{}' ({})",
+                ws.basename, ws.project_key
+            );
             println!("   session: {sid}");
             println!("   node: {worker} · tool: {tool}");
             if let Some(g) = goal {
@@ -63,7 +66,9 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
             note,
         } => {
             if summary.is_none() && focus.is_none() && note.is_none() {
-                anyhow::bail!("nothing to report — pass at least one of --summary / --focus / --note");
+                anyhow::bail!(
+                    "nothing to report — pass at least one of --summary / --focus / --note"
+                );
             }
             let dir = effective_cwd(cwd)?;
             let ws = workstreams::workstream_for_dir(&pg, &dir)
@@ -79,7 +84,10 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
                 note.as_deref(),
             )
             .await?;
-            println!("✅ reported into '{}' ({})", updated.basename, updated.project_key);
+            println!(
+                "✅ reported into '{}' ({})",
+                updated.basename, updated.project_key
+            );
             if let Some(s) = &updated.working_summary {
                 println!("   summary: {s}");
             }
@@ -108,7 +116,11 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
                     .last_report_at
                     .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
                     .unwrap_or_else(|| "never".to_string());
-                let mark = if c.session_id == me { " ← this session" } else { "" };
+                let mark = if c.session_id == me {
+                    " ← this session"
+                } else {
+                    ""
+                };
                 println!(
                     "     • {} [{}] {} · last report {}{}",
                     c.worker_name, c.tool, c.status, last, mark

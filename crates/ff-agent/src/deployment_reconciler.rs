@@ -80,6 +80,13 @@ fn autorestart_enabled(value: Option<&str>) -> bool {
         .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "on" | "true" | "1"))
 }
 
+const AUTORESTART_HEALTH_STATUS: &str = "unhealthy";
+
+#[cfg(test)]
+fn health_requires_autorestart(status: &str) -> bool {
+    status == AUTORESTART_HEALTH_STATUS
+}
+
 fn restart_spec(library_id: Option<String>, port: i32) -> Option<(String, u16)> {
     let port = u16::try_from(port).ok().filter(|port| *port != 0)?;
     Some((library_id?, port))
@@ -96,11 +103,12 @@ pub async fn restart_hung_local_deployments(pool: &sqlx::PgPool) -> u64 {
         "SELECT id::text, library_id::text, port \
            FROM fleet_model_deployments \
           WHERE worker_name = $1 AND desired_state = 'active' \
-            AND health_status = 'unhealthy' \
+            AND health_status = $2 \
             AND COALESCE(catalog_id, '') NOT ILIKE '%480b%' \
             AND (started_at IS NULL OR started_at < now() - interval '15 minutes')",
     )
     .bind(&node)
+    .bind(AUTORESTART_HEALTH_STATUS)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
@@ -755,6 +763,17 @@ mod tests {
             assert!(!autorestart_enabled(Some(disabled)), "{disabled:?}");
         }
         assert!(!autorestart_enabled(None));
+    }
+
+    #[test]
+    fn autorestart_health_requires_unhealthy_deployment() {
+        assert!(health_requires_autorestart("unhealthy"));
+        for status in ["healthy", "stale", "unknown", "loading", ""] {
+            assert!(
+                !health_requires_autorestart(status),
+                "{status:?} must not trigger an automatic restart"
+            );
+        }
     }
 
     #[test]
