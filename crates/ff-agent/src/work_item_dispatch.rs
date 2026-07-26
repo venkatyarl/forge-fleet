@@ -3253,19 +3253,26 @@ async fn run_ff_dispatch(
     // heavy) — the local lane wedges/half-finishes on those, so we send them
     // straight to the capable cloud CLI from attempt 0 instead of burning a
     // wedge-prone local attempt first.
-    // Is the CLOUD lane currently unrunnable? True when no cloud builder
-    // (codex/kimi) has an open budget window — i.e. every one is rate-limited /
-    // exhausted. In that state, skipping local for a "prefers-cloud" task would
-    // send it straight to a dead cloud lane and fail "cloud budget exhausted"
-    // (exactly the recurring stall on lily/thalia while local sat healthy). When
-    // cloud is exhausted we force the local lane on instead. NULL/absent rows →
-    // treat cloud as available (don't force local off real capacity).
+    // Is the CLOUD lane currently unrunnable FOR THIS NODE? True when EITHER
+    //   (a) this node has NO authenticated cloud backend (codex/kimi) — the
+    //       common real case: codex is only logged-in on ace, kimi nowhere, so
+    //       16/17 nodes have no cloud CLI to run and would bail "no dispatchable
+    //       backend on this node" (2026-07-26); OR
+    //   (b) every cloud builder's budget window is exhausted (rate-limited).
+    // In either state, force the LOCAL lane on — codegen_apply routes through
+    // fleet_oneshot to ANY healthy fleet LLM (devstral/glm on any node), so the
+    // item BUILDS ON LOCAL instead of hard-failing for lack of a local cloud CLI.
+    // This is what keeps the backlog draining while cloud auth is degraded.
     let cloud_exhausted: bool = sqlx::query_scalar(
-        "SELECT NOT EXISTS (\
-            SELECT 1 FROM cloud_budget_buckets \
-             WHERE provider IN ('codex','kimi') \
-               AND (window_exhausted_until IS NULL OR window_exhausted_until < now()))",
+        "SELECT \
+           NOT EXISTS (SELECT 1 FROM computer_backends \
+                        WHERE computer_id = $1 AND installed AND authenticated \
+                          AND backend <> 'claude') \
+           OR NOT EXISTS (SELECT 1 FROM cloud_budget_buckets \
+                           WHERE provider IN ('codex','kimi') \
+                             AND (window_exhausted_until IS NULL OR window_exhausted_until < now()))",
     )
+    .bind(item.computer_id)
     .fetch_one(pg)
     .await
     .unwrap_or(false);
