@@ -859,13 +859,17 @@ pub struct ReapedSlot {
     /// Whether that work item was re-queued (`status = 'ready'`) for another
     /// dispatch. `false` when the item had already reached a terminal status.
     pub requeued: bool,
+    /// Whether the slot is waiting for its owning host to clean the orphaned
+    /// worktree before it can be dispatched again.
+    pub cleanup_pending: bool,
 }
 
 /// Reset every `'busy'` sub_agent whose `last_heartbeat_at` is older than
-/// `stale_after_secs` back to `'idle'`, clear its `current_work_item_id`, and
-/// re-queue the orphaned work item (`status = 'ready'`, assignment cleared) so
-/// the scheduler can dispatch it to another slot. All in ONE atomic statement,
-/// so a crash between "free slot" and "re-queue item" cannot strand the item.
+/// `stale_after_secs` and re-queue its orphaned work item (`status = 'ready'`,
+/// assignment cleared). Slots with an on-disk worktree move to
+/// `'cleanup_pending'` until the owning host's worktree reaper removes build
+/// artifacts; slots without one return directly to `'idle'`. All in ONE atomic
+/// statement, so a crash cannot expose a dirty slot to another dispatch.
 ///
 /// Slots holding an ACTIVE `work_item_leases` row are exempt: the lease
 /// lifecycle owns those (lease takeover reclaims them when the lease dies),
@@ -875,27 +879,35 @@ pub async fn reap_stale_busy_slots(
     pool: &PgPool,
     stale_after_secs: i64,
 ) -> Result<Vec<ReapedSlot>, CoordError> {
-    let rows: Vec<(Uuid, Option<Uuid>, bool)> = sqlx::query_as(
+    let rows: Vec<(Uuid, Option<Uuid>, bool, bool)> = sqlx::query_as(
         "WITH stale AS ( \
-             SELECT id, current_work_item_id \
-               FROM sub_agents \
-              WHERE status = 'busy' \
-                AND (last_heartbeat_at IS NULL \
-                     OR last_heartbeat_at < NOW() - make_interval(secs => $1)) \
+             SELECT s.id, s.current_work_item_id, \
+                    EXISTS ( \
+                        SELECT 1 FROM work_item_worktrees wt \
+                         WHERE wt.work_item_id = s.current_work_item_id \
+                           AND wt.status <> 'cleaned') AS needs_cleanup \
+               FROM sub_agents s \
+              WHERE s.status = 'busy' \
+                AND (s.last_heartbeat_at IS NULL \
+                     OR s.last_heartbeat_at < NOW() - make_interval(secs => $1)) \
                 AND NOT EXISTS ( \
                      SELECT 1 FROM work_item_leases l \
-                      WHERE l.sub_agent_id = sub_agents.id \
+                      WHERE l.sub_agent_id = s.id \
                         AND l.released_at IS NULL) \
                 FOR UPDATE SKIP LOCKED \
          ), reaped AS ( \
              UPDATE sub_agents s \
-                SET status = 'idle', \
-                    current_work_item_id = NULL, \
-                    started_at = NULL, \
+                SET status = CASE WHEN stale.needs_cleanup \
+                                  THEN 'cleanup_pending' ELSE 'idle' END, \
+                    current_work_item_id = CASE WHEN stale.needs_cleanup \
+                                                THEN stale.current_work_item_id ELSE NULL END, \
+                    started_at = CASE WHEN stale.needs_cleanup \
+                                      THEN s.started_at ELSE NULL END, \
                     last_heartbeat_at = NOW() \
                FROM stale \
               WHERE s.id = stale.id \
-              RETURNING s.id AS sub_agent_id, stale.current_work_item_id AS work_item_id \
+              RETURNING s.id AS sub_agent_id, stale.current_work_item_id AS work_item_id, \
+                        stale.needs_cleanup \
          ), requeued AS ( \
              UPDATE work_items w \
                 SET status = 'ready', \
@@ -907,7 +919,8 @@ pub async fn reap_stale_busy_slots(
               RETURNING w.id \
          ) \
          SELECT r.sub_agent_id, r.work_item_id, \
-                EXISTS (SELECT 1 FROM requeued q WHERE q.id = r.work_item_id) AS requeued \
+                EXISTS (SELECT 1 FROM requeued q WHERE q.id = r.work_item_id) AS requeued, \
+                r.needs_cleanup \
            FROM reaped r",
     )
     .bind(stale_after_secs as f64)
@@ -915,11 +928,14 @@ pub async fn reap_stale_busy_slots(
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(sub_agent_id, work_item_id, requeued)| ReapedSlot {
-            sub_agent_id,
-            work_item_id,
-            requeued,
-        })
+        .map(
+            |(sub_agent_id, work_item_id, requeued, cleanup_pending)| ReapedSlot {
+                sub_agent_id,
+                work_item_id,
+                requeued,
+                cleanup_pending,
+            },
+        )
         .collect())
 }
 
@@ -946,6 +962,7 @@ pub fn spawn_stale_slot_reaper(
                                     sub_agent = %r.sub_agent_id,
                                     work_item = ?r.work_item_id,
                                     requeued = r.requeued,
+                                    cleanup_pending = r.cleanup_pending,
                                     "stale slot reaper: reset busy slot with stale heartbeat"
                                 );
                             }

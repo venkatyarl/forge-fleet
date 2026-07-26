@@ -97,7 +97,10 @@ async fn run_once(pg: &PgPool) -> Result<()> {
     .map(|r| r.rows_affected())
     .unwrap_or(0);
     if restored > 0 {
-        warn!(restored, "deploy-converge: restored stale-drained nodes (orphaned by a failed deploy) — re-enabling their slots");
+        warn!(
+            restored,
+            "deploy-converge: restored stale-drained nodes (orphaned by a failed deploy) — re-enabling their slots"
+        );
         let _ = sqlx::query(
             "UPDATE sub_agents SET status='idle' WHERE status='disabled' \
               AND computer_id IN (SELECT id FROM computers WHERE reservation_state='available')",

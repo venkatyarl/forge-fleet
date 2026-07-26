@@ -5211,10 +5211,10 @@ pub async fn evaluate_worktree_reaper(pg: &PgPool, worker_name: &str) -> Result<
         let tree = PathBuf::from(&wt.worktree_path);
         let worktree_removed =
             remove_worktree(&repo, &tree).is_ok() && (tree == repo || !tree.exists());
-        // Clone-direct rows: the "worktree" is the slot's long-lived clone —
-        // reclaiming would delete its target/node_modules out from under the
-        // next build. Only legacy detached worktree dirs are reclaimed.
-        if tree != repo {
+        // Clone-direct rows normally retain warm build caches. A slot reset
+        // after a stale heartbeat is different: its interrupted build may have
+        // left partial artifacts, so reclaim those before exposing it as idle.
+        if wt.orphaned_slot || tree != repo {
             reclaimed_bytes = reclaimed_bytes.saturating_add(reclaim_build_artifacts(&tree));
         }
         let branch_deleted = run_git(
@@ -5378,14 +5378,36 @@ mod tests {
         complexity_at_least_moderate, contains_file_line_citation, default_clone_path,
         dispatch_budget_for_host, dispatch_prompt, expand_home, is_build_timeout, mirror_repo_url,
         order_cloud_reviewers, parse_cli_tokens, primary_or_default_backend,
-        quick_empty_success_is_provider_failure, repo_cache_path, repo_slug,
-        retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
+        quick_empty_success_is_provider_failure, reclaim_build_artifacts, repo_cache_path,
+        repo_slug, retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
         should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
         task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
     };
     use std::path::PathBuf;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn stale_slot_cleanup_removes_nested_build_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        let target = workspace.join("target/debug");
+        let node_modules = workspace.join("web/node_modules/pkg");
+        let venv = workspace.join("tools/.venv/bin");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&node_modules).unwrap();
+        std::fs::create_dir_all(&venv).unwrap();
+        std::fs::write(target.join("artifact"), b"cargo").unwrap();
+        std::fs::write(node_modules.join("artifact"), b"node").unwrap();
+        std::fs::write(venv.join("artifact"), b"python").unwrap();
+        std::fs::write(workspace.join("source.rs"), b"keep").unwrap();
+
+        assert!(reclaim_build_artifacts(workspace) > 0);
+        assert!(!workspace.join("target").exists());
+        assert!(!workspace.join("web/node_modules").exists());
+        assert!(!workspace.join("tools/.venv").exists());
+        assert!(workspace.join("source.rs").exists());
+    }
 
     #[test]
     fn contains_file_line_citation_requires_dotted_path_and_digit_line() {

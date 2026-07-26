@@ -26,8 +26,9 @@
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -104,6 +105,45 @@ pub const REFRESH_POLL_SECS: u64 = 30;
 /// reading its credential file lets its native refresh-token flow run; ff then
 /// copies the resulting complete credential document to peers.
 const AUTO_REFRESH_PROVIDERS: &[&str] = &["claude", "codex", "kimi"];
+
+fn propagation_marker(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.ff-propagated", path.display()))
+}
+
+fn credential_digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+async fn is_propagated_copy(path: &Path, bytes: &[u8]) -> bool {
+    tokio::fs::read_to_string(propagation_marker(path))
+        .await
+        .is_ok_and(|marker| marker.trim() == credential_digest(bytes))
+}
+
+pub async fn claim_refresher(pool: &PgPool, backend: &str, node: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO cloud_backends (backend, refresher_node) VALUES ($1, $2)
+         ON CONFLICT (backend) DO UPDATE SET refresher_node = EXCLUDED.refresher_node",
+    )
+    .bind(backend)
+    .bind(node)
+    .execute(pool)
+    .await
+    .with_context(|| format!("claim {backend} refresher ownership for {node}"))?;
+    Ok(())
+}
+
+async fn is_refresher(pool: &PgPool, backend: &str, node: &str) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM cloud_backends
+                         WHERE backend = $1 AND refresher_node = $2)",
+    )
+    .bind(backend)
+    .bind(node)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false)
+}
 
 /// Read the password value of a macOS Keychain generic-password entry
 /// via `security find-generic-password -s <service> -a $USER -w`. Used
@@ -317,23 +357,24 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
     // creds instead of failing on a nonexistent `~/.claude/.credentials.json`.
     let bytes = read_leader_cred_bytes(provider).await?;
     let b64 = BASE64.encode(&bytes);
+    let digest = credential_digest(&bytes);
 
-    // Target list = every fleet member EXCEPT the leader (the leader's
+    // Target list = every fleet member EXCEPT the refresher (its
     // local copy is already authoritative). Members are looked up by
     // primary_ip + ssh_user from the `computers` table.
-    let leader_id = ff_db::pg_get_current_leader(pool)
-        .await
-        .ok()
-        .flatten()
-        .map(|l| l.computer_id);
+    let refresher_node: Option<String> =
+        sqlx::query_scalar("SELECT refresher_node FROM cloud_backends WHERE backend = $1")
+            .bind(provider.name)
+            .fetch_optional(pool)
+            .await
+            .context("read designated refresher")?;
+    let refresher_node = match refresher_node {
+        Some(node) => node,
+        None => crate::fleet_info::resolve_this_worker_name().await,
+    };
 
     let rows = sqlx::query(
-        // 'online' is the live status the heartbeat materializer writes;
-        // ('ok','pending','maintenance') are legacy/transitional vocab kept
-        // for compat. Omitting 'online' made distribute resolve ZERO targets
-        // on a fleet whose members are all 'online' (silent enqueued=0).
-        "SELECT id, name, ssh_user, primary_ip
-           FROM computers
+        "SELECT name, ssh_user, primary_ip FROM computers
           WHERE status IN ('online', 'ok', 'pending', 'maintenance')",
     )
     .fetch_all(pool)
@@ -341,14 +382,12 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
     .context("list computers")?;
 
     let mut enqueued = 0usize;
-    let leader_uuid = leader_id;
     for row in rows {
         use sqlx::Row;
-        let id: uuid::Uuid = row.get("id");
-        if Some(id) == leader_uuid {
+        let name: String = row.get("name");
+        if name == refresher_node {
             continue;
         }
-        let name: String = row.get("name");
         let ssh_user: String = row.get("ssh_user");
         let primary_ip: String = row.get("primary_ip");
         // Bind the DB-sourced target IP + the (const) cred path to shell vars
@@ -392,6 +431,7 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
              umask 077\n\
              printf '%s' '{b64}' | base64 -d > \"$CRED_PATH\"\n\
              chmod 600 \"$CRED_PATH\"\n\
+             printf '%s\\n' '{digest}' > \"$CRED_PATH.ff-propagated\"\n\
              echo distributed: $(stat -c %y \"$CRED_PATH\" 2>/dev/null || stat -f %Sm \"$CRED_PATH\")\n\
              else\n\
              ssh -T {ssh_bypass} -o StrictHostKeyChecking=accept-new \
@@ -400,6 +440,7 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
              umask 077\n\
              printf '%s' '{b64}' | base64 -d > {cred_path}\n\
              chmod 600 {cred_path}\n\
+             printf '%s\\n' '{digest}' > {cred_path}.ff-propagated\n\
              echo distributed: $(stat -c %y {cred_path} 2>/dev/null || stat -f %Sm {cred_path})\n\
              FF_OAUTH_EOF\n\
              fi\n",
@@ -410,6 +451,7 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
             cred_path = provider.cred_path,
             cred_path_sh = cred_path_sh,
             b64 = b64,
+            digest = digest,
             ssh_bypass = crate::ssh_opts::SSH_AGENT_BYPASS,
         );
 
@@ -572,12 +614,10 @@ pub async fn validate_startup_and_request_repush(pool: &PgPool, worker_name: &st
     }
 }
 
-/// Leader-gated: spawned unconditionally on every node, but each tick checks
-/// the process-local leader cache and skips unless this node is the current
-/// leader (only the leader probes the shared OAuth credentials).
+/// Only the designated refresher invokes each backend's CLI.
 pub fn spawn_oauth_probe_tick(
     pg: PgPool,
-    _worker_name: String,
+    worker_name: String,
     interval_secs: u64,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -587,12 +627,11 @@ pub fn spawn_oauth_probe_tick(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if !crate::leader_cache::is_current_leader() {
-                        continue;
-                    }
-
                     for name in AUTO_REFRESH_PROVIDERS {
                         let Some(provider) = provider_by_name(name) else { continue };
+                        if !is_refresher(&pg, provider.name, &worker_name).await {
+                            continue;
+                        }
                         match refresh_and_distribute(&pg, provider).await {
                             Ok(enqueued) => info!(provider = provider.name, enqueued,
                                 "periodic OAuth refresh and distribution complete"),
@@ -703,6 +742,7 @@ pub async fn probe_one(pool: &PgPool, provider: &OauthProvider) -> ProbeResult {
 /// Exits when `shutdown` flips to true.
 pub fn spawn_refresh_watch(pool: PgPool, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let worker_name = crate::fleet_info::resolve_this_worker_name().await;
         // Track last-seen mtime per provider so we only fire on change.
         let mut last_mtime: std::collections::HashMap<&str, SystemTime> =
             std::collections::HashMap::new();
@@ -719,14 +759,20 @@ pub fn spawn_refresh_watch(pool: PgPool, mut shutdown: watch::Receiver<bool>) ->
                     continue;
                 };
                 let prev = last_mtime.insert(p.name, mtime);
-                let changed = match prev {
-                    Some(prev_t) => prev_t != mtime,
-                    // First sighting — don't fire (the import was either
-                    // already done or will be done explicitly via
-                    // `ff oauth import`).
-                    None => false,
-                };
+                let changed = prev.is_none_or(|prev_t| prev_t != mtime);
                 if changed {
+                    let Ok(bytes) = tokio::fs::read(&path).await else {
+                        continue;
+                    };
+                    if !AUTO_REFRESH_PROVIDERS.contains(&p.name)
+                        || is_propagated_copy(&path, &bytes).await
+                    {
+                        continue;
+                    }
+                    if let Err(e) = claim_refresher(&pool, p.name, &worker_name).await {
+                        warn!(provider = p.name, error = %e, "failed to claim refresher ownership");
+                        continue;
+                    }
                     info!(provider = p.name, "cred file changed — re-importing");
                     if let Err(e) = import_token(&pool, p).await {
                         warn!(provider = p.name, error = %e, "auto-import failed");
@@ -745,4 +791,21 @@ pub fn spawn_refresh_watch(pool: PgPool, mut shutdown: watch::Receiver<bool>) ->
             }
         }
     })
+}
+
+#[cfg(test)]
+mod single_refresher_tests {
+    use super::*;
+
+    #[test]
+    fn propagated_marker_and_digest_are_stable() {
+        assert_eq!(
+            propagation_marker(Path::new("/tmp/auth.json")),
+            PathBuf::from("/tmp/auth.json.ff-propagated")
+        );
+        assert_eq!(
+            credential_digest(b"fleet credential"),
+            "7e078ef46edb3010e11cff9edd7ba4216899ac01cf22cdf3cd9137d16996290f"
+        );
+    }
 }
