@@ -2371,6 +2371,29 @@ const MAX_DISPATCH_ATTEMPTS: i32 = 5;
 /// the task isn't complexity-routed to cloud. Pure so the routing is testable —
 /// the `ESCALATE_TO_CLOUD_AT = 1` value means a mechanical task gets ONE local try
 /// then goes cloud (#62: the local lane starves the heartbeat; cloud does not).
+/// Tier-aware model hint for the LOCAL codegen lane (operator 2026-07-25: "use
+/// glm-4.5-air and qwen36-35b for complex work"). `fleet_oneshot` biases toward
+/// the hinted family (and falls back if it's saturated/absent), so:
+///   • COMPLEX / MODERATE tasks → prefer the most capable healthy fleet coder
+///     (`glm-4.5-air`, 106B); qwen36-35b/qwen3-70b serve as the fallback pool.
+///   • MECHANICAL tasks → no hint → least-loaded, which is the plentiful 24B
+///     Devstral. This stops complex work from landing on a 24B that wedges on it.
+/// Overridable at runtime via the `local_capable_model_hint` fleet-secret so the
+/// preferred capable model can change (e.g. to qwen3-70b once it finishes
+/// downloading) without a rebuild.
+async fn local_model_hint(pg: &PgPool, complexity: &str) -> Option<String> {
+    match complexity {
+        "complex" | "moderate" => Some(
+            ff_db::pg_get_secret(pg, "local_capable_model_hint")
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "glm-4.5-air".to_string()),
+        ),
+        _ => None,
+    }
+}
+
 fn use_local_lane(
     attempts: i32,
     breaker_open: bool,
@@ -3258,13 +3281,16 @@ async fn run_ff_dispatch(
         // OVER to the cloud backstop instead of wedging the slot forever (see
         // LANE1_TIMEOUT_SECS). Without this, a hang here stalls the build while
         // the outer heartbeat keeps the lease alive — unrecoverable.
+        // Tier-aware: complex/moderate tasks prefer a capable fleet coder
+        // (glm-4.5-air/qwen36-35b) instead of landing on a 24B that wedges.
+        let hint = local_model_hint(pg, &item.complexity).await;
         let lane1 = tokio::time::timeout(
             Duration::from_secs(LANE1_TIMEOUT_SECS),
             crate::codegen_apply::codegen_apply(
                 pg,
                 &worktree.worktree_path,
                 &prompt,
-                None,
+                hint.as_deref(),
                 4,
                 Some(item.work_item_id),
             ),
