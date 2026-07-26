@@ -3,6 +3,7 @@ import { RefreshCw } from 'lucide-react'
 import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
 import { Badge, type BadgeProps } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
+import { ProjectCard } from '../components/ProjectCard'
 import { getJson, patchJson, postJson } from '../lib/api'
 import { cn } from '../lib/utils'
 
@@ -31,6 +32,7 @@ type Project = {
   id: string
   company_id: string
   name: string
+  logo_url?: string | null
   description: string
   status: PortfolioStatus | string
   owner: string
@@ -610,27 +612,14 @@ export function Projects() {
               {projects.map((project) => {
                 const selected = project.id === selectedProjectId
                 return (
-                  <button
+                  <ProjectCard
                     key={project.id}
-                    onClick={() => setSelectedProjectId(project.id)}
-                    className={cn(
-                      'w-full rounded-xl border p-4 text-left transition',
-                      selected
-                        ? 'border-primary bg-primary-subtle'
-                        : 'border-border bg-panel hover:border-border-subtle hover:bg-elevated',
-                    )}
-                    type="button"
+                    project={project}
+                    selected={selected}
+                    onSelect={() => setSelectedProjectId(project.id)}
+                    subtitle={`${project.owner || 'unassigned'} / ${humanize(String(project.operating_stage))}`}
+                    status={<StatusBadge status={String(project.status)} className="shrink-0" />}
                   >
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="min-w-0">
-                        <p className="truncate text-sm font-semibold text-foreground">{project.name}</p>
-                        <p className="mt-1 truncate text-xs text-dim">
-                          {project.owner || 'unassigned'} / {humanize(String(project.operating_stage))}
-                        </p>
-                      </div>
-                      <StatusBadge status={String(project.status)} className="shrink-0" />
-                    </div>
-
                     <InventoryList title="Repos" empty="No repos.">
                       {project.repos.map((repo, index) => (
                         <li key={`${repo.github_url}-${index}`} className="flex min-w-0 flex-wrap items-center gap-1.5">
@@ -651,7 +640,7 @@ export function Projects() {
                         </li>
                       ))}
                     </InventoryList>
-                  </button>
+                  </ProjectCard>
                 )
               })}
             </div>
