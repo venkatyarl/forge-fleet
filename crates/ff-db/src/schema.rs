@@ -12254,6 +12254,15 @@ INSERT INTO cloud_backends (backend, refresher_node) VALUES
 ON CONFLICT (backend) DO NOTHING;
 "#;
 
+/// Optional project metadata used to attach projects to workstreams and create
+/// their initial digest configuration.
+pub const SCHEMA_V274_PROJECT_DIGEST_FIELDS: &str = r#"
+ALTER TABLE projects
+    ADD COLUMN IF NOT EXISTS workstream_id TEXT,
+    ADD COLUMN IF NOT EXISTS digest_template_id TEXT,
+    ADD COLUMN IF NOT EXISTS logo_url TEXT;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

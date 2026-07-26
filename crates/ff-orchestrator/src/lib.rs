@@ -27,6 +27,7 @@ pub mod node_manager;
 pub mod parallel;
 pub mod placement;
 pub mod planner;
+pub mod project_handler;
 pub mod project_policy;
 pub mod queue;
 pub mod router;
@@ -55,6 +56,7 @@ pub use node_manager::NodeManager;
 pub use parallel::{ExecutionResult, ParallelExecutor, SubTaskResult};
 pub use placement::{AntiAffinityRule, NodeWorkloadPreference, PlacementEngine, PlacementPolicy};
 pub use planner::{ExecutionPlan, PlanNode, PlanStage};
+pub use project_handler::ProjectHandler;
 pub use project_policy::{
     ApprovalTrigger, ComplianceFlag, DataSensitivity, DeploymentTarget, ExecutionPolicy,
     HumanApprovalLevel, HumanApprovalPolicy, ProjectExecutionProfile, ProjectPolicyEngine,

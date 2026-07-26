@@ -1215,6 +1215,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "cloud_backends",
         sql: schema::SCHEMA_V273_CLOUD_BACKENDS,
     },
+    PgMigration {
+        version: 274,
+        name: "project_digest_fields",
+        sql: schema::SCHEMA_V274_PROJECT_DIGEST_FIELDS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
