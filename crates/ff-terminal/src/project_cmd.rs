@@ -1,6 +1,9 @@
 use crate::{CYAN, GREEN, RED, RESET, YELLOW};
 use anyhow::Result;
 
+#[path = "../../../src/forge_fleet/scan.rs"]
+mod project_scan;
+
 pub async fn handle_project(cmd: crate::ProjectCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
@@ -254,21 +257,13 @@ pub async fn handle_project(cmd: crate::ProjectCommand) -> Result<()> {
 
 async fn handle_scan(pool: &sqlx::PgPool, path: &str, project: &str) -> Result<()> {
     let expanded = expand_tilde(path);
-    let source =
-        std::fs::canonicalize(&expanded).map_err(|e| anyhow::anyhow!("scan {}: {e}", expanded))?;
-    if !source.is_dir() {
-        return Err(anyhow::anyhow!("not a directory: {}", source.display()));
-    }
-
-    let tech_stack = detect_tech_stack(&source)?;
-    let github_url = git_origin(&source)
-        .ok_or_else(|| anyhow::anyhow!("no git origin found from {}", source.display()))?;
-    let local_path = source.to_string_lossy();
+    let scan = project_scan::scan_project(&expanded)?;
+    let local_path = scan.source.to_string_lossy();
     let updated = ff_db::pm::pg_update_project_repo_scan(
         pool,
         project,
-        &github_url,
-        &tech_stack,
+        &scan.github_url,
+        &scan.tech_stack,
         &local_path,
     )
     .await
@@ -276,62 +271,17 @@ async fn handle_scan(pool: &sqlx::PgPool, path: &str, project: &str) -> Result<(
 
     let Some(repo) = updated else {
         return Err(anyhow::anyhow!(
-            "project '{project}' has no project_repos row for origin '{github_url}'"
+            "project '{project}' has no project_repos row for origin '{}'",
+            scan.github_url
         ));
     };
     println!(
         "{GREEN}✓ scanned{RESET} {} → {} ({})",
-        source.display(),
+        scan.source.display(),
         repo.github_url,
-        tech_stack
+        scan.tech_stack
     );
     Ok(())
-}
-
-fn detect_tech_stack(root: &std::path::Path) -> Result<String> {
-    use std::collections::BTreeMap;
-
-    let mut counts = BTreeMap::<&'static str, usize>::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir)
-            .map_err(|e| anyhow::anyhow!("read {}: {e}", dir.display()))?
-            .flatten()
-        {
-            let path = entry.path();
-            if path.is_dir() {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !matches!(name, ".git" | "node_modules" | "target" | ".venv") {
-                    stack.push(path);
-                }
-                continue;
-            }
-            let language = match path.extension().and_then(|ext| ext.to_str()) {
-                Some("rs") => Some("rust"),
-                Some("py") => Some("python"),
-                Some("ts" | "tsx") => Some("typescript"),
-                Some("js" | "jsx") => Some("javascript"),
-                Some("go") => Some("go"),
-                Some("java") => Some("java"),
-                Some("rb") => Some("ruby"),
-                Some("php") => Some("php"),
-                Some("swift") => Some("swift"),
-                Some("kt" | "kts") => Some("kotlin"),
-                _ => None,
-            };
-            if let Some(language) = language {
-                *counts.entry(language).or_default() += 1;
-            }
-        }
-    }
-
-    counts
-        .into_iter()
-        .max_by(|(a_lang, a_count), (b_lang, b_count)| {
-            a_count.cmp(b_count).then_with(|| b_lang.cmp(a_lang))
-        })
-        .map(|(language, _)| language.to_string())
-        .ok_or_else(|| anyhow::anyhow!("no recognized source files under {}", root.display()))
 }
 
 async fn handle_repo(pool: &sqlx::PgPool, cmd: crate::ProjectRepoCommand) -> Result<()> {
@@ -666,7 +616,7 @@ fn expand_tilde(p: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::detect_tech_stack;
+    use super::project_scan::detect_tech_stack;
 
     #[test]
     fn detects_stack_from_source_extensions() {
