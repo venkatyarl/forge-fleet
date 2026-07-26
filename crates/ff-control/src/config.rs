@@ -128,6 +128,18 @@ pub struct Endpoint480bConfig {
     /// Request timeout in seconds for calls to the 480B endpoint.
     #[serde(default = "default_endpoint_480b_timeout_secs")]
     pub timeout_secs: u64,
+
+    /// Zero-based shard served by the controller in the llama.cpp RPC ring.
+    #[serde(default)]
+    pub rpc_shard_id: u32,
+
+    /// Number of shards in the canonical 480B RPC ring.
+    #[serde(default = "default_endpoint_480b_rpc_shard_count")]
+    pub rpc_shard_count: u32,
+
+    /// Ordered worker names forming the llama.cpp RPC ring.
+    #[serde(default = "default_endpoint_480b_rpc_ring_topology")]
+    pub rpc_ring_topology: String,
 }
 
 impl Endpoint480bConfig {
@@ -148,6 +160,9 @@ impl Default for Endpoint480bConfig {
             url: String::new(),
             model: default_endpoint_480b_model(),
             timeout_secs: default_endpoint_480b_timeout_secs(),
+            rpc_shard_id: 0,
+            rpc_shard_count: default_endpoint_480b_rpc_shard_count(),
+            rpc_ring_topology: default_endpoint_480b_rpc_ring_topology(),
         }
     }
 }
@@ -158,6 +173,14 @@ fn default_endpoint_480b_model() -> String {
 
 fn default_endpoint_480b_timeout_secs() -> u64 {
     600
+}
+
+fn default_endpoint_480b_rpc_shard_count() -> u32 {
+    3
+}
+
+fn default_endpoint_480b_rpc_ring_topology() -> String {
+    "adele,rihanna,beyonce".to_string()
 }
 
 /// Top-level control-plane configuration.
@@ -253,6 +276,9 @@ mod tests {
         assert_eq!(cfg.endpoint.model, "qwen3-coder-480b");
         assert_eq!(cfg.endpoint.timeout_secs, 600);
         assert_eq!(cfg.endpoint.timeout(), std::time::Duration::from_secs(600));
+        assert_eq!(cfg.endpoint.rpc_shard_id, 0);
+        assert_eq!(cfg.endpoint.rpc_shard_count, 3);
+        assert_eq!(cfg.endpoint.rpc_ring_topology, "adele,rihanna,beyonce");
     }
 
     #[test]
@@ -265,6 +291,9 @@ mod tests {
                 url: "http://127.0.0.1:51001".to_string(),
                 model: "qwen3-coder-480b-a35b".to_string(),
                 timeout_secs: 900,
+                rpc_shard_id: 1,
+                rpc_shard_count: 3,
+                rpc_ring_topology: "adele,rihanna,beyonce".to_string(),
             },
         };
         let json = serde_json::to_string(&cfg).unwrap();
@@ -275,6 +304,20 @@ mod tests {
         assert!(parsed.endpoint.is_configured());
         assert_eq!(parsed.endpoint.url, "http://127.0.0.1:51001");
         assert_eq!(parsed.endpoint.timeout_secs, 900);
+        assert_eq!(parsed.endpoint.rpc_shard_id, 1);
+        assert_eq!(parsed.endpoint.rpc_shard_count, 3);
+        assert_eq!(parsed.endpoint.rpc_ring_topology, "adele,rihanna,beyonce");
+    }
+
+    #[test]
+    fn endpoint_480b_legacy_config_uses_rpc_ring_recipe() {
+        let parsed: Endpoint480bConfig = serde_json::from_str(
+            r#"{"url":"http://127.0.0.1:51001","model":"qwen3-coder-480b","timeout_secs":600}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.rpc_shard_id, 0);
+        assert_eq!(parsed.rpc_shard_count, 3);
+        assert_eq!(parsed.rpc_ring_topology, "adele,rihanna,beyonce");
     }
 
     #[test]
