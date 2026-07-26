@@ -5162,7 +5162,7 @@ async fn main() -> Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
             use ff_agent::oauth_distributor::{
-                OAUTH_PROVIDERS, distribute_token, import_token, provider_by_name,
+                OAUTH_PROVIDERS, claim_refresher, distribute_token, import_token, provider_by_name,
                 spawn_refresh_watch, status,
             };
             // Resolve `all` to every catalog entry; otherwise look up the
@@ -5180,12 +5180,18 @@ async fn main() -> Result<()> {
             };
             match command {
                 OauthCommand::Import { provider } => {
+                    let node = ff_agent::fleet_info::resolve_this_worker_name().await;
                     for p in resolve(&provider)? {
                         match import_token(&pool, p).await {
-                            Ok(()) => println!(
-                                "{GREEN}✓{RESET} imported {} → fleet_secrets[{}]",
-                                p.name, p.secret_key
-                            ),
+                            Ok(()) => {
+                                if ["claude", "codex", "kimi"].contains(&p.name) {
+                                    claim_refresher(&pool, p.name, &node).await?;
+                                }
+                                println!(
+                                    "{GREEN}✓{RESET} imported {} → fleet_secrets[{}]",
+                                    p.name, p.secret_key
+                                )
+                            }
                             Err(e) => println!("{RED}✗{RESET} {}: {e}", p.name),
                         }
                     }
