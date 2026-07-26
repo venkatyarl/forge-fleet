@@ -65,6 +65,14 @@ pub const TRANSIENT_ERROR_SIGNATURES: &[&str] = &[
     "stalled attempts",            // stall/lock class — retry after the reaper clears it
     "git reset",                   // dirty worktree — a fresh worktree clears it
     "could not fetch origin",      // transient git/network fetch failure
+    // worktree-setup transient (operator 2026-07-26): a per-node worktree/cache
+    // hiccup ("create repo parent", "clone project repo", "clone from cache")
+    // is node-local — a retry lands the item on a healthy node (or the node
+    // recovers). These stranded 7 real items in `failed` with attempts=4 until
+    // manually reset; now ff self-heals them.
+    "create repo parent",
+    "clone project repo",
+    "clone from cache",
 ];
 
 /// Whether a stored `last_error` matches a [`TRANSIENT_ERROR_SIGNATURES`]
