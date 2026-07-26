@@ -74,13 +74,20 @@ pub struct ReconcileSummary {
 /// flip to "on" deliberately. Skips the multi-node 480B RING (`%480b%` — it needs
 /// its RPC ring recipe, not a plain reload). `started_at` gives a natural 15-min
 /// cooldown so a freshly-(re)started/loading server isn't restarted again.
+fn autorestart_enabled(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "on" | "true" | "1"))
+}
+
+fn restart_spec(library_id: Option<String>, port: i32) -> Option<(String, u16)> {
+    let port = u16::try_from(port).ok().filter(|port| *port != 0)?;
+    Some((library_id?, port))
+}
+
 pub async fn restart_hung_local_deployments(pool: &sqlx::PgPool) -> u64 {
-    let enabled = matches!(
-        ff_db::pg_read_gate_value(pool, "deployment_autorestart_mode", "off", "off")
-            .await
-            .as_deref(),
-        Ok("on") | Ok("true") | Ok("1")
-    );
+    let gate = ff_db::pg_read_gate_value(pool, "deployment_autorestart_mode", "off", "off").await;
+    let enabled = autorestart_enabled(gate.as_deref().ok());
     if !enabled {
         return 0;
     }
@@ -90,7 +97,7 @@ pub async fn restart_hung_local_deployments(pool: &sqlx::PgPool) -> u64 {
            FROM fleet_model_deployments \
           WHERE worker_name = $1 AND desired_state = 'active' \
             AND health_status = 'unhealthy' \
-            AND catalog_id NOT ILIKE '%480b%' \
+            AND COALESCE(catalog_id, '') NOT ILIKE '%480b%' \
             AND (started_at IS NULL OR started_at < now() - interval '15 minutes')",
     )
     .bind(&node)
@@ -99,8 +106,12 @@ pub async fn restart_hung_local_deployments(pool: &sqlx::PgPool) -> u64 {
     .unwrap_or_default();
     let mut recovered = 0u64;
     for (id, library_id, port) in rows {
-        let Some(library_id) = library_id else {
-            tracing::warn!(deployment = %id, "reconciler: hung model has no library_id — cannot reload");
+        let Some((library_id, port)) = restart_spec(library_id, port) else {
+            tracing::warn!(
+                deployment = %id,
+                port,
+                "reconciler: hung model has no valid library/port — cannot reload"
+            );
             continue;
         };
         tracing::warn!(deployment = %id, port, node = %node,
@@ -113,7 +124,7 @@ pub async fn restart_hung_local_deployments(pool: &sqlx::PgPool) -> u64 {
             pool,
             crate::model_runtime::LoadOptions {
                 library_id,
-                port: port as u16,
+                port,
                 context_size: None,
                 parallel: None,
                 agent_profile: true,
@@ -690,6 +701,40 @@ fn match_library_to_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autorestart_gate_accepts_only_explicit_enabled_values() {
+        for enabled in ["on", "true", "1", " ON ", "TrUe"] {
+            assert!(autorestart_enabled(Some(enabled)), "{enabled:?}");
+        }
+        for disabled in ["off", "false", "0", "", "yes", "enabled"] {
+            assert!(!autorestart_enabled(Some(disabled)), "{disabled:?}");
+        }
+        assert!(!autorestart_enabled(None));
+    }
+
+    #[test]
+    fn restart_spec_requires_library_and_valid_port() {
+        assert_eq!(
+            restart_spec(Some("library-id".to_string()), 55000),
+            Some(("library-id".to_string(), 55000))
+        );
+        assert_eq!(
+            restart_spec(Some("library-id".to_string()), 1),
+            Some(("library-id".to_string(), 1))
+        );
+        assert_eq!(
+            restart_spec(Some("library-id".to_string()), u16::MAX.into()),
+            Some(("library-id".to_string(), u16::MAX))
+        );
+        assert_eq!(restart_spec(None, 55000), None);
+        assert_eq!(restart_spec(Some("library-id".to_string()), 0), None);
+        assert_eq!(restart_spec(Some("library-id".to_string()), -1), None);
+        assert_eq!(
+            restart_spec(Some("library-id".to_string()), i32::from(u16::MAX) + 1),
+            None
+        );
+    }
 
     fn lib(id: &str, catalog_id: &str) -> ff_db::ModelLibraryRow {
         ff_db::ModelLibraryRow {
