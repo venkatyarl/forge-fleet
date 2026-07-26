@@ -973,6 +973,16 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
         ),
     };
 
+    // When cloud lands the change after the local escalation ladder was
+    // exhausted, retain why local failed so the improvement pipeline can make
+    // the next similar task succeed locally.
+    if dispatch_result.is_ok()
+        && item.attempts >= ff_routing_policy::LOCAL_LANE_MAX_TRIES as i32
+        && !backend_used.starts_with("local")
+    {
+        record_local_failure_diagnosis(&pg, &item, &backend_used).await;
+    }
+
     // Capture the dispatch I/O in ff_interactions (training data) — `ff cli` is a
     // pass-through that doesn't log itself, so the dispatch records its own turn.
     record_dispatch_interaction(
@@ -3044,6 +3054,88 @@ async fn record_dispatch_interaction(
     };
     if let Err(e) = ff_db::pg_record_interaction(pg, &rec).await {
         warn!(error = %e, "work_item_dispatch: failed to log interaction (non-fatal)");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalFailureCategory {
+    ContextGap,
+    PromptGap,
+    CapabilityLimit,
+}
+
+impl LocalFailureCategory {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ContextGap => "context_gap",
+            Self::PromptGap => "prompt_gap",
+            Self::CapabilityLimit => "capability_limit",
+        }
+    }
+
+    fn routes_to(self) -> &'static str {
+        match self {
+            Self::ContextGap | Self::PromptGap => "context_pack",
+            Self::CapabilityLimit => "fine_tune_dataset",
+        }
+    }
+}
+
+fn classify_local_failure(last_error: &str) -> LocalFailureCategory {
+    let lower = last_error.to_lowercase();
+    const CONTEXT_MARKERS: [&str; 8] = [
+        "no such file",
+        "file not found",
+        "cannot find",
+        "can't find",
+        "does not exist",
+        "unknown symbol",
+        "not found in",
+        "no such table",
+    ];
+    const PROMPT_MARKERS: [&str; 6] = [
+        "ambiguous",
+        "unclear",
+        "could not determine",
+        "no diff",
+        "empty stdout",
+        "already_done claim rejected",
+    ];
+    if CONTEXT_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        LocalFailureCategory::ContextGap
+    } else if PROMPT_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        LocalFailureCategory::PromptGap
+    } else {
+        LocalFailureCategory::CapabilityLimit
+    }
+}
+
+/// Best-effort bookkeeping: diagnosis persistence must never fail a rescued
+/// build.
+async fn record_local_failure_diagnosis(pg: &PgPool, item: &AssignedWorkItem, backend_used: &str) {
+    let Some(last_error) = item.last_error.as_deref().filter(|e| !e.trim().is_empty()) else {
+        return;
+    };
+    let category = classify_local_failure(last_error);
+    if let Err(error) = sqlx::query(
+        "INSERT INTO local_failure_diagnoses \
+            (work_item_id, local_attempts, rescued_by_backend, failure_category, routed_to, diagnosis) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(item.work_item_id)
+    .bind(item.attempts)
+    .bind(backend_used)
+    .bind(category.as_str())
+    .bind(category.routes_to())
+    .bind(truncate_for_db(last_error))
+    .execute(pg)
+    .await
+    {
+        warn!(
+            work_item_id = %item.work_item_id,
+            %error,
+            "work_item_dispatch: failed to record local-failure diagnosis (non-fatal)"
+        );
     }
 }
 
@@ -5346,14 +5438,14 @@ pub fn spawn_worktree_reaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS, ReviewerStat,
-        affected_crate_manifests, agent_output_tail, backend_failed_without_output,
-        builder_excludes_480b, classify_dispatch_outcome, command_display,
-        complexity_at_least_moderate, contains_file_line_citation, default_clone_path,
-        dispatch_budget_for_host, dispatch_prompt, expand_home, is_build_timeout, mirror_repo_url,
-        order_cloud_reviewers, parse_cli_tokens, primary_or_default_backend,
-        quick_empty_success_is_provider_failure, repo_cache_path, repo_slug,
-        retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
+        AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS,
+        LocalFailureCategory, ReviewerStat, affected_crate_manifests, agent_output_tail,
+        backend_failed_without_output, builder_excludes_480b, classify_dispatch_outcome,
+        classify_local_failure, command_display, complexity_at_least_moderate,
+        contains_file_line_citation, default_clone_path, dispatch_budget_for_host, dispatch_prompt,
+        expand_home, is_build_timeout, mirror_repo_url, order_cloud_reviewers, parse_cli_tokens,
+        primary_or_default_backend, quick_empty_success_is_provider_failure, repo_cache_path,
+        repo_slug, retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
         should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
         task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
     };
@@ -6399,5 +6491,27 @@ mod tests {
         assert!(repo.join("committed.txt").exists());
         assert!(repo.join("dirty.txt").exists());
         assert!(!super::worktree_has_diff(repo));
+    }
+
+    #[test]
+    fn local_failure_diagnoses_route_to_improvement_pipeline() {
+        assert_eq!(
+            classify_local_failure("cannot find function `foo` in this scope"),
+            LocalFailureCategory::ContextGap
+        );
+        assert_eq!(
+            classify_local_failure("backend exited cleanly with empty stdout and no diff"),
+            LocalFailureCategory::PromptGap
+        );
+        assert_eq!(
+            classify_local_failure("cargo check failed: mismatched types"),
+            LocalFailureCategory::CapabilityLimit
+        );
+        assert_eq!(LocalFailureCategory::ContextGap.routes_to(), "context_pack");
+        assert_eq!(LocalFailureCategory::PromptGap.routes_to(), "context_pack");
+        assert_eq!(
+            LocalFailureCategory::CapabilityLimit.routes_to(),
+            "fine_tune_dataset"
+        );
     }
 }

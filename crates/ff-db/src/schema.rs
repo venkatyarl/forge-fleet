@@ -12201,6 +12201,29 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// Records why a local build lane failed when a cloud backend subsequently
+/// rescues the work item. Context and prompt gaps feed context-pack
+/// improvements; capability limits feed the fine-tune dataset.
+pub const SCHEMA_V271_LOCAL_FAILURE_DIAGNOSIS: &str = r#"
+CREATE TABLE IF NOT EXISTS local_failure_diagnoses (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    work_item_id       UUID NOT NULL,
+    local_attempts     INT NOT NULL,
+    rescued_by_backend TEXT NOT NULL,
+    failure_category   TEXT NOT NULL
+                           CHECK (failure_category IN ('context_gap', 'prompt_gap', 'capability_limit')),
+    routed_to          TEXT NOT NULL
+                           CHECK (routed_to IN ('context_pack', 'fine_tune_dataset')),
+    diagnosis          TEXT,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_failure_diagnoses_work_item
+    ON local_failure_diagnoses (work_item_id);
+CREATE INDEX IF NOT EXISTS idx_local_failure_diagnoses_routed_to
+    ON local_failure_diagnoses (routed_to, created_at);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

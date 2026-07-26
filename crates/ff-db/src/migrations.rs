@@ -1200,6 +1200,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_catalog_view",
         sql: schema::SCHEMA_V258_MODEL_CATALOG_VIEW,
     },
+    PgMigration {
+        version: 271,
+        name: "local_failure_diagnosis",
+        sql: schema::SCHEMA_V271_LOCAL_FAILURE_DIAGNOSIS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1510,6 +1515,40 @@ mod tests {
             .await
             .expect("v161 bootstrap should be recorded in _migrations");
         assert_eq!(row.0 as u32, BOOTSTRAP_BASELINE_VERSION);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v271_creates_local_failure_diagnoses() {
+        // CI's library test job has no Postgres. The shared helper checks both
+        // supported URL variables and returns None instead of panicking.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on a fresh database");
+
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name FROM information_schema.columns
+             WHERE table_schema = 'public'
+               AND table_name = 'local_failure_diagnoses'
+             ORDER BY ordinal_position",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read local_failure_diagnoses columns");
+        for expected in [
+            "work_item_id",
+            "local_attempts",
+            "rescued_by_backend",
+            "failure_category",
+            "routed_to",
+            "diagnosis",
+        ] {
+            assert!(columns.iter().any(|column| column == expected));
+        }
 
         drop_temp_db(admin, pool, &db_name).await;
     }
