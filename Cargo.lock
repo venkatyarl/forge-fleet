@@ -1633,6 +1633,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "dashmap",
+ "ff-api",
  "ff-core",
  "ff-db",
  "ff-deploy",

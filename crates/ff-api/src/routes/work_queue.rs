@@ -3,7 +3,7 @@
 //! Provides a lightweight, in-memory work queue for submitting work items,
 //! retrieving them by ID or as the next pending item, and updating their status.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     Json,
@@ -49,6 +49,7 @@ pub struct WorkItemResponse {
 #[derive(Debug, Default)]
 pub struct WorkQueue {
     items: DashMap<String, WorkQueueItem>,
+    claim_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +102,47 @@ impl WorkQueue {
                 (item.priority, item.created_at)
             })
             .map(|entry| entry.value().to_response())
+    }
+
+    /// Atomically claim the highest-scoring pending item. Score ties favor the
+    /// oldest item and then the lowest id; non-finite scores sort last.
+    pub fn claim_pending_by_score(
+        &self,
+        score: impl Fn(&WorkItemResponse) -> f64,
+    ) -> Option<(WorkItemResponse, f64)> {
+        let _guard = self
+            .claim_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let selected = self
+            .items
+            .iter()
+            .filter(|entry| entry.value().status == "pending")
+            .map(|entry| {
+                let item = entry.value().to_response();
+                let score = score(&item);
+                (
+                    item,
+                    if score.is_finite() {
+                        score
+                    } else {
+                        f64::NEG_INFINITY
+                    },
+                )
+            })
+            .min_by(|(a, a_score), (b, b_score)| {
+                b_score
+                    .total_cmp(a_score)
+                    .then_with(|| a.created_at.cmp(&b.created_at))
+                    .then_with(|| a.id.cmp(&b.id))
+            })?;
+        let mut item = self.items.get_mut(&selected.0.id)?;
+        if item.status != "pending" {
+            return None;
+        }
+        item.status = "running".into();
+        item.updated_at = Utc::now().timestamp();
+        Some((item.to_response(), selected.1))
     }
 
     /// Update a work item's status.
@@ -239,6 +281,47 @@ mod tests {
         let next = queue.next_pending().unwrap();
         assert_eq!(next.id, high.id);
         assert_ne!(next.id, low.id);
+    }
+
+    #[test]
+    fn scored_claim_is_ordered_and_atomic() {
+        let queue = Arc::new(WorkQueue::new());
+        queue.submit(SubmitWorkItemRequest {
+            kind: "low".into(),
+            payload: Value::Null,
+            priority: 5,
+        });
+        let high = queue.submit(SubmitWorkItemRequest {
+            kind: "high".into(),
+            payload: Value::Null,
+            priority: 1,
+        });
+        let (claimed, score) = queue
+            .claim_pending_by_score(|item| 100.0 - f64::from(item.priority))
+            .unwrap();
+        assert_eq!(claimed.id, high.id);
+        assert_eq!(claimed.status, "running");
+        assert_eq!(score, 99.0);
+
+        let only = Arc::new(WorkQueue::new());
+        only.submit(SubmitWorkItemRequest {
+            kind: "only".into(),
+            payload: Value::Null,
+            priority: 1,
+        });
+        let claims: Vec<_> = (0..8)
+            .map(|_| {
+                let queue = Arc::clone(&only);
+                std::thread::spawn(move || queue.claim_pending_by_score(|_| 1.0))
+            })
+            .collect();
+        assert_eq!(
+            claims
+                .into_iter()
+                .filter_map(|claim| claim.join().unwrap())
+                .count(),
+            1
+        );
     }
 
     #[test]

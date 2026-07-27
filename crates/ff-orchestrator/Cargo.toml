@@ -7,6 +7,7 @@ authors.workspace = true
 description = "ForgeFleet task decomposition, multi-model routing, and parallel execution — Perplexity-style orchestration"
 
 [dependencies]
+ff-api = { path = "../ff-api" }
 ff-core = { path = "../ff-core" }
 ff-deploy = { path = "../ff-deploy" }
 ff-db = { path = "../ff-db" }

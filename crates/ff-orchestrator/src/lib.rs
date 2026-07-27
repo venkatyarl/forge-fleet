@@ -37,6 +37,7 @@ pub mod router;
 #[path = "ff-orchestrator.rs"]
 pub mod rpc_480b;
 pub mod scheduler;
+pub mod slots;
 pub mod task_decomposer;
 pub mod train_branch;
 
@@ -82,6 +83,7 @@ pub use scheduler::{
     NodeCapacity, ResourceRequirements, RunningTask, ScheduleDecision, ScheduledTask, Scheduler,
     TaskPriority,
 };
+pub use slots::{DispatchedTask, SlotAssignment, SlotPool, eisenhower_quadrant, priority_score};
 pub use task_decomposer::{
     DecomposedSubTask, DecompositionStrategy, TaskPattern, TemplateDecomposer,
 };
