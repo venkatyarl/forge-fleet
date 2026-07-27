@@ -22,6 +22,7 @@ pub struct AgentConfig {
     pub slm_threads: Option<usize>,
     pub slm_mem_budget_mb: Option<u64>,
     pub log_monitor: LogMonitoringConfig,
+    pub log_shipping: LogShippingConfig,
 }
 
 impl AgentConfig {
@@ -68,6 +69,7 @@ impl AgentConfig {
                 .ok()
                 .and_then(|value| value.parse().ok()),
             log_monitor: LogMonitoringConfig::from_env(),
+            log_shipping: LogShippingConfig::from_env(),
         }
     }
 }
@@ -122,6 +124,46 @@ impl LogMonitoringConfig {
                 .ok()
                 .map(|v| parse_string_list(&v))
                 .unwrap_or_default(),
+        }
+    }
+}
+
+/// Central log shipping configuration for the local agent daemon.
+///
+/// Tails configured log files and periodically ships entries to the fleet log
+/// store for centralized analysis.
+#[derive(Debug, Clone)]
+pub struct LogShippingConfig {
+    /// Enable central log shipping.
+    pub enabled: bool,
+    /// Log file paths to ship. Supports comma-separated paths in the
+    /// `FF_AGENT_LOG_SHIPPING_PATHS` environment variable.
+    pub log_paths: Vec<PathBuf>,
+    /// Maximum number of log entries to ship in one batch.
+    pub batch_size: usize,
+    /// Polling interval in seconds.
+    pub poll_interval_secs: u64,
+}
+
+impl LogShippingConfig {
+    pub fn from_env() -> Self {
+        Self {
+            enabled: std::env::var("FF_AGENT_LOG_SHIPPING_ENABLED")
+                .ok()
+                .map(|v| v.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            log_paths: std::env::var("FF_AGENT_LOG_SHIPPING_PATHS")
+                .ok()
+                .map(|v| parse_path_list(&v))
+                .unwrap_or_else(default_log_paths),
+            batch_size: std::env::var("FF_AGENT_LOG_SHIPPING_BATCH_SIZE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(100),
+            poll_interval_secs: std::env::var("FF_AGENT_LOG_SHIPPING_POLL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30),
         }
     }
 }
