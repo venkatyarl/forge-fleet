@@ -1654,12 +1654,14 @@ name = "ff-pipeline"
 version = "2026.4.7"
 dependencies = [
  "chrono",
+ "ff-db",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
