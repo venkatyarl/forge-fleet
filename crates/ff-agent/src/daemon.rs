@@ -70,6 +70,12 @@ impl TickRegistry {
                 runner: run_telegram_reply_poller_tick,
             },
             TickDefinition {
+                name: "jira_ingest",
+                interval: Duration::from_secs(300),
+                scope: TickScope::LeaderOnly,
+                runner: run_jira_ingest_tick,
+            },
+            TickDefinition {
                 name: "log_analysis_worker",
                 interval: crate::log_analysis_worker::DEFAULT_INTERVAL,
                 scope: TickScope::LeaderOnly,
@@ -246,6 +252,10 @@ fn run_telegram_reply_poller_tick(
             .await
             .map(|_| ())
     })
+}
+
+fn run_jira_ingest_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move { crate::ha::jira_ingest::run_jira_ingest_tick(&pg).await })
 }
 
 fn run_log_analysis_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
