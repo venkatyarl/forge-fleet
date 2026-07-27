@@ -22,6 +22,7 @@ pub mod confidence;
 pub mod crew;
 pub mod decomposer;
 pub mod leader;
+pub mod llm_router;
 pub mod merge_train;
 pub mod node_manager;
 pub mod parallel;
@@ -53,6 +54,7 @@ pub use leader::{
     AgentHeartbeatResult, AgentTask, LeaderCoordinator, Preemption, SubmissionAction,
     SubmissionResult, TickResult,
 };
+pub use llm_router::{LlmCandidate, LlmFailureKind, LlmRouter};
 pub use merge_train::MergeTrainConfig;
 pub use node_manager::NodeManager;
 pub use parallel::{ExecutionResult, ParallelExecutor, SubTaskResult};
