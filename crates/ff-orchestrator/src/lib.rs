@@ -14,6 +14,7 @@
 //! - [`agent_team`] — Composable agent team management with tier-aware templates
 //! - [`task_decomposer`] — Template-based task decomposition (build/fix/review patterns)
 //! - [`confidence`] — Confidence-based escalation and trend tracking
+//! - [`llm_router`] — Shared contract for selecting and retrying LLM endpoints
 
 pub mod agent_team;
 pub mod alerts;
