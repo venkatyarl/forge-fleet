@@ -1312,7 +1312,12 @@ async fn dispatch_one(
             %reason,
             "work_item_dispatch: acceptance-criteria gate rejected the build before PR"
         );
-        requeue_or_fail(&pg, &item, &format!("acceptance criteria not met: {reason}")).await?;
+        requeue_or_fail(
+            &pg,
+            &item,
+            &format!("acceptance criteria not met: {reason}"),
+        )
+        .await?;
         let sweep_warnings = post_phase.finish();
         return Ok(WorkItemDispatchResult { sweep_warnings });
     }
@@ -2239,8 +2244,17 @@ async fn run_in_place_review(
     // across ALL nodes, the same fleet-wide local routing the build lane uses.
     // A local-Devstral review beats failing the item outright.
     let started_at = chrono::Utc::now();
-    match crate::fleet_oneshot::fleet_oneshot(pg, &prompt, None, Some(REVIEW_CLOUD_TIMEOUT)).await {
-        Ok(resp) if !resp.text.trim().is_empty() => {
+    let health = ff_pulse::lane_1_5::check_llm_health(|| async {
+        crate::fleet_oneshot::fleet_oneshot(pg, &prompt, None, Some(REVIEW_CLOUD_TIMEOUT))
+            .await
+            .map(|response| {
+                let text = response.text.clone();
+                (response, text)
+            })
+    })
+    .await;
+    match health {
+        ff_pulse::lane_1_5::LlmHealthGate::Healthy(resp) => {
             record_review_interaction(
                 pg,
                 item.work_item_id,
@@ -2266,14 +2280,13 @@ async fn run_in_place_review(
                 completed_at: chrono::Utc::now(),
             });
         }
-        Ok(_) => warn!(
-            work_item_id = %item.work_item_id,
-            "work_item_dispatch: fleet-local review returned empty"
-        ),
-        Err(e) => warn!(
-            work_item_id = %item.work_item_id, error = format!("{e:#}"),
-            "work_item_dispatch: fleet-local review fallback failed"
-        ),
+        ff_pulse::lane_1_5::LlmHealthGate::Unhealthy(reason) => {
+            warn!(
+                work_item_id = %item.work_item_id,
+                reason,
+                "work_item_dispatch: fleet-local reviewer failed Lane-1.5 health gate"
+            );
+        }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("no in-place review backend available")))
 }
@@ -2331,7 +2344,9 @@ async fn diff_meets_acceptance_criteria(
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
     if diff.trim().is_empty() {
-        return Some(Err("no diff to check against acceptance criteria".to_string()));
+        return Some(Err(
+            "no diff to check against acceptance criteria".to_string()
+        ));
     }
     let list = criteria
         .iter()
@@ -2372,7 +2387,11 @@ async fn diff_meets_acceptance_criteria(
                     .join("; ");
                 Some(Err(format!(
                     "diff does not meet acceptance criteria: {}",
-                    if reasons.trim().is_empty() { "reviewer gave no detail".into() } else { reasons }
+                    if reasons.trim().is_empty() {
+                        "reviewer gave no detail".into()
+                    } else {
+                        reasons
+                    }
                 )))
             } else {
                 // Unparseable verdict → don't block (fail-open), just log.
@@ -3635,7 +3654,11 @@ async fn run_ff_dispatch(
     // evolution have a signal. Fail-open: no relevant skill / query error → skip.
     let injected_skills: Vec<uuid::Uuid> = match crate::skill_evidence::select_relevant_skills(
         pg,
-        &format!("{} {}", item.title, item.description.as_deref().unwrap_or_default()),
+        &format!(
+            "{} {}",
+            item.title,
+            item.description.as_deref().unwrap_or_default()
+        ),
         2,
     )
     .await
