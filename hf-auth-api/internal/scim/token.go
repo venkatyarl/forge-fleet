@@ -24,15 +24,49 @@ type Name struct {
 }
 
 type ScimToken struct {
-	Subject     string  `json:"sub,omitempty"`
-	Issuer      string  `json:"iss,omitempty"`
-	ExpiresAt   int64   `json:"exp,omitempty"`
-	ExternalID  string  `json:"externalId,omitempty"`
-	UserName    string  `json:"userName"`
-	DisplayName string  `json:"displayName,omitempty"`
-	Name        Name    `json:"name,omitempty"`
-	Emails      []Email `json:"emails,omitempty"`
-	Active      bool    `json:"active"`
+	Subject        string  `json:"sub,omitempty"`
+	Issuer         string  `json:"iss,omitempty"`
+	ExpiresAt      int64   `json:"exp,omitempty"`
+	ExternalID     string  `json:"externalId,omitempty"`
+	UserName       string  `json:"userName"`
+	DisplayName    string  `json:"displayName,omitempty"`
+	Name           Name    `json:"name,omitempty"`
+	Emails         []Email `json:"emails,omitempty"`
+	Active         bool    `json:"active"`
+	ActiveProvided bool    `json:"-"`
+}
+
+func (t *ScimToken) UnmarshalJSON(raw []byte) error {
+	type scimTokenJSON struct {
+		Subject     string  `json:"sub,omitempty"`
+		Issuer      string  `json:"iss,omitempty"`
+		ExpiresAt   int64   `json:"exp,omitempty"`
+		ExternalID  string  `json:"externalId,omitempty"`
+		UserName    string  `json:"userName"`
+		DisplayName string  `json:"displayName,omitempty"`
+		Name        Name    `json:"name,omitempty"`
+		Emails      []Email `json:"emails,omitempty"`
+		Active      *bool   `json:"active"`
+	}
+	var token scimTokenJSON
+	if err := json.Unmarshal(raw, &token); err != nil {
+		return err
+	}
+	*t = ScimToken{
+		Subject:        token.Subject,
+		Issuer:         token.Issuer,
+		ExpiresAt:      token.ExpiresAt,
+		ExternalID:     token.ExternalID,
+		UserName:       token.UserName,
+		DisplayName:    token.DisplayName,
+		Name:           token.Name,
+		Emails:         token.Emails,
+		ActiveProvided: token.Active != nil,
+	}
+	if token.Active != nil {
+		t.Active = *token.Active
+	}
+	return nil
 }
 
 func ParseScimToken(raw []byte) (*ScimToken, error) {
