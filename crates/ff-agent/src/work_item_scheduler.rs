@@ -154,6 +154,77 @@ UPDATE work_items w
  WHERE w.id = claimed.work_item_id
 "#;
 
+/// Materialize diagnosed local failures in the existing improvement stores.
+/// The diagnosis row and its derived artifact advance in one transaction, so a
+/// scheduler restart cannot duplicate training or context-pack inputs.
+const ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL: &str = r#"
+WITH claimed AS MATERIALIZED (
+    SELECT d.id, d.work_item_id, d.local_failure_summary, d.cloud_diagnosis,
+           d.cause_class, d.improvement_route
+      FROM local_failure_diagnoses d
+     WHERE d.remediation_status = 'diagnosed'
+       AND d.improvement_route IN ('dreamer_context_pack', 'fine_tune_model_ab')
+     ORDER BY d.created_at, d.id
+     FOR UPDATE SKIP LOCKED
+     LIMIT $1
+),
+context_sources AS (
+    INSERT INTO local_context_sources (uri, title, source_type, metadata)
+    SELECT 'local-failure-diagnosis://' || c.id,
+           'Cloud rescue diagnosis for work item ' || c.work_item_id,
+           'note',
+           jsonb_build_object(
+               'local_failure_diagnosis_id', c.id,
+               'work_item_id', c.work_item_id,
+               'cause_class', c.cause_class,
+               'improvement_route', c.improvement_route
+           )
+      FROM claimed c
+     WHERE c.improvement_route = 'dreamer_context_pack'
+    RETURNING id, metadata
+),
+context_chunks AS (
+    INSERT INTO local_context_chunks (source_id, chunk_index, content, metadata)
+    SELECT s.id, 0,
+           c.local_failure_summary || E'\n\nCloud diagnosis: ' || c.cloud_diagnosis,
+           s.metadata
+      FROM context_sources s
+      JOIN claimed c
+        ON c.id = (s.metadata->>'local_failure_diagnosis_id')::uuid
+    RETURNING source_id
+),
+training_inputs AS (
+    INSERT INTO training_jobs
+        (name, training_data_path, training_type, params, created_by)
+    SELECT 'local-failure-' || c.id,
+           'local-failure-diagnosis://' || c.id,
+           'lora',
+           jsonb_build_object(
+               'local_failure_diagnosis_id', c.id,
+               'work_item_id', c.work_item_id,
+               'local_failure_summary', c.local_failure_summary,
+               'cloud_diagnosis', c.cloud_diagnosis,
+               'cause_class', c.cause_class
+           ),
+           'cloud-fixes-local'
+      FROM claimed c
+     WHERE c.improvement_route = 'fine_tune_model_ab'
+    RETURNING id
+)
+UPDATE local_failure_diagnoses d
+   SET remediation_status = 'deploy_pending',
+       updated_at = NOW()
+  FROM claimed c
+ WHERE d.id = c.id
+   AND (
+       (c.improvement_route = 'dreamer_context_pack'
+        AND EXISTS (SELECT 1 FROM context_chunks))
+       OR
+       (c.improvement_route = 'fine_tune_model_ab'
+        AND EXISTS (SELECT 1 FROM training_inputs))
+   )
+"#;
+
 fn lease_stale_secs_from_success_p99(sample_count: i64, p99_secs: Option<f64>) -> i64 {
     if sample_count < LEASE_STALE_MIN_SAMPLES {
         return MIN_LEASE_STALE_SECS;
@@ -222,6 +293,14 @@ async fn requeue_deployed_local_retests(pg: &PgPool) -> Result<u64> {
         .rows_affected())
 }
 
+async fn route_diagnosed_local_failures(pg: &PgPool) -> Result<u64> {
+    Ok(sqlx::query(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL)
+        .bind(MAX_ASSIGN_PER_TICK)
+        .execute(pg)
+        .await?
+        .rows_affected())
+}
+
 /// One scheduler pass. Returns the number of work_items assigned this tick.
 pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
     let stale_secs = lease_stale_secs(pg).await;
@@ -236,6 +315,14 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         warn!(
             reaped,
             "work_item_scheduler: reaped stale leases (slots freed, items re-queued)"
+        );
+    }
+
+    let routed_diagnoses = route_diagnosed_local_failures(pg).await?;
+    if routed_diagnoses > 0 {
+        info!(
+            routed_diagnoses,
+            "work_item_scheduler: routed local-failure diagnoses to improvement pipelines"
         );
     }
 
@@ -705,6 +792,26 @@ mod tests {
         );
         assert!(REQUEUE_DEPLOYED_LOCAL_RETESTS_SQL.contains("attempts = 0"));
         assert!(REQUEUE_DEPLOYED_LOCAL_RETESTS_SQL.contains("l.released_at IS NULL"));
+    }
+
+    #[test]
+    fn diagnosed_local_failures_route_to_existing_improvement_pipelines() {
+        assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("local_context_sources"));
+        assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("local_context_chunks"));
+        assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("training_jobs"));
+        assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("dreamer_context_pack"));
+        assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("fine_tune_model_ab"));
+        assert!(
+            ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("remediation_status = 'deploy_pending'")
+        );
+    }
+
+    #[test]
+    fn diagnosed_local_failure_routing_is_idempotent_by_diagnosis_id() {
+        assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("d.remediation_status = 'diagnosed'"));
+        assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("FOR UPDATE SKIP LOCKED"));
+        assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("local-failure-diagnosis://' || c.id"));
+        assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("'local_failure_diagnosis_id', c.id"));
     }
 
     fn slot(computer: uuid::Uuid) -> ff_db::FreeSlot {
