@@ -618,6 +618,20 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         info!("subsystem disabled: per-project digest framework (no pg pool)");
     }
 
+    // 7c) Jira queue ingestion — every 300s, leader-gated.
+    // Polls configured Jira queues and creates/updates `work_items` for issues
+    // matching each config's queue JQL.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: jira ingestion tick (300s, leader-gated)");
+        subsystem_tasks.push(ff_agent::jira_ingestion_tick::spawn_jira_ingestion_tick(
+            pg_pool,
+            300,
+            shutdown_rx.clone(),
+        ));
+    } else {
+        info!("subsystem disabled: jira ingestion tick (no pg pool)");
+    }
+
     // 8) evolution runtime loop
     if config.loops.evolution.enabled {
         info!("starting subsystem: evolution loop");
