@@ -12445,6 +12445,10 @@ ALTER TABLE work_item_leases
     ADD COLUMN IF NOT EXISTS build_started_at TIMESTAMPTZ;
 "#;
 
+/// Append-only store for fleet node log lines.
+pub const SCHEMA_V279_FLEET_LOGS: &str =
+    include_str!("migrations/20260727000000_create_fleet_logs.sql");
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
