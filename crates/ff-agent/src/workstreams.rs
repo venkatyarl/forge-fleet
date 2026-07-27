@@ -322,13 +322,12 @@ pub async fn derive_working_summaries(pg: &PgPool) -> Result<u64> {
 /// `report` calls. Silent no-op if the session isn't attached (the SessionStart
 /// hook attaches; a Stop firing before attach shouldn't error).
 pub async fn heartbeat(pg: &PgPool, session_id: &str) -> Result<bool> {
-    let n = sqlx::query(
-        "UPDATE workstream_clients SET last_report_at = now() WHERE session_id = $1",
-    )
-    .bind(session_id)
-    .execute(pg)
-    .await?
-    .rows_affected();
+    let n =
+        sqlx::query("UPDATE workstream_clients SET last_report_at = now() WHERE session_id = $1")
+            .bind(session_id)
+            .execute(pg)
+            .await?
+            .rows_affected();
     Ok(n > 0)
 }
 

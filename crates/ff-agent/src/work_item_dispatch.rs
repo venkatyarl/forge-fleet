@@ -4501,7 +4501,9 @@ fn https_pat_url(remote: &str, pat: &str) -> Option<String> {
     if owner_repo.is_empty() || !owner_repo.contains('/') {
         return None;
     }
-    Some(format!("https://x-access-token:{pat}@github.com/{owner_repo}.git"))
+    Some(format!(
+        "https://x-access-token:{pat}@github.com/{owner_repo}.git"
+    ))
 }
 
 fn checkout_clone_for_build(

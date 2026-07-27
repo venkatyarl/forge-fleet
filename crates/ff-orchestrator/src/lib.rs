@@ -73,3 +73,32 @@ pub use task_decomposer::{
     DecomposedSubTask, DecompositionStrategy, TaskPattern, TemplateDecomposer,
 };
 pub use train_branch::{QueuedPr, TrainBranch, TrainBranchError, create_train_branch};
+
+/// Run the native deployment convergence step for one orchestrator tick.
+///
+/// `ff-deploy` groups targets by their architecture string. Deriving that
+/// value from the selected deployment profile here keeps the orchestrator's
+/// profile selection authoritative and avoids the retired shell reconciler.
+pub async fn run_native_deployment_tick<O>(
+    profile: ff_core::DeploymentProfile,
+    target_names: impl IntoIterator<Item = String>,
+    operations: &O,
+) -> ff_deploy::NativeDeployReport
+where
+    O: ff_deploy::NativeDeployOperations + Sync,
+{
+    let architecture = match profile {
+        ff_core::DeploymentProfile::LinuxX86 => "linux-x86",
+        ff_core::DeploymentProfile::LinuxAarch64Dgx => "linux-aarch64-dgx",
+        ff_core::DeploymentProfile::MacosAarch64 => "macos-aarch64",
+        ff_core::DeploymentProfile::Windows => "windows",
+    };
+    let targets = target_names
+        .into_iter()
+        .map(|name| ff_deploy::NativeDeployTarget {
+            name,
+            architecture: architecture.to_owned(),
+        });
+
+    ff_deploy::run_native_deploy_tick(targets, operations).await
+}
