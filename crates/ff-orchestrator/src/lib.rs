@@ -14,6 +14,7 @@
 //! - [`agent_team`] — Composable agent team management with tier-aware templates
 //! - [`task_decomposer`] — Template-based task decomposition (build/fix/review patterns)
 //! - [`confidence`] — Confidence-based escalation and trend tracking
+//! - [`emoji_mapping`] — Custom logo emoji configuration for known projects
 //! - [`llm_router`] — Shared contract for selecting and retrying LLM endpoints
 //! - [`health_monitor`] — In-memory LLM backend health tracking
 
@@ -24,6 +25,7 @@ pub mod circuit_breaker;
 pub mod confidence;
 pub mod crew;
 pub mod decomposer;
+pub mod emoji_mapping;
 pub mod health_monitor;
 pub mod leader;
 pub mod llm_router;
@@ -55,6 +57,7 @@ pub use confidence::{
 };
 pub use crew::{AgentRole, CrewAssignment, CrewDefinition};
 pub use decomposer::{SubTask, SubTaskType, TaskDecomposition};
+pub use emoji_mapping::{PROJECT_EMOJI_MAPPING, project_emoji_code};
 pub use health_monitor::{LlmHealth, LlmHealthMonitor};
 pub use leader::{
     AgentHeartbeatResult, AgentTask, LeaderCoordinator, Preemption, SubmissionAction,
