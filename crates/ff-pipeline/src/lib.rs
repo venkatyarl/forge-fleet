@@ -13,6 +13,7 @@ pub mod registry;
 pub mod step;
 pub mod templates;
 pub mod testing_pipeline;
+pub mod training_corpus;
 
 pub use error::{PipelineError, Result};
 pub use executor::{ExecutorConfig, PipelineEvent, PipelineRunResult, execute};
