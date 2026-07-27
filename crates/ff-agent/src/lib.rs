@@ -20,6 +20,7 @@ pub mod research;
 pub mod retry_policy;
 pub mod review_pipeline;
 pub mod skill_catalog;
+pub mod skill_evidence;
 pub mod slm;
 pub mod slm_config;
 pub mod task_probe;

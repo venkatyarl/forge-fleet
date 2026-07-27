@@ -3628,6 +3628,29 @@ async fn run_ff_dispatch(
         prompt = format!("{pack}\n{prompt}");
     }
 
+    // OPENSPACE SKILL INJECTION (2026-07-27): surface the most relevant proven
+    // skills for this task so a weaker/local model REUSES a known-good approach
+    // instead of re-deriving (the lift OpenSpace demonstrates). The injected
+    // skills' ids are recorded as evidence after the build resolves so grading +
+    // evolution have a signal. Fail-open: no relevant skill / query error → skip.
+    let injected_skills: Vec<uuid::Uuid> = match crate::skill_evidence::select_relevant_skills(
+        pg,
+        &format!("{} {}", item.title, item.description.as_deref().unwrap_or_default()),
+        2,
+    )
+    .await
+    {
+        Ok(skills) if !skills.is_empty() => {
+            let block = crate::skill_evidence::render_skill_block(&skills);
+            if !block.is_empty() {
+                info!(work_item_id = %item.work_item_id, skills = skills.len(), "run_ff_dispatch: injected relevant skills");
+                prompt = format!("{block}\n{prompt}");
+            }
+            skills.iter().map(|s| s.id).collect()
+        }
+        _ => Vec::new(),
+    };
+
     // ACCEPTANCE CRITERIA (Anthropic long-running-agent feature-list pattern): if
     // the planner attached a checkable definition-of-done, put it in the builder's
     // prompt so a weaker/local model targets the EXACT criteria the self-verify
@@ -3838,6 +3861,20 @@ async fn run_ff_dispatch(
                     rounds = outcome.rounds,
                     "work_item_dispatch: local codegen harness landed the change"
                 );
+                // OPENSPACE EVIDENCE: the injected skills correlated with a build
+                // that produced a diff — record positive evidence so grading can
+                // graduate proven skills (provisional→trusted).
+                for sid in &injected_skills {
+                    crate::skill_evidence::record_skill_invocation(
+                        pg,
+                        *sid,
+                        &item.work_item_id.to_string(),
+                        &item.computer_id.to_string(),
+                        &item.title,
+                        "applied",
+                    )
+                    .await;
+                }
                 return Ok((
                     "local".to_string(),
                     synthetic_output(&outcome.final_diff.unwrap_or_else(|| "applied".into())),
