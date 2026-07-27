@@ -10,6 +10,7 @@ pub mod backup;
 pub mod error_tracker;
 pub mod handoff;
 pub mod jira_config;
+pub mod jira_ingest;
 pub mod log_monitor;
 pub mod manager;
 pub mod mirror_service;
