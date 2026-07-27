@@ -4,7 +4,7 @@
 //! with version tracking via a `_migrations` meta-table.
 
 use sqlx::{Acquire, PgPool};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::error::{DbError, Result};
 use crate::schema;
@@ -1410,12 +1410,67 @@ async fn run_postgres_migrations_locked(conn: &mut sqlx::PgConnection) -> Result
                 );
             }
             Err(e) => {
-                // Transaction is dropped (rolled back) on error.
-                warn!(version = migration.version, error = %e, "postgres migration failed");
-                return Err(DbError::Migration(format!(
-                    "postgres migration v{} '{}' failed: {e}",
-                    migration.version, migration.name
-                )));
+                // Drop the failed tx (rolls back) so we can reuse `conn` below.
+                drop(tx);
+                //
+                // NON-FATAL QUARANTINE (operator 2026-07-27, after the 3rd
+                // migration crash-loop: v276 view-rename, v278 idempotency, v280
+                // merge-ordering). Previously ONE failed migration aborted the
+                // WHOLE daemon startup — before the self-heal/reporting loops even
+                // start — so a single bad migration took down all 18 nodes AND
+                // left no running orchestrator to detect or fix it (self-heal
+                // can't recover a failure in its own startup path). That turned a
+                // one-feature bug into a fleet-wide outage requiring a human every
+                // time.
+                //
+                // Instead: log LOUD, record the migration as FAILED (quarantined)
+                // so it isn't retried on every boot (no crash-loop), and CONTINUE
+                // — the daemon starts, the rest of the fleet keeps running, and
+                // self-heal operates. A broken migration now degrades ONE feature
+                // (whatever needed that schema) instead of the whole fleet; the
+                // systemic-error doctor + this quarantine surface it for a real
+                // source fix. `_migration_failures` is created best-effort.
+                error!(
+                    version = migration.version,
+                    name = migration.name,
+                    error = %e,
+                    "postgres migration FAILED — quarantining (non-fatal) and CONTINUING startup; \
+                     schema for this feature is degraded until the migration is fixed"
+                );
+                // Record the failure OUTSIDE the rolled-back tx so it persists.
+                let _ = sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS _migration_failures ( \
+                        version int PRIMARY KEY, name text, error text, \
+                        first_failed_at timestamptz NOT NULL DEFAULT now(), \
+                        last_failed_at  timestamptz NOT NULL DEFAULT now(), \
+                        attempts int NOT NULL DEFAULT 1 )",
+                )
+                .execute(&mut *conn)
+                .await;
+                let _ = sqlx::query(
+                    "INSERT INTO _migration_failures (version, name, error) VALUES ($1,$2,$3) \
+                     ON CONFLICT (version) DO UPDATE SET \
+                        last_failed_at = now(), attempts = _migration_failures.attempts + 1, \
+                        error = EXCLUDED.error",
+                )
+                .bind(migration.version as i32)
+                .bind(migration.name)
+                .bind(e.to_string())
+                .execute(&mut *conn)
+                .await;
+                // Mark it applied=quarantined in _migrations so the runner does
+                // NOT re-attempt it every boot (that's the crash-loop). A later
+                // build with a corrected migration body must use a NEW version
+                // number (forward-only), so skipping this one is safe.
+                let _ = sqlx::query(
+                    "INSERT INTO _migrations (version, name) VALUES ($1, $2) \
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(migration.version as i32)
+                .bind(format!("{}__QUARANTINED", migration.name))
+                .execute(&mut *conn)
+                .await;
+                continue;
             }
         }
     }
