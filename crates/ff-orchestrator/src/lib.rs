@@ -23,6 +23,7 @@ pub mod circuit_breaker;
 pub mod confidence;
 pub mod crew;
 pub mod decomposer;
+pub mod emoji_mapping;
 pub mod leader;
 pub mod llm_router;
 pub mod merge_train;
@@ -53,6 +54,7 @@ pub use confidence::{
 };
 pub use crew::{AgentRole, CrewAssignment, CrewDefinition};
 pub use decomposer::{SubTask, SubTaskType, TaskDecomposition};
+pub use emoji_mapping::PROJECT_EMOJI_MAPPING;
 pub use leader::{
     AgentHeartbeatResult, AgentTask, LeaderCoordinator, Preemption, SubmissionAction,
     SubmissionResult, TickResult,
