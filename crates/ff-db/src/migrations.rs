@@ -1240,6 +1240,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "durable_project_workstreams",
         sql: schema::SCHEMA_V278_DURABLE_PROJECT_WORKSTREAMS,
     },
+    PgMigration {
+        version: 279,
+        name: "fleet_logs",
+        sql: schema::SCHEMA_V279_FLEET_LOGS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -2602,5 +2607,22 @@ mod tests {
         assert_eq!(conflict.count, 2);
 
         drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[test]
+    fn v279_creates_fleet_logs_table() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 279)
+            .expect("V279 must be registered");
+        assert_eq!(migration.name, "fleet_logs");
+        assert!(
+            migration
+                .sql
+                .contains("CREATE TABLE IF NOT EXISTS fleet_logs")
+        );
+        assert!(migration.sql.contains("node_id"));
+        assert!(migration.sql.contains("log_level"));
+        assert!(migration.sql.contains("message"));
     }
 }
