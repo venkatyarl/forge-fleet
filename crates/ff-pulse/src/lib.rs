@@ -53,6 +53,7 @@ pub mod error;
 pub mod fabric_upsert;
 pub mod heartbeat;
 pub mod heartbeat_v2;
+pub mod lane_1_5;
 pub mod llm_probe;
 pub mod materializer;
 pub mod metrics;

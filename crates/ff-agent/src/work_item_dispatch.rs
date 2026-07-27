@@ -2244,8 +2244,17 @@ async fn run_in_place_review(
     // across ALL nodes, the same fleet-wide local routing the build lane uses.
     // A local-Devstral review beats failing the item outright.
     let started_at = chrono::Utc::now();
-    match crate::fleet_oneshot::fleet_oneshot(pg, &prompt, None, Some(REVIEW_CLOUD_TIMEOUT)).await {
-        Ok(resp) if !resp.text.trim().is_empty() => {
+    let health = ff_pulse::lane_1_5::check_llm_health(|| async {
+        crate::fleet_oneshot::fleet_oneshot(pg, &prompt, None, Some(REVIEW_CLOUD_TIMEOUT))
+            .await
+            .map(|response| {
+                let text = response.text.clone();
+                (response, text)
+            })
+    })
+    .await;
+    match health {
+        ff_pulse::lane_1_5::LlmHealthGate::Healthy(resp) => {
             record_review_interaction(
                 pg,
                 item.work_item_id,
@@ -2271,14 +2280,13 @@ async fn run_in_place_review(
                 completed_at: chrono::Utc::now(),
             });
         }
-        Ok(_) => warn!(
-            work_item_id = %item.work_item_id,
-            "work_item_dispatch: fleet-local review returned empty"
-        ),
-        Err(e) => warn!(
-            work_item_id = %item.work_item_id, error = format!("{e:#}"),
-            "work_item_dispatch: fleet-local review fallback failed"
-        ),
+        ff_pulse::lane_1_5::LlmHealthGate::Unhealthy(reason) => {
+            warn!(
+                work_item_id = %item.work_item_id,
+                reason,
+                "work_item_dispatch: fleet-local reviewer failed Lane-1.5 health gate"
+            );
+        }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("no in-place review backend available")))
 }
