@@ -1200,6 +1200,7 @@ dependencies = [
  "futures",
  "glob",
  "libc",
+ "notify",
  "rand 0.8.5",
  "redis",
  "regex",
