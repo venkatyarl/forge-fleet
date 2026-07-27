@@ -79,6 +79,38 @@ pub async fn workstream_for_project(pg: &PgPool, project_key: &str) -> Result<Op
     Ok(ws)
 }
 
+/// Attach a client session as an open workstream thread and publish its current
+/// summary. Both writes are committed together so readers never observe a
+/// newly attached session without its corresponding workstream state.
+pub async fn attach_client_session(
+    pg: &PgPool,
+    workstream_id: uuid::Uuid,
+    session_id: &str,
+    working_summary: &str,
+) -> Result<()> {
+    let mut tx = pg.begin().await?;
+    sqlx::query(
+        "INSERT INTO workstream_threads \
+            (workstream_id, label, claimed_by) \
+         VALUES ($1, $2, $2)",
+    )
+    .bind(workstream_id)
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE ff_workstreams \
+            SET working_summary = $2, updated_at = now() \
+          WHERE id = $1",
+    )
+    .bind(workstream_id)
+    .bind(working_summary)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Attach + reporting (2026-07-26): make "ff owns the session" real end-to-end.
 // A CLI (this Claude session on forge-fleet, or Codex/Kimi elsewhere) resolves
