@@ -31,6 +31,8 @@ pub mod project_handler;
 pub mod project_policy;
 pub mod queue;
 pub mod router;
+#[path = "ff-orchestrator.rs"]
+pub mod rpc_480b;
 pub mod scheduler;
 pub mod task_decomposer;
 pub mod train_branch;
@@ -65,6 +67,12 @@ pub use project_policy::{
 };
 pub use queue::{PriorityQueue, QueuedTask};
 pub use router::{ModelScore, RouteDecision, TaskRouter};
+pub use rpc_480b::{
+    DEFAULT_480B_CTX_SIZE, DEFAULT_480B_ENDPOINT_URL, DEFAULT_480B_MODEL, DEFAULT_480B_PARALLEL,
+    DEFAULT_480B_PORT, DEFAULT_480B_RPC_RING_TOPOLOGY, DEFAULT_480B_RPC_SHARD_COUNT,
+    Rpc480bRecipeError, Rpc480bRingConfig, Rpc480bRingRecipe, Rpc480bShardRecipe,
+    orchestrator_480b_ring_rpc,
+};
 pub use scheduler::{
     NodeCapacity, ResourceRequirements, RunningTask, ScheduleDecision, ScheduledTask, Scheduler,
     TaskPriority,
