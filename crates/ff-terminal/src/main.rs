@@ -5036,6 +5036,9 @@ async fn main() -> Result<()> {
                         None => ff_agent::workstreams::workstream_for_dir(&pool, dir).await?,
                     }
                     .ok_or_else(|| anyhow::anyhow!("no workstream resolves for this project"))?;
+                    let operator = std::env::var("FORGEFLEET_OPERATOR_IDENTITY")
+                        .unwrap_or_else(|_| "operator:fleet".to_string());
+                    ff_agent::workstreams::authorize_operator(&ws, &operator)?;
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
