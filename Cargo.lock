@@ -1634,6 +1634,7 @@ dependencies = [
  "dashmap",
  "ff-core",
  "ff-db",
+ "ff-deploy",
  "ff-observability",
  "futures",
  "reqwest",
