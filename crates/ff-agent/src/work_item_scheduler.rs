@@ -241,6 +241,65 @@ UPDATE local_failure_diagnoses d
    )
 "#;
 
+/// Advance an improvement only when its artifact is available to the local
+/// lane. Context-pack chunks live in the shared database and are immediately
+/// deployed; capability fixes additionally require a completed training job
+/// whose resulting model is healthy and active somewhere in the fleet.
+const RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL: &str = r#"
+WITH eligible AS MATERIALIZED (
+    SELECT d.id
+      FROM local_failure_diagnoses d
+     WHERE d.remediation_status = 'deploy_pending'
+       AND (
+           (
+               d.improvement_route = 'dreamer_context_pack'
+               AND EXISTS (
+                   SELECT 1
+                     FROM local_context_sources s
+                     JOIN local_context_chunks c ON c.source_id = s.id
+                    WHERE s.uri = 'local-failure-diagnosis://' || d.id
+               )
+           )
+           OR
+           (
+               d.improvement_route = 'fine_tune_model_ab'
+               AND EXISTS (
+                   SELECT 1
+                     FROM training_jobs t
+                    WHERE t.params->>'local_failure_diagnosis_id' = d.id::text
+                      AND t.status = 'completed'
+                      AND NULLIF(t.result_model_id, '') IS NOT NULL
+                      AND (
+                          EXISTS (
+                              SELECT 1
+                                FROM fleet_model_deployments f
+                               WHERE f.catalog_id = t.result_model_id
+                                 AND f.health_status = 'healthy'
+                                 AND f.desired_state = 'active'
+                          )
+                          OR EXISTS (
+                              SELECT 1
+                                FROM computer_model_deployments c
+                               WHERE c.model_id = t.result_model_id
+                                 AND c.status = 'active'
+                          )
+                      )
+               )
+           )
+       )
+     ORDER BY d.created_at, d.id
+     FOR UPDATE OF d SKIP LOCKED
+     LIMIT $1
+)
+UPDATE local_failure_diagnoses d
+   SET remediation_status = 'deployed',
+       deployed_at = COALESCE(d.deployed_at, NOW()),
+       updated_at = NOW()
+  FROM eligible e
+ WHERE d.id = e.id
+   AND d.remediation_status = 'deploy_pending'
+"#;
+
 fn lease_stale_secs_from_success_p99(sample_count: i64, p99_secs: Option<f64>) -> i64 {
     if sample_count < LEASE_STALE_MIN_SAMPLES {
         return MIN_LEASE_STALE_SECS;
@@ -350,6 +409,14 @@ async fn route_diagnosed_local_failures(pg: &PgPool) -> Result<u64> {
         .rows_affected())
 }
 
+async fn reconcile_deploy_pending_local_failures(pg: &PgPool) -> Result<u64> {
+    Ok(sqlx::query(RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL)
+        .bind(MAX_ASSIGN_PER_TICK)
+        .execute(pg)
+        .await?
+        .rows_affected())
+}
+
 /// One scheduler pass. Returns the number of work_items assigned this tick.
 pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
     let stale_secs = lease_stale_secs(pg).await;
@@ -372,6 +439,14 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         info!(
             routed_diagnoses,
             "work_item_scheduler: routed local-failure diagnoses to improvement pipelines"
+        );
+    }
+
+    let deployed_remediations = reconcile_deploy_pending_local_failures(pg).await?;
+    if deployed_remediations > 0 {
+        info!(
+            deployed_remediations,
+            "work_item_scheduler: deployed local-failure remediations"
         );
     }
 
@@ -861,6 +936,35 @@ mod tests {
         assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("FOR UPDATE SKIP LOCKED"));
         assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("local-failure-diagnosis://' || c.id"));
         assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("'local_failure_diagnosis_id', c.id"));
+    }
+
+    #[test]
+    fn deploy_reconciliation_requires_an_available_local_improvement() {
+        assert!(
+            RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL
+                .contains("d.remediation_status = 'deploy_pending'")
+        );
+        assert!(
+            RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL
+                .contains("JOIN local_context_chunks c ON c.source_id = s.id")
+        );
+        assert!(RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL.contains("t.status = 'completed'"));
+        assert!(
+            RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL
+                .contains("NULLIF(t.result_model_id, '') IS NOT NULL")
+        );
+        assert!(
+            RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL.contains("f.health_status = 'healthy'")
+        );
+        assert!(RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL.contains("f.desired_state = 'active'"));
+        assert!(RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL.contains("c.status = 'active'"));
+        assert!(
+            RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL.contains("FOR UPDATE OF d SKIP LOCKED")
+        );
+        assert!(
+            RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL
+                .contains("deployed_at = COALESCE(d.deployed_at, NOW())")
+        );
     }
 
     fn slot(computer: uuid::Uuid) -> ff_db::FreeSlot {
