@@ -66,6 +66,8 @@ const DISPATCH_TICK_STALE_SECS: i64 = 60;
 const FAILED_RETRY_COOLDOWN_MINUTES: i64 = 20;
 const MAX_FAILED_RETRIES: i32 = 3;
 
+const LEASE_STALE_DURATION_BASIS: &str = "released_at-dispatch_tick_at";
+
 const LEASE_STALE_SAMPLE_SQL: &str = r#"
 SELECT COUNT(*)::bigint AS sample_count,
        percentile_cont(0.99) WITHIN GROUP (
@@ -188,6 +190,7 @@ pub(crate) async fn lease_stale_secs(pg: &PgPool) -> i64 {
                 stale_secs,
                 min_samples = LEASE_STALE_MIN_SAMPLES,
                 sample_days = LEASE_STALE_SAMPLE_DAYS,
+                duration_basis = LEASE_STALE_DURATION_BASIS,
                 "work_item_scheduler: measured lease-stale heartbeat window"
             );
             stale_secs
@@ -907,6 +910,7 @@ mod tests {
 
     #[test]
     fn lease_stale_samples_are_valid_recent_successful_completions() {
+        assert_eq!(LEASE_STALE_DURATION_BASIS, "released_at-dispatch_tick_at");
         assert!(LEASE_STALE_SAMPLE_SQL.contains("release_reason = 'ready for review'"));
         assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at - dispatch_tick_at"));
         assert!(LEASE_STALE_SAMPLE_SQL.contains("dispatch_tick_at IS NOT NULL"));
