@@ -1,9 +1,10 @@
 //! Log analysis worker — leader-gated periodic scan of configured log paths.
 //!
-//! Scans log files for recurring error/warning patterns and creates `ready`
-//! work_items in a configurable project so the Pillar-4 scheduler can dispatch
-//! remediation. Designed to integrate with the existing self-heal queue system
-//! (canonical `work_items` table) rather than inventing a parallel queue.
+//! Scans local log files and centrally shipped `fleet_logs` for recurring
+//! error/warning patterns and creates `ready` work_items in a configurable
+//! project so the Pillar-4 scheduler can dispatch remediation. Designed to
+//! integrate with the existing self-heal queue system (canonical `work_items`
+//! table) rather than inventing a parallel queue.
 //!
 //! Configuration is read from environment on each tick so operators can tune it
 //! without restarting the daemon:
@@ -31,6 +32,7 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(300);
 const DEFAULT_PROJECT_ID: &str = "ff-log-analysis";
 const DEFAULT_MIN_RECURRENCE: usize = 3;
 const DEFAULT_TAIL_LINES: usize = 1000;
+const CENTRAL_LOG_LIMIT: i64 = 10_000;
 const DEFAULT_PATHS: &[&str] = &["/var/log/**/*.log"];
 const DEFAULT_PATTERNS: &[&str] = &["ERROR", "FATAL", "EXCEPTION", "WARN"];
 
@@ -50,7 +52,7 @@ struct RecurringPattern {
     normalized: String,
     example: String,
     count: usize,
-    last_path: PathBuf,
+    source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -172,7 +174,7 @@ impl LogAnalysisWorker {
                                         normalized,
                                         example: line,
                                         count: 1,
-                                        last_path: path.clone(),
+                                        source: path.display().to_string(),
                                     });
                             }
                         }
@@ -183,6 +185,8 @@ impl LogAnalysisWorker {
                 }
             }
         }
+
+        self.scan_central_logs(&mut grouped, &mut report).await?;
 
         let recurring: Vec<&RecurringPattern> = grouped
             .values()
@@ -239,6 +243,60 @@ impl LogAnalysisWorker {
         }
     }
 
+    /// Read the central log-shipping table for the current analysis window.
+    ///
+    /// Prefixing each message with its structured level lets the same
+    /// normalization and configurable pattern matching serve local and shipped
+    /// logs. The node is evidence, not part of the signature, so an identical
+    /// failure occurring across several computers is grouped as one systemic
+    /// problem.
+    async fn scan_central_logs(
+        &self,
+        grouped: &mut HashMap<String, RecurringPattern>,
+        report: &mut ScanReport,
+    ) -> Result<()> {
+        let lookback_secs = i64::try_from(self.config.interval.as_secs()).unwrap_or(i64::MAX);
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT node_id, log_level, message \
+               FROM fleet_logs \
+              WHERE ts >= NOW() - make_interval(secs => $1) \
+              ORDER BY ts DESC \
+              LIMIT $2",
+        )
+        .bind(lookback_secs as f64)
+        .bind(CENTRAL_LOG_LIMIT)
+        .fetch_all(&self.pg)
+        .await
+        .context("query centrally shipped fleet logs")?;
+
+        report.lines_scanned += rows.len();
+        for (node_id, level, message) in rows {
+            let line = format!("{level} {message}");
+            let Some(normalized) = normalize_log_line(&line, &self.config.patterns) else {
+                continue;
+            };
+            let signature = compute_signature(&normalized);
+            grouped
+                .entry(signature.clone())
+                .and_modify(|pattern| {
+                    pattern.count += 1;
+                    if pattern.example.len() < line.len() {
+                        pattern.example = line.clone();
+                        pattern.source = format!("fleet-log://{node_id}");
+                    }
+                })
+                .or_insert_with(|| RecurringPattern {
+                    signature,
+                    normalized,
+                    example: line,
+                    count: 1,
+                    source: format!("fleet-log://{node_id}"),
+                });
+        }
+
+        Ok(())
+    }
+
     /// Idempotently create the target project so work_item inserts never fail on FK.
     async fn ensure_project(&self) -> Result<(), sqlx::Error> {
         sqlx::query(
@@ -289,17 +347,14 @@ impl LogAnalysisWorker {
             let title = truncate(&pattern.normalized, 120);
             let description = format!(
                 "Recurring log pattern detected {} time(s).\n\nNormalized:\n{}\n\nExample:\n{}\n\nSource: {}",
-                pattern.count,
-                pattern.normalized,
-                pattern.example,
-                pattern.last_path.display()
+                pattern.count, pattern.normalized, pattern.example, pattern.source
             );
 
             let metadata = serde_json::json!({
                 "log_signature": pattern.signature,
                 "log_pattern": pattern.normalized,
                 "log_example": pattern.example,
-                "log_source": pattern.last_path.display().to_string(),
+                "log_source": pattern.source,
                 "occurrence_count": pattern.count,
                 "detected_by": &self.my_name,
             });
@@ -313,10 +368,10 @@ impl LogAnalysisWorker {
                     "signature": pattern.signature,
                     "excerpt": pattern.example,
                     "normalized": pattern.normalized,
-                    "source": pattern.last_path.display().to_string(),
+                    "source": pattern.source,
                     "occurrence_count": pattern.count,
                 },
-                "relevant_files": [pattern.last_path.display().to_string()],
+                "relevant_files": relevant_files_for_source(&pattern.source),
                 "related_work_items": prior_id.into_iter().collect::<Vec<_>>(),
                 "brain_search_terms": [pattern.normalized.clone()],
             });
@@ -334,7 +389,7 @@ impl LogAnalysisWorker {
             let original_signal = serde_json::json!({
                 "kind": "recurring_log",
                 "signature": pattern.signature,
-                "source": pattern.last_path.display().to_string(),
+                "source": pattern.source,
             });
 
             let id: uuid::Uuid = sqlx::query_scalar(
@@ -605,6 +660,14 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
+fn relevant_files_for_source(source: &str) -> Vec<&str> {
+    if source.starts_with("fleet-log://") {
+        Vec::new()
+    } else {
+        vec![source]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,6 +715,15 @@ mod tests {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("abcdefghij", 10), "abcdefghij");
         assert_eq!(truncate("abcdefghijk", 10), "abcdefghij…");
+    }
+
+    #[test]
+    fn central_log_sources_are_not_reported_as_files() {
+        assert!(relevant_files_for_source("fleet-log://node-a").is_empty());
+        assert_eq!(
+            relevant_files_for_source("/var/log/forgefleetd.log"),
+            vec!["/var/log/forgefleetd.log"]
+        );
     }
 
     #[test]
