@@ -96,7 +96,7 @@ pub async fn attach_client_session(
     pg: &PgPool,
     workstream_id: uuid::Uuid,
     session_id: &str,
-    working_summary: &str,
+    _working_summary: &str,
 ) -> Result<()> {
     let mut tx = pg.begin().await?;
     sqlx::query(
@@ -106,15 +106,6 @@ pub async fn attach_client_session(
     )
     .bind(workstream_id)
     .bind(session_id)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "UPDATE ff_workstreams \
-            SET working_summary = $2, updated_at = now() \
-          WHERE id = $1",
-    )
-    .bind(workstream_id)
-    .bind(working_summary)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -188,7 +179,7 @@ pub async fn workstream_for_dir(pg: &PgPool, cwd: &std::path::Path) -> Result<Op
     for ws in &all {
         if let Some(aliases) = ws.aliases.as_object()
             && candidates.iter().any(|candidate| {
-                aliases.contains_key(**candidate)
+                aliases.contains_key(*candidate)
                     || aliases
                         .values()
                         .any(|value| value.as_str() == Some(*candidate))
@@ -362,6 +353,9 @@ pub async fn report(
     focus: Option<&str>,
     note: Option<&str>,
 ) -> Result<Workstream> {
+    if summary.is_some() {
+        anyhow::bail!("working_summary is leader-owned; clients may report focus or notes only");
+    }
     let ws_id: uuid::Uuid = sqlx::query_scalar(
         "UPDATE workstream_clients SET last_report_at = now() \
           WHERE session_id = $1 RETURNING workstream_id",
@@ -377,17 +371,15 @@ pub async fn report(
     // to the open_threads jsonb array with a server timestamp + the session id.
     let ws = sqlx::query_as::<_, Workstream>(&format!(
         "UPDATE ff_workstreams SET \
-            working_summary = COALESCE($2, working_summary), \
-            focus           = COALESCE($3, focus), \
-            open_threads    = CASE WHEN $4::text IS NULL THEN open_threads \
+            focus           = COALESCE($2, focus), \
+            open_threads    = CASE WHEN $3::text IS NULL THEN open_threads \
                 ELSE COALESCE(open_threads, '[]'::jsonb) || \
-                     jsonb_build_object('at', now(), 'session', $5::text, 'note', $4::text) END, \
+                     jsonb_build_object('at', now(), 'session', $4::text, 'note', $3::text) END, \
             updated_at      = now() \
           WHERE id = $1 \
        RETURNING {WORKSTREAM_COLUMNS}"
     ))
     .bind(ws_id)
-    .bind(summary)
     .bind(focus)
     .bind(note)
     .bind(session_id)
@@ -513,4 +505,22 @@ pub async fn attached_clients(
     .fetch_all(pg)
     .await?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notes_are_redacted_before_hash_or_persistence() {
+        let note = "deploy token=abc sk-live-secret ghp_private password=hunter2 safely";
+        let redacted = redact_secrets(note);
+        assert_eq!(
+            redacted,
+            "deploy [REDACTED] [REDACTED] [REDACTED] [REDACTED] safely"
+        );
+        assert!(!redacted.contains("abc"));
+        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("hunter2"));
+    }
 }
