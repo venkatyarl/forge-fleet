@@ -252,6 +252,106 @@ pub async fn attach_operator(pg: &PgPool, ws: &Workstream, operator_identity: &s
     Ok(())
 }
 
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct WorkstreamNote {
+    pub seq: i64,
+    pub note: String,
+    pub created_by: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct SessionPresence {
+    pub operator_identity: String,
+    pub attached_at: chrono::DateTime<chrono::Utc>,
+    pub last_seen_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResumeContext {
+    pub notes: Vec<WorkstreamNote>,
+    pub causal_watermark: i64,
+    pub live_presence: Vec<SessionPresence>,
+}
+
+/// Refresh presence and return a causally ordered resume tail from one
+/// transaction. The workstream row is locked while its sequence watermark is
+/// sampled, so notes appended after the packet are unambiguously after it.
+pub async fn attach_resume_context(
+    pg: &PgPool,
+    ws: &Workstream,
+    operator_identity: &str,
+) -> Result<ResumeContext> {
+    authorize_operator(ws, operator_identity)?;
+    let mut tx = pg.begin().await?;
+    let causal_watermark: i64 = sqlx::query_scalar(
+        "SELECT next_seq FROM ff_workstreams \
+         WHERE id = $1 AND owner_identity = $2 FOR UPDATE",
+    )
+    .bind(ws.id)
+    .bind(operator_identity)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO session_attachments \
+            (workstream_id, operator_identity, attached_at, last_seen_at) \
+         VALUES ($1, $2, now(), now()) \
+         ON CONFLICT (workstream_id, operator_identity) DO UPDATE \
+             SET last_seen_at = now()",
+    )
+    .bind(ws.id)
+    .bind(operator_identity)
+    .execute(&mut *tx)
+    .await?;
+    let mut notes = sqlx::query_as::<_, WorkstreamNote>(
+        "SELECT seq, note, created_by, created_at FROM workstream_notes \
+         WHERE workstream_id = $1 AND seq <= $2 \
+         ORDER BY seq DESC LIMIT 50",
+    )
+    .bind(ws.id)
+    .bind(causal_watermark)
+    .fetch_all(&mut *tx)
+    .await?;
+    notes.reverse();
+    let live_presence = live_presence_in(&mut tx, ws.id).await?;
+    tx.commit().await?;
+    Ok(ResumeContext {
+        notes,
+        causal_watermark,
+        live_presence,
+    })
+}
+
+/// Read authoritative presence. Five minutes without an attach/heartbeat is
+/// considered disconnected; timestamps are not used for causal note ordering.
+pub async fn live_presence(
+    pg: &PgPool,
+    ws: &Workstream,
+    operator_identity: &str,
+) -> Result<Vec<SessionPresence>> {
+    authorize_operator(ws, operator_identity)?;
+    let mut tx = pg.begin().await?;
+    let presence = live_presence_in(&mut tx, ws.id).await?;
+    tx.commit().await?;
+    Ok(presence)
+}
+
+async fn live_presence_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workstream_id: uuid::Uuid,
+) -> Result<Vec<SessionPresence>> {
+    Ok(sqlx::query_as::<_, SessionPresence>(
+        "SELECT operator_identity, attached_at, last_seen_at \
+         FROM session_attachments \
+         WHERE workstream_id = $1 \
+           AND last_seen_at >= now() - interval '5 minutes' \
+         ORDER BY operator_identity",
+    )
+    .bind(workstream_id)
+    .fetch_all(&mut **tx)
+    .await?)
+}
+
 /// Enforce owner scoping for read-only and mutating session operations.
 pub fn authorize_operator(ws: &Workstream, operator_identity: &str) -> Result<()> {
     if operator_identity.trim().is_empty() || operator_identity != ws.owner_identity {

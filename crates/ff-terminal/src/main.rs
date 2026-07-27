@@ -88,6 +88,7 @@ mod research_cmd;
 mod route_cmd;
 mod secrets_cmd;
 mod self_heal_cmd;
+mod session_workstream_cmd;
 mod skills_cmd;
 mod social_cmd;
 mod software_cmd;
@@ -5029,82 +5030,21 @@ async fn main() -> Result<()> {
                         .cwd
                         .as_deref()
                         .unwrap_or_else(|| std::path::Path::new("."));
-                    let ws = match project {
-                        Some(project) => {
-                            ff_agent::workstreams::workstream_for_project(&pool, &project).await?
-                        }
-                        None => ff_agent::workstreams::workstream_for_dir(&pool, dir).await?,
-                    }
-                    .ok_or_else(|| anyhow::anyhow!("no workstream resolves for this project"))?;
-                    let operator = std::env::var("FORGEFLEET_OPERATOR_IDENTITY")
-                        .unwrap_or_else(|_| "operator:fleet".to_string());
-                    ff_agent::workstreams::authorize_operator(&ws, &operator)?;
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "project_id": ws.project_id,
-                            "git_remote": ws.git_remote,
-                            "basename": ws.basename,
-                            "goal": ws.goal,
-                            "working_summary": ws.working_summary,
-                            "focus": ws.focus,
-                            "open_threads": ws.open_threads,
-                            "status": ws.status,
-                            "leader_generation": ws.leader_generation,
-                        }))?
-                    );
-                    Ok(())
+                    session_workstream_cmd::status(&pool, dir, project).await
                 }
                 SessionCommand::Attach { project } | SessionCommand::Resume { project } => {
                     let dir = cli
                         .cwd
                         .as_deref()
                         .unwrap_or_else(|| std::path::Path::new("."));
-                    let ws = match project {
-                        Some(project) => {
-                            ff_agent::workstreams::workstream_for_project(&pool, &project).await?
-                        }
-                        None => ff_agent::workstreams::workstream_for_dir(&pool, dir).await?,
-                    }
-                    .ok_or_else(|| anyhow::anyhow!("no workstream resolves for this project"))?;
-                    let operator = std::env::var("FORGEFLEET_OPERATOR_IDENTITY")
-                        .unwrap_or_else(|_| "operator:fleet".to_string());
-                    ff_agent::workstreams::attach_operator(&pool, &ws, &operator).await?;
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "project_id": ws.project_id,
-                            "git_remote": ws.git_remote,
-                            "basename": ws.basename,
-                            "goal": ws.goal,
-                            "working_summary": ws.working_summary,
-                            "focus": ws.focus,
-                            "open_threads": ws.open_threads,
-                            "status": ws.status,
-                            "leader_generation": ws.leader_generation,
-                            "operator_identity": operator,
-                        }))?
-                    );
-                    Ok(())
+                    session_workstream_cmd::attach(&pool, dir, project).await
                 }
                 SessionCommand::Note { text, project } => {
                     let dir = cli
                         .cwd
                         .as_deref()
                         .unwrap_or_else(|| std::path::Path::new("."));
-                    let ws = match project {
-                        Some(project) => {
-                            ff_agent::workstreams::workstream_for_project(&pool, &project).await?
-                        }
-                        None => ff_agent::workstreams::workstream_for_dir(&pool, dir).await?,
-                    }
-                    .ok_or_else(|| anyhow::anyhow!("no workstream resolves for this project"))?;
-                    let operator = std::env::var("FORGEFLEET_OPERATOR_IDENTITY")
-                        .unwrap_or_else(|_| "operator:fleet".to_string());
-                    let seq =
-                        ff_agent::workstreams::append_note(&pool, &ws, &operator, &text).await?;
-                    println!("{GREEN}✓{RESET} note appended (seq {seq})");
-                    Ok(())
+                    session_workstream_cmd::note(&pool, dir, project, text).await
                 }
                 SessionCommand::Export { .. } => unreachable!("handled before database setup"),
                 SessionCommand::Spawn { goal, budget } => {
