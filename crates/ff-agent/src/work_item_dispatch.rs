@@ -1081,15 +1081,16 @@ async fn dispatch_one(
     // Preserve a tail of the agent's OWN output so a no-diff outcome below is
     // diagnosable (froze? errored? hung on a tool call? claimed done without
     // editing?) straight from the daemon log — no host repro needed (#69).
-    let agent_output_tail = match dispatch_result {
-        Ok(output) => {
+    let dispatch_output = match dispatch_result {
+        Ok(ref output) => {
             info!(
                 work_item_id = %item.work_item_id,
                 stdout_len = output.stdout.len(),
                 stderr_len = output.stderr.len(),
                 "work_item_dispatch: ff dispatch completed"
             );
-            agent_output_tail(&output, 1500)
+            post_phase.set_log_tail(agent_output_tail(output, 1500));
+            output
         }
         Err(e) => {
             post_phase.set_log_tail(format!("dispatch failed before producing output: {e:#}"));
@@ -1097,7 +1098,7 @@ async fn dispatch_one(
             return Err(e);
         }
     };
-    post_phase.set_log_tail(agent_output_tail.clone());
+    let agent_output_tail = agent_output_tail(dispatch_output, 1500);
 
     // codex (and most CLI agents) EDIT files but don't `git commit`. Commit any
     // changes it made in the worktree so they can become a PR. A clean worktree
@@ -1367,7 +1368,10 @@ async fn dispatch_one(
         return Ok(WorkItemDispatchResult { sweep_warnings });
     }
 
-    if let Err(e) = record_cloud_rescue_local_failure_diagnosis(&pg, &item, &backend_used).await {
+    if let Err(e) =
+        record_cloud_rescue_local_failure_diagnosis(&pg, &item, &backend_used, dispatch_output)
+            .await
+    {
         let reason = format!(
             "missing_artifact_local_failure_diagnosis: cloud rescue by {backend_used} \
              cannot advance without its structured local-failure diagnosis: {e:#}"
@@ -1409,6 +1413,57 @@ struct LocalFailureDiagnosis {
     improvement_route: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloudProducedLocalFailureDiagnosis {
+    cause_class: &'static str,
+    summary: String,
+}
+
+fn parse_cloud_produced_local_failure_diagnosis(
+    output: &Output,
+) -> Result<CloudProducedLocalFailureDiagnosis> {
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let markers = combined
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(LOCAL_FAILURE_DIAGNOSIS_MARKER))
+        .collect::<Vec<_>>();
+    if markers.len() != 1 {
+        bail!(
+            "cloud rescue must emit exactly one {LOCAL_FAILURE_DIAGNOSIS_MARKER} marker; found {}",
+            markers.len()
+        );
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(markers[0].trim()).context("invalid diagnosis JSON")?;
+    let cause_class = match value.get("cause_class").and_then(serde_json::Value::as_str) {
+        Some("context_prompt_gap") => "context_prompt_gap",
+        Some("capability_limit") => "capability_limit",
+        Some("unknown") => "unknown",
+        Some(other) => bail!("invalid local-failure cause_class {other:?}"),
+        None => bail!("local-failure diagnosis is missing cause_class"),
+    };
+    let summary = value
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+        .context("local-failure diagnosis is missing a non-empty summary")?;
+    if summary.chars().count() > LOCAL_FAILURE_DIAGNOSIS_MAX_CHARS {
+        bail!(
+            "local-failure diagnosis summary exceeds {} characters",
+            LOCAL_FAILURE_DIAGNOSIS_MAX_CHARS
+        );
+    }
+    Ok(CloudProducedLocalFailureDiagnosis {
+        cause_class,
+        summary: summary.to_string(),
+    })
+}
+
 fn normalized_cloud_backend(builder: &str) -> Option<String> {
     let lower = builder.trim().to_ascii_lowercase();
     let backend = lower
@@ -1424,6 +1479,7 @@ fn normalized_cloud_backend(builder: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn local_failure_diagnosis_for(
     item: &AssignedWorkItem,
     builder: &str,
@@ -1493,6 +1549,7 @@ async fn record_cloud_rescue_local_failure_diagnosis(
     pg: &PgPool,
     item: &AssignedWorkItem,
     builder: &str,
+    output: &Output,
 ) -> Result<()> {
     let mut tx = pg.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
@@ -1511,11 +1568,20 @@ async fn record_cloud_rescue_local_failure_diagnosis(
     .await?;
     let retest_rescue_attempt = latest_diagnosis
         .and_then(|(attempt, status)| (status == "local_retest_failed").then_some(attempt + 1));
-    let Some(diagnosis) = local_failure_diagnosis_for_attempt(item, builder, retest_rescue_attempt)
+    let Some(mut diagnosis) =
+        local_failure_diagnosis_for_attempt(item, builder, retest_rescue_attempt)
     else {
         tx.commit().await?;
         return Ok(());
     };
+    let cloud_produced = parse_cloud_produced_local_failure_diagnosis(output)?;
+    diagnosis.cause_class = cloud_produced.cause_class;
+    diagnosis.improvement_route = match cloud_produced.cause_class {
+        "context_prompt_gap" => "dreamer_context_pack",
+        "capability_limit" => "fine_tune_model_ab",
+        _ => "manual_triage",
+    };
+    diagnosis.cloud_diagnosis = cloud_produced.summary;
 
     sqlx::query(
         r#"
@@ -3348,6 +3414,9 @@ commit the tree becomes CLEAN and the harness DISCARDS your finished work as a n
 (your task then fails despite the code being correct).\n\
 - Keep the diff minimal and scoped strictly to the task.\n";
 
+const LOCAL_FAILURE_DIAGNOSIS_MARKER: &str = "LOCAL_FAILURE_DIAGNOSIS:";
+const LOCAL_FAILURE_DIAGNOSIS_MAX_CHARS: usize = 2000;
+
 /// Whether a stored `last_error` is a TASK-level failure the coding agent can
 /// act on (compile error, test failure, lint, missing file, type/assert error)
 /// versus an INFRASTRUCTURE failure (backend spawn, heartbeat/lease lifecycle,
@@ -3414,8 +3483,22 @@ fn dispatch_prompt(item: &AssignedWorkItem) -> String {
     } else {
         String::new()
     };
+    let cloud_rescue_contract = if item.attempts >= ff_routing_policy::LOCAL_LANE_MAX_TRIES as i32 {
+        format!(
+            "\n\nCloud-rescue requirement: if you are a cloud backend rescuing the exhausted \
+                 local lane, end your final response with exactly one single-line marker:\n\
+                 {LOCAL_FAILURE_DIAGNOSIS_MARKER} \
+                 {{\"cause_class\":\"context_prompt_gap|capability_limit|unknown\",\
+                 \"summary\":\"what the local model got wrong and why this fix enables local next time\"}}\n\
+                 The summary must be specific, non-empty, and under \
+                 {LOCAL_FAILURE_DIAGNOSIS_MAX_CHARS} characters. Do not emit this marker if you are \
+                 a local backend.\n"
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "Target repo:\n- project_id: {}\n- repo_url: {}\n- checkout: {}\n\n{}{}{}{}{}{}{}",
+        "Target repo:\n- project_id: {}\n- repo_url: {}\n- checkout: {}\n\n{}{}{}{}{}{}{}{}",
         item.project_id,
         item.repo_url.as_deref().unwrap_or("unknown"),
         item.repo_path.display(),
@@ -3426,6 +3509,7 @@ fn dispatch_prompt(item: &AssignedWorkItem) -> String {
         phase("POST_WORK — complete after implementation", &item.post_work),
         retry_context,
         DISPATCH_HOUSE_RULES,
+        cloud_rescue_contract,
     )
 }
 
@@ -6265,12 +6349,12 @@ mod tests {
         expand_home, is_build_timeout, local_failure_diagnosis_for,
         local_failure_diagnosis_for_attempt, mark_local_retest_failed, mark_local_retest_passed,
         mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers, parse_cli_tokens,
-        primary_or_default_backend, quick_empty_success_is_provider_failure,
-        record_cloud_rescue_local_failure_diagnosis, repo_cache_path, repo_slug,
-        retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
-        should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
-        task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
-        validate_manifest_fields,
+        parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
+        quick_empty_success_is_provider_failure, record_cloud_rescue_local_failure_diagnosis,
+        repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
+        same_model_family, should_attempt_lane15, status_output_is_clean, synthetic_output,
+        task_failed_alert_text, task_prefers_cloud_lane, try_acquire_lane15_480b_permit,
+        use_local_lane, validate_manifest_fields,
     };
     use sqlx::Row;
     use std::path::PathBuf;
@@ -6667,6 +6751,37 @@ mod tests {
     }
 
     #[test]
+    fn cloud_rescue_parses_backend_produced_structured_diagnosis() {
+        let output = synthetic_output(
+            "build complete\nLOCAL_FAILURE_DIAGNOSIS: \
+             {\"cause_class\":\"capability_limit\",\"summary\":\"The local model timed out while \
+             tracing the cross-crate call path; route this class to a stronger local model.\"}",
+        );
+        let diagnosis =
+            parse_cloud_produced_local_failure_diagnosis(&output).expect("valid diagnosis");
+        assert_eq!(diagnosis.cause_class, "capability_limit");
+        assert!(diagnosis.summary.contains("cross-crate call path"));
+    }
+
+    #[test]
+    fn cloud_rescue_rejects_missing_duplicate_and_invalid_diagnoses() {
+        assert!(
+            parse_cloud_produced_local_failure_diagnosis(&synthetic_output("build complete"))
+                .is_err()
+        );
+        let duplicate = synthetic_output(
+            "LOCAL_FAILURE_DIAGNOSIS: {\"cause_class\":\"unknown\",\"summary\":\"one\"}\n\
+             LOCAL_FAILURE_DIAGNOSIS: {\"cause_class\":\"unknown\",\"summary\":\"two\"}",
+        );
+        assert!(parse_cloud_produced_local_failure_diagnosis(&duplicate).is_err());
+        let invalid = synthetic_output(
+            "LOCAL_FAILURE_DIAGNOSIS: \
+             {\"cause_class\":\"made_up\",\"summary\":\"not a supported class\"}",
+        );
+        assert!(parse_cloud_produced_local_failure_diagnosis(&invalid).is_err());
+    }
+
+    #[test]
     fn failed_local_retest_cloud_rescue_starts_a_new_diagnosis_cycle() {
         let item = test_item(
             1,
@@ -6741,12 +6856,17 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup before test");
+        let cloud_output = synthetic_output(
+            "LOCAL_FAILURE_DIAGNOSIS: \
+             {\"cause_class\":\"context_prompt_gap\",\"summary\":\"The local prompt omitted the \
+             owning dispatch module and led the model to edit the scheduler instead.\"}",
+        );
 
-        record_cloud_rescue_local_failure_diagnosis(&pool, &item, "codex")
+        record_cloud_rescue_local_failure_diagnosis(&pool, &item, "codex", &cloud_output)
             .await
             .expect("insert diagnosis");
         item.last_error = Some("error[E0433]: failed to resolve module".to_string());
-        record_cloud_rescue_local_failure_diagnosis(&pool, &item, "cloud:codex")
+        record_cloud_rescue_local_failure_diagnosis(&pool, &item, "cloud:codex", &cloud_output)
             .await
             .expect("upsert diagnosis");
 
@@ -6823,7 +6943,7 @@ mod tests {
 
         item.attempts = 1;
         item.last_error = Some("local compile failed after deployed remediation".to_string());
-        record_cloud_rescue_local_failure_diagnosis(&pool, &item, "codex")
+        record_cloud_rescue_local_failure_diagnosis(&pool, &item, "codex", &cloud_output)
             .await
             .expect("record the next cloud rescue after failed local retest");
         let next_cycle: (i32, String) = sqlx::query_as(
@@ -6838,7 +6958,7 @@ mod tests {
         .await
         .expect("next diagnosis cycle should exist");
         assert_eq!(next_cycle, (5, "diagnosed".to_string()));
-        record_cloud_rescue_local_failure_diagnosis(&pool, &item, "codex")
+        record_cloud_rescue_local_failure_diagnosis(&pool, &item, "codex", &cloud_output)
             .await
             .expect("an older failed retest must not reopen another cycle");
         let cycle_count: i64 = sqlx::query_scalar(

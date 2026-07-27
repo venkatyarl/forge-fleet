@@ -14,7 +14,9 @@
 //! and every project's work is tied together under its single workstream.
 
 use anyhow::Result;
+use regex::Regex;
 use sqlx::PgPool;
+use std::sync::OnceLock;
 
 /// Idempotent: unique key on project_key so exactly one workstream exists per
 /// project (the "single session for a project" invariant the operator wants).
@@ -295,24 +297,25 @@ pub async fn append_note(
 
 /// Redact common credential forms before content leaves the node.
 pub fn redact_secrets(input: &str) -> String {
-    input
-        .split_whitespace()
-        .map(|token| {
-            let lower = token.to_ascii_lowercase();
-            if lower.starts_with("sk-")
-                || lower.starts_with("ghp_")
-                || lower.starts_with("github_pat_")
-                || lower.contains("password=")
-                || lower.contains("token=")
-                || lower.contains("secret=")
-            {
-                "[REDACTED]"
-            } else {
-                token
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            r#"(?i)["']?\b(?:password|token|secret|api[_-]?key)["']?\s*[:=]\s*["']?[^\s,;"'}]+"#,
+            r"(?i)\b(?:authorization\s*:\s*)?bearer\s+[A-Za-z0-9._~+/=-]+",
+            r"\bghp_[A-Za-z0-9_]+",
+            r"\bgithub_pat_[A-Za-z0-9_]+",
+            r"\bsk-[A-Za-z0-9_-]+",
+            r"\bAGE-SECRET-KEY-[A-Z0-9-]+",
+            r"\bops_[A-Za-z0-9_-]+",
+            r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+        ]
+        .into_iter()
+        .map(|pattern| Regex::new(pattern).expect("valid workstream redaction regex"))
+        .collect()
+    });
+    patterns.iter().fold(input.to_owned(), |text, pattern| {
+        pattern.replace_all(&text, "[REDACTED]").into_owned()
+    })
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -581,5 +584,17 @@ mod tests {
         assert!(!redacted.contains("abc"));
         assert!(!redacted.contains("secret"));
         assert!(!redacted.contains("hunter2"));
+    }
+
+    #[test]
+    fn source_redaction_handles_structured_and_multiline_secrets() {
+        let note = "headers:\nAuthorization: Bearer abc.def-123\n\
+                    payload={\"api_key\":\"top-secret\"}\n\
+                    jwt=eyJabc.def.ghi";
+        let redacted = redact_secrets(note);
+        assert_eq!(redacted.lines().count(), note.lines().count());
+        for secret in ["abc.def-123", "top-secret", "eyJabc.def.ghi"] {
+            assert!(!redacted.contains(secret), "secret leaked: {secret}");
+        }
     }
 }
