@@ -155,8 +155,12 @@ pub fn normalize_error_signature(err: &str) -> String {
     }
     // Collapse whitespace and cap length so the tail (huge command echoes /
     // stderr dumps) doesn't fragment otherwise-identical signatures.
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
-        .chars().take(120).collect()
+    out.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(120)
+        .collect()
 }
 
 /// A remediation hint for a known systemic signature (best-effort operator guidance).
@@ -167,11 +171,14 @@ fn remediation_hint_for(sig: &str) -> String {
     } else if sig.contains("migration") {
         "a Postgres migration is failing on daemon startup (crash-loop risk). Fix/skip the migration, \
          then reset-failed + restart forgefleetd fleet-wide.".to_string()
-    } else if sig.contains("no healthy fleet deployment") || sig.contains("no dispatchable backend") {
+    } else if sig.contains("no healthy fleet deployment") || sig.contains("no dispatchable backend")
+    {
         "the LLM router has no serving model — check deployment health (`fleet_model_deployments` \
-         fresh?) and daemon liveness.".to_string()
+         fresh?) and daemon liveness."
+            .to_string()
     } else if sig.contains("could not fetch") || sig.contains("clone") {
-        "git fetch/clone is failing on a node — check the PAT/SSH remote and network to GitHub.".to_string()
+        "git fetch/clone is failing on a node — check the PAT/SSH remote and network to GitHub."
+            .to_string()
     } else if sig.contains("produced no diff") {
         "the routed LLM keeps producing no diff — the model may be wedged; check the router rotation.".to_string()
     } else {
@@ -197,7 +204,9 @@ pub async fn detect_systemic_failures(pg: &PgPool) -> Result<Vec<SystemicFinding
         std::collections::HashMap::new();
     for (id, err) in rows {
         let sig = normalize_error_signature(&err);
-        let e = clusters.entry(sig).or_insert_with(|| (0, err.clone(), Vec::new()));
+        let e = clusters
+            .entry(sig)
+            .or_insert_with(|| (0, err.clone(), Vec::new()));
         e.0 += 1;
         e.2.push(id);
     }
@@ -210,14 +219,13 @@ pub async fn detect_systemic_failures(pg: &PgPool) -> Result<Vec<SystemicFinding
         // Halt the storm: park every item in this cluster so the scheduler stops
         // re-dispatching them into the same wall (they cannot self-fix a systemic
         // fault). A human/auto-remediation un-parks them once the root cause is fixed.
-        let parked = sqlx::query(
-            "UPDATE work_items SET parked = true WHERE id = ANY($1) AND NOT parked",
-        )
-        .bind(&ids)
-        .execute(pg)
-        .await
-        .map(|r| r.rows_affected())
-        .unwrap_or(0);
+        let parked =
+            sqlx::query("UPDATE work_items SET parked = true WHERE id = ANY($1) AND NOT parked")
+                .bind(&ids)
+                .execute(pg)
+                .await
+                .map(|r| r.rows_affected())
+                .unwrap_or(0);
         let hint = remediation_hint_for(&sig);
         tracing::warn!(
             signature = %sig,
@@ -680,17 +688,27 @@ mod systemic_tests {
     #[test]
     fn identical_infra_errors_cluster_varied_task_errors_do_not() {
         // The 32 missing-column failures → ONE key (identifier kept, digits→#).
-        let a = normalize_error_signature("error returned from database: column \"build_started_at\" does not exist");
-        let b = normalize_error_signature("[attempt 3] error returned from database: column \"build_started_at\" does not exist");
+        let a = normalize_error_signature(
+            "error returned from database: column \"build_started_at\" does not exist",
+        );
+        let b = normalize_error_signature(
+            "[attempt 3] error returned from database: column \"build_started_at\" does not exist",
+        );
         assert_eq!(a, b, "same infra error must collapse to one cluster key");
 
         // Different missing columns → DIFFERENT keys (distinct problems).
-        let c = normalize_error_signature("error returned from database: column \"foo\" does not exist");
+        let c = normalize_error_signature(
+            "error returned from database: column \"foo\" does not exist",
+        );
         assert_ne!(a, c);
 
         // Varied per-task review rejections → DIFFERENT keys (stay per-task, not parked).
-        let r1 = normalize_error_signature("in-place review rejected by codex: Dropping both legacy tables");
-        let r2 = normalize_error_signature("in-place review rejected by codex: The config uses placeholders");
+        let r1 = normalize_error_signature(
+            "in-place review rejected by codex: Dropping both legacy tables",
+        );
+        let r2 = normalize_error_signature(
+            "in-place review rejected by codex: The config uses placeholders",
+        );
         assert_ne!(r1, r2, "distinct per-task errors must NOT cluster");
     }
 }
