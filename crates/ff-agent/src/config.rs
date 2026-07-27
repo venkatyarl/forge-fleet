@@ -206,3 +206,25 @@ fn parse_activity_level(raw: &str) -> Option<ActivityLevel> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::default_log_paths;
+
+    #[test]
+    fn default_log_paths_include_forgefleetd_logs() {
+        let paths = default_log_paths();
+
+        assert!(paths.iter().any(|path| path.ends_with("forgefleetd.log")));
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("forgefleetd.out.log"))
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("forgefleetd.err.log"))
+        );
+    }
+}

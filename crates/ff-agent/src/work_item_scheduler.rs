@@ -209,6 +209,24 @@ context_chunks AS (
         ON c.id = (s.metadata->>'local_failure_diagnosis_id')::uuid
     RETURNING source_id
 ),
+context_updates AS (
+    UPDATE work_items w
+       SET context = COALESCE(w.context, '{}'::jsonb) ||
+           jsonb_build_object(
+               'local_failure_improvement',
+               jsonb_build_object(
+                   'diagnosis_id', c.id,
+                   'cause_class', c.cause_class,
+                   'local_failure_summary', c.local_failure_summary,
+                   'cloud_diagnosis', c.cloud_diagnosis
+               )
+           )
+      FROM claimed c
+     WHERE w.id = c.work_item_id
+       AND c.improvement_route = 'dreamer_context_pack'
+       AND EXISTS (SELECT 1 FROM context_chunks)
+    RETURNING w.id
+),
 training_inputs AS (
     INSERT INTO training_jobs
         (name, training_data_path, training_type, params, created_by)
@@ -234,7 +252,7 @@ UPDATE local_failure_diagnoses d
  WHERE d.id = c.id
    AND (
        (c.improvement_route = 'dreamer_context_pack'
-        AND EXISTS (SELECT 1 FROM context_chunks))
+        AND EXISTS (SELECT 1 FROM context_updates))
        OR
        (c.improvement_route = 'fine_tune_model_ab'
         AND EXISTS (SELECT 1 FROM training_inputs))
@@ -269,11 +287,25 @@ WITH eligible AS MATERIALIZED (
                     WHERE t.params->>'local_failure_diagnosis_id' = d.id::text
                       AND t.status = 'completed'
                       AND NULLIF(t.result_model_id, '') IS NOT NULL
-                      AND (
+                      AND EXISTS (
+                          SELECT 1
+                            FROM computers target
+                           WHERE target.status = 'online'
+                             AND target.has_gpu
+                             AND target.reservation_state <> 'drained'
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                            FROM computers target
+                           WHERE target.status = 'online'
+                             AND target.has_gpu
+                             AND target.reservation_state <> 'drained'
+                             AND NOT (
                           EXISTS (
                               SELECT 1
                                 FROM fleet_model_deployments f
                                WHERE f.catalog_id = t.result_model_id
+                                 AND f.worker_name = target.name
                                  AND f.health_status = 'healthy'
                                  AND f.desired_state = 'active'
                           )
@@ -281,8 +313,10 @@ WITH eligible AS MATERIALIZED (
                               SELECT 1
                                 FROM computer_model_deployments c
                                WHERE c.model_id = t.result_model_id
+                                 AND c.computer_id = target.id
                                  AND c.status = 'active'
                           )
+                      )
                       )
                )
            )
@@ -922,6 +956,11 @@ mod tests {
     fn diagnosed_local_failures_route_to_existing_improvement_pipelines() {
         assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("local_context_sources"));
         assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("local_context_chunks"));
+        assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("UPDATE work_items w"));
+        assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("'local_failure_improvement'"));
+        assert!(
+            ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("EXISTS (SELECT 1 FROM context_updates)")
+        );
         assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("training_jobs"));
         assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("dreamer_context_pack"));
         assert!(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL.contains("fine_tune_model_ab"));
@@ -953,6 +992,18 @@ mod tests {
             RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL
                 .contains("NULLIF(t.result_model_id, '') IS NOT NULL")
         );
+        assert!(RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL.contains("NOT EXISTS ("));
+        assert!(RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL.contains("AND EXISTS ("));
+        assert!(RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL.contains("target.status = 'online'"));
+        assert!(RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL.contains("target.has_gpu"));
+        assert!(
+            RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL
+                .contains("target.reservation_state <> 'drained'")
+        );
+        assert!(
+            RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL.contains("f.worker_name = target.name")
+        );
+        assert!(RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL.contains("c.computer_id = target.id"));
         assert!(
             RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL.contains("f.health_status = 'healthy'")
         );
