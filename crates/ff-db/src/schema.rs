@@ -12449,6 +12449,10 @@ ALTER TABLE work_item_leases
 pub const SCHEMA_V279_FLEET_LOGS: &str =
     include_str!("migrations/20260727000000_create_fleet_logs.sql");
 
+/// Merge the physical computer and worker registries into `fleet_nodes`.
+pub const SCHEMA_V280_MERGE_FLEET_TABLES: &str =
+    include_str!("migrations/20260728000000_merge_fleet_tables.sql");
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
