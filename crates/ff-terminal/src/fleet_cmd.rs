@@ -1353,10 +1353,9 @@ pub async fn handle_fleet_db_restore(
     Ok(())
 }
 
-/// Count rows in the *live* fleet_workers table via the existing pool.
-/// Count rows in the *live* fleet_workers table via the existing pool.
+/// Count rows in the canonical live fleet node table via the existing pool.
 async fn count_fleet_workers_live(pool: &sqlx::PgPool) -> Result<i64> {
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fleet_workers")
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fleet_nodes")
         .fetch_one(pool)
         .await?;
     Ok(n)

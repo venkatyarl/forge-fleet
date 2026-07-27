@@ -1245,6 +1245,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "fleet_logs",
         sql: schema::SCHEMA_V279_FLEET_LOGS,
     },
+    PgMigration {
+        version: 280,
+        name: "merge_fleet_tables",
+        sql: schema::SCHEMA_V280_MERGE_FLEET_TABLES,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -2624,5 +2629,62 @@ mod tests {
         assert!(migration.sql.contains("node_id"));
         assert!(migration.sql.contains("log_level"));
         assert!(migration.sql.contains("message"));
+    }
+
+    #[test]
+    fn v280_merges_fleet_tables() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 280)
+            .expect("V280 must be registered");
+        assert_eq!(migration.name, "merge_fleet_tables");
+        assert!(
+            migration
+                .sql
+                .contains("ALTER TABLE computers RENAME TO fleet_nodes")
+        );
+        assert!(
+            migration
+                .sql
+                .contains("DROP TABLE fleet_workers_legacy RESTRICT")
+        );
+    }
+
+    #[tokio::test]
+    async fn v280_applies_and_is_idempotent() {
+        // CI commonly has no Postgres; the helper checks both supported URL vars.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply on a fresh database");
+
+        let relations: Vec<(String, String)> = sqlx::query_as(
+            "SELECT relname, relkind::text
+               FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'public'
+                AND relname IN ('fleet_nodes', 'computers', 'fleet_workers')
+              ORDER BY relname",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read merged fleet relations");
+        assert_eq!(
+            relations,
+            vec![
+                ("computers".into(), "v".into()),
+                ("fleet_nodes".into(), "r".into()),
+                ("fleet_workers".into(), "v".into()),
+            ]
+        );
+
+        sqlx::raw_sql(schema::SCHEMA_V280_MERGE_FLEET_TABLES)
+            .execute(&pool)
+            .await
+            .expect("V280 should be idempotent");
+
+        drop_temp_db(admin, pool, &db_name).await;
     }
 }
