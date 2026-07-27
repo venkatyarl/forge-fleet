@@ -1255,6 +1255,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "work_item_acceptance_criteria",
         sql: schema::SCHEMA_V281_WORK_ITEM_ACCEPTANCE_CRITERIA,
     },
+    PgMigration {
+        version: 282,
+        name: "oplog_replay",
+        sql: schema::SCHEMA_V282_OPLOG_REPLAY,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -2746,5 +2751,34 @@ mod tests {
             .expect("V280 should be idempotent");
 
         drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[test]
+    fn v282_creates_oplog_replay_tables() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 282)
+            .expect("V282 must be registered");
+        assert_eq!(migration.name, "oplog_replay");
+        assert!(
+            migration
+                .sql
+                .contains("CREATE TABLE IF NOT EXISTS isolated_node_oplog")
+        );
+        assert!(
+            migration
+                .sql
+                .contains("CREATE TABLE IF NOT EXISTS oplog_shared_state")
+        );
+        assert!(
+            migration
+                .sql
+                .contains("CREATE TABLE IF NOT EXISTS oplog_replay_checkpoints")
+        );
+        assert!(
+            migration
+                .sql
+                .contains("CREATE TABLE IF NOT EXISTS oplog_replay_applied")
+        );
     }
 }

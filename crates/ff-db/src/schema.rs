@@ -12459,6 +12459,11 @@ pub const SCHEMA_V280_MERGE_FLEET_TABLES: &str =
 pub const SCHEMA_V281_WORK_ITEM_ACCEPTANCE_CRITERIA: &str =
     include_str!("migrations/20260728100000_work_item_acceptance_criteria.sql");
 
+/// v282: isolated-node OpLog replay state, idempotency, and shared-field
+/// versioning.
+pub const SCHEMA_V282_OPLOG_REPLAY: &str =
+    include_str!("migrations/20260728110000_oplog_replay.sql");
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

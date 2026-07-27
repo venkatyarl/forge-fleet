@@ -81,18 +81,22 @@ pub async fn select_relevant_skills(
 
     Ok(rows
         .into_iter()
-        .map(|(id, name, when_to_invoke, body_md, success_rate, invocations)| {
-            let ok = success_rate.map(|r| (r * invocations as f64).round() as i64).unwrap_or(0);
-            RelevantSkill {
-                id,
-                name,
-                when_to_invoke,
-                body_md,
-                success_rate,
-                invocations,
-                trusted: ok >= TRUST_MIN_SUCCESSES,
-            }
-        })
+        .map(
+            |(id, name, when_to_invoke, body_md, success_rate, invocations)| {
+                let ok = success_rate
+                    .map(|r| (r * invocations as f64).round() as i64)
+                    .unwrap_or(0);
+                RelevantSkill {
+                    id,
+                    name,
+                    when_to_invoke,
+                    body_md,
+                    success_rate,
+                    invocations,
+                    trusted: ok >= TRUST_MIN_SUCCESSES,
+                }
+            },
+        )
         .collect())
 }
 
