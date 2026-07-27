@@ -13,6 +13,16 @@
 use std::path::Path;
 use std::process::Command;
 
+use anyhow::{Context, Result};
+use sqlx::PgPool;
+
+/// Project resolution plus best-effort session binding metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProjectSession {
+    pub project_id: String,
+    pub session_id: Option<String>,
+}
+
 /// Resolve a stable project id from `dir` (or the process cwd when `None`).
 ///
 /// Precedence:
@@ -53,6 +63,67 @@ pub fn resolve_from_dir(dir: Option<&Path>) -> Option<String> {
         return Some(format!("local:{}", base.to_lowercase()));
     }
     None
+}
+
+/// Resolve a stable project id from `dir` and attach this client session to the
+/// project's workstream when one exists.
+///
+/// Resolution keeps the same precedence as [`resolve_from_dir`]. Attach failures
+/// are returned with context because a resolved project with a broken session
+/// binding should be visible to the caller.
+pub async fn resolve_from_dir_and_attach(
+    pg: &PgPool,
+    dir: Option<&Path>,
+    tool: &str,
+    goal: Option<&str>,
+) -> Result<Option<ResolvedProjectSession>> {
+    let Some(project_id) = resolve_from_dir(dir) else {
+        return Ok(None);
+    };
+    let session_id = attach_client_session(pg, dir, &project_id, tool, goal).await?;
+    Ok(Some(ResolvedProjectSession {
+        project_id,
+        session_id,
+    }))
+}
+
+/// Attach the current worker's client session to the workstream for a resolved
+/// project id. Returns `Ok(None)` when the project has no active workstream yet.
+pub async fn attach_client_session(
+    pg: &PgPool,
+    dir: Option<&Path>,
+    project_id: &str,
+    tool: &str,
+    goal: Option<&str>,
+) -> Result<Option<String>> {
+    let cwd = match dir {
+        Some(dir) => dir.to_path_buf(),
+        None => std::env::current_dir().context("resolve current directory for client attach")?,
+    };
+    let ws = crate::workstreams::workstream_for_project(pg, project_id)
+        .await
+        .with_context(|| format!("resolve workstream for project '{project_id}'"))?;
+    let ws = match ws {
+        Some(ws) => Some(ws),
+        None => crate::workstreams::workstream_for_dir(pg, &cwd)
+            .await
+            .with_context(|| {
+                format!(
+                    "resolve workstream for project '{}' from {}",
+                    project_id,
+                    cwd.display()
+                )
+            })?,
+    };
+    let Some(ws) = ws else {
+        return Ok(None);
+    };
+    let worker = crate::fleet_info::resolve_this_worker_name().await;
+    let session_id =
+        crate::workstreams::attach(pg, &ws, &worker, tool, &cwd.display().to_string(), goal)
+            .await
+            .with_context(|| format!("attach client session to project '{project_id}'"))?;
+    Ok(Some(session_id))
 }
 
 /// Walk up from `dir` (or cwd) looking for a `.forgefleet-project` marker. Its
