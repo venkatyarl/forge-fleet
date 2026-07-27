@@ -1363,12 +1363,19 @@ async fn dispatch_one(
     }
 
     if let Err(e) = record_cloud_rescue_local_failure_diagnosis(&pg, &item, &backend_used).await {
+        let reason = format!(
+            "missing_artifact_local_failure_diagnosis: cloud rescue by {backend_used} \
+             cannot advance without its structured local-failure diagnosis: {e:#}"
+        );
         warn!(
             work_item_id = %item.work_item_id,
             builder = %backend_used,
             error = %e,
-            "work_item_dispatch: failed to record cloud-rescue local failure diagnosis"
+            "work_item_dispatch: cloud rescue diagnosis is required before ready-for-review"
         );
+        requeue_or_fail(&pg, &item, &reason).await?;
+        let sweep_warnings = post_phase.finish();
+        return Ok(WorkItemDispatchResult { sweep_warnings });
     }
     mark_ready_for_review(
         &pg,
@@ -6567,6 +6574,23 @@ mod tests {
         let diagnosis = local_failure_diagnosis_for(&item, "cloud:kimi").expect("diagnosis");
         assert_eq!(diagnosis.cause_class, "capability_limit");
         assert_eq!(diagnosis.improvement_route, "fine_tune_model_ab");
+    }
+
+    #[test]
+    fn cloud_rescue_cannot_advance_when_diagnosis_artifact_is_missing() {
+        let source = include_str!("work_item_dispatch.rs");
+        let diagnosis_gate = source
+            .find("missing_artifact_local_failure_diagnosis")
+            .expect("cloud rescue must fail closed when diagnosis persistence fails");
+        let ready_for_review = source[diagnosis_gate..]
+            .find("mark_ready_for_review(")
+            .expect("diagnosis gate must precede ready-for-review");
+        let return_before_ready = source[diagnosis_gate..diagnosis_gate + ready_for_review]
+            .contains("return Ok(WorkItemDispatchResult");
+        assert!(
+            return_before_ready,
+            "diagnosis persistence failure must return before ready-for-review"
+        );
     }
 
     #[tokio::test]
