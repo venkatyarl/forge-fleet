@@ -59,20 +59,30 @@ pub async fn ensure_all_workstreams(pg: &PgPool) -> Result<u64> {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Workstream {
     pub id: uuid::Uuid,
+    pub project_id: String,
     pub project_key: String,
-    pub git_remote: String,
-    pub basename: String,
+    pub git_remote: Option<String>,
+    pub basename: Option<String>,
+    pub aliases: serde_json::Value,
+    pub goal: Option<String>,
     pub working_summary: Option<String>,
+    pub focus: Option<String>,
+    pub open_threads: serde_json::Value,
     pub status: String,
+    pub leader_generation: i32,
+    pub owner_identity: String,
 }
+
+const WORKSTREAM_COLUMNS: &str = "id, project_id, project_key, git_remote, basename, aliases, \
+    goal, working_summary, focus, open_threads, status, leader_generation, owner_identity";
 
 /// Resolve the workstream for a project key (the session-of-record clients
 /// attach to). `None` if the project has no workstream yet.
 pub async fn workstream_for_project(pg: &PgPool, project_key: &str) -> Result<Option<Workstream>> {
-    let ws = sqlx::query_as::<_, Workstream>(
-        "SELECT id, project_key, git_remote, basename, working_summary, status \
-           FROM ff_workstreams WHERE project_key = $1",
-    )
+    let ws = sqlx::query_as::<_, Workstream>(&format!(
+        "SELECT {WORKSTREAM_COLUMNS} FROM ff_workstreams \
+             WHERE project_id = $1 OR project_key = $1"
+    ))
     .bind(project_key)
     .fetch_optional(pg)
     .await?;
@@ -86,7 +96,7 @@ pub async fn attach_client_session(
     pg: &PgPool,
     workstream_id: uuid::Uuid,
     session_id: &str,
-    working_summary: &str,
+    _working_summary: &str,
 ) -> Result<()> {
     let mut tx = pg.begin().await?;
     sqlx::query(
@@ -96,15 +106,6 @@ pub async fn attach_client_session(
     )
     .bind(workstream_id)
     .bind(session_id)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "UPDATE ff_workstreams \
-            SET working_summary = $2, updated_at = now() \
-          WHERE id = $1",
-    )
-    .bind(workstream_id)
-    .bind(working_summary)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -155,20 +156,48 @@ fn canon(remote: &str) -> Option<String> {
 /// matches — the caller reports that the dir isn't under a known project.
 pub async fn workstream_for_dir(pg: &PgPool, cwd: &std::path::Path) -> Result<Option<Workstream>> {
     let resolved = crate::project_scope::resolve_from_dir(Some(cwd));
-    let all = sqlx::query_as::<_, Workstream>(
-        "SELECT id, project_key, git_remote, basename, working_summary, status \
-           FROM ff_workstreams WHERE status = 'active'",
-    )
+    let identity = crate::project_scope::identity_from_dir(Some(cwd));
+    let all = sqlx::query_as::<_, Workstream>(&format!(
+        "SELECT {WORKSTREAM_COLUMNS} FROM ff_workstreams WHERE status = 'active'"
+    ))
     .fetch_all(pg)
     .await?;
 
+    let candidates = identity
+        .iter()
+        .flat_map(|identity| {
+            [
+                identity.explicit.as_deref(),
+                identity.git_remote.as_deref(),
+                identity.basename.as_deref(),
+            ]
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+
+    // Alias-map override wins over every derived identity.
+    for ws in &all {
+        if let Some(aliases) = ws.aliases.as_object()
+            && candidates.iter().any(|candidate| {
+                aliases.contains_key(*candidate)
+                    || aliases
+                        .values()
+                        .any(|value| value.as_str() == Some(*candidate))
+            })
+        {
+            return Ok(Some(ws.clone()));
+        }
+    }
+
     // 1. Canonical git-remote match (stable across clone paths + SSH aliases).
-    if let Some(id) = resolved.as_deref()
+    if let Some(id) = identity
+        .as_ref()
+        .and_then(|identity| identity.git_remote.as_deref())
         && let Some(want) = canon(id)
     {
         if let Some(ws) = all
             .iter()
-            .find(|w| canon(&w.git_remote).as_deref() == Some(&want))
+            .find(|w| w.git_remote.as_deref().and_then(canon).as_deref() == Some(&want))
         {
             return Ok(Some(ws.clone()));
         }
@@ -176,14 +205,99 @@ pub async fn workstream_for_dir(pg: &PgPool, cwd: &std::path::Path) -> Result<Op
     // 2. Fallback: resolved id (or its `local:<base>` / basename) == project_key.
     if let Some(id) = resolved.as_deref() {
         let base = id.rsplit(['/', ':']).next().unwrap_or(id);
-        if let Some(ws) = all
-            .iter()
-            .find(|w| w.project_key == id || w.project_key.eq_ignore_ascii_case(base))
-        {
+        if let Some(ws) = all.iter().find(|w| {
+            w.project_id == id
+                || w.project_key == id
+                || w.project_id.eq_ignore_ascii_case(base)
+                || w.basename
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(base))
+        }) {
             return Ok(Some(ws.clone()));
         }
     }
     Ok(None)
+}
+
+/// Attach an authenticated fleet operator and refresh durable presence.
+pub async fn attach_operator(pg: &PgPool, ws: &Workstream, operator_identity: &str) -> Result<()> {
+    if operator_identity.trim().is_empty() || operator_identity != ws.owner_identity {
+        anyhow::bail!("operator fleet identity is not authorized for this workstream");
+    }
+    sqlx::query(
+        "INSERT INTO session_attachments \
+            (workstream_id, operator_identity, attached_at, last_seen_at) \
+         VALUES ($1, $2, now(), now()) \
+         ON CONFLICT (workstream_id, operator_identity) DO UPDATE \
+             SET last_seen_at = now()",
+    )
+    .bind(ws.id)
+    .bind(operator_identity)
+    .execute(pg)
+    .await?;
+    Ok(())
+}
+
+/// Append a redacted note with leader-assigned monotonic causal sequence.
+pub async fn append_note(
+    pg: &PgPool,
+    ws: &Workstream,
+    operator_identity: &str,
+    note: &str,
+) -> Result<i64> {
+    attach_operator(pg, ws, operator_identity).await?;
+    let redacted = redact_secrets(note);
+    let source_sha256 = sha256_hex(redacted.as_bytes());
+    let mut tx = pg.begin().await?;
+    let seq: i64 = sqlx::query_scalar(
+        "UPDATE ff_workstreams SET next_seq = next_seq + 1, updated_at = now() \
+         WHERE id = $1 AND owner_identity = $2 RETURNING next_seq",
+    )
+    .bind(ws.id)
+    .bind(operator_identity)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO workstream_notes \
+            (workstream_id, seq, note, source_sha256, created_by) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(ws.id)
+    .bind(seq)
+    .bind(redacted)
+    .bind(source_sha256)
+    .bind(operator_identity)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(seq)
+}
+
+/// Redact common credential forms before content leaves the node.
+pub fn redact_secrets(input: &str) -> String {
+    input
+        .split_whitespace()
+        .map(|token| {
+            let lower = token.to_ascii_lowercase();
+            if lower.starts_with("sk-")
+                || lower.starts_with("ghp_")
+                || lower.starts_with("github_pat_")
+                || lower.contains("password=")
+                || lower.contains("token=")
+                || lower.contains("secret=")
+            {
+                "[REDACTED]"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Stable session id for a (worker, project, tool) triple — the same folder on
@@ -239,6 +353,9 @@ pub async fn report(
     focus: Option<&str>,
     note: Option<&str>,
 ) -> Result<Workstream> {
+    if summary.is_some() {
+        anyhow::bail!("working_summary is leader-owned; clients may report focus or notes only");
+    }
     let ws_id: uuid::Uuid = sqlx::query_scalar(
         "UPDATE workstream_clients SET last_report_at = now() \
           WHERE session_id = $1 RETURNING workstream_id",
@@ -252,19 +369,17 @@ pub async fn report(
 
     // COALESCE keeps prior values when a field is omitted; the note is appended
     // to the open_threads jsonb array with a server timestamp + the session id.
-    let ws = sqlx::query_as::<_, Workstream>(
+    let ws = sqlx::query_as::<_, Workstream>(&format!(
         "UPDATE ff_workstreams SET \
-            working_summary = COALESCE($2, working_summary), \
-            focus           = COALESCE($3, focus), \
-            open_threads    = CASE WHEN $4::text IS NULL THEN open_threads \
+            focus           = COALESCE($2, focus), \
+            open_threads    = CASE WHEN $3::text IS NULL THEN open_threads \
                 ELSE COALESCE(open_threads, '[]'::jsonb) || \
-                     jsonb_build_object('at', now(), 'session', $5::text, 'note', $4::text) END, \
+                     jsonb_build_object('at', now(), 'session', $4::text, 'note', $3::text) END, \
             updated_at      = now() \
           WHERE id = $1 \
-       RETURNING id, project_key, git_remote, basename, working_summary, status",
-    )
+       RETURNING {WORKSTREAM_COLUMNS}"
+    ))
     .bind(ws_id)
-    .bind(summary)
     .bind(focus)
     .bind(note)
     .bind(session_id)
@@ -390,4 +505,22 @@ pub async fn attached_clients(
     .fetch_all(pg)
     .await?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notes_are_redacted_before_hash_or_persistence() {
+        let note = "deploy token=abc sk-live-secret ghp_private password=hunter2 safely";
+        let redacted = redact_secrets(note);
+        assert_eq!(
+            redacted,
+            "deploy [REDACTED] [REDACTED] [REDACTED] [REDACTED] safely"
+        );
+        assert!(!redacted.contains("abc"));
+        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("hunter2"));
+    }
 }

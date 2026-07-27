@@ -50,7 +50,8 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
             .await?;
             println!(
                 "✅ attached to workstream '{}' ({})",
-                ws.basename, ws.project_key
+                ws.basename.as_deref().unwrap_or("<unnamed>"),
+                ws.project_key
             );
             println!("   session: {sid}");
             println!("   node: {worker} · tool: {tool}");
@@ -86,7 +87,8 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
             .await?;
             println!(
                 "✅ reported into '{}' ({})",
-                updated.basename, updated.project_key
+                updated.basename.as_deref().unwrap_or("<unnamed>"),
+                updated.project_key
             );
             if let Some(s) = &updated.working_summary {
                 println!("   summary: {s}");
@@ -101,8 +103,16 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
             let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
             let me = workstreams::session_id_for(&worker, &ws.project_key, &tool);
 
-            println!("📽  Workstream: {} ({})", ws.basename, ws.project_key);
-            println!("   status: {}  ·  remote: {}", ws.status, ws.git_remote);
+            println!(
+                "📽  Workstream: {} ({})",
+                ws.basename.as_deref().unwrap_or("<unnamed>"),
+                ws.project_key
+            );
+            println!(
+                "   status: {}  ·  remote: {}",
+                ws.status,
+                ws.git_remote.as_deref().unwrap_or("<none>")
+            );
             println!(
                 "   working_summary: {}",
                 ws.working_summary.as_deref().unwrap_or("<none>")

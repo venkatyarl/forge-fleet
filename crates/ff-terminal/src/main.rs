@@ -5039,11 +5039,15 @@ async fn main() -> Result<()> {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
-                            "project_id": ws.project_key,
+                            "project_id": ws.project_id,
                             "git_remote": ws.git_remote,
                             "basename": ws.basename,
+                            "goal": ws.goal,
                             "working_summary": ws.working_summary,
+                            "focus": ws.focus,
+                            "open_threads": ws.open_threads,
                             "status": ws.status,
+                            "leader_generation": ws.leader_generation,
                         }))?
                     );
                     Ok(())
@@ -5060,25 +5064,22 @@ async fn main() -> Result<()> {
                         None => ff_agent::workstreams::workstream_for_dir(&pool, dir).await?,
                     }
                     .ok_or_else(|| anyhow::anyhow!("no workstream resolves for this project"))?;
-                    let operator = ff_agent::fleet_info::resolve_this_worker_name().await;
-                    let session_id = ff_agent::workstreams::attach(
-                        &pool,
-                        &ws,
-                        &operator,
-                        "operator",
-                        &dir.display().to_string(),
-                        None,
-                    )
-                    .await?;
+                    let operator = std::env::var("FORGEFLEET_OPERATOR_IDENTITY")
+                        .unwrap_or_else(|_| "operator:fleet".to_string());
+                    ff_agent::workstreams::attach_operator(&pool, &ws, &operator).await?;
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
-                            "project_id": ws.project_key,
+                            "project_id": ws.project_id,
                             "git_remote": ws.git_remote,
                             "basename": ws.basename,
+                            "goal": ws.goal,
                             "working_summary": ws.working_summary,
+                            "focus": ws.focus,
+                            "open_threads": ws.open_threads,
                             "status": ws.status,
-                            "session_id": session_id,
+                            "leader_generation": ws.leader_generation,
+                            "operator_identity": operator,
                         }))?
                     );
                     Ok(())
@@ -5095,15 +5096,11 @@ async fn main() -> Result<()> {
                         None => ff_agent::workstreams::workstream_for_dir(&pool, dir).await?,
                     }
                     .ok_or_else(|| anyhow::anyhow!("no workstream resolves for this project"))?;
-                    let operator = ff_agent::fleet_info::resolve_this_worker_name().await;
-                    let session_id = ff_agent::workstreams::session_id_for(
-                        &operator,
-                        &ws.project_key,
-                        "operator",
-                    );
-                    ff_agent::workstreams::report(&pool, &session_id, None, None, Some(&text))
-                        .await?;
-                    println!("{GREEN}✓{RESET} note appended");
+                    let operator = std::env::var("FORGEFLEET_OPERATOR_IDENTITY")
+                        .unwrap_or_else(|_| "operator:fleet".to_string());
+                    let seq =
+                        ff_agent::workstreams::append_note(&pool, &ws, &operator, &text).await?;
+                    println!("{GREEN}✓{RESET} note appended (seq {seq})");
                     Ok(())
                 }
                 SessionCommand::Export { .. } => unreachable!("handled before database setup"),
