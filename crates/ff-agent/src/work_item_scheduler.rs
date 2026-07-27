@@ -282,6 +282,25 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         Err(e) => warn!(error = %e, "work_item_scheduler: self-heal requeue sweep failed"),
     }
 
+    // SYSTEMIC-ERROR DOCTOR: before the per-item retry loop wastes the backlog on
+    // a shared infrastructure fault (a missing DB column, a migration crash, a
+    // dead router), detect clusters of DIFFERENT items failing with the IDENTICAL
+    // error, park them (halt the retry storm), and alert the operator with the
+    // signature + remediation hint. Best-effort — never stalls scheduling.
+    match crate::self_heal::detect_systemic_failures(pg).await {
+        Ok(findings) if !findings.is_empty() => {
+            for f in &findings {
+                warn!(
+                    signature = %f.signature, count = f.count, hint = %f.remediation_hint,
+                    "work_item_scheduler: SYSTEMIC failure cluster — parked + operator-alert"
+                );
+                crate::self_heal::alert_systemic_finding(pg, f).await;
+            }
+        }
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "work_item_scheduler: systemic-error doctor sweep failed"),
+    }
+
     // Auto-complete decomposed parents (bug/feature) once all of their task
     // children are terminal. This stops parent rows from lingering in `ready`
     // and cluttering the board after their leaves finish.

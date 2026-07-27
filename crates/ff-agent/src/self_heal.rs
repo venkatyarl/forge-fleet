@@ -99,6 +99,176 @@ pub const SELF_HEAL_REQUEUE_BATCH: i64 = 16;
 /// an item would burn its whole self-heal budget inside a single outage.
 pub const SELF_HEAL_COOLDOWN_SECS: i64 = 20 * 60;
 
+// ---------------------------------------------------------------------------
+// SYSTEMIC-ERROR DOCTOR (operator 2026-07-26): ff self-heals BUILD failures but
+// not INFRASTRUCTURE failures. When many DIFFERENT work_items fail with the SAME
+// error (a missing DB column, a migration crash, "no healthy fleet deployment"),
+// that is ONE systemic fault — not N task bugs — and the per-item retry loop
+// CANNOT fix it (the building agent can't fix a schema/migration/router problem),
+// so it silently grinds the whole backlog to terminal failure over ~an hour. The
+// doctor detects the cluster fast, HALTS the retry storm (parks the items so they
+// stop burning retries), and ALERTS the operator with the exact signature + a
+// remediation hint — turning "operator catches it via screenshot an hour later"
+// into "ff catches it at failure #3 and surfaces the fix".
+// ---------------------------------------------------------------------------
+
+/// A detected systemic failure cluster.
+#[derive(Debug, Clone)]
+pub struct SystemicFinding {
+    pub signature: String,
+    pub count: i64,
+    pub sample_error: String,
+    pub remediation_hint: String,
+}
+
+/// Minimum distinct failed items sharing one normalized signature to call it
+/// systemic (not a per-task coincidence). 3 different tasks with the IDENTICAL
+/// error = a shared root cause.
+pub const SYSTEMIC_CLUSTER_THRESHOLD: i64 = 3;
+
+/// Normalize a `last_error` into a stable clustering key: lowercase, strip the
+/// VARIABLE parts (uuids, hex, long digit runs, `[attempt N]` tags, tail-trimmed
+/// stderr) while KEEPING the error STRUCTURE + identifiers (a column/table name).
+/// So the 32 "column \"build_started_at\" does not exist" failures collapse to
+/// ONE key, but varied per-task errors ("review rejected: <different reason>")
+/// stay distinct and are NOT clustered/parked. PURE (testable).
+pub fn normalize_error_signature(err: &str) -> String {
+    let mut s = err.to_ascii_lowercase();
+    // Drop a leading "[attempt N] " tag.
+    if let Some(rest) = s.strip_prefix('[')
+        && let Some(idx) = rest.find(']')
+    {
+        s = rest[idx + 1..].trim_start().to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() {
+            // Collapse any run of digits to a single '#'.
+            while chars.peek().is_some_and(|n| n.is_ascii_digit()) {
+                chars.next();
+            }
+            out.push('#');
+        } else {
+            out.push(c);
+        }
+    }
+    // Collapse whitespace and cap length so the tail (huge command echoes /
+    // stderr dumps) doesn't fragment otherwise-identical signatures.
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+        .chars().take(120).collect()
+}
+
+/// A remediation hint for a known systemic signature (best-effort operator guidance).
+fn remediation_hint_for(sig: &str) -> String {
+    if sig.contains("does not exist") && sig.contains("column") {
+        "a DB column is missing — likely a migration didn't apply. Check `_migrations` vs schema.rs; \
+         apply the missing `ADD COLUMN IF NOT EXISTS` and requeue.".to_string()
+    } else if sig.contains("migration") {
+        "a Postgres migration is failing on daemon startup (crash-loop risk). Fix/skip the migration, \
+         then reset-failed + restart forgefleetd fleet-wide.".to_string()
+    } else if sig.contains("no healthy fleet deployment") || sig.contains("no dispatchable backend") {
+        "the LLM router has no serving model — check deployment health (`fleet_model_deployments` \
+         fresh?) and daemon liveness.".to_string()
+    } else if sig.contains("could not fetch") || sig.contains("clone") {
+        "git fetch/clone is failing on a node — check the PAT/SSH remote and network to GitHub.".to_string()
+    } else if sig.contains("produced no diff") {
+        "the routed LLM keeps producing no diff — the model may be wedged; check the router rotation.".to_string()
+    } else {
+        "recurring identical failure across many items — a shared infrastructure fault; investigate the signature.".to_string()
+    }
+}
+
+/// Detect systemic failure clusters, HALT the retry storm (park them), and record
+/// findings for the operator. Returns the findings so the caller can alert.
+/// Leader-gated by the caller. Parks only clusters ≥ threshold — genuinely
+/// per-task failures (each a distinct error) never cluster, so they're untouched.
+pub async fn detect_systemic_failures(pg: &PgPool) -> Result<Vec<SystemicFinding>> {
+    // Pull recent failed items with an error, cluster in Rust by normalized sig.
+    let rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+        "SELECT id, last_error FROM work_items \
+          WHERE status = 'failed' AND last_error IS NOT NULL AND last_error <> '' \
+            AND NOT parked",
+    )
+    .fetch_all(pg)
+    .await?;
+
+    let mut clusters: std::collections::HashMap<String, (i64, String, Vec<uuid::Uuid>)> =
+        std::collections::HashMap::new();
+    for (id, err) in rows {
+        let sig = normalize_error_signature(&err);
+        let e = clusters.entry(sig).or_insert_with(|| (0, err.clone(), Vec::new()));
+        e.0 += 1;
+        e.2.push(id);
+    }
+
+    let mut findings = Vec::new();
+    for (sig, (count, sample, ids)) in clusters {
+        if count < SYSTEMIC_CLUSTER_THRESHOLD {
+            continue;
+        }
+        // Halt the storm: park every item in this cluster so the scheduler stops
+        // re-dispatching them into the same wall (they cannot self-fix a systemic
+        // fault). A human/auto-remediation un-parks them once the root cause is fixed.
+        let parked = sqlx::query(
+            "UPDATE work_items SET parked = true WHERE id = ANY($1) AND NOT parked",
+        )
+        .bind(&ids)
+        .execute(pg)
+        .await
+        .map(|r| r.rows_affected())
+        .unwrap_or(0);
+        let hint = remediation_hint_for(&sig);
+        tracing::warn!(
+            signature = %sig,
+            count,
+            parked,
+            hint = %hint,
+            sample = %sample.chars().take(120).collect::<String>(),
+            "SYSTEMIC-ERROR DOCTOR: cluster of identical failures detected — PARKED to halt retry storm; operator remediation needed"
+        );
+        findings.push(SystemicFinding {
+            signature: sig,
+            count,
+            sample_error: sample.chars().take(200).collect(),
+            remediation_hint: hint,
+        });
+    }
+    Ok(findings)
+}
+
+/// Alert the operator about a systemic failure cluster — deduped to at most once
+/// per signature per hour (via `operator_notify_dedup`) so a persistent fault
+/// doesn't spam. Sends to Telegram if configured; always logs. Best-effort.
+pub async fn alert_systemic_finding(pg: &PgPool, f: &SystemicFinding) {
+    // Hourly single-flight per signature (same table/pattern as task-fail alerts).
+    let should_send: bool = sqlx::query_scalar(
+        "INSERT INTO operator_notify_dedup (signature, last_sent) VALUES ($1, NOW()) \
+         ON CONFLICT (signature) DO UPDATE SET last_sent = NOW() \
+           WHERE operator_notify_dedup.last_sent < NOW() - INTERVAL '1 hour' \
+         RETURNING true",
+    )
+    .bind(format!("systemic:{}", f.signature))
+    .fetch_optional(pg)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false);
+    if !should_send {
+        return; // throttled — already alerted this signature within the hour
+    }
+    let title = "🩺 ForgeFleet doctor: systemic failure";
+    let body = format!(
+        "{} items are failing with the SAME error — a shared infrastructure fault, \
+         not per-task bugs. Parked to stop the retry storm.\n\n\
+         Signature: {}\n\nSample: {}\n\n→ {}",
+        f.count, f.signature, f.sample_error, f.remediation_hint
+    );
+    if let Err(e) = crate::telegram::send_telegram_from_secrets(pg, title, &body).await {
+        tracing::warn!(error = %e, signature = %f.signature, "alert_systemic_finding: telegram send failed (logged only)");
+    }
+}
+
 /// One self-heal sweep with the default knobs; called from the scheduler tick.
 pub async fn requeue_transient_failures(pg: &PgPool) -> Result<u64> {
     requeue_transient_failures_with(
@@ -500,5 +670,27 @@ mod tests {
         assert_eq!(status, "ready");
 
         drop_temp_db(admin, pool, &db_name).await;
+    }
+}
+
+#[cfg(test)]
+mod systemic_tests {
+    use super::*;
+
+    #[test]
+    fn identical_infra_errors_cluster_varied_task_errors_do_not() {
+        // The 32 missing-column failures → ONE key (identifier kept, digits→#).
+        let a = normalize_error_signature("error returned from database: column \"build_started_at\" does not exist");
+        let b = normalize_error_signature("[attempt 3] error returned from database: column \"build_started_at\" does not exist");
+        assert_eq!(a, b, "same infra error must collapse to one cluster key");
+
+        // Different missing columns → DIFFERENT keys (distinct problems).
+        let c = normalize_error_signature("error returned from database: column \"foo\" does not exist");
+        assert_ne!(a, c);
+
+        // Varied per-task review rejections → DIFFERENT keys (stay per-task, not parked).
+        let r1 = normalize_error_signature("in-place review rejected by codex: Dropping both legacy tables");
+        let r2 = normalize_error_signature("in-place review rejected by codex: The config uses placeholders");
+        assert_ne!(r1, r2, "distinct per-task errors must NOT cluster");
     }
 }
