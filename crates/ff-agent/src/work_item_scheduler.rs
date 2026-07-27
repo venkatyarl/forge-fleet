@@ -1018,6 +1018,143 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn context_gap_remediation_routes_deploys_and_requeues_same_item_locally() {
+        let url = match std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+        {
+            Ok(url) => url,
+            Err(_) => {
+                eprintln!(
+                    "skipping cloud-fixes-local DB test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL"
+                );
+                return;
+            }
+        };
+        let pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("skipping cloud-fixes-local DB test: database unavailable: {e}");
+                return;
+            }
+        };
+        ff_db::run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should create cloud-fixes-local tables");
+
+        let work_item_id = uuid::Uuid::new_v4();
+        let diagnosis_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO work_items (id, project_id, kind, title, status, attempts)
+             VALUES ($1, 'forge-fleet', 'task', 'cloud-fixes-local acceptance', 'done', 3)",
+        )
+        .bind(work_item_id)
+        .execute(&pool)
+        .await
+        .expect("insert acceptance work item");
+        sqlx::query(
+            "INSERT INTO local_failure_diagnoses
+                (id, work_item_id, rescue_attempt, local_failure_summary, cloud_backend,
+                 cloud_diagnosis, cause_class, improvement_route)
+             VALUES ($1, $2, 4, 'local edited the wrong module', 'codex',
+                     'include the owning dispatch module in the context pack',
+                     'context_prompt_gap', 'dreamer_context_pack')",
+        )
+        .bind(diagnosis_id)
+        .bind(work_item_id)
+        .execute(&pool)
+        .await
+        .expect("insert local-failure diagnosis");
+
+        assert_eq!(
+            route_diagnosed_local_failures(&pool)
+                .await
+                .expect("route diagnosis"),
+            1
+        );
+        let routed: (String, i64, serde_json::Value) = sqlx::query_as(
+            "SELECT d.remediation_status,
+                    (SELECT COUNT(*)
+                       FROM local_context_sources s
+                       JOIN local_context_chunks c ON c.source_id = s.id
+                      WHERE s.uri = 'local-failure-diagnosis://' || d.id),
+                    w.context
+               FROM local_failure_diagnoses d
+               JOIN work_items w ON w.id = d.work_item_id
+              WHERE d.id = $1",
+        )
+        .bind(diagnosis_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read routed diagnosis");
+        assert_eq!(routed.0, "deploy_pending");
+        assert_eq!(routed.1, 1);
+        assert_eq!(
+            routed.2["local_failure_improvement"]["diagnosis_id"],
+            diagnosis_id.to_string()
+        );
+        assert_eq!(
+            route_diagnosed_local_failures(&pool)
+                .await
+                .expect("repeat route"),
+            0,
+            "a scheduler retry must not duplicate the context artifact"
+        );
+
+        assert_eq!(
+            reconcile_deploy_pending_local_failures(&pool)
+                .await
+                .expect("deploy shared context"),
+            1
+        );
+        assert_eq!(
+            requeue_deployed_local_retests(&pool)
+                .await
+                .expect("requeue original item"),
+            1
+        );
+        let requeued: (String, i32, String) = sqlx::query_as(
+            "SELECT w.status, w.attempts, d.remediation_status
+               FROM work_items w
+               JOIN local_failure_diagnoses d ON d.work_item_id = w.id
+              WHERE w.id = $1",
+        )
+        .bind(work_item_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read local-first requeue");
+        assert_eq!(requeued, ("ready".into(), 0, "local_retest_running".into()));
+        assert_eq!(
+            requeue_deployed_local_retests(&pool)
+                .await
+                .expect("repeat requeue"),
+            0
+        );
+
+        sqlx::query(
+            "DELETE FROM local_context_sources
+              WHERE uri = 'local-failure-diagnosis://' || $1::uuid",
+        )
+        .bind(diagnosis_id)
+        .execute(&pool)
+        .await
+        .expect("delete acceptance context source");
+        sqlx::query("DELETE FROM local_failure_diagnoses WHERE id = $1")
+            .bind(diagnosis_id)
+            .execute(&pool)
+            .await
+            .expect("delete acceptance diagnosis");
+        sqlx::query("DELETE FROM work_items WHERE id = $1")
+            .bind(work_item_id)
+            .execute(&pool)
+            .await
+            .expect("delete acceptance work item");
+    }
+
     fn slot(computer: uuid::Uuid) -> ff_db::FreeSlot {
         ff_db::FreeSlot {
             sub_agent_id: uuid::Uuid::new_v4(),
