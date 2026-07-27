@@ -608,11 +608,13 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     // operator never received a native digest: the leader (adele) had no
     // `[transport.telegram]` config, so the old gate disabled it entirely.
     if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        let project_emoji_mapping = Arc::new(ff_orchestrator::PROJECT_EMOJI_MAPPING.clone());
         info!("starting subsystem: per-project digest framework (leader-gated)");
         subsystem_tasks.push(ff_agent::project_digests::spawn_project_digests_tick(
             pg_pool,
             60, // wake every 60s; each config's interval_secs drives cadence
             shutdown_rx.clone(),
+            project_emoji_mapping,
         ));
     } else {
         info!("subsystem disabled: per-project digest framework (no pg pool)");

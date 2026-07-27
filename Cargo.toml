@@ -110,6 +110,7 @@ ff-gateway = { path = "crates/ff-gateway" }
 ff-cron = { path = "crates/ff-cron" }
 ff-control = { path = "crates/ff-control" }
 ff-observability = { path = "crates/ff-observability" }
+ff-orchestrator = { path = "crates/ff-orchestrator" }
 ff-evolution = { path = "crates/ff-evolution" }
 ff-runtime = { path = "crates/ff-runtime" }
 ff-updater = { path = "crates/ff-updater" }

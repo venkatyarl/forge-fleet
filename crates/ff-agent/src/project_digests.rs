@@ -17,6 +17,8 @@
 //! The config table IS the source of truth: to change what the operator
 //! receives, `UPDATE project_digest_configs` — no code change, no new tick.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -136,6 +138,7 @@ pub fn spawn_project_digests_tick(
     pg: PgPool,
     check_secs: u64,
     mut shutdown: watch::Receiver<bool>,
+    emoji_mapping: Arc<HashMap<&'static str, &'static str>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(err) = ensure_schema(&pg).await {
@@ -149,7 +152,7 @@ pub fn spawn_project_digests_tick(
                     if !crate::leader_cache::is_current_leader() {
                         continue;
                     }
-                    if let Err(err) = run_once(&pg).await {
+                    if let Err(err) = run_once(&pg, &emoji_mapping).await {
                         warn!(error = %err, "project digests tick failed");
                     }
                 }
@@ -166,7 +169,7 @@ pub fn spawn_project_digests_tick(
 
 /// One pass: age temporary digests toward expiry, disable expired ones, then
 /// send every enabled config that is due.
-async fn run_once(pg: &PgPool) -> Result<()> {
+async fn run_once(pg: &PgPool, emoji_mapping: &HashMap<&'static str, &'static str>) -> Result<()> {
     // Keep the per-project session-of-record ("workstream") seeded — one row per
     // active project. Leader-gated (we're inside the leader-only tick), idempotent
     // and cheap. This is the foundation for ff-owns-the-session: clients attach to
@@ -223,7 +226,7 @@ async fn run_once(pg: &PgPool) -> Result<()> {
     .unwrap_or_default();
 
     for (id, project_id, title, logo) in due {
-        let body = match build_project_digest(pg, &project_id).await {
+        let body = match build_project_digest(pg, &project_id, emoji_mapping).await {
             Ok(b) => b,
             Err(err) => {
                 warn!(project = %project_id, error = %err, "project digest build failed");
@@ -279,10 +282,14 @@ fn fmt_mins(m: i64) -> String {
 /// failures (with reason), rolling deployment (fleet only), backlog counts +
 /// items-still-to-build, Jira (if configured), and a final ETA to clear the
 /// backlog at the current merge pace. Everything is queried live.
-pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<String> {
+pub async fn build_project_digest(
+    pg: &PgPool,
+    project_id: &str,
+    emoji_mapping: &HashMap<&'static str, &'static str>,
+) -> Result<String> {
     // The synthetic 'ff' project = the platform's own status, not project work.
     if project_id == "ff" {
-        return build_system_digest(pg).await;
+        return build_system_digest(pg, emoji_mapping).await;
     }
 
     // Building now — with the COMPUTER (assigned_computer) and the LLM (parsed
@@ -386,7 +393,10 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
     .await
     .unwrap_or(0);
 
-    let mut msg = String::new();
+    let mut msg = emoji_mapping
+        .get(project_id)
+        .map(|emoji| format!("{emoji} "))
+        .unwrap_or_default();
 
     // §1 Completed since last update (FIRST — operator wants completions up top;
     // always shown, "(none)" when the window had no completions so the section is
@@ -514,8 +524,14 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
 /// leader, and the last rolling deployment. This answers "what is ff doing
 /// outside the projects?" All queries are defensive (a missing table/column
 /// degrades that one line, never the whole digest).
-pub async fn build_system_digest(pg: &PgPool) -> Result<String> {
-    let mut msg = String::new();
+pub async fn build_system_digest(
+    pg: &PgPool,
+    emoji_mapping: &HashMap<&'static str, &'static str>,
+) -> Result<String> {
+    let mut msg = emoji_mapping
+        .get("forge-fleet")
+        .map(|emoji| format!("{emoji} "))
+        .unwrap_or_default();
 
     // Self-improvement: work items ff merged into itself in the last 24h, and
     // what's building across ALL projects right now.
