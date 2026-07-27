@@ -79,6 +79,7 @@ impl ToolRegistry {
         self.register(Self::mcp_federation_status());
         self.register(Self::model_recommend());
         self.register(Self::model_stats());
+        self.register(Self::llm_training_init());
         self.register(Self::project_profile_upsert());
         self.register(Self::project_profile_get());
         self.register(Self::project_profile_list());
@@ -939,6 +940,61 @@ impl ToolRegistry {
                     }
                 },
                 "required": ["query"]
+            }),
+        }
+    }
+
+    fn llm_training_init() -> ToolDefinition {
+        ToolDefinition {
+            name: "llm_training_init".to_string(),
+            description: "Initialize a durable queued ff-LLM training job. First research and select a base model with fleet_models_search/catalog and relevant benchmarks; then pass its exact catalog id plus a reference explaining that selection. This does not start training: use the returned `ff train start <job-id>` next step.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Human-readable training job name"
+                    },
+                    "base_model_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Exact fleet model catalog id selected by the base-model research process"
+                    },
+                    "base_model_selection": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Reference or concise rationale documenting the completed base-model selection research"
+                    },
+                    "training_data_path": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "adapter_output_path": { "type": "string" },
+                    "training_type": {
+                        "type": "string",
+                        "enum": ["lora", "full_finetune", "dpo"]
+                    },
+                    "computer_name": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "epochs": { "type": "integer", "minimum": 1 },
+                    "learning_rate": { "type": "number", "exclusiveMinimum": 0 },
+                    "batch_size": { "type": "integer", "minimum": 1 },
+                    "lora_rank": { "type": "integer", "minimum": 1 },
+                    "max_seq_len": { "type": "integer", "minimum": 1 },
+                    "created_by": { "type": "string" }
+                },
+                "required": [
+                    "name",
+                    "base_model_id",
+                    "base_model_selection",
+                    "training_data_path",
+                    "training_type",
+                    "computer_name"
+                ],
+                "additionalProperties": false
             }),
         }
     }
@@ -1951,6 +2007,7 @@ mod tests {
             "mcp_federation_status",
             "model_recommend",
             "model_stats",
+            "llm_training_init",
             "project_profile_upsert",
             "project_profile_get",
             "project_profile_list",

@@ -22,6 +22,7 @@ pub mod cortex_tools;
 pub mod federation;
 pub mod handlers;
 pub mod llm_exec;
+pub mod llm_training;
 pub mod memory_tools;
 pub mod pool;
 pub mod protocol;

@@ -2767,6 +2767,11 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "mcp_federation_status" => mcp_federation_status(params).await,
         "model_recommend" => model_recommend(params).await,
         "model_stats" => model_stats(params).await,
+        "llm_training_init" => {
+            let config = crate::llm_training::LlmTrainingInitConfig::from_params(params)?;
+            let pool = crate::pool::shared_pg_pool().await?;
+            crate::llm_training::initialize(pool, config).await
+        }
         "project_profile_upsert" => project_profile_upsert(params).await,
         "project_profile_get" => project_profile_get(params).await,
         "project_profile_list" => project_profile_list(params).await,
