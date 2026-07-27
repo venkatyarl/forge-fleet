@@ -1250,6 +1250,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "merge_fleet_tables",
         sql: schema::SCHEMA_V280_MERGE_FLEET_TABLES,
     },
+    PgMigration {
+        version: 281,
+        name: "work_item_acceptance_criteria",
+        sql: schema::SCHEMA_V281_WORK_ITEM_ACCEPTANCE_CRITERIA,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

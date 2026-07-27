@@ -1297,6 +1297,26 @@ async fn dispatch_one(
         commit_worktree_changes(&worktree.worktree_path, &item.title, &git_name, &git_email)?;
     }
 
+    // ACCEPTANCE-CRITERIA GATE (2026-07-27): self-verify proves the diff compiles/
+    // isn't garbage; THIS proves it does what the task asked. A fleet reviewer
+    // checks the diff against the planner's checkable definition-of-done. On
+    // failure, feed the specific unmet criteria back into a requeue so the next
+    // attempt fixes THAT — the fix for "glm produced a diff but not the RIGHT
+    // diff" (the failure mode after the reasoning-content fix). No-op when the
+    // item has no criteria (older items / degraded planner) → fail-open.
+    if let Some(Err(reason)) =
+        diff_meets_acceptance_criteria(&pg, item.work_item_id, &worktree.worktree_path).await
+    {
+        warn!(
+            work_item_id = %item.work_item_id,
+            %reason,
+            "work_item_dispatch: acceptance-criteria gate rejected the build before PR"
+        );
+        requeue_or_fail(&pg, &item, &format!("acceptance criteria not met: {reason}")).await?;
+        let sweep_warnings = post_phase.finish();
+        return Ok(WorkItemDispatchResult { sweep_warnings });
+    }
+
     let head_sha = git_head_sha(&worktree.worktree_path)?;
     push_branch(&item.repo_path, &worktree.task_branch)?;
     let pr_url = create_pr(&worktree.worktree_path, &item, &worktree).await?;
@@ -2262,6 +2282,101 @@ async fn run_in_place_review(
 /// This is the un-foolable half of the verification gate: an LLM can hallucinate
 /// a citation, but a table/view/column either exists in the live DB or it does
 /// not. Guarded to SELECT-only so an acceptance_check can never mutate state.
+/// Load the natural-language acceptance criteria (the definition-of-done the
+/// planner wrote) for a work_item. None/empty when the planner didn't attach any.
+async fn load_acceptance_criteria(pg: &PgPool, work_item_id: Uuid) -> Option<Vec<String>> {
+    let raw: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT acceptance_criteria FROM work_items WHERE id = $1")
+            .bind(work_item_id)
+            .fetch_optional(pg)
+            .await
+            .ok()
+            .flatten();
+    let arr = raw?.as_array()?.clone();
+    Some(
+        arr.into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.trim().is_empty())
+            .collect(),
+    )
+}
+
+/// SELF-VERIFY THE DIFF AGAINST ACCEPTANCE CRITERIA (the quality gate that turns
+/// "produced a diff" into "produced the RIGHT diff"). After the build produced a
+/// diff, ask a fleet reviewer LLM whether the diff satisfies EVERY criterion.
+/// Returns Some(false) + the failing reasons when it doesn't, Some(true) when it
+/// does, None when there are no criteria (gate is a no-op — don't block). This
+/// runs BEFORE the PR so a criteria-missing diff is caught cheaply and fed back
+/// into the retry, exactly the failure mode local models hit (a diff that doesn't
+/// do what the task asked). Routes through fleet_oneshot (local-first).
+async fn diff_meets_acceptance_criteria(
+    pg: &PgPool,
+    work_item_id: Uuid,
+    worktree_path: &Path,
+) -> Option<Result<(), String>> {
+    let criteria = load_acceptance_criteria(pg, work_item_id).await?;
+    if criteria.is_empty() {
+        return None;
+    }
+    // The actual diff produced by the build.
+    let diff = run_git(worktree_path, ["diff", "HEAD"], Duration::from_secs(30))
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    if diff.trim().is_empty() {
+        return Some(Err("no diff to check against acceptance criteria".to_string()));
+    }
+    let list = criteria
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("{}. {}", i + 1, c))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Cap the diff so a huge change doesn't blow the context.
+    let diff_capped: String = diff.chars().take(12000).collect();
+    let prompt = format!(
+        "You are a strict code reviewer. Below is a git diff and a numbered list of \
+         ACCEPTANCE CRITERIA the change MUST satisfy. For EACH criterion decide PASS or FAIL \
+         based ONLY on the diff. If ALL pass, reply with exactly: VERDICT: PASS. Otherwise reply \
+         with exactly: VERDICT: FAIL followed by one line per failing criterion: 'N: <why it fails>'.\n\n\
+         ACCEPTANCE CRITERIA:\n{list}\n\nDIFF:\n{diff_capped}"
+    );
+    match crate::fleet_oneshot::fleet_oneshot(
+        pg,
+        &prompt,
+        Some("glm-4.5-air"),
+        Some(Duration::from_secs(120)),
+    )
+    .await
+    {
+        Ok(resp) => {
+            let text = resp.text.to_ascii_uppercase();
+            if text.contains("VERDICT: PASS") {
+                Some(Ok(()))
+            } else if text.contains("VERDICT: FAIL") {
+                // Return the failing lines as the feedback for the retry prompt.
+                let reasons: String = resp
+                    .text
+                    .lines()
+                    .skip_while(|l| !l.to_ascii_uppercase().contains("VERDICT: FAIL"))
+                    .skip(1)
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                Some(Err(format!(
+                    "diff does not meet acceptance criteria: {}",
+                    if reasons.trim().is_empty() { "reviewer gave no detail".into() } else { reasons }
+                )))
+            } else {
+                // Unparseable verdict → don't block (fail-open), just log.
+                None
+            }
+        }
+        // Reviewer unavailable → fail-open (don't block the build on a flaky check).
+        Err(_) => None,
+    }
+}
+
 async fn acceptance_check_passes(pg: &PgPool, work_item_id: Uuid) -> Option<bool> {
     let sql: Option<String> =
         sqlx::query_scalar("SELECT acceptance_check FROM work_items WHERE id = $1")
@@ -3504,6 +3619,26 @@ async fn run_ff_dispatch(
     if !pack.is_empty() {
         info!(work_item_id = %item.work_item_id, pack_bytes = pack.len(), "run_ff_dispatch: prepended Cortex context pack");
         prompt = format!("{pack}\n{prompt}");
+    }
+
+    // ACCEPTANCE CRITERIA (Anthropic long-running-agent feature-list pattern): if
+    // the planner attached a checkable definition-of-done, put it in the builder's
+    // prompt so a weaker/local model targets the EXACT criteria the self-verify
+    // gate will check the diff against — the structure that gets glm's diffs to
+    // PASS review instead of merely produce a diff (2026-07-27).
+    if let Some(criteria) = load_acceptance_criteria(pg, item.work_item_id).await
+        && !criteria.is_empty()
+    {
+        let list = criteria
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("  {}. {}", i + 1, c))
+            .collect::<Vec<_>>()
+            .join("\n");
+        prompt = format!(
+            "ACCEPTANCE CRITERIA — your change is accepted ONLY when the diff satisfies EVERY one \
+             of these. Verify each before you finish:\n{list}\n\n{prompt}"
+        );
     }
 
     // Lane-1 health gate: the local codegen harness needs a local agent-capable

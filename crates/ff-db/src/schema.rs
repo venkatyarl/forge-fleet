@@ -12453,6 +12453,12 @@ pub const SCHEMA_V279_FLEET_LOGS: &str =
 pub const SCHEMA_V280_MERGE_FLEET_TABLES: &str =
     include_str!("migrations/20260728000000_merge_fleet_tables.sql");
 
+/// v281: natural-language acceptance criteria checklist on work_items (the
+/// Anthropic long-running-agent "feature list" pattern) — planner writes it,
+/// builder targets it, self-verify checks the diff against it.
+pub const SCHEMA_V281_WORK_ITEM_ACCEPTANCE_CRITERIA: &str =
+    include_str!("migrations/20260728100000_work_item_acceptance_criteria.sql");
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

@@ -10,6 +10,11 @@ struct LeafTask {
     files: Vec<String>,
     #[serde(default)]
     complexity: Option<String>,
+    /// Checkable "definition of done" the builder targets + the self-verify gate
+    /// checks the diff against (the Anthropic long-running-agent feature-list
+    /// pattern). Empty when the planner omitted it (older model / degraded).
+    #[serde(default)]
+    acceptance_criteria: Vec<String>,
 }
 
 pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()> {
@@ -1008,9 +1013,16 @@ async fn handle_pm_decompose(
          when useful>\", \"files\": [\"<repo-relative path(s) this task edits — \
          prefer exactly one; every path MUST be a file that already exists in \
          the repository (scope new code into existing files)>\"], \
-         \"complexity\": \"<mechanical|moderate|complex>\"}}. \
+         \"complexity\": \"<mechanical|moderate|complex>\", \
+         \"acceptance_criteria\": [\"<2-5 SHORT, SPECIFIC, CHECKABLE statements of \
+         what a CORRECT implementation must satisfy — the reviewer/builder verifies \
+         the diff against EACH one. Be concrete: name the exact function/symbol, \
+         the exact behavior, and that it compiles. e.g. 'greet() has a /// doc \
+         comment', 'the comment describes the return value', 'cargo check passes'. \
+         Avoid vague criteria like 'works correctly'>\"]}}. \
          `complexity` = mechanical for a one-file localized edit, complex for a \
-         cross-cutting change. \
+         cross-cutting change. The acceptance_criteria are the DEFINITION OF DONE — \
+         the build is only accepted when the diff satisfies every one. \
          GOAL:\n{goal_text}"
     );
 
@@ -1087,6 +1099,7 @@ async fn handle_pm_decompose(
             repo_context.as_ref(),
             &t.files,
             complexity,
+            &t.acceptance_criteria,
         )
         .await?;
         ids.push(row.0);
@@ -1561,7 +1574,14 @@ async fn insert_decomposed_work_item(
     repo_context: Option<&crate::repo_context::RepoContext>,
     predicted_paths: &[String],
     complexity: &str,
+    acceptance_criteria: &[String],
 ) -> Result<(uuid::Uuid,)> {
+    // NULL when empty so an un-graded task is distinguishable from "0 criteria".
+    let criteria_json = if acceptance_criteria.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!(acceptance_criteria))
+    };
     sqlx::query_as(decomposed_work_item_insert_sql())
         .bind(project)
         .bind(title)
@@ -1577,6 +1597,7 @@ async fn insert_decomposed_work_item(
         )
         .bind(serde_json::json!(predicted_paths))
         .bind(complexity)
+        .bind(criteria_json)
         .fetch_one(pool)
         .await
         .map_err(|e| anyhow::anyhow!("insert child task: {e}"))
@@ -1584,8 +1605,8 @@ async fn insert_decomposed_work_item(
 
 fn decomposed_work_item_insert_sql() -> &'static str {
     "INSERT INTO work_items \
-        (project_id, kind, title, description, priority, created_by, parent_id, repo_id, repo_url, repo_path, predicted_paths, complexity, context, pre_work, work, post_work) \
-     VALUES ($1, 'task', $2, $3, 'normal', $4, $5, $6, $7, $8, $9, $10, \
+        (project_id, kind, title, description, priority, created_by, parent_id, repo_id, repo_url, repo_path, predicted_paths, complexity, acceptance_criteria, context, pre_work, work, post_work) \
+     VALUES ($1, 'task', $2, $3, 'normal', $4, $5, $6, $7, $8, $9, $10, $11, \
         COALESCE((SELECT context FROM work_items WHERE id = $5), '{}'::jsonb), \
         COALESCE((SELECT pre_work FROM work_items WHERE id = $5), '[]'::jsonb), \
         COALESCE((SELECT work FROM work_items WHERE id = $5), '[]'::jsonb), \
