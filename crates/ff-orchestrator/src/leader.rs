@@ -32,8 +32,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use ff_core::Tier;
 use ff_core::leader::ElectionState;
 
+use crate::llm_router::{LlmCandidate, LlmRouter};
 use crate::placement::PlacementPolicy;
 use crate::queue::{PriorityQueue, QueuedTask};
 use crate::scheduler::{
@@ -70,6 +72,7 @@ impl NodeHealth {
 struct PendingAssignment {
     task_id: Uuid,
     assigned_at: DateTime<Utc>,
+    llm_candidate: Option<LlmCandidate>,
 }
 
 /// Result of submitting a task to the leader coordinator.
@@ -108,6 +111,8 @@ pub struct AgentTask {
     pub priority: TaskPriority,
     /// Resource requirements.
     pub requirements: ResourceRequirements,
+    /// LLM selected for this task, when a router was configured for the tick.
+    pub llm_candidate: Option<LlmCandidate>,
 }
 
 /// Result returned to an agent after it heartbeats to the leader.
@@ -130,6 +135,8 @@ pub struct Assignment {
     pub worker_name: String,
     /// Placement score for the assignment.
     pub score: f64,
+    /// LLM selected for this task, when a router was configured for the tick.
+    pub llm_candidate: Option<LlmCandidate>,
 }
 
 /// A single preemption produced by a leader tick.
@@ -143,6 +150,8 @@ pub struct Preemption {
     pub evict_task_id: Uuid,
     /// Placement score.
     pub score: f64,
+    /// LLM selected for this task, when a router was configured for the tick.
+    pub llm_candidate: Option<LlmCandidate>,
 }
 
 /// Result of running one leader scheduling tick.
@@ -368,6 +377,7 @@ impl LeaderCoordinator {
                 description: task.description,
                 priority: task.effective_priority,
                 requirements: task.requirements,
+                llm_candidate: pending.llm_candidate,
             })
         } else {
             None
@@ -390,6 +400,24 @@ impl LeaderCoordinator {
     ///    all receive work in the same tick.
     /// 4. Records pending assignments to be confirmed by agent heartbeats.
     pub fn tick(&mut self) -> TickResult {
+        self.tick_without_llm_router()
+    }
+
+    /// Run one leader scheduling tick and select an LLM for each assignment.
+    ///
+    /// Node placement still goes through the existing scheduler. The router
+    /// only decides which LLM endpoint the assigned worker should use. When no
+    /// LLM is currently routable for a queued task, the task remains unreserved
+    /// in the queue and no node capacity is consumed.
+    pub async fn tick_with_llm_router(&mut self, llm_router: &dyn LlmRouter) -> TickResult {
+        self.tick_inner(Some(llm_router)).await
+    }
+
+    fn tick_without_llm_router(&mut self) -> TickResult {
+        futures::executor::block_on(self.tick_inner(None))
+    }
+
+    async fn tick_inner(&mut self, llm_router: Option<&dyn LlmRouter>) -> TickResult {
         if !self.am_i_leader() {
             return TickResult::empty();
         }
@@ -426,6 +454,23 @@ impl LeaderCoordinator {
         for task in candidates {
             let scheduled = ScheduledTask::from_queued(&task);
             let task_id = scheduled.id;
+            let llm_candidate = if let Some(llm_router) = llm_router {
+                match llm_router
+                    .select_next_llm(preferred_llm_tier(&scheduled))
+                    .await
+                {
+                    Some(candidate) => Some(candidate),
+                    None => {
+                        debug!(
+                            task_id = %task_id,
+                            "task remains queued because no LLM route is available"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
 
             match self
                 .scheduler
@@ -439,12 +484,14 @@ impl LeaderCoordinator {
                         PendingAssignment {
                             task_id,
                             assigned_at: Utc::now(),
+                            llm_candidate: llm_candidate.clone(),
                         },
                     );
                     result.assignments.push(Assignment {
                         task_id,
                         worker_name,
                         score,
+                        llm_candidate,
                     });
                 }
                 ScheduleDecision::Preempt {
@@ -459,6 +506,7 @@ impl LeaderCoordinator {
                         PendingAssignment {
                             task_id,
                             assigned_at: Utc::now(),
+                            llm_candidate: llm_candidate.clone(),
                         },
                     );
                     result.preemptions.push(Preemption {
@@ -466,6 +514,7 @@ impl LeaderCoordinator {
                         worker_name,
                         evict_task_id,
                         score,
+                        llm_candidate,
                     });
                 }
                 ScheduleDecision::Queue { reason } => {
@@ -576,6 +625,14 @@ impl LeaderCoordinator {
     }
 }
 
+fn preferred_llm_tier(task: &ScheduledTask) -> Tier {
+    match task.priority {
+        TaskPriority::Critical | TaskPriority::High => Tier::Tier3,
+        TaskPriority::Normal => Tier::Tier2,
+        TaskPriority::Low | TaskPriority::Background => Tier::Tier1,
+    }
+}
+
 // ─── Conversions between queue and scheduler task types ──────────────────────
 
 impl QueuedTask {
@@ -619,6 +676,42 @@ mod tests {
     use super::*;
 
     use crate::scheduler::ResourceRequirements;
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct StaticLlmRouter {
+        candidate: Option<LlmCandidate>,
+        requested_tiers: Mutex<Vec<Tier>>,
+    }
+
+    impl StaticLlmRouter {
+        fn new(candidate: Option<LlmCandidate>) -> Self {
+            Self {
+                candidate,
+                requested_tiers: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requested_tiers(&self) -> Vec<Tier> {
+            self.requested_tiers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmRouter for StaticLlmRouter {
+        async fn select_next_llm(&self, preferred_tier: Tier) -> Option<LlmCandidate> {
+            self.requested_tiers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(preferred_tier);
+            self.candidate.clone()
+        }
+
+        async fn report_failure(&self, _candidate: &LlmCandidate, _kind: crate::LlmFailureKind) {}
+    }
 
     fn make_node(name: &str, cpus: u32, mem: u64, gpu: bool) -> NodeCapacity {
         NodeCapacity::from_config(name.to_string(), cpus, mem, gpu)
@@ -640,6 +733,15 @@ mod tests {
             since: Utc::now(),
         });
         coordinator
+    }
+
+    fn make_llm_candidate() -> LlmCandidate {
+        LlmCandidate {
+            model_id: "qwen3-coder-30b".to_string(),
+            model_name: "Qwen3 Coder 30B".to_string(),
+            endpoint: "http://worker-1:8000/v1".to_string(),
+            tier: Tier::Tier2,
+        }
     }
 
     #[test]
@@ -692,6 +794,57 @@ mod tests {
         coordinator.heartbeat_from_agent("james");
         coordinator.heartbeat_from_agent("marcus");
         assert_eq!(coordinator.queued_task_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_router_tick_attaches_llm_to_assignment_and_agent_task() {
+        let mut coordinator = make_leader("taylor");
+        coordinator.register_node(make_node("james", 16, 64, false));
+        let router = StaticLlmRouter::new(Some(make_llm_candidate()));
+
+        let submit_result = coordinator.submit_task(make_task("build feature", 4, 8));
+        let tick = coordinator.tick_with_llm_router(&router).await;
+
+        assert_eq!(tick.assignments.len(), 1);
+        assert_eq!(tick.assignments[0].task_id, submit_result.task_id);
+        assert_eq!(
+            tick.assignments[0]
+                .llm_candidate
+                .as_ref()
+                .map(|candidate| candidate.model_id.as_str()),
+            Some("qwen3-coder-30b")
+        );
+        assert_eq!(router.requested_tiers(), vec![Tier::Tier2]);
+
+        let heartbeat = coordinator.heartbeat_from_agent("james");
+        assert_eq!(
+            heartbeat
+                .assigned_task
+                .as_ref()
+                .and_then(|task| task.llm_candidate.as_ref())
+                .map(|candidate| candidate.endpoint.as_str()),
+            Some("http://worker-1:8000/v1")
+        );
+        assert_eq!(coordinator.queued_task_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_router_tick_leaves_task_queued_without_llm_candidate() {
+        let mut coordinator = make_leader("taylor");
+        coordinator.register_node(make_node("james", 16, 64, false));
+        let router = StaticLlmRouter::new(None);
+
+        coordinator.submit_task(make_task("build feature", 4, 8));
+        let tick = coordinator.tick_with_llm_router(&router).await;
+
+        assert!(tick.assignments.is_empty());
+        assert_eq!(coordinator.queued_task_count(), 1);
+        assert!(
+            coordinator
+                .heartbeat_from_agent("james")
+                .assigned_task
+                .is_none()
+        );
     }
 
     #[test]

@@ -7,11 +7,12 @@
 
 use async_trait::async_trait;
 use ff_core::Tier;
+use serde::{Deserialize, Serialize};
 
 // ─── Candidate ───────────────────────────────────────────────────────────────
 
 /// A concrete LLM selected by the router.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmCandidate {
     /// Model identifier (e.g. `qwen3-32b`).
     pub model_id: String,
