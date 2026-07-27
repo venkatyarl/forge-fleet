@@ -1007,7 +1007,43 @@ pub(crate) fn parse_review_response(response: &str) -> (bool, String) {
         return (false, "empty review response".to_string());
     };
 
-    let approved = first_line.to_uppercase().starts_with("APPROVE");
+    // VERDICT PARSE — reasoning-model tolerant (2026-07-27). The old rule required
+    // the FIRST line to start with "APPROVE", which fails for a REASONING reviewer
+    // (glm-4.5-air, Qwen/DeepSeek): it writes its analysis first and emits the
+    // verdict later, or approves in PROSE without the bare keyword — so a review
+    // that literally said "The diff correctly and cleanly implements the work item,
+    // does not degrade code, cargo test shows no failures" was parsed as REJECTED
+    // (starts_with APPROVE = false → default reject). That single mis-parse was
+    // why local (glm) builds NEVER merged despite glm producing good diffs AND
+    // approving them. Now: scan the WHOLE response for an explicit verdict token
+    // (an APPROVE/REJECT line anywhere), and only fall back to the first line.
+    let upper = response.to_uppercase();
+    // Explicit verdict lines win, checked in reject-first order (a review that says
+    // both is being cautious → treat as reject). A line that IS a verdict, not just
+    // the word buried in prose: it starts the trimmed line.
+    let has_verdict_line = |needle: &str| {
+        response
+            .lines()
+            .map(|l| l.trim().to_uppercase())
+            .any(|l| l.starts_with(needle) || l == needle || l.contains(&format!("VERDICT: {needle}")))
+    };
+    let approved = if has_verdict_line("REJECT") {
+        false
+    } else if has_verdict_line("APPROVE") {
+        true
+    } else {
+        // No explicit verdict token anywhere — infer from prose. A clear positive
+        // review ("correctly implements", "no regressions", "tests pass") that
+        // lacks the keyword should NOT default to reject (the glm case). Require an
+        // affirmative signal AND the absence of a negative one.
+        let positive = ["correctly implement", "cleanly implement", "no regression", "no failures",
+                        "looks correct", "is correct", "meets the", "satisfies"]
+            .iter().any(|p| upper.contains(&p.to_uppercase()));
+        let negative = ["does not implement", "incorrect", "regression", "fails to", "missing",
+                        "should reject", "not acceptable", "bug"]
+            .iter().any(|n| upper.contains(&n.to_uppercase()));
+        positive && !negative
+    };
     let reason = response
         .lines()
         .skip(idx + 1)
@@ -1860,5 +1896,28 @@ mod tests {
         for other in ["BLOCKED", "UNSTABLE", "HAS_HOOKS", "", "clean"] {
             assert_eq!(parse_merge_state(other), PrMergeState::Other, "{other}");
         }
+    }
+}
+
+#[cfg(test)]
+mod verdict_parse_tests {
+    #[test]
+    fn reasoning_model_prose_approval_is_approved() {
+        // The EXACT text that was mis-parsed as reject (glm on duncan).
+        let (approved, _) = super::parse_review_response(
+            "The diff correctly and cleanly implements the requested work item, adds the tailscale flags, \
+             and updates the connection string. The diff does not degrade existing code and cargo test shows no failures.");
+        assert!(approved, "clear prose approval must not default to reject");
+    }
+    #[test]
+    fn explicit_verdict_lines_still_work() {
+        assert!(super::parse_review_response("APPROVE\nlooks good").0);
+        assert!(!super::parse_review_response("REJECT\nmissing the handler").0);
+        // reasoning first, verdict later:
+        assert!(super::parse_review_response("Let me analyze...\nThe change is fine.\nVERDICT: APPROVE").0);
+    }
+    #[test]
+    fn negative_prose_is_rejected() {
+        assert!(!super::parse_review_response("This does not implement the requirement; it is missing the config section.").0);
     }
 }
