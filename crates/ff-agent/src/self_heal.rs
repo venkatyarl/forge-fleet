@@ -181,15 +181,15 @@ fn is_task_level_cluster(sig: &str) -> bool {
 /// retry loop can never fix — the doctor parks + alerts on exactly these.
 fn is_infra_fault(sig: &str) -> bool {
     const INFRA: &[&str] = &[
-        "does not exist",              // missing DB column/table/relation
-        "column",                      // schema mismatch
+        "does not exist", // missing DB column/table/relation
+        "column",         // schema mismatch
         "relation",
         "migration",                   // migration crash
         "no healthy fleet deployment", // dead router
         "no dispatchable backend",
-        "could not fetch",             // git access broken
+        "could not fetch", // git access broken
         "refusing to build",
-        "syntax error",                // bad SQL/migration
+        "syntax error", // bad SQL/migration
         "connection refused",
         "pool timed out",
     ];
@@ -758,10 +758,20 @@ mod systemic_tests {
         );
         assert_ne!(r1, r2, "distinct per-task errors must NOT cluster");
         // Classifier: infra faults are parked; task-level clusters are NOT.
-        assert!(is_infra_fault(&normalize_error_signature("column \"build_started_at\" does not exist")));
-        assert!(is_infra_fault(&normalize_error_signature("no healthy fleet deployment")));
-        assert!(is_task_level_cluster(&normalize_error_signature("failed after 5 stalled attempts (max 5 reached)")));
-        assert!(is_task_level_cluster(&normalize_error_signature("in-place review rejected by codex: The diff is empty")));
-        assert!(!is_infra_fault(&normalize_error_signature("failed after 5 stalled attempts")));
+        assert!(is_infra_fault(&normalize_error_signature(
+            "column \"build_started_at\" does not exist"
+        )));
+        assert!(is_infra_fault(&normalize_error_signature(
+            "no healthy fleet deployment"
+        )));
+        assert!(is_task_level_cluster(&normalize_error_signature(
+            "failed after 5 stalled attempts (max 5 reached)"
+        )));
+        assert!(is_task_level_cluster(&normalize_error_signature(
+            "in-place review rejected by codex: The diff is empty"
+        )));
+        assert!(!is_infra_fault(&normalize_error_signature(
+            "failed after 5 stalled attempts"
+        )));
     }
 }
