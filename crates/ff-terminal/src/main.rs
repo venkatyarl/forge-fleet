@@ -8045,6 +8045,40 @@ mod jira_cli_tests {
 }
 
 #[cfg(test)]
+mod durable_session_cli_tests {
+    use super::{Cli, Command, SessionCommand};
+    use clap::Parser;
+
+    #[test]
+    fn durable_workstream_commands_are_exposed_under_ff_session() {
+        for args in [
+            vec!["ff", "session", "status", "--project", "forge-fleet"],
+            vec!["ff", "session", "attach", "--project", "forge-fleet"],
+            vec!["ff", "session", "resume", "--project", "forge-fleet"],
+            vec![
+                "ff",
+                "session",
+                "note",
+                "handoff is durable",
+                "--project",
+                "forge-fleet",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("durable session command should parse");
+            assert!(matches!(
+                cli.command,
+                Some(Command::Session {
+                    command: SessionCommand::Status { .. }
+                        | SessionCommand::Attach { .. }
+                        | SessionCommand::Resume { .. }
+                        | SessionCommand::Note { .. }
+                })
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
 mod fleet_deploy_cli_tests {
     use super::{Cli, Command, FleetCommand};
     use clap::Parser;
