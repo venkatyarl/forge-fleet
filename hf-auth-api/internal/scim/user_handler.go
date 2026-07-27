@@ -26,11 +26,20 @@ type UserService interface {
 }
 
 type UserHandler struct {
-	users UserService
+	users  UserService
+	events any
 }
 
 func NewUserHandler(users UserService) *UserHandler {
 	return &UserHandler{users: users}
+}
+
+func NewUserHandlerWithEventBus(users UserService, events any) *UserHandler {
+	return &UserHandler{users: users, events: events}
+}
+
+func NewUserHandlerWithEvents(users UserService, events any) *UserHandler {
+	return NewUserHandlerWithEventBus(users, events)
 }
 
 func (h *UserHandler) HandleCreateUser(w http.ResponseWriter, r *http.Request) {
@@ -47,7 +56,7 @@ func (h *UserHandler) HandleCreateUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *UserHandler) HandleUpdateUser(w http.ResponseWriter, r *http.Request) {
-	attributes, ok := attributesFromRequest(w, r)
+	attributes, token, ok := userTokenFromRequest(w, r)
 	if !ok {
 		return
 	}
@@ -62,6 +71,19 @@ func (h *UserHandler) HandleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		writeSCIMError(w, http.StatusBadRequest, "scim: user id is required")
 		return
 	}
+	if token.ActiveProvided && !token.Active {
+		user, err := h.deactivateUser(r.Context(), id)
+		if err != nil {
+			writeSCIMError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := h.publishUserDeprovisioned(r.Context(), user); err != nil {
+			writeSCIMError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, user)
+		return
+	}
 	user, err := h.users.UpdateUser(r.Context(), id, attributes)
 	if err != nil {
 		writeSCIMError(w, http.StatusInternalServerError, err.Error())
@@ -71,22 +93,27 @@ func (h *UserHandler) HandleUpdateUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func attributesFromRequest(w http.ResponseWriter, r *http.Request) (*User, bool) {
+	attributes, _, ok := userTokenFromRequest(w, r)
+	return attributes, ok
+}
+
+func userTokenFromRequest(w http.ResponseWriter, r *http.Request) (*User, *ScimToken, bool) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeSCIMError(w, http.StatusBadRequest, "scim: read request body")
-		return nil, false
+		return nil, nil, false
 	}
 	token, err := ParseScimToken(body)
 	if err != nil {
 		writeSCIMError(w, http.StatusBadRequest, err.Error())
-		return nil, false
+		return nil, nil, false
 	}
 	attributes, err := token.MapToUserAttributes()
 	if err != nil {
 		writeSCIMError(w, http.StatusBadRequest, err.Error())
-		return nil, false
+		return nil, nil, false
 	}
-	return attributes, true
+	return attributes, token, true
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
