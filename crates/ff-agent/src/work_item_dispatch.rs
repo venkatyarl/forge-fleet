@@ -3866,6 +3866,27 @@ async fn run_ff_dispatch(
         policy.preferred_cloud_backstop = Some(preferred);
         ff_routing_policy::promote_cloud_backstop(&mut backends, &policy);
     }
+    // ROTATE AWAY FROM A BACKEND THAT JUST PRODUCED NO DIFF (operator 2026-07-26):
+    // if the item's last_error names the backend that failed with "produced no
+    // diff", DEPRIORITIZE it (move to the end of the try-order) so this attempt
+    // fronts a DIFFERENT LLM. Without this the weak id+attempts rotation could
+    // keep re-picking the same backend (kimi) that already stalled — the operator
+    // saw "backend kimi produced no diff — FAILED after max retries" with the
+    // other LLMs never tried. Now a no-diff on kimi → next attempt fronts codex
+    // (or the local lane), converging on an LLM that actually applies the change.
+    if let Some(dead) = last_no_diff_backend(item.last_error.as_deref())
+        && backends.len() > 1
+        && let Some(pos) = backends.iter().position(|b| b == &dead)
+    {
+        let b = backends.remove(pos);
+        backends.push(b);
+        info!(
+            work_item_id = %item.work_item_id,
+            deprioritized = %dead,
+            now_fronting = %backends.first().cloned().unwrap_or_default(),
+            "run_ff_dispatch: last attempt's backend produced no diff — rotating to a different LLM"
+        );
+    }
     let computer_id = item.computer_id;
     let forced_backend = primary_or_default_backend(&backends);
     let mut attempted_backend = false;
@@ -4277,6 +4298,24 @@ static CAPACITY_LOAD_STARTED: std::sync::atomic::AtomicBool =
 /// request uses the legacy SQL picker. Refresh failures retain the last good
 /// snapshot inside `ff-capacity`, so registry outages do not enter the token
 /// path.
+/// Extract the backend name from a `last_error` of the form
+/// "backend <X> produced no diff (no commits) — required change not applied".
+/// Used to deprioritize that backend on the next attempt so a no-diff failure
+/// rotates to a DIFFERENT LLM instead of re-picking the one that just stalled.
+/// Returns None when the error isn't a named-backend no-diff. PURE (testable).
+fn last_no_diff_backend(last_error: Option<&str>) -> Option<String> {
+    let e = last_error?;
+    if !e.contains("produced no diff") {
+        return None;
+    }
+    // "backend kimi produced no diff …" → the token after "backend ".
+    let after = e.split("backend ").nth(1)?;
+    let name = after.split_whitespace().next()?;
+    // Only accept known backend names to avoid grabbing stray words.
+    matches!(name, "codex" | "kimi" | "claude" | "gemini" | "grok")
+        .then(|| name.to_string())
+}
+
 async fn routed_backends(pg: &PgPool, computer_id: Uuid, fresh_secs: i64) -> Vec<String> {
     if let Some(snapshot) = CAPACITY_SNAPSHOT.get() {
         let cutoff = chrono::Utc::now() - chrono::Duration::seconds(fresh_secs);
