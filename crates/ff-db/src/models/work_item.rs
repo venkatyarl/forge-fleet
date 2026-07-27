@@ -444,14 +444,23 @@ mod tests {
             return;
         };
 
-        sqlx::query("INSERT INTO projects (id) VALUES ('p1')")
+        sqlx::query("INSERT INTO projects (id) VALUES ('hireflow360')")
             .execute(&pool)
             .await
             .unwrap();
 
-        let item = sample("p1");
+        let mut item = sample("hireflow360");
+        item.kind = "jira".to_string();
+        item.metadata = serde_json::json!({
+            "jira_issue_id": "10001",
+            "jira_issue_key": "HFPROD-268",
+            "jira_url": "https://hireflow360.atlassian.net/browse/HFPROD-268"
+        });
         let inserted = item.insert(&pool).await.unwrap();
         assert_eq!(inserted.id, item.id);
+        assert_eq!(inserted.project_id, "hireflow360");
+        assert_eq!(inserted.kind, "jira");
+        assert_eq!(inserted.metadata["jira_issue_key"], "HFPROD-268");
         assert_eq!(inserted.title, "derived work item");
         assert_eq!(inserted.status, "idea");
 
