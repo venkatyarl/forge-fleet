@@ -48,6 +48,7 @@ pub mod tool_path;
 pub mod types;
 pub mod url;
 pub mod verifier;
+pub mod work_queue;
 
 use serde::{Deserialize, Serialize};
 
