@@ -1389,11 +1389,22 @@ fn repo_context_from_binding(
 /// `fleet_oneshot` prefers then fails over from. Data-driven (no hardcoded
 /// names); `None` when nothing qualifies → caller keeps default routing.
 async fn strongest_planner_hint(pool: &sqlx::PgPool) -> Option<String> {
+    // Pick the strongest tool-calling model that is ACTUALLY SERVING right now —
+    // healthy AND fresh (health probed in the last 180s), the same routability bar
+    // the router uses. Without the freshness gate this returned a STALE 'healthy'
+    // row for a dead endpoint (Qwen3-Coder-30B-A3B lingered 'healthy' after it
+    // stopped serving), so decompose pinned that hint and fleet_oneshot then found
+    // "no healthy fleet deployment" — the feeder silently failed to decompose ANY
+    // idea for days (operator 2026-07-26). With the gate it picks glm-4.5-air
+    // (tool-calling, healthy+fresh on ~10 nodes) instead. Go through the router's
+    // real live state, never a name that isn't servable.
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT cat.name \
            FROM fleet_model_deployments d \
            JOIN fleet_model_catalog cat ON cat.id = d.catalog_id \
-          WHERE d.health_status = 'healthy' \
+          WHERE d.desired_state = 'active' \
+            AND d.health_status = 'healthy' \
+            AND EXTRACT(EPOCH FROM (now() - d.last_health_at)) <= 180 \
             AND cat.tool_calling = TRUE \
             AND cat.name IS NOT NULL AND cat.name <> '' \
           ORDER BY cat.tier DESC, d.last_health_at DESC NULLS LAST \
