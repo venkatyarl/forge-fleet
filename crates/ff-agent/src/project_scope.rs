@@ -10,7 +10,7 @@
 //! server-side, keyed off the working directory. Format is stable across clone
 //! paths and SSH aliases: `github.com/org/repo`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -21,6 +21,15 @@ use sqlx::PgPool;
 pub struct ResolvedProjectSession {
     pub project_id: String,
     pub session_id: Option<String>,
+}
+
+/// Path-independent identities discovered for a project root.  Callers that
+/// have access to Postgres must still apply `ff_workstreams.aliases` last.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectIdentity {
+    pub explicit: Option<String>,
+    pub git_remote: Option<String>,
+    pub basename: Option<String>,
 }
 
 /// Resolve a stable project id from `dir` (or the process cwd when `None`).
@@ -37,32 +46,121 @@ pub struct ResolvedProjectSession {
 ///
 /// The returned value is the bare id — callers set `scope_type = "project"`.
 pub fn resolve_from_dir(dir: Option<&Path>) -> Option<String> {
-    if let Some(id) = marker_project_id(dir) {
-        return Some(id);
-    }
-    let git = |args: &[&str]| -> Option<String> {
-        let mut cmd = Command::new("git");
-        if let Some(d) = dir {
-            cmd.arg("-C").arg(d);
+    let identity = identity_from_dir(dir)?;
+    identity
+        .explicit
+        .or(identity.git_remote)
+        .or(identity.basename)
+}
+
+/// Resolve the project root before deriving identity, so opening `repo/src`
+/// never scopes the session to a generic leaf such as `src`.
+pub fn identity_from_dir(dir: Option<&Path>) -> Option<ProjectIdentity> {
+    let start = dir
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())?;
+    let explicit = marker_project_id(Some(&start));
+    let root = project_root(&start);
+    let git_remote = git_remote_at(&root).or_else(|| one_level_down_remote(&root));
+    let basename = human_project_dir(&start, &root)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(normalize_project_name);
+    Some(ProjectIdentity {
+        explicit,
+        git_remote,
+        basename,
+    })
+}
+
+fn project_root(start: &Path) -> PathBuf {
+    let mut markers = Vec::new();
+    for ancestor in start.ancestors() {
+        if has_project_marker(ancestor) {
+            markers.push(ancestor.to_path_buf());
         }
-        let out = cmd.args(args).output().ok()?;
-        if !out.status.success() {
-            return None;
+    }
+    // The outermost manifest is the project root; an explicit marker or git
+    // checkout is a stronger boundary and therefore wins when encountered.
+    markers
+        .iter()
+        .find(|path| {
+            path.join(".forgefleet/project").is_file()
+                || path.join(".forgefleet-project").is_file()
+                || path.join(".git").exists()
+        })
+        .cloned()
+        .or_else(|| markers.last().cloned())
+        .unwrap_or_else(|| start.to_path_buf())
+}
+
+fn has_project_marker(path: &Path) -> bool {
+    [
+        ".git",
+        ".forgefleet/project",
+        ".forgefleet-project",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+    ]
+    .iter()
+    .any(|marker| path.join(marker).exists())
+}
+
+fn git_remote_at(path: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .and_then(|url| canonical_remote(&url))
+}
+
+fn one_level_down_remote(root: &Path) -> Option<String> {
+    let mut children = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join(".git").exists())
+        .collect::<Vec<_>>();
+    children.sort();
+    children.into_iter().find_map(|path| git_remote_at(&path))
+}
+
+fn human_project_dir<'a>(start: &'a Path, detected_root: &'a Path) -> &'a Path {
+    const WORKSPACES: &[&str] = &["projects", "business", "downloads"];
+    for ancestor in start.ancestors() {
+        if let Some(parent) = ancestor.parent()
+            && parent
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|name| WORKSPACES.contains(&name.to_ascii_lowercase().as_str()))
+        {
+            return ancestor;
         }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if s.is_empty() { None } else { Some(s) }
-    };
-    if let Some(url) = git(&["remote", "get-url", "origin"])
-        && let Some(canon) = canonical_remote(&url)
-    {
-        return Some(canon);
+        if ancestor
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|s| s.to_str())
+            .is_some_and(|name| name.starts_with("sub-agent-"))
+        {
+            return ancestor;
+        }
     }
-    if let Some(top) = git(&["rev-parse", "--show-toplevel"])
-        && let Some(base) = Path::new(&top).file_name().and_then(|s| s.to_str())
-    {
-        return Some(format!("local:{}", base.to_lowercase()));
-    }
-    None
+    detected_root
+}
+
+fn normalize_project_name(name: &str) -> String {
+    name.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 /// Resolve a stable project id from `dir` and attach this client session to the
@@ -137,10 +235,15 @@ fn marker_project_id(dir: Option<&Path>) -> Option<String> {
     };
     let mut cur: &Path = start.as_path();
     for _ in 0..64 {
-        if let Ok(content) = std::fs::read_to_string(cur.join(".forgefleet-project"))
-            && let Some(id) = marker_id_from_contents(&content)
-        {
-            return Some(id);
+        for marker in [
+            cur.join(".forgefleet/project"),
+            cur.join(".forgefleet-project"),
+        ] {
+            if let Ok(content) = std::fs::read_to_string(marker)
+                && let Some(id) = marker_id_from_contents(&content)
+            {
+                return Some(id);
+            }
         }
         match cur.parent() {
             Some(p) => cur = p,
@@ -273,6 +376,31 @@ mod tests {
         assert_eq!(
             resolve_from_dir(Some(&sub)).as_deref(),
             Some("acme/monorepo")
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn nested_folder_uses_project_root_not_leaf() {
+        let tmp = std::env::temp_dir().join(format!("ffroot_{}", std::process::id()));
+        let sub = tmp.join("HireFlow360/src/api");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(tmp.join("HireFlow360/package.json"), "{}").unwrap();
+        let identity = identity_from_dir(Some(&sub)).unwrap();
+        assert_eq!(identity.basename.as_deref(), Some("hireflow360"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn forgefleet_project_file_ranks_above_other_identity() {
+        let tmp = std::env::temp_dir().join(format!("ffexplicit_{}", std::process::id()));
+        let sub = tmp.join("repo/src");
+        std::fs::create_dir_all(tmp.join("repo/.forgefleet")).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(tmp.join("repo/.forgefleet/project"), "operator-project\n").unwrap();
+        assert_eq!(
+            resolve_from_dir(Some(&sub)).as_deref(),
+            Some("operator-project")
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
