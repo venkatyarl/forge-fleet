@@ -266,6 +266,16 @@ async fn dispatch_to_candidate(
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": false,
+        // EXPLICIT generous token budget (2026-07-27). Without max_tokens the
+        // server default cap truncated the response — fatal for a REASONING model
+        // (glm-4.5-air, Qwen/DeepSeek reasoners): it spends hundreds of tokens
+        // "thinking" in reasoning_content BEFORE emitting the answer/edit block in
+        // content, so a low cap cut it off mid-think → empty content → codegen saw
+        // no edit block → 0 completions (proven root cause). 4096 leaves ample
+        // room for the think + a multi-block SEARCH/REPLACE answer within the 32K
+        // ctx. temperature low for deterministic, format-faithful edits.
+        "max_tokens": 4096,
+        "temperature": 0.2,
     });
     let start = std::time::Instant::now();
 
@@ -469,9 +479,27 @@ pub(crate) fn extract_completion_text(payload: &Value) -> Option<String> {
         .get("message")
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
-        && !content.is_empty()
+        && !content.trim().is_empty()
     {
         return Some(content.to_string());
+    }
+    // REASONING-MODEL FALLBACK (2026-07-27): a reasoning model (glm-4.5-air, and
+    // the Qwen/DeepSeek reasoners) splits its output — it "thinks" in
+    // `message.reasoning_content` and emits the ANSWER in `message.content`. But
+    // when the response is short OR the token budget runs out mid-think, `content`
+    // comes back EMPTY while the actual answer (including the code / edit block)
+    // sits in `reasoning_content`. Reading only `content` then loses it entirely
+    // — the root cause of glm completing 0 codegen builds (proven: a 400-token
+    // codegen call returned empty content, full answer in reasoning_content). Fall
+    // back to reasoning_content so the caller still gets the model's work; the
+    // codegen parser tolerates the surrounding think-prose.
+    if let Some(reasoning) = choice
+        .get("message")
+        .and_then(|m| m.get("reasoning_content"))
+        .and_then(|c| c.as_str())
+        && !reasoning.trim().is_empty()
+    {
+        return Some(reasoning.to_string());
     }
     choice
         .get("text")
