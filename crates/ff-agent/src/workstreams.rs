@@ -79,14 +79,32 @@ const WORKSTREAM_COLUMNS: &str = "id, project_id, project_key, git_remote, basen
 /// Resolve the workstream for a project key (the session-of-record clients
 /// attach to). `None` if the project has no workstream yet.
 pub async fn workstream_for_project(pg: &PgPool, project_key: &str) -> Result<Option<Workstream>> {
-    let ws = sqlx::query_as::<_, Workstream>(&format!(
-        "SELECT {WORKSTREAM_COLUMNS} FROM ff_workstreams \
-             WHERE project_id = $1 OR project_key = $1"
+    let all = sqlx::query_as::<_, Workstream>(&format!(
+        "SELECT {WORKSTREAM_COLUMNS} FROM ff_workstreams WHERE status = 'active'"
     ))
-    .bind(project_key)
-    .fetch_optional(pg)
+    .fetch_all(pg)
     .await?;
-    Ok(ws)
+
+    // Explicit aliases are operator overrides and therefore win even if the
+    // supplied value also happens to be another row's derived project key.
+    if let Some(ws) = all
+        .iter()
+        .find(|ws| alias_matches(&ws.aliases, project_key))
+    {
+        return Ok(Some(ws.clone()));
+    }
+    Ok(all
+        .into_iter()
+        .find(|ws| ws.project_id == project_key || ws.project_key == project_key))
+}
+
+fn alias_matches(aliases: &serde_json::Value, candidate: &str) -> bool {
+    aliases.as_object().is_some_and(|aliases| {
+        aliases.contains_key(candidate)
+            || aliases
+                .values()
+                .any(|value| value.as_str() == Some(candidate))
+    })
 }
 
 /// Attach a client session as an open workstream thread and publish its current
@@ -177,13 +195,9 @@ pub async fn workstream_for_dir(pg: &PgPool, cwd: &std::path::Path) -> Result<Op
 
     // Alias-map override wins over every derived identity.
     for ws in &all {
-        if let Some(aliases) = ws.aliases.as_object()
-            && candidates.iter().any(|candidate| {
-                aliases.contains_key(*candidate)
-                    || aliases
-                        .values()
-                        .any(|value| value.as_str() == Some(*candidate))
-            })
+        if candidates
+            .iter()
+            .any(|candidate| alias_matches(&ws.aliases, candidate))
         {
             return Ok(Some(ws.clone()));
         }
@@ -221,9 +235,7 @@ pub async fn workstream_for_dir(pg: &PgPool, cwd: &std::path::Path) -> Result<Op
 
 /// Attach an authenticated fleet operator and refresh durable presence.
 pub async fn attach_operator(pg: &PgPool, ws: &Workstream, operator_identity: &str) -> Result<()> {
-    if operator_identity.trim().is_empty() || operator_identity != ws.owner_identity {
-        anyhow::bail!("operator fleet identity is not authorized for this workstream");
-    }
+    authorize_operator(ws, operator_identity)?;
     sqlx::query(
         "INSERT INTO session_attachments \
             (workstream_id, operator_identity, attached_at, last_seen_at) \
@@ -235,6 +247,14 @@ pub async fn attach_operator(pg: &PgPool, ws: &Workstream, operator_identity: &s
     .bind(operator_identity)
     .execute(pg)
     .await?;
+    Ok(())
+}
+
+/// Enforce owner scoping for read-only and mutating session operations.
+pub fn authorize_operator(ws: &Workstream, operator_identity: &str) -> Result<()> {
+    if operator_identity.trim().is_empty() || operator_identity != ws.owner_identity {
+        anyhow::bail!("operator fleet identity is not authorized for this workstream");
+    }
     Ok(())
 }
 
@@ -356,6 +376,8 @@ pub async fn report(
     if summary.is_some() {
         anyhow::bail!("working_summary is leader-owned; clients may report focus or notes only");
     }
+    let redacted_focus = focus.map(redact_secrets);
+    let redacted_note = note.map(redact_secrets);
     let ws_id: uuid::Uuid = sqlx::query_scalar(
         "UPDATE workstream_clients SET last_report_at = now() \
           WHERE session_id = $1 RETURNING workstream_id",
@@ -380,8 +402,8 @@ pub async fn report(
        RETURNING {WORKSTREAM_COLUMNS}"
     ))
     .bind(ws_id)
-    .bind(focus)
-    .bind(note)
+    .bind(redacted_focus.as_deref())
+    .bind(redacted_note.as_deref())
     .bind(session_id)
     .fetch_one(pg)
     .await?;
@@ -510,6 +532,43 @@ pub async fn attached_clients(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_workstream() -> Workstream {
+        Workstream {
+            id: uuid::Uuid::nil(),
+            project_id: "hireflow360".to_string(),
+            project_key: "hireflow360".to_string(),
+            git_remote: None,
+            basename: Some("hireflow360".to_string()),
+            aliases: serde_json::json!({
+                "github.com/acme/hireflow": true,
+                "legacy-hireflow": "hireflow360"
+            }),
+            goal: None,
+            working_summary: None,
+            focus: None,
+            open_threads: serde_json::json!([]),
+            status: "active".to_string(),
+            leader_generation: 0,
+            owner_identity: "operator:acme".to_string(),
+        }
+    }
+
+    #[test]
+    fn aliases_match_keys_and_values() {
+        let ws = test_workstream();
+        assert!(alias_matches(&ws.aliases, "github.com/acme/hireflow"));
+        assert!(alias_matches(&ws.aliases, "hireflow360"));
+        assert!(!alias_matches(&ws.aliases, "another-project"));
+    }
+
+    #[test]
+    fn workstream_reads_are_owner_scoped() {
+        let ws = test_workstream();
+        assert!(authorize_operator(&ws, "operator:acme").is_ok());
+        assert!(authorize_operator(&ws, "operator:other").is_err());
+        assert!(authorize_operator(&ws, "").is_err());
+    }
 
     #[test]
     fn notes_are_redacted_before_hash_or_persistence() {

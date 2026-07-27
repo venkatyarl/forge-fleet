@@ -1428,8 +1428,18 @@ fn local_failure_diagnosis_for(
     item: &AssignedWorkItem,
     builder: &str,
 ) -> Option<LocalFailureDiagnosis> {
+    local_failure_diagnosis_for_attempt(item, builder, None)
+}
+
+fn local_failure_diagnosis_for_attempt(
+    item: &AssignedWorkItem,
+    builder: &str,
+    retest_rescue_attempt: Option<i32>,
+) -> Option<LocalFailureDiagnosis> {
     let cloud_backend = normalized_cloud_backend(builder)?;
-    if item.attempts < ff_routing_policy::LOCAL_LANE_MAX_TRIES as i32 {
+    if retest_rescue_attempt.is_none()
+        && item.attempts < ff_routing_policy::LOCAL_LANE_MAX_TRIES as i32
+    {
         return None;
     }
 
@@ -1443,8 +1453,7 @@ fn local_failure_diagnosis_for(
         .take(1200)
         .collect::<String>();
     let lower = summary.to_ascii_lowercase();
-    let capability_hint = item.prefers_cloud_lane()
-        || lower.contains("timeout")
+    let capability_hint = lower.contains("timeout")
         || lower.contains("timed out")
         || lower.contains("hung")
         || lower.contains("stalled")
@@ -1468,7 +1477,7 @@ fn local_failure_diagnosis_for(
     };
 
     Some(LocalFailureDiagnosis {
-        rescue_attempt: item.attempts + 1,
+        rescue_attempt: retest_rescue_attempt.unwrap_or(item.attempts + 1),
         local_failure_summary: summary,
         cloud_backend: cloud_backend.clone(),
         cloud_diagnosis: format!(
@@ -1485,7 +1494,26 @@ async fn record_cloud_rescue_local_failure_diagnosis(
     item: &AssignedWorkItem,
     builder: &str,
 ) -> Result<()> {
-    let Some(diagnosis) = local_failure_diagnosis_for(item, builder) else {
+    let mut tx = pg.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+        .bind(item.work_item_id)
+        .execute(&mut *tx)
+        .await?;
+    let latest_diagnosis: Option<(i32, String)> = sqlx::query_as(
+        "SELECT rescue_attempt, remediation_status
+           FROM local_failure_diagnoses
+          WHERE work_item_id = $1
+          ORDER BY rescue_attempt DESC
+          LIMIT 1",
+    )
+    .bind(item.work_item_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let retest_rescue_attempt = latest_diagnosis
+        .and_then(|(attempt, status)| (status == "local_retest_failed").then_some(attempt + 1));
+    let Some(diagnosis) = local_failure_diagnosis_for_attempt(item, builder, retest_rescue_attempt)
+    else {
+        tx.commit().await?;
         return Ok(());
     };
 
@@ -1517,9 +1545,10 @@ async fn record_cloud_rescue_local_failure_diagnosis(
     .bind(&diagnosis.cloud_diagnosis)
     .bind(diagnosis.cause_class)
     .bind(diagnosis.improvement_route)
-    .execute(pg)
+    .execute(&mut *tx)
     .await?;
 
+    tx.commit().await?;
     Ok(())
 }
 
@@ -6233,9 +6262,10 @@ mod tests {
         builder_excludes_480b, check_dispatch_prerequisites, classify_dispatch_outcome,
         collect_leftover_tmp_output, command_display, complexity_at_least_moderate,
         contains_file_line_citation, default_clone_path, dispatch_budget_for_host, dispatch_prompt,
-        expand_home, is_build_timeout, local_failure_diagnosis_for, mark_local_retest_failed,
-        mark_local_retest_passed, mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers,
-        parse_cli_tokens, primary_or_default_backend, quick_empty_success_is_provider_failure,
+        expand_home, is_build_timeout, local_failure_diagnosis_for,
+        local_failure_diagnosis_for_attempt, mark_local_retest_failed, mark_local_retest_passed,
+        mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers, parse_cli_tokens,
+        primary_or_default_backend, quick_empty_success_is_provider_failure,
         record_cloud_rescue_local_failure_diagnosis, repo_cache_path, repo_slug,
         retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
         should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
@@ -6637,6 +6667,25 @@ mod tests {
     }
 
     #[test]
+    fn failed_local_retest_cloud_rescue_starts_a_new_diagnosis_cycle() {
+        let item = test_item(
+            1,
+            Some("rebuild still produced no diff after remediation"),
+            "complex",
+        );
+        assert!(
+            local_failure_diagnosis_for(&item, "codex").is_none(),
+            "a normal early cloud attempt is not a three-failure rescue"
+        );
+
+        let diagnosis = local_failure_diagnosis_for_attempt(&item, "codex", Some(5))
+            .expect("a failed local retest must be diagnosed on its next cloud rescue");
+        assert_eq!(diagnosis.rescue_attempt, 5);
+        assert_eq!(diagnosis.cause_class, "context_prompt_gap");
+        assert_eq!(diagnosis.improvement_route, "dreamer_context_pack");
+    }
+
+    #[test]
     fn cloud_rescue_cannot_advance_when_diagnosis_artifact_is_missing() {
         let source = include_str!("work_item_dispatch.rs");
         let diagnosis_gate = source
@@ -6771,6 +6820,35 @@ mod tests {
             failed.get::<String, _>("local_retest_error"),
             "local compile failed"
         );
+
+        item.attempts = 1;
+        item.last_error = Some("local compile failed after deployed remediation".to_string());
+        record_cloud_rescue_local_failure_diagnosis(&pool, &item, "codex")
+            .await
+            .expect("record the next cloud rescue after failed local retest");
+        let next_cycle: (i32, String) = sqlx::query_as(
+            "SELECT rescue_attempt, remediation_status
+               FROM local_failure_diagnoses
+              WHERE work_item_id = $1
+              ORDER BY rescue_attempt DESC
+              LIMIT 1",
+        )
+        .bind(item.work_item_id)
+        .fetch_one(&pool)
+        .await
+        .expect("next diagnosis cycle should exist");
+        assert_eq!(next_cycle, (5, "diagnosed".to_string()));
+        record_cloud_rescue_local_failure_diagnosis(&pool, &item, "codex")
+            .await
+            .expect("an older failed retest must not reopen another cycle");
+        let cycle_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM local_failure_diagnoses WHERE work_item_id = $1",
+        )
+        .bind(item.work_item_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count diagnosis cycles");
+        assert_eq!(cycle_count, 2);
 
         sqlx::query("DELETE FROM local_failure_diagnoses WHERE work_item_id = $1")
             .bind(item.work_item_id)
