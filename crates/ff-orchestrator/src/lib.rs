@@ -15,6 +15,7 @@
 //! - [`task_decomposer`] — Template-based task decomposition (build/fix/review patterns)
 //! - [`confidence`] — Confidence-based escalation and trend tracking
 //! - [`llm_router`] — Shared contract for selecting and retrying LLM endpoints
+//! - [`health_monitor`] — In-memory LLM backend health tracking
 
 pub mod agent_team;
 pub mod alerts;
@@ -23,6 +24,7 @@ pub mod circuit_breaker;
 pub mod confidence;
 pub mod crew;
 pub mod decomposer;
+pub mod health_monitor;
 pub mod leader;
 pub mod llm_router;
 pub mod merge_train;
@@ -53,6 +55,7 @@ pub use confidence::{
 };
 pub use crew::{AgentRole, CrewAssignment, CrewDefinition};
 pub use decomposer::{SubTask, SubTaskType, TaskDecomposition};
+pub use health_monitor::{LlmHealth, LlmHealthMonitor};
 pub use leader::{
     AgentHeartbeatResult, AgentTask, LeaderCoordinator, Preemption, SubmissionAction,
     SubmissionResult, TickResult,

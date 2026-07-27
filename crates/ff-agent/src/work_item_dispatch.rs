@@ -1312,7 +1312,12 @@ async fn dispatch_one(
             %reason,
             "work_item_dispatch: acceptance-criteria gate rejected the build before PR"
         );
-        requeue_or_fail(&pg, &item, &format!("acceptance criteria not met: {reason}")).await?;
+        requeue_or_fail(
+            &pg,
+            &item,
+            &format!("acceptance criteria not met: {reason}"),
+        )
+        .await?;
         let sweep_warnings = post_phase.finish();
         return Ok(WorkItemDispatchResult { sweep_warnings });
     }
@@ -2331,7 +2336,9 @@ async fn diff_meets_acceptance_criteria(
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
     if diff.trim().is_empty() {
-        return Some(Err("no diff to check against acceptance criteria".to_string()));
+        return Some(Err(
+            "no diff to check against acceptance criteria".to_string()
+        ));
     }
     let list = criteria
         .iter()
@@ -2372,7 +2379,11 @@ async fn diff_meets_acceptance_criteria(
                     .join("; ");
                 Some(Err(format!(
                     "diff does not meet acceptance criteria: {}",
-                    if reasons.trim().is_empty() { "reviewer gave no detail".into() } else { reasons }
+                    if reasons.trim().is_empty() {
+                        "reviewer gave no detail".into()
+                    } else {
+                        reasons
+                    }
                 )))
             } else {
                 // Unparseable verdict → don't block (fail-open), just log.
@@ -3635,7 +3646,11 @@ async fn run_ff_dispatch(
     // evolution have a signal. Fail-open: no relevant skill / query error → skip.
     let injected_skills: Vec<uuid::Uuid> = match crate::skill_evidence::select_relevant_skills(
         pg,
-        &format!("{} {}", item.title, item.description.as_deref().unwrap_or_default()),
+        &format!(
+            "{} {}",
+            item.title,
+            item.description.as_deref().unwrap_or_default()
+        ),
         2,
     )
     .await
