@@ -107,6 +107,53 @@ UPDATE work_items w
  WHERE w.id = eligible.id
 "#;
 
+/// Claim deployed cloud-fixes-local remediations and rebuild the original item
+/// with a fresh local-first attempt budget. The diagnosis row is the durable
+/// state machine, so concurrent leader ticks cannot enqueue the same retest
+/// twice.
+const REQUEUE_DEPLOYED_LOCAL_RETESTS_SQL: &str = r#"
+WITH claimed AS (
+    UPDATE local_failure_diagnoses d
+       SET remediation_status = 'local_retest_running',
+           local_retest_started_at = NOW(),
+           local_retest_completed_at = NULL,
+           local_retest_error = NULL,
+           updated_at = NOW()
+     WHERE d.id IN (
+        SELECT d2.id
+          FROM local_failure_diagnoses d2
+          JOIN work_items w ON w.id = d2.work_item_id
+         WHERE d2.remediation_status = 'deployed'
+           AND d2.deployed_at IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM local_failure_diagnoses newer
+                WHERE newer.work_item_id = d2.work_item_id
+                  AND newer.remediation_status = 'deployed'
+                  AND newer.rescue_attempt > d2.rescue_attempt
+           )
+           AND w.status IN ('done', 'failed', 'merged')
+           AND NOT EXISTS (
+               SELECT 1 FROM work_item_leases l
+                WHERE l.work_item_id = w.id AND l.released_at IS NULL
+           )
+         ORDER BY d2.created_at, d2.id
+         FOR UPDATE OF d2 SKIP LOCKED
+         LIMIT $1
+     )
+ RETURNING d.work_item_id
+)
+UPDATE work_items w
+   SET status = 'ready',
+       attempts = 0,
+       assigned_to = NULL,
+       assigned_computer = NULL,
+       completed_at = NULL,
+       last_error = NULL
+  FROM claimed
+ WHERE w.id = claimed.work_item_id
+"#;
+
 fn lease_stale_secs_from_success_p99(sample_count: i64, p99_secs: Option<f64>) -> i64 {
     if sample_count < LEASE_STALE_MIN_SAMPLES {
         return MIN_LEASE_STALE_SECS;
@@ -167,6 +214,14 @@ async fn auto_requeue_failed_work_items(pg: &PgPool) -> Result<u64> {
         .rows_affected())
 }
 
+async fn requeue_deployed_local_retests(pg: &PgPool) -> Result<u64> {
+    Ok(sqlx::query(REQUEUE_DEPLOYED_LOCAL_RETESTS_SQL)
+        .bind(MAX_ASSIGN_PER_TICK)
+        .execute(pg)
+        .await?
+        .rows_affected())
+}
+
 /// One scheduler pass. Returns the number of work_items assigned this tick.
 pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
     let stale_secs = lease_stale_secs(pg).await;
@@ -181,6 +236,14 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         warn!(
             reaped,
             "work_item_scheduler: reaped stale leases (slots freed, items re-queued)"
+        );
+    }
+
+    let local_retests = requeue_deployed_local_retests(pg).await?;
+    if local_retests > 0 {
+        info!(
+            local_retests,
+            "work_item_scheduler: queued deployed remediations for local-first verification"
         );
     }
 
@@ -610,6 +673,19 @@ mod tests {
         assert!(AUTO_REQUEUE_FAILED_SQL.contains("l.released_at IS NULL"));
         assert_eq!(MAX_FAILED_RETRIES, 3);
         assert_eq!(FAILED_RETRY_COOLDOWN_MINUTES, 20);
+    }
+
+    #[test]
+    fn deployed_local_retest_query_is_atomic_local_first_and_idempotent() {
+        assert!(REQUEUE_DEPLOYED_LOCAL_RETESTS_SQL.contains("remediation_status = 'deployed'"));
+        assert!(REQUEUE_DEPLOYED_LOCAL_RETESTS_SQL.contains("deployed_at IS NOT NULL"));
+        assert!(REQUEUE_DEPLOYED_LOCAL_RETESTS_SQL.contains("FOR UPDATE OF d2 SKIP LOCKED"));
+        assert!(
+            REQUEUE_DEPLOYED_LOCAL_RETESTS_SQL
+                .contains("remediation_status = 'local_retest_running'")
+        );
+        assert!(REQUEUE_DEPLOYED_LOCAL_RETESTS_SQL.contains("attempts = 0"));
+        assert!(REQUEUE_DEPLOYED_LOCAL_RETESTS_SQL.contains("l.released_at IS NULL"));
     }
 
     fn slot(computer: uuid::Uuid) -> ff_db::FreeSlot {

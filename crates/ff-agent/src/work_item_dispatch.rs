@@ -1350,7 +1350,6 @@ async fn dispatch_one(
             "work_item_dispatch: failed to record cloud-rescue local failure diagnosis"
         );
     }
-
     mark_ready_for_review(
         &pg,
         &item,
@@ -1361,6 +1360,9 @@ async fn dispatch_one(
         Some(&review),
     )
     .await?;
+    if normalized_cloud_backend(&backend_used).is_none() {
+        mark_local_retest_passed(&pg, item.work_item_id).await?;
+    }
     let sweep_warnings = post_phase.finish_without_cleanup();
     Ok(WorkItemDispatchResult { sweep_warnings })
 }
@@ -1486,6 +1488,43 @@ async fn record_cloud_rescue_local_failure_diagnosis(
     .execute(pg)
     .await?;
 
+    Ok(())
+}
+
+async fn mark_local_retest_passed(pg: &PgPool, work_item_id: Uuid) -> Result<()> {
+    sqlx::query(
+        "UPDATE local_failure_diagnoses
+            SET remediation_status = 'local_retest_passed',
+                local_retest_completed_at = NOW(),
+                local_retest_error = NULL,
+                updated_at = NOW()
+          WHERE work_item_id = $1
+            AND remediation_status = 'local_retest_running'",
+    )
+    .bind(work_item_id)
+    .execute(pg)
+    .await?;
+    Ok(())
+}
+
+async fn mark_local_retest_failed(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    work_item_id: Uuid,
+    error: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE local_failure_diagnoses
+            SET remediation_status = 'local_retest_failed',
+                local_retest_completed_at = NOW(),
+                local_retest_error = $2,
+                updated_at = NOW()
+          WHERE work_item_id = $1
+            AND remediation_status = 'local_retest_running'",
+    )
+    .bind(work_item_id)
+    .bind(truncate_for_db(error))
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -2876,6 +2915,7 @@ async fn requeue_or_fail(pg: &PgPool, item: &AssignedWorkItem, error: &str) -> R
     )))
     .execute(&mut *tx)
     .await?;
+    mark_local_retest_failed(&mut tx, item.work_item_id, error).await?;
     // Clear the failed worktree row so a fresh one is created next attempt.
     sqlx::query(
         "UPDATE work_item_worktrees
@@ -4501,7 +4541,9 @@ fn https_pat_url(remote: &str, pat: &str) -> Option<String> {
     if owner_repo.is_empty() || !owner_repo.contains('/') {
         return None;
     }
-    Some(format!("https://x-access-token:{pat}@github.com/{owner_repo}.git"))
+    Some(format!(
+        "https://x-access-token:{pat}@github.com/{owner_repo}.git"
+    ))
 }
 
 fn checkout_clone_for_build(
@@ -5888,9 +5930,9 @@ mod tests {
         builder_excludes_480b, check_dispatch_prerequisites, classify_dispatch_outcome,
         collect_leftover_tmp_output, command_display, complexity_at_least_moderate,
         contains_file_line_citation, default_clone_path, dispatch_budget_for_host, dispatch_prompt,
-        expand_home, is_build_timeout, local_failure_diagnosis_for, mirror_repo_url,
-        normalized_cloud_backend, order_cloud_reviewers, parse_cli_tokens,
-        primary_or_default_backend, quick_empty_success_is_provider_failure,
+        expand_home, is_build_timeout, local_failure_diagnosis_for, mark_local_retest_failed,
+        mark_local_retest_passed, mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers,
+        parse_cli_tokens, primary_or_default_backend, quick_empty_success_is_provider_failure,
         record_cloud_rescue_local_failure_diagnosis, repo_cache_path, repo_slug,
         retry_error_is_actionable, rewrite_github_host_alias, same_model_family,
         should_attempt_lane15, status_output_is_clean, task_failed_alert_text,
@@ -6356,6 +6398,59 @@ mod tests {
             "dreamer_context_pack"
         );
         assert_eq!(row.get::<String, _>("remediation_status"), "diagnosed");
+
+        sqlx::query(
+            "UPDATE local_failure_diagnoses
+                SET remediation_status = 'local_retest_running'
+              WHERE work_item_id = $1",
+        )
+        .bind(item.work_item_id)
+        .execute(&pool)
+        .await
+        .expect("start local retest");
+        mark_local_retest_passed(&pool, item.work_item_id)
+            .await
+            .expect("mark local retest passed");
+        let status: String = sqlx::query_scalar(
+            "SELECT remediation_status FROM local_failure_diagnoses WHERE work_item_id = $1",
+        )
+        .bind(item.work_item_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read passed status");
+        assert_eq!(status, "local_retest_passed");
+
+        sqlx::query(
+            "UPDATE local_failure_diagnoses
+                SET remediation_status = 'local_retest_running'
+              WHERE work_item_id = $1",
+        )
+        .bind(item.work_item_id)
+        .execute(&pool)
+        .await
+        .expect("restart local retest");
+        let mut tx = pool.begin().await.expect("begin failed-retest transaction");
+        mark_local_retest_failed(&mut tx, item.work_item_id, "local compile failed")
+            .await
+            .expect("mark local retest failed");
+        tx.commit().await.expect("commit failed-retest transaction");
+        let failed = sqlx::query(
+            "SELECT remediation_status, local_retest_error
+               FROM local_failure_diagnoses
+              WHERE work_item_id = $1",
+        )
+        .bind(item.work_item_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read failed status");
+        assert_eq!(
+            failed.get::<String, _>("remediation_status"),
+            "local_retest_failed"
+        );
+        assert_eq!(
+            failed.get::<String, _>("local_retest_error"),
+            "local compile failed"
+        );
 
         sqlx::query("DELETE FROM local_failure_diagnoses WHERE work_item_id = $1")
             .bind(item.work_item_id)
