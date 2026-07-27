@@ -159,6 +159,39 @@ pub fn normalize_error_signature(err: &str) -> String {
         .chars().take(120).collect()
 }
 
+/// A clustered signature that is TASK-LEVEL (each item hard for the model) — the
+/// retry ladder escalates these; the doctor must NOT park them.
+fn is_task_level_cluster(sig: &str) -> bool {
+    const TASK_LEVEL: &[&str] = &[
+        "stalled attempts",
+        "produced no diff",
+        "review rejected",
+        "self-verify failed",
+        "diff is empty",
+        "no diff",
+    ];
+    TASK_LEVEL.iter().any(|s| sig.contains(s))
+}
+
+/// A clustered signature that IS a genuine infrastructure fault the per-item
+/// retry loop can never fix — the doctor parks + alerts on exactly these.
+fn is_infra_fault(sig: &str) -> bool {
+    const INFRA: &[&str] = &[
+        "does not exist",              // missing DB column/table/relation
+        "column",                      // schema mismatch
+        "relation",
+        "migration",                   // migration crash
+        "no healthy fleet deployment", // dead router
+        "no dispatchable backend",
+        "could not fetch",             // git access broken
+        "refusing to build",
+        "syntax error",                // bad SQL/migration
+        "connection refused",
+        "pool timed out",
+    ];
+    INFRA.iter().any(|s| sig.contains(s))
+}
+
 /// A remediation hint for a known systemic signature (best-effort operator guidance).
 fn remediation_hint_for(sig: &str) -> String {
     if sig.contains("does not exist") && sig.contains("column") {
@@ -205,6 +238,20 @@ pub async fn detect_systemic_failures(pg: &PgPool) -> Result<Vec<SystemicFinding
     let mut findings = Vec::new();
     for (sig, (count, sample, ids)) in clusters {
         if count < SYSTEMIC_CLUSTER_THRESHOLD {
+            continue;
+        }
+        // NOT everything that clusters is a systemic INFRA fault the operator must
+        // fix. A cluster of "stalled attempts" / "produced no diff" / "review
+        // rejected" is N tasks each too hard for the routed model — the retry
+        // ladder (escalate to cloud, rotate LLM) OWNS those; parking them would
+        // HALT progress instead of escalating. Only PARK+ALERT clusters whose
+        // signature is a genuine infra fault the per-item loop can NEVER fix
+        // (missing DB column, migration crash, dead router, git-fetch). Skip a
+        // cluster that's already a known transient/build-retry signature.
+        if error_is_transient(&sample) || is_task_level_cluster(&sig) {
+            continue;
+        }
+        if !is_infra_fault(&sig) {
             continue;
         }
         // Halt the storm: park every item in this cluster so the scheduler stops
@@ -692,5 +739,11 @@ mod systemic_tests {
         let r1 = normalize_error_signature("in-place review rejected by codex: Dropping both legacy tables");
         let r2 = normalize_error_signature("in-place review rejected by codex: The config uses placeholders");
         assert_ne!(r1, r2, "distinct per-task errors must NOT cluster");
+        // Classifier: infra faults are parked; task-level clusters are NOT.
+        assert!(is_infra_fault(&normalize_error_signature("column \"build_started_at\" does not exist")));
+        assert!(is_infra_fault(&normalize_error_signature("no healthy fleet deployment")));
+        assert!(is_task_level_cluster(&normalize_error_signature("failed after 5 stalled attempts (max 5 reached)")));
+        assert!(is_task_level_cluster(&normalize_error_signature("in-place review rejected by codex: The diff is empty")));
+        assert!(!is_infra_fault(&normalize_error_signature("failed after 5 stalled attempts")));
     }
 }
