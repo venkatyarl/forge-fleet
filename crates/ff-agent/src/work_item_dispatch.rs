@@ -3568,7 +3568,25 @@ async fn run_ff_dispatch(
         // the outer heartbeat keeps the lease alive — unrecoverable.
         // Tier-aware: complex/moderate tasks prefer a capable fleet coder
         // (glm-4.5-air/qwen36-35b) instead of landing on a 24B that wedges.
-        let hint = local_model_hint(pg, &item.complexity).await;
+        let mut hint = local_model_hint(pg, &item.complexity).await;
+        // ROTATE THE LOCAL MODEL VIA THE ROUTER when the previous attempt's LOCAL
+        // model produced no diff (operator 2026-07-26: "go through the LLM router
+        // to find the next local LLM instead of hardcoding"; local = any model on
+        // any computer). Ask the router for a DIFFERENT healthy code-capable model
+        // than the one that just stalled, so a no-diff glm → next tries devstral/
+        // qwen from the router, not glm again. Falls back to the default hint when
+        // the router has no other local coder.
+        if let Some(failed_model) = last_no_diff_local_model(item.last_error.as_deref())
+            && let Some(next) = next_local_coder_excluding(pg, &failed_model).await
+        {
+            info!(
+                work_item_id = %item.work_item_id,
+                failed_local_model = %failed_model,
+                next_local_model = %next,
+                "run_ff_dispatch: local model produced no diff — rotating to next router local coder"
+            );
+            hint = Some(next);
+        }
         // Record which local MODEL is serving this build on the lease, so the
         // digest shows `local:glm-4.5-air` (and provenance knows the builder)
         // instead of a bare "local". Lane 1.5 already does this; Lane 1 didn't,
@@ -3874,7 +3892,7 @@ async fn run_ff_dispatch(
     // saw "backend kimi produced no diff — FAILED after max retries" with the
     // other LLMs never tried. Now a no-diff on kimi → next attempt fronts codex
     // (or the local lane), converging on an LLM that actually applies the change.
-    if let Some(dead) = last_no_diff_backend(item.last_error.as_deref())
+    if let Some(dead) = last_no_diff_cloud_backend(item.last_error.as_deref())
         && backends.len() > 1
         && let Some(pos) = backends.iter().position(|b| b == &dead)
     {
@@ -4298,22 +4316,64 @@ static CAPACITY_LOAD_STARTED: std::sync::atomic::AtomicBool =
 /// request uses the legacy SQL picker. Refresh failures retain the last good
 /// snapshot inside `ff-capacity`, so registry outages do not enter the token
 /// path.
-/// Extract the backend name from a `last_error` of the form
-/// "backend <X> produced no diff (no commits) — required change not applied".
-/// Used to deprioritize that backend on the next attempt so a no-diff failure
-/// rotates to a DIFFERENT LLM instead of re-picking the one that just stalled.
-/// Returns None when the error isn't a named-backend no-diff. PURE (testable).
-fn last_no_diff_backend(last_error: Option<&str>) -> Option<String> {
+/// Extract the model/backend that produced no diff from a `last_error` of the
+/// form "backend <X> produced no diff …". `<X>` is either a LOCAL model tagged
+/// `local:<model>` (e.g. `local:glm-4.5-air` — any LLM the router serves on any
+/// node) or a cloud backend (`codex`/`kimi`/…). Returns the raw token so the
+/// caller can branch: a `local:` target rotates to a DIFFERENT router model, a
+/// cloud target deprioritizes that backend. NOT a hardcoded name list — the set
+/// of local models is whatever the router has (operator 2026-07-26). PURE.
+fn last_no_diff_target(last_error: Option<&str>) -> Option<String> {
     let e = last_error?;
     if !e.contains("produced no diff") {
         return None;
     }
-    // "backend kimi produced no diff …" → the token after "backend ".
+    // "backend local:glm-4.5-air produced no diff …" → token after "backend ".
     let after = e.split("backend ").nth(1)?;
-    let name = after.split_whitespace().next()?;
-    // Only accept known backend names to avoid grabbing stray words.
-    matches!(name, "codex" | "kimi" | "claude" | "gemini" | "grok")
-        .then(|| name.to_string())
+    let tok = after.split_whitespace().next()?;
+    (!tok.is_empty()).then(|| tok.to_string())
+}
+
+/// If the no-diff target was a LOCAL model, return the model name (strips the
+/// `local:` tag). None for a cloud backend or no no-diff.
+fn last_no_diff_local_model(last_error: Option<&str>) -> Option<String> {
+    last_no_diff_target(last_error)?
+        .strip_prefix("local:")
+        .map(|m| m.to_string())
+}
+
+/// If the no-diff target was a CLOUD backend, return its name. None for local.
+fn last_no_diff_cloud_backend(last_error: Option<&str>) -> Option<String> {
+    let t = last_no_diff_target(last_error)?;
+    (!t.starts_with("local:")).then_some(t)
+}
+
+/// Ask the LLM ROUTER for the next healthy, code-capable LOCAL model to try —
+/// EXCLUDING one that just failed. "Local" = any model the fleet serves on any
+/// computer (operator's definition 2026-07-26). Picks from live
+/// `fleet_model_deployments` (desired=active, healthy, fresh) whose catalog
+/// declares the `code` workload, preferring the one served on the MOST nodes
+/// (widest availability = least likely to be saturated). Returns the catalog_id
+/// to use as the next local hint, or None if no OTHER local coder is available.
+async fn next_local_coder_excluding(pg: &PgPool, exclude: &str) -> Option<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT d.catalog_id \
+           FROM fleet_model_deployments d \
+           JOIN fleet_model_catalog cat ON cat.id = d.catalog_id \
+          WHERE d.desired_state = 'active' \
+            AND d.health_status = 'healthy' \
+            AND EXTRACT(EPOCH FROM (now() - d.last_health_at)) <= 180 \
+            AND cat.preferred_workloads::text ILIKE '%code%' \
+            AND d.catalog_id <> $1 \
+          GROUP BY d.catalog_id \
+          ORDER BY count(*) DESC, d.catalog_id \
+          LIMIT 1",
+    )
+    .bind(exclude)
+    .fetch_optional(pg)
+    .await
+    .ok()
+    .flatten()
 }
 
 async fn routed_backends(pg: &PgPool, computer_id: Uuid, fresh_secs: i64) -> Vec<String> {
