@@ -67,26 +67,14 @@ const FAILED_RETRY_COOLDOWN_MINUTES: i64 = 20;
 const MAX_FAILED_RETRIES: i32 = 3;
 
 const LEASE_STALE_SAMPLE_SQL: &str = r#"
-SELECT COUNT(*) FILTER (
-           WHERE build_started_at IS NOT NULL
-             AND released_at > build_started_at
-       )::bigint AS native_sample_count,
+SELECT COUNT(*)::bigint AS sample_count,
        percentile_cont(0.99) WITHIN GROUP (
-           ORDER BY EXTRACT(EPOCH FROM (released_at - build_started_at))
-       ) FILTER (
-           WHERE build_started_at IS NOT NULL
-             AND released_at > build_started_at
-       ) AS native_p99_secs,
-       COUNT(*) FILTER (
-           WHERE released_at > created_at
-       )::bigint AS bootstrap_sample_count,
-       percentile_cont(0.99) WITHIN GROUP (
-           ORDER BY EXTRACT(EPOCH FROM (released_at - created_at))
-       ) FILTER (
-           WHERE released_at > created_at
-       ) AS bootstrap_p99_secs
+           ORDER BY EXTRACT(EPOCH FROM (released_at - dispatch_tick_at))
+       ) AS p99_secs
   FROM work_item_leases
  WHERE release_reason = 'ready for review'
+   AND dispatch_tick_at IS NOT NULL
+   AND released_at > dispatch_tick_at
    AND released_at <= NOW()
    AND released_at >= NOW() - make_interval(days => $1)
 "#;
@@ -183,23 +171,6 @@ fn lease_stale_secs_from_success_p99(sample_count: i64, p99_secs: Option<f64>) -
     with_margin.clamp(MIN_LEASE_STALE_SECS, MAX_LEASE_STALE_SECS)
 }
 
-fn select_lease_stale_sample(
-    native_sample_count: i64,
-    native_p99_secs: Option<f64>,
-    bootstrap_sample_count: i64,
-    bootstrap_p99_secs: Option<f64>,
-) -> (&'static str, i64, Option<f64>) {
-    if native_sample_count >= LEASE_STALE_MIN_SAMPLES {
-        ("build_started_at", native_sample_count, native_p99_secs)
-    } else {
-        (
-            "created_at_bootstrap",
-            bootstrap_sample_count,
-            bootstrap_p99_secs,
-        )
-    }
-}
-
 pub(crate) async fn lease_stale_secs(pg: &PgPool) -> i64 {
     let row = sqlx::query(LEASE_STALE_SAMPLE_SQL)
         .bind(LEASE_STALE_SAMPLE_DAYS as i32)
@@ -208,23 +179,12 @@ pub(crate) async fn lease_stale_secs(pg: &PgPool) -> i64 {
 
     match row {
         Ok(row) => {
-            let native_sample_count: i64 = row.get("native_sample_count");
-            let native_p99_secs: Option<f64> = row.try_get("native_p99_secs").ok().flatten();
-            let bootstrap_sample_count: i64 = row.get("bootstrap_sample_count");
-            let bootstrap_p99_secs: Option<f64> = row.try_get("bootstrap_p99_secs").ok().flatten();
-            let (sample_source, sample_count, p99_secs) = select_lease_stale_sample(
-                native_sample_count,
-                native_p99_secs,
-                bootstrap_sample_count,
-                bootstrap_p99_secs,
-            );
+            let sample_count: i64 = row.get("sample_count");
+            let p99_secs: Option<f64> = row.try_get("p99_secs").ok().flatten();
             let stale_secs = lease_stale_secs_from_success_p99(sample_count, p99_secs);
             info!(
-                sample_source,
                 sample_count,
                 p99_secs,
-                native_sample_count,
-                bootstrap_sample_count,
                 stale_secs,
                 min_samples = LEASE_STALE_MIN_SAMPLES,
                 sample_days = LEASE_STALE_SAMPLE_DAYS,
@@ -946,26 +906,13 @@ mod tests {
     }
 
     #[test]
-    fn lease_stale_samples_bootstrap_until_real_build_starts_are_populated() {
-        assert_eq!(
-            select_lease_stale_sample(0, None, 393, Some(1_137.0)),
-            ("created_at_bootstrap", 393, Some(1_137.0))
-        );
-        assert_eq!(
-            select_lease_stale_sample(LEASE_STALE_MIN_SAMPLES, Some(517.0), 393, Some(1_137.0)),
-            ("build_started_at", LEASE_STALE_MIN_SAMPLES, Some(517.0))
-        );
-    }
-
-    #[test]
     fn lease_stale_samples_are_valid_recent_successful_completions() {
         assert!(LEASE_STALE_SAMPLE_SQL.contains("release_reason = 'ready for review'"));
-        assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at - build_started_at"));
-        assert!(LEASE_STALE_SAMPLE_SQL.contains("build_started_at IS NOT NULL"));
-        assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at > build_started_at"));
-        assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at - created_at"));
-        assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at > created_at"));
-        assert!(!LEASE_STALE_SAMPLE_SQL.contains("released_at - dispatch_tick_at"));
+        assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at - dispatch_tick_at"));
+        assert!(LEASE_STALE_SAMPLE_SQL.contains("dispatch_tick_at IS NOT NULL"));
+        assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at > dispatch_tick_at"));
+        assert!(!LEASE_STALE_SAMPLE_SQL.contains("build_started_at"));
+        assert!(!LEASE_STALE_SAMPLE_SQL.contains("created_at"));
         assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at <= NOW()"));
         assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at >= NOW() - make_interval"));
     }
