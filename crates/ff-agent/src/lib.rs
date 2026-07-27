@@ -126,6 +126,7 @@ pub mod nats_log_layer;
 pub mod notifications;
 pub mod oauth_distributor;
 pub mod openai_bridge;
+pub mod oplog_replay;
 pub mod orchestrator_agent;
 pub mod orphan_reaper;
 pub mod panic_stop;
