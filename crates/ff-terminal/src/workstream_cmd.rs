@@ -157,9 +157,12 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
                 .with_context(|| format!("no workstream matches {}", dir.display()))?;
             let clients = workstreams::attached_clients(&pg, ws.id).await?;
             let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
-            let token = resolve_session_token(session.as_deref());
-            let me =
-                workstreams::session_id_for_token(&worker, &ws.project_key, &tool, token.as_deref());
+            // Only mark "this session" when the caller told us which CLI they
+            // are — an unmarked listing beats a wrong marker.
+            let me = tool.as_deref().map(|t| {
+                let token = resolve_session_token(session.as_deref());
+                workstreams::session_id_for_token(&worker, &ws.project_key, t, token.as_deref())
+            });
 
             println!(
                 "📽  Workstream: {} ({})",
@@ -184,7 +187,7 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
                     .last_report_at
                     .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
                     .unwrap_or_else(|| "never".to_string());
-                let mark = if c.session_id == me {
+                let mark = if me.as_deref() == Some(c.session_id.as_str()) {
                     " ← this session"
                 } else {
                     ""
@@ -241,11 +244,11 @@ fn install_workstream_hooks(which: &str, dry_run: bool) -> Result<()> {
         match tool {
             // Claude Code has deterministic SessionStart/Stop lifecycle hooks.
             "claude" => install_claude_hooks(&home, dry_run)?,
-            // Codex + Kimi hooks are TOOL-CALL/command lifecycle (fire around
+            // Codex hooks are TOOL-CALL/command lifecycle (fire around
             // tool use), NOT session-start — so there's no clean "on session
             // start" hook like Claude's. The cross-CLI mechanism that works today
-            // is their AGENTS.md global-instructions file (both read it): a
-            // directive telling the agent to attach on start + report as it works.
+            // is its AGENTS.md global-instructions file: a directive telling the
+            // agent to attach on start + report as it works.
             // Instruction-based (relies on model compliance) rather than a
             // deterministic hook — honest tradeoff until an MCP-side auto-attach
             // (CLI-agnostic, deterministic) is built.
@@ -254,8 +257,12 @@ fn install_workstream_hooks(which: &str, dry_run: bool) -> Result<()> {
                 "codex",
                 dry_run,
             )?,
+            // Kimi Code CLI ≥0.29 has real SessionStart/Stop hooks (stdin JSON
+            // carries session_id → per-session seats work). Keep the AGENTS.md
+            // directive too as an instruction-level fallback.
             "kimi" => {
-                install_agents_md_directive(&home.join(".kimi").join("AGENTS.md"), "kimi", dry_run)?
+                install_kimi_hooks(&home, dry_run)?;
+                install_agents_md_directive(&home.join(".kimi").join("AGENTS.md"), "kimi", dry_run)?;
             }
             other => println!("  ⚠ unknown tool '{other}' — skipping"),
         }
@@ -384,5 +391,64 @@ fn install_claude_hooks(home: &std::path::Path, dry_run: bool) -> Result<()> {
         path.display()
     );
     println!("    (new sessions in a project folder now auto-attach to its workstream)");
+    Ok(())
+}
+
+/// Add SessionStart (`ff workstream attach`) + Stop (`ff workstream heartbeat`)
+/// hooks to `~/.kimi-code/config.toml` as `[[hooks]]` entries. Kimi Code pipes
+/// the hook payload (incl. `session_id`) to the command's stdin, and
+/// `resolve_session_token` already reads that — so hooked kimi sessions get
+/// per-session seats with no flags. Idempotent: our block is delimited by
+/// marker comments and replaced (not duplicated) on re-run. A bare top-level
+/// `hooks = []` key is removed first, since it would collide with `[[hooks]]`.
+fn install_kimi_hooks(home: &std::path::Path, dry_run: bool) -> Result<()> {
+    const BEGIN: &str = "# ff-workstream:begin";
+    const END: &str = "# ff-workstream:end";
+    let path = home.join(".kimi-code").join("config.toml");
+    let block = format!(
+        "{BEGIN} — managed by `ff workstream install-hooks`; re-run replaces this block\n\
+         [[hooks]]\n\
+         event = \"SessionStart\"\n\
+         command = \"ff workstream attach --tool kimi >/dev/null 2>&1 || true\"\n\
+         \n\
+         [[hooks]]\n\
+         event = \"Stop\"\n\
+         command = \"ff workstream heartbeat --tool kimi >/dev/null 2>&1 || true\"\n\
+         {END}"
+    );
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    // Strip any prior ff block, then append the fresh one.
+    let cleaned = match (existing.find(BEGIN), existing.find(END)) {
+        (Some(b), Some(e)) if e > b => {
+            let mut s = existing.clone();
+            s.replace_range(b..e + END.len(), "");
+            s.trim_end().to_string()
+        }
+        _ => existing.trim_end().to_string(),
+    };
+    // A bare `hooks = []` top-level key conflicts with the `[[hooks]]` array.
+    let cleaned = cleaned
+        .lines()
+        .filter(|l| l.trim() != "hooks = []")
+        .collect::<Vec<_>>()
+        .join("\n");
+    let joined = if cleaned.is_empty() {
+        block
+    } else {
+        format!("{cleaned}\n\n{block}")
+    };
+    if dry_run {
+        println!("  [dry-run] would append [[hooks]] block to {}", path.display());
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&path, format!("{joined}\n"))
+        .with_context(|| format!("write {}", path.display()))?;
+    println!(
+        "  ✓ kimi: SessionStart auto-attach + Stop heartbeat → {}",
+        path.display()
+    );
     Ok(())
 }

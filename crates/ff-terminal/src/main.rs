@@ -2633,8 +2633,11 @@ pub enum WorkstreamCommand {
     },
     /// Show the current project's workstream: summary, focus, attached clients.
     Status {
-        #[arg(long, default_value = "claude")]
-        tool: String,
+        /// Which CLI's seat to mark as "← this session". No default: guessing
+        /// wrong (e.g. marking the claude seat inside a kimi session) is worse
+        /// than showing no marker at all.
+        #[arg(long)]
+        tool: Option<String>,
         /// This session's native id — marks which attached client is "you".
         #[arg(long)]
         session: Option<String>,

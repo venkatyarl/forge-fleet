@@ -271,9 +271,10 @@ fn install_kimi(
     write_instructions: bool,
     dry_run: bool,
 ) -> Result<()> {
-    // Kimi Code CLI uses ~/.kimi/config.json with the same mcpServers shape
-    // as Claude Code.
-    let config = home.join(".kimi").join("config.json");
+    // Kimi Code CLI ≥0.29 reads user-level MCP servers from
+    // ~/.kimi-code/mcp.json (the legacy ~/.kimi/config.json location is no
+    // longer loaded by current releases).
+    let config = home.join(".kimi-code").join("mcp.json");
     upsert_resilient_mcp_server_json(&config, "forgefleet", server_url, dry_run)?;
     println!("  ✓ kimi: {}", config.display());
     if write_instructions {
@@ -289,7 +290,7 @@ fn install_kimi(
 // ─── Kimi Desktop (Kimi Work / Vivace app) ───────────────────────────────────
 /// Config path for the Kimi DESKTOP app, which bundles a kimi-code runtime
 /// with its own `mcpServers` file (distinct from the standalone Kimi CLI's
-/// `~/.kimi/config.json`). macOS keeps the app data under
+/// `~/.kimi-code/mcp.json`). macOS keeps the app data under
 /// `~/Library/Application Support/kimi-desktop/`; the runtime's MCP config is
 /// `daimon-share/daimon/runtime/kimi-code/home/mcp.json`. Same `mcpServers`
 /// JSON shape as the CLI.
@@ -653,7 +654,13 @@ fn print_status(as_json: bool) {
         ("claude-desktop", vec![claude_desktop_config_path(&home)]),
         ("codex", vec![home.join(".codex").join("config.toml")]),
         ("gemini", vec![home.join(".gemini").join("settings.json")]),
-        ("kimi", vec![home.join(".kimi").join("config.json")]),
+        (
+            "kimi",
+            vec![
+                home.join(".kimi-code").join("config.toml"),
+                home.join(".kimi").join("config.json"),
+            ],
+        ),
         ("kimi-desktop", vec![kimi_desktop_config_path(&home)]),
         ("cursor", vec![home.join(".cursor").join("mcp.json")]),
         (
