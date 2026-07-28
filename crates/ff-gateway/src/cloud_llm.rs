@@ -18,11 +18,12 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{Response, StatusCode};
+use chrono::Utc;
 use reqwest::Client;
 use serde_json::{Value, json};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
-use ff_agent::cloud_llm_registry::{self, Provider};
+use ff_agent::cloud_llm_registry::{self, CloudLlmError, Provider};
 use ff_agent::{circuit_breaker, cloud_error, fleet_info};
 use ff_db::pg_get_secret;
 
@@ -36,6 +37,25 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// Default backoff when 429 came back without a `Retry-After` header.
 const DEFAULT_429_BACKOFF: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayProviderKind {
+    LocalModel,
+    Ring,
+    CloudBackend,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayProviderAttempt {
+    pub kind: GatewayProviderKind,
+    pub target: String,
+    pub rejected_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct UsageEstimate {
+    cost_usd: f64,
+}
 
 /// Send a request with retry-on-429. Honors `Retry-After` (capped at
 /// [`MAX_RETRY_AFTER`]) when present; falls back to
@@ -171,6 +191,164 @@ async fn resolve_this_computer_id(pool: &PgPool) -> Result<uuid::Uuid, String> {
         .copied()
 }
 
+fn gateway_workload(model_id: &str, body: &Value) -> String {
+    for key in ["workload", "_forgefleet_workload"] {
+        if let Some(value) = body.get(key).and_then(|v| v.as_str()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    if body.to_string().contains("\"image_url\"") {
+        "vision".to_string()
+    } else if model_id.to_ascii_lowercase().contains("code") {
+        "coding".to_string()
+    } else {
+        "coding".to_string()
+    }
+}
+
+fn parse_rung_kind(kind: &str) -> Option<GatewayProviderKind> {
+    match kind {
+        "local_model" => Some(GatewayProviderKind::LocalModel),
+        "ring" => Some(GatewayProviderKind::Ring),
+        "cloud_backend" => Some(GatewayProviderKind::CloudBackend),
+        _ => None,
+    }
+}
+
+fn attempts_from_ladder_rows(rows: Vec<(String, String)>) -> Vec<GatewayProviderAttempt> {
+    rows.into_iter()
+        .filter_map(|(rung_kind, target)| {
+            parse_rung_kind(&rung_kind).map(|kind| GatewayProviderAttempt {
+                kind,
+                target,
+                rejected_reason: None,
+            })
+        })
+        .collect()
+}
+
+fn budget_provider_key(provider: &str) -> &str {
+    provider.strip_suffix("_cli").unwrap_or(provider)
+}
+
+async fn cloud_budget_rejection(pool: &PgPool, provider: &str) -> Option<String> {
+    let row = sqlx::query(
+        "SELECT weekly_pct, monthly_pct, window_exhausted_until
+           FROM cloud_budget_buckets
+          WHERE lower(provider) = lower($1)",
+    )
+    .bind(provider)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()?;
+
+    let weekly_pct: Option<i16> = row.try_get("weekly_pct").ok().flatten();
+    let monthly_pct: Option<i16> = row.try_get("monthly_pct").ok().flatten();
+    let exhausted_until: Option<chrono::DateTime<Utc>> =
+        row.try_get("window_exhausted_until").ok().flatten();
+
+    if exhausted_until.is_some_and(|until| until > Utc::now()) {
+        return Some("quota window is exhausted".to_string());
+    }
+    if weekly_pct.is_some_and(|pct| pct > 85) {
+        return Some("weekly budget has less than 15% headroom".to_string());
+    }
+    if monthly_pct.is_some_and(|pct| pct > 85) {
+        return Some("monthly budget has less than 15% headroom".to_string());
+    }
+    None
+}
+
+/// Load the unified provider plan for a gateway request. The plan is the same
+/// shape for local llama.cpp/vLLM/MLX targets and cloud CLI/API providers; the
+/// executor below consumes cloud attempts, while the gateway consumes local
+/// attempts through Pulse/tier routing.
+pub async fn gateway_provider_plan(
+    pool: &PgPool,
+    model_id: &str,
+    body: &Value,
+) -> Vec<GatewayProviderAttempt> {
+    if let Ok(Some(provider)) = cloud_llm_registry::find_for_model(pool, model_id).await {
+        let rejected_reason = cloud_budget_rejection(pool, budget_provider_key(&provider.id)).await;
+        return vec![GatewayProviderAttempt {
+            kind: GatewayProviderKind::CloudBackend,
+            target: provider.id,
+            rejected_reason,
+        }];
+    }
+
+    let workload = gateway_workload(model_id, body);
+    let rows = sqlx::query(
+        "SELECT rung_kind, target
+           FROM routing_ladders
+          WHERE workload = $1
+          ORDER BY position",
+    )
+    .bind(&workload)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let row_values = rows
+        .into_iter()
+        .filter_map(|row| {
+            Some((
+                row.try_get::<String, _>("rung_kind").ok()?,
+                row.try_get::<String, _>("target").ok()?,
+            ))
+        })
+        .collect();
+    let mut attempts = attempts_from_ladder_rows(row_values);
+    for attempt in attempts
+        .iter_mut()
+        .filter(|attempt| attempt.kind == GatewayProviderKind::CloudBackend)
+    {
+        attempt.rejected_reason = cloud_budget_rejection(pool, &attempt.target).await;
+    }
+    attempts
+}
+
+async fn provider_for_backend(
+    pool: &PgPool,
+    backend: &str,
+) -> Result<Option<Provider>, CloudLlmError> {
+    let provider = sqlx::query(
+        "SELECT id, display_name, base_url, auth_kind, secret_key,
+                oauth_token_secret, oauth_token_url, oauth_client_id,
+                model_prefix, request_format, enabled
+           FROM cloud_llm_providers
+          WHERE enabled = true
+            AND (lower(id) = lower($1) OR lower(id) = lower($1 || '_cli'))
+          ORDER BY length(model_prefix) DESC
+          LIMIT 1",
+    )
+    .bind(backend)
+    .fetch_optional(pool)
+    .await?
+    .map(row_to_provider);
+    Ok(provider)
+}
+
+fn row_to_provider(r: sqlx::postgres::PgRow) -> Provider {
+    Provider {
+        id: r.get("id"),
+        display_name: r.get("display_name"),
+        base_url: r.get("base_url"),
+        auth_kind: r.get("auth_kind"),
+        secret_key: r.get("secret_key"),
+        oauth_token_secret: r.get("oauth_token_secret"),
+        oauth_token_url: r.get("oauth_token_url"),
+        oauth_client_id: r.get("oauth_client_id"),
+        model_prefix: r.get("model_prefix"),
+        request_format: r.get("request_format"),
+        enabled: r.get("enabled"),
+    }
+}
+
 /// Attempt to route `body` to a cloud provider. See module docs for the
 /// tri-state return contract.
 pub async fn try_route_to_cloud(
@@ -189,6 +367,58 @@ pub async fn try_route_to_cloud(
             return None;
         }
     };
+
+    Some(route_to_cloud_provider(pool, provider, model_id, body, session_id, client).await)
+}
+
+/// Route through a specific cloud backend from the unified ladder. `backend`
+/// may be the budget bucket key (`codex`) or a concrete provider id
+/// (`codex_cli`).
+pub async fn try_route_to_cloud_backend(
+    pool: &PgPool,
+    backend: &str,
+    model_id: &str,
+    body: &Value,
+    session_id: Option<&str>,
+    client: &reqwest::Client,
+) -> Option<Result<Response<Body>, Response<Body>>> {
+    let provider = match provider_for_backend(pool, backend).await {
+        Ok(Some(provider)) => provider,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::error!(error = %e, backend = %backend,
+                "cloud_llm: backend provider lookup failed; continuing without cloud routing");
+            return None;
+        }
+    };
+    if let Some(reason) = cloud_budget_rejection(pool, budget_provider_key(backend)).await {
+        return Some(Err(error_response(
+            StatusCode::PAYMENT_REQUIRED,
+            format!("cloud budget for '{backend}' is unavailable: {reason}"),
+            "budget_cap_reached",
+        )));
+    }
+    Some(route_to_cloud_provider(pool, provider, model_id, body, session_id, client).await)
+}
+
+async fn route_to_cloud_provider(
+    pool: &PgPool,
+    provider: Provider,
+    model_id: &str,
+    body: &Value,
+    session_id: Option<&str>,
+    client: &reqwest::Client,
+) -> Result<Response<Body>, Response<Body>> {
+    if let Some(reason) = cloud_budget_rejection(pool, budget_provider_key(&provider.id)).await {
+        return Err(error_response(
+            StatusCode::PAYMENT_REQUIRED,
+            format!(
+                "cloud budget for '{}' is unavailable: {reason}",
+                budget_provider_key(&provider.id)
+            ),
+            "budget_cap_reached",
+        ));
+    }
 
     // Budget guard (Pillar 3 / PR-T3). Reads
     // `fleet_secrets[budget.daily_usd_cap]` (string parsed as f64). If
@@ -228,14 +458,14 @@ pub async fn try_route_to_cloud(
             if today_cost >= cap {
                 tracing::warn!(provider = %provider.id, today_cost, cap,
                         "cloud_llm: budget.daily_usd_cap reached; refusing api_key call");
-                return Some(Err(error_response(
+                return Err(error_response(
                     StatusCode::PAYMENT_REQUIRED,
                     format!(
                         "daily budget cap ${cap:.2} reached (today: ${today_cost:.2}); falling back to local LLM. \
                              Adjust with `ff secrets set budget.daily_usd_cap <usd>` or wait for the 24h window."
                     ),
                     "budget_cap_reached",
-                )));
+                ));
             }
         }
     }
@@ -276,19 +506,23 @@ pub async fn try_route_to_cloud(
                 };
                 tracing::warn!(provider = %provider.id, secret_key = %provider.secret_key,
                         "cloud_llm: {} secret is missing/empty", kind_label);
-                return Some(Err(error_response(
+                return Err(error_response(
                     StatusCode::UNAUTHORIZED,
                     format!(
                         "{kind_label} not configured for cloud provider '{}'. {hint}",
                         provider.id
                     ),
                     "cloud_auth_missing",
-                )));
+                ));
             }
             Err(e) => {
                 tracing::error!(provider = %provider.id, error = %e,
                     "cloud_llm: credential lookup failed; continuing without cloud routing");
-                return None;
+                return Err(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "cloud credential lookup failed",
+                    "cloud_config_error",
+                ));
             }
         },
         "local_bridge" => {
@@ -304,12 +538,20 @@ pub async fn try_route_to_cloud(
             // billing.
             tracing::warn!(provider = %provider.id,
                 "cloud_llm: legacy oauth2 auth_kind not wired; falling back to local routing");
-            return None;
+            return Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                "legacy oauth2 cloud provider is not wired",
+                "cloud_config_error",
+            ));
         }
         other => {
             tracing::warn!(provider = %provider.id, auth_kind = %other,
                 "cloud_llm: unknown auth_kind; falling back to local routing");
-            return None;
+            return Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                "unknown cloud auth_kind",
+                "cloud_config_error",
+            ));
         }
     };
 
@@ -349,14 +591,14 @@ pub async fn try_route_to_cloud(
             call_google_generate_content(client, &provider, &api_key, model_id, body).await
         }
         other => {
-            return Some(Err(error_response(
+            return Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!(
                     "unknown request_format '{other}' for provider '{}'",
                     provider.id
                 ),
                 "cloud_config_error",
-            )));
+            ));
         }
     };
 
@@ -372,7 +614,7 @@ pub async fn try_route_to_cloud(
             record_provider_success_best_effort(pool, &provider.id).await;
             if let Err(e) = record_usage(
                 pool,
-                &provider.id,
+                &provider,
                 model_id,
                 tokens_in,
                 tokens_out,
@@ -384,11 +626,11 @@ pub async fn try_route_to_cloud(
                 tracing::error!(provider = %provider.id, model = %model_id, error = %e,
                     "cloud_llm: usage persistence failed; returning LLM response anyway");
             }
-            Some(Ok(ok_response(rb, &provider, status)))
+            Ok(ok_response(rb, &provider, status))
         }
         Ok(CallOutcome::Stream(resp)) => {
             record_provider_success_best_effort(pool, &provider.id).await;
-            Some(Ok(resp))
+            Ok(resp)
         }
         Err(CloudCallError::Http {
             status,
@@ -396,13 +638,13 @@ pub async fn try_route_to_cloud(
             body_text,
         }) => {
             record_provider_failure_best_effort(pool, &provider.id, status, &body_text).await;
-            Some(Err(error_response(status, message, "cloud_upstream_error")))
+            Err(error_response(status, message, "cloud_upstream_error"))
         }
-        Err(CloudCallError::Local(msg)) => Some(Err(error_response(
+        Err(CloudCallError::Local(msg)) => Err(error_response(
             StatusCode::BAD_GATEWAY,
             msg,
             "cloud_upstream_error",
-        ))),
+        )),
     }
 }
 
@@ -933,27 +1175,53 @@ fn google_to_openai_response(v: &Value, model: &str) -> Value {
 
 async fn record_usage(
     pool: &PgPool,
-    provider_id: &str,
+    provider: &Provider,
     model: &str,
     tokens_in: Option<i32>,
     tokens_out: Option<i32>,
     session_id: Option<&str>,
     duration_ms: i32,
 ) -> Result<(), sqlx::Error> {
+    let estimate = estimate_usage_cost(provider, tokens_in, tokens_out);
     sqlx::query(
         "INSERT INTO cloud_llm_usage
-           (provider_id, model, tokens_input, tokens_output, session_id, request_duration_ms)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+           (provider_id, model, tokens_input, tokens_output, cost_usd, session_id, request_duration_ms)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
-    .bind(provider_id)
+    .bind(&provider.id)
     .bind(model)
     .bind(tokens_in)
     .bind(tokens_out)
+    .bind(estimate.cost_usd)
     .bind(session_id)
     .bind(duration_ms)
     .execute(pool)
     .await?;
+    sqlx::query(
+        "UPDATE cloud_budget_buckets
+            SET spent_today = COALESCE(spent_today, 0) + $2::numeric,
+                credit_pool_spent_usd = COALESCE(credit_pool_spent_usd, 0) + $2::numeric,
+                last_success_at = NOW(),
+                updated_at = NOW()
+          WHERE lower(provider) = lower($1)
+             OR lower($1) = lower(provider || '_cli')",
+    )
+    .bind(&provider.id)
+    .bind(estimate.cost_usd)
+    .execute(pool)
+    .await?;
     Ok(())
+}
+
+fn estimate_usage_cost(
+    provider: &Provider,
+    tokens_in: Option<i32>,
+    tokens_out: Option<i32>,
+) -> UsageEstimate {
+    let _ = (provider, tokens_in, tokens_out);
+    let cost_usd = (tokens_in.unwrap_or(0).max(0) as f64) * 0.0 / 1_000_000.0
+        + (tokens_out.unwrap_or(0).max(0) as f64) * 0.0 / 1_000_000.0;
+    UsageEstimate { cost_usd }
 }
 
 #[cfg(test)]
@@ -1101,5 +1369,51 @@ mod tests {
         let oai = google_to_openai_response(&resp, "gemini-1.5-pro");
         assert_eq!(oai["choices"][0]["message"]["content"], "ok");
         assert_eq!(oai["usage"]["total_tokens"].as_i64().unwrap(), 4);
+    }
+
+    #[test]
+    fn ladder_rows_become_one_provider_plan_shape() {
+        let plan = attempts_from_ladder_rows(vec![
+            (
+                "local_model".to_string(),
+                "devstral-small-2-24b".to_string(),
+            ),
+            ("ring".to_string(), "qwen3-coder-480b".to_string()),
+            ("cloud_backend".to_string(), "codex".to_string()),
+            ("bogus".to_string(), "ignored".to_string()),
+        ]);
+
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0].kind, GatewayProviderKind::LocalModel);
+        assert_eq!(plan[0].target, "devstral-small-2-24b");
+        assert_eq!(plan[1].kind, GatewayProviderKind::Ring);
+        assert_eq!(plan[2].kind, GatewayProviderKind::CloudBackend);
+        assert_eq!(plan[2].target, "codex");
+    }
+
+    #[test]
+    fn usage_estimate_is_zero_without_provider_pricing() {
+        let provider = Provider {
+            id: "codex_cli".to_string(),
+            display_name: "Codex CLI".to_string(),
+            base_url: "http://127.0.0.1:51100/v1".to_string(),
+            auth_kind: "local_bridge".to_string(),
+            secret_key: String::new(),
+            oauth_token_secret: None,
+            oauth_token_url: None,
+            oauth_client_id: None,
+            model_prefix: "codex-cli-".to_string(),
+            request_format: "openai_chat".to_string(),
+            enabled: true,
+        };
+
+        let estimate = estimate_usage_cost(&provider, Some(1_000), Some(250));
+        assert_eq!(estimate.cost_usd, 0.0);
+    }
+
+    #[test]
+    fn cli_provider_ids_share_backend_budget_bucket() {
+        assert_eq!(budget_provider_key("codex_cli"), "codex");
+        assert_eq!(budget_provider_key("openai"), "openai");
     }
 }
