@@ -99,9 +99,41 @@ fn relativize(file: &str) -> &str {
     file.rsplit('/').next().unwrap_or(file)
 }
 
+fn expected_corpus(repo_path: &Path) -> Option<&str> {
+    repo_path
+        .file_name()?
+        .to_str()
+        .filter(|name| !name.is_empty())
+}
+
+fn cortex_hit_belongs_to_corpus(hit: &serde_json::Value, expected_corpus: &str) -> bool {
+    if hit.get("corpus").and_then(|v| v.as_str()) != Some(expected_corpus) {
+        return false;
+    }
+
+    let is_extern = hit
+        .get("node_type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|kind| kind.trim_start_matches("code:") == "extern");
+    if !is_extern {
+        return true;
+    }
+
+    let has_file = hit
+        .get("file")
+        .and_then(|v| v.as_str())
+        .is_some_and(|file| !file.is_empty() && file != "?");
+    let has_line = hit
+        .get("start_line")
+        .and_then(|v| v.as_i64())
+        .is_some_and(|line| line > 0);
+    has_file && has_line
+}
+
 /// Build the context pack: `--all` substring-find each task identifier across
 /// EVERY indexed corpus (cwd-independent — a fresh worktree has no corpus of its
-/// own), rank unique hits by fan-in, and emit them as SYMBOL POINTERS
+/// own), retain only hits from the resolved repository's corpus, rank unique hits
+/// by fan-in, and emit them as SYMBOL POINTERS
 /// (`qualified_name — kind at file:line`). Pointers alone kill the grep-storm:
 /// the agent opens the exact symbol directly instead of hunting for it. Returns
 /// empty when Cortex has nothing (or is unavailable) — caller prepends it, so
@@ -116,6 +148,9 @@ pub fn build_cortex_context_pack(
     if idents.is_empty() {
         return String::new();
     }
+    let Some(expected_corpus) = expected_corpus(repo_path) else {
+        return String::new();
+    };
 
     // Unique hits: (qualified_name, kind, relfile, line, fan_in).
     let mut ranked: Vec<(String, String, String, i64, i64)> = Vec::new();
@@ -126,7 +161,11 @@ pub fn build_cortex_context_pack(
         else {
             continue;
         };
-        for h in hits.iter().take(3) {
+        for h in hits
+            .iter()
+            .filter(|hit| cortex_hit_belongs_to_corpus(hit, expected_corpus))
+            .take(3)
+        {
             let Some(qn) = h.get("qualified_name").and_then(|v| v.as_str()) else {
                 continue;
             };
@@ -373,9 +412,11 @@ pub async fn context_pack_for_dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_brain_decisions_pack, build_context_pack_from_store, extract_task_identifiers,
-        relativize,
+        build_brain_decisions_pack, build_context_pack_from_store, cortex_hit_belongs_to_corpus,
+        expected_corpus, extract_task_identifiers, relativize,
     };
+    use serde_json::json;
+    use std::path::Path;
 
     #[test]
     fn extracts_camel_and_snake_idents_skips_plain_words() {
@@ -410,6 +451,69 @@ mod tests {
         assert_eq!(relativize("/home/x/repo/src/bar.rs"), "src/bar.rs");
         // 3. neither found -> returns basename
         assert_eq!(relativize("/var/log/system/thing.log"), "thing.log");
+    }
+
+    #[test]
+    fn expected_corpus_comes_from_resolved_repo_path() {
+        assert_eq!(
+            expected_corpus(Path::new("/srv/checkouts/forge-fleet")),
+            Some("forge-fleet")
+        );
+        assert_eq!(
+            expected_corpus(Path::new("/srv/checkouts/hireflow360-api/")),
+            Some("hireflow360-api")
+        );
+    }
+
+    #[test]
+    fn cortex_hits_are_scoped_to_expected_repo_corpus() {
+        let forge_fleet = json!({
+            "corpus": "forge-fleet",
+            "node_type": "code:function",
+            "file": "/leader/forge-fleet/crates/ff-agent/src/dispatch_context.rs",
+            "start_line": 97
+        });
+        let hireflow = json!({
+            "corpus": "hireflow360-api",
+            "node_type": "code:function",
+            "file": "/leader/hireflow360-api/src/dispatch_context.rs",
+            "start_line": 97
+        });
+
+        assert!(cortex_hit_belongs_to_corpus(&forge_fleet, "forge-fleet"));
+        assert!(!cortex_hit_belongs_to_corpus(&hireflow, "forge-fleet"));
+        assert!(cortex_hit_belongs_to_corpus(&hireflow, "hireflow360-api"));
+    }
+
+    #[test]
+    fn unresolved_extern_hits_are_dropped_even_in_expected_corpus() {
+        for hit in [
+            json!({
+                "corpus": "forge-fleet",
+                "node_type": "code:extern",
+                "file": null,
+                "start_line": null
+            }),
+            json!({
+                "corpus": "forge-fleet",
+                "node_type": "code:extern",
+                "file": "?",
+                "start_line": 0
+            }),
+        ] {
+            assert!(!cortex_hit_belongs_to_corpus(&hit, "forge-fleet"));
+        }
+
+        let resolved_in_repo = json!({
+            "corpus": "forge-fleet",
+            "node_type": "code:extern",
+            "file": "crates/ff-agent/src/lib.rs",
+            "start_line": 12
+        });
+        assert!(cortex_hit_belongs_to_corpus(
+            &resolved_in_repo,
+            "forge-fleet"
+        ));
     }
 
     #[test]
