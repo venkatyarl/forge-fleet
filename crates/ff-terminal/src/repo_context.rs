@@ -107,7 +107,24 @@ pub async fn resolve_repo_context(
 
     if let Some(mut ctx) = cwd_repo {
         if let Some(url) = ctx.repo_url.as_deref() {
-            ctx.repo_id = find_project_repo_by_url(pool, project, url).await?;
+            let repo_id = find_project_repo_by_url(pool, project, url).await?;
+            // The cwd repo belongs to THIS project → use it (the common case:
+            // decomposing a forge-fleet item from the forge-fleet checkout).
+            if repo_id.is_some() {
+                ctx.repo_id = repo_id;
+                return Ok(Some(ctx));
+            }
+            // The cwd repo is NOT this project's repo (e.g. decomposing a
+            // hireflow360 jira from the forge-fleet directory). Using the cwd repo
+            // here is the 0-PR bug: children get built against the wrong repo,
+            // produce a nonsensical diff, fail the acceptance gate, and never PR
+            // (2026-07-28). Fall through to the project's OWN repo binding instead.
+            if let Some(project_ctx) = primary_project_repo(pool, project).await? {
+                return Ok(Some(project_ctx));
+            }
+            // Project has no repo binding either (e.g. a jira with repo_url=NULL).
+            // Keep the cwd repo as a last resort rather than failing outright, but
+            // it's better than nothing only when the project truly has no repo.
         }
         return Ok(Some(ctx));
     }
