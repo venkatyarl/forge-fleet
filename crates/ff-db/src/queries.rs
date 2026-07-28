@@ -4702,53 +4702,34 @@ mod tests {
 
     #[test]
     fn test_route_workload_synonyms() {
-        // Helper: assert the returned cluster equals an unordered set.
-        fn assert_cluster(got: Vec<String>, want: &[&str]) {
-            let mut g = got;
-            g.sort();
-            let mut w: Vec<String> = want.iter().map(|s| s.to_string()).collect();
-            w.sort();
-            assert_eq!(g, w);
-        }
         // Every member of a cluster resolves to the WHOLE cluster (fully
-        // connected) regardless of which spelling the caller passes.
-        assert_cluster(
-            route_workload_synonyms(Some("embedding")),
-            &["embedding", "embeddings"],
-        );
-        assert_cluster(
-            route_workload_synonyms(Some("embeddings")),
-            &["embedding", "embeddings"],
-        );
-        assert_cluster(
-            route_workload_synonyms(Some("rerank")),
-            &["rerank", "reranking"],
-        );
-        // "code"/"code-gen": MCP-documented "code" still reaches deployed code-gen coders.
-        assert_cluster(route_workload_synonyms(Some("code")), &["code", "code-gen"]);
-        assert_cluster(
-            route_workload_synonyms(Some("code-gen")),
-            &["code", "code-gen"],
-        );
-        // "agent"/"tool_calling": the agentic-capability concept is one cluster so
-        // the natural swarm vocabulary ("agent") reaches tool_calling-tagged endpoints.
-        assert_cluster(
-            route_workload_synonyms(Some("agent")),
-            &["agent", "tool_calling"],
-        );
-        assert_cluster(
-            route_workload_synonyms(Some("tool_calling")),
-            &["agent", "tool_calling"],
-        );
-        // "multimodal"/"vision" are clustered; "omni" is deliberately NOT (adds audio).
-        assert_cluster(
-            route_workload_synonyms(Some("multimodal")),
-            &["multimodal", "vision"],
-        );
-        assert_cluster(route_workload_synonyms(Some("omni")), &["omni"]);
+        // connected) regardless of which spelling the caller passes. Deriving
+        // expectations from the table itself keeps this test from drifting
+        // behind new synonyms (it did, twice).
+        for cluster in WORKLOAD_SYNONYM_CLUSTERS {
+            let mut want: Vec<String> = cluster.iter().map(|s| s.to_string()).collect();
+            want.sort();
+            for member in cluster.iter() {
+                let mut got = route_workload_synonyms(Some(member));
+                got.sort();
+                assert_eq!(got, want, "cluster member {member}");
+            }
+        }
+        // No overlap: a tag belongs to at most one cluster (a shared member
+        // would make the returned set depend on cluster order).
+        let members: Vec<&str> = WORKLOAD_SYNONYM_CLUSTERS
+            .iter()
+            .flat_map(|c| c.iter().copied())
+            .collect();
+        let unique: std::collections::HashSet<&&str> = members.iter().collect();
+        assert_eq!(unique.len(), members.len(), "clusters must not share members");
+        // "omni" is deliberately NOT clustered with multimodal (adds audio).
+        assert_eq!(route_workload_synonyms(Some("omni")), &["omni"]);
         // Unknown tags resolve to just themselves.
-        assert_cluster(route_workload_synonyms(Some("chat")), &["chat"]);
-        assert_cluster(route_workload_synonyms(Some("general")), &["general"]);
+        assert_eq!(
+            route_workload_synonyms(Some("unknown-thing")),
+            &["unknown-thing"]
+        );
         // No workload filter → empty set (the SQL guard disables the clause).
         assert!(route_workload_synonyms(None).is_empty());
     }
