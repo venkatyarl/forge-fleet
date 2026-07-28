@@ -218,7 +218,7 @@ pub async fn attach_client_session(
     };
     let worker = crate::fleet_info::resolve_this_worker_name().await;
     let session_id =
-        crate::workstreams::attach(pg, &ws, &worker, tool, &cwd.display().to_string(), goal)
+        crate::workstreams::attach(pg, &ws, &worker, tool, &cwd.display().to_string(), goal, None)
             .await
             .with_context(|| format!("attach client session to project '{project_id}'"))?;
     Ok(Some(session_id))

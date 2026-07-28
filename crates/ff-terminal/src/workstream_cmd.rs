@@ -25,10 +25,61 @@ async fn pool() -> Result<sqlx::PgPool> {
         .map_err(|e| anyhow::anyhow!("connect to fleet Postgres: {e}"))
 }
 
+/// Resolve this session's native token so multiple sessions of the SAME tool each
+/// get their own seat. Priority (first non-empty wins):
+///   1. explicit `--session <id>` (auto-attach hooks pass the CLI's native id)
+///   2. `FORGEFLEET_WS_SESSION` env (operator/wrapper override)
+///   3. a known CLI-native session env var (Claude/Codex/Kimi expose their own)
+///   4. the SessionStart hook JSON on stdin — Claude Code pipes `{"session_id":…}`
+///      to its hook command, so a bare `ff workstream attach` auto-detects it
+/// Returns `None` when nothing is found → falls back to the single-seat-per-tool
+/// id (backward compatible).
+fn resolve_session_token(explicit: Option<&str>) -> Option<String> {
+    let clean = |s: String| {
+        let t = s.trim().to_string();
+        if t.is_empty() { None } else { Some(t) }
+    };
+    if let Some(s) = explicit.and_then(|s| clean(s.to_string())) {
+        return Some(s);
+    }
+    for var in [
+        "FORGEFLEET_WS_SESSION",
+        "CLAUDE_SESSION_ID",
+        "CODEX_SESSION_ID",
+        "KIMI_SESSION_ID",
+        "CODEX_CONVERSATION_ID",
+    ] {
+        if let Ok(v) = std::env::var(var)
+            && let Some(v) = clean(v)
+        {
+            return Some(v);
+        }
+    }
+    // Hook context: Claude Code pipes a JSON payload to the hook command's stdin.
+    // Only read when stdin is NOT a terminal (a real pipe), so an interactive
+    // `ff workstream attach` never blocks waiting for input.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        use std::io::Read;
+        let mut buf = String::new();
+        if std::io::stdin().read_to_string(&mut buf).is_ok()
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&buf)
+            && let Some(sid) = v.get("session_id").and_then(|s| s.as_str())
+            && let Some(sid) = clean(sid.to_string())
+        {
+            return Some(sid);
+        }
+    }
+    None
+}
+
 pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBuf>) -> Result<()> {
     let pg = pool().await?;
     match cmd {
-        crate::WorkstreamCommand::Attach { tool, goal } => {
+        crate::WorkstreamCommand::Attach {
+            tool,
+            goal,
+            session,
+        } => {
             let dir = effective_cwd(cwd)?;
             let ws = workstreams::workstream_for_dir(&pg, &dir)
                 .await?
@@ -39,6 +90,7 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
                     )
                 })?;
             let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
+            let token = resolve_session_token(session.as_deref());
             let sid = workstreams::attach(
                 &pg,
                 &ws,
@@ -46,6 +98,7 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
                 &tool,
                 &dir.display().to_string(),
                 goal.as_deref(),
+                token.as_deref(),
             )
             .await?;
             println!(
@@ -65,6 +118,7 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
             summary,
             focus,
             note,
+            session,
         } => {
             if summary.is_none() && focus.is_none() && note.is_none() {
                 anyhow::bail!(
@@ -76,7 +130,9 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
                 .await?
                 .with_context(|| format!("no workstream matches {}", dir.display()))?;
             let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
-            let sid = workstreams::session_id_for(&worker, &ws.project_key, &tool);
+            let token = resolve_session_token(session.as_deref());
+            let sid =
+                workstreams::session_id_for_token(&worker, &ws.project_key, &tool, token.as_deref());
             let updated = workstreams::report(
                 &pg,
                 &sid,
@@ -94,14 +150,16 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
                 println!("   summary: {s}");
             }
         }
-        crate::WorkstreamCommand::Status { tool } => {
+        crate::WorkstreamCommand::Status { tool, session } => {
             let dir = effective_cwd(cwd)?;
             let ws = workstreams::workstream_for_dir(&pg, &dir)
                 .await?
                 .with_context(|| format!("no workstream matches {}", dir.display()))?;
             let clients = workstreams::attached_clients(&pg, ws.id).await?;
             let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
-            let me = workstreams::session_id_for(&worker, &ws.project_key, &tool);
+            let token = resolve_session_token(session.as_deref());
+            let me =
+                workstreams::session_id_for_token(&worker, &ws.project_key, &tool, token.as_deref());
 
             println!(
                 "📽  Workstream: {} ({})",
@@ -152,13 +210,15 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
                 println!("  • {base}  ({key})  {remote}");
             }
         }
-        crate::WorkstreamCommand::Heartbeat { tool } => {
+        crate::WorkstreamCommand::Heartbeat { tool, session } => {
             // Best-effort liveness — never error a session's Stop hook. If the dir
             // isn't a known project or the session isn't attached, silently no-op.
             let dir = effective_cwd(cwd)?;
             if let Ok(Some(ws)) = workstreams::workstream_for_dir(&pg, &dir).await {
                 let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
-                let sid = workstreams::session_id_for(&worker, &ws.project_key, &tool);
+                let token = resolve_session_token(session.as_deref());
+                let sid =
+                    workstreams::session_id_for_token(&worker, &ws.project_key, &tool, token.as_deref());
                 let _ = workstreams::heartbeat(&pg, &sid).await;
             }
         }

@@ -2606,6 +2606,11 @@ pub enum WorkstreamCommand {
         /// One-line goal for this session (what you're here to do).
         #[arg(long)]
         goal: Option<String>,
+        /// This CLI's OWN native session id (Claude/Codex/Kimi each expose one).
+        /// Lets MULTIPLE sessions of the same tool on one repo each get their own
+        /// seat. Auto-detected from the hook payload / env when omitted.
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Report working state into the project's workstream: update the shared
     /// summary/focus and append a timestamped note to the activity log.
@@ -2621,11 +2626,18 @@ pub enum WorkstreamCommand {
         /// Append a timestamped note to the running activity log.
         #[arg(long)]
         note: Option<String>,
+        /// This session's native id (see `attach --session`). Targets the right
+        /// seat when multiple sessions of this tool are attached.
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Show the current project's workstream: summary, focus, attached clients.
     Status {
         #[arg(long, default_value = "claude")]
         tool: String,
+        /// This session's native id — marks which attached client is "you".
+        #[arg(long)]
+        session: Option<String>,
     },
     /// List all active project workstreams.
     List,
@@ -2634,6 +2646,9 @@ pub enum WorkstreamCommand {
     Heartbeat {
         #[arg(long, default_value = "claude")]
         tool: String,
+        /// This session's native id (see `attach --session`).
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Install SessionStart auto-attach + Stop heartbeat hooks into a CLI's
     /// config, so every session in a project folder binds to its workstream with

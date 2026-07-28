@@ -325,8 +325,46 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Stable session id for a (worker, project, tool) triple — the same folder on
 /// the same node with the same CLI always re-attaches to one row.
+///
+/// See [`session_id_for_token`] for the multi-session form. Kept for callers that
+/// only need the single-seat identity (e.g. a legacy re-attach).
 pub fn session_id_for(worker: &str, project_key: &str, tool: &str) -> String {
-    format!("{worker}-{project_key}-{tool}")
+    session_id_for_token(worker, project_key, tool, None)
+}
+
+/// Session id for a (worker, project, tool) plus an optional per-session `token`
+/// — the CLI's OWN native session UUID (Claude/Codex/Kimi each expose one).
+///
+/// With a token, TWO sessions of the SAME tool on the SAME node+project get
+/// DISTINCT rows (`…-{tool}-{uuid}`), so an operator can run 2 codex + 1 kimi + 3
+/// claude sessions on one repo and each is its own seat in `workstream_clients`
+/// (2026-07-28). Without a token it falls back to the bare `…-{tool}` triple
+/// (one seat per tool — backward compatible). The token is trimmed and any
+/// characters outside `[A-Za-z0-9._-]` are replaced with `_` so a stray native
+/// id can't break the composite key.
+pub fn session_id_for_token(
+    worker: &str,
+    project_key: &str,
+    tool: &str,
+    token: Option<&str>,
+) -> String {
+    let base = format!("{worker}-{project_key}-{tool}");
+    match token.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => {
+            let clean: String = t
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            format!("{base}-{clean}")
+        }
+        None => base,
+    }
 }
 
 /// Attach a client session to its project's workstream. Idempotent on
@@ -339,9 +377,10 @@ pub async fn attach(
     tool: &str,
     cwd: &str,
     goal: Option<&str>,
+    session_token: Option<&str>,
 ) -> Result<String> {
     ensure_client_schema(pg).await?;
-    let sid = session_id_for(worker, &ws.project_key, tool);
+    let sid = session_id_for_token(worker, &ws.project_key, tool, session_token);
     sqlx::query(
         "INSERT INTO workstream_clients \
             (workstream_id, session_id, worker_name, tool, cwd, goal, status, attached_at) \
