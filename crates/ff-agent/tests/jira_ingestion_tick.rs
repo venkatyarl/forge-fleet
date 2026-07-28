@@ -4,12 +4,9 @@
 //! access is intentionally unavailable in the library-only CI test job.
 
 use std::env;
-use std::path::PathBuf;
 
 use axum::{Json, Router, routing::get};
-use ff_agent::tools::{
-    AgentTool, AgentToolContext, checkout_edit_lock, jira::JiraQueueTool, session_shell_state,
-};
+use ff_agent::ha::jira_ingest::run_jira_ingest_tick;
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
@@ -69,6 +66,14 @@ async fn create_test_db() -> Option<(PgPool, PgPool, String)> {
          CREATE TABLE fleet_secrets (
              key TEXT PRIMARY KEY,
              value TEXT NOT NULL
+         );
+         CREATE TABLE jira_watch_state (
+             config_id TEXT NOT NULL REFERENCES jira_configs(name),
+             issue_id TEXT NOT NULL,
+             last_seen_status TEXT,
+             last_seen_assignee_id TEXT,
+             state_json JSONB NOT NULL DEFAULT '{}',
+             PRIMARY KEY (config_id, issue_id)
          );
          CREATE TABLE work_items (
              id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -200,21 +205,9 @@ async fn jira_ingestion_tick_creates_a_work_item_from_mocked_issue() {
             .expect("insert Jira secret");
     }
 
-    let working_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let context = AgentToolContext {
-        working_dir: working_dir.clone(),
-        session_id: "jira-ingestion-test".to_owned(),
-        shell_state: session_shell_state("jira-ingestion-test"),
-        edit_lock: checkout_edit_lock(&working_dir),
-        pg_pool: Some(pool.clone()),
-    };
-    let result = JiraQueueTool::default()
-        .execute(json!({"config": "hireflow360"}), &context)
-        .await;
-    assert!(!result.is_error, "Jira tick failed: {}", result.content);
-    let output: Value = serde_json::from_str(&result.content).expect("parse Jira tick result");
-    assert_eq!(output["fetched"], 1);
-    assert_eq!(output["created"], 1);
+    run_jira_ingest_tick(&pool)
+        .await
+        .expect("run Jira ingestion tick");
 
     let row = sqlx::query(
         "SELECT project_id, kind, title, description, labels, status, priority, created_by,
@@ -237,12 +230,7 @@ async fn jira_ingestion_tick_creates_a_work_item_from_mocked_issue() {
     assert_eq!(row.get::<Value, _>("labels"), json!(["hireflow360-api"]));
     assert_eq!(row.get::<String, _>("status"), "ready");
     assert_eq!(row.get::<String, _>("priority"), "critical");
-    assert_eq!(row.get::<String, _>("created_by"), "jira_queue_poll");
-    assert_eq!(
-        row.get::<String, _>("repo_url"),
-        "git@example.test:hireflow360-api.git"
-    );
-    assert_eq!(row.get::<String, _>("base_branch"), "develop");
+    assert_eq!(row.get::<String, _>("created_by"), "jira_ingest_tick");
     assert_eq!(
         row.get::<Value, _>("metadata")["jira_issue_key"],
         "HFPROD-268"
@@ -250,6 +238,26 @@ async fn jira_ingestion_tick_creates_a_work_item_from_mocked_issue() {
     assert_eq!(
         row.get::<Value, _>("original_signal")["signature"],
         "jira:hireflow360:10001"
+    );
+
+    let watch = sqlx::query(
+        "SELECT config_id, issue_id, last_seen_status, state_json
+           FROM jira_watch_state",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read Jira watch state");
+    assert_eq!(watch.get::<String, _>("config_id"), "hireflow360");
+    assert_eq!(watch.get::<String, _>("issue_id"), "10001");
+    assert_eq!(
+        watch
+            .get::<Option<String>, _>("last_seen_status")
+            .as_deref(),
+        Some("To Do")
+    );
+    assert_eq!(
+        watch.get::<Value, _>("state_json")["jira_issue_key"],
+        "HFPROD-268"
     );
 
     server.abort();
