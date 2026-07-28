@@ -125,7 +125,27 @@ pub async fn fleet_oneshot(
     model_hint: Option<&str>,
     timeout: Option<Duration>,
 ) -> Result<FleetOneshot> {
-    let ordered = resolve_route_candidates(pool, model_hint).await?;
+    fleet_oneshot_for(pool, prompt, model_hint, timeout, None).await
+}
+
+/// Like [`fleet_oneshot`] but constrains the candidate pool to deployments that
+/// declare `workload` in `preferred_workloads` (via the router's synonym
+/// clusters). Pass `Some("code")` for codegen/review so a build can NEVER land on
+/// a non-coder deployment (a 1.7B research SLM or a 500M video model marked
+/// healthy) — those produce no valid diff and the item fails "no diff to check"
+/// (root-caused 2026-07-28: 12 codegen calls hit Lucy-1.7B, others hit
+/// SmolVLM2-500M-video). This is capability-based, NOT a hardcoded model list:
+/// glm-4.5-air / devstral / qwen3-coder declare "code"; Lucy/SmolVLM do not, so
+/// they are excluded automatically as the roster changes. `None` preserves the
+/// old unfiltered behavior for council/chat/planner callers.
+pub async fn fleet_oneshot_for(
+    pool: &PgPool,
+    prompt: &str,
+    model_hint: Option<&str>,
+    timeout: Option<Duration>,
+    workload: Option<&str>,
+) -> Result<FleetOneshot> {
+    let ordered = resolve_route_candidates(pool, model_hint, workload).await?;
 
     let client = reqwest::Client::builder()
         .timeout(timeout.unwrap_or(Duration::from_secs(180)))
@@ -183,7 +203,7 @@ pub async fn fleet_oneshot(
 /// Resolve a catalog model hint to the same best-first deployment candidate
 /// ordering used by [`fleet_oneshot`].
 pub async fn resolve_route_candidate(pool: &PgPool, model_hint: &str) -> Result<RouteCandidate> {
-    resolve_route_candidates(pool, Some(model_hint))
+    resolve_route_candidates(pool, Some(model_hint), None)
         .await?
         .into_iter()
         .find(|candidate| candidate_catalog_id_matches(candidate, model_hint))
@@ -193,9 +213,13 @@ pub async fn resolve_route_candidate(pool: &PgPool, model_hint: &str) -> Result<
 async fn resolve_route_candidates(
     pool: &PgPool,
     model_hint: Option<&str>,
+    workload: Option<&str>,
 ) -> Result<Vec<RouteCandidate>> {
     let filter = RouteFilter {
-        workload: None,
+        // Capability filter: when set (e.g. "code" for codegen/review), the router
+        // OR-matches the workload's synonym cluster against each deployment's
+        // `preferred_workloads`, so only code-capable models are candidates.
+        workload: workload.map(|w| w.to_string()),
         require_tool_calling: false,
         min_ctx: None,
         exclude_hosts: Vec::new(),
@@ -208,9 +232,27 @@ async fn resolve_route_candidates(
         // tier coder deployment), and we'd silently fall back. No hint → top-8.
         limit: if model_hint.is_some() { 64 } else { 8 },
     };
-    let all_candidates = pg_route_deployments(pool, &filter)
+    let mut all_candidates = pg_route_deployments(pool, &filter)
         .await
         .map_err(|e| anyhow!("route deployments: {e}"))?;
+    // FAIL-OPEN on the capability filter: if a workload was requested but no
+    // deployment declares it (e.g. every coder is momentarily unhealthy), retry
+    // unfiltered rather than hard-failing the build. Correctness (prefer a coder)
+    // without a new starvation mode (never a coder → error). Only the capability
+    // filter is relaxed; the health/freshness filter still applies.
+    if all_candidates.is_empty() && workload.is_some() {
+        tracing::warn!(
+            workload = workload.unwrap_or(""),
+            "fleet_oneshot: no deployment declares this workload — retrying unfiltered (fail-open)"
+        );
+        let relaxed = RouteFilter {
+            workload: None,
+            ..filter
+        };
+        all_candidates = pg_route_deployments(pool, &relaxed)
+            .await
+            .map_err(|e| anyhow!("route deployments (relaxed): {e}"))?;
+    }
     if all_candidates.is_empty() {
         return Err(anyhow!(
             "no healthy fleet deployment to serve a local council member"

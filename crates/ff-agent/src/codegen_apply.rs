@@ -146,11 +146,16 @@ pub async fn codegen_apply(
             max_rounds, "requesting codegen edits from fleet model"
         );
 
-        let response = crate::fleet_oneshot::fleet_oneshot(
+        // Constrain to code-capable deployments: a build must never route to a
+        // non-coder model (Lucy-1.7B / SmolVLM2-video), which return prose and no
+        // valid diff → "no diff to check" failures. Capability-based via the
+        // router, not a model list; fails open if no coder is momentarily healthy.
+        let response = crate::fleet_oneshot::fleet_oneshot_for(
             pool,
             &prompt,
             model_hint,
             Some(Duration::from_secs(300)),
+            Some("code"),
         )
         .await
         .with_context(|| format!("fleet_oneshot round {round}"))?;

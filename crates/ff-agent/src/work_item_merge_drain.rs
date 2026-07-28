@@ -782,11 +782,12 @@ async fn local_pool_review(
     work_item_id: uuid::Uuid,
     prompt: &str,
 ) -> Result<(bool, String, String)> {
-    let resp = crate::fleet_oneshot::fleet_oneshot(
+    let resp = crate::fleet_oneshot::fleet_oneshot_for(
         pg,
         prompt,
         Some("qwen3-coder"),
         Some(REVIEW_LOCAL_POOL_TIMEOUT),
+        Some("code"),
     )
     .await
     .context("local pool PR review")?;
@@ -826,11 +827,12 @@ async fn review_via_480b(
     let _permit = crate::dispatch_concurrency::acquire_480b_permit()
         .await
         .expect("480b review gate is never closed");
-    let resp = crate::fleet_oneshot::fleet_oneshot(
+    let resp = crate::fleet_oneshot::fleet_oneshot_for(
         pg,
         prompt,
         Some(REVIEWER_480B_HINT),
         Some(REVIEW_480B_TIMEOUT),
+        Some("code"),
     )
     .await
     .context("480b PR review")?;

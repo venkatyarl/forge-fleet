@@ -2340,7 +2340,7 @@ async fn run_in_place_review(
     // A local-Devstral review beats failing the item outright.
     let started_at = chrono::Utc::now();
     let health = ff_pulse::lane_1_5::check_llm_health(|| async {
-        crate::fleet_oneshot::fleet_oneshot(pg, &prompt, None, Some(REVIEW_CLOUD_TIMEOUT))
+        crate::fleet_oneshot::fleet_oneshot_for(pg, &prompt, None, Some(REVIEW_CLOUD_TIMEOUT), Some("code"))
             .await
             .map(|response| {
                 let text = response.text.clone();
@@ -2458,11 +2458,12 @@ async fn diff_meets_acceptance_criteria(
          with exactly: VERDICT: FAIL followed by one line per failing criterion: 'N: <why it fails>'.\n\n\
          ACCEPTANCE CRITERIA:\n{list}\n\nDIFF:\n{diff_capped}"
     );
-    match crate::fleet_oneshot::fleet_oneshot(
+    match crate::fleet_oneshot::fleet_oneshot_for(
         pg,
         &prompt,
         Some("glm-4.5-air"),
         Some(Duration::from_secs(120)),
+        Some("code"),
     )
     .await
     {
