@@ -2463,12 +2463,14 @@ mod tests {
                 description: "change parser".into(),
                 files: vec!["src/lib.rs".into()],
                 complexity: Some("mechanical".into()),
+                acceptance_criteria: vec![],
             },
             LeafTask {
                 title: "second".into(),
                 description: "add parser test".into(),
                 files: vec!["src/lib.rs".into(), "src/tests.rs".into()],
                 complexity: Some("moderate".into()),
+                acceptance_criteria: vec![],
             },
         ];
         // Tests the sibling-merge logic directly (the gate now fails-closed on a
@@ -2497,6 +2499,7 @@ mod tests {
             description: title.into(),
             files: files.iter().map(|file| (*file).into()).collect(),
             complexity: None,
+            acceptance_criteria: vec![],
         };
         let gated = merge_overlapping_siblings(vec![
             task("first", &["a.rs"]),
@@ -2563,6 +2566,7 @@ mod tests {
             description: description.into(),
             files: files.iter().map(|file| (*file).into()).collect(),
             complexity: None,
+            acceptance_criteria: vec![],
         }
     }
 

@@ -72,6 +72,143 @@ fn resolve_session_token(explicit: Option<&str>) -> Option<String> {
     None
 }
 
+/// Resolve which CLI is attaching/reporting. Priority:
+///   1. explicit `--tool <cli>`
+///   2. `FORGEFLEET_WS_TOOL` env (operator/wrapper override)
+///   3. the nearest CLI in this process's ancestor chain (claude/codex/kimi
+///      spawn `ff` as a child, so the parent walk finds the real caller even
+///      through intermediate shells)
+///   4. CLI-specific env markers (inherited by spawned children)
+/// Falls back to "unknown" rather than guessing "claude" — a seat under the
+/// WRONG tool (the old default) silently splits one session's record in two.
+fn resolve_tool(explicit: Option<&str>) -> String {
+    let clean = |s: &str| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    };
+    if let Some(t) = explicit.and_then(clean) {
+        return t;
+    }
+    if let Ok(v) = std::env::var("FORGEFLEET_WS_TOOL")
+        && let Some(t) = clean(&v)
+    {
+        return t;
+    }
+    detect_tool_from_ancestors()
+        .or_else(detect_tool_from_env)
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Like `resolve_tool` but returns `None` when detection fails — for read-only
+/// paths (status "← this session" marker) where no marker beats a wrong one.
+fn detect_tool() -> Option<String> {
+    let clean = |s: String| {
+        let t = s.trim().to_string();
+        if t.is_empty() { None } else { Some(t) }
+    };
+    if let Ok(v) = std::env::var("FORGEFLEET_WS_TOOL")
+        && let Some(t) = clean(v)
+    {
+        return Some(t);
+    }
+    detect_tool_from_ancestors().or_else(detect_tool_from_env)
+}
+
+/// Map a process command name (basename) to its CLI tool, when it's one of ours.
+fn tool_from_comm(comm: &str) -> Option<&'static str> {
+    match comm.rsplit('/').next().unwrap_or(comm) {
+        "claude" => Some("claude"),
+        "codex" => Some("codex"),
+        "kimi" => Some("kimi"),
+        _ => None,
+    }
+}
+
+/// CLI-specific env markers. Claude Code exports CLAUDECODE/CLAUDE_CODE_*;
+/// Codex and Kimi expose session-id vars. `get` is injectable for testing.
+fn detect_tool_from_env() -> Option<String> {
+    tool_from_env_markers(&|k| std::env::var(k).ok())
+}
+
+fn tool_from_env_markers(get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let set = |vars: &[&str]| {
+        vars.iter()
+            .any(|v| get(v).is_some_and(|s| !s.trim().is_empty()))
+    };
+    if set(&["KIMI_SESSION_ID"]) {
+        Some("kimi".to_string())
+    } else if set(&["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_SESSION_ID"]) {
+        Some("claude".to_string())
+    } else if set(&["CODEX_SESSION_ID", "CODEX_CONVERSATION_ID", "CODEX_SANDBOX"]) {
+        Some("codex".to_string())
+    } else {
+        None
+    }
+}
+
+/// Walk up to 8 ancestors looking for a claude/codex/kimi process. Nearest hit
+/// wins, which also resolves the nested case (one CLI launched from another's
+/// shell) correctly — env markers can't express "closest caller".
+#[cfg(target_os = "linux")]
+fn detect_tool_from_ancestors() -> Option<String> {
+    let mut pid = std::process::id();
+    for _ in 0..8 {
+        if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            && let Some(t) = tool_from_comm(comm.trim())
+        {
+            return Some(t.to_string());
+        }
+        let ppid = linux_ppid(pid)?;
+        if ppid <= 1 {
+            return None;
+        }
+        pid = ppid;
+    }
+    None
+}
+
+/// Parent pid from /proc/<pid>/stat. After the closing paren of comm (which may
+/// itself contain spaces/parens) the fields are: state, ppid, …
+#[cfg(target_os = "linux")]
+fn linux_ppid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut fields = stat[stat.rfind(')')? + 2..].split_whitespace();
+    fields.next()?; // state
+    fields.next()?.parse().ok()
+}
+
+/// `ps`-based fallback for non-Linux (macOS): walk ppids via `ps -o ppid=,comm=`.
+#[cfg(not(target_os = "linux"))]
+fn detect_tool_from_ancestors() -> Option<String> {
+    let mut pid = std::process::id();
+    for _ in 0..8 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "ppid=,comm=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&out.stdout);
+        let mut fields = line.trim().split_whitespace();
+        let ppid: u32 = fields.next()?.parse().ok()?;
+        if let Some(comm) = fields.next()
+            && let Some(t) = tool_from_comm(comm)
+        {
+            return Some(t.to_string());
+        }
+        if ppid <= 1 {
+            return None;
+        }
+        pid = ppid;
+    }
+    None
+}
+
 pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBuf>) -> Result<()> {
     let pg = pool().await?;
     match cmd {
@@ -80,6 +217,7 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
             goal,
             session,
         } => {
+            let tool = resolve_tool(tool.as_deref());
             let dir = effective_cwd(cwd)?;
             let ws = workstreams::workstream_for_dir(&pg, &dir)
                 .await?
@@ -120,6 +258,7 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
             note,
             session,
         } => {
+            let tool = resolve_tool(tool.as_deref());
             if summary.is_none() && focus.is_none() && note.is_none() {
                 anyhow::bail!(
                     "nothing to report — pass at least one of --summary / --focus / --note"
@@ -131,8 +270,12 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
                 .with_context(|| format!("no workstream matches {}", dir.display()))?;
             let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
             let token = resolve_session_token(session.as_deref());
-            let sid =
-                workstreams::session_id_for_token(&worker, &ws.project_key, &tool, token.as_deref());
+            let sid = workstreams::session_id_for_token(
+                &worker,
+                &ws.project_key,
+                &tool,
+                token.as_deref(),
+            );
             let updated = workstreams::report(
                 &pg,
                 &sid,
@@ -157,12 +300,22 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
                 .with_context(|| format!("no workstream matches {}", dir.display()))?;
             let clients = workstreams::attached_clients(&pg, ws.id).await?;
             let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
-            // Only mark "this session" when the caller told us which CLI they
-            // are — an unmarked listing beats a wrong marker.
-            let me = tool.as_deref().map(|t| {
-                let token = resolve_session_token(session.as_deref());
-                workstreams::session_id_for_token(&worker, &ws.project_key, t, token.as_deref())
-            });
+            // Mark "this session" from the explicit flag or auto-detection; if
+            // neither identifies a CLI, show no marker — an unmarked listing
+            // beats a wrong one.
+            let me = tool
+                .as_deref()
+                .map(str::to_string)
+                .or_else(detect_tool)
+                .map(|t| {
+                    let token = resolve_session_token(session.as_deref());
+                    workstreams::session_id_for_token(
+                        &worker,
+                        &ws.project_key,
+                        &t,
+                        token.as_deref(),
+                    )
+                });
 
             println!(
                 "📽  Workstream: {} ({})",
@@ -216,17 +369,53 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
         crate::WorkstreamCommand::Heartbeat { tool, session } => {
             // Best-effort liveness — never error a session's Stop hook. If the dir
             // isn't a known project or the session isn't attached, silently no-op.
+            let tool = resolve_tool(tool.as_deref());
             let dir = effective_cwd(cwd)?;
             if let Ok(Some(ws)) = workstreams::workstream_for_dir(&pg, &dir).await {
                 let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
                 let token = resolve_session_token(session.as_deref());
-                let sid =
-                    workstreams::session_id_for_token(&worker, &ws.project_key, &tool, token.as_deref());
+                let sid = workstreams::session_id_for_token(
+                    &worker,
+                    &ws.project_key,
+                    &tool,
+                    token.as_deref(),
+                );
                 let _ = workstreams::heartbeat(&pg, &sid).await;
             }
         }
         crate::WorkstreamCommand::InstallHooks { r#for, dry_run } => {
             install_workstream_hooks(&r#for, dry_run)?;
+        }
+        crate::WorkstreamCommand::Prune {
+            older_than_hours,
+            dry_run,
+        } => {
+            let dir = effective_cwd(cwd)?;
+            let ws = workstreams::workstream_for_dir(&pg, &dir)
+                .await?
+                .with_context(|| format!("no workstream matches {}", dir.display()))?;
+            let cutoff = chrono::Utc::now() - chrono::Duration::hours(i64::from(older_than_hours));
+            let pruned = workstreams::prune_stale_clients(&pg, ws.id, cutoff, dry_run).await?;
+            let verb = if dry_run { "would detach" } else { "detached" };
+            println!(
+                "🧹 {} {} stale seat(s) in '{}' (idle > {}h):",
+                verb,
+                pruned.len(),
+                ws.project_key,
+                older_than_hours
+            );
+            for p in &pruned {
+                println!(
+                    "     • {} [{}] {} · last active {}",
+                    p.worker_name,
+                    p.tool,
+                    p.session_id,
+                    p.last_active_at.format("%Y-%m-%d %H:%M UTC")
+                );
+            }
+            if pruned.is_empty() {
+                println!("     <none — every seat is fresh>");
+            }
         }
     }
     Ok(())
@@ -262,7 +451,11 @@ fn install_workstream_hooks(which: &str, dry_run: bool) -> Result<()> {
             // directive too as an instruction-level fallback.
             "kimi" => {
                 install_kimi_hooks(&home, dry_run)?;
-                install_agents_md_directive(&home.join(".kimi").join("AGENTS.md"), "kimi", dry_run)?;
+                install_agents_md_directive(
+                    &home.join(".kimi").join("AGENTS.md"),
+                    "kimi",
+                    dry_run,
+                )?;
             }
             other => println!("  ⚠ unknown tool '{other}' — skipping"),
         }
@@ -438,7 +631,10 @@ fn install_kimi_hooks(home: &std::path::Path, dry_run: bool) -> Result<()> {
         format!("{cleaned}\n\n{block}")
     };
     if dry_run {
-        println!("  [dry-run] would append [[hooks]] block to {}", path.display());
+        println!(
+            "  [dry-run] would append [[hooks]] block to {}",
+            path.display()
+        );
         return Ok(());
     }
     if let Some(parent) = path.parent() {
@@ -451,4 +647,101 @@ fn install_kimi_hooks(home: &std::path::Path, dry_run: bool) -> Result<()> {
         path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env_with<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn comm_names_map_to_their_cli() {
+        assert_eq!(tool_from_comm("claude"), Some("claude"));
+        assert_eq!(tool_from_comm("codex"), Some("codex"));
+        assert_eq!(tool_from_comm("kimi"), Some("kimi"));
+        // ps comm can be a full path — basename still matches.
+        assert_eq!(tool_from_comm("/usr/local/bin/kimi"), Some("kimi"));
+        // Shells, node, and unknown processes are not CLIs we track.
+        assert_eq!(tool_from_comm("bash"), None);
+        assert_eq!(tool_from_comm("node"), None);
+        assert_eq!(tool_from_comm("gnome-terminal-"), None);
+    }
+
+    #[test]
+    fn env_markers_identify_each_cli() {
+        assert_eq!(
+            tool_from_env_markers(&env_with(&[("KIMI_SESSION_ID", "abc")])),
+            Some("kimi".to_string())
+        );
+        assert_eq!(
+            tool_from_env_markers(&env_with(&[("CLAUDECODE", "1")])),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            tool_from_env_markers(&env_with(&[("CLAUDE_SESSION_ID", "s1")])),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            tool_from_env_markers(&env_with(&[("CODEX_CONVERSATION_ID", "c1")])),
+            Some("codex".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_env_marker_does_not_count() {
+        assert_eq!(
+            tool_from_env_markers(&env_with(&[("CLAUDECODE", "")])),
+            None
+        );
+        assert_eq!(tool_from_env_markers(&env_with(&[])), None);
+    }
+
+    #[test]
+    fn kimi_marker_beats_inherited_claude_marker() {
+        // A kimi session launched from inside a claude shell inherits
+        // CLAUDECODE=1; kimi's own marker must win for the env fallback.
+        let env = env_with(&[("KIMI_SESSION_ID", "k1"), ("CLAUDECODE", "1")]);
+        assert_eq!(tool_from_env_markers(&env), Some("kimi".to_string()));
+    }
+
+    #[test]
+    fn explicit_tool_always_wins() {
+        assert_eq!(resolve_tool(Some("codex")), "codex");
+        assert_eq!(resolve_tool(Some("  kimi  ")), "kimi");
+    }
+
+    #[test]
+    fn explicit_empty_tool_falls_through_to_detection() {
+        // An empty --tool is treated as omitted; detection runs (ancestor walk
+        // finds the test runner's tree or nothing), never a panic.
+        let detected = resolve_tool(Some("   "));
+        assert!(!detected.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_ppid_matches_ps() {
+        let pid = std::process::id();
+        let expected = std::process::Command::new("ps")
+            .args(["-o", "ppid=", "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+            });
+        if let Some(expected) = expected {
+            assert_eq!(linux_ppid(pid), Some(expected));
+        }
+    }
 }

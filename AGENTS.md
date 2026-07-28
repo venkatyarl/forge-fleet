@@ -5,6 +5,19 @@ details for hireflow360 and start working” to
 `ff jira monitor --config hireflow360 --daemon`. Shared Postgres cursors,
 awaiting state, and leases are authoritative; do not ask the operator to restate them.
 
+## Cross-session sync (standing rule, all CLIs)
+
+Multiple CLI sessions (claude/codex/kimi) work this repo CONCURRENTLY on the
+same shared checkout. Before and while building anything:
+
+1. Run `ff workstream attach --goal "<your lane>"` (auto-detects your CLI) and
+   read `ff workstream status` + the recent activity notes
+   (`ff db query "SELECT n->>'at' at, n->>'session' session, n->>'note' note FROM ff_workstreams w, jsonb_array_elements(w.open_threads) n WHERE w.project_key='forge-fleet' ORDER BY 1 DESC LIMIT 12"`).
+2. Announce your lane before touching files another session owns:
+   `ff workstream report --focus "…" --note "…"`. Check for SYNC notes claiming
+   files/work_items first; do not take overlapping files without reconciling.
+3. Report when you finish or change lanes so the record stays true for everyone.
+
 <!-- forgefleet MCP tools -->
 ## MCP Tools: forgefleet
 
