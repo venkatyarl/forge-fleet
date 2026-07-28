@@ -916,10 +916,11 @@ async fn handle_pm_decompose(
     // If `goal` is a work_item UUID, decompose ITS title+description; else treat
     // the string itself as the goal. When it's an existing item, the children
     // hang off it via parent_id.
-    let (parent_id, goal_text, parent_repo): (
+    let (parent_id, goal_text, parent_repo, parent_project): (
         Option<uuid::Uuid>,
         String,
         Option<crate::repo_context::RepoContext>,
+        Option<String>,
     ) = match uuid::Uuid::parse_str(goal.trim()) {
         Ok(uid) => {
             let row: Option<(
@@ -928,30 +929,44 @@ async fn handle_pm_decompose(
                     Option<uuid::Uuid>,
                     Option<String>,
                     Option<String>,
+                    String,
                 )> =
                     sqlx::query_as(
-                        "SELECT title, description, repo_id, repo_url, repo_path FROM work_items WHERE id = $1",
+                        "SELECT title, description, repo_id, repo_url, repo_path, project_id FROM work_items WHERE id = $1",
                     )
                         .bind(uid)
                         .fetch_optional(pool)
                         .await
                         .map_err(|e| anyhow::anyhow!("load work item {uid}: {e}"))?;
             match row {
-                Some((title, desc, repo_id, repo_url, repo_path)) => (
+                Some((title, desc, repo_id, repo_url, repo_path, project_id)) => (
                     Some(uid),
                     format!("{title}\n\n{}", desc.unwrap_or_default()),
                     repo_context_from_binding(repo_id, repo_url, repo_path),
+                    Some(project_id),
                 ),
                 None => return Err(anyhow::anyhow!("no work item with id {goal}")),
             }
         }
-        Err(_) => (None, goal.clone(), None),
+        Err(_) => (None, goal.clone(), None, None),
     };
+
+    // Children MUST inherit the PARENT's project — not the CLI's `--project`
+    // default (which is the cwd repo, e.g. forge-fleet). 2026-07-28: decomposing
+    // hireflow360 jira from a forge-fleet checkout created leaf tasks tagged
+    // project_id='forge-fleet' with repo_path=…/forge-fleet, so glm built
+    // "Add background check model to ff-db" against the WRONG repo → garbage diff
+    // → acceptance-gate reject → requeue, never a PR (the "0 PRs / 0 completions"
+    // layer). An explicit `--project` still overrides (unchanged when it differs
+    // from the default); a bare decompose of an existing item now follows its
+    // parent's project.
+    let effective_project = parent_project.clone().unwrap_or_else(|| project.clone());
 
     let repo_context = if repo.is_none() && cwd.is_none() && parent_repo.is_some() {
         parent_repo
     } else {
-        crate::repo_context::resolve_repo_context(pool, &project, cwd, repo.as_deref()).await?
+        crate::repo_context::resolve_repo_context(pool, &effective_project, cwd, repo.as_deref())
+            .await?
     };
 
     println!("{CYAN}▶ decomposing goal via fleet LLM…{RESET}");
@@ -1091,7 +1106,7 @@ async fn handle_pm_decompose(
         let complexity = normalize_complexity(t.complexity.as_deref());
         let row = insert_decomposed_work_item(
             pool,
-            &project,
+            &effective_project,
             &t.title,
             &t.description,
             &created_by,
