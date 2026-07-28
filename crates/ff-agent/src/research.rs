@@ -1020,9 +1020,16 @@ impl ResearchSession {
     /// tool-calling, so this loses no usable research backend. Candidates come
     /// back ordered tier-ASC then freshest-first; we then round-robin across
     /// DISTINCT computers to maximize real parallelism.
+    ///
+    /// `workload = "research"` (operator 2026-07-28): research sub-agents run on
+    /// the fleet's research SLM (Lucy-1.7B), NOT on the build-lane coders.
+    /// Before this, `workload: None` mixed devstral/qwen3-coder into research
+    /// runs, competing with builds for the coding deployments the GLM routers
+    /// own. The catalog `research` tag is the contract — a research-tagged
+    /// deployment is a valid sub-agent backend by declaration.
     async fn pick_distinct_backends(&self, n: usize) -> Result<Vec<FleetBackend>> {
         let filter = ff_db::RouteFilter {
-            workload: None,
+            workload: Some("research".to_string()),
             require_tool_calling: true,
             min_ctx: None,
             exclude_hosts: self.config.exclude_hosts.clone(),
@@ -1042,9 +1049,9 @@ impl ResearchSession {
 
         if candidates.is_empty() {
             anyhow::bail!(
-                "no healthy OpenAI-compatible LLM deployments within the {}s \
+                "no healthy research-tagged LLM deployments within the {}s \
                  health-freshness window — start one with `ff model load`, or \
-                 check `ff fleet route chat` for wedged hosts",
+                 check `ff fleet route research` for wedged hosts",
                 ff_db::queries::DISPATCH_HEALTH_MAX_AGE_SEC,
             );
         }

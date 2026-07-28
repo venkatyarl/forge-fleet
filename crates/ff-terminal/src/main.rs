@@ -473,9 +473,10 @@ enum Command {
     /// the results into a cited markdown report.
     ///
     /// Uses Schema V42 tables (research_sessions / research_subtasks /
-    /// research_findings). Planner + synthesizer run on Taylor's gateway
-    /// using the "thinking" pool alias (Qwen3.5-35B-A3B thinking reserve);
-    /// sub-agents round-robin across distinct active fleet LLM deployments.
+    /// research_findings). Planner + synthesizer run on the current LEADER's
+    /// gateway (resolved live from fleet_leader_state) using the "thinking"
+    /// pool alias; sub-agents round-robin across distinct research-tagged
+    /// deployments (Lucy-1.7B SLMs).
     Research {
         /// The research question. Omit when using --recover.
         prompt: Option<String>,
