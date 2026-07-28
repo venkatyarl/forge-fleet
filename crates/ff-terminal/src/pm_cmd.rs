@@ -950,6 +950,11 @@ async fn handle_pm_decompose(
         }
         Err(_) => (None, goal.clone(), None, None),
     };
+    let jira_binding = if let Some(parent_id) = parent_id {
+        ff_agent::jira_repo_binding::validate_jira_repo_binding(pool, parent_id).await?
+    } else {
+        None
+    };
 
     // Children MUST inherit the PARENT's project — not the CLI's `--project`
     // default (which is the cwd repo, e.g. forge-fleet). 2026-07-28: decomposing
@@ -962,7 +967,11 @@ async fn handle_pm_decompose(
     // parent's project.
     let effective_project = parent_project.clone().unwrap_or_else(|| project.clone());
 
-    let repo_context = if repo.is_none() && cwd.is_none() && parent_repo.is_some() {
+    let repo_context = if jira_binding.is_some() {
+        // Jira bindings are authoritative. In particular, never let the
+        // invoking checkout or a project's primary repo override the parent.
+        parent_repo
+    } else if repo.is_none() && cwd.is_none() && parent_repo.is_some() {
         parent_repo
     } else {
         crate::repo_context::resolve_repo_context(pool, &effective_project, cwd, repo.as_deref())

@@ -681,7 +681,12 @@ fn jsonb_string_array(row: &sqlx::postgres::PgRow, column: &str) -> Vec<String> 
 }
 
 async fn ensure_repo_checked_out(pg: &PgPool, item: &AssignedWorkItem) -> Result<()> {
+    let jira_binding =
+        crate::jira_repo_binding::validate_jira_repo_binding(pg, item.work_item_id).await?;
     if item.repo_path.exists() && item.repo_path.join(".git").exists() {
+        if let Some(binding) = jira_binding.as_ref() {
+            verify_repo_remote(&item.repo_path, &binding.repo_url)?;
+        }
         return Ok(());
     }
 
@@ -703,7 +708,7 @@ async fn ensure_repo_checked_out(pg: &PgPool, item: &AssignedWorkItem) -> Result
         .fetch_optional(pg)
         .await
         .with_context(|| format!("lookup repo {repo_id} for work_item {}", item.work_item_id))?
-    } else {
+    } else if jira_binding.is_none() {
         sqlx::query_scalar(
             "SELECT github_url
                FROM project_repos
@@ -716,6 +721,8 @@ async fn ensure_repo_checked_out(pg: &PgPool, item: &AssignedWorkItem) -> Result
         .fetch_optional(pg)
         .await
         .with_context(|| format!("lookup primary repo for project {}", item.project_id))?
+    } else {
+        None
     };
 
     let github_url = github_url.ok_or_else(|| {
@@ -795,6 +802,9 @@ async fn ensure_repo_checked_out(pg: &PgPool, item: &AssignedWorkItem) -> Result
         .await
         .context("join cache-clone task")??;
 
+        if let Some(binding) = jira_binding.as_ref() {
+            verify_repo_remote(&item.repo_path, &binding.repo_url)?;
+        }
         return Ok(());
     }
 
@@ -847,6 +857,9 @@ async fn ensure_repo_checked_out(pg: &PgPool, item: &AssignedWorkItem) -> Result
         );
     }
 
+    if let Some(binding) = jira_binding.as_ref() {
+        verify_repo_remote(&item.repo_path, &binding.repo_url)?;
+    }
     Ok(())
 }
 
@@ -961,11 +974,53 @@ fn check_dispatch_prerequisites(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn normalized_repo_identity(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    let path = trimmed
+        .split_once(':')
+        .filter(|(host, _)| host.contains("github.com"))
+        .map(|(_, path)| path)
+        .or_else(|| trimmed.split_once("github.com/").map(|(_, path)| path))
+        .unwrap_or(trimmed);
+    path.trim_start_matches('/').to_ascii_lowercase()
+}
+
+fn verify_repo_remote(repo_path: &Path, expected_url: &str) -> Result<()> {
+    let output = run_git(
+        repo_path,
+        ["remote", "get-url", "origin"],
+        Duration::from_secs(30),
+    )?;
+    let actual = String::from_utf8_lossy(&output.stdout);
+    if normalized_repo_identity(&actual) != normalized_repo_identity(expected_url) {
+        bail!(
+            "checkout {} origin is {}, expected canonical Jira repo {}",
+            repo_path.display(),
+            actual.trim(),
+            expected_url
+        );
+    }
+    Ok(())
+}
+
+async fn revalidate_jira_checkout(pg: &PgPool, item: &AssignedWorkItem) -> Result<()> {
+    if let Some(binding) =
+        crate::jira_repo_binding::validate_jira_repo_binding(pg, item.work_item_id).await?
+    {
+        if item.repo_id != Some(binding.repo_id) {
+            bail!("Jira repo binding changed while work_item was building");
+        }
+        verify_repo_remote(&item.repo_path, &binding.repo_url)?;
+    }
+    Ok(())
+}
+
 async fn dispatch_one(
     pg: PgPool,
     item: AssignedWorkItem,
     worker_name: String,
 ) -> Result<WorkItemDispatchResult> {
+    crate::jira_repo_binding::validate_jira_repo_binding(&pg, item.work_item_id).await?;
     // CLAIM + heartbeat FIRST, before the (possibly slow cold-clone) checkout.
     // dispatch_one now runs CONCURRENTLY with this host's other assigned leases
     // (spawned by evaluate_work_item_dispatch — a serial `.await` here blocked the
@@ -1323,8 +1378,11 @@ async fn dispatch_one(
         return Ok(WorkItemDispatchResult { sweep_warnings });
     }
 
+    crate::jira_repo_binding::validate_jira_repo_binding(&pg, item.work_item_id).await?;
     let head_sha = git_head_sha(&worktree.worktree_path)?;
+    revalidate_jira_checkout(&pg, &item).await?;
     push_branch(&item.repo_path, &worktree.task_branch)?;
+    revalidate_jira_checkout(&pg, &item).await?;
     let pr_url = create_pr(&worktree.worktree_path, &item, &worktree).await?;
     record_pr_provenance(&pg, &item, &backend_used, &pr_url).await?;
 
@@ -1386,6 +1444,7 @@ async fn dispatch_one(
         let sweep_warnings = post_phase.finish();
         return Ok(WorkItemDispatchResult { sweep_warnings });
     }
+    revalidate_jira_checkout(&pg, &item).await?;
     mark_ready_for_review(
         &pg,
         &item,

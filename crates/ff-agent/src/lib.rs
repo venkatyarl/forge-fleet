@@ -90,6 +90,7 @@ pub mod http_auth;
 pub mod inference_router;
 pub mod instructions_sync;
 pub mod jira_ingestion_tick;
+pub mod jira_repo_binding;
 pub mod job_sweeper;
 pub mod kimi_usage_poller;
 pub mod leader_cache;
