@@ -1,3 +1,4 @@
+//! Core shared types for ForgeFleet.
 //! Core primitives shared across ForgeFleet crates.
 //!
 //! This crate is the foundation of ForgeFleet, providing:
