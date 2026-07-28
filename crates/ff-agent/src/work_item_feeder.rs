@@ -12,6 +12,16 @@ use uuid::Uuid;
 
 const AUTO_FEEDER_MODE: &str = "auto_feeder_mode";
 
+pub(crate) fn jira_parent_eligibility_sql(alias: &str) -> String {
+    format!(
+        "({alias}.kind <> 'jira' OR (\
+         {alias}.status = 'ready' \
+         AND LOWER(BTRIM(COALESCE({alias}.metadata->>'jira_status', ''))) \
+             NOT IN ('blocked', 'blocked on vinny') \
+         AND NULLIF(BTRIM(COALESCE({alias}.metadata->>'jira_execution_hold', '')), '') IS NULL))"
+    )
+}
+
 /// Return whether pipeline capacity permits promoting one more idea.
 pub fn feed_decision(free_slots: i64, in_review: i64, active: i64) -> bool {
     free_slots > 0 && in_review < 40 && active < 30
@@ -46,30 +56,44 @@ async fn feed_once(pg: &PgPool) -> Result<()> {
     // capacity gate: a stuck backlog must be healed even when the pipeline looks
     // busy. Bounded (LIMIT 1/tick) and self-terminating (the `NOT EXISTS task
     // child` guard skips an item once it has been decomposed).
-    if let Some((id, kind)) = sqlx::query_as::<_, (Uuid, String)>(
-        "SELECT id, kind FROM work_items w \
-         WHERE w.status = 'ready' AND w.kind <> 'task' AND NOT w.parked \
-           AND NOT EXISTS (SELECT 1 FROM work_items c \
-                           WHERE c.parent_id = w.id AND c.kind = 'task') \
-         ORDER BY CASE w.priority \
-           WHEN 'critical' THEN 0 WHEN 'high' THEN 1 \
-           WHEN 'medium' THEN 2 ELSE 3 END, w.created_at \
-         LIMIT 1",
-    )
-    .fetch_optional(pg)
-    .await?
+    let ready_parent_sql = format!(
+        "UPDATE work_items p SET status = 'decomposing', last_error = NULL \
+         WHERE p.id = ( \
+           SELECT w.id FROM work_items w \
+           WHERE w.status = 'ready' AND w.kind <> 'task' AND NOT w.parked \
+             AND {} \
+             AND NOT EXISTS (SELECT 1 FROM work_items c \
+                             WHERE c.parent_id = w.id AND c.kind = 'task') \
+           ORDER BY CASE w.priority \
+             WHEN 'critical' THEN 0 WHEN 'high' THEN 1 \
+             WHEN 'medium' THEN 2 ELSE 3 END, w.created_at \
+           LIMIT 1 FOR UPDATE SKIP LOCKED) \
+         RETURNING p.id, p.kind",
+        jira_parent_eligibility_sql("w")
+    );
+    if let Some((id, kind)) = sqlx::query_as::<_, (Uuid, String)>(&ready_parent_sql)
+        .fetch_optional(pg)
+        .await?
     {
         warn!(
             work_item_id = %id,
             kind = %kind,
             "feeder: healing unschedulable READY non-task item — auto-decomposing into leaf tasks"
         );
-        decompose(id).await?;
-        // The parent is now broken into `ready` leaf tasks; take it out of the
-        // `ready` set so it isn't re-scanned and never lingers as a bogus
-        // unschedulable ready item.
+        if let Err(error) = decompose(id).await {
+            sqlx::query(
+                "UPDATE work_items SET status = 'ready', last_error = $2 \
+                 WHERE id = $1 AND status = 'decomposing'",
+            )
+            .bind(id)
+            .bind(format!("ready parent auto-decompose: {error:#}"))
+            .execute(pg)
+            .await?;
+            return Err(error);
+        }
         sqlx::query(
-            "UPDATE work_items SET status = 'decomposed' WHERE id = $1 AND status = 'ready'",
+            "UPDATE work_items SET status = 'decomposed' \
+             WHERE id = $1 AND status = 'decomposing'",
         )
         .bind(id)
         .execute(pg)
@@ -95,6 +119,7 @@ async fn feed_once(pg: &PgPool) -> Result<()> {
     let idea = sqlx::query_as::<_, (Uuid, String)>(
         "SELECT id, kind FROM work_items \
          WHERE status = 'idea' AND NOT parked \
+           AND kind <> 'jira' \
          ORDER BY CASE priority \
            WHEN 'critical' THEN 0 WHEN 'high' THEN 1 \
            WHEN 'medium' THEN 2 ELSE 3 END, created_at \
@@ -121,12 +146,9 @@ async fn feed_once(pg: &PgPool) -> Result<()> {
                 info!(work_item_id = %id, "work item feeder promoted task");
             }
         }
-        // epics decompose exactly like bugs/features — a parent goal broken into
-        // buildable leaf tasks (operator 2026-07-26: epics were being SKIPPED,
-        // starving the fleet of the priority work). `jira` added 2026-07-28: the
-        // HireFlow360 backlog ingests as kind='jira' (52 rows), which the catch-all
-        // below was silently skipping — another way the fleet starved of tasks.
-        "bug" | "feature" | "epic" | "jira" => decompose(id).await?,
+        // Epics decompose exactly like bugs/features. Jira parents intentionally
+        // reach decomposition only through the persisted-ready selector above.
+        "bug" | "feature" | "epic" => decompose(id).await?,
         other => {
             warn!(work_item_id = %id, kind = other, "work item feeder skipped unsupported kind")
         }
@@ -206,7 +228,8 @@ pub fn spawn_work_item_feeder(
 
 #[cfg(test)]
 mod tests {
-    use super::feed_decision;
+    use super::{feed_decision, jira_parent_eligibility_sql};
+    use sqlx::PgPool;
 
     #[test]
     fn feed_requires_slot_and_pipeline_headroom() {
@@ -215,5 +238,36 @@ mod tests {
         assert!(!feed_decision(-1, 39, 29));
         assert!(!feed_decision(1, 40, 29));
         assert!(!feed_decision(1, 39, 30));
+    }
+
+    #[tokio::test]
+    async fn persisted_jira_parent_eligibility_skips_blocked_and_allows_active_statuses() {
+        let Some(database_url) = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .ok()
+            .or_else(|| std::env::var("FORGEFLEET_DATABASE_URL").ok())
+        else {
+            return;
+        };
+        let pg = PgPool::connect(&database_url)
+            .await
+            .expect("connect test db");
+        let sql = format!(
+            "SELECT label FROM (VALUES \
+             ('stale blocked', 'jira', 'ready', '{{\"jira_status\":\"Blocked\"}}'::jsonb), \
+             ('vinny blocked', 'jira', 'ready', '{{\"jira_status\":\"Blocked on Vinny\"}}'::jsonb), \
+             ('to do', 'jira', 'ready', '{{\"jira_status\":\"To Do\"}}'::jsonb), \
+             ('in progress', 'jira', 'ready', '{{\"jira_status\":\"In Progress\"}}'::jsonb), \
+             ('held', 'jira', 'ready', '{{\"jira_status\":\"To Do\",\"jira_execution_hold\":\"awaiting_council\"}}'::jsonb), \
+             ('idea jira', 'jira', 'idea', '{{\"jira_status\":\"To Do\"}}'::jsonb), \
+             ('non-jira idea', 'feature', 'idea', '{{}}'::jsonb)) \
+             AS candidate(label, kind, status, metadata) \
+             WHERE {} ORDER BY label",
+            jira_parent_eligibility_sql("candidate")
+        );
+        let eligible: Vec<String> = sqlx::query_scalar(&sql)
+            .fetch_all(&pg)
+            .await
+            .expect("evaluate Jira eligibility");
+        assert_eq!(eligible, vec!["in progress", "non-jira idea", "to do"]);
     }
 }
