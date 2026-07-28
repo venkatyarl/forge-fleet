@@ -575,6 +575,42 @@ pub async fn attached_clients(
 mod tests {
     use super::*;
 
+    #[test]
+    fn session_id_without_token_is_the_bare_triple() {
+        // Backward compatible: one seat per (worker, project, tool).
+        assert_eq!(
+            session_id_for_token("adele", "forge-fleet", "kimi", None),
+            "adele-forge-fleet-kimi"
+        );
+        assert_eq!(
+            session_id_for("adele", "forge-fleet", "kimi"),
+            "adele-forge-fleet-kimi"
+        );
+        // Empty/whitespace token collapses to the bare triple (no trailing dash).
+        assert_eq!(
+            session_id_for_token("adele", "forge-fleet", "kimi", Some("   ")),
+            "adele-forge-fleet-kimi"
+        );
+    }
+
+    #[test]
+    fn distinct_tokens_yield_distinct_seats_for_same_tool() {
+        // The whole point: two kimi sessions on one repo → two rows.
+        let a = session_id_for_token("adele", "forge-fleet", "kimi", Some("session_a2aaef27"));
+        let b = session_id_for_token("adele", "forge-fleet", "kimi", Some("session_9bcd1234"));
+        assert_ne!(a, b);
+        assert_eq!(a, "adele-forge-fleet-kimi-session_a2aaef27");
+    }
+
+    #[test]
+    fn token_is_sanitized_so_a_stray_id_cant_break_the_key() {
+        // Spaces/slashes/colons in a native id are replaced with '_'.
+        assert_eq!(
+            session_id_for_token("adele", "forge-fleet", "codex", Some("a b/c:d")),
+            "adele-forge-fleet-codex-a_b_c_d"
+        );
+    }
+
     fn test_workstream() -> Workstream {
         Workstream {
             id: uuid::Uuid::nil(),
