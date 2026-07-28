@@ -386,6 +386,37 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
         crate::WorkstreamCommand::InstallHooks { r#for, dry_run } => {
             install_workstream_hooks(&r#for, dry_run)?;
         }
+        crate::WorkstreamCommand::Prune {
+            older_than_hours,
+            dry_run,
+        } => {
+            let dir = effective_cwd(cwd)?;
+            let ws = workstreams::workstream_for_dir(&pg, &dir)
+                .await?
+                .with_context(|| format!("no workstream matches {}", dir.display()))?;
+            let cutoff = chrono::Utc::now() - chrono::Duration::hours(i64::from(older_than_hours));
+            let pruned = workstreams::prune_stale_clients(&pg, ws.id, cutoff, dry_run).await?;
+            let verb = if dry_run { "would detach" } else { "detached" };
+            println!(
+                "🧹 {} {} stale seat(s) in '{}' (idle > {}h):",
+                verb,
+                pruned.len(),
+                ws.project_key,
+                older_than_hours
+            );
+            for p in &pruned {
+                println!(
+                    "     • {} [{}] {} · last active {}",
+                    p.worker_name,
+                    p.tool,
+                    p.session_id,
+                    p.last_active_at.format("%Y-%m-%d %H:%M UTC")
+                );
+            }
+            if pruned.is_empty() {
+                println!("     <none — every seat is fresh>");
+            }
+        }
     }
     Ok(())
 }

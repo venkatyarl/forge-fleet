@@ -2646,6 +2646,17 @@ pub enum WorkstreamCommand {
     },
     /// List all active project workstreams.
     List,
+    /// Detach stale seats (soft prune): sessions with no report/heartbeat since
+    /// the cutoff are marked 'detached' and hidden from `status`. Reversible —
+    /// any attach/report/heartbeat from that session revives its seat.
+    Prune {
+        /// Seats idle longer than this many hours are stale.
+        #[arg(long, default_value_t = 24)]
+        older_than_hours: u32,
+        /// Show what would be pruned without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Liveness ping — bump this session's last_report_at without changing the
     /// shared summary. Called automatically by the session Stop hook.
     Heartbeat {

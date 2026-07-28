@@ -421,7 +421,7 @@ pub async fn report(
     let redacted_focus = focus.map(redact_secrets);
     let redacted_note = note.map(redact_secrets);
     let ws_id: uuid::Uuid = sqlx::query_scalar(
-        "UPDATE workstream_clients SET last_report_at = now() \
+        "UPDATE workstream_clients SET last_report_at = now(), status = 'attached' \
           WHERE session_id = $1 RETURNING workstream_id",
     )
     .bind(session_id)
@@ -531,15 +531,18 @@ pub async fn derive_working_summaries(pg: &PgPool) -> Result<u64> {
 /// Lightweight liveness ping from an attached session — bumps `last_report_at`
 /// WITHOUT touching the shared summary/focus. Called from a session Stop hook so
 /// the workstream knows the client is still alive even between substantive
-/// `report` calls. Silent no-op if the session isn't attached (the SessionStart
-/// hook attaches; a Stop firing before attach shouldn't error).
+/// `report` calls. Also revives a pruned (detached) seat: any sign of life means
+/// the session is real. Silent no-op if the session isn't attached (the
+/// SessionStart hook attaches; a Stop firing before attach shouldn't error).
 pub async fn heartbeat(pg: &PgPool, session_id: &str) -> Result<bool> {
-    let n =
-        sqlx::query("UPDATE workstream_clients SET last_report_at = now() WHERE session_id = $1")
-            .bind(session_id)
-            .execute(pg)
-            .await?
-            .rows_affected();
+    let n = sqlx::query(
+        "UPDATE workstream_clients SET last_report_at = now(), status = 'attached' \
+          WHERE session_id = $1",
+    )
+    .bind(session_id)
+    .execute(pg)
+    .await?
+    .rows_affected();
     Ok(n > 0)
 }
 
@@ -555,6 +558,7 @@ pub struct AttachedClient {
 }
 
 /// List the sessions attached to a workstream, most-recently-active first.
+/// Detached (pruned) seats are hidden — re-attach or any heartbeat revives one.
 pub async fn attached_clients(
     pg: &PgPool,
     workstream_id: uuid::Uuid,
@@ -562,12 +566,62 @@ pub async fn attached_clients(
     ensure_client_schema(pg).await?;
     let rows = sqlx::query_as::<_, AttachedClient>(
         "SELECT session_id, worker_name, tool, goal, status, last_report_at \
-           FROM workstream_clients WHERE workstream_id = $1 \
+           FROM workstream_clients WHERE workstream_id = $1 AND status = 'attached' \
           ORDER BY last_report_at DESC NULLS LAST, attached_at DESC",
     )
     .bind(workstream_id)
     .fetch_all(pg)
     .await?;
+    Ok(rows)
+}
+
+/// A seat pruned by `prune_stale_clients`, for reporting what changed.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PrunedClient {
+    pub session_id: String,
+    pub worker_name: String,
+    pub tool: String,
+    pub last_active_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Mark seats with no activity since `cutoff` as detached (soft prune — the row
+/// stays for history; `attach`/`report`/`heartbeat` revive it on any sign of
+/// life). A seat's activity is `last_report_at`, falling back to `attached_at`
+/// for sessions that never reported. `dry_run` returns what WOULD be pruned
+/// without writing. Returns the affected seats, most-stale first.
+pub async fn prune_stale_clients(
+    pg: &PgPool,
+    workstream_id: uuid::Uuid,
+    cutoff: chrono::DateTime<chrono::Utc>,
+    dry_run: bool,
+) -> Result<Vec<PrunedClient>> {
+    ensure_client_schema(pg).await?;
+    let rows = if dry_run {
+        sqlx::query_as::<_, PrunedClient>(
+            "SELECT session_id, worker_name, tool, \
+                    COALESCE(last_report_at, attached_at) AS last_active_at \
+               FROM workstream_clients \
+              WHERE workstream_id = $1 AND status = 'attached' \
+                AND COALESCE(last_report_at, attached_at) < $2 \
+              ORDER BY last_active_at",
+        )
+        .bind(workstream_id)
+        .bind(cutoff)
+        .fetch_all(pg)
+        .await?
+    } else {
+        sqlx::query_as::<_, PrunedClient>(
+            "UPDATE workstream_clients SET status = 'detached' \
+              WHERE workstream_id = $1 AND status = 'attached' \
+                AND COALESCE(last_report_at, attached_at) < $2 \
+            RETURNING session_id, worker_name, tool, \
+                    COALESCE(last_report_at, attached_at) AS last_active_at",
+        )
+        .bind(workstream_id)
+        .bind(cutoff)
+        .fetch_all(pg)
+        .await?
+    };
     Ok(rows)
 }
 
