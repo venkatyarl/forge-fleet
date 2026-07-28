@@ -5199,6 +5199,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconcile_sub_agent_slots_has_one_database_owner() {
+        let Some((admin, pool, db_name)) = create_slot_reconcile_db().await else {
+            return;
+        };
+
+        let computer = uuid::Uuid::new_v4();
+        let item = uuid::Uuid::new_v4();
+        let slot = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'testbox')")
+            .bind(computer)
+            .execute(&pool)
+            .await
+            .expect("insert computer");
+        sqlx::query("INSERT INTO work_items (id, status) VALUES ($1, 'claimed')")
+            .bind(item)
+            .execute(&pool)
+            .await
+            .expect("insert work item");
+        sqlx::query(
+            "INSERT INTO sub_agents (id, computer_id, slot, status)
+             VALUES ($1, $2, 0, 'idle')",
+        )
+        .bind(slot)
+        .bind(computer)
+        .execute(&pool)
+        .await
+        .expect("insert slot");
+        sqlx::query(
+            "INSERT INTO work_item_leases (work_item_id, sub_agent_id, computer_id)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(item)
+        .bind(slot)
+        .bind(computer)
+        .execute(&pool)
+        .await
+        .expect("insert lease");
+
+        let mut owner = pool.begin().await.expect("begin lock owner");
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('sub_agent_slot_lease_reconciler'))")
+            .execute(&mut *owner)
+            .await
+            .expect("hold reconciler lock");
+
+        assert_eq!(
+            pg_reconcile_sub_agent_slots(&pool)
+                .await
+                .expect("competing reconcile"),
+            (0, 0),
+            "a competing reconciler must be a no-op"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM sub_agents WHERE id = $1")
+            .bind(slot)
+            .fetch_one(&pool)
+            .await
+            .expect("read unchanged slot");
+        assert_eq!(status, "idle");
+
+        owner.rollback().await.expect("release reconciler lock");
+        assert_eq!(
+            pg_reconcile_sub_agent_slots(&pool)
+                .await
+                .expect("owner reconcile"),
+            (1, 0)
+        );
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
     async fn reset_busy_slots_on_startup_only_touches_named_computer() {
         let Some((admin, pool, db_name)) = create_slot_reconcile_db().await else {
             return;
@@ -8899,7 +8969,22 @@ pub async fn pg_free_slots(
 ///    The released-lease guard keeps this from clobbering the agent
 ///    coordinator's non-lease claims (`fleet_run` dispatch never writes lease
 ///    rows), which stay owned by the stuck-slot reaper's age ceiling.
+///
+/// The leader gate at the caller is necessary but not sufficient during leader
+/// handoff: an old and new leader can briefly overlap. A transaction-scoped
+/// advisory lock elects exactly one reconciler, and the transaction makes both
+/// directions visible atomically. A competing tick returns `(0, 0)`.
 pub async fn pg_reconcile_sub_agent_slots(pool: &PgPool) -> Result<(u64, u64)> {
+    let mut tx = pool.begin().await?;
+    let owns_reconciler: bool = sqlx::query_scalar(
+        "SELECT pg_try_advisory_xact_lock(hashtext('sub_agent_slot_lease_reconciler'))",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if !owns_reconciler {
+        return Ok((0, 0));
+    }
+
     let relinked = sqlx::query(
         "UPDATE sub_agents sa
             SET status = 'busy',
@@ -8915,7 +9000,7 @@ pub async fn pg_reconcile_sub_agent_slots(pool: &PgPool) -> Result<(u64, u64)> {
             AND (sa.status <> 'busy'
                  OR sa.current_work_item_id IS DISTINCT FROM l.work_item_id)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
 
@@ -8936,10 +9021,11 @@ pub async fn pg_reconcile_sub_agent_slots(pool: &PgPool) -> Result<(u64, u64)> {
                    AND l.work_item_id = sa.current_work_item_id
                    AND l.released_at IS NOT NULL)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
 
+    tx.commit().await?;
     Ok((relinked, freed))
 }
 
