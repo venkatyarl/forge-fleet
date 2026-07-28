@@ -4227,6 +4227,18 @@ async fn run_ff_dispatch(
             "run_ff_dispatch: last attempt's backend produced no diff — rotating to a different LLM"
         );
     }
+    // OPERATOR POLICY GUARD (the intent above is documented everywhere but was
+    // never actually enforced on the final list — 2026-07-28 the fleet was
+    // observed running `ff cli claude` builds that hung ~26min each, ignoring
+    // --timeout, churning the lease AND rotating the operator's shared OAuth
+    // token (the /login-expiry loop the operator reported)). Enforce it here,
+    // unconditionally, as the last thing before the try-loop:
+    //   • claude is NEVER a fleet builder (operator-reserved) — a stale capacity
+    //     snapshot / fallback can still leak it into `backends`; drop it.
+    //   • honor `[general] disabled_backends` in fleet.toml so an operator pause
+    //     (e.g. kimi) is DURABLE — unlike the computer_backends.authenticated DB
+    //     flag, which background auth-probes revert.
+    backends.retain(|b| b != "claude" && !crate::fleet_info::is_backend_disabled(b));
     let computer_id = item.computer_id;
     let forced_backend = primary_or_default_backend(&backends);
     let mut attempted_backend = false;
@@ -6067,6 +6079,17 @@ fn command_display(cmd: &Command) -> String {
 /// that handler dead code — an already-built feature task requeued to death.)
 fn run_command_capture(mut cmd: Command, timeout: Duration) -> Result<Output> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Own process group so a timeout SIGKILLs the WHOLE tree. `ff cli <backend>`
+    // forks the actual vendor CLI (claude/codex/kimi) as a GRANDCHILD; killing
+    // only the direct `ff` child (the old `child.kill()`) leaves that grandchild
+    // running — observed 2026-07-28: `ff cli claude` ran ~26min (1560s+) past its
+    // ~18.5min timeout, holding the build lease and churning it. pgid == child pid
+    // because we spawn it as the group leader.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let program = command_display(&cmd);
     let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
     let start = Instant::now();
@@ -6077,6 +6100,12 @@ fn run_command_capture(mut cmd: Command, timeout: Duration) -> Result<Output> {
                 .with_context(|| format!("collect output for {program}"));
         }
         if start.elapsed() >= timeout {
+            // SIGKILL the entire process group — not just the direct child — so the
+            // forked vendor CLI dies too instead of running on for another ~8min.
+            #[cfg(unix)]
+            unsafe {
+                libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+            }
             let _ = child.kill();
             let _ = child.wait();
             bail!("command timed out after {timeout:?}: {program}");
