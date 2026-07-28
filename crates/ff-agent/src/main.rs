@@ -125,6 +125,23 @@ async fn main() -> anyhow::Result<()> {
             ))
         });
 
+    let log_shipper_handle = std::env::var("FORGEFLEET_POSTGRES_URL")
+        .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+        .ok()
+        .and_then(|database_url| {
+            sqlx::PgPool::connect_lazy(&database_url)
+                .map_err(|error| warn!(%error, "log shipper database URL is invalid"))
+                .ok()
+        })
+        .map(|pool| {
+            tokio::spawn(ff_agent::log_shipper::run(
+                pool,
+                config.node_id.clone(),
+                config.log_shipping.clone(),
+                cancel.clone(),
+            ))
+        });
+
     let executor_handle = tokio::spawn(run_task_executor(
         shared_state,
         task_rx,
@@ -148,6 +165,9 @@ async fn main() -> anyhow::Result<()> {
     poller_handle.abort();
     build_monitor_handle.abort();
     if let Some(handle) = fabric_handle {
+        handle.abort();
+    }
+    if let Some(handle) = log_shipper_handle {
         handle.abort();
     }
     executor_handle.abort();

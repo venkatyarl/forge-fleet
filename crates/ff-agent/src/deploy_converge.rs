@@ -246,8 +246,10 @@ async fn run_once(pg: &PgPool) -> Result<()> {
             .unwrap_or_default()
             .into_iter()
             .collect();
-            let real_failures: Vec<&String> =
-                failed_nodes.iter().filter(|n| online.contains(*n)).collect();
+            let real_failures: Vec<&String> = failed_nodes
+                .iter()
+                .filter(|n| online.contains(*n))
+                .collect();
             if real_failures.is_empty() {
                 info!(
                     head = %head,
