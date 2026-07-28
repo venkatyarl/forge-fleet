@@ -52,7 +52,7 @@ pub async fn run_auto_backlog_feeder_tick(pg: &PgPool) -> Result<usize> {
                 .rows_affected();
                 fed += usize::from(changed == 1);
             }
-            "bug" | "feature" => match decompose_idea(&idea).await {
+            "bug" | "feature" | "epic" | "jira" => match decompose_idea(&idea).await {
                 Ok(()) => fed += 1,
                 Err(error) => {
                     warn!(item = %idea.id, %error, "auto backlog feeder decomposition failed");
@@ -83,9 +83,14 @@ pub async fn run_auto_backlog_feeder_tick(pg: &PgPool) -> Result<usize> {
 async fn rescue_ready_parent(pg: &PgPool) -> Result<usize> {
     // A parent that already has children was decomposed by an older CLI which
     // did not transition ready parents. Repair it without generating duplicates.
+    // Kinds that are NOT schedulable as-is (the scheduler only dispatches
+    // kind='task') and must be decomposed into leaf tasks. 'jira'/'epic' added
+    // 2026-07-28: a ready jira/epic with no task children was a silent dead zone —
+    // unschedulable AND skipped here — which starved the fleet to 0 completions
+    // (54 HireFlow360 jira sat ready for hours). Must match the `next_idea` kinds.
     sqlx::query(
         "UPDATE work_items p SET status = 'decomposed', last_error = NULL \
-         WHERE p.status = 'ready' AND p.kind IN ('bug', 'feature') \
+         WHERE p.status = 'ready' AND p.kind IN ('bug', 'feature', 'epic', 'jira') \
            AND EXISTS (SELECT 1 FROM work_items c WHERE c.parent_id = p.id)",
     )
     .execute(pg)
@@ -95,7 +100,7 @@ async fn rescue_ready_parent(pg: &PgPool) -> Result<usize> {
         "UPDATE work_items p SET status = 'decomposing', last_error = NULL \
          WHERE p.id = ( \
              SELECT w.id FROM work_items w \
-              WHERE w.status = 'ready' AND w.kind IN ('bug', 'feature') \
+              WHERE w.status = 'ready' AND w.kind IN ('bug', 'feature', 'epic', 'jira') \
                 AND COALESCE(w.parked, FALSE) = FALSE \
                 AND w.created_at <= NOW() - make_interval(mins => $1) \
                 AND NOT EXISTS (SELECT 1 FROM work_items c WHERE c.parent_id = w.id) \
@@ -170,7 +175,7 @@ async fn next_idea(pg: &PgPool, attempted: &HashSet<Uuid>) -> Result<Option<Idea
         "SELECT id, project_id, kind, repo_path \
            FROM work_items \
           WHERE status = 'idea' AND parked = FALSE \
-            AND kind IN ('task', 'bug', 'feature') \
+            AND kind IN ('task', 'bug', 'feature', 'epic', 'jira') \
             AND NOT (id = ANY($1::uuid[])) \
           ORDER BY CASE priority \
                      WHEN 'critical' THEN 0 WHEN 'high' THEN 1 \
