@@ -68,10 +68,12 @@ async fn feed_once(pg: &PgPool) -> Result<()> {
         // The parent is now broken into `ready` leaf tasks; take it out of the
         // `ready` set so it isn't re-scanned and never lingers as a bogus
         // unschedulable ready item.
-        sqlx::query("UPDATE work_items SET status = 'decomposed' WHERE id = $1 AND status = 'ready'")
-            .bind(id)
-            .execute(pg)
-            .await?;
+        sqlx::query(
+            "UPDATE work_items SET status = 'decomposed' WHERE id = $1 AND status = 'ready'",
+        )
+        .bind(id)
+        .execute(pg)
+        .await?;
         return Ok(());
     }
 
