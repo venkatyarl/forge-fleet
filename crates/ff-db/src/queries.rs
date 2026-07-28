@@ -9415,15 +9415,22 @@ pub struct MergeQueueItem {
 /// serializes merges to ONE per project. (A 'ci_running' row is one we're
 /// already watching; re-returning it lets the drain re-check its PR CI.)
 pub async fn pg_next_merge_queue_item(pool: &PgPool) -> Result<Option<MergeQueueItem>> {
+    // Fail-open enqueues (review produced no verdict) insert with a NULL/empty
+    // review_verdict — by design they are still meant to drain ('reject' rows
+    // are only ever written with status='failed', so an ACTIVE row can never
+    // carry a reject). Filtering on `= 'approve'` made such rows both
+    // unselectable AND permanent head-blockers via the NOT EXISTS sibling
+    // guard (2026-07-28: PR #1480 stalled the whole forge-fleet queue).
     let row = sqlx::query(
         "SELECT id, work_item_id, project_id, pr_url, branch_name
            FROM work_item_merge_queue q
           WHERE q.status IN ('queued', 'ci_running', 'mergeable')
-            AND q.review_verdict = 'approve'
+            AND COALESCE(q.review_verdict, '') <> 'reject'
             AND NOT EXISTS (
                 SELECT 1 FROM work_item_merge_queue q2
                  WHERE q2.project_id = q.project_id
                    AND q2.status IN ('queued', 'ci_running', 'mergeable')
+                   AND COALESCE(q2.review_verdict, '') <> 'reject'
                    AND q2.position < q.position)
           ORDER BY q.position ASC
           LIMIT 1",
