@@ -1975,6 +1975,14 @@ enum FleetCommand {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
+    /// Recover an ownerless deploy drain and return its sub-agent slots to
+    /// rotation. Refuses Taylor and any operator-owned reservation.
+    Undrain {
+        /// Computer name (e.g. "sophie").
+        computer: String,
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
     /// Upgrade a software entry across the fleet using its upgrade_playbook.
     ///
     /// Looks up every (computer, software_id) row in computer_software,
