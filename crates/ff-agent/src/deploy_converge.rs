@@ -214,11 +214,63 @@ async fn run_once(pg: &PgPool) -> Result<()> {
                 info!(requeued, head = %head, "deploy-converge: auto-requeued fixable failures for the new code");
             }
         }
-        Ok(o) => warn!(
-            head = %head, code = ?o.status.code(),
-            stderr = %String::from_utf8_lossy(&o.stderr).chars().take(400).collect::<String>(),
-            "deploy-converge: fleet deploy returned non-zero — will retry next tick"
-        ),
+        Ok(o) => {
+            // `ff fleet deploy --all` exits NON-ZERO if ANY node fails — including
+            // a node that is simply powered off / unreachable (shakira, taylor).
+            // The old code then never advanced LAST_DEPLOYED_KEY, so every 5-min
+            // tick saw `head != last`, redeployed, and RESTART-DRAINED every
+            // in-flight build fleet-wide — a permanent completion outage triggered
+            // by a single offline box (observed 2026-07-28: ~10 restart waves,
+            // 0 completions). Fix: if the ONLY failures are offline/unreachable
+            // nodes, the reachable fleet DID converge — record the SHA so we stop
+            // looping. Only a genuine ONLINE-node failure retries next tick.
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            let failed_nodes: std::collections::HashSet<String> = combined
+                .lines()
+                .filter(|l| l.contains('✗'))
+                .filter_map(|l| {
+                    l.split_whitespace()
+                        .find(|t| !t.contains('✗'))
+                        .map(|s| s.to_string())
+                })
+                .collect();
+            let online: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
+                "SELECT name FROM computers WHERE coalesce(status,'') = 'online'",
+            )
+            .fetch_all(pg)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+            let real_failures: Vec<&String> =
+                failed_nodes.iter().filter(|n| online.contains(*n)).collect();
+            if real_failures.is_empty() {
+                info!(
+                    head = %head,
+                    offline_skipped = ?failed_nodes,
+                    "deploy-converge: reachable fleet converged (only offline nodes failed) — recording SHA to stop the redeploy/restart loop"
+                );
+                let _ = ff_db::pg_set_secret(
+                    pg,
+                    LAST_DEPLOYED_KEY,
+                    &head,
+                    Some("deploy-converge: converged across all ONLINE nodes (offline nodes skipped)"),
+                    Some("deploy-converge"),
+                )
+                .await;
+            } else {
+                warn!(
+                    head = %head, code = ?o.status.code(),
+                    online_failures = ?real_failures,
+                    stderr = %String::from_utf8_lossy(&o.stderr).chars().take(400).collect::<String>(),
+                    "deploy-converge: ONLINE node(s) failed deploy — will retry next tick"
+                );
+            }
+        }
         Err(e) => warn!(error = %e, "deploy-converge: failed to invoke ff fleet deploy"),
     }
     Ok(())
