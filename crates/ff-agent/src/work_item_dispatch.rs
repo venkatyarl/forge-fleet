@@ -451,6 +451,32 @@ fn repo_slug(repo_url: &str) -> String {
     }
 }
 
+fn repo_identity(repo_url: &str) -> String {
+    let trimmed = repo_url
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git");
+    let path = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest.split_once('/').map(|(_, p)| p).unwrap_or(rest))
+        .or_else(|| trimmed.split_once(':').map(|(_, p)| p))
+        .unwrap_or(trimmed)
+        .trim_start_matches('/');
+    let parts = path
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>();
+    parts
+        .iter()
+        .rev()
+        .take(2)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+        .join("/")
+        .to_ascii_lowercase()
+}
+
 /// Clone location for a work_item's repo: INSIDE the assigned sub-agent slot, so
 /// each slot holds its OWN full checkout (build-path option A, 2026-07-07) — e.g.
 /// `~/.forgefleet/sub-agents/sub-agent-3/forge-fleet`. Replaces the old shared
@@ -850,6 +876,108 @@ async fn ensure_repo_checked_out(pg: &PgPool, item: &AssignedWorkItem) -> Result
     Ok(())
 }
 
+/// Fail closed for task rows descended from Jira.  The binding is checked from
+/// the authoritative tables each time (rather than trusting the assignment
+/// snapshot), so a Jira/project-repo edit made while an agent is building
+/// cannot turn a valid checkout into a wrong-repository push or PR.
+async fn revalidate_jira_repo_binding(pg: &PgPool, item: &AssignedWorkItem) -> Result<()> {
+    let valid: bool = sqlx::query_scalar(
+        r#"
+        WITH RECURSIVE ancestors AS (
+            SELECT p.* FROM work_items p
+             WHERE p.id = (SELECT parent_id FROM work_items WHERE id = $1)
+            UNION ALL
+            SELECT p.* FROM work_items p JOIN ancestors a ON a.parent_id = p.id
+        ),
+        jira AS (
+            SELECT * FROM ancestors WHERE kind = 'jira' LIMIT 1
+        )
+        SELECT CASE
+            WHEN NOT EXISTS (SELECT 1 FROM jira) THEN TRUE
+            ELSE EXISTS (
+                SELECT 1
+                  FROM work_items child
+                  JOIN project_repos repo
+                    ON repo.id = child.repo_id
+                   AND repo.project_id = child.project_id
+                 CROSS JOIN jira
+                 WHERE child.id = $1
+                   AND NULLIF(BTRIM(repo.github_url), '') IS NOT NULL
+                   AND (child.repo_url IS NULL
+                        OR BTRIM(child.repo_url) = BTRIM(repo.github_url))
+                   AND (
+                       child.repo_id = jira.repo_id
+                       OR (
+                           jira.repo_id IS NULL
+                           AND COALESCE(
+                               jira.metadata->'jira_allowed_repo_ids',
+                               jira.metadata->'allowed_repo_ids',
+                               '[]'::jsonb
+                           ) ? child.repo_id::text
+                       )
+                   )
+            )
+        END
+        "#,
+    )
+    .bind(item.work_item_id)
+    .fetch_one(pg)
+    .await
+    .with_context(|| format!("revalidate Jira repo binding for {}", item.work_item_id))?;
+    if !valid {
+        bail!(
+            "Jira repo binding rejected work_item {} before checkout/result/push/PR",
+            item.work_item_id
+        );
+    }
+    Ok(())
+}
+
+async fn revalidate_jira_checkout(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    checkout: &Path,
+) -> Result<()> {
+    revalidate_jira_repo_binding(pg, item).await?;
+    let Some(repo_id) = item.repo_id else {
+        return Ok(());
+    };
+    let is_jira_descendant: bool = sqlx::query_scalar(
+        "WITH RECURSIVE ancestors AS (\
+             SELECT p.id, p.parent_id, p.kind FROM work_items p \
+              WHERE p.id = (SELECT parent_id FROM work_items WHERE id = $1) \
+             UNION ALL \
+             SELECT p.id, p.parent_id, p.kind FROM work_items p \
+              JOIN ancestors a ON a.parent_id = p.id) \
+         SELECT EXISTS (SELECT 1 FROM ancestors WHERE kind = 'jira')",
+    )
+    .bind(item.work_item_id)
+    .fetch_one(pg)
+    .await?;
+    if !is_jira_descendant {
+        return Ok(());
+    }
+    let expected: String = sqlx::query_scalar("SELECT github_url FROM project_repos WHERE id = $1")
+        .bind(repo_id)
+        .fetch_one(pg)
+        .await?;
+    let origin = run_git(
+        checkout,
+        ["remote", "get-url", "origin"],
+        Duration::from_secs(30),
+    )?;
+    let actual = String::from_utf8_lossy(&origin.stdout);
+    if repo_identity(actual.trim()) != repo_identity(&expected) {
+        bail!(
+            "Jira checkout {} points at {}, expected allowed repo {}",
+            checkout.display(),
+            actual.trim(),
+            expected
+        );
+    }
+    Ok(())
+}
+
 /// Seed the shared repo artifact cache from a freshly cloned slot checkout.
 /// Failures are surfaced to the caller but intentionally do NOT fail the
 /// dispatch — the cache is an optimization, not a hard requirement.
@@ -1042,7 +1170,9 @@ async fn dispatch_one(
 
     // PRE: stage the clone, validate the lifecycle manifest, and verify local
     // prerequisites before checkout/reset and before agent execution.
+    revalidate_jira_repo_binding(&pg, &item).await?;
     ensure_repo_checked_out(&pg, &item).await?;
+    revalidate_jira_checkout(&pg, &item, &item.repo_path).await?;
     validate_dispatch_manifest(&item)?;
     check_dispatch_prerequisites(&item.repo_path)?;
     let worktree = create_worktree_for_item(&pg, &item).await?;
@@ -1305,6 +1435,7 @@ async fn dispatch_one(
     // attempt fixes THAT — the fix for "glm produced a diff but not the RIGHT
     // diff" (the failure mode after the reasoning-content fix). No-op when the
     // item has no criteria (older items / degraded planner) → fail-open.
+    revalidate_jira_checkout(&pg, &item, &worktree.worktree_path).await?;
     if let Some(Err(reason)) =
         diff_meets_acceptance_criteria(&pg, item.work_item_id, &worktree.worktree_path).await
     {
@@ -1324,7 +1455,9 @@ async fn dispatch_one(
     }
 
     let head_sha = git_head_sha(&worktree.worktree_path)?;
+    revalidate_jira_checkout(&pg, &item, &worktree.worktree_path).await?;
     push_branch(&item.repo_path, &worktree.task_branch)?;
+    revalidate_jira_checkout(&pg, &item, &worktree.worktree_path).await?;
     let pr_url = create_pr(&worktree.worktree_path, &item, &worktree).await?;
     record_pr_provenance(&pg, &item, &backend_used, &pr_url).await?;
 
@@ -6387,10 +6520,10 @@ mod tests {
         mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers, parse_cli_tokens,
         parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
         quick_empty_success_is_provider_failure, record_cloud_rescue_local_failure_diagnosis,
-        repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
-        same_model_family, should_attempt_lane15, status_output_is_clean, synthetic_output,
-        task_failed_alert_text, task_prefers_cloud_lane, try_acquire_lane15_480b_permit,
-        use_local_lane, validate_manifest_fields,
+        repo_cache_path, repo_identity, repo_slug, retry_error_is_actionable,
+        rewrite_github_host_alias, same_model_family, should_attempt_lane15,
+        status_output_is_clean, synthetic_output, task_failed_alert_text, task_prefers_cloud_lane,
+        try_acquire_lane15_480b_permit, use_local_lane, validate_manifest_fields,
     };
     use sqlx::Row;
     use std::path::PathBuf;
@@ -6517,6 +6650,18 @@ mod tests {
         assert_eq!(
             mirror_repo_url("https://git-mirror.local/", "not a url"),
             None
+        );
+    }
+
+    #[test]
+    fn repo_identity_matches_aliases_but_not_same_named_repo_in_other_org() {
+        assert_eq!(
+            repo_identity("git@github.com-venkat:HireFlow360-INC/app-profilex.git"),
+            repo_identity("https://github.com/HireFlow360-INC/app-profilex")
+        );
+        assert_ne!(
+            repo_identity("git@github.com:other/app-profilex.git"),
+            repo_identity("git@github.com:HireFlow360-INC/app-profilex.git")
         );
     }
 

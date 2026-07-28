@@ -15,6 +15,9 @@ struct LeafTask {
     /// pattern). Empty when the planner omitted it (older model / degraded).
     #[serde(default)]
     acceptance_criteria: Vec<String>,
+    /// Required on every child when a Jira parent spans more than one repo.
+    #[serde(default)]
+    repo_id: Option<uuid::Uuid>,
 }
 
 pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()> {
@@ -916,11 +919,13 @@ async fn handle_pm_decompose(
     // If `goal` is a work_item UUID, decompose ITS title+description; else treat
     // the string itself as the goal. When it's an existing item, the children
     // hang off it via parent_id.
-    let (parent_id, goal_text, parent_repo, parent_project): (
+    let (parent_id, goal_text, parent_repo, parent_project, parent_is_jira, parent_metadata): (
         Option<uuid::Uuid>,
         String,
         Option<crate::repo_context::RepoContext>,
         Option<String>,
+        bool,
+        serde_json::Value,
     ) = match uuid::Uuid::parse_str(goal.trim()) {
         Ok(uid) => {
             let row: Option<(
@@ -930,25 +935,29 @@ async fn handle_pm_decompose(
                     Option<String>,
                     Option<String>,
                     String,
+                    String,
+                    serde_json::Value,
                 )> =
                     sqlx::query_as(
-                        "SELECT title, description, repo_id, repo_url, repo_path, project_id FROM work_items WHERE id = $1",
+                        "SELECT title, description, repo_id, repo_url, repo_path, project_id, kind, metadata FROM work_items WHERE id = $1",
                     )
                         .bind(uid)
                         .fetch_optional(pool)
                         .await
                         .map_err(|e| anyhow::anyhow!("load work item {uid}: {e}"))?;
             match row {
-                Some((title, desc, repo_id, repo_url, repo_path, project_id)) => (
+                Some((title, desc, repo_id, repo_url, repo_path, project_id, kind, metadata)) => (
                     Some(uid),
                     format!("{title}\n\n{}", desc.unwrap_or_default()),
                     repo_context_from_binding(repo_id, repo_url, repo_path),
                     Some(project_id),
+                    kind == "jira",
+                    metadata,
                 ),
                 None => return Err(anyhow::anyhow!("no work item with id {goal}")),
             }
         }
-        Err(_) => (None, goal.clone(), None, None),
+        Err(_) => (None, goal.clone(), None, None, false, serde_json::json!({})),
     };
 
     // Children MUST inherit the PARENT's project — not the CLI's `--project`
@@ -962,7 +971,49 @@ async fn handle_pm_decompose(
     // parent's project.
     let effective_project = parent_project.clone().unwrap_or_else(|| project.clone());
 
-    let repo_context = if repo.is_none() && cwd.is_none() && parent_repo.is_some() {
+    let jira_allowed_repo_ids = if parent_is_jira {
+        jira_allowed_repo_ids(parent_repo.as_ref(), &parent_metadata)?
+    } else {
+        Vec::new()
+    };
+    if parent_is_jira {
+        let allowed_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM project_repos \
+              WHERE project_id = $1 AND id = ANY($2::uuid[]) \
+                AND NULLIF(BTRIM(github_url), '') IS NOT NULL",
+        )
+        .bind(&effective_project)
+        .bind(&jira_allowed_repo_ids)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("validate Jira parent repo bindings: {e}"))?;
+        if allowed_count != jira_allowed_repo_ids.len() as i64 {
+            return Err(anyhow::anyhow!(
+                "Jira parent repo set contains a repo outside project {effective_project}"
+            ));
+        }
+    }
+
+    let mut jira_repo_contexts = std::collections::HashMap::new();
+    if parent_is_jira {
+        for repo_id in &jira_allowed_repo_ids {
+            let row: (String, Option<String>) =
+                sqlx::query_as("SELECT github_url, local_path FROM project_repos WHERE id = $1")
+                    .bind(repo_id)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("load allowed Jira repo {repo_id}: {e}"))?;
+            let ctx = repo_context_from_binding(Some(*repo_id), Some(row.0), row.1)
+                .ok_or_else(|| anyhow::anyhow!("allowed Jira repo {repo_id} has no binding"))?;
+            jira_repo_contexts.insert(*repo_id, ctx);
+        }
+    }
+
+    let repo_context = if parent_is_jira {
+        (jira_allowed_repo_ids.len() == 1)
+            .then(|| jira_repo_contexts.get(&jira_allowed_repo_ids[0]).cloned())
+            .flatten()
+    } else if repo.is_none() && cwd.is_none() && parent_repo.is_some() {
         parent_repo
     } else {
         crate::repo_context::resolve_repo_context(pool, &effective_project, cwd, repo.as_deref())
@@ -981,12 +1032,28 @@ async fn handle_pm_decompose(
             ctx.primary_language
         );
     }
-    let repo_block = repo_context
+    let repo_block = if parent_is_jira && jira_allowed_repo_ids.len() > 1 {
+        let allowed = jira_allowed_repo_ids
+            .iter()
+            .filter_map(|id| {
+                jira_repo_contexts
+                    .get(id)
+                    .map(|ctx| format!("- repo_id={id}\n{}", ctx.prompt_block()))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "Target repository contexts (Jira multi-repo set):\n{allowed}\n\
+             Every output task MUST include exactly one `repo_id` from this set.\n"
+        )
+    } else {
+        repo_context
         .as_ref()
         .map(|ctx| format!("{}\n", ctx.prompt_block()))
         .unwrap_or_else(|| {
             "Target repository context:\n- unknown; infer cautiously from the goal and do not assume forge-fleet.\n\n".to_string()
-        });
+        })
+    };
     // Give the LLM the repo's REAL source directories so its `files` point at a
     // layout that exists. Without this it invents a plausible-but-wrong tree
     // (observed: `crates/forge-fleet/src/commands/pm.rs`, which doesn't exist —
@@ -1029,6 +1096,7 @@ async fn handle_pm_decompose(
          prefer exactly one; every path MUST be a file that already exists in \
          the repository (scope new code into existing files)>\"], \
          \"complexity\": \"<mechanical|moderate|complex>\", \
+         \"repo_id\": \"<required UUID for a Jira multi-repo goal; omit otherwise>\", \
          \"acceptance_criteria\": [\"<2-5 SHORT, SPECIFIC, CHECKABLE statements of \
          what a CORRECT implementation must satisfy — the reviewer/builder verifies \
          the diff against EACH one. Be concrete: name the exact function/symbol, \
@@ -1068,7 +1136,12 @@ async fn handle_pm_decompose(
     .map_err(|e| anyhow::anyhow!("fleet_oneshot decompose: {e}"))?;
 
     let tasks = parse_leaf_tasks(&resp.text)?;
-    let tasks = match quality_gate_decomposition(tasks, repo_context.as_ref()) {
+    let tasks = match quality_gate_partitioned_decomposition(
+        tasks,
+        repo_context.as_ref(),
+        &jira_repo_contexts,
+        parent_is_jira,
+    ) {
         Ok(tasks) => tasks,
         Err(first_error) => {
             // Bad paths and false assumptions are planning errors, not work for a
@@ -1089,7 +1162,13 @@ async fn handle_pm_decompose(
             .await
             .map_err(|e| anyhow::anyhow!("fleet_oneshot decompose regeneration: {e}"))?;
             let retry_tasks = parse_leaf_tasks(&retry.text)?;
-            quality_gate_decomposition(retry_tasks, repo_context.as_ref()).map_err(|e| {
+            quality_gate_partitioned_decomposition(
+                retry_tasks,
+                repo_context.as_ref(),
+                &jira_repo_contexts,
+                parent_is_jira,
+            )
+            .map_err(|e| {
                 anyhow::anyhow!("decomposition quality gate failed after regeneration: {e}")
             })?
         }
@@ -1104,6 +1183,10 @@ async fn handle_pm_decompose(
     let mut ids = Vec::new();
     for t in tasks.into_iter().take(max) {
         let complexity = normalize_complexity(t.complexity.as_deref());
+        let task_repo_context = t
+            .repo_id
+            .and_then(|id| jira_repo_contexts.get(&id))
+            .or(repo_context.as_ref());
         let row = insert_decomposed_work_item(
             pool,
             &effective_project,
@@ -1111,7 +1194,7 @@ async fn handle_pm_decompose(
             &t.description,
             &created_by,
             parent_id,
-            repo_context.as_ref(),
+            task_repo_context,
             &t.files,
             complexity,
             &t.acceptance_criteria,
@@ -1168,6 +1251,71 @@ fn parse_leaf_tasks(text: &str) -> Result<Vec<LeafTask>> {
         return Err(anyhow::anyhow!("LLM returned zero tasks"));
     }
     Ok(tasks)
+}
+
+fn jira_allowed_repo_ids(
+    canonical: Option<&crate::repo_context::RepoContext>,
+    metadata: &serde_json::Value,
+) -> Result<Vec<uuid::Uuid>> {
+    if let Some(repo_id) = canonical.and_then(|ctx| ctx.repo_id) {
+        return Ok(vec![repo_id]);
+    }
+    let raw = metadata
+        .get("jira_allowed_repo_ids")
+        .or_else(|| metadata.get("allowed_repo_ids"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Jira parent has no canonical binding or resolved multi-repo set; \
+                 refusing decomposition (no primary-repo fallback)"
+            )
+        })?;
+    let mut ids = raw
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(uuid::Uuid::parse_str)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("invalid Jira allowed repo id: {e}"))?;
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Jira parent resolved multi-repo set is empty"
+        ));
+    }
+    Ok(ids)
+}
+
+fn quality_gate_partitioned_decomposition(
+    tasks: Vec<LeafTask>,
+    default_repo: Option<&crate::repo_context::RepoContext>,
+    jira_repos: &std::collections::HashMap<uuid::Uuid, crate::repo_context::RepoContext>,
+    is_jira: bool,
+) -> Result<Vec<LeafTask>> {
+    let multi_repo = is_jira && jira_repos.len() > 1;
+    let mut checked = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let context = if multi_repo {
+            let repo_id = task.repo_id.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Jira multi-repo child '{}' has no explicit repo_id",
+                    task.title
+                )
+            })?;
+            jira_repos.get(&repo_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Jira child '{}' selected repo {repo_id} outside the allowed set",
+                    task.title
+                )
+            })?
+        } else {
+            default_repo.ok_or_else(|| {
+                anyhow::anyhow!("decomposition has no canonical repository binding")
+            })?
+        };
+        checked.extend(quality_gate_decomposition(vec![task], Some(context))?);
+    }
+    Ok(checked)
 }
 
 fn quality_gate_decomposition(
@@ -3149,5 +3297,39 @@ mod tests {
         assert!(sql.contains("repo_url"));
         assert!(sql.contains("repo_path"));
         assert!(sql.contains("$6, $7, $8"));
+    }
+
+    #[test]
+    fn jira_decompose_requires_canonical_or_resolved_repo_set() {
+        assert!(jira_allowed_repo_ids(None, &serde_json::json!({})).is_err());
+
+        let repo_id = uuid::Uuid::new_v4();
+        let canonical = repo_context_from_binding(
+            Some(repo_id),
+            Some("git@github.com:org/repo.git".into()),
+            Some("/tmp/repo".into()),
+        )
+        .expect("canonical context");
+        assert_eq!(
+            jira_allowed_repo_ids(Some(&canonical), &serde_json::json!({})).unwrap(),
+            vec![repo_id]
+        );
+    }
+
+    #[test]
+    fn jira_multi_repo_set_is_deduped_and_children_parse_explicit_binding() {
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let metadata = serde_json::json!({"jira_allowed_repo_ids": [first, second, first]});
+        let ids = jira_allowed_repo_ids(None, &metadata).expect("resolved multi repo set");
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&first));
+        assert!(ids.contains(&second));
+
+        let tasks = parse_leaf_tasks(&format!(
+            r#"[{{"title":"partitioned","description":"x","files":["src/x.rs"],"repo_id":"{first}"}}]"#
+        ))
+        .expect("parse partitioned child");
+        assert_eq!(tasks[0].repo_id, Some(first));
     }
 }

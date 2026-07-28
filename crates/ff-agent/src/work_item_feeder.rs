@@ -18,7 +18,29 @@ pub(crate) fn jira_parent_eligibility_sql(alias: &str) -> String {
          {alias}.status = 'ready' \
          AND LOWER(BTRIM(COALESCE({alias}.metadata->>'jira_status', ''))) \
              NOT IN ('blocked', 'blocked on vinny') \
-         AND NULLIF(BTRIM(COALESCE({alias}.metadata->>'jira_execution_hold', '')), '') IS NULL))"
+         AND NULLIF(BTRIM(COALESCE({alias}.metadata->>'jira_execution_hold', '')), '') IS NULL \
+         AND (\
+             ({alias}.repo_id IS NOT NULL \
+              AND EXISTS (SELECT 1 FROM project_repos jira_repo \
+                           WHERE jira_repo.id = {alias}.repo_id \
+                             AND jira_repo.project_id = {alias}.project_id \
+                             AND NULLIF(BTRIM(jira_repo.github_url), '') IS NOT NULL \
+                             AND ({alias}.repo_url IS NULL \
+                                  OR BTRIM({alias}.repo_url) = BTRIM(jira_repo.github_url)))) \
+             OR (jsonb_typeof(COALESCE({alias}.metadata->'jira_allowed_repo_ids', \
+                                        {alias}.metadata->'allowed_repo_ids')) = 'array' \
+                 AND jsonb_array_length(COALESCE({alias}.metadata->'jira_allowed_repo_ids', \
+                                                 {alias}.metadata->'allowed_repo_ids')) > 1 \
+                 AND NOT EXISTS (\
+                     SELECT 1 \
+                       FROM jsonb_array_elements_text(COALESCE(\
+                                {alias}.metadata->'jira_allowed_repo_ids', \
+                                {alias}.metadata->'allowed_repo_ids')) allowed(repo_id) \
+                      WHERE NOT EXISTS (SELECT 1 FROM project_repos candidate \
+                                         WHERE candidate.project_id = {alias}.project_id \
+                                           AND candidate.id::text = allowed.repo_id \
+                                           AND NULLIF(BTRIM(candidate.github_url), '') IS NOT NULL)\
+                 )))))"
     )
 }
 
@@ -238,6 +260,17 @@ mod tests {
         assert!(!feed_decision(-1, 39, 29));
         assert!(!feed_decision(1, 40, 29));
         assert!(!feed_decision(1, 39, 30));
+    }
+
+    #[test]
+    fn jira_parent_selector_requires_project_repo_binding_without_changing_non_jira() {
+        let sql = jira_parent_eligibility_sql("candidate");
+        assert!(sql.contains("candidate.kind <> 'jira'"));
+        assert!(sql.contains("jira_repo.project_id = candidate.project_id"));
+        assert!(sql.contains("candidate.repo_id"));
+        assert!(sql.contains("jira_allowed_repo_ids"));
+        assert!(sql.contains("allowed_repo_ids"));
+        assert!(!sql.contains("is_primary"));
     }
 
     #[tokio::test]

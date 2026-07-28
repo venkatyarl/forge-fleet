@@ -8728,6 +8728,44 @@ pub async fn pg_ready_work_items(pool: &PgPool, limit: i64) -> Result<Vec<ReadyW
                  WHERE w.status = 'ready'
                    AND w.kind = 'task'
                    AND NOT EXISTS (
+                       WITH RECURSIVE ancestors AS (
+                           SELECT p.*
+                             FROM work_items p
+                            WHERE p.id = w.parent_id
+                           UNION ALL
+                           SELECT p.*
+                             FROM work_items p
+                             JOIN ancestors a ON a.parent_id = p.id
+                       )
+                       SELECT 1
+                         FROM ancestors jira
+                        WHERE jira.kind = 'jira'
+                          AND (
+                              w.repo_id IS NULL
+                              OR NOT EXISTS (
+                                  SELECT 1
+                                    FROM project_repos child_repo
+                                   WHERE child_repo.id = w.repo_id
+                                     AND child_repo.project_id = w.project_id
+                                     AND NULLIF(BTRIM(child_repo.github_url), '') IS NOT NULL
+                                     AND (w.repo_url IS NULL
+                                          OR BTRIM(w.repo_url) = BTRIM(child_repo.github_url))
+                              )
+                              OR (
+                                  jira.repo_id IS NOT NULL
+                                  AND w.repo_id <> jira.repo_id
+                              )
+                              OR (
+                                  jira.repo_id IS NULL
+                                  AND NOT (COALESCE(
+                                      jira.metadata->'jira_allowed_repo_ids',
+                                      jira.metadata->'allowed_repo_ids',
+                                      '[]'::jsonb
+                                  ) ? w.repo_id::text)
+                              )
+                          )
+                   )
+                   AND NOT EXISTS (
                        SELECT 1 FROM work_item_leases l
                         WHERE l.work_item_id = w.id AND l.released_at IS NULL)
                    AND NOT EXISTS (
@@ -9233,8 +9271,41 @@ pub async fn pg_assign_work_item(
     let inserted = sqlx::query(
         "INSERT INTO work_item_leases
             (work_item_id, sub_agent_id, computer_id, project_id, lease_state, lease_expires_at)
-         VALUES ($1, $2, $3, (SELECT project_id FROM work_items WHERE id = $1), 'claimed',
-                 NOW() + make_interval(secs => $4))
+         SELECT $1, $2, $3, w.project_id, 'claimed',
+                NOW() + make_interval(secs => $4)
+           FROM work_items w
+          WHERE w.id = $1
+            AND w.status = 'ready'
+            AND w.kind = 'task'
+            AND NOT EXISTS (
+                WITH RECURSIVE ancestors AS (
+                    SELECT p.* FROM work_items p WHERE p.id = w.parent_id
+                    UNION ALL
+                    SELECT p.* FROM work_items p JOIN ancestors a ON a.parent_id = p.id
+                )
+                SELECT 1 FROM ancestors jira
+                 WHERE jira.kind = 'jira'
+                   AND (
+                       w.repo_id IS NULL
+                       OR NOT EXISTS (
+                           SELECT 1 FROM project_repos child_repo
+                            WHERE child_repo.id = w.repo_id
+                              AND child_repo.project_id = w.project_id
+                              AND NULLIF(BTRIM(child_repo.github_url), '') IS NOT NULL
+                              AND (w.repo_url IS NULL
+                                   OR BTRIM(w.repo_url) = BTRIM(child_repo.github_url))
+                       )
+                       OR (jira.repo_id IS NOT NULL AND w.repo_id <> jira.repo_id)
+                       OR (
+                           jira.repo_id IS NULL
+                           AND NOT (COALESCE(
+                               jira.metadata->'jira_allowed_repo_ids',
+                               jira.metadata->'allowed_repo_ids',
+                               '[]'::jsonb
+                           ) ? w.repo_id::text)
+                       )
+                   )
+            )
          ON CONFLICT DO NOTHING
          RETURNING id",
     )
