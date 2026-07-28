@@ -61,6 +61,28 @@ const MAX_UNKNOWN_DEFERS: u32 = 3;
 /// ticks GitHub has left it in the `UNKNOWN` (mergeability-computing) state; it
 /// is owned by the drain loop so the count survives across ticks. See
 /// [`MAX_UNKNOWN_DEFERS`].
+/// Map a PR's GitHub `state` to the queue-row action the drain must take
+/// BEFORE the mergeability path. A terminal PR reports mergeStateStatus
+/// UNKNOWN forever, so without this guard the UNKNOWN defer/poke/rotate path
+/// never escapes it (2026-07-28: PR #1303 head-blocked the whole forge-fleet
+/// queue for 37h behind a CLOSED PR). Pure for testability.
+#[derive(Debug, PartialEq, Eq)]
+enum TerminalPrAction {
+    /// Merged out-of-band (hand merge, another tool) — close the row as merged.
+    MarkMerged,
+    /// Closed without merging — fail the row; the item is cancelled (mirrors
+    /// `reconcile_orphaned_reviews`' closed → cancelled).
+    FailClosed,
+}
+
+fn terminal_pr_action(state: Option<&str>) -> Option<TerminalPrAction> {
+    match state?.to_ascii_uppercase().as_str() {
+        "MERGED" => Some(TerminalPrAction::MarkMerged),
+        "CLOSED" => Some(TerminalPrAction::FailClosed),
+        _ => None,
+    }
+}
+
 pub async fn evaluate_merge_queue(
     pg: &PgPool,
     unknown_defers: &mut HashMap<Uuid, u32>,
@@ -74,6 +96,55 @@ pub async fn evaluate_merge_queue(
             .await?;
         return Ok(0);
     };
+
+    // Terminal-PR guard: a MERGED/CLOSED PR reports mergeStateStatus UNKNOWN
+    // forever, so the mergeability path below can never resolve it. Settle the
+    // row from the PR's real state first (see terminal_pr_action).
+    match terminal_pr_action(gh_pr_view_state(&pr_url).await.as_deref()) {
+        Some(TerminalPrAction::MarkMerged) => {
+            info!(pr = %pr_url, "merge_drain: PR already merged out-of-band — closing queue row as merged");
+            ff_db::pg_mark_merge_merged(pg, item.id, item.work_item_id).await?;
+            unknown_defers.remove(&item.id);
+            return Ok(1);
+        }
+        Some(TerminalPrAction::FailClosed) => {
+            warn!(
+                pr = %pr_url,
+                work_item = %item.work_item_id,
+                "merge_drain: PR closed unmerged — failing queue row + cancelling item"
+            );
+            let mut tx = pg.begin().await?;
+            sqlx::query(
+                "UPDATE work_item_merge_queue SET status = 'failed', failed_at = NOW(), \
+                    failure_reason = 'PR closed unmerged (out-of-band)' WHERE id = $1",
+            )
+            .bind(item.id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE work_items SET status = 'cancelled', \
+                    completed_at = COALESCE(completed_at, NOW()) \
+                  WHERE id = $1 AND status IN ('in_review', 'ready', 'building', 'in_progress')",
+            )
+            .bind(item.work_item_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            auditor.record(
+                ReconciliationAction::StatusReconciled,
+                &item.work_item_id.to_string(),
+                "merge-queue head PR closed unmerged — row failed, item cancelled",
+                serde_json::json!({
+                    "pr_url": pr_url,
+                    "queue_id": item.id.to_string(),
+                    "work_item_id": item.work_item_id.to_string(),
+                }),
+            );
+            unknown_defers.remove(&item.id);
+            return Ok(0);
+        }
+        None => {} // OPEN (or state undetermined) → normal mergeability path
+    }
 
     // Conflict-cascade guard: when several sibling PRs land near-simultaneously,
     // each squash-merge advances main and stales the rest — `gh pr merge` then
@@ -1770,10 +1841,33 @@ async fn db_confirms_leader(pg: &PgPool, worker_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        PrMergeState, PrReviewVerdict, github_actions_run_id, is_semantic_merge_compile_failure,
-        parse_merge_state, parse_review_response, parse_review_verdict, served_by_480b,
-        update_branch_api_path,
+        PrMergeState, PrReviewVerdict, TerminalPrAction, github_actions_run_id,
+        is_semantic_merge_compile_failure, parse_merge_state, parse_review_response,
+        parse_review_verdict, served_by_480b, terminal_pr_action, update_branch_api_path,
     };
+
+    #[test]
+    fn terminal_pr_states_settle_the_queue_row() {
+        // The 37h head-block: a CLOSED PR reads mergeStateStatus UNKNOWN
+        // forever — the drain must settle the row from the real state instead.
+        assert_eq!(
+            terminal_pr_action(Some("CLOSED")),
+            Some(TerminalPrAction::FailClosed)
+        );
+        assert_eq!(
+            terminal_pr_action(Some("MERGED")),
+            Some(TerminalPrAction::MarkMerged)
+        );
+        // Case-insensitive (gh is uppercase, but never trust a wire format).
+        assert_eq!(
+            terminal_pr_action(Some("closed")),
+            Some(TerminalPrAction::FailClosed)
+        );
+        // OPEN / unknown / missing states take the normal mergeability path.
+        assert_eq!(terminal_pr_action(Some("OPEN")), None);
+        assert_eq!(terminal_pr_action(Some("whatever")), None);
+        assert_eq!(terminal_pr_action(None), None);
+    }
 
     #[test]
     fn extracts_only_github_actions_run_ids() {
