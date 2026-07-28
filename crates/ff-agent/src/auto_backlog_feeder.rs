@@ -52,7 +52,7 @@ pub async fn run_auto_backlog_feeder_tick(pg: &PgPool) -> Result<usize> {
                 .rows_affected();
                 fed += usize::from(changed == 1);
             }
-            "bug" | "feature" | "epic" | "jira" => match decompose_idea(&idea).await {
+            "bug" | "feature" | "epic" => match decompose_idea(&idea).await {
                 Ok(()) => fed += 1,
                 Err(error) => {
                     warn!(item = %idea.id, %error, "auto backlog feeder decomposition failed");
@@ -87,29 +87,34 @@ async fn rescue_ready_parent(pg: &PgPool) -> Result<usize> {
     // kind='task') and must be decomposed into leaf tasks. 'jira'/'epic' added
     // 2026-07-28: a ready jira/epic with no task children was a silent dead zone —
     // unschedulable AND skipped here — which starved the fleet to 0 completions
-    // (54 HireFlow360 jira sat ready for hours). Must match the `next_idea` kinds.
-    sqlx::query(
+    // (54 HireFlow360 jira sat ready for hours). Jira ideas remain untouched until
+    // the Jira sync has persisted scheduler status `ready`.
+    let repair_sql = format!(
         "UPDATE work_items p SET status = 'decomposed', last_error = NULL \
          WHERE p.status = 'ready' AND p.kind IN ('bug', 'feature', 'epic', 'jira') \
+           AND {} \
            AND EXISTS (SELECT 1 FROM work_items c WHERE c.parent_id = p.id)",
-    )
-    .execute(pg)
-    .await?;
+        crate::work_item_feeder::jira_parent_eligibility_sql("p")
+    );
+    sqlx::query(&repair_sql).execute(pg).await?;
 
-    let row = sqlx::query(
+    let claim_sql = format!(
         "UPDATE work_items p SET status = 'decomposing', last_error = NULL \
          WHERE p.id = ( \
              SELECT w.id FROM work_items w \
               WHERE w.status = 'ready' AND w.kind IN ('bug', 'feature', 'epic', 'jira') \
                 AND COALESCE(w.parked, FALSE) = FALSE \
+                AND {} \
                 AND w.created_at <= NOW() - make_interval(mins => $1) \
                 AND NOT EXISTS (SELECT 1 FROM work_items c WHERE c.parent_id = w.id) \
               ORDER BY w.created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED) \
          RETURNING p.id, p.project_id, p.kind, p.repo_path",
-    )
-    .bind(READY_PARENT_MIN_AGE_MINUTES as i32)
-    .fetch_optional(pg)
-    .await?;
+        crate::work_item_feeder::jira_parent_eligibility_sql("w")
+    );
+    let row = sqlx::query(&claim_sql)
+        .bind(READY_PARENT_MIN_AGE_MINUTES as i32)
+        .fetch_optional(pg)
+        .await?;
     let Some(row) = row else { return Ok(0) };
     let parent = Idea {
         id: row.get("id"),
@@ -175,7 +180,7 @@ async fn next_idea(pg: &PgPool, attempted: &HashSet<Uuid>) -> Result<Option<Idea
         "SELECT id, project_id, kind, repo_path \
            FROM work_items \
           WHERE status = 'idea' AND parked = FALSE \
-            AND kind IN ('task', 'bug', 'feature', 'epic', 'jira') \
+            AND kind IN ('task', 'bug', 'feature', 'epic') \
             AND NOT (id = ANY($1::uuid[])) \
           ORDER BY CASE priority \
                      WHEN 'critical' THEN 0 WHEN 'high' THEN 1 \
