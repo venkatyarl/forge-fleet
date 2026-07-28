@@ -209,7 +209,9 @@ fn parse_activity_level(raw: &str) -> Option<ActivityLevel> {
 
 #[cfg(test)]
 mod tests {
-    use super::default_log_paths;
+    use std::path::PathBuf;
+
+    use super::{default_log_paths, parse_path_list};
 
     #[test]
     fn default_log_paths_include_forgefleetd_logs() {
@@ -225,6 +227,17 @@ mod tests {
             paths
                 .iter()
                 .any(|path| path.ends_with("forgefleetd.err.log"))
+        );
+    }
+
+    #[test]
+    fn log_shipping_paths_accept_comma_separated_config() {
+        assert_eq!(
+            parse_path_list(" /var/log/forgefleetd.log, /tmp/forgefleetd.err.log "),
+            vec![
+                PathBuf::from("/var/log/forgefleetd.log"),
+                PathBuf::from("/tmp/forgefleetd.err.log"),
+            ]
         );
     }
 }
