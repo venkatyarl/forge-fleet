@@ -33,6 +33,30 @@ use tracing::{info, warn};
 /// fleet-secret key holding the SHA of the last commit this tick deployed, so a
 /// new push is detected as `origin/main HEAD != last_deployed_sha`.
 const LAST_DEPLOYED_KEY: &str = "rolling_deploy_last_sha";
+const RESTORE_OWNERLESS_DEPLOY_DRAINS_SQL: &str = "
+    WITH restored AS (
+        UPDATE computers
+           SET reservation_state = 'available',
+               reserved_reason = NULL,
+               reservation_expires_at = NULL
+         WHERE reservation_state = 'drained'
+           AND reservation_owner IS NULL
+           AND lower(name) <> 'taylor'
+           AND (reserved_reason = 'fleet-deploy' OR reserved_reason IS NULL)
+        RETURNING id
+    )
+    UPDATE sub_agents
+       SET status = 'idle'
+     WHERE status = 'disabled'
+       AND computer_id IN (SELECT id FROM restored)";
+
+async fn restore_ownerless_deploy_drains(pg: &PgPool) -> u64 {
+    sqlx::query(RESTORE_OWNERLESS_DEPLOY_DRAINS_SQL)
+        .execute(pg)
+        .await
+        .map(|result| result.rows_affected())
+        .unwrap_or(0)
+}
 
 /// Spawn the convergence tick. Runs on every daemon, leader-gates itself.
 pub fn spawn_deploy_converge_tick(
@@ -86,11 +110,21 @@ async fn run_once(pg: &PgPool) -> Result<()> {
     // for 30+ min), independent of the deploy gate below. Never touches taylor
     // (operator-reserved) or the leader.
     let restored = sqlx::query(
-        "UPDATE computers SET reservation_state='available', reserved_reason=NULL, \
-                reservation_owner=NULL, reservation_expires_at=NULL \
-          WHERE reservation_state='drained' \
-            AND coalesce(reserved_at, now() - interval '1 hour') < now() - interval '30 minutes' \
-            AND lower(name) <> 'taylor'",
+        "WITH restored AS (
+             UPDATE computers
+                SET reservation_state='available', reserved_reason=NULL,
+                    reservation_expires_at=NULL
+              WHERE reservation_state='drained'
+                AND reservation_owner IS NULL
+                AND lower(name) <> 'taylor'
+                AND (reserved_reason = 'fleet-deploy' OR reserved_reason IS NULL)
+                AND coalesce(reserved_at, now() - interval '1 hour')
+                    < now() - interval '30 minutes'
+             RETURNING id
+         )
+         UPDATE sub_agents SET status='idle'
+          WHERE status='disabled'
+            AND computer_id IN (SELECT id FROM restored)",
     )
     .execute(pg)
     .await
@@ -101,12 +135,6 @@ async fn run_once(pg: &PgPool) -> Result<()> {
             restored,
             "deploy-converge: restored stale-drained nodes (orphaned by a failed deploy) — re-enabling their slots"
         );
-        let _ = sqlx::query(
-            "UPDATE sub_agents SET status='idle' WHERE status='disabled' \
-              AND computer_id IN (SELECT id FROM computers WHERE reservation_state='available')",
-        )
-        .execute(pg)
-        .await;
     }
 
     if !mode_enabled(pg).await {
@@ -164,6 +192,21 @@ async fn run_once(pg: &PgPool) -> Result<()> {
         .current_dir(&repo)
         .output()
         .await;
+
+    // The child normally restores its scoped drain state, but it can be killed
+    // or exit through an unforeseen error path. Recover its ownerless deploy
+    // drains immediately after every child exit; do not wait for the stale
+    // 30-minute crash sweep. The query cannot touch Taylor or operator-owned
+    // reservations.
+    if out.is_ok() {
+        let restored_slots = restore_ownerless_deploy_drains(pg).await;
+        if restored_slots > 0 {
+            warn!(
+                restored_slots,
+                "deploy-converge: immediately restored ownerless deploy drains after child exit"
+            );
+        }
+    }
 
     match out {
         Ok(o) if o.status.success() => {
@@ -276,4 +319,17 @@ async fn run_once(pg: &PgPool) -> Result<()> {
         Err(e) => warn!(error = %e, "deploy-converge: failed to invoke ff fleet deploy"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RESTORE_OWNERLESS_DEPLOY_DRAINS_SQL;
+
+    #[test]
+    fn immediate_recovery_preserves_operator_reservations_and_taylor() {
+        assert!(RESTORE_OWNERLESS_DEPLOY_DRAINS_SQL.contains("reservation_owner IS NULL"));
+        assert!(RESTORE_OWNERLESS_DEPLOY_DRAINS_SQL.contains("lower(name) <> 'taylor'"));
+        assert!(RESTORE_OWNERLESS_DEPLOY_DRAINS_SQL.contains("reserved_reason = 'fleet-deploy'"));
+        assert!(!RESTORE_OWNERLESS_DEPLOY_DRAINS_SQL.contains("reservation_owner = NULL"));
+    }
 }

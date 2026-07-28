@@ -247,6 +247,46 @@ pub async fn handle_fleet_drain(pool: &sqlx::PgPool, computer: &str, yes: bool) 
     Ok(())
 }
 
+/// `ff fleet undrain <computer>` — explicitly recover an ownerless deploy
+/// drain. Operator-owned reservations and Taylor are deliberately immutable.
+pub async fn handle_fleet_undrain(pool: &sqlx::PgPool, computer: &str, yes: bool) -> Result<()> {
+    if !yes {
+        anyhow::bail!("pass --yes to recover the ownerless deploy drain on '{computer}'");
+    }
+
+    let mut tx = pool.begin().await?;
+    let computer_id: Option<uuid::Uuid> = sqlx::query_scalar(
+        "UPDATE computers
+            SET reservation_state = 'available',
+                reserved_reason = NULL,
+                reservation_expires_at = NULL
+          WHERE LOWER(name) = LOWER($1)
+            AND LOWER(name) <> 'taylor'
+            AND reservation_state = 'drained'
+            AND reservation_owner IS NULL
+        RETURNING id",
+    )
+    .bind(computer)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(computer_id) = computer_id else {
+        anyhow::bail!(
+            "refusing to undrain '{computer}': node is Taylor, not drained, or has an operator owner"
+        );
+    };
+    let enabled = sqlx::query(
+        "UPDATE sub_agents SET status = 'idle'
+          WHERE computer_id = $1 AND status = 'disabled'",
+    )
+    .bind(computer_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    println!("  {GREEN}✓{RESET} undrained '{computer}' and enabled {enabled} sub-agent slot(s)");
+    Ok(())
+}
+
 /// `ff fleet upgrade <software_id>` — dispatch the software's upgrade_playbook
 /// across the fleet via the deferred task queue.
 ///
@@ -3914,6 +3954,9 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         FleetCommand::Drain { computer, yes } => {
             handle_fleet_drain(&pool, &computer, yes).await?;
         }
+        FleetCommand::Undrain { computer, yes } => {
+            handle_fleet_undrain(&pool, &computer, yes).await?;
+        }
         FleetCommand::Upgrade {
             software_id,
             computer,
@@ -4764,8 +4807,10 @@ async fn handoff_deploy_leader(
     }
 }
 
+const DEPLOY_DRAIN_REASON: &str = "fleet-deploy";
+
 struct DeployDrainState {
-    computers: Vec<(uuid::Uuid, String)>,
+    computers: Vec<(uuid::Uuid, String, Option<String>)>,
     sub_agents: Vec<(uuid::Uuid, String)>,
 }
 
@@ -4776,8 +4821,8 @@ async fn drain_deploy_targets(
     target_names: &[String],
 ) -> Result<DeployDrainState> {
     let mut tx = pool.begin().await?;
-    let computers = sqlx::query_as::<_, (uuid::Uuid, String)>(
-        "SELECT id, COALESCE(reservation_state, 'available')
+    let computers = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>)>(
+        "SELECT id, COALESCE(reservation_state, 'available'), reserved_reason
            FROM computers
           WHERE name = ANY($1)
           FOR UPDATE",
@@ -4785,7 +4830,7 @@ async fn drain_deploy_targets(
     .bind(target_names)
     .fetch_all(&mut *tx)
     .await?;
-    let computer_ids: Vec<uuid::Uuid> = computers.iter().map(|(id, _)| *id).collect();
+    let computer_ids: Vec<uuid::Uuid> = computers.iter().map(|(id, _, _)| *id).collect();
     let sub_agents = sqlx::query_as::<_, (uuid::Uuid, String)>(
         "SELECT id, CASE WHEN status = 'busy' THEN 'idle' ELSE status END
            FROM sub_agents
@@ -4797,10 +4842,12 @@ async fn drain_deploy_targets(
     .await?;
     sqlx::query(
         "UPDATE computers
-            SET reservation_state = 'drained'
+            SET reservation_state = 'drained',
+                reserved_reason = $2
           WHERE name = ANY($1)",
     )
     .bind(target_names)
+    .bind(DEPLOY_DRAIN_REASON)
     .execute(&mut *tx)
     .await?;
     sqlx::query(
@@ -4831,12 +4878,21 @@ async fn drain_deploy_targets(
 }
 
 async fn restore_deploy_targets(pool: &sqlx::PgPool, previous: &DeployDrainState) {
-    for (computer_id, reservation_state) in &previous.computers {
-        if let Err(error) = sqlx::query("UPDATE computers SET reservation_state = $2 WHERE id = $1")
-            .bind(computer_id)
-            .bind(reservation_state)
-            .execute(pool)
-            .await
+    for (computer_id, reservation_state, reserved_reason) in &previous.computers {
+        if let Err(error) = sqlx::query(
+            "UPDATE computers
+                SET reservation_state = $2, reserved_reason = $3
+              WHERE id = $1
+                AND reservation_state = 'drained'
+                AND reservation_owner IS NULL
+                AND reserved_reason = $4",
+        )
+        .bind(computer_id)
+        .bind(reservation_state)
+        .bind(reserved_reason)
+        .bind(DEPLOY_DRAIN_REASON)
+        .execute(pool)
+        .await
         {
             eprintln!(
                 "{YELLOW}⚠ failed to restore deploy target reservation {computer_id}: {error}{RESET}"
@@ -5212,18 +5268,21 @@ async fn deploy_ssh(
     }
 }
 
-/// Probe a target's CPU architecture over SSH. `uname -m` is accurate across
-/// the supported fleet (x86_64 Linux/Mac, aarch64 Linux/Mac/GB10) and avoids
-/// adding a DB column just for deploy grouping.
-async fn detect_target_arch(t: &DeployTarget) -> Option<String> {
-    let (code, stdout, _stderr) = deploy_ssh(t, "uname -m", 30).await;
-    if code == 0 {
-        let arch = stdout.lines().next().unwrap_or("").trim();
-        if !arch.is_empty() {
-            return Some(arch.to_string());
-        }
+/// Resolve architecture and prove SSH reachability in one preflight. Deploy
+/// targets are filtered with this before any fleet-wide drain is acquired.
+async fn preflight_deploy_target(t: DeployTarget) -> Result<DeployTarget, (DeployTarget, String)> {
+    let (code, stdout, stderr) = deploy_ssh(&t, "uname -m", 15).await;
+    if code != 0 {
+        let detail = stderr.lines().next().unwrap_or("SSH unreachable").trim();
+        return Err((t, detail.to_string()));
     }
-    None
+    let arch = stdout.lines().next().unwrap_or("").trim();
+    if arch.is_empty() {
+        return Err((t, "SSH preflight returned no architecture".to_string()));
+    }
+    let mut target = t;
+    target.arch = arch.to_string();
+    Ok(target)
 }
 
 /// Copy the two release binaries from `builder`'s source tree to `receiver`'s
@@ -5788,7 +5847,7 @@ async fn handle_fleet_deploy(
     // nodes beyonce/rihanna) just vanishes from the run and the convergence
     // summary reports "N/N converged" as if it covered the whole fleet. Report
     // them so the operator knows to re-deploy once they're back online.
-    let skipped: Vec<(String, String, String)> = if all {
+    let mut skipped: Vec<(String, String, String)> = if all {
         sqlx::query_as::<_, (String, String, String)>(
             "SELECT c.name,
                     COALESCE(c.status, '?')                       AS status,
@@ -5823,23 +5882,43 @@ async fn handle_fleet_deploy(
         return Ok(());
     }
 
-    // Detect CPU architecture for each target so we can group by
-    // (os_family, arch) and build once per group. Missing detection is
-    // non-fatal: the host lands in an "unknown" group and self-builds.
-    let arch_by_name: std::collections::HashMap<String, String> =
-        futures::future::join_all(targets.iter().map(|t| async {
-            let arch = detect_target_arch(t)
-                .await
-                .unwrap_or_else(|| "unknown".to_string());
-            (t.name.clone(), arch)
-        }))
-        .await
-        .into_iter()
-        .collect();
-    for t in &mut targets {
-        if let Some(a) = arch_by_name.get(&t.name) {
-            t.arch.clone_from(a);
+    // Prove every DB-online target is actually reachable before taking a
+    // fleet-wide deploy drain. An SSH-dead host is reported and omitted from
+    // this attempt, so it cannot repeatedly drain healthy nodes.
+    let mut reachable = Vec::with_capacity(targets.len());
+    for result in futures::future::join_all(targets.into_iter().map(preflight_deploy_target)).await
+    {
+        match result {
+            Ok(target) => reachable.push(target),
+            Err((target, detail)) => {
+                eprintln!(
+                    "{YELLOW}⚠ {:<12} SSH-unreachable before drain: {detail}{RESET}",
+                    target.name
+                );
+                skipped.push((
+                    target.name,
+                    "online".to_string(),
+                    "ssh-unreachable".to_string(),
+                ));
+            }
         }
+    }
+    targets = reachable;
+
+    if targets.is_empty() {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "results": [], "skipped": skipped
+                    .iter()
+                    .map(|(n, s, r)| serde_json::json!({"host": n, "status": s, "reservation": r}))
+                    .collect::<Vec<_>>() })
+            );
+        } else {
+            println!("{YELLOW}No SSH-reachable deploy targets; nothing was drained.{RESET}");
+            report_skipped_hosts(&skipped);
+        }
+        return Ok(());
     }
 
     // Stop new assignments before any build starts, then let in-flight work
@@ -6643,6 +6722,57 @@ mod route_tests {
             !leader_window.contains(".await?") && !leader_window.contains("bail!"),
             "leader refresh must not error out while its host is drained"
         );
+    }
+
+    #[test]
+    fn fleet_deploy_filters_ssh_unreachable_targets_before_drain() {
+        let source = include_str!("fleet_cmd.rs");
+        let deploy = source
+            .split("async fn handle_fleet_deploy")
+            .nth(1)
+            .expect("fleet deploy handler");
+        let preflight = deploy
+            .find("preflight_deploy_target")
+            .expect("deploy must preflight SSH");
+        let replace_targets = deploy
+            .find("targets = reachable")
+            .expect("deploy must retain only reachable targets");
+        let drain = deploy
+            .find("drain_deploy_targets(pool")
+            .expect("deploy must drain reachable targets");
+        assert!(
+            preflight < replace_targets && replace_targets < drain,
+            "online-but-SSH-unreachable targets must be removed before any drain"
+        );
+        assert!(
+            deploy[preflight..drain].contains("\"ssh-unreachable\""),
+            "partial unreachable failures must be explicitly reported"
+        );
+    }
+
+    #[test]
+    fn deploy_drain_restore_cannot_overwrite_operator_reservation() {
+        let source = include_str!("fleet_cmd.rs");
+        let restore = source
+            .split("async fn restore_deploy_targets")
+            .nth(1)
+            .expect("deploy restore helper");
+        assert!(restore.contains("reservation_owner IS NULL"));
+        assert!(restore.contains("reserved_reason = $4"));
+        assert!(source.contains("const DEPLOY_DRAIN_REASON: &str = \"fleet-deploy\""));
+    }
+
+    #[test]
+    fn undrain_is_limited_to_ownerless_non_taylor_drains() {
+        let source = include_str!("fleet_cmd.rs");
+        let undrain = source
+            .split("pub async fn handle_fleet_undrain")
+            .nth(1)
+            .expect("undrain handler");
+        assert!(undrain.contains("reservation_state = 'drained'"));
+        assert!(undrain.contains("reservation_owner IS NULL"));
+        assert!(undrain.contains("LOWER(name) <> 'taylor'"));
+        assert!(undrain.contains("status = 'disabled'"));
     }
 
     #[test]
