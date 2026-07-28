@@ -239,55 +239,65 @@ pub async fn pg_yield_leader(pool: &PgPool, my_name: &str) -> Result<bool, sqlx:
     Ok(result.rows_affected() == 1)
 }
 
-/// HA Phase 2 — record a maintenance lease on the singleton leader row: while
-/// the lease is live, election prefers `standby_member` outright. `until` is the
-/// auto-fail-back deadline. Updates the existing row in place (the row may name a
-/// different current leader — that's fine; the lease just biases the next pick).
+/// HA Phase 2 — record a maintenance lease: while the lease is live, election
+/// prefers `standby_member` outright. `until` is the auto-fail-back deadline.
+///
+/// Stored as a `fleet_secrets` entry, NOT on the singleton leader row: the row
+/// is DELETEd by `pg_yield_leader` and rewritten by every claim, so a lease
+/// stored there was wiped by the very handover it was meant to steer
+/// (2026-07-28: step-down --to beyonce vanished when the row was deleted on
+/// yield; the old leader reclaimed instead of the standby). fleet_secrets
+/// survives every leader transition.
 pub async fn pg_set_maintenance_lease(
     pool: &PgPool,
     standby_member: &str,
     until: chrono::DateTime<chrono::Utc>,
 ) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE fleet_leader_state
-            SET standby_member = $1, relinquishing_until = $2
-          WHERE singleton_key = 'current'",
+    crate::queries::pg_set_secret(
+        pool,
+        "leader_maintenance_lease",
+        &format!("{}|{}", standby_member.trim(), until.to_rfc3339()),
+        Some("HA Phase 2 maintenance lease: election prefers this standby until the deadline"),
+        Some("ff fleet leader step-down"),
     )
-    .bind(standby_member)
-    .bind(until)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() == 1)
+    .await
+    .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+    Ok(true)
 }
 
 /// Clear any maintenance lease (immediate fail-back to normal election).
 pub async fn pg_clear_maintenance_lease(pool: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE fleet_leader_state
-            SET standby_member = NULL, relinquishing_until = NULL
-          WHERE singleton_key = 'current'",
-    )
-    .execute(pool)
-    .await?;
+    crate::queries::pg_delete_secret(pool, "leader_maintenance_lease")
+        .await
+        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
     Ok(())
 }
 
 /// The currently-active maintenance lease, if any: returns `(standby_member,
 /// relinquishing_until)` only when a standby is set AND the deadline is still in
 /// the future. An expired lease reads as `None` (auto-fail-back) without needing
-/// a write — the next step-down or a status read can lazily clear the columns.
+/// a write — the next step-down or a status read can lazily clear the entry.
 pub async fn pg_get_active_maintenance_lease(
     pool: &PgPool,
 ) -> Result<Option<(String, chrono::DateTime<chrono::Utc>)>, sqlx::Error> {
-    let row: Option<(Option<String>, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
-        "SELECT standby_member, relinquishing_until
-           FROM fleet_leader_state
-          WHERE singleton_key = 'current'",
-    )
-    .fetch_optional(pool)
-    .await?;
-    Ok(match row {
-        Some((Some(standby), Some(until))) if until > chrono::Utc::now() => Some((standby, until)),
+    let raw = crate::queries::pg_get_secret(pool, "leader_maintenance_lease")
+        .await
+        .unwrap_or(None);
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let parsed = raw.split_once('|').and_then(|(standby, until)| {
+        let standby = standby.trim();
+        if standby.is_empty() {
+            return None;
+        }
+        let until = chrono::DateTime::parse_from_rfc3339(until.trim())
+            .ok()?
+            .with_timezone(&chrono::Utc);
+        Some((standby.to_string(), until))
+    });
+    Ok(match parsed {
+        Some((standby, until)) if until > chrono::Utc::now() => Some((standby, until)),
         _ => None,
     })
 }
