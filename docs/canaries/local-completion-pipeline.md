@@ -57,3 +57,7 @@ fn my_db_test() {
 - Database tests panic in CI without URL checks
 - Migration integrity breaks if existing migrations are modified
 - Uncommitted changes bypass CI but get committed by harness
+
+---
+
+**Canary Marker**: <!-- 2025-06-23T12:00:00Z --> Local completion pipeline documentation last reviewed for CI prevention rules
