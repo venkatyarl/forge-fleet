@@ -2600,9 +2600,10 @@ pub enum WorkstreamCommand {
     /// Attach this CLI session to the workstream for the current project
     /// (resolved from cwd, git-remote-first). Idempotent — re-attach refreshes.
     Attach {
-        /// Which CLI is attaching (claude|codex|kimi|tui|web).
-        #[arg(long, default_value = "claude")]
-        tool: String,
+        /// Which CLI is attaching (claude|codex|kimi|tui|web). Auto-detected
+        /// from the calling CLI (ancestor process / env markers) when omitted.
+        #[arg(long)]
+        tool: Option<String>,
         /// One-line goal for this session (what you're here to do).
         #[arg(long)]
         goal: Option<String>,
@@ -2615,8 +2616,9 @@ pub enum WorkstreamCommand {
     /// Report working state into the project's workstream: update the shared
     /// summary/focus and append a timestamped note to the activity log.
     Report {
-        #[arg(long, default_value = "claude")]
-        tool: String,
+        /// Which CLI is reporting. Auto-detected when omitted (see `attach`).
+        #[arg(long)]
+        tool: Option<String>,
         /// Replace the shared "what's happening now" summary.
         #[arg(long)]
         summary: Option<String>,
@@ -2633,9 +2635,9 @@ pub enum WorkstreamCommand {
     },
     /// Show the current project's workstream: summary, focus, attached clients.
     Status {
-        /// Which CLI's seat to mark as "← this session". No default: guessing
-        /// wrong (e.g. marking the claude seat inside a kimi session) is worse
-        /// than showing no marker at all.
+        /// Which CLI's seat to mark as "← this session". Auto-detected from the
+        /// calling CLI when omitted; if detection fails, no seat is marked —
+        /// an unmarked listing beats a wrong marker.
         #[arg(long)]
         tool: Option<String>,
         /// This session's native id — marks which attached client is "you".
@@ -2647,8 +2649,9 @@ pub enum WorkstreamCommand {
     /// Liveness ping — bump this session's last_report_at without changing the
     /// shared summary. Called automatically by the session Stop hook.
     Heartbeat {
-        #[arg(long, default_value = "claude")]
-        tool: String,
+        /// Which CLI is heartbeating. Auto-detected when omitted (see `attach`).
+        #[arg(long)]
+        tool: Option<String>,
         /// This session's native id (see `attach --session`).
         #[arg(long)]
         session: Option<String>,
@@ -6048,50 +6051,58 @@ mod free_prompt_guard_tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// The guard builds the full clap command tree for subcommand suggestions
+    /// (`Cli::command()`), which overflows the default 2 MiB test-thread stack
+    /// in debug builds — run it on a thread with an explicit stack.
+    fn guard(v: &[&str]) -> Option<String> {
+        let input = toks(v);
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || free_prompt_command_guard(&input))
+            .expect("spawn guard test")
+            .join()
+            .expect("guard test panicked")
+    }
+
     #[test]
     fn help_flag_after_unknown_word_is_refused() {
-        assert!(free_prompt_command_guard(&toks(&["pulse", "--help"])).is_some());
-        assert!(free_prompt_command_guard(&toks(&["route", "-h"])).is_some());
+        assert!(guard(&["pulse", "--help"]).is_some());
+        assert!(guard(&["route", "-h"]).is_some());
     }
 
     #[test]
     fn single_bare_word_is_refused() {
-        assert!(free_prompt_command_guard(&toks(&["pulse"])).is_some());
+        assert!(guard(&["pulse"]).is_some());
     }
 
     #[test]
     fn natural_language_prompts_pass_through() {
-        assert!(
-            free_prompt_command_guard(&toks(&["summarize", "the", "fleet", "state"])).is_none()
-        );
-        assert!(free_prompt_command_guard(&toks(&["what's", "running?"])).is_none());
+        assert!(guard(&["summarize", "the", "fleet", "state"]).is_none());
+        assert!(guard(&["what's", "running?"]).is_none());
     }
 
     #[test]
     fn command_shaped_input_with_flag_is_refused() {
         // The iter-13 dogfood finding: `ff db psql -c "select …"` fell through
         // to the agent and hallucinated a fake result. Verb + flag must refuse.
-        assert!(free_prompt_command_guard(&toks(&["db", "psql", "-c", "select 1"])).is_some());
-        assert!(free_prompt_command_guard(&toks(&["model", "ls", "--json"])).is_some());
-        assert!(free_prompt_command_guard(&toks(&["fleet", "helath", "-v"])).is_some());
+        assert!(guard(&["db", "psql", "-c", "select 1"]).is_some());
+        assert!(guard(&["model", "ls", "--json"]).is_some());
+        assert!(guard(&["fleet", "helath", "-v"]).is_some());
     }
 
     #[test]
     fn natural_language_with_no_flag_still_passes() {
         // A prose sentence (carries a function word) is genuine free-text — keep
         // dispatching even when every other token is command-shaped.
-        assert!(free_prompt_command_guard(&toks(&["restart", "the", "daemon"])).is_none());
+        assert!(guard(&["restart", "the", "daemon"]).is_none());
         // A prose token that merely contains a dash is not a flag.
-        assert!(free_prompt_command_guard(&toks(&["explain", "the", "auto-upgrade"])).is_none());
+        assert!(guard(&["explain", "the", "auto-upgrade"]).is_none());
         // Apostrophe/punctuation in the first token => not command-shaped.
-        assert!(free_prompt_command_guard(&toks(&["what's", "the", "--status"])).is_none());
+        assert!(guard(&["what's", "the", "--status"]).is_none());
         // A terse question carries function words ("what", "is") => prose.
-        assert!(free_prompt_command_guard(&toks(&["what", "is", "running"])).is_none());
+        assert!(guard(&["what", "is", "running"]).is_none());
         // ≥4 tokens with no function word is treated as a real prompt, not a typo.
-        assert!(
-            free_prompt_command_guard(&toks(&["summarize", "recent", "fleet", "activity"]))
-                .is_none()
-        );
+        assert!(guard(&["summarize", "recent", "fleet", "activity"]).is_none());
     }
 
     #[test]
@@ -6100,18 +6111,18 @@ mod free_prompt_guard_tests {
         // agent, which hallucinated a psql session and *attempted* `rm -rf` on a
         // postgres data dir. A short all-command-shaped run with no function word
         // is a mistyped subcommand, not prose — refuse it.
-        assert!(free_prompt_command_guard(&toks(&["db", "psql"])).is_some());
-        assert!(free_prompt_command_guard(&toks(&["modle", "ls"])).is_some());
-        assert!(free_prompt_command_guard(&toks(&["cortx", "indx", "now"])).is_some());
+        assert!(guard(&["db", "psql"]).is_some());
+        assert!(guard(&["modle", "ls"]).is_some());
+        assert!(guard(&["cortx", "indx", "now"]).is_some());
         // Message names the command-shaped refusal and the run escape hatch.
-        let msg = free_prompt_command_guard(&toks(&["db", "psql"])).unwrap();
+        let msg = guard(&["db", "psql"]).unwrap();
         assert!(msg.contains("command-shaped"), "got: {msg}");
         assert!(msg.contains("ff run"), "got: {msg}");
     }
 
     #[test]
     fn near_miss_suggests_real_subcommand() {
-        let msg = free_prompt_command_guard(&toks(&["task"])).unwrap();
+        let msg = guard(&["task"]).unwrap();
         assert!(
             msg.contains("tasks"),
             "expected 'tasks' suggestion in: {msg}"
@@ -6127,12 +6138,12 @@ mod free_prompt_guard_tests {
         // agent — the exact `ff "model library" --json` repro that burned agent
         // runs, and the dangerous `ff "db psql -c …"` case. The guard must be
         // quoting-invariant: these must refuse just like their split forms.
-        assert!(free_prompt_command_guard(&toks(&["model library", "--json"])).is_some());
-        assert!(free_prompt_command_guard(&toks(&["model library --json"])).is_some());
-        assert!(free_prompt_command_guard(&toks(&["fleet health"])).is_some());
-        assert!(free_prompt_command_guard(&toks(&["db psql -c select 1"])).is_some());
+        assert!(guard(&["model library", "--json"]).is_some());
+        assert!(guard(&["model library --json"]).is_some());
+        assert!(guard(&["fleet health"]).is_some());
+        assert!(guard(&["db psql -c select 1"]).is_some());
         // Suggestion + escape hatch survive the split (first sub-word drives them).
-        let msg = free_prompt_command_guard(&toks(&["model library", "--json"])).unwrap();
+        let msg = guard(&["model library", "--json"]).unwrap();
         assert!(msg.contains("model"), "got: {msg}");
         assert!(msg.contains("ff run"), "got: {msg}");
     }
@@ -6143,8 +6154,8 @@ mod free_prompt_guard_tests {
         // (`ff "summarize the fleet"`) must STILL dispatch — splitting on
         // whitespace reveals its function word ("the"), so it passes exactly as
         // the multi-arg form does. Quoting must not change the verdict.
-        assert!(free_prompt_command_guard(&toks(&["summarize the fleet state"])).is_none());
-        assert!(free_prompt_command_guard(&toks(&["what is running on the fleet"])).is_none());
+        assert!(guard(&["summarize the fleet state"]).is_none());
+        assert!(guard(&["what is running on the fleet"]).is_none());
     }
 }
 
@@ -8069,30 +8080,41 @@ mod durable_session_cli_tests {
 
     #[test]
     fn durable_workstream_commands_are_exposed_under_ff_session() {
-        for args in [
-            vec!["ff", "session", "status", "--project", "forge-fleet"],
-            vec!["ff", "session", "attach", "--project", "forge-fleet"],
-            vec!["ff", "session", "resume", "--project", "forge-fleet"],
-            vec![
-                "ff",
-                "session",
-                "note",
-                "handoff is durable",
-                "--project",
-                "forge-fleet",
-            ],
-        ] {
-            let cli = Cli::try_parse_from(args).expect("durable session command should parse");
-            assert!(matches!(
-                cli.command,
-                Some(Command::Session {
-                    command: SessionCommand::Status { .. }
-                        | SessionCommand::Attach { .. }
-                        | SessionCommand::Resume { .. }
-                        | SessionCommand::Note { .. }
-                })
-            ));
-        }
+        // Parsing the full `Cli` tree overflows the default 2 MiB test-thread
+        // stack in debug builds — run on a thread with an explicit stack
+        // (same pattern as jira_cli_tests above).
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                for args in [
+                    vec!["ff", "session", "status", "--project", "forge-fleet"],
+                    vec!["ff", "session", "attach", "--project", "forge-fleet"],
+                    vec!["ff", "session", "resume", "--project", "forge-fleet"],
+                    vec![
+                        "ff",
+                        "session",
+                        "note",
+                        "handoff is durable",
+                        "--project",
+                        "forge-fleet",
+                    ],
+                ] {
+                    let cli =
+                        Cli::try_parse_from(args).expect("durable session command should parse");
+                    assert!(matches!(
+                        cli.command,
+                        Some(Command::Session {
+                            command: SessionCommand::Status { .. }
+                                | SessionCommand::Attach { .. }
+                                | SessionCommand::Resume { .. }
+                                | SessionCommand::Note { .. }
+                        })
+                    ));
+                }
+            })
+            .expect("spawn parser test")
+            .join()
+            .expect("parser test panicked");
     }
 }
 
