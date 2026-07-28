@@ -33,6 +33,48 @@ async fn feed_once(pg: &PgPool) -> Result<()> {
         return Ok(());
     }
 
+    // INVARIANT: a work_item that is `ready` but NOT a schedulable `task` is a
+    // silent dead zone. The scheduler only dispatches kind='task'
+    // (`ff_db::pg_ready_work_items` filters `AND w.kind = 'task'`), so a `ready`
+    // feature/epic/bug/jira sits forever — unschedulable AND invisible to the
+    // idea-promoter below (which only scans `status='idea'`). On 2026-07-28 this
+    // starved the fleet to ZERO completions for ~6h: 52 `jira` + 2 `feature` were
+    // `ready` with 0 `task` rows, so `pg_ready_work_items` returned nothing and the
+    // scheduler correctly assigned nothing — with no alarm anywhere. Auto-decompose
+    // such items into leaf tasks BEFORE anything else so a full-but-unschedulable
+    // backlog can never silently stall the pipeline again. Runs ahead of the
+    // capacity gate: a stuck backlog must be healed even when the pipeline looks
+    // busy. Bounded (LIMIT 1/tick) and self-terminating (the `NOT EXISTS task
+    // child` guard skips an item once it has been decomposed).
+    if let Some((id, kind)) = sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT id, kind FROM work_items w \
+         WHERE w.status = 'ready' AND w.kind <> 'task' AND NOT w.parked \
+           AND NOT EXISTS (SELECT 1 FROM work_items c \
+                           WHERE c.parent_id = w.id AND c.kind = 'task') \
+         ORDER BY CASE w.priority \
+           WHEN 'critical' THEN 0 WHEN 'high' THEN 1 \
+           WHEN 'medium' THEN 2 ELSE 3 END, w.created_at \
+         LIMIT 1",
+    )
+    .fetch_optional(pg)
+    .await?
+    {
+        warn!(
+            work_item_id = %id,
+            kind = %kind,
+            "feeder: healing unschedulable READY non-task item — auto-decomposing into leaf tasks"
+        );
+        decompose(id).await?;
+        // The parent is now broken into `ready` leaf tasks; take it out of the
+        // `ready` set so it isn't re-scanned and never lingers as a bogus
+        // unschedulable ready item.
+        sqlx::query("UPDATE work_items SET status = 'decomposed' WHERE id = $1 AND status = 'ready'")
+            .bind(id)
+            .execute(pg)
+            .await?;
+        return Ok(());
+    }
+
     let (free_slots, in_review, active) = sqlx::query_as::<_, (i64, i64, i64)>(
         "SELECT \
            (SELECT COUNT(*) FROM sub_agents WHERE status <> 'disabled')::bigint \
@@ -79,8 +121,10 @@ async fn feed_once(pg: &PgPool) -> Result<()> {
         }
         // epics decompose exactly like bugs/features — a parent goal broken into
         // buildable leaf tasks (operator 2026-07-26: epics were being SKIPPED,
-        // starving the fleet of the priority work).
-        "bug" | "feature" | "epic" => decompose(id).await?,
+        // starving the fleet of the priority work). `jira` added 2026-07-28: the
+        // HireFlow360 backlog ingests as kind='jira' (52 rows), which the catch-all
+        // below was silently skipping — another way the fleet starved of tasks.
+        "bug" | "feature" | "epic" | "jira" => decompose(id).await?,
         other => {
             warn!(work_item_id = %id, kind = other, "work item feeder skipped unsupported kind")
         }
