@@ -2340,12 +2340,18 @@ async fn run_in_place_review(
     // A local-Devstral review beats failing the item outright.
     let started_at = chrono::Utc::now();
     let health = ff_pulse::lane_1_5::check_llm_health(|| async {
-        crate::fleet_oneshot::fleet_oneshot_for(pg, &prompt, None, Some(REVIEW_CLOUD_TIMEOUT), Some("code"))
-            .await
-            .map(|response| {
-                let text = response.text.clone();
-                (response, text)
-            })
+        crate::fleet_oneshot::fleet_oneshot_for(
+            pg,
+            &prompt,
+            None,
+            Some(REVIEW_CLOUD_TIMEOUT),
+            Some("code"),
+        )
+        .await
+        .map(|response| {
+            let text = response.text.clone();
+            (response, text)
+        })
     })
     .await;
     match health {
