@@ -20,6 +20,7 @@ use std::{
 use tokio::sync::watch;
 #[cfg(test)]
 use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -32,6 +33,7 @@ use crate::sub_agents::ensure_workspaces;
 /// reapers' regression tests can assert the coupling.
 pub(crate) const HEARTBEAT_SECS: u64 = 45;
 const COMMAND_POLL_MS: u64 = 250;
+const CANCEL_GRACE_SECS: u64 = 3;
 // 18 min. codex reliably WRITES a complete diff in ~5-8 min but then often fails
 // to EXIT, running until the timeout (dogfooded 2026-06-30/07-01). Since the
 // dispatch now SALVAGES the worktree diff on timeout (worktree_has_diff →
@@ -1004,7 +1006,7 @@ async fn dispatch_one(
             "UPDATE work_items SET status = 'done', verified = 1, completed_at = NOW(), \
                     verified_at = NOW(), \
                     last_error = 'pre-build gate: acceptance_check already passes — work already done, no build needed' \
-              WHERE id = $1 AND status NOT IN ('merged')",
+              WHERE id = $1 AND status = 'building'",
         )
         .bind(item.work_item_id)
         .execute(&pg)
@@ -1969,19 +1971,24 @@ async fn mark_ready_for_review(
     review: Option<&ReviewOutcome>,
 ) -> Result<()> {
     let mut tx = pg.begin().await?;
-    sqlx::query(
+    let updated = sqlx::query(
         "UPDATE work_items
             SET status = 'in_review',
                 branch_name = $2,
                 pr_url = $3,
                 cleanup_complete = TRUE
-          WHERE id = $1",
+          WHERE id = $1 AND status = 'building'",
     )
     .bind(item.work_item_id)
     .bind(&worktree.task_branch)
     .bind(pr_url)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        tx.rollback().await?;
+        bail!("work item left building state before review finalization");
+    }
 
     sqlx::query(
         "UPDATE work_item_worktrees
@@ -3957,7 +3964,7 @@ async fn run_ff_dispatch(
                         let _ = sqlx::query(
                             "UPDATE work_items SET status = 'done', completed_at = NOW(), \
                                 last_error = $2 \
-                              WHERE id = $1 AND status NOT IN ('merged')",
+                              WHERE id = $1 AND status = 'building'",
                         )
                         .bind(item.work_item_id)
                         .bind(truncate_for_db(&format!(
@@ -4273,7 +4280,9 @@ async fn run_ff_dispatch(
         let mut attempt: u32 = 0;
         loop {
             let started = Instant::now();
-            let out = match run_backend_cli(backend, &worktree.worktree_path, &prompt).await {
+            let out = match run_backend_cli(pg, item, backend, &worktree.worktree_path, &prompt)
+                .await
+            {
                 Ok(o) => o,
                 Err(e) => {
                     // A timeout / spawn error is a `Timeout`-class provider fault.
@@ -4548,7 +4557,7 @@ async fn run_ff_dispatch(
             "run_ff_dispatch: all routed backends were skipped before launch; forcing one direct attempt"
         );
         let started = std::time::Instant::now();
-        match run_backend_cli(&forced_backend, &worktree.worktree_path, &prompt).await {
+        match run_backend_cli(pg, item, &forced_backend, &worktree.worktree_path, &prompt).await {
             Ok(out) => {
                 if quick_empty_success_is_provider_failure(&out, started.elapsed()) {
                     let _ = crate::cloud_budget::record_failure(
@@ -4831,10 +4840,43 @@ fn slot_cargo_target(worktree_cwd: &Path) -> PathBuf {
         .join("cargo-shared-target")
 }
 
-async fn run_backend_cli(backend: &str, cwd: &Path, prompt: &str) -> Result<Output> {
+async fn run_backend_cli(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    backend: &str,
+    cwd: &Path,
+    prompt: &str,
+) -> Result<Output> {
     let backend = backend.to_string();
     let cwd = cwd.to_path_buf();
     let prompt = prompt.to_string();
+    let cancellation = CancellationToken::new();
+    let cancellation_watch = cancellation.clone();
+    let watch_pool = pg.clone();
+    let work_item_id = item.work_item_id;
+    let watcher = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(COMMAND_POLL_MS));
+        loop {
+            interval.tick().await;
+            match sqlx::query_scalar::<_, String>("SELECT status FROM work_items WHERE id = $1")
+                .bind(work_item_id)
+                .fetch_optional(&watch_pool)
+                .await
+            {
+                Ok(Some(status)) if status == "cancelled" => {
+                    cancellation_watch.cancel();
+                    return;
+                }
+                Ok(None) => return,
+                Ok(Some(_)) | Err(_) => {}
+            }
+        }
+    });
+    let process_nonce = Uuid::new_v4();
+    let process_pool = pg.clone();
+    let sub_agent_id = item.sub_agent_id;
+    let process_cancel = cancellation.clone();
+    let runtime = tokio::runtime::Handle::current();
     // Fetch the GitHub token HERE (async) and inject it into the backend's env so
     // the agent has an authenticated `gh` for the ENTIRE build — not only the
     // final `gh pr create` step. Without it, a codex/claude/kimi run that shells
@@ -4842,7 +4884,7 @@ async fn run_backend_cli(backend: &str, cwd: &Path, prompt: &str) -> Result<Outp
     // login" and exits non-zero on any node lacking ambient gh auth (i.e. all of
     // them — the fleet authenticates gh purely via this secret, not `gh auth login`).
     let gh_token = crate::fleet_info::fetch_secret("github_gh_token").await;
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new("ff");
         cmd.arg("cli")
             .arg(&backend)
@@ -4871,10 +4913,53 @@ async fn run_backend_cli(backend: &str, cwd: &Path, prompt: &str) -> Result<Outp
         // capture (not _timeout): keep the Output for ANY exit so run_ff_dispatch
         // can distinguish exit-3 (require-change no-op = already done) from a real
         // failure. Only spawn/timeout become Err here.
-        run_command_capture(cmd, Duration::from_secs(FF_TIMEOUT_SECS + 30))
+        run_command_capture_cancellable(
+            cmd,
+            Duration::from_secs(FF_TIMEOUT_SECS + 30),
+            &process_cancel,
+            |pid| {
+                runtime.block_on(async {
+                    let identity = serde_json::json!({
+                        "work_item_id": work_item_id,
+                        "pid": pid,
+                        "pgid": pid,
+                        "nonce": process_nonce,
+                        "started_at": chrono::Utc::now(),
+                    });
+                    let updated = sqlx::query(
+                        "UPDATE sub_agents
+                            SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb),
+                                '{backend_process}', $3::jsonb, true)
+                          WHERE id = $1 AND current_work_item_id = $2",
+                    )
+                    .bind(sub_agent_id)
+                    .bind(work_item_id)
+                    .bind(identity)
+                    .execute(&process_pool)
+                    .await
+                    .context("persist backend process identity")?;
+                    if updated.rows_affected() != 1 {
+                        bail!("slot no longer owns work item before backend launch");
+                    }
+                    Ok(())
+                })
+            },
+        )
     })
     .await
-    .context("join ff dispatch task")?
+    .context("join ff dispatch task")?;
+    watcher.abort();
+    let _ = sqlx::query(
+        "UPDATE sub_agents
+            SET metadata = COALESCE(metadata, '{}'::jsonb) - 'backend_process'
+          WHERE id = $1
+            AND metadata->'backend_process'->>'nonce' = $2",
+    )
+    .bind(sub_agent_id)
+    .bind(process_nonce.to_string())
+    .execute(pg)
+    .await;
+    result
 }
 
 /// Runs `git status --porcelain` and returns true if the worktree has any
@@ -6077,7 +6162,19 @@ fn command_display(cmd: &Command) -> String {
 /// (the change already exists), which `run_ff_dispatch` must treat as "already
 /// done", NOT as a backend failure to retry/fail. (Bailing on exit 3 here made
 /// that handler dead code — an already-built feature task requeued to death.)
-fn run_command_capture(mut cmd: Command, timeout: Duration) -> Result<Output> {
+fn run_command_capture(cmd: Command, timeout: Duration) -> Result<Output> {
+    run_command_capture_cancellable(cmd, timeout, &CancellationToken::new(), |_| Ok(()))
+}
+
+fn run_command_capture_cancellable<F>(
+    mut cmd: Command,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+    on_spawn: F,
+) -> Result<Output>
+where
+    F: FnOnce(u32) -> Result<()>,
+{
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     // Own process group so a timeout SIGKILLs the WHOLE tree. `ff cli <backend>`
     // forks the actual vendor CLI (claude/codex/kimi) as a GRANDCHILD; killing
@@ -6092,12 +6189,26 @@ fn run_command_capture(mut cmd: Command, timeout: Duration) -> Result<Output> {
     }
     let program = command_display(&cmd);
     let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
+    let child_pid = child.id();
+    if let Err(error) = on_spawn(child_pid) {
+        #[cfg(unix)]
+        unsafe {
+            libc::killpg(child_pid as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
     let start = Instant::now();
     loop {
         if child.try_wait()?.is_some() {
             return child
                 .wait_with_output()
                 .with_context(|| format!("collect output for {program}"));
+        }
+        if cancellation.is_cancelled() {
+            terminate_process_group(&mut child, Duration::from_secs(CANCEL_GRACE_SECS));
+            bail!("command cancelled: {program}");
         }
         if start.elapsed() >= timeout {
             // SIGKILL the entire process group — not just the direct child — so the
@@ -6112,6 +6223,27 @@ fn run_command_capture(mut cmd: Command, timeout: Duration) -> Result<Output> {
         }
         std::thread::sleep(Duration::from_millis(COMMAND_POLL_MS));
     }
+}
+
+fn terminate_process_group(child: &mut std::process::Child, grace: Duration) {
+    let pid = child.id();
+    #[cfg(unix)]
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(COMMAND_POLL_MS));
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn run_command_timeout(mut cmd: Command, timeout: Duration) -> Result<Output> {
@@ -7214,6 +7346,67 @@ mod tests {
         cmd.arg("-c").arg("exit 0");
         let out = run_command_capture(cmd, std::time::Duration::from_secs(10)).expect("clean run");
         assert!(out.status.success());
+    }
+
+    #[test]
+    fn cancelled_child_gets_graceful_term_and_unrelated_process_survives() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("term-observed");
+        let mut unrelated = Command::new("sh")
+            .arg("-c")
+            .arg("while :; do sleep 1; done")
+            .spawn()
+            .expect("spawn unrelated process");
+        let token = tokio_util::sync::CancellationToken::new();
+        let cancel = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            cancel.cancel();
+        });
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "trap 'touch {}; exit 0' TERM; while :; do sleep 0.1; done",
+            marker.display()
+        ));
+        let error = super::run_command_capture_cancellable(
+            cmd,
+            std::time::Duration::from_secs(10),
+            &token,
+            |_| Ok(()),
+        )
+        .expect_err("cancelled child must not succeed");
+        assert!(error.to_string().contains("command cancelled"));
+        assert!(marker.exists(), "child did not observe graceful SIGTERM");
+        assert!(
+            unrelated.try_wait().expect("poll unrelated").is_none(),
+            "unrelated process was terminated"
+        );
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+    }
+
+    #[test]
+    fn cancelled_child_force_kills_term_ignoring_process_group() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let cancel = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            cancel.cancel();
+        });
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("trap '' TERM; while :; do sleep 0.1; done");
+        let started = std::time::Instant::now();
+        let error = super::run_command_capture_cancellable(
+            cmd,
+            std::time::Duration::from_secs(10),
+            &token,
+            |_| Ok(()),
+        )
+        .expect_err("TERM-ignoring child must be force killed");
+        assert!(error.to_string().contains("command cancelled"));
+        assert!(started.elapsed() >= std::time::Duration::from_secs(super::CANCEL_GRACE_SECS));
+        assert!(started.elapsed() < std::time::Duration::from_secs(8));
     }
 
     #[test]

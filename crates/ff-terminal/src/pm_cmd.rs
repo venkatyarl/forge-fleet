@@ -356,24 +356,29 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
         crate::PmCommand::Cancel { id } => {
             let uid = uuid::Uuid::parse_str(&id)
                 .map_err(|e| anyhow::anyhow!("invalid work item id '{id}': {e}"))?;
-            // Release any active lease + free the slot, then mark terminal.
-            sqlx::query(
-                "UPDATE sub_agents SET current_work_item_id = NULL, status = 'idle' \
-                  WHERE current_work_item_id = $1",
+            // Status is the cancellation signal. The worker that owns the live
+            // child handle terminates that exact process group, reaps it, and
+            // only then releases the lease/slot. Never signal a persisted PID
+            // here: it may be stale or belong to another host/process.
+            let n = sqlx::query(
+                "UPDATE work_items SET status = 'cancelled' \
+                  WHERE id = $1 AND status <> 'cancelled'",
             )
             .bind(uid)
             .execute(&pool)
             .await
-            .map_err(|e| anyhow::anyhow!("free slot: {e}"))?;
-            sqlx::query(
-                "UPDATE work_item_leases \
-                    SET released_at = NOW(), lease_state = 'released', release_reason = 'cancelled' \
-                  WHERE work_item_id = $1 AND released_at IS NULL",
-            )
-            .bind(uid)
-            .execute(&pool)
-            .await
-            .map_err(|e| anyhow::anyhow!("release lease: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("cancel work item: {e}"))?
+            .rows_affected();
+            if n == 0 {
+                let exists: bool =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_items WHERE id = $1)")
+                        .bind(uid)
+                        .fetch_one(&pool)
+                        .await?;
+                if !exists {
+                    return Err(anyhow::anyhow!("no work item with id {id}"));
+                }
+            }
             // Drop it out of the merge queue so the drain stops considering it
             // (the per-host worktree reaper cleans the on-disk worktree).
             let _ = sqlx::query(
@@ -384,16 +389,34 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
             .bind(uid)
             .execute(&pool)
             .await;
-            let n = sqlx::query("UPDATE work_items SET status = 'cancelled' WHERE id = $1")
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            let released = loop {
+                let active: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM work_item_leases
+                         WHERE work_item_id = $1 AND released_at IS NULL
+                    )",
+                )
                 .bind(uid)
-                .execute(&pool)
-                .await
-                .map_err(|e| anyhow::anyhow!("cancel work item: {e}"))?
-                .rows_affected();
-            if n == 0 {
-                return Err(anyhow::anyhow!("no work item with id {id}"));
+                .fetch_one(&pool)
+                .await?;
+                if !active {
+                    break true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break false;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            };
+            if released {
+                println!(
+                    "{GREEN}✓ work item {id} cancelled{RESET} (backend stopped, lease released)"
+                );
+            } else {
+                println!(
+                    "{YELLOW}⚠ work item {id} cancellation accepted{RESET}; worker termination is still pending"
+                );
             }
-            println!("{GREEN}✓ work item {id} cancelled{RESET} (lease released, slot freed)");
         }
         crate::PmCommand::Show { id } => {
             let uid = uuid::Uuid::parse_str(&id)
