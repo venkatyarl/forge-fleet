@@ -9233,8 +9233,35 @@ pub async fn pg_assign_work_item(
     let inserted = sqlx::query(
         "INSERT INTO work_item_leases
             (work_item_id, sub_agent_id, computer_id, project_id, lease_state, lease_expires_at)
-         VALUES ($1, $2, $3, (SELECT project_id FROM work_items WHERE id = $1), 'claimed',
-                 NOW() + make_interval(secs => $4))
+         SELECT w.id, $2, $3, w.project_id, 'claimed',
+                NOW() + make_interval(secs => $4)
+           FROM work_items w
+           LEFT JOIN work_items p ON p.id = w.parent_id
+           LEFT JOIN project_repos r ON r.id = w.repo_id AND r.project_id = w.project_id
+          WHERE w.id = $1
+            AND (
+              (w.kind <> 'jira' AND COALESCE(p.kind, '') <> 'jira')
+              OR (
+                w.kind <> 'jira'
+                AND p.kind = 'jira'
+                AND r.id IS NOT NULL
+                AND (
+                  w.repo_id = p.repo_id
+                  OR EXISTS (
+                    SELECT 1
+                      FROM jsonb_array_elements_text(
+                        COALESCE(
+                          p.metadata->'allowed_repo_ids',
+                          p.metadata->'repo_ids',
+                          p.metadata->'repo_binding_repo_ids',
+                          '[]'::jsonb
+                        )
+                      ) allowed(repo_id)
+                     WHERE allowed.repo_id = w.repo_id::text
+                  )
+                )
+              )
+            )
          ON CONFLICT DO NOTHING
          RETURNING id",
     )

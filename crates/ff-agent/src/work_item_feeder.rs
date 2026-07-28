@@ -64,7 +64,7 @@ async fn feed_once(pg: &PgPool) -> Result<()> {
             kind = %kind,
             "feeder: healing unschedulable READY non-task item — auto-decomposing into leaf tasks"
         );
-        decompose(id).await?;
+        decompose(pg, id).await?;
         // The parent is now broken into `ready` leaf tasks; take it out of the
         // `ready` set so it isn't re-scanned and never lingers as a bogus
         // unschedulable ready item.
@@ -126,7 +126,7 @@ async fn feed_once(pg: &PgPool) -> Result<()> {
         // starving the fleet of the priority work). `jira` added 2026-07-28: the
         // HireFlow360 backlog ingests as kind='jira' (52 rows), which the catch-all
         // below was silently skipping — another way the fleet starved of tasks.
-        "bug" | "feature" | "epic" | "jira" => decompose(id).await?,
+        "bug" | "feature" | "epic" | "jira" => decompose(pg, id).await?,
         other => {
             warn!(work_item_id = %id, kind = other, "work item feeder skipped unsupported kind")
         }
@@ -153,7 +153,8 @@ fn ff_binary() -> PathBuf {
     PathBuf::from("ff")
 }
 
-async fn decompose(id: Uuid) -> Result<()> {
+async fn decompose(pg: &PgPool, id: Uuid) -> Result<()> {
+    crate::jira_repo_binding::validate_jira_repo_binding(pg, id).await?;
     let output = Command::new(ff_binary())
         .args(["pm", "decompose", &id.to_string(), "--ready"])
         .output()

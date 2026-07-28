@@ -732,6 +732,10 @@ async fn try_assign_item(
     viable: &HashSet<uuid::Uuid>,
     fallback_assigns: &mut usize,
 ) -> bool {
+    if let Err(e) = crate::jira_repo_binding::validate_jira_repo_binding(pg, item.id).await {
+        warn!(item = %item.id, error = %e, "work_item_scheduler: refusing invalid Jira repo binding");
+        return false;
+    }
     // Honor a host pin by re-querying that host's free slots; else take from
     // the shared pool, preferring an agent-viable computer.
     let slot = if let Some(host) = item.assigned_computer.as_deref() {

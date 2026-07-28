@@ -131,8 +131,12 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
                 .with_context(|| format!("no workstream matches {}", dir.display()))?;
             let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
             let token = resolve_session_token(session.as_deref());
-            let sid =
-                workstreams::session_id_for_token(&worker, &ws.project_key, &tool, token.as_deref());
+            let sid = workstreams::session_id_for_token(
+                &worker,
+                &ws.project_key,
+                &tool,
+                token.as_deref(),
+            );
             let updated = workstreams::report(
                 &pg,
                 &sid,
@@ -220,8 +224,12 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
             if let Ok(Some(ws)) = workstreams::workstream_for_dir(&pg, &dir).await {
                 let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
                 let token = resolve_session_token(session.as_deref());
-                let sid =
-                    workstreams::session_id_for_token(&worker, &ws.project_key, &tool, token.as_deref());
+                let sid = workstreams::session_id_for_token(
+                    &worker,
+                    &ws.project_key,
+                    &tool,
+                    token.as_deref(),
+                );
                 let _ = workstreams::heartbeat(&pg, &sid).await;
             }
         }
@@ -262,7 +270,11 @@ fn install_workstream_hooks(which: &str, dry_run: bool) -> Result<()> {
             // directive too as an instruction-level fallback.
             "kimi" => {
                 install_kimi_hooks(&home, dry_run)?;
-                install_agents_md_directive(&home.join(".kimi").join("AGENTS.md"), "kimi", dry_run)?;
+                install_agents_md_directive(
+                    &home.join(".kimi").join("AGENTS.md"),
+                    "kimi",
+                    dry_run,
+                )?;
             }
             other => println!("  ⚠ unknown tool '{other}' — skipping"),
         }
@@ -438,7 +450,10 @@ fn install_kimi_hooks(home: &std::path::Path, dry_run: bool) -> Result<()> {
         format!("{cleaned}\n\n{block}")
     };
     if dry_run {
-        println!("  [dry-run] would append [[hooks]] block to {}", path.display());
+        println!(
+            "  [dry-run] would append [[hooks]] block to {}",
+            path.display()
+        );
         return Ok(());
     }
     if let Some(parent) = path.parent() {

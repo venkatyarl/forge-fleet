@@ -52,7 +52,7 @@ pub async fn run_auto_backlog_feeder_tick(pg: &PgPool) -> Result<usize> {
                 .rows_affected();
                 fed += usize::from(changed == 1);
             }
-            "bug" | "feature" | "epic" | "jira" => match decompose_idea(&idea).await {
+            "bug" | "feature" | "epic" | "jira" => match decompose_idea(pg, &idea).await {
                 Ok(()) => fed += 1,
                 Err(error) => {
                     warn!(item = %idea.id, %error, "auto backlog feeder decomposition failed");
@@ -118,7 +118,7 @@ async fn rescue_ready_parent(pg: &PgPool) -> Result<usize> {
         repo_path: row.try_get("repo_path").ok().flatten(),
     };
 
-    match decompose_idea(&parent).await {
+    match decompose_idea(pg, &parent).await {
         Ok(()) => {
             info!(item = %parent.id, "rescued unschedulable ready parent");
             Ok(1)
@@ -195,7 +195,8 @@ async fn next_idea(pg: &PgPool, attempted: &HashSet<Uuid>) -> Result<Option<Idea
     }))
 }
 
-async fn decompose_idea(idea: &Idea) -> Result<()> {
+async fn decompose_idea(pg: &PgPool, idea: &Idea) -> Result<()> {
+    crate::jira_repo_binding::validate_jira_repo_binding(pg, idea.id).await?;
     let ff = std::env::var_os("FORGEFLEET_FF_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("ff"));
