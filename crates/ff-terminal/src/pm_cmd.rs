@@ -752,6 +752,10 @@ async fn print_pm_doctor(pool: &sqlx::PgPool) -> Result<()> {
     let orphaned_in_progress = ff_db::pg_count_orphaned_work_items(pool, 3600)
         .await
         .map_err(|e| anyhow::anyhow!("doctor orphaned work_items: {e}"))?;
+    let jira_dispatch: (i64, i64, i64, i64) = sqlx::query_as(jira_dispatch_doctor_sql())
+        .fetch_one(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("doctor Jira dispatch invariants: {e}"))?;
 
     let leader_ok = !fresh_leaders.is_empty();
     if leader_ok {
@@ -797,14 +801,96 @@ async fn print_pm_doctor(pool: &sqlx::PgPool) -> Result<()> {
         );
     }
 
+    let jira_ok = jira_dispatch == (0, 0, 0, 0);
+    print!(
+        "{}",
+        render_jira_dispatch_diagnostics(
+            jira_dispatch.0,
+            jira_dispatch.1,
+            jira_dispatch.2,
+            jira_dispatch.3,
+        )
+    );
+
     println!();
-    if leader_ok && stale_ok && slots_ok && orphans_ok {
+    if leader_ok && stale_ok && slots_ok && orphans_ok && jira_ok {
         println!("{GREEN}✓ Summary:{RESET} Pillar-4 work_item pipeline is healthy");
     } else {
         println!("{RED}⚠ Summary:{RESET} Pillar-4 work_item pipeline needs attention");
     }
 
     Ok(())
+}
+
+fn jira_dispatch_doctor_sql() -> &'static str {
+    "WITH RECURSIVE jira_lineage AS ( \
+         SELECT p.id AS root_id, p.id AS item_id, \
+                LOWER(BTRIM(COALESCE(p.metadata->>'jira_status', ''))) AS jira_status, \
+                p.metadata->>'jira_held_at' AS jira_held_at \
+           FROM work_items p \
+          WHERE p.kind = 'jira' \
+         UNION ALL \
+         SELECT l.root_id, c.id, l.jira_status, l.jira_held_at \
+           FROM jira_lineage l \
+           JOIN work_items c ON c.parent_id = l.item_id \
+     ), blocked_roots AS ( \
+         SELECT l.root_id, l.jira_held_at \
+           FROM jira_lineage l \
+          WHERE l.root_id = l.item_id \
+            AND l.jira_status IN ('blocked', 'blocked on vinny') \
+     ), scheduler_ready AS ( \
+         SELECT l.root_id, l.item_id \
+           FROM jira_lineage l \
+           JOIN work_items w ON w.id = l.item_id \
+          WHERE w.status = 'ready' AND NOT w.parked \
+            AND (w.kind = 'jira' OR w.kind = 'task') \
+     ) \
+     SELECT \
+       COUNT(DISTINCT b.root_id) FILTER ( \
+           WHERE p.status = 'ready' AND NOT p.parked)::bigint AS blocked_parents_ready, \
+       COUNT(DISTINCT l.item_id) FILTER ( \
+           WHERE l.item_id <> l.root_id \
+             AND c.status IN ('ready', 'claimed', 'building', 'in_progress'))::bigint \
+           AS live_children_of_blocked, \
+       COUNT(DISTINCT s.item_id) FILTER ( \
+           WHERE w.repo_id IS NULL OR NOT EXISTS ( \
+               SELECT 1 FROM project_repos pr \
+                WHERE pr.id = w.repo_id AND pr.project_id = w.project_id))::bigint \
+           AS eligible_without_repo, \
+       COUNT(DISTINCT b.root_id) FILTER ( \
+           WHERE p.status = 'ready' AND NOT p.parked \
+             AND (b.jira_held_at IS NULL \
+                  OR b.jira_held_at !~ '^\\d{4}-\\d{2}-\\d{2}T' \
+                  OR b.jira_held_at::timestamptz < NOW() - INTERVAL '15 minutes'))::bigint \
+           AS stale_eligibility \
+       FROM blocked_roots b \
+       JOIN work_items p ON p.id = b.root_id \
+       LEFT JOIN jira_lineage l ON l.root_id = b.root_id \
+       LEFT JOIN work_items c ON c.id = l.item_id \
+       FULL JOIN scheduler_ready s ON TRUE \
+       LEFT JOIN work_items w ON w.id = s.item_id"
+}
+
+fn render_jira_dispatch_diagnostics(
+    blocked_parents_ready: i64,
+    live_children_of_blocked: i64,
+    eligible_without_repo: i64,
+    stale_eligibility: i64,
+) -> String {
+    if (
+        blocked_parents_ready,
+        live_children_of_blocked,
+        eligible_without_repo,
+        stale_eligibility,
+    ) == (0, 0, 0, 0)
+    {
+        return format!("{GREEN}✓ Jira dispatch invariants{RESET}: clear\n");
+    }
+    format!(
+        "{RED}✗ Jira dispatch invariants{RESET}: blocked parents ready {blocked_parents_ready}, \
+         live children {live_children_of_blocked}, no canonical repo {eligible_without_repo}, \
+         stale holds {stale_eligibility}\n"
+    )
 }
 
 fn project_fair_share(project_count: usize, total_capacity: i64) -> i64 {
@@ -3111,6 +3197,30 @@ mod tests {
         assert!(out.contains("hireflow360"));
         assert!(out.contains("<unassigned>"));
         assert_eq!(out.matches('4').count(), 3);
+    }
+
+    #[test]
+    fn jira_dispatch_doctor_uses_canonical_binding_and_existing_hold_timestamp() {
+        let sql = jira_dispatch_doctor_sql();
+        assert!(sql.contains("metadata->>'jira_status'"));
+        assert!(sql.contains("metadata->>'jira_held_at'"));
+        assert!(sql.contains("project_repos"));
+        assert!(sql.contains("pr.id = w.repo_id AND pr.project_id = w.project_id"));
+        assert!(sql.contains("WITH RECURSIVE jira_lineage"));
+    }
+
+    #[test]
+    fn jira_dispatch_doctor_fail_output_is_concise_and_complete() {
+        let out = render_jira_dispatch_diagnostics(1, 2, 3, 4);
+        assert!(out.contains("blocked parents ready 1"));
+        assert!(out.contains("live children 2"));
+        assert!(out.contains("no canonical repo 3"));
+        assert!(out.contains("stale holds 4"));
+        assert_eq!(out.lines().count(), 1);
+
+        let healthy = render_jira_dispatch_diagnostics(0, 0, 0, 0);
+        assert!(healthy.contains("Jira dispatch invariants"));
+        assert!(healthy.contains("clear"));
     }
 
     #[test]
