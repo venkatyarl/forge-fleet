@@ -8238,8 +8238,9 @@ pub async fn pg_memory_record_eviction(
 
 // ── Pillar 4: distributed-dev work_item scheduler ────────────────────────
 // Leader-only, serial tick. The partial-unique active-lease index guards
-// double-assignment; single-leader serial execution means no FOR UPDATE
-// gymnastics needed. IMPORTANT: only schedules work_items explicitly set to
+// double-assignment, and the claim transaction rechecks eligibility so stale
+// ready-list rows cannot bypass parent/hold/repo guards. IMPORTANT: only
+// schedules work_items explicitly set to
 // status='ready' (execution-flagged) — never touches operator PM items in
 // their PM statuses ('idea' etc.), avoiding the split-brain the council flagged.
 // Design: .forgefleet/plans/DECISION-pillar4-canonical-home.md
@@ -8257,6 +8258,46 @@ pub struct ReadyWorkItem {
 pub struct FreeSlot {
     pub sub_agent_id: uuid::Uuid,
     pub computer_id: uuid::Uuid,
+}
+
+const JIRA_ANCESTOR_GUARD_SQL: &str = "\
+AND NOT EXISTS (
+    WITH RECURSIVE ancestors AS (
+        SELECT p.id, p.project_id, p.parent_id, p.kind, p.status,
+               p.metadata, p.repo_id, p.repo_url, ARRAY[p.id] AS path
+          FROM work_items p
+         WHERE p.id = w.parent_id
+        UNION ALL
+        SELECT p.id, p.project_id, p.parent_id, p.kind, p.status,
+               p.metadata, p.repo_id, p.repo_url, a.path || p.id
+          FROM ancestors a
+          JOIN work_items p ON p.id = a.parent_id
+         WHERE NOT p.id = ANY(a.path)
+    )
+    SELECT 1
+      FROM ancestors a
+     WHERE a.kind = 'jira'
+       AND (
+           LOWER(BTRIM(COALESCE(a.status, ''))) IN ('blocked', 'blocked on vinny')
+        OR LOWER(BTRIM(COALESCE(a.metadata->>'jira_status', ''))) IN ('blocked', 'blocked on vinny')
+        OR NULLIF(BTRIM(COALESCE(a.metadata->>'jira_execution_hold', '')), '') IS NOT NULL
+        OR LOWER(BTRIM(COALESCE(a.metadata->>'repo_binding_required', ''))) NOT IN ('', 'false', '0', 'no')
+        OR NOT EXISTS (
+            SELECT 1
+              FROM project_repos pr
+             WHERE pr.project_id = a.project_id
+               AND NULLIF(BTRIM(pr.github_url), '') IS NOT NULL
+               AND (
+                   (a.repo_id IS NOT NULL AND pr.id = a.repo_id)
+                OR (NULLIF(BTRIM(COALESCE(a.repo_url, '')), '') IS NOT NULL
+                    AND pr.github_url = a.repo_url)
+               )
+        )
+       )
+)";
+
+fn schedulable_work_item_predicate(alias: &str) -> String {
+    JIRA_ANCESTOR_GUARD_SQL.replace(" w.", &format!(" {alias}."))
 }
 
 #[derive(Debug, Clone)]
@@ -8712,7 +8753,7 @@ pub async fn pg_maintain_computer_metrics_history(pool: &PgPool) -> Result<(u64,
 /// fetched set and monopolize scheduling while other ready projects were
 /// excluded. NULL project_id groups as its own bucket.
 pub async fn pg_ready_work_items(pool: &PgPool, limit: i64) -> Result<Vec<ReadyWorkItem>> {
-    let rows = sqlx::query(
+    let sql = format!(
         "SELECT id, assigned_computer, project_id
            FROM (
                 SELECT w.id, w.assigned_computer, w.project_id,
@@ -8735,18 +8776,21 @@ pub async fn pg_ready_work_items(pool: &PgPool, limit: i64) -> Result<Vec<ReadyW
                          JOIN work_items dep ON dep.id = r.from_id
                         WHERE r.to_id = w.id AND r.relation_type = 'blocks'
                           AND dep.status <> 'merged')
+                   {}
                 ) ranked
           ORDER BY project_rank ASC, risk_score DESC,
                    (retry_count > 0) DESC, created_at ASC, id ASC
           LIMIT $1",
-    )
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| {
-        warn!(limit, error = %e, "pg_ready_work_items query failed");
-        e
-    })?;
+        schedulable_work_item_predicate("w")
+    );
+    let rows = sqlx::query(&sql)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| {
+            warn!(limit, error = %e, "pg_ready_work_items query failed");
+            e
+        })?;
     let items: Vec<ReadyWorkItem> = rows
         .iter()
         .map(|r| ReadyWorkItem {
@@ -9230,20 +9274,55 @@ pub async fn pg_assign_work_item(
     lease_secs: i64,
 ) -> Result<bool> {
     let mut tx = pool.begin().await?;
-    let inserted = sqlx::query(
-        "INSERT INTO work_item_leases
-            (work_item_id, sub_agent_id, computer_id, project_id, lease_state, lease_expires_at)
-         VALUES ($1, $2, $3, (SELECT project_id FROM work_items WHERE id = $1), 'claimed',
-                 NOW() + make_interval(secs => $4))
-         ON CONFLICT DO NOTHING
-         RETURNING id",
+    sqlx::query(
+        "WITH RECURSIVE claim_chain AS (
+            SELECT w.id, w.parent_id, ARRAY[w.id] AS path
+              FROM work_items w
+             WHERE w.id = $1
+            UNION ALL
+            SELECT p.id, p.parent_id, a.path || p.id
+              FROM claim_chain a
+              JOIN work_items p ON p.id = a.parent_id
+             WHERE NOT p.id = ANY(a.path)
+        )
+        SELECT w.id
+          FROM work_items w
+          JOIN claim_chain c ON c.id = w.id
+         ORDER BY w.id
+         FOR UPDATE OF w",
     )
     .bind(work_item_id)
-    .bind(sub_agent_id)
-    .bind(computer_id)
-    .bind(lease_secs as f64)
-    .fetch_optional(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
+
+    let sql = format!(
+        "INSERT INTO work_item_leases
+            (work_item_id, sub_agent_id, computer_id, project_id, lease_state, lease_expires_at)
+         SELECT w.id, $2, $3, w.project_id, 'claimed', NOW() + make_interval(secs => $4)
+           FROM work_items w
+          WHERE w.id = $1
+            AND w.status = 'ready'
+            AND w.kind = 'task'
+            AND NOT EXISTS (
+                SELECT 1 FROM work_item_leases l
+                 WHERE l.work_item_id = w.id AND l.released_at IS NULL)
+            AND NOT EXISTS (
+                SELECT 1 FROM work_item_relations r
+                  JOIN work_items dep ON dep.id = r.from_id
+                 WHERE r.to_id = w.id AND r.relation_type = 'blocks'
+                   AND dep.status <> 'merged')
+            {}
+         ON CONFLICT DO NOTHING
+         RETURNING id",
+        schedulable_work_item_predicate("w")
+    );
+    let inserted = sqlx::query(&sql)
+        .bind(work_item_id)
+        .bind(sub_agent_id)
+        .bind(computer_id)
+        .bind(lease_secs as f64)
+        .fetch_optional(&mut *tx)
+        .await?;
 
     if inserted.is_none() {
         tx.rollback().await?;
@@ -9759,6 +9838,305 @@ mod parent_completion_tests {
         );
         assert_eq!(pg_complete_parent_work_items(&pool).await.unwrap(), 0);
         assert_eq!(status_of(&pool, childless).await, "ready");
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+}
+
+#[cfg(test)]
+mod jira_claim_guard_tests {
+    use super::*;
+    use std::env;
+
+    use serde_json::json;
+    use sqlx::postgres::PgPoolOptions;
+
+    fn base_db_url() -> Option<String> {
+        env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()
+    }
+
+    async fn temp_pool() -> Option<(PgPool, PgPool, String)> {
+        let base_url = base_db_url()?;
+        let (prefix, _) = base_url.rsplit_once('/')?;
+        let db_name = format!("ff_jira_claim_guard_{}", uuid::Uuid::new_v4().simple());
+
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("{prefix}/postgres"))
+            .await
+            .expect("connect to admin db");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create temp db");
+
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&format!("{prefix}/{db_name}"))
+            .await
+            .expect("connect to temp db");
+
+        sqlx::raw_sql(
+            "CREATE EXTENSION IF NOT EXISTS pgcrypto;
+             CREATE TABLE projects (
+                 id TEXT PRIMARY KEY
+             );
+             CREATE TABLE project_repos (
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 project_id TEXT NOT NULL REFERENCES projects(id),
+                 github_url TEXT NOT NULL,
+                 name TEXT,
+                 default_branch TEXT NOT NULL DEFAULT 'main',
+                 is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+                 metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+             );
+             CREATE TABLE computers (
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 name TEXT NOT NULL
+             );
+             CREATE TABLE sub_agents (
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 computer_id UUID NOT NULL REFERENCES computers(id),
+                 current_work_item_id UUID,
+                 status TEXT NOT NULL DEFAULT 'idle'
+             );
+             CREATE TABLE work_items (
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 project_id TEXT NOT NULL REFERENCES projects(id),
+                 parent_id UUID REFERENCES work_items(id),
+                 kind TEXT NOT NULL,
+                 title TEXT NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'idea',
+                 metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                 repo_id UUID,
+                 repo_url TEXT,
+                 assigned_computer TEXT,
+                 risk_score REAL NOT NULL DEFAULT 0,
+                 retry_count INTEGER NOT NULL DEFAULT 0,
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );
+             CREATE TABLE work_item_relations (
+                 from_id UUID NOT NULL REFERENCES work_items(id),
+                 to_id UUID NOT NULL REFERENCES work_items(id),
+                 relation_type TEXT NOT NULL
+             );
+             CREATE TABLE work_item_leases (
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 work_item_id UUID NOT NULL REFERENCES work_items(id),
+                 sub_agent_id UUID REFERENCES sub_agents(id),
+                 computer_id UUID REFERENCES computers(id),
+                 project_id TEXT,
+                 lease_state TEXT NOT NULL,
+                 lease_expires_at TIMESTAMPTZ,
+                 released_at TIMESTAMPTZ
+             );
+             CREATE UNIQUE INDEX ux_work_item_leases_active
+                 ON work_item_leases(work_item_id)
+                 WHERE released_at IS NULL;",
+        )
+        .execute(&pool)
+        .await
+        .expect("create minimal scheduler schema");
+
+        Some((admin, pool, db_name))
+    }
+
+    async fn drop_temp_db(admin: PgPool, pool: PgPool, db_name: &str) {
+        pool.close().await;
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid)
+               FROM pg_stat_activity
+              WHERE datname = $1
+                AND pid <> pg_backend_pid()",
+        )
+        .bind(db_name)
+        .execute(&admin)
+        .await
+        .expect("terminate temp db sessions");
+        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("drop temp db");
+        admin.close().await;
+    }
+
+    async fn seed_project_slot(pool: &PgPool) -> (uuid::Uuid, uuid::Uuid, uuid::Uuid) {
+        sqlx::query("INSERT INTO projects (id) VALUES ('hireflow360')")
+            .execute(pool)
+            .await
+            .unwrap();
+        let repo_id = sqlx::query_scalar(
+            "INSERT INTO project_repos (project_id, github_url, name, is_primary)
+             VALUES ('hireflow360', 'git@github.com-venkat:HireFlow360-INC/hf-auth-api.git',
+                     'hf-auth-api', true)
+             RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let computer_id =
+            sqlx::query_scalar("INSERT INTO computers (name) VALUES ('sia') RETURNING id")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let sub_agent_id =
+            sqlx::query_scalar("INSERT INTO sub_agents (computer_id) VALUES ($1) RETURNING id")
+                .bind(computer_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        (repo_id, computer_id, sub_agent_id)
+    }
+
+    async fn insert_work_item(
+        pool: &PgPool,
+        kind: &str,
+        status: &str,
+        parent_id: Option<uuid::Uuid>,
+        metadata: serde_json::Value,
+        repo_id: Option<uuid::Uuid>,
+        repo_url: Option<&str>,
+    ) -> uuid::Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO work_items
+                (project_id, kind, title, status, parent_id, metadata, repo_id, repo_url)
+             VALUES ('hireflow360', $1, $2, $3, $4, $5, $6, $7)
+             RETURNING id",
+        )
+        .bind(kind)
+        .bind(format!("{kind} {status}"))
+        .bind(status)
+        .bind(parent_id)
+        .bind(metadata)
+        .bind(repo_id)
+        .bind(repo_url)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn blocked_jira_ancestor_is_not_returned_or_claimed() {
+        let Some((admin, pool, db_name)) = temp_pool().await else {
+            return;
+        };
+        let (repo_id, computer_id, sub_agent_id) = seed_project_slot(&pool).await;
+        let parent = insert_work_item(
+            &pool,
+            "jira",
+            "ready",
+            None,
+            json!({"jira_status": "Blocked"}),
+            Some(repo_id),
+            None,
+        )
+        .await;
+        let child =
+            insert_work_item(&pool, "task", "ready", Some(parent), json!({}), None, None).await;
+
+        assert!(pg_ready_work_items(&pool, 10).await.unwrap().is_empty());
+        assert!(
+            !pg_assign_work_item(&pool, child, sub_agent_id, computer_id, 600)
+                .await
+                .unwrap()
+        );
+        let leases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_item_leases")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(leases, 0);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn jira_child_requires_valid_canonical_repo_binding() {
+        let Some((admin, pool, db_name)) = temp_pool().await else {
+            return;
+        };
+        let (repo_id, computer_id, sub_agent_id) = seed_project_slot(&pool).await;
+        let unbound_parent = insert_work_item(
+            &pool,
+            "jira",
+            "ready",
+            None,
+            json!({"jira_status": "To Do"}),
+            None,
+            None,
+        )
+        .await;
+        let unbound_child = insert_work_item(
+            &pool,
+            "task",
+            "ready",
+            Some(unbound_parent),
+            json!({}),
+            None,
+            None,
+        )
+        .await;
+        let bound_parent = insert_work_item(
+            &pool,
+            "jira",
+            "ready",
+            None,
+            json!({"jira_status": "To Do"}),
+            Some(repo_id),
+            None,
+        )
+        .await;
+        let bound_child = insert_work_item(
+            &pool,
+            "task",
+            "ready",
+            Some(bound_parent),
+            json!({}),
+            None,
+            None,
+        )
+        .await;
+
+        let ready = pg_ready_work_items(&pool, 10).await.unwrap();
+        assert_eq!(
+            ready.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![bound_child]
+        );
+        assert!(
+            !pg_assign_work_item(&pool, unbound_child, sub_agent_id, computer_id, 600)
+                .await
+                .unwrap()
+        );
+        assert!(
+            pg_assign_work_item(&pool, bound_child, sub_agent_id, computer_id, 600)
+                .await
+                .unwrap()
+        );
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn non_jira_child_remains_schedulable_without_repo_binding() {
+        let Some((admin, pool, db_name)) = temp_pool().await else {
+            return;
+        };
+        let (_repo_id, computer_id, sub_agent_id) = seed_project_slot(&pool).await;
+        let parent = insert_work_item(&pool, "feature", "ready", None, json!({}), None, None).await;
+        let child =
+            insert_work_item(&pool, "task", "ready", Some(parent), json!({}), None, None).await;
+
+        let ready = pg_ready_work_items(&pool, 10).await.unwrap();
+        assert_eq!(
+            ready.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![child]
+        );
+        assert!(
+            pg_assign_work_item(&pool, child, sub_agent_id, computer_id, 600)
+                .await
+                .unwrap()
+        );
 
         drop_temp_db(admin, pool, &db_name).await;
     }
