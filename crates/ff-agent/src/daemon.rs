@@ -117,6 +117,18 @@ impl TickRegistry {
                 runner: run_kimi_usage_poller_tick,
             },
             TickDefinition {
+                name: "codex_usage_poller",
+                interval: Duration::from_secs(600),
+                scope: TickScope::LeaderOnly,
+                runner: run_codex_usage_poller_tick,
+            },
+            TickDefinition {
+                name: "claude_usage_poller",
+                interval: Duration::from_secs(600),
+                scope: TickScope::LeaderOnly,
+                runner: run_claude_usage_poller_tick,
+            },
+            TickDefinition {
                 name: "ssh_mesh_check",
                 interval: Duration::from_secs(6 * 60 * 60),
                 scope: TickScope::LeaderOnly,
@@ -322,6 +334,25 @@ fn run_kimi_usage_poller_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'st
     })
 }
 
+fn run_codex_usage_poller_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::codex_usage_poller::poll_codex_usage_once(&pg)
+            .await
+            .map(|_| ())
+    })
+}
+
+fn run_claude_usage_poller_tick(
+    pg: PgPool,
+    _worker_name: String,
+) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::claude_usage_poller::poll_claude_usage_once(&pg)
+            .await
+            .map(|_| ())
+    })
+}
+
 fn run_ssh_mesh_check_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'static, Result<()>> {
     Box::pin(async move {
         crate::mesh_check::pairwise_ssh_check(&pg)
@@ -410,6 +441,24 @@ pub fn start_tick_scheduler(
 
         info!("daemon tick scheduler stopped");
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_pollers_are_registered_for_daemon_ticks() {
+        let registry = TickRegistry::new();
+        let names: Vec<_> = registry
+            .ticks
+            .iter()
+            .map(|tick| tick.definition.name)
+            .collect();
+
+        assert!(names.contains(&"codex_usage_poller"));
+        assert!(names.contains(&"claude_usage_poller"));
+    }
 }
 
 /// Self-watchdog for the dispatch-tick scheduler.
