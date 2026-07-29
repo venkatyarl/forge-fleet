@@ -1386,7 +1386,7 @@ async fn dispatch_one(
         let sweep_warnings = post_phase.finish();
         return Ok(WorkItemDispatchResult { sweep_warnings });
     }
-    mark_ready_for_review(
+    let advanced = mark_ready_for_review(
         &pg,
         &item,
         &worktree,
@@ -1396,6 +1396,15 @@ async fn dispatch_one(
         Some(&review),
     )
     .await?;
+    if !advanced {
+        info!(
+            work_item_id = %item.work_item_id,
+            sub_agent_id = %item.sub_agent_id,
+            "work_item_dispatch: ignoring stale result after item or lease changed"
+        );
+        let sweep_warnings = post_phase.finish();
+        return Ok(WorkItemDispatchResult { sweep_warnings });
+    }
     if normalized_cloud_backend(&backend_used).is_none() {
         mark_local_retest_passed(&pg, item.work_item_id).await?;
     }
@@ -1967,21 +1976,35 @@ async fn mark_ready_for_review(
     pr_url: &str,
     builder: &str,
     review: Option<&ReviewOutcome>,
-) -> Result<()> {
+) -> Result<bool> {
     let mut tx = pg.begin().await?;
-    sqlx::query(
+    let transitioned = sqlx::query(
         "UPDATE work_items
             SET status = 'in_review',
                 branch_name = $2,
                 pr_url = $3,
                 cleanup_complete = TRUE
-          WHERE id = $1",
+          WHERE id = $1
+            AND status = 'building'
+            AND EXISTS (
+                SELECT 1
+                  FROM work_item_leases l
+                 WHERE l.work_item_id = work_items.id
+                   AND l.sub_agent_id = $4
+                   AND l.released_at IS NULL
+            )",
     )
     .bind(item.work_item_id)
     .bind(&worktree.task_branch)
     .bind(pr_url)
+    .bind(item.sub_agent_id)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if transitioned == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
 
     sqlx::query(
         "UPDATE work_item_worktrees
@@ -2089,7 +2112,7 @@ async fn mark_ready_for_review(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 // ── Pillar 4 v2: in-place review stage (after build+PR, before enqueue) ──────
@@ -6378,14 +6401,14 @@ pub fn spawn_worktree_reaper(
 mod tests {
     use super::{
         AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS, ReviewerStat,
-        affected_crate_manifests, agent_output_tail, backend_failed_without_output,
+        WorktreeRecord, affected_crate_manifests, agent_output_tail, backend_failed_without_output,
         builder_excludes_480b, check_dispatch_prerequisites, classify_dispatch_outcome,
         collect_leftover_tmp_output, command_display, complexity_at_least_moderate,
         contains_file_line_citation, default_clone_path, dispatch_budget_for_host, dispatch_prompt,
         expand_home, is_build_timeout, local_failure_diagnosis_for,
         local_failure_diagnosis_for_attempt, mark_local_retest_failed, mark_local_retest_passed,
-        mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers, parse_cli_tokens,
-        parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
+        mark_ready_for_review, mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers,
+        parse_cli_tokens, parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
         quick_empty_success_is_provider_failure, record_cloud_rescue_local_failure_diagnosis,
         repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
         same_model_family, should_attempt_lane15, status_output_is_clean, synthetic_output,
@@ -6424,6 +6447,194 @@ mod tests {
             work: Vec::new(),
             post_work: Vec::new(),
         }
+    }
+
+    async fn lease_gate_test_pool() -> Option<sqlx::PgPool> {
+        let url = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .ok()?;
+        ff_db::run_postgres_migrations(&pool).await.ok()?;
+        Some(pool)
+    }
+
+    async fn lease_gate_fixture(
+        pool: &sqlx::PgPool,
+        status: &str,
+        released: bool,
+    ) -> (AssignedWorkItem, WorktreeRecord) {
+        let suffix = Uuid::new_v4();
+        let project_id = format!("dispatch-lease-gate-{suffix}");
+        let computer_id = Uuid::new_v4();
+        let sub_agent_id = Uuid::new_v4();
+        let work_item_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects (id, display_name) VALUES ($1, $1)")
+            .bind(&project_id)
+            .execute(pool)
+            .await
+            .expect("insert lease-gate project");
+        sqlx::query(
+            "INSERT INTO computers (id, name, primary_ip, os_family, ssh_user)
+             VALUES ($1, $2, '127.0.0.1', 'linux', 'test')",
+        )
+        .bind(computer_id)
+        .bind(format!("dispatch-lease-gate-{suffix}"))
+        .execute(pool)
+        .await
+        .expect("insert lease-gate computer");
+        sqlx::query(
+            "INSERT INTO sub_agents (id, computer_id, slot, workspace_dir)
+             VALUES ($1, $2, 987654, '/tmp/dispatch-lease-gate')",
+        )
+        .bind(sub_agent_id)
+        .bind(computer_id)
+        .execute(pool)
+        .await
+        .expect("insert lease-gate sub-agent");
+        sqlx::query(
+            "INSERT INTO work_items (id, project_id, kind, title, status)
+             VALUES ($1, $2, 'task', 'lease gate regression', $3)",
+        )
+        .bind(work_item_id)
+        .bind(&project_id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("insert lease-gate work item");
+        sqlx::query(
+            "INSERT INTO work_item_leases
+                (work_item_id, sub_agent_id, computer_id, project_id, lease_expires_at, released_at)
+             VALUES ($1, $2, $3, $4, NOW() + INTERVAL '5 minutes',
+                     CASE WHEN $5 THEN NOW() ELSE NULL END)",
+        )
+        .bind(work_item_id)
+        .bind(sub_agent_id)
+        .bind(computer_id)
+        .bind(&project_id)
+        .bind(released)
+        .execute(pool)
+        .await
+        .expect("insert lease-gate lease");
+
+        let mut item = test_item(0, None, "mechanical");
+        item.work_item_id = work_item_id;
+        item.project_id = project_id;
+        item.computer_id = computer_id;
+        item.sub_agent_id = sub_agent_id;
+        let worktree = WorktreeRecord {
+            worktree_path: PathBuf::from("/tmp/dispatch-lease-gate"),
+            base_branch: "main".to_string(),
+            task_branch: format!("wi/{work_item_id}"),
+        };
+        (item, worktree)
+    }
+
+    async fn cleanup_lease_gate_fixture(pool: &sqlx::PgPool, item: &AssignedWorkItem) {
+        sqlx::query("DELETE FROM work_item_leases WHERE work_item_id = $1")
+            .bind(item.work_item_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM work_items WHERE id = $1")
+            .bind(item.work_item_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM sub_agents WHERE id = $1")
+            .bind(item.sub_agent_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM computers WHERE id = $1")
+            .bind(item.computer_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(&item.project_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn cancelled_item_cannot_transition_to_review_or_enqueue() {
+        let Some(pool) = lease_gate_test_pool().await else {
+            eprintln!("skipping lease-gate DB test: no usable ForgeFleet database URL");
+            return;
+        };
+        let (item, worktree) = lease_gate_fixture(&pool, "cancelled", false).await;
+
+        let advanced = mark_ready_for_review(
+            &pool,
+            &item,
+            &worktree,
+            "deadbeef",
+            "https://pr/1",
+            "codex",
+            None,
+        )
+        .await
+        .expect("cancelled result should be ignored");
+
+        assert!(!advanced);
+        let status: String = sqlx::query_scalar("SELECT status FROM work_items WHERE id = $1")
+            .bind(item.work_item_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let queued: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_item_merge_queue WHERE work_item_id = $1",
+        )
+        .bind(item.work_item_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "cancelled");
+        assert_eq!(queued, 0);
+        cleanup_lease_gate_fixture(&pool, &item).await;
+    }
+
+    #[tokio::test]
+    async fn stale_lease_result_cannot_transition_to_review_or_enqueue() {
+        let Some(pool) = lease_gate_test_pool().await else {
+            eprintln!("skipping lease-gate DB test: no usable ForgeFleet database URL");
+            return;
+        };
+        let (item, worktree) = lease_gate_fixture(&pool, "ready", true).await;
+
+        let advanced = mark_ready_for_review(
+            &pool,
+            &item,
+            &worktree,
+            "deadbeef",
+            "https://pr/2",
+            "codex",
+            None,
+        )
+        .await
+        .expect("stale result should be ignored");
+
+        assert!(!advanced);
+        let status: String = sqlx::query_scalar("SELECT status FROM work_items WHERE id = $1")
+            .bind(item.work_item_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let queued: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_item_merge_queue WHERE work_item_id = $1",
+        )
+        .bind(item.work_item_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "ready");
+        assert_eq!(queued, 0);
+        cleanup_lease_gate_fixture(&pool, &item).await;
     }
 
     #[test]
