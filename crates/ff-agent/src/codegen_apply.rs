@@ -113,6 +113,16 @@ fn builder_engine(resp: &crate::fleet_oneshot::FleetOneshot) -> String {
     crate::llm_attribution::engine_label(&label)
 }
 
+/// SYSTEM-message contract for codegen (canary-3, 2026-07-29): reasoning
+/// coders obey a system contract where they ignore mid-user-message format
+/// instructions. Kept byte-identical in wording to the lab-proven thalia
+/// experiments (first-try clean unified diffs / full files).
+const CODEGEN_SYSTEM_CONTRACT: &str = "You are a code-editing engine, not a conversational assistant. \
+Your ENTIRE reply must be SEARCH/REPLACE edit blocks in the exact format the user specifies — \
+start the reply directly with the first '*** FILE:' block. NEVER explain, reason aloud, narrate, \
+plan, or wrap the reply in markdown fences or prose. If no change is needed, reply with the single \
+ALREADY_IMPLEMENTED line the user describes and nothing else.";
+
 pub async fn codegen_apply(
     pool: &PgPool,
     repo_path: &Path,
@@ -154,10 +164,14 @@ pub async fn codegen_apply(
         // Ctx floor (2026-07-29, canary-2 root cause): glm-4.5-air is a REASONING
         // model — its slot must hold prompt + think + max_tokens or the reply
         // truncates into prose. Estimate prompt tokens (chars/4) and require the
-        // slot to fit it plus the output (4096) plus a think reserve, so fat
+        // slot to fit it plus the output plus a think reserve, so fat
         // repo-context prompts route to the 32K slots instead of thalia's 12K.
         let est_prompt_tokens = (prompt.len() / 4) as i32;
-        let min_ctx = Some((est_prompt_tokens + 4096 + 2048).min(49152));
+        let min_ctx = Some((est_prompt_tokens + 8192 + 2048).min(49152));
+        // Canary-3 root cause: with the format contract mid-user-message, the
+        // reasoning model thinks out loud in `content` and burns the completion
+        // budget before any edit block. Strict SYSTEM contract (lab-proven on
+        // thalia) + 8192 completion budget for multi-block edits.
         let response = crate::fleet_oneshot::fleet_oneshot_for_ctx(
             pool,
             &prompt,
@@ -165,6 +179,8 @@ pub async fn codegen_apply(
             Some(Duration::from_secs(300)),
             Some("code"),
             min_ctx,
+            Some(CODEGEN_SYSTEM_CONTRACT),
+            8192,
         )
         .await
         .with_context(|| format!("fleet_oneshot round {round}"))?;
