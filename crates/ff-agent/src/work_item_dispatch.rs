@@ -2767,6 +2767,127 @@ async fn diff_meets_acceptance_criteria(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SqlLexState {
+    Normal,
+    SingleQuoted,
+    DoubleQuoted,
+    DollarQuoted(String),
+    BlockComment(usize),
+}
+
+/// Recover the SQL prefix from rows written by the legacy `ff pm close`.
+/// Metadata markers delimit only lines outside SQL strings and comments.
+fn legacy_acceptance_sql(raw: &str) -> Option<String> {
+    let mut state = SqlLexState::Normal;
+    let mut offset = 0;
+    for line_with_ending in raw.split_inclusive('\n') {
+        let line = line_with_ending
+            .strip_suffix('\n')
+            .unwrap_or(line_with_ending);
+        let trimmed = line.trim_start();
+        if state == SqlLexState::Normal
+            && (trimmed.starts_with("human-close:") || trimmed.starts_with("prior-last-error:"))
+        {
+            let sql = raw[..offset].trim();
+            return (!sql.is_empty()).then(|| sql.to_string());
+        }
+        scan_sql_line(line.as_bytes(), &mut state);
+        offset += line_with_ending.len();
+    }
+    let sql = raw.trim();
+    (!sql.is_empty()).then(|| sql.to_string())
+}
+
+fn scan_sql_line(line: &[u8], state: &mut SqlLexState) {
+    let mut i = 0;
+    while i < line.len() {
+        match state {
+            SqlLexState::Normal => match line[i] {
+                b'\'' => {
+                    *state = SqlLexState::SingleQuoted;
+                    i += 1;
+                }
+                b'"' => {
+                    *state = SqlLexState::DoubleQuoted;
+                    i += 1;
+                }
+                b'-' if line.get(i + 1) == Some(&b'-') => return,
+                b'/' if line.get(i + 1) == Some(&b'*') => {
+                    *state = SqlLexState::BlockComment(1);
+                    i += 2;
+                }
+                b'$' => {
+                    let end = line[i + 1..]
+                        .iter()
+                        .position(|byte| *byte == b'$')
+                        .map(|position| i + 1 + position);
+                    if let Some(end) = end
+                        && line[i + 1..end]
+                            .iter()
+                            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                    {
+                        *state = SqlLexState::DollarQuoted(
+                            String::from_utf8_lossy(&line[i..=end]).into_owned(),
+                        );
+                        i = end + 1;
+                        continue;
+                    }
+                    i += 1;
+                }
+                _ => i += 1,
+            },
+            SqlLexState::SingleQuoted => {
+                if line[i] == b'\'' {
+                    if line.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                    } else {
+                        *state = SqlLexState::Normal;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            SqlLexState::DoubleQuoted => {
+                if line[i] == b'"' {
+                    if line.get(i + 1) == Some(&b'"') {
+                        i += 2;
+                    } else {
+                        *state = SqlLexState::Normal;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            SqlLexState::DollarQuoted(tag) => {
+                if line[i..].starts_with(tag.as_bytes()) {
+                    let tag_len = tag.len();
+                    *state = SqlLexState::Normal;
+                    i += tag_len;
+                } else {
+                    i += 1;
+                }
+            }
+            SqlLexState::BlockComment(depth) => {
+                if line[i..].starts_with(b"/*") {
+                    *depth += 1;
+                    i += 2;
+                } else if line[i..].starts_with(b"*/") {
+                    *depth -= 1;
+                    i += 2;
+                    if *depth == 0 {
+                        *state = SqlLexState::Normal;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+}
+
 async fn acceptance_check_passes(pg: &PgPool, work_item_id: Uuid) -> Option<bool> {
     let sql: Option<String> =
         sqlx::query_scalar("SELECT acceptance_check FROM work_items WHERE id = $1")
@@ -2775,17 +2896,23 @@ async fn acceptance_check_passes(pg: &PgPool, work_item_id: Uuid) -> Option<bool
             .await
             .ok()
             .flatten();
-    let sql = sql
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())?;
+    let sql = legacy_acceptance_sql(&sql?)?;
     // Read-only guard: only a bare SELECT may run as an acceptance check.
     let lowered = sql.to_lowercase();
     if !lowered.starts_with("select") || lowered.contains(';') {
+        warn!(work_item_id = %work_item_id, "acceptance_check is not a single read-only SELECT");
         return Some(false);
     }
     match sqlx::query_scalar::<_, bool>(&sql).fetch_optional(pg).await {
         Ok(Some(v)) => Some(v),
-        _ => Some(false),
+        Ok(None) => {
+            warn!(work_item_id = %work_item_id, "acceptance_check returned no row");
+            Some(false)
+        }
+        Err(error) => {
+            warn!(work_item_id = %work_item_id, %error, "acceptance_check SQL is malformed or failed");
+            Some(false)
+        }
     }
 }
 
@@ -6961,7 +7088,7 @@ mod tests {
         builder_excludes_480b, check_dispatch_prerequisites, classify_dispatch_outcome,
         collect_leftover_tmp_output, command_display, complexity_at_least_moderate,
         contains_file_line_citation, default_clone_path, dispatch_budget_for_host, dispatch_prompt,
-        expand_home, is_build_timeout, local_failure_diagnosis_for,
+        expand_home, is_build_timeout, legacy_acceptance_sql, local_failure_diagnosis_for,
         local_failure_diagnosis_for_attempt, mark_local_retest_failed, mark_local_retest_passed,
         mark_ready_for_review, mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers,
         parse_cli_tokens, parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
@@ -7005,6 +7132,44 @@ mod tests {
             work: Vec::new(),
             post_work: Vec::new(),
         }
+    }
+
+    #[test]
+    fn legacy_acceptance_parser_separates_only_real_metadata_lines() {
+        assert_eq!(legacy_acceptance_sql(" \n human-close: {}"), None);
+        assert_eq!(
+            legacy_acceptance_sql(
+                "SELECT true\nprior-last-error: failed\nhuman-close: {\"evidence\":\"ok\"}"
+            )
+            .as_deref(),
+            Some("SELECT true")
+        );
+        assert_eq!(
+            legacy_acceptance_sql("SELECT 'value\nhuman-close: still SQL' = 'x'").as_deref(),
+            Some("SELECT 'value\nhuman-close: still SQL' = 'x'")
+        );
+        assert_eq!(
+            legacy_acceptance_sql("SELECT $$value\nprior-last-error: still SQL$$ = 'x'").as_deref(),
+            Some("SELECT $$value\nprior-last-error: still SQL$$ = 'x'")
+        );
+        assert_eq!(
+            legacy_acceptance_sql("SELECT true /*\nhuman-close: still SQL\n*/").as_deref(),
+            Some("SELECT true /*\nhuman-close: still SQL\n*/")
+        );
+        assert_eq!(
+            legacy_acceptance_sql(
+                "SELECT true /* outer /* inner */\nprior-last-error: still SQL\n*/"
+            )
+            .as_deref(),
+            Some("SELECT true /* outer /* inner */\nprior-last-error: still SQL\n*/")
+        );
+        assert_eq!(
+            legacy_acceptance_sql(
+                "SELECT true -- human-close: still SQL\nhuman-close: {\"evidence\":\"ok\"}"
+            )
+            .as_deref(),
+            Some("SELECT true -- human-close: still SQL")
+        );
     }
 
     #[tokio::test]
