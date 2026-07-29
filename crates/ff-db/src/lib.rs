@@ -115,6 +115,7 @@ pub use queries::{
     pg_cancel_deferred,
     pg_canonical_github_alias,
     pg_claim_deferred,
+    pg_claim_work_item_for_merge,
     pg_cloud_route_for_computer,
     pg_complete_parent_work_items,
     pg_cortex_resolution_stats,
