@@ -9,6 +9,7 @@ pub struct RepoContext {
     pub repo_id: Option<Uuid>,
     pub repo_url: Option<String>,
     pub repo_path: Option<PathBuf>,
+    pub base_branch: Option<String>,
     pub primary_language: String,
     pub build_system: Option<String>,
     pub key_dirs: Vec<String>,
@@ -64,9 +65,13 @@ pub async fn resolve_repo_context(
 
     if let Some(repo_arg) = explicit_repo.map(str::trim).filter(|s| !s.is_empty()) {
         let repo_row = find_project_repo(pool, project, repo_arg).await?;
-        let (repo_id, repo_url) = match repo_row {
-            Some((id, url)) => (Some(id), Some(url)),
-            None if looks_like_repo_url(repo_arg) => (None, Some(repo_arg.to_string())),
+        let (repo_id, repo_url, base_branch) = match repo_row {
+            Some((id, url, branch)) => (Some(id), Some(url), branch),
+            None if looks_like_repo_url(repo_arg) => (
+                None,
+                Some(repo_arg.to_string()),
+                project_default_branch(pool, project).await?,
+            ),
             None => {
                 return Err(anyhow!(
                     "unknown repo '{repo_arg}' for project '{project}' (expected project_repos.id or URL)"
@@ -92,12 +97,14 @@ pub async fn resolve_repo_context(
             Some(mut ctx) => {
                 ctx.repo_id = repo_id;
                 ctx.repo_url = repo_url;
+                ctx.base_branch = base_branch;
                 ctx
             }
             None => RepoContext {
                 repo_id,
                 repo_url,
                 repo_path: None,
+                base_branch,
                 primary_language: "unknown".to_string(),
                 build_system: None,
                 key_dirs: Vec::new(),
@@ -107,11 +114,12 @@ pub async fn resolve_repo_context(
 
     if let Some(mut ctx) = cwd_repo {
         if let Some(url) = ctx.repo_url.as_deref() {
-            let repo_id = find_project_repo_by_url(pool, project, url).await?;
+            let repo_row = find_project_repo_by_url(pool, project, url).await?;
             // The cwd repo belongs to THIS project → use it (the common case:
             // decomposing a forge-fleet item from the forge-fleet checkout).
-            if repo_id.is_some() {
-                ctx.repo_id = repo_id;
+            if let Some((repo_id, base_branch)) = repo_row {
+                ctx.repo_id = Some(repo_id);
+                ctx.base_branch = base_branch;
                 return Ok(Some(ctx));
             }
             // The cwd repo is NOT this project's repo (e.g. decomposing a
@@ -126,6 +134,7 @@ pub async fn resolve_repo_context(
             // Keep the cwd repo as a last resort rather than failing outright, but
             // it's better than nothing only when the project truly has no repo.
         }
+        ctx.base_branch = project_default_branch(pool, project).await?;
         return Ok(Some(ctx));
     }
 
@@ -142,6 +151,7 @@ pub fn detect_repo_from_cwd(cwd: &Path) -> Result<RepoContext> {
         repo_id: None,
         repo_url,
         repo_path: Some(root),
+        base_branch: None,
         primary_language,
         build_system,
         key_dirs,
@@ -229,27 +239,36 @@ async fn find_project_repo(
     pool: &PgPool,
     project: &str,
     repo_arg: &str,
-) -> Result<Option<(Uuid, String)>> {
+) -> Result<Option<(Uuid, String, Option<String>)>> {
     if let Ok(id) = Uuid::parse_str(repo_arg) {
         let row = sqlx::query(
-            "SELECT id, github_url FROM project_repos WHERE project_id = $1 AND id = $2",
+            "SELECT id, github_url, default_branch FROM project_repos WHERE project_id = $1 AND id = $2",
         )
         .bind(project)
         .bind(id)
         .fetch_optional(pool)
         .await?;
-        return Ok(row.map(|r| (r.get("id"), r.get("github_url"))));
+        return Ok(row.map(|r| {
+            (
+                r.get("id"),
+                r.get("github_url"),
+                r.try_get("default_branch").ok().flatten(),
+            )
+        }));
     }
 
-    let rows = sqlx::query("SELECT id, github_url, name FROM project_repos WHERE project_id = $1")
-        .bind(project)
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT id, github_url, name, default_branch FROM project_repos WHERE project_id = $1",
+    )
+    .bind(project)
+    .fetch_all(pool)
+    .await?;
     let wanted = normalize_repo_url(repo_arg);
     Ok(rows.into_iter().find_map(|r| {
         let id: Uuid = r.get("id");
         let url: String = r.get("github_url");
         let name: Option<String> = r.try_get("name").ok().flatten();
+        let base_branch: Option<String> = r.try_get("default_branch").ok().flatten();
         let url_matches = wanted
             .as_deref()
             .zip(normalize_repo_url(&url).as_deref())
@@ -257,7 +276,7 @@ async fn find_project_repo(
             .unwrap_or(false)
             || url == repo_arg;
         if url_matches || name.as_deref() == Some(repo_arg) {
-            Some((id, url))
+            Some((id, url, base_branch))
         } else {
             None
         }
@@ -268,20 +287,43 @@ async fn find_project_repo_by_url(
     pool: &PgPool,
     project: &str,
     repo_url: &str,
-) -> Result<Option<Uuid>> {
-    let rows = sqlx::query("SELECT id, github_url FROM project_repos WHERE project_id = $1")
-        .bind(project)
-        .fetch_all(pool)
-        .await?;
+) -> Result<Option<(Uuid, Option<String>)>> {
+    let rows = sqlx::query(
+        "SELECT id, github_url, default_branch FROM project_repos WHERE project_id = $1",
+    )
+    .bind(project)
+    .fetch_all(pool)
+    .await?;
     let wanted = normalize_repo_url(repo_url);
     Ok(rows.into_iter().find_map(|r| {
         let id: Uuid = r.get("id");
         let url: String = r.get("github_url");
+        let base_branch: Option<String> = r.try_get("default_branch").ok().flatten();
         wanted
             .as_deref()
             .zip(normalize_repo_url(&url).as_deref())
-            .and_then(|(a, b)| (a == b).then_some(id))
+            .and_then(|(a, b)| (a == b).then_some((id, base_branch)))
     }))
+}
+
+async fn project_default_branch(pool: &PgPool, project: &str) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT default_branch FROM projects WHERE id = $1")
+            .bind(project)
+            .fetch_optional(pool)
+            .await?
+            .flatten(),
+    )
+}
+
+fn select_base_branch(
+    repo_branch: Option<Option<String>>,
+    project_branch: Option<String>,
+) -> Option<String> {
+    match repo_branch {
+        Some(branch) => branch,
+        None => project_branch,
+    }
 }
 
 async fn detect_project_folder(
@@ -326,16 +368,18 @@ async fn primary_project_repo(pool: &PgPool, project: &str) -> Result<Option<Rep
     // fail-closed quality gate has a real checkout to validate against, and the
     // LLM is told the actual language instead of guessing.
     let repo = sqlx::query(
-        "SELECT id, github_url, local_path, tech_stack FROM project_repos \
+        "SELECT id, github_url, local_path, tech_stack, default_branch FROM project_repos \
           WHERE project_id = $1 AND is_primary = TRUE ORDER BY created_at ASC LIMIT 1",
     )
     .bind(project)
     .fetch_optional(pool)
     .await?;
-    let proj = sqlx::query("SELECT repo_url, local_path, tech_stack FROM projects WHERE id = $1")
-        .bind(project)
-        .fetch_optional(pool)
-        .await?;
+    let proj = sqlx::query(
+        "SELECT repo_url, local_path, tech_stack, default_branch FROM projects WHERE id = $1",
+    )
+    .bind(project)
+    .fetch_optional(pool)
+    .await?;
 
     let repo_id: Option<Uuid> = repo.as_ref().map(|r| r.get("id"));
     let repo_url: Option<String> = repo
@@ -359,6 +403,12 @@ async fn primary_project_repo(pool: &PgPool, project: &str) -> Result<Option<Rep
             proj.as_ref()
                 .and_then(|p| p.try_get("tech_stack").ok().flatten())
         });
+    let base_branch = select_base_branch(
+        repo.as_ref()
+            .map(|r| r.try_get("default_branch").ok().flatten()),
+        proj.as_ref()
+            .and_then(|p| p.try_get("default_branch").ok().flatten()),
+    );
 
     if repo_id.is_none() && repo_url.is_none() && local_path.is_none() {
         return Ok(None);
@@ -367,6 +417,7 @@ async fn primary_project_repo(pool: &PgPool, project: &str) -> Result<Option<Rep
         repo_id,
         repo_url,
         repo_path: local_path.map(PathBuf::from),
+        base_branch,
         primary_language: tech_stack.unwrap_or_else(|| "unknown".to_string()),
         build_system: None,
         key_dirs: Vec::new(),
@@ -452,6 +503,19 @@ mod tests {
         assert_eq!(
             normalize_repo_url("git@github.com:Acme/Orders.git"),
             normalize_repo_url("https://github.com/acme/orders")
+        );
+    }
+
+    #[test]
+    fn project_branch_is_only_a_fallback_when_no_repo_row_exists() {
+        assert_eq!(
+            select_base_branch(Some(Some("develop".into())), Some("main".into())).as_deref(),
+            Some("develop")
+        );
+        assert_eq!(select_base_branch(Some(None), Some("main".into())), None);
+        assert_eq!(
+            select_base_branch(None, Some("main".into())).as_deref(),
+            Some("main")
         );
     }
 }
