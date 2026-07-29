@@ -137,7 +137,7 @@ static CONTROL_PLANE_SECRET: ControlPlaneSecretCache = ControlPlaneSecretCache::
 /// after process restart.
 pub async fn control_plane_secret() -> Result<String, String> {
     CONTROL_PLANE_SECRET
-        .resolve_with(crate::fleet_info::fetch_secret)
+        .resolve_with(crate::fleet_info::fetch_secret_from_postgres)
         .await
         .map(str::to_owned)
 }
@@ -261,12 +261,22 @@ mod tests {
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const LEGACY_SECRET_ENV: &str = "ENROLLMENT_SHARED_SECRET";
 
     fn set_secret_env(value: Option<&str>) {
         unsafe {
             match value {
                 Some(value) => std::env::set_var(SECRET_ENV, value),
                 None => std::env::remove_var(SECRET_ENV),
+            }
+        }
+    }
+
+    fn set_legacy_secret_env(value: Option<&str>) {
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(LEGACY_SECRET_ENV, value),
+                None => std::env::remove_var(LEGACY_SECRET_ENV),
             }
         }
     }
@@ -330,6 +340,25 @@ mod tests {
 
         assert_eq!(resolved, "db-secret");
         assert_eq!(&*requested_key.lock().unwrap(), CANONICAL_SECRET_KEY);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_environment_fallback_is_not_an_auth_secret_source() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        set_secret_env(None);
+        set_legacy_secret_env(Some("unauthorized-legacy-secret"));
+
+        let err = resolve_control_plane_secret_with(|key| async move {
+            assert_eq!(key, CANONICAL_SECRET_KEY);
+            None
+        })
+        .await
+        .unwrap_err();
+
+        assert!(err.contains(SECRET_ENV));
+        assert!(err.contains(CANONICAL_SECRET_KEY));
+        assert!(!err.contains("unauthorized-legacy-secret"));
+        set_legacy_secret_env(None);
     }
 
     #[tokio::test(flavor = "current_thread")]
