@@ -895,13 +895,6 @@ struct CloseResult {
     status: String,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct HumanCloseEvidence {
-    at: chrono::DateTime<chrono::Utc>,
-    actor: String,
-    evidence: String,
-}
-
 fn validate_close_request<'a>(
     evidence: &'a str,
     commit: Option<&'a str>,
@@ -922,46 +915,21 @@ fn validate_close_request<'a>(
     Ok((evidence, commit))
 }
 
-fn append_human_close_evidence(
-    acceptance_check: Option<&str>,
-    last_error: Option<&str>,
-    actor: &str,
+fn matching_human_close_event(
+    detail: &str,
     evidence: &str,
-    at: chrono::DateTime<chrono::Utc>,
-) -> Result<(String, bool)> {
-    const PREFIX: &str = "human-close: ";
-    let mut out = acceptance_check.unwrap_or_default().trim_end().to_string();
-    if let Some(last_error) = last_error.filter(|value| !value.trim().is_empty()) {
-        let preserved = format!("prior-last-error: {}", last_error.trim());
-        if !out.lines().any(|line| line == preserved) {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(&preserved);
-        }
-    }
-
-    let duplicate = out
-        .lines()
-        .filter_map(|line| line.strip_prefix(PREFIX))
-        .any(|json| {
-            serde_json::from_str::<HumanCloseEvidence>(json)
-                .map(|old| old.evidence == evidence)
-                .unwrap_or(false)
-        });
-    if duplicate {
-        return Ok((out, false));
-    }
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out.push_str(PREFIX);
-    out.push_str(&serde_json::to_string(&HumanCloseEvidence {
-        at,
-        actor: actor.to_string(),
-        evidence: evidence.to_string(),
-    })?);
-    Ok((out, true))
+    commit: Option<&str>,
+    verified: bool,
+    deploy_verified: bool,
+) -> bool {
+    let Ok(detail) = serde_json::from_str::<serde_json::Value>(detail) else {
+        return false;
+    };
+    detail["action"] == "human_close"
+        && detail["evidence"] == evidence
+        && detail["commit"].as_str() == commit
+        && detail["verified"].as_bool() == Some(verified)
+        && detail["deploy_verified"].as_bool() == Some(deploy_verified)
 }
 
 async fn close_work_item(
@@ -975,15 +943,8 @@ async fn close_work_item(
 ) -> Result<CloseResult> {
     let (evidence, commit) = validate_close_request(evidence, commit, verified, deploy_verified)?;
     let mut tx = pool.begin().await?;
-    let row: Option<(
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        i16,
-        i32,
-    )> = sqlx::query_as(
-        "SELECT status, acceptance_check, last_error, fix_commit, verified, \
+    let row: Option<(String, Option<String>, Option<String>, i16, i32)> = sqlx::query_as(
+        "SELECT status, last_error, fix_commit, verified, \
                 COALESCE(deploy_verified, 0) \
            FROM work_items WHERE id = $1 FOR UPDATE",
     )
@@ -993,7 +954,6 @@ async fn close_work_item(
     .map_err(|error| anyhow::anyhow!("lock work item: {error}"))?;
     let Some((
         source_status,
-        acceptance_check,
         last_error,
         existing_commit,
         existing_verified,
@@ -1035,22 +995,23 @@ async fn close_work_item(
         );
     }
 
-    let now = chrono::Utc::now();
-    let prior_acceptance = acceptance_check.as_deref().unwrap_or_default().trim_end();
-    let (acceptance_check, _) = append_human_close_evidence(
-        acceptance_check.as_deref(),
-        last_error.as_deref(),
-        actor,
-        evidence,
-        now,
-    )?;
-    let acceptance_changed = acceptance_check != prior_acceptance;
     let target_status = if matches!(source_status.as_str(), "done" | "merged") {
         source_status.as_str()
     } else {
         "done"
     };
-    let already_idempotent = !acceptance_changed
+    let event_details: Vec<String> = sqlx::query_scalar(
+        "SELECT detail FROM work_item_events \
+          WHERE work_item_id = $1 AND detail IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|error| anyhow::anyhow!("check prior close event: {error}"))?;
+    let matching_event = event_details.iter().any(|detail| {
+        matching_human_close_event(detail, evidence, commit, verified, deploy_verified)
+    });
+    let already_idempotent = matching_event
         && target_status == source_status
         && commit.map_or(true, |requested| {
             existing_commit
@@ -1069,21 +1030,21 @@ async fn close_work_item(
         });
     }
 
+    let now = chrono::Utc::now();
     let updated: Option<(String,)> = sqlx::query_as(
         "UPDATE work_items \
-            SET status = $3, acceptance_check = $4, last_error = NULL, \
-                completed_at = COALESCE(completed_at, $5), \
-                fix_commit = COALESCE(NULLIF(fix_commit, ''), $6), \
-                verified = CASE WHEN $7 THEN 1 ELSE verified END, \
-                verified_at = CASE WHEN $7 THEN COALESCE(verified_at, $5) ELSE verified_at END, \
-                deploy_verified = CASE WHEN $8 THEN 1 ELSE deploy_verified END \
+            SET status = $3, last_error = NULL, \
+                completed_at = COALESCE(completed_at, $4), \
+                fix_commit = COALESCE(NULLIF(fix_commit, ''), $5), \
+                verified = CASE WHEN $6 THEN 1 ELSE verified END, \
+                verified_at = CASE WHEN $6 THEN COALESCE(verified_at, $4) ELSE verified_at END, \
+                deploy_verified = CASE WHEN $7 THEN 1 ELSE deploy_verified END \
           WHERE id = $1 AND status = $2 \
         RETURNING status",
     )
     .bind(id)
     .bind(&source_status)
     .bind(target_status)
-    .bind(&acceptance_check)
     .bind(now)
     .bind(commit)
     .bind(verified)
@@ -1099,7 +1060,8 @@ async fn close_work_item(
             (work_item_id, from_status, to_status, computer, detail) \
          VALUES ($1, $2, $3, $4, jsonb_build_object( \
             'action', 'human_close', 'evidence', $5::text, 'commit', $6::text, \
-            'verified', $7::boolean, 'deploy_verified', $8::boolean))",
+            'verified', $7::boolean, 'deploy_verified', $8::boolean, \
+            'prior_last_error', $9::text)::text)",
     )
     .bind(id)
     .bind(&source_status)
@@ -1109,6 +1071,7 @@ async fn close_work_item(
     .bind(commit)
     .bind(verified)
     .bind(deploy_verified)
+    .bind(last_error.as_deref())
     .execute(&mut *tx)
     .await
     .map_err(|error| anyhow::anyhow!("audit work item close: {error}"))?;
@@ -3176,6 +3139,12 @@ mod tests {
                 status TEXT NOT NULL,
                 attempts INT NOT NULL DEFAULT 0,
                 last_error TEXT,
+                acceptance_check TEXT,
+                fix_commit TEXT,
+                verified SMALLINT NOT NULL DEFAULT 0,
+                verified_at TIMESTAMPTZ,
+                deploy_verified INT NOT NULL DEFAULT 0,
+                completed_at TIMESTAMPTZ,
                 repo_id UUID REFERENCES project_repos(id),
                 repo_url TEXT,
                 repo_path TEXT,
@@ -3572,34 +3541,137 @@ mod tests {
         assert!(validate_close_request(" proof ", Some("abc"), true, true).is_ok());
     }
 
-    #[test]
-    fn close_evidence_preserves_prior_content_and_error_and_deduplicates() {
-        let at = chrono::DateTime::parse_from_rfc3339("2026-07-29T09:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let (once, first_appended) = append_human_close_evidence(
-            Some("existing acceptance"),
-            Some("old failure"),
-            "marcus",
-            "tests pass",
-            at,
+    #[tokio::test]
+    async fn close_preserves_acceptance_and_structures_event_idempotently() {
+        let Some((admin, pool, db_name)) = bind_repo_temp_pool().await else {
+            return;
+        };
+        sqlx::query("INSERT INTO projects(id) VALUES ('p1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let acceptance = "SELECT E'line\\\\n' = E'line\\\\n'  \n";
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO work_items(project_id, status, acceptance_check, last_error) \
+             VALUES ('p1', 'failed', $1, 'old failure') RETURNING id",
         )
+        .bind(acceptance)
+        .fetch_one(&pool)
+        .await
         .unwrap();
-        let (twice, second_appended) = append_human_close_evidence(
-            Some(&once),
-            Some("old failure"),
-            "adele",
-            "tests pass",
-            at + chrono::Duration::minutes(1),
+
+        let first_pool = pool.clone();
+        let second_pool = pool.clone();
+        let first = tokio::spawn(async move {
+            close_work_item(
+                &first_pool,
+                id,
+                "targeted tests pass",
+                Some("abc123"),
+                true,
+                true,
+                "tester",
+            )
+            .await
+        });
+        let second = tokio::spawn(async move {
+            close_work_item(
+                &second_pool,
+                id,
+                "targeted tests pass",
+                Some("abc123"),
+                true,
+                true,
+                "tester",
+            )
+            .await
+        });
+        assert!(first.await.unwrap().is_ok());
+        assert!(second.await.unwrap().is_ok());
+
+        let row = sqlx::query(
+            "SELECT status, acceptance_check, last_error, fix_commit, verified, \
+                    deploy_verified FROM work_items WHERE id = $1",
         )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
         .unwrap();
-        assert!(first_appended);
-        assert!(!second_appended);
-        assert!(twice.starts_with("existing acceptance\n"));
-        assert_eq!(twice.matches("prior-last-error: old failure").count(), 1);
-        assert_eq!(twice.matches("human-close: ").count(), 1);
-        assert!(twice.contains("\"actor\":\"marcus\""));
-        assert!(twice.contains("\"evidence\":\"tests pass\""));
+        assert_eq!(row.get::<String, _>("status"), "done");
+        assert_eq!(
+            row.get::<Option<String>, _>("acceptance_check").as_deref(),
+            Some(acceptance)
+        );
+        assert_eq!(row.get::<Option<String>, _>("last_error"), None);
+        assert_eq!(
+            row.get::<Option<String>, _>("fix_commit").as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(row.get::<i16, _>("verified"), 1);
+        assert_eq!(row.get::<i32, _>("deploy_verified"), 1);
+
+        let details: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT detail::jsonb FROM work_item_events WHERE work_item_id = $1",
+        )
+        .bind(id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0]["action"], "human_close");
+        assert_eq!(details[0]["evidence"], "targeted tests pass");
+        assert_eq!(details[0]["prior_last_error"], "old failure");
+        drop_bind_repo_temp_pool(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn close_event_failure_rolls_back_item_update() {
+        let Some((admin, pool, db_name)) = bind_repo_temp_pool().await else {
+            return;
+        };
+        sqlx::query("INSERT INTO projects(id) VALUES ('p1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO work_items(project_id, status, acceptance_check, last_error) \
+             VALUES ('p1', 'failed', 'SELECT true', 'old failure') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "CREATE FUNCTION reject_human_close() RETURNS trigger LANGUAGE plpgsql AS $$ \
+               BEGIN RAISE EXCEPTION 'audit unavailable'; END $$; \
+             CREATE TRIGGER reject_human_close BEFORE INSERT ON work_item_events \
+               FOR EACH ROW EXECUTE FUNCTION reject_human_close();",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            close_work_item(&pool, id, "proof", None, false, false, "tester")
+                .await
+                .is_err()
+        );
+        let row = sqlx::query(
+            "SELECT status, acceptance_check, last_error FROM work_items WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            row.get::<Option<String>, _>("acceptance_check").as_deref(),
+            Some("SELECT true")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("last_error").as_deref(),
+            Some("old failure")
+        );
+        drop_bind_repo_temp_pool(admin, pool, &db_name).await;
     }
 
     #[test]
