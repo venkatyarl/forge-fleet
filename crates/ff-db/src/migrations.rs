@@ -1260,6 +1260,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "oplog_replay",
         sql: schema::SCHEMA_V282_OPLOG_REPLAY,
     },
+    PgMigration {
+        version: 284,
+        name: "github_capability_nonces",
+        sql: schema::SCHEMA_V284_GITHUB_CAPABILITY_NONCES,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -2780,5 +2785,20 @@ mod tests {
                 .sql
                 .contains("CREATE TABLE IF NOT EXISTS oplog_replay_applied")
         );
+    }
+
+    #[test]
+    fn v284_creates_github_capability_nonces() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 284)
+            .expect("V284 must be registered");
+        assert_eq!(migration.name, "github_capability_nonces");
+        assert!(
+            migration
+                .sql
+                .contains("CREATE TABLE IF NOT EXISTS github_capability_nonces")
+        );
+        assert!(migration.sql.contains("nonce_hash BYTEA NOT NULL UNIQUE"));
     }
 }
