@@ -39,6 +39,15 @@ pub struct LoadOptions {
     pub mmproj_path: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ExpectedDeployment {
+    id: String,
+    library_id: String,
+    catalog_id: Option<String>,
+    pid: Option<i32>,
+    process_start_marker: Option<String>,
+}
+
 /// Minimum per-slot context window for the agent-capable serving profile —
 /// enough for the tool-schema system prompt + user prompt + reasoning.
 pub const AGENT_MIN_CTX: u32 = 32_768;
@@ -255,6 +264,25 @@ pub fn check_runtime_placement(node: &ff_db::FleetNodeRow, runtime: &str) -> Res
 /// Spawn an inference server for the given library row, wait for health, and record
 /// the deployment row in Postgres.
 pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadResult, String> {
+    load_model_with_authority(pool, opts, None).await
+}
+
+/// Relaunch one known dead desired deployment without deleting its durable
+/// placement intent first. Activation is fenced against the exact incumbent
+/// row captured before launch.
+pub(crate) async fn respawn_model(
+    pool: &sqlx::PgPool,
+    opts: LoadOptions,
+    expected_deployment_id: &str,
+) -> Result<LoadResult, String> {
+    load_model_with_authority(pool, opts, Some(expected_deployment_id)).await
+}
+
+async fn load_model_with_authority(
+    pool: &sqlx::PgPool,
+    opts: LoadOptions,
+    expected_deployment_id: Option<&str>,
+) -> Result<LoadResult, String> {
     // Find the library row.
     let libs = ff_db::pg_list_library(pool, None)
         .await
@@ -304,12 +332,21 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         ));
     }
 
+    let mut release_reservation = true;
     let result = async {
+        let mut expected_deployment: Option<ExpectedDeployment> = None;
         // desired_state is durable placement intent. A stale health snapshot or
         // an unreachable endpoint is never permission to overwrite that intent.
-        let incumbent: Option<(String, Option<String>, Option<String>, Option<i32>, String)> =
-            sqlx::query_as(
-            "SELECT id::text, library_id::text, catalog_id, pid, desired_state
+        let incumbent: Option<(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<i32>,
+            Option<String>,
+            String,
+        )> = sqlx::query_as(
+            "SELECT id::text, library_id::text, catalog_id, pid,
+                    process_start_marker, desired_state
                FROM fleet_model_deployments
               WHERE LOWER(worker_name) = LOWER($1) AND port = $2",
         )
@@ -318,30 +355,64 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         .fetch_optional(pool)
         .await
         .map_err(|e| format!("inspect placement intent for {worker_name}:{port}: {e}"))?;
-    if let Some((id, library_id, catalog_id, pid, desired_state)) = incumbent {
+    if let Some((id, library_id, catalog_id, pid, process_start_marker, desired_state)) = incumbent {
         let same_model = library_id.as_deref() == Some(lib.id.as_str())
             || catalog_id.as_deref() == Some(lib.catalog_id.as_str());
-        if desired_state == "active" && same_model {
-            let live_pids = pids_listening_on_port(port).await;
-            if let Some(recorded_pid) = pid.and_then(|p| u32::try_from(p).ok())
-                && live_pids.as_slice() == [recorded_pid]
-            {
-                return Ok(LoadResult {
-                    deployment_id: id,
-                    pid: recorded_pid,
-                    runtime: lib.runtime,
-                    port,
-                    model_path: lib.file_path,
-                });
+        if let Some(expected_id) = expected_deployment_id {
+            if id != expected_id || desired_state != "active" || !same_model {
+                return Err(format!(
+                    "expected desired deployment {expected_id} no longer owns \
+                     {worker_name}:{port}; preserving incumbent {id}"
+                ));
             }
+            let live_pids = pids_listening_on_port(port).await;
+            if !live_pids.is_empty() {
+                return Err(format!(
+                    "expected dead deployment {id} still has listener pid(s) \
+                     {live_pids:?}; refusing unauthenticated replacement"
+                ));
+            }
+            let Some(expected_library_id) = library_id else {
+                return Err(format!(
+                    "expected deployment {id} has no library identity; refusing replacement"
+                ));
+            };
+            expected_deployment = Some(ExpectedDeployment {
+                id,
+                library_id: expected_library_id,
+                catalog_id,
+                pid,
+                process_start_marker,
+            });
+        } else if desired_state == "active" && same_model {
+            let recorded_pid = pid.and_then(|p| u32::try_from(p).ok());
+            let Some(recorded_pid) = recorded_pid else {
+                return Err(format!(
+                    "desired deployment {id} has no recorded PID identity; preserving intent"
+                ));
+            };
+            let Some(recorded_start) = process_start_marker.as_deref() else {
+                return Err(format!(
+                    "desired deployment {id} has no process-incarnation identity; preserving intent"
+                ));
+            };
+            inspect_listener_identity(port, recorded_pid, recorded_start, &lib.file_path).await?;
+            return Ok(LoadResult {
+                deployment_id: id,
+                pid: recorded_pid,
+                runtime: lib.runtime,
+                port,
+                model_path: lib.file_path,
+            });
+        } else {
             return Err(format!(
-                "desired deployment {id} already owns {worker_name}:{port}, but \
-                 its listener identity is not verified; preserving intent"
+                "deployment {id} ({desired_state}) already owns {worker_name}:{port}; \
+                 explicit authenticated replacement is required"
             ));
         }
+    } else if let Some(expected_id) = expected_deployment_id {
         return Err(format!(
-            "deployment {id} ({desired_state}) already owns {worker_name}:{port}; \
-             explicit authenticated replacement is required"
+            "expected deployment {expected_id} disappeared before relaunch; refusing vacant activation"
         ));
     }
 
@@ -733,10 +804,26 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         });
         pid
     };
-    let launched_start = process_start_marker(pid)
-        .ok_or_else(|| format!("launched pid {pid} exited before identity capture"))?;
-    let launched_model_path = launched_model_path(runtime_label, &args)
-        .ok_or_else(|| format!("cannot derive launched model identity for {runtime_label}"))?;
+    let launched_start = match process_start_marker(pid) {
+        Some(start) => start,
+        None => {
+            if !cleanup_unidentified_launch(pid, port, systemd_pid.is_some()).await {
+                release_reservation = false;
+            }
+            return Err(format!("launched pid {pid} exited before identity capture"));
+        }
+    };
+    let launched_model_path = match launched_model_path(runtime_label, &args) {
+        Some(path) => path,
+        None => {
+            if !cleanup_launched_process(pid, &launched_start, port, systemd_pid.is_some()).await {
+                release_reservation = false;
+            }
+            return Err(format!(
+                "cannot derive launched model identity for {runtime_label}"
+            ));
+        }
+    };
 
     // Wait for health endpoint to come up (up to 90s).
     let health_ok = wait_for_health(
@@ -751,7 +838,9 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         let identity_error = identity
             .err()
             .unwrap_or_else(|| "launched endpoint did not become healthy".to_string());
-        cleanup_launched_process(pid, &launched_start, port, systemd_pid.is_some()).await;
+        if !cleanup_launched_process(pid, &launched_start, port, systemd_pid.is_some()).await {
+            release_reservation = false;
+        }
         return Err(format!(
             "EADDRINUSE: refusing to activate {worker_name}:{port}: {identity_error}"
         ));
@@ -765,44 +854,77 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         ServingMode::Chat => parallel as i32,
         ServingMode::Embedding | ServingMode::Reranking => 1,
     };
+    // The configured ctx is not supply evidence. Query the authenticated live
+    // runtime and persist its measured per-slot profile; when the runtime
+    // cannot report this, activation remains valid placement intent but does
+    // not count toward agent-ready capacity.
+    let measured_profile = probe_agent_ctx(runtime_label, port).await;
+    let (activation_ctx, activation_slots, agent_profile_verified) =
+        if let Some((per_slot, measured_slots)) = measured_profile {
+            (
+                per_slot.saturating_mul(measured_slots),
+                measured_slots,
+                true,
+            )
+        } else {
+            (ctx as i32, recorded_slots, false)
+        };
 
-    // Re-check durable intent at the activation boundary. A row created while
-    // this process was loading is an incumbent, never permission to overwrite.
-    let activation_incumbent: Option<String> = sqlx::query_scalar(
-        "SELECT id::text FROM fleet_model_deployments
-          WHERE LOWER(worker_name) = LOWER($1) AND port = $2",
-    )
-    .bind(&worker_name)
-    .bind(port as i32)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| format!("recheck placement intent for activation: {e}"))?;
-    if let Some(id) = activation_incumbent {
-        cleanup_launched_process(pid, &launched_start, port, systemd_pid.is_some()).await;
-        return Err(format!(
-            "EADDRINUSE: deployment {id} claimed {worker_name}:{port} during launch; preserving incumbent"
-        ));
-    }
-
-    // Upsert deployment row.
-    let deployment_id = match ff_db::pg_upsert_deployment(
-        pool,
-        &worker_name,
-        Some(&lib.id),
-        Some(&lib.catalog_id),
-        runtime_label,
-        port as i32,
-        Some(pid as i32),
-        if health_ok { "healthy" } else { "starting" },
-        Some(ctx as i32),
-        Some(recorded_slots),
-    )
-    .await
-    {
-        Ok(id) => id,
+    // Activate in one conditional statement. A normal load can only insert
+    // into a vacant slot; a respawn can only replace the exact dead desired
+    // row captured before launch.
+    let activated = if let Some(expected) = expected_deployment.as_ref() {
+        ff_db::pg_activate_expected_deployment(
+            pool,
+            &expected.id,
+            &worker_name,
+            port as i32,
+            &expected.library_id,
+            expected.catalog_id.as_deref(),
+            expected.pid,
+            expected.process_start_marker.as_deref(),
+            runtime_label,
+            pid as i32,
+            &launched_start,
+            "healthy",
+            activation_ctx,
+            activation_slots,
+            agent_profile_verified,
+        )
+        .await
+    } else {
+        ff_db::pg_activate_deployment_if_vacant(
+            pool,
+            &worker_name,
+            &lib.id,
+            &lib.catalog_id,
+            runtime_label,
+            port as i32,
+            pid as i32,
+            &launched_start,
+            "healthy",
+            activation_ctx,
+            activation_slots,
+            agent_profile_verified,
+        )
+        .await
+    };
+    let deployment_id = match activated {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            if !cleanup_launched_process(pid, &launched_start, port, systemd_pid.is_some()).await {
+                release_reservation = false;
+            }
+            return Err(format!(
+                "EADDRINUSE: placement authority changed while launching \
+                 {worker_name}:{port}; preserving incumbent"
+            ));
+        }
         Err(e) => {
-            cleanup_launched_process(pid, &launched_start, port, systemd_pid.is_some()).await;
-            return Err(format!("pg_upsert_deployment: {e}"));
+            if !cleanup_launched_process(pid, &launched_start, port, systemd_pid.is_some()).await {
+                release_reservation = false;
+            }
+            return Err(format!("activate deployment: {e}"));
         }
     };
 
@@ -845,19 +967,26 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
     })
     }
     .await;
-    if let Err(e) = ff_db::pg_release_model_load_reservation(
-        pool,
-        &worker_name,
-        port,
-        &lib.id,
-        reservation_token,
-    )
-    .await
-    {
-        tracing::warn!(
-            error = %e,
+    if release_reservation {
+        if let Err(e) = ff_db::pg_release_model_load_reservation(
+            pool,
+            &worker_name,
+            port,
+            &lib.id,
+            reservation_token,
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %e,
+                token = %reservation_token,
+                "failed to release model-load reservation; bounded expiry will recover it"
+            );
+        }
+    } else {
+        tracing::error!(
             token = %reservation_token,
-            "failed to release model-load reservation; bounded expiry will recover it"
+            "launched process termination was not confirmed; retaining reservation until expiry"
         );
     }
     result
@@ -913,73 +1042,114 @@ pub async fn unload_model(pool: &sqlx::PgPool, deployment_id: &str) -> Result<()
 
     let port = dep.port as u16;
     let recorded_pid = dep.pid.and_then(|p| u32::try_from(p).ok());
+    let recorded_start = dep.process_start_marker.clone();
+    let expected_path = if let Some(library_id) = dep.library_id.as_deref() {
+        ff_db::pg_list_library(pool, Some(&worker_name))
+            .await
+            .map_err(|e| format!("pg_list_library: {e}"))?
+            .into_iter()
+            .find(|lib| lib.id == library_id)
+            .map(|lib| lib.file_path)
+    } else {
+        None
+    };
+    let local_processes = list_local_processes().await;
     let live_pids = pids_listening_on_port(port).await;
-    if !live_pids.is_empty() {
-        let Some(pid) = recorded_pid else {
+    if live_pids.len() > 1 {
+        return Err(format!(
+            "multiple listeners on {worker_name}:{port}: {live_pids:?}; refusing unload"
+        ));
+    }
+    let mut stop_identity: Option<(u32, String)> = None;
+    if let Some(&pid) = live_pids.first() {
+        let Some(actual_start) = process_start_marker(pid) else {
             return Err(format!(
-                "listener on {worker_name}:{port} has no recorded PID identity; refusing unload"
+                "listener PID {pid} exited during identity capture; retry unload"
             ));
         };
-        if live_pids.as_slice() != [pid] {
-            return Err(format!(
-                "listener identity changed on {worker_name}:{port}: recorded {pid}, \
-                 kernel reports {live_pids:?}; refusing unload"
-            ));
-        }
-        let expected_path = if let Some(library_id) = dep.library_id.as_deref() {
-            ff_db::pg_list_library(pool, Some(&worker_name))
-                .await
-                .map_err(|e| format!("pg_list_library: {e}"))?
-                .into_iter()
-                .find(|lib| lib.id == library_id)
-                .map(|lib| lib.file_path)
-        } else {
-            None
-        };
-        let local_processes = list_local_processes().await;
-        let identity_matches = expected_path.as_deref().is_some_and(|expected| {
+        let model_matches = expected_path.as_deref().is_some_and(|expected| {
             local_processes.iter().any(|proc| {
                 proc.pid == pid
                     && proc.port == Some(port)
-                    && proc.model_path.as_deref().is_some_and(|actual| {
-                        actual == expected
-                            || std::path::Path::new(actual).starts_with(expected)
-                            || std::path::Path::new(expected).starts_with(actual)
-                    })
+                    && proc
+                        .model_path
+                        .as_deref()
+                        .is_some_and(|actual| model_paths_match(expected, actual))
             })
         });
-        if !identity_matches {
+        if !model_matches {
             return Err(format!(
                 "PID {pid} on {worker_name}:{port} does not match the deployment's \
-                 library/start identity; refusing unload"
+                 library/model identity; refusing unload"
             ));
         }
+        let recorded_identity_matches =
+            recorded_pid == Some(pid) && recorded_start.as_deref() == Some(actual_start.as_str());
+        let supervised_restart_matches = expected_path
+            .as_deref()
+            .is_some_and(|expected| systemd_unit_owns_process(port, pid, expected));
+        if !recorded_identity_matches && !supervised_restart_matches {
+            return Err(format!(
+                "listener identity changed on {worker_name}:{port}: recorded \
+                 {recorded_pid:?}/{recorded_start:?}, live {pid}/{actual_start}; \
+                 no matching ForgeFleet systemd supervisor; refusing unload"
+            ));
+        }
+        stop_identity = Some((pid, actual_start));
+    } else if let Some(pid) = recorded_pid
+        && let Some(actual_start) = process_start_marker(pid)
+    {
+        let Some(expected_start) = recorded_start.as_deref() else {
+            return Err(format!(
+                "non-listening PID {pid} is still alive but has no persisted \
+                 process-incarnation identity; refusing unload"
+            ));
+        };
+        if actual_start != expected_start {
+            return Err(format!(
+                "non-listening PID {pid} was reused ({expected_start} -> {actual_start}); \
+                 refusing unload"
+            ));
+        }
+        stop_identity = Some((pid, actual_start));
     }
 
     // Mark desired_state='retired' BEFORE the kill so a racing reconciler
     // tick doesn't see a missing process for an 'active' row and spawn
     // a replacement we're about to delete. See V90.
-    let _ = sqlx::query(
-        "UPDATE fleet_model_deployments SET desired_state = 'retired' WHERE id = $1::uuid",
+    let retired: Option<String> = sqlx::query_scalar(
+        "UPDATE fleet_model_deployments
+            SET desired_state = 'retired',
+                pid = COALESCE($4, pid),
+                process_start_marker = COALESCE($5, process_start_marker)
+          WHERE id = $1::uuid
+            AND desired_state IN ('active', 'retired')
+            AND pid IS NOT DISTINCT FROM $2
+            AND process_start_marker IS NOT DISTINCT FROM $3
+         RETURNING id::text",
     )
     .bind(deployment_id)
-    .execute(pool)
+    .bind(dep.pid)
+    .bind(recorded_start.as_deref())
+    .bind(stop_identity.as_ref().map(|(pid, _)| *pid as i32))
+    .bind(stop_identity.as_ref().map(|(_, start)| start.as_str()))
+    .fetch_optional(pool)
     .await
     .map_err(|e| format!("mark retired: {e}"))?;
+    if retired.is_none() {
+        return Err(format!(
+            "deployment {deployment_id} identity changed before retirement; refusing unload"
+        ));
+    }
 
-    // On Linux, stop+disable the systemd supervisor FIRST. The unit uses
-    // `Restart=on-failure`, and a SIGTERM/SIGKILL counts as a non-clean exit,
-    // so without this systemd would immediately respawn a fresh llama-server
-    // (with a new PID) the moment we kill the listener — defeating the unload.
-    #[cfg(target_os = "linux")]
-    stop_systemd_unit(port).await;
-
-    // Kill the process that is ACTUALLY listening on this deployment's port,
-    // resolved live from the kernel — not the (possibly stale) recorded PID.
-    // The recorded PID is passed only as a fallback target. SIGTERM → wait →
-    // SIGKILL, against the PID and its process group. Never `pkill -f`.
-    let killed = stop_listener_on_port(port, recorded_pid).await;
-    if killed.is_empty() {
+    if let Some((pid, start)) = stop_identity {
+        if !cleanup_launched_process(pid, &start, port, cfg!(target_os = "linux")).await {
+            return Err(format!(
+                "deployment {deployment_id} was retired but exact process incarnation \
+                {pid}/{start} did not terminate; row retained for operator recovery"
+            ));
+        }
+    } else {
         tracing::warn!(
             deployment = %deployment_id,
             port,
@@ -1656,7 +1826,7 @@ fn launched_model_path(runtime: &str, args: &[String]) -> Option<String> {
 
 /// Stable OS process incarnation marker. PID alone is unsafe because kernels
 /// recycle it; Linux start ticks and `ps lstart` both change on PID reuse.
-fn process_start_marker(pid: u32) -> Option<String> {
+pub(crate) fn process_start_marker(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -1728,17 +1898,57 @@ async fn inspect_listener_identity(
     Ok(())
 }
 
-async fn cleanup_launched_process(pid: u32, start: &str, port: u16, systemd_owned: bool) {
+async fn wait_for_process_incarnation_exit(pid: u32, start: &str) -> bool {
+    for _ in 0..50 {
+        if process_start_marker(pid).as_deref() != Some(start) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Stop only the process incarnation created by this launch and confirm that
+/// incarnation is gone. A recycled PID is success (the launched process
+/// exited) and is never signalled.
+async fn cleanup_launched_process(pid: u32, start: &str, port: u16, systemd_owned: bool) -> bool {
     if process_start_marker(pid).as_deref() != Some(start) {
-        return;
+        return true;
     }
     if systemd_owned {
         stop_systemd_unit(port).await;
+        if wait_for_process_incarnation_exit(pid, start).await {
+            return true;
+        }
     }
     let _ = tokio::process::Command::new("kill")
         .args(["-TERM", &pid.to_string()])
         .output()
         .await;
+    if wait_for_process_incarnation_exit(pid, start).await {
+        return true;
+    }
+    if process_start_marker(pid).as_deref() == Some(start) {
+        let _ = tokio::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .output()
+            .await;
+    }
+    wait_for_process_incarnation_exit(pid, start).await
+}
+
+/// Cleanup for the narrow failure where a just-launched PID could not be
+/// identity-captured. Re-read the marker before signalling; if it remains
+/// unavailable, the process is already gone. A systemd-owned launch can also
+/// be stopped by the exact unit we just created for this port.
+async fn cleanup_unidentified_launch(pid: u32, port: u16, systemd_owned: bool) -> bool {
+    if systemd_owned {
+        stop_systemd_unit(port).await;
+    }
+    match process_start_marker(pid) {
+        Some(start) => cleanup_launched_process(pid, &start, port, false).await,
+        None => true,
+    }
 }
 
 fn pid_is_alive(pid: u32) -> bool {
@@ -1944,6 +2154,57 @@ pub(crate) async fn stop_systemd_unit(port: u16) {
             }
         }
     }
+}
+
+/// Authenticate a systemd-supervised restart after the persisted PID/start
+/// marker became stale. The current listener must be this exact unit's MainPID
+/// and the unit's configured model path must still match the deployment's
+/// library identity. This grants an explicit operator unload authority to stop
+/// the current incarnation without making arbitrary listeners adoptable.
+fn systemd_unit_owns_process(port: u16, pid: u32, expected_model: &str) -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    let unit = format!("llama-{port}.service");
+    let Ok(show) = std::process::Command::new("systemctl")
+        .args(["--user", "show", "-p", "MainPID", "--value", &unit])
+        .output()
+    else {
+        return false;
+    };
+    if !show.status.success() || String::from_utf8_lossy(&show.stdout).trim() != pid.to_string() {
+        return false;
+    }
+    let Ok(user_home) = std::env::var("HOME") else {
+        return false;
+    };
+    let unit_path = PathBuf::from(user_home)
+        .join(".config/systemd/user")
+        .join(&unit);
+    let Ok(unit_text) = std::fs::read_to_string(unit_path) else {
+        return false;
+    };
+    let Some(exec_start) = unit_text
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))
+    else {
+        return false;
+    };
+    let configured_model = parse_flag_value(exec_start, "--model").or_else(|| {
+        let mut words = exec_start.split_whitespace();
+        while let Some(word) = words.next() {
+            if word == "serve" {
+                return words
+                    .next()
+                    .map(|value| value.trim_matches('"').to_string());
+            }
+        }
+        None
+    });
+    configured_model
+        .as_deref()
+        .map(|value| value.trim_matches('"'))
+        .is_some_and(|configured| model_paths_match(expected_model, configured))
 }
 
 /// Start (restart) the `llama-<port>.service` systemd user unit and return its

@@ -1113,9 +1113,13 @@ pub struct ModelDeploymentRow {
     pub runtime: String,
     pub port: i32,
     pub pid: Option<i32>,
+    /// OS process-incarnation identity captured at launch. PID reuse must
+    /// never authorize a refresh, replacement, or unload.
+    pub process_start_marker: Option<String>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub last_health_at: Option<chrono::DateTime<chrono::Utc>>,
     pub health_status: String,
+    pub desired_state: String,
     pub context_window: Option<i32>,
     /// Launched `--parallel` slot count (llama.cpp). `None` for older rows /
     /// runtimes that don't split context across slots.
@@ -1160,9 +1164,13 @@ pub async fn pg_list_deployments(
                 runtime: r.get("runtime"),
                 port: r.get("port"),
                 pid: r.get("pid"),
+                process_start_marker: r.try_get("process_start_marker").ok(),
                 started_at: r.get("started_at"),
                 last_health_at: r.get("last_health_at"),
                 health_status: r.get("health_status"),
+                desired_state: r
+                    .try_get("desired_state")
+                    .unwrap_or_else(|_| "active".to_string()),
                 context_window: r.get("context_window"),
                 parallel_slots: r.get("parallel_slots"),
                 usable_agent_ctx: r.get("usable_agent_ctx"),
@@ -1233,6 +1241,121 @@ pub async fn pg_upsert_deployment(
     .await?;
     let id: sqlx::types::Uuid = row.get("id");
     Ok(id.to_string())
+}
+
+/// Activate a newly launched deployment only when `(worker_name, port)` is
+/// still vacant. Unlike [`pg_upsert_deployment`], this never overwrites an
+/// incumbent that appeared while the model was loading.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_activate_deployment_if_vacant(
+    pool: &PgPool,
+    worker_name: &str,
+    library_id: &str,
+    catalog_id: &str,
+    runtime: &str,
+    port: i32,
+    pid: i32,
+    process_start_marker: &str,
+    health_status: &str,
+    context_window: i32,
+    parallel_slots: i32,
+    agent_profile_verified: bool,
+) -> Result<Option<String>> {
+    let library_id = sqlx::types::Uuid::parse_str(library_id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad library uuid: {e}")))?;
+    let row = sqlx::query_scalar::<_, sqlx::types::Uuid>(
+        "INSERT INTO fleet_model_deployments
+            (worker_name, library_id, catalog_id, runtime, port, pid,
+             process_start_marker, health_status, context_window,
+             parallel_slots, usable_agent_ctx, last_health_at,
+             agent_profile_verified_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                 $9 / GREATEST(1, $10), NOW(),
+                 CASE WHEN $11 THEN NOW() END)
+         ON CONFLICT (worker_name, port) DO NOTHING
+         RETURNING id",
+    )
+    .bind(worker_name)
+    .bind(library_id)
+    .bind(catalog_id)
+    .bind(runtime)
+    .bind(port)
+    .bind(pid)
+    .bind(process_start_marker)
+    .bind(health_status)
+    .bind(context_window)
+    .bind(parallel_slots)
+    .bind(agent_profile_verified)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|id| id.to_string()))
+}
+
+/// Replace one known dead desired deployment after a successful relaunch.
+/// Every captured incumbent field is compared in the same statement so an
+/// operator edit, unload, or competing recovery wins instead of being
+/// overwritten.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_activate_expected_deployment(
+    pool: &PgPool,
+    deployment_id: &str,
+    worker_name: &str,
+    port: i32,
+    expected_library_id: &str,
+    expected_catalog_id: Option<&str>,
+    expected_pid: Option<i32>,
+    expected_process_start_marker: Option<&str>,
+    runtime: &str,
+    new_pid: i32,
+    new_process_start_marker: &str,
+    health_status: &str,
+    context_window: i32,
+    parallel_slots: i32,
+    agent_profile_verified: bool,
+) -> Result<Option<String>> {
+    let deployment_id = sqlx::types::Uuid::parse_str(deployment_id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad deployment uuid: {e}")))?;
+    let library_id = sqlx::types::Uuid::parse_str(expected_library_id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad library uuid: {e}")))?;
+    let row = sqlx::query_scalar::<_, sqlx::types::Uuid>(
+        "UPDATE fleet_model_deployments
+            SET runtime = $8,
+                pid = $9,
+                process_start_marker = $10,
+                health_status = $11,
+                context_window = $12,
+                parallel_slots = $13,
+                usable_agent_ctx = $12 / GREATEST(1, $13),
+                agent_profile_verified_at = CASE WHEN $14 THEN NOW() END,
+                started_at = NOW(),
+                last_health_at = NOW()
+          WHERE id = $1
+            AND LOWER(worker_name) = LOWER($2)
+            AND port = $3
+            AND desired_state = 'active'
+            AND library_id = $4
+            AND catalog_id IS NOT DISTINCT FROM $5
+            AND pid IS NOT DISTINCT FROM $6
+            AND process_start_marker IS NOT DISTINCT FROM $7
+         RETURNING id",
+    )
+    .bind(deployment_id)
+    .bind(worker_name)
+    .bind(port)
+    .bind(library_id)
+    .bind(expected_catalog_id)
+    .bind(expected_pid)
+    .bind(expected_process_start_marker)
+    .bind(runtime)
+    .bind(new_pid)
+    .bind(new_process_start_marker)
+    .bind(health_status)
+    .bind(context_window)
+    .bind(parallel_slots)
+    .bind(agent_profile_verified)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|id| id.to_string()))
 }
 
 /// Insert payload for a classified model-server error event.
@@ -2238,7 +2361,8 @@ pub async fn pg_supplied_slots_by_kind(pool: &PgPool, min_ctx: i32) -> Result<Se
                (cat.preferred_workloads @> '["code-gen"]'::jsonb)  AS is_code,
                (d.health_status = 'healthy'
                 AND d.usable_agent_ctx IS NOT NULL
-                AND d.usable_agent_ctx >= $1) AS agent_ready
+                AND d.usable_agent_ctx >= $1
+                AND d.agent_profile_verified_at >= NOW() - INTERVAL '3 minutes') AS agent_ready
           FROM fleet_model_deployments d
           JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
          WHERE d.desired_state = 'active'
@@ -2264,10 +2388,10 @@ pub async fn pg_supplied_slots_by_kind(pool: &PgPool, min_ctx: i32) -> Result<Se
         };
         let is_code = r.try_get::<bool, _>("is_code").unwrap_or(false);
         if is_code {
-            supply.code_count += 1;
+            supply.code_count += i64::from(agent_ready);
             supply.code_endpoints.push(ep);
         } else {
-            supply.general_count += 1;
+            supply.general_count += i64::from(agent_ready);
             supply.general_endpoints.push(ep);
         }
     }

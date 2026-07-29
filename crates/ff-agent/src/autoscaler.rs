@@ -276,8 +276,8 @@ fn exclude_leader_supply(
         .filter(|e| e.worker_name != leader)
         .collect();
     let filtered = ff_db::ServingSupply {
-        code_count: code_endpoints.len() as i64,
-        general_count: general_endpoints.len() as i64,
+        code_count: code_endpoints.iter().filter(|e| e.agent_ready).count() as i64,
+        general_count: general_endpoints.iter().filter(|e| e.agent_ready).count() as i64,
         code_endpoints,
         general_endpoints,
     };
@@ -994,7 +994,10 @@ async fn autoscaler_enqueue_block_reason(
             .await
             .ok()?
             .iter()
-            .any(|deployment| deployment.catalog_id.as_deref() == Some(catalog_id));
+            .any(|deployment| {
+                deployment.desired_state == "active"
+                    && deployment.catalog_id.as_deref() == Some(catalog_id)
+            });
         if !completed_autoload_blocks(still_placed) {
             return None;
         }
@@ -1631,6 +1634,26 @@ mod tests {
         assert_eq!(excluded, 0);
         assert_eq!(filtered.code_count, 2);
         assert_eq!(filtered.code_endpoints.len(), 2);
+    }
+
+    #[test]
+    fn exclude_leader_supply_preserves_unready_intent_without_counting_it() {
+        let mut unready = endpoint("offline-desired");
+        unready.agent_ready = false;
+        let supply = ff_db::ServingSupply {
+            code_count: 1,
+            general_count: 0,
+            code_endpoints: vec![endpoint("logan"), unready],
+            general_endpoints: vec![],
+        };
+        let (filtered, excluded) = exclude_leader_supply(supply, Some("taylor"));
+        assert_eq!(excluded, 0);
+        assert_eq!(filtered.code_count, 1);
+        assert_eq!(
+            filtered.code_endpoints.len(),
+            2,
+            "durable intent remains visible for non-destructive planning"
+        );
     }
 
     #[test]

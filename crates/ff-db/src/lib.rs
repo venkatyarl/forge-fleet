@@ -97,6 +97,8 @@ pub use queries::{
     WorkerSshKeyRow,
     db_exec,
     load_fleet_config_from_postgres,
+    pg_activate_deployment_if_vacant,
+    pg_activate_expected_deployment,
     pg_active_deployment_counts,
     pg_active_lease_counts_by_project,
     pg_advance_intent_cursor,

@@ -2802,6 +2802,16 @@ mod tests {
         assert!(migration.sql.contains("model_load_reservations"));
         assert!(migration.sql.contains("owner_token UUID NOT NULL"));
         assert!(migration.sql.contains("expires_at TIMESTAMPTZ NOT NULL"));
+        assert!(
+            migration
+                .sql
+                .contains("ADD COLUMN IF NOT EXISTS process_start_marker TEXT")
+        );
+        assert!(
+            migration
+                .sql
+                .contains("agent_profile_verified_at TIMESTAMPTZ")
+        );
     }
 
     #[tokio::test]
@@ -2862,6 +2872,150 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(owners, vec![second, second]);
+
+        sqlx::query(
+            "INSERT INTO fleet_workers (name, ip, ssh_user)
+             VALUES ('activation-node', '127.0.0.1', 'tester')
+             ON CONFLICT (name) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO fleet_model_catalog
+                    (id, name, family, parameters, tier, preferred_workloads, tool_calling)
+             VALUES ('model-a', 'Model A', 'test', '1B', 1, '[\"code-gen\"]', TRUE)
+             ON CONFLICT (id) DO UPDATE
+                 SET preferred_workloads = EXCLUDED.preferred_workloads,
+                     tool_calling = TRUE",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let library_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO fleet_model_library
+                    (worker_name, catalog_id, runtime, file_path)
+             VALUES ('activation-node', 'model-a', 'llama.cpp', '/models/a.gguf')
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let library_id = library_id.to_string();
+        let first_activation = crate::queries::pg_activate_deployment_if_vacant(
+            &pool,
+            "activation-node",
+            &library_id,
+            "model-a",
+            "llama.cpp",
+            55000,
+            101,
+            "start-101",
+            "healthy",
+            32768,
+            1,
+            true,
+        );
+        let second_activation = crate::queries::pg_activate_deployment_if_vacant(
+            &pool,
+            "activation-node",
+            &library_id,
+            "model-a",
+            "llama.cpp",
+            55000,
+            202,
+            "start-202",
+            "healthy",
+            32768,
+            1,
+            true,
+        );
+        let (first_activation, second_activation) =
+            tokio::join!(first_activation, second_activation);
+        let activations = [first_activation.unwrap(), second_activation.unwrap()];
+        assert_eq!(
+            activations.iter().filter(|result| result.is_some()).count(),
+            1,
+            "exactly one vacant activation may win"
+        );
+        let deployment_id = activations.into_iter().flatten().next().unwrap();
+        let (old_pid, old_start): (i32, String) = sqlx::query_as(
+            "SELECT pid, process_start_marker
+               FROM fleet_model_deployments
+              WHERE id = $1::uuid",
+        )
+        .bind(&deployment_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let supply = crate::queries::pg_supplied_slots_by_kind(&pool, 32768)
+            .await
+            .unwrap();
+        assert_eq!(supply.code_count, 1);
+        sqlx::query(
+            "UPDATE fleet_model_deployments
+                SET agent_profile_verified_at = NOW() - INTERVAL '4 minutes'
+              WHERE id = $1::uuid",
+        )
+        .bind(&deployment_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let stale_supply = crate::queries::pg_supplied_slots_by_kind(&pool, 32768)
+            .await
+            .unwrap();
+        assert_eq!(stale_supply.code_count, 0);
+        assert_eq!(
+            stale_supply.code_endpoints.len(),
+            1,
+            "stale desired intent remains visible but is not usable supply"
+        );
+        assert!(
+            crate::queries::pg_activate_expected_deployment(
+                &pool,
+                &deployment_id,
+                "activation-node",
+                55000,
+                &library_id,
+                Some("model-a"),
+                Some(old_pid),
+                Some("wrong-start"),
+                "llama.cpp",
+                303,
+                "start-303",
+                "healthy",
+                32768,
+                1,
+                true,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "stale process identity must not replace desired placement"
+        );
+        assert_eq!(
+            crate::queries::pg_activate_expected_deployment(
+                &pool,
+                &deployment_id,
+                "activation-node",
+                55000,
+                &library_id,
+                Some("model-a"),
+                Some(old_pid),
+                Some(&old_start),
+                "llama.cpp",
+                303,
+                "start-303",
+                "healthy",
+                32768,
+                1,
+                true,
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some(deployment_id.as_str())
+        );
 
         drop_temp_db(admin, pool, &db_name).await;
     }
