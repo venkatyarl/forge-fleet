@@ -245,6 +245,15 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
                         assigned_computer = COALESCE($2, assigned_computer) \
                   WHERE id = $1 \
                     AND status IN ('failed', 'cancelled', 'blocked') \
+                    AND NOT EXISTS ( \
+                        SELECT 1 FROM work_item_leases l \
+                         WHERE l.work_item_id = work_items.id \
+                           AND l.released_at IS NULL \
+                    ) \
+                    AND NOT EXISTS ( \
+                        SELECT 1 FROM sub_agents sa \
+                         WHERE sa.current_work_item_id = work_items.id \
+                    ) \
                  RETURNING kind",
             )
             .bind(uid)
@@ -254,6 +263,25 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
             .map_err(|e| anyhow::anyhow!("retry: {e}"))?;
             match row {
                 None => {
+                    let state: Option<(String, bool, bool)> = sqlx::query_as(
+                        "SELECT w.status, \
+                                EXISTS(SELECT 1 FROM work_item_leases l \
+                                        WHERE l.work_item_id = w.id AND l.released_at IS NULL), \
+                                EXISTS(SELECT 1 FROM sub_agents sa \
+                                        WHERE sa.current_work_item_id = w.id) \
+                           FROM work_items w WHERE w.id = $1",
+                    )
+                    .bind(uid)
+                    .fetch_optional(&pool)
+                    .await?;
+                    if let Some((status, live_lease, owned_slot)) = state
+                        && (live_lease || owned_slot)
+                    {
+                        return Err(anyhow::anyhow!(
+                            "work item {id} is '{status}' but its prior lease/slot is still owned; \
+                             retry is fenced until the cancelling worker reaps its backend and releases ownership"
+                        ));
+                    }
                     return Err(anyhow::anyhow!(
                         "no retryable work item with id {id} — it must be failed/cancelled/blocked \
                          (use `ff pm ready` for a fresh/idea item; a live item can't be reset)"
@@ -415,24 +443,62 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
         crate::PmCommand::Cancel { id } => {
             let uid = uuid::Uuid::parse_str(&id)
                 .map_err(|e| anyhow::anyhow!("invalid work item id '{id}': {e}"))?;
-            // Release any active lease + free the slot, then mark terminal.
+            let mut tx = pool.begin().await?;
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM work_items WHERE id = $1 FOR UPDATE")
+                    .bind(uid)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let Some(status) = status else {
+                tx.rollback().await?;
+                return Err(anyhow::anyhow!("no work item with id {id}"));
+            };
+            if matches!(status.as_str(), "done" | "merged") {
+                tx.rollback().await?;
+                return Err(anyhow::anyhow!(
+                    "work item {id} is already terminal '{status}' and cannot be cancelled"
+                ));
+            }
+            let backend_may_be_running = status == "building";
             sqlx::query(
-                "UPDATE sub_agents SET current_work_item_id = NULL, status = 'idle' \
-                  WHERE current_work_item_id = $1",
+                "UPDATE work_items SET status = 'cancelled' \
+                  WHERE id = $1 AND status NOT IN ('done', 'merged', 'cancelled')",
             )
             .bind(uid)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| anyhow::anyhow!("free slot: {e}"))?;
-            sqlx::query(
-                "UPDATE work_item_leases \
-                    SET released_at = NOW(), lease_state = 'released', release_reason = 'cancelled' \
-                  WHERE work_item_id = $1 AND released_at IS NULL",
-            )
-            .bind(uid)
-            .execute(&pool)
-            .await
-            .map_err(|e| anyhow::anyhow!("release lease: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("cancel work item: {e}"))?;
+
+            // A claimed/ready/review item cannot own a running backend. Release
+            // those leases atomically here. A BUILDING item is different: status
+            // is only the cancellation intent signal, and the spawning worker
+            // retains the slot until it TERM/KILLs and reaps its exact process.
+            if !backend_may_be_running {
+                sqlx::query(
+                    "WITH released AS (
+                         UPDATE work_item_leases
+                            SET released_at = NOW(),
+                                lease_state = 'released',
+                                release_reason = 'cancelled before backend ownership'
+                          WHERE work_item_id = $1
+                            AND released_at IS NULL
+                      RETURNING sub_agent_id, computer_id, work_item_id
+                     )
+                     UPDATE sub_agents sa
+                        SET current_work_item_id = NULL,
+                            status = 'idle',
+                            started_at = NULL,
+                            last_heartbeat_at = NOW()
+                       FROM released r
+                      WHERE sa.id = r.sub_agent_id
+                        AND sa.computer_id = r.computer_id
+                        AND sa.current_work_item_id = r.work_item_id",
+                )
+                .bind(uid)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| anyhow::anyhow!("release non-building cancellation: {e}"))?;
+            }
             // Drop it out of the merge queue so the drain stops considering it
             // (the per-host worktree reaper cleans the on-disk worktree).
             let _ = sqlx::query(
@@ -441,18 +507,45 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
                   WHERE work_item_id = $1 AND status NOT IN ('merged')",
             )
             .bind(uid)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await;
-            let n = sqlx::query("UPDATE work_items SET status = 'cancelled' WHERE id = $1")
+            tx.commit().await?;
+
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            let released = loop {
+                let owned: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM work_item_leases
+                         WHERE work_item_id = $1 AND released_at IS NULL
+                        UNION ALL
+                        SELECT 1 FROM sub_agents
+                         WHERE current_work_item_id = $1
+                    )",
+                )
                 .bind(uid)
-                .execute(&pool)
-                .await
-                .map_err(|e| anyhow::anyhow!("cancel work item: {e}"))?
-                .rows_affected();
-            if n == 0 {
-                return Err(anyhow::anyhow!("no work item with id {id}"));
+                .fetch_one(&pool)
+                .await?;
+                if !owned {
+                    break true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break false;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            };
+            if released && backend_may_be_running {
+                println!(
+                    "{GREEN}✓ work item {id} cancelled{RESET} (backend reaped, lease released, slot freed)"
+                );
+            } else if released {
+                println!(
+                    "{GREEN}✓ work item {id} cancelled{RESET} (no running backend; lease released, slot freed)"
+                );
+            } else {
+                println!(
+                    "{YELLOW}⚠ work item {id} cancellation accepted{RESET}; exact worker termination/reap is still pending"
+                );
             }
-            println!("{GREEN}✓ work item {id} cancelled{RESET} (lease released, slot freed)");
         }
         crate::PmCommand::Show { id } => {
             let uid = uuid::Uuid::parse_str(&id)

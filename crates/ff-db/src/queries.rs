@@ -9377,20 +9377,42 @@ pub async fn pg_active_lease_counts_by_project(
 /// stale-heartbeat reaper bug class (#589/#590) on the expiry axis.
 pub async fn pg_heartbeat_work_item_lease(
     pool: &PgPool,
+    lease_id: uuid::Uuid,
     work_item_id: uuid::Uuid,
+    sub_agent_id: uuid::Uuid,
+    computer_id: uuid::Uuid,
+    expected_state: &str,
     extend_secs: i64,
-) -> Result<()> {
-    sqlx::query(
-        "UPDATE work_item_leases \
+) -> Result<bool> {
+    let updated = sqlx::query(
+        "UPDATE work_item_leases l \
             SET heartbeat_at = NOW(), \
-                lease_expires_at = GREATEST(lease_expires_at, NOW() + make_interval(secs => $2)) \
-          WHERE work_item_id = $1 AND released_at IS NULL",
+                lease_expires_at = GREATEST(l.lease_expires_at, NOW() + make_interval(secs => $6)) \
+           FROM work_items w, sub_agents sa \
+          WHERE l.id = $1 \
+            AND l.work_item_id = $2 \
+            AND l.sub_agent_id = $3 \
+            AND l.computer_id = $4 \
+            AND l.released_at IS NULL \
+            AND l.lease_expires_at > NOW() \
+            AND l.lease_state = $5 \
+            AND w.id = l.work_item_id \
+            AND w.status = $5 \
+            AND sa.id = l.sub_agent_id \
+            AND sa.computer_id = l.computer_id \
+            AND sa.current_work_item_id = l.work_item_id \
+            AND sa.status = 'busy'",
     )
+    .bind(lease_id)
     .bind(work_item_id)
+    .bind(sub_agent_id)
+    .bind(computer_id)
+    .bind(expected_state)
     .bind(extend_secs as f64)
     .execute(pool)
-    .await?;
-    Ok(())
+    .await?
+    .rows_affected();
+    Ok(updated == 1)
 }
 
 /// A merge-queue entry ready to be processed by the drain.
