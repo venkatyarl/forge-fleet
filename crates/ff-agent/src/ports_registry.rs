@@ -92,8 +92,8 @@ fn default_status() -> String {
 /// starts with `vllm` (51001/51003); ollama → 11434 (always 11434 since
 /// Ollama's routing is internal, so we just return that).
 ///
-/// Excludes ports already bound by active rows in `computer_model_deployments`
-/// for the given computer. Returns `sqlx::Error::RowNotFound` when every
+/// Excludes ports carrying durable placement intent in
+/// `fleet_model_deployments`. Returns `sqlx::Error::RowNotFound` when every
 /// candidate slot is already taken.
 pub async fn pick_llm_port(
     pool: &PgPool,
@@ -122,17 +122,14 @@ pub async fn pick_llm_port(
     .fetch_all(pool)
     .await?;
 
-    // Ports already bound by active deployments on THIS computer.
-    // The `endpoint` column is a URL (e.g. http://127.0.0.1:55000) — parse
-    // the port out with a regex-friendly substring match at the SQL level
-    // so we don't have to pull every row back to Rust.
+    // Health is observed state, not permission to overwrite durable intent.
+    // Never consult computer_model_deployments here: it is a secondary
+    // inventory and can lag the owning host.
     let busy_ports: Vec<i32> = sqlx::query_scalar(
-        "SELECT (substring(cmd.endpoint from ':(\\d+)(?:/|$)'))::INT AS port
-           FROM computer_model_deployments cmd
-           JOIN computers c ON c.id = cmd.computer_id
-          WHERE LOWER(c.name) = LOWER($1)
-            AND cmd.status = 'active'
-            AND cmd.endpoint ~ ':\\d+'",
+        "SELECT port
+           FROM fleet_model_deployments
+          WHERE LOWER(worker_name) = LOWER($1)
+            AND desired_state = 'active'",
     )
     .bind(computer_name)
     .fetch_all(pool)

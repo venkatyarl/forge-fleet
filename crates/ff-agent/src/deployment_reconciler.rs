@@ -196,25 +196,9 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
                 pid = proc_info.pid,
                 port,
                 runtime = %proc_info.runtime,
-                "non-canonical port — killing process per canonical-port policy"
+                "unclaimed non-canonical listener — leaving it untouched; explicit authenticated replacement is required"
             );
-            let _ = tokio::process::Command::new("kill")
-                .args(["-TERM", &proc_info.pid.to_string()])
-                .output()
-                .await;
             summary.port_violations += 1;
-            // If a deployment row was tracking this port, mark it retired
-            // so the row gets cleaned up in pass B.
-            if let Some(&existing) = db_by_port.get(&port_i32) {
-                let _ = sqlx::query(
-                    "UPDATE fleet_model_deployments
-                        SET desired_state = 'retired'
-                      WHERE id = $1::uuid AND desired_state = 'active'",
-                )
-                .bind(&existing.id)
-                .execute(pool)
-                .await;
-            }
             continue;
         }
 
@@ -229,62 +213,58 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
         if let Some(&existing) = db_by_port.get(&port_i32) {
             // ── Both DB row and process exist ─────────────────────────────
             if existing.desired_state == "retired" {
-                // Operator wants this gone — kill the stray process. Row
-                // will be deleted in pass B.
-                let pid = proc_info.pid;
-                tracing::info!(pid, port, "killing stray process for retired deployment");
-                let _ = tokio::process::Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .output()
-                    .await;
-                summary.killed += 1;
+                // Retirement alone is not process identity. The explicit
+                // operator unload path performs the identity-qualified stop;
+                // a reconciler snapshot may be stale or the PID may be reused.
+                tracing::warn!(
+                    pid = proc_info.pid,
+                    port,
+                    "retired deployment still has a listener — refusing unauthenticated reap"
+                );
                 continue;
             }
 
-            // desired_state='active': refresh + backfill library/catalog IDs
-            // if missing (covers post-adopt library scan completing later).
-            let needs_backfill = existing.library_id.is_none() || existing.catalog_id.is_none();
-            let (lib_id_str, cat_id_str): (Option<String>, Option<String>) = if needs_backfill {
-                if let Some(mp) = &proc_info.model_path {
-                    match_library_to_path(&libs, mp)
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            };
-            let lib_uuid: Option<sqlx::types::Uuid> = lib_id_str
+            // Refresh only an already-authorized process incarnation. PID,
+            // persisted OS start marker, and library/model identity must all
+            // match; neither health nor a recognizable command line grants
+            // adoption authority.
+            let matched_library = proc_info
+                .model_path
                 .as_deref()
-                .and_then(|s| sqlx::types::Uuid::parse_str(s).ok());
+                .and_then(|path| match_library_to_path(&libs, path).0);
+            let authenticated = existing.pid == Some(proc_info.pid as i32)
+                && existing
+                    .process_start_marker
+                    .as_deref()
+                    .is_some_and(|expected| {
+                        crate::model_runtime::process_start_marker(proc_info.pid).as_deref()
+                            == Some(expected)
+                    })
+                && matched_library.as_deref() == existing.library_id.as_deref();
+            if !authenticated {
+                tracing::warn!(
+                    deployment = %existing.id,
+                    pid = proc_info.pid,
+                    port,
+                    "live listener does not match persisted PID/start/model identity; refusing refresh or adoption"
+                );
+                continue;
+            }
 
-            // Self-heal context columns for adopted/under-probed deployments.
-            // `context_window == 0` means we never recorded a real ctx (server
-            // started out-of-band, or cmdline lacked --ctx-size). Probe the
-            // live server for ground truth so the agent router — which filters
-            // `usable_agent_ctx >= min_ctx` — can see this endpoint. Also
-            // corrects a stale `parallel_slots` (e.g. veronica's DB said 2 but
-            // /props reports 4). Only when healthy (an unhealthy server won't
-            // answer /props anyway).
+            // Refresh agent-capacity evidence from the authenticated live
+            // runtime on every healthy pass. Configured/cmdline values are not
+            // proof that the server accepted that profile, and old evidence
+            // must expire rather than satisfying a reliability floor forever.
             let mut ctx_total: Option<i32> = None;
             let mut slots: Option<i32> = None;
             let mut usable: Option<i32> = None;
-            if healthy && existing.context_window == 0 {
+            if healthy {
                 if let Some((per_slot, total_slots)) =
                     crate::model_runtime::probe_agent_ctx(&proc_info.runtime, port).await
                 {
                     ctx_total = Some(per_slot.saturating_mul(total_slots));
                     slots = Some(total_slots);
                     usable = Some(per_slot);
-                } else if let (Some(cw), Some(ps)) =
-                    (proc_info.context_window, proc_info.parallel_slots)
-                {
-                    // No HTTP probe for this runtime (mlx_lm.server exposes no
-                    // ctx endpoint) — fall back to what the cmdline/model-config
-                    // parse found. Without this, mlx rows kept usable_agent_ctx
-                    // NULL forever and the V111 router never saw them.
-                    ctx_total = Some(cw);
-                    slots = Some(ps);
-                    usable = Some(cw / ps.max(1));
                 }
             }
 
@@ -292,22 +272,23 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
                 "UPDATE fleet_model_deployments
                     SET health_status = $1,
                         last_health_at = NOW(),
-                        pid = $2,
-                        library_id = COALESCE(library_id, $3),
-                        catalog_id = COALESCE(catalog_id, $4),
-                        context_window = COALESCE($6::int, context_window),
-                        parallel_slots = COALESCE($7::int, parallel_slots),
-                        usable_agent_ctx = COALESCE($8::int, usable_agent_ctx)
-                  WHERE id = $5::uuid",
+                        context_window = COALESCE($4::int, context_window),
+                        parallel_slots = COALESCE($5::int, parallel_slots),
+                        usable_agent_ctx = COALESCE($6::int, usable_agent_ctx),
+                        agent_profile_verified_at =
+                            CASE WHEN $1 = 'healthy' AND $6::int IS NOT NULL
+                                 THEN NOW() ELSE NULL END
+                  WHERE id = $7::uuid
+                    AND pid = $2
+                    AND process_start_marker = $3",
             )
             .bind(status)
             .bind(proc_info.pid as i32)
-            .bind(lib_uuid)
-            .bind(cat_id_str)
-            .bind(&existing.id)
+            .bind(existing.process_start_marker.as_deref())
             .bind(ctx_total)
             .bind(slots)
             .bind(usable)
+            .bind(&existing.id)
             .execute(pool)
             .await
             {
@@ -323,32 +304,13 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
                 }
             }
         } else {
-            // ── Process exists, no DB row → adopt ─────────────────────────
-            let (library_id, catalog_id) = if let Some(mp) = &proc_info.model_path {
-                match_library_to_path(&libs, mp)
-            } else {
-                (None, None)
-            };
-
-            match ff_db::pg_upsert_deployment(
-                pool,
-                &worker_name,
-                library_id.as_deref(),
-                catalog_id.as_deref(),
-                &proc_info.runtime,
-                port_i32,
-                Some(proc_info.pid as i32),
-                status,
-                // Adopt the real ctx + slot count parsed from the cmdline so an
-                // out-of-band server still gets usable_agent_ctx recorded.
-                proc_info.context_window,
-                proc_info.parallel_slots,
-            )
-            .await
-            {
-                Ok(_) => summary.adopted += 1,
-                Err(e) => tracing::warn!("adopt port {port}: {e}"),
-            }
+            // ── Process exists, no DB row → foreign/unclaimed ─────────────
+            tracing::warn!(
+                pid = proc_info.pid,
+                port,
+                runtime = %proc_info.runtime,
+                "unclaimed listener is not placement authority; refusing auto-adoption"
+            );
         }
     }
 
@@ -457,30 +419,6 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
         }
     }
 
-    // ── Pass C — reap ORPHAN systemd units ─────────────────────────────────
-    // A `llama-<port>.service` unit file whose port has NO active deployment row
-    // is a leftover from a retired model. Its `Restart=` directive keeps
-    // respawning that old model, which competes for memory with the model this
-    // node SHOULD run — the root cause of the glm "flapping" (a killed glm's
-    // memory got eaten by a stale devstral/qwen unit respawning, so glm never
-    // stayed healthy). DB rows + live processes are handled above; the unit FILE
-    // is the durable respawner that neither touches. Canonical ports with an
-    // active row are left alone (that's the model we want running).
-    #[cfg(target_os = "linux")]
-    {
-        let active_ports: std::collections::HashSet<i32> = db_rows
-            .iter()
-            .filter(|r| r.desired_state == "active")
-            .map(|r| r.port)
-            .collect();
-        for port in crate::model_runtime::list_llama_unit_ports() {
-            if !active_ports.contains(&(port as i32)) {
-                crate::model_runtime::reap_orphan_llama_unit(port).await;
-                summary.port_violations += 1;
-            }
-        }
-    }
-
     Ok(summary)
 }
 
@@ -537,12 +475,9 @@ async fn respawn_dead_deployment(
         "respawning dead deployment (desired_state=active)"
     );
 
-    // NO delete-first. load_model upserts ON CONFLICT(worker_name, port), so it
-    // REPLACES this row in place with the fresh pid. Deleting first was the
-    // durability bug: if load_model then failed (e.g. RAM pressure during a
-    // co-located build), the row was gone forever and the endpoint silently
-    // vanished with no retry. Leaving the row intact (desired_state='active')
-    // means a failed respawn is simply retried on the next 60s tick.
+    // NO delete-first. `respawn_model` keeps this desired row durable throughout
+    // the health wait and conditionally replaces only its exact captured
+    // identity at activation. A failed launch leaves intent for the next tick.
     let ctx = if row.context_window > 0 {
         row.context_window as u32
     } else {
@@ -556,7 +491,7 @@ async fn respawn_dead_deployment(
     } else {
         4
     };
-    let result = crate::model_runtime::load_model(
+    let result = crate::model_runtime::respawn_model(
         pool,
         crate::model_runtime::LoadOptions {
             library_id: lib.id.clone(),
@@ -566,6 +501,7 @@ async fn respawn_dead_deployment(
             agent_profile: false,
             mmproj_path: None, // auto-detect sibling mmproj on relaunch
         },
+        &row.id,
     )
     .await
     .map_err(|e| format!("load_model: {e}"))?;
@@ -692,6 +628,8 @@ fn evict_deletes_row(row_worker: &str, this_worker: &str) -> bool {
 struct DeploymentRow {
     id: String,
     port: i32,
+    pid: Option<i32>,
+    process_start_marker: Option<String>,
     library_id: Option<String>,
     catalog_id: Option<String>,
     desired_state: String,
@@ -706,7 +644,7 @@ async fn list_deployments_with_desired_state(
     worker_name: &str,
 ) -> Result<Vec<DeploymentRow>, String> {
     sqlx::query_as::<_, DeploymentRow>(
-        "SELECT id::text AS id, port,
+        "SELECT id::text AS id, port, pid, process_start_marker,
                 library_id::text AS library_id,
                 catalog_id,
                 desired_state,
@@ -820,6 +758,8 @@ mod tests {
         DeploymentRow {
             id: "11111111-1111-1111-1111-111111111111".to_string(),
             port: 55000,
+            pid: None,
+            process_start_marker: None,
             library_id: None,
             catalog_id: catalog_id.map(str::to_string),
             desired_state: "active".to_string(),

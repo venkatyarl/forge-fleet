@@ -12577,6 +12577,10 @@ BEFORE UPDATE OF last_sent_at ON project_digest_configs
 FOR EACH ROW EXECUTE FUNCTION guard_project_digest_cursor_regression();
 "#;
 
+/// v284: short-lived, token-fenced reservations for model launch resources.
+pub const SCHEMA_V284_MODEL_LOAD_RESERVATIONS: &str =
+    include_str!("migrations/20260729160000_model_load_reservations.sql");
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

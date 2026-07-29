@@ -1113,9 +1113,13 @@ pub struct ModelDeploymentRow {
     pub runtime: String,
     pub port: i32,
     pub pid: Option<i32>,
+    /// OS process-incarnation identity captured at launch. PID reuse must
+    /// never authorize a refresh, replacement, or unload.
+    pub process_start_marker: Option<String>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub last_health_at: Option<chrono::DateTime<chrono::Utc>>,
     pub health_status: String,
+    pub desired_state: String,
     pub context_window: Option<i32>,
     /// Launched `--parallel` slot count (llama.cpp). `None` for older rows /
     /// runtimes that don't split context across slots.
@@ -1160,9 +1164,13 @@ pub async fn pg_list_deployments(
                 runtime: r.get("runtime"),
                 port: r.get("port"),
                 pid: r.get("pid"),
+                process_start_marker: r.try_get("process_start_marker").ok(),
                 started_at: r.get("started_at"),
                 last_health_at: r.get("last_health_at"),
                 health_status: r.get("health_status"),
+                desired_state: r
+                    .try_get("desired_state")
+                    .unwrap_or_else(|_| "active".to_string()),
                 context_window: r.get("context_window"),
                 parallel_slots: r.get("parallel_slots"),
                 usable_agent_ctx: r.get("usable_agent_ctx"),
@@ -1233,6 +1241,121 @@ pub async fn pg_upsert_deployment(
     .await?;
     let id: sqlx::types::Uuid = row.get("id");
     Ok(id.to_string())
+}
+
+/// Activate a newly launched deployment only when `(worker_name, port)` is
+/// still vacant. Unlike [`pg_upsert_deployment`], this never overwrites an
+/// incumbent that appeared while the model was loading.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_activate_deployment_if_vacant(
+    pool: &PgPool,
+    worker_name: &str,
+    library_id: &str,
+    catalog_id: &str,
+    runtime: &str,
+    port: i32,
+    pid: i32,
+    process_start_marker: &str,
+    health_status: &str,
+    context_window: i32,
+    parallel_slots: i32,
+    agent_profile_verified: bool,
+) -> Result<Option<String>> {
+    let library_id = sqlx::types::Uuid::parse_str(library_id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad library uuid: {e}")))?;
+    let row = sqlx::query_scalar::<_, sqlx::types::Uuid>(
+        "INSERT INTO fleet_model_deployments
+            (worker_name, library_id, catalog_id, runtime, port, pid,
+             process_start_marker, health_status, context_window,
+             parallel_slots, usable_agent_ctx, last_health_at,
+             agent_profile_verified_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                 $9 / GREATEST(1, $10), NOW(),
+                 CASE WHEN $11 THEN NOW() END)
+         ON CONFLICT (worker_name, port) DO NOTHING
+         RETURNING id",
+    )
+    .bind(worker_name)
+    .bind(library_id)
+    .bind(catalog_id)
+    .bind(runtime)
+    .bind(port)
+    .bind(pid)
+    .bind(process_start_marker)
+    .bind(health_status)
+    .bind(context_window)
+    .bind(parallel_slots)
+    .bind(agent_profile_verified)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|id| id.to_string()))
+}
+
+/// Replace one known dead desired deployment after a successful relaunch.
+/// Every captured incumbent field is compared in the same statement so an
+/// operator edit, unload, or competing recovery wins instead of being
+/// overwritten.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_activate_expected_deployment(
+    pool: &PgPool,
+    deployment_id: &str,
+    worker_name: &str,
+    port: i32,
+    expected_library_id: &str,
+    expected_catalog_id: Option<&str>,
+    expected_pid: Option<i32>,
+    expected_process_start_marker: Option<&str>,
+    runtime: &str,
+    new_pid: i32,
+    new_process_start_marker: &str,
+    health_status: &str,
+    context_window: i32,
+    parallel_slots: i32,
+    agent_profile_verified: bool,
+) -> Result<Option<String>> {
+    let deployment_id = sqlx::types::Uuid::parse_str(deployment_id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad deployment uuid: {e}")))?;
+    let library_id = sqlx::types::Uuid::parse_str(expected_library_id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad library uuid: {e}")))?;
+    let row = sqlx::query_scalar::<_, sqlx::types::Uuid>(
+        "UPDATE fleet_model_deployments
+            SET runtime = $8,
+                pid = $9,
+                process_start_marker = $10,
+                health_status = $11,
+                context_window = $12,
+                parallel_slots = $13,
+                usable_agent_ctx = $12 / GREATEST(1, $13),
+                agent_profile_verified_at = CASE WHEN $14 THEN NOW() END,
+                started_at = NOW(),
+                last_health_at = NOW()
+          WHERE id = $1
+            AND LOWER(worker_name) = LOWER($2)
+            AND port = $3
+            AND desired_state = 'active'
+            AND library_id = $4
+            AND catalog_id IS NOT DISTINCT FROM $5
+            AND pid IS NOT DISTINCT FROM $6
+            AND process_start_marker IS NOT DISTINCT FROM $7
+         RETURNING id",
+    )
+    .bind(deployment_id)
+    .bind(worker_name)
+    .bind(port)
+    .bind(library_id)
+    .bind(expected_catalog_id)
+    .bind(expected_pid)
+    .bind(expected_process_start_marker)
+    .bind(runtime)
+    .bind(new_pid)
+    .bind(new_process_start_marker)
+    .bind(health_status)
+    .bind(context_window)
+    .bind(parallel_slots)
+    .bind(agent_profile_verified)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|id| id.to_string()))
 }
 
 /// Insert payload for a classified model-server error event.
@@ -2221,6 +2344,8 @@ pub struct ServingEndpoint {
     pub request_count: i64,
     /// Seconds since the last health ping (NULL → very old / unknown).
     pub health_age_sec: Option<i32>,
+    /// Verified healthy and context-qualified right now.
+    pub agent_ready: bool,
 }
 
 /// Bucket the healthy agent-capable deployments into code vs general supply.
@@ -2233,14 +2358,15 @@ pub async fn pg_supplied_slots_by_kind(pool: &PgPool, min_ctx: i32) -> Result<Se
                d.catalog_id      AS catalog_id,
                d.request_count   AS request_count,
                EXTRACT(EPOCH FROM (NOW() - d.last_health_at))::int AS health_age_sec,
-               (cat.preferred_workloads @> '["code-gen"]'::jsonb)  AS is_code
+               (cat.preferred_workloads @> '["code-gen"]'::jsonb)  AS is_code,
+               (d.health_status = 'healthy'
+                AND d.usable_agent_ctx IS NOT NULL
+                AND d.usable_agent_ctx >= $1
+                AND d.agent_profile_verified_at >= NOW() - INTERVAL '3 minutes') AS agent_ready
           FROM fleet_model_deployments d
           JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
-         WHERE d.health_status = 'healthy'
-           AND d.desired_state = 'active'
+         WHERE d.desired_state = 'active'
            AND cat.tool_calling = TRUE
-           AND d.usable_agent_ctx IS NOT NULL
-           AND d.usable_agent_ctx >= $1
         "#,
     )
     .bind(min_ctx)
@@ -2250,6 +2376,7 @@ pub async fn pg_supplied_slots_by_kind(pool: &PgPool, min_ctx: i32) -> Result<Se
     let mut supply = ServingSupply::default();
     for r in &rows {
         let id: sqlx::types::Uuid = r.get("id");
+        let agent_ready = r.try_get::<bool, _>("agent_ready").unwrap_or(false);
         let ep = ServingEndpoint {
             deployment_id: id.to_string(),
             worker_name: r.get("worker_name"),
@@ -2257,12 +2384,14 @@ pub async fn pg_supplied_slots_by_kind(pool: &PgPool, min_ctx: i32) -> Result<Se
             catalog_id: r.try_get("catalog_id").ok(),
             request_count: r.try_get("request_count").unwrap_or(0),
             health_age_sec: r.try_get("health_age_sec").ok(),
+            agent_ready,
         };
-        if r.try_get::<bool, _>("is_code").unwrap_or(false) {
-            supply.code_count += 1;
+        let is_code = r.try_get::<bool, _>("is_code").unwrap_or(false);
+        if is_code {
+            supply.code_count += i64::from(agent_ready);
             supply.code_endpoints.push(ep);
         } else {
-            supply.general_count += 1;
+            supply.general_count += i64::from(agent_ready);
             supply.general_endpoints.push(ep);
         }
     }
@@ -2537,13 +2666,20 @@ pub async fn pg_loadable_library_for_kind(
           JOIN fleet_model_catalog cat ON cat.id = lib.catalog_id
          WHERE lib.worker_name = $1
            AND cat.tool_calling = TRUE
+           AND lib.pinned = TRUE
            AND ($2 = (cat.preferred_workloads @> '["code-gen"]'::jsonb))
            AND NOT EXISTS (
                SELECT 1 FROM fleet_model_deployments d
                 WHERE d.library_id = lib.id
                   AND d.desired_state = 'active'
            )
-         ORDER BY cat.tier ASC, lib.size_bytes ASC
+         ORDER BY EXISTS (
+                      SELECT 1
+                        FROM fleet_task_coverage tc
+                       WHERE tc.preferred_model_ids ? lib.catalog_id
+                  ) DESC,
+                  cat.tier ASC,
+                  lib.size_bytes ASC
          LIMIT 1
         "#,
     )
@@ -3422,6 +3558,143 @@ pub async fn pg_enqueue_deferred(
         0,
     )
     .await
+}
+
+/// Atomically reserve both identities that make a model launch exclusive:
+/// `(host, port)` and `(host, library)`. Expired rows are replaceable, while a
+/// live row owned by any token makes the whole transaction fail closed.
+pub async fn pg_reserve_model_load(
+    pool: &PgPool,
+    host: &str,
+    port: u16,
+    library_id: &str,
+    owner_token: uuid::Uuid,
+    ttl_secs: i64,
+) -> Result<bool> {
+    let host = host.to_ascii_lowercase();
+    let port = port.to_string();
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "DELETE FROM model_load_reservations
+          WHERE host_name = $1
+            AND expires_at <= NOW()
+            AND ((resource_kind = 'port' AND resource_value = $2)
+              OR (resource_kind = 'library' AND resource_value = $3))",
+    )
+    .bind(&host)
+    .bind(&port)
+    .bind(library_id)
+    .execute(&mut *tx)
+    .await?;
+    let inserted: i64 = sqlx::query_scalar(
+        "WITH inserted AS (
+             INSERT INTO model_load_reservations
+                    (host_name, resource_kind, resource_value, owner_token, expires_at)
+             VALUES ($1, 'port', $2, $4, NOW() + make_interval(secs => $5)),
+                    ($1, 'library', $3, $4, NOW() + make_interval(secs => $5))
+             ON CONFLICT DO NOTHING
+             RETURNING 1
+         )
+         SELECT COUNT(*) FROM inserted",
+    )
+    .bind(&host)
+    .bind(&port)
+    .bind(library_id)
+    .bind(owner_token)
+    .bind(ttl_secs.max(1) as f64)
+    .fetch_one(&mut *tx)
+    .await?;
+    if inserted != 2 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Release only the two reservation rows still owned by `owner_token`.
+pub async fn pg_release_model_load_reservation(
+    pool: &PgPool,
+    host: &str,
+    port: u16,
+    library_id: &str,
+    owner_token: uuid::Uuid,
+) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM model_load_reservations
+          WHERE host_name = $1
+            AND owner_token = $4
+            AND ((resource_kind = 'port' AND resource_value = $2)
+              OR (resource_kind = 'library' AND resource_value = $3))",
+    )
+    .bind(host.to_ascii_lowercase())
+    .bind(port.to_string())
+    .bind(library_id)
+    .bind(owner_token)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Short durable mutex for an enqueue decision. The reservation is committed
+/// before the caller performs its read/insert and is always token-released.
+pub async fn pg_reserve_operation(
+    pool: &PgPool,
+    host: &str,
+    operation: &str,
+    owner_token: uuid::Uuid,
+    ttl_secs: i64,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let host = host.to_ascii_lowercase();
+    sqlx::query(
+        "DELETE FROM model_load_reservations
+          WHERE host_name = $1 AND resource_kind = 'operation'
+            AND resource_value = $2 AND expires_at <= NOW()",
+    )
+    .bind(&host)
+    .bind(operation)
+    .execute(&mut *tx)
+    .await?;
+    let inserted = sqlx::query(
+        "INSERT INTO model_load_reservations
+                (host_name, resource_kind, resource_value, owner_token, expires_at)
+         VALUES ($1, 'operation', $2, $3, NOW() + make_interval(secs => $4))
+         ON CONFLICT DO NOTHING
+         RETURNING owner_token",
+    )
+    .bind(&host)
+    .bind(operation)
+    .bind(owner_token)
+    .bind(ttl_secs.max(1) as f64)
+    .fetch_optional(&mut *tx)
+    .await?
+    .is_some();
+    if inserted {
+        tx.commit().await?;
+    } else {
+        tx.rollback().await?;
+    }
+    Ok(inserted)
+}
+
+pub async fn pg_release_operation_reservation(
+    pool: &PgPool,
+    host: &str,
+    operation: &str,
+    owner_token: uuid::Uuid,
+) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM model_load_reservations
+          WHERE host_name = $1 AND resource_kind = 'operation'
+            AND resource_value = $2 AND owner_token = $3",
+    )
+    .bind(host.to_ascii_lowercase())
+    .bind(operation)
+    .bind(owner_token)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// Like [`pg_enqueue_deferred`] but seeds `next_attempt_at = NOW() + delay_secs`
