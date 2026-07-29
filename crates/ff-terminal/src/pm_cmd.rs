@@ -817,16 +817,8 @@ async fn bind_work_item_repo(
     let repairable_error = last_error
         .as_deref()
         .is_some_and(is_repository_resolution_failed_closed);
-    match status.as_str() {
-        "ready" => {}
-        "failed" if repairable_error => {}
-        "failed" => anyhow::bail!(
-            "failed work item {id} is not a repository-resolution fail-closed failure"
-        ),
-        _ => anyhow::bail!(
-            "work item {id} is '{status}'; bind-repo only permits unbound ready items \
-             or failed repository-resolution repairs"
-        ),
+    if status != "ready" {
+        anyhow::bail!("work item {id} is '{status}'; bind-repo only permits unbound ready items");
     }
 
     let has_live_lease: bool = sqlx::query_scalar(
@@ -851,7 +843,7 @@ async fn bind_work_item_repo(
         anyhow::bail!("work item {id} is still assigned to a live sub-agent slot");
     }
 
-    let clear_ready_error = status == "ready" && repairable_error;
+    let clear_repair_error = repairable_error;
     let updated = sqlx::query(
         "UPDATE work_items \
             SET repo_id = $2, repo_url = $3, \
@@ -863,7 +855,7 @@ async fn bind_work_item_repo(
     .bind(id)
     .bind(repo_id)
     .bind(&repo_url)
-    .bind(clear_ready_error)
+    .bind(clear_repair_error)
     .bind(&status)
     .execute(&mut *tx)
     .await?
@@ -3297,71 +3289,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bind_repo_ready_and_failed_repairs_preserve_fields_and_audit() {
+    async fn bind_repo_ready_repair_preserves_fields_and_audits() {
         let Some((admin, pool, db_name)) = bind_repo_temp_pool().await else {
             return;
         };
         let (repo_id, _) = seed_bind_repo(&pool).await;
         let repair_error = "repository resolution failed closed: no registered project_repos row";
         let ready = insert_bind_item(&pool, "ready", Some(repair_error)).await;
-        let failed = insert_bind_item(&pool, "failed", Some(repair_error)).await;
 
         let ready_result = bind_work_item_repo(&pool, ready, "api", "tester")
             .await
             .unwrap();
-        let failed_result = bind_work_item_repo(&pool, failed, &repo_id.to_string(), "tester")
-            .await
-            .unwrap();
         assert_eq!(ready_result.repo_id, repo_id);
-        assert_eq!(failed_result.status, "failed");
 
-        for (id, expected_error) in [(ready, None), (failed, Some(repair_error))] {
-            let row = sqlx::query(
-                "SELECT status, attempts, last_error, repo_id, repo_url, repo_path, priority, \
+        let row = sqlx::query(
+            "SELECT status, attempts, last_error, repo_id, repo_url, repo_path, priority, \
                         payload, assigned_to, assigned_computer, base_sha, base_branch \
                    FROM work_items WHERE id = $1",
+        )
+        .bind(ready)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("status"), "ready");
+        assert_eq!(row.get::<i32, _>("attempts"), 7);
+        assert_eq!(row.get::<Option<String>, _>("last_error"), None);
+        assert_eq!(row.get::<uuid::Uuid, _>("repo_id"), repo_id);
+        assert_eq!(row.get::<String, _>("repo_path"), "/explicit/path");
+        assert_eq!(row.get::<String, _>("priority"), "high");
+        assert_eq!(row.get::<serde_json::Value, _>("payload")["keep"], true);
+        assert_eq!(
+            row.get::<Option<String>, _>("assigned_to").as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("assigned_computer").as_deref(),
+            Some("sia")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("base_sha").as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("base_branch").as_deref(),
+            Some("develop")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM work_item_events \
+                      WHERE work_item_id = $1 AND to_status = 'repo_bound'"
             )
-            .bind(id)
+            .bind(ready)
             .fetch_one(&pool)
             .await
-            .unwrap();
-            assert_eq!(row.get::<i32, _>("attempts"), 7);
-            assert_eq!(
-                row.get::<Option<String>, _>("last_error").as_deref(),
-                expected_error
-            );
-            assert_eq!(row.get::<uuid::Uuid, _>("repo_id"), repo_id);
-            assert_eq!(row.get::<String, _>("repo_path"), "/explicit/path");
-            assert_eq!(row.get::<String, _>("priority"), "high");
-            assert_eq!(row.get::<serde_json::Value, _>("payload")["keep"], true);
-            assert_eq!(
-                row.get::<Option<String>, _>("assigned_to").as_deref(),
-                Some("alice")
-            );
-            assert_eq!(
-                row.get::<Option<String>, _>("assigned_computer").as_deref(),
-                Some("sia")
-            );
-            assert_eq!(
-                row.get::<Option<String>, _>("base_sha").as_deref(),
-                Some("abc123")
-            );
-            assert_eq!(
-                row.get::<Option<String>, _>("base_branch").as_deref(),
-                Some("develop")
-            );
-            assert_eq!(
-                sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM work_item_events \
-                      WHERE work_item_id = $1 AND to_status = 'repo_bound'"
-                )
-                .bind(id)
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-                1
-            );
-        }
+            .unwrap(),
+            1
+        );
         drop_bind_repo_temp_pool(admin, pool, &db_name).await;
     }
 
@@ -3400,6 +3383,10 @@ mod tests {
             ("claimed", None),
             ("building", None),
             ("failed", Some("compile failed")),
+            (
+                "failed",
+                Some("repository resolution failed closed: no registered project_repos row"),
+            ),
         ] {
             let id = insert_bind_item(&pool, status, error).await;
             assert!(
