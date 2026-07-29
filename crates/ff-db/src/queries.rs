@@ -4722,7 +4722,11 @@ mod tests {
             .flat_map(|c| c.iter().copied())
             .collect();
         let unique: std::collections::HashSet<&&str> = members.iter().collect();
-        assert_eq!(unique.len(), members.len(), "clusters must not share members");
+        assert_eq!(
+            unique.len(),
+            members.len(),
+            "clusters must not share members"
+        );
         // "omni" is deliberately NOT clustered with multimodal (adds audio).
         assert_eq!(route_workload_synonyms(Some("omni")), &["omni"]);
         // Unknown tags resolve to just themselves.
