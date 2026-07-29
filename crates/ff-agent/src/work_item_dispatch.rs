@@ -1831,7 +1831,12 @@ fn task_branch_name(title: &str, work_item_id: uuid::Uuid) -> String {
 async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Result<WorktreeRecord> {
     let base_branch = match item.base_branch.as_deref() {
         Some(branch) if !branch.trim().is_empty() => branch.trim().to_string(),
-        _ => default_branch(&item.repo_path).unwrap_or_else(|_| "main".to_string()),
+        _ => default_branch(&item.repo_path).with_context(|| {
+            format!(
+                "determine configured default branch for {}",
+                item.repo_path.display()
+            )
+        })?,
     };
     let task_branch = task_branch_name(&item.title, item.work_item_id);
 
@@ -5176,6 +5181,26 @@ fn checkout_clone_for_build(
     }
 
     if !fetched {
+        // A failed fetch can mean either that this node cannot reach origin or
+        // that the configured branch does not exist. Preserve the intentional
+        // offline-node fallback only in the former case: an authoritative,
+        // reachable origin that has no such branch must never be masked by a
+        // stale refs/remotes/origin/<base> left in the clone.
+        match remote_branch_exists(repo_path, base_branch) {
+            Ok(true) => {}
+            Ok(false) => bail!(
+                "checkout_clone_for_build: configured branch {base_branch:?} does not exist on origin"
+            ),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "checkout_clone_for_build: cannot verify configured branch {base_branch:?} \
+                         on origin; refusing to build from an unverified local ref"
+                    )
+                });
+            }
+        }
+
         // GRACEFUL DEGRADATION (operator 2026-07-26): both the LAN mirror and
         // direct GitHub fetch failed — usually because THIS node is network-
         // isolated from GitHub (e.g. priya, the DB primary, has no GitHub route
@@ -5229,6 +5254,30 @@ fn checkout_clone_for_build(
         Duration::from_secs(120),
     )?;
     Ok(())
+}
+
+/// Query origin directly for a configured branch. Exit code 2 from
+/// `git ls-remote --exit-code` means the remote was reachable but no matching
+/// ref exists; transport/authentication failures remain errors so callers can
+/// distinguish a missing branch from an offline build node.
+fn remote_branch_exists(repo_path: &Path, branch: &str) -> Result<bool> {
+    let mut command = Command::new("git");
+    command
+        .current_dir(repo_path)
+        .args(["ls-remote", "--exit-code", "--heads", "origin"])
+        .arg(format!("refs/heads/{branch}"));
+    let output = run_command_capture(command, Duration::from_secs(30))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(2) => Ok(false),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "query configured branch {branch:?} on origin failed: {}",
+                truncate_for_log(&stderr)
+            )
+        }
+    }
 }
 
 fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
@@ -7515,6 +7564,85 @@ mod tests {
     #[test]
     fn forced_fallback_defaults_to_claude_when_unrouted() {
         assert_eq!(primary_or_default_backend(&[]), "claude");
+    }
+
+    #[test]
+    fn checkout_rejects_configured_branch_missing_from_origin_even_with_stale_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let seed = tmp.path().join("seed");
+        let clone = tmp.path().join("clone");
+        super::run_git(
+            tmp.path(),
+            ["init", "--bare", origin.to_str().unwrap()],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        std::fs::create_dir(&seed).unwrap();
+        super::run_git(&seed, ["init"], Duration::from_secs(10)).unwrap();
+        super::run_git(
+            &seed,
+            ["config", "user.name", "Test"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            &seed,
+            ["config", "user.email", "test@example.com"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        std::fs::write(seed.join("base.txt"), "base").unwrap();
+        super::run_git(&seed, ["add", "-A"], Duration::from_secs(10)).unwrap();
+        super::run_git(&seed, ["commit", "-m", "base"], Duration::from_secs(10)).unwrap();
+        super::run_git(
+            &seed,
+            ["branch", "-M", "configured"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            &seed,
+            ["remote", "add", "origin", origin.to_str().unwrap()],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            &seed,
+            ["push", "-u", "origin", "configured"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            tmp.path(),
+            ["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+
+        // Remove the authoritative remote branch after cloning, leaving the
+        // clone's origin/configured tracking ref stale.
+        super::run_git(
+            &origin,
+            ["branch", "-D", "configured"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            &clone,
+            ["rev-parse", "--verify", "origin/configured"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+
+        let error =
+            super::checkout_clone_for_build(&clone, "configured", "wi/test", None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("configured branch \"configured\" does not exist on origin"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]
