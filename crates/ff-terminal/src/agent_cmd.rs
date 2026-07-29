@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::{CYAN, GREEN, RESET, YELLOW, resolve_pulse_redis_url};
+use crate::{CYAN, GREEN, RESET, resolve_pulse_redis_url};
 
 /// GAP-D-iso: treat `run_cwd` as the canonical repo, then run each dispatched
 /// agent in a fresh throwaway worktree. The worktree intentionally persists
@@ -117,6 +117,167 @@ fn non_empty_or(value: &str, default: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+const REMOTE_GIT_ENV: &str = "env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_GLOBAL=/dev/null \
+GIT_CONFIG_LOCAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false \
+SSH_ASKPASS=/bin/false GIT_SSH_COMMAND=/bin/false";
+const REMOTE_GIT: &str = "git -c core.hooksPath=/dev/null \
+-c core.attributesFile=/dev/null -c credential.helper= \
+-c protocol.file.allow=never -c protocol.ext.allow=never";
+
+#[derive(Debug)]
+struct CommitBackAuthority {
+    worker: String,
+    ssh_user: String,
+    primary_ip: String,
+    slot: i32,
+    workspace: String,
+    source_root: String,
+    repo_url: String,
+}
+
+fn has_unsafe_path_char(value: &str) -> bool {
+    value.chars().any(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '\'' | '"' | '`' | '$' | ';' | '&' | '|' | '<' | '>' | '(' | ')' | '\\' | '\0'
+            )
+    })
+}
+
+fn validate_absolute_location<'a>(label: &str, value: &'a str) -> Result<&'a std::path::Path> {
+    use std::path::{Component, Path};
+
+    if value.is_empty() || value.starts_with('~') || has_unsafe_path_char(value) {
+        anyhow::bail!("{label} contains unsupported characters");
+    }
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        anyhow::bail!("{label} must be absolute");
+    }
+    if path
+        .components()
+        .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+    {
+        anyhow::bail!("{label} contains traversal");
+    }
+    Ok(path)
+}
+
+fn validate_commit_back_locations(
+    metadata: &serde_json::Value,
+    modified_files: &[String],
+    authority: &CommitBackAuthority,
+) -> Result<Vec<String>> {
+    let workspace = validate_absolute_location("registered workspace", &authority.workspace)?;
+    let source_root = validate_absolute_location("registered source root", &authority.source_root)?;
+    let supplied_workspace = metadata
+        .get("working_dir")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("work output has no absolute metadata.working_dir"))?;
+    validate_absolute_location("metadata.working_dir", supplied_workspace)?;
+    if supplied_workspace != authority.workspace {
+        anyhow::bail!("metadata.working_dir does not match the leased slot workspace");
+    }
+
+    let expected_slot = format!("sub-agent-{}", authority.slot);
+    if !workspace
+        .components()
+        .any(|part| part.as_os_str() == expected_slot.as_str())
+    {
+        anyhow::bail!("registered workspace does not match the leased slot");
+    }
+    if !source_root.is_absolute() {
+        anyhow::bail!("registered source root must be absolute");
+    }
+
+    modified_files
+        .iter()
+        .map(|file| {
+            let absolute = validate_absolute_location("modified_files entry", file)?;
+            let relative = absolute.strip_prefix(workspace).map_err(|_| {
+                anyhow::anyhow!("modified_files entry is outside the leased slot workspace")
+            })?;
+            if relative.as_os_str().is_empty() {
+                anyhow::bail!("modified_files entry names the workspace itself");
+            }
+            Ok(relative.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+fn validate_git_atom(label: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.starts_with('-')
+        || value.contains("..")
+        || value.contains("@{")
+        || value.ends_with('.')
+        || value.ends_with('/')
+        || value.ends_with(".lock")
+        || has_unsafe_path_char(value)
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+    {
+        anyhow::bail!("{label} is not a safe Git name");
+    }
+    Ok(())
+}
+
+fn remote_commit_script(
+    authority: &CommitBackAuthority,
+    branch_name: &str,
+    commit_msg: &str,
+    modified_files: &[String],
+) -> String {
+    let slot_root = std::path::Path::new(&authority.workspace)
+        .parent()
+        .expect("validated workspace has a parent")
+        .to_string_lossy();
+    let mut args = vec![
+        authority.workspace.as_str(),
+        slot_root.as_ref(),
+        authority.source_root.as_str(),
+        authority.repo_url.as_str(),
+        branch_name,
+        commit_msg,
+    ];
+    args.extend(modified_files.iter().map(String::as_str));
+
+    let body = format!(
+        "set -eu; workspace=$1; slot_root=$2; source_root=$3; repo_url=$4; \
+         branch=$5; message=$6; shift 6; \
+         workspace_real=$(realpath -e -- \"$workspace\"); \
+         slot_real=$(realpath -e -- \"$slot_root\"); \
+         source_real=$(realpath -e -- \"$source_root\"); \
+         case \"$workspace_real/\" in \"$slot_real/\"*|\"$source_real/\"*) ;; \
+           *) echo 'workspace escapes approved roots' >&2; exit 70;; esac; \
+         test \"$({git_env} {git} -C \"$workspace_real\" rev-parse --show-toplevel)\" = \"$workspace_real\"; \
+         test \"$({git_env} {git} -C \"$workspace_real\" remote get-url origin)\" = \"$repo_url\"; \
+         orig=$({git_env} {git} -C \"$workspace_real\" symbolic-ref --quiet --short HEAD || \
+              {git_env} {git} -C \"$workspace_real\" rev-parse HEAD); \
+         {git_env} {git} -C \"$workspace_real\" check-ref-format --branch \"$branch\" >/dev/null; \
+         {git_env} {git} -C \"$workspace_real\" checkout -b \"$branch\"; \
+         for file do \
+           file_real=$(realpath -e -- \"$workspace_real/$file\"); \
+           case \"$file_real\" in \"$workspace_real\"/*) ;; \
+             *) echo 'modified file escapes workspace' >&2; exit 71;; esac; \
+           {git_env} {git} -C \"$workspace_real\" add -- \"$file\"; \
+         done; \
+         {git_env} {git} -C \"$workspace_real\" commit -m \"$message\"; \
+         {git_env} {git} -C \"$workspace_real\" checkout --detach \"$orig\"",
+        git_env = REMOTE_GIT_ENV,
+        git = REMOTE_GIT,
+    );
+    let mut command = format!("sh -c {} sh", shell_quote(&body));
+    for arg in args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
+    }
+    command
 }
 
 pub async fn handle_agent_fanout(
@@ -343,6 +504,14 @@ pub async fn handle_agent_commit_back(
 
     let project_supplied = project.is_some();
     let git_policy = resolve_agent_git_policy(pool, project.as_deref()).await?;
+    if push || pr || project_supplied {
+        anyhow::bail!(
+            "agent commit-back push and PR integration is disabled until the typed Git transport boundary is available"
+        );
+    }
+    validate_git_atom("branch prefix", &git_policy.branch_prefix)?;
+    validate_git_atom("base branch", &git_policy.base_branch)?;
+    validate_git_atom("Git remote", &git_policy.git_remote)?;
 
     // 1. Look up the latest work_output for this session.
     let row: Option<(
@@ -374,9 +543,9 @@ pub async fn handle_agent_commit_back(
         title,
         worker,
         modified_files_json,
-        model_id,
-        tok_in,
-        tok_out,
+        _model_id,
+        _tok_in,
+        _tok_out,
         metadata,
     ) = row.ok_or_else(|| {
         anyhow::anyhow!(
@@ -397,31 +566,56 @@ pub async fn handle_agent_commit_back(
         ));
     }
 
-    // 2. Resolve SSH target + workspace path.
-    let (ssh_user, primary_ip): (String, String) =
-        sqlx::query_as("SELECT ssh_user, ip FROM fleet_workers WHERE name = $1")
-            .bind(&worker)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| anyhow::anyhow!("lookup fleet_workers: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("no fleet_workers row for computer={worker}"))?;
-
-    // GAP-D1: prefer the actual run working_dir the producer recorded
-    // (`metadata.working_dir`), so commit-back lifts from wherever the run
-    // edited files instead of a hardcoded path. Fall back to the canonical
-    // per-worker checkout (reference_source_tree_locations.md) for older rows.
-    let workspace: String = metadata
-        .get("working_dir")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| {
-            if worker.eq_ignore_ascii_case("taylor") {
-                "~/projects/forge-fleet".to_string()
-            } else {
-                "~/.forgefleet/sub-agents/sub-agent-0/forge-fleet".to_string()
-            }
-        });
+    // 2. Resolve the workspace only through the exact work-item lease, slot,
+    // repository, and computer registrations. The work output merely asserts
+    // identity; it never supplies authority.
+    let authority_row: Option<(String, String, String, i32, String, String, String)> =
+        sqlx::query_as(
+            "SELECT c.name, c.ssh_user, c.primary_ip, sa.slot, sa.workspace_dir, \
+                    c.source_tree_path, COALESCE(pr.github_url, wi.repo_url) \
+             FROM work_items wi \
+             JOIN work_item_leases wl ON wl.work_item_id = wi.id \
+             JOIN sub_agents sa ON sa.id = wl.sub_agent_id \
+                               AND sa.computer_id = wl.computer_id \
+                               AND sa.current_work_item_id = wi.id \
+             JOIN computers c ON c.id = wl.computer_id \
+             LEFT JOIN project_repos pr ON pr.id = wi.repo_id \
+             WHERE wi.id = $1 \
+               AND wl.session_id::text = $2 \
+               AND wl.lease_state = 'building' \
+               AND wl.lease_expires_at > NOW() \
+               AND wi.assigned_computer = c.name \
+               AND c.source_tree_path IS NOT NULL \
+               AND COALESCE(pr.github_url, wi.repo_url) IS NOT NULL \
+             ORDER BY wl.attempt DESC \
+             LIMIT 1",
+        )
+        .bind(work_item_id)
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("resolve exact commit-back authority: {e}"))?;
+    let (registered_worker, ssh_user, primary_ip, slot, workspace, source_root, repo_url) =
+        authority_row.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no active exact lease/slot/repo authority for work item {work_item_id} and session {session_id}"
+            )
+        })?;
+    if worker != registered_worker {
+        anyhow::bail!(
+            "work output computer does not match exact leased computer ({worker} != {registered_worker})"
+        );
+    }
+    let authority = CommitBackAuthority {
+        worker: registered_worker,
+        ssh_user,
+        primary_ip,
+        slot,
+        workspace,
+        source_root,
+        repo_url,
+    };
+    let modified_files = validate_commit_back_locations(&metadata, &modified_files, &authority)?;
 
     // 3. Build branch name: <branch_prefix>/<worker>/<yyyymmdd-HHMMSS>-<slug>-<wi8>.
     //    The work_item_id suffix (GAP-B) guarantees uniqueness even when two
@@ -434,9 +628,10 @@ pub async fn handle_agent_commit_back(
     let branch_name = format!(
         "{}/{}/{stamp}-{title_slug}-{}",
         git_policy.branch_prefix,
-        worker,
+        authority.worker,
         &wi_short[..8.min(wi_short.len())]
     );
+    validate_git_atom("generated branch", &branch_name)?;
     let output_branch_name = if project_supplied && git_policy.integration_strategy == "direct" {
         git_policy.base_branch.clone()
     } else {
@@ -451,8 +646,11 @@ pub async fn handle_agent_commit_back(
 
     eprintln!("{CYAN}▶ ff agent commit-back{RESET}");
     eprintln!("  session:   {session_id}");
-    eprintln!("  worker:    {worker} ({ssh_user}@{primary_ip})");
-    eprintln!("  workspace: {workspace}");
+    eprintln!(
+        "  worker:    {} ({}@{})",
+        authority.worker, authority.ssh_user, authority.primary_ip
+    );
+    eprintln!("  workspace: {}", authority.workspace);
     if let Some(project_id) = project.as_deref() {
         eprintln!("  project:   {project_id}");
         eprintln!("  policy:    {}", git_policy.integration_strategy);
@@ -476,43 +674,8 @@ pub async fn handle_agent_commit_back(
     // branch — observed switching the operator's working tree mid-session. The
     // commit lives on the new branch ref; the push/PR steps below operate on it
     // by name without it being checked out.
-    let mut script = String::new();
-    script.push_str(&format!("cd {workspace} && "));
-    script.push_str("_ff_orig=$(git symbolic-ref --quiet --short HEAD || git rev-parse HEAD) && ");
-    if project_supplied && git_policy.integration_strategy == "direct" {
-        script.push_str(&format!(
-            "git fetch {remote} {base} >/dev/null 2>&1 || true && \
-             {{ git checkout {base} 2>&1 || git checkout -B {base} {remote_ref} 2>&1; }} && ",
-            remote = shell_quote(&git_policy.git_remote),
-            base = shell_quote(&git_policy.base_branch),
-            remote_ref = shell_quote(&format!(
-                "{}/{}",
-                git_policy.git_remote, git_policy.base_branch
-            )),
-        ));
-    } else {
-        script.push_str(&format!(
-            "git fetch {remote} {base} >/dev/null 2>&1 || true && \
-             git checkout -b {shell_branch} 2>&1 && ",
-            remote = shell_quote(&git_policy.git_remote),
-            base = shell_quote(&git_policy.base_branch),
-            shell_branch = shell_quote(&branch_name)
-        ));
-    }
-    for f in &modified_files {
-        script.push_str(&format!("git add -- {} && ", shell_quote(f)));
-    }
-    script.push_str(&format!(
-        "git commit -m {msg} 2>&1 && ",
-        msg = shell_quote(&commit_msg)
-    ));
-    // Restore the original branch (best-effort; the commit is safe on the new
-    // branch regardless). A clean working tree after commit makes this succeed.
-    script.push_str(
-        "{ git checkout \"$_ff_orig\" 2>&1 || echo \"warn: could not restore $_ff_orig\"; }",
-    );
-
-    let target = format!("{ssh_user}@{primary_ip}");
+    let script = remote_commit_script(&authority, &branch_name, &commit_msg, &modified_files);
+    let target = format!("{}@{}", authority.ssh_user, authority.primary_ip);
     let out = Command::new("ssh")
         .args([
             "-o",
@@ -521,6 +684,7 @@ pub async fn handle_agent_commit_back(
             "ConnectTimeout=10",
             "-o",
             "StrictHostKeyChecking=accept-new",
+            "--",
             &target,
             &script,
         ])
@@ -539,144 +703,7 @@ pub async fn handle_agent_commit_back(
         ));
     }
     eprintln!("{GREEN}✓ committed{RESET}");
-
-    // 4. Optional push.
-    let should_push = if project_supplied {
-        matches!(
-            git_policy.integration_strategy.as_str(),
-            "direct" | "feature_pr" | "feature_push"
-        )
-    } else {
-        push || pr
-    };
-    if should_push {
-        let push_cmd = if project_supplied && git_policy.integration_strategy == "direct" {
-            format!(
-                "cd {workspace} && git push {remote} {base}:{base}",
-                remote = shell_quote(&git_policy.git_remote),
-                base = shell_quote(&git_policy.base_branch),
-            )
-        } else {
-            format!(
-                "cd {workspace} && git push -u {remote} {br}",
-                remote = shell_quote(&git_policy.git_remote),
-                br = shell_quote(&branch_name)
-            )
-        };
-        let out = Command::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                &target,
-                &push_cmd,
-            ])
-            .output()
-            .await
-            .map_err(|e| anyhow::anyhow!("ssh push: {e}"))?;
-        if !out.status.success() {
-            return Err(anyhow::anyhow!(
-                "remote git push failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        if project_supplied && git_policy.integration_strategy == "direct" {
-            eprintln!(
-                "{GREEN}✓ pushed{RESET} {}/{}",
-                git_policy.git_remote, git_policy.base_branch
-            );
-        } else {
-            eprintln!(
-                "{GREEN}✓ pushed{RESET} {}/{}",
-                git_policy.git_remote, branch_name
-            );
-        }
-    }
-
-    // 5. Optional PR via gh on the worker.
-    let mut pr_url: Option<String> = None;
-    let should_open_pr = if project_supplied {
-        git_policy.integration_strategy == "feature_pr"
-    } else {
-        pr
-    };
-    if should_open_pr {
-        // Confirm gh auth before attempting.
-        let auth_check = Command::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                &target,
-                "gh auth status >/dev/null 2>&1 && echo ok || echo missing",
-            ])
-            .output()
-            .await
-            .map_err(|e| anyhow::anyhow!("ssh gh auth status: {e}"))?;
-        let auth_ok = String::from_utf8_lossy(&auth_check.stdout).trim() == "ok";
-        if !auth_ok {
-            return Err(anyhow::anyhow!(
-                "gh CLI is not authenticated on {worker}. \
-                 Run `ssh {target} gh auth login` first, or skip --pr."
-            ));
-        }
-
-        let body = format!(
-            "Produced by ff agent on {worker} in session {session_id}.\n\n\
-             - Worker: {worker}\n\
-             - Model:  {}\n\
-             - Tokens: prompt={} completion={}\n\
-             - Files:  {} modified\n\n\
-             Generated by `ff agent commit-back`.",
-            model_id.as_deref().unwrap_or("(unknown)"),
-            tok_in.unwrap_or(0),
-            tok_out.unwrap_or(0),
-            modified_files.len(),
-        );
-        let pr_title = title.as_deref().unwrap_or("ff agent commit-back");
-
-        let gh_cmd = format!(
-            "cd {workspace} && gh pr create --base {base} --head {br} \
-             --title {title_q} --body {body_q}",
-            base = shell_quote(&git_policy.base_branch),
-            br = shell_quote(&branch_name),
-            title_q = shell_quote(pr_title),
-            body_q = shell_quote(&body),
-        );
-        let out = Command::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=30",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                &target,
-                &gh_cmd,
-            ])
-            .output()
-            .await
-            .map_err(|e| anyhow::anyhow!("ssh gh pr create: {e}"))?;
-        if !out.status.success() {
-            return Err(anyhow::anyhow!(
-                "remote `gh pr create` failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !url.is_empty() {
-            pr_url = Some(url.clone());
-            eprintln!("{GREEN}✓ PR opened{RESET} {url}");
-        } else {
-            eprintln!("{YELLOW}! PR created but no URL returned{RESET}");
-        }
-    }
+    let pr_url: Option<String> = None;
 
     // Persist branch + PR URL onto the work_item.
     let _ = sqlx::query(
@@ -756,6 +783,130 @@ pub fn shell_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+#[cfg(test)]
+mod commit_back_security_tests {
+    use super::*;
+
+    fn authority() -> CommitBackAuthority {
+        CommitBackAuthority {
+            worker: "sophie".into(),
+            ssh_user: "sophie".into(),
+            primary_ip: "10.0.0.8".into(),
+            slot: 0,
+            workspace: "/home/sophie/.forgefleet/sub-agents/sub-agent-0/forge-fleet".into(),
+            source_root: "/home/sophie/projects/forge-fleet".into(),
+            repo_url: "git@github.com-venkat:venkatyarl/forge-fleet.git".into(),
+        }
+    }
+
+    fn metadata(path: &str) -> serde_json::Value {
+        serde_json::json!({ "working_dir": path })
+    }
+
+    #[test]
+    fn hostile_workspace_metadata_is_rejected() {
+        let auth = authority();
+        let file = format!("{}/src/lib.rs", auth.workspace);
+        for hostile in [
+            "~/.forgefleet/sub-agents/sub-agent-0/forge-fleet",
+            "relative/forge-fleet",
+            "/home/sophie/other",
+            "/home/sophie/.forgefleet/sub-agents/sub-agent-0/../outside",
+            "/home/sophie/forge fleet",
+            "/home/sophie/forge'fleet",
+            "/home/sophie/forge;touch-pwned",
+            "/home/sophie/forge$(touch-pwned)",
+        ] {
+            assert!(
+                validate_commit_back_locations(
+                    &metadata(hostile),
+                    std::slice::from_ref(&file),
+                    &auth
+                )
+                .is_err(),
+                "accepted hostile workspace {hostile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_modified_files_are_rejected() {
+        let auth = authority();
+        for hostile in [
+            "src/lib.rs",
+            "~/src/lib.rs",
+            "/tmp/outside.rs",
+            "/home/sophie/.forgefleet/sub-agents/sub-agent-0/forge-fleet/../outside.rs",
+            "/home/sophie/.forgefleet/sub-agents/sub-agent-0/forge-fleet/white space.rs",
+            "/home/sophie/.forgefleet/sub-agents/sub-agent-0/forge-fleet/quote'.rs",
+            "/home/sophie/.forgefleet/sub-agents/sub-agent-0/forge-fleet/x;touch-pwned",
+            "/home/sophie/.forgefleet/sub-agents/sub-agent-0/forge-fleet/$(touch-pwned)",
+        ] {
+            assert!(
+                validate_commit_back_locations(
+                    &metadata(&auth.workspace),
+                    &[hostile.to_string()],
+                    &auth
+                )
+                .is_err(),
+                "accepted hostile file {hostile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_files_become_workspace_relative() {
+        let auth = authority();
+        let files = vec![
+            format!("{}/crates/ff-terminal/src/agent_cmd.rs", auth.workspace),
+            format!("{}/README.md", auth.workspace),
+        ];
+        assert_eq!(
+            validate_commit_back_locations(&metadata(&auth.workspace), &files, &auth).unwrap(),
+            ["crates/ff-terminal/src/agent_cmd.rs", "README.md"]
+        );
+    }
+
+    #[test]
+    fn branch_and_ref_validation_rejects_options_and_ref_syntax() {
+        for hostile in [
+            "-main",
+            "refs/heads/x..y",
+            "refs/heads/x@{0}",
+            "refs/heads/x.lock",
+            "refs/heads/x;",
+            "refs/heads/$(touch-pwned)",
+            "refs/heads/white space",
+            "refs/heads/quote'",
+        ] {
+            assert!(validate_git_atom("ref", hostile).is_err(), "{hostile}");
+        }
+        assert!(validate_git_atom("ref", "fleet/sophie/safe-123").is_ok());
+    }
+
+    #[test]
+    fn remote_script_canonicalizes_symlinks_and_sanitizes_git() {
+        let auth = authority();
+        let script = remote_commit_script(
+            &auth,
+            "fleet/sophie/safe-123",
+            "safe commit",
+            &["crates/ff-terminal/src/agent_cmd.rs".into()],
+        );
+        assert!(script.contains("realpath -e"));
+        assert!(script.contains("workspace escapes approved roots"));
+        assert!(script.contains("modified file escapes workspace"));
+        assert!(script.contains("GIT_CONFIG_NOSYSTEM=1"));
+        assert!(script.contains("GIT_CONFIG_SYSTEM=/dev/null"));
+        assert!(script.contains("GIT_CONFIG_GLOBAL=/dev/null"));
+        assert!(script.contains("GIT_CONFIG_LOCAL=/dev/null"));
+        assert!(script.contains("core.hooksPath=/dev/null"));
+        assert!(script.contains("GIT_SSH_COMMAND=/bin/false"));
+        assert!(!script.contains("git push"));
+        assert!(!script.contains("gh "));
+    }
 }
 
 pub async fn handle_agent(cmd: crate::AgentCommand) -> Result<()> {
