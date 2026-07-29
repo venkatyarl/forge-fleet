@@ -575,6 +575,17 @@ pub async fn attached_clients(
     Ok(rows)
 }
 
+/// Mark a single session's workstream seat as detached.
+pub async fn detach(pg: &PgPool, session_id: &str) -> Result<bool> {
+    ensure_client_schema(pg).await?;
+    let result =
+        sqlx::query("UPDATE workstream_clients SET status = 'detached' WHERE session_id = $1")
+            .bind(session_id)
+            .execute(pg)
+            .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// A seat pruned by `prune_stale_clients`, for reporting what changed.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct PrunedClient {
