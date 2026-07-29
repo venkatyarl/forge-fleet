@@ -128,6 +128,30 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
             println!("  priority: {prio}");
             println!("  created_by: {created_by}");
         }
+        crate::PmCommand::Close {
+            id,
+            evidence,
+            commit,
+            verified,
+            deploy_verified,
+        } => {
+            let uid = uuid::Uuid::parse_str(&id)
+                .map_err(|e| anyhow::anyhow!("invalid work item id '{id}': {e}"))?;
+            let actor = ff_agent::fleet_info::resolve_this_worker_name().await;
+            let result = close_work_item(
+                &pool,
+                uid,
+                &evidence,
+                commit.as_deref(),
+                verified,
+                deploy_verified,
+                &actor,
+            )
+            .await?;
+            println!("{GREEN}✓ work item {id} closed with evidence{RESET}");
+            println!("  status: {}", result.status);
+            println!("  actor:  {actor}");
+        }
         crate::PmCommand::Decompose {
             goal,
             project,
@@ -518,6 +542,232 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
         }
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct CloseResult {
+    status: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HumanCloseEvidence {
+    at: chrono::DateTime<chrono::Utc>,
+    actor: String,
+    evidence: String,
+}
+
+fn validate_close_request<'a>(
+    evidence: &'a str,
+    commit: Option<&'a str>,
+    verified: bool,
+    deploy_verified: bool,
+) -> Result<(&'a str, Option<&'a str>)> {
+    let evidence = evidence.trim();
+    if evidence.is_empty() {
+        anyhow::bail!("--evidence must not be blank");
+    }
+    if deploy_verified && !verified {
+        anyhow::bail!("--deploy-verified requires --verified");
+    }
+    let commit = commit.map(str::trim);
+    if commit == Some("") {
+        anyhow::bail!("--commit must not be blank");
+    }
+    Ok((evidence, commit))
+}
+
+fn append_human_close_evidence(
+    acceptance_check: Option<&str>,
+    last_error: Option<&str>,
+    actor: &str,
+    evidence: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<(String, bool)> {
+    const PREFIX: &str = "human-close: ";
+    let mut out = acceptance_check.unwrap_or_default().trim_end().to_string();
+    if let Some(last_error) = last_error.filter(|value| !value.trim().is_empty()) {
+        let preserved = format!("prior-last-error: {}", last_error.trim());
+        if !out.lines().any(|line| line == preserved) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&preserved);
+        }
+    }
+
+    let duplicate = out
+        .lines()
+        .filter_map(|line| line.strip_prefix(PREFIX))
+        .any(|json| {
+            serde_json::from_str::<HumanCloseEvidence>(json)
+                .map(|old| old.evidence == evidence)
+                .unwrap_or(false)
+        });
+    if duplicate {
+        return Ok((out, false));
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(PREFIX);
+    out.push_str(&serde_json::to_string(&HumanCloseEvidence {
+        at,
+        actor: actor.to_string(),
+        evidence: evidence.to_string(),
+    })?);
+    Ok((out, true))
+}
+
+async fn close_work_item(
+    pool: &sqlx::PgPool,
+    id: uuid::Uuid,
+    evidence: &str,
+    commit: Option<&str>,
+    verified: bool,
+    deploy_verified: bool,
+    actor: &str,
+) -> Result<CloseResult> {
+    let (evidence, commit) = validate_close_request(evidence, commit, verified, deploy_verified)?;
+    let mut tx = pool.begin().await?;
+    let row: Option<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i16,
+        i32,
+    )> = sqlx::query_as(
+        "SELECT status, acceptance_check, last_error, fix_commit, verified, \
+                COALESCE(deploy_verified, 0) \
+           FROM work_items WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| anyhow::anyhow!("lock work item: {error}"))?;
+    let Some((
+        source_status,
+        acceptance_check,
+        last_error,
+        existing_commit,
+        existing_verified,
+        existing_deploy_verified,
+    )) = row
+    else {
+        anyhow::bail!("no work item with id {id}");
+    };
+
+    match source_status.as_str() {
+        "building" | "claimed" | "in_review" | "decomposing" => {
+            anyhow::bail!("work item {id} is active ({source_status}) and cannot be closed");
+        }
+        "idea" | "backlog" | "ready" | "blocked" | "failed" | "cancelled" | "decomposed"
+        | "in_progress" | "done" | "merged" => {}
+        other => anyhow::bail!("work item {id} has unsupported close source status '{other}'"),
+    }
+    // Treat every unreleased lease as active for closure purposes, even after
+    // its timestamp expires. Otherwise a concurrent heartbeat could revive an
+    // expired row after this check and leave a terminal item with a live slot.
+    // The lease reaper must release stale rows before evidence closure.
+    let unreleased_lease: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM work_item_leases \
+          WHERE work_item_id = $1 AND released_at IS NULL)",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|error| anyhow::anyhow!("check active lease: {error}"))?;
+    if unreleased_lease {
+        anyhow::bail!("work item {id} has an unreleased lease and cannot be closed");
+    }
+    if let (Some(existing), Some(requested)) = (existing_commit.as_deref(), commit)
+        && !existing.trim().is_empty()
+        && existing.trim() != requested
+    {
+        anyhow::bail!(
+            "work item {id} already records fix_commit '{existing}', conflicting with '{requested}'"
+        );
+    }
+
+    let now = chrono::Utc::now();
+    let prior_acceptance = acceptance_check.as_deref().unwrap_or_default().trim_end();
+    let (acceptance_check, _) = append_human_close_evidence(
+        acceptance_check.as_deref(),
+        last_error.as_deref(),
+        actor,
+        evidence,
+        now,
+    )?;
+    let acceptance_changed = acceptance_check != prior_acceptance;
+    let target_status = if matches!(source_status.as_str(), "done" | "merged") {
+        source_status.as_str()
+    } else {
+        "done"
+    };
+    let already_idempotent = !acceptance_changed
+        && target_status == source_status
+        && commit.map_or(true, |requested| {
+            existing_commit
+                .as_deref()
+                .is_some_and(|existing| existing.trim() == requested)
+        })
+        && last_error
+            .as_deref()
+            .map_or(true, |error| error.trim().is_empty())
+        && (!verified || existing_verified != 0)
+        && (!deploy_verified || existing_deploy_verified != 0);
+    if already_idempotent {
+        tx.rollback().await?;
+        return Ok(CloseResult {
+            status: source_status,
+        });
+    }
+
+    let updated: Option<(String,)> = sqlx::query_as(
+        "UPDATE work_items \
+            SET status = $3, acceptance_check = $4, last_error = NULL, \
+                completed_at = COALESCE(completed_at, $5), \
+                fix_commit = COALESCE(NULLIF(fix_commit, ''), $6), \
+                verified = CASE WHEN $7 THEN 1 ELSE verified END, \
+                verified_at = CASE WHEN $7 THEN COALESCE(verified_at, $5) ELSE verified_at END, \
+                deploy_verified = CASE WHEN $8 THEN 1 ELSE deploy_verified END \
+          WHERE id = $1 AND status = $2 \
+        RETURNING status",
+    )
+    .bind(id)
+    .bind(&source_status)
+    .bind(target_status)
+    .bind(&acceptance_check)
+    .bind(now)
+    .bind(commit)
+    .bind(verified)
+    .bind(deploy_verified)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| anyhow::anyhow!("close work item: {error}"))?;
+    let Some((status,)) = updated else {
+        anyhow::bail!("work item {id} changed status concurrently; closure rolled back");
+    };
+    sqlx::query(
+        "INSERT INTO work_item_events \
+            (work_item_id, from_status, to_status, computer, detail) \
+         VALUES ($1, $2, $3, $4, jsonb_build_object( \
+            'action', 'human_close', 'evidence', $5::text, 'commit', $6::text, \
+            'verified', $7::boolean, 'deploy_verified', $8::boolean))",
+    )
+    .bind(id)
+    .bind(&source_status)
+    .bind(&status)
+    .bind(actor)
+    .bind(evidence)
+    .bind(commit)
+    .bind(verified)
+    .bind(deploy_verified)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| anyhow::anyhow!("audit work item close: {error}"))?;
+    tx.commit().await?;
+    Ok(CloseResult { status })
 }
 
 /// `ff pm integrate` — build an integration branch by merging a cluster of
@@ -2540,6 +2790,44 @@ async fn handle_pm_purge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_validation_rejects_blank_evidence_and_bad_verification_dependency() {
+        assert!(validate_close_request(" \n", None, false, false).is_err());
+        assert!(validate_close_request("proof", None, false, true).is_err());
+        assert!(validate_close_request("proof", Some(" "), true, false).is_err());
+        assert!(validate_close_request(" proof ", Some("abc"), true, true).is_ok());
+    }
+
+    #[test]
+    fn close_evidence_preserves_prior_content_and_error_and_deduplicates() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-07-29T09:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let (once, first_appended) = append_human_close_evidence(
+            Some("existing acceptance"),
+            Some("old failure"),
+            "marcus",
+            "tests pass",
+            at,
+        )
+        .unwrap();
+        let (twice, second_appended) = append_human_close_evidence(
+            Some(&once),
+            Some("old failure"),
+            "adele",
+            "tests pass",
+            at + chrono::Duration::minutes(1),
+        )
+        .unwrap();
+        assert!(first_appended);
+        assert!(!second_appended);
+        assert!(twice.starts_with("existing acceptance\n"));
+        assert_eq!(twice.matches("prior-last-error: old failure").count(), 1);
+        assert_eq!(twice.matches("human-close: ").count(), 1);
+        assert!(twice.contains("\"actor\":\"marcus\""));
+        assert!(twice.contains("\"evidence\":\"tests pass\""));
+    }
 
     #[test]
     fn decomposition_quality_gate_merges_sibling_file_overlap() {
