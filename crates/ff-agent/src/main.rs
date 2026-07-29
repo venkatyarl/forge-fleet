@@ -64,7 +64,9 @@ async fn main() -> anyhow::Result<()> {
     let http_ctx = AppContext {
         state: shared_state.clone(),
         task_tx: task_tx.clone(),
-        auth_secret: ff_agent::http_auth::control_plane_secret().map_err(anyhow::Error::msg)?,
+        auth_secret: ff_agent::http_auth::control_plane_secret()
+            .await
+            .map_err(anyhow::Error::msg)?,
     };
 
     let http_cancel = cancel.clone();
