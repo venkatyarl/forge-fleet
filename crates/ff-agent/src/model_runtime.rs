@@ -2156,6 +2156,9 @@ pub(crate) async fn stop_systemd_unit(port: u16) {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn stop_systemd_unit(_port: u16) {}
+
 /// Authenticate a systemd-supervised restart after the persisted PID/start
 /// marker became stale. The current listener must be this exact unit's MainPID
 /// and the unit's configured model path must still match the deployment's
