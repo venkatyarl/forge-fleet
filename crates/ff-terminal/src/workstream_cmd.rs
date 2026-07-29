@@ -371,16 +371,20 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
                 }
             }
         }
-        crate::WorkstreamCommand::List => {
+        crate::WorkstreamCommand::List { json } => {
             let rows = sqlx::query_as::<_, (String, String, String)>(
                 "SELECT project_key, basename, coalesce(git_remote,'') \
                    FROM ff_workstreams WHERE status='active' ORDER BY project_key",
             )
             .fetch_all(&pg)
             .await?;
-            println!("Active workstreams ({}):", rows.len());
-            for (key, base, remote) in rows {
-                println!("  • {base}  ({key})  {remote}");
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                println!("Active workstreams ({}):", rows.len());
+                for (key, base, remote) in rows {
+                    println!("  • {base}  ({key})  {remote}");
+                }
             }
         }
         crate::WorkstreamCommand::Heartbeat { tool, session } => {
