@@ -1,0 +1,7 @@
+tailscale:
+  enabled: true
+  flags:
+    - --accept-routes
+
+postgres:
+  primary: postgresql://forgefleet:forgefleet@priya.tailnet-name.ts.net:55432/forgefleet

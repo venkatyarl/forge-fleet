@@ -6976,6 +6976,11 @@ mod tests {
     use std::time::Duration;
     use uuid::Uuid;
 
+    use crate::work_item_scheduler::{
+        reconcile_deploy_pending_local_failures, requeue_deployed_local_retests,
+        route_diagnosed_local_failures,
+    };
+
     fn test_item(attempts: i32, last_error: Option<&str>, complexity: &str) -> AssignedWorkItem {
         AssignedWorkItem {
             work_item_id: Uuid::new_v4(),
@@ -8012,6 +8017,130 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup after test");
+    }
+
+    #[tokio::test]
+    async fn cloud_rescue_diagnosis_drives_deployed_local_first_retest() {
+        let url = match std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+        {
+            Ok(url) => url,
+            Err(_) => {
+                eprintln!(
+                    "skipping cloud rescue learning-loop DB test: no \
+                     FORGEFLEET_POSTGRES_URL/FORGEFLEET_DATABASE_URL"
+                );
+                return;
+            }
+        };
+        let pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("skipping cloud rescue learning-loop DB test: database unavailable: {e}");
+                return;
+            }
+        };
+        ff_db::run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should create cloud-fixes-local tables");
+
+        let mut item = test_item(
+            3,
+            Some("local model edited the scheduler instead of the owning dispatch module"),
+            "mechanical",
+        );
+        item.work_item_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO work_items (id, project_id, kind, title, status, attempts)
+             VALUES ($1, 'forge-fleet', 'task', 'cloud rescue learning loop', 'done', 3)",
+        )
+        .bind(item.work_item_id)
+        .execute(&pool)
+        .await
+        .expect("insert learning-loop work item");
+
+        let cloud_output = synthetic_output(
+            "LOCAL_FAILURE_DIAGNOSIS: \
+             {\"cause_class\":\"context_prompt_gap\",\"summary\":\"The local prompt omitted the \
+             owning dispatch module; add that module and the failed review to its context pack.\"}",
+        );
+        record_cloud_rescue_local_failure_diagnosis(&pool, &item, "cloud:codex", &cloud_output)
+            .await
+            .expect("cloud rescue must persist its diagnosis");
+
+        let diagnosed: (String, String, String) = sqlx::query_as(
+            "SELECT cloud_diagnosis, cause_class, remediation_status
+               FROM local_failure_diagnoses
+              WHERE work_item_id = $1",
+        )
+        .bind(item.work_item_id)
+        .fetch_one(&pool)
+        .await
+        .expect("populated diagnosis row");
+        assert!(!diagnosed.0.is_empty());
+        assert_eq!(diagnosed.1, "context_prompt_gap");
+        assert_eq!(diagnosed.2, "diagnosed");
+
+        assert_eq!(route_diagnosed_local_failures(&pool).await.unwrap(), 1);
+        assert_eq!(
+            reconcile_deploy_pending_local_failures(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(requeue_deployed_local_retests(&pool).await.unwrap(), 1);
+
+        let rebuilt: (String, i32, String, serde_json::Value) = sqlx::query_as(
+            "SELECT w.status, w.attempts, d.remediation_status, w.context
+               FROM work_items w
+               JOIN local_failure_diagnoses d ON d.work_item_id = w.id
+              WHERE w.id = $1",
+        )
+        .bind(item.work_item_id)
+        .fetch_one(&pool)
+        .await
+        .expect("same item must be requeued for a local-first rebuild");
+        assert_eq!(rebuilt.0, "ready");
+        assert_eq!(rebuilt.1, 0);
+        assert_eq!(rebuilt.2, "local_retest_running");
+        assert_eq!(
+            rebuilt.3["local_failure_improvement"]["cause_class"],
+            "context_prompt_gap"
+        );
+        assert_eq!(
+            requeue_deployed_local_retests(&pool).await.unwrap(),
+            0,
+            "the deployed diagnosis must enqueue its local retest only once"
+        );
+
+        let diagnosis_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM local_failure_diagnoses WHERE work_item_id = $1")
+                .bind(item.work_item_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read diagnosis id for cleanup");
+        sqlx::query(
+            "DELETE FROM local_context_sources
+              WHERE uri = 'local-failure-diagnosis://' || $1::uuid",
+        )
+        .bind(diagnosis_id)
+        .execute(&pool)
+        .await
+        .expect("delete learning-loop context source");
+        sqlx::query("DELETE FROM local_failure_diagnoses WHERE work_item_id = $1")
+            .bind(item.work_item_id)
+            .execute(&pool)
+            .await
+            .expect("delete learning-loop diagnosis");
+        sqlx::query("DELETE FROM work_items WHERE id = $1")
+            .bind(item.work_item_id)
+            .execute(&pool)
+            .await
+            .expect("delete learning-loop work item");
     }
 
     #[tokio::test]

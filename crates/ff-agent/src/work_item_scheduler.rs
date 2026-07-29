@@ -427,7 +427,7 @@ async fn auto_requeue_failed_work_items(pg: &PgPool) -> Result<u64> {
         .rows_affected())
 }
 
-async fn requeue_deployed_local_retests(pg: &PgPool) -> Result<u64> {
+pub(crate) async fn requeue_deployed_local_retests(pg: &PgPool) -> Result<u64> {
     Ok(sqlx::query(REQUEUE_DEPLOYED_LOCAL_RETESTS_SQL)
         .bind(MAX_ASSIGN_PER_TICK)
         .execute(pg)
@@ -435,7 +435,7 @@ async fn requeue_deployed_local_retests(pg: &PgPool) -> Result<u64> {
         .rows_affected())
 }
 
-async fn route_diagnosed_local_failures(pg: &PgPool) -> Result<u64> {
+pub(crate) async fn route_diagnosed_local_failures(pg: &PgPool) -> Result<u64> {
     Ok(sqlx::query(ROUTE_DIAGNOSED_LOCAL_FAILURES_SQL)
         .bind(MAX_ASSIGN_PER_TICK)
         .execute(pg)
@@ -443,7 +443,7 @@ async fn route_diagnosed_local_failures(pg: &PgPool) -> Result<u64> {
         .rows_affected())
 }
 
-async fn reconcile_deploy_pending_local_failures(pg: &PgPool) -> Result<u64> {
+pub(crate) async fn reconcile_deploy_pending_local_failures(pg: &PgPool) -> Result<u64> {
     Ok(sqlx::query(RECONCILE_DEPLOY_PENDING_LOCAL_FAILURES_SQL)
         .bind(MAX_ASSIGN_PER_TICK)
         .execute(pg)
