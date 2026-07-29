@@ -5355,6 +5355,7 @@ mod tests {
                  id                   UUID PRIMARY KEY,
                  computer_id          UUID NOT NULL REFERENCES computers(id),
                  slot                 INT NOT NULL,
+                 kind                 TEXT NOT NULL DEFAULT 'sub_agent',
                  status               TEXT NOT NULL DEFAULT 'idle',
                  current_work_item_id UUID REFERENCES work_items(id),
                  started_at           TIMESTAMPTZ,
@@ -5378,6 +5379,76 @@ mod tests {
         .await
         .expect("create minimal slot/lease schema");
         Some((admin, pool, db_name))
+    }
+
+    #[tokio::test]
+    async fn free_slots_allow_stale_idle_heartbeat_but_exclude_occupied_and_leased_slots() {
+        let Some((admin, pool, db_name)) = create_slot_reconcile_db().await else {
+            return;
+        };
+
+        let computer = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'fresh-host')")
+            .bind(computer)
+            .execute(&pool)
+            .await
+            .expect("insert computer");
+
+        let occupied_item = uuid::Uuid::new_v4();
+        let leased_item = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO work_items (id, status)
+             VALUES ($1, 'building'), ($2, 'claimed')",
+        )
+        .bind(occupied_item)
+        .bind(leased_item)
+        .execute(&pool)
+        .await
+        .expect("insert work items");
+
+        let stale_idle = uuid::Uuid::new_v4();
+        let occupied = uuid::Uuid::new_v4();
+        let leased = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO sub_agents
+                 (id, computer_id, slot, status, current_work_item_id, last_heartbeat_at)
+             VALUES
+                 ($1, $4, 0, 'idle', NULL, NOW() - INTERVAL '1 day'),
+                 ($2, $4, 1, 'busy', $5, NOW()),
+                 ($3, $4, 2, 'idle', NULL, NOW())",
+        )
+        .bind(stale_idle)
+        .bind(occupied)
+        .bind(leased)
+        .bind(computer)
+        .bind(occupied_item)
+        .execute(&pool)
+        .await
+        .expect("insert slots");
+        sqlx::query(
+            "INSERT INTO work_item_leases
+                 (work_item_id, sub_agent_id, computer_id)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(leased_item)
+        .bind(leased)
+        .bind(computer)
+        .execute(&pool)
+        .await
+        .expect("insert active lease");
+
+        let free = pg_free_slots(&pool, None, 10)
+            .await
+            .expect("query free slots");
+        assert_eq!(
+            free.iter()
+                .map(|slot| slot.sub_agent_id)
+                .collect::<Vec<_>>(),
+            vec![stale_idle],
+            "idle heartbeat age is not a gate; occupied and actively leased slots are"
+        );
+
+        drop_temp_db(admin, pool, &db_name).await;
     }
 
     /// Minimal schema for exercising the complete stale-lease transaction
