@@ -88,6 +88,8 @@ struct AssignedWorkItem {
     title: String,
     description: Option<String>,
     base_branch: Option<String>,
+    repo_default_branch: Option<String>,
+    project_default_branch: Option<String>,
     repo_id: Option<Uuid>,
     repo_url: Option<String>,
     repo_path: PathBuf,
@@ -496,6 +498,8 @@ async fn assigned_work_items(
             w.title,
             w.description,
             w.base_branch,
+            NULLIF(wr.default_branch, '') AS repo_default_branch,
+            NULLIF(p.default_branch, '') AS project_default_branch,
             w.repo_id,
             COALESCE(w.attempts, 0) AS attempts,
             w.last_error,
@@ -540,6 +544,7 @@ async fn assigned_work_items(
           JOIN computers c ON c.id = sa.computer_id
           JOIN work_items w ON w.id = sa.current_work_item_id
           LEFT JOIN project_repos wr ON wr.id = w.repo_id
+          LEFT JOIN projects p ON p.id = w.project_id
           JOIN work_item_leases l
             ON l.work_item_id = w.id
            AND l.sub_agent_id = sa.id
@@ -631,6 +636,8 @@ async fn assigned_work_items(
                 title: r.get("title"),
                 description: r.try_get("description").ok().flatten(),
                 base_branch: r.try_get("base_branch").ok().flatten(),
+                repo_default_branch: r.try_get("repo_default_branch").ok().flatten(),
+                project_default_branch: r.try_get("project_default_branch").ok().flatten(),
                 repo_id: r.try_get("repo_id").ok().flatten(),
                 repo_url,
                 repo_path,
@@ -1828,11 +1835,100 @@ fn task_branch_name(title: &str, work_item_id: uuid::Uuid) -> String {
     }
 }
 
-async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Result<WorktreeRecord> {
-    let base_branch = match item.base_branch.as_deref() {
-        Some(branch) if !branch.trim().is_empty() => branch.trim().to_string(),
-        _ => default_branch(&item.repo_path).unwrap_or_else(|_| "main".to_string()),
+#[derive(Debug, PartialEq, Eq)]
+struct BaseBranchResolution {
+    branch: String,
+    tier: &'static str,
+    repo_default: Option<String>,
+    project_default: Option<String>,
+}
+
+fn nonempty_branch(branch: Option<&str>) -> Option<String> {
+    branch
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_string)
+}
+
+fn resolve_base_branch(
+    work_item: Option<&str>,
+    repo_default: Option<&str>,
+    project_default: Option<&str>,
+    origin_head: Option<&str>,
+) -> BaseBranchResolution {
+    let work_item = nonempty_branch(work_item);
+    let repo_default = nonempty_branch(repo_default);
+    let project_default = nonempty_branch(project_default);
+    let origin_head = nonempty_branch(origin_head);
+    let (branch, tier) = if let Some(branch) = work_item {
+        (branch, "work_item")
+    } else if let Some(branch) = repo_default.clone() {
+        (branch, "repo_default")
+    } else if let Some(branch) = project_default.clone() {
+        (branch, "project_default")
+    } else if let Some(branch) = origin_head {
+        (branch, "origin_head")
+    } else {
+        ("main".to_string(), "hardcoded_main")
     };
+    BaseBranchResolution {
+        branch,
+        tier,
+        repo_default,
+        project_default,
+    }
+}
+
+fn log_base_branch_resolution(item: &AssignedWorkItem, resolution: &BaseBranchResolution) {
+    if let (Some(repo_default), Some(project_default)) = (
+        resolution.repo_default.as_deref(),
+        resolution.project_default.as_deref(),
+    ) && repo_default != project_default
+    {
+        warn!(
+            event = "base_branch_defaults_disagree",
+            work_item_id = %item.work_item_id,
+            project_id = %item.project_id,
+            repo_id = ?item.repo_id,
+            repo_default,
+            project_default,
+            "repo and project default branches disagree"
+        );
+    }
+
+    if resolution.tier == "hardcoded_main" {
+        warn!(
+            event = "work_item_base_branch_resolved",
+            work_item_id = %item.work_item_id,
+            project_id = %item.project_id,
+            repo_id = ?item.repo_id,
+            branch = %resolution.branch,
+            tier = resolution.tier,
+            "resolved work item base branch"
+        );
+    } else {
+        info!(
+            event = "work_item_base_branch_resolved",
+            work_item_id = %item.work_item_id,
+            project_id = %item.project_id,
+            repo_id = ?item.repo_id,
+            branch = %resolution.branch,
+            tier = resolution.tier,
+            "resolved work item base branch"
+        );
+    }
+}
+
+async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Result<WorktreeRecord> {
+    let origin_head = default_branch(&item.repo_path).ok();
+    let branch_resolution = resolve_base_branch(
+        item.base_branch.as_deref(),
+        item.repo_default_branch.as_deref(),
+        item.project_default_branch.as_deref(),
+        origin_head.as_deref(),
+    );
+    log_base_branch_resolution(item, &branch_resolution);
+    let base_branch = branch_resolution.branch;
     let task_branch = task_branch_name(&item.title, item.work_item_id);
 
     // Canonical slots reuse an existing project checkout (~/projects/{project});
@@ -6387,10 +6483,10 @@ mod tests {
         mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers, parse_cli_tokens,
         parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
         quick_empty_success_is_provider_failure, record_cloud_rescue_local_failure_diagnosis,
-        repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
-        same_model_family, should_attempt_lane15, status_output_is_clean, synthetic_output,
-        task_failed_alert_text, task_prefers_cloud_lane, try_acquire_lane15_480b_permit,
-        use_local_lane, validate_manifest_fields,
+        repo_cache_path, repo_slug, resolve_base_branch, retry_error_is_actionable,
+        rewrite_github_host_alias, same_model_family, should_attempt_lane15,
+        status_output_is_clean, synthetic_output, task_failed_alert_text, task_prefers_cloud_lane,
+        try_acquire_lane15_480b_permit, use_local_lane, validate_manifest_fields,
     };
     use sqlx::Row;
     use std::path::PathBuf;
@@ -6404,6 +6500,8 @@ mod tests {
             title: "test cloud rescue".to_string(),
             description: None,
             base_branch: Some("main".to_string()),
+            repo_default_branch: None,
+            project_default_branch: None,
             repo_id: None,
             repo_url: None,
             repo_path: PathBuf::from("/tmp/forge-fleet"),
@@ -6424,6 +6522,54 @@ mod tests {
             work: Vec::new(),
             post_work: Vec::new(),
         }
+    }
+
+    #[test]
+    fn base_branch_resolution_uses_ordered_tiers_and_trims_values() {
+        let cases = [
+            (
+                (
+                    Some(" feature "),
+                    Some("repo"),
+                    Some("project"),
+                    Some("git"),
+                ),
+                ("feature", "work_item"),
+            ),
+            (
+                (Some(" "), Some(" repo "), Some("project"), Some("git")),
+                ("repo", "repo_default"),
+            ),
+            (
+                (None, Some(""), Some(" project "), Some("git")),
+                ("project", "project_default"),
+            ),
+            (
+                (None, None, Some(" "), Some(" git ")),
+                ("git", "origin_head"),
+            ),
+            ((None, None, None, Some("")), ("main", "hardcoded_main")),
+        ];
+
+        for ((work_item, repo, project, origin), (branch, tier)) in cases {
+            let resolution = resolve_base_branch(work_item, repo, project, origin);
+            assert_eq!(resolution.branch, branch);
+            assert_eq!(resolution.tier, tier);
+        }
+    }
+
+    #[test]
+    fn base_branch_resolution_retains_disagreeing_defaults_for_logging() {
+        let resolution = resolve_base_branch(
+            Some("feature"),
+            Some("develop"),
+            Some("main"),
+            Some("trunk"),
+        );
+        assert_eq!(resolution.branch, "feature");
+        assert_eq!(resolution.repo_default.as_deref(), Some("develop"));
+        assert_eq!(resolution.project_default.as_deref(), Some("main"));
+        assert_ne!(resolution.repo_default, resolution.project_default);
     }
 
     #[test]
@@ -7432,6 +7578,8 @@ mod tests {
             title: "Make Telegram alerts readable".into(),
             description: None,
             base_branch: None,
+            repo_default_branch: None,
+            project_default_branch: None,
             repo_id: None,
             repo_url: None,
             repo_path: PathBuf::new(),
