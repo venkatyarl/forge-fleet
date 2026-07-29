@@ -1535,6 +1535,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "ff-github-helperd"
+version = "2026.4.7"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "ff-mc"
 version = "2026.4.7"
 dependencies = [

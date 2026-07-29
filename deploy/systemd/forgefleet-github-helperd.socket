@@ -1,0 +1,14 @@
+[Unit]
+Description=ForgeFleet GitHub capability helper socket
+
+[Socket]
+ListenStream=/run/forgefleet/github-helperd.sock
+SocketUser=root
+SocketGroup=forgefleet-scheduler
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=yes
+Service=forgefleet-github-helperd.service
+
+[Install]
+WantedBy=sockets.target

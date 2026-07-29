@@ -12464,6 +12464,48 @@ pub const SCHEMA_V281_WORK_ITEM_ACCEPTANCE_CRITERIA: &str =
 pub const SCHEMA_V282_OPLOG_REPLAY: &str =
     include_str!("migrations/20260728110000_oplog_replay.sql");
 
+/// V284: durable, replica-safe capabilities and deterministic terminal outcomes.
+/// V283 is reserved by concurrent work and is intentionally not reused.
+pub const SCHEMA_V284_GITHUB_CAPABILITY_NONCES: &str = r#"
+CREATE TABLE IF NOT EXISTS github_capability_nonces (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    nonce_hash BYTEA NOT NULL UNIQUE,
+    work_item_id UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    repo_id UUID NOT NULL REFERENCES project_repos(id),
+    lease_id UUID NOT NULL REFERENCES work_item_leases(id),
+    session_id UUID,
+    attempt INTEGER NOT NULL,
+    computer_id UUID NOT NULL,
+    slot INTEGER NOT NULL,
+    worktree_path TEXT NOT NULL,
+    base_branch TEXT NOT NULL,
+    task_ref TEXT NOT NULL,
+    head_sha TEXT,
+    operation TEXT NOT NULL CHECK (operation IN ('read_pr','push_task_branch')),
+    bound_value TEXT NOT NULL,
+    request_digest TEXT NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    expected_remote_sha TEXT NOT NULL CHECK (expected_remote_sha ~ '^[0-9a-f]{40}$'),
+    peer_uid BIGINT NOT NULL,
+    peer_gid BIGINT NOT NULL,
+    peer_pid INTEGER NOT NULL,
+    peer_start_time BIGINT NOT NULL,
+    peer_executable_sha256 TEXT NOT NULL CHECK (peer_executable_sha256 ~ '^[0-9a-f]{64}$'),
+    peer_cgroup_sha256 BYTEA NOT NULL,
+    state TEXT NOT NULL DEFAULT 'issued' CHECK (state IN ('issued','completed')),
+    issued_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    consumed_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    outcome TEXT CHECK (outcome IN ('backend_unavailable')),
+    CHECK (expires_at > issued_at),
+    CHECK ((state='issued' AND consumed_at IS NULL AND completed_at IS NULL AND outcome IS NULL)
+        OR (state='completed' AND consumed_at IS NOT NULL AND completed_at IS NOT NULL
+            AND outcome IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_github_capability_work_item
+    ON github_capability_nonces (work_item_id, issued_at DESC);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
