@@ -864,7 +864,7 @@ async fn bind_work_item_repo(
         anyhow::bail!("work item {id} changed concurrently; repository binding rolled back");
     }
 
-    sqlx::query(
+    let audited = sqlx::query(
         "INSERT INTO work_item_events \
             (work_item_id, from_status, to_status, computer, attempt, detail) \
          SELECT id, status, 'repo_bound', $2, attempts, \
@@ -878,7 +878,13 @@ async fn bind_work_item_repo(
     .bind(&repo_url)
     .bind(&repo_name)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if audited != 1 {
+        anyhow::bail!(
+            "work item {id} could not be audited after repository binding; transaction rolled back"
+        );
+    }
     tx.commit().await?;
 
     Ok(BindRepoResult {
@@ -3303,6 +3309,21 @@ mod tests {
         assert_eq!(
             row.get::<Option<String>, _>("base_branch").as_deref(),
             Some("develop")
+        );
+        let dispatch_binding: (uuid::Uuid, String) = sqlx::query_as(
+            "SELECT wi.repo_id, pr.github_url \
+               FROM work_items wi \
+               JOIN project_repos pr \
+                 ON pr.id = wi.repo_id AND pr.project_id = wi.project_id \
+              WHERE wi.id = $1 AND wi.status = 'ready'",
+        )
+        .bind(ready)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            dispatch_binding,
+            (repo_id, "https://example.test/p1/api.git".to_string())
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
