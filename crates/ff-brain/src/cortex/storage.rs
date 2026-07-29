@@ -1111,6 +1111,26 @@ fn parse_backend_choice(raw: Option<&str>) -> Result<CortexBackendChoice> {
 static BACKEND_CHOICE: OnceCell<std::result::Result<CortexBackendChoice, String>> =
     OnceCell::const_new();
 
+const FALKOR_READ_CUTOVER_ENV: &str = "CORTEX_FALKOR_READ_CUTOVER";
+
+fn cutover_backend_choice(
+    configured: CortexBackendChoice,
+    cutover_enabled: bool,
+    parity_matches: bool,
+) -> CortexBackendChoice {
+    if configured == CortexBackendChoice::Falkordb {
+        return configured;
+    }
+    if configured != CortexBackendChoice::FalkordbMigration {
+        return CortexBackendChoice::Postgres;
+    }
+    if cutover_enabled && parity_matches {
+        CortexBackendChoice::FalkordbMigration
+    } else {
+        CortexBackendChoice::Postgres
+    }
+}
+
 /// Resolve the configured backend once per process: `CORTEX_GRAPH_BACKEND`
 /// wins, then the `cortex.graph_backend` fleet setting, then Postgres.
 pub async fn configured_backend(pool: &PgPool) -> Result<CortexBackendChoice> {
@@ -1127,11 +1147,54 @@ pub async fn configured_backend(pool: &PgPool) -> Result<CortexBackendChoice> {
         .map_err(anyhow::Error::msg)
 }
 
-/// Config-driven backend factory: the single chokepoint that turns fleet
-/// configuration into a concrete [`CortexGraphStore`]. Selecting a FalkorDB
-/// backend that cannot be reached is an error, not a fallback.
-pub async fn graph_store_from_config(pool: &PgPool) -> Result<Box<dyn CortexGraphStore>> {
-    match configured_backend(pool).await? {
+/// Resolve the safe read backend. FalkorDB reads require an explicit cutover
+/// flag and a successful parity check; disabling the flag rolls reads back to
+/// Postgres on the next process start. The authoritative backend remains a
+/// separate, pre-existing mode.
+async fn read_backend_choice(pool: &PgPool) -> Result<CortexBackendChoice> {
+    let configured = configured_backend(pool).await?;
+    if configured == CortexBackendChoice::Falkordb {
+        return Ok(configured);
+    }
+    if configured != CortexBackendChoice::FalkordbMigration {
+        return Ok(CortexBackendChoice::Postgres);
+    }
+    let cutover_enabled = std::env::var(FALKOR_READ_CUTOVER_ENV)
+        .ok()
+        .as_deref()
+        .is_some_and(enabled_value);
+    if !cutover_enabled {
+        return Ok(CortexBackendChoice::Postgres);
+    }
+    // Evaluate parity for every new read router/store. A process-global success
+    // cache would let later graph divergence keep serving Falkor reads until
+    // restart, defeating the rollback gate.
+    let parity_matches = match parity_check_falkordb(pool, 10).await {
+        Ok(report) if report.matches() => true,
+        Ok(_) => {
+            tracing::warn!("FalkorDB Cortex parity check failed; keeping Postgres reads");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "FalkorDB Cortex parity check unavailable; keeping Postgres reads"
+            );
+            false
+        }
+    };
+    Ok(cutover_backend_choice(
+        configured,
+        cutover_enabled,
+        parity_matches,
+    ))
+}
+
+async fn graph_store_for_choice(
+    pool: &PgPool,
+    choice: CortexBackendChoice,
+) -> Result<Box<dyn CortexGraphStore>> {
+    match choice {
         CortexBackendChoice::Postgres => {
             #[allow(deprecated)]
             let store = PostgresCortexGraphStore::new(pool.clone());
@@ -1147,6 +1210,13 @@ pub async fn graph_store_from_config(pool: &PgPool) -> Result<Box<dyn CortexGrap
             Ok(Box::new(backend))
         }
     }
+}
+
+/// Config-driven backend factory: the single chokepoint that turns fleet
+/// configuration into a concrete [`CortexGraphStore`]. Selecting a FalkorDB
+/// backend that cannot be reached is an error, not a fallback.
+pub async fn graph_store_from_config(pool: &PgPool) -> Result<Box<dyn CortexGraphStore>> {
+    graph_store_for_choice(pool, read_backend_choice(pool).await?).await
 }
 
 #[derive(sqlx::FromRow)]
@@ -1485,8 +1555,8 @@ impl CortexReadRouter {
     /// FalkorDB backend propagates configuration and connection errors
     /// instead of silently reverting to Postgres.
     pub async fn from_env(pool: &PgPool) -> Result<Self> {
-        let choice = configured_backend(pool).await?;
-        let primary: Box<dyn CortexGraphStore> = match graph_store_from_config(pool).await {
+        let choice = read_backend_choice(pool).await?;
+        let primary: Box<dyn CortexGraphStore> = match graph_store_for_choice(pool, choice).await {
             Ok(store) => store,
             Err(error) if choice == CortexBackendChoice::FalkordbMigration => {
                 tracing::warn!(%error, "FalkorDB Cortex read adapter unavailable; using Postgres");
@@ -1698,6 +1768,56 @@ mod tests {
             CortexBackendChoice::Falkordb
         );
         assert!(parse_backend_choice(Some("sqlite")).is_err());
+    }
+
+    #[test]
+    fn read_cutover_defaults_to_postgres() {
+        assert_eq!(
+            cutover_backend_choice(CortexBackendChoice::Postgres, false, false),
+            CortexBackendChoice::Postgres
+        );
+        assert_eq!(
+            cutover_backend_choice(CortexBackendChoice::FalkordbMigration, false, true),
+            CortexBackendChoice::Postgres
+        );
+    }
+
+    #[test]
+    fn read_cutover_requires_opt_in_and_parity() {
+        assert_eq!(
+            cutover_backend_choice(CortexBackendChoice::FalkordbMigration, true, true),
+            CortexBackendChoice::FalkordbMigration
+        );
+        assert_eq!(
+            cutover_backend_choice(CortexBackendChoice::FalkordbMigration, true, false),
+            CortexBackendChoice::Postgres
+        );
+    }
+
+    #[test]
+    fn explicit_postgres_is_never_overridden_by_cutover_flag() {
+        assert_eq!(
+            cutover_backend_choice(CortexBackendChoice::Postgres, true, true),
+            CortexBackendChoice::Postgres
+        );
+    }
+
+    #[test]
+    fn authoritative_falkordb_mode_is_preserved() {
+        assert_eq!(
+            cutover_backend_choice(CortexBackendChoice::Falkordb, false, false),
+            CortexBackendChoice::Falkordb
+        );
+    }
+
+    #[test]
+    fn read_cutover_rolls_back_when_flag_is_disabled() {
+        let cut_over = cutover_backend_choice(CortexBackendChoice::FalkordbMigration, true, true);
+        assert_eq!(cut_over, CortexBackendChoice::FalkordbMigration);
+        assert_eq!(
+            cutover_backend_choice(cut_over, false, true),
+            CortexBackendChoice::Postgres
+        );
     }
 
     #[tokio::test]
