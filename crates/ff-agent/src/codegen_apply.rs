@@ -691,6 +691,22 @@ fn extract_relevant_regions(content: &str, identifiers: &[String]) -> String {
             }
         }
     }
+    if identifiers.iter().any(|identifier| identifier == "test")
+        && let Some(test_start) = lines.iter().position(|line| line.trim() == "#[cfg(test)]")
+    {
+        ranges.push((test_start, lines.len() - 1));
+    }
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+    ranges = ranges.into_iter().fold(Vec::new(), |mut merged, range| {
+        if let Some((_, last_end)) = merged.last_mut()
+            && range.0 <= *last_end + 1
+        {
+            *last_end = (*last_end).max(range.1);
+        } else {
+            merged.push(range);
+        }
+        merged
+    });
 
     if ranges.is_empty() {
         return fallback_head_tail_regions(&lines);
@@ -962,7 +978,21 @@ fn apply_one_edit(
                 info!(path = %edit.path, "codegen: SEARCH matched via whitespace-tolerant fallback");
                 (pos, len)
             }
-            None => return Err(anyhow!("SEARCH block not found in {}", edit.path)),
+            None => {
+                let quoted_search = edit
+                    .search
+                    .lines()
+                    .take(3)
+                    .map(|line| format!("> {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Err(anyhow!(
+                    "SEARCH block not found verbatim in {}. Failed SEARCH (first 3 lines):\n{}\n\
+                     use only lines shown in the prompt; do not invent helpers or modules",
+                    edit.path,
+                    quoted_search
+                ));
+            }
         },
     };
     let mut updated = String::with_capacity(content.len() - matched_len + edit.replace.len());
@@ -1392,6 +1422,55 @@ mod tests {
         assert!(regions.contains("let unrelated_1 = 1;\n"));
         assert!(regions.contains("Region (lines 81-140):"));
         assert!(regions.contains("let unrelated_140 = 140;\n"));
+    }
+
+    #[test]
+    fn codegen_extract_relevant_regions_includes_cfg_test_module_for_test_tasks() {
+        let content = (1..=100)
+            .map(|line| match line {
+                10 => "fn production_handler() {}\n".to_string(),
+                80 => "#[cfg(test)]\n".to_string(),
+                81 => "mod tests {\n".to_string(),
+                90 => "    fn distant_regression_test() {}\n".to_string(),
+                100 => "}\n".to_string(),
+                _ => format!("let line_{line} = {line};\n"),
+            })
+            .collect::<String>();
+
+        let regions = extract_relevant_regions(
+            &content,
+            &["production_handler".to_string(), "test".to_string()],
+        );
+
+        assert!(regions.contains("#[cfg(test)]\n"));
+        assert!(regions.contains("    fn distant_regression_test() {}\n"));
+    }
+
+    #[test]
+    fn search_mismatch_quotes_file_first_three_lines_and_reminder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("src/lib.rs");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "fn actual() {}\n").unwrap();
+
+        let err = apply_edits(
+            dir.path(),
+            &[Edit {
+                path: "src/lib.rs".to_string(),
+                search: "fn invented() {\n    missing_helper();\n}\nfourth line\n".to_string(),
+                replace: "fn replacement() {}\n".to_string(),
+            }],
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "SEARCH block not found verbatim in src/lib.rs. Failed SEARCH (first 3 lines):\n\
+             > fn invented() {\n\
+             >     missing_helper();\n\
+             > }\n\
+             use only lines shown in the prompt; do not invent helpers or modules"
+        );
     }
 
     #[test]
