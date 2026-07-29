@@ -9,7 +9,7 @@ use ff_deploy::resolution::{
 
 use crate::{
     CYAN, FleetCommand, FleetDbCommand, GREEN, LeaderAction, RED, RESET, TaskCoverageCommand,
-    YELLOW, pulse_reader, whoami_tag,
+    YELLOW, pulse_reader, shell_escape_single, whoami_tag,
 };
 
 /// `ff fleet panic-stop` — emergency halt of every daemon.
@@ -3255,11 +3255,139 @@ fn versions_live_status(
     target: Option<&str>,
 ) -> &'static str {
     match target {
-        Some(t) if running_sha == Some(t) => "converged",
-        Some(t) if disk_sha == t => "stale-daemon",
+        Some(t)
+            if ff_core::build_version::same_commit(disk_sha, t)
+                && running_sha
+                    .is_some_and(|running| ff_core::build_version::same_commit(running, t)) =>
+        {
+            "converged"
+        }
+        Some(t) if ff_core::build_version::same_commit(disk_sha, t) => "stale-daemon",
         Some(_) => "drift",
         None => "unknown",
     }
+}
+
+fn versions_live_probe_command() -> &'static str {
+    "~/.local/bin/forgefleetd --version 2>&1 | head -1; \
+     echo '@@H@@'; \
+     curl -s --max-time 4 http://localhost:51002/health 2>/dev/null"
+}
+
+fn parse_ls_remote_sha(output: &str, target_ref: &str) -> Result<String> {
+    let sha = output
+        .lines()
+        .filter_map(|line| line.split_once(char::is_whitespace))
+        .find_map(|(sha, remote_ref)| (remote_ref.trim() == target_ref).then_some(sha.trim()))
+        .ok_or_else(|| anyhow::anyhow!("ls-remote did not return {target_ref}"))?;
+    if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("ls-remote returned invalid SHA for {target_ref}: {sha}");
+    }
+    Ok(sha.to_ascii_lowercase())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LiveRemoteMain {
+    remote_url: String,
+    sha: String,
+}
+
+async fn live_remote_main_target() -> Result<LiveRemoteMain> {
+    let (checkout, remote) = configured_forgefleet_checkout()?;
+    live_remote_main_target_from_checkout(&checkout, &remote).await
+}
+
+async fn live_remote_main_sha() -> Result<String> {
+    Ok(live_remote_main_target().await?.sha)
+}
+
+fn configured_forgefleet_checkout() -> Result<(PathBuf, String)> {
+    if let Some(path) = std::env::var_os("FORGEFLEET_REPO").filter(|p| !p.is_empty()) {
+        return Ok((PathBuf::from(path), "origin".into()));
+    }
+
+    let config_path = dirs::home_dir()
+        .map(|home| home.join(".forgefleet/fleet.toml"))
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory for ForgeFleet config"))?;
+    if config_path.exists() {
+        let config = ff_core::config::load_config(&config_path)
+            .map_err(|e| anyhow::anyhow!("load {}: {e}", config_path.display()))?;
+        if let Some(path) = config
+            .loops
+            .updater
+            .repo_path
+            .or(config.fleet.default_repo)
+            .filter(|path| !path.trim().is_empty())
+        {
+            return Ok((
+                PathBuf::from(expand_home(&path)),
+                config.loops.updater.git_remote,
+            ));
+        }
+    }
+
+    let checkout = PathBuf::from(expand_home(CANONICAL_WORKER_SOURCE_TREE));
+    if checkout.exists() {
+        return Ok((checkout, "origin".into()));
+    }
+    anyhow::bail!(
+        "ForgeFleet checkout is not configured; set FORGEFLEET_REPO or \
+         [loops.updater].repo_path in ~/.forgefleet/fleet.toml"
+    )
+}
+
+async fn live_remote_main_target_from_checkout(
+    checkout: &Path,
+    remote: &str,
+) -> Result<LiveRemoteMain> {
+    if remote.trim().is_empty() {
+        anyhow::bail!("configured ForgeFleet git remote is empty");
+    }
+    let remote_output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(["remote", "get-url", remote])
+        .output()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to resolve git remote {remote} in {}: {e}",
+                checkout.display()
+            )
+        })?;
+    if !remote_output.status.success() {
+        anyhow::bail!(
+            "git remote {remote} is missing or malformed in {}: {}",
+            checkout.display(),
+            String::from_utf8_lossy(&remote_output.stderr).trim()
+        );
+    }
+    let remote_url = String::from_utf8_lossy(&remote_output.stdout)
+        .trim()
+        .to_string();
+    if remote_url.is_empty() {
+        anyhow::bail!("git remote {remote} has no URL in {}", checkout.display());
+    }
+
+    let output = tokio::process::Command::new("git")
+        .current_dir(checkout)
+        .arg("ls-remote")
+        .arg("--")
+        .arg(&remote_url)
+        .arg("refs/heads/main")
+        .output()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("failed to run git ls-remote {remote_url} refs/heads/main: {e}")
+        })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git ls-remote {remote_url} refs/heads/main failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let sha = parse_ls_remote_sha(&String::from_utf8_lossy(&output.stdout), "refs/heads/main")?;
+    Ok(LiveRemoteMain { remote_url, sha })
 }
 
 pub async fn handle_fleet_versions_live(
@@ -3279,6 +3407,7 @@ pub async fn handle_fleet_versions_live(
         return Ok(());
     }
 
+    let target_sha = live_remote_main_sha().await?;
     let me = ff_agent::fleet_info::resolve_this_worker_name().await;
     let mut futs = FuturesUnordered::new();
     for n in nodes {
@@ -3287,13 +3416,10 @@ pub async fn handle_fleet_versions_live(
         let user = n.ssh_user.clone();
         let is_me = me.eq_ignore_ascii_case(&name);
         futs.push(async move {
-            // On-disk binary SHA (`--version`) AND the RUNNING process SHA
-            // (`/health` build_sha, #568). They disagree when a deploy installed
-            // the new binary but the daemon restart lagged (the ace
-            // false-converged case) — `--version` alone can't see that.
-            let cmd = "~/.local/bin/forgefleetd --version 2>&1 | head -1; \
-                       echo '@@H@@'; \
-                       curl -s --max-time 4 http://localhost:51002/health 2>/dev/null";
+            // Measure the installed executable, not a source checkout that may
+            // have advanced without being built or installed. Compare that disk
+            // identity and the running process identity to live remote main.
+            let cmd = versions_live_probe_command();
             let out = if is_me {
                 Command::new("sh").args(["-c", cmd]).output().await
             } else {
@@ -3317,9 +3443,9 @@ pub async fn handle_fleet_versions_live(
                 Ok(o) => format!("ssh-exit:{}", o.status.code().unwrap_or(-1)),
                 Err(e) => format!("ssh-error:{e}"),
             };
-            let (ver_line, health) = raw.split_once("@@H@@").unwrap_or((raw.as_str(), ""));
+            let (disk, health) = raw.split_once("@@H@@").unwrap_or((raw.as_str(), ""));
             let running_sha = extract_health_build_sha(health.trim());
-            (name, ver_line.trim().to_string(), running_sha)
+            (name, disk.trim().to_string(), running_sha)
         });
     }
 
@@ -3330,17 +3456,9 @@ pub async fn handle_fleet_versions_live(
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Pick the most-common on-disk SHA as the fleet target.
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for (_, _, parsed, _) in &rows {
-        if let Some(p) = parsed {
-            *counts.entry(p.sha.clone()).or_insert(0) += 1;
-        }
-    }
-    let target_sha: Option<String> = counts
-        .iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(sha, _)| sha.clone());
+    // LATEST is the live remote branch SHA, never a cached origin/main or the
+    // modal installed checkout SHA.
+    let target_sha = Some(target_sha);
 
     if json {
         let hosts: Vec<serde_json::Value> = rows
@@ -5016,8 +5134,14 @@ fn deploy_install_restart_playbook(os_family: &str) -> String {
     }
 }
 
-fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
+fn deploy_playbook(
+    os_family: &str,
+    source_tree_path: &str,
+    target_remote_url: &str,
+    target_sha: &str,
+) -> String {
     let src = expand_home(source_tree_path);
+    let remote = shell_escape_single(target_remote_url);
     // -p forge-fleet builds the forgefleetd daemon bin; -p ff-terminal builds
     // the ff CLI. Both in one cargo invocation → one shared compile.
     let cargo_build = if os_family == "linux-dgx" {
@@ -5037,14 +5161,22 @@ fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
          fi"
     );
 
-    // git: force-converge to origin/main. Linux trees accumulate build
-    // artifacts that block a clean reset, so clean those two paths first
-    // (mirrors the upgrade playbook).
+    // Fetch the immutable live target directly into FETCH_HEAD. Do not trust a
+    // cached origin/main, and prove the checkout landed on the advertised SHA
+    // before building anything. Linux trees accumulate build artifacts that
+    // block a clean reset, so clean those two paths first.
+    let fetch_reset = format!(
+        "git fetch -- {remote} refs/heads/main && git reset --hard FETCH_HEAD && \
+         ACTUAL_SHA=$(git rev-parse HEAD) && \
+         [ \"$ACTUAL_SHA\" = \"{target_sha}\" ] || {{ \
+           echo \"DEPLOY_SHA_MISMATCH: expected {target_sha}, got $ACTUAL_SHA\" >&2; exit 9; \
+         }}"
+    );
     let git_sync = if os_family == "macos" {
-        format!("cd \"{src}\" && {dirty_guard} && git fetch origin && git reset --hard origin/main")
+        format!("cd \"{src}\" && {dirty_guard} && {fetch_reset}")
     } else {
         format!(
-            "cd \"{src}\" && {dirty_guard} && git fetch origin && git reset --hard origin/main && \
+            "cd \"{src}\" && {dirty_guard} && {fetch_reset} && \
              git clean -fdx graphify-out node-compile-cache"
         )
     };
@@ -5074,21 +5206,31 @@ fn deploy_receiver_playbook(os_family: &str, source_tree_path: &str) -> String {
 
 /// Build + install + restart forgefleetd/ff for the LEADER, run LOCALLY on the
 /// host executing `ff fleet deploy --all`. Deliberately OMITS the
-/// `git reset --hard origin/main` that `deploy_playbook` runs on remote worker
+/// `git reset --hard FETCH_HEAD` that `deploy_playbook` runs on remote worker
 /// trees: the leader's tree is the operator's DEV checkout, so a hard reset could
 /// wipe uncommitted work. The caller guards this to run only when the tree is
-/// clean AND already at origin/main HEAD, so a plain build of the current tree is
-/// exactly the merged state. OS-aware restart idiom mirrors `deploy_playbook`.
-fn leader_refresh_playbook(os_family: &str, source_tree_path: &str) -> String {
+/// clean AND already at the rollout's immutable target SHA, so a plain build of
+/// the current tree is exactly the deployed state. OS-aware restart idiom mirrors
+/// `deploy_playbook`.
+fn leader_refresh_playbook(os_family: &str, source_tree_path: &str, target_sha: &str) -> String {
     let src = expand_home(source_tree_path);
     let cargo_build = if os_family == "linux-dgx" {
         "cargo build --release -p forge-fleet -p ff-terminal -j 2"
     } else {
         "cargo build --release -p forge-fleet -p ff-terminal"
     };
+    let final_guard = format!(
+        "if [ -n \"$(git status --porcelain)\" ]; then \
+           echo \"LEADER_REFRESH_DIRTY: refusing to build a changed tree at {src}\" >&2; exit 1; \
+         fi; \
+         ACTUAL_SHA=$(git rev-parse HEAD) && \
+         [ \"$ACTUAL_SHA\" = \"{target_sha}\" ] || {{ \
+           echo \"LEADER_REFRESH_SHA_MISMATCH: expected {target_sha}, got $ACTUAL_SHA\" >&2; exit 9; \
+         }};"
+    );
     match os_family {
         "macos" => format!(
-            ". \"$HOME/.cargo/env\" 2>/dev/null || true; cd \"{src}\" && {cargo_build} && \
+            ". \"$HOME/.cargo/env\" 2>/dev/null || true; cd \"{src}\" && {final_guard} {cargo_build} && \
              install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
              install -m 755 target/release/ff ~/.local/bin/ff && \
              install -m 755 target/release/ff ~/.cargo/bin/ff 2>/dev/null || true; \
@@ -5105,7 +5247,7 @@ fn leader_refresh_playbook(os_family: &str, source_tree_path: &str) -> String {
              echo \"LEADER_REFRESH count=$RN\"; [ \"$RN\" -ge 1 ]"
         ),
         _ => format!(
-            ". \"$HOME/.cargo/env\" 2>/dev/null || true; cd \"{src}\" && {cargo_build} && \
+            ". \"$HOME/.cargo/env\" 2>/dev/null || true; cd \"{src}\" && {final_guard} {cargo_build} && \
              install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
              install -m 755 target/release/ff ~/.local/bin/ff && \
              install -m 755 target/release/ff ~/.cargo/bin/ff 2>/dev/null || true; \
@@ -5148,15 +5290,27 @@ async fn run_local_shell(cmd: &str, timeout_secs: u64) -> (i32, String, String) 
     }
 }
 
+fn leader_refresh_guard_command(source_tree_path: &str, target_sha: &str) -> String {
+    let src = expand_home(source_tree_path);
+    format!(
+        "cd \"{src}\" && [ -z \"$(git status --porcelain)\" ] && \
+         [ \"$(git rev-parse HEAD)\" = \"{target_sha}\" ]"
+    )
+}
+
 /// Refresh the leader's OWN forgefleetd/ff after an `--all` deploy. `--all`
 /// excludes the leader (the host running this command can't SSH-restart itself),
 /// which silently left the leader's daemon lagging source after every deploy —
 /// the recurring "leader drift" (2026-06-20). Now closes that gap: if THIS host
-/// is the leader AND its tree is clean + already at origin/main HEAD, rebuild +
-/// reinstall + restart locally. Returns `Some((ok, detail))` when this host is
+/// is the leader AND its tree is clean + already at the rollout's immutable
+/// target SHA, rebuild + reinstall + restart locally. Returns `Some((ok, detail))`
+/// when this host is
 /// the leader (so the caller can report), `None` when it isn't this host's job.
 /// Best-effort: a failure never fails the overall deploy.
-async fn refresh_local_leader_if_self(pool: &sqlx::PgPool) -> Option<(bool, String)> {
+async fn refresh_local_leader_if_self(
+    pool: &sqlx::PgPool,
+    target_sha: &str,
+) -> Option<(bool, String)> {
     let me = ff_agent::fleet_info::resolve_this_worker_name().await;
     let (leader_name, os_family, stp) = sqlx::query_as::<_, (String, String, Option<String>)>(
         "SELECT c.name, COALESCE(c.os_family, 'macos'), c.source_tree_path
@@ -5173,24 +5327,20 @@ async fn refresh_local_leader_if_self(pool: &sqlx::PgPool) -> Option<(bool, Stri
         return None;
     }
     let src = expand_home(&stp.unwrap_or_else(|| LEADER_SOURCE_TREE.into()));
-    // Guard: only act on a tree with no TRACKED modifications, already at
-    // origin/main HEAD. A plain build then equals the merged/deployed state; we
-    // never touch a dirty dev tree. `--untracked-files=no` deliberately IGNORES
-    // untracked files (operator artifacts like `research/`, `graphify-out`): the
-    // leader-refresh playbook only `cargo build`s from tracked HEAD and never
-    // resets/cleans, so an untracked dir can't change the build and must NOT block
-    // the auto-refresh — an untracked `research/` silently forced a manual Taylor
-    // rebuild on every deploy this session.
-    let clean = run_local_shell(
-        &format!("cd \"{src}\" && [ -z \"$(git status --porcelain --untracked-files=no)\" ] && \
-                  git fetch origin -q && [ \"$(git rev-parse HEAD)\" = \"$(git rev-parse origin/main)\" ]"),
-        120,
-    )
-    .await;
+    // Guard: only act on a tree with no TRACKED modifications whose HEAD is the
+    // rollout's already-resolved immutable target. Never fetch here: main could
+    // advance during a rollout, and leader refresh must not build a different
+    // commit than the workers. We never touch a dirty dev tree.
+    // Include untracked files: an untracked Rust source or build script can affect
+    // the resulting binary even when tracked HEAD is unchanged.
+    let clean = run_local_shell(&leader_refresh_guard_command(&src, target_sha), 120).await;
     if clean.0 != 0 {
         return Some((
             false,
-            "skipped — leader tree dirty or not at origin/main HEAD (won't touch dev tree)".into(),
+            format!(
+                "skipped — leader tree dirty or not at rollout target {} (won't touch dev tree)",
+                short10(target_sha)
+            ),
         ));
     }
     eprintln!(
@@ -5204,7 +5354,8 @@ async fn refresh_local_leader_if_self(pool: &sqlx::PgPool) -> Option<(bool, Stri
             Ok(previous) => previous,
             Err(error) => return Some((false, format!("leader lease drain failed: {error}"))),
         };
-    let (code, _out, err) = run_local_shell(&leader_refresh_playbook(&os_family, &src), 2700).await;
+    let (code, _out, err) =
+        run_local_shell(&leader_refresh_playbook(&os_family, &src, target_sha), 2700).await;
     restore_deploy_targets(pool, &previous_reservation).await;
     if code == 0 {
         Some((true, "leader daemon rebuilt + restarted".into()))
@@ -5404,7 +5555,11 @@ async fn scp_binaries_from_builder(
 /// Deploy the full forgefleetd + ff playbook to one target, then verify
 /// convergence by reading the RUNNING binary SHA. Never panics — every
 /// failure mode collapses into a `DeployResult { ok: false, .. }`.
-async fn deploy_one_host(t: DeployTarget) -> DeployResult {
+async fn deploy_one_host(
+    t: DeployTarget,
+    target_remote_url: String,
+    target_sha: String,
+) -> DeployResult {
     let start = std::time::Instant::now();
     let tight = t.total_ram_gb > 0 && t.total_ram_gb <= MEMORY_TIGHT_RAM_GB;
     let timeout_secs = if tight {
@@ -5421,7 +5576,12 @@ async fn deploy_one_host(t: DeployTarget) -> DeployResult {
     }
 
     // 2) Build + install + restart.
-    let playbook = deploy_playbook(&t.os_family, &t.source_tree_path);
+    let playbook = deploy_playbook(
+        &t.os_family,
+        &t.source_tree_path,
+        &target_remote_url,
+        &target_sha,
+    );
     let (code, _stdout, stderr) = deploy_ssh(&t, &playbook, timeout_secs).await;
     if code != 0 {
         let snippet: String = stderr
@@ -5445,13 +5605,18 @@ async fn deploy_one_host(t: DeployTarget) -> DeployResult {
         };
     }
 
-    verify_deploy_convergence(t, start).await
+    verify_deploy_convergence(t, start, &target_sha, true).await
 }
 
 /// Receiver path: ship the builder's binaries over and run only the
 /// install+restart portion of the playbook. If the ship or the receiver
 /// install fails, fall back to a full self-build on this node.
-async fn deploy_receiver(receiver: DeployTarget, builder: DeployTarget) -> DeployResult {
+async fn deploy_receiver(
+    receiver: DeployTarget,
+    builder: DeployTarget,
+    target_remote_url: String,
+    target_sha: String,
+) -> DeployResult {
     let start = std::time::Instant::now();
     let timeout_secs = DEPLOY_TIMEOUT_ROOMY_SECS;
 
@@ -5479,11 +5644,11 @@ async fn deploy_receiver(receiver: DeployTarget, builder: DeployTarget) -> Deplo
     }
 
     if ship_ok {
-        return verify_deploy_convergence(receiver, start).await;
+        return verify_deploy_convergence(receiver, start, &target_sha, false).await;
     }
 
     // Fall back to a full self-build.
-    let fb = deploy_one_host(receiver).await;
+    let fb = deploy_one_host(receiver, target_remote_url, target_sha).await;
     DeployResult {
         name: fb.name,
         ok: fb.ok,
@@ -5493,26 +5658,46 @@ async fn deploy_receiver(receiver: DeployTarget, builder: DeployTarget) -> Deplo
     }
 }
 
-/// Convergence = RUNNING binary. Give the freshly-restarted daemon a moment,
-/// then read its version SHA. We read forgefleetd (the daemon we just bounced)
-/// so the SHA reflects the running process, not just the on-disk binary.
+fn deploy_convergence_probe_command(source_tree_path: &str, verify_checkout: bool) -> String {
+    if verify_checkout {
+        format!(
+            "sleep 3; cd \"{}\" && git rev-parse HEAD && echo '@@V@@' && \
+             ~/.local/bin/forgefleetd --version 2>&1 | tail -3",
+            expand_home(source_tree_path)
+        )
+    } else {
+        "sleep 3; ~/.local/bin/forgefleetd --version 2>&1 | tail -3".to_string()
+    }
+}
+
+/// Give the freshly-restarted daemon a moment, then verify the installed binary
+/// SHA. Full-build hosts also prove their checkout still equals the immutable
+/// rollout target. Binary-shipped receivers deliberately skip that Git probe:
+/// they may have only a destination directory, not a usable repository.
 /// The version-probe over SSH can transiently fail (exit 255 — a host-key
 /// "Warning: Permanently added …" on first connect, or a flaky link), which
 /// would mark a SUCCESSFUL build+restart as a scary ✗ "version unparsable".
 /// Retry a few times and strip SSH warning noise before parsing. `tail -3`
 /// (not `head -1`) so a leading warning line doesn't hide the version.
-async fn verify_deploy_convergence(t: DeployTarget, start: std::time::Instant) -> DeployResult {
+async fn verify_deploy_convergence(
+    t: DeployTarget,
+    start: std::time::Instant,
+    target_sha: &str,
+    verify_checkout: bool,
+) -> DeployResult {
     use ff_core::build_version::BuildVersion;
     let mut raw = String::new();
+    let probe = deploy_convergence_probe_command(&t.source_tree_path, verify_checkout);
     for attempt in 0..3 {
-        let (vcode, vout, verr) = deploy_ssh(
-            &t,
-            "sleep 3; ~/.local/bin/forgefleetd --version 2>&1 | tail -3",
-            60,
-        )
-        .await;
+        let (vcode, vout, verr) = deploy_ssh(&t, &probe, 60).await;
         if vcode == 0 {
-            let cleaned = clean_version_line(&vout);
+            let (head, version) = vout.split_once("@@V@@").unwrap_or(("", vout.as_str()));
+            let head = head.trim();
+            let cleaned = clean_version_line(version);
+            if verify_checkout && head != target_sha {
+                raw = format!("checkout mismatch: expected {target_sha}, got {head}");
+                break;
+            }
             if !cleaned.is_empty() {
                 raw = cleaned;
                 break;
@@ -5525,12 +5710,19 @@ async fn verify_deploy_convergence(t: DeployTarget, start: std::time::Instant) -
         }
     }
     match BuildVersion::parse(&raw) {
-        Some(v) => DeployResult {
+        Some(v) if ff_core::build_version::same_commit(&v.sha, target_sha) => DeployResult {
             name: t.name,
             ok: true,
             sha: v.short_sha().to_string(),
             secs: start.elapsed().as_secs_f64(),
             detail: format!("{} ({})", v.date, v.state),
+        },
+        Some(v) => DeployResult {
+            name: t.name,
+            ok: false,
+            sha: v.short_sha().to_string(),
+            secs: start.elapsed().as_secs_f64(),
+            detail: format!("running SHA mismatch: expected {target_sha}"),
         },
         None => {
             // Built + restarted fine but we couldn't parse a SHA — report the
@@ -5562,12 +5754,19 @@ struct GroupPlan {
 async fn deploy_group(
     plan: GroupPlan,
     sem: std::sync::Arc<tokio::sync::Semaphore>,
+    target_remote_url: String,
+    target_sha: String,
 ) -> Vec<DeployResult> {
     let builder_permit = sem.acquire().await.unwrap_or_else(|_| {
         // The semaphore is never closed; this branch keeps the compiler happy.
         std::process::exit(1)
     });
-    let builder_res = deploy_one_host(plan.builder.clone()).await;
+    let builder_res = deploy_one_host(
+        plan.builder.clone(),
+        target_remote_url.clone(),
+        target_sha.clone(),
+    )
+    .await;
     drop(builder_permit);
 
     if !builder_res.ok {
@@ -5576,9 +5775,11 @@ async fn deploy_group(
         let mut handles: Vec<tokio::task::JoinHandle<DeployResult>> = Vec::new();
         for r in plan.receivers {
             let s = sem.clone();
+            let remote = target_remote_url.clone();
+            let expected = target_sha.clone();
             handles.push(tokio::spawn(async move {
                 let _p = s.acquire().await.unwrap();
-                deploy_one_host(r).await
+                deploy_one_host(r, remote, expected).await
             }));
         }
         for h in handles {
@@ -5599,9 +5800,11 @@ async fn deploy_group(
     for r in plan.receivers {
         let s = sem.clone();
         let b = plan.builder.clone();
+        let remote = target_remote_url.clone();
+        let expected = target_sha.clone();
         handles.push(tokio::spawn(async move {
             let _p = s.acquire().await.unwrap();
-            deploy_receiver(r, b).await
+            deploy_receiver(r, b, remote, expected).await
         }));
     }
     for h in handles {
@@ -5921,6 +6124,13 @@ async fn handle_fleet_deploy(
         return Ok(());
     }
 
+    // Pin this rollout to the live remote branch tip before draining any host.
+    // Every builder fetches this exact object into FETCH_HEAD and verifies its
+    // post-reset HEAD against the same immutable target.
+    let target = live_remote_main_target().await?;
+    let target_sha = target.sha;
+    let target_remote_url = target.remote_url;
+
     // Stop new assignments before any build starts, then let in-flight work
     // be requeued attempt-neutrally before a restart can tear down its daemon.
     let target_names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
@@ -6002,7 +6212,11 @@ async fn handle_fleet_deploy(
         let mut handles: Vec<tokio::task::JoinHandle<Vec<DeployResult>>> = Vec::new();
         for plan in plans {
             let s = sem.clone();
-            handles.push(tokio::spawn(async move { deploy_group(plan, s).await }));
+            let remote = target_remote_url.clone();
+            let expected = target_sha.clone();
+            handles.push(tokio::spawn(async move {
+                deploy_group(plan, s, remote, expected).await
+            }));
         }
         let mut results: Vec<DeployResult> = Vec::new();
         for h in handles {
@@ -6055,22 +6269,14 @@ async fn handle_fleet_deploy(
     }
     let results = deploy_outcome?;
 
-    // Convergence target = the most-common SHA among successful hosts.
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for r in &results {
-        if r.ok {
-            *counts.entry(r.sha.clone()).or_insert(0) += 1;
-        }
-    }
-    let target_sha = counts
-        .iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(sha, _)| sha.clone());
     let converged = results
         .iter()
-        .filter(|r| r.ok && target_sha.as_deref() == Some(r.sha.as_str()))
+        .filter(|r| r.ok && ff_core::build_version::same_commit(&r.sha, &target_sha))
         .count();
     let total = results.len();
+    let saw_fetch_mismatch = results.iter().any(|r| {
+        !r.ok && (r.detail.contains("playbook exit 9") || r.detail.contains("DEPLOY_SHA_MISMATCH"))
+    });
 
     // Leader self-refresh (closes the recurring leader-drift): --all excludes the
     // leader, so its own daemon lagged source after every deploy. Refresh THIS
@@ -6083,10 +6289,10 @@ async fn handle_fleet_deploy(
     // the leader EVERY time → the leader silently ran stale binaries. `converged
     // > 0` means at least one host built AND is running the new code, proving the
     // build is good (so we won't rebuild the leader onto a broken tree); the
-    // refresh's own clean-tree-@-origin/main-HEAD guard is what guarantees the
-    // leader rebuilds the deployed state and never a dirty dev tree.
+    // refresh's own clean-tree-at-target guard guarantees the leader rebuilds
+    // the same immutable deployed state and never a dirty dev tree.
     let leader_refresh: Option<(bool, String)> = if all && converged > 0 {
-        refresh_local_leader_if_self(pool).await
+        refresh_local_leader_if_self(pool, &target_sha).await
     } else {
         None
     };
@@ -6119,7 +6325,7 @@ async fn handle_fleet_deploy(
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         if converged != total {
-            std::process::exit(1);
+            std::process::exit(if saw_fetch_mismatch { 9 } else { 1 });
         }
         return Ok(());
     }
@@ -6137,7 +6343,7 @@ async fn handle_fleet_deploy(
         };
         println!("{:<14} {:<8} {:<10} {:>7.0}", r.name, status, r.sha, r.secs);
     }
-    let target_disp = target_sha.as_deref().unwrap_or("-");
+    let target_disp = short10(&target_sha);
     println!();
     if let Some((ok, detail)) = &leader_refresh {
         if *ok {
@@ -6154,7 +6360,7 @@ async fn handle_fleet_deploy(
              ({} not converged)",
             total - converged
         );
-        std::process::exit(1);
+        std::process::exit(if saw_fetch_mismatch { 9 } else { 1 });
     }
     // Re-surface skipped hosts at the END too — the convergence line above only
     // counts TARGETED hosts, so "N/N converged" can otherwise read as full-fleet
@@ -6472,10 +6678,102 @@ mod version_target_tests {
 }
 
 #[cfg(test)]
+mod live_remote_sha_tests {
+    use std::process::Command;
+
+    use super::{live_remote_main_target_from_checkout, parse_ls_remote_sha};
+
+    const MAIN: &str = "refs/heads/main";
+
+    #[test]
+    fn parses_live_main_without_using_other_refs() {
+        let live = "0123456789abcdef0123456789abcdef01234567";
+        let stale = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let output = format!("{stale}\trefs/remotes/origin/main\n{live}\t{MAIN}\n");
+        assert_eq!(parse_ls_remote_sha(&output, MAIN).unwrap(), live);
+    }
+
+    #[test]
+    fn rejects_missing_or_malformed_live_sha() {
+        assert!(parse_ls_remote_sha("", MAIN).is_err());
+        assert!(parse_ls_remote_sha("not-a-sha\trefs/heads/main\n", MAIN).is_err());
+    }
+
+    fn git(cwd: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_explicit_checkout_remote_independent_of_caller_repo() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = temp.path().join("remote.git");
+        let seed = temp.path().join("seed");
+        let checkout = temp.path().join("checkout");
+        git(temp.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        git(temp.path(), &["init", seed.to_str().unwrap()]);
+        git(&seed, &["config", "user.email", "test@example.com"]);
+        git(&seed, &["config", "user.name", "ForgeFleet Test"]);
+        std::fs::write(seed.join("README"), "test").unwrap();
+        git(&seed, &["add", "README"]);
+        git(&seed, &["commit", "-m", "seed"]);
+        git(&seed, &["branch", "-M", "main"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&seed, &["push", "origin", "main"]);
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "--branch",
+                "main",
+                remote.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+        let expected = Command::new("git")
+            .current_dir(&checkout)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        git(&checkout, &["remote", "rename", "origin", "release"]);
+
+        let target = live_remote_main_target_from_checkout(&checkout, "release")
+            .await
+            .unwrap();
+        assert_eq!(target.sha, String::from_utf8_lossy(&expected.stdout).trim());
+        assert_eq!(target.remote_url, remote.to_string_lossy().to_string());
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_configured_remote() {
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init"]);
+        let error = live_remote_main_target_from_checkout(temp.path(), "missing")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing or malformed"), "{error}");
+    }
+}
+
+#[cfg(test)]
 mod route_tests {
     use super::{
-        extract_health_build_sha, fmt_route_load, normalize_route_limit,
-        route_require_tool_calling, route_warns_below_agent_floor, short10, versions_live_status,
+        deploy_convergence_probe_command, extract_health_build_sha, fmt_route_load,
+        leader_refresh_guard_command, leader_refresh_playbook, normalize_route_limit,
+        route_require_tool_calling, route_warns_below_agent_floor, short10,
+        versions_live_probe_command, versions_live_status,
     };
 
     // Authored by a fleet model (qwen36 on lily) via `ff offload`, then reviewed
@@ -6484,26 +6782,98 @@ mod route_tests {
     fn versions_live_status_cases() {
         // 1. running matches target -> "converged"
         assert_eq!(
-            versions_live_status("aaa", Some("aaa"), Some("aaa")),
+            versions_live_status(
+                "aaaaaaaaaa",
+                Some("aaaaaaaaaa"),
+                Some("aaaaaaaaaaaaaaaaaaaa")
+            ),
             "converged"
+        );
+        // A fresh checkout/running process cannot hide a stale installed binary.
+        assert_eq!(
+            versions_live_status(
+                "bbbbbbbbbb",
+                Some("aaaaaaaaaa"),
+                Some("aaaaaaaaaaaaaaaaaaaa")
+            ),
+            "drift"
         );
         // 2. disk matches target but running does not (running is an OLD sha) -> "stale-daemon"
         assert_eq!(
-            versions_live_status("bbb", Some("aaa"), Some("bbb")),
+            versions_live_status(
+                "bbbbbbbbbb",
+                Some("aaaaaaaaaa"),
+                Some("bbbbbbbbbbbbbbbbbbbb")
+            ),
             "stale-daemon"
         );
         // 3. disk does NOT match target -> "drift"
         assert_eq!(
-            versions_live_status("aaa", Some("bbb"), Some("ccc")),
+            versions_live_status(
+                "aaaaaaaaaa",
+                Some("bbbbbbbbbb"),
+                Some("cccccccccccccccccccc")
+            ),
             "drift"
         );
         // 4. target is None -> "unknown"
-        assert_eq!(versions_live_status("aaa", Some("aaa"), None), "unknown");
+        assert_eq!(
+            versions_live_status("aaaaaaaaaa", Some("aaaaaaaaaa"), None),
+            "unknown"
+        );
         // 5. running is None (gateway down) but disk matches target -> "stale-daemon"
         assert_eq!(
-            versions_live_status("bbb", None, Some("bbb")),
+            versions_live_status("bbbbbbbbbb", None, Some("bbbbbbbbbbbbbbbbbbbb")),
             "stale-daemon"
         );
+    }
+
+    #[test]
+    fn live_probe_reads_installed_binary_not_checkout_head() {
+        let command = versions_live_probe_command();
+        assert!(command.contains("~/.local/bin/forgefleetd --version"));
+        assert!(command.contains("/health"));
+        assert!(!command.contains("rev-parse"));
+    }
+
+    #[test]
+    fn shipped_receiver_probe_does_not_require_a_git_checkout() {
+        let command = deploy_convergence_probe_command("/not/a/repository", false);
+        assert!(command.contains("~/.local/bin/forgefleetd --version"));
+        assert!(!command.contains("/not/a/repository"));
+        assert!(!command.contains("git "));
+        assert!(!command.contains("rev-parse"));
+
+        let builder = deploy_convergence_probe_command("~/projects/forge-fleet", true);
+        assert!(builder.contains("git rev-parse HEAD"));
+        assert!(builder.contains("@@V@@"));
+    }
+
+    #[test]
+    fn leader_refresh_is_pinned_to_rollout_target_without_fetching_main() {
+        let expected = "0123456789abcdef0123456789abcdef01234567";
+        let guard = leader_refresh_guard_command("~/projects/forge-fleet", expected);
+        assert!(guard.contains(expected));
+        assert!(guard.contains("git rev-parse HEAD"));
+        assert!(guard.contains("git status --porcelain"));
+        assert!(!guard.contains("--untracked-files=no"));
+        assert!(!guard.contains("git fetch"));
+        assert!(!guard.contains("origin/main"));
+
+        let playbook = leader_refresh_playbook("linux", "~/projects/forge-fleet", expected);
+        let final_clean = playbook
+            .find("LEADER_REFRESH_DIRTY")
+            .expect("must re-check cleanliness at build boundary");
+        let final_sha = playbook
+            .find("LEADER_REFRESH_SHA_MISMATCH")
+            .expect("must re-check immutable target at build boundary");
+        let build = playbook
+            .find("cargo build --release")
+            .expect("must build after final guard");
+        assert!(final_clean < final_sha && final_sha < build);
+        assert!(playbook.contains("git status --porcelain"));
+        assert!(!playbook.contains("--untracked-files=no"));
+        assert!(!playbook.contains("git fetch"));
     }
 
     #[test]
@@ -6595,7 +6965,12 @@ mod route_tests {
 
     #[test]
     fn macos_deploy_kills_orphans_before_kickstart() {
-        let p = super::deploy_playbook("macos", "~/projects/forge-fleet");
+        let p = super::deploy_playbook(
+            "macos",
+            "~/projects/forge-fleet",
+            "git@example.test:forge-fleet.git",
+            &"a".repeat(40),
+        );
         let kill = p.find("kill -KILL").expect("must kill stray forgefleetd");
         let kick = p
             .find("launchctl kickstart")
@@ -6777,7 +7152,12 @@ mod route_tests {
 
     #[test]
     fn linux_deploy_uses_systemd_not_launchctl() {
-        let p = super::deploy_playbook("linux", "~/projects/forge-fleet");
+        let p = super::deploy_playbook(
+            "linux",
+            "~/projects/forge-fleet",
+            "git@example.test:forge-fleet.git",
+            &"a".repeat(40),
+        );
         assert!(p.contains("systemctl --user"));
         assert!(p.contains("deploy/systemd/forgefleetd.service"));
         assert!(p.contains("systemctl --user enable forgefleetd.service"));
@@ -6791,12 +7171,17 @@ mod route_tests {
 
     #[test]
     fn deploy_playbook_refuses_dirty_tree_before_reset_hard() {
-        let p = super::deploy_playbook("macos", "~/projects/forge-fleet");
+        let p = super::deploy_playbook(
+            "macos",
+            "~/projects/forge-fleet",
+            "git@example.test:forge-fleet.git",
+            &"a".repeat(40),
+        );
         let dirty = p
             .find("DEPLOY_DIRTY_TREE")
             .expect("must check dirty tree before reset");
         let reset = p
-            .find("git reset --hard origin/main")
+            .find("git reset --hard FETCH_HEAD")
             .expect("must reset --hard");
         assert!(dirty < reset, "dirty-tree guard must precede reset --hard");
         assert!(
@@ -6804,6 +7189,28 @@ mod route_tests {
             "must check tracked and untracked work"
         );
         assert!(!p.contains("--untracked-files=no"));
+    }
+
+    #[test]
+    fn deploy_playbook_fetches_explicit_main_into_fetch_head_and_verifies_sha() {
+        let expected = "0123456789abcdef0123456789abcdef01234567";
+        let remote = "git@example.test:forge-fleet.git";
+        let p = super::deploy_playbook("linux", "~/projects/forge-fleet", remote, expected);
+        let fetch = p
+            .find("git fetch -- 'git@example.test:forge-fleet.git' refs/heads/main")
+            .expect("must fetch explicit main ref");
+        let reset = p
+            .find("git reset --hard FETCH_HEAD")
+            .expect("must reset to FETCH_HEAD");
+        let verify = p
+            .find("DEPLOY_SHA_MISMATCH")
+            .expect("must verify post-reset HEAD");
+        let build = p.find("cargo build --release").expect("must build");
+        assert!(fetch < reset && reset < verify && verify < build);
+        assert!(p.contains(expected));
+        assert!(p.contains("exit 9"));
+        assert!(!p.contains("git fetch origin"));
+        assert!(!p.contains("git reset --hard origin/main"));
     }
 
     /// Layout invariant (2026-07-07 migration): a NULL-source-tree WORKER must
