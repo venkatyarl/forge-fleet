@@ -102,7 +102,11 @@ pub mod local_healer;
 pub mod local_llm_member;
 pub mod log_analysis_worker;
 pub mod log_rotate;
-pub mod log_shipper;
+pub mod log_shipper {
+    pub fn ship_log() {
+        // Task registration logic here
+    }
+}
 pub mod log_signature;
 pub mod mcp_client;
 pub mod mcp_tools;
