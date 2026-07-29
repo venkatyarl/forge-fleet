@@ -221,3 +221,121 @@ async fn v176_merge_train_tables_are_created() {
 
     drop_temp_db(admin, pool, &db_name).await;
 }
+
+/// V283 must upgrade the three-state prototype ledger in place and
+/// prevent an older writer from moving a durable cursor backwards.
+#[tokio::test]
+async fn v283_upgrades_attempt_states_and_guards_cursor_regression() {
+    let Some((admin, pool, db_name)) = create_temp_db().await else {
+        eprintln!("skipping v283 digest migration test: no database URL");
+        return;
+    };
+
+    sqlx::raw_sql(
+        "CREATE TABLE project_digest_configs (\
+            id text PRIMARY KEY, project_id text NOT NULL, kind text NOT NULL,\
+            title text NOT NULL, enabled boolean NOT NULL DEFAULT true,\
+            interval_secs integer NOT NULL DEFAULT 900, logo_png bytea,\
+            logo_path text, task_work_item_id text, expires_at timestamptz,\
+            last_sent_at timestamptz, created_at timestamptz NOT NULL DEFAULT now(),\
+            updated_at timestamptz NOT NULL DEFAULT now());\
+         CREATE TABLE project_digest_attempts (\
+            config_id text NOT NULL REFERENCES project_digest_configs(id),\
+            prior_cursor timestamptz, cursor_at timestamptz NOT NULL,\
+            window_end timestamptz NOT NULL, title text NOT NULL, body text NOT NULL,\
+            logo_png bytea, delivery_key text NOT NULL UNIQUE,\
+            delivery_status text NOT NULL DEFAULT 'prepared'\
+                CHECK (delivery_status IN ('prepared','sending','delivered')),\
+            delivered_at timestamptz, external_id text,\
+            created_at timestamptz NOT NULL DEFAULT now(),\
+            updated_at timestamptz NOT NULL DEFAULT now(),\
+            PRIMARY KEY(config_id,cursor_at,window_end));",
+    )
+    .execute(&pool)
+    .await
+    .expect("create legacy digest ledger");
+
+    let start: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT clock_timestamp()-interval '1 hour'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let end = start + chrono::Duration::minutes(15);
+    sqlx::query(
+        "INSERT INTO project_digest_configs(id,project_id,kind,title,last_sent_at) \
+         VALUES('legacy','p','standing','legacy digest',$1)",
+    )
+    .bind(end)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO project_digest_attempts \
+            (config_id,cursor_at,window_end,title,body,delivery_key,delivery_status,delivered_at) \
+         VALUES('legacy',$1,$2,'legacy digest','legacy body','legacy-key','delivered',now())",
+    )
+    .bind(start)
+    .bind(end)
+    .execute(&pool)
+    .await
+    .expect("insert legacy delivered row without Telegram acknowledgement");
+
+    sqlx::raw_sql(ff_db::schema::SCHEMA_V283_PROJECT_DIGEST_ATTEMPTS)
+        .execute(&pool)
+        .await
+        .expect("apply V283 compatibility migration");
+
+    let legacy: (String, Option<serde_json::Value>) = sqlx::query_as(
+        "SELECT delivery_status,acknowledgement \
+           FROM project_digest_attempts WHERE config_id='legacy'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("legacy delivered row survives the upgrade");
+    assert_eq!(legacy, ("delivered".into(), None));
+
+    sqlx::query(
+        "INSERT INTO project_digest_configs(id,project_id,kind,title,last_sent_at) \
+         VALUES('cfg','p','standing','digest',$1)",
+    )
+    .bind(start)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO project_digest_attempts \
+            (config_id,cursor_at,window_end,title,body,delivery_key,delivery_status,\
+             attempt,fence,last_error) \
+         VALUES('cfg',$1,$2,'digest','body','key','retryable',2,$3,'definite')",
+    )
+    .bind(start)
+    .bind(end)
+    .bind(uuid::Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect("new V283 columns and retryable state are writable");
+    sqlx::query(
+        "UPDATE project_digest_attempts \
+            SET delivery_status='ambiguous',acknowledgement='[]'::jsonb",
+    )
+    .execute(&pool)
+    .await
+    .expect("ambiguous state and acknowledgement are writable");
+    let unacknowledged_delivery =
+        sqlx::query("UPDATE project_digest_attempts SET delivery_status='delivered'")
+            .execute(&pool)
+            .await;
+    assert!(
+        unacknowledged_delivery.is_err(),
+        "delivered rows must contain a durable Telegram acknowledgement"
+    );
+
+    let regression =
+        sqlx::query("UPDATE project_digest_configs SET last_sent_at=$1 WHERE id='cfg'")
+            .bind(start - chrono::Duration::seconds(1))
+            .execute(&pool)
+            .await;
+    assert!(regression.is_err(), "V283 must reject cursor regression");
+
+    drop_temp_db(admin, pool, &db_name).await;
+}

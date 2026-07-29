@@ -302,6 +302,25 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
                 }
             }
         }
+        crate::PmCommand::BindRepo { id, repo } => {
+            let uid = uuid::Uuid::parse_str(&id)
+                .map_err(|e| anyhow::anyhow!("invalid work item id '{id}': {e}"))?;
+            let actor = ff_agent::fleet_info::resolve_this_worker_name().await;
+            let result = bind_work_item_repo(&pool, uid, &repo, &actor).await?;
+            if result.already_bound {
+                println!(
+                    "{YELLOW}work item {id} is already bound to {} ({}){RESET}",
+                    result.repo_name, result.repo_id
+                );
+            } else {
+                println!(
+                    "{GREEN}✓ bound work item {id} to {} ({}){RESET}",
+                    result.repo_name, result.repo_id
+                );
+                println!("  repo_url: {}", result.repo_url);
+                println!("  status:   {} (unchanged)", result.status);
+            }
+        }
         crate::PmCommand::Board { limit } => {
             // Fleet-wide rollup first — the at-a-glance state of distributed
             // concurrent dev (Pillar 4) across all computers, before the detail.
@@ -670,6 +689,205 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
         }
     }
     Ok(())
+}
+
+const REPOSITORY_RESOLUTION_FAILED_CLOSED_PREFIX: &str = "repository resolution failed closed: ";
+
+#[derive(Debug, PartialEq, Eq)]
+struct BindRepoResult {
+    repo_id: uuid::Uuid,
+    repo_name: String,
+    repo_url: String,
+    status: String,
+    already_bound: bool,
+}
+
+fn is_repository_resolution_failed_closed(error: &str) -> bool {
+    error
+        .strip_prefix(REPOSITORY_RESOLUTION_FAILED_CLOSED_PREFIX)
+        .is_some_and(|detail| !detail.trim().is_empty())
+}
+
+async fn bind_work_item_repo(
+    pool: &sqlx::PgPool,
+    id: uuid::Uuid,
+    selector: &str,
+    actor: &str,
+) -> Result<BindRepoResult> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        anyhow::bail!("repository selector must not be empty");
+    }
+
+    let mut tx = pool.begin().await?;
+    let item: Option<(
+        String,
+        String,
+        Option<String>,
+        Option<uuid::Uuid>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT project_id, status, last_error, repo_id, repo_url \
+           FROM work_items \
+          WHERE id = $1 \
+          FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((project_id, status, last_error, existing_repo_id, existing_repo_url)) = item else {
+        anyhow::bail!("no work item with id {id}");
+    };
+
+    // UUID lookup is deliberately project-scoped, so a valid UUID owned by a
+    // different project is indistinguishable from an unknown selector.
+    // A syntactically valid UUID is always an ID selector, never also a name
+    // selector. This avoids a contrived UUID-shaped name making a valid ID
+    // ambiguous while preserving exact-name ambiguity detection.
+    let repos: Vec<(uuid::Uuid, String, String)> =
+        if let Ok(selector_id) = uuid::Uuid::parse_str(selector) {
+            sqlx::query_as(
+                "SELECT id, COALESCE(name, id::text), github_url \
+                   FROM project_repos \
+                  WHERE project_id = $1 AND id = $2",
+            )
+            .bind(&project_id)
+            .bind(selector_id)
+            .fetch_all(&mut *tx)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT id, COALESCE(name, id::text), github_url \
+                   FROM project_repos \
+                  WHERE project_id = $1 AND name = $2 \
+                  ORDER BY id",
+            )
+            .bind(&project_id)
+            .bind(selector)
+            .fetch_all(&mut *tx)
+            .await?
+        };
+    let (repo_id, repo_name, repo_url) = match repos.as_slice() {
+        [only] => only.clone(),
+        [] => anyhow::bail!(
+            "unknown repository '{selector}' in project '{project_id}' \
+             (expected a project_repos UUID or exact name)"
+        ),
+        many => anyhow::bail!(
+            "repository name '{selector}' is ambiguous in project '{project_id}' \
+             ({} matches); use the project_repos UUID",
+            many.len()
+        ),
+    };
+    if repo_url.trim().is_empty() {
+        anyhow::bail!("repository {repo_id} in project '{project_id}' has a blank github_url");
+    }
+
+    if let Some(bound_id) = existing_repo_id {
+        if bound_id != repo_id {
+            anyhow::bail!(
+                "work item {id} is already bound to different repository {bound_id}; refusing overwrite"
+            );
+        }
+        if existing_repo_url.as_deref() != Some(repo_url.as_str()) {
+            anyhow::bail!(
+                "work item {id} has repository {repo_id} but a non-canonical repo_url; \
+                 refusing to mutate an existing binding"
+            );
+        }
+        tx.rollback().await?;
+        return Ok(BindRepoResult {
+            repo_id,
+            repo_name,
+            repo_url,
+            status,
+            already_bound: true,
+        });
+    }
+    if existing_repo_url
+        .as_deref()
+        .is_some_and(|url| !url.is_empty())
+    {
+        anyhow::bail!(
+            "work item {id} already has repo_url '{}' without repo_id; refusing overwrite",
+            existing_repo_url.as_deref().unwrap_or_default()
+        );
+    }
+
+    let repairable_error = last_error
+        .as_deref()
+        .is_some_and(is_repository_resolution_failed_closed);
+    if status != "ready" {
+        anyhow::bail!("work item {id} is '{status}'; bind-repo only permits unbound ready items");
+    }
+
+    let has_live_lease: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM work_item_leases \
+                        WHERE work_item_id = $1 AND released_at IS NULL)",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if has_live_lease {
+        anyhow::bail!(
+            "work item {id} has an unreleased lease (including an expired lease pending reaping)"
+        );
+    }
+    let has_slot: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sub_agents WHERE current_work_item_id = $1)",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if has_slot {
+        anyhow::bail!("work item {id} is still assigned to a live sub-agent slot");
+    }
+
+    let clear_repair_error = repairable_error;
+    let updated = sqlx::query(
+        "UPDATE work_items \
+            SET repo_id = $2, repo_url = $3, \
+                last_error = CASE WHEN $4 THEN NULL ELSE last_error END \
+          WHERE id = $1 AND repo_id IS NULL \
+            AND (repo_url IS NULL OR repo_url = '') \
+            AND status = $5",
+    )
+    .bind(id)
+    .bind(repo_id)
+    .bind(&repo_url)
+    .bind(clear_repair_error)
+    .bind(&status)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        anyhow::bail!("work item {id} changed concurrently; repository binding rolled back");
+    }
+
+    sqlx::query(
+        "INSERT INTO work_item_events \
+            (work_item_id, from_status, to_status, computer, attempt, detail) \
+         SELECT id, status, 'repo_bound', $2, attempts, \
+                jsonb_build_object('action', 'repo_bound', 'repo_id', $3::text, \
+                                   'repo_url', $4::text, 'repo_name', $5::text) \
+           FROM work_items WHERE id = $1",
+    )
+    .bind(id)
+    .bind(actor)
+    .bind(repo_id)
+    .bind(&repo_url)
+    .bind(&repo_name)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok(BindRepoResult {
+        repo_id,
+        repo_name,
+        repo_url,
+        status,
+        already_bound: false,
+    })
 }
 
 #[derive(Debug)]
@@ -2918,6 +3136,433 @@ async fn handle_pm_purge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::{Row, postgres::PgPoolOptions};
+    use std::str::FromStr;
+
+    async fn bind_repo_temp_pool() -> Option<(sqlx::PgPool, sqlx::PgPool, String)> {
+        let database_url = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()?;
+        let mut options = sqlx::postgres::PgConnectOptions::from_str(&database_url).ok()?;
+        let admin = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.clone())
+            .await
+            .ok()?;
+        let db_name = format!("ff_bind_repo_test_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .ok()?;
+        options = options.database(&db_name);
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect_with(options)
+            .await
+            .ok()?;
+        sqlx::raw_sql(
+            "CREATE EXTENSION IF NOT EXISTS pgcrypto;
+             CREATE TABLE projects (id TEXT PRIMARY KEY);
+             CREATE TABLE project_repos (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                github_url TEXT NOT NULL,
+                name TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );
+             CREATE TABLE work_items (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                status TEXT NOT NULL,
+                attempts INT NOT NULL DEFAULT 0,
+                last_error TEXT,
+                repo_id UUID REFERENCES project_repos(id),
+                repo_url TEXT,
+                repo_path TEXT,
+                priority TEXT NOT NULL DEFAULT 'normal',
+                payload JSONB NOT NULL DEFAULT '{}',
+                assigned_to TEXT,
+                assigned_computer TEXT,
+                base_sha TEXT,
+                base_branch TEXT
+             );
+             CREATE TABLE computers (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                name TEXT NOT NULL
+             );
+             CREATE TABLE sub_agents (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                current_work_item_id UUID REFERENCES work_items(id)
+             );
+             CREATE TABLE work_item_leases (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                work_item_id UUID NOT NULL REFERENCES work_items(id),
+                computer_id UUID NOT NULL REFERENCES computers(id),
+                lease_expires_at TIMESTAMPTZ NOT NULL,
+                released_at TIMESTAMPTZ
+             );
+             CREATE TABLE work_item_events (
+                id BIGSERIAL PRIMARY KEY,
+                work_item_id UUID NOT NULL REFERENCES work_items(id),
+                from_status TEXT,
+                to_status TEXT NOT NULL,
+                computer TEXT,
+                attempt INT,
+                detail TEXT
+             );",
+        )
+        .execute(&pool)
+        .await
+        .expect("create bind-repo test schema");
+        Some((admin, pool, db_name))
+    }
+
+    async fn drop_bind_repo_temp_pool(admin: sqlx::PgPool, pool: sqlx::PgPool, db_name: &str) {
+        pool.close().await;
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+              WHERE datname = $1 AND pid <> pg_backend_pid()",
+        )
+        .bind(db_name)
+        .execute(&admin)
+        .await
+        .unwrap();
+        sqlx::query(&format!("DROP DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .unwrap();
+        admin.close().await;
+    }
+
+    async fn seed_bind_repo(pool: &sqlx::PgPool) -> (uuid::Uuid, uuid::Uuid) {
+        sqlx::query("INSERT INTO projects(id) VALUES ('p1'), ('p2')")
+            .execute(pool)
+            .await
+            .unwrap();
+        let repo1 = sqlx::query_scalar(
+            "INSERT INTO project_repos(project_id, name, github_url) \
+             VALUES ('p1', 'api', 'https://example.test/p1/api.git') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let repo2 = sqlx::query_scalar(
+            "INSERT INTO project_repos(project_id, name, github_url) \
+             VALUES ('p2', 'api', 'https://example.test/p2/api.git') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (repo1, repo2)
+    }
+
+    async fn insert_bind_item(
+        pool: &sqlx::PgPool,
+        status: &str,
+        error: Option<&str>,
+    ) -> uuid::Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO work_items \
+               (project_id, status, attempts, last_error, repo_path, priority, payload, \
+                assigned_to, assigned_computer, base_sha, base_branch) \
+             VALUES ('p1', $1, 7, $2, '/explicit/path', 'high', '{\"keep\":true}', \
+                     'alice', 'sia', 'abc123', 'develop') RETURNING id",
+        )
+        .bind(status)
+        .bind(error)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[test]
+    fn repository_resolution_error_class_is_exact_prefix() {
+        assert!(is_repository_resolution_failed_closed(
+            "repository resolution failed closed: no registered project_repos row"
+        ));
+        assert!(!is_repository_resolution_failed_closed(
+            "wrapper: repository resolution failed closed: no repo"
+        ));
+        assert!(!is_repository_resolution_failed_closed(
+            "repository resolution failed closed: "
+        ));
+    }
+
+    #[tokio::test]
+    async fn bind_repo_ready_repair_preserves_fields_and_audits() {
+        let Some((admin, pool, db_name)) = bind_repo_temp_pool().await else {
+            return;
+        };
+        let (repo_id, _) = seed_bind_repo(&pool).await;
+        let repair_error = "repository resolution failed closed: no registered project_repos row";
+        let ready = insert_bind_item(&pool, "ready", Some(repair_error)).await;
+
+        let ready_result = bind_work_item_repo(&pool, ready, "api", "tester")
+            .await
+            .unwrap();
+        assert_eq!(ready_result.repo_id, repo_id);
+
+        let row = sqlx::query(
+            "SELECT status, attempts, last_error, repo_id, repo_url, repo_path, priority, \
+                        payload, assigned_to, assigned_computer, base_sha, base_branch \
+                   FROM work_items WHERE id = $1",
+        )
+        .bind(ready)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("status"), "ready");
+        assert_eq!(row.get::<i32, _>("attempts"), 7);
+        assert_eq!(row.get::<Option<String>, _>("last_error"), None);
+        assert_eq!(row.get::<uuid::Uuid, _>("repo_id"), repo_id);
+        assert_eq!(row.get::<String, _>("repo_path"), "/explicit/path");
+        assert_eq!(row.get::<String, _>("priority"), "high");
+        assert_eq!(row.get::<serde_json::Value, _>("payload")["keep"], true);
+        assert_eq!(
+            row.get::<Option<String>, _>("assigned_to").as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("assigned_computer").as_deref(),
+            Some("sia")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("base_sha").as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("base_branch").as_deref(),
+            Some("develop")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM work_item_events \
+                      WHERE work_item_id = $1 AND to_status = 'repo_bound'"
+            )
+            .bind(ready)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        drop_bind_repo_temp_pool(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn bind_repo_rejects_states_errors_selectors_and_live_ownership() {
+        let Some((admin, pool, db_name)) = bind_repo_temp_pool().await else {
+            return;
+        };
+        let (repo_id, cross_project_repo) = seed_bind_repo(&pool).await;
+        sqlx::query(
+            "INSERT INTO project_repos(project_id, name, github_url) \
+             VALUES ('p1', 'duplicate', 'https://example.test/a'), \
+                    ('p1', 'duplicate', 'https://example.test/b')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO project_repos(project_id, name, github_url) \
+             VALUES ('p1', $1, 'https://example.test/uuid-shaped-name')",
+        )
+        .bind(repo_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let uuid_precedence = insert_bind_item(&pool, "ready", None).await;
+        assert_eq!(
+            bind_work_item_repo(&pool, uuid_precedence, &repo_id.to_string(), "tester")
+                .await
+                .unwrap()
+                .repo_id,
+            repo_id
+        );
+        for (status, error) in [
+            ("idea", None),
+            ("claimed", None),
+            ("building", None),
+            ("failed", Some("compile failed")),
+            (
+                "failed",
+                Some("repository resolution failed closed: no registered project_repos row"),
+            ),
+        ] {
+            let id = insert_bind_item(&pool, status, error).await;
+            assert!(
+                bind_work_item_repo(&pool, id, "api", "tester")
+                    .await
+                    .is_err()
+            );
+        }
+        let selector_item = insert_bind_item(&pool, "ready", None).await;
+        for selector in [
+            cross_project_repo.to_string(),
+            "duplicate".to_string(),
+            "https://example.test/p1/api.git".to_string(),
+        ] {
+            assert!(
+                bind_work_item_repo(&pool, selector_item, &selector, "tester")
+                    .await
+                    .is_err()
+            );
+        }
+
+        let computer: uuid::Uuid =
+            sqlx::query_scalar("INSERT INTO computers(name) VALUES ('sia') RETURNING id")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let active = insert_bind_item(&pool, "ready", None).await;
+        sqlx::query(
+            "INSERT INTO work_item_leases(work_item_id, computer_id, lease_expires_at) \
+             VALUES ($1, $2, NOW() + interval '1 minute')",
+        )
+        .bind(active)
+        .bind(computer)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            bind_work_item_repo(&pool, active, "api", "tester")
+                .await
+                .is_err()
+        );
+        let leased = insert_bind_item(&pool, "ready", None).await;
+        sqlx::query(
+            "INSERT INTO work_item_leases(work_item_id, computer_id, lease_expires_at) \
+             VALUES ($1, $2, NOW() - interval '1 minute')",
+        )
+        .bind(leased)
+        .bind(computer)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            bind_work_item_repo(&pool, leased, &repo_id.to_string(), "tester")
+                .await
+                .is_err()
+        );
+        sqlx::query("UPDATE work_item_leases SET released_at = NOW() WHERE work_item_id = $1")
+            .bind(leased)
+            .execute(&pool)
+            .await
+            .unwrap();
+        bind_work_item_repo(&pool, leased, &repo_id.to_string(), "tester")
+            .await
+            .unwrap();
+
+        let slotted = insert_bind_item(&pool, "ready", None).await;
+        sqlx::query("INSERT INTO sub_agents(current_work_item_id) VALUES ($1)")
+            .bind(slotted)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            bind_work_item_repo(&pool, slotted, "api", "tester")
+                .await
+                .is_err()
+        );
+        drop_bind_repo_temp_pool(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn bind_repo_is_idempotent_and_event_failure_rolls_back() {
+        let Some((admin, pool, db_name)) = bind_repo_temp_pool().await else {
+            return;
+        };
+        let (repo_id, _) = seed_bind_repo(&pool).await;
+        let id = insert_bind_item(&pool, "ready", None).await;
+        bind_work_item_repo(&pool, id, "api", "tester")
+            .await
+            .unwrap();
+        let repeated = bind_work_item_repo(&pool, id, &repo_id.to_string(), "tester")
+            .await
+            .unwrap();
+        assert!(repeated.already_bound);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM work_item_events WHERE work_item_id = $1"
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+
+        let rollback_id = insert_bind_item(&pool, "ready", None).await;
+        sqlx::raw_sql(
+            "CREATE FUNCTION reject_repo_bound() RETURNS trigger LANGUAGE plpgsql AS $$ \
+               BEGIN RAISE EXCEPTION 'audit unavailable'; END $$; \
+             CREATE TRIGGER reject_repo_bound BEFORE INSERT ON work_item_events \
+               FOR EACH ROW EXECUTE FUNCTION reject_repo_bound();",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            bind_work_item_repo(&pool, rollback_id, "api", "tester")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+                "SELECT repo_id FROM work_items WHERE id = $1"
+            )
+            .bind(rollback_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            None
+        );
+        drop_bind_repo_temp_pool(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn bind_repo_serializes_with_claim_and_rechecks_status() {
+        let Some((admin, pool, db_name)) = bind_repo_temp_pool().await else {
+            return;
+        };
+        seed_bind_repo(&pool).await;
+        let id = insert_bind_item(&pool, "ready", None).await;
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM work_items WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+        let claim_pool = pool.clone();
+        let claim = tokio::spawn(async move {
+            sqlx::query(
+                "UPDATE work_items SET status = 'claimed' \
+                  WHERE id = $1 AND status = 'ready'",
+            )
+            .bind(id)
+            .execute(&claim_pool)
+            .await
+            .unwrap()
+            .rows_affected()
+        });
+        blocker.commit().await.unwrap();
+        assert_eq!(claim.await.unwrap(), 1);
+        assert!(
+            bind_work_item_repo(&pool, id, "api", "tester")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+                "SELECT repo_id FROM work_items WHERE id = $1"
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            None
+        );
+        drop_bind_repo_temp_pool(admin, pool, &db_name).await;
+    }
 
     #[test]
     fn close_validation_rejects_blank_evidence_and_bad_verification_dependency() {

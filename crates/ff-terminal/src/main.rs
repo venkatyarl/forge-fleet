@@ -2622,6 +2622,15 @@ pub enum WorkstreamCommand {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Detach this CLI session's seat from the current project's workstream.
+    Detach {
+        /// Which CLI is detaching. Auto-detected when omitted (see `attach`).
+        #[arg(long)]
+        tool: Option<String>,
+        /// This CLI's own native session id (see `attach --session`).
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Report working state into the project's workstream: update the shared
     /// summary/focus and append a timestamped note to the activity log.
     Report {
@@ -3253,6 +3262,15 @@ pub enum PmCommand {
         /// Optionally pin execution to one computer (sets assigned_computer).
         #[arg(long)]
         on: Option<String>,
+    },
+    /// Repair a work item's authoritative project repository binding without
+    /// changing its scheduling state. Failed items still require `pm retry`.
+    BindRepo {
+        /// Exact work item UUID.
+        id: String,
+        /// Registered repository UUID or exact name within the item's project.
+        #[arg(long)]
+        repo: String,
     },
     /// Live Pillar-4 pipeline board: active/recent work_items with their host,
     /// lease/worktree state, merge-queue status, and PR — the autonomous build
@@ -8210,6 +8228,48 @@ mod pm_create_cli_tests {
                         command: PmCommand::Create { repo: Some(_), .. }
                     })
                 ));
+            })
+            .expect("spawn parser test")
+            .join()
+            .expect("parser test panicked");
+    }
+}
+
+#[cfg(test)]
+mod pm_bind_repo_cli_tests {
+    use super::{Cli, Command, PmCommand};
+    use clap::Parser;
+
+    #[test]
+    fn pm_bind_repo_requires_id_and_repo_selector() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "ff",
+                    "pm",
+                    "bind-repo",
+                    "00000000-0000-0000-0000-000000000001",
+                    "--repo",
+                    "api",
+                ])
+                .expect("typed bind-repo shape should parse");
+                assert!(matches!(
+                    cli.command,
+                    Some(Command::Pm {
+                        command: PmCommand::BindRepo { repo, .. }
+                    }) if repo == "api"
+                ));
+                assert!(
+                    Cli::try_parse_from([
+                        "ff",
+                        "pm",
+                        "bind-repo",
+                        "00000000-0000-0000-0000-000000000001"
+                    ])
+                    .is_err(),
+                    "--repo is required"
+                );
             })
             .expect("spawn parser test")
             .join()
