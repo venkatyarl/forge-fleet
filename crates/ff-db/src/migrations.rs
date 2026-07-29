@@ -1260,6 +1260,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "oplog_replay",
         sql: schema::SCHEMA_V282_OPLOG_REPLAY,
     },
+    PgMigration {
+        version: 283,
+        name: "project_digest_attempts",
+        sql: schema::SCHEMA_V283_PROJECT_DIGEST_ATTEMPTS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -2779,6 +2784,46 @@ mod tests {
             migration
                 .sql
                 .contains("CREATE TABLE IF NOT EXISTS oplog_replay_applied")
+        );
+    }
+
+    #[test]
+    fn v283_creates_project_digest_attempt_ledger() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 283)
+            .expect("V283 must be registered");
+        assert_eq!(migration.name, "project_digest_attempts");
+        assert!(
+            migration
+                .sql
+                .contains("CREATE TABLE IF NOT EXISTS project_digest_attempts")
+        );
+        assert!(
+            migration
+                .sql
+                .contains("CREATE TABLE IF NOT EXISTS project_digest_configs")
+        );
+        assert!(
+            migration
+                .sql
+                .contains("PRIMARY KEY (config_id, cursor_at, window_end)")
+        );
+        assert!(migration.sql.contains("delivery_key"));
+        assert!(migration.sql.contains("'retryable'"));
+        assert!(migration.sql.contains("'ambiguous'"));
+        assert!(migration.sql.contains("attempt         BIGINT"));
+        assert!(migration.sql.contains("fence           UUID"));
+        assert!(migration.sql.contains("acknowledgement JSONB"));
+        assert!(
+            migration
+                .sql
+                .contains("project_digest_attempts_delivered_ack_check")
+        );
+        assert!(
+            migration
+                .sql
+                .contains("guard_project_digest_cursor_regression")
         );
     }
 }
