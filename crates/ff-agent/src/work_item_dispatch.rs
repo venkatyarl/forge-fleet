@@ -91,6 +91,10 @@ struct AssignedWorkItem {
     repo_id: Option<Uuid>,
     repo_url: Option<String>,
     repo_path: PathBuf,
+    /// Fail-closed repository resolution error. Kept on the assigned record so
+    /// the item can transition claimed -> building and then enter the normal
+    /// retry/release path instead of wedging the host dispatch tick.
+    repo_resolution_error: Option<String>,
     sub_agent_id: Uuid,
     computer_id: Uuid,
     computer_name: String,
@@ -507,7 +511,11 @@ async fn assigned_work_items(
             COALESCE(w.pre_work, '[]'::jsonb) AS pre_work,
             COALESCE(w.work, '[]'::jsonb) AS work,
             COALESCE(w.post_work, '[]'::jsonb) AS post_work,
-            COALESCE(NULLIF(w.repo_url, ''), NULLIF(wr.github_url, '')) AS repo_url,
+            NULLIF(w.repo_url, '') AS work_item_repo_url,
+            NULLIF(wr.github_url, '') AS repo_id_url,
+            COALESCE(project_repo.repo_count, 0) AS project_repo_count,
+            project_repo.sole_repo_id,
+            NULLIF(project_repo.sole_repo_url, '') AS sole_repo_url,
             NULLIF(w.repo_path, '') AS bound_repo_path,
             NULLIF(w.metadata->>'repo_path', '') AS metadata_repo_path,
             -- Legacy/default path resolution (per-project, V141 project_folders):
@@ -539,7 +547,18 @@ async fn assigned_work_items(
           FROM sub_agents sa
           JOIN computers c ON c.id = sa.computer_id
           JOIN work_items w ON w.id = sa.current_work_item_id
-          LEFT JOIN project_repos wr ON wr.id = w.repo_id
+          LEFT JOIN project_repos wr
+            ON wr.id = w.repo_id
+           AND wr.project_id = w.project_id
+          LEFT JOIN LATERAL (
+              SELECT COUNT(*) OVER ()::bigint AS repo_count,
+                     pr.id AS sole_repo_id,
+                     pr.github_url AS sole_repo_url
+                FROM project_repos pr
+               WHERE pr.project_id = w.project_id
+               ORDER BY pr.created_at ASC, pr.id ASC
+               LIMIT 1
+          ) project_repo ON TRUE
           JOIN work_item_leases l
             ON l.work_item_id = w.id
            AND l.sub_agent_id = sa.id
@@ -548,12 +567,6 @@ async fn assigned_work_items(
            AND sa.status = 'busy'
            AND sa.current_work_item_id IS NOT NULL
            AND w.status = 'claimed'
-           AND NOT EXISTS (
-               SELECT 1
-                 FROM work_item_worktrees wt
-                WHERE wt.work_item_id = w.id
-                  AND wt.status IN ('creating', 'active', 'ready_for_review')
-           )
          ORDER BY l.created_at ASC
          LIMIT $3
         "#,
@@ -566,7 +579,15 @@ async fn assigned_work_items(
 
     rows.into_iter()
         .map(|r| {
-            let repo_url: Option<String> = r.try_get("repo_url").ok().flatten();
+            let resolved_repo = resolve_dispatch_repo_binding(
+                r.try_get("repo_id").ok().flatten(),
+                r.try_get("work_item_repo_url").ok().flatten(),
+                r.try_get("repo_id_url").ok().flatten(),
+                r.try_get("project_repo_count").unwrap_or(0),
+                r.try_get("sole_repo_id").ok().flatten(),
+                r.try_get("sole_repo_url").ok().flatten(),
+            );
+            let repo_url = resolved_repo.repo_url;
             let bound_repo_path: Option<PathBuf> = r
                 .try_get::<Option<String>, _>("bound_repo_path")
                 .ok()
@@ -631,9 +652,10 @@ async fn assigned_work_items(
                 title: r.get("title"),
                 description: r.try_get("description").ok().flatten(),
                 base_branch: r.try_get("base_branch").ok().flatten(),
-                repo_id: r.try_get("repo_id").ok().flatten(),
+                repo_id: resolved_repo.repo_id,
                 repo_url,
                 repo_path,
+                repo_resolution_error: resolved_repo.error,
                 kind,
                 sub_agent_id: r.get("sub_agent_id"),
                 computer_id: r.get("computer_id"),
@@ -657,6 +679,76 @@ async fn assigned_work_items(
             })
         })
         .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DispatchRepoBinding {
+    repo_id: Option<Uuid>,
+    repo_url: Option<String>,
+    error: Option<String>,
+}
+
+fn resolve_dispatch_repo_binding(
+    explicit_repo_id: Option<Uuid>,
+    explicit_repo_url: Option<String>,
+    repo_id_url: Option<String>,
+    project_repo_count: i64,
+    sole_repo_id: Option<Uuid>,
+    sole_repo_url: Option<String>,
+) -> DispatchRepoBinding {
+    if let Some(repo_id) = explicit_repo_id
+        && repo_id_url
+            .as_deref()
+            .is_none_or(|url| url.trim().is_empty())
+    {
+        return DispatchRepoBinding {
+            repo_id: Some(repo_id),
+            repo_url: None,
+            error: Some(format!(
+                "work item repo_id {repo_id} does not resolve to a non-blank repo in its project"
+            )),
+        };
+    }
+    if let Some(url) = explicit_repo_url.filter(|url| !url.trim().is_empty()) {
+        return DispatchRepoBinding {
+            repo_id: explicit_repo_id,
+            repo_url: Some(url),
+            error: None,
+        };
+    }
+    if let Some(repo_id) = explicit_repo_id {
+        return DispatchRepoBinding {
+            repo_id: Some(repo_id),
+            repo_url: repo_id_url,
+            error: None,
+        };
+    }
+    if project_repo_count == 1 {
+        return match sole_repo_url.filter(|url| !url.trim().is_empty()) {
+            Some(url) => DispatchRepoBinding {
+                repo_id: sole_repo_id,
+                repo_url: Some(url),
+                error: None,
+            },
+            None => DispatchRepoBinding {
+                repo_id: sole_repo_id,
+                repo_url: None,
+                error: Some("the project's sole registered repo has a blank URL".to_string()),
+            },
+        };
+    }
+    let detail = if project_repo_count == 0 {
+        "no registered project_repos row".to_string()
+    } else {
+        format!("{project_repo_count} registered project_repos rows")
+    };
+    DispatchRepoBinding {
+        repo_id: None,
+        repo_url: None,
+        error: Some(format!(
+            "work item has no explicit repo binding and its project has {detail}; dispatch requires exactly one"
+        )),
+    }
 }
 
 /// Parse a JSONB array column into a `Vec<String>`, skipping non-string values.
@@ -1021,6 +1113,10 @@ async fn dispatch_one(
         return Ok(WorkItemDispatchResult::default());
     }
 
+    if let Some(error) = item.repo_resolution_error.as_deref() {
+        bail!("repository resolution failed closed: {error}");
+    }
+
     // Keep the lease heartbeat alive for the ENTIRE dispatch — the backend build
     // AND the commit/push/PR tail — via an RAII guard that stops it when
     // dispatch_one returns on ANY path. Previously the heartbeat stopped the
@@ -1042,6 +1138,7 @@ async fn dispatch_one(
 
     // PRE: stage the clone, validate the lifecycle manifest, and verify local
     // prerequisites before checkout/reset and before agent execution.
+    invalidate_nonlocal_worktree_mapping(&pg, &item).await?;
     ensure_repo_checked_out(&pg, &item).await?;
     validate_dispatch_manifest(&item)?;
     check_dispatch_prerequisites(&item.repo_path)?;
@@ -1835,6 +1932,57 @@ fn task_branch_name(title: &str, work_item_id: uuid::Uuid) -> String {
     } else {
         format!("feature/{slug}-{id4}")
     }
+}
+
+/// Invalidate only a stale DB mapping that points at a different physical
+/// checkout. Never delete/reset its filesystem: an old backend on that host may
+/// still be writing there. A mapping on this same computer and checkout remains
+/// a hard fence; the normal failure cleanup may terminalize its DB row, but this
+/// dispatch does not touch or reuse that checkout while ownership is ambiguous.
+async fn invalidate_nonlocal_worktree_mapping(pg: &PgPool, item: &AssignedWorkItem) -> Result<()> {
+    let expected_path = item.repo_path.to_string_lossy().to_string();
+    let invalidated = sqlx::query(
+        "UPDATE work_item_worktrees
+            SET status = 'failed'
+          WHERE work_item_id = $1
+            AND status IN ('creating', 'active', 'ready_for_review')
+            AND (computer_id IS DISTINCT FROM $2 OR worktree_path IS DISTINCT FROM $3)",
+    )
+    .bind(item.work_item_id)
+    .bind(item.computer_id)
+    .bind(&expected_path)
+    .execute(pg)
+    .await?
+    .rows_affected();
+    if invalidated > 0 {
+        warn!(
+            work_item_id = %item.work_item_id,
+            invalidated,
+            "work_item_dispatch: invalidated stale nonlocal worktree mapping without filesystem deletion"
+        );
+    }
+
+    let local_collision: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1
+              FROM work_item_worktrees
+             WHERE work_item_id = $1
+               AND computer_id IS NOT DISTINCT FROM $2
+               AND worktree_path IS NOT DISTINCT FROM $3
+               AND status IN ('creating', 'active', 'ready_for_review')
+        )",
+    )
+    .bind(item.work_item_id)
+    .bind(item.computer_id)
+    .bind(&expected_path)
+    .fetch_one(pg)
+    .await?;
+    if local_collision {
+        bail!(
+            "refusing to reset checkout {expected_path}: an active persisted mapping on this computer still owns it"
+        );
+    }
+    Ok(())
 }
 
 async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Result<WorktreeRecord> {
@@ -6411,10 +6559,10 @@ mod tests {
         mark_ready_for_review, mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers,
         parse_cli_tokens, parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
         quick_empty_success_is_provider_failure, record_cloud_rescue_local_failure_diagnosis,
-        repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
-        same_model_family, should_attempt_lane15, status_output_is_clean, synthetic_output,
-        task_failed_alert_text, task_prefers_cloud_lane, try_acquire_lane15_480b_permit,
-        use_local_lane, validate_manifest_fields,
+        repo_cache_path, repo_slug, resolve_dispatch_repo_binding, retry_error_is_actionable,
+        rewrite_github_host_alias, same_model_family, should_attempt_lane15,
+        status_output_is_clean, synthetic_output, task_failed_alert_text, task_prefers_cloud_lane,
+        try_acquire_lane15_480b_permit, use_local_lane, validate_manifest_fields,
     };
     use sqlx::Row;
     use std::path::PathBuf;
@@ -6431,6 +6579,7 @@ mod tests {
             repo_id: None,
             repo_url: None,
             repo_path: PathBuf::from("/tmp/forge-fleet"),
+            repo_resolution_error: None,
             sub_agent_id: Uuid::new_v4(),
             computer_id: Uuid::new_v4(),
             computer_name: "test-node".to_string(),
@@ -7274,6 +7423,62 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_repo_resolution_precedence_and_fail_closed_cases() {
+        let explicit_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let sole_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let explicit = resolve_dispatch_repo_binding(
+            Some(explicit_id),
+            Some("git@github.com:acme/explicit.git".into()),
+            Some("git@github.com:acme/id-row.git".into()),
+            1,
+            Some(sole_id),
+            Some("git@github.com:acme/sole.git".into()),
+        );
+        assert_eq!(explicit.repo_id, Some(explicit_id));
+        assert_eq!(
+            explicit.repo_url.as_deref(),
+            Some("git@github.com:acme/explicit.git")
+        );
+        assert!(explicit.error.is_none());
+
+        let by_id = resolve_dispatch_repo_binding(
+            Some(explicit_id),
+            None,
+            Some("git@github.com:acme/id-row.git".into()),
+            2,
+            None,
+            None,
+        );
+        assert_eq!(
+            by_id.repo_url.as_deref(),
+            Some("git@github.com:acme/id-row.git")
+        );
+        assert!(by_id.error.is_none());
+
+        let sole = resolve_dispatch_repo_binding(
+            None,
+            None,
+            None,
+            1,
+            Some(sole_id),
+            Some("git@github.com:acme/sole.git".into()),
+        );
+        assert_eq!(sole.repo_id, Some(sole_id));
+        assert!(sole.error.is_none());
+
+        for count in [0, 2] {
+            let unresolved = resolve_dispatch_repo_binding(None, None, None, count, None, None);
+            assert!(unresolved.repo_url.is_none());
+            assert!(unresolved.error.is_some());
+        }
+        assert!(
+            resolve_dispatch_repo_binding(Some(explicit_id), None, None, 1, None, None)
+                .error
+                .is_some()
+        );
+    }
+
+    #[test]
     fn repo_slug_derives_from_url_tail() {
         assert_eq!(
             repo_slug("git@github.com:venkatyarl/forge-fleet.git"),
@@ -7647,6 +7852,7 @@ mod tests {
             repo_id: None,
             repo_url: None,
             repo_path: PathBuf::new(),
+            repo_resolution_error: None,
             sub_agent_id: Uuid::nil(),
             computer_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
             computer_name: "build-mac".into(),

@@ -14,6 +14,15 @@ pub struct RepoContext {
     pub key_dirs: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectRepoRow {
+    id: Uuid,
+    github_url: String,
+    name: Option<String>,
+    local_path: Option<String>,
+    tech_stack: Option<String>,
+}
+
 impl RepoContext {
     pub fn prompt_block(&self) -> String {
         let repo = self.repo_url.as_deref().unwrap_or("unknown");
@@ -130,6 +139,131 @@ pub async fn resolve_repo_context(
     }
 
     primary_project_repo(pool, project).await
+}
+
+/// Resolve the authoritative repository binding for a newly-created PM item.
+///
+/// Unlike the decomposition-oriented [`resolve_repo_context`], this is strict:
+/// an explicit selector must identify exactly one registered `project_repos`
+/// row, and an omitted selector is accepted only for a project with exactly one
+/// registered repo. This prevents a command's cwd (often forge-fleet itself)
+/// from silently binding work for an unrelated or multi-repo project.
+pub async fn resolve_required_project_repo(
+    pool: &PgPool,
+    project: &str,
+    cwd: Option<PathBuf>,
+    explicit_repo: Option<&str>,
+) -> Result<RepoContext> {
+    let rows = sqlx::query(
+        "SELECT id, github_url, name, local_path, tech_stack \
+           FROM project_repos \
+          WHERE project_id = $1 \
+          ORDER BY created_at ASC, id ASC",
+    )
+    .bind(project)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| ProjectRepoRow {
+        id: row.get("id"),
+        github_url: row.get("github_url"),
+        name: row.try_get("name").ok().flatten(),
+        local_path: row.try_get("local_path").ok().flatten(),
+        tech_stack: row.try_get("tech_stack").ok().flatten(),
+    })
+    .collect::<Vec<_>>();
+    let selected = select_required_project_repo(project, &rows, explicit_repo)?;
+    if selected.github_url.trim().is_empty() {
+        return Err(anyhow!(
+            "project repo '{}' for project '{project}' has a blank github_url",
+            selected.id
+        ));
+    }
+
+    let cwd = cwd
+        .map(Ok)
+        .unwrap_or_else(std::env::current_dir)
+        .context("resolve cwd")?;
+    let cwd_context = detect_repo_from_cwd(&cwd).ok().filter(|context| {
+        context
+            .repo_url
+            .as_deref()
+            .and_then(normalize_repo_url)
+            .zip(normalize_repo_url(&selected.github_url))
+            .is_some_and(|(cwd_url, selected_url)| cwd_url == selected_url)
+    });
+    let configured_path = selected.local_path.as_deref().map(|raw| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        crate::expand_tilde(raw, &home)
+    });
+    let configured_context = configured_path
+        .as_deref()
+        .and_then(|path| detect_repo_from_cwd(path).ok());
+
+    let mut context = cwd_context.or(configured_context).unwrap_or(RepoContext {
+        repo_id: None,
+        repo_url: None,
+        repo_path: configured_path,
+        primary_language: selected
+            .tech_stack
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        build_system: None,
+        key_dirs: Vec::new(),
+    });
+    context.repo_id = Some(selected.id);
+    context.repo_url = Some(selected.github_url.clone());
+    if context.repo_path.is_none() {
+        context.repo_path = selected.local_path.as_ref().map(PathBuf::from);
+    }
+    Ok(context)
+}
+
+fn select_required_project_repo<'a>(
+    project: &str,
+    rows: &'a [ProjectRepoRow],
+    explicit_repo: Option<&str>,
+) -> Result<&'a ProjectRepoRow> {
+    let explicit_repo = explicit_repo
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(selector) = explicit_repo else {
+        return match rows {
+            [only] => Ok(only),
+            [] => Err(anyhow!(
+                "project '{project}' has no registered repos; register one or pass --repo after registration"
+            )),
+            many => Err(anyhow!(
+                "project '{project}' has {} registered repos; pass --repo <UUID|URL|name>",
+                many.len()
+            )),
+        };
+    };
+
+    let selector_id = Uuid::parse_str(selector).ok();
+    let selector_url = normalize_repo_url(selector);
+    let matches = rows
+        .iter()
+        .filter(|row| {
+            selector_id == Some(row.id)
+                || row.name.as_deref() == Some(selector)
+                || row.github_url == selector
+                || selector_url
+                    .as_deref()
+                    .zip(normalize_repo_url(&row.github_url).as_deref())
+                    .is_some_and(|(wanted, candidate)| wanted == candidate)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [only] => Ok(*only),
+        [] => Err(anyhow!(
+            "unknown repo '{selector}' for project '{project}' (expected a registered project_repos UUID, URL, or name)"
+        )),
+        many => Err(anyhow!(
+            "repo selector '{selector}' is ambiguous for project '{project}' ({} matches); use the project_repos UUID",
+            many.len()
+        )),
+    }
 }
 
 pub fn detect_repo_from_cwd(cwd: &Path) -> Result<RepoContext> {
@@ -453,5 +587,64 @@ mod tests {
             normalize_repo_url("git@github.com:Acme/Orders.git"),
             normalize_repo_url("https://github.com/acme/orders")
         );
+    }
+
+    fn project_repo(id: &str, url: &str, name: Option<&str>) -> ProjectRepoRow {
+        ProjectRepoRow {
+            id: Uuid::parse_str(id).expect("uuid"),
+            github_url: url.to_string(),
+            name: name.map(str::to_string),
+            local_path: None,
+            tech_stack: None,
+        }
+    }
+
+    #[test]
+    fn required_repo_auto_binds_only_a_single_registered_repo() {
+        let one = vec![project_repo(
+            "00000000-0000-0000-0000-000000000001",
+            "git@github.com:acme/one.git",
+            Some("one"),
+        )];
+        assert_eq!(
+            select_required_project_repo("project", &one, None)
+                .expect("one repo")
+                .id,
+            one[0].id
+        );
+        assert!(select_required_project_repo("project", &[], None).is_err());
+        let two = vec![
+            one[0].clone(),
+            project_repo(
+                "00000000-0000-0000-0000-000000000002",
+                "git@github.com:acme/two.git",
+                Some("two"),
+            ),
+        ];
+        assert!(select_required_project_repo("project", &two, None).is_err());
+    }
+
+    #[test]
+    fn required_repo_resolves_uuid_url_or_name_and_rejects_unknown() {
+        let rows = vec![
+            project_repo(
+                "00000000-0000-0000-0000-000000000001",
+                "git@github.com:acme/one.git",
+                Some("one"),
+            ),
+            project_repo(
+                "00000000-0000-0000-0000-000000000002",
+                "https://github.com/acme/two",
+                Some("two"),
+            ),
+        ];
+        for selector in [
+            "00000000-0000-0000-0000-000000000001",
+            "https://github.com/acme/one",
+            "two",
+        ] {
+            assert!(select_required_project_repo("project", &rows, Some(selector)).is_ok());
+        }
+        assert!(select_required_project_repo("project", &rows, Some("missing")).is_err());
     }
 }

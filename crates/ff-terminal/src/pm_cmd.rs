@@ -90,6 +90,7 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
             title,
             description,
             priority,
+            repo,
         } => {
             // Validate project exists first so we give a clear error instead of an FK violation.
             let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM projects WHERE id = $1")
@@ -103,11 +104,25 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
                 ));
             }
 
+            // A schedulable work item must carry an authoritative repository
+            // binding. `--repo` resolves within this project's registered repos;
+            // without it, only a single-repo project is unambiguous. Never infer
+            // a different project's repo merely because the command was run from
+            // that checkout.
+            let repo_context = crate::repo_context::resolve_required_project_repo(
+                &pool,
+                &project,
+                cwd.clone(),
+                repo.as_deref(),
+            )
+            .await?;
             let created_by = ff_agent::fleet_info::resolve_this_worker_name().await;
             let prio = priority.unwrap_or_else(|| "normal".to_string());
             let row: (uuid::Uuid,) = sqlx::query_as(
-                "INSERT INTO work_items (project_id, kind, title, description, priority, created_by) \
-                 VALUES ($1, $2, $3, $4, $5, $6) \
+                "INSERT INTO work_items \
+                    (project_id, kind, title, description, priority, created_by, \
+                     repo_id, repo_url, repo_path) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
                  RETURNING id",
             )
             .bind(&project)
@@ -116,6 +131,14 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
             .bind(description.as_deref())
             .bind(&prio)
             .bind(&created_by)
+            .bind(repo_context.repo_id)
+            .bind(repo_context.repo_url.as_deref())
+            .bind(
+                repo_context
+                    .repo_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string()),
+            )
             .fetch_one(&pool)
             .await
             .map_err(|e| anyhow::anyhow!("insert work item: {e}"))?;
@@ -126,6 +149,18 @@ pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()
             println!("  kind:     {kind}");
             println!("  title:    {title}");
             println!("  priority: {prio}");
+            println!(
+                "  repo_id:  {}",
+                repo_context
+                    .repo_id
+                    .map(|id| id.to_string())
+                    .as_deref()
+                    .unwrap_or("-")
+            );
+            println!(
+                "  repo_url: {}",
+                repo_context.repo_url.as_deref().unwrap_or("-")
+            );
             println!("  created_by: {created_by}");
         }
         crate::PmCommand::Close {
