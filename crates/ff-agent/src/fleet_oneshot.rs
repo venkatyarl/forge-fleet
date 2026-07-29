@@ -145,7 +145,24 @@ pub async fn fleet_oneshot_for(
     timeout: Option<Duration>,
     workload: Option<&str>,
 ) -> Result<FleetOneshot> {
-    let ordered = resolve_route_candidates(pool, model_hint, workload).await?;
+    fleet_oneshot_for_ctx(pool, prompt, model_hint, timeout, workload, None).await
+}
+
+/// Like [`fleet_oneshot_for`] but requires each candidate's per-slot usable
+/// context to be at least `min_ctx` tokens. Codegen passes
+/// prompt-estimate + reasoning reserve + max_tokens so a reasoning coder
+/// (glm-4.5-air) never receives a prompt its slot can't hold — the overflow
+/// truncates the reply into unusable prose. Falls back to unfloored routing
+/// when nothing satisfies the floor (a truncated answer beats no build).
+pub async fn fleet_oneshot_for_ctx(
+    pool: &PgPool,
+    prompt: &str,
+    model_hint: Option<&str>,
+    timeout: Option<Duration>,
+    workload: Option<&str>,
+    min_ctx: Option<i32>,
+) -> Result<FleetOneshot> {
+    let ordered = resolve_route_candidates(pool, model_hint, workload, min_ctx).await?;
 
     let client = reqwest::Client::builder()
         .timeout(timeout.unwrap_or(Duration::from_secs(180)))
@@ -203,7 +220,7 @@ pub async fn fleet_oneshot_for(
 /// Resolve a catalog model hint to the same best-first deployment candidate
 /// ordering used by [`fleet_oneshot`].
 pub async fn resolve_route_candidate(pool: &PgPool, model_hint: &str) -> Result<RouteCandidate> {
-    resolve_route_candidates(pool, Some(model_hint), None)
+    resolve_route_candidates(pool, Some(model_hint), None, None)
         .await?
         .into_iter()
         .find(|candidate| candidate_catalog_id_matches(candidate, model_hint))
@@ -214,6 +231,7 @@ async fn resolve_route_candidates(
     pool: &PgPool,
     model_hint: Option<&str>,
     workload: Option<&str>,
+    min_ctx: Option<i32>,
 ) -> Result<Vec<RouteCandidate>> {
     let filter = RouteFilter {
         // Capability filter: when set (e.g. "code" for codegen/review), the router
@@ -221,7 +239,11 @@ async fn resolve_route_candidates(
         // `preferred_workloads`, so only code-capable models are candidates.
         workload: workload.map(|w| w.to_string()),
         require_tool_calling: false,
-        min_ctx: None,
+        // Per-slot context floor: reasoning models (glm-4.5-air) need
+        // prompt + think + max_tokens to FIT the slot, or the reply truncates
+        // into unusable prose (the 2026-07-29 canary-2 failure on thalia's
+        // 12K slots with a fat repo-context prompt).
+        min_ctx,
         exclude_hosts: Vec::new(),
         // Only dispatch to deployments whose health is fresh — never a wedged host
         // lingering as 'healthy' with a stale heartbeat (the priya-wedge class).
@@ -235,6 +257,16 @@ async fn resolve_route_candidates(
     let mut all_candidates = pg_route_deployments(pool, &filter)
         .await
         .map_err(|e| anyhow!("route deployments: {e}"))?;
+    // FAIL-OPEN on the ctx floor: an over-large prompt must not hard-fail the
+    // build when only smaller slots exist — retry unfloored (the response may
+    // still truncate, but a truncated answer beats no build at all).
+    if all_candidates.is_empty() && min_ctx.is_some() {
+        tracing::warn!(
+            min_ctx,
+            "fleet_oneshot: no deployment satisfies the ctx floor — retrying without it"
+        );
+        return Box::pin(resolve_route_candidates(pool, model_hint, workload, None)).await;
+    }
     // FAIL-OPEN on the capability filter: if a workload was requested but no
     // deployment declares it (e.g. every coder is momentarily unhealthy), retry
     // unfiltered rather than hard-failing the build. Correctness (prefer a coder)

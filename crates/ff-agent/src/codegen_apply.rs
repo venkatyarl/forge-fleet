@@ -150,12 +150,21 @@ pub async fn codegen_apply(
         // non-coder model (Lucy-1.7B / SmolVLM2-video), which return prose and no
         // valid diff → "no diff to check" failures. Capability-based via the
         // router, not a model list; fails open if no coder is momentarily healthy.
-        let response = crate::fleet_oneshot::fleet_oneshot_for(
+        //
+        // Ctx floor (2026-07-29, canary-2 root cause): glm-4.5-air is a REASONING
+        // model — its slot must hold prompt + think + max_tokens or the reply
+        // truncates into prose. Estimate prompt tokens (chars/4) and require the
+        // slot to fit it plus the output (4096) plus a think reserve, so fat
+        // repo-context prompts route to the 32K slots instead of thalia's 12K.
+        let est_prompt_tokens = (prompt.len() / 4) as i32;
+        let min_ctx = Some((est_prompt_tokens + 4096 + 2048).min(49152));
+        let response = crate::fleet_oneshot::fleet_oneshot_for_ctx(
             pool,
             &prompt,
             model_hint,
             Some(Duration::from_secs(300)),
             Some("code"),
+            min_ctx,
         )
         .await
         .with_context(|| format!("fleet_oneshot round {round}"))?;
@@ -190,7 +199,10 @@ pub async fn codegen_apply(
                         already_done: true,
                     });
                 }
-                let err = "model response did not contain any edit blocks".to_string();
+                let err = "model response contained NO edit blocks — it was prose. \
+                           Reply with ONLY edit blocks starting with '*** FILE:' — \
+                           no explanation, no reasoning, no markdown fences around the whole reply"
+                    .to_string();
                 warn!(round, error = %err, "codegen response rejected");
                 last_edits = None;
                 last_error = Some(err);
