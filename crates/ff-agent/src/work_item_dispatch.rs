@@ -177,6 +177,33 @@ struct WorkItemDispatchResult {
     sweep_warnings: Vec<String>,
 }
 
+const MERGE_QUEUE_READY_UPSERT: &str = r#"
+    INSERT INTO work_item_merge_queue
+        (work_item_id, project_id, status, branch_name, pr_url, head_sha,
+         builder, reviewer, review_verdict, review_reason,
+         review_started_at, review_completed_at, reviewer_computer)
+    SELECT $1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+      WHERE EXISTS (
+            SELECT 1 FROM work_items
+             WHERE id = $1
+               AND status NOT IN ('done', 'merged', 'failed', 'cancelled'))
+    ON CONFLICT (work_item_id) DO UPDATE
+        SET status = 'queued',
+            branch_name = EXCLUDED.branch_name,
+            pr_url = EXCLUDED.pr_url,
+            head_sha = EXCLUDED.head_sha,
+            failed_at = NULL,
+            failure_reason = NULL,
+            builder = EXCLUDED.builder,
+            reviewer = EXCLUDED.reviewer,
+            review_verdict = EXCLUDED.review_verdict,
+            review_reason = EXCLUDED.review_reason,
+            review_started_at = EXCLUDED.review_started_at,
+            review_completed_at = EXCLUDED.review_completed_at,
+            reviewer_computer = EXCLUDED.reviewer_computer
+        WHERE work_item_merge_queue.status NOT IN ('failed', 'merged')
+    "#;
+
 /// Count this host's recently-failed work_item dispatches (last 15 min), used
 /// as the backpressure signal for [`dispatch_budget_for_host`]. Best-effort —
 /// the caller treats an error as "0 failures" (no backpressure).
@@ -1975,7 +2002,8 @@ async fn mark_ready_for_review(
                 branch_name = $2,
                 pr_url = $3,
                 cleanup_complete = TRUE
-          WHERE id = $1",
+          WHERE id = $1
+            AND status NOT IN ('done', 'merged', 'failed', 'cancelled')",
     )
     .bind(item.work_item_id)
     .bind(&worktree.task_branch)
@@ -1996,43 +2024,21 @@ async fn mark_ready_for_review(
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query(
-        r#"
-        INSERT INTO work_item_merge_queue
-            (work_item_id, project_id, status, branch_name, pr_url, head_sha,
-             builder, reviewer, review_verdict, review_reason,
-             review_started_at, review_completed_at, reviewer_computer)
-        VALUES ($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        ON CONFLICT (work_item_id) DO UPDATE
-            SET status = 'queued',
-                branch_name = EXCLUDED.branch_name,
-                pr_url = EXCLUDED.pr_url,
-                head_sha = EXCLUDED.head_sha,
-                failed_at = NULL,
-                failure_reason = NULL,
-                builder = EXCLUDED.builder,
-                reviewer = EXCLUDED.reviewer,
-                review_verdict = EXCLUDED.review_verdict,
-                review_reason = EXCLUDED.review_reason,
-                review_started_at = EXCLUDED.review_started_at,
-                review_completed_at = EXCLUDED.review_completed_at,
-                reviewer_computer = EXCLUDED.reviewer_computer
-        "#,
-    )
-    .bind(item.work_item_id)
-    .bind(&item.project_id)
-    .bind(&worktree.task_branch)
-    .bind(pr_url)
-    .bind(head_sha)
-    .bind(builder)
-    .bind(review.map(|r| r.reviewer.as_str()))
-    .bind(review.map(|r| if r.approved { "approve" } else { "reject" }))
-    .bind(review.map(|r| truncate_for_db(&r.reason)))
-    .bind(review.map(|r| r.started_at))
-    .bind(review.map(|r| r.completed_at))
-    .bind(review.map(|_| item.computer_name.as_str()))
-    .execute(&mut *tx)
-    .await?;
+    sqlx::query(MERGE_QUEUE_READY_UPSERT)
+        .bind(item.work_item_id)
+        .bind(&item.project_id)
+        .bind(&worktree.task_branch)
+        .bind(pr_url)
+        .bind(head_sha)
+        .bind(builder)
+        .bind(review.map(|r| r.reviewer.as_str()))
+        .bind(review.map(|r| if r.approved { "approve" } else { "reject" }))
+        .bind(review.map(|r| truncate_for_db(&r.reason)))
+        .bind(review.map(|r| r.started_at))
+        .bind(review.map(|r| r.completed_at))
+        .bind(review.map(|_| item.computer_name.as_str()))
+        .execute(&mut *tx)
+        .await?;
 
     sqlx::query(
         r#"INSERT INTO work_item_provenance
@@ -6377,15 +6383,15 @@ pub fn spawn_worktree_reaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS, ReviewerStat,
-        affected_crate_manifests, agent_output_tail, backend_failed_without_output,
-        builder_excludes_480b, check_dispatch_prerequisites, classify_dispatch_outcome,
-        collect_leftover_tmp_output, command_display, complexity_at_least_moderate,
-        contains_file_line_citation, default_clone_path, dispatch_budget_for_host, dispatch_prompt,
-        expand_home, is_build_timeout, local_failure_diagnosis_for,
-        local_failure_diagnosis_for_attempt, mark_local_retest_failed, mark_local_retest_passed,
-        mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers, parse_cli_tokens,
-        parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
+        AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS,
+        MERGE_QUEUE_READY_UPSERT, ReviewerStat, affected_crate_manifests, agent_output_tail,
+        backend_failed_without_output, builder_excludes_480b, check_dispatch_prerequisites,
+        classify_dispatch_outcome, collect_leftover_tmp_output, command_display,
+        complexity_at_least_moderate, contains_file_line_citation, default_clone_path,
+        dispatch_budget_for_host, dispatch_prompt, expand_home, is_build_timeout,
+        local_failure_diagnosis_for, local_failure_diagnosis_for_attempt, mark_local_retest_failed,
+        mark_local_retest_passed, mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers,
+        parse_cli_tokens, parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
         quick_empty_success_is_provider_failure, record_cloud_rescue_local_failure_diagnosis,
         repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
         same_model_family, should_attempt_lane15, status_output_is_clean, synthetic_output,
@@ -6396,6 +6402,96 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use uuid::Uuid;
+
+    async fn optional_test_pool() -> Option<sqlx::PgPool> {
+        let url = match std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+        {
+            Ok(url) => url,
+            Err(_) => {
+                eprintln!("skipping merge-queue DB test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL");
+                return None;
+            }
+        };
+        match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+        {
+            Ok(pool) => Some(pool),
+            Err(e) => {
+                eprintln!("skipping merge-queue DB test: database unavailable: {e}");
+                None
+            }
+        }
+    }
+
+    async fn insert_merge_queue_fixture(pool: &sqlx::PgPool, queue_status: &str) -> (Uuid, Uuid) {
+        ff_db::run_postgres_migrations(pool)
+            .await
+            .expect("migrations should create merge-queue tables");
+        let project_id = format!("merge-queue-test-{}", Uuid::new_v4());
+        let work_item_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO projects (id, display_name, default_branch, status)
+             VALUES ($1, $1, 'main', 'active')",
+        )
+        .bind(&project_id)
+        .execute(pool)
+        .await
+        .expect("insert test project");
+        sqlx::query(
+            "INSERT INTO work_items (id, project_id, kind, title, status)
+             VALUES ($1, $2, 'task', 'merge queue test',
+                     CASE WHEN $3 = 'failed' THEN 'failed' ELSE 'in_review' END)",
+        )
+        .bind(work_item_id)
+        .bind(&project_id)
+        .bind(queue_status)
+        .execute(pool)
+        .await
+        .expect("insert test work item");
+        let queue_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO work_item_merge_queue
+                (work_item_id, project_id, status, branch_name, failed_at, failure_reason)
+             VALUES ($1, $2, $3, 'test-branch',
+                     CASE WHEN $3 = 'failed' THEN NOW() END,
+                     CASE WHEN $3 = 'failed' THEN 'terminal failure' END)
+             RETURNING id",
+        )
+        .bind(work_item_id)
+        .bind(&project_id)
+        .bind(queue_status)
+        .fetch_one(pool)
+        .await
+        .expect("insert test merge-queue row");
+        (queue_id, work_item_id)
+    }
+
+    async fn run_ready_upsert(pool: &sqlx::PgPool, work_item_id: Uuid) {
+        sqlx::query(MERGE_QUEUE_READY_UPSERT)
+            .bind(work_item_id)
+            .bind(
+                sqlx::query_scalar::<_, String>("SELECT project_id FROM work_items WHERE id = $1")
+                    .bind(work_item_id)
+                    .fetch_one(pool)
+                    .await
+                    .expect("load test project"),
+            )
+            .bind("test-branch")
+            .bind("https://github.com/example/repo/pull/1")
+            .bind("0123456789abcdef")
+            .bind("test-builder")
+            .bind(Option::<String>::None)
+            .bind(Option::<String>::None)
+            .bind(Option::<String>::None)
+            .bind(Option::<chrono::DateTime<chrono::Utc>>::None)
+            .bind(Option::<chrono::DateTime<chrono::Utc>>::None)
+            .bind(Option::<String>::None)
+            .execute(pool)
+            .await
+            .expect("run ready-for-review merge-queue upsert");
+    }
 
     fn test_item(attempts: i32, last_error: Option<&str>, complexity: &str) -> AssignedWorkItem {
         AssignedWorkItem {
@@ -6424,6 +6520,61 @@ mod tests {
             work: Vec::new(),
             post_work: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn ready_upsert_does_not_resurrect_terminal_merge_queue_row() {
+        let Some(pool) = optional_test_pool().await else {
+            return;
+        };
+        let (queue_id, work_item_id) = insert_merge_queue_fixture(&pool, "failed").await;
+
+        run_ready_upsert(&pool, work_item_id).await;
+
+        let row =
+            sqlx::query("SELECT status, failure_reason FROM work_item_merge_queue WHERE id = $1")
+                .bind(queue_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load terminal queue row");
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            row.get::<Option<String>, _>("failure_reason").as_deref(),
+            Some("terminal failure")
+        );
+        let item_status: String = sqlx::query_scalar("SELECT status FROM work_items WHERE id = $1")
+            .bind(work_item_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load terminal work item");
+        assert_eq!(item_status, "failed");
+    }
+
+    #[tokio::test]
+    async fn active_merge_queue_row_still_completes_normally() {
+        let Some(pool) = optional_test_pool().await else {
+            return;
+        };
+        let (queue_id, work_item_id) = insert_merge_queue_fixture(&pool, "queued").await;
+
+        run_ready_upsert(&pool, work_item_id).await;
+        ff_db::pg_mark_merge_merged(&pool, queue_id, work_item_id)
+            .await
+            .expect("normal completion should succeed");
+
+        let queue_status: String =
+            sqlx::query_scalar("SELECT status FROM work_item_merge_queue WHERE id = $1")
+                .bind(queue_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load completed queue row");
+        let item_status: String = sqlx::query_scalar("SELECT status FROM work_items WHERE id = $1")
+            .bind(work_item_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load completed work item");
+        assert_eq!(queue_status, "merged");
+        assert_eq!(item_status, "merged");
     }
 
     #[test]
