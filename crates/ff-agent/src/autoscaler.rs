@@ -887,7 +887,11 @@ async fn do_load(
         let port = crate::ports_registry::pick_llm_port(pg, host, runtime)
             .await
             .map(|p| p as u16)
-            .unwrap_or(55000);
+            .map_err(|_| {
+                format!(
+                    "no genuinely free registered {runtime} port on {host}; preserving incumbents"
+                )
+            })?;
         model_runtime::load_model(
             pg,
             LoadOptions {

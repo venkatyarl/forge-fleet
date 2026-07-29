@@ -213,6 +213,34 @@ pub struct RunningProcess {
     pub context_window: Option<i32>,
 }
 
+/// Release only the still-unactivated reservation created by this load call.
+/// Every identity field participates so a late failure can never delete a row
+/// that a concurrent actor has activated or replaced.
+async fn release_matching_load_claim(
+    pool: &sqlx::PgPool,
+    claim_id: &str,
+    worker_name: &str,
+    port: u16,
+    library_id: &str,
+) {
+    let _ = sqlx::query(
+        "DELETE FROM fleet_model_deployments
+          WHERE id = $1::uuid
+            AND LOWER(worker_name) = LOWER($2)
+            AND port = $3
+            AND library_id = $4::uuid
+            AND desired_state = 'active'
+            AND health_status = 'starting'
+            AND pid IS NULL",
+    )
+    .bind(claim_id)
+    .bind(worker_name)
+    .bind(port as i32)
+    .bind(library_id)
+    .execute(pool)
+    .await;
+}
+
 /// PLACEMENT GUARD (V118): can `node` run a model whose runtime is `runtime`?
 ///
 /// The rule mirrors the runtime-choice policy and the autoscaler's
@@ -288,6 +316,43 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
     }
 
     let port = opts.port;
+
+    // A verified desired incumbent for the same library is already the
+    // requested end state.  Return it without touching the process or row.
+    // Both DB intent and live argv identity must agree; a stale row alone is
+    // preserved but is not reported as a successful load.
+    let existing: Option<(String, Option<i32>, String, String)> = sqlx::query_as(
+        "SELECT id::text, pid, runtime, desired_state
+           FROM fleet_model_deployments
+          WHERE LOWER(worker_name) = LOWER($1)
+            AND port = $2
+            AND library_id = $3::uuid",
+    )
+    .bind(&worker_name)
+    .bind(port as i32)
+    .bind(&lib.id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("read existing placement on {worker_name}:{port}: {e}"))?;
+    if let Some((deployment_id, Some(recorded_pid), runtime, desired_state)) = existing
+        && desired_state == "active"
+        && let Some(process) = list_local_processes().await.into_iter().find(|process| {
+            process.pid == recorded_pid as u32
+                && process.port == Some(port)
+                && process.model_path.as_deref().is_some_and(|model_path| {
+                    Path::new(model_path) == Path::new(&lib.file_path)
+                        || Path::new(model_path).starts_with(&lib.file_path)
+                })
+        })
+    {
+        return Ok(LoadResult {
+            deployment_id,
+            pid: process.pid,
+            runtime,
+            port,
+            model_path: process.model_path.unwrap_or(lib.file_path),
+        });
+    }
 
     // Look up the catalog row so we can pick the right serving mode (chat /
     // embedding / reranking) AND whether the model is tool-calling (which drives
@@ -516,6 +581,45 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         other => return Err(format!("unsupported runtime: {other}")),
     };
 
+    // Claim placement intent immediately before bind. The unique
+    // (worker_name, port) key serializes autoscaler, reconciler and manual
+    // callers without a destructive reap.
+    let claim_id: Option<String> = sqlx::query_scalar(
+        "INSERT INTO fleet_model_deployments
+             (worker_name, library_id, catalog_id, runtime, port,
+              health_status, desired_state)
+         VALUES ($1, $2::uuid, $3, $4, $5, 'starting', 'active')
+         ON CONFLICT (worker_name, port) DO NOTHING
+         RETURNING id::text",
+    )
+    .bind(&worker_name)
+    .bind(&lib.id)
+    .bind(&lib.catalog_id)
+    .bind(runtime_label)
+    .bind(port as i32)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("reserve model placement on {worker_name}:{port}: {e}"))?;
+    let Some(claim_id) = claim_id else {
+        return Err(format!(
+            "port {port} on {worker_name} has durable placement intent; refusing to replace it"
+        ));
+    };
+
+    // Kernel occupancy is independently authoritative. A foreign listener can
+    // exist without a DB row; release only our exact reservation and fail.
+    let occupied = list_local_processes()
+        .await
+        .into_iter()
+        .any(|process| process.port == Some(port) && pid_is_alive(process.pid))
+        || !pids_listening_on_port(port).await.is_empty();
+    if occupied {
+        release_matching_load_claim(pool, &claim_id, &worker_name, port, &lib.id).await;
+        return Err(format!(
+            "port {port} on {worker_name} is occupied by an unverified listener; refusing to replace it"
+        ));
+    }
+
     tracing::info!(program, ?args, "spawning inference server");
 
     // Spawn detached (parent doesn't wait). stdout/stderr to log file if present.
@@ -532,13 +636,6 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
     let log_err = log_file
         .try_clone()
         .map_err(|e| format!("clone log handle: {e}"))?;
-
-    // IDEMPOTENT-SPAWN GUARD: reap any inference server already on this port
-    // (listening OR still loading) before we launch. Without this, a reconcile
-    // tick / second load firing during a big model's multi-minute load window
-    // stacks a second server loading the SAME model → dual mmap storm → neither
-    // finishes → 503 forever and the node can wedge (the DGX-Spark glm flap).
-    let _ = reap_stale_launchers_on_port(port).await;
 
     let mut cmd = std::process::Command::new(&program);
     cmd.args(&args)
@@ -650,6 +747,7 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
+                release_matching_load_claim(pool, &claim_id, &worker_name, port, &lib.id).await;
                 let msg = format!("spawn {program}: {e}");
                 log_model_error(
                     pool,
@@ -1553,44 +1651,6 @@ async fn pids_listening_on_port(port: u16) -> Vec<u32> {
     }
 
     pids
-}
-
-/// Reap any inference server (llama.cpp / mlx / vllm) already carrying
-/// `--port <port>` in its argv — whether it's LISTENING or still mmap-loading a
-/// large model and not yet bound. Unlike [`pids_listening_on_port`] (which only
-/// finds bound sockets), this uses [`list_local_processes`] argv parsing, so it
-/// also catches a server that's mid-load. Returns the PIDs it killed.
-///
-/// This is the idempotent-spawn guard: a large model (e.g. glm-4.5-air, ~73 GB,
-/// 2-3 min to load) stays UNHEALTHY for the whole load window, so a reconcile
-/// tick or a second `ff model load` that fires before it binds the port would
-/// stack a SECOND llama-server loading the SAME model. On a unified-memory DGX
-/// two concurrent 73 GB mmap loads storm the disk/page-cache and neither
-/// finishes — the endpoint sticks at 503 and the box can wedge (observed on the
-/// DGX Spark units 2026-07-26). Killing any pre-existing launcher on the port
-/// before we spawn guarantees at most ONE server per port, from any caller.
-/// Signals numeric PIDs only (never `pkill -f`), so it can't self-kill.
-async fn reap_stale_launchers_on_port(port: u16) -> Vec<u32> {
-    let procs = list_local_processes().await;
-    let mut killed = Vec::new();
-    for p in procs {
-        if p.port == Some(port) && pid_is_alive(p.pid) {
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &p.pid.to_string()])
-                .output();
-            killed.push(p.pid);
-        }
-    }
-    if !killed.is_empty() {
-        tracing::warn!(
-            port,
-            pids = ?killed,
-            "idempotent-spawn guard: reaped pre-existing inference server(s) on this port before relaunch"
-        );
-        // Give the kernel a moment to release the mmap + port before we bind.
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-    }
-    killed
 }
 
 /// Stop whatever is actually LISTENING on `port`: resolve the live PID(s) via
