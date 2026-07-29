@@ -730,6 +730,14 @@ mod tests {
     }
 
     #[test]
+    fn kimi_marker_env_detection() {
+        assert_eq!(
+            tool_from_env_markers(&env_with(&[("KIMI_SESSION_ID", "k1")])),
+            Some("kimi".to_string())
+        );
+    }
+
+    #[test]
     fn kimi_marker_beats_inherited_claude_marker() {
         // A kimi session launched from inside a claude shell inherits
         // CLAUDECODE=1; kimi's own marker must win for the env fallback.
