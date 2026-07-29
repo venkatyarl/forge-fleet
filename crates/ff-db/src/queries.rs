@@ -4918,6 +4918,30 @@ mod tests {
         assert_eq!(decision.last_error, "stale-heartbeat takeover (attempt 2)");
     }
 
+    #[test]
+    fn stale_lease_recovery_rewrites_only_lease_managed_statuses() {
+        for status in ["claimed", "building", "in_progress"] {
+            assert!(
+                stale_lease_status_is_recoverable(status),
+                "{status} must remain recoverable"
+            );
+        }
+        for status in [
+            "cancelled",
+            "merged",
+            "done",
+            "failed",
+            "ready",
+            "blocked",
+            "future_terminal_state",
+        ] {
+            assert!(
+                !stale_lease_status_is_recoverable(status),
+                "{status} must be preserved by default"
+            );
+        }
+    }
+
     fn temp_db_urls(name_prefix: &str) -> Option<(String, String, String)> {
         let base_url = env::var("FORGEFLEET_POSTGRES_URL")
             .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
@@ -5081,6 +5105,483 @@ mod tests {
         .await
         .expect("create minimal slot/lease schema");
         Some((admin, pool, db_name))
+    }
+
+    /// Minimal schema for exercising the complete stale-lease transaction
+    /// against PostgreSQL, including its exact slot/worktree fences.
+    async fn create_stale_lease_reap_db() -> Option<(PgPool, PgPool, String)> {
+        let (admin_url, db_url, db_name) = temp_db_urls("ff_stale_lease_reap")?;
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("connect admin db");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create temp db");
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&db_url)
+            .await
+            .expect("connect temp db");
+        sqlx::raw_sql(
+            "CREATE EXTENSION IF NOT EXISTS pgcrypto;
+             CREATE TABLE computers (
+                 id   UUID PRIMARY KEY,
+                 name TEXT NOT NULL
+             );
+             CREATE TABLE work_items (
+                 id                UUID PRIMARY KEY,
+                 status            TEXT NOT NULL,
+                 attempts          INT NOT NULL DEFAULT 0,
+                 assigned_computer TEXT,
+                 last_error        TEXT
+             );
+             CREATE TABLE sub_agents (
+                 id                   UUID PRIMARY KEY,
+                 computer_id          UUID NOT NULL,
+                 slot                 INT NOT NULL,
+                 status               TEXT NOT NULL DEFAULT 'idle',
+                 current_work_item_id UUID,
+                 started_at           TIMESTAMPTZ,
+                 last_heartbeat_at    TIMESTAMPTZ
+             );
+             CREATE TABLE work_item_leases (
+                 id               UUID PRIMARY KEY,
+                 work_item_id     UUID NOT NULL,
+                 sub_agent_id     UUID,
+                 computer_id      UUID NOT NULL,
+                 lease_state      TEXT NOT NULL,
+                 endpoint         TEXT,
+                 attempt          INT NOT NULL DEFAULT 1,
+                 heartbeat_at     TIMESTAMPTZ NOT NULL,
+                 dispatch_tick_at TIMESTAMPTZ,
+                 lease_expires_at TIMESTAMPTZ NOT NULL,
+                 created_at       TIMESTAMPTZ NOT NULL,
+                 released_at      TIMESTAMPTZ,
+                 release_reason   TEXT
+             );
+             CREATE TABLE work_item_events (
+                 id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 work_item_id UUID NOT NULL,
+                 from_status  TEXT,
+                 to_status    TEXT NOT NULL,
+                 computer     TEXT,
+                 attempt      INT,
+                 detail       TEXT,
+                 created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );
+             CREATE TABLE work_item_worktrees (
+                 id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 work_item_id  UUID NOT NULL,
+                 computer_id   UUID,
+                 sub_agent_id  UUID,
+                 repo_path     TEXT NOT NULL,
+                 worktree_path TEXT NOT NULL,
+                 base_branch   TEXT NOT NULL,
+                 task_branch   TEXT NOT NULL UNIQUE,
+                 status        TEXT NOT NULL,
+                 created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );",
+        )
+        .execute(&pool)
+        .await
+        .expect("create minimal stale-lease schema");
+        Some((admin, pool, db_name))
+    }
+
+    #[tokio::test]
+    async fn stale_lease_reap_preserves_cancelled_and_ignores_fresh_replacement() {
+        let Some((admin, pool, db_name)) = create_stale_lease_reap_db().await else {
+            return;
+        };
+
+        let computer = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'testbox')")
+            .bind(computer)
+            .execute(&pool)
+            .await
+            .expect("insert computer");
+
+        let cancelled = uuid::Uuid::new_v4();
+        let recoverable = uuid::Uuid::new_v4();
+        let fresh = uuid::Uuid::new_v4();
+        let replaced_cancelled = uuid::Uuid::new_v4();
+        let unassigned_cancelled = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO work_items (id, status, attempts, assigned_computer, last_error)
+             VALUES ($1, 'cancelled', 2, 'testbox', 'operator cancellation'),
+                    ($2, 'building', 1, 'testbox', 'old build error'),
+                    ($3, 'ready', 0, NULL, 'fresh build'),
+                    ($4, 'cancelled', 4, 'testbox', 'cancelled before handoff'),
+                    ($5, 'cancelled', 1, 'testbox', 'legacy unassigned cancel')",
+        )
+        .bind(cancelled)
+        .bind(recoverable)
+        .bind(fresh)
+        .bind(replaced_cancelled)
+        .bind(unassigned_cancelled)
+        .execute(&pool)
+        .await
+        .expect("insert work items");
+
+        let cancelled_slot = uuid::Uuid::new_v4();
+        let recoverable_slot = uuid::Uuid::new_v4();
+        let fresh_slot = uuid::Uuid::new_v4();
+        for (slot, index, status, item) in [
+            (cancelled_slot, 0, "busy", Some(cancelled)),
+            (recoverable_slot, 1, "busy", Some(recoverable)),
+            (fresh_slot, 2, "idle", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO sub_agents
+                     (id, computer_id, slot, status, current_work_item_id, started_at)
+                 VALUES ($1, $2, $3, $4, $5,
+                         CASE WHEN $4 = 'busy' THEN NOW() ELSE NULL END)",
+            )
+            .bind(slot)
+            .bind(computer)
+            .bind(index)
+            .bind(status)
+            .bind(item)
+            .execute(&pool)
+            .await
+            .expect("insert slot");
+        }
+
+        let cancelled_lease = uuid::Uuid::new_v4();
+        let recoverable_lease = uuid::Uuid::new_v4();
+        let fresh_lease = uuid::Uuid::new_v4();
+        for (lease, item, slot, stale) in [
+            (cancelled_lease, cancelled, cancelled_slot, true),
+            (recoverable_lease, recoverable, recoverable_slot, true),
+        ] {
+            sqlx::query(
+                "INSERT INTO work_item_leases
+                     (id, work_item_id, sub_agent_id, computer_id, lease_state,
+                      endpoint, attempt, heartbeat_at, dispatch_tick_at,
+                      lease_expires_at, created_at)
+                 VALUES ($1, $2, $3, $4, 'building', 'local:test', 1,
+                         CASE WHEN $5 THEN NOW() - INTERVAL '2 hours' ELSE NOW() END,
+                         CASE WHEN $5 THEN NOW() - INTERVAL '2 hours' ELSE NOW() END,
+                         NOW() + INTERVAL '1 hour',
+                         CASE WHEN $5 THEN NOW() - INTERVAL '2 hours' ELSE NOW() END)",
+            )
+            .bind(lease)
+            .bind(item)
+            .bind(slot)
+            .bind(computer)
+            .bind(stale)
+            .execute(&pool)
+            .await
+            .expect("insert lease");
+
+            sqlx::query(
+                "INSERT INTO work_item_worktrees
+                     (work_item_id, computer_id, sub_agent_id, repo_path,
+                      worktree_path, base_branch, task_branch, status)
+                 VALUES ($1, $2, $3, '/repo', $4, 'main', $5, 'active')",
+            )
+            .bind(item)
+            .bind(computer)
+            .bind(slot)
+            .bind(format!("/repo/{}", item.simple()))
+            .bind(format!("feature/{}", item.simple()))
+            .execute(&pool)
+            .await
+            .expect("insert worktree");
+        }
+
+        // Simulate a corrupt/concurrent handoff window: the old cancelled
+        // lease is stale, while a fresh replacement lease and worktree already
+        // own the exact same slot. The reaper may release the old lease but
+        // must not idle or mutate any same-slot resources.
+        let replaced_lease = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO work_item_leases
+                 (id, work_item_id, sub_agent_id, computer_id, lease_state,
+                  endpoint, attempt, heartbeat_at, dispatch_tick_at,
+                  lease_expires_at, created_at)
+             VALUES ($1, $2, $3, $4, 'building', 'local:old', 4,
+                     NOW() - INTERVAL '2 hours',
+                     NOW() - INTERVAL '2 hours',
+                     NOW() + INTERVAL '1 hour',
+                     NOW() - INTERVAL '2 hours')",
+        )
+        .bind(replaced_lease)
+        .bind(replaced_cancelled)
+        .bind(fresh_slot)
+        .bind(computer)
+        .execute(&pool)
+        .await
+        .expect("insert replaced stale lease");
+        sqlx::query(
+            "INSERT INTO work_item_worktrees
+                 (work_item_id, computer_id, sub_agent_id, repo_path,
+                  worktree_path, base_branch, task_branch, status)
+             VALUES ($1, $2, $3, '/repo', '/repo/replaced-old', 'main',
+                     'feature/replaced-old', 'active')",
+        )
+        .bind(replaced_cancelled)
+        .bind(computer)
+        .bind(fresh_slot)
+        .execute(&pool)
+        .await
+        .expect("insert replaced stale worktree");
+
+        let unassigned_lease = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO work_item_leases
+                 (id, work_item_id, sub_agent_id, computer_id, lease_state,
+                  endpoint, attempt, heartbeat_at, dispatch_tick_at,
+                  lease_expires_at, created_at)
+             VALUES ($1, $2, NULL, $3, 'claimed', 'legacy', 1,
+                     NOW() - INTERVAL '2 hours',
+                     NOW() - INTERVAL '2 hours',
+                     NOW() + INTERVAL '1 hour',
+                     NOW() - INTERVAL '2 hours')",
+        )
+        .bind(unassigned_lease)
+        .bind(unassigned_cancelled)
+        .bind(computer)
+        .execute(&pool)
+        .await
+        .expect("insert unassigned stale lease");
+        sqlx::query(
+            "INSERT INTO work_item_worktrees
+                 (work_item_id, computer_id, sub_agent_id, repo_path,
+                  worktree_path, base_branch, task_branch, status)
+             VALUES ($1, $2, NULL, '/repo', '/repo/unassigned-old', 'main',
+                     'feature/unassigned-old', 'creating')",
+        )
+        .bind(unassigned_cancelled)
+        .bind(computer)
+        .execute(&pool)
+        .await
+        .expect("insert unassigned stale worktree");
+
+        // Hold the shared slot lock while a replacement assignment is still
+        // uncommitted. The reaper must block on this row rather than observing
+        // a READ COMMITTED snapshot with no replacement lease.
+        let mut replacement_tx = pool.begin().await.expect("begin replacement");
+        assert!(
+            lock_available_sub_agent_slot(&mut replacement_tx, fresh_slot, computer)
+                .await
+                .expect("lock replacement slot")
+        );
+        sqlx::query(
+            "INSERT INTO work_item_leases
+                 (id, work_item_id, sub_agent_id, computer_id, lease_state,
+                  endpoint, attempt, heartbeat_at, dispatch_tick_at,
+                  lease_expires_at, created_at)
+             VALUES ($1, $2, $3, $4, 'building', 'local:fresh', 1,
+                     NOW(), NOW(), NOW() + INTERVAL '1 hour', NOW())",
+        )
+        .bind(fresh_lease)
+        .bind(fresh)
+        .bind(fresh_slot)
+        .bind(computer)
+        .execute(&mut *replacement_tx)
+        .await
+        .expect("insert uncommitted replacement lease");
+        sqlx::query(
+            "UPDATE sub_agents
+                SET status = 'busy', current_work_item_id = $1, started_at = NOW()
+              WHERE id = $2",
+        )
+        .bind(fresh)
+        .bind(fresh_slot)
+        .execute(&mut *replacement_tx)
+        .await
+        .expect("occupy replacement slot");
+        sqlx::query(
+            "UPDATE work_items
+                SET status = 'building', assigned_computer = 'testbox'
+              WHERE id = $1",
+        )
+        .bind(fresh)
+        .execute(&mut *replacement_tx)
+        .await
+        .expect("mark replacement item building");
+        sqlx::query(
+            "INSERT INTO work_item_worktrees
+                 (work_item_id, computer_id, sub_agent_id, repo_path,
+                  worktree_path, base_branch, task_branch, status)
+             VALUES ($1, $2, $3, '/repo', '/repo/fresh', 'main',
+                     'feature/fresh', 'active')",
+        )
+        .bind(fresh)
+        .bind(computer)
+        .bind(fresh_slot)
+        .execute(&mut *replacement_tx)
+        .await
+        .expect("insert uncommitted replacement worktree");
+
+        let reaper_pool = pool.clone();
+        let reaper =
+            tokio::spawn(
+                async move { pg_reap_stale_work_item_leases(&reaper_pool, 60, 3600, 3).await },
+            );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !reaper.is_finished(),
+            "reaper must wait for the uncommitted same-slot replacement"
+        );
+        replacement_tx
+            .commit()
+            .await
+            .expect("commit replacement assignment");
+        let reaped = tokio::time::timeout(std::time::Duration::from_secs(5), reaper)
+            .await
+            .expect("reaper unblocks after replacement commit")
+            .expect("reaper task joins")
+            .expect("reap stale leases");
+        assert_eq!(reaped, 4, "all four stale leases are reaped");
+
+        let cancelled_state: (String, i32, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, attempts, assigned_computer, last_error
+               FROM work_items WHERE id = $1",
+        )
+        .bind(cancelled)
+        .fetch_one(&pool)
+        .await
+        .expect("read cancelled item");
+        assert_eq!(
+            cancelled_state,
+            (
+                "cancelled".into(),
+                2,
+                Some("testbox".into()),
+                Some("operator cancellation".into())
+            ),
+            "terminal cancellation metadata must be untouched"
+        );
+
+        let recoverable_state: (String, i32, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, attempts, assigned_computer, last_error
+               FROM work_items WHERE id = $1",
+        )
+        .bind(recoverable)
+        .fetch_one(&pool)
+        .await
+        .expect("read recoverable item");
+        assert_eq!(recoverable_state.0, "ready");
+        assert_eq!(recoverable_state.1, 2);
+        assert_eq!(recoverable_state.2, None);
+        assert_eq!(
+            recoverable_state.3.as_deref(),
+            Some("stale-heartbeat takeover (attempt 2)")
+        );
+
+        let fresh_state: (String, i32, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, attempts, assigned_computer, last_error
+               FROM work_items WHERE id = $1",
+        )
+        .bind(fresh)
+        .fetch_one(&pool)
+        .await
+        .expect("read fresh item");
+        assert_eq!(
+            fresh_state,
+            (
+                "building".into(),
+                0,
+                Some("testbox".into()),
+                Some("fresh build".into())
+            )
+        );
+
+        let replaced_state: (String, i32, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, attempts, assigned_computer, last_error
+               FROM work_items WHERE id = $1",
+        )
+        .bind(replaced_cancelled)
+        .fetch_one(&pool)
+        .await
+        .expect("read replaced cancelled item");
+        assert_eq!(
+            replaced_state,
+            (
+                "cancelled".into(),
+                4,
+                Some("testbox".into()),
+                Some("cancelled before handoff".into())
+            )
+        );
+
+        let released: Vec<(uuid::Uuid, bool, String)> = sqlx::query_as(
+            "SELECT id, released_at IS NOT NULL, lease_state
+               FROM work_item_leases ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read leases");
+        for (id, is_released, state) in released {
+            if id == fresh_lease {
+                assert!(!is_released);
+                assert_eq!(state, "building");
+            } else {
+                assert!(is_released);
+                assert_eq!(state, "stale");
+            }
+        }
+
+        let slots: Vec<(uuid::Uuid, String, Option<uuid::Uuid>)> = sqlx::query_as(
+            "SELECT id, status, current_work_item_id
+               FROM sub_agents ORDER BY slot",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read fenced slots");
+        assert_eq!(slots[0], (cancelled_slot, "idle".into(), None));
+        assert_eq!(slots[1], (recoverable_slot, "idle".into(), None));
+        assert_eq!(
+            slots[2],
+            (fresh_slot, "busy".into(), Some(fresh)),
+            "same-slot fresh replacement must retain ownership"
+        );
+
+        let worktrees: Vec<(uuid::Uuid, String)> =
+            sqlx::query_as("SELECT work_item_id, status FROM work_item_worktrees")
+                .fetch_all(&pool)
+                .await
+                .expect("read fenced worktrees");
+        let worktree_status = |item: uuid::Uuid| {
+            worktrees
+                .iter()
+                .find_map(|(id, status)| (*id == item).then_some(status.as_str()))
+                .expect("worktree status")
+        };
+        assert_eq!(worktree_status(cancelled), "failed");
+        assert_eq!(worktree_status(recoverable), "failed");
+        assert_eq!(worktree_status(fresh), "active");
+        assert_eq!(
+            worktree_status(replaced_cancelled),
+            "active",
+            "old same-slot worktree is not mutated while a replacement owns the slot"
+        );
+        assert_eq!(
+            worktree_status(unassigned_cancelled),
+            "failed",
+            "legacy NULL-slot worktree must not be stranded"
+        );
+
+        let preservation_event: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM work_item_events
+                  WHERE work_item_id = $1
+                    AND detail =
+                        'stale lease released; non-lease-managed status preserved'
+             )",
+        )
+        .bind(cancelled)
+        .fetch_one(&pool)
+        .await
+        .expect("read preservation event");
+        assert!(preservation_event);
+
+        drop_temp_db(admin, pool, &db_name).await;
     }
 
     #[tokio::test]
@@ -8317,6 +8818,13 @@ fn stale_lease_attempt_decision(attempts: i32, max_attempts: i32) -> StaleLeaseA
     }
 }
 
+/// Only these states are owned by the lease lifecycle and may be rewritten by
+/// stale-lease recovery. Everything else is preserve-by-default so a newly
+/// added terminal/operator state cannot be resurrected accidentally.
+fn stale_lease_status_is_recoverable(status: &str) -> bool {
+    matches!(status, "claimed" | "building" | "in_progress")
+}
+
 /// Fleet-global capacity ranking for work dispatch. Active leases are counted
 /// across all work_items/projects so dispatch spreads away from busy computers.
 pub async fn pg_rank_computers_by_capacity(pool: &PgPool) -> Result<Vec<HostCapacity>> {
@@ -8410,13 +8918,30 @@ pub async fn pg_reap_stale_work_item_leases(
     for r in &rows {
         let lease_id: uuid::Uuid = r.get("id");
         let wi: uuid::Uuid = r.get("work_item_id");
-        let sa: Option<uuid::Uuid> = r.try_get("sub_agent_id").ok().flatten();
 
         let outcome = async {
             let mut tx = pool.begin().await?;
+            // PM cancellation locks the item before it conditionally releases
+            // a lease. Use the same order here so cancellation and stale
+            // recovery serialize without an item↔lease deadlock.
+            let Some((item_status, attempts)) = sqlx::query_as::<_, (String, i32)>(
+                "SELECT status, attempts
+                       FROM work_items
+                      WHERE id = $1
+                      FOR UPDATE",
+            )
+            .bind(wi)
+            .fetch_optional(&mut *tx)
+            .await?
+            else {
+                tx.rollback().await?;
+                return Ok::<bool, sqlx::Error>(false);
+            };
+
             let released = sqlx::query(
                 "WITH releasing AS (
-                     SELECT id, work_item_id, lease_state, endpoint, attempt, computer_id
+                     SELECT id, work_item_id, sub_agent_id, lease_state, endpoint,
+                            attempt, computer_id
                        FROM work_item_leases
                       WHERE id = $1
                         AND released_at IS NULL
@@ -8438,12 +8963,13 @@ pub async fn pg_reap_stale_work_item_leases(
                        FROM releasing r
                       WHERE l.id = r.id
                   RETURNING r.work_item_id,
+                            r.sub_agent_id,
                             r.lease_state AS from_status,
                             r.endpoint,
                             r.attempt,
                             l.release_reason,
                             r.computer_id
-                 )
+                 ), event AS (
                  INSERT INTO work_item_events
                      (work_item_id, from_status, to_status, computer, attempt, detail)
                  SELECT r.work_item_id,
@@ -8459,44 +8985,106 @@ pub async fn pg_reap_stale_work_item_leases(
                             ELSE 'local'
                         END), '')
                    FROM released r
-                   LEFT JOIN computers c ON c.id = r.computer_id",
+                   LEFT JOIN computers c ON c.id = r.computer_id
+                 RETURNING work_item_id
+                 )
+                 SELECT r.work_item_id, r.sub_agent_id, r.computer_id
+                   FROM released r
+                   JOIN event e ON e.work_item_id = r.work_item_id",
             )
             .bind(lease_id)
             .bind(stale_secs as f64)
             .bind(max_lease_age_secs as f64)
-            .execute(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
 
-            if released.rows_affected() == 0 {
+            let Some(released) = released else {
                 tx.rollback().await?;
                 return Ok::<bool, sqlx::Error>(false);
-            }
+            };
+            let released_sa: Option<uuid::Uuid> = released.try_get("sub_agent_id").ok().flatten();
+            let released_computer: uuid::Uuid = released.get("computer_id");
 
-            if let Some(sa) = sa {
+            if let Some(sa) = released_sa {
                 sqlx::query(
-                    "UPDATE sub_agents
+                    "UPDATE sub_agents sa
                         SET current_work_item_id = NULL,
                             status = 'idle',
                             started_at = NULL,
                             last_heartbeat_at = NOW()
-                      WHERE id = $1
-                        AND (current_work_item_id = $2 OR current_work_item_id IS NULL)",
+                      WHERE sa.id = $1
+                        AND sa.computer_id = $2
+                        AND (sa.current_work_item_id = $3
+                             OR sa.current_work_item_id IS NULL)
+                        AND NOT EXISTS (
+                            SELECT 1
+                              FROM work_item_leases replacement
+                             WHERE replacement.sub_agent_id = sa.id
+                               AND replacement.computer_id = sa.computer_id
+                               AND replacement.released_at IS NULL
+                               AND replacement.id <> $4
+                        )",
                 )
                 .bind(sa)
+                .bind(released_computer)
                 .bind(wi)
+                .bind(lease_id)
+                .execute(&mut *tx)
+                .await?;
+
+                // Fence worktree failure to the exact old assignment. A
+                // replacement lease on this slot wins and its resources are
+                // left untouched.
+                sqlx::query(
+                    "UPDATE work_item_worktrees
+                        SET status = 'failed'
+                      WHERE work_item_id = $1
+                        AND computer_id = $2
+                        AND sub_agent_id = $3
+                        AND status IN ('creating', 'active')
+                        AND NOT EXISTS (
+                            SELECT 1
+                              FROM work_item_leases replacement
+                             WHERE replacement.sub_agent_id = $3
+                               AND replacement.computer_id = $2
+                               AND replacement.released_at IS NULL
+                               AND replacement.id <> $4
+                        )",
+                )
+                .bind(wi)
+                .bind(released_computer)
+                .bind(sa)
+                .bind(lease_id)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                // Legacy/unassigned leases may not have a slot id. Preserve
+                // the old behavior for their equally-unassigned worktree, but
+                // still fence by work item + computer + NULL assignment so a
+                // replacement slot-owned worktree cannot be touched.
+                sqlx::query(
+                    "UPDATE work_item_worktrees
+                        SET status = 'failed'
+                      WHERE work_item_id = $1
+                        AND computer_id = $2
+                        AND sub_agent_id IS NULL
+                        AND status IN ('creating', 'active')
+                        AND NOT EXISTS (
+                            SELECT 1
+                              FROM work_item_leases replacement
+                             WHERE replacement.work_item_id = $1
+                               AND replacement.computer_id = $2
+                               AND replacement.sub_agent_id IS NULL
+                               AND replacement.released_at IS NULL
+                               AND replacement.id <> $3
+                        )",
+                )
+                .bind(wi)
+                .bind(released_computer)
+                .bind(lease_id)
                 .execute(&mut *tx)
                 .await?;
             }
-
-            sqlx::query(
-                "UPDATE work_item_worktrees
-                    SET status = 'failed'
-                  WHERE work_item_id = $1
-                    AND status IN ('creating', 'active')",
-            )
-            .bind(wi)
-            .execute(&mut *tx)
-            .await?;
 
             // Failure convergence: re-queue for another attempt ONLY while under
             // the cap; once `attempts` would reach `max_attempts`, mark the item
@@ -8505,30 +9093,39 @@ pub async fn pg_reap_stale_work_item_leases(
             // (observed: 17 re-claims / 65 min / 0 PRs, holding a slot the whole
             // time). Failing cleanly frees the slot and surfaces the task for a
             // human or a retry-with-error-context.
-            let attempts: i32 = sqlx::query_scalar(
-                "SELECT attempts
-                   FROM work_items
-                  WHERE id = $1
-                  FOR UPDATE",
-            )
-            .bind(wi)
-            .fetch_one(&mut *tx)
-            .await?;
-            let decision = stale_lease_attempt_decision(attempts, max_attempts);
-
-            sqlx::query(
-                "UPDATE work_items
-                    SET status = $2,
-                        attempts = attempts + 1,
-                        assigned_computer = NULL,
-                        last_error = $3
-                  WHERE id = $1",
-            )
-            .bind(wi)
-            .bind(decision.status)
-            .bind(decision.last_error)
-            .execute(&mut *tx)
-            .await?;
+            // An operator may have cancelled the item after its backend died
+            // but before this sweep. Preserve every non-lease-managed status
+            // by default: no resurrection, attempt bump, assignment clearing,
+            // or last_error clobber.
+            if stale_lease_status_is_recoverable(&item_status) {
+                let decision = stale_lease_attempt_decision(attempts, max_attempts);
+                sqlx::query(
+                    "UPDATE work_items
+                        SET status = $2,
+                            attempts = attempts + 1,
+                            assigned_computer = NULL,
+                            last_error = $3
+                      WHERE id = $1
+                        AND status IN ('claimed', 'building', 'in_progress')",
+                )
+                .bind(wi)
+                .bind(decision.status)
+                .bind(decision.last_error)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                sqlx::query(
+                    "INSERT INTO work_item_events
+                         (work_item_id, from_status, to_status, attempt, detail)
+                     VALUES ($1, $2, $2, $3,
+                             'stale lease released; non-lease-managed status preserved')",
+                )
+                .bind(wi)
+                .bind(&item_status)
+                .bind(attempts)
+                .execute(&mut *tx)
+                .await?;
+            }
 
             tx.commit().await?;
             Ok(true)
@@ -9259,6 +9856,27 @@ pub async fn pg_dispatchable_backends(
 /// slot busy, and flip the work_item to 'claimed'. The partial-unique active
 /// lease index makes a duplicate claim a no-op (returns false). Returns true if
 /// the assignment landed.
+async fn lock_available_sub_agent_slot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sub_agent_id: uuid::Uuid,
+    computer_id: uuid::Uuid,
+) -> std::result::Result<bool, sqlx::Error> {
+    let locked: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT id
+           FROM sub_agents
+          WHERE id = $1
+            AND computer_id = $2
+            AND status = 'idle'
+            AND current_work_item_id IS NULL
+          FOR UPDATE",
+    )
+    .bind(sub_agent_id)
+    .bind(computer_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(locked.is_some())
+}
+
 pub async fn pg_assign_work_item(
     pool: &PgPool,
     work_item_id: uuid::Uuid,
@@ -9287,6 +9905,14 @@ pub async fn pg_assign_work_item(
     .bind(work_item_id)
     .fetch_all(&mut *tx)
     .await?;
+
+    // Shared serialization fence with stale-lease cleanup. Without this row
+    // lock, a replacement lease could remain uncommitted while the reaper's
+    // READ COMMITTED snapshot sees no replacement and idles the same slot.
+    if !lock_available_sub_agent_slot(&mut tx, sub_agent_id, computer_id).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
 
     let sql = format!(
         "INSERT INTO work_item_leases
