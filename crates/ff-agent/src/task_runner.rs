@@ -84,6 +84,20 @@ const MAX_TASK_DURATION: Duration = Duration::from_secs(10 * 60);
 /// over-processing in a long-running task runner.
 const MAX_ITERATIONS: usize = 100;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LeaseUpdate {
+    Active,
+    StaleCancellation,
+}
+
+fn classify_lease_update(rows_affected: u64) -> LeaseUpdate {
+    if rows_affected == 0 {
+        LeaseUpdate::StaleCancellation
+    } else {
+        LeaseUpdate::Active
+    }
+}
+
 /// GAP-C fair-share cap: the max number of `running` tasks a single caller
 /// (one `parent_task_id` — a swarm/fanout/build invocation) may hold
 /// fleet-wide *while another caller has pending work waiting*. Keeps one
@@ -539,19 +553,31 @@ impl TaskRunner {
 
         // 2. Spawn a heartbeat ticker for the duration of the run.
         let pg_hb = self.pg.clone();
+        let heartbeat_computer_id = self.my_computer_id;
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
-        let hb_task: JoinHandle<()> = tokio::spawn(async move {
+        let hb_task: JoinHandle<LeaseUpdate> = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(HEARTBEAT_EVERY) => {
-                        let _ = sqlx::query(
-                            "UPDATE fleet_tasks SET last_heartbeat_at = NOW() WHERE id = $1",
+                        let update = sqlx::query(
+                            "UPDATE fleet_tasks
+                                SET last_heartbeat_at = NOW()
+                              WHERE id = $1
+                                AND status = 'running'
+                                AND claimed_by_computer_id = $2",
                         )
                         .bind(task_id)
+                        .bind(heartbeat_computer_id)
                         .execute(&pg_hb)
                         .await;
+                        if let Ok(update) = update
+                            && classify_lease_update(update.rows_affected())
+                                == LeaseUpdate::StaleCancellation
+                        {
+                            return LeaseUpdate::StaleCancellation;
+                        }
                     }
-                    _ = &mut cancel_rx => break,
+                    _ = &mut cancel_rx => return LeaseUpdate::Active,
                 }
             }
         });
@@ -579,7 +605,14 @@ impl TaskRunner {
             other => Err(TaskRunnerError::UnsupportedType(other.to_string())),
         };
         let _ = cancel_tx.send(());
-        let _ = hb_task.await;
+        let heartbeat_update = hb_task.await.unwrap_or(LeaseUpdate::StaleCancellation);
+        if heartbeat_update == LeaseUpdate::StaleCancellation {
+            warn!(
+                task_id = %task_id,
+                "task lease became stale or was cancelled; discarding late result"
+            );
+            return Ok(Some(task_id));
+        }
 
         // 4. Persist result. The `WHERE status = 'running'` guard makes
         // the completion update idempotent against operator
@@ -590,7 +623,7 @@ impl TaskRunner {
             Ok(result) => {
                 let exit = result.get("exit").and_then(Value::as_i64).unwrap_or(-1);
                 if exit == 0 {
-                    sqlx::query(
+                    let update = sqlx::query(
                         "UPDATE fleet_tasks
                             SET status        = 'completed',
                                 completed_at  = NOW(),
@@ -602,9 +635,13 @@ impl TaskRunner {
                     .bind(task_id)
                     .execute(&self.pg)
                     .await?;
-                    info!(task_id = %task_id, "task completed");
+                    if classify_lease_update(update.rows_affected()) == LeaseUpdate::Active {
+                        info!(task_id = %task_id, "task completed");
+                    } else {
+                        warn!(task_id = %task_id, "stale task result discarded after cancellation");
+                    }
                 } else {
-                    sqlx::query(
+                    let update = sqlx::query(
                         "UPDATE fleet_tasks
                             SET status        = 'failed',
                                 completed_at  = NOW(),
@@ -617,11 +654,15 @@ impl TaskRunner {
                     .bind(task_id)
                     .execute(&self.pg)
                     .await?;
-                    warn!(task_id = %task_id, exit, "task failed (non-zero exit)");
+                    if classify_lease_update(update.rows_affected()) == LeaseUpdate::Active {
+                        warn!(task_id = %task_id, exit, "task failed (non-zero exit)");
+                    } else {
+                        warn!(task_id = %task_id, "stale task result discarded after cancellation");
+                    }
                 }
             }
             Err(e) => {
-                sqlx::query(
+                let update = sqlx::query(
                     "UPDATE fleet_tasks
                         SET status       = 'failed',
                             completed_at = NOW(),
@@ -632,7 +673,11 @@ impl TaskRunner {
                 .bind(task_id)
                 .execute(&self.pg)
                 .await?;
-                warn!(task_id = %task_id, error = %e, "task failed (runner error)");
+                if classify_lease_update(update.rows_affected()) == LeaseUpdate::Active {
+                    warn!(task_id = %task_id, error = %e, "task failed (runner error)");
+                } else {
+                    warn!(task_id = %task_id, "stale task result discarded after cancellation");
+                }
             }
         }
 
@@ -2364,6 +2409,26 @@ fn is_blocked_command(command: &str) -> bool {
         "init 6",
     ];
     blocked.iter().any(|b| lower.contains(b))
+}
+
+#[cfg(test)]
+mod lease_update_tests {
+    use super::{LeaseUpdate, classify_lease_update};
+
+    #[test]
+    fn zero_row_heartbeat_is_a_stale_cancellation() {
+        assert_eq!(classify_lease_update(0), LeaseUpdate::StaleCancellation);
+    }
+
+    #[test]
+    fn zero_row_result_is_stale_and_cannot_resurrect_cancelled_status() {
+        assert_eq!(classify_lease_update(0), LeaseUpdate::StaleCancellation);
+    }
+
+    #[test]
+    fn updated_result_keeps_an_active_lease() {
+        assert_eq!(classify_lease_update(1), LeaseUpdate::Active);
+    }
 }
 
 #[cfg(test)]
