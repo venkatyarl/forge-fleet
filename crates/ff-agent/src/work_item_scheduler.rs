@@ -813,7 +813,19 @@ fn project_at_fair_share(
 /// `dispatch_one`'s own guard takes over for the rest of the lease lifecycle.
 fn spawn_claim_heartbeat(pg: PgPool, work_item_id: uuid::Uuid) {
     tokio::spawn(async move {
-        let _guard = crate::work_item_dispatch::HeartbeatGuard::spawn(work_item_id);
+        let Some(lease_id) = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT id FROM work_item_leases
+              WHERE work_item_id = $1 AND released_at IS NULL
+              ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(work_item_id)
+        .fetch_optional(&pg)
+        .await
+        .ok()
+        .flatten() else {
+            return;
+        };
+        let _guard = crate::work_item_dispatch::HeartbeatGuard::spawn(lease_id, work_item_id);
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
             crate::work_item_dispatch::HEARTBEAT_SECS,
         ));

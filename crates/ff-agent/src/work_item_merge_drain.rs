@@ -75,6 +75,32 @@ enum TerminalPrAction {
     FailClosed,
 }
 
+fn transition_allowed(item_status: &str, lease_active: bool, lease_state: &str) -> bool {
+    item_status == "in_review" && lease_active && lease_state == "reviewing"
+}
+
+/// Recheck the durable work-item/lease fence immediately before an external
+/// merge. The queue row may have been selected before an operator cancelled
+/// the item or a stale-lease reaper released its owner.
+async fn merge_transition_allowed(pg: &PgPool, work_item_id: Uuid) -> Result<bool> {
+    let row = sqlx::query_as::<_, (String, bool, String)>(
+        "SELECT w.status,
+                l.released_at IS NULL,
+                l.lease_state
+           FROM work_items w
+           JOIN work_item_leases l ON l.work_item_id = w.id
+          WHERE w.id = $1
+          ORDER BY (l.released_at IS NULL) DESC, l.created_at DESC
+          LIMIT 1",
+    )
+    .bind(work_item_id)
+    .fetch_optional(pg)
+    .await?;
+    Ok(row
+        .map(|(status, active, lease_state)| transition_allowed(&status, active, &lease_state))
+        .unwrap_or(false))
+}
+
 fn terminal_pr_action(state: Option<&str>) -> Option<TerminalPrAction> {
     match state?.to_ascii_uppercase().as_str() {
         "MERGED" => Some(TerminalPrAction::MarkMerged),
@@ -353,6 +379,14 @@ pub async fn evaluate_merge_queue(
             Ok(0)
         }
         CiState::Success => {
+            if !merge_transition_allowed(pg, item.work_item_id).await? {
+                info!(
+                    work_item = %item.work_item_id,
+                    pr = %pr_url,
+                    "merge_drain: skipping stale/cancelled queue result without an active reviewing lease"
+                );
+                return Ok(0);
+            }
             // SAFETY GATE: never auto-merge LLM-authored code to main unless the
             // operator has explicitly opted in. Default OFF → the PR is left
             // 'mergeable' (CI-green, awaiting approval); flip
@@ -1843,7 +1877,8 @@ mod tests {
     use super::{
         PrMergeState, PrReviewVerdict, TerminalPrAction, github_actions_run_id,
         is_semantic_merge_compile_failure, parse_merge_state, parse_review_response,
-        parse_review_verdict, served_by_480b, terminal_pr_action, update_branch_api_path,
+        parse_review_verdict, served_by_480b, terminal_pr_action, transition_allowed,
+        update_branch_api_path,
     };
 
     #[test]
@@ -1867,6 +1902,18 @@ mod tests {
         assert_eq!(terminal_pr_action(Some("OPEN")), None);
         assert_eq!(terminal_pr_action(Some("whatever")), None);
         assert_eq!(terminal_pr_action(None), None);
+    }
+
+    #[test]
+    fn merge_transitions_require_nonterminal_item_and_active_reviewing_lease() {
+        assert!(transition_allowed("in_review", true, "reviewing"));
+
+        // Cancellation after enqueue must fence the queued result.
+        assert!(!transition_allowed("cancelled", true, "reviewing"));
+        // A stale heartbeat/reaper release must fence the old result.
+        assert!(!transition_allowed("in_review", false, "reviewing"));
+        assert!(!transition_allowed("in_review", true, "stale"));
+        assert!(!transition_allowed("merged", true, "reviewing"));
     }
 
     #[test]

@@ -91,6 +91,7 @@ struct AssignedWorkItem {
     repo_id: Option<Uuid>,
     repo_url: Option<String>,
     repo_path: PathBuf,
+    lease_id: Uuid,
     sub_agent_id: Uuid,
     computer_id: Uuid,
     computer_name: String,
@@ -535,7 +536,8 @@ async fn assigned_work_items(
             sa.kind,
             sa.workspace_dir,
             c.name AS computer_name,
-            l.session_id
+            l.session_id,
+            l.id AS lease_id
           FROM sub_agents sa
           JOIN computers c ON c.id = sa.computer_id
           JOIN work_items w ON w.id = sa.current_work_item_id
@@ -634,6 +636,7 @@ async fn assigned_work_items(
                 repo_id: r.try_get("repo_id").ok().flatten(),
                 repo_url,
                 repo_path,
+                lease_id: r.get("lease_id"),
                 kind,
                 sub_agent_id: r.get("sub_agent_id"),
                 computer_id: r.get("computer_id"),
@@ -1027,7 +1030,7 @@ async fn dispatch_one(
     // instant the backend CLI returned, so a slow `git push` / `gh pr create` on
     // a big diff ran with a frozen lease and the watchdog could reap it
     // mid-finalize as a "stale-heartbeat takeover".
-    let _heartbeat_guard = HeartbeatGuard::spawn(item.work_item_id);
+    let _heartbeat_guard = HeartbeatGuard::spawn(item.lease_id, item.work_item_id);
 
     // Periodic Telegram status update for the operator, spanning the same
     // whole-dispatch window as the heartbeat guard above. Keyed by the
@@ -1702,12 +1705,12 @@ pub(crate) struct HeartbeatGuard {
 }
 
 impl HeartbeatGuard {
-    pub(crate) fn spawn(work_item_id: Uuid) -> Self {
+    pub(crate) fn spawn(lease_id: Uuid, work_item_id: Uuid) -> Self {
         let (stop_tx, stop_rx) = watch::channel(false);
         // Detached: the task loops on its own timer and exits promptly when the
         // guard's drop sends `true` on stop_tx. (spawn_heartbeat already
         // tokio::spawns; dropping the JoinHandle is the intentional detach.)
-        drop(spawn_heartbeat(work_item_id, stop_rx));
+        drop(spawn_heartbeat(lease_id, work_item_id, stop_rx));
         Self { stop_tx }
     }
 }
@@ -1719,6 +1722,7 @@ impl Drop for HeartbeatGuard {
 }
 
 fn spawn_heartbeat(
+    lease_id: Uuid,
     work_item_id: Uuid,
     mut stop_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -1727,7 +1731,7 @@ fn spawn_heartbeat(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    heartbeat_lease_once(work_item_id).await;
+                    heartbeat_lease_once(lease_id, work_item_id).await;
                 }
                 changed = stop_rx.changed() => {
                     if changed.is_err() || *stop_rx.borrow() {
@@ -1747,11 +1751,12 @@ fn spawn_heartbeat(
 /// dispatch/tick contention; the retry rides out a genuine DB hiccup within the
 /// beat interval; a final failure is logged loudly instead of vanishing.
 /// (ff council codex+kimi 2026-07-04.)
-async fn heartbeat_lease_once(work_item_id: Uuid) {
+async fn heartbeat_lease_once(lease_id: Uuid, work_item_id: Uuid) {
     for attempt in 0..3u32 {
         match crate::fleet_info::get_heartbeat_pool().await {
             Ok(pool) => match ff_db::pg_heartbeat_work_item_lease(
                 &pool,
+                lease_id,
                 work_item_id,
                 crate::work_item_scheduler::LEASE_GRANT_SECS,
             )
@@ -1967,21 +1972,40 @@ async fn mark_ready_for_review(
     pr_url: &str,
     builder: &str,
     review: Option<&ReviewOutcome>,
-) -> Result<()> {
+) -> Result<bool> {
     let mut tx = pg.begin().await?;
-    sqlx::query(
-        "UPDATE work_items
+    let transitioned = sqlx::query(
+        "UPDATE work_items w
             SET status = 'in_review',
                 branch_name = $2,
                 pr_url = $3,
                 cleanup_complete = TRUE
-          WHERE id = $1",
+          WHERE w.id = $1
+            AND w.status = 'building'
+            AND EXISTS (
+                SELECT 1
+                  FROM work_item_leases l
+                 WHERE l.work_item_id = w.id
+                   AND l.sub_agent_id = $4
+                   AND l.released_at IS NULL
+                   AND l.lease_state = 'building')",
     )
     .bind(item.work_item_id)
     .bind(&worktree.task_branch)
     .bind(pr_url)
+    .bind(item.sub_agent_id)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if transitioned == 0 {
+        tx.rollback().await?;
+        warn!(
+            work_item_id = %item.work_item_id,
+            sub_agent_id = %item.sub_agent_id,
+            "work_item_dispatch: stale result cannot enter review or enqueue"
+        );
+        return Ok(false);
+    }
 
     sqlx::query(
         "UPDATE work_item_worktrees
@@ -2080,16 +2104,27 @@ async fn mark_ready_for_review(
     // Folder ownership spans build -> review -> merge. Keep the slot occupied
     // until the serial drain reports the merged signal; the host reaper then
     // deletes the branch/tree before this folder can claim another item.
-    sqlx::query(
+    let lease_transitioned = sqlx::query(
         "UPDATE work_item_leases SET lease_state = 'reviewing', heartbeat_at = NOW() \
-          WHERE work_item_id = $1 AND sub_agent_id = $2 AND released_at IS NULL",
+          WHERE work_item_id = $1 AND sub_agent_id = $2 AND released_at IS NULL \
+            AND lease_state = 'building'",
     )
     .bind(item.work_item_id)
     .bind(item.sub_agent_id)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if lease_transitioned == 0 {
+        tx.rollback().await?;
+        warn!(
+            work_item_id = %item.work_item_id,
+            sub_agent_id = %item.sub_agent_id,
+            "work_item_dispatch: lease became stale before review enqueue committed"
+        );
+        return Ok(false);
+    }
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 // ── Pillar 4 v2: in-place review stage (after build+PR, before enqueue) ──────
@@ -6400,6 +6435,7 @@ mod tests {
     fn test_item(attempts: i32, last_error: Option<&str>, complexity: &str) -> AssignedWorkItem {
         AssignedWorkItem {
             work_item_id: Uuid::new_v4(),
+            lease_id: Uuid::new_v4(),
             project_id: "forge-fleet".to_string(),
             title: "test cloud rescue".to_string(),
             description: None,
@@ -7428,6 +7464,7 @@ mod tests {
     fn terminal_failure_alert_leads_with_human_context_and_puts_ids_last() {
         let item = AssignedWorkItem {
             work_item_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            lease_id: Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap(),
             project_id: "forge-fleet".into(),
             title: "Make Telegram alerts readable".into(),
             description: None,

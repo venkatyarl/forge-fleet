@@ -4722,7 +4722,11 @@ mod tests {
             .flat_map(|c| c.iter().copied())
             .collect();
         let unique: std::collections::HashSet<&&str> = members.iter().collect();
-        assert_eq!(unique.len(), members.len(), "clusters must not share members");
+        assert_eq!(
+            unique.len(),
+            members.len(),
+            "clusters must not share members"
+        );
         // "omni" is deliberately NOT clustered with multimodal (adds audio).
         assert_eq!(route_workload_synonyms(Some("omni")), &["omni"]);
         // Unknown tags resolve to just themselves.
@@ -9365,15 +9369,18 @@ pub async fn pg_active_lease_counts_by_project(
 /// stale-heartbeat reaper bug class (#589/#590) on the expiry axis.
 pub async fn pg_heartbeat_work_item_lease(
     pool: &PgPool,
+    lease_id: uuid::Uuid,
     work_item_id: uuid::Uuid,
     extend_secs: i64,
 ) -> Result<()> {
     sqlx::query(
         "UPDATE work_item_leases \
             SET heartbeat_at = NOW(), \
-                lease_expires_at = GREATEST(lease_expires_at, NOW() + make_interval(secs => $2)) \
-          WHERE work_item_id = $1 AND released_at IS NULL",
+                lease_expires_at = GREATEST(lease_expires_at, NOW() + make_interval(secs => $3)) \
+          WHERE id = $1 AND work_item_id = $2 AND released_at IS NULL
+            AND lease_state IN ('claimed', 'building', 'reviewing')",
     )
+    .bind(lease_id)
     .bind(work_item_id)
     .bind(extend_secs as f64)
     .execute(pool)
@@ -9403,15 +9410,29 @@ pub async fn pg_next_merge_queue_item(pool: &PgPool) -> Result<Option<MergeQueue
     // unselectable AND permanent head-blockers via the NOT EXISTS sibling
     // guard (2026-07-28: PR #1480 stalled the whole forge-fleet queue).
     let row = sqlx::query(
-        "SELECT id, work_item_id, project_id, pr_url, branch_name
+        "SELECT q.id, q.work_item_id, q.project_id, q.pr_url, q.branch_name
            FROM work_item_merge_queue q
+           JOIN work_items w ON w.id = q.work_item_id
           WHERE q.status IN ('queued', 'ci_running', 'mergeable')
             AND COALESCE(q.review_verdict, '') <> 'reject'
+            AND w.status = 'in_review'
+            AND EXISTS (
+                SELECT 1 FROM work_item_leases l
+                 WHERE l.work_item_id = q.work_item_id
+                   AND l.released_at IS NULL
+                   AND l.lease_state = 'reviewing')
             AND NOT EXISTS (
                 SELECT 1 FROM work_item_merge_queue q2
+                  JOIN work_items w2 ON w2.id = q2.work_item_id
                  WHERE q2.project_id = q.project_id
                    AND q2.status IN ('queued', 'ci_running', 'mergeable')
                    AND COALESCE(q2.review_verdict, '') <> 'reject'
+                   AND w2.status = 'in_review'
+                   AND EXISTS (
+                       SELECT 1 FROM work_item_leases l2
+                        WHERE l2.work_item_id = q2.work_item_id
+                          AND l2.released_at IS NULL
+                          AND l2.lease_state = 'reviewing')
                    AND q2.position < q.position)
           ORDER BY q.position ASC
           LIMIT 1",
@@ -9453,9 +9474,18 @@ pub async fn pg_defer_merge_queue_item_to_back(pool: &PgPool, id: uuid::Uuid) ->
 /// Mark a merge-queue entry as ci_running (we're watching its PR CI).
 pub async fn pg_mark_merge_ci_running(pool: &PgPool, id: uuid::Uuid) -> Result<()> {
     sqlx::query(
-        "UPDATE work_item_merge_queue \
+        "UPDATE work_item_merge_queue q \
             SET status = 'ci_running', started_at = COALESCE(started_at, NOW()) \
-          WHERE id = $1",
+          WHERE q.id = $1
+            AND q.status IN ('queued', 'ci_running')
+            AND EXISTS (
+                SELECT 1 FROM work_items w
+                 WHERE w.id = q.work_item_id AND w.status = 'in_review')
+            AND EXISTS (
+                SELECT 1 FROM work_item_leases l
+                 WHERE l.work_item_id = q.work_item_id
+                   AND l.released_at IS NULL
+                   AND l.lease_state = 'reviewing')",
     )
     .bind(id)
     .execute(pool)
@@ -9467,10 +9497,22 @@ pub async fn pg_mark_merge_ci_running(pool: &PgPool, id: uuid::Uuid) -> Result<(
 /// the PR awaits operator approval (flip work_item_automerge_mode on, or merge by
 /// hand). Idempotent.
 pub async fn pg_mark_merge_mergeable(pool: &PgPool, id: uuid::Uuid) -> Result<()> {
-    sqlx::query("UPDATE work_item_merge_queue SET status = 'mergeable' WHERE id = $1")
-        .bind(id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE work_item_merge_queue q SET status = 'mergeable'
+          WHERE q.id = $1
+            AND q.status IN ('queued', 'ci_running', 'mergeable')
+            AND EXISTS (
+                SELECT 1 FROM work_items w
+                 WHERE w.id = q.work_item_id AND w.status = 'in_review')
+            AND EXISTS (
+                SELECT 1 FROM work_item_leases l
+                 WHERE l.work_item_id = q.work_item_id
+                   AND l.released_at IS NULL
+                   AND l.lease_state = 'reviewing')",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -9482,14 +9524,33 @@ pub async fn pg_mark_merge_merged(
     work_item_id: uuid::Uuid,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    sqlx::query(
-        "UPDATE work_item_merge_queue SET status = 'merged', merged_at = NOW() WHERE id = $1",
+    let queue_updated = sqlx::query(
+        "UPDATE work_item_merge_queue q
+            SET status = 'merged', merged_at = NOW()
+          WHERE q.id = $1
+            AND q.work_item_id = $2
+            AND q.status IN ('queued', 'ci_running', 'mergeable')
+            AND EXISTS (
+                SELECT 1 FROM work_items w
+                 WHERE w.id = q.work_item_id AND w.status = 'in_review')
+            AND EXISTS (
+                SELECT 1 FROM work_item_leases l
+                 WHERE l.work_item_id = q.work_item_id
+                   AND l.released_at IS NULL
+                   AND l.lease_state = 'reviewing')",
     )
     .bind(id)
+    .bind(work_item_id)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if queue_updated == 0 {
+        tx.rollback().await?;
+        return Ok(());
+    }
     sqlx::query(
-        "UPDATE work_items SET status = 'merged', completed_at = NOW(), last_error = NULL WHERE id = $1",
+        "UPDATE work_items SET status = 'merged', completed_at = NOW(), last_error = NULL
+          WHERE id = $1 AND status = 'in_review'",
     )
     .bind(work_item_id)
     .execute(&mut *tx)
@@ -9516,11 +9577,14 @@ pub async fn pg_mark_merge_failed(
     .bind(reason)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("UPDATE work_items SET status = 'failed', last_error = $2 WHERE id = $1")
-        .bind(work_item_id)
-        .bind(reason)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "UPDATE work_items SET status = 'failed', last_error = $2
+          WHERE id = $1 AND status = 'in_review'",
+    )
+    .bind(work_item_id)
+    .bind(reason)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
 }
