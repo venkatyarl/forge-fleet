@@ -761,7 +761,37 @@ async fn try_assign_item(
     {
         Ok(true) => {
             *active_by_computer.entry(slot.computer_id).or_default() += 1;
-            spawn_claim_heartbeat(pg.clone(), item.id);
+            let lease_id = sqlx::query_scalar::<_, uuid::Uuid>(
+                "SELECT id FROM work_item_leases
+                  WHERE work_item_id = $1
+                    AND sub_agent_id = $2
+                    AND computer_id = $3
+                    AND released_at IS NULL
+                  ORDER BY created_at DESC
+                  LIMIT 1",
+            )
+            .bind(item.id)
+            .bind(slot.sub_agent_id)
+            .bind(slot.computer_id)
+            .fetch_optional(pg)
+            .await
+            .ok()
+            .flatten();
+            if let Some(lease_id) = lease_id {
+                spawn_claim_heartbeat(
+                    pg.clone(),
+                    lease_id,
+                    item.id,
+                    slot.sub_agent_id,
+                    slot.computer_id,
+                );
+            } else {
+                warn!(
+                    work_item_id = %item.id,
+                    sub_agent_id = %slot.sub_agent_id,
+                    "work_item_scheduler: assigned item but could not resolve exact lease for claim heartbeat"
+                );
+            }
             // Keep the shared pool consistent if a pinned assignment consumed
             // a slot that also sat in `pool`, and remove the rest of this
             // computer's slots as soon as its dispatch capacity is full.
@@ -811,19 +841,28 @@ fn project_at_fair_share(
 /// Keep a newly-created lease alive while it waits for the owning host's
 /// dispatch loop. Once dispatch changes the item from `claimed` to `building`,
 /// `dispatch_one`'s own guard takes over for the rest of the lease lifecycle.
-fn spawn_claim_heartbeat(pg: PgPool, work_item_id: uuid::Uuid) {
+fn spawn_claim_heartbeat(
+    pg: PgPool,
+    lease_id: uuid::Uuid,
+    work_item_id: uuid::Uuid,
+    sub_agent_id: uuid::Uuid,
+    computer_id: uuid::Uuid,
+) {
     tokio::spawn(async move {
-        let _guard = crate::work_item_dispatch::HeartbeatGuard::spawn(work_item_id);
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
             crate::work_item_dispatch::HEARTBEAT_SECS,
         ));
         loop {
             ticker.tick().await;
-            let still_queued = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM work_items WHERE id = $1 AND status = 'claimed')",
+            let still_queued = ff_db::pg_heartbeat_work_item_lease(
+                &pg,
+                lease_id,
+                work_item_id,
+                sub_agent_id,
+                computer_id,
+                "claimed",
+                LEASE_GRANT_SECS,
             )
-            .bind(work_item_id)
-            .fetch_one(&pg)
             .await
             .unwrap_or(true);
             if !still_queued {

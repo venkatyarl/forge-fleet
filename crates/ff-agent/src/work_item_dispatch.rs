@@ -20,6 +20,7 @@ use std::{
 use tokio::sync::watch;
 #[cfg(test)]
 use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -32,6 +33,7 @@ use crate::sub_agents::ensure_workspaces;
 /// reapers' regression tests can assert the coupling.
 pub(crate) const HEARTBEAT_SECS: u64 = 45;
 const COMMAND_POLL_MS: u64 = 250;
+const CANCEL_GRACE_SECS: u64 = 3;
 // 18 min. codex reliably WRITES a complete diff in ~5-8 min but then often fails
 // to EXIT, running until the timeout (dogfooded 2026-06-30/07-01). Since the
 // dispatch now SALVAGES the worktree diff on timeout (worktree_has_diff →
@@ -84,6 +86,7 @@ fn dispatch_budget_for_host(free_slots: usize, recent_failures: usize) -> i64 {
 #[derive(Debug, Clone)]
 struct AssignedWorkItem {
     work_item_id: Uuid,
+    lease_id: Uuid,
     project_id: String,
     title: String,
     description: Option<String>,
@@ -91,6 +94,10 @@ struct AssignedWorkItem {
     repo_id: Option<Uuid>,
     repo_url: Option<String>,
     repo_path: PathBuf,
+    /// Fail-closed repository resolution error. Kept on the assigned record so
+    /// the item can transition claimed -> building and then enter the normal
+    /// retry/release path instead of wedging the host dispatch tick.
+    repo_resolution_error: Option<String>,
     sub_agent_id: Uuid,
     computer_id: Uuid,
     computer_name: String,
@@ -492,6 +499,7 @@ async fn assigned_work_items(
         r#"
         SELECT
             w.id AS work_item_id,
+            l.id AS lease_id,
             w.project_id,
             w.title,
             w.description,
@@ -507,7 +515,11 @@ async fn assigned_work_items(
             COALESCE(w.pre_work, '[]'::jsonb) AS pre_work,
             COALESCE(w.work, '[]'::jsonb) AS work,
             COALESCE(w.post_work, '[]'::jsonb) AS post_work,
-            COALESCE(NULLIF(w.repo_url, ''), NULLIF(wr.github_url, '')) AS repo_url,
+            NULLIF(w.repo_url, '') AS work_item_repo_url,
+            NULLIF(wr.github_url, '') AS repo_id_url,
+            COALESCE(project_repo.repo_count, 0) AS project_repo_count,
+            project_repo.sole_repo_id,
+            NULLIF(project_repo.sole_repo_url, '') AS sole_repo_url,
             NULLIF(w.repo_path, '') AS bound_repo_path,
             NULLIF(w.metadata->>'repo_path', '') AS metadata_repo_path,
             -- Legacy/default path resolution (per-project, V141 project_folders):
@@ -539,7 +551,18 @@ async fn assigned_work_items(
           FROM sub_agents sa
           JOIN computers c ON c.id = sa.computer_id
           JOIN work_items w ON w.id = sa.current_work_item_id
-          LEFT JOIN project_repos wr ON wr.id = w.repo_id
+          LEFT JOIN project_repos wr
+            ON wr.id = w.repo_id
+           AND wr.project_id = w.project_id
+          LEFT JOIN LATERAL (
+              SELECT COUNT(*) OVER ()::bigint AS repo_count,
+                     pr.id AS sole_repo_id,
+                     pr.github_url AS sole_repo_url
+                FROM project_repos pr
+               WHERE pr.project_id = w.project_id
+               ORDER BY pr.created_at ASC, pr.id ASC
+               LIMIT 1
+          ) project_repo ON TRUE
           JOIN work_item_leases l
             ON l.work_item_id = w.id
            AND l.sub_agent_id = sa.id
@@ -548,12 +571,6 @@ async fn assigned_work_items(
            AND sa.status = 'busy'
            AND sa.current_work_item_id IS NOT NULL
            AND w.status = 'claimed'
-           AND NOT EXISTS (
-               SELECT 1
-                 FROM work_item_worktrees wt
-                WHERE wt.work_item_id = w.id
-                  AND wt.status IN ('creating', 'active', 'ready_for_review')
-           )
          ORDER BY l.created_at ASC
          LIMIT $3
         "#,
@@ -566,7 +583,15 @@ async fn assigned_work_items(
 
     rows.into_iter()
         .map(|r| {
-            let repo_url: Option<String> = r.try_get("repo_url").ok().flatten();
+            let resolved_repo = resolve_dispatch_repo_binding(
+                r.try_get("repo_id").ok().flatten(),
+                r.try_get("work_item_repo_url").ok().flatten(),
+                r.try_get("repo_id_url").ok().flatten(),
+                r.try_get("project_repo_count").unwrap_or(0),
+                r.try_get("sole_repo_id").ok().flatten(),
+                r.try_get("sole_repo_url").ok().flatten(),
+            );
+            let repo_url = resolved_repo.repo_url;
             let bound_repo_path: Option<PathBuf> = r
                 .try_get::<Option<String>, _>("bound_repo_path")
                 .ok()
@@ -627,13 +652,15 @@ async fn assigned_work_items(
             };
             Ok(AssignedWorkItem {
                 work_item_id: r.get("work_item_id"),
+                lease_id: r.get("lease_id"),
                 project_id: r.get("project_id"),
                 title: r.get("title"),
                 description: r.try_get("description").ok().flatten(),
                 base_branch: r.try_get("base_branch").ok().flatten(),
-                repo_id: r.try_get("repo_id").ok().flatten(),
+                repo_id: resolved_repo.repo_id,
                 repo_url,
                 repo_path,
+                repo_resolution_error: resolved_repo.error,
                 kind,
                 sub_agent_id: r.get("sub_agent_id"),
                 computer_id: r.get("computer_id"),
@@ -657,6 +684,76 @@ async fn assigned_work_items(
             })
         })
         .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DispatchRepoBinding {
+    repo_id: Option<Uuid>,
+    repo_url: Option<String>,
+    error: Option<String>,
+}
+
+fn resolve_dispatch_repo_binding(
+    explicit_repo_id: Option<Uuid>,
+    explicit_repo_url: Option<String>,
+    repo_id_url: Option<String>,
+    project_repo_count: i64,
+    sole_repo_id: Option<Uuid>,
+    sole_repo_url: Option<String>,
+) -> DispatchRepoBinding {
+    if let Some(repo_id) = explicit_repo_id
+        && repo_id_url
+            .as_deref()
+            .is_none_or(|url| url.trim().is_empty())
+    {
+        return DispatchRepoBinding {
+            repo_id: Some(repo_id),
+            repo_url: None,
+            error: Some(format!(
+                "work item repo_id {repo_id} does not resolve to a non-blank repo in its project"
+            )),
+        };
+    }
+    if let Some(url) = explicit_repo_url.filter(|url| !url.trim().is_empty()) {
+        return DispatchRepoBinding {
+            repo_id: explicit_repo_id,
+            repo_url: Some(url),
+            error: None,
+        };
+    }
+    if let Some(repo_id) = explicit_repo_id {
+        return DispatchRepoBinding {
+            repo_id: Some(repo_id),
+            repo_url: repo_id_url,
+            error: None,
+        };
+    }
+    if project_repo_count == 1 {
+        return match sole_repo_url.filter(|url| !url.trim().is_empty()) {
+            Some(url) => DispatchRepoBinding {
+                repo_id: sole_repo_id,
+                repo_url: Some(url),
+                error: None,
+            },
+            None => DispatchRepoBinding {
+                repo_id: sole_repo_id,
+                repo_url: None,
+                error: Some("the project's sole registered repo has a blank URL".to_string()),
+            },
+        };
+    }
+    let detail = if project_repo_count == 0 {
+        "no registered project_repos row".to_string()
+    } else {
+        format!("{project_repo_count} registered project_repos rows")
+    };
+    DispatchRepoBinding {
+        repo_id: None,
+        repo_url: None,
+        error: Some(format!(
+            "work item has no explicit repo binding and its project has {detail}; dispatch requires exactly one"
+        )),
+    }
 }
 
 /// Parse a JSONB array column into a `Vec<String>`, skipping non-string values.
@@ -1000,25 +1097,47 @@ async fn dispatch_one(
             work_item_id = %item.work_item_id,
             "work_item_dispatch: acceptance_check ALREADY PASSES — work is done, skipping build"
         );
-        let _ = sqlx::query(
+        let mut tx = pg.begin().await?;
+        let completed = sqlx::query(
             "UPDATE work_items SET status = 'done', verified = 1, completed_at = NOW(), \
                     verified_at = NOW(), \
                     last_error = 'pre-build gate: acceptance_check already passes — work already done, no build needed' \
-              WHERE id = $1 AND status NOT IN ('merged')",
+              WHERE id = $1
+                AND status = 'building'
+                AND EXISTS (
+                    SELECT 1
+                      FROM work_item_leases l
+                      JOIN sub_agents sa ON sa.id = l.sub_agent_id
+                     WHERE l.id = $2
+                       AND l.work_item_id = work_items.id
+                       AND l.sub_agent_id = $3
+                       AND l.computer_id = $4
+                       AND l.released_at IS NULL
+                       AND l.lease_expires_at > NOW()
+                       AND sa.current_work_item_id = work_items.id
+                )",
         )
         .bind(item.work_item_id)
-        .execute(&pg)
-        .await;
+        .bind(item.lease_id)
+        .bind(item.sub_agent_id)
+        .bind(item.computer_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if completed != 1 {
+            tx.rollback().await?;
+            bail!("acceptance gate lost exact lease authority before completion");
+        }
         // Release the lease/slot so the scheduler stops holding this node for a
         // build that isn't going to happen.
-        let _ = sqlx::query(
-            "UPDATE work_item_leases SET released_at = NOW(), release_reason = 'pre-build acceptance gate: already done' \
-              WHERE work_item_id = $1 AND released_at IS NULL",
-        )
-        .bind(item.work_item_id)
-        .execute(&pg)
-        .await;
+        release_slot_and_lease_tx(&mut tx, &item, "pre-build acceptance gate: already done")
+            .await?;
+        tx.commit().await?;
         return Ok(WorkItemDispatchResult::default());
+    }
+
+    if let Some(error) = item.repo_resolution_error.as_deref() {
+        bail!("repository resolution failed closed: {error}");
     }
 
     // Keep the lease heartbeat alive for the ENTIRE dispatch — the backend build
@@ -1027,7 +1146,12 @@ async fn dispatch_one(
     // instant the backend CLI returned, so a slow `git push` / `gh pr create` on
     // a big diff ran with a frozen lease and the watchdog could reap it
     // mid-finalize as a "stale-heartbeat takeover".
-    let _heartbeat_guard = HeartbeatGuard::spawn(item.work_item_id);
+    let _heartbeat_guard = HeartbeatGuard::spawn(
+        item.lease_id,
+        item.work_item_id,
+        item.sub_agent_id,
+        item.computer_id,
+    );
 
     // Periodic Telegram status update for the operator, spanning the same
     // whole-dispatch window as the heartbeat guard above. Keyed by the
@@ -1042,6 +1166,7 @@ async fn dispatch_one(
 
     // PRE: stage the clone, validate the lifecycle manifest, and verify local
     // prerequisites before checkout/reset and before agent execution.
+    invalidate_nonlocal_worktree_mapping(&pg, &item).await?;
     ensure_repo_checked_out(&pg, &item).await?;
     validate_dispatch_manifest(&item)?;
     check_dispatch_prerequisites(&item.repo_path)?;
@@ -1094,7 +1219,7 @@ async fn dispatch_one(
         }
         Err(e) => {
             post_phase.set_log_tail(format!("dispatch failed before producing output: {e:#}"));
-            mark_worktree_failed(&pg, item.work_item_id, &e.to_string()).await?;
+            mark_worktree_failed(&pg, &item, &e.to_string()).await?;
             return Err(e);
         }
     };
@@ -1711,12 +1836,23 @@ pub(crate) struct HeartbeatGuard {
 }
 
 impl HeartbeatGuard {
-    pub(crate) fn spawn(work_item_id: Uuid) -> Self {
+    pub(crate) fn spawn(
+        lease_id: Uuid,
+        work_item_id: Uuid,
+        sub_agent_id: Uuid,
+        computer_id: Uuid,
+    ) -> Self {
         let (stop_tx, stop_rx) = watch::channel(false);
         // Detached: the task loops on its own timer and exits promptly when the
         // guard's drop sends `true` on stop_tx. (spawn_heartbeat already
         // tokio::spawns; dropping the JoinHandle is the intentional detach.)
-        drop(spawn_heartbeat(work_item_id, stop_rx));
+        drop(spawn_heartbeat(
+            lease_id,
+            work_item_id,
+            sub_agent_id,
+            computer_id,
+            stop_rx,
+        ));
         Self { stop_tx }
     }
 }
@@ -1728,7 +1864,10 @@ impl Drop for HeartbeatGuard {
 }
 
 fn spawn_heartbeat(
+    lease_id: Uuid,
     work_item_id: Uuid,
+    sub_agent_id: Uuid,
+    computer_id: Uuid,
     mut stop_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1736,7 +1875,14 @@ fn spawn_heartbeat(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    heartbeat_lease_once(work_item_id).await;
+                    if !heartbeat_lease_once(
+                        lease_id,
+                        work_item_id,
+                        sub_agent_id,
+                        computer_id,
+                    ).await {
+                        break;
+                    }
                 }
                 changed = stop_rx.changed() => {
                     if changed.is_err() || *stop_rx.borrow() {
@@ -1756,18 +1902,36 @@ fn spawn_heartbeat(
 /// dispatch/tick contention; the retry rides out a genuine DB hiccup within the
 /// beat interval; a final failure is logged loudly instead of vanishing.
 /// (ff council codex+kimi 2026-07-04.)
-async fn heartbeat_lease_once(work_item_id: Uuid) {
+async fn heartbeat_lease_once(
+    lease_id: Uuid,
+    work_item_id: Uuid,
+    sub_agent_id: Uuid,
+    computer_id: Uuid,
+) -> bool {
     for attempt in 0..3u32 {
         match crate::fleet_info::get_heartbeat_pool().await {
             Ok(pool) => match ff_db::pg_heartbeat_work_item_lease(
                 &pool,
+                lease_id,
                 work_item_id,
+                sub_agent_id,
+                computer_id,
+                "building",
                 crate::work_item_scheduler::LEASE_GRANT_SECS,
             )
             .await
             {
-                Ok(()) => return,
+                Ok(true) => return true,
+                Ok(false) => {
+                    warn!(
+                        lease_id = %lease_id,
+                        work_item_id = %work_item_id,
+                        "work_item_dispatch: exact lease heartbeat fenced out — stopping heartbeat"
+                    );
+                    return false;
+                }
                 Err(e) => warn!(
+                    lease_id = %lease_id,
                     work_item_id = %work_item_id, attempt, error = %e,
                     "work_item_dispatch: lease heartbeat UPDATE failed; retrying on dedicated pool"
                 ),
@@ -1783,6 +1947,7 @@ async fn heartbeat_lease_once(work_item_id: Uuid) {
         work_item_id = %work_item_id,
         "work_item_dispatch: lease heartbeat FAILED after 3 tries — lease may go stale (watchdog could reap a LIVE build)"
     );
+    false
 }
 
 /// Bump `dispatch_tick_at` for every active lease on this host. Best-effort:
@@ -1837,6 +2002,57 @@ fn task_branch_name(title: &str, work_item_id: uuid::Uuid) -> String {
     }
 }
 
+/// Invalidate only a stale DB mapping that points at a different physical
+/// checkout. Never delete/reset its filesystem: an old backend on that host may
+/// still be writing there. A mapping on this same computer and checkout remains
+/// a hard fence; the normal failure cleanup may terminalize its DB row, but this
+/// dispatch does not touch or reuse that checkout while ownership is ambiguous.
+async fn invalidate_nonlocal_worktree_mapping(pg: &PgPool, item: &AssignedWorkItem) -> Result<()> {
+    let expected_path = item.repo_path.to_string_lossy().to_string();
+    let invalidated = sqlx::query(
+        "UPDATE work_item_worktrees
+            SET status = 'failed'
+          WHERE work_item_id = $1
+            AND status IN ('creating', 'active', 'ready_for_review')
+            AND (computer_id IS DISTINCT FROM $2 OR worktree_path IS DISTINCT FROM $3)",
+    )
+    .bind(item.work_item_id)
+    .bind(item.computer_id)
+    .bind(&expected_path)
+    .execute(pg)
+    .await?
+    .rows_affected();
+    if invalidated > 0 {
+        warn!(
+            work_item_id = %item.work_item_id,
+            invalidated,
+            "work_item_dispatch: invalidated stale nonlocal worktree mapping without filesystem deletion"
+        );
+    }
+
+    let local_collision: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1
+              FROM work_item_worktrees
+             WHERE work_item_id = $1
+               AND computer_id IS NOT DISTINCT FROM $2
+               AND worktree_path IS NOT DISTINCT FROM $3
+               AND status IN ('creating', 'active', 'ready_for_review')
+        )",
+    )
+    .bind(item.work_item_id)
+    .bind(item.computer_id)
+    .bind(&expected_path)
+    .fetch_one(pg)
+    .await?;
+    if local_collision {
+        bail!(
+            "refusing to reset checkout {expected_path}: an active persisted mapping on this computer still owns it"
+        );
+    }
+    Ok(())
+}
+
 async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Result<WorktreeRecord> {
     let base_branch = match item.base_branch.as_deref() {
         Some(branch) if !branch.trim().is_empty() => branch.trim().to_string(),
@@ -1882,7 +2098,7 @@ async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Resul
             .await?;
         }
         Err(e) => {
-            mark_worktree_failed(pg, item.work_item_id, &e.to_string()).await?;
+            mark_worktree_failed(pg, item, &e.to_string()).await?;
             return Err(e);
         }
     }
@@ -1949,21 +2165,32 @@ async fn mark_building(pg: &PgPool, item: &AssignedWorkItem) -> Result<bool> {
         tx.rollback().await?;
         return Ok(false);
     }
-    sqlx::query(
+    let lease_updated = sqlx::query(
         "UPDATE work_item_leases
             SET lease_state = 'building',
                 build_started_at = COALESCE(build_started_at, NOW()),
                 heartbeat_at = NOW(),
-                lease_expires_at = GREATEST(lease_expires_at, NOW() + make_interval(secs => $3))
-          WHERE work_item_id = $1
-            AND sub_agent_id = $2
-            AND released_at IS NULL",
+                lease_expires_at = GREATEST(lease_expires_at, NOW() + make_interval(secs => $5))
+          WHERE id = $1
+            AND work_item_id = $2
+            AND sub_agent_id = $3
+            AND computer_id = $4
+            AND released_at IS NULL
+            AND lease_expires_at > NOW()
+            AND lease_state = 'claimed'",
     )
+    .bind(item.lease_id)
     .bind(item.work_item_id)
     .bind(item.sub_agent_id)
+    .bind(item.computer_id)
     .bind(crate::work_item_scheduler::LEASE_GRANT_SECS as f64)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if lease_updated != 1 {
+        tx.rollback().await?;
+        bail!("claimed work item lost its exact lease before building transition");
+    }
     tx.commit().await?;
     Ok(true)
 }
@@ -1989,16 +2216,24 @@ async fn mark_ready_for_review(
             AND EXISTS (
                 SELECT 1
                   FROM work_item_leases l
+                  JOIN sub_agents sa ON sa.id = l.sub_agent_id
                  WHERE l.work_item_id = work_items.id
-                   AND l.sub_agent_id = $4
+                   AND l.id = $4
+                   AND l.sub_agent_id = $5
+                   AND l.computer_id = $6
                    AND l.released_at IS NULL
                    AND l.lease_expires_at > NOW()
+                   AND sa.computer_id = l.computer_id
+                   AND sa.current_work_item_id = work_items.id
+                   AND sa.status = 'busy'
             )",
     )
     .bind(item.work_item_id)
     .bind(&worktree.task_branch)
     .bind(pr_url)
+    .bind(item.lease_id)
     .bind(item.sub_agent_id)
+    .bind(item.computer_id)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -2070,8 +2305,7 @@ async fn mark_ready_for_review(
                    $4, $7, $8,
                    CASE WHEN $4 LIKE 'local:%' THEN 'local' ELSE 'cloud' END,
                    $5, NOW(), $6, NOW()
-              FROM work_item_leases l WHERE l.work_item_id = $1
-              ORDER BY l.created_at DESC LIMIT 1
+              FROM work_item_leases l WHERE l.id = $9 AND l.work_item_id = $1
             ON CONFLICT (work_item_id) DO UPDATE SET
               builder_model = EXCLUDED.builder_model,
               builder_computer = EXCLUDED.builder_computer,
@@ -2098,6 +2332,7 @@ async fn mark_ready_for_review(
             .unwrap_or(&item.computer_name),
     )
     .bind(review.and_then(|r| r.reviewer_port))
+    .bind(item.lease_id)
     .execute(&mut *tx)
     .await?;
 
@@ -2106,10 +2341,13 @@ async fn mark_ready_for_review(
     // deletes the branch/tree before this folder can claim another item.
     sqlx::query(
         "UPDATE work_item_leases SET lease_state = 'reviewing', heartbeat_at = NOW() \
-          WHERE work_item_id = $1 AND sub_agent_id = $2 AND released_at IS NULL",
+          WHERE id = $1 AND work_item_id = $2 AND sub_agent_id = $3 \
+            AND computer_id = $4 AND released_at IS NULL",
     )
+    .bind(item.lease_id)
     .bind(item.work_item_id)
     .bind(item.sub_agent_id)
+    .bind(item.computer_id)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -3050,13 +3288,17 @@ async fn acquire_within(sem: &Semaphore, wait: Duration) -> Option<SemaphorePerm
 async fn mark_lease_endpoint(pg: &PgPool, item: &AssignedWorkItem, endpoint: &str) {
     if let Err(e) = sqlx::query(
         "UPDATE work_item_leases
-            SET endpoint = $3
-          WHERE work_item_id = $1
-            AND sub_agent_id = $2
+            SET endpoint = $5
+          WHERE id = $1
+            AND work_item_id = $2
+            AND sub_agent_id = $3
+            AND computer_id = $4
             AND released_at IS NULL",
     )
+    .bind(item.lease_id)
     .bind(item.work_item_id)
     .bind(item.sub_agent_id)
+    .bind(item.computer_id)
     .bind(endpoint)
     .execute(pg)
     .await
@@ -3168,13 +3410,25 @@ async fn requeue_or_fail(pg: &PgPool, item: &AssignedWorkItem, error: &str) -> R
     let mut tx = pg.begin().await?;
     // Requeue: back to 'ready', bump attempts, and append the error to last_error
     // so the next attempt's prompt/context can see why the prior run failed.
-    sqlx::query(
+    let requeued = sqlx::query(
         "UPDATE work_items
             SET status = 'ready',
                 attempts = COALESCE(attempts, 0) + 1,
                 last_error = $2
           WHERE id = $1
-            AND status NOT IN ('done', 'merged', 'cancelled')",
+            AND status = 'building'
+            AND EXISTS (
+                SELECT 1
+                  FROM work_item_leases l
+                  JOIN sub_agents sa ON sa.id = l.sub_agent_id
+                 WHERE l.id = $3
+                   AND l.work_item_id = work_items.id
+                   AND l.sub_agent_id = $4
+                   AND l.computer_id = $5
+                   AND l.released_at IS NULL
+                   AND l.lease_expires_at > NOW()
+                   AND sa.current_work_item_id = work_items.id
+            )",
     )
     .bind(item.work_item_id)
     .bind(truncate_for_db(&format!(
@@ -3182,57 +3436,117 @@ async fn requeue_or_fail(pg: &PgPool, item: &AssignedWorkItem, error: &str) -> R
         attempts + 1,
         error
     )))
+    .bind(item.lease_id)
+    .bind(item.sub_agent_id)
+    .bind(item.computer_id)
     .execute(&mut *tx)
-    .await?;
-    mark_local_retest_failed(&mut tx, item.work_item_id, error).await?;
+    .await?
+    .rows_affected();
+    if requeued == 1 {
+        mark_local_retest_failed(&mut tx, item.work_item_id, error).await?;
+    }
     // Clear the failed worktree row so a fresh one is created next attempt.
     sqlx::query(
         "UPDATE work_item_worktrees
             SET status = 'failed'
           WHERE work_item_id = $1
+            AND computer_id = $2
+            AND sub_agent_id = $3
+            AND worktree_path = $4
             AND status IN ('creating', 'active')",
     )
     .bind(item.work_item_id)
+    .bind(item.computer_id)
+    .bind(item.sub_agent_id)
+    .bind(item.repo_path.to_string_lossy().to_string())
     .execute(&mut *tx)
     .await?;
-    release_slot_and_lease_tx(&mut tx, item, "dispatch failed — requeued for retry").await?;
+    let released =
+        release_slot_and_lease_tx(&mut tx, item, "dispatch failed — requeued for retry").await?;
+    if requeued == 1 && !released {
+        tx.rollback().await?;
+        bail!("exact lease disappeared while requeueing; rolled back item transition");
+    }
     tx.commit().await?;
-    info!(
-        work_item_id = %item.work_item_id,
-        attempts = attempts + 1,
-        "work_item_dispatch: requeued for retry with error context"
-    );
+    if requeued == 1 {
+        info!(
+            work_item_id = %item.work_item_id,
+            attempts = attempts + 1,
+            released,
+            "work_item_dispatch: requeued for retry with error context"
+        );
+    } else {
+        info!(
+            work_item_id = %item.work_item_id,
+            released,
+            "work_item_dispatch: exact worker cleanup finished without overwriting terminal or reassigned state"
+        );
+    }
     Ok(())
 }
 
 async fn mark_failed_and_release(pg: &PgPool, item: &AssignedWorkItem, error: &str) -> Result<()> {
     let mut tx = pg.begin().await?;
-    sqlx::query(
+    let failed = sqlx::query(
         "UPDATE work_items
             SET status = 'failed',
                 last_error = $2
           WHERE id = $1
-            AND status NOT IN ('done', 'merged', 'cancelled')",
+            AND status = 'building'
+            AND EXISTS (
+                SELECT 1
+                  FROM work_item_leases l
+                  JOIN sub_agents sa ON sa.id = l.sub_agent_id
+                 WHERE l.id = $3
+                   AND l.work_item_id = work_items.id
+                   AND l.sub_agent_id = $4
+                   AND l.computer_id = $5
+                   AND l.released_at IS NULL
+                   AND l.lease_expires_at > NOW()
+                   AND sa.current_work_item_id = work_items.id
+            )",
     )
     .bind(item.work_item_id)
     .bind(truncate_for_db(error))
+    .bind(item.lease_id)
+    .bind(item.sub_agent_id)
+    .bind(item.computer_id)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
     sqlx::query(
         "UPDATE work_item_worktrees
             SET status = 'failed'
           WHERE work_item_id = $1
+            AND computer_id = $2
+            AND sub_agent_id = $3
+            AND worktree_path = $4
             AND status IN ('creating', 'active')",
     )
     .bind(item.work_item_id)
+    .bind(item.computer_id)
+    .bind(item.sub_agent_id)
+    .bind(item.repo_path.to_string_lossy().to_string())
     .execute(&mut *tx)
     .await?;
-    release_slot_and_lease_tx(&mut tx, item, "dispatch failed").await?;
+    let released = release_slot_and_lease_tx(&mut tx, item, "dispatch failed").await?;
+    if failed == 1 && !released {
+        tx.rollback().await?;
+        bail!("exact lease disappeared while failing item; rolled back terminal transition");
+    }
     tx.commit().await?;
     // Escalation ladder stage 3: the fleet (local + cloud) couldn't build this
     // after the full retry budget — tell the operator. Best-effort; a notify
     // failure never fails the dispatch.
-    notify_operator_task_failed(pg, item, error).await;
+    if failed == 1 {
+        notify_operator_task_failed(pg, item, error).await;
+    } else {
+        info!(
+            work_item_id = %item.work_item_id,
+            released,
+            "work_item_dispatch: stale failure finalizer preserved terminal or reassigned state"
+        );
+    }
     Ok(())
 }
 
@@ -3341,28 +3655,42 @@ async fn release_slot_and_lease_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     item: &AssignedWorkItem,
     reason: &str,
-) -> Result<()> {
-    sqlx::query(
+) -> Result<bool> {
+    let released = sqlx::query(
         "WITH releasing AS (
-             SELECT id, work_item_id, lease_state, endpoint, attempt, computer_id
+             SELECT id, work_item_id, sub_agent_id, lease_state, endpoint, attempt, computer_id
                FROM work_item_leases
-              WHERE work_item_id = $1
-                AND sub_agent_id = $2
+              WHERE id = $1
+                AND work_item_id = $2
+                AND sub_agent_id = $3
+                AND computer_id = $4
                 AND released_at IS NULL
               FOR UPDATE
          ), released AS (
              UPDATE work_item_leases l
                 SET lease_state = 'released',
                     released_at = NOW(),
-                    release_reason = $3
+                    release_reason = $5
                FROM releasing r
               WHERE l.id = r.id
           RETURNING r.work_item_id,
+                    r.sub_agent_id,
                     r.lease_state AS from_status,
                     r.endpoint,
                     r.attempt,
                     l.release_reason,
                     r.computer_id
+         ), slot_freed AS (
+             UPDATE sub_agents sa
+                SET current_work_item_id = NULL,
+                    status = 'idle',
+                    started_at = NULL,
+                    last_heartbeat_at = NOW()
+               FROM released r
+              WHERE sa.id = r.sub_agent_id
+                AND sa.computer_id = r.computer_id
+                AND sa.current_work_item_id = r.work_item_id
+          RETURNING sa.id
          )
          INSERT INTO work_item_events
              (work_item_id, from_status, to_status, computer, attempt, detail)
@@ -3381,46 +3709,56 @@ async fn release_slot_and_lease_tx(
            FROM released r
            LEFT JOIN computers c ON c.id = r.computer_id",
     )
+    .bind(item.lease_id)
     .bind(item.work_item_id)
     .bind(item.sub_agent_id)
+    .bind(item.computer_id)
     .bind(reason)
     .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(
-        "UPDATE sub_agents
-            SET current_work_item_id = NULL,
-                status = 'idle',
-                started_at = NULL,
-                last_heartbeat_at = NOW()
-          WHERE id = $1
-            AND current_work_item_id = $2",
-    )
-    .bind(item.sub_agent_id)
-    .bind(item.work_item_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    .await?
+    .rows_affected();
+    Ok(released == 1)
 }
 
-async fn mark_worktree_failed(pg: &PgPool, work_item_id: Uuid, error: &str) -> Result<()> {
+async fn mark_worktree_failed(pg: &PgPool, item: &AssignedWorkItem, error: &str) -> Result<()> {
     sqlx::query(
         "UPDATE work_item_worktrees
             SET status = 'failed'
           WHERE work_item_id = $1
+            AND computer_id = $2
+            AND sub_agent_id = $3
+            AND worktree_path = $4
             AND status IN ('creating', 'active')",
     )
-    .bind(work_item_id)
+    .bind(item.work_item_id)
+    .bind(item.computer_id)
+    .bind(item.sub_agent_id)
+    .bind(item.repo_path.to_string_lossy().to_string())
     .execute(pg)
     .await?;
 
     sqlx::query(
         "UPDATE work_items
             SET last_error = $2
-          WHERE id = $1",
+          WHERE id = $1
+            AND status = 'building'
+            AND EXISTS (
+                SELECT 1
+                  FROM work_item_leases l
+                  JOIN sub_agents sa ON sa.id = l.sub_agent_id
+                 WHERE l.id = $3
+                   AND l.work_item_id = work_items.id
+                   AND l.sub_agent_id = $4
+                   AND l.computer_id = $5
+                   AND l.released_at IS NULL
+                   AND sa.current_work_item_id = work_items.id
+            )",
     )
-    .bind(work_item_id)
+    .bind(item.work_item_id)
     .bind(truncate_for_db(error))
+    .bind(item.lease_id)
+    .bind(item.sub_agent_id)
+    .bind(item.computer_id)
     .execute(pg)
     .await?;
     Ok(())
@@ -3978,18 +4316,38 @@ async fn run_ff_dispatch(
                             reviewer = %v.reviewer,
                             "work_item_dispatch: already_done claim VERIFIED with citations — marking work_item done"
                         );
-                        let _ = sqlx::query(
+                        let completed = sqlx::query(
                             "UPDATE work_items SET status = 'done', completed_at = NOW(), \
                                 last_error = $2 \
-                              WHERE id = $1 AND status NOT IN ('merged')",
+                              WHERE id = $1
+                                AND status = 'building'
+                                AND EXISTS (
+                                    SELECT 1
+                                      FROM work_item_leases l
+                                      JOIN sub_agents sa ON sa.id = l.sub_agent_id
+                                     WHERE l.id = $3
+                                       AND l.work_item_id = work_items.id
+                                       AND l.sub_agent_id = $4
+                                       AND l.computer_id = $5
+                                       AND l.released_at IS NULL
+                                       AND l.lease_expires_at > NOW()
+                                       AND sa.current_work_item_id = work_items.id
+                                )",
                         )
                         .bind(item.work_item_id)
                         .bind(truncate_for_db(&format!(
                             "already implemented (verified by {}: {})",
                             v.reviewer, v.reason
                         )))
+                        .bind(item.lease_id)
+                        .bind(item.sub_agent_id)
+                        .bind(item.computer_id)
                         .execute(pg)
-                        .await;
+                        .await?
+                        .rows_affected();
+                        if completed != 1 {
+                            bail!("dispatch authority lost before already-done completion");
+                        }
                         let _ = remove_worktree(&item.repo_path, &worktree.worktree_path);
                         anyhow::bail!("already-implemented — work_item marked done, no PR needed");
                     }
@@ -4297,9 +4655,14 @@ async fn run_ff_dispatch(
         let mut attempt: u32 = 0;
         loop {
             let started = Instant::now();
-            let out = match run_backend_cli(backend, &worktree.worktree_path, &prompt).await {
+            let out = match run_backend_cli(pg, item, backend, &worktree.worktree_path, &prompt)
+                .await
+            {
                 Ok(o) => o,
                 Err(e) => {
+                    if is_dispatch_authority_error(&e) {
+                        return Err(e);
+                    }
                     // A timeout / spawn error is a `Timeout`-class provider fault.
                     // BUT the CLI (esp. codex) often writes a complete, valid diff
                     // early and then just fails to EXIT — so a timeout doesn't mean
@@ -4572,7 +4935,7 @@ async fn run_ff_dispatch(
             "run_ff_dispatch: all routed backends were skipped before launch; forcing one direct attempt"
         );
         let started = std::time::Instant::now();
-        match run_backend_cli(&forced_backend, &worktree.worktree_path, &prompt).await {
+        match run_backend_cli(pg, item, &forced_backend, &worktree.worktree_path, &prompt).await {
             Ok(out) => {
                 if quick_empty_success_is_provider_failure(&out, started.elapsed()) {
                     let _ = crate::cloud_budget::record_failure(
@@ -4589,6 +4952,9 @@ async fn run_ff_dispatch(
                 return Ok((forced_backend, out));
             }
             Err(e) => {
+                if is_dispatch_authority_error(&e) {
+                    return Err(e);
+                }
                 if worktree_has_diff(&worktree.worktree_path) {
                     warn!(backend = %forced_backend, error = %e, "run_ff_dispatch: forced backend timed out but wrote a real diff — salvaging");
                     let _ = crate::circuit_breaker::record_provider_success(
@@ -4855,10 +5221,76 @@ fn slot_cargo_target(worktree_cwd: &Path) -> PathBuf {
         .join("cargo-shared-target")
 }
 
-async fn run_backend_cli(backend: &str, cwd: &Path, prompt: &str) -> Result<Output> {
+fn is_dispatch_authority_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("dispatch authority lost"))
+}
+
+async fn run_backend_cli(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    backend: &str,
+    cwd: &Path,
+    prompt: &str,
+) -> Result<Output> {
     let backend = backend.to_string();
     let cwd = cwd.to_path_buf();
     let prompt = prompt.to_string();
+    let cancellation = CancellationToken::new();
+    let cancellation_watch = cancellation.clone();
+    let watch_pool = pg.clone();
+    let lease_id = item.lease_id;
+    let work_item_id = item.work_item_id;
+    let sub_agent_id = item.sub_agent_id;
+    let computer_id = item.computer_id;
+    let watcher = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(COMMAND_POLL_MS));
+        loop {
+            interval.tick().await;
+            let authoritative = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(
+                    SELECT 1
+                      FROM work_item_leases l
+                      JOIN work_items w ON w.id = l.work_item_id
+                      JOIN sub_agents sa ON sa.id = l.sub_agent_id
+                     WHERE l.id = $1
+                       AND l.work_item_id = $2
+                       AND l.sub_agent_id = $3
+                       AND l.computer_id = $4
+                       AND l.released_at IS NULL
+                       AND l.lease_expires_at > NOW()
+                       AND w.status = 'building'
+                       AND sa.computer_id = l.computer_id
+                       AND sa.current_work_item_id = l.work_item_id
+                       AND sa.status = 'busy'
+                )",
+            )
+            .bind(lease_id)
+            .bind(work_item_id)
+            .bind(sub_agent_id)
+            .bind(computer_id)
+            .fetch_one(&watch_pool)
+            .await;
+            match authoritative {
+                Ok(true) => {}
+                Ok(false) => {
+                    cancellation_watch.cancel();
+                    return;
+                }
+                Err(error) => warn!(
+                    lease_id = %lease_id,
+                    work_item_id = %work_item_id,
+                    error = %error,
+                    "work_item_dispatch: cancellation watcher query failed; retrying"
+                ),
+            }
+        }
+    });
+    let process_nonce = Uuid::new_v4();
+    let process_pool = pg.clone();
+    let process_cancel = cancellation.clone();
+    let runtime = tokio::runtime::Handle::current();
     // Fetch the GitHub token HERE (async) and inject it into the backend's env so
     // the agent has an authenticated `gh` for the ENTIRE build — not only the
     // final `gh pr create` step. Without it, a codex/claude/kimi run that shells
@@ -4866,7 +5298,7 @@ async fn run_backend_cli(backend: &str, cwd: &Path, prompt: &str) -> Result<Outp
     // login" and exits non-zero on any node lacking ambient gh auth (i.e. all of
     // them — the fleet authenticates gh purely via this secret, not `gh auth login`).
     let gh_token = crate::fleet_info::fetch_secret("github_gh_token").await;
-    tokio::task::spawn_blocking(move || {
+    let joined = tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new("ff");
         cmd.arg("cli")
             .arg(&backend)
@@ -4895,10 +5327,77 @@ async fn run_backend_cli(backend: &str, cwd: &Path, prompt: &str) -> Result<Outp
         // capture (not _timeout): keep the Output for ANY exit so run_ff_dispatch
         // can distinguish exit-3 (require-change no-op = already done) from a real
         // failure. Only spawn/timeout become Err here.
-        run_command_capture(cmd, Duration::from_secs(FF_TIMEOUT_SECS + 30))
+        run_command_capture_cancellable(
+            cmd,
+            Duration::from_secs(FF_TIMEOUT_SECS + 30),
+            &process_cancel,
+            |pid| {
+                runtime.block_on(async {
+                    let identity = serde_json::json!({
+                        "work_item_id": work_item_id,
+                        "lease_id": lease_id,
+                        "pid": pid,
+                        "pgid": pid,
+                        "nonce": process_nonce,
+                        "started_at": chrono::Utc::now(),
+                    });
+                    let updated = sqlx::query(
+                        "UPDATE sub_agents sa
+                            SET metadata = jsonb_set(
+                                COALESCE(sa.metadata, '{}'::jsonb),
+                                '{backend_process}',
+                                $5::jsonb,
+                                true
+                            )
+                          WHERE sa.id = $1
+                            AND sa.computer_id = $2
+                            AND sa.current_work_item_id = $3
+                            AND sa.status = 'busy'
+                            AND EXISTS (
+                                SELECT 1
+                                  FROM work_item_leases l
+                                  JOIN work_items w ON w.id = l.work_item_id
+                                 WHERE l.id = $4
+                                   AND l.work_item_id = sa.current_work_item_id
+                                   AND l.sub_agent_id = sa.id
+                                   AND l.computer_id = sa.computer_id
+                                   AND l.released_at IS NULL
+                                   AND l.lease_expires_at > NOW()
+                                   AND w.status = 'building'
+                            )",
+                    )
+                    .bind(sub_agent_id)
+                    .bind(computer_id)
+                    .bind(work_item_id)
+                    .bind(lease_id)
+                    .bind(identity)
+                    .execute(&process_pool)
+                    .await
+                    .context("persist exact backend process identity")?
+                    .rows_affected();
+                    if updated != 1 {
+                        bail!("dispatch authority lost before backend launch");
+                    }
+                    Ok(())
+                })
+            },
+        )
     })
-    .await
-    .context("join ff dispatch task")?
+    .await;
+    watcher.abort();
+    let _ = sqlx::query(
+        "UPDATE sub_agents
+            SET metadata = COALESCE(metadata, '{}'::jsonb) - 'backend_process'
+          WHERE id = $1
+            AND computer_id = $2
+            AND metadata->'backend_process'->>'nonce' = $3",
+    )
+    .bind(sub_agent_id)
+    .bind(computer_id)
+    .bind(process_nonce.to_string())
+    .execute(pg)
+    .await;
+    joined.context("join ff dispatch task")?
 }
 
 /// Runs `git status --porcelain` and returns true if the worktree has any
@@ -6101,7 +6600,22 @@ fn command_display(cmd: &Command) -> String {
 /// (the change already exists), which `run_ff_dispatch` must treat as "already
 /// done", NOT as a backend failure to retry/fail. (Bailing on exit 3 here made
 /// that handler dead code — an already-built feature task requeued to death.)
-fn run_command_capture(mut cmd: Command, timeout: Duration) -> Result<Output> {
+fn run_command_capture(cmd: Command, timeout: Duration) -> Result<Output> {
+    run_command_capture_cancellable(cmd, timeout, &CancellationToken::new(), |_| Ok(()))
+}
+
+fn run_command_capture_cancellable<F>(
+    mut cmd: Command,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+    on_spawn: F,
+) -> Result<Output>
+where
+    F: FnOnce(u32) -> Result<()>,
+{
+    if cancellation.is_cancelled() {
+        bail!("dispatch authority lost before command spawn");
+    }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     // Own process group so a timeout SIGKILLs the WHOLE tree. `ff cli <backend>`
     // forks the actual vendor CLI (claude/codex/kimi) as a GRANDCHILD; killing
@@ -6116,12 +6630,25 @@ fn run_command_capture(mut cmd: Command, timeout: Duration) -> Result<Output> {
     }
     let program = command_display(&cmd);
     let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
+    let child_pid = child.id();
+    if let Err(error) = on_spawn(child_pid) {
+        terminate_process_group(&mut child, Duration::ZERO);
+        return Err(error);
+    }
+    if cancellation.is_cancelled() {
+        terminate_process_group(&mut child, Duration::from_secs(CANCEL_GRACE_SECS));
+        bail!("dispatch authority lost after command spawn: {program}");
+    }
     let start = Instant::now();
     loop {
         if child.try_wait()?.is_some() {
             return child
                 .wait_with_output()
                 .with_context(|| format!("collect output for {program}"));
+        }
+        if cancellation.is_cancelled() {
+            terminate_process_group(&mut child, Duration::from_secs(CANCEL_GRACE_SECS));
+            bail!("dispatch authority lost; command cancelled and reaped: {program}");
         }
         if start.elapsed() >= timeout {
             // SIGKILL the entire process group — not just the direct child — so the
@@ -6135,6 +6662,34 @@ fn run_command_capture(mut cmd: Command, timeout: Duration) -> Result<Output> {
             bail!("command timed out after {timeout:?}: {program}");
         }
         std::thread::sleep(Duration::from_millis(COMMAND_POLL_MS));
+    }
+}
+
+fn terminate_process_group(child: &mut std::process::Child, grace: Duration) {
+    let pid = child.id();
+    #[cfg(unix)]
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + grace;
+    let mut leader_reaped = false;
+    while Instant::now() < deadline {
+        if !leader_reaped && child.try_wait().ok().flatten().is_some() {
+            leader_reaped = true;
+        }
+        std::thread::sleep(Duration::from_millis(COMMAND_POLL_MS));
+    }
+    // The direct `ff` group leader may exit on TERM while its vendor CLI
+    // grandchild ignores or outlives TERM. Never treat leader exit as proof that
+    // the process group is empty: after the full grace period, kill the group
+    // unconditionally. This is the physical checkout-reuse fence.
+    #[cfg(unix)]
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    }
+    if !leader_reaped {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -6411,10 +6966,10 @@ mod tests {
         mark_ready_for_review, mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers,
         parse_cli_tokens, parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
         quick_empty_success_is_provider_failure, record_cloud_rescue_local_failure_diagnosis,
-        repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
-        same_model_family, should_attempt_lane15, status_output_is_clean, synthetic_output,
-        task_failed_alert_text, task_prefers_cloud_lane, try_acquire_lane15_480b_permit,
-        use_local_lane, validate_manifest_fields,
+        repo_cache_path, repo_slug, resolve_dispatch_repo_binding, retry_error_is_actionable,
+        rewrite_github_host_alias, same_model_family, should_attempt_lane15,
+        status_output_is_clean, synthetic_output, task_failed_alert_text, task_prefers_cloud_lane,
+        try_acquire_lane15_480b_permit, use_local_lane, validate_manifest_fields,
     };
     use sqlx::Row;
     use std::path::PathBuf;
@@ -6424,6 +6979,7 @@ mod tests {
     fn test_item(attempts: i32, last_error: Option<&str>, complexity: &str) -> AssignedWorkItem {
         AssignedWorkItem {
             work_item_id: Uuid::new_v4(),
+            lease_id: Uuid::new_v4(),
             project_id: "forge-fleet".to_string(),
             title: "test cloud rescue".to_string(),
             description: None,
@@ -6431,6 +6987,7 @@ mod tests {
             repo_id: None,
             repo_url: None,
             repo_path: PathBuf::from("/tmp/forge-fleet"),
+            repo_resolution_error: None,
             sub_agent_id: Uuid::new_v4(),
             computer_id: Uuid::new_v4(),
             computer_name: "test-node".to_string(),
@@ -6539,13 +7096,24 @@ mod tests {
             .await
             .expect("insert test work item");
             sqlx::query(
+                "UPDATE sub_agents
+                    SET status = 'busy', current_work_item_id = $2
+                  WHERE id = $1",
+            )
+            .bind(leased_sub_agent_id)
+            .bind(work_item_id)
+            .execute(&pool)
+            .await
+            .expect("assign leased sub-agent");
+            let lease_id: Uuid = sqlx::query_scalar(
                 "INSERT INTO work_item_leases
                     (work_item_id, sub_agent_id, computer_id, project_id,
                      lease_expires_at, released_at)
                  VALUES ($1, $2, $3, $4,
                          CASE WHEN $5 THEN NOW() - INTERVAL '1 second'
                               ELSE NOW() + INTERVAL '5 minutes' END,
-                         CASE WHEN $6 THEN NOW() ELSE NULL END)",
+                         CASE WHEN $6 THEN NOW() ELSE NULL END)
+                 RETURNING id",
             )
             .bind(work_item_id)
             .bind(leased_sub_agent_id)
@@ -6553,12 +7121,13 @@ mod tests {
             .bind(&project_id)
             .bind(expired)
             .bind(released)
-            .execute(&pool)
+            .fetch_one(&pool)
             .await
             .expect("insert test lease");
 
             let mut item = test_item(0, None, "mechanical");
             item.work_item_id = work_item_id;
+            item.lease_id = lease_id;
             item.project_id = project_id.clone();
             item.computer_id = computer_id;
             item.sub_agent_id = dispatch_sub_agent_id;
@@ -6636,6 +7205,226 @@ mod tests {
                 .await
                 .ok();
         }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_is_fenced_to_exact_live_lease_status_and_slot_owner() {
+        let url = match std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+        {
+            Ok(url) => url,
+            Err(_) => {
+                eprintln!("skipping exact heartbeat DB test: no Postgres URL");
+                return;
+            }
+        };
+        let pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(error) => {
+                eprintln!("skipping exact heartbeat DB test: database unavailable: {error}");
+                return;
+            }
+        };
+        ff_db::run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should create lease tables");
+
+        let suffix = Uuid::new_v4();
+        let project_id = format!("dispatch-heartbeat-fence-{suffix}");
+        let computer_id = Uuid::new_v4();
+        let sub_agent_id = Uuid::new_v4();
+        let work_item_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects (id, display_name) VALUES ($1, $1)")
+            .bind(&project_id)
+            .execute(&pool)
+            .await
+            .expect("insert project");
+        sqlx::query(
+            "INSERT INTO computers (id, name, primary_ip, os_family, ssh_user)
+             VALUES ($1, $2, '127.0.0.1', 'linux', 'test')",
+        )
+        .bind(computer_id)
+        .bind(format!("dispatch-heartbeat-fence-{suffix}"))
+        .execute(&pool)
+        .await
+        .expect("insert computer");
+        sqlx::query(
+            "INSERT INTO sub_agents
+                (id, computer_id, slot, workspace_dir, status)
+             VALUES ($1, $2, 0, '/tmp/dispatch-heartbeat-fence', 'idle')",
+        )
+        .bind(sub_agent_id)
+        .bind(computer_id)
+        .execute(&pool)
+        .await
+        .expect("insert sub-agent");
+        sqlx::query(
+            "INSERT INTO work_items (id, project_id, kind, title, status)
+             VALUES ($1, $2, 'task', 'exact heartbeat fence', 'building')",
+        )
+        .bind(work_item_id)
+        .bind(&project_id)
+        .execute(&pool)
+        .await
+        .expect("insert work item");
+        sqlx::query(
+            "UPDATE sub_agents
+                SET status = 'busy', current_work_item_id = $2
+              WHERE id = $1",
+        )
+        .bind(sub_agent_id)
+        .bind(work_item_id)
+        .execute(&pool)
+        .await
+        .expect("own slot");
+        let lease_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO work_item_leases
+                (work_item_id, sub_agent_id, computer_id, project_id,
+                 lease_state, lease_expires_at)
+             VALUES ($1, $2, $3, $4, 'building', NOW() + INTERVAL '5 minutes')
+             RETURNING id",
+        )
+        .bind(work_item_id)
+        .bind(sub_agent_id)
+        .bind(computer_id)
+        .bind(&project_id)
+        .fetch_one(&pool)
+        .await
+        .expect("insert lease");
+
+        async fn heartbeat(
+            pool: &sqlx::PgPool,
+            lease_id: Uuid,
+            work_item_id: Uuid,
+            sub_agent_id: Uuid,
+            computer_id: Uuid,
+        ) -> bool {
+            ff_db::pg_heartbeat_work_item_lease(
+                pool,
+                lease_id,
+                work_item_id,
+                sub_agent_id,
+                computer_id,
+                "building",
+                600,
+            )
+            .await
+            .expect("heartbeat query")
+        }
+        assert!(heartbeat(&pool, lease_id, work_item_id, sub_agent_id, computer_id).await);
+        assert!(
+            !heartbeat(
+                &pool,
+                Uuid::new_v4(),
+                work_item_id,
+                sub_agent_id,
+                computer_id
+            )
+            .await
+        );
+
+        sqlx::query("UPDATE work_items SET status = 'cancelled' WHERE id = $1")
+            .bind(work_item_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!heartbeat(&pool, lease_id, work_item_id, sub_agent_id, computer_id).await);
+        sqlx::query("UPDATE work_items SET status = 'building' WHERE id = $1")
+            .bind(work_item_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE work_item_leases SET lease_expires_at = NOW() - INTERVAL '1 second'
+              WHERE id = $1",
+        )
+        .bind(lease_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(!heartbeat(&pool, lease_id, work_item_id, sub_agent_id, computer_id).await);
+        sqlx::query(
+            "UPDATE work_item_leases
+                SET lease_expires_at = NOW() + INTERVAL '5 minutes',
+                    released_at = NOW(), lease_state = 'released'
+              WHERE id = $1",
+        )
+        .bind(lease_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(!heartbeat(&pool, lease_id, work_item_id, sub_agent_id, computer_id).await);
+
+        let replacement_lease_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO work_item_leases
+                (work_item_id, sub_agent_id, computer_id, project_id,
+                 lease_state, lease_expires_at)
+             VALUES ($1, $2, $3, $4, 'building', NOW() + INTERVAL '5 minutes')
+             RETURNING id",
+        )
+        .bind(work_item_id)
+        .bind(sub_agent_id)
+        .bind(computer_id)
+        .bind(&project_id)
+        .fetch_one(&pool)
+        .await
+        .expect("insert replacement lease");
+        assert!(!heartbeat(&pool, lease_id, work_item_id, sub_agent_id, computer_id).await);
+        assert!(
+            heartbeat(
+                &pool,
+                replacement_lease_id,
+                work_item_id,
+                sub_agent_id,
+                computer_id
+            )
+            .await
+        );
+        sqlx::query("UPDATE sub_agents SET current_work_item_id = NULL WHERE id = $1")
+            .bind(sub_agent_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !heartbeat(
+                &pool,
+                replacement_lease_id,
+                work_item_id,
+                sub_agent_id,
+                computer_id
+            )
+            .await
+        );
+
+        sqlx::query("DELETE FROM work_item_leases WHERE work_item_id = $1")
+            .bind(work_item_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM work_items WHERE id = $1")
+            .bind(work_item_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM sub_agents WHERE id = $1")
+            .bind(sub_agent_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM computers WHERE id = $1")
+            .bind(computer_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(&project_id)
+            .execute(&pool)
+            .await
+            .ok();
     }
 
     #[test]
@@ -7274,6 +8063,62 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_repo_resolution_precedence_and_fail_closed_cases() {
+        let explicit_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let sole_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let explicit = resolve_dispatch_repo_binding(
+            Some(explicit_id),
+            Some("git@github.com:acme/explicit.git".into()),
+            Some("git@github.com:acme/id-row.git".into()),
+            1,
+            Some(sole_id),
+            Some("git@github.com:acme/sole.git".into()),
+        );
+        assert_eq!(explicit.repo_id, Some(explicit_id));
+        assert_eq!(
+            explicit.repo_url.as_deref(),
+            Some("git@github.com:acme/explicit.git")
+        );
+        assert!(explicit.error.is_none());
+
+        let by_id = resolve_dispatch_repo_binding(
+            Some(explicit_id),
+            None,
+            Some("git@github.com:acme/id-row.git".into()),
+            2,
+            None,
+            None,
+        );
+        assert_eq!(
+            by_id.repo_url.as_deref(),
+            Some("git@github.com:acme/id-row.git")
+        );
+        assert!(by_id.error.is_none());
+
+        let sole = resolve_dispatch_repo_binding(
+            None,
+            None,
+            None,
+            1,
+            Some(sole_id),
+            Some("git@github.com:acme/sole.git".into()),
+        );
+        assert_eq!(sole.repo_id, Some(sole_id));
+        assert!(sole.error.is_none());
+
+        for count in [0, 2] {
+            let unresolved = resolve_dispatch_repo_binding(None, None, None, count, None, None);
+            assert!(unresolved.repo_url.is_none());
+            assert!(unresolved.error.is_some());
+        }
+        assert!(
+            resolve_dispatch_repo_binding(Some(explicit_id), None, None, 1, None, None)
+                .error
+                .is_some()
+        );
+    }
+
+    #[test]
     fn repo_slug_derives_from_url_tail() {
         assert_eq!(
             repo_slug("git@github.com:venkatyarl/forge-fleet.git"),
@@ -7403,7 +8248,9 @@ mod tests {
             );
         }
     }
-    use super::run_command_capture;
+    use super::{
+        is_dispatch_authority_error, run_command_capture, run_command_capture_cancellable,
+    };
     use anyhow::anyhow;
     use std::os::unix::process::ExitStatusExt;
     use std::process::{Command, Output};
@@ -7426,6 +8273,137 @@ mod tests {
         cmd.arg("-c").arg("exit 0");
         let out = run_command_capture(cmd, std::time::Duration::from_secs(10)).expect("clean run");
         assert!(out.status.success());
+    }
+
+    #[test]
+    fn cancelled_before_spawn_never_launches_or_records_a_process() {
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let recorded = std::sync::atomic::AtomicBool::new(false);
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("exit 0");
+        let error = run_command_capture_cancellable(
+            cmd,
+            std::time::Duration::from_secs(10),
+            &token,
+            |_| {
+                recorded.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .expect_err("pre-cancelled command must not launch");
+        assert!(is_dispatch_authority_error(&error));
+        assert!(!recorded.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_child_gets_term_and_unrelated_process_survives() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("term-observed");
+        let mut unrelated = Command::new("sh")
+            .arg("-c")
+            .arg("while :; do sleep 1; done")
+            .spawn()
+            .expect("spawn unrelated process");
+        let token = tokio_util::sync::CancellationToken::new();
+        let cancel = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            cancel.cancel();
+        });
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "trap 'touch {}; exit 0' TERM; while :; do sleep 0.1; done",
+            marker.display()
+        ));
+        let error = run_command_capture_cancellable(
+            cmd,
+            std::time::Duration::from_secs(10),
+            &token,
+            |_| Ok(()),
+        )
+        .expect_err("cancelled child must not succeed");
+        assert!(is_dispatch_authority_error(&error));
+        assert!(marker.exists(), "child did not observe graceful SIGTERM");
+        assert!(
+            unrelated.try_wait().expect("poll unrelated").is_none(),
+            "unrelated process was terminated"
+        );
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_child_force_kills_term_ignoring_process_group() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let cancel = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            cancel.cancel();
+        });
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("trap '' TERM; while :; do sleep 0.1; done");
+        let started = std::time::Instant::now();
+        let error = run_command_capture_cancellable(
+            cmd,
+            std::time::Duration::from_secs(10),
+            &token,
+            |_| Ok(()),
+        )
+        .expect_err("TERM-ignoring child must be force killed");
+        assert!(is_dispatch_authority_error(&error));
+        assert!(started.elapsed() >= std::time::Duration::from_secs(super::CANCEL_GRACE_SECS));
+        assert!(started.elapsed() < std::time::Duration::from_secs(8));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leader_exit_on_term_does_not_leave_term_ignoring_grandchild() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("grandchild.pid");
+        let token = tokio_util::sync::CancellationToken::new();
+        let cancel = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            cancel.cancel();
+        });
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "trap 'exit 0' TERM; \
+             sh -c \"trap '' TERM; while :; do sleep 0.1; done\" & \
+             echo $! > {}; wait",
+            pid_file.display()
+        ));
+        let error = run_command_capture_cancellable(
+            cmd,
+            std::time::Duration::from_secs(10),
+            &token,
+            |_| Ok(()),
+        )
+        .expect_err("cancelled process group must stop");
+        assert!(is_dispatch_authority_error(&error));
+        let grandchild_pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("grandchild pid file")
+            .trim()
+            .parse()
+            .expect("grandchild pid");
+        let still_running = Command::new("ps")
+            .args(["-o", "stat=", "-p", &grandchild_pid.to_string()])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| {
+                let state = String::from_utf8_lossy(&output.stdout);
+                !state.trim().is_empty() && !state.trim_start().starts_with('Z')
+            })
+            .unwrap_or(false);
+        assert!(
+            !still_running,
+            "TERM-ignoring grandchild survived group SIGKILL"
+        );
     }
 
     #[test]
@@ -7640,6 +8618,7 @@ mod tests {
     fn terminal_failure_alert_leads_with_human_context_and_puts_ids_last() {
         let item = AssignedWorkItem {
             work_item_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            lease_id: Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap(),
             project_id: "forge-fleet".into(),
             title: "Make Telegram alerts readable".into(),
             description: None,
@@ -7647,6 +8626,7 @@ mod tests {
             repo_id: None,
             repo_url: None,
             repo_path: PathBuf::new(),
+            repo_resolution_error: None,
             sub_agent_id: Uuid::nil(),
             computer_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
             computer_name: "build-mac".into(),

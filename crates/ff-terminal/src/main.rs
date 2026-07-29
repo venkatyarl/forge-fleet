@@ -3182,6 +3182,10 @@ pub enum PmCommand {
         description: Option<String>,
         #[arg(long)]
         priority: Option<String>,
+        /// Target project repository by project_repos UUID, URL, or name.
+        /// When omitted, the project must have exactly one registered repo.
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Show details of a work item (by UUID).
     Show { id: String },
@@ -8169,6 +8173,43 @@ mod pm_close_cli_tests {
                     );
                 }
                 assert!(Cli::try_parse_from(["ff", "pm", "done"]).is_err());
+            })
+            .expect("spawn parser test")
+            .join()
+            .expect("parser test panicked");
+    }
+}
+
+#[cfg(test)]
+mod pm_create_cli_tests {
+    use super::{Cli, Command, PmCommand};
+    use clap::Parser;
+
+    #[test]
+    fn pm_create_accepts_an_explicit_repo_selector() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "ff",
+                    "pm",
+                    "create",
+                    "--project",
+                    "forge-fleet",
+                    "--kind",
+                    "task",
+                    "--title",
+                    "safe task",
+                    "--repo",
+                    "00000000-0000-0000-0000-000000000001",
+                ])
+                .expect("pm create --repo should parse");
+                assert!(matches!(
+                    cli.command,
+                    Some(Command::Pm {
+                        command: PmCommand::Create { repo: Some(_), .. }
+                    })
+                ));
             })
             .expect("spawn parser test")
             .join()
