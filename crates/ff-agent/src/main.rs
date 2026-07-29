@@ -33,6 +33,13 @@ async fn main() -> anyhow::Result<()> {
     }
     info!(node_id = %config.node_id, "starting ff-agent daemon");
 
+    // Authentication is a startup prerequisite: resolve it before registration,
+    // pulse, or any other network activity. The same process-local value is
+    // injected into the inbound router and reused by outbound signing.
+    let auth_secret = ff_agent::http_auth::control_plane_secret()
+        .await
+        .map_err(anyhow::Error::msg)?;
+
     let hardware = detect_hardware_profile();
     let shared_state: SharedState = Arc::new(RwLock::new(AgentState::new(
         config.node_id.clone(),
@@ -64,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     let http_ctx = AppContext {
         state: shared_state.clone(),
         task_tx: task_tx.clone(),
-        auth_secret: ff_agent::http_auth::control_plane_secret().map_err(anyhow::Error::msg)?,
+        auth_secret,
     };
 
     let http_cancel = cancel.clone();

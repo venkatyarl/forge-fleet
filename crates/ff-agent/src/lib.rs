@@ -378,7 +378,9 @@ pub async fn run(
     // Start the agent HTTP server for inter-node messaging callbacks on port 50002.
     // Uses a minimal standalone router so it compiles without the binary-only state module.
     {
-        let auth_secret = http_auth::control_plane_secret().map_err(anyhow::Error::msg)?;
+        let auth_secret = http_auth::control_plane_secret()
+            .await
+            .map_err(anyhow::Error::msg)?;
         let message_router = build_agent_message_router(auth_secret);
         let agent_http_addr = http_auth::bind_addr(50002).map_err(anyhow::Error::msg)?;
         tokio::spawn(async move {
