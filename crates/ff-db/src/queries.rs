@@ -8871,6 +8871,14 @@ pub async fn pg_free_slots(
             -- (2026-07-19: sarah, a 3GB traveler, kept claiming builds it
             -- cannot run because this filter was missing).
             AND COALESCE(sa.status, '') <> 'disabled'
+            -- Liveness floor (2026-07-29): a slot whose heartbeat is stale is
+            -- a ZOMBIE — its supervisor is dead (daemon restart killed it) and
+            -- anything claimed by it sits 'claimed' forever with zero build
+            -- activity (canary-3: beyonce slot hb-stale 27m, duncan slot
+            -- hb-stale 1h+ with a 4h zombie codex build). NULL stays eligible
+            -- (freshly registered slot that hasn't heartbeated yet).
+            AND (sa.last_heartbeat_at IS NULL
+                 OR sa.last_heartbeat_at > NOW() - make_interval(mins => 10))
             AND NOT EXISTS (
                 SELECT 1 FROM work_item_leases l
                  WHERE l.sub_agent_id = sa.id AND l.released_at IS NULL)
