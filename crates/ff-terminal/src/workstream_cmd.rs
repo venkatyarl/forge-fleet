@@ -676,6 +676,12 @@ mod tests {
     }
 
     #[test]
+    fn tool_from_comm_recognizes_claude_but_not_bash() {
+        assert_eq!(tool_from_comm("claude"), Some("claude"));
+        assert_eq!(tool_from_comm("bash"), None);
+    }
+
+    #[test]
     fn env_markers_identify_each_cli() {
         assert_eq!(
             tool_from_env_markers(&env_with(&[("KIMI_SESSION_ID", "abc")])),
