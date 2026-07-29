@@ -1829,6 +1829,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ff-tui"
+version = "2026.7.28"
+dependencies = [
+ "anyhow",
+ "crossterm 0.29.0",
+ "ff-agent",
+ "ff-core",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "ff-updater"
 version = "2026.4.7"
 dependencies = [

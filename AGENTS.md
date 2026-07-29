@@ -18,6 +18,13 @@ same shared checkout. Before and while building anything:
    files/work_items first; do not take overlapping files without reconciling.
 3. Report when you finish or change lanes so the record stays true for everyone.
 
+## ff TUI (workspace member `tui/`)
+
+The kimi-style agent TUI lives at repo-root `tui/` (crate `ff-tui`, binary
+`fftui`) — NOT in `crates/`, deliberately, for the planned repo reorg. It
+attaches to any LLM: `--backend router|local|endpoint <url> [model]|claude|codex|kimi`
+(live-switch with `/backend`). Build: `cargo build -p ff-tui`.
+
 <!-- forgefleet MCP tools -->
 ## MCP Tools: forgefleet
 

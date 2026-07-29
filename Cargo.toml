@@ -36,6 +36,7 @@ members = [
     "crates/ff-capacity",
     "crates/ff-routing-policy",
     "crates/ra2a",
+    "tui",
 ]
 
 [workspace.package]
