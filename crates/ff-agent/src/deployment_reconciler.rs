@@ -196,25 +196,9 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
                 pid = proc_info.pid,
                 port,
                 runtime = %proc_info.runtime,
-                "non-canonical port — killing process per canonical-port policy"
+                "unclaimed non-canonical listener — leaving it untouched; explicit authenticated replacement is required"
             );
-            let _ = tokio::process::Command::new("kill")
-                .args(["-TERM", &proc_info.pid.to_string()])
-                .output()
-                .await;
             summary.port_violations += 1;
-            // If a deployment row was tracking this port, mark it retired
-            // so the row gets cleaned up in pass B.
-            if let Some(&existing) = db_by_port.get(&port_i32) {
-                let _ = sqlx::query(
-                    "UPDATE fleet_model_deployments
-                        SET desired_state = 'retired'
-                      WHERE id = $1::uuid AND desired_state = 'active'",
-                )
-                .bind(&existing.id)
-                .execute(pool)
-                .await;
-            }
             continue;
         }
 
@@ -229,15 +213,14 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
         if let Some(&existing) = db_by_port.get(&port_i32) {
             // ── Both DB row and process exist ─────────────────────────────
             if existing.desired_state == "retired" {
-                // Operator wants this gone — kill the stray process. Row
-                // will be deleted in pass B.
-                let pid = proc_info.pid;
-                tracing::info!(pid, port, "killing stray process for retired deployment");
-                let _ = tokio::process::Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .output()
-                    .await;
-                summary.killed += 1;
+                // Retirement alone is not process identity. The explicit
+                // operator unload path performs the identity-qualified stop;
+                // a reconciler snapshot may be stale or the PID may be reused.
+                tracing::warn!(
+                    pid = proc_info.pid,
+                    port,
+                    "retired deployment still has a listener — refusing unauthenticated reap"
+                );
                 continue;
             }
 
@@ -453,30 +436,6 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
                     "unknown desired_state '{other}' for deployment {}; skipping",
                     row.id
                 );
-            }
-        }
-    }
-
-    // ── Pass C — reap ORPHAN systemd units ─────────────────────────────────
-    // A `llama-<port>.service` unit file whose port has NO active deployment row
-    // is a leftover from a retired model. Its `Restart=` directive keeps
-    // respawning that old model, which competes for memory with the model this
-    // node SHOULD run — the root cause of the glm "flapping" (a killed glm's
-    // memory got eaten by a stale devstral/qwen unit respawning, so glm never
-    // stayed healthy). DB rows + live processes are handled above; the unit FILE
-    // is the durable respawner that neither touches. Canonical ports with an
-    // active row are left alone (that's the model we want running).
-    #[cfg(target_os = "linux")]
-    {
-        let active_ports: std::collections::HashSet<i32> = db_rows
-            .iter()
-            .filter(|r| r.desired_state == "active")
-            .map(|r| r.port)
-            .collect();
-        for port in crate::model_runtime::list_llama_unit_ports() {
-            if !active_ports.contains(&(port as i32)) {
-                crate::model_runtime::reap_orphan_llama_unit(port).await;
-                summary.port_violations += 1;
             }
         }
     }

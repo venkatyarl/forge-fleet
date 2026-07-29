@@ -12464,6 +12464,10 @@ pub const SCHEMA_V281_WORK_ITEM_ACCEPTANCE_CRITERIA: &str =
 pub const SCHEMA_V282_OPLOG_REPLAY: &str =
     include_str!("migrations/20260728110000_oplog_replay.sql");
 
+/// v283: short-lived, token-fenced reservations for model launch resources.
+pub const SCHEMA_V283_MODEL_LOAD_RESERVATIONS: &str =
+    include_str!("migrations/20260729160000_model_load_reservations.sql");
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

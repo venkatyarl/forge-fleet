@@ -1260,6 +1260,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "oplog_replay",
         sql: schema::SCHEMA_V282_OPLOG_REPLAY,
     },
+    PgMigration {
+        version: 283,
+        name: "model_load_reservations",
+        sql: schema::SCHEMA_V283_MODEL_LOAD_RESERVATIONS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -2780,5 +2785,79 @@ mod tests {
                 .sql
                 .contains("CREATE TABLE IF NOT EXISTS oplog_replay_applied")
         );
+    }
+
+    #[test]
+    fn v283_creates_token_fenced_model_load_reservations() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 283)
+            .expect("V283 must be registered");
+        assert_eq!(migration.name, "model_load_reservations");
+        assert!(migration.sql.contains("model_load_reservations"));
+        assert!(migration.sql.contains("owner_token UUID NOT NULL"));
+        assert!(migration.sql.contains("expires_at TIMESTAMPTZ NOT NULL"));
+    }
+
+    #[tokio::test]
+    async fn v283_reservation_races_expiry_and_matching_cleanup() {
+        // CI has no database; this helper checks both supported URL variables.
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should apply");
+
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        assert!(
+            crate::queries::pg_reserve_model_load(&pool, "node-a", 55000, "lib-a", first, 60)
+                .await
+                .unwrap()
+        );
+
+        let same_port =
+            crate::queries::pg_reserve_model_load(&pool, "node-a", 55000, "lib-b", second, 60);
+        let same_library =
+            crate::queries::pg_reserve_model_load(&pool, "node-a", 55001, "lib-a", second, 60);
+        let (same_port, same_library) = tokio::join!(same_port, same_library);
+        assert!(!same_port.unwrap());
+        assert!(!same_library.unwrap());
+
+        assert_eq!(
+            crate::queries::pg_release_model_load_reservation(
+                &pool, "node-a", 55000, "lib-a", second,
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        sqlx::query("UPDATE model_load_reservations SET expires_at = NOW() - interval '1 second'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            crate::queries::pg_reserve_model_load(&pool, "node-a", 55000, "lib-a", second, 60)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            crate::queries::pg_release_model_load_reservation(
+                &pool, "node-a", 55000, "lib-a", first,
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        let owners: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT owner_token FROM model_load_reservations ORDER BY resource_kind",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(owners, vec![second, second]);
+
+        drop_temp_db(admin, pool, &db_name).await;
     }
 }

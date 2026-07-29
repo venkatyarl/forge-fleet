@@ -660,6 +660,7 @@ async fn plan_pass(pg: &PgPool) -> Result<(Vec<Action>, AutoscaleSummary), Strin
         // and never one on an excluded host.
         let victim = eps
             .iter()
+            .filter(|e| e.agent_ready)
             .filter(|e| {
                 !EXCLUDE_HOSTS
                     .iter()
@@ -915,35 +916,51 @@ async fn do_load(
         // for this (host, model) is already in-flight, or if the last one FAILED
         // within the cooldown window.
         let title = format!("autoscaler: autoload {catalog_id} on {host}");
-        if let Some(reason) = autoscaler_enqueue_block_reason(pg, &title, host).await {
-            debug!(host = %host, %catalog_id, reason, "autoscaler: skipping cross-node autoload");
+        let token = uuid::Uuid::new_v4();
+        if !ff_db::pg_reserve_operation(pg, host, &title, token, 30)
+            .await
+            .map_err(|e| format!("reserve autoscaler enqueue ({host}, {catalog_id}): {e}"))?
+        {
             return Ok(false);
         }
-        let command = format!(
-            "~/.local/bin/ff model autoload {} --node {} --agent",
-            shell_quote(catalog_id),
-            shell_quote(host)
-        );
-        let payload = serde_json::json!({ "command": command });
-        let trigger_spec = serde_json::json!({});
-        ff_db::pg_enqueue_deferred(
-            pg,
-            &title,
-            "shell",
-            &payload,
-            "now",
-            &trigger_spec,
-            Some(host),
-            &serde_json::json!([]),
-            Some(RESERVE_OWNER),
-            Some(3),
-        )
-        .await
-        .map(|defer_id| {
-            info!(host = %host, %catalog_id, %defer_id, "autoscaler: enqueued cross-node load");
-            true
-        })
-        .map_err(|e| format!("pg_enqueue_deferred(load on {host}): {e}"))
+        let result = async {
+            if let Some(reason) =
+                autoscaler_enqueue_block_reason(pg, &title, host, Some(catalog_id)).await
+            {
+                debug!(host = %host, %catalog_id, reason, "autoscaler: skipping cross-node autoload");
+                return Ok(false);
+            }
+            let command = format!(
+                "~/.local/bin/ff model autoload {} --node {} --agent",
+                shell_quote(catalog_id),
+                shell_quote(host)
+            );
+            let payload = serde_json::json!({ "command": command });
+            let trigger_spec = serde_json::json!({});
+            ff_db::pg_enqueue_deferred(
+                pg,
+                &title,
+                "shell",
+                &payload,
+                "now",
+                &trigger_spec,
+                Some(host),
+                &serde_json::json!([]),
+                Some(RESERVE_OWNER),
+                Some(3),
+            )
+            .await
+            .map(|defer_id| {
+                info!(host = %host, %catalog_id, %defer_id, "autoscaler: enqueued cross-node load");
+                true
+            })
+            .map_err(|e| format!("pg_enqueue_deferred(load on {host}): {e}"))
+        }
+        .await;
+        if let Err(e) = ff_db::pg_release_operation_reservation(pg, host, &title, token).await {
+            warn!(host = %host, error = %e, "autoscaler: enqueue reservation cleanup deferred to expiry");
+        }
+        result
     }
 }
 
@@ -964,22 +981,40 @@ async fn autoscaler_enqueue_block_reason(
     pg: &PgPool,
     title: &str,
     host: &str,
+    completed_catalog_id: Option<&str>,
 ) -> Option<&'static str> {
     let recent = ff_db::pg_list_deferred(pg, None, 300).await.ok()?;
     let prior = recent
         .iter()
         .find(|t| t.title == title && t.preferred_node.as_deref() == Some(host))?;
+    if prior.status == "completed"
+        && let Some(catalog_id) = completed_catalog_id
+    {
+        let still_placed = ff_db::pg_list_deployments(pg, Some(host))
+            .await
+            .ok()?
+            .iter()
+            .any(|deployment| deployment.catalog_id.as_deref() == Some(catalog_id));
+        if !completed_autoload_blocks(still_placed) {
+            return None;
+        }
+    }
     let age_secs = (chrono::Utc::now() - prior.created_at).num_seconds();
     autoscaler_skip_reason(&prior.status, age_secs, AUTOSCALER_ENQUEUE_COOLDOWN_SECS)
 }
 
+fn completed_autoload_blocks(still_placed: bool) -> bool {
+    still_placed
+}
+
 /// Pure re-enqueue policy given the most recent prior task's `status` and
 /// `age_secs`. In-flight states always block (don't pile on work that is still
-/// running); a `failed` task blocks only inside the cooldown window; anything
-/// else (completed/cancelled/none) permits a fresh enqueue.
+/// running); terminal success/no-op also blocks stale re-enqueue; a `failed`
+/// task blocks only inside the cooldown window.
 fn autoscaler_skip_reason(status: &str, age_secs: i64, cooldown_secs: i64) -> Option<&'static str> {
     match status {
         "pending" | "dispatchable" | "running" | "claimed" => Some("already in-flight"),
+        "completed" => Some("already completed"),
         "failed" if age_secs < cooldown_secs => Some("recent failure (cooldown)"),
         _ => None,
     }
@@ -1033,32 +1068,46 @@ async fn do_reprofile(pg: &PgPool, host: &str, deployment_id: &str) -> Result<bo
     let payload = serde_json::json!({ "command": command });
     let trigger_spec = serde_json::json!({});
     let title = format!("autoscaler: reprofile {deployment_id} on {host}");
+    let token = uuid::Uuid::new_v4();
+    if !ff_db::pg_reserve_operation(pg, host, &title, token, 30)
+        .await
+        .map_err(|e| format!("reserve autoscaler enqueue ({host}, {deployment_id}): {e}"))?
+    {
+        return Ok(false);
+    }
     // Same dedup/cooldown guard as do_load (#564): the autoscaler re-decides
     // every tick, so without this a reprofile that is still running (ff model
     // reprofile health-waits the relaunch up to 90s) or that keeps failing would
     // get a fresh task every ~6min and flood the deferred queue.
-    if let Some(reason) = autoscaler_enqueue_block_reason(pg, &title, host).await {
-        debug!(host = %host, %deployment_id, reason, "autoscaler: skipping reprofile enqueue");
-        return Ok(false);
+    let result = async {
+        if let Some(reason) = autoscaler_enqueue_block_reason(pg, &title, host, None).await {
+            debug!(host = %host, %deployment_id, reason, "autoscaler: skipping reprofile enqueue");
+            return Ok(false);
+        }
+        ff_db::pg_enqueue_deferred(
+            pg,
+            &title,
+            "shell",
+            &payload,
+            "now",
+            &trigger_spec,
+            Some(host),
+            &serde_json::json!([]),
+            Some(RESERVE_OWNER),
+            Some(3),
+        )
+        .await
+        .map(|defer_id| {
+            info!(host = %host, %deployment_id, %defer_id, "autoscaler: enqueued reprofile");
+            true
+        })
+        .map_err(|e| format!("pg_enqueue_deferred(reprofile on {host}): {e}"))
     }
-    ff_db::pg_enqueue_deferred(
-        pg,
-        &title,
-        "shell",
-        &payload,
-        "now",
-        &trigger_spec,
-        Some(host),
-        &serde_json::json!([]),
-        Some(RESERVE_OWNER),
-        Some(3),
-    )
-    .await
-    .map(|defer_id| {
-        info!(host = %host, %deployment_id, %defer_id, "autoscaler: enqueued reprofile");
-        true
-    })
-    .map_err(|e| format!("pg_enqueue_deferred(reprofile on {host}): {e}"))
+    .await;
+    if let Err(e) = ff_db::pg_release_operation_reservation(pg, host, &title, token).await {
+        warn!(host = %host, error = %e, "autoscaler: enqueue reservation cleanup deferred to expiry");
+    }
+    result
 }
 
 /// Minimal single-quote shell escaping for the defer-shell / SSH command we build.
@@ -1268,10 +1317,15 @@ mod tests {
     }
 
     #[test]
-    fn autoload_skip_terminal_success_permits_reenqueue() {
-        // A model that loaded then got unloaded must be reloadable immediately.
-        assert!(autoscaler_skip_reason("completed", 1, AUTOSCALER_ENQUEUE_COOLDOWN_SECS).is_none());
+    fn autoload_skip_terminal_success_suppresses_reenqueue() {
+        assert!(autoscaler_skip_reason("completed", 1, AUTOSCALER_ENQUEUE_COOLDOWN_SECS).is_some());
         assert!(autoscaler_skip_reason("cancelled", 1, AUTOSCALER_ENQUEUE_COOLDOWN_SECS).is_none());
+    }
+
+    #[test]
+    fn completed_autoload_suppresses_noop_but_not_post_unload_reload() {
+        assert!(completed_autoload_blocks(true));
+        assert!(!completed_autoload_blocks(false));
     }
 
     fn host(
@@ -1523,6 +1577,7 @@ mod tests {
             catalog_id: Some("qwen36-35b-a3b".into()),
             request_count: 0,
             health_age_sec: Some(1),
+            agent_ready: true,
         }
     }
 

@@ -2221,6 +2221,8 @@ pub struct ServingEndpoint {
     pub request_count: i64,
     /// Seconds since the last health ping (NULL → very old / unknown).
     pub health_age_sec: Option<i32>,
+    /// Verified healthy and context-qualified right now.
+    pub agent_ready: bool,
 }
 
 /// Bucket the healthy agent-capable deployments into code vs general supply.
@@ -2233,14 +2235,14 @@ pub async fn pg_supplied_slots_by_kind(pool: &PgPool, min_ctx: i32) -> Result<Se
                d.catalog_id      AS catalog_id,
                d.request_count   AS request_count,
                EXTRACT(EPOCH FROM (NOW() - d.last_health_at))::int AS health_age_sec,
-               (cat.preferred_workloads @> '["code-gen"]'::jsonb)  AS is_code
+               (cat.preferred_workloads @> '["code-gen"]'::jsonb)  AS is_code,
+               (d.health_status = 'healthy'
+                AND d.usable_agent_ctx IS NOT NULL
+                AND d.usable_agent_ctx >= $1) AS agent_ready
           FROM fleet_model_deployments d
           JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
-         WHERE d.health_status = 'healthy'
-           AND d.desired_state = 'active'
+         WHERE d.desired_state = 'active'
            AND cat.tool_calling = TRUE
-           AND d.usable_agent_ctx IS NOT NULL
-           AND d.usable_agent_ctx >= $1
         "#,
     )
     .bind(min_ctx)
@@ -2250,6 +2252,7 @@ pub async fn pg_supplied_slots_by_kind(pool: &PgPool, min_ctx: i32) -> Result<Se
     let mut supply = ServingSupply::default();
     for r in &rows {
         let id: sqlx::types::Uuid = r.get("id");
+        let agent_ready = r.try_get::<bool, _>("agent_ready").unwrap_or(false);
         let ep = ServingEndpoint {
             deployment_id: id.to_string(),
             worker_name: r.get("worker_name"),
@@ -2257,8 +2260,10 @@ pub async fn pg_supplied_slots_by_kind(pool: &PgPool, min_ctx: i32) -> Result<Se
             catalog_id: r.try_get("catalog_id").ok(),
             request_count: r.try_get("request_count").unwrap_or(0),
             health_age_sec: r.try_get("health_age_sec").ok(),
+            agent_ready,
         };
-        if r.try_get::<bool, _>("is_code").unwrap_or(false) {
+        let is_code = r.try_get::<bool, _>("is_code").unwrap_or(false);
+        if is_code {
             supply.code_count += 1;
             supply.code_endpoints.push(ep);
         } else {
@@ -2537,13 +2542,20 @@ pub async fn pg_loadable_library_for_kind(
           JOIN fleet_model_catalog cat ON cat.id = lib.catalog_id
          WHERE lib.worker_name = $1
            AND cat.tool_calling = TRUE
+           AND lib.pinned = TRUE
            AND ($2 = (cat.preferred_workloads @> '["code-gen"]'::jsonb))
            AND NOT EXISTS (
                SELECT 1 FROM fleet_model_deployments d
                 WHERE d.library_id = lib.id
                   AND d.desired_state = 'active'
            )
-         ORDER BY cat.tier ASC, lib.size_bytes ASC
+         ORDER BY EXISTS (
+                      SELECT 1
+                        FROM fleet_task_coverage tc
+                       WHERE tc.preferred_model_ids ? lib.catalog_id
+                  ) DESC,
+                  cat.tier ASC,
+                  lib.size_bytes ASC
          LIMIT 1
         "#,
     )
@@ -3422,6 +3434,143 @@ pub async fn pg_enqueue_deferred(
         0,
     )
     .await
+}
+
+/// Atomically reserve both identities that make a model launch exclusive:
+/// `(host, port)` and `(host, library)`. Expired rows are replaceable, while a
+/// live row owned by any token makes the whole transaction fail closed.
+pub async fn pg_reserve_model_load(
+    pool: &PgPool,
+    host: &str,
+    port: u16,
+    library_id: &str,
+    owner_token: uuid::Uuid,
+    ttl_secs: i64,
+) -> Result<bool> {
+    let host = host.to_ascii_lowercase();
+    let port = port.to_string();
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "DELETE FROM model_load_reservations
+          WHERE host_name = $1
+            AND expires_at <= NOW()
+            AND ((resource_kind = 'port' AND resource_value = $2)
+              OR (resource_kind = 'library' AND resource_value = $3))",
+    )
+    .bind(&host)
+    .bind(&port)
+    .bind(library_id)
+    .execute(&mut *tx)
+    .await?;
+    let inserted: i64 = sqlx::query_scalar(
+        "WITH inserted AS (
+             INSERT INTO model_load_reservations
+                    (host_name, resource_kind, resource_value, owner_token, expires_at)
+             VALUES ($1, 'port', $2, $4, NOW() + make_interval(secs => $5)),
+                    ($1, 'library', $3, $4, NOW() + make_interval(secs => $5))
+             ON CONFLICT DO NOTHING
+             RETURNING 1
+         )
+         SELECT COUNT(*) FROM inserted",
+    )
+    .bind(&host)
+    .bind(&port)
+    .bind(library_id)
+    .bind(owner_token)
+    .bind(ttl_secs.max(1) as f64)
+    .fetch_one(&mut *tx)
+    .await?;
+    if inserted != 2 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Release only the two reservation rows still owned by `owner_token`.
+pub async fn pg_release_model_load_reservation(
+    pool: &PgPool,
+    host: &str,
+    port: u16,
+    library_id: &str,
+    owner_token: uuid::Uuid,
+) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM model_load_reservations
+          WHERE host_name = $1
+            AND owner_token = $4
+            AND ((resource_kind = 'port' AND resource_value = $2)
+              OR (resource_kind = 'library' AND resource_value = $3))",
+    )
+    .bind(host.to_ascii_lowercase())
+    .bind(port.to_string())
+    .bind(library_id)
+    .bind(owner_token)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Short durable mutex for an enqueue decision. The reservation is committed
+/// before the caller performs its read/insert and is always token-released.
+pub async fn pg_reserve_operation(
+    pool: &PgPool,
+    host: &str,
+    operation: &str,
+    owner_token: uuid::Uuid,
+    ttl_secs: i64,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let host = host.to_ascii_lowercase();
+    sqlx::query(
+        "DELETE FROM model_load_reservations
+          WHERE host_name = $1 AND resource_kind = 'operation'
+            AND resource_value = $2 AND expires_at <= NOW()",
+    )
+    .bind(&host)
+    .bind(operation)
+    .execute(&mut *tx)
+    .await?;
+    let inserted = sqlx::query(
+        "INSERT INTO model_load_reservations
+                (host_name, resource_kind, resource_value, owner_token, expires_at)
+         VALUES ($1, 'operation', $2, $3, NOW() + make_interval(secs => $4))
+         ON CONFLICT DO NOTHING
+         RETURNING owner_token",
+    )
+    .bind(&host)
+    .bind(operation)
+    .bind(owner_token)
+    .bind(ttl_secs.max(1) as f64)
+    .fetch_optional(&mut *tx)
+    .await?
+    .is_some();
+    if inserted {
+        tx.commit().await?;
+    } else {
+        tx.rollback().await?;
+    }
+    Ok(inserted)
+}
+
+pub async fn pg_release_operation_reservation(
+    pool: &PgPool,
+    host: &str,
+    operation: &str,
+    owner_token: uuid::Uuid,
+) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM model_load_reservations
+          WHERE host_name = $1 AND resource_kind = 'operation'
+            AND resource_value = $2 AND owner_token = $3",
+    )
+    .bind(host.to_ascii_lowercase())
+    .bind(operation)
+    .bind(owner_token)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// Like [`pg_enqueue_deferred`] but seeds `next_attempt_at = NOW() + delay_secs`
