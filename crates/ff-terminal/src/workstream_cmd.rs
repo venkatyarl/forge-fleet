@@ -696,6 +696,14 @@ mod tests {
     }
 
     #[test]
+    fn codex_session_id_identifies_codex() {
+        assert_eq!(
+            tool_from_env_markers(&env_with(&[("CODEX_SESSION_ID", "c1")])),
+            Some("codex".to_string())
+        );
+    }
+
+    #[test]
     fn empty_env_marker_does_not_count() {
         assert_eq!(
             tool_from_env_markers(&env_with(&[("CLAUDECODE", "")])),
