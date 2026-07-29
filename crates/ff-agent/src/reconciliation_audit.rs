@@ -335,6 +335,10 @@ mod tests {
         let store = Arc::new(RecordingStore::default());
         let (auditor, writer) = ReconciliationAuditor::start(store);
         let trace_id = tracing::subscriber::with_default(subscriber, || {
+            // Other tests register tracing callsites concurrently. Refresh the
+            // interest cache after installing this scoped subscriber so this
+            // callsite cannot retain a transiently-disabled global interest.
+            tracing::callsite::rebuild_interest_cache();
             auditor.record(
                 ReconciliationAction::ConflictResolved,
                 "wi-42",
