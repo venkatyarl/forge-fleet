@@ -960,9 +960,44 @@ pub async fn build_system_digest(pg: &PgPool) -> Result<String> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use sqlx::postgres::PgPoolOptions;
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use uuid::Uuid;
+
+    async fn digest_test_pool() -> Option<PgPool> {
+        let url = std::env::var("DATABASE_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_POSTGRES_URL"))
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()?;
+        let schema = format!("ff_digest_test_{}", Uuid::new_v4().simple());
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .ok()?;
+        sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+            .execute(&admin)
+            .await
+            .ok()?;
+        drop(admin);
+
+        PgPoolOptions::new()
+            .max_connections(5)
+            .after_connect(move |connection, _| {
+                let schema = schema.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('search_path', $1, false)")
+                        .bind(schema)
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .ok()
+    }
 
     struct MockSender {
         outcomes: Mutex<VecDeque<crate::telegram::TelegramDigestOutcome>>,
@@ -1097,8 +1132,12 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
-    async fn event_windows_fallback_status_fences_and_durations(pool: PgPool) {
+    #[tokio::test]
+    async fn event_windows_fallback_status_fences_and_durations() {
+        let Some(pool) = digest_test_pool().await else {
+            eprintln!("skipping project digest DB test: no test database is available");
+            return;
+        };
         sqlx::raw_sql(
             "CREATE TABLE project_digest_configs (id text PRIMARY KEY, project_id text NOT NULL, last_sent_at timestamptz);\
              CREATE TABLE work_items (id uuid PRIMARY KEY, project_id text NOT NULL, title text NOT NULL, status text NOT NULL, started_at timestamptz, completed_at timestamptz, last_error text, verified smallint NOT NULL DEFAULT 0, assigned_computer text);\
@@ -1291,8 +1330,12 @@ mod tests {
         assert!(!body.contains("recovered-failure"));
     }
 
-    #[sqlx::test]
-    async fn run_once_success_atomically_records_ack_and_cursor(pool: PgPool) {
+    #[tokio::test]
+    async fn run_once_success_atomically_records_ack_and_cursor() {
+        let Some(pool) = digest_test_pool().await else {
+            eprintln!("skipping project digest DB test: no test database is available");
+            return;
+        };
         let old_cursor = run_once_fixture(&pool).await;
         let sender = MockSender::new(vec![acknowledged(42)]);
 
@@ -1328,8 +1371,12 @@ mod tests {
         assert_eq!(calls[0].2.as_deref(), Some(&[1, 2, 3][..]));
     }
 
-    #[sqlx::test]
-    async fn run_once_definite_failure_retries_same_frozen_payload(pool: PgPool) {
+    #[tokio::test]
+    async fn run_once_definite_failure_retries_same_frozen_payload() {
+        let Some(pool) = digest_test_pool().await else {
+            eprintln!("skipping project digest DB test: no test database is available");
+            return;
+        };
         let old_cursor = run_once_fixture(&pool).await;
         let sender = MockSender::new(vec![
             crate::telegram::TelegramDigestOutcome::DefinitelyNotDelivered {
@@ -1364,8 +1411,12 @@ mod tests {
         assert_eq!(calls[0], calls[1], "retry must reuse title/body/logo");
     }
 
-    #[sqlx::test]
-    async fn run_once_ambiguous_and_stranded_sending_never_resend(pool: PgPool) {
+    #[tokio::test]
+    async fn run_once_ambiguous_and_stranded_sending_never_resend() {
+        let Some(pool) = digest_test_pool().await else {
+            eprintln!("skipping project digest DB test: no test database is available");
+            return;
+        };
         let old_cursor = run_once_fixture(&pool).await;
         let sender = MockSender::new(vec![crate::telegram::TelegramDigestOutcome::Ambiguous {
             error: "response parse loss".into(),
@@ -1400,8 +1451,12 @@ mod tests {
         assert_eq!(sender.calls.lock().unwrap().len(), 1);
     }
 
-    #[sqlx::test]
-    async fn run_once_success_without_message_identity_fails_closed(pool: PgPool) {
+    #[tokio::test]
+    async fn run_once_success_without_message_identity_fails_closed() {
+        let Some(pool) = digest_test_pool().await else {
+            eprintln!("skipping project digest DB test: no test database is available");
+            return;
+        };
         let old_cursor = run_once_fixture(&pool).await;
         let sender = MockSender::new(vec![crate::telegram::TelegramDigestOutcome::Acknowledged {
             messages: Vec::new(),
@@ -1424,8 +1479,12 @@ mod tests {
         assert_eq!(sender.calls.lock().unwrap().len(), 1);
     }
 
-    #[sqlx::test]
-    async fn run_once_concurrent_claim_sends_once(pool: PgPool) {
+    #[tokio::test]
+    async fn run_once_concurrent_claim_sends_once() {
+        let Some(pool) = digest_test_pool().await else {
+            eprintln!("skipping project digest DB test: no test database is available");
+            return;
+        };
         run_once_fixture(&pool).await;
         let mut sender = MockSender::new(vec![acknowledged(44)]);
         sender.delay = Duration::from_millis(100);
@@ -1445,8 +1504,12 @@ mod tests {
         assert_eq!(state, "delivered");
     }
 
-    #[sqlx::test]
-    async fn run_once_stale_fence_cannot_commit_ack_or_cursor(pool: PgPool) {
+    #[tokio::test]
+    async fn run_once_stale_fence_cannot_commit_ack_or_cursor() {
+        let Some(pool) = digest_test_pool().await else {
+            eprintln!("skipping project digest DB test: no test database is available");
+            return;
+        };
         let old_cursor = run_once_fixture(&pool).await;
         let mut sender = MockSender::new(vec![acknowledged(45)]);
         sender.interfere = true;
@@ -1465,8 +1528,12 @@ mod tests {
         assert_eq!(row.3, old_cursor);
     }
 
-    #[sqlx::test]
-    async fn run_once_ack_finishes_attempt_without_regressing_later_cursor(pool: PgPool) {
+    #[tokio::test]
+    async fn run_once_ack_finishes_attempt_without_regressing_later_cursor() {
+        let Some(pool) = digest_test_pool().await else {
+            eprintln!("skipping project digest DB test: no test database is available");
+            return;
+        };
         run_once_fixture(&pool).await;
         let mut sender = MockSender::new(vec![acknowledged(46)]);
         sender.later_cursor = true;
@@ -1483,8 +1550,12 @@ mod tests {
         assert!(row.2 > row.1);
     }
 
-    #[sqlx::test]
-    async fn attempt_payload_reuse_ambiguous_dedup_and_atomic_cursor(pool: PgPool) {
+    #[tokio::test]
+    async fn attempt_payload_reuse_ambiguous_dedup_and_atomic_cursor() {
+        let Some(pool) = digest_test_pool().await else {
+            eprintln!("skipping project digest DB test: no test database is available");
+            return;
+        };
         sqlx::query("CREATE TABLE project_digest_configs (id text PRIMARY KEY, last_sent_at timestamptz, updated_at timestamptz DEFAULT now())").execute(&pool).await.unwrap();
         sqlx::raw_sql(ff_db::schema::SCHEMA_V283_PROJECT_DIGEST_ATTEMPTS)
             .execute(&pool)
