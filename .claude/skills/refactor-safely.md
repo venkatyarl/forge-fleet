@@ -1,4 +1,12 @@
----
+---# Refactor Safely Skill
+
+This skill ensures safe refactoring by following best practices and maintaining code quality.
+
+## Principles
+- Make small, incremental changes
+- Maintain backward compatibility
+- Write tests for new functionality
+- Review changes thoroughly
 name: Refactor Safely
 description: Plan and execute safe refactoring using dependency analysis
 ---

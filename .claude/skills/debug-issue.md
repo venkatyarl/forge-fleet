@@ -1,4 +1,13 @@
----
+---# Debug Issue Skill
+
+This skill helps debug issues by following a systematic approach to identify and resolve problems.
+
+## Steps
+1. Identify the issue
+2. Gather relevant information
+3. Analyze the root cause
+4. Implement a fix
+5. Verify the solution
 name: Debug Issue
 description: Systematically debug issues using graph-powered code navigation
 ---

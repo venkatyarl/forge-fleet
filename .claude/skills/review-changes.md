@@ -1,4 +1,13 @@
----
+---# Review Changes Skill
+
+This skill provides guidelines for reviewing code changes effectively.
+
+## Checklist
+- Code follows project standards
+- Tests pass
+- Documentation is updated
+- Performance impact is considered
+- Security implications are reviewed
 name: Review Changes
 description: Perform a structured code review using change detection and impact
 ---
