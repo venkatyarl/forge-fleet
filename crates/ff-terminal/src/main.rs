@@ -2663,7 +2663,11 @@ pub enum WorkstreamCommand {
         session: Option<String>,
     },
     /// List all active project workstreams.
-    List,
+    List {
+        /// Emit JSON array instead of the text table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Detach stale seats (soft prune): sessions with no report/heartbeat since
     /// the cutoff are marked 'detached' and hidden from `status`. Reversible —
     /// any attach/report/heartbeat from that session revives its seat.
