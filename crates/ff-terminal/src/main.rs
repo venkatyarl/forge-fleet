@@ -2622,6 +2622,15 @@ pub enum WorkstreamCommand {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Detach this CLI session's seat from the current project's workstream.
+    Detach {
+        /// Which CLI is detaching. Auto-detected when omitted (see `attach`).
+        #[arg(long)]
+        tool: Option<String>,
+        /// This CLI's own native session id (see `attach --session`).
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Report working state into the project's workstream: update the shared
     /// summary/focus and append a timestamped note to the activity log.
     Report {

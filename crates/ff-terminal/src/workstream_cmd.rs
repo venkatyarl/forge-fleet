@@ -251,6 +251,23 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
             }
             println!("\nreport progress with:  ff workstream report --summary \"…\" --note \"…\"");
         }
+        crate::WorkstreamCommand::Detach { tool, session } => {
+            let tool = resolve_tool(tool.as_deref());
+            let dir = effective_cwd(cwd)?;
+            let ws = workstreams::workstream_for_dir(&pg, &dir)
+                .await?
+                .with_context(|| format!("no workstream matches {}", dir.display()))?;
+            let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
+            let token = resolve_session_token(session.as_deref());
+            let sid = workstreams::session_id_for_token(
+                &worker,
+                &ws.project_key,
+                &tool,
+                token.as_deref(),
+            );
+            workstreams::detach(&pg, &sid).await?;
+            println!("detached from workstream {}", ws.project_key);
+        }
         crate::WorkstreamCommand::Report {
             tool,
             summary,
