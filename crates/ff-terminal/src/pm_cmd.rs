@@ -1015,20 +1015,21 @@ async fn handle_pm_decompose(
                     Option<uuid::Uuid>,
                     Option<String>,
                     Option<String>,
+                    Option<String>,
                     String,
                 )> =
                     sqlx::query_as(
-                        "SELECT title, description, repo_id, repo_url, repo_path, project_id FROM work_items WHERE id = $1",
+                        "SELECT title, description, repo_id, repo_url, repo_path, base_branch, project_id FROM work_items WHERE id = $1",
                     )
                         .bind(uid)
                         .fetch_optional(pool)
                         .await
                         .map_err(|e| anyhow::anyhow!("load work item {uid}: {e}"))?;
             match row {
-                Some((title, desc, repo_id, repo_url, repo_path, project_id)) => (
+                Some((title, desc, repo_id, repo_url, repo_path, base_branch, project_id)) => (
                     Some(uid),
                     format!("{title}\n\n{}", desc.unwrap_or_default()),
-                    repo_context_from_binding(repo_id, repo_url, repo_path),
+                    repo_context_from_binding(repo_id, repo_url, repo_path, base_branch),
                     Some(project_id),
                 ),
                 None => return Err(anyhow::anyhow!("no work item with id {goal}")),
@@ -1468,8 +1469,9 @@ fn repo_context_from_binding(
     repo_id: Option<uuid::Uuid>,
     repo_url: Option<String>,
     repo_path: Option<String>,
+    base_branch: Option<String>,
 ) -> Option<crate::repo_context::RepoContext> {
-    if repo_id.is_none() && repo_url.is_none() && repo_path.is_none() {
+    if repo_id.is_none() && repo_url.is_none() && repo_path.is_none() && base_branch.is_none() {
         return None;
     }
     let repo_path = repo_path.map(PathBuf::from);
@@ -1480,6 +1482,7 @@ fn repo_context_from_binding(
             repo_id: None,
             repo_url: None,
             repo_path: repo_path.clone(),
+            base_branch: None,
             primary_language: "unknown".to_string(),
             build_system: None,
             key_dirs: Vec::new(),
@@ -1491,6 +1494,7 @@ fn repo_context_from_binding(
     if repo_path.is_some() {
         ctx.repo_path = repo_path;
     }
+    ctx.base_branch = base_branch;
     Some(ctx)
 }
 
@@ -1696,6 +1700,7 @@ async fn insert_decomposed_work_item(
                 .and_then(|ctx| ctx.repo_path.as_ref())
                 .map(|p| p.to_string_lossy().to_string()),
         )
+        .bind(repo_context.and_then(|ctx| ctx.base_branch.as_deref()))
         .bind(serde_json::json!(predicted_paths))
         .bind(complexity)
         .bind(criteria_json)
@@ -1706,8 +1711,8 @@ async fn insert_decomposed_work_item(
 
 fn decomposed_work_item_insert_sql() -> &'static str {
     "INSERT INTO work_items \
-        (project_id, kind, title, description, priority, created_by, parent_id, repo_id, repo_url, repo_path, predicted_paths, complexity, acceptance_criteria, context, pre_work, work, post_work) \
-     VALUES ($1, 'task', $2, $3, 'normal', $4, $5, $6, $7, $8, $9, $10, $11, \
+        (project_id, kind, title, description, priority, created_by, parent_id, repo_id, repo_url, repo_path, base_branch, predicted_paths, complexity, acceptance_criteria, context, pre_work, work, post_work) \
+     VALUES ($1, 'task', $2, $3, 'normal', $4, $5, $6, $7, $8, $9, $10, $11, $12, \
         COALESCE((SELECT context FROM work_items WHERE id = $5), '{}'::jsonb), \
         COALESCE((SELECT pre_work FROM work_items WHERE id = $5), '[]'::jsonb), \
         COALESCE((SELECT work FROM work_items WHERE id = $5), '[]'::jsonb), \
@@ -2639,6 +2644,7 @@ mod tests {
             repo_id: None,
             repo_url: None,
             repo_path: Some(repo.path.clone()),
+            base_branch: None,
             primary_language: "rust".to_string(),
             build_system: None,
             key_dirs: Vec::new(),
@@ -3034,7 +3040,15 @@ mod tests {
         assert!(sql.contains("repo_id"));
         assert!(sql.contains("repo_url"));
         assert!(sql.contains("repo_path"));
-        assert!(sql.contains("$6, $7, $8"));
+        assert!(sql.contains("base_branch"));
+        assert!(sql.contains("$6, $7, $8, $9"));
+    }
+
+    #[test]
+    fn parent_base_branch_binding_is_preserved_without_other_repo_fields() {
+        let ctx = repo_context_from_binding(None, None, None, Some("release".into()))
+            .expect("base branch is a repository binding");
+        assert_eq!(ctx.base_branch.as_deref(), Some("release"));
     }
 
     #[test]
@@ -3042,8 +3056,7 @@ mod tests {
         let sql = decomposed_work_item_insert_sql();
         assert!(sql.contains("predicted_paths"));
         assert!(sql.contains("complexity"));
-        // 12 bound columns now (was 10) → placeholders through $10.
-        assert!(sql.contains("$9, $10"));
+        assert!(sql.contains("$10, $11, $12"));
     }
 
     #[test]
@@ -3258,6 +3271,7 @@ mod tests {
         assert!(sql.contains("repo_id"));
         assert!(sql.contains("repo_url"));
         assert!(sql.contains("repo_path"));
-        assert!(sql.contains("$6, $7, $8"));
+        assert!(sql.contains("base_branch"));
+        assert!(sql.contains("$6, $7, $8, $9"));
     }
 }

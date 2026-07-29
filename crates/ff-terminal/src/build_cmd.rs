@@ -85,8 +85,8 @@ pub async fn handle_build(
     for task in tasks {
         let id: uuid::Uuid = sqlx::query_scalar(
             "INSERT INTO work_items \
-                (project_id, kind, title, description, status, created_by, repo_id, repo_url, repo_path) \
-             VALUES ($1, 'task', $2, $3, 'ready', 'ff build', $4, $5, $6) \
+                (project_id, kind, title, description, status, created_by, repo_id, repo_url, repo_path, base_branch) \
+             VALUES ($1, 'task', $2, $3, 'ready', 'ff build', $4, $5, $6, $7) \
              RETURNING id",
         )
         .bind(&project)
@@ -100,6 +100,7 @@ pub async fn handle_build(
                 .and_then(|ctx| ctx.repo_path.as_ref())
                 .map(|p| p.to_string_lossy().to_string()),
         )
+        .bind(repo_context.as_ref().and_then(|ctx| ctx.base_branch.as_deref()))
         .fetch_one(&pool)
         .await
         .map_err(|e| anyhow!("insert work_item '{}': {e}", task.title))?;
@@ -234,6 +235,7 @@ mod tests {
             repo_id: None,
             repo_url: Some("https://github.com/acme/orders".into()),
             repo_path: Some(std::path::PathBuf::from("/tmp/orders")),
+            base_branch: Some("develop".into()),
             primary_language: "Java".into(),
             build_system: Some("Maven".into()),
             key_dirs: vec!["src".into()],
