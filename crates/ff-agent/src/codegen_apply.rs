@@ -473,6 +473,9 @@ fn build_prompt(
     );
 
     let identifiers = task_identifiers(task);
+    // Grounding flag for region extraction: test tasks must always see the
+    // file's #[cfg(test)] module (2026-07-29 hallucination root cause).
+    let wants_test = task.to_ascii_lowercase().contains("test");
 
     // Repo structure anchor: without a listing of what files ACTUALLY exist, the model invents
     // plausible-but-wrong paths (e.g. a Python `src/work_item/relations.py` in a Rust repo) and
@@ -499,7 +502,7 @@ fn build_prompt(
             prompt.push_str(" (large file; not full content):\n");
             prompt.push_str(&regions_with_path_headers(
                 &path.to_string_lossy(),
-                &extract_relevant_regions(&content, &identifiers),
+                &extract_relevant_regions(&content, &identifiers, wants_test),
             ));
         }
     }
@@ -665,7 +668,7 @@ fn regions_with_path_headers(path: &str, regions: &str) -> String {
     out
 }
 
-fn extract_relevant_regions(content: &str, identifiers: &[String]) -> String {
+fn extract_relevant_regions(content: &str, identifiers: &[String], wants_test: bool) -> String {
     let lines: Vec<&str> = content.split_inclusive('\n').collect();
     if lines.is_empty() {
         return "No content.\n".to_string();
@@ -690,6 +693,29 @@ fn extract_relevant_regions(content: &str, identifiers: &[String]) -> String {
                 ranges.push((start, end));
             }
         }
+    }
+
+    // Test tasks ground on the test module: when the task mentions tests,
+    // the `#[cfg(test)]` module is the FIRST region so the char cap can never
+    // truncate it away (2026-07-29: the cap silently dropped the tests module
+    // and the model invented a `test_utils` helper that doesn't exist).
+    if wants_test && let Some(idx) = lines.iter().position(|l| l.contains("#[cfg(test)]")) {
+        let tr = (idx, lines.len() - 1);
+        // Keep/clamp identifier ranges that start before the test module;
+        // drop ones fully inside it (it is shown in full anyway).
+        ranges = ranges
+            .into_iter()
+            .filter_map(|(s, e)| {
+                if e < tr.0 {
+                    Some((s, e))
+                } else if s < tr.0 {
+                    Some((s, tr.0 - 1))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        ranges.insert(0, tr);
     }
 
     if ranges.is_empty() {
@@ -736,15 +762,20 @@ fn render_ranges(lines: &[&str], ranges: &[(usize, usize)]) -> String {
 
         if out.len() + block.len() > LARGE_CONTEXT_FILE_CHARS {
             omitted = ranges.len() - idx;
+            // Name what the model CANNOT see: unnamed truncation invites the
+            // model to invent the missing content (2026-07-29 hallucination).
+            let spans: Vec<String> = ranges[idx..]
+                .iter()
+                .map(|(s, e)| format!("lines {}-{}", s + 1, e + 1))
+                .collect();
+            out.push_str(&format!(
+                "\n... omitted {omitted} later region(s) ({}) after ~{LARGE_CONTEXT_FILE_CHARS} chars. \
+                 Those lines are INVISIBLE to you — do NOT invent their content; SEARCH only from lines shown above.\n",
+                spans.join(", ")
+            ));
             break;
         }
         out.push_str(&block);
-    }
-
-    if omitted > 0 {
-        out.push_str(&format!(
-            "\n... omitted {omitted} later region(s) after ~{LARGE_CONTEXT_FILE_CHARS} chars for this file.\n"
-        ));
     }
 
     out
@@ -962,7 +993,21 @@ fn apply_one_edit(
                 info!(path = %edit.path, "codegen: SEARCH matched via whitespace-tolerant fallback");
                 (pos, len)
             }
-            None => return Err(anyhow!("SEARCH block not found in {}", edit.path)),
+            None => {
+                // Quote the mismatch back: a bare "not found" lets the model
+                // repeat the same invented block for every round (2026-07-29).
+                let head: String = edit.search.lines().take(3).collect::<Vec<_>>().join("\n");
+                return Err(anyhow!(
+                    "SEARCH block not found in {}. The SEARCH text must be copied VERBATIM \
+                     from the file content shown in the prompt — do NOT invent lines, helpers, \
+                     or modules (e.g. no 'test_utils' unless shown). Your SEARCH block began:\n\
+                     {}\n\
+                     If the exact lines you need were NOT shown in the prompt, do not guess — \
+                     pick SEARCH text from lines that WERE shown.",
+                    edit.path,
+                    head
+                ));
+            }
         },
     };
     let mut updated = String::with_capacity(content.len() - matched_len + edit.replace.len());
@@ -1372,11 +1417,59 @@ mod tests {
             })
             .collect::<String>();
 
-        let regions = extract_relevant_regions(&content, &["special_handler".to_string()]);
+        let regions = extract_relevant_regions(&content, &["special_handler".to_string()], false);
 
         assert!(regions.contains("Region (lines 15-65):"));
         assert!(regions.contains("fn special_handler() {}\n"));
         assert!(!regions.contains("No task identifiers matched"));
+    }
+    #[test]
+    fn codegen_regions_test_module_first_when_task_wants_test() {
+        // Large file: identifier hit early, tests module at the end. With
+        // wants_test the cfg(test) module must lead (cap can't drop it).
+        let mut content = String::new();
+        for i in 1..40 {
+            content.push_str(&format!("fn filler_{i}() {{}}\n"));
+        }
+        content.push_str("fn special_handler() {}\n");
+        content.push_str("#[cfg(test)]\nmod tests {\n    fn real_helper() {}\n}\n");
+
+        let regions = extract_relevant_regions(&content, &["special_handler".to_string()], true);
+        let tests_pos = regions.find("#[cfg(test)]").expect("tests module shown");
+        let handler_pos = regions
+            .find("fn special_handler")
+            .expect("identifier shown");
+        assert!(
+            tests_pos < handler_pos,
+            "tests module must be the first region"
+        );
+        assert!(regions.contains("fn real_helper()"));
+    }
+
+    #[test]
+    fn codegen_apply_error_quotes_search_head_and_forbids_invention() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("src/lib.rs");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "real content\n").unwrap();
+
+        let err = apply_edits(
+            dir.path(),
+            &[Edit {
+                path: "src/lib.rs".to_string(),
+                search: "invented line one\ninvented line two\ninvented line three\ninvented line four\n".to_string(),
+                replace: "whatever\n".to_string(),
+            }],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("invented line one"),
+            "quotes SEARCH head: {err}"
+        );
+        assert!(err.contains("VERBATIM"), "explains the contract: {err}");
+        assert!(err.contains("do NOT invent"), "forbids invention: {err}");
     }
 
     #[test]
@@ -1385,7 +1478,8 @@ mod tests {
             .map(|line| format!("let unrelated_{line} = {line};\n"))
             .collect::<String>();
 
-        let regions = extract_relevant_regions(&content, &["missing_identifier".to_string()]);
+        let regions =
+            extract_relevant_regions(&content, &["missing_identifier".to_string()], false);
 
         assert!(regions.contains("No task identifiers matched this large file"));
         assert!(regions.contains("Region (lines 1-60):"));
