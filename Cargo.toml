@@ -21,6 +21,7 @@ members = [
     "crates/ff-observability",
     "crates/ff-voice",
     "crates/ff-security",
+    "crates/ff-github-capabilities",
     "crates/ff-evolution",
     "crates/ff-deploy",
     "crates/ff-benchmark",
