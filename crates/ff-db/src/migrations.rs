@@ -1260,6 +1260,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "oplog_replay",
         sql: schema::SCHEMA_V282_OPLOG_REPLAY,
     },
+    PgMigration {
+        version: 283,
+        name: "workstream_alias_map",
+        sql: schema::SCHEMA_V283_WORKSTREAM_ALIAS_MAP,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -1672,6 +1677,37 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn v283_repairs_workstream_alias_map_when_postgres_is_available() {
+        let Some(database_url) = db_url() else {
+            return;
+        };
+        let pool = PgPool::connect(&database_url).await.unwrap();
+        sqlx::raw_sql(schema::SCHEMA_V283_WORKSTREAM_ALIAS_MAP)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let default: String = sqlx::query_scalar(
+            "SELECT column_default FROM information_schema.columns \
+             WHERE table_name = 'ff_workstreams' AND column_name = 'aliases'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(default, "'{}'::jsonb");
+    }
+
+    #[test]
+    fn v283_registers_workstream_alias_map_guardrail() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 283)
+            .expect("V283 must be registered");
+        assert_eq!(migration.name, "workstream_alias_map");
+        assert!(migration.sql.contains("ALTER COLUMN aliases SET DEFAULT"));
+        assert!(migration.sql.contains("jsonb_typeof(aliases) = 'object'"));
     }
 
     fn db_url() -> Option<String> {

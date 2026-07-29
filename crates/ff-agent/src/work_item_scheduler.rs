@@ -30,7 +30,9 @@ pub(crate) const MIN_LEASE_STALE_SECS: i64 = 480;
 /// below [`MAX_LEASE_DURATION_SECS`], which remains the separate hard age cap
 /// for leases whose heartbeat keeps refreshing while the build is wedged.
 const MAX_LEASE_STALE_SECS: i64 = 2400;
-const LEASE_STALE_MIN_SAMPLES: i64 = 20;
+/// A p99 needs at least 100 observations; below that it is merely the sample
+/// maximum and can understate the real tail.
+const LEASE_STALE_MIN_SAMPLES: i64 = 100;
 const LEASE_STALE_SAMPLE_DAYS: i64 = 30;
 /// Safety margin over the measured p99 successful build duration.
 const LEASE_STALE_P99_MARGIN_NUMERATOR: i64 = 5;
@@ -79,15 +81,13 @@ SELECT COUNT(*) FILTER (
        ) AS native_p99_secs,
        COUNT(*) FILTER (
            WHERE build_started_at IS NULL
-             AND dispatch_tick_at IS NOT NULL
-             AND released_at > dispatch_tick_at
+             AND released_at > created_at
        )::bigint AS bootstrap_sample_count,
        percentile_cont(0.99) WITHIN GROUP (
-           ORDER BY EXTRACT(EPOCH FROM (released_at - dispatch_tick_at))
+           ORDER BY EXTRACT(EPOCH FROM (released_at - created_at))
        ) FILTER (
            WHERE build_started_at IS NULL
-             AND dispatch_tick_at IS NOT NULL
-             AND released_at > dispatch_tick_at
+             AND released_at > created_at
        ) AS bootstrap_p99_secs
   FROM work_item_leases
  WHERE release_reason = 'ready for review'
@@ -366,7 +366,7 @@ fn select_lease_stale_sample(
         )
     } else {
         (
-            "released_at-dispatch_tick_at-bootstrap",
+            "released_at-created_at-bootstrap",
             bootstrap_sample_count,
             bootstrap_p99_secs,
         )
@@ -1363,8 +1363,8 @@ mod tests {
     #[test]
     fn lease_stale_window_uses_successful_build_p99_with_margin() {
         assert_eq!(
-            lease_stale_secs_from_success_p99(135, Some(517.57952862)),
-            647
+            lease_stale_secs_from_success_p99(393, Some(1357.40533888)),
+            1697
         );
     }
 
@@ -1395,11 +1395,11 @@ mod tests {
     #[test]
     fn lease_stale_samples_bootstrap_until_real_build_durations_are_populated() {
         assert_eq!(
-            select_lease_stale_sample(LEASE_STALE_MIN_SAMPLES - 1, Some(600.0), 135, Some(517.0)),
-            ("released_at-dispatch_tick_at-bootstrap", 135, Some(517.0))
+            select_lease_stale_sample(LEASE_STALE_MIN_SAMPLES - 1, Some(600.0), 393, Some(1357.0)),
+            ("released_at-created_at-bootstrap", 393, Some(1357.0))
         );
         assert_eq!(
-            select_lease_stale_sample(LEASE_STALE_MIN_SAMPLES, Some(600.0), 135, Some(517.0)),
+            select_lease_stale_sample(LEASE_STALE_MIN_SAMPLES, Some(600.0), 393, Some(1357.0)),
             (
                 "released_at-build_started_at",
                 LEASE_STALE_MIN_SAMPLES,
@@ -1407,8 +1407,8 @@ mod tests {
             )
         );
         assert_eq!(
-            select_lease_stale_sample(LEASE_STALE_MIN_SAMPLES, None, 135, Some(517.0)),
-            ("released_at-dispatch_tick_at-bootstrap", 135, Some(517.0))
+            select_lease_stale_sample(LEASE_STALE_MIN_SAMPLES, None, 393, Some(1357.0)),
+            ("released_at-created_at-bootstrap", 393, Some(1357.0))
         );
     }
 
@@ -1418,11 +1418,10 @@ mod tests {
         assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at - build_started_at"));
         assert!(LEASE_STALE_SAMPLE_SQL.contains("build_started_at IS NOT NULL"));
         assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at > build_started_at"));
-        assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at - dispatch_tick_at"));
+        assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at - created_at"));
         assert!(LEASE_STALE_SAMPLE_SQL.contains("build_started_at IS NULL"));
-        assert!(LEASE_STALE_SAMPLE_SQL.contains("dispatch_tick_at IS NOT NULL"));
-        assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at > dispatch_tick_at"));
-        assert!(!LEASE_STALE_SAMPLE_SQL.contains("created_at"));
+        assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at > created_at"));
+        assert!(!LEASE_STALE_SAMPLE_SQL.contains("dispatch_tick_at"));
         assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at <= NOW()"));
         assert!(LEASE_STALE_SAMPLE_SQL.contains("released_at >= NOW() - make_interval"));
     }

@@ -12464,6 +12464,33 @@ pub const SCHEMA_V281_WORK_ITEM_ACCEPTANCE_CRITERIA: &str =
 pub const SCHEMA_V282_OPLOG_REPLAY: &str =
     include_str!("migrations/20260728110000_oplog_replay.sql");
 
+/// v283: keep the workstream alias override map object-shaped.  The original
+/// live V278 column retained an array default even though resolution consumes
+/// aliases as a JSON object.
+pub const SCHEMA_V283_WORKSTREAM_ALIAS_MAP: &str = r#"
+ALTER TABLE ff_workstreams
+    ALTER COLUMN aliases SET DEFAULT '{}'::jsonb;
+
+UPDATE ff_workstreams
+SET aliases = '{}'::jsonb
+WHERE jsonb_typeof(aliases) <> 'object';
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'ff_workstreams'::regclass
+          AND conname = 'ff_workstreams_aliases_object'
+    ) THEN
+        ALTER TABLE ff_workstreams
+            ADD CONSTRAINT ff_workstreams_aliases_object
+            CHECK (jsonb_typeof(aliases) = 'object');
+    END IF;
+END
+$$;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
