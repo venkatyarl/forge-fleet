@@ -5212,16 +5212,25 @@ fn deploy_receiver_playbook(os_family: &str, source_tree_path: &str) -> String {
 /// clean AND already at the rollout's immutable target SHA, so a plain build of
 /// the current tree is exactly the deployed state. OS-aware restart idiom mirrors
 /// `deploy_playbook`.
-fn leader_refresh_playbook(os_family: &str, source_tree_path: &str) -> String {
+fn leader_refresh_playbook(os_family: &str, source_tree_path: &str, target_sha: &str) -> String {
     let src = expand_home(source_tree_path);
     let cargo_build = if os_family == "linux-dgx" {
         "cargo build --release -p forge-fleet -p ff-terminal -j 2"
     } else {
         "cargo build --release -p forge-fleet -p ff-terminal"
     };
+    let final_guard = format!(
+        "if [ -n \"$(git status --porcelain)\" ]; then \
+           echo \"LEADER_REFRESH_DIRTY: refusing to build a changed tree at {src}\" >&2; exit 1; \
+         fi; \
+         ACTUAL_SHA=$(git rev-parse HEAD) && \
+         [ \"$ACTUAL_SHA\" = \"{target_sha}\" ] || {{ \
+           echo \"LEADER_REFRESH_SHA_MISMATCH: expected {target_sha}, got $ACTUAL_SHA\" >&2; exit 9; \
+         }};"
+    );
     match os_family {
         "macos" => format!(
-            ". \"$HOME/.cargo/env\" 2>/dev/null || true; cd \"{src}\" && {cargo_build} && \
+            ". \"$HOME/.cargo/env\" 2>/dev/null || true; cd \"{src}\" && {final_guard} {cargo_build} && \
              install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
              install -m 755 target/release/ff ~/.local/bin/ff && \
              install -m 755 target/release/ff ~/.cargo/bin/ff 2>/dev/null || true; \
@@ -5238,7 +5247,7 @@ fn leader_refresh_playbook(os_family: &str, source_tree_path: &str) -> String {
              echo \"LEADER_REFRESH count=$RN\"; [ \"$RN\" -ge 1 ]"
         ),
         _ => format!(
-            ". \"$HOME/.cargo/env\" 2>/dev/null || true; cd \"{src}\" && {cargo_build} && \
+            ". \"$HOME/.cargo/env\" 2>/dev/null || true; cd \"{src}\" && {final_guard} {cargo_build} && \
              install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
              install -m 755 target/release/ff ~/.local/bin/ff && \
              install -m 755 target/release/ff ~/.cargo/bin/ff 2>/dev/null || true; \
@@ -5284,7 +5293,7 @@ async fn run_local_shell(cmd: &str, timeout_secs: u64) -> (i32, String, String) 
 fn leader_refresh_guard_command(source_tree_path: &str, target_sha: &str) -> String {
     let src = expand_home(source_tree_path);
     format!(
-        "cd \"{src}\" && [ -z \"$(git status --porcelain --untracked-files=no)\" ] && \
+        "cd \"{src}\" && [ -z \"$(git status --porcelain)\" ] && \
          [ \"$(git rev-parse HEAD)\" = \"{target_sha}\" ]"
     )
 }
@@ -5322,12 +5331,8 @@ async fn refresh_local_leader_if_self(
     // rollout's already-resolved immutable target. Never fetch here: main could
     // advance during a rollout, and leader refresh must not build a different
     // commit than the workers. We never touch a dirty dev tree.
-    // `--untracked-files=no` deliberately IGNORES
-    // untracked files (operator artifacts like `research/`, `graphify-out`): the
-    // leader-refresh playbook only `cargo build`s from tracked HEAD and never
-    // resets/cleans, so an untracked dir can't change the build and must NOT block
-    // the auto-refresh — an untracked `research/` silently forced a manual Taylor
-    // rebuild on every deploy this session.
+    // Include untracked files: an untracked Rust source or build script can affect
+    // the resulting binary even when tracked HEAD is unchanged.
     let clean = run_local_shell(&leader_refresh_guard_command(&src, target_sha), 120).await;
     if clean.0 != 0 {
         return Some((
@@ -5349,7 +5354,8 @@ async fn refresh_local_leader_if_self(
             Ok(previous) => previous,
             Err(error) => return Some((false, format!("leader lease drain failed: {error}"))),
         };
-    let (code, _out, err) = run_local_shell(&leader_refresh_playbook(&os_family, &src), 2700).await;
+    let (code, _out, err) =
+        run_local_shell(&leader_refresh_playbook(&os_family, &src, target_sha), 2700).await;
     restore_deploy_targets(pool, &previous_reservation).await;
     if code == 0 {
         Some((true, "leader daemon rebuilt + restarted".into()))
@@ -6765,8 +6771,9 @@ mod live_remote_sha_tests {
 mod route_tests {
     use super::{
         deploy_convergence_probe_command, extract_health_build_sha, fmt_route_load,
-        leader_refresh_guard_command, normalize_route_limit, route_require_tool_calling,
-        route_warns_below_agent_floor, short10, versions_live_probe_command, versions_live_status,
+        leader_refresh_guard_command, leader_refresh_playbook, normalize_route_limit,
+        route_require_tool_calling, route_warns_below_agent_floor, short10,
+        versions_live_probe_command, versions_live_status,
     };
 
     // Authored by a fleet model (qwen36 on lily) via `ff offload`, then reviewed
@@ -6848,8 +6855,25 @@ mod route_tests {
         let guard = leader_refresh_guard_command("~/projects/forge-fleet", expected);
         assert!(guard.contains(expected));
         assert!(guard.contains("git rev-parse HEAD"));
+        assert!(guard.contains("git status --porcelain"));
+        assert!(!guard.contains("--untracked-files=no"));
         assert!(!guard.contains("git fetch"));
         assert!(!guard.contains("origin/main"));
+
+        let playbook = leader_refresh_playbook("linux", "~/projects/forge-fleet", expected);
+        let final_clean = playbook
+            .find("LEADER_REFRESH_DIRTY")
+            .expect("must re-check cleanliness at build boundary");
+        let final_sha = playbook
+            .find("LEADER_REFRESH_SHA_MISMATCH")
+            .expect("must re-check immutable target at build boundary");
+        let build = playbook
+            .find("cargo build --release")
+            .expect("must build after final guard");
+        assert!(final_clean < final_sha && final_sha < build);
+        assert!(playbook.contains("git status --porcelain"));
+        assert!(!playbook.contains("--untracked-files=no"));
+        assert!(!playbook.contains("git fetch"));
     }
 
     #[test]
