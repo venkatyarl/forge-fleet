@@ -1386,7 +1386,7 @@ async fn dispatch_one(
         let sweep_warnings = post_phase.finish();
         return Ok(WorkItemDispatchResult { sweep_warnings });
     }
-    mark_ready_for_review(
+    let advanced = mark_ready_for_review(
         &pg,
         &item,
         &worktree,
@@ -1396,6 +1396,15 @@ async fn dispatch_one(
         Some(&review),
     )
     .await?;
+    if !advanced {
+        info!(
+            work_item_id = %item.work_item_id,
+            sub_agent_id = %item.sub_agent_id,
+            "work_item_dispatch: ignoring stale result after item or lease changed"
+        );
+        let sweep_warnings = post_phase.finish();
+        return Ok(WorkItemDispatchResult { sweep_warnings });
+    }
     if normalized_cloud_backend(&backend_used).is_none() {
         mark_local_retest_passed(&pg, item.work_item_id).await?;
     }
@@ -1967,21 +1976,36 @@ async fn mark_ready_for_review(
     pr_url: &str,
     builder: &str,
     review: Option<&ReviewOutcome>,
-) -> Result<()> {
+) -> Result<bool> {
     let mut tx = pg.begin().await?;
-    sqlx::query(
+    let transitioned = sqlx::query(
         "UPDATE work_items
             SET status = 'in_review',
                 branch_name = $2,
                 pr_url = $3,
                 cleanup_complete = TRUE
-          WHERE id = $1",
+          WHERE id = $1
+            AND status = 'building'
+            AND EXISTS (
+                SELECT 1
+                  FROM work_item_leases l
+                 WHERE l.work_item_id = work_items.id
+                   AND l.sub_agent_id = $4
+                   AND l.released_at IS NULL
+                   AND l.lease_expires_at > NOW()
+            )",
     )
     .bind(item.work_item_id)
     .bind(&worktree.task_branch)
     .bind(pr_url)
+    .bind(item.sub_agent_id)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if transitioned == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
 
     sqlx::query(
         "UPDATE work_item_worktrees
@@ -2089,7 +2113,7 @@ async fn mark_ready_for_review(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 // ── Pillar 4 v2: in-place review stage (after build+PR, before enqueue) ──────
@@ -6378,14 +6402,14 @@ pub fn spawn_worktree_reaper(
 mod tests {
     use super::{
         AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS, ReviewerStat,
-        affected_crate_manifests, agent_output_tail, backend_failed_without_output,
+        WorktreeRecord, affected_crate_manifests, agent_output_tail, backend_failed_without_output,
         builder_excludes_480b, check_dispatch_prerequisites, classify_dispatch_outcome,
         collect_leftover_tmp_output, command_display, complexity_at_least_moderate,
         contains_file_line_citation, default_clone_path, dispatch_budget_for_host, dispatch_prompt,
         expand_home, is_build_timeout, local_failure_diagnosis_for,
         local_failure_diagnosis_for_attempt, mark_local_retest_failed, mark_local_retest_passed,
-        mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers, parse_cli_tokens,
-        parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
+        mark_ready_for_review, mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers,
+        parse_cli_tokens, parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
         quick_empty_success_is_provider_failure, record_cloud_rescue_local_failure_diagnosis,
         repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
         same_model_family, should_attempt_lane15, status_output_is_clean, synthetic_output,
@@ -6423,6 +6447,194 @@ mod tests {
             pre_work: Vec::new(),
             work: Vec::new(),
             post_work: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_for_review_requires_building_item_and_exact_active_lease() {
+        let url = match std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+        {
+            Ok(url) => url,
+            Err(_) => {
+                eprintln!(
+                    "skipping ready-for-review lease DB test: no FORGEFLEET_POSTGRES_URL/DATABASE_URL"
+                );
+                return;
+            }
+        };
+        let pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(error) => {
+                eprintln!("skipping ready-for-review lease DB test: database unavailable: {error}");
+                return;
+            }
+        };
+        ff_db::run_postgres_migrations(&pool)
+            .await
+            .expect("migrations should create dispatch tables");
+
+        for (name, status, released, expired, mismatched, expected) in [
+            ("cancelled", "cancelled", false, false, false, false),
+            ("released", "building", true, false, false, false),
+            ("expired", "building", false, true, false, false),
+            ("mismatched", "building", false, false, true, false),
+            ("valid", "building", false, false, false, true),
+        ] {
+            let suffix = Uuid::new_v4();
+            let project_id = format!("dispatch-review-gate-{suffix}");
+            let computer_id = Uuid::new_v4();
+            let leased_sub_agent_id = Uuid::new_v4();
+            let dispatch_sub_agent_id = if mismatched {
+                Uuid::new_v4()
+            } else {
+                leased_sub_agent_id
+            };
+            let work_item_id = Uuid::new_v4();
+
+            sqlx::query("INSERT INTO projects (id, display_name) VALUES ($1, $1)")
+                .bind(&project_id)
+                .execute(&pool)
+                .await
+                .expect("insert test project");
+            sqlx::query(
+                "INSERT INTO computers (id, name, primary_ip, os_family, ssh_user)
+                 VALUES ($1, $2, '127.0.0.1', 'linux', 'test')",
+            )
+            .bind(computer_id)
+            .bind(format!("dispatch-review-gate-{suffix}"))
+            .execute(&pool)
+            .await
+            .expect("insert test computer");
+            for (slot, sub_agent_id) in [leased_sub_agent_id, dispatch_sub_agent_id]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .enumerate()
+            {
+                sqlx::query(
+                    "INSERT INTO sub_agents (id, computer_id, slot, workspace_dir)
+                     VALUES ($1, $2, $3, '/tmp/dispatch-review-gate')",
+                )
+                .bind(sub_agent_id)
+                .bind(computer_id)
+                .bind(slot as i32)
+                .execute(&pool)
+                .await
+                .expect("insert test sub-agent");
+            }
+            sqlx::query(
+                "INSERT INTO work_items (id, project_id, kind, title, status)
+                 VALUES ($1, $2, 'task', $3, $4)",
+            )
+            .bind(work_item_id)
+            .bind(&project_id)
+            .bind(format!("{name} lease gate regression"))
+            .bind(status)
+            .execute(&pool)
+            .await
+            .expect("insert test work item");
+            sqlx::query(
+                "INSERT INTO work_item_leases
+                    (work_item_id, sub_agent_id, computer_id, project_id,
+                     lease_expires_at, released_at)
+                 VALUES ($1, $2, $3, $4,
+                         CASE WHEN $5 THEN NOW() - INTERVAL '1 second'
+                              ELSE NOW() + INTERVAL '5 minutes' END,
+                         CASE WHEN $6 THEN NOW() ELSE NULL END)",
+            )
+            .bind(work_item_id)
+            .bind(leased_sub_agent_id)
+            .bind(computer_id)
+            .bind(&project_id)
+            .bind(expired)
+            .bind(released)
+            .execute(&pool)
+            .await
+            .expect("insert test lease");
+
+            let mut item = test_item(0, None, "mechanical");
+            item.work_item_id = work_item_id;
+            item.project_id = project_id.clone();
+            item.computer_id = computer_id;
+            item.sub_agent_id = dispatch_sub_agent_id;
+            let worktree = WorktreeRecord {
+                worktree_path: PathBuf::from("/tmp/dispatch-review-gate"),
+                base_branch: "main".to_string(),
+                task_branch: format!("wi/{work_item_id}"),
+            };
+            let advanced = mark_ready_for_review(
+                &pool,
+                &item,
+                &worktree,
+                "deadbeef",
+                &format!("https://example.invalid/pr/{work_item_id}"),
+                "codex",
+                None,
+            )
+            .await
+            .expect("lease gate should return a transition result");
+
+            assert_eq!(advanced, expected, "{name}");
+            let persisted_status: String =
+                sqlx::query_scalar("SELECT status FROM work_items WHERE id = $1")
+                    .bind(work_item_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read work item status");
+            assert_eq!(
+                persisted_status,
+                if expected { "in_review" } else { status },
+                "{name}"
+            );
+            let queued: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM work_item_merge_queue WHERE work_item_id = $1",
+            )
+            .bind(work_item_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count merge queue rows");
+            assert_eq!(queued, i64::from(expected), "{name}");
+
+            sqlx::query("DELETE FROM work_item_merge_queue WHERE work_item_id = $1")
+                .bind(work_item_id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM work_item_provenance WHERE work_item_id = $1")
+                .bind(work_item_id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM work_item_leases WHERE work_item_id = $1")
+                .bind(work_item_id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM work_items WHERE id = $1")
+                .bind(work_item_id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM sub_agents WHERE computer_id = $1")
+                .bind(computer_id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM computers WHERE id = $1")
+                .bind(computer_id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM projects WHERE id = $1")
+                .bind(&project_id)
+                .execute(&pool)
+                .await
+                .ok();
         }
     }
 
