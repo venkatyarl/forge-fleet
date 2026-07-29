@@ -600,7 +600,7 @@ fn append_human_close_evidence(
         .filter_map(|line| line.strip_prefix(PREFIX))
         .any(|json| {
             serde_json::from_str::<HumanCloseEvidence>(json)
-                .map(|old| old.actor == actor && old.evidence == evidence)
+                .map(|old| old.evidence == evidence)
                 .unwrap_or(false)
         });
     if duplicate {
@@ -665,16 +665,20 @@ async fn close_work_item(
         | "in_progress" | "done" | "merged" => {}
         other => anyhow::bail!("work item {id} has unsupported close source status '{other}'"),
     }
-    let active_lease: bool = sqlx::query_scalar(
+    // Treat every unreleased lease as active for closure purposes, even after
+    // its timestamp expires. Otherwise a concurrent heartbeat could revive an
+    // expired row after this check and leave a terminal item with a live slot.
+    // The lease reaper must release stale rows before evidence closure.
+    let unreleased_lease: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM work_item_leases \
-          WHERE work_item_id = $1 AND released_at IS NULL AND lease_expires_at > NOW())",
+          WHERE work_item_id = $1 AND released_at IS NULL)",
     )
     .bind(id)
     .fetch_one(&mut *tx)
     .await
     .map_err(|error| anyhow::anyhow!("check active lease: {error}"))?;
-    if active_lease {
-        anyhow::bail!("work item {id} has an active lease and cannot be closed");
+    if unreleased_lease {
+        anyhow::bail!("work item {id} has an unreleased lease and cannot be closed");
     }
     if let (Some(existing), Some(requested)) = (existing_commit.as_deref(), commit)
         && !existing.trim().is_empty()
@@ -2811,7 +2815,7 @@ mod tests {
         let (twice, second_appended) = append_human_close_evidence(
             Some(&once),
             Some("old failure"),
-            "marcus",
+            "adele",
             "tests pass",
             at + chrono::Duration::minutes(1),
         )
