@@ -1829,10 +1829,24 @@ fn task_branch_name(title: &str, work_item_id: uuid::Uuid) -> String {
 }
 
 async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Result<WorktreeRecord> {
-    let base_branch = match item.base_branch.as_deref() {
-        Some(branch) if !branch.trim().is_empty() => branch.trim().to_string(),
-        _ => default_branch(&item.repo_path).unwrap_or_else(|_| "main".to_string()),
-    };
+    // Base-branch precedence: explicit work_items.base_branch > repo default >
+    // project default > origin/HEAD > "main" (see resolve_base_branch). The
+    // repo/project tiers are deliberately NOT wired here: Jira ingestion
+    // already copies project_repos.default_branch into work_items.base_branch
+    // (so it lands in the explicit tier), and projects.default_branch is
+    // NOT NULL DEFAULT 'main' — consulting it would shadow origin/HEAD for
+    // every unconfigured project. The origin/HEAD lookup stays lazy so a
+    // configured branch never pays for (or fails on) a git subprocess.
+    let (base_branch, base_branch_tier) =
+        resolve_base_branch(item.base_branch.as_deref(), None, None, || {
+            default_branch(&item.repo_path).ok()
+        });
+    info!(
+        work_item = %item.work_item_id,
+        base_branch = %base_branch,
+        resolution_tier = base_branch_tier.as_str(),
+        "create_worktree_for_item: resolved base branch"
+    );
     let task_branch = task_branch_name(&item.title, item.work_item_id);
 
     // Canonical slots reuse an existing project checkout (~/projects/{project});
@@ -6043,6 +6057,62 @@ fn default_branch(repo_path: &Path) -> Result<String> {
     Ok(branch)
 }
 
+/// Which precedence tier produced the base branch. Precedence (highest first):
+/// explicit `work_items.base_branch` > repo default (`project_repos.default_branch`)
+/// > project default (`projects.default_branch`) > `origin/HEAD` > built-in
+/// "main". Returned alongside the branch so dispatch can log the tier that
+/// resolved; `as_str` is the stable log-field value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseBranchTier {
+    Explicit,
+    Repo,
+    Project,
+    OriginHead,
+    Default,
+}
+
+impl BaseBranchTier {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Repo => "repo",
+            Self::Project => "project",
+            Self::OriginHead => "origin_head",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// Pure base-branch resolution: the first non-blank candidate in tier order
+/// wins (candidates are trimmed). `origin_head` is a LAZY lookup (a git
+/// subprocess behind it) so it only runs when no configured tier resolved; a
+/// `None`/blank answer is NOT an error — resolution falls through to the
+/// built-in "main" default. Never requires any `origin/*` ref to exist, so a
+/// local/configured branch always resolves even in a clone with no remote.
+fn resolve_base_branch(
+    explicit: Option<&str>,
+    repo_default: Option<&str>,
+    project_default: Option<&str>,
+    origin_head: impl FnOnce() -> Option<String>,
+) -> (String, BaseBranchTier) {
+    for (candidate, tier) in [
+        (explicit, BaseBranchTier::Explicit),
+        (repo_default, BaseBranchTier::Repo),
+        (project_default, BaseBranchTier::Project),
+    ] {
+        if let Some(branch) = candidate.map(str::trim).filter(|b| !b.is_empty()) {
+            return (branch.to_string(), tier);
+        }
+    }
+    if let Some(branch) = origin_head()
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty())
+    {
+        return (branch, BaseBranchTier::OriginHead);
+    }
+    ("main".to_string(), BaseBranchTier::Default)
+}
+
 #[doc(hidden)]
 pub fn run_git<I, S>(cwd: &Path, args: I, timeout: Duration) -> Result<Output>
 where
@@ -6377,20 +6447,20 @@ pub fn spawn_worktree_reaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS, ReviewerStat,
-        affected_crate_manifests, agent_output_tail, backend_failed_without_output,
-        builder_excludes_480b, check_dispatch_prerequisites, classify_dispatch_outcome,
-        collect_leftover_tmp_output, command_display, complexity_at_least_moderate,
-        contains_file_line_citation, default_clone_path, dispatch_budget_for_host, dispatch_prompt,
-        expand_home, is_build_timeout, local_failure_diagnosis_for,
-        local_failure_diagnosis_for_attempt, mark_local_retest_failed, mark_local_retest_passed,
-        mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers, parse_cli_tokens,
-        parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
+        AssignedWorkItem, BaseBranchTier, DISPATCH_HOUSE_RULES, DispatchOutcome,
+        LANE15_480B_PERMITS, ReviewerStat, affected_crate_manifests, agent_output_tail,
+        backend_failed_without_output, builder_excludes_480b, check_dispatch_prerequisites,
+        classify_dispatch_outcome, collect_leftover_tmp_output, command_display,
+        complexity_at_least_moderate, contains_file_line_citation, default_clone_path,
+        dispatch_budget_for_host, dispatch_prompt, expand_home, is_build_timeout,
+        local_failure_diagnosis_for, local_failure_diagnosis_for_attempt, mark_local_retest_failed,
+        mark_local_retest_passed, mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers,
+        parse_cli_tokens, parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
         quick_empty_success_is_provider_failure, record_cloud_rescue_local_failure_diagnosis,
-        repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
-        same_model_family, should_attempt_lane15, status_output_is_clean, synthetic_output,
-        task_failed_alert_text, task_prefers_cloud_lane, try_acquire_lane15_480b_permit,
-        use_local_lane, validate_manifest_fields,
+        repo_cache_path, repo_slug, resolve_base_branch, retry_error_is_actionable,
+        rewrite_github_host_alias, same_model_family, should_attempt_lane15,
+        status_output_is_clean, synthetic_output, task_failed_alert_text, task_prefers_cloud_lane,
+        try_acquire_lane15_480b_permit, use_local_lane, validate_manifest_fields,
     };
     use sqlx::Row;
     use std::path::PathBuf;
@@ -7758,5 +7828,90 @@ mod tests {
         assert!(repo.join("committed.txt").exists());
         assert!(repo.join("dirty.txt").exists());
         assert!(!super::worktree_has_diff(repo));
+    }
+
+    #[test]
+    fn base_branch_explicit_tier_wins_over_all_others() {
+        let (branch, tier) = resolve_base_branch(
+            Some("  feature/hotfix  "),
+            Some("repo-release"),
+            Some("project-dev"),
+            || Some("origin-main".to_string()),
+        );
+        // Trimmed, and never shadowed by repo/project/origin-HEAD candidates.
+        assert_eq!(branch, "feature/hotfix");
+        assert_eq!(tier, BaseBranchTier::Explicit);
+    }
+
+    #[test]
+    fn base_branch_repo_tier_wins_when_explicit_blank() {
+        // None, empty, and whitespace-only explicit values all fall through.
+        for explicit in [None, Some(""), Some("   ")] {
+            let (branch, tier) =
+                resolve_base_branch(explicit, Some("repo-release"), Some("project-dev"), || {
+                    Some("origin-main".to_string())
+                });
+            assert_eq!(branch, "repo-release", "explicit={explicit:?}");
+            assert_eq!(tier, BaseBranchTier::Repo, "explicit={explicit:?}");
+        }
+    }
+
+    #[test]
+    fn base_branch_project_tier_wins_when_explicit_and_repo_blank() {
+        let (branch, tier) = resolve_base_branch(Some(" "), None, Some("dev"), || {
+            Some("origin-main".to_string())
+        });
+        assert_eq!(branch, "dev");
+        assert_eq!(tier, BaseBranchTier::Project);
+    }
+
+    #[test]
+    fn base_branch_origin_head_tier_when_no_configured_branch() {
+        let (branch, tier) =
+            resolve_base_branch(None, None, None, || Some("origin/develop".to_string()));
+        assert_eq!(branch, "origin/develop");
+        assert_eq!(tier, BaseBranchTier::OriginHead);
+    }
+
+    #[test]
+    fn base_branch_falls_back_to_main_default_tier_without_requiring_origin_ref() {
+        // origin/HEAD unresolvable (e.g. a local clone with no remote HEAD) and
+        // no configured branch anywhere: built-in "main", NOT an error — the
+        // resolver must never require an origin/* ref to resolve a branch.
+        let (branch, tier) = resolve_base_branch(None, None, None, || None);
+        assert_eq!(branch, "main");
+        assert_eq!(tier, BaseBranchTier::Default);
+        // A blank origin/HEAD answer degrades the same way.
+        let (branch, tier) = resolve_base_branch(Some(""), Some(" "), None, || Some(String::new()));
+        assert_eq!(branch, "main");
+        assert_eq!(tier, BaseBranchTier::Default);
+    }
+
+    #[test]
+    fn base_branch_origin_head_lookup_is_lazy() {
+        // The git subprocess behind origin/HEAD must not run when a configured
+        // tier already resolved (a configured branch resolves even where no
+        // git repo/remote exists at all).
+        let called = std::cell::Cell::new(false);
+        let (branch, tier) = resolve_base_branch(Some("main"), None, None, || {
+            called.set(true);
+            Some("ignored".to_string())
+        });
+        assert_eq!(branch, "main");
+        assert_eq!(tier, BaseBranchTier::Explicit);
+        assert!(
+            !called.get(),
+            "origin/HEAD lookup ran despite an explicit base branch"
+        );
+    }
+
+    #[test]
+    fn base_branch_tier_names_are_stable_for_logs() {
+        // These strings are the `resolution_tier` log field; keep them stable.
+        assert_eq!(BaseBranchTier::Explicit.as_str(), "explicit");
+        assert_eq!(BaseBranchTier::Repo.as_str(), "repo");
+        assert_eq!(BaseBranchTier::Project.as_str(), "project");
+        assert_eq!(BaseBranchTier::OriginHead.as_str(), "origin_head");
+        assert_eq!(BaseBranchTier::Default.as_str(), "default");
     }
 }
