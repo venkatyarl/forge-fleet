@@ -12,6 +12,7 @@ pub mod handoff;
 pub mod jira_config;
 pub mod jira_ingest;
 pub mod log_monitor;
+pub mod log_shipper;
 pub mod manager;
 pub mod mirror_service;
 pub mod node_drain;

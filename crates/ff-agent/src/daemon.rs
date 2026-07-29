@@ -82,6 +82,12 @@ impl TickRegistry {
                 runner: run_log_analysis_tick,
             },
             TickDefinition {
+                name: "log_shipper",
+                interval: Duration::from_secs(5),
+                scope: TickScope::EveryNode,
+                runner: run_log_shipper_tick,
+            },
+            TickDefinition {
                 name: "metrics_scraper",
                 interval: crate::metrics_scraper::DEFAULT_INTERVAL,
                 scope: TickScope::EveryNode,
@@ -261,6 +267,14 @@ fn run_jira_ingest_tick(pg: PgPool, _worker_name: String) -> BoxFuture<'static, 
 fn run_log_analysis_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
     Box::pin(async move {
         crate::log_analysis_worker::run_log_analysis_tick(&pg, &worker_name)
+            .await
+            .map(|_| ())
+    })
+}
+
+fn run_log_shipper_tick(pg: PgPool, worker_name: String) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        crate::ha::log_shipper::run_log_shipper_tick(&pg, &worker_name)
             .await
             .map(|_| ())
     })
