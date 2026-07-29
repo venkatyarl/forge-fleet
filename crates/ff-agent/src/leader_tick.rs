@@ -620,7 +620,7 @@ impl LeaderTick {
 
             // Leader row exists and it's us.
             (Some(cur), Some(best)) if cur.member_name == self.my_name => {
-                if prefer.is_some() && best.member_name != self.my_name {
+                if should_yield_to_best(prefer, &yielding, &self.my_name, &best.member_name) {
                     // A more-preferred peer is alive → yield.
                     let yielded = pg_yield_leader(&self.pg, &self.my_name).await?;
                     if yielded {
@@ -1539,6 +1539,15 @@ fn pick_best_candidate<'a>(
     })
 }
 
+fn should_yield_to_best(
+    prefer: Option<&str>,
+    yielding: &std::collections::HashSet<String>,
+    my_name: &str,
+    best_name: &str,
+) -> bool {
+    best_name != my_name && (prefer.is_some() || yielding.contains(my_name))
+}
+
 fn leaderless_wait(computer_id: Uuid) -> Duration {
     let hash = computer_id
         .as_bytes()
@@ -1708,6 +1717,22 @@ mod tests {
         let yielding = ["taylor".to_string()].into_iter().collect();
         let best = pick_best_candidate(&cands, &alive, &yielding, None).unwrap();
         assert_eq!(best.member_name, "james");
+    }
+
+    #[test]
+    fn self_yielding_leader_without_lease_yields_to_best_candidate() {
+        let cands = vec![cand("taylor", 0), cand("james", 10)];
+        let alive = alive_all(&["taylor", "james"]);
+        let yielding = ["taylor".to_string()].into_iter().collect();
+        let best = pick_best_candidate(&cands, &alive, &yielding, None).unwrap();
+
+        assert_eq!(best.member_name, "james");
+        assert!(should_yield_to_best(
+            None,
+            &yielding,
+            "taylor",
+            &best.member_name
+        ));
     }
 
     #[test]

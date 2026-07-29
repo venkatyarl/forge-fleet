@@ -100,7 +100,8 @@ pub async fn evaluate_merge_queue(
     // Terminal-PR guard: a MERGED/CLOSED PR reports mergeStateStatus UNKNOWN
     // forever, so the mergeability path below can never resolve it. Settle the
     // row from the PR's real state first (see terminal_pr_action).
-    match terminal_pr_action(gh_pr_view_state(&pr_url).await.as_deref()) {
+    let pr_state = gh_pr_view_state(&pr_url).await;
+    match terminal_pr_action(pr_state.as_deref()) {
         Some(TerminalPrAction::MarkMerged) => {
             info!(pr = %pr_url, "merge_drain: PR already merged out-of-band — closing queue row as merged");
             ff_db::pg_mark_merge_merged(pg, item.id, item.work_item_id).await?;
@@ -144,6 +145,18 @@ pub async fn evaluate_merge_queue(
             return Ok(0);
         }
         None => {} // OPEN (or state undetermined) → normal mergeability path
+    }
+
+    if pr_state.as_deref() == Some("OPEN") && gh_pr_view_is_draft(&pr_url).await == Some(true) {
+        info!(
+            pr = %pr_url,
+            "merge_drain: PR is draft — deferring until marked ready"
+        );
+        if let Err(e) = ff_db::pg_defer_merge_queue_item_to_back(pg, item.id).await {
+            warn!(pr = %pr_url, error = %e, "merge_drain: rotate-to-back failed");
+        }
+        unknown_defers.remove(&item.id);
+        return Ok(0);
     }
 
     // Conflict-cascade guard: when several sibling PRs land near-simultaneously,
@@ -1587,6 +1600,23 @@ async fn gh_pr_view_state(pr_url: &str) -> Option<String> {
         .and_then(|v| v.get("state").and_then(|s| s.as_str()).map(str::to_string))
 }
 
+fn pr_is_draft_from_json(value: &serde_json::Value) -> Option<bool> {
+    value.get("isDraft").and_then(|draft| draft.as_bool())
+}
+
+/// Fetch `isDraft` from `gh pr view --json isDraft`.
+async fn gh_pr_view_is_draft(pr_url: &str) -> Option<bool> {
+    let mut cmd = gh_cmd().await;
+    cmd.args(["pr", "view", pr_url, "--json", "isDraft"]);
+    let out = cmd.output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .ok()
+        .and_then(|value| pr_is_draft_from_json(&value))
+}
+
 /// Best-effort deletion of a PR's head branch via the GitHub API. Used when
 /// `gh pr merge --delete-branch` merged the PR but failed to delete the branch.
 async fn gh_delete_branch(pr_url: &str) -> Result<()> {
@@ -1843,7 +1873,8 @@ mod tests {
     use super::{
         PrMergeState, PrReviewVerdict, TerminalPrAction, github_actions_run_id,
         is_semantic_merge_compile_failure, parse_merge_state, parse_review_response,
-        parse_review_verdict, served_by_480b, terminal_pr_action, update_branch_api_path,
+        parse_review_verdict, pr_is_draft_from_json, served_by_480b, terminal_pr_action,
+        update_branch_api_path,
     };
 
     #[test]
@@ -1867,6 +1898,19 @@ mod tests {
         assert_eq!(terminal_pr_action(Some("OPEN")), None);
         assert_eq!(terminal_pr_action(Some("whatever")), None);
         assert_eq!(terminal_pr_action(None), None);
+    }
+
+    #[test]
+    fn maps_pr_view_is_draft_response() {
+        assert_eq!(
+            pr_is_draft_from_json(&serde_json::json!({ "isDraft": true })),
+            Some(true)
+        );
+        assert_eq!(
+            pr_is_draft_from_json(&serde_json::json!({ "isDraft": false })),
+            Some(false)
+        );
+        assert_eq!(pr_is_draft_from_json(&serde_json::json!({})), None);
     }
 
     #[test]

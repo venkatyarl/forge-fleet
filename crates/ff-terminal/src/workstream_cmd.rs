@@ -251,6 +251,23 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
             }
             println!("\nreport progress with:  ff workstream report --summary \"…\" --note \"…\"");
         }
+        crate::WorkstreamCommand::Detach { tool, session } => {
+            let tool = resolve_tool(tool.as_deref());
+            let dir = effective_cwd(cwd)?;
+            let ws = workstreams::workstream_for_dir(&pg, &dir)
+                .await?
+                .with_context(|| format!("no workstream matches {}", dir.display()))?;
+            let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
+            let token = resolve_session_token(session.as_deref());
+            let sid = workstreams::session_id_for_token(
+                &worker,
+                &ws.project_key,
+                &tool,
+                token.as_deref(),
+            );
+            workstreams::detach(&pg, &sid).await?;
+            println!("detached from workstream {}", ws.project_key);
+        }
         crate::WorkstreamCommand::Report {
             tool,
             summary,
@@ -696,12 +713,28 @@ mod tests {
     }
 
     #[test]
+    fn codex_session_id_identifies_codex() {
+        assert_eq!(
+            tool_from_env_markers(&env_with(&[("CODEX_SESSION_ID", "c1")])),
+            Some("codex".to_string())
+        );
+    }
+
+    #[test]
     fn empty_env_marker_does_not_count() {
         assert_eq!(
             tool_from_env_markers(&env_with(&[("CLAUDECODE", "")])),
             None
         );
         assert_eq!(tool_from_env_markers(&env_with(&[])), None);
+    }
+
+    #[test]
+    fn kimi_marker_env_detection() {
+        assert_eq!(
+            tool_from_env_markers(&env_with(&[("KIMI_SESSION_ID", "k1")])),
+            Some("kimi".to_string())
+        );
     }
 
     #[test]

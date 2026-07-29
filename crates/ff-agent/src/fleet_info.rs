@@ -177,10 +177,12 @@ pub async fn fetch_snapshot() -> Result<FleetSnapshot, String> {
 
 // ─── Secrets ───────────────────────────────────────────────────────────────
 
-/// Fetch a secret by key. Priority: Postgres `fleet_secrets` table, then the
-/// corresponding environment variable (e.g. `HF_TOKEN` for `huggingface.token`).
-/// Returns `None` if neither source has a value.
-pub async fn fetch_secret(key: &str) -> Option<String> {
+/// Fetch a secret by key from the canonical Postgres `fleet_secrets` table.
+///
+/// This deliberately does not consult environment variables. Callers with a
+/// security-sensitive, explicitly ordered source policy can use this helper
+/// without inheriting [`fetch_secret`]'s compatibility fallback.
+pub async fn fetch_secret_from_postgres(key: &str) -> Option<String> {
     if let Ok(pool) = get_fleet_pool().await
         && let Ok(Some(value)) = pg_get_secret(&pool, key).await
     {
@@ -188,6 +190,16 @@ pub async fn fetch_secret(key: &str) -> Option<String> {
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());
         }
+    }
+    None
+}
+
+/// Fetch a secret by key. Priority: Postgres `fleet_secrets` table, then the
+/// corresponding environment variable (e.g. `HF_TOKEN` for `huggingface.token`).
+/// Returns `None` if neither source has a value.
+pub async fn fetch_secret(key: &str) -> Option<String> {
+    if let Some(secret) = fetch_secret_from_postgres(key).await {
+        return Some(secret);
     }
     // Fallback: environment variable.
     let env_key = env_key_for_secret(key);
