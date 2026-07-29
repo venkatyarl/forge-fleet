@@ -99,11 +99,92 @@ fn relativize(file: &str) -> &str {
     file.rsplit('/').next().unwrap_or(file)
 }
 
-fn expected_corpus(repo_path: &Path) -> Option<&str> {
-    repo_path
-        .file_name()?
-        .to_str()
-        .filter(|name| !name.is_empty())
+/// Match `ff cortex index`'s default corpus-slug derivation.
+fn slug_from_path(path: &Path) -> String {
+    let base = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("corpus")
+        .to_lowercase();
+    let mut slug = String::with_capacity(base.len());
+    let mut previous_was_dash = false;
+    for ch in base.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            previous_was_dash = false;
+        } else if !previous_was_dash && !slug.is_empty() {
+            slug.push('-');
+            previous_was_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "corpus".to_string()
+    } else {
+        slug
+    }
+}
+
+fn normalized_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .trim_end_matches(['/', '\\'])
+        .to_string()
+}
+
+/// Resolve the corpus from the authoritative source registry. An exact source
+/// registration wins (including custom `--slug` mappings). For a fresh clone
+/// that has not been registered yet, reuse a single unambiguous corpus already
+/// associated with the same sanitized checkout basename. Only fall back to the
+/// default inferred slug when that corpus exists. Multiple custom corpora for
+/// the same basename fail closed instead of leaking cross-project symbols.
+fn choose_expected_corpus(
+    repo_path: &Path,
+    sources: &[(String, String)],
+    known_corpora: &BTreeSet<String>,
+) -> Option<String> {
+    let exact_path = normalized_path(repo_path);
+    let exact: BTreeSet<&str> = sources
+        .iter()
+        .filter(|(_, root)| normalized_path(Path::new(root)) == exact_path)
+        .map(|(slug, _)| slug.as_str())
+        .collect();
+    if exact.len() == 1 {
+        return exact.into_iter().next().map(str::to_string);
+    }
+    if !exact.is_empty() {
+        return None;
+    }
+
+    let inferred = slug_from_path(repo_path);
+    let basename_matches: BTreeSet<&str> = sources
+        .iter()
+        .filter(|(_, root)| slug_from_path(Path::new(root)) == inferred)
+        .map(|(slug, _)| slug.as_str())
+        .collect();
+    match basename_matches.len() {
+        1 => basename_matches.into_iter().next().map(str::to_string),
+        0 if known_corpora.contains(&inferred) => Some(inferred),
+        _ => None,
+    }
+}
+
+async fn expected_corpus(pool: &PgPool, repo_path: &Path) -> Option<String> {
+    let canonical = std::fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    let sources: Vec<(String, String)> = sqlx::query_as(
+        "SELECT c.slug, s.root_path \
+           FROM brain_sources s \
+           JOIN brain_corpora c ON c.id = s.corpus_id",
+    )
+    .fetch_all(pool)
+    .await
+    .ok()?;
+    let known_corpora: BTreeSet<String> = sqlx::query_scalar("SELECT slug FROM brain_corpora")
+        .fetch_all(pool)
+        .await
+        .ok()?
+        .into_iter()
+        .collect();
+    choose_expected_corpus(&canonical, &sources, &known_corpora)
 }
 
 fn cortex_hit_belongs_to_corpus(hit: &serde_json::Value, expected_corpus: &str) -> bool {
@@ -142,15 +223,13 @@ pub fn build_cortex_context_pack(
     title: &str,
     description: &str,
     repo_path: &Path,
+    expected_corpus: &str,
     max_symbols: usize,
 ) -> String {
     let idents = extract_task_identifiers(title, description);
     if idents.is_empty() {
         return String::new();
     }
-    let Some(expected_corpus) = expected_corpus(repo_path) else {
-        return String::new();
-    };
 
     // Unique hits: (qualified_name, kind, relfile, line, fan_in).
     let mut ranked: Vec<(String, String, String, i64, i64)> = Vec::new();
@@ -213,10 +292,17 @@ pub async fn cortex_context_pack_async(
     title: String,
     description: String,
     repo_path: std::path::PathBuf,
+    expected_corpus: String,
     max_symbols: usize,
 ) -> String {
     let fut = tokio::task::spawn_blocking(move || {
-        build_cortex_context_pack(&title, &description, &repo_path, max_symbols)
+        build_cortex_context_pack(
+            &title,
+            &description,
+            &repo_path,
+            &expected_corpus,
+            max_symbols,
+        )
     });
     match tokio::time::timeout(Duration::from_secs(20), fut).await {
         Ok(Ok(pack)) => pack,
@@ -401,7 +487,19 @@ pub async fn context_pack_for_dispatch(
     let symbol_pack = if !store_pack.is_empty() {
         store_pack
     } else {
-        cortex_context_pack_async(title.clone(), description.clone(), repo_path, max_symbols).await
+        match expected_corpus(pool, &repo_path).await {
+            Some(corpus) => {
+                cortex_context_pack_async(
+                    title.clone(),
+                    description.clone(),
+                    repo_path,
+                    corpus,
+                    max_symbols,
+                )
+                .await
+            }
+            None => String::new(),
+        }
     };
 
     let decisions_pack = build_brain_decisions_pack(pool, &title, &description).await;
@@ -412,10 +510,11 @@ pub async fn context_pack_for_dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_brain_decisions_pack, build_context_pack_from_store, cortex_hit_belongs_to_corpus,
-        expected_corpus, extract_task_identifiers, relativize,
+        build_brain_decisions_pack, build_context_pack_from_store, choose_expected_corpus,
+        cortex_hit_belongs_to_corpus, extract_task_identifiers, relativize, slug_from_path,
     };
     use serde_json::json;
+    use std::collections::BTreeSet;
     use std::path::Path;
 
     #[test]
@@ -454,14 +553,71 @@ mod tests {
     }
 
     #[test]
-    fn expected_corpus_comes_from_resolved_repo_path() {
+    fn corpus_slug_matches_cortex_sanitization() {
         assert_eq!(
-            expected_corpus(Path::new("/srv/checkouts/forge-fleet")),
-            Some("forge-fleet")
+            slug_from_path(Path::new("/srv/checkouts/Forge Fleet.git")),
+            "forge-fleet-git"
         );
         assert_eq!(
-            expected_corpus(Path::new("/srv/checkouts/hireflow360-api/")),
-            Some("hireflow360-api")
+            slug_from_path(Path::new("/srv/checkouts/__HireFlow360 API__")),
+            "hireflow360-api"
+        );
+    }
+
+    #[test]
+    fn exact_registered_source_preserves_custom_corpus_slug() {
+        let sources = vec![
+            (
+                "custom-cortex".to_string(),
+                "/srv/worktrees/Repo Name".to_string(),
+            ),
+            (
+                "repo-name".to_string(),
+                "/leader/projects/Repo Name".to_string(),
+            ),
+        ];
+        let known = BTreeSet::from(["custom-cortex".to_string(), "repo-name".to_string()]);
+        assert_eq!(
+            choose_expected_corpus(Path::new("/srv/worktrees/Repo Name/"), &sources, &known),
+            Some("custom-cortex".to_string())
+        );
+    }
+
+    #[test]
+    fn unregistered_same_basename_with_multiple_corpora_fails_closed() {
+        let sources = vec![
+            ("alpha".to_string(), "/leader/a/shared-repo".to_string()),
+            ("beta".to_string(), "/leader/b/shared-repo".to_string()),
+        ];
+        let known = BTreeSet::from(["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            choose_expected_corpus(Path::new("/worker/new/shared-repo"), &sources, &known),
+            None
+        );
+    }
+
+    #[test]
+    fn unregistered_clone_uses_one_known_source_or_existing_default_slug() {
+        let known_source = vec![(
+            "forge-fleet".to_string(),
+            "/leader/projects/Forge Fleet".to_string(),
+        )];
+        let known = BTreeSet::from(["forge-fleet".to_string()]);
+        assert_eq!(
+            choose_expected_corpus(
+                Path::new("/worker/sub-agent/forge fleet"),
+                &known_source,
+                &known
+            ),
+            Some("forge-fleet".to_string())
+        );
+        assert_eq!(
+            choose_expected_corpus(Path::new("/worker/sub-agent/Forge Fleet"), &[], &known),
+            Some("forge-fleet".to_string())
+        );
+        assert_eq!(
+            choose_expected_corpus(Path::new("/worker/sub-agent/not-indexed"), &[], &known),
+            None
         );
     }
 
