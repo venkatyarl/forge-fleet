@@ -99,9 +99,122 @@ fn relativize(file: &str) -> &str {
     file.rsplit('/').next().unwrap_or(file)
 }
 
+/// Match `ff cortex index`'s default corpus-slug derivation.
+fn slug_from_path(path: &Path) -> String {
+    let base = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("corpus")
+        .to_lowercase();
+    let mut slug = String::with_capacity(base.len());
+    let mut previous_was_dash = false;
+    for ch in base.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            previous_was_dash = false;
+        } else if !previous_was_dash && !slug.is_empty() {
+            slug.push('-');
+            previous_was_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "corpus".to_string()
+    } else {
+        slug
+    }
+}
+
+fn normalized_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .trim_end_matches(['/', '\\'])
+        .to_string()
+}
+
+/// Resolve the corpus from the authoritative source registry. An exact source
+/// registration wins (including custom `--slug` mappings). For a fresh clone
+/// that has not been registered yet, reuse a single unambiguous corpus already
+/// associated with the same sanitized checkout basename. Only fall back to the
+/// default inferred slug when that corpus exists. Multiple custom corpora for
+/// the same basename fail closed instead of leaking cross-project symbols.
+fn choose_expected_corpus(
+    repo_path: &Path,
+    sources: &[(String, String)],
+    known_corpora: &BTreeSet<String>,
+) -> Option<String> {
+    let exact_path = normalized_path(repo_path);
+    let exact: BTreeSet<&str> = sources
+        .iter()
+        .filter(|(_, root)| normalized_path(Path::new(root)) == exact_path)
+        .map(|(slug, _)| slug.as_str())
+        .collect();
+    if exact.len() == 1 {
+        return exact.into_iter().next().map(str::to_string);
+    }
+    if !exact.is_empty() {
+        return None;
+    }
+
+    let inferred = slug_from_path(repo_path);
+    let basename_matches: BTreeSet<&str> = sources
+        .iter()
+        .filter(|(_, root)| slug_from_path(Path::new(root)) == inferred)
+        .map(|(slug, _)| slug.as_str())
+        .collect();
+    match basename_matches.len() {
+        1 => basename_matches.into_iter().next().map(str::to_string),
+        0 if known_corpora.contains(&inferred) => Some(inferred),
+        _ => None,
+    }
+}
+
+async fn expected_corpus(pool: &PgPool, repo_path: &Path) -> Option<String> {
+    let canonical = std::fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    let sources: Vec<(String, String)> = sqlx::query_as(
+        "SELECT c.slug, s.root_path \
+           FROM brain_sources s \
+           JOIN brain_corpora c ON c.id = s.corpus_id",
+    )
+    .fetch_all(pool)
+    .await
+    .ok()?;
+    let known_corpora: BTreeSet<String> = sqlx::query_scalar("SELECT slug FROM brain_corpora")
+        .fetch_all(pool)
+        .await
+        .ok()?
+        .into_iter()
+        .collect();
+    choose_expected_corpus(&canonical, &sources, &known_corpora)
+}
+
+fn cortex_hit_belongs_to_corpus(hit: &serde_json::Value, expected_corpus: &str) -> bool {
+    if hit.get("corpus").and_then(|v| v.as_str()) != Some(expected_corpus) {
+        return false;
+    }
+
+    let is_extern = hit
+        .get("node_type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|kind| kind.trim_start_matches("code:") == "extern");
+    if !is_extern {
+        return true;
+    }
+
+    let has_file = hit
+        .get("file")
+        .and_then(|v| v.as_str())
+        .is_some_and(|file| !file.is_empty() && file != "?");
+    let has_line = hit
+        .get("start_line")
+        .and_then(|v| v.as_i64())
+        .is_some_and(|line| line > 0);
+    has_file && has_line
+}
+
 /// Build the context pack: `--all` substring-find each task identifier across
 /// EVERY indexed corpus (cwd-independent — a fresh worktree has no corpus of its
-/// own), rank unique hits by fan-in, and emit them as SYMBOL POINTERS
+/// own), retain only hits from the resolved repository's corpus, rank unique hits
+/// by fan-in, and emit them as SYMBOL POINTERS
 /// (`qualified_name — kind at file:line`). Pointers alone kill the grep-storm:
 /// the agent opens the exact symbol directly instead of hunting for it. Returns
 /// empty when Cortex has nothing (or is unavailable) — caller prepends it, so
@@ -110,6 +223,7 @@ pub fn build_cortex_context_pack(
     title: &str,
     description: &str,
     repo_path: &Path,
+    expected_corpus: &str,
     max_symbols: usize,
 ) -> String {
     let idents = extract_task_identifiers(title, description);
@@ -126,7 +240,11 @@ pub fn build_cortex_context_pack(
         else {
             continue;
         };
-        for h in hits.iter().take(3) {
+        for h in hits
+            .iter()
+            .filter(|hit| cortex_hit_belongs_to_corpus(hit, expected_corpus))
+            .take(3)
+        {
             let Some(qn) = h.get("qualified_name").and_then(|v| v.as_str()) else {
                 continue;
             };
@@ -174,10 +292,17 @@ pub async fn cortex_context_pack_async(
     title: String,
     description: String,
     repo_path: std::path::PathBuf,
+    expected_corpus: String,
     max_symbols: usize,
 ) -> String {
     let fut = tokio::task::spawn_blocking(move || {
-        build_cortex_context_pack(&title, &description, &repo_path, max_symbols)
+        build_cortex_context_pack(
+            &title,
+            &description,
+            &repo_path,
+            &expected_corpus,
+            max_symbols,
+        )
     });
     match tokio::time::timeout(Duration::from_secs(20), fut).await {
         Ok(Ok(pack)) => pack,
@@ -362,7 +487,24 @@ pub async fn context_pack_for_dispatch(
     let symbol_pack = if !store_pack.is_empty() {
         store_pack
     } else {
-        cortex_context_pack_async(title.clone(), description.clone(), repo_path, max_symbols).await
+        let resolved_corpus =
+            tokio::time::timeout(Duration::from_secs(3), expected_corpus(pool, &repo_path))
+                .await
+                .ok()
+                .flatten();
+        match resolved_corpus {
+            Some(corpus) => {
+                cortex_context_pack_async(
+                    title.clone(),
+                    description.clone(),
+                    repo_path,
+                    corpus,
+                    max_symbols,
+                )
+                .await
+            }
+            None => String::new(),
+        }
     };
 
     let decisions_pack = build_brain_decisions_pack(pool, &title, &description).await;
@@ -373,9 +515,12 @@ pub async fn context_pack_for_dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_brain_decisions_pack, build_context_pack_from_store, extract_task_identifiers,
-        relativize,
+        build_brain_decisions_pack, build_context_pack_from_store, choose_expected_corpus,
+        cortex_hit_belongs_to_corpus, extract_task_identifiers, relativize, slug_from_path,
     };
+    use serde_json::json;
+    use std::collections::BTreeSet;
+    use std::path::Path;
 
     #[test]
     fn extracts_camel_and_snake_idents_skips_plain_words() {
@@ -410,6 +555,126 @@ mod tests {
         assert_eq!(relativize("/home/x/repo/src/bar.rs"), "src/bar.rs");
         // 3. neither found -> returns basename
         assert_eq!(relativize("/var/log/system/thing.log"), "thing.log");
+    }
+
+    #[test]
+    fn corpus_slug_matches_cortex_sanitization() {
+        assert_eq!(
+            slug_from_path(Path::new("/srv/checkouts/Forge Fleet.git")),
+            "forge-fleet-git"
+        );
+        assert_eq!(
+            slug_from_path(Path::new("/srv/checkouts/__HireFlow360 API__")),
+            "hireflow360-api"
+        );
+    }
+
+    #[test]
+    fn exact_registered_source_preserves_custom_corpus_slug() {
+        let sources = vec![
+            (
+                "custom-cortex".to_string(),
+                "/srv/worktrees/Repo Name".to_string(),
+            ),
+            (
+                "repo-name".to_string(),
+                "/leader/projects/Repo Name".to_string(),
+            ),
+        ];
+        let known = BTreeSet::from(["custom-cortex".to_string(), "repo-name".to_string()]);
+        assert_eq!(
+            choose_expected_corpus(Path::new("/srv/worktrees/Repo Name/"), &sources, &known),
+            Some("custom-cortex".to_string())
+        );
+    }
+
+    #[test]
+    fn unregistered_same_basename_with_multiple_corpora_fails_closed() {
+        let sources = vec![
+            ("alpha".to_string(), "/leader/a/shared-repo".to_string()),
+            ("beta".to_string(), "/leader/b/shared-repo".to_string()),
+        ];
+        let known = BTreeSet::from(["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            choose_expected_corpus(Path::new("/worker/new/shared-repo"), &sources, &known),
+            None
+        );
+    }
+
+    #[test]
+    fn unregistered_clone_uses_one_known_source_or_existing_default_slug() {
+        let known_source = vec![(
+            "forge-fleet".to_string(),
+            "/leader/projects/Forge Fleet".to_string(),
+        )];
+        let known = BTreeSet::from(["forge-fleet".to_string()]);
+        assert_eq!(
+            choose_expected_corpus(
+                Path::new("/worker/sub-agent/forge fleet"),
+                &known_source,
+                &known
+            ),
+            Some("forge-fleet".to_string())
+        );
+        assert_eq!(
+            choose_expected_corpus(Path::new("/worker/sub-agent/Forge Fleet"), &[], &known),
+            Some("forge-fleet".to_string())
+        );
+        assert_eq!(
+            choose_expected_corpus(Path::new("/worker/sub-agent/not-indexed"), &[], &known),
+            None
+        );
+    }
+
+    #[test]
+    fn cortex_hits_are_scoped_to_expected_repo_corpus() {
+        let forge_fleet = json!({
+            "corpus": "forge-fleet",
+            "node_type": "code:function",
+            "file": "/leader/forge-fleet/crates/ff-agent/src/dispatch_context.rs",
+            "start_line": 97
+        });
+        let hireflow = json!({
+            "corpus": "hireflow360-api",
+            "node_type": "code:function",
+            "file": "/leader/hireflow360-api/src/dispatch_context.rs",
+            "start_line": 97
+        });
+
+        assert!(cortex_hit_belongs_to_corpus(&forge_fleet, "forge-fleet"));
+        assert!(!cortex_hit_belongs_to_corpus(&hireflow, "forge-fleet"));
+        assert!(cortex_hit_belongs_to_corpus(&hireflow, "hireflow360-api"));
+    }
+
+    #[test]
+    fn unresolved_extern_hits_are_dropped_even_in_expected_corpus() {
+        for hit in [
+            json!({
+                "corpus": "forge-fleet",
+                "node_type": "code:extern",
+                "file": null,
+                "start_line": null
+            }),
+            json!({
+                "corpus": "forge-fleet",
+                "node_type": "code:extern",
+                "file": "?",
+                "start_line": 0
+            }),
+        ] {
+            assert!(!cortex_hit_belongs_to_corpus(&hit, "forge-fleet"));
+        }
+
+        let resolved_in_repo = json!({
+            "corpus": "forge-fleet",
+            "node_type": "code:extern",
+            "file": "crates/ff-agent/src/lib.rs",
+            "start_line": 12
+        });
+        assert!(cortex_hit_belongs_to_corpus(
+            &resolved_in_repo,
+            "forge-fleet"
+        ));
     }
 
     #[test]
