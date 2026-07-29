@@ -3185,6 +3185,23 @@ pub enum PmCommand {
     },
     /// Show details of a work item (by UUID).
     Show { id: String },
+    /// Close one work item with durable human-supplied evidence.
+    Close {
+        /// Exact work item UUID.
+        id: String,
+        /// Evidence supporting the closure.
+        #[arg(long)]
+        evidence: String,
+        /// Commit that delivered the work, when applicable.
+        #[arg(long)]
+        commit: Option<String>,
+        /// Record that the work was verified.
+        #[arg(long, default_value_t = false)]
+        verified: bool,
+        /// Record deployment verification (requires --verified).
+        #[arg(long, default_value_t = false)]
+        deploy_verified: bool,
+    },
     /// Decompose a goal into leaf `task` work_items via a fleet LLM, then (with
     /// --ready) flag them for the scheduler — the planner→PM bridge. Give it a
     /// goal string OR an existing work_item UUID (its title+description are the
@@ -8086,6 +8103,72 @@ mod jira_cli_tests {
                 ] {
                     Cli::try_parse_from(args).expect("supported Jira command should parse");
                 }
+            })
+            .expect("spawn parser test")
+            .join()
+            .expect("parser test panicked");
+    }
+}
+
+#[cfg(test)]
+mod pm_close_cli_tests {
+    use super::{Cli, Command, PmCommand};
+    use clap::Parser;
+
+    #[test]
+    fn pm_close_accepts_only_the_single_uuid_evidence_shape() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "ff",
+                    "pm",
+                    "close",
+                    "00000000-0000-0000-0000-000000000001",
+                    "--evidence",
+                    "targeted tests pass",
+                    "--commit",
+                    "abc123",
+                    "--verified",
+                    "--deploy-verified",
+                ])
+                .expect("documented close shape should parse");
+                assert!(matches!(
+                    cli.command,
+                    Some(Command::Pm {
+                        command: PmCommand::Close {
+                            verified: true,
+                            deploy_verified: true,
+                            ..
+                        }
+                    })
+                ));
+                assert!(
+                    Cli::try_parse_from([
+                        "ff",
+                        "pm",
+                        "close",
+                        "00000000-0000-0000-0000-000000000001"
+                    ])
+                    .is_err(),
+                    "--evidence is required"
+                );
+                for forbidden in ["--all", "--stdin", "--selector"] {
+                    assert!(
+                        Cli::try_parse_from([
+                            "ff",
+                            "pm",
+                            "close",
+                            "00000000-0000-0000-0000-000000000001",
+                            "--evidence",
+                            "proof",
+                            forbidden
+                        ])
+                        .is_err(),
+                        "{forbidden} must remain unsupported"
+                    );
+                }
+                assert!(Cli::try_parse_from(["ff", "pm", "done"]).is_err());
             })
             .expect("spawn parser test")
             .join()
