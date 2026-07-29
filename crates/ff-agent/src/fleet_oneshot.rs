@@ -145,7 +145,10 @@ pub async fn fleet_oneshot_for(
     timeout: Option<Duration>,
     workload: Option<&str>,
 ) -> Result<FleetOneshot> {
-    fleet_oneshot_for_ctx(pool, prompt, model_hint, timeout, workload, None).await
+    fleet_oneshot_for_ctx(
+        pool, prompt, model_hint, timeout, workload, None, None, 4096,
+    )
+    .await
 }
 
 /// Like [`fleet_oneshot_for`] but requires each candidate's per-slot usable
@@ -154,6 +157,12 @@ pub async fn fleet_oneshot_for(
 /// (glm-4.5-air) never receives a prompt its slot can't hold — the overflow
 /// truncates the reply into unusable prose. Falls back to unfloored routing
 /// when nothing satisfies the floor (a truncated answer beats no build).
+///
+/// `system` carries the output contract as a SYSTEM message (reasoning coders
+/// obey it far better than mid-user-message instructions — the difference
+/// between clean diffs and prose preamble, lab-proven). `max_tokens` lets
+/// callers with multi-block outputs exceed the 4096 default.
+#[allow(clippy::too_many_arguments)]
 pub async fn fleet_oneshot_for_ctx(
     pool: &PgPool,
     prompt: &str,
@@ -161,6 +170,8 @@ pub async fn fleet_oneshot_for_ctx(
     timeout: Option<Duration>,
     workload: Option<&str>,
     min_ctx: Option<i32>,
+    system: Option<&str>,
+    max_tokens: u32,
 ) -> Result<FleetOneshot> {
     let ordered = resolve_route_candidates(pool, model_hint, workload, min_ctx).await?;
 
@@ -179,7 +190,7 @@ pub async fn fleet_oneshot_for_ctx(
             continue;
         };
         attempted = true;
-        match dispatch_to_candidate(cand, &client, prompt, model_hint).await {
+        match dispatch_to_candidate(cand, &client, prompt, model_hint, system, max_tokens).await {
             Ok(ok) => return Ok(ok),
             Err(e) => {
                 tracing::warn!(
@@ -200,7 +211,8 @@ pub async fn fleet_oneshot_for_ctx(
         );
         for cand in &ordered {
             let _guard = InFlightGuard::acquire(&cand.endpoint);
-            match dispatch_to_candidate(cand, &client, prompt, model_hint).await {
+            match dispatch_to_candidate(cand, &client, prompt, model_hint, system, max_tokens).await
+            {
                 Ok(ok) => return Ok(ok),
                 Err(e) => {
                     tracing::warn!(
@@ -326,6 +338,8 @@ async fn dispatch_to_candidate(
     client: &reqwest::Client,
     prompt: &str,
     model_hint: Option<&str>,
+    system: Option<&str>,
+    max_tokens: u32,
 ) -> anyhow::Result<FleetOneshot> {
     let worker_name = cand.worker_name.clone();
     let endpoint = cand.endpoint.clone();
@@ -336,9 +350,21 @@ async fn dispatch_to_candidate(
         .or_else(|| model_hint.map(|s| s.to_string()))
         .unwrap_or_else(|| "local".to_string());
     let url = ff_core::url::normalize_chat_completions_url(&endpoint);
+    // Reasoning coders (glm-4.5-air) start "thinking out loud" in `content`
+    // when the format contract lives mid-user-message — and the prose eats
+    // the completion budget before any edit block is emitted (canary-3,
+    // 2026-07-29). A strict SYSTEM message carries the contract instead
+    // (lab-proven on thalia: first-try clean diffs).
+    let messages = match system {
+        Some(sys) => json!([
+            {"role": "system", "content": sys},
+            {"role": "user", "content": prompt},
+        ]),
+        None => json!([{"role": "user", "content": prompt}]),
+    };
     let body = json!({
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "stream": false,
         // EXPLICIT generous token budget (2026-07-27). Without max_tokens the
         // server default cap truncated the response — fatal for a REASONING model
@@ -348,7 +374,7 @@ async fn dispatch_to_candidate(
         // no edit block → 0 completions (proven root cause). 4096 leaves ample
         // room for the think + a multi-block SEARCH/REPLACE answer within the 32K
         // ctx. temperature low for deterministic, format-faithful edits.
-        "max_tokens": 4096,
+        "max_tokens": max_tokens,
         "temperature": 0.2,
     });
     let start = std::time::Instant::now();
