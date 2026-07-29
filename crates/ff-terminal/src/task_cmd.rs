@@ -3,6 +3,13 @@ use anyhow::Result;
 use std::path::Path;
 
 pub async fn handle_task(cmd: crate::TaskCommand, _config_path: &Path) -> Result<()> {
+    // Scope authentication initialization to the task command: unrelated CLI
+    // commands must not depend on enrollment-secret availability. All task
+    // sends below are cache-only after this startup step.
+    ff_agent::http_auth::control_plane_secret()
+        .await
+        .map_err(|error| anyhow::anyhow!("cannot initialize agent HTTP authentication: {error}"))?;
+
     static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
         std::sync::LazyLock::new(reqwest::Client::new);
     let client = &*SHARED_HTTP;

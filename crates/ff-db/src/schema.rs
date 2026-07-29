@@ -12464,8 +12464,121 @@ pub const SCHEMA_V281_WORK_ITEM_ACCEPTANCE_CRITERIA: &str =
 pub const SCHEMA_V282_OPLOG_REPLAY: &str =
     include_str!("migrations/20260728110000_oplog_replay.sql");
 
-/// v283: short-lived, token-fenced reservations for model launch resources.
-pub const SCHEMA_V283_MODEL_LOAD_RESERVATIONS: &str =
+/// v283: immutable project-digest payloads and delivery attempts.
+///
+/// A row is the durable boundary between selecting a frozen event window and
+/// contacting an external notification service.  `sending` is deliberately
+/// fail-closed: after a process crash or ambiguous HTTP outcome the same
+/// payload/key remains inspectable, but is not automatically sent again.
+pub const SCHEMA_V283_PROJECT_DIGEST_ATTEMPTS: &str = r#"
+CREATE TABLE IF NOT EXISTS project_digest_configs (
+    id                TEXT PRIMARY KEY,
+    project_id        TEXT NOT NULL,
+    kind              TEXT NOT NULL DEFAULT 'standing',
+    title             TEXT NOT NULL,
+    enabled           BOOLEAN NOT NULL DEFAULT true,
+    interval_secs     INTEGER NOT NULL DEFAULT 900,
+    logo_png          BYTEA,
+    logo_path         TEXT,
+    task_work_item_id TEXT,
+    expires_at        TIMESTAMPTZ,
+    last_sent_at      TIMESTAMPTZ,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS project_digest_attempts (
+    config_id       TEXT NOT NULL REFERENCES project_digest_configs(id) ON DELETE CASCADE,
+    prior_cursor    TIMESTAMPTZ,
+    cursor_at       TIMESTAMPTZ NOT NULL,
+    window_end      TIMESTAMPTZ NOT NULL,
+    title           TEXT NOT NULL,
+    body            TEXT NOT NULL,
+    logo_png        BYTEA,
+    delivery_key    TEXT NOT NULL UNIQUE,
+    delivery_status TEXT NOT NULL DEFAULT 'prepared'
+                    CHECK (delivery_status IN
+                           ('prepared', 'sending', 'retryable', 'delivered', 'ambiguous')),
+    attempt         BIGINT NOT NULL DEFAULT 0,
+    fence           UUID,
+    delivered_at    TIMESTAMPTZ,
+    external_id     TEXT,
+    acknowledgement JSONB,
+    ack_chat_id     TEXT,
+    ack_message_id  BIGINT,
+    last_error      TEXT,
+    error_at        TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (config_id, cursor_at, window_end),
+    CHECK (cursor_at < window_end),
+    CONSTRAINT project_digest_attempts_delivered_ack_check
+        CHECK (delivery_status <> 'delivered' OR
+               (acknowledgement IS NOT NULL
+                AND jsonb_typeof(acknowledgement) = 'array'
+                AND jsonb_array_length(acknowledgement) > 0
+                AND ack_chat_id IS NOT NULL
+                AND ack_message_id IS NOT NULL))
+);
+
+ALTER TABLE project_digest_attempts
+    ADD COLUMN IF NOT EXISTS attempt BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS fence UUID,
+    ADD COLUMN IF NOT EXISTS acknowledgement JSONB,
+    ADD COLUMN IF NOT EXISTS ack_chat_id TEXT,
+    ADD COLUMN IF NOT EXISTS ack_message_id BIGINT,
+    ADD COLUMN IF NOT EXISTS last_error TEXT,
+    ADD COLUMN IF NOT EXISTS error_at TIMESTAMPTZ;
+
+ALTER TABLE project_digest_attempts
+    DROP CONSTRAINT IF EXISTS project_digest_attempts_delivery_status_check;
+ALTER TABLE project_digest_attempts
+    ADD CONSTRAINT project_digest_attempts_delivery_status_check
+    CHECK (delivery_status IN
+           ('prepared', 'sending', 'retryable', 'delivered', 'ambiguous'));
+ALTER TABLE project_digest_attempts
+    DROP CONSTRAINT IF EXISTS project_digest_attempts_delivered_ack_check;
+ALTER TABLE project_digest_attempts
+    ADD CONSTRAINT project_digest_attempts_delivered_ack_check
+    CHECK (delivery_status <> 'delivered' OR
+           (acknowledgement IS NOT NULL
+            AND jsonb_typeof(acknowledgement) = 'array'
+            AND jsonb_array_length(acknowledgement) > 0
+            AND ack_chat_id IS NOT NULL
+            AND ack_message_id IS NOT NULL))
+    NOT VALID;
+
+CREATE INDEX IF NOT EXISTS idx_project_digest_attempts_status
+    ON project_digest_attempts (delivery_status, created_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_digest_attempts_one_unfinished
+    ON project_digest_attempts (config_id)
+    WHERE delivery_status <> 'delivered';
+
+-- Compatibility fence for an old digest writer racing an upgraded one. A
+-- legacy `last_sent_at=now()` may advance beyond a frozen window, but no writer
+-- may erase or move a durable cursor backwards.
+CREATE OR REPLACE FUNCTION guard_project_digest_cursor_regression()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.last_sent_at IS NOT NULL
+       AND (NEW.last_sent_at IS NULL OR NEW.last_sent_at < OLD.last_sent_at) THEN
+        RAISE EXCEPTION 'project digest cursor regression for %: % -> %',
+            OLD.id, OLD.last_sent_at, NEW.last_sent_at;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_project_digest_cursor_no_regression
+    ON project_digest_configs;
+CREATE TRIGGER trg_project_digest_cursor_no_regression
+BEFORE UPDATE OF last_sent_at ON project_digest_configs
+FOR EACH ROW EXECUTE FUNCTION guard_project_digest_cursor_regression();
+"#;
+
+/// v284: short-lived, token-fenced reservations for model launch resources.
+pub const SCHEMA_V284_MODEL_LOAD_RESERVATIONS: &str =
     include_str!("migrations/20260729160000_model_load_reservations.sql");
 
 /// Squashed Postgres bootstrap through migration v161.

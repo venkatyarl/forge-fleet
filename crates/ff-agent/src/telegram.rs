@@ -9,6 +9,7 @@
 //! reason on any failure (missing secret, HTTP error, timeout) so callers
 //! can log without crashing.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -18,6 +19,39 @@ use crate::notifications::SHARED_HTTP;
 
 const TELEGRAM_BOT_TOKEN_KEY: &str = "telegram_bot_token";
 const TELEGRAM_CHAT_ID_KEY: &str = "telegram_chat_id";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TelegramMessageIdentity {
+    pub chat_id: String,
+    pub message_id: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TelegramDigestOutcome {
+    Acknowledged {
+        messages: Vec<TelegramMessageIdentity>,
+    },
+    DefinitelyNotDelivered {
+        error: String,
+    },
+    Ambiguous {
+        error: String,
+    },
+}
+
+/// Whether a send can actually be attempted. Callers that own durable cursors
+/// must not interpret the legacy sender's no-op-on-missing-config behavior as
+/// confirmed delivery.
+pub async fn telegram_is_configured(pool: &PgPool) -> Result<bool> {
+    Ok(ff_db::pg_get_secret(pool, TELEGRAM_BOT_TOKEN_KEY)
+        .await
+        .context("lookup telegram bot token")?
+        .is_some()
+        && ff_db::pg_get_secret(pool, TELEGRAM_CHAT_ID_KEY)
+            .await
+            .context("lookup telegram chat id")?
+            .is_some())
+}
 
 fn telegram_payload(chat_id: &str, title: &str, body: &str) -> serde_json::Value {
     let text = if body.is_empty() {
@@ -224,6 +258,235 @@ pub async fn send_telegram_digest(
     Ok(())
 }
 
+/// Classified delivery boundary for durable callers. A successful result
+/// includes every Telegram identity. Transport errors and response parse loss
+/// are ambiguous because Telegram may already have accepted the message.
+pub async fn send_telegram_digest_classified(
+    pool: &PgPool,
+    title: &str,
+    body: &str,
+    photo: Option<&[u8]>,
+) -> TelegramDigestOutcome {
+    let token = match ff_db::pg_get_secret(pool, TELEGRAM_BOT_TOKEN_KEY).await {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return TelegramDigestOutcome::DefinitelyNotDelivered {
+                error: "telegram bot token is not configured".into(),
+            };
+        }
+        Err(err) => {
+            return TelegramDigestOutcome::DefinitelyNotDelivered {
+                error: format!("lookup telegram bot token: {err}"),
+            };
+        }
+    };
+    let chat_id = match ff_db::pg_get_secret(pool, TELEGRAM_CHAT_ID_KEY).await {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return TelegramDigestOutcome::DefinitelyNotDelivered {
+                error: "telegram chat id is not configured".into(),
+            };
+        }
+        Err(err) => {
+            return TelegramDigestOutcome::DefinitelyNotDelivered {
+                error: format!("lookup telegram chat id: {err}"),
+            };
+        }
+    };
+
+    let mut messages = Vec::new();
+    let mut requests: VecDeque<TelegramDigestRequest> = VecDeque::new();
+    if let Some(bytes) = photo.filter(|bytes| !bytes.is_empty()) {
+        let combined_len = title.chars().count() + 2 + body.chars().count();
+        if combined_len <= 1024 {
+            requests.push_back(TelegramDigestRequest::Photo {
+                caption: if body.is_empty() {
+                    title.to_string()
+                } else {
+                    format!("{title}\n\n{body}")
+                },
+                bytes: bytes.to_vec(),
+                fallback_text: if body.is_empty() {
+                    title.to_string()
+                } else {
+                    format!("{title}\n{body}")
+                },
+            });
+        } else {
+            requests.push_back(TelegramDigestRequest::Photo {
+                caption: title.to_string(),
+                bytes: bytes.to_vec(),
+                fallback_text: title.to_string(),
+            });
+            requests.extend(
+                chunk_text(body, 3800)
+                    .into_iter()
+                    .filter(|chunk| !chunk.trim().is_empty())
+                    .map(TelegramDigestRequest::Text),
+            );
+        }
+    } else {
+        let full = if body.is_empty() {
+            title.to_string()
+        } else {
+            format!("{title}\n{body}")
+        };
+        requests.extend(
+            chunk_text(&full, 3800)
+                .into_iter()
+                .filter(|chunk| !chunk.trim().is_empty())
+                .map(TelegramDigestRequest::Text),
+        );
+    }
+
+    while let Some(request) = requests.pop_front() {
+        let photo_fallback = match &request {
+            TelegramDigestRequest::Photo { fallback_text, .. } => Some(fallback_text.clone()),
+            TelegramDigestRequest::Text(_) => None,
+        };
+        match send_classified_request(&token, &chat_id, request).await {
+            Ok(identity) => messages.push(identity),
+            Err(ClassifiedRequestError::Definite(_)) if photo_fallback.is_some() => {
+                // Telegram explicitly rejected the photo before accepting it.
+                // Preserve the established logo behavior by safely falling
+                // back to text; the rejection makes this retry non-ambiguous.
+                requests.push_front(TelegramDigestRequest::Text(photo_fallback.unwrap()));
+            }
+            Err(ClassifiedRequestError::Definite(error)) if messages.is_empty() => {
+                return TelegramDigestOutcome::DefinitelyNotDelivered { error };
+            }
+            Err(ClassifiedRequestError::Definite(error)) => {
+                return TelegramDigestOutcome::Ambiguous {
+                    error: format!(
+                        "partial Telegram digest: {} chunk(s) acknowledged before rejection: {error}",
+                        messages.len()
+                    ),
+                };
+            }
+            Err(ClassifiedRequestError::Ambiguous(error)) => {
+                return TelegramDigestOutcome::Ambiguous {
+                    error: if messages.is_empty() {
+                        error
+                    } else {
+                        format!(
+                            "partial Telegram digest: {} chunk(s) acknowledged before ambiguous outcome: {error}",
+                            messages.len()
+                        )
+                    },
+                };
+            }
+        }
+    }
+
+    TelegramDigestOutcome::Acknowledged { messages }
+}
+
+enum TelegramDigestRequest {
+    Text(String),
+    Photo {
+        caption: String,
+        bytes: Vec<u8>,
+        fallback_text: String,
+    },
+}
+
+enum ClassifiedRequestError {
+    Definite(String),
+    Ambiguous(String),
+}
+
+fn classify_non_success(status: reqwest::StatusCode, body: &str) -> ClassifiedRequestError {
+    let error = format!("telegram HTTP {status}: {}", body.trim());
+    if status.is_client_error() {
+        // Telegram conclusively rejected a 4xx request, including rate limits.
+        ClassifiedRequestError::Definite(error)
+    } else {
+        // A proxy/server failure or unexpected redirect cannot prove whether
+        // Telegram accepted the message before the response failed.
+        ClassifiedRequestError::Ambiguous(error)
+    }
+}
+
+async fn send_classified_request(
+    token: &str,
+    chat_id: &str,
+    request: TelegramDigestRequest,
+) -> std::result::Result<TelegramMessageIdentity, ClassifiedRequestError> {
+    let (method, response) = match request {
+        TelegramDigestRequest::Text(text) => {
+            let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+            let payload = telegram_payload(chat_id, &text, "");
+            (
+                "sendMessage",
+                SHARED_HTTP
+                    .post(url)
+                    .json(&payload)
+                    .timeout(Duration::from_secs(10))
+                    .send()
+                    .await,
+            )
+        }
+        TelegramDigestRequest::Photo {
+            caption,
+            bytes,
+            fallback_text: _,
+        } => {
+            let part = reqwest::multipart::Part::bytes(bytes)
+                .file_name("logo.png")
+                .mime_str("image/png")
+                .map_err(|err| ClassifiedRequestError::Definite(err.to_string()))?;
+            let form = reqwest::multipart::Form::new()
+                .text("chat_id", chat_id.to_string())
+                .text("caption", caption)
+                .part("photo", part);
+            let url = format!("https://api.telegram.org/bot{token}/sendPhoto");
+            (
+                "sendPhoto",
+                SHARED_HTTP
+                    .post(url)
+                    .multipart(form)
+                    .timeout(Duration::from_secs(20))
+                    .send()
+                    .await,
+            )
+        }
+    };
+    let response = response.map_err(|err| {
+        ClassifiedRequestError::Ambiguous(format!("POST Telegram {method}: {err}"))
+    })?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(classify_non_success(status, &body));
+    }
+    let json: serde_json::Value = response.json().await.map_err(|err| {
+        ClassifiedRequestError::Ambiguous(format!(
+            "parse successful Telegram {method} response: {err}"
+        ))
+    })?;
+    let message_id = json
+        .pointer("/result/message_id")
+        .and_then(|value| value.as_i64())
+        .ok_or_else(|| {
+            ClassifiedRequestError::Ambiguous(format!(
+                "successful Telegram {method} response missing result.message_id"
+            ))
+        })?;
+    let returned_chat_id = json
+        .pointer("/result/chat/id")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string())
+        })
+        .unwrap_or_else(|| chat_id.to_string());
+    Ok(TelegramMessageIdentity {
+        chat_id: returned_chat_id,
+        message_id,
+    })
+}
+
 /// Shared send path: returns `None` when telegram isn't configured, else
 /// `(chat_id, message_id)` of the delivered message.
 async fn send_returning_id(
@@ -278,7 +541,7 @@ async fn send_returning_id(
 
 #[cfg(test)]
 mod tests {
-    use super::telegram_payload;
+    use super::{ClassifiedRequestError, classify_non_success, telegram_payload};
 
     #[test]
     fn telegram_payload_uses_plain_text() {
@@ -289,5 +552,25 @@ mod tests {
             "Fleet alert\nwork_items #42: ff_interactions"
         );
         assert!(payload.get("parse_mode").is_none());
+    }
+
+    #[test]
+    fn telegram_http_failures_retry_only_conclusive_client_rejections() {
+        assert!(matches!(
+            classify_non_success(reqwest::StatusCode::BAD_REQUEST, "bad request"),
+            ClassifiedRequestError::Definite(_)
+        ));
+        assert!(matches!(
+            classify_non_success(reqwest::StatusCode::TOO_MANY_REQUESTS, "retry later"),
+            ClassifiedRequestError::Definite(_)
+        ));
+        assert!(matches!(
+            classify_non_success(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "server failed"),
+            ClassifiedRequestError::Ambiguous(_)
+        ));
+        assert!(matches!(
+            classify_non_success(reqwest::StatusCode::FOUND, "unexpected redirect"),
+            ClassifiedRequestError::Ambiguous(_)
+        ));
     }
 }

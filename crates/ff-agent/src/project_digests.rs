@@ -20,13 +20,43 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 /// How long a temporary task-digest keeps sending after its task completes.
 const TEMP_DIGEST_LINGER_SECS: i64 = 15 * 60;
+
+#[async_trait]
+trait DigestSender: Send + Sync {
+    async fn send(
+        &self,
+        pg: &PgPool,
+        title: &str,
+        body: &str,
+        logo: Option<&[u8]>,
+    ) -> crate::telegram::TelegramDigestOutcome;
+}
+
+struct TelegramDigestSender;
+
+#[async_trait]
+impl DigestSender for TelegramDigestSender {
+    async fn send(
+        &self,
+        pg: &PgPool,
+        title: &str,
+        body: &str,
+        logo: Option<&[u8]>,
+    ) -> crate::telegram::TelegramDigestOutcome {
+        crate::telegram::send_telegram_digest_classified(pg, title, body, logo).await
+    }
+}
 
 /// Idempotent schema + seed. Creates `project_digest_configs` if absent and
 /// seeds a standing digest for each active project that doesn't already have
@@ -59,6 +89,13 @@ pub async fn ensure_schema(pg: &PgPool) -> Result<()> {
     // and can re-render it. `logo_png` caches the rendered/resized bytes sent
     // to Telegram.
     sqlx::query("ALTER TABLE project_digest_configs ADD COLUMN IF NOT EXISTS logo_path text")
+        .execute(pg)
+        .await?;
+
+    // Bootstrap parity with ff-db V283.  Daemons historically owned this
+    // feature's bootstrap, so an upgraded agent must be safe even when it
+    // starts before the standalone migration runner.
+    sqlx::raw_sql(ff_db::schema::SCHEMA_V283_PROJECT_DIGEST_ATTEMPTS)
         .execute(pg)
         .await?;
 
@@ -167,6 +204,10 @@ pub fn spawn_project_digests_tick(
 /// One pass: age temporary digests toward expiry, disable expired ones, then
 /// send every enabled config that is due.
 async fn run_once(pg: &PgPool) -> Result<()> {
+    run_once_with_sender(pg, &TelegramDigestSender).await
+}
+
+async fn run_once_with_sender(pg: &PgPool, sender: &dyn DigestSender) -> Result<()> {
     // Keep the per-project session-of-record ("workstream") seeded — one row per
     // active project. Leader-gated (we're inside the leader-only tick), idempotent
     // and cheap. This is the foundation for ff-owns-the-session: clients attach to
@@ -209,39 +250,226 @@ async fn run_once(pg: &PgPool) -> Result<()> {
     .execute(pg)
     .await?;
 
-    // 3) Find configs that are due (never sent, or older than their interval).
-    let due: Vec<(String, String, String, Option<Vec<u8>>)> = sqlx::query_as(
-        "SELECT id, project_id, title, logo_png \
-           FROM project_digest_configs \
-          WHERE enabled \
-            AND (last_sent_at IS NULL \
-                 OR now() - last_sent_at >= make_interval(secs => interval_secs)) \
+    // 3) Find due configs plus every unfinished attempt. The latter is
+    // independent of the mutable cursor: retryability belongs to the frozen
+    // attempt, not to project_digest_configs.last_sent_at. `sending` is itself
+    // permanently fail-closed after a crash; there is intentionally no timer
+    // that can race an active multi-message Telegram delivery.
+    let due: Vec<(
+        String,
+        String,
+        String,
+        Option<Vec<u8>>,
+        Option<DateTime<Utc>>,
+        DateTime<Utc>,
+    )> = sqlx::query_as(
+        "SELECT id, project_id, title, logo_png, last_sent_at, clock_timestamp() \
+           FROM project_digest_configs c \
+          WHERE (c.enabled AND (c.last_sent_at IS NULL \
+                 OR now() - c.last_sent_at >= make_interval(secs => c.interval_secs))) \
+             OR EXISTS (SELECT 1 FROM project_digest_attempts a \
+                         WHERE a.config_id=c.id AND a.delivery_status<>'delivered') \
           ORDER BY kind, project_id",
     )
     .fetch_all(pg)
     .await
     .unwrap_or_default();
 
-    for (id, project_id, title, logo) in due {
-        let body = match build_project_digest(pg, &project_id).await {
-            Ok(b) => b,
-            Err(err) => {
-                warn!(project = %project_id, error = %err, "project digest build failed");
-                continue;
-            }
-        };
-        if let Err(err) =
-            crate::telegram::send_telegram_digest(pg, &title, &body, logo.as_deref()).await
-        {
-            warn!(project = %project_id, error = %err, "project digest send failed");
-            continue;
-        }
-        let _ = sqlx::query(
-            "UPDATE project_digest_configs SET last_sent_at = now(), updated_at = now() WHERE id = $1",
+    for (id, project_id, title, logo, prior_cursor, window_end) in due {
+        type Attempt = (
+            Option<DateTime<Utc>>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            String,
+            String,
+            Option<Vec<u8>>,
+            String,
+            String,
+        );
+        // An unfinished attempt owns the config until it is confirmed. This is
+        // what freezes both the payload/key and window across every retry.
+        let attempt: Attempt = if let Some(existing) = sqlx::query_as(
+            "SELECT prior_cursor,cursor_at,window_end,title,body,logo_png,delivery_key,delivery_status \
+               FROM project_digest_attempts WHERE config_id=$1 AND delivery_status<>'delivered' \
+              ORDER BY created_at LIMIT 1",
         )
         .bind(&id)
-        .execute(pg)
-        .await;
+        .fetch_optional(pg)
+        .await?
+        {
+            existing
+        } else {
+            let cursor_at = prior_cursor.unwrap_or(window_end - chrono::Duration::hours(24));
+            let body =
+                match build_project_digest_window(pg, &project_id, cursor_at, window_end).await {
+                    Ok(b) => b,
+                    Err(err) => {
+                        warn!(project = %project_id, error = %err, "project digest build failed");
+                        continue;
+                    }
+                };
+            let delivery_key = digest_delivery_key(&id, cursor_at, window_end);
+            let inserted: Option<Attempt> = sqlx::query_as(
+                "INSERT INTO project_digest_attempts \
+                (config_id, prior_cursor, cursor_at, window_end, title, body, logo_png, delivery_key) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
+                 ON CONFLICT DO NOTHING \
+                 RETURNING prior_cursor,cursor_at,window_end,title,body,logo_png,delivery_key,delivery_status",
+            )
+            .bind(&id)
+            .bind(prior_cursor)
+            .bind(cursor_at)
+            .bind(window_end)
+            .bind(&title)
+            .bind(&body)
+            .bind(&logo)
+            .bind(&delivery_key)
+            .fetch_optional(pg)
+            .await?;
+            if let Some(inserted) = inserted {
+                inserted
+            } else {
+                // A concurrent leader/handoff may have frozen a different
+                // window first. Reuse that exact payload/key instead of
+                // failing the whole tick or creating a replacement attempt.
+                sqlx::query_as(
+                    "SELECT prior_cursor,cursor_at,window_end,title,body,logo_png,delivery_key,delivery_status \
+                       FROM project_digest_attempts \
+                      WHERE config_id=$1 AND delivery_status<>'delivered' \
+                      ORDER BY created_at LIMIT 1",
+                )
+                .bind(&id)
+                .fetch_one(pg)
+                .await?
+            }
+        };
+
+        if !matches!(attempt.7.as_str(), "prepared" | "retryable") {
+            continue;
+        }
+
+        let fence = Uuid::new_v4();
+        let claimed_attempt: Option<i64> = sqlx::query_scalar(
+            "UPDATE project_digest_attempts \
+                SET delivery_status='sending', attempt=attempt+1, fence=$4, \
+                    last_error=NULL, error_at=NULL, updated_at=now() \
+              WHERE config_id=$1 AND cursor_at=$2 AND window_end=$3 \
+                AND delivery_status IN ('prepared','retryable') \
+             RETURNING attempt",
+        )
+        .bind(&id)
+        .bind(attempt.1)
+        .bind(attempt.2)
+        .bind(fence)
+        .fetch_optional(pg)
+        .await?;
+        let Some(claimed_attempt) = claimed_attempt else {
+            continue;
+        };
+
+        let outcome = match sender
+            .send(pg, &attempt.3, &attempt.4, attempt.5.as_deref())
+            .await
+        {
+            crate::telegram::TelegramDigestOutcome::Acknowledged { messages }
+                if messages.is_empty() =>
+            {
+                crate::telegram::TelegramDigestOutcome::Ambiguous {
+                    error: "Telegram reported success without a message identity".into(),
+                }
+            }
+            outcome => outcome,
+        };
+        match outcome {
+            crate::telegram::TelegramDigestOutcome::Acknowledged { messages } => {
+                let acknowledgement = serde_json::to_value(
+                    &messages
+                        .iter()
+                        .map(|message| {
+                            serde_json::json!({
+                                "chat_id": message.chat_id,
+                                "message_id": message.message_id,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )?;
+                let first = messages.first();
+                let mut tx = pg.begin().await?;
+                let delivered = sqlx::query(
+                    "UPDATE project_digest_attempts \
+                        SET delivery_status='delivered', delivered_at=now(), \
+                            acknowledgement=$6, ack_chat_id=$7, ack_message_id=$8, \
+                            last_error=NULL, error_at=NULL, updated_at=now() \
+                      WHERE config_id=$1 AND cursor_at=$2 AND window_end=$3 \
+                        AND delivery_status='sending' AND attempt=$4 AND fence=$5",
+                )
+                .bind(&id)
+                .bind(attempt.1)
+                .bind(attempt.2)
+                .bind(claimed_attempt)
+                .bind(fence)
+                .bind(acknowledgement)
+                .bind(first.map(|message| message.chat_id.as_str()))
+                .bind(first.map(|message| message.message_id))
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+                if delivered == 1 {
+                    // A later legacy cursor wins, but can never leave this
+                    // acknowledged attempt unfinished or regress the cursor.
+                    sqlx::query(
+                        "UPDATE project_digest_configs \
+                            SET last_sent_at=greatest(coalesce(last_sent_at,$2),$2), updated_at=now() \
+                          WHERE id=$1",
+                    )
+                    .bind(&id)
+                    .bind(attempt.2)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                tx.commit().await?;
+            }
+            crate::telegram::TelegramDigestOutcome::DefinitelyNotDelivered { error } => {
+                let changed = sqlx::query(
+                    "UPDATE project_digest_attempts \
+                        SET delivery_status='retryable', last_error=$6, error_at=now(), updated_at=now() \
+                      WHERE config_id=$1 AND cursor_at=$2 AND window_end=$3 \
+                        AND delivery_status='sending' AND attempt=$4 AND fence=$5",
+                )
+                .bind(&id)
+                .bind(attempt.1)
+                .bind(attempt.2)
+                .bind(claimed_attempt)
+                .bind(fence)
+                .bind(&error)
+                .execute(pg)
+                .await?
+                .rows_affected();
+                if changed == 1 {
+                    warn!(project = %project_id, %error, "project digest definitely not delivered; retryable");
+                }
+            }
+            crate::telegram::TelegramDigestOutcome::Ambiguous { error } => {
+                let changed = sqlx::query(
+                    "UPDATE project_digest_attempts \
+                        SET delivery_status='ambiguous', last_error=$6, error_at=now(), updated_at=now() \
+                      WHERE config_id=$1 AND cursor_at=$2 AND window_end=$3 \
+                        AND delivery_status='sending' AND attempt=$4 AND fence=$5",
+                )
+                .bind(&id)
+                .bind(attempt.1)
+                .bind(attempt.2)
+                .bind(claimed_attempt)
+                .bind(fence)
+                .bind(&error)
+                .execute(pg)
+                .await?
+                .rows_affected();
+                if changed == 1 {
+                    warn!(project = %project_id, %error, "project digest delivery ambiguous; failing closed");
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -273,6 +501,19 @@ fn fmt_mins(m: i64) -> String {
     }
 }
 
+fn digest_delivery_key(
+    config_id: &str,
+    cursor_at: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(config_id.as_bytes());
+    hash.update([0]);
+    hash.update(cursor_at.timestamp_micros().to_be_bytes());
+    hash.update(window_end.timestamp_micros().to_be_bytes());
+    format!("project-digest:{:x}", hash.finalize())
+}
+
 /// Build one project's digest body, scoped to that project's `work_items`.
 /// Sections (blank-line separated): building now (computer · LLM · duration ·
 /// heartbeat · eta, STUCK flag), recently completed (with build time), recent
@@ -285,6 +526,35 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
         return build_system_digest(pg).await;
     }
 
+    let window_end: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(pg)
+        .await?;
+    let since: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT last_sent_at FROM project_digest_configs \
+          WHERE project_id = $1 ORDER BY last_sent_at DESC NULLS LAST LIMIT 1",
+    )
+    .bind(project_id)
+    .fetch_optional(pg)
+    .await?
+    .flatten();
+    build_project_digest_window(
+        pg,
+        project_id,
+        since.unwrap_or(window_end - chrono::Duration::hours(24)),
+        window_end,
+    )
+    .await
+}
+
+async fn build_project_digest_window(
+    pg: &PgPool,
+    project_id: &str,
+    cursor_at: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+) -> Result<String> {
+    if project_id == "ff" {
+        return build_system_digest(pg).await;
+    }
     // Building now — with the COMPUTER (assigned_computer) and the LLM (parsed
     // from the lease endpoint) building each item.
     // The LLM label is {serving-node}:{model} — the build runs in a slot on
@@ -321,44 +591,67 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
     .await
     .unwrap_or_default();
 
-    // Window = SINCE THE LAST DIGEST (operator: "only show what completed since
-    // the last update"). The config's last_sent_at still holds the PREVIOUS send
-    // time during this build (run_once updates it only after sending). First send
-    // (NULL) falls back to a 24h window.
-    let since: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-        "SELECT last_sent_at FROM project_digest_configs \
-          WHERE project_id = $1 ORDER BY last_sent_at DESC NULLS LAST LIMIT 1",
+    // Event history is authoritative per item. Legacy completed_at is eligible
+    // only for items with no terminal event history at all.
+    let completed: Vec<(String, Option<i32>)> = sqlx::query_as(
+        "WITH terminal_any AS ( \
+             SELECT DISTINCT e.work_item_id \
+               FROM work_item_events e \
+              WHERE e.to_status IN ('done','merged','failed','cancelled') \
+         ), completion_history AS ( \
+             SELECT DISTINCT ON (e.work_item_id) e.work_item_id, e.occurred_at \
+               FROM work_item_events e \
+              WHERE e.to_status IN ('done','merged') AND e.occurred_at <= $3 \
+              ORDER BY e.work_item_id, e.occurred_at DESC, e.id DESC \
+         ), selected AS ( \
+             SELECT w.title, w.started_at, \
+                    CASE WHEN c.work_item_id IS NOT NULL THEN c.occurred_at \
+                         WHEN a.work_item_id IS NULL THEN w.completed_at END event_at \
+               FROM work_items w \
+               LEFT JOIN terminal_any a ON a.work_item_id=w.id \
+               LEFT JOIN completion_history c ON c.work_item_id=w.id \
+              WHERE w.project_id=$1 AND w.status IN ('done','merged') \
+                AND CASE WHEN c.work_item_id IS NOT NULL \
+                         THEN c.occurred_at > $2 AND c.occurred_at <= $3 \
+                         WHEN a.work_item_id IS NULL \
+                         THEN w.completed_at > $2 AND w.completed_at <= $3 \
+                         ELSE false END \
+         ) SELECT left(title,32), \
+                  CASE WHEN started_at IS NOT NULL AND event_at >= started_at \
+                       THEN round(EXTRACT(EPOCH FROM (event_at-started_at))/60)::int END \
+             FROM selected ORDER BY event_at DESC LIMIT 8",
     )
     .bind(project_id)
-    .fetch_optional(pg)
-    .await
-    .ok()
-    .flatten();
-
-    // Completed since the last digest, with how long each took.
-    let completed: Vec<(String, i32)> = sqlx::query_as(
-        "SELECT left(title, 32), \
-                round(EXTRACT(EPOCH FROM (completed_at - started_at)) / 60)::int \
-           FROM work_items \
-          WHERE project_id = $1 AND status IN ('done','merged') \
-            AND completed_at > coalesce($2, now() - interval '24 hours') \
-            AND started_at IS NOT NULL \
-          ORDER BY completed_at DESC LIMIT 8",
-    )
-    .bind(project_id)
-    .bind(since)
+    .bind(cursor_at)
+    .bind(window_end)
     .fetch_all(pg)
     .await
     .unwrap_or_default();
 
-    // Recent failures with the reason.
+    // Newly failed in the same frozen window, fenced by current status.
     let failures: Vec<(String, String)> = sqlx::query_as(
-        "SELECT left(title, 28), left(coalesce(last_error, 'unknown'), 52) \
-           FROM work_items \
-          WHERE project_id = $1 AND status = 'failed' \
-          ORDER BY completed_at DESC NULLS LAST LIMIT 5",
+        "WITH failed_any AS ( \
+             SELECT DISTINCT e.work_item_id FROM work_item_events e WHERE e.to_status='failed' \
+         ), latest AS ( \
+             SELECT DISTINCT ON (e.work_item_id) e.work_item_id, e.occurred_at \
+               FROM work_item_events e \
+              WHERE e.to_status='failed' AND e.occurred_at <= $3 \
+              ORDER BY e.work_item_id, e.occurred_at DESC, e.id DESC \
+         ), selected AS ( \
+             SELECT w.title,w.last_error, \
+                    CASE WHEN e.work_item_id IS NOT NULL THEN e.occurred_at \
+                         WHEN a.work_item_id IS NULL THEN w.completed_at END event_at \
+               FROM work_items w \
+               LEFT JOIN failed_any a ON a.work_item_id=w.id \
+               LEFT JOIN latest e ON e.work_item_id=w.id \
+            WHERE w.project_id=$1 AND w.status='failed' \
+         ) SELECT left(title,28),left(coalesce(last_error,'unknown'),52) \
+             FROM selected WHERE event_at > $2 AND event_at <= $3 \
+            ORDER BY event_at DESC LIMIT 5",
     )
     .bind(project_id)
+    .bind(cursor_at)
+    .bind(window_end)
     .fetch_all(pg)
     .await
     .unwrap_or_default();
@@ -396,7 +689,10 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
         msg.push_str("• (none)\n");
     } else {
         for (title, mins) in &completed {
-            msg.push_str(&format!("• {} — took {}\n", title, fmt_mins(*mins as i64)));
+            let duration = mins
+                .map(|m| fmt_mins(m as i64))
+                .unwrap_or_else(|| "duration unavailable".into());
+            msg.push_str(&format!("• {title} — took {duration}\n"));
         }
     }
     msg.push('\n');
@@ -426,7 +722,7 @@ pub async fn build_project_digest(pg: &PgPool, project_id: &str) -> Result<Strin
 
     // §3 Failures
     if !failures.is_empty() {
-        msg.push_str("\n❌ Failed (reason):\n");
+        msg.push_str("\n❌ Newly failed since last update (still failing):\n");
         for (title, reason) in &failures {
             msg.push_str(&format!("• {} — {}\n", title, reason));
         }
@@ -658,4 +954,615 @@ pub async fn build_system_digest(pg: &PgPool) -> Result<String> {
     }
 
     Ok(msg.trim_end().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use uuid::Uuid;
+
+    struct MockSender {
+        outcomes: Mutex<VecDeque<crate::telegram::TelegramDigestOutcome>>,
+        calls: Mutex<Vec<(String, String, Option<Vec<u8>>)>>,
+        delay: Duration,
+        interfere: bool,
+        later_cursor: bool,
+    }
+
+    impl MockSender {
+        fn new(outcomes: Vec<crate::telegram::TelegramDigestOutcome>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into()),
+                calls: Mutex::new(Vec::new()),
+                delay: Duration::ZERO,
+                interfere: false,
+                later_cursor: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DigestSender for MockSender {
+        async fn send(
+            &self,
+            pg: &PgPool,
+            title: &str,
+            body: &str,
+            logo: Option<&[u8]>,
+        ) -> crate::telegram::TelegramDigestOutcome {
+            self.calls.lock().unwrap().push((
+                title.to_string(),
+                body.to_string(),
+                logo.map(<[u8]>::to_vec),
+            ));
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            if self.interfere {
+                sqlx::query(
+                    "UPDATE project_digest_attempts \
+                        SET attempt=attempt+1,fence=$1 WHERE delivery_status='sending'",
+                )
+                .bind(Uuid::new_v4())
+                .execute(pg)
+                .await
+                .unwrap();
+            }
+            if self.later_cursor {
+                sqlx::query(
+                    "UPDATE project_digest_configs \
+                        SET last_sent_at=now()+interval '1 hour' WHERE id='cfg'",
+                )
+                .execute(pg)
+                .await
+                .unwrap();
+            }
+            self.outcomes.lock().unwrap().pop_front().unwrap()
+        }
+    }
+
+    fn acknowledged(message_id: i64) -> crate::telegram::TelegramDigestOutcome {
+        crate::telegram::TelegramDigestOutcome::Acknowledged {
+            messages: vec![crate::telegram::TelegramMessageIdentity {
+                chat_id: "-1001".into(),
+                message_id,
+            }],
+        }
+    }
+
+    async fn run_once_fixture(pool: &PgPool) -> DateTime<Utc> {
+        sqlx::raw_sql(ff_db::schema::SCHEMA_V283_PROJECT_DIGEST_ATTEMPTS)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE work_items (\
+                id uuid PRIMARY KEY, project_id text NOT NULL, title text NOT NULL,\
+                status text NOT NULL, started_at timestamptz, completed_at timestamptz,\
+                last_error text, verified smallint NOT NULL DEFAULT 0,\
+                assigned_computer text);\
+             CREATE TABLE work_item_events (\
+                id bigserial PRIMARY KEY, work_item_id uuid NOT NULL,\
+                from_status text, to_status text NOT NULL, occurred_at timestamptz NOT NULL);\
+             CREATE TABLE work_item_leases (\
+                work_item_id uuid, endpoint text, created_at timestamptz,\
+                heartbeat_at timestamptz, released_at timestamptz);",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let cursor = Utc::now() - chrono::Duration::hours(2);
+        sqlx::query(
+            "INSERT INTO project_digest_configs \
+                (id,project_id,kind,title,interval_secs,last_sent_at,logo_png) \
+             VALUES ('cfg','p','standing','Project',1,$1,$2)",
+        )
+        .bind(cursor)
+        .bind(vec![1_u8, 2, 3])
+        .execute(pool)
+        .await
+        .unwrap();
+        let item = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO work_items \
+                (id,project_id,title,status,started_at,completed_at) \
+             VALUES ($1,'p','finished','done',$2,$3)",
+        )
+        .bind(item)
+        .bind(cursor)
+        .bind(cursor + chrono::Duration::minutes(30))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query_scalar("SELECT last_sent_at FROM project_digest_configs WHERE id='cfg'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn delivery_key_is_stable_and_window_specific() {
+        let start = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let end = start + chrono::Duration::minutes(15);
+        assert_eq!(
+            digest_delivery_key("cfg", start, end),
+            digest_delivery_key("cfg", start, end)
+        );
+        assert_ne!(
+            digest_delivery_key("cfg", start, end),
+            digest_delivery_key("cfg", start, end + chrono::Duration::seconds(1))
+        );
+    }
+
+    #[sqlx::test]
+    async fn event_windows_fallback_status_fences_and_durations(pool: PgPool) {
+        sqlx::raw_sql(
+            "CREATE TABLE project_digest_configs (id text PRIMARY KEY, project_id text NOT NULL, last_sent_at timestamptz);\
+             CREATE TABLE work_items (id uuid PRIMARY KEY, project_id text NOT NULL, title text NOT NULL, status text NOT NULL, started_at timestamptz, completed_at timestamptz, last_error text, verified smallint NOT NULL DEFAULT 0, assigned_computer text);\
+             CREATE TABLE work_item_events (id bigserial PRIMARY KEY, work_item_id uuid NOT NULL, from_status text, to_status text NOT NULL, occurred_at timestamptz NOT NULL);\
+             CREATE TABLE work_item_leases (work_item_id uuid, endpoint text, created_at timestamptz, heartbeat_at timestamptz, released_at timestamptz);",
+        )
+        .execute(&pool).await.unwrap();
+        let start = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let end = start + chrono::Duration::hours(1);
+        let rows = [
+            (
+                "reclosed",
+                "done",
+                Some(start),
+                Some(start + chrono::Duration::minutes(5)),
+                None,
+            ),
+            (
+                "reopened",
+                "ready",
+                Some(start),
+                Some(start + chrono::Duration::minutes(10)),
+                None,
+            ),
+            (
+                "legacy",
+                "merged",
+                None,
+                Some(start + chrono::Duration::minutes(20)),
+                None,
+            ),
+            (
+                "invalid-duration",
+                "done",
+                Some(end),
+                Some(start + chrono::Duration::minutes(30)),
+                None,
+            ),
+            ("open-boundary", "done", Some(start), Some(start), None),
+            ("closed-boundary", "done", Some(start), Some(end), None),
+            (
+                "stale-fallback",
+                "done",
+                Some(start),
+                Some(start + chrono::Duration::minutes(40)),
+                None,
+            ),
+            (
+                "new-failure",
+                "failed",
+                Some(start),
+                Some(start + chrono::Duration::minutes(15)),
+                Some("boom"),
+            ),
+            (
+                "recovered-failure",
+                "ready",
+                Some(start),
+                Some(start + chrono::Duration::minutes(16)),
+                Some("old"),
+            ),
+            (
+                "terminal-other",
+                "done",
+                Some(start),
+                Some(start + chrono::Duration::minutes(22)),
+                None,
+            ),
+            (
+                "legacy-failure",
+                "failed",
+                Some(start),
+                Some(start + chrono::Duration::minutes(23)),
+                Some("legacy boom"),
+            ),
+        ];
+        let mut ids = std::collections::HashMap::new();
+        for (title, status, started, completed, error) in rows {
+            let id = Uuid::new_v4();
+            ids.insert(title, id);
+            sqlx::query("INSERT INTO work_items(id,project_id,title,status,started_at,completed_at,last_error) VALUES($1,'p',$2,$3,$4,$5,$6)")
+                .bind(id).bind(title).bind(status).bind(started).bind(completed).bind(error)
+                .execute(&pool).await.unwrap();
+        }
+        async fn event(pool: &PgPool, id: Uuid, status: &str, at: DateTime<Utc>) {
+            sqlx::query(
+                "INSERT INTO work_item_events(work_item_id,to_status,occurred_at) VALUES($1,$2,$3)",
+            )
+            .bind(id)
+            .bind(status)
+            .bind(at)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        event(
+            &pool,
+            ids["reclosed"],
+            "done",
+            start + chrono::Duration::minutes(15),
+        )
+        .await;
+        event(
+            &pool,
+            ids["reclosed"],
+            "merged",
+            start + chrono::Duration::minutes(45),
+        )
+        .await;
+        event(
+            &pool,
+            ids["reclosed"],
+            "merged",
+            end + chrono::Duration::minutes(5),
+        )
+        .await;
+        event(
+            &pool,
+            ids["reclosed"],
+            "merged",
+            start + chrono::Duration::minutes(45),
+        )
+        .await;
+        event(
+            &pool,
+            ids["reopened"],
+            "done",
+            start + chrono::Duration::minutes(25),
+        )
+        .await;
+        event(
+            &pool,
+            ids["invalid-duration"],
+            "done",
+            start + chrono::Duration::minutes(30),
+        )
+        .await;
+        event(&pool, ids["open-boundary"], "done", start).await;
+        event(&pool, ids["closed-boundary"], "done", end).await;
+        event(
+            &pool,
+            ids["stale-fallback"],
+            "done",
+            start - chrono::Duration::minutes(1),
+        )
+        .await;
+        event(
+            &pool,
+            ids["new-failure"],
+            "failed",
+            start + chrono::Duration::minutes(35),
+        )
+        .await;
+        event(
+            &pool,
+            ids["new-failure"],
+            "failed",
+            end + chrono::Duration::minutes(5),
+        )
+        .await;
+        event(
+            &pool,
+            ids["recovered-failure"],
+            "failed",
+            start + chrono::Duration::minutes(36),
+        )
+        .await;
+        event(
+            &pool,
+            ids["terminal-other"],
+            "failed",
+            start - chrono::Duration::minutes(1),
+        )
+        .await;
+
+        let body = build_project_digest_window(&pool, "p", start, end)
+            .await
+            .unwrap();
+        assert!(body.contains("reclosed"));
+        assert!(body.contains("legacy — took duration unavailable"));
+        assert!(body.contains("invalid-duration — took duration unavailable"));
+        assert!(body.contains("closed-boundary"));
+        assert!(!body.contains("reopened"));
+        assert!(!body.contains("open-boundary"));
+        assert!(!body.contains("stale-fallback"));
+        assert!(!body.contains("terminal-other"));
+        assert!(body.contains("Newly failed since last update (still failing)"));
+        assert!(body.contains("new-failure — boom"));
+        assert!(body.contains("legacy-failure — legacy boom"));
+        assert!(!body.contains("recovered-failure"));
+    }
+
+    #[sqlx::test]
+    async fn run_once_success_atomically_records_ack_and_cursor(pool: PgPool) {
+        let old_cursor = run_once_fixture(&pool).await;
+        let sender = MockSender::new(vec![acknowledged(42)]);
+
+        run_once_with_sender(&pool, &sender).await.unwrap();
+
+        let row: (
+            String,
+            i64,
+            String,
+            i64,
+            serde_json::Value,
+            DateTime<Utc>,
+            DateTime<Utc>,
+        ) = sqlx::query_as(
+            "SELECT delivery_status,attempt,ack_chat_id,ack_message_id,\
+                    acknowledgement,window_end,c.last_sent_at \
+               FROM project_digest_attempts a \
+               JOIN project_digest_configs c ON c.id=a.config_id \
+              WHERE a.config_id='cfg'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "delivered");
+        assert_eq!(row.1, 1);
+        assert_eq!(row.2, "-1001");
+        assert_eq!(row.3, 42);
+        assert_eq!(row.4[0]["message_id"], 42);
+        assert_eq!(row.5, row.6);
+        assert!(row.6 > old_cursor);
+        let calls = sender.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].2.as_deref(), Some(&[1, 2, 3][..]));
+    }
+
+    #[sqlx::test]
+    async fn run_once_definite_failure_retries_same_frozen_payload(pool: PgPool) {
+        let old_cursor = run_once_fixture(&pool).await;
+        let sender = MockSender::new(vec![
+            crate::telegram::TelegramDigestOutcome::DefinitelyNotDelivered {
+                error: "telegram HTTP 503".into(),
+            },
+            acknowledged(43),
+        ]);
+
+        run_once_with_sender(&pool, &sender).await.unwrap();
+        let retryable: (String, i64, String, DateTime<Utc>) = sqlx::query_as(
+            "SELECT delivery_status,attempt,last_error,c.last_sent_at \
+               FROM project_digest_attempts a \
+               JOIN project_digest_configs c ON c.id=a.config_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retryable.0, "retryable");
+        assert_eq!(retryable.1, 1);
+        assert!(retryable.2.contains("503"));
+        assert_eq!(retryable.3, old_cursor);
+
+        run_once_with_sender(&pool, &sender).await.unwrap();
+        let delivered: (String, i64) =
+            sqlx::query_as("SELECT delivery_status,attempt FROM project_digest_attempts")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(delivered, ("delivered".into(), 2));
+        let calls = sender.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], calls[1], "retry must reuse title/body/logo");
+    }
+
+    #[sqlx::test]
+    async fn run_once_ambiguous_and_stranded_sending_never_resend(pool: PgPool) {
+        let old_cursor = run_once_fixture(&pool).await;
+        let sender = MockSender::new(vec![crate::telegram::TelegramDigestOutcome::Ambiguous {
+            error: "response parse loss".into(),
+        }]);
+        run_once_with_sender(&pool, &sender).await.unwrap();
+        run_once_with_sender(&pool, &sender).await.unwrap();
+        assert_eq!(sender.calls.lock().unwrap().len(), 1);
+        let ambiguous: (String, DateTime<Utc>) = sqlx::query_as(
+            "SELECT delivery_status,c.last_sent_at \
+               FROM project_digest_attempts a \
+               JOIN project_digest_configs c ON c.id=a.config_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ambiguous, ("ambiguous".into(), old_cursor));
+
+        sqlx::query(
+            "UPDATE project_digest_attempts \
+                SET delivery_status='sending',updated_at=now()-interval '1 day'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        run_once_with_sender(&pool, &sender).await.unwrap();
+        let state: String =
+            sqlx::query_scalar("SELECT delivery_status FROM project_digest_attempts")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "sending");
+        assert_eq!(sender.calls.lock().unwrap().len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn run_once_success_without_message_identity_fails_closed(pool: PgPool) {
+        let old_cursor = run_once_fixture(&pool).await;
+        let sender = MockSender::new(vec![crate::telegram::TelegramDigestOutcome::Acknowledged {
+            messages: Vec::new(),
+        }]);
+
+        run_once_with_sender(&pool, &sender).await.unwrap();
+        run_once_with_sender(&pool, &sender).await.unwrap();
+
+        let state: (String, Option<serde_json::Value>, DateTime<Utc>) = sqlx::query_as(
+            "SELECT delivery_status,acknowledgement,c.last_sent_at \
+               FROM project_digest_attempts a \
+               JOIN project_digest_configs c ON c.id=a.config_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.0, "ambiguous");
+        assert_eq!(state.1, None);
+        assert_eq!(state.2, old_cursor);
+        assert_eq!(sender.calls.lock().unwrap().len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn run_once_concurrent_claim_sends_once(pool: PgPool) {
+        run_once_fixture(&pool).await;
+        let mut sender = MockSender::new(vec![acknowledged(44)]);
+        sender.delay = Duration::from_millis(100);
+        let sender = std::sync::Arc::new(sender);
+        let (first, second) = tokio::join!(
+            run_once_with_sender(&pool, sender.as_ref()),
+            run_once_with_sender(&pool, sender.as_ref())
+        );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(sender.calls.lock().unwrap().len(), 1);
+        let state: String =
+            sqlx::query_scalar("SELECT delivery_status FROM project_digest_attempts")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "delivered");
+    }
+
+    #[sqlx::test]
+    async fn run_once_stale_fence_cannot_commit_ack_or_cursor(pool: PgPool) {
+        let old_cursor = run_once_fixture(&pool).await;
+        let mut sender = MockSender::new(vec![acknowledged(45)]);
+        sender.interfere = true;
+        run_once_with_sender(&pool, &sender).await.unwrap();
+        let row: (String, i64, Option<serde_json::Value>, DateTime<Utc>) = sqlx::query_as(
+            "SELECT delivery_status,attempt,acknowledgement,c.last_sent_at \
+               FROM project_digest_attempts a \
+               JOIN project_digest_configs c ON c.id=a.config_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "sending");
+        assert_eq!(row.1, 2);
+        assert_eq!(row.2, None);
+        assert_eq!(row.3, old_cursor);
+    }
+
+    #[sqlx::test]
+    async fn run_once_ack_finishes_attempt_without_regressing_later_cursor(pool: PgPool) {
+        run_once_fixture(&pool).await;
+        let mut sender = MockSender::new(vec![acknowledged(46)]);
+        sender.later_cursor = true;
+        run_once_with_sender(&pool, &sender).await.unwrap();
+        let row: (String, DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+            "SELECT delivery_status,window_end,c.last_sent_at \
+               FROM project_digest_attempts a \
+               JOIN project_digest_configs c ON c.id=a.config_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "delivered");
+        assert!(row.2 > row.1);
+    }
+
+    #[sqlx::test]
+    async fn attempt_payload_reuse_ambiguous_dedup_and_atomic_cursor(pool: PgPool) {
+        sqlx::query("CREATE TABLE project_digest_configs (id text PRIMARY KEY, last_sent_at timestamptz, updated_at timestamptz DEFAULT now())").execute(&pool).await.unwrap();
+        sqlx::raw_sql(ff_db::schema::SCHEMA_V283_PROJECT_DIGEST_ATTEMPTS)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let start = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let end = start + chrono::Duration::minutes(15);
+        sqlx::query("INSERT INTO project_digest_configs(id,last_sent_at) VALUES('cfg',$1)")
+            .bind(start)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let key = digest_delivery_key("cfg", start, end);
+        for body in ["exact payload", "replacement must lose"] {
+            sqlx::query("INSERT INTO project_digest_attempts(config_id,prior_cursor,cursor_at,window_end,title,body,delivery_key) VALUES('cfg',$1,$1,$2,'title',$3,$4) ON CONFLICT(config_id,cursor_at,window_end) DO NOTHING")
+                .bind(start).bind(end).bind(body).bind(&key).execute(&pool).await.unwrap();
+        }
+        let stored: (String, String) = sqlx::query_as(
+            "SELECT body,delivery_key FROM project_digest_attempts WHERE config_id='cfg'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, ("exact payload".into(), key));
+        let later_end = end + chrono::Duration::minutes(15);
+        let later_key = digest_delivery_key("cfg", start, later_end);
+        let concurrent: Option<String> = sqlx::query_scalar(
+            "INSERT INTO project_digest_attempts \
+                (config_id,prior_cursor,cursor_at,window_end,title,body,delivery_key) \
+             VALUES ('cfg',$1,$1,$2,'later','replacement window',$3) \
+             ON CONFLICT DO NOTHING RETURNING body",
+        )
+        .bind(start)
+        .bind(later_end)
+        .bind(later_key)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(concurrent, None);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT body FROM project_digest_attempts \
+                  WHERE config_id='cfg' AND delivery_status<>'delivered'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "exact payload"
+        );
+        sqlx::query(
+            "UPDATE project_digest_attempts SET delivery_status='sending' WHERE config_id='cfg'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let reclaimed: Option<bool> = sqlx::query_scalar("UPDATE project_digest_attempts SET delivery_status='sending' WHERE config_id='cfg' AND delivery_status='prepared' RETURNING true").fetch_optional(&pool).await.unwrap();
+        assert_eq!(reclaimed, None);
+        let cursor: DateTime<Utc> =
+            sqlx::query_scalar("SELECT last_sent_at FROM project_digest_configs WHERE id='cfg'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cursor, start);
+
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE project_digest_attempts \
+                SET delivery_status='delivered',delivered_at=now(), \
+                    acknowledgement='[{\"chat_id\":\"-1001\",\"message_id\":47}]'::jsonb, \
+                    ack_chat_id='-1001',ack_message_id=47 \
+              WHERE config_id='cfg'",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE project_digest_configs SET last_sent_at=$1 WHERE id='cfg' AND last_sent_at IS NOT DISTINCT FROM $2").bind(end).bind(start).execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        let final_state: (DateTime<Utc>, String) = sqlx::query_as("SELECT c.last_sent_at,a.delivery_status FROM project_digest_configs c JOIN project_digest_attempts a ON a.config_id=c.id WHERE c.id='cfg'").fetch_one(&pool).await.unwrap();
+        assert_eq!(final_state, (end, "delivered".into()));
+    }
 }

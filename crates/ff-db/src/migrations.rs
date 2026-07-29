@@ -1262,8 +1262,13 @@ static PG_MIGRATIONS: &[PgMigration] = &[
     },
     PgMigration {
         version: 283,
+        name: "project_digest_attempts",
+        sql: schema::SCHEMA_V283_PROJECT_DIGEST_ATTEMPTS,
+    },
+    PgMigration {
+        version: 284,
         name: "model_load_reservations",
-        sql: schema::SCHEMA_V283_MODEL_LOAD_RESERVATIONS,
+        sql: schema::SCHEMA_V284_MODEL_LOAD_RESERVATIONS,
     },
 ];
 
@@ -2788,11 +2793,11 @@ mod tests {
     }
 
     #[test]
-    fn v283_creates_token_fenced_model_load_reservations() {
+    fn v284_creates_token_fenced_model_load_reservations() {
         let migration = PG_MIGRATIONS
             .iter()
-            .find(|migration| migration.version == 283)
-            .expect("V283 must be registered");
+            .find(|migration| migration.version == 284)
+            .expect("V284 must be registered");
         assert_eq!(migration.name, "model_load_reservations");
         assert!(migration.sql.contains("model_load_reservations"));
         assert!(migration.sql.contains("owner_token UUID NOT NULL"));
@@ -2800,7 +2805,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v283_reservation_races_expiry_and_matching_cleanup() {
+    async fn v284_reservation_races_expiry_and_matching_cleanup() {
         // CI has no database; this helper checks both supported URL variables.
         let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
             return;
@@ -2859,5 +2864,45 @@ mod tests {
         assert_eq!(owners, vec![second, second]);
 
         drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[test]
+    fn v283_creates_project_digest_attempt_ledger() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 283)
+            .expect("V283 must be registered");
+        assert_eq!(migration.name, "project_digest_attempts");
+        assert!(
+            migration
+                .sql
+                .contains("CREATE TABLE IF NOT EXISTS project_digest_attempts")
+        );
+        assert!(
+            migration
+                .sql
+                .contains("CREATE TABLE IF NOT EXISTS project_digest_configs")
+        );
+        assert!(
+            migration
+                .sql
+                .contains("PRIMARY KEY (config_id, cursor_at, window_end)")
+        );
+        assert!(migration.sql.contains("delivery_key"));
+        assert!(migration.sql.contains("'retryable'"));
+        assert!(migration.sql.contains("'ambiguous'"));
+        assert!(migration.sql.contains("attempt         BIGINT"));
+        assert!(migration.sql.contains("fence           UUID"));
+        assert!(migration.sql.contains("acknowledgement JSONB"));
+        assert!(
+            migration
+                .sql
+                .contains("project_digest_attempts_delivered_ack_check")
+        );
+        assert!(
+            migration
+                .sql
+                .contains("guard_project_digest_cursor_regression")
+        );
     }
 }
