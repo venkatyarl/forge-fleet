@@ -1110,7 +1110,6 @@ fn parse_backend_choice(raw: Option<&str>) -> Result<CortexBackendChoice> {
 
 static BACKEND_CHOICE: OnceCell<std::result::Result<CortexBackendChoice, String>> =
     OnceCell::const_new();
-static FALKOR_READ_PARITY: OnceCell<bool> = OnceCell::const_new();
 
 const FALKOR_READ_CUTOVER_ENV: &str = "CORTEX_FALKOR_READ_CUTOVER";
 
@@ -1121,6 +1120,9 @@ fn cutover_backend_choice(
 ) -> CortexBackendChoice {
     if configured == CortexBackendChoice::Falkordb {
         return configured;
+    }
+    if configured != CortexBackendChoice::FalkordbMigration {
+        return CortexBackendChoice::Postgres;
     }
     if cutover_enabled && parity_matches {
         CortexBackendChoice::FalkordbMigration
@@ -1154,6 +1156,9 @@ async fn read_backend_choice(pool: &PgPool) -> Result<CortexBackendChoice> {
     if configured == CortexBackendChoice::Falkordb {
         return Ok(configured);
     }
+    if configured != CortexBackendChoice::FalkordbMigration {
+        return Ok(CortexBackendChoice::Postgres);
+    }
     let cutover_enabled = std::env::var(FALKOR_READ_CUTOVER_ENV)
         .ok()
         .as_deref()
@@ -1161,24 +1166,23 @@ async fn read_backend_choice(pool: &PgPool) -> Result<CortexBackendChoice> {
     if !cutover_enabled {
         return Ok(CortexBackendChoice::Postgres);
     }
-    let parity_matches = *FALKOR_READ_PARITY
-        .get_or_init(|| async {
-            match parity_check_falkordb(pool, 10).await {
-                Ok(report) if report.matches() => true,
-                Ok(_) => {
-                    tracing::warn!("FalkorDB Cortex parity check failed; keeping Postgres reads");
-                    false
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        "FalkorDB Cortex parity check unavailable; keeping Postgres reads"
-                    );
-                    false
-                }
-            }
-        })
-        .await;
+    // Evaluate parity for every new read router/store. A process-global success
+    // cache would let later graph divergence keep serving Falkor reads until
+    // restart, defeating the rollback gate.
+    let parity_matches = match parity_check_falkordb(pool, 10).await {
+        Ok(report) if report.matches() => true,
+        Ok(_) => {
+            tracing::warn!("FalkorDB Cortex parity check failed; keeping Postgres reads");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "FalkorDB Cortex parity check unavailable; keeping Postgres reads"
+            );
+            false
+        }
+    };
     Ok(cutover_backend_choice(
         configured,
         cutover_enabled,
@@ -1781,18 +1785,34 @@ mod tests {
     #[test]
     fn read_cutover_requires_opt_in_and_parity() {
         assert_eq!(
-            cutover_backend_choice(CortexBackendChoice::Postgres, true, true),
+            cutover_backend_choice(CortexBackendChoice::FalkordbMigration, true, true),
             CortexBackendChoice::FalkordbMigration
         );
         assert_eq!(
-            cutover_backend_choice(CortexBackendChoice::Postgres, true, false),
+            cutover_backend_choice(CortexBackendChoice::FalkordbMigration, true, false),
             CortexBackendChoice::Postgres
         );
     }
 
     #[test]
+    fn explicit_postgres_is_never_overridden_by_cutover_flag() {
+        assert_eq!(
+            cutover_backend_choice(CortexBackendChoice::Postgres, true, true),
+            CortexBackendChoice::Postgres
+        );
+    }
+
+    #[test]
+    fn authoritative_falkordb_mode_is_preserved() {
+        assert_eq!(
+            cutover_backend_choice(CortexBackendChoice::Falkordb, false, false),
+            CortexBackendChoice::Falkordb
+        );
+    }
+
+    #[test]
     fn read_cutover_rolls_back_when_flag_is_disabled() {
-        let cut_over = cutover_backend_choice(CortexBackendChoice::Postgres, true, true);
+        let cut_over = cutover_backend_choice(CortexBackendChoice::FalkordbMigration, true, true);
         assert_eq!(cut_over, CortexBackendChoice::FalkordbMigration);
         assert_eq!(
             cutover_backend_choice(cut_over, false, true),
