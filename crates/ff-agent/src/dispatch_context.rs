@@ -487,7 +487,12 @@ pub async fn context_pack_for_dispatch(
     let symbol_pack = if !store_pack.is_empty() {
         store_pack
     } else {
-        match expected_corpus(pool, &repo_path).await {
+        let resolved_corpus =
+            tokio::time::timeout(Duration::from_secs(3), expected_corpus(pool, &repo_path))
+                .await
+                .ok()
+                .flatten();
+        match resolved_corpus {
             Some(corpus) => {
                 cortex_context_pack_async(
                     title.clone(),
