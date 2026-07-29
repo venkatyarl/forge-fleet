@@ -1829,10 +1829,36 @@ fn task_branch_name(title: &str, work_item_id: uuid::Uuid) -> String {
 }
 
 async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Result<WorktreeRecord> {
-    let base_branch = match item.base_branch.as_deref() {
-        Some(branch) if !branch.trim().is_empty() => branch.trim().to_string(),
-        _ => default_branch(&item.repo_path).unwrap_or_else(|_| "main".to_string()),
+    let repo_branch = match item.repo_id {
+        Some(repo_id) => {
+            sqlx::query_scalar::<_, String>(
+                "SELECT default_branch FROM project_repos WHERE id = $1 AND project_id = $2",
+            )
+            .bind(repo_id)
+            .bind(&item.project_id)
+            .fetch_optional(pg)
+            .await?
+        }
+        None => None,
     };
+    let project_branch =
+        sqlx::query_scalar::<_, String>("SELECT default_branch FROM projects WHERE id = $1")
+            .bind(&item.project_id)
+            .fetch_optional(pg)
+            .await?;
+    let resolved = resolve_base_branch(
+        &item.repo_path,
+        item.base_branch.as_deref(),
+        repo_branch.as_deref(),
+        project_branch.as_deref(),
+    )?;
+    let base_branch = resolved.branch;
+    info!(
+        work_item_id = %item.work_item_id,
+        base_branch = %base_branch,
+        resolution_tier = resolved.tier,
+        "work_item_dispatch: resolved base branch"
+    );
     let task_branch = task_branch_name(&item.title, item.work_item_id);
 
     // Canonical slots reuse an existing project checkout (~/projects/{project});
@@ -1881,6 +1907,51 @@ async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Resul
         worktree_path,
         base_branch,
         task_branch,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BaseBranchResolution {
+    branch: String,
+    tier: &'static str,
+}
+
+fn resolve_base_branch(
+    repo_path: &Path,
+    explicit: Option<&str>,
+    repo_default: Option<&str>,
+    project_default: Option<&str>,
+) -> Result<BaseBranchResolution> {
+    for (candidate, tier) in [
+        (explicit, "explicit"),
+        (repo_default, "repo"),
+        (project_default, "project"),
+    ] {
+        let Some(branch) = candidate.map(str::trim).filter(|branch| !branch.is_empty()) else {
+            continue;
+        };
+        let branch_ref = format!("refs/heads/{branch}");
+        run_git(
+            repo_path,
+            ["ls-remote", "--exit-code", "--heads", "origin", &branch_ref],
+            Duration::from_secs(30),
+        )
+        .with_context(|| format!("configured {tier} branch '{branch}' does not exist on origin"))?;
+        return Ok(BaseBranchResolution {
+            branch: branch.to_string(),
+            tier,
+        });
+    }
+
+    if let Ok(branch) = default_branch(repo_path) {
+        return Ok(BaseBranchResolution {
+            branch,
+            tier: "origin_head",
+        });
+    }
+    Ok(BaseBranchResolution {
+        branch: "main".to_string(),
+        tier: "fallback",
     })
 }
 
@@ -6387,15 +6458,24 @@ mod tests {
         mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers, parse_cli_tokens,
         parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
         quick_empty_success_is_provider_failure, record_cloud_rescue_local_failure_diagnosis,
-        repo_cache_path, repo_slug, retry_error_is_actionable, rewrite_github_host_alias,
-        same_model_family, should_attempt_lane15, status_output_is_clean, synthetic_output,
-        task_failed_alert_text, task_prefers_cloud_lane, try_acquire_lane15_480b_permit,
-        use_local_lane, validate_manifest_fields,
+        repo_cache_path, repo_slug, resolve_base_branch, retry_error_is_actionable,
+        rewrite_github_host_alias, same_model_family, should_attempt_lane15,
+        status_output_is_clean, synthetic_output, task_failed_alert_text, task_prefers_cloud_lane,
+        try_acquire_lane15_480b_permit, use_local_lane, validate_manifest_fields,
     };
     use sqlx::Row;
     use std::path::PathBuf;
     use std::time::Duration;
     use uuid::Uuid;
+
+    fn run(dir: &std::path::Path, args: &[&str]) {
+        let status = Command::new(args[0])
+            .args(&args[1..])
+            .current_dir(dir)
+            .status()
+            .expect("run command");
+        assert!(status.success(), "{args:?} failed");
+    }
 
     fn test_item(attempts: i32, last_error: Option<&str>, complexity: &str) -> AssignedWorkItem {
         AssignedWorkItem {
@@ -6424,6 +6504,44 @@ mod tests {
             work: Vec::new(),
             post_work: Vec::new(),
         }
+    }
+
+    #[test]
+    fn repo_default_dev_wins_over_stale_origin_head_main_and_reports_repo_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("origin.git");
+        let repo = tmp.path().join("repo");
+        run(
+            tmp.path(),
+            &["git", "init", "--bare", remote.to_str().unwrap()],
+        );
+        run(tmp.path(), &["git", "init", repo.to_str().unwrap()]);
+        run(&repo, &["git", "config", "user.email", "test@example.com"]);
+        run(&repo, &["git", "config", "user.name", "ForgeFleet Test"]);
+        std::fs::write(repo.join("README.md"), "main\n").unwrap();
+        run(&repo, &["git", "add", "README.md"]);
+        run(&repo, &["git", "commit", "-m", "main"]);
+        run(&repo, &["git", "branch", "-M", "main"]);
+        run(
+            &repo,
+            &["git", "remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run(&repo, &["git", "push", "-u", "origin", "main"]);
+        run(&repo, &["git", "switch", "-c", "dev"]);
+        std::fs::write(repo.join("README.md"), "dev\n").unwrap();
+        run(&repo, &["git", "commit", "-am", "dev"]);
+        run(&repo, &["git", "push", "-u", "origin", "dev"]);
+        run(&repo, &["git", "remote", "set-head", "origin", "main"]);
+
+        let resolved = resolve_base_branch(&repo, None, Some("dev"), Some("main")).unwrap();
+
+        assert_eq!(resolved.branch, "dev");
+        assert_eq!(resolved.tier, "repo");
+        assert_eq!(
+            super::default_branch(&repo).unwrap(),
+            "main",
+            "fixture must retain a stale origin/HEAD that disagrees with repo=dev"
+        );
     }
 
     #[test]
