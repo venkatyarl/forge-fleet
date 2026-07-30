@@ -10405,8 +10405,40 @@ pub async fn pg_mark_merge_mergeable(pool: &PgPool, id: uuid::Uuid) -> Result<()
     Ok(())
 }
 
+/// Atomically re-check that a work_item is still in the review pipeline
+/// immediately before its PR is merged on GitHub, claiming it as 'merging'.
+///
+/// This is the TOCTOU-safe form of "re-check item state before GitHub merge":
+/// a plain `SELECT status` re-check races — the item can leave `in_review`
+/// between the read and `gh pr merge` (sibling-conflict reset → 'ready',
+/// out-of-band close → 'cancelled', operator action), and the stale PR would
+/// merge anyway. One guarded UPDATE either wins the row (`true`) or proves
+/// another owner already moved it (`false`) — the caller must skip the merge
+/// on `false`.
+///
+/// 'merging' is re-claimable (`IN ('in_review','merging')`) so a drain that
+/// crashed mid-merge re-claims its own row on the next tick instead of
+/// stranding it. Nothing but this claim ever writes 'merging'.
+pub async fn pg_claim_work_item_for_merge(pool: &PgPool, work_item_id: uuid::Uuid) -> Result<bool> {
+    Ok(sqlx::query(
+        "UPDATE work_items SET status = 'merging' \
+         WHERE id = $1 AND status IN ('in_review', 'merging')",
+    )
+    .bind(work_item_id)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
 /// Mark a merge as landed. The owning folder remains leased until that
 /// computer's reaper deletes the branch/tree and releases it for another item.
+///
+/// No status resurrection: the work_items flip is guarded to the review
+/// pipeline (`in_review`/`merging`). If the item left the pipeline between
+/// the pre-merge claim and this mark (reset for rebuild → 'ready', failed,
+/// cancelled), its current state is kept — the queue row still closes as
+/// 'merged' because the PR DID land, but the item's new lifecycle owns it.
 pub async fn pg_mark_merge_merged(
     pool: &PgPool,
     id: uuid::Uuid,
@@ -10420,7 +10452,8 @@ pub async fn pg_mark_merge_merged(
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "UPDATE work_items SET status = 'merged', completed_at = NOW(), last_error = NULL WHERE id = $1",
+        "UPDATE work_items SET status = 'merged', completed_at = NOW(), last_error = NULL \
+         WHERE id = $1 AND status IN ('in_review', 'merging')",
     )
     .bind(work_item_id)
     .execute(&mut *tx)
@@ -10757,6 +10790,226 @@ mod parent_completion_tests {
         );
         assert_eq!(pg_complete_parent_work_items(&pool).await.unwrap(), 0);
         assert_eq!(status_of(&pool, childless).await, "ready");
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+}
+
+#[cfg(test)]
+mod pre_merge_recheck_tests {
+    use super::*;
+    use std::env;
+
+    use sqlx::postgres::PgPoolOptions;
+
+    fn base_db_url() -> Option<String> {
+        env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()
+    }
+
+    async fn temp_pool() -> Option<(PgPool, PgPool, String)> {
+        let base_url = base_db_url()?;
+        let (prefix, _) = base_url.rsplit_once('/')?;
+        let db_name = format!("ff_pre_merge_recheck_{}", uuid::Uuid::new_v4().simple());
+
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("{prefix}/postgres"))
+            .await
+            .expect("connect to admin db");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create temp db");
+
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&format!("{prefix}/{db_name}"))
+            .await
+            .expect("connect to temp db");
+
+        sqlx::raw_sql(
+            "CREATE EXTENSION IF NOT EXISTS pgcrypto;
+             CREATE TABLE projects (id TEXT PRIMARY KEY);
+             CREATE TABLE work_items (
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 project_id TEXT NOT NULL REFERENCES projects(id),
+                 kind TEXT NOT NULL,
+                 title TEXT NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'idea',
+                 completed_at TIMESTAMPTZ,
+                 last_error TEXT,
+                 created_by TEXT NOT NULL DEFAULT 'test'
+             );
+             CREATE TABLE work_item_merge_queue (
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 work_item_id UUID NOT NULL REFERENCES work_items(id),
+                 status TEXT NOT NULL DEFAULT 'queued',
+                 merge_attempts INT NOT NULL DEFAULT 0,
+                 merged_at TIMESTAMPTZ,
+                 failed_at TIMESTAMPTZ,
+                 failure_reason TEXT
+             );",
+        )
+        .execute(&pool)
+        .await
+        .expect("create minimal merge schema");
+
+        Some((admin, pool, db_name))
+    }
+
+    async fn drop_temp_db(admin: PgPool, pool: PgPool, db_name: &str) {
+        pool.close().await;
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid)
+               FROM pg_stat_activity
+              WHERE datname = $1
+                AND pid <> pg_backend_pid()",
+        )
+        .bind(db_name)
+        .execute(&admin)
+        .await
+        .expect("terminate temp db sessions");
+        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("drop temp db");
+        admin.close().await;
+    }
+
+    async fn insert_work_item(pool: &PgPool, status: &str) -> uuid::Uuid {
+        let row = sqlx::query(
+            "INSERT INTO work_items (project_id, kind, title, status, created_by)
+             VALUES ('p1', 'task', 'item', $1, 'test')
+             RETURNING id",
+        )
+        .bind(status)
+        .fetch_one(pool)
+        .await
+        .expect("insert work item");
+        row.get("id")
+    }
+
+    async fn insert_queue_row(pool: &PgPool, work_item_id: uuid::Uuid) -> uuid::Uuid {
+        let row = sqlx::query(
+            "INSERT INTO work_item_merge_queue (work_item_id, status)
+             VALUES ($1, 'ci_running')
+             RETURNING id",
+        )
+        .bind(work_item_id)
+        .fetch_one(pool)
+        .await
+        .expect("insert merge queue row");
+        row.get("id")
+    }
+
+    async fn status_of(pool: &PgPool, id: uuid::Uuid) -> String {
+        sqlx::query_scalar("SELECT status FROM work_items WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("fetch status")
+    }
+
+    async fn queue_status_of(pool: &PgPool, id: uuid::Uuid) -> String {
+        sqlx::query_scalar("SELECT status FROM work_item_merge_queue WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("fetch queue status")
+    }
+
+    /// Normal completion: in_review → (atomic claim) merging → (mark) merged,
+    /// with the queue row closed as merged.
+    #[tokio::test]
+    async fn claim_then_mark_completes_normally() {
+        let Some((admin, pool, db_name)) = temp_pool().await else {
+            return;
+        };
+        sqlx::query("INSERT INTO projects (id) VALUES ('p1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let item = insert_work_item(&pool, "in_review").await;
+        let queue_row = insert_queue_row(&pool, item).await;
+
+        assert!(pg_claim_work_item_for_merge(&pool, item).await.unwrap());
+        assert_eq!(status_of(&pool, item).await, "merging");
+        // Re-claim is idempotent (crash recovery: a drain that died mid-merge
+        // re-claims its own row next tick instead of stranding it).
+        assert!(pg_claim_work_item_for_merge(&pool, item).await.unwrap());
+
+        pg_mark_merge_merged(&pool, queue_row, item).await.unwrap();
+        assert_eq!(status_of(&pool, item).await, "merged");
+        assert_eq!(queue_status_of(&pool, queue_row).await, "merged");
+        let completed: bool =
+            sqlx::query_scalar("SELECT completed_at IS NOT NULL FROM work_items WHERE id = $1")
+                .bind(item)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(completed, "merged item must carry completed_at");
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    /// No status resurrection: once the item leaves the review pipeline
+    /// (reset for rebuild → 'ready', failed, cancelled), the pre-merge claim
+    /// fails (the drain must skip the GitHub merge), and even if a stale PR
+    /// did land, the guarded mark keeps the item's current state.
+    #[tokio::test]
+    async fn claim_fails_and_mark_does_not_resurrect_after_status_left_in_review() {
+        let Some((admin, pool, db_name)) = temp_pool().await else {
+            return;
+        };
+        sqlx::query("INSERT INTO projects (id) VALUES ('p1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The TOCTOU path: item was in_review when the drain selected it, but
+        // a sibling-conflict reset flipped it to 'ready' before the merge.
+        let reset_item = insert_work_item(&pool, "ready").await;
+        assert!(
+            !pg_claim_work_item_for_merge(&pool, reset_item)
+                .await
+                .unwrap()
+        );
+        assert_eq!(status_of(&pool, reset_item).await, "ready");
+
+        // Every non-pipeline state refuses the claim.
+        for status in ["ready", "failed", "cancelled", "merged", "in_progress"] {
+            let item = insert_work_item(&pool, status).await;
+            assert!(
+                !pg_claim_work_item_for_merge(&pool, item).await.unwrap(),
+                "claim must fail from {status}"
+            );
+            assert_eq!(status_of(&pool, item).await, status);
+        }
+
+        // The stale PR landed anyway (race lost before the claim existed):
+        // the queue row closes as merged — the PR DID merge — but the item
+        // that left the pipeline is NOT resurrected to 'merged'.
+        let failed_item = insert_work_item(&pool, "failed").await;
+        let queue_row = insert_queue_row(&pool, failed_item).await;
+        pg_mark_merge_merged(&pool, queue_row, failed_item)
+            .await
+            .unwrap();
+        assert_eq!(queue_status_of(&pool, queue_row).await, "merged");
+        assert_eq!(
+            status_of(&pool, failed_item).await,
+            "failed",
+            "a terminal item must never be resurrected to merged"
+        );
+        let completed: bool =
+            sqlx::query_scalar("SELECT completed_at IS NOT NULL FROM work_items WHERE id = $1")
+                .bind(failed_item)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!completed, "resurrected flip must not set completed_at");
 
         drop_temp_db(admin, pool, &db_name).await;
     }

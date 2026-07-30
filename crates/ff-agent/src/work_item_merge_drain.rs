@@ -125,7 +125,7 @@ pub async fn evaluate_merge_queue(
             sqlx::query(
                 "UPDATE work_items SET status = 'cancelled', \
                     completed_at = COALESCE(completed_at, NOW()) \
-                  WHERE id = $1 AND status IN ('in_review', 'ready', 'building', 'in_progress')",
+                  WHERE id = $1 AND status IN ('in_review', 'merging', 'ready', 'building', 'in_progress')",
             )
             .bind(item.work_item_id)
             .execute(&mut *tx)
@@ -382,6 +382,45 @@ pub async fn evaluate_merge_queue(
             // The folder that built this PR already recorded an approval in
             // the queue. pg_next_merge_queue_item filters out every other
             // verdict, so the leader remains a pure serial train-merger.
+            //
+            // PRE-MERGE RE-CHECK (atomic): re-verify the item is still in the
+            // review pipeline immediately before touching GitHub by claiming
+            // it as 'merging' in ONE guarded UPDATE. A plain SELECT re-check
+            // is TOCTOU — the item can leave 'in_review' between the read and
+            // `gh pr merge` (sibling-conflict reset → 'ready', out-of-band
+            // close → 'cancelled', operator action) and the stale PR would
+            // merge anyway. The claim either wins the row or fails; on a lost
+            // claim the queue row is stale, so close it WITHOUT touching the
+            // work_item — whatever moved it (rebuild reset, cancel) owns it.
+            if !ff_db::pg_claim_work_item_for_merge(pg, item.work_item_id).await? {
+                warn!(
+                    pr = %pr_url,
+                    work_item = %item.work_item_id,
+                    "merge_drain: item left in_review before merge — skipping gh merge, closing stale queue row"
+                );
+                sqlx::query(
+                    "UPDATE work_item_merge_queue \
+                        SET status = 'failed', failed_at = NOW(), \
+                            failure_reason = 'work item left in_review before merge (claimed by another path)' \
+                      WHERE id = $1",
+                )
+                .bind(item.id)
+                .execute(pg)
+                .await?;
+                auditor.record(
+                    ReconciliationAction::DuplicateSkipped,
+                    &item.work_item_id.to_string(),
+                    "pre-merge re-check lost — item left in_review, stale merge skipped",
+                    serde_json::json!({
+                        "pr_url": pr_url,
+                        "queue_id": item.id.to_string(),
+                        "work_item_id": item.work_item_id.to_string(),
+                        "skipped": "github_merge",
+                        "cause": "item_left_in_review_before_merge",
+                    }),
+                );
+                return Ok(0);
+            }
             match gh_merge_squash(&pr_url).await {
                 Ok(()) => {
                     ff_db::pg_mark_merge_merged(pg, item.id, item.work_item_id).await?;
@@ -1675,16 +1714,19 @@ async fn gh_pr_comment(pr_url: &str, body: &str) -> Result<()> {
 /// out-of-band — hand-merged by the operator, or merged by any path other than
 /// [`evaluate_merge_queue`] (e.g. a plain `gh pr merge` in a terminal, which
 /// touches GitHub but never the DB). Without this, such items sit in `in_review`
-/// forever and the queue/ETA never reflects that they actually shipped.
+/// forever and the queue/ETA never reflects that they actually shipped. Items
+/// claimed as `merging` by the pre-merge re-check are swept too: a drain that
+/// crashed between the claim and the final mark leaves the row in `merging`
+/// with an already-landed PR.
 ///
 /// Bounded (25 rows/pass) and leader-gated by the caller. Best-effort: a `gh`
 /// failure for one PR is logged and skipped — it never aborts the pass. Only
-/// rows that are still `in_review` at UPDATE time are flipped (guards against a
-/// racing drain that already claimed the row).
+/// rows that are still `in_review`/`merging` at UPDATE time are flipped (guards
+/// against a racing drain that already claimed the row).
 async fn reconcile_orphaned_reviews(pg: &PgPool, auditor: &ReconciliationAuditor) -> Result<usize> {
     let rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
         "SELECT id, pr_url FROM work_items \
-         WHERE status = 'in_review' AND pr_url IS NOT NULL AND pr_url LIKE '%github.com%' \
+         WHERE status IN ('in_review', 'merging') AND pr_url IS NOT NULL AND pr_url LIKE '%github.com%' \
          ORDER BY COALESCE(started_at, created_at) ASC LIMIT 25",
     )
     .fetch_all(pg)
@@ -1725,7 +1767,7 @@ async fn reconcile_orphaned_reviews(pg: &PgPool, auditor: &ReconciliationAuditor
         let affected = sqlx::query(
             "UPDATE work_items SET status = $2, \
              completed_at = COALESCE(completed_at, NOW()), last_error = NULL \
-             WHERE id = $1 AND status = 'in_review'",
+             WHERE id = $1 AND status IN ('in_review', 'merging')",
         )
         .bind(id)
         .bind(new_status)
