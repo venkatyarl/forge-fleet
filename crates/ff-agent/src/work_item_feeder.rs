@@ -18,7 +18,12 @@ pub(crate) fn jira_parent_eligibility_sql(alias: &str) -> String {
          {alias}.status = 'ready' \
          AND LOWER(BTRIM(COALESCE({alias}.metadata->>'jira_status', ''))) \
              NOT IN ('blocked', 'blocked on vinny') \
-         AND NULLIF(BTRIM(COALESCE({alias}.metadata->>'jira_execution_hold', '')), '') IS NULL))"
+         AND NULLIF(BTRIM(COALESCE({alias}.metadata->>'jira_execution_hold', '')), '') IS NULL \
+         AND {alias}.repo_id IS NOT NULL \
+         AND NULLIF(BTRIM(COALESCE({alias}.repo_url, '')), '') IS NOT NULL \
+         AND NULLIF(BTRIM(COALESCE({alias}.repo_path, '')), '') IS NOT NULL \
+         AND NULLIF(BTRIM(COALESCE({alias}.base_branch, '')), '') IS NOT NULL \
+         AND {alias}.metadata->>'jira_repo_resolution_state' = 'bound'))"
     )
 }
 
@@ -253,14 +258,19 @@ mod tests {
             .expect("connect test db");
         let sql = format!(
             "SELECT label FROM (VALUES \
-             ('stale blocked', 'jira', 'ready', '{{\"jira_status\":\"Blocked\"}}'::jsonb), \
-             ('vinny blocked', 'jira', 'ready', '{{\"jira_status\":\"Blocked on Vinny\"}}'::jsonb), \
-             ('to do', 'jira', 'ready', '{{\"jira_status\":\"To Do\"}}'::jsonb), \
-             ('in progress', 'jira', 'ready', '{{\"jira_status\":\"In Progress\"}}'::jsonb), \
-             ('held', 'jira', 'ready', '{{\"jira_status\":\"To Do\",\"jira_execution_hold\":\"awaiting_council\"}}'::jsonb), \
-             ('idea jira', 'jira', 'idea', '{{\"jira_status\":\"To Do\"}}'::jsonb), \
-             ('non-jira idea', 'feature', 'idea', '{{}}'::jsonb)) \
-             AS candidate(label, kind, status, metadata) \
+             ('stale blocked', 'jira', 'ready', '{{\"jira_status\":\"Blocked\",\"jira_repo_resolution_state\":\"bound\"}}'::jsonb, 'repo', 'url', '/path', 'main'), \
+             ('vinny blocked', 'jira', 'ready', '{{\"jira_status\":\"Blocked on Vinny\",\"jira_repo_resolution_state\":\"bound\"}}'::jsonb, 'repo', 'url', '/path', 'main'), \
+             ('to do', 'jira', 'ready', '{{\"jira_status\":\"To Do\",\"jira_repo_resolution_state\":\"bound\"}}'::jsonb, 'repo', 'url', '/path', 'main'), \
+             ('in progress', 'jira', 'ready', '{{\"jira_status\":\"In Progress\",\"jira_repo_resolution_state\":\"bound\"}}'::jsonb, 'repo', 'url', '/path', 'main'), \
+             ('held', 'jira', 'ready', '{{\"jira_status\":\"To Do\",\"jira_execution_hold\":\"awaiting_council\",\"jira_repo_resolution_state\":\"bound\"}}'::jsonb, 'repo', 'url', '/path', 'main'), \
+             ('missing repo id', 'jira', 'ready', '{{\"jira_status\":\"To Do\",\"jira_repo_resolution_state\":\"bound\"}}'::jsonb, NULL, 'url', '/path', 'main'), \
+             ('missing repo url', 'jira', 'ready', '{{\"jira_status\":\"To Do\",\"jira_repo_resolution_state\":\"bound\"}}'::jsonb, 'repo', ' ', '/path', 'main'), \
+             ('missing repo path', 'jira', 'ready', '{{\"jira_status\":\"To Do\",\"jira_repo_resolution_state\":\"bound\"}}'::jsonb, 'repo', 'url', ' ', 'main'), \
+             ('missing base branch', 'jira', 'ready', '{{\"jira_status\":\"To Do\",\"jira_repo_resolution_state\":\"bound\"}}'::jsonb, 'repo', 'url', '/path', ' '), \
+             ('missing bound state', 'jira', 'ready', '{{\"jira_status\":\"To Do\"}}'::jsonb, 'repo', 'url', '/path', 'main'), \
+             ('idea jira', 'jira', 'idea', '{{\"jira_status\":\"To Do\"}}'::jsonb, NULL, NULL, NULL, NULL), \
+             ('non-jira idea', 'feature', 'idea', '{{}}'::jsonb, NULL, NULL, NULL, NULL)) \
+             AS candidate(label, kind, status, metadata, repo_id, repo_url, repo_path, base_branch) \
              WHERE {} ORDER BY label",
             jira_parent_eligibility_sql("candidate")
         );
