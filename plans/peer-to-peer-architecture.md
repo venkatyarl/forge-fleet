@@ -13,7 +13,7 @@ coordination substrate. **Do NOT split into subprocesses.**
 - Leader is a throughput/latency bottleneck under high task churn.
 - Leader-only responsibilities accumulate unrelated failure modes.
 - **Self-upgrade exclusion = permanent manual care + drift** — the exact
-  `leader_self_upgrade` gate pain. In a peer model taylor is a normal node, so
+  `leader_self_upgrade` gate pain. In a peer model vinny is a normal node, so
   the gate + its "self-suicide" problem DISAPPEAR.
 - Failover only treats symptoms; the shape stays fragile.
 
@@ -37,16 +37,16 @@ atomic dispatch — which is ff's.
 - Singleton Postgres leases ONLY where exactly-one-planner is genuinely required
   (merge-drain coordination, full cortex reindex planning, schema migration).
 
-## Migration path (incremental — taylor stays fallback throughout)
+## Migration path (incremental — vinny stays fallback throughout)
 1. Classify leader-ticks: {per-work schedulers · per-node reconcilers ·
    singleton-global · maintenance}. (Same classification as the tick-registry
    work — they MERGE.)
 2. Standardize lease fields across claim tables.
 3. Move work_item scheduling to SKIP-LOCKED claims first.
-4. Run all-node schedulers in SHADOW/limited mode while taylor remains fallback.
+4. Run all-node schedulers in SHADOW/limited mode while vinny remains fallback.
 5. Convert global ticks to singleton leases with TTLs.
 6. Add local actor supervision per daemon.
-7. Remove leader special-casing → taylor becomes a normal peer.
+7. Remove leader special-casing → vinny becomes a normal peer.
 
 ## Relationship to the tick registry (plans/daemon-tick-registry.md)
 Same effort. The registry's tick classification IS migration step 1; the

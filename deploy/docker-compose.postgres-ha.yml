@@ -15,7 +15,7 @@ services:
       - --advertise-client-urls=http://${NODE_IP:?set NODE_IP}:52379
       - --listen-peer-urls=http://0.0.0.0:52380
       - --initial-advertise-peer-urls=http://${NODE_IP}:52380
-      - --initial-cluster=taylor=http://${TAYLOR_IP:?set TAYLOR_IP}:52380,marcus=http://${MARCUS_IP:?set MARCUS_IP}:52380,sophie=http://${SOPHIE_IP:?set SOPHIE_IP}:52380
+      - --initial-cluster=vinny=http://${VINNY_IP:?set VINNY_IP}:52380,marcus=http://${MARCUS_IP:?set MARCUS_IP}:52380,sophie=http://${SOPHIE_IP:?set SOPHIE_IP}:52380
       - --initial-cluster-state=${ETCD_INITIAL_CLUSTER_STATE:-new}
       - --initial-cluster-token=forgefleet-postgres-ha-v1
     volumes:
@@ -37,7 +37,7 @@ services:
     environment:
       NODE_NAME: ${NODE_NAME}
       NODE_IP: ${NODE_IP}
-      TAYLOR_IP: ${TAYLOR_IP}
+      VINNY_IP: ${VINNY_IP}
       MARCUS_IP: ${MARCUS_IP}
       SOPHIE_IP: ${SOPHIE_IP}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
@@ -57,7 +57,7 @@ services:
     image: haproxy:3.0-alpine
     network_mode: host
     environment:
-      TAYLOR_IP: ${TAYLOR_IP}
+      VINNY_IP: ${VINNY_IP}
       MARCUS_IP: ${MARCUS_IP}
       SOPHIE_IP: ${SOPHIE_IP}
     volumes:
@@ -66,7 +66,7 @@ services:
       - /bin/sh
       - -ec
       - |
-        sed -e "s/__TAYLOR_IP__/$${TAYLOR_IP}/g" \
+        sed -e "s/__VINNY_IP__/$${VINNY_IP}/g" \
             -e "s/__MARCUS_IP__/$${MARCUS_IP}/g" \
             -e "s/__SOPHIE_IP__/$${SOPHIE_IP}/g" \
             /usr/local/etc/haproxy/haproxy.cfg.in >/tmp/haproxy.cfg

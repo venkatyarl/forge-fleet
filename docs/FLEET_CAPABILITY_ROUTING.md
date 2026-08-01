@@ -242,7 +242,7 @@ flowchart TB
     end
 
     subgraph Fleet["Fleet Nodes"]
-        F["taylor: reasoning"]
+        F["vinny: reasoning"]
         G["sophie/marcus: code"]
         H["james: vision"]
         I["aura: embeddings"]
@@ -339,7 +339,7 @@ ff model download qwen3-omni-7b --node james
 
 | Node | Binary | Gateway | Models Deployed |
 |------|--------|---------|-----------------|
-| taylor | 2026.5.5_4 | ✅ | qwen36-35b-a3b, gemma-4-31b |
+| vinny | 2026.5.5_4 | ✅ | qwen36-35b-a3b, gemma-4-31b |
 | ace | 2026.5.5_4 | ✅ | qwen3.5-9b |
 | adele | 2026.5.5_4 | ✅ | — |
 | aura | 2026.5.5_4 | ✅ | qwen3.5-9b, **qwen3-embedding-8b** |

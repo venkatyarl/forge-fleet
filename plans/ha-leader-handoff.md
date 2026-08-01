@@ -52,7 +52,7 @@ as opt-in, gated, and separately reviewed.
 - **Postgres failover is INDEPENDENT of fleet leadership**
   (ha/pg_failover.rs). The fleet leader promotes a local PG replica only if it
   *hosts one* and the primary is ODOWN. The leader is **not required** to host
-  the PG primary — but in the real deployment Taylor tends to host both.
+  the PG primary — but in the real deployment Vinny tends to host both.
 
 ## The goal feature
 
@@ -64,17 +64,17 @@ DB-primary moves.)
 
 ## §4 — The crux / risk: PG-primary coupling
 
-If the current leader **also hosts the Postgres primary** (Taylor today), a
+If the current leader **also hosts the Postgres primary** (Vinny today), a
 naive "yield fleet leadership, let the follower upgrade me, restart me" is
-**unsafe**: restarting Taylor's `forgefleetd` is fine, but if the upgrade or a
-reboot disrupts Taylor's Postgres, the whole fleet loses its DB. Handoff that
+**unsafe**: restarting Vinny's `forgefleetd` is fine, but if the upgrade or a
+reboot disrupts Vinny's Postgres, the whole fleet loses its DB. Handoff that
 moves *fleet leadership* without considering *DB primary* buys nothing for the
-dangerous case (a Taylor reboot) and adds a second moving part.
+dangerous case (a Vinny reboot) and adds a second moving part.
 
 **Therefore the ordering for a safe maintenance handoff is:**
 1. Confirm a follower (e.g. James) has a **caught-up** PG replica (`lag_bytes`
    ≈ 0 in `database_replicas`).
-2. Demote Taylor PG primary → promote James PG replica → primary (and Redis).
+2. Demote Vinny PG primary → promote James PG replica → primary (and Redis).
 3. Repoint the fleet's DB DSN to James (this is the hard part — connection
    strings are currently static per host env; see open question Q2).
 4. Only then hand fleet leadership to James.
@@ -104,17 +104,17 @@ build the full feature casually.
 - Drain/refuse `forgefleetd_git`/`ff_git` waves during an active handoff (extend
   the V62 family-singleton) to avoid the wave self-kill race.
 - Still **no PG move** — Phase 2 only covers the case where the leader does NOT
-  host the PG primary (true for any non-Taylor leader).
+  host the PG primary (true for any non-Vinny leader).
 
 ### Phase 3 — DB-primary-aware handoff *(highest risk; separate review)*
 - Implement the §4 ordering: replica-lag gate → PG/Redis primary move → DSN
   repoint → fleet-leadership move → fail-back. Requires solving dynamic DSN
   repoint (Q2) and a tested promote/demote runbook (`database_replicas` already
   models the roles).
-- Only Phase 3 makes a **Taylor** maintenance/reboot truly zero-downtime.
+- Only Phase 3 makes a **Vinny** maintenance/reboot truly zero-downtime.
 
 ## Open questions (resolve before Phase 2/3)
-- **Q1.** Do we actually want zero-downtime Taylor maintenance, or is the
+- **Q1.** Do we actually want zero-downtime Vinny maintenance, or is the
   in-place self-upgrade + a short manual window acceptable? (If the latter,
   stop at Phase 1.)
 - **Q2.** How do workers learn the *current* DB DSN after a primary move? Today

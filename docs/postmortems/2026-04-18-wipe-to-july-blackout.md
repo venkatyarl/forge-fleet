@@ -18,7 +18,7 @@ commits that were its actual response.
 
 ## Chapter 1 — The Apr-18 wipe
 
-**What happened.** On 2026-04-17 at 18:13 (`57d8b31f`, Taylor Oclaw), the fleet
+**What happened.** On 2026-04-17 at 18:13 (`57d8b31f`, Vinny Oclaw), the fleet
 consolidated Postgres + Redis + Sentinel into a single unified
 `deploy/docker-compose.yml` stack with named volumes
 (`forgefleet-postgres-data`, `forgefleet-redis-data`,

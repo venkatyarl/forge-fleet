@@ -57,7 +57,7 @@
 │  └─────────────────────────────────────────────────────┘    │
 │                                                             │
 │  ┌─────────────────────────────────────────────────────┐    │
-│  │  🗄️  DATA LAYER (Postgres :55432 — Taylor)          │    │
+│  │  🗄️  DATA LAYER (Postgres :55432 — Vinny)          │    │
 │  │  ⚠️  SINGLE POINT OF FAILURE                         │    │
 │  │                                                      │    │
 │  │  ┌─ fleet_tasks ─────────────────────────────────┐   │    │
@@ -85,7 +85,7 @@
 │  │  └───────────────────────────────────────────────┘   │    │
 │  │                                                      │    │
 │  │  ┌─ fleet_leader_state ───────────────────────────┐   │    │
-│  │  │  • Elected leader (Taylor)                     │   │    │
+│  │  │  • Elected leader (Vinny)                     │   │    │
 │  │  └───────────────────────────────────────────────┘   │    │
 │  └─────────────────────────────────────────────────────┘    │
 │                                                             │
@@ -259,15 +259,15 @@ These components exist in the codebase but are **not spawned in src/main.rs**:
 │  ┌─────────────────────────────────────────────────────┐    │
 │  │  🗄️  DATA LAYER (Postgres HA)  🟢                    │    │
 │  │                                                      │    │
-│  │  ┌─ Primary: Taylor (:55432) ─────────────────────┐   │    │
+│  │  ┌─ Primary: Vinny (:55432) ─────────────────────┐   │    │
 │  │  │  • Read + write                                │   │    │
 │  │  └───────────────────────────────────────────────┘   │    │
 │  │  ┌─ Hot Standby: Marcus ──────────────────────────┐   │    │
-│  │  │  • Streaming replication from Taylor            │   │    │
-│  │  │  • 🆕 Auto-promote on Taylor failure (Patroni) │   │    │
+│  │  │  • Streaming replication from Vinny            │   │    │
+│  │  │  • 🆕 Auto-promote on Vinny failure (Patroni) │   │    │
 │  │  └───────────────────────────────────────────────┘   │    │
 │  │  ┌─ Patroni + etcd (3-node consensus) ────────────┐   │    │
-│  │  │  • Taylor, Marcus, Sophie                      │   │    │
+│  │  │  • Vinny, Marcus, Sophie                      │   │    │
 │  │  │  • Health checks every 5s                      │   │    │
 │  │  │  • Automatic failover ~15s                     │   │    │
 │  │  └───────────────────────────────────────────────┘   │    │
@@ -358,10 +358,10 @@ These components exist in the codebase but are **not spawned in src/main.rs**:
 
 ## 4. Per-Node Breakdown
 
-### Taylor (Leader + Primary Postgres)
+### Vinny (Leader + Primary Postgres)
 
 ```
-💻 Taylor
+💻 Vinny
 ├── 🟢 Postgres Primary (:55432)
 ├── 🟢 Patroni + etcd
 ├── 🟢 Gateway (:51002)
@@ -388,7 +388,7 @@ These components exist in the codebase but are **not spawned in src/main.rs**:
 
 ```
 💻 Marcus
-├── 🟢 Postgres Standby (streaming from Taylor)
+├── 🟢 Postgres Standby (streaming from Vinny)
 ├── 🟢 Patroni + etcd
 ├── 🟢 TaskRunner
 ├── 🆕 Delegate Server (:51003)
@@ -478,18 +478,18 @@ Client → Gateway (:51002) → POST /v1/orchestrate
 ### Flow 3: Direct Node Delegation (Inter-Node RPC)
 
 ```
-Node A (Taylor) needs Node B (Marcus) to do work
+Node A (Vinny) needs Node B (Marcus) to do work
 
 Before Phase 3:
-  Taylor → INSERT fleet_tasks (preferred_computer_id = marcus)
+  Vinny → INSERT fleet_tasks (preferred_computer_id = marcus)
   Marcus → polls every 10s → claims → executes
   Latency: 0-10s
 
 After Phase 3:
-  Taylor → HTTP POST to Marcus:51003/v1/internal/delegate
+  Vinny → HTTP POST to Marcus:51003/v1/internal/delegate
     Body: { task_id, task_type, payload, timeout_secs }
   Marcus → accepts → executes → streams SSE progress
-  Taylor ← receives result via SSE
+  Vinny ← receives result via SSE
   Latency: ~50ms + execution
 ```
 
@@ -520,7 +520,7 @@ Client → Gateway (:51002)
 
 | Component | Before | After |
 |-----------|--------|-------|
-| **Database** | Single Postgres on Taylor | Primary (Taylor) + Hot Standby (Marcus) + Patroni |
+| **Database** | Single Postgres on Vinny | Primary (Vinny) + Hot Standby (Marcus) + Patroni |
 | **Failover** | Manual WAN promotion | Auto-failover ~15s |
 | **Orchestration** | Keyword matching (`contains("write")`) | LLM-powered JSON plan |
 | **Node Delegation** | Postgres polling (10s) | Direct HTTP RPC (~50ms) |

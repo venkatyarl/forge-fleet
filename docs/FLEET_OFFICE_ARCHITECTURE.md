@@ -17,7 +17,7 @@ You have **15 employees** (computers). Each employee:
 
 ### The Bulletin Board
 
-There's a **central bulletin board** in the main lobby (Postgres on Taylor). Every employee checks it every 10 seconds for new jobs:
+There's a **central bulletin board** in the main lobby (Postgres on Vinny). Every employee checks it every 10 seconds for new jobs:
 
 ```
 ┌─────────────────────────────────────────┐
@@ -42,7 +42,7 @@ Employees claim jobs with a **sticky note protocol** (`FOR UPDATE SKIP LOCKED`) 
 
 ### The Manager's Office
 
-There's a **Manager** (the leader node, currently Taylor). The Manager:
+There's a **Manager** (the leader node, currently Vinny). The Manager:
 - Runs the **payroll system** (metrics downsampler)
 - Checks the **fire alarm** (alert evaluator)
 - Schedules **building maintenance** (auto-upgrade)
@@ -52,7 +52,7 @@ There's a **Manager** (the leader node, currently Taylor). The Manager:
 - ❌ Can't intelligently match jobs to skills — uses keyword matching, not understanding
 - ❌ Doesn't know who's swamped vs. idle — claims are first-come-first-served
 - ❌ Can't delegate directly — has to pin a note to the bulletin board and hope someone picks it up
-- ❌ If the Manager's office burns down (Taylor dies), the **entire bulletin board vanishes**
+- ❌ If the Manager's office burns down (Vinny dies), the **entire bulletin board vanishes**
 
 ### The Receptionist
 
@@ -107,7 +107,7 @@ Client → "Build me a mobile app"
 | **No direct coworker calls** | If Alice needs Bob's help, she pins a note to the board and waits | No RPC — only Postgres polling |
 | **First-come-first-served chaos** | The fastest employee grabs everything, even jobs they're bad at | `TaskRunner` uses `ORDER BY priority, created_at` — no load-aware scoring |
 | **No peer review** | Employees mark their own work "done" — no one checks it | `VerificationPipeline` exists but unwired |
-| **Bulletin board is in one office** | If that office floods, every employee loses their job list | Postgres on Taylor = SPOF |
+| **Bulletin board is in one office** | If that office floods, every employee loses their job list | Postgres on Vinny = SPOF |
 | **Receptionist turns people away** | "Everyone's busy, go away" instead of "Leave your number, we'll call back" | Gateway is synchronous only — no async queue |
 | **No project memory** | Every project starts from scratch — no one remembers last week's work | Brain context injection exists but is shallow |
 | **Employees don't advertise capacity** | "I'm at 95% CPU" isn't visible on the bulletin board | Pulse tracks load but `TaskRunner` doesn't use it |
@@ -128,12 +128,12 @@ Every office needs a **competent manager** who:
 ```
 Client: "Build me a mobile app with user auth"
 
-Manager (thinking via qwen3.5-9b on Taylor):
+Manager (thinking via qwen3.5-9b on Vinny):
   → This is [architecture, code, security]
   → Estimated: 4 parallel tracks
   → Track 1: Research auth patterns → james (reasoning)
   → Track 2: Design UI mockups → james (vision) — WAIT, james is at 90% GPU
-  → Track 2 ALT: Design UI mockups → taylor (gemma-4, idle)
+  → Track 2 ALT: Design UI mockups → vinny (gemma-4, idle)
   → Track 3: Backend API → sophie (coding, 30% load)
   → Track 4: Database schema → marcus (coding, 20% load)
   → Track 5 (after 1-4): Security review → rihanna (deepseek-v3.2, reasoning)
@@ -174,7 +174,7 @@ The bulletin board should be **smart**:
 │  Best fit:                              │
 │    1. sophie (coding, 20% load) ⭐      │
 │    2. marcus (coding, 45% load)         │
-│    3. taylor (gemma-4, 10% load)        │
+│    3. vinny (gemma-4, 10% load)        │
 ├─────────────────────────────────────────┤
 │  JOB: "Quick summary of logs"           │
 │  Complexity: LOW (fast response)        │
@@ -200,10 +200,10 @@ Sophie finishes code → Status: "PENDING REVIEW"
 ### The Redundant Bulletin Board (Postgres HA)
 
 The bulletin board exists in **two offices**:
-- Primary: Taylor's office
+- Primary: Vinny's office
 - Hot Standby: Marcus's office (streaming replication)
 
-If Taylor's office floods:
+If Vinny's office floods:
 1. Marcus automatically promotes his copy (Patroni)
 2. Employees start checking Marcus's board within 5 seconds
 3. No jobs are lost
@@ -259,7 +259,7 @@ flowchart TB
 
     subgraph Workers["👷 Workers (Every Node)"]
         direction TB
-        W1["taylor<br/>💪 reasoning + vision<br/>Slots: 0/8 busy"]
+        W1["vinny<br/>💪 reasoning + vision<br/>Slots: 0/8 busy"]
         W2["sophie<br/>💻 coding<br/>Slots: 2/4 busy"]
         W3["marcus<br/>💻 coding<br/>Slots: 1/4 busy"]
         W4["james<br/>👁️ vision<br/>Slots: 3/4 busy"]
@@ -314,12 +314,12 @@ flowchart TB
 ## 5. Migration Path: From Today's Office to Tomorrow's
 
 ### Phase 1: Bulletproof the Bulletin Board (Week 1-2)
-**Goal**: Survive Taylor going offline.
+**Goal**: Survive Vinny going offline.
 
 ```
-BEFORE: Postgres only on Taylor
+BEFORE: Postgres only on Vinny
          ↓
-AFTER:  Postgres on Taylor (primary)
+AFTER:  Postgres on Vinny (primary)
         + Postgres on Marcus (hot standby, streaming replication)
         + Patroni for auto-failover (10-15s detection, 5s promotion)
         + Every node's fleet.toml has both IPs in connection pool
@@ -462,12 +462,12 @@ AFTER:  POST /v1/chat/completions?async=true
 │    └── Budget Watchdog                      │
 │                                             │
 │  📋 BULLETIN BOARD (Postgres HA)            │
-│    ├── Primary: Taylor                      │
+│    ├── Primary: Vinny                      │
 │    ├── Hot Standby: Marcus (auto-promote)   │
 │    └── WAN Cold Standby: Off-site           │
 │                                             │
 │  👷 WORKERS (15 nodes)                      │
-│    ├── Taylor   — Reasoning + Vision        │
+│    ├── Vinny   — Reasoning + Vision        │
 │    ├── James    — Vision Specialist         │
 │    ├── Sophie   — Coding Lead               │
 │    ├── Marcus   — Coding                    │
@@ -542,7 +542,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
 
 | If you want… | Build Phase | Effort | Risk |
 |-------------|-------------|--------|------|
-| Survive Taylor dying | Phase 1 (Postgres HA) | Medium | Low (Patroni is proven) |
+| Survive Vinny dying | Phase 1 (Postgres HA) | Medium | Low (Patroni is proven) |
 | Intelligent task routing | Phase 2 (Orchestration LLM) | Medium | Low (local model, no external deps) |
 | Fast cross-node delegation | Phase 3 (Direct RPC) | Medium | Medium (new HTTP surface) |
 | Fair workload distribution | Phase 4 (Load-aware board) | Low | Low (SQL change only) |

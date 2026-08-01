@@ -13,7 +13,7 @@ routes so the `ff` CLI can talk to them uniformly.
 
 ### Install / Binary path
 
-Built from source on Taylor:
+Built from source on Vinny:
 
 ```
 ~/projects/llama.cpp/build/bin/llama-server

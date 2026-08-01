@@ -1,6 +1,6 @@
 -- Create replication user (run once on primary).
 --
--- Apply on the primary Postgres (Taylor) with:
+-- Apply on the primary Postgres (Vinny) with:
 --   docker exec -i forgefleet-postgres \
 --     psql -U forgefleet -d forgefleet < deploy/sql/setup-replication.sql
 --

@@ -201,7 +201,7 @@ flowchart TB
      - Priority (from `fleet_tasks.priority`)
      - Worker load (from Pulse beats, joined via `computers.name`)
      - Model affinity (from `fleet_models`)
-     - Taylor yield mode (from Pulse beat `yield_mode`)
+     - Vinny yield mode (from Pulse beat `yield_mode`)
    - This gives us ff-mesh's intelligent scheduling without losing durability.
 
 3. **Delete or archive `ff-mesh::WorkQueue`.**
@@ -244,7 +244,7 @@ flowchart TB
 **Goal**: Extract value, then deprecate.
 
 1. **Port `TaskScheduler::score_worker` logic into SQL.**
-   - The scoring formula (CPU load × 1.0 + memory × 0.5 + GPU × 0.8 + active_tasks × 15.0 + Taylor yield penalties + GPU bonus) can become a Postgres view or a Rust helper that ranks `computers` rows before the `UPDATE … SKIP LOCKED` claim.
+   - The scoring formula (CPU load × 1.0 + memory × 0.5 + GPU × 0.8 + active_tasks × 15.0 + Vinny yield penalties + GPU bonus) can become a Postgres view or a Rust helper that ranks `computers` rows before the `UPDATE … SKIP LOCKED` claim.
 
 2. **Port `ElectionManager::check_failover` into `leader_tick`.**
    - The production leader election already uses `fleet_leader_state` + Pulse.

@@ -528,13 +528,13 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     }
 
     // 7) telegram polling transport (bidirectional control channel).
-    // Gate on worker_name == "taylor": Telegram only allows a single
+    // Gate on worker_name == "vinny": Telegram only allows a single
     // long-poll holder per bot token. Without this gate, 15 fleet
     // daemons race for getUpdates() and each gets 409 Conflict every
-    // ~5s; nothing usable comes through. Taylor (leader) holds the
+    // ~5s; nothing usable comes through. Vinny (leader) holds the
     // session; other daemons skip the subsystem entirely.
     let telegram_owner =
-        std::env::var("FORGEFLEET_TELEGRAM_OWNER").unwrap_or_else(|_| "taylor".to_string());
+        std::env::var("FORGEFLEET_TELEGRAM_OWNER").unwrap_or_else(|_| "vinny".to_string());
     if worker_name == telegram_owner
         && config
             .transport
@@ -2353,7 +2353,7 @@ fn resolve_node_name(cli: &Cli, config: &FleetConfig) -> String {
     // `hostname` shell command — systemd user services don't inherit
     // $HOSTNAME, so this is the realistic Linux fallback. On a cleanly
     // enrolled member the short hostname matches the `computers.name`
-    // row (taylor, sia, marcus, …).
+    // row (vinny, sia, marcus, …).
     if let Ok(out) = std::process::Command::new("hostname").output()
         && out.status.success()
     {
@@ -2368,7 +2368,7 @@ fn resolve_node_name(cli: &Cli, config: &FleetConfig) -> String {
         }
     }
 
-    // Look for the gateway node (usually "taylor").
+    // Look for the gateway node (usually "vinny").
     if let Some((name, _node)) = config.nodes.iter().find(|(_, n)| n.role.is_leader_like()) {
         return name.clone();
     }
@@ -2666,7 +2666,7 @@ fn start_telegram_transport_subsystem(
         };
 
         let router = ff_gateway::MessageRouter::new(
-            vec!["forgefleet".to_string(), "taylor".to_string()],
+            vec!["forgefleet".to_string(), "vinny".to_string()],
             vec!['/', '!'],
         );
 
@@ -4058,11 +4058,11 @@ mod tests {
     #[test]
     fn embedded_agent_config_defaults_to_heartbeat_mode() {
         let config: FleetConfig = toml::from_str("").expect("default config");
-        let embedded = build_embedded_agent_config(&config, "taylor".to_string());
+        let embedded = build_embedded_agent_config(&config, "vinny".to_string());
 
         assert!(!embedded.autonomous_mode);
         assert_eq!(embedded.poll_interval_secs, 8);
-        assert_eq!(embedded.worker_name, "taylor");
+        assert_eq!(embedded.worker_name, "vinny");
     }
 
     #[test]

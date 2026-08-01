@@ -1,7 +1,7 @@
 # PostgreSQL HA
 
 `docker-compose.postgres-ha.yml` runs one etcd, Patroni/Postgres, HAProxy, and
-pgcat member on each of Taylor, Marcus, and Sophie. Run it on all three hosts;
+pgcat member on each of Vinny, Marcus, and Sophie. Run it on all three hosts;
 three containers on one host do not provide HA.
 
 ```bash

@@ -17,7 +17,7 @@
 | priya | 192.168.5.104 | online | runs the whole `deploy/docker-compose.yml` stack |
 | marcus | 192.168.5.102 | online | 31 GB linux-ubuntu, target for FalkorDB + NATS peer |
 | sophie | 192.168.5.103 | online | 31 GB linux-ubuntu, target for NATS peer |
-| taylor | 192.168.5.100 | **offline** since 2026-07-16 | old macOS leader; many stale hardcoded fallbacks still point here (§5) |
+| vinny | 192.168.5.100 | **offline** since 2026-07-16 | old macOS leader; many stale hardcoded fallbacks still point here (§5) |
 
 ### TCP probes (from adele, 2026-07-20)
 
@@ -36,8 +36,8 @@
 
 ### NATS / JetStream state (`http://192.168.5.104:58222/varz` + `/jsz`)
 
-- Server 2.10.29, `server_name: forgefleet-nats-taylor` — **name drift**: the compose stack
-  was moved taylor→priya without updating `deploy/docker/nats.conf`.
+- Server 2.10.29, `server_name: forgefleet-nats-vinny` — **name drift**: the compose stack
+  was moved vinny→priya without updating `deploy/docker/nats.conf`.
 - JetStream enabled (20 GB file store) but **0 streams, 0 consumers, 0 messages**.
 - Only 2 client connections, both from `172.18.0.1` (priya's own docker bridge gateway,
   i.e. priya-local processes). No other fleet node is connected to NATS at all.
@@ -84,7 +84,7 @@ goal "FF_TASKS survives a node loss" requires wiring this call into daemon start
 **F5 — Cluster scaffolding exists but is stale.**
 `deploy/docker/nats.conf` has the cluster block commented out with placeholder routes
 `marcus.local:6222` / `sophie.local:6222` (mDNS names; the fleet uses static IPs) and a
-hardcoded `server_name: forgefleet-nats-taylor`. Compose maps 56222→6222 already. Note the
+hardcoded `server_name: forgefleet-nats-vinny`. Compose maps 56222→6222 already. Note the
 conf's own warning: an orphan cluster block with no routes makes JetStream refuse to start —
 the cluster must be enabled with real routes on all three nodes in one operation.
 
@@ -103,7 +103,7 @@ Target endpoint: **192.168.5.102:63379** (browser UI 63000). Ports verified free
    empty volume `docker volume rm forgefleet-falkordb-data`. Safe: GRAPH.LIST/DBSIZE are 0
    (re-verify immediately before deleting).
 4. Doc/comment updates in-repo: `deploy/docker-compose.yml` header (lines 12-15 still say
-   192.168.5.100 — taylor, offline; falkordb line should say 192.168.5.102),
+   192.168.5.100 — vinny, offline; falkordb line should say 192.168.5.102),
    `plans/cortex-falkordb-backend.md` endpoint references,
    `crates/ff-db/src/schema.rs` V163 comment is historical — leave it (forward-only rule).
 5. Verify: port probe 192.168.5.102:63379 OPEN, 192.168.5.104:63379 closed; next backup tick
@@ -119,7 +119,7 @@ greenfield cluster formation.
 
 1. **Per-node nats.conf** (replace the single shared `deploy/docker/nats.conf`; template it
    with `server_name: forgefleet-nats-<node>` — unique names are mandatory in a cluster, and
-   this also fixes the `-taylor` drift):
+   this also fixes the `-vinny` drift):
 
    ```
    server_name: forgefleet-nats-priya        # marcus / sophie per node
@@ -168,8 +168,8 @@ greenfield cluster formation.
   touches postgres/pgcat on priya; the FalkorDB move (§3) is a 15-minute independent task and
   must not displace the replica work. The NATS cluster (§4) is also independent but includes a
   code change (step 3) that should ride a normal PR.
-- **Stale taylor (192.168.5.100) endpoints found while auditing** — each is a latent outage
-  since taylor is offline; file as follow-up items:
+- **Stale vinny (192.168.5.100) endpoints found while auditing** — each is a latent outage
+  since vinny is offline; file as follow-up items:
   - `crates/ff-agent/src/fleet_events.rs:35` — redis fallback `redis://192.168.5.100:56379`
   - `crates/ff-agent/src/main.rs:202` — gateway fallback `http://192.168.5.100:51002`
   - `scripts/lib/fleet.sh:63` — PGURL fallback `…@192.168.5.100:55432/…`

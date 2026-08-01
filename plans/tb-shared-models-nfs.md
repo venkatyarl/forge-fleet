@@ -1,17 +1,17 @@
 # TB.4 — Shared `~/models` over NFS on Thunderbolt
 
-**Status:** ready, needs operator sudo on Taylor.
+**Status:** ready, needs operator sudo on Vinny.
 
 ## Goal
 
-Make Taylor's `~/models` directory available read-only over Thunderbolt
+Make Vinny's `~/models` directory available read-only over Thunderbolt
 to James so both can load the same GGUF/MLX weights without each
 downloading their own copy. Free up James's 64 GB for inference, not
 duplicate model storage.
 
 ## Steps
 
-1. **Configure macOS NFS exports on Taylor**
+1. **Configure macOS NFS exports on Vinny**
 
 `/etc/exports` (root-owned):
 
@@ -32,22 +32,22 @@ showmount -e 10.44.0.1
 2. **Mount on James** (also macOS):
 
 ```bash
-ssh james "sudo mkdir -p /Volumes/taylor-models && \
-  sudo mount -t nfs -o resvport,ro,nolocks 10.44.0.1:/Users/venkat/models /Volumes/taylor-models"
+ssh james "sudo mkdir -p /Volumes/vinny-models && \
+  sudo mount -t nfs -o resvport,ro,nolocks 10.44.0.1:/Users/venkat/models /Volumes/vinny-models"
 ```
 
 3. **Persist via launchd on James** so it auto-mounts at boot:
 
-`~/Library/LaunchAgents/com.forgefleet.nfs-taylor-models.plist` →
+`~/Library/LaunchAgents/com.forgefleet.nfs-vinny-models.plist` →
 calls the mount command at startup; verify with `launchctl bootstrap`.
 
 4. **Wire into model deployments**
 
-For each James deployment that wants Taylor's model:
+For each James deployment that wants Vinny's model:
 
 ```bash
 ff model load <catalog-id> --node james --port 55003 \
-  --model-path /Volumes/taylor-models/<dir>
+  --model-path /Volumes/vinny-models/<dir>
 ```
 
 The `model_path` column in `fleet_model_library` should be the NFS
@@ -59,8 +59,8 @@ mount path on James's side.
   testing, but random small reads (which inference servers do at load
   time) can stutter. Pre-cache by `cat <model-file> > /dev/null` before
   starting the server.
-- **Read-only is intentional** — James must not write into Taylor's
-  models dir. Downloads still happen on Taylor; James only consumes.
+- **Read-only is intentional** — James must not write into Vinny's
+  models dir. Downloads still happen on Vinny; James only consumes.
 - **macOS NFS handle stability** — after sleep/wake cycles the mount
   can go stale; the launchd plist should `umount && mount` on every
   boot rather than expecting persistence.

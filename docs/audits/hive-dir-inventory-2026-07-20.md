@@ -44,7 +44,7 @@ Source of truth: `computers` table (live Postgres), 18 rows.
 | sophie | online | clean |
 | thalia | online | clean |
 | veronica | online | clean |
-| taylor | **offline** since 2026-04-24 | NOT AUDITED (unreachable) |
+| vinny | **offline** since 2026-04-24 | NOT AUDITED (unreachable) |
 
 ## Findings
 
@@ -53,7 +53,7 @@ Source of truth: `computers` table (live Postgres), 18 rows.
 - 17 online computers audited (including the local `adele` box and all
   `~/.forgefleet/sub-agents/sub-agent-*` slots on each). Every host returned zero
   directories named `hive` or `hive-mind`, whether inside or outside forge-fleet repos.
-- 1 computer (`taylor`) is offline (last seen 2026-04-24) and could not be reached;
+- 1 computer (`vinny`) is offline (last seen 2026-04-24) and could not be reached;
   it should be re-audited when it comes back online.
 
 ## Notes

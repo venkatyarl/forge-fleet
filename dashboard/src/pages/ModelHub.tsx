@@ -380,7 +380,7 @@ export function ModelHub() {
               label="Computer"
               value={form.computer}
               onChange={(value) => updateForm('computer', value)}
-              placeholder="taylor"
+              placeholder="vinny"
               required
             />
             <Field

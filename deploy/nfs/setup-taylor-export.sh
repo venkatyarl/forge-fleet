@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TB.4 setup — Taylor side. Run as: sudo bash deploy/nfs/setup-taylor-export.sh
+# TB.4 setup — Vinny side. Run as: sudo bash deploy/nfs/setup-vinny-export.sh
 #
 # Exports /Users/venkat/models read-only over Thunderbolt (10.44.0.0/24)
 # so James can mount it without duplicating the 50GB model directory.
@@ -34,11 +34,11 @@ cat <<'NEXT'
 
 ----
 On James, run:
-  sudo mkdir -p /Volumes/taylor-models
-  sudo mount -t nfs -o resvport,ro,nolocks,soft,intr,timeo=50,retrans=3 10.44.0.1:/Users/venkat/models /Volumes/taylor-models
-  ls /Volumes/taylor-models
+  sudo mkdir -p /Volumes/vinny-models
+  sudo mount -t nfs -o resvport,ro,nolocks,soft,intr,timeo=50,retrans=3 10.44.0.1:/Users/venkat/models /Volumes/vinny-models
+  ls /Volumes/vinny-models
 
-Then on Taylor:
-  ff fleet ssh-mesh-check  # confirm james→taylor still reachable
-  ls /Volumes/  # NOT expected to show on Taylor; only on James
+Then on Vinny:
+  ff fleet ssh-mesh-check  # confirm james→vinny still reachable
+  ls /Volumes/  # NOT expected to show on Vinny; only on James
 NEXT

@@ -324,7 +324,7 @@ export function MyTasks() {
             <input
               value={assigneeInput}
               onChange={(event) => setAssigneeInput(event.target.value)}
-              placeholder="venkat / taylor / unassigned"
+              placeholder="venkat / vinny / unassigned"
               className={fieldClass}
             />
           </label>

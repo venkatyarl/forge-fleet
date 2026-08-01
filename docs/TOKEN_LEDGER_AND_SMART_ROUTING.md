@@ -110,13 +110,13 @@ cloud_complexity_threshold = 3  # Only use cloud for tier 3+ tasks
 
 ## Deployment
 
-### Local (taylor/leader)
+### Local (vinny/leader)
 ```bash
 cd ~/projects/forge-fleet
 cargo build --release --bin forgefleetd
 cp target/release/forgefleetd ~/.local/bin/
 codesign --force --sign - ~/.local/bin/forgefleetd
-forgefleetd --node-name taylor start
+forgefleetd --node-name vinny start
 ```
 
 ### Fleet-wide

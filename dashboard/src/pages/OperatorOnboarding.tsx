@@ -291,7 +291,7 @@ export function OperatorOnboarding() {
               <code className="rounded-sm bg-elevated px-1 py-0.5 font-mono text-foreground">
                 ff secrets set enrollment.shared_secret &lt;token&gt;
               </code>{' '}
-              on Taylor before running the command above.
+              on Vinny before running the command above.
             </div>
           )}
         </Card>

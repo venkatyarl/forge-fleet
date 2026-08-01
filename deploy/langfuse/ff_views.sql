@@ -14,10 +14,10 @@
 -- Data shape we depend on:
 --   metadata is Map(String, String) with one key 'resourceAttributes'
 --   whose VALUE is a JSON string like
---   {"ff.computer":"taylor","service.name":"forgefleetd","ff.role":"daemon"}
+--   {"ff.computer":"vinny","service.name":"forgefleetd","ff.role":"daemon"}
 --   so every read needs JSONExtractString(metadata['resourceAttributes'], …).
 --
--- Verified on 2026-05-20 with 88 observations from forgefleetd@taylor.
+-- Verified on 2026-05-20 with 88 observations from forgefleetd@vinny.
 
 DROP VIEW IF EXISTS default.ff_spans_by_computer;
 DROP VIEW IF EXISTS default.ff_cost_split;

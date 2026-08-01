@@ -289,10 +289,10 @@ export const CHECKLIST: ChecklistItem[] = [
   {
     id: 'perm_passwordless_sudo',
     group: 'Permissions',
-    title: 'Passwordless sudo configured (skipped on Taylor)',
+    title: 'Passwordless sudo configured (skipped on Vinny)',
     applies_to: ['linux', 'linux-gpu', 'dgx-os'],
     detail_md:
-      'Bootstrap script writes `/etc/sudoers.d/forgefleet-<user>` with NOPASSWD:ALL.\n\nTaylor is explicitly excluded from this — the leader keeps human-confirmed sudo.',
+      'Bootstrap script writes `/etc/sudoers.d/forgefleet-<user>` with NOPASSWD:ALL.\n\nVinny is explicitly excluded from this — the leader keeps human-confirmed sudo.',
   },
 
   // ─── Windows-specific prerequisites ────────────────────────────

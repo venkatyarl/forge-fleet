@@ -51,7 +51,7 @@ Ranked by severity. The dominant theme: **two daemons (legacy `ff daemon` / `dae
 10. **`fleet_scan(mode=full)` MCP tool ungated** — any MCP client can trigger the subnet scan that caused the 130% CPU outage (daemon gates it; the tool doesn't).
 11. **`agent_procedures` write-only** — consolidation loop fills it; nothing ever SELECTs it.
 12. **MCP per-call pools** — `open_operational_store`, `get_pg_pool` paths build fresh pools (pool-per-call anti-pattern); `cli_interaction_pool` too.
-13. **Leader self-upgrade missing `free-for-build`** — dormant today (Taylor 96GB) but OOMs a memory-tight leader.
+13. **Leader self-upgrade missing `free-for-build`** — dormant today (Vinny 96GB) but OOMs a memory-tight leader.
 
 ## 4. Answers to the 6 questions
 
@@ -126,11 +126,11 @@ heartbeat), and `registry.current_leader()` had exactly ONE consumer (the gatewa
 fallback (`registry → db_snapshot.role=='leader'`) couldn't resolve because
 `fleet_worker_runtime` is empty in practice. Repointed `leader_hint` to read
 `fleet_leader_state` directly (same source as the `/api/fleet/leader` GET) — it now
-resolves to the real leader (`taylor`, proven runtime-resolvable: the identical
-`operational_store.pg_pool()` path serves `/api/fleet/leader`→taylor). **Caveat —
+resolves to the real leader (`vinny`, proven runtime-resolvable: the identical
+`operational_store.pg_pool()` path serves `/api/fleet/leader`→vinny). **Caveat —
 the dashboard `is_leader` flag still doesn't light up** because the DOWNSTREAM
 `build_fleet_worker_view` match (`node.config_name|hostname|display_name == leader`)
-can't match taylor: its registry `FleetComputer` has `config_name=None`,
+can't match vinny: its registry `FleetComputer` has `config_name=None`,
 `hostname=None` (not a config-sourced node), and the DB-runtime role is empty. Same
 root cause as the `fleet_worker_runtime`-empty follow-up below — tracked there, not
 fixed here. So #4's HA core is closed; the dashboard leader rendering rides on the
@@ -145,7 +145,7 @@ pre-rename / pre-Pulse-v2 relics that nothing populates anymore (**0 rows each**
 live; the live state is materialized into `computers` + `fleet_workers`). So the
 gateway's entire DB fleet snapshot was blind → every node `role="unknown"`, no
 leader, running on registry/config only. **Fix (#545):** repointed `list_nodes()`
-at `computers ⋈ fleet_workers` (15 live rows, taylor=leader) and made
+at `computers ⋈ fleet_workers` (15 live rows, vinny=leader) and made
 `build_fleet_worker_view`'s `is_leader` honor the live DB role (not only a
 `leader_hint` name-match). This closes the #4 dashboard-rendering follow-up too.
 **Still open:** `list_runtime_nodes` (`fleet_worker_runtime`) — the OTHER dead-table
@@ -166,8 +166,8 @@ affects the accuracy of the whole fleet-status/dashboard payload. **Also gates t
 dashboard leader rendering:** `build_fleet_worker_view` derives a node's `role`
 from `db_node.role` (empty → "unknown") and matches `leader_hint` against
 `config_name|hostname|display_name`. For nodes whose registry `FleetComputer` lacks
-config_name/hostname (e.g. taylor, discovered not config-seeded), neither resolves,
-so `is_leader` stays false even though `leader_hint`=taylor is correct. Fix here =
+config_name/hostname (e.g. vinny, discovered not config-seeded), neither resolves,
+so `is_leader` stays false even though `leader_hint`=vinny is correct. Fix here =
 correlate the node to its DB/runtime identity (match `leader_hint` against the
 resolved DB name too, and source `role` from the live table).
 

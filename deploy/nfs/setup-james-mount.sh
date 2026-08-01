@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TB.4 setup — James side. Run as: sudo bash deploy/nfs/setup-james-mount.sh
 #
-# Mounts Taylor's /Users/venkat/models read-only at /Volumes/taylor-models
+# Mounts Vinny's /Users/venkat/models read-only at /Volumes/vinny-models
 # over Thunderbolt (10.44.0.1).
 
 set -euo pipefail
@@ -11,7 +11,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-MOUNT=/Volumes/taylor-models
+MOUNT=/Volumes/vinny-models
 SERVER=10.44.0.1
 EXPORT=/Users/venkat/models
 
@@ -37,7 +37,7 @@ cat <<'NEXT'
 ----
 Persist across reboot — install the launchd plist:
 
-  sudo install -m 644 deploy/nfs/com.forgefleet.taylor-models-mount.plist \
-       /Library/LaunchDaemons/com.forgefleet.taylor-models-mount.plist
-  sudo launchctl bootstrap system /Library/LaunchDaemons/com.forgefleet.taylor-models-mount.plist
+  sudo install -m 644 deploy/nfs/com.forgefleet.vinny-models-mount.plist \
+       /Library/LaunchDaemons/com.forgefleet.vinny-models-mount.plist
+  sudo launchctl bootstrap system /Library/LaunchDaemons/com.forgefleet.vinny-models-mount.plist
 NEXT

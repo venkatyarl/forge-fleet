@@ -1,13 +1,13 @@
-# TB.2 — Pipeline-parallel critic across Taylor↔James over Thunderbolt
+# TB.2 — Pipeline-parallel critic across Vinny↔James over Thunderbolt
 
 **Status:** ready to execute — Thunderbolt fabric measured at **18-20 Gbps**
-end-to-end on 2026-05-19 (`ff fabric benchmark james taylor`).
+end-to-end on 2026-05-19 (`ff fabric benchmark james vinny`).
 
 ## Goal
 
-Run one large code-review/judge model split across Taylor (Mac Studio M3
+Run one large code-review/judge model split across Vinny (Mac Studio M3
 Ultra 96GB) and James (Mac mini 64GB) so the model's parameters live on
-two boxes but appear to clients as a single endpoint. Frees up Taylor's
+two boxes but appear to clients as a single endpoint. Frees up Vinny's
 RAM for other workloads while still serving a frontier-class critic.
 
 ## Candidate models
@@ -28,26 +28,26 @@ plenty even at 64K context.
   support multi-host out of the box.
 - **llama.cpp**: has experimental `--rpc` mode where one node is the
   master and others serve layer ranges. Less mature on macOS but works.
-- **vLLM**: Linux/CUDA only — not an option for Taylor+James (both macOS).
+- **vLLM**: Linux/CUDA only — not an option for Vinny+James (both macOS).
 
-Recommendation: **llama.cpp RPC mode**, master on Taylor, worker on James.
+Recommendation: **llama.cpp RPC mode**, master on Vinny, worker on James.
 
 ## Steps
 
 1. **Build llama.cpp on both with `GGML_RPC=ON`**
 
 ```bash
-# On Taylor + James:
+# On Vinny + James:
 cd ~/build
 git clone https://github.com/ggerganov/llama.cpp llama-rpc
 cd llama-rpc
 make GGML_RPC=ON LLAMA_METAL=1 -j8
 ```
 
-2. **Download Qwen3-Next-80B-A3B-Q5_K_M.gguf on Taylor**
+2. **Download Qwen3-Next-80B-A3B-Q5_K_M.gguf on Vinny**
 
 ```bash
-ff model download qwen3-next-80b-a3b --quant Q5_K_M --node taylor
+ff model download qwen3-next-80b-a3b --quant Q5_K_M --node vinny
 ```
 
 3. **Start RPC worker on James (port 50051)**
@@ -56,7 +56,7 @@ ff model download qwen3-next-80b-a3b --quant Q5_K_M --node taylor
 ssh james "cd ~/build/llama-rpc && ./bin/rpc-server -H 10.44.0.2 -p 50051 -t 16"
 ```
 
-4. **Start RPC master on Taylor with worker pinned via TB IP**
+4. **Start RPC master on Vinny with worker pinned via TB IP**
 
 ```bash
 ~/build/llama-rpc/bin/llama-server \
@@ -71,27 +71,27 @@ ssh james "cd ~/build/llama-rpc && ./bin/rpc-server -H 10.44.0.2 -p 50051 -t 16"
 5. **Register the deployment**
 
 ```bash
-ff model load qwen3-next-80b-a3b --node taylor --port 55005 \
+ff model load qwen3-next-80b-a3b --node vinny --port 55005 \
   --runtime llama.cpp \
-  --note "pipeline-parallel across taylor+james via Thunderbolt rpc"
+  --note "pipeline-parallel across vinny+james via Thunderbolt rpc"
 ```
 
 6. **Update fleet_resolver to route `consensus.judge.large` here**
 
 ```sql
 INSERT INTO model_tiers (tier_id, model_id, endpoint, role, priority)
-VALUES ('judge.large', 'qwen3-next-80b-a3b', 'http://taylor:55005/v1/chat/completions', 'judge', 100);
+VALUES ('judge.large', 'qwen3-next-80b-a3b', 'http://vinny:55005/v1/chat/completions', 'judge', 100);
 ```
 
 ## Smoke tests
 
 ```bash
 # Latency:
-curl -s -X POST http://taylor:55005/v1/chat/completions \
+curl -s -X POST http://vinny:55005/v1/chat/completions \
   -d '{"model":"default","messages":[{"role":"user","content":"3+5?"}]}' \
   -w '\ntime=%{time_total}s\n'
 
-# Compare to single-host baseline (taylor mlx 55001):
+# Compare to single-host baseline (vinny mlx 55001):
 ff swarm run "compare a tricky code edit on both endpoints"
 ```
 

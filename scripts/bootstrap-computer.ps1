@@ -3,7 +3,7 @@
 # Usage:
 #   PowerShell> .\bootstrap-computer.ps1 -FleetLeaderIp 192.168.5.100 -Name tony -Role member -Runtime llama.cpp
 #
-# Drafted by Marcus (Qwen3-Coder-30B via ff run) and cleaned up on Taylor.
+# Drafted by Marcus (Qwen3-Coder-30B via ff run) and cleaned up on Vinny.
 
 param(
     [Parameter(Mandatory=$true)]

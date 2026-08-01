@@ -2,7 +2,7 @@
 # Rendered at serve time from /onboard/bootstrap.ps1; placeholders:
 #   {{LEADER_HOST}}, {{LEADER_PORT}}, {{TOKEN}}, {{COMPUTER_NAME}}, {{COMPUTER_IP}},
 #   {{SSH_USER}}, {{ROLE}}, {{RUNTIME}}, {{GITHUB_OWNER}},
-#   {{GITHUB_PAT_SECRET_KEY}}, {{IS_TAYLOR}}
+#   {{GITHUB_PAT_SECRET_KEY}}, {{IS_VINNY}}
 #
 # Run in an ELEVATED PowerShell 7+ / Windows PowerShell:
 #   iwr -useb "http://leader:51002/onboard/bootstrap.ps1?..." | iex
@@ -24,7 +24,7 @@ $ROLE                  = "{{ROLE}}"
 $RUNTIME_HINT          = "{{RUNTIME}}"
 $GITHUB_OWNER          = "{{GITHUB_OWNER}}"
 $GITHUB_PAT_SECRET_KEY = "{{GITHUB_PAT_SECRET_KEY}}"
-$IS_TAYLOR             = "{{IS_TAYLOR}}"
+$IS_VINNY             = "{{IS_VINNY}}"
 $LEADER                = "http://$LEADER_HOST`:$LEADER_PORT"
 
 # ─── Helpers ─────────────────────────────────────────────────────────────

@@ -1,14 +1,14 @@
-# Telegram Setup (Taylor Runtime)
+# Telegram Setup (Vinny Runtime)
 
-This guide wires Telegram into ForgeFleet so `forgefleetd` on **Taylor** can run two-way Telegram messaging (polling mode) and media ingest.
+This guide wires Telegram into ForgeFleet so `forgefleetd` on **Vinny** can run two-way Telegram messaging (polling mode) and media ingest.
 
 ## 1) Create Telegram bot (BotFather)
 
 1. Open Telegram and chat with **@BotFather**.
 2. Run `/newbot`.
 3. Choose:
-   - Bot display name (example: `Taylor ForgeFleet`)
-   - Bot username ending in `bot` (example: `taylor_forgefleet_bot`)
+   - Bot display name (example: `Vinny ForgeFleet`)
+   - Bot username ending in `bot` (example: `vinny_forgefleet_bot`)
 4. Copy the bot token BotFather returns.
 5. (Recommended) disable privacy mode for richer group behavior:
    - `/setprivacy` → select your bot → `Disable`

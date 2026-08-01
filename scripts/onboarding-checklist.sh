@@ -18,7 +18,7 @@ COMPUTERS=$($PG -c "SELECT name FROM computers ORDER BY name" 2>/dev/null)
 {
   echo "# ForgeFleet Onboarding Checklist — $STAMP"
   echo
-  echo "Per-computer status across 12 onboarding items. Run from Taylor."
+  echo "Per-computer status across 12 onboarding items. Run from Vinny."
   echo
   printf "| %-8s | %-4s | %-4s | %-5s | %-5s | %-6s | %-4s | %-6s | %-4s | %-7s | %-5s | %-7s |\n" \
     computer ident ssh sudo ff daemon pulse runtime llm subagnt disk netscope
@@ -33,8 +33,8 @@ COMPUTERS=$($PG -c "SELECT name FROM computers ORDER BY name" 2>/dev/null)
     TRUST_CNT=$($PG -c "SELECT COUNT(*) FROM computer_trust WHERE source_computer_id=(SELECT id FROM computers WHERE name='$NAME')")
     if [[ "${TRUST_CNT:-0}" -ge 3 ]]; then SSH="✓"; else SSH="⚠ $TRUST_CNT"; fi
 
-    # 3. sudo — check metadata (Taylor is intentionally excluded)
-    if [[ "$NAME" == "taylor" ]]; then
+    # 3. sudo — check metadata (Vinny is intentionally excluded)
+    if [[ "$NAME" == "vinny" ]]; then
       SUDO="n/a"
     else
       SUDO_OK=$($PG -c "SELECT (metadata->>'passwordless_sudo') FROM computers WHERE name='$NAME'" 2>/dev/null)
@@ -87,7 +87,7 @@ COMPUTERS=$($PG -c "SELECT name FROM computers ORDER BY name" 2>/dev/null)
   echo
   echo "- **ident** — row in \`computers\` table"
   echo "- **ssh** — ≥3 mesh trust rows (out of 5 peers)"
-  echo "- **sudo** — passwordless_sudo flag (Taylor excluded by policy)"
+  echo "- **sudo** — passwordless_sudo flag (Vinny excluded by policy)"
   echo "- **ff** — \`ff\` binary tracked in computer_software"
   echo "- **daemon** — forgefleetd tracked in computer_software"
   echo "- **pulse** — last_seen_at < 60s"

@@ -5,7 +5,7 @@ Source work item: `b19c5264-d3b0-4587-81a9-4f05108086eb`
 
 ## Result
 
-The recovered item referred to roughly 784 findings in the old Taylor database. That snapshot is not present in the current database, so this triage reran `ff cortex audit --corpus fb --format json` against the current `fb` corpus and reviewed all 255 current `endpoints-no-guard` findings. The rule is intentionally a needs-verification heuristic: it reports handlers without a direct `guarded_by` edge and cannot currently propagate router-level middleware or prove that a router is reachable.
+The recovered item referred to roughly 784 findings in the old Vinny database. That snapshot is not present in the current database, so this triage reran `ff cortex audit --corpus fb --format json` against the current `fb` corpus and reviewed all 255 current `endpoints-no-guard` findings. The rule is intentionally a needs-verification heuristic: it reports handlers without a direct `guarded_by` edge and cannot currently propagate router-level middleware or prove that a router is reachable.
 
 Three real gaps were promoted to high-priority `forge-fleet` work items:
 

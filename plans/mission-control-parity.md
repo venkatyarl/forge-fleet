@@ -1,6 +1,6 @@
 # Mission-Control → ForgeFleet Project-Management Parity
 
-Source: codex deep-dive of `/Users/venkat/taylorProjects/mission-control-legacy` vs ff (2026-06-17). Full transcript: `/tmp/ff_missioncontrol_parity.md`.
+Source: codex deep-dive of `/Users/venkat/vinnyProjects/mission-control-legacy` vs ff (2026-06-17). Full transcript: `/tmp/ff_missioncontrol_parity.md`.
 
 **Headline:** ForgeFleet already has a substantial PM surface (`crates/ff-mc` API + dashboard pages + `ff pm`/`ff project` CLI + Postgres `projects`/`fleet_work_items`). The gaps are mostly **UI/UX depth + a few high-leverage features**, plus one real **architecture discrepancy**.
 

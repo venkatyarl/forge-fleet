@@ -36,7 +36,7 @@ ff supervise "<task>"   # tiered with retry
 
 | Task shape | Default route | Why |
 |------------|---------------|-----|
-| One-shot text | Taylor mlx (Qwen3.5-35B) | Lowest latency on leader |
+| One-shot text | Vinny mlx (Qwen3.5-35B) | Lowest latency on leader |
 | Code edit | Marcus Qwen3-Coder-30B | Best local tool-caller |
 | Code review | Sophie Qwen3-Coder-30B + Sia Qwen3-30B (debate) | Two models cheaper than one cloud call |
 | Long-horizon plan | James Qwen3.5-72B | More headroom for chain-of-thought |

@@ -121,13 +121,13 @@
 <div id="bg"></div><canvas id="scene"></canvas>
 <div class="corner tl"></div><div class="corner tr"></div><div class="corner bl"></div><div class="corner br"></div>
 
-<div class="hud" id="brand"><div class="wm">J.A.R.V.I.S.<small>FORGEFLEET OS · MK 0.1</small></div><div id="node">NODE: TAYLOR · LEADER · ONLINE</div></div>
+<div class="hud" id="brand"><div class="wm">J.A.R.V.I.S.<small>FORGEFLEET OS · MK 0.1</small></div><div id="node">NODE: VINNY · LEADER · ONLINE</div></div>
 <div class="hud" id="clock"><div class="t" id="ct">--:--:--</div><div class="d" id="cd">--</div><div class="rail" id="crail"></div></div>
 <div class="hud" id="wx"><div class="big">15 NODES</div><div class="l">offload: warm · marcus<br>schema V114 · main synced<br>0 cloud tokens today</div></div>
 
 <div class="hud col" id="lcol">
   <div class="grp"><h3>MACS<span class="tag">DARWIN</span></h3>
-    <div class="li"><span><i class="dot ok"></i>taylor</span><span class="v">leader</span></div>
+    <div class="li"><span><i class="dot ok"></i>vinny</span><span class="v">leader</span></div>
     <div class="li"><span><i class="dot ok"></i>james</span><span class="v">64G</span></div>
     <div class="li"><span><i class="dot ok"></i>ace</span><span class="v">16G</span></div></div>
   <div class="grp"><h3>AMD STRIX<span class="tag">123G</span></h3>
@@ -317,7 +317,7 @@ function say(txt){transcript.innerHTML='<span class="j">'+txt+'</span>';const u=
 // :8472 prototype server with no gateway). Keeps the HUD demoable offline.
 function respondLocal(q){const s=q.toLowerCase();
   if(/status|systems|report|how are/.test(s)){showSection('systems',15,'NODES ONLINE');return "All systems nominal, sir. Fifteen nodes online, offload warm on Marcus, schema at version one-fourteen.";}
-  if(/fleet|computers|nodes|machines/.test(s)){showSection('fleet',15,'NODES');return "The fleet stands at fifteen: Taylor leads, three Macs, four AMD Strix nodes, and four DGX Sparks. All converged.";}
+  if(/fleet|computers|nodes|machines/.test(s)){showSection('fleet',15,'NODES');return "The fleet stands at fifteen: Vinny leads, three Macs, four AMD Strix nodes, and four DGX Sparks. All converged.";}
   if(/offload|credit|token|save/.test(s)){showSection('offload',0,'CLOUD TOKENS');return "Offload is warm on Marcus's coder. Code tasks run locally — zero cloud tokens spent today, sir.";}
   if(/working on|tasks|building|busy/.test(s)){showSection('tasks',4,'ACTIVE BUILDS');return "Four builds in progress, sir: the demand-sensing orchestrator, the agent catalog, this interface, and the durability deploy.";}
   if(/hello|hi |hey|good (morning|evening|night)|jarvis|you there/.test(s)){return "I'm here, sir. At your service.";}
@@ -449,7 +449,7 @@ async function pollState(){
     }
     // per-node-class load from the live nodes[] array (online fraction by class).
     if(Array.isArray(d.nodes)){
-      const cls={mac:['taylor','james','ace'],
+      const cls={mac:['vinny','james','ace'],
         amd:['logan','veronica','lily','duncan'],
         dgx:['sia','adele','rihanna','beyonce']};
       const frac=(names)=>{const set=d.nodes.filter(n=>names.includes((n.name||'').toLowerCase()));

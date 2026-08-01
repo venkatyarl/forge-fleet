@@ -12,7 +12,7 @@
 #   {{RUNTIME}}                — "auto" | "llama.cpp" | "mlx" | "vllm"
 #   {{GITHUB_OWNER}}           — e.g. "venkatyarl"
 #   {{GITHUB_PAT_SECRET_KEY}}  — "github.venkat_pat"
-#   {{IS_TAYLOR}}              — "true" or "false" (controls passwordless sudo)
+#   {{IS_VINNY}}              — "true" or "false" (controls passwordless sudo)
 #
 # This script expects to be run with sudo on the new machine:
 #   curl -fsSL 'http://...' | sudo bash
@@ -33,7 +33,7 @@ ROLE="{{ROLE}}"
 RUNTIME_HINT="{{RUNTIME}}"
 GITHUB_OWNER="{{GITHUB_OWNER}}"
 GITHUB_PAT_SECRET_KEY="{{GITHUB_PAT_SECRET_KEY}}"
-IS_TAYLOR="{{IS_TAYLOR}}"
+IS_VINNY="{{IS_VINNY}}"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -266,9 +266,9 @@ if ! run_as_user bash -lc 'command -v cargo >/dev/null'; then
 fi
 report "rust" ok
 
-# ─── 4. Passwordless sudo (except on Taylor) ─────────────────────────────
+# ─── 4. Passwordless sudo (except on Vinny) ─────────────────────────────
 
-if [ "$IS_TAYLOR" != "true" ]; then
+if [ "$IS_VINNY" != "true" ]; then
   report "sudoers" running
   SUDOERS_FILE="/etc/sudoers.d/forgefleet-${SUDO_INVOKER}"
   echo "${SUDO_INVOKER} ALL=(ALL) NOPASSWD:ALL" > "$SUDOERS_FILE"
@@ -278,7 +278,7 @@ if [ "$IS_TAYLOR" != "true" ]; then
   run_as_user sudo -n true || die "passwordless sudo not working"
   report "sudoers" ok
 else
-  report "sudoers" ok "skipped (taylor)"
+  report "sudoers" ok "skipped (vinny)"
 fi
 
 # ─── 5. GitHub CLI + auth ────────────────────────────────────────────────
@@ -301,7 +301,7 @@ esac
 report "gh" ok
 
 # ─── 5b. gh auth login via PAT stored in fleet_secrets ───────────────────
-# Prereq: operator ran `ff secrets set github.venkat_pat ghp_xxx` on taylor.
+# Prereq: operator ran `ff secrets set github.venkat_pat ghp_xxx` on vinny.
 # If the secret isn't set we skip — `git clone` will still work for PUBLIC
 # repos, and `gh auth status` will fail at verify-time so the operator knows.
 report "gh_auth" running

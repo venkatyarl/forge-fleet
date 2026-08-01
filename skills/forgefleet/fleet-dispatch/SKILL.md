@@ -63,7 +63,7 @@ Is the task self-contained (no multi-file context needed)?
 
 ## Avoid these failure modes
 
-- **Gemma-4 can't tool-call**: don't dispatch coding work to Taylor's
+- **Gemma-4 can't tool-call**: don't dispatch coding work to Vinny's
   mlx default — use `--llm http://192.168.5.102:55000` (Marcus) or
   Sophie's Qwen3-Coder.
 - **Loop detection false positives**: if `ff supervise` reports a

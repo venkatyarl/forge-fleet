@@ -9,7 +9,7 @@
   in-daemon alert_evaluator fails silently (the 9h DGX outage of
   2026-04-22).
 
-  Install on Taylor:
+  Install on Vinny:
     cp deploy/launchd/com.forgefleet.external-alerter.plist \
        ~/Library/LaunchAgents/
     launchctl load -w ~/Library/LaunchAgents/com.forgefleet.external-alerter.plist

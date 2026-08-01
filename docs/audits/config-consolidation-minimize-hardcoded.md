@@ -45,7 +45,7 @@ reference the V39 retirement and the current `model_catalog` table instead (leaf
 | `KIMI_CONFIG_FILES` | `crates/ff-agent/src/config_distributor.rs:32` | List of Kimi config file paths to distribute |
 | `ALLOWED_LICENSES` | `crates/ff-agent/src/model_scout.rs:41` | License allowlist for model discovery |
 | `EVALUATOR_METRICS`, `COMPUTER_STATUS_VALUES`, `IMPERATIVE_METRICS` | `crates/ff-agent/src/alert_evaluator.rs:168,186,193` | Metric/threshold routing tables |
-| `EXCLUDE_HOSTS` | `crates/ff-agent/src/autoscaler.rs:74` | Node exclusion list for autoscale churn (`&["taylor"]`) |
+| `EXCLUDE_HOSTS` | `crates/ff-agent/src/autoscaler.rs:74` | Node exclusion list for autoscale churn (`&["vinny"]`) |
 | `VISION_MODEL_PREFS` | `crates/ff-agent/src/social_ingest/mod.rs:40` | Preferred vision-model list |
 | `DAEMON_GATES` | `crates/ff-terminal/src/fleet_cmd.rs:5848` | Every daemon subsystem gate key + default + description |
 | `COMMANDS` | `crates/ff-gateway/src/telegram_commands.rs:24` | Full Telegram bot command table |
@@ -108,7 +108,7 @@ single coherent diff to produce and defaulted to a no-op. Fixing this means disp
    clean, no references to the retired TOML path remain (`grep -r model_catalog.toml crates/`
    returns nothing outside migration history/docs).
 2. **Migrate `EXCLUDE_HOSTS` autoscaler denylist to `fleet_settings`.** Smallest table (single
-   `&["taylor"]`), good pilot for the read-path pattern. Add a `fleet_settings` row
+   `&["vinny"]`), good pilot for the read-path pattern. Add a `fleet_settings` row
    (`key = 'autoscaler.exclude_hosts'`, JSONB array), a loader in
    `crates/ff-agent/src/autoscaler.rs` that reads it with the current array as the fallback
    default, migration in `crates/ff-db/src/migrations.rs` (next version int). Verifiable output:

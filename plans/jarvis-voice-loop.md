@@ -1,4 +1,4 @@
-# NATIVE JARVIS Voice Loop — Implementation Plan (Taylor)
+# NATIVE JARVIS Voice Loop — Implementation Plan (Vinny)
 
 > Status: DESIGN, ready for operator review (2026-05-31). Browser speech in the
 > HUD already works today; this is the always-listening native "Jarvis" wake-word
@@ -19,11 +19,11 @@ a thin new `ff voice` subcommand. Stack:
   concise British "sir" answer; **request field is `query`**)
 - **TTS** via `say -v Daniel` (macOS built-in, instant, British, zero install)
 
-New install on Taylor: `brew install whisper-cpp` + one `ggml-base.en.bin`.
+New install on Vinny: `brew install whisper-cpp` + one `ggml-base.en.bin`.
 Phase 2 upgrades wake-word → Picovoice Porcupine (prebuilt "Jarvis" keyword, lower
 idle CPU) and TTS → Piper British voice.
 
-## What's already on Taylor
+## What's already on Vinny
 
 | Tool | Present? | Role |
 |---|---|---|
@@ -60,7 +60,7 @@ native `say` TTS engine + a cpal capture module; changes nothing existing.
 A new **`ff voice` subcommand in `crates/ff-terminal`** (NOT a new crate, NOT inside
 `forgefleetd`). Rationale: operator wants things "through `ff`"; the heavy lifting already
 lives in `ff-voice`; keep always-on mic/CoreAudio threads + the TCC prompt OUT of the
-headless core daemon. Voice runs only on Taylor where the operator sits (login LaunchAgent
+headless core daemon. Voice runs only on Vinny where the operator sits (login LaunchAgent
 later via `ff voice --daemon`, but the daemon does not own it).
 
 ```
@@ -81,7 +81,7 @@ already present. Phase 2: `pv_porcupine = "3"` + shell to `piper`.
 
 ## Phase 1 build steps (ordered)
 
-1. `brew install whisper-cpp` on Taylor → `/opt/homebrew/bin/whisper-cli`.
+1. `brew install whisper-cpp` on Vinny → `/opt/homebrew/bin/whisper-cli`.
 2. Download `ggml-base.en.bin` into `~/models/whisper/`; pass via `-m`.
 3. Add `cpal = "0.16"`, `hound = "3.5"` to `crates/ff-voice/Cargo.toml`.
 4. `capture.rs`: open input by NAME (C920; `--device` override), cpal 16kHz mono stream
@@ -118,7 +118,7 @@ already present. Phase 2: `pv_porcupine = "3"` + shell to `piper`.
   before whisper-cli or accuracy degrades.
 - **Porcupine AccessKey (Phase 2)** — store in `fleet_secrets`, not a file.
 - **Gateway URL** — make it a flag; don't hardcode the port (code default is `0.0.0.0:8787`,
-  Taylor runs 51002).
+  Vinny runs 51002).
 
 ## Files of record
 - `crates/ff-voice/src/{stt.rs,wake_word.rs,pipeline.rs,tts.rs,audio.rs,lib.rs}` (reused)

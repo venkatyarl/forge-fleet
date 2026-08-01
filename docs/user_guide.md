@@ -113,11 +113,11 @@ ssh marcus "ff model delete <library-uuid> --yes"
 
 ### Swap runtime variants
 
-Taylor has both a GGUF and an MLX Gemma-4 — the GGUF is unused on Taylor
-(MLX is Taylor's runtime). Smart-LRU will flag the GGUF for eviction first:
+Vinny has both a GGUF and an MLX Gemma-4 — the GGUF is unused on Vinny
+(MLX is Vinny's runtime). Smart-LRU will flag the GGUF for eviction first:
 
 ```bash
-ff model prune --node taylor
+ff model prune --node vinny
 # → Gemma-4 GGUF flagged with reason "wrong-runtime(llama.cpp/mlx)"
 ```
 
@@ -135,7 +135,7 @@ ff model transfer --library-id <uuid-on-source> --from marcus --to sophie
 Apple Silicon only. Fallback when mlx-community lacks a pre-converted variant:
 
 ```bash
-ssh taylor "ff model convert <safetensors-lib-uuid> --q-bits 4"
+ssh vinny "ff model convert <safetensors-lib-uuid> --q-bits 4"
 # spawns mlx_lm.convert; output logged to ~/.forgefleet/logs/
 ```
 

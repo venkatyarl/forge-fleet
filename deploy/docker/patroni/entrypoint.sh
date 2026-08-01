@@ -3,7 +3,7 @@ set -eu
 
 : "${NODE_NAME:?set NODE_NAME}"
 : "${NODE_IP:?set NODE_IP}"
-: "${TAYLOR_IP:?set TAYLOR_IP}"
+: "${VINNY_IP:?set VINNY_IP}"
 : "${MARCUS_IP:?set MARCUS_IP}"
 : "${SOPHIE_IP:?set SOPHIE_IP}"
 : "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}"

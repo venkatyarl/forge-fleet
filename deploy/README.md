@@ -11,12 +11,12 @@ long-running background service on each fleet node.
 | Disk usage sampler    | 300 s            | Snapshot free / used / models-dir bytes to Postgres |
 | Deployment reconciler | 60 s             | Sync `fleet_model_deployments` with real processes  |
 
-Exactly **one** fleet node (typically the leader, `taylor`) should run with
+Exactly **one** fleet node (typically the leader, `vinny`) should run with
 `--scheduler`. Others run workers only.
 
 ---
 
-## macOS — launchd (Taylor, Ace, James)
+## macOS — launchd (Vinny, Ace, James)
 
 ```bash
 # 1. Copy the template and update USER paths if your username isn't `venkat`:
@@ -59,7 +59,7 @@ journalctl -u forgefleet-daemon@marcus.service -f
 ```
 
 The provided unit does NOT include `--scheduler` — it's worker-only.
-Leader (Taylor) on Mac runs the scheduler via launchd.
+Leader (Vinny) on Mac runs the scheduler via launchd.
 
 ---
 

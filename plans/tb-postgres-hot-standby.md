@@ -5,10 +5,10 @@ backup_orchestrator is spamming the err log).
 
 ## Goal
 
-James becomes a live read-replica of Taylor's Postgres so:
+James becomes a live read-replica of Vinny's Postgres so:
 1. Reads can fan out to James for the brain-search / dashboard load
-2. Backups stream from James (no impact on Taylor's WAL)
-3. If Taylor dies hard, James can be promoted in <30s (operator manual)
+2. Backups stream from James (no impact on Vinny's WAL)
+3. If Vinny dies hard, James can be promoted in <30s (operator manual)
 
 Network: Postgres replication runs over Thunderbolt (10.44.0.x) so
 WAL traffic doesn't compete with LAN.
@@ -37,7 +37,7 @@ SELECT pg_reload_conf();
 host  replication  replicator  10.44.0.2/32  scram-sha-256
 ```
 
-Restart Taylor's Postgres (in Docker) to pick up wal_level change:
+Restart Vinny's Postgres (in Docker) to pick up wal_level change:
 `docker compose restart postgres`.
 
 Store the password in fleet_secrets:
@@ -70,7 +70,7 @@ ssh james "PGPASSWORD=... pg_basebackup \
 4. **Verify replication lag**
 
 ```sql
--- on Taylor:
+-- on Vinny:
 SELECT client_addr, state, sync_state,
        pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS bytes_behind
 FROM pg_stat_replication;
@@ -90,14 +90,14 @@ user = "forgefleet_read"   # create as RO role
 ```
 
 Only the embedding search + dashboard queries should target the replica
-initially — anything that writes must hit Taylor.
+initially — anything that writes must hit Vinny.
 
 ## Failover (manual, not automatic)
 
 ```bash
 # On James:
 pg_ctl promote -D /var/lib/postgresql/data
-# Then re-point Taylor's clients via ff fleet leader-override.
+# Then re-point Vinny's clients via ff fleet leader-override.
 ```
 
 We do NOT want automatic failover until we have a quorum cluster

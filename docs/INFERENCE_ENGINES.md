@@ -26,7 +26,7 @@
 |-----------|-----|-------------|
 | DGX Spark (×4) | 128GB each | vLLM (tensor parallel) or TensorRT-LLM |
 | GMKtec EVO-X2 (×4) | 128GB each | llama.cpp (ROCm/Vulkan) or mistral.rs |
-| Mac Studio (Taylor) | 96GB | MLX or llama.cpp (Metal) |
+| Mac Studio (Vinny) | 96GB | MLX or llama.cpp (Metal) |
 | Mac mini M4 (Ace) | 16GB | llama.cpp (Metal) |
 | Intel boxes (Marcus/Sophie/Priya) | 32GB each | llama.cpp (CPU) |
 | Mac mini Intel (James) | 64GB | llama.cpp (CPU) |

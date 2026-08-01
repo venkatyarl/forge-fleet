@@ -1,5 +1,5 @@
 #!/bin/bash
-# External fleet alerter — runs on Taylor OUTSIDE forgefleetd.
+# External fleet alerter — runs on Vinny OUTSIDE forgefleetd.
 #
 # The in-daemon alert_evaluator dies when forgefleetd dies. This script
 # queries Postgres directly for stale computer.last_seen_at and pages via
@@ -96,13 +96,13 @@ while IFS='|' read -r NAME AGE STATUS; do
   fi
 done <<< "$ROWS"
 
-# Bonus: alert if forgefleetd itself is dead on Taylor (this script runs
+# Bonus: alert if forgefleetd itself is dead on Vinny (this script runs
 # here, so a local check is cheap and catches "daemon died but we didn't
 # notice for N minutes" — the exact 9h DGX outage scenario in reverse).
 if ! pgrep -f '/forgefleetd($| )' >/dev/null 2>&1; then
-  KEY="taylor/daemon_dead"
+  KEY="vinny/daemon_dead"
   if ! on_cooldown "$KEY"; then
-    page_telegram critical "forgefleetd is NOT running on taylor — no process matches forgefleetd"
+    page_telegram critical "forgefleetd is NOT running on vinny — no process matches forgefleetd"
     mark_paged "$KEY"
   fi
 fi
