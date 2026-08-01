@@ -40,7 +40,7 @@ pub enum SwarmCommand {
         capability: String,
         /// Computer names that must NOT claim any sub-task,
         /// comma-separated (e.g. "sia,adele,rihanna,beyonce" to keep the
-        /// swarm off the DGX pairs, or "taylor" to spare the leader).
+        /// swarm off the DGX pairs, or "vinny" to spare the leader).
         /// Sets fleet_tasks.excludes_computer_ids on every fanned-out
         /// sub-task; unknown names are warned about and skipped, never
         /// silently dropped.
@@ -733,7 +733,7 @@ mod tests {
             vec!["sia", "adele", "rihanna"]
         );
         // empty segments from leading/trailing/double commas are ignored
-        assert_eq!(parse_exclude_names(",taylor,,"), vec!["taylor"]);
+        assert_eq!(parse_exclude_names(",vinny,,"), vec!["vinny"]);
         // duplicates collapse
         assert_eq!(parse_exclude_names("sia,sia,adele"), vec!["sia", "adele"]);
     }

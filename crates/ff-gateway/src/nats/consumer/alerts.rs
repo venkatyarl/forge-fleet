@@ -60,14 +60,14 @@ mod tests {
             "cpu_usage",
             AlertSeverity::Warning,
             "CPU usage is high",
-            Some("taylor".into()),
+            Some("vinny".into()),
             None,
         );
         let repeated = tracker.track_for_telegram(
             "cpu_usage",
             AlertSeverity::Warning,
             "CPU usage remains high",
-            Some("taylor".into()),
+            Some("vinny".into()),
             None,
         );
 
@@ -83,10 +83,10 @@ mod tests {
         let tracker = TelegramAlertTracker::new();
 
         for (metric, node, model) in [
-            ("cpu_usage", Some("taylor".into()), None),
-            ("memory_usage", Some("taylor".into()), None),
+            ("cpu_usage", Some("vinny".into()), None),
+            ("memory_usage", Some("vinny".into()), None),
             ("cpu_usage", Some("veronica".into()), None),
-            ("cpu_usage", Some("taylor".into()), Some("llama".into())),
+            ("cpu_usage", Some("vinny".into()), Some("llama".into())),
         ] {
             assert!(
                 tracker

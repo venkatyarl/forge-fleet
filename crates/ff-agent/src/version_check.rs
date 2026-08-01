@@ -229,7 +229,7 @@ async fn enqueue_upgrade_tasks(
     // `git reset --hard origin/main && cargo build` IN ~/projects/forge-fleet —
     // the operator's LIVE dev tree. A deferred worker running that playbook on
     // the leader hard-resets the working tree and clobbers in-progress branch
-    // work (observed every ~140s on Taylor 2026-06-24, wiping an unmerged fix).
+    // work (observed every ~140s on Vinny 2026-06-24, wiping an unmerged fix).
     // The leader self-upgrades ONLY via the separately-gated leader-self-upgrade
     // path, so never enqueue a source-build upgrade that targets the leader.
     let node_is_leader = crate::auto_upgrade::is_leader(pool, node).await;

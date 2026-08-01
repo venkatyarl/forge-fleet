@@ -62,7 +62,7 @@ pub async fn handle_fleet_panic_stop(pool: &sqlx::PgPool, yes: bool, halt_dbs: b
 
     if halt_dbs {
         println!("\n{CYAN}▶ --halt-dbs — stopping local Docker data-plane containers…{RESET}");
-        let (ok, detail) = ff_agent::panic_stop::stop_taylor_docker_stack().await;
+        let (ok, detail) = ff_agent::panic_stop::stop_vinny_docker_stack().await;
         let marker = if ok {
             format!("{GREEN}✓{RESET}")
         } else {
@@ -71,7 +71,7 @@ pub async fn handle_fleet_panic_stop(pool: &sqlx::PgPool, yes: bool, halt_dbs: b
         println!("  {marker} docker stack\n{detail}");
         if !ok {
             println!(
-                "{YELLOW}(some containers weren't running locally — expected if this isn't Taylor){RESET}"
+                "{YELLOW}(some containers weren't running locally — expected if this isn't Vinny){RESET}"
             );
         }
     }
@@ -248,7 +248,7 @@ pub async fn handle_fleet_drain(pool: &sqlx::PgPool, computer: &str, yes: bool) 
 }
 
 /// `ff fleet undrain <computer>` — explicitly recover an ownerless deploy
-/// drain. Operator-owned reservations and Taylor are deliberately immutable.
+/// drain. Operator-owned reservations and Vinny are deliberately immutable.
 pub async fn handle_fleet_undrain(pool: &sqlx::PgPool, computer: &str, yes: bool) -> Result<()> {
     if !yes {
         anyhow::bail!("pass --yes to recover the ownerless deploy drain on '{computer}'");
@@ -261,7 +261,7 @@ pub async fn handle_fleet_undrain(pool: &sqlx::PgPool, computer: &str, yes: bool
                 reserved_reason = NULL,
                 reservation_expires_at = NULL
           WHERE LOWER(name) = LOWER($1)
-            AND LOWER(name) <> 'taylor'
+            AND LOWER(name) <> 'vinny'
             AND reservation_state = 'drained'
             AND reservation_owner IS NULL
         RETURNING id",
@@ -271,7 +271,7 @@ pub async fn handle_fleet_undrain(pool: &sqlx::PgPool, computer: &str, yes: bool
     .await?;
     let Some(computer_id) = computer_id else {
         anyhow::bail!(
-            "refusing to undrain '{computer}': node is Taylor, not drained, or has an operator owner"
+            "refusing to undrain '{computer}': node is Vinny, not drained, or has an operator owner"
         );
     };
     let enabled = sqlx::query(
@@ -580,7 +580,7 @@ pub async fn handle_fleet_db(pool: &sqlx::PgPool, cmd: FleetDbCommand) -> Result
             println!("Now run on the off-site machine:");
             println!("  cd deploy/");
             println!(
-                "  POSTGRES_PRIMARY_HOST=<taylor-tailscale-ip> \\\n    \
+                "  POSTGRES_PRIMARY_HOST=<vinny-tailscale-ip> \\\n    \
                  POSTGRES_REPLICATION_PASSWORD=<same as primary> \\\n    \
                  docker compose -f docker-compose.follower-remote.yml up -d"
             );
@@ -1923,7 +1923,7 @@ struct RemoveComputerReport {
 /// `ff fleet disband`.
 ///
 /// Runs the DB deletes in a single transaction, enqueues the SSH-trust
-/// revocation task on the leader (preferred_node="taylor"), and
+/// revocation task on the leader (preferred_node="vinny"), and
 /// best-effort publishes `fleet.events.computer_removed` on NATS.
 /// Returns a row-level report. Errors are surfaced to the caller; the
 /// transaction rolls back on any SQL failure.
@@ -1965,7 +1965,7 @@ async fn remove_computer_core(pool: &sqlx::PgPool, name: &str) -> Result<RemoveC
 
     tx.commit().await?;
 
-    // Enqueue SSH revocation as a deferred task so it survives Taylor being
+    // Enqueue SSH revocation as a deferred task so it survives Vinny being
     // offline or the operator running this from a non-leader. Payload is a
     // shell script that invokes `ff fleet revoke-trust`, which re-reads the
     // (now-deleted) key from fleet_ssh_revocations… wait — the key is gone
@@ -1982,7 +1982,7 @@ async fn remove_computer_core(pool: &sqlx::PgPool, name: &str) -> Result<RemoveC
     // authorized_keys line is a reasonable fallback.
     let script = build_remove_computer_ssh_script(name);
     let payload = serde_json::json!({ "command": script });
-    let trigger_spec = serde_json::json!({ "node": "taylor" });
+    let trigger_spec = serde_json::json!({ "node": "vinny" });
     let title = format!("Revoke SSH trust for {name}");
     let who = whoami_tag();
     let defer_id = ff_db::pg_enqueue_deferred(
@@ -1992,7 +1992,7 @@ async fn remove_computer_core(pool: &sqlx::PgPool, name: &str) -> Result<RemoveC
         &payload,
         "node_online",
         &trigger_spec,
-        Some("taylor"),
+        Some("vinny"),
         &serde_json::json!([]),
         Some(&who),
         Some(3),
@@ -2017,9 +2017,9 @@ async fn remove_computer_core(pool: &sqlx::PgPool, name: &str) -> Result<RemoveC
 
 /// Build a shell script that SSH-fans-out a revocation of `name`'s user
 /// key across every remaining peer. Run as a `node_online` deferred task
-/// on Taylor.
+/// on Vinny.
 ///
-/// Strategy: ask the local DB on Taylor for every peer's primary_ip, then
+/// Strategy: ask the local DB on Vinny for every peer's primary_ip, then
 /// for each peer run a grep -v filter on `authorized_keys` that drops any
 /// line ending with `@<name>` (the canonical comment suffix ForgeFleet
 /// writes during onboarding).
@@ -2028,7 +2028,7 @@ fn build_remove_computer_ssh_script(name: &str) -> String {
     format!(
         r#"set -e
 NAME='{name}'
-# Pull the list of peers from the local Postgres on Taylor. If psql isn't
+# Pull the list of peers from the local Postgres on Vinny. If psql isn't
 # available we fall back to the .forgefleet/fleet.toml parse below.
 PEERS=$(ff fleet health --json 2>/dev/null | \
   python3 -c 'import json,sys; d=json.load(sys.stdin); print("\n".join(r["name"] for r in d if r["name"] != "'"$NAME"'"))' 2>/dev/null || true)
@@ -2091,7 +2091,7 @@ pub async fn handle_fleet_remove_computer(
     println!("                    computer_docker_containers");
     println!("  explicit deletes: fleet_models (no cascade),");
     println!("                    fleet_leader_state WHERE member_name=<name>");
-    println!("  side-effect:      1 deferred SSH-revocation task on taylor");
+    println!("  side-effect:      1 deferred SSH-revocation task on vinny");
 
     if !yes {
         eprintln!("\n{YELLOW}Removal is destructive. Pass --yes to proceed.{RESET}");
@@ -2124,16 +2124,16 @@ pub async fn handle_fleet_disband(
     yes: bool,
     i_know_what_im_doing: bool,
 ) -> Result<()> {
-    // Collect every computer that isn't Taylor. We look at both tables
+    // Collect every computer that isn't Vinny. We look at both tables
     // because a computer may exist in one but not the other if something
     // went sideways during onboarding.
     let fleet_names: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM fleet_workers WHERE LOWER(name) <> 'taylor' ORDER BY name",
+        "SELECT name FROM fleet_workers WHERE LOWER(name) <> 'vinny' ORDER BY name",
     )
     .fetch_all(pool)
     .await?;
     let computer_names: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM computers WHERE LOWER(name) <> 'taylor' ORDER BY name",
+        "SELECT name FROM computers WHERE LOWER(name) <> 'vinny' ORDER BY name",
     )
     .fetch_all(pool)
     .await?;
@@ -2147,7 +2147,7 @@ pub async fn handle_fleet_disband(
     targets.sort();
 
     println!("{CYAN}▶ ff fleet disband{RESET}");
-    println!("  This will DELETE every fleet_workers/computers row except 'taylor'.");
+    println!("  This will DELETE every fleet_workers/computers row except 'vinny'.");
     println!("  Requires BOTH --yes AND --i-know-what-im-doing to actually run.");
     println!("  targets:         {} computer(s)", targets.len());
     for n in &targets {
@@ -2155,7 +2155,7 @@ pub async fn handle_fleet_disband(
     }
 
     if targets.is_empty() {
-        println!("{YELLOW}No non-Taylor rows to remove. Nothing to do.{RESET}");
+        println!("{YELLOW}No non-Vinny rows to remove. Nothing to do.{RESET}");
         return Ok(());
     }
 
@@ -2210,7 +2210,7 @@ pub async fn handle_fleet_migrate_source_trees(
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
-    // Build the candidate set: every computer that isn't Taylor.
+    // Build the candidate set: every computer that isn't Vinny.
     // We join fleet_workers (for ssh_user/ip) with computers (for
     // source_tree_path) on name.
     #[derive(Debug)]
@@ -2225,7 +2225,7 @@ pub async fn handle_fleet_migrate_source_trees(
                 COALESCE(c.source_tree_path, '~/.forgefleet/sub-agents/sub-agent-0/forge-fleet') AS canonical
            FROM fleet_workers n
            LEFT JOIN computers c ON c.name = n.name
-          WHERE LOWER(n.name) <> 'taylor'
+          WHERE LOWER(n.name) <> 'vinny'
           ORDER BY n.name",
     )
     .fetch_all(pool)
@@ -2241,9 +2241,9 @@ pub async fn handle_fleet_migrate_source_trees(
         .collect();
 
     println!("{CYAN}▶ ff fleet migrate-source-trees{RESET}");
-    println!("  candidates: {} non-Taylor node(s)", candidates.len());
+    println!("  candidates: {} non-Vinny node(s)", candidates.len());
     if candidates.is_empty() {
-        println!("{YELLOW}No non-Taylor nodes. Nothing to do.{RESET}");
+        println!("{YELLOW}No non-Vinny nodes. Nothing to do.{RESET}");
         return Ok(());
     }
 
@@ -2262,7 +2262,7 @@ pub async fn handle_fleet_migrate_source_trees(
         let target = format!("{user}@{host}");
         // One SSH call returns both flags, separated by "|".
         let script = "legacy=0; canonical=0; \
-             [ -d ~/taylorProjects/forge-fleet ] && legacy=1; \
+             [ -d ~/vinnyProjects/forge-fleet ] && legacy=1; \
              [ -d ~/.forgefleet/sub-agents/sub-agent-0/forge-fleet/.git ] && canonical=1; \
              echo \"$legacy|$canonical\"";
         let out = tokio::time::timeout(
@@ -2397,19 +2397,19 @@ fn build_migrate_source_tree_script(canonical: &str) -> String {
 CANONICAL="{canonical}"
 mkdir -p "$(dirname "$CANONICAL")"
 if [ -d "$CANONICAL/.git" ]; then
-  rm -rf ~/taylorProjects/forge-fleet 2>/dev/null || true
-  rmdir ~/taylorProjects 2>/dev/null || true
+  rm -rf ~/vinnyProjects/forge-fleet 2>/dev/null || true
+  rmdir ~/vinnyProjects 2>/dev/null || true
   echo "canonical already present — dropped legacy"
   exit 0
 fi
-if [ -d ~/taylorProjects/forge-fleet/.git ]; then
-  mv ~/taylorProjects/forge-fleet "$CANONICAL"
-  rmdir ~/taylorProjects 2>/dev/null || true
+if [ -d ~/vinnyProjects/forge-fleet/.git ]; then
+  mv ~/vinnyProjects/forge-fleet "$CANONICAL"
+  rmdir ~/vinnyProjects 2>/dev/null || true
   echo "moved legacy → canonical"
 else
   git clone https://github.com/venkatyarl/forge-fleet "$CANONICAL"
-  rm -rf ~/taylorProjects/forge-fleet 2>/dev/null || true
-  rmdir ~/taylorProjects 2>/dev/null || true
+  rm -rf ~/vinnyProjects/forge-fleet 2>/dev/null || true
+  rmdir ~/vinnyProjects 2>/dev/null || true
   echo "fresh clone into canonical"
 fi
 "#,
@@ -6546,7 +6546,7 @@ else
   HOME_BASE="/home/$USER"
   OS_TYPE="linux"
 fi
-OLD_DIR="$HOME_BASE/taylorProjects/forge-fleet"
+OLD_DIR="$HOME_BASE/vinnyProjects/forge-fleet"
 NEW_DIR="$HOME_BASE/projects/forge-fleet"
 mkdir -p "$HOME_BASE/projects"
 if [ ! -d "$NEW_DIR/.git" ]; then
@@ -6556,7 +6556,7 @@ if [ ! -d "$NEW_DIR/.git" ]; then
     git clone --depth 50 "https://github.com/{new_owner}/forge-fleet.git" "$NEW_DIR"
   fi
 fi
-# Retire ~/taylorProjects fully. If the legacy dir or symlink lingers, drop it.
+# Retire ~/vinnyProjects fully. If the legacy dir or symlink lingers, drop it.
 rm -rf "$OLD_DIR" 2>/dev/null || true
 cd "$NEW_DIR"
 git remote set-url origin "https://github.com/{new_owner}/forge-fleet.git"
@@ -6570,7 +6570,7 @@ fi
 if [ "$OS_TYPE" = "linux" ]; then
   UNIT="/etc/systemd/system/forgefleet-daemon.service"
   if [ -f "$UNIT" ]; then
-    sudo sed -i "s|WorkingDirectory=.*taylorProjects.*forge-fleet|WorkingDirectory=$NEW_DIR|" "$UNIT" || true
+    sudo sed -i "s|WorkingDirectory=.*vinnyProjects.*forge-fleet|WorkingDirectory=$NEW_DIR|" "$UNIT" || true
     sudo systemctl daemon-reload || true
     sudo systemctl restart forgefleet-daemon.service || true
   fi
@@ -7138,7 +7138,7 @@ mod route_tests {
     }
 
     #[test]
-    fn undrain_is_limited_to_ownerless_non_taylor_drains() {
+    fn undrain_is_limited_to_ownerless_non_vinny_drains() {
         let source = include_str!("fleet_cmd.rs");
         let undrain = source
             .split("pub async fn handle_fleet_undrain")
@@ -7146,7 +7146,7 @@ mod route_tests {
             .expect("undrain handler");
         assert!(undrain.contains("reservation_state = 'drained'"));
         assert!(undrain.contains("reservation_owner IS NULL"));
-        assert!(undrain.contains("LOWER(name) <> 'taylor'"));
+        assert!(undrain.contains("LOWER(name) <> 'vinny'"));
         assert!(undrain.contains("status = 'disabled'"));
     }
 

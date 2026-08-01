@@ -315,10 +315,10 @@ pub async fn fleet_resume(pg: &PgPool, local_name: &str) -> Result<HaltReport, s
     Ok(HaltReport::from_entries(entries))
 }
 
-/// Docker stack halt — used by `--halt-dbs`. Only meaningful on Taylor,
+/// Docker stack halt — used by `--halt-dbs`. Only meaningful on Vinny,
 /// where the compose project lives. Silently stops the three data-plane
 /// containers; each is no-op-safe if the container doesn't exist.
-pub async fn stop_taylor_docker_stack() -> (bool, String) {
+pub async fn stop_vinny_docker_stack() -> (bool, String) {
     const CONTAINERS: &[&str] = &[
         "forgefleet-postgres",
         "forgefleet-redis",

@@ -13,11 +13,11 @@
 //! name = "ForgeFleet"
 //! version = "1.0"
 //!
-//! [nodes.taylor]
+//! [nodes.vinny]
 //! ip = "192.168.5.100"
 //! role = "gateway"
 //!
-//! [nodes.taylor.models.qwen35_35b]
+//! [nodes.vinny.models.qwen35_35b]
 //! name = "Qwen3.5-35B"
 //! tier = 2
 //! ```
@@ -65,7 +65,7 @@ pub struct FleetConfig {
     #[serde(default, alias = "general")]
     pub fleet: FleetSettings,
 
-    /// Named nodes — `[nodes.taylor]`, `[nodes.james]`, etc.
+    /// Named nodes — `[nodes.vinny]`, `[nodes.james]`, etc.
     /// Key is the node name, value is the node configuration.
     #[serde(default)]
     pub nodes: HashMap<String, NodeConfig>,
@@ -383,7 +383,7 @@ pub struct NodeConfig {
     pub alt_ips: Vec<String>,
 
     /// Models deployed on this node, keyed by model slug.
-    /// Example: `[nodes.taylor.models.qwen35_35b]`
+    /// Example: `[nodes.vinny.models.qwen35_35b]`
     #[serde(default)]
     pub models: HashMap<String, NodeModelConfig>,
 
@@ -1496,7 +1496,7 @@ impl Default for LeaderConfig {
 }
 
 fn default_preferred_leader() -> String {
-    "taylor".into()
+    "vinny".into()
 }
 fn default_election_interval() -> u64 {
     10
@@ -1954,7 +1954,7 @@ version = "1.0"
 default_repo = "/tmp/test-repo"
 disabled_backends = ["claude"]
 
-[nodes.taylor]
+[nodes.vinny]
 ip = "192.168.5.100"
 ssh_user = "venkat"
 ram_gb = 96
@@ -1964,7 +1964,7 @@ role = "gateway"
 alt_ips = ["192.168.5.101"]
 election_priority = 1
 
-[nodes.taylor.models.qwen35_35b]
+[nodes.vinny.models.qwen35_35b]
 name = "Qwen3.5-35B"
 family = "qwen"
 port = 55000
@@ -1974,19 +1974,19 @@ lifecycle = "production"
 mode = "on_demand"
 preferred_workloads = ["fallback_reasoning", "control_assist"]
 
-[nodes.taylor.resources]
+[nodes.vinny.resources]
 cpu_cores = 32
 ram_gb = 96
 vram_gb = 0
 
-[nodes.taylor.capabilities]
+[nodes.vinny.capabilities]
 control_plane = true
 model_building = false
 premium_inference = false
 local_inference = true
 docker = true
 
-[nodes.taylor.preferences]
+[nodes.vinny.preferences]
 preferred_workloads = ["control", "coordination"]
 first_preference_workloads = []
 
@@ -2049,7 +2049,7 @@ model_start = 55000
 model_end = 55010
 
 [scheduling]
-canonical_writer = "taylor"
+canonical_writer = "vinny"
 degraded_coordinator_mode = true
 max_handoffs_per_task = 2
 
@@ -2116,7 +2116,7 @@ password = "CHANGEME_IN_PRODUCTION"
 url = "postgresql://forgefleet:forgefleet@127.0.0.1:55432/forgefleet"
 
 [leader]
-preferred = "taylor"
+preferred = "vinny"
 fallback_order = ["marcus"]
 
 [fleet_secrets]
@@ -2149,17 +2149,17 @@ notes = "Setup started."
         assert_eq!(config.fleet.disabled_backends, vec!["claude".to_string()]);
         assert_eq!(config.nodes.len(), 2);
 
-        let taylor = config.nodes.get("taylor").expect("taylor node");
-        assert_eq!(taylor.ip, "192.168.5.100");
-        assert_eq!(taylor.role, Role::Gateway);
-        assert_eq!(taylor.ssh_user.as_deref(), Some("venkat"));
-        assert_eq!(taylor.ram_gb, Some(96));
-        assert_eq!(taylor.os.as_deref(), Some("macOS 26.3"));
-        assert_eq!(taylor.alt_ips, vec!["192.168.5.101".to_string()]);
-        assert_eq!(taylor.priority(), 1);
+        let vinny = config.nodes.get("vinny").expect("vinny node");
+        assert_eq!(vinny.ip, "192.168.5.100");
+        assert_eq!(vinny.role, Role::Gateway);
+        assert_eq!(vinny.ssh_user.as_deref(), Some("venkat"));
+        assert_eq!(vinny.ram_gb, Some(96));
+        assert_eq!(vinny.os.as_deref(), Some("macOS 26.3"));
+        assert_eq!(vinny.alt_ips, vec!["192.168.5.101".to_string()]);
+        assert_eq!(vinny.priority(), 1);
 
         // Check nested models.
-        let qwen = taylor.models.get("qwen35_35b").expect("qwen model");
+        let qwen = vinny.models.get("qwen35_35b").expect("qwen model");
         assert_eq!(qwen.name, "Qwen3.5-35B");
         assert_eq!(qwen.family.as_deref(), Some("qwen"));
         assert_eq!(qwen.tier, 2);
@@ -2171,13 +2171,13 @@ notes = "Setup started."
         );
 
         // Check resources.
-        let res = taylor.resources.as_ref().expect("resources");
+        let res = vinny.resources.as_ref().expect("resources");
         assert_eq!(res.ram_gb, Some(96));
         assert_eq!(res.cpu_cores, Some(32));
         assert_eq!(res.vram_gb, Some(0));
 
         // Check capabilities.
-        let caps = taylor.capabilities.as_ref().expect("capabilities");
+        let caps = vinny.capabilities.as_ref().expect("capabilities");
         assert_eq!(caps.control_plane, Some(true));
         assert_eq!(caps.docker, Some(true));
 
@@ -2226,7 +2226,7 @@ notes = "Setup started."
         // Check scheduling.
         assert_eq!(
             config.scheduling.canonical_writer.as_deref(),
-            Some("taylor")
+            Some("vinny")
         );
         assert_eq!(config.scheduling.project_weights.default_weight, 1.0);
         assert_eq!(
@@ -2279,7 +2279,7 @@ notes = "Setup started."
         assert_eq!(config.database.name.as_deref(), Some("forgefleet"));
 
         // Check leader.
-        assert_eq!(config.leader.preferred, "taylor");
+        assert_eq!(config.leader.preferred, "vinny");
 
         // Check fleet secrets.
         assert!(config.fleet_secrets.distributed_review_mode);
@@ -2318,7 +2318,7 @@ notes = "Setup started."
 
         let config = load_config(&path).unwrap();
         assert_eq!(config.nodes.len(), 2);
-        assert!(config.nodes.contains_key("taylor"));
+        assert!(config.nodes.contains_key("vinny"));
 
         // Cleanup.
         let _ = std::fs::remove_file(&path);
@@ -2338,7 +2338,7 @@ notes = "Setup started."
         assert_eq!(config.fleet.heartbeat_interval_secs, 15);
         assert_eq!(config.fleet.api_port, 51000);
         assert!(config.fleet.disabled_backends.is_empty());
-        assert_eq!(config.leader.preferred, "taylor");
+        assert_eq!(config.leader.preferred, "vinny");
         assert_eq!(config.database.max_connections, 10);
         assert_eq!(config.database.mode, DatabaseMode::PostgresRuntime);
         assert!(config.loops.evolution.enabled);
@@ -2480,25 +2480,25 @@ mode = "{alias}"
     #[test]
     fn test_node_convenience_methods() {
         let config: FleetConfig = toml::from_str(sample_toml()).unwrap();
-        assert!(config.get_node("taylor").is_some());
+        assert!(config.get_node("vinny").is_some());
         assert!(config.get_node("nonexistent").is_none());
 
         let all_models = config.all_node_models();
         assert!(!all_models.is_empty());
-        // Should find qwen35_35b on taylor.
+        // Should find qwen35_35b on vinny.
         assert!(
             all_models
                 .iter()
-                .any(|(node, slug, _)| *node == "taylor" && *slug == "qwen35_35b")
+                .any(|(node, slug, _)| *node == "vinny" && *slug == "qwen35_35b")
         );
     }
 
     #[test]
     fn test_effective_ram_and_cpu() {
         let config: FleetConfig = toml::from_str(sample_toml()).unwrap();
-        let taylor = config.get_node("taylor").unwrap();
-        assert_eq!(taylor.effective_ram_gb(), Some(96));
-        assert_eq!(taylor.effective_cpu_cores(), Some(32));
+        let vinny = config.get_node("vinny").unwrap();
+        assert_eq!(vinny.effective_ram_gb(), Some(96));
+        assert_eq!(vinny.effective_cpu_cores(), Some(32));
     }
 
     #[test]

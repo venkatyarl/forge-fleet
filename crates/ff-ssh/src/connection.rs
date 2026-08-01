@@ -288,8 +288,8 @@ mod tests {
     #[test]
     fn resolve_host_maps_alias_to_roster_ip() {
         let mut roster = HashMap::new();
-        roster.insert("taylor".into(), "192.168.5.100".into());
-        let mut opts = opts_with_host("taylor");
+        roster.insert("vinny".into(), "192.168.5.100".into());
+        let mut opts = opts_with_host("vinny");
         opts.roster = Some(roster);
         let conn = SshConnection::new(opts);
         assert_eq!(conn.resolve_host(), "192.168.5.100");

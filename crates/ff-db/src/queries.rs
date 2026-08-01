@@ -1537,7 +1537,7 @@ pub struct RouteFilter {
     /// effective per-slot ctx must fit the agent's tool-schema system prompt.
     /// `None` = no ctx floor.
     pub min_ctx: Option<i32>,
-    /// Hosts to exclude by worker_name (case-insensitive), e.g. ["taylor"] to
+    /// Hosts to exclude by worker_name (case-insensitive), e.g. ["vinny"] to
     /// keep agent load off the leader.
     pub exclude_hosts: Vec<String>,
     /// Drop deployments whose `last_health_at` is older than this many seconds —
@@ -1734,7 +1734,7 @@ fn route_limit_or_default(limit: i64) -> i64 {
 }
 
 /// Lower-case the exclude list so host matching against `LOWER(worker_name)` is
-/// case-insensitive — operators pass "Taylor"/"taylor" interchangeably.
+/// case-insensitive — operators pass "Vinny"/"vinny" interchangeably.
 fn normalize_exclude_hosts(hosts: &[String]) -> Vec<String> {
     hosts.iter().map(|h| h.to_lowercase()).collect()
 }
@@ -1753,7 +1753,7 @@ fn is_mlx_runtime(runtime: &Option<String>) -> bool {
 /// `tier`); then — for synthesis/general kinds only (`penalize_mlx`) — prefer a
 /// non-mlx endpoint, because mlx_lm.server serving a reasoning/"thinking" model
 /// reasons past any token cap and returns EMPTY content on multi-section
-/// synthesis (live-observed iter-15: taylor:55001 mlx qwen36-a3b returned empty
+/// synthesis (live-observed iter-15: vinny:55001 mlx qwen36-a3b returned empty
 /// where the same model on lily/logan llama.cpp succeeded). The penalty is a
 /// soft, last-resort preference — it sits BELOW tier (never makes a pricier
 /// model win) and ABOVE the load tiebreak, so among equal-tier endpoints a
@@ -5022,8 +5022,8 @@ mod tests {
 
     #[test]
     fn test_normalize_exclude_hosts() {
-        let got = normalize_exclude_hosts(&["Taylor".into(), "JAMES".into(), "sia".into()]);
-        assert_eq!(got, vec!["taylor", "james", "sia"]);
+        let got = normalize_exclude_hosts(&["Vinny".into(), "JAMES".into(), "sia".into()]);
+        assert_eq!(got, vec!["vinny", "james", "sia"]);
         assert!(normalize_exclude_hosts(&[]).is_empty());
     }
 
@@ -5097,27 +5097,27 @@ mod tests {
         use std::collections::HashMap;
         let load = HashMap::new(); // all idle → load tiebreak is neutral
 
-        // Same model on the same tier: an mlx endpoint (taylor) and a llama.cpp
+        // Same model on the same tier: an mlx endpoint (vinny) and a llama.cpp
         // one (lily) — the exact iter-15 shape.
         let mut cands = [
-            route_candidate_rt("taylor", 2, "mlx"),
+            route_candidate_rt("vinny", 2, "mlx"),
             route_candidate_rt("lily", 2, "llama.cpp"),
         ];
 
         // Synthesis/general kinds (penalize_mlx=true): llama.cpp wins, mlx last.
         cands.sort_by_key(|c| offload_sort_key(c, &load, true));
         assert_eq!(cands[0].worker_name, "lily");
-        assert_eq!(cands[1].worker_name, "taylor");
+        assert_eq!(cands[1].worker_name, "vinny");
 
         // Code kinds (penalize_mlx=false): mlx is NOT penalized; the load
         // tiebreak is neutral here so order is stable input order (sort is
         // stable) — assert mlx is no longer forced last.
         let mut cands2 = [
-            route_candidate_rt("taylor", 2, "mlx"),
+            route_candidate_rt("vinny", 2, "mlx"),
             route_candidate_rt("lily", 2, "llama.cpp"),
         ];
         cands2.sort_by_key(|c| offload_sort_key(c, &load, false));
-        assert_eq!(cands2[0].worker_name, "taylor");
+        assert_eq!(cands2[0].worker_name, "vinny");
     }
 
     #[test]
@@ -5129,10 +5129,10 @@ mod tests {
         // penalty is a within-tier preference, not a cost override).
         let mut cands = [
             route_candidate_rt("james", 2, "llama.cpp"),
-            route_candidate_rt("taylor", 1, "mlx"),
+            route_candidate_rt("vinny", 1, "mlx"),
         ];
         cands.sort_by_key(|c| offload_sort_key(c, &load, true));
-        assert_eq!(cands[0].worker_name, "taylor", "tier 1 mlx beats tier 2");
+        assert_eq!(cands[0].worker_name, "vinny", "tier 1 mlx beats tier 2");
     }
 
     // ── offload_workload_for_kind: pure kind→workload-tag mapping (no DB) ──
@@ -6140,7 +6140,7 @@ mod tests {
             "model-qwen3-30b",
             "v1.0",
             "deadbeef",
-            &["taylor".to_string(), "james".to_string()],
+            &["vinny".to_string(), "james".to_string()],
         )
         .await
         .unwrap();
@@ -6153,14 +6153,14 @@ mod tests {
         assert_eq!(row.artifact, "model-qwen3-30b");
         assert_eq!(row.version, "v1.0");
         assert_eq!(row.sha256, "deadbeef");
-        assert_eq!(row.holder_nodes, vec!["taylor", "james"]);
+        assert_eq!(row.holder_nodes, vec!["vinny", "james"]);
 
         // Update holders
         let updated = pg_update_artifact_index_holders(
             &pool,
             "model-qwen3-30b",
             "v1.0",
-            &["taylor".to_string()],
+            &["vinny".to_string()],
         )
         .await
         .unwrap();
@@ -6169,7 +6169,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.holder_nodes, vec!["taylor"]);
+        assert_eq!(row.holder_nodes, vec!["vinny"]);
 
         // List filtered
         pg_upsert_artifact_index(
@@ -6192,7 +6192,7 @@ mod tests {
             "model-qwen3-30b",
             "v1.0",
             "newhash",
-            &["taylor".to_string(), "james".to_string()],
+            &["vinny".to_string(), "james".to_string()],
         )
         .await
         .unwrap();

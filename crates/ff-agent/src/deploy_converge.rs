@@ -41,7 +41,7 @@ const RESTORE_OWNERLESS_DEPLOY_DRAINS_SQL: &str = "
                reservation_expires_at = NULL
          WHERE reservation_state = 'drained'
            AND reservation_owner IS NULL
-           AND lower(name) <> 'taylor'
+           AND lower(name) <> 'vinny'
            AND (reserved_reason = 'fleet-deploy' OR reserved_reason IS NULL)
         RETURNING id
     )
@@ -107,7 +107,7 @@ async fn run_once(pg: &PgPool) -> Result<()> {
     // merges) AND every later deploy sees "no eligible targets" and false-
     // succeeds. This happened live: 16 nodes stranded drained. Restore any node
     // drained longer than a deploy could possibly take (no deploy drains a node
-    // for 30+ min), independent of the deploy gate below. Never touches taylor
+    // for 30+ min), independent of the deploy gate below. Never touches vinny
     // (operator-reserved) or the leader.
     let restored = sqlx::query(
         "WITH restored AS (
@@ -116,7 +116,7 @@ async fn run_once(pg: &PgPool) -> Result<()> {
                     reservation_expires_at=NULL
               WHERE reservation_state='drained'
                 AND reservation_owner IS NULL
-                AND lower(name) <> 'taylor'
+                AND lower(name) <> 'vinny'
                 AND (reserved_reason = 'fleet-deploy' OR reserved_reason IS NULL)
                 AND coalesce(reserved_at, now() - interval '1 hour')
                     < now() - interval '30 minutes'
@@ -196,7 +196,7 @@ async fn run_once(pg: &PgPool) -> Result<()> {
     // The child normally restores its scoped drain state, but it can be killed
     // or exit through an unforeseen error path. Recover its ownerless deploy
     // drains immediately after every child exit; do not wait for the stale
-    // 30-minute crash sweep. The query cannot touch Taylor or operator-owned
+    // 30-minute crash sweep. The query cannot touch Vinny or operator-owned
     // reservations.
     if out.is_ok() {
         let restored_slots = restore_ownerless_deploy_drains(pg).await;
@@ -259,7 +259,7 @@ async fn run_once(pg: &PgPool) -> Result<()> {
         }
         Ok(o) => {
             // `ff fleet deploy --all` exits NON-ZERO if ANY node fails — including
-            // a node that is simply powered off / unreachable (shakira, taylor).
+            // a node that is simply powered off / unreachable (shakira, vinny).
             // The old code then never advanced LAST_DEPLOYED_KEY, so every 5-min
             // tick saw `head != last`, redeployed, and RESTART-DRAINED every
             // in-flight build fleet-wide — a permanent completion outage triggered
@@ -326,9 +326,9 @@ mod tests {
     use super::RESTORE_OWNERLESS_DEPLOY_DRAINS_SQL;
 
     #[test]
-    fn immediate_recovery_preserves_operator_reservations_and_taylor() {
+    fn immediate_recovery_preserves_operator_reservations_and_vinny() {
         assert!(RESTORE_OWNERLESS_DEPLOY_DRAINS_SQL.contains("reservation_owner IS NULL"));
-        assert!(RESTORE_OWNERLESS_DEPLOY_DRAINS_SQL.contains("lower(name) <> 'taylor'"));
+        assert!(RESTORE_OWNERLESS_DEPLOY_DRAINS_SQL.contains("lower(name) <> 'vinny'"));
         assert!(RESTORE_OWNERLESS_DEPLOY_DRAINS_SQL.contains("reserved_reason = 'fleet-deploy'"));
         assert!(!RESTORE_OWNERLESS_DEPLOY_DRAINS_SQL.contains("reservation_owner = NULL"));
     }

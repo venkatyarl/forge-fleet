@@ -110,7 +110,7 @@ impl PulseClient {
             .query_async(&mut self.conn)
             .await?;
 
-        // Extract node names from keys like "pulse:taylor:metrics"
+        // Extract node names from keys like "pulse:vinny:metrics"
         let prefix_len = self.prefix.len() + 1; // "pulse:"
         let suffix = ":metrics";
         let nodes = keys

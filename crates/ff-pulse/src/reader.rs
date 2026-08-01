@@ -32,7 +32,7 @@ pub enum PulseError {
 /// reader created a brand-new `MultiplexedConnection` per call — ~500
 /// new TCP handshakes/sec from forgefleetd under normal operation, which
 /// pushed macOS past 16K TIME_WAIT source ports and caused
-/// `EADDRNOTAVAIL` for every other outbound connect() on Taylor.
+/// `EADDRNOTAVAIL` for every other outbound connect() on Vinny.
 pub struct PulseReader {
     client: redis::Client,
     conn: tokio::sync::OnceCell<redis::aio::ConnectionManager>,

@@ -1038,8 +1038,8 @@ static PG_MIGRATIONS: &[PgMigration] = &[
     },
     PgMigration {
         version: 211,
-        name: "decommission_taylor_github_identity",
-        sql: schema::SCHEMA_V211_DECOMMISSION_TAYLOR_GITHUB_IDENTITY,
+        name: "decommission_vinny_github_identity",
+        sql: schema::SCHEMA_V211_DECOMMISSION_VINNY_GITHUB_IDENTITY,
     },
     PgMigration {
         version: 212,
@@ -2392,7 +2392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v211_decommissions_taylor_github_identity() {
+    async fn v211_decommissions_vinny_github_identity() {
         // CI has no Postgres. Keep this integration test optional on both
         // supported database URL variables.
         let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
@@ -2405,7 +2405,7 @@ mod tests {
         let aliases: Vec<(String, bool)> = sqlx::query_as(
             "SELECT alias_name, is_canonical
                FROM github_ssh_aliases
-              WHERE alias_name IN ('github.com-venkat', 'github.com-taylor')
+              WHERE alias_name IN ('github.com-venkat', 'github.com-vinny')
               ORDER BY alias_name",
         )
         .fetch_all(&pool)
@@ -2415,7 +2415,7 @@ mod tests {
 
         let legacy_secrets: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM fleet_secrets
-              WHERE key IN ('github_ssh_id_taylor_priv', 'github_ssh_id_taylor_pub')",
+              WHERE key IN ('github_ssh_id_vinny_priv', 'github_ssh_id_vinny_pub')",
         )
         .fetch_one(&pool)
         .await

@@ -35,7 +35,7 @@ const SEMANTIC_MERGE_RESET_MARKER: &str =
 ///
 /// The merge-drain runs on whichever node is currently leader, and that node's
 /// *ambient* `gh` auth (`~/.config/gh`) may be unset or point at a retired
-/// account (e.g. `taylor-oclaw`) — relying on it silently breaks every drain
+/// account (e.g. `vinny-oclaw`) — relying on it silently breaks every drain
 /// call with `gh ... failed: authenticate with gh auth login`, stranding
 /// CI-green PRs in the queue. Pulling `github_gh_token` from `fleet_secrets` at
 /// call time makes the drain authenticate on ANY leader with no per-node `gh

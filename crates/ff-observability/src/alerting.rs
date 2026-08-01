@@ -634,12 +634,12 @@ mod tests {
     fn test_high_cpu_alert() {
         let engine = AlertEngine::new(vec![AlertRule::high_cpu(90.0)]);
         let metrics = MetricsCollector::new();
-        metrics.record_node(hot_node("taylor", 95.0));
+        metrics.record_node(hot_node("vinny", 95.0));
         metrics.record_node(hot_node("james", 50.0));
 
         let alerts = engine.evaluate(&metrics);
         assert_eq!(alerts.len(), 1);
-        assert!(alerts[0].message.contains("taylor"));
+        assert!(alerts[0].message.contains("vinny"));
         assert_eq!(engine.active_count(), 1);
 
         // Evaluating again should NOT duplicate.
@@ -653,12 +653,12 @@ mod tests {
     fn test_resolve_alerts() {
         let engine = AlertEngine::new(vec![AlertRule::high_cpu(90.0)]);
         let metrics = MetricsCollector::new();
-        metrics.record_node(hot_node("taylor", 95.0));
+        metrics.record_node(hot_node("vinny", 95.0));
 
         engine.evaluate(&metrics);
         assert_eq!(engine.active_count(), 1);
 
-        engine.resolve_by_prefix("high_cpu:taylor");
+        engine.resolve_by_prefix("high_cpu:vinny");
         assert_eq!(engine.active_count(), 0);
     }
 
@@ -697,8 +697,8 @@ mod tests {
         engine.fire_alert(
             "node_down",
             AlertSeverity::Critical,
-            "Node taylor is unreachable".into(),
-            Some("taylor".into()),
+            "Node vinny is unreachable".into(),
+            Some("vinny".into()),
             None,
         );
         engine.fire_alert(
@@ -739,11 +739,11 @@ mod tests {
         let first = engine.evaluate(&metrics);
         assert_eq!(first.len(), 1);
 
-        metrics.record_node(hot_node("taylor", 96.0));
+        metrics.record_node(hot_node("vinny", 96.0));
         let new_alerts = engine.evaluate(&metrics);
 
         assert_eq!(new_alerts.len(), 1);
-        assert_eq!(new_alerts[0].node.as_deref(), Some("taylor"));
+        assert_eq!(new_alerts[0].node.as_deref(), Some("vinny"));
         assert_eq!(new_alerts[0].count, 1);
         assert_eq!(engine.active_count(), 2);
         let james = engine
@@ -789,7 +789,7 @@ mod tests {
         let engine =
             AlertEngine::with_deduplication_config(vec![AlertRule::high_cpu(90.0)], &config);
         let metrics = MetricsCollector::new();
-        metrics.record_node(hot_node("taylor", 95.0));
+        metrics.record_node(hot_node("vinny", 95.0));
 
         assert_eq!(engine.evaluate(&metrics).len(), 1);
         assert_eq!(engine.evaluate(&metrics).len(), 1);

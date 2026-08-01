@@ -260,8 +260,8 @@ pub(crate) fn ip_sort_key(ip: &str) -> u32 {
 ///
 /// Each node's pulse beat reports its server endpoints as it sees them locally
 /// — `http://127.0.0.1:<port>` (also `localhost` / `0.0.0.0` / `[::1]`). That
-/// host is meaningless in a fleet-wide listing: `ff llm status` on taylor would
-/// print `james … http://127.0.0.1:55000`, which resolves to taylor, not james.
+/// host is meaningless in a fleet-wide listing: `ff llm status` on vinny would
+/// print `james … http://127.0.0.1:55000`, which resolves to vinny, not james.
 /// Swap a loopback/unspecified host for the node's `primary_ip` (port + path
 /// preserved) so the printed endpoint can actually be called. When `primary_ip`
 /// is empty (node absent from the beats) the original string is returned
@@ -442,16 +442,16 @@ mod tests {
         // has no IP → parks last; the stable sort keeps the pre-sort order (the
         // SQL `ORDER BY worker_name, …`) within an equal IP.
         let ip_by_name: HashMap<&str, &str> = HashMap::from([
-            ("taylor", "192.168.5.100"),
+            ("vinny", "192.168.5.100"),
             ("james", "192.168.5.108"),
             ("sia", "192.168.5.116"),
             ("aura", ""), // present but NULL primary_ip → sorts last
         ]);
         // Pre-sorted by name (what the DB returns); ghost has no map entry.
-        let mut rows = vec!["aura", "ghost", "james", "sia", "taylor"];
+        let mut rows = vec!["aura", "ghost", "james", "sia", "vinny"];
         rows.sort_by_key(|name| ip_sort_key(ip_by_name.get(name).copied().unwrap_or("")));
-        // taylor(.100) < james(.108) < sia(.116) < {aura,ghost} both u32::MAX,
+        // vinny(.100) < james(.108) < sia(.116) < {aura,ghost} both u32::MAX,
         // and among the ties the original name order (aura before ghost) holds.
-        assert_eq!(rows, vec!["taylor", "james", "sia", "aura", "ghost"]);
+        assert_eq!(rows, vec!["vinny", "james", "sia", "aura", "ghost"]);
     }
 }

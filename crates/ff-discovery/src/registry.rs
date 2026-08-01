@@ -32,7 +32,7 @@ pub struct FleetComputer {
     pub ip: IpAddr,
     /// Resolved hostname (if available).
     pub hostname: Option<String>,
-    /// Fleet config name (e.g. "taylor", "james"). Set for config-sourced nodes.
+    /// Fleet config name (e.g. "vinny", "james"). Set for config-sourced nodes.
     pub config_name: Option<String>,
     /// Election priority from config (lower = more preferred).
     pub election_priority: Option<u32>,
@@ -125,7 +125,7 @@ pub struct NodeRegistry {
     nodes: DashMap<Uuid, FleetComputer>,
     /// IP address → node ID index.
     ip_index: DashMap<IpAddr, Uuid>,
-    /// Config name → node ID index (e.g. "taylor" → uuid).
+    /// Config name → node ID index (e.g. "vinny" → uuid).
     name_index: DashMap<String, Uuid>,
     /// Current leader name, updated via election or announcement.
     current_leader: RwLock<Option<String>>,
@@ -175,7 +175,7 @@ impl NodeRegistry {
         self.get_node(id)
     }
 
-    /// Get a node by config name (e.g. "taylor").
+    /// Get a node by config name (e.g. "vinny").
     pub fn get_node_by_name(&self, name: &str) -> Option<FleetComputer> {
         let id = self.name_index.get(name).map(|v| *v.value())?;
         self.get_node(id)
@@ -520,12 +520,12 @@ mod tests {
     #[test]
     fn test_upsert_config_node() {
         let reg = NodeRegistry::new();
-        let id = reg.upsert_config_node("taylor", ip(100), 51800, 1);
+        let id = reg.upsert_config_node("vinny", ip(100), 51800, 1);
 
         assert_eq!(reg.len(), 1);
 
         let node = reg.get_node(id).unwrap();
-        assert_eq!(node.config_name.as_deref(), Some("taylor"));
+        assert_eq!(node.config_name.as_deref(), Some("vinny"));
         assert_eq!(node.election_priority, Some(1));
         assert_eq!(node.api_port, Some(51800));
         assert_eq!(node.ip, ip(100));
@@ -534,11 +534,11 @@ mod tests {
     #[test]
     fn test_get_node_by_name() {
         let reg = NodeRegistry::new();
-        reg.upsert_config_node("taylor", ip(100), 51800, 1);
+        reg.upsert_config_node("vinny", ip(100), 51800, 1);
         reg.upsert_config_node("james", ip(101), 51800, 2);
 
-        let taylor = reg.get_node_by_name("taylor").unwrap();
-        assert_eq!(taylor.ip, ip(100));
+        let vinny = reg.get_node_by_name("vinny").unwrap();
+        assert_eq!(vinny.ip, ip(100));
 
         let james = reg.get_node_by_name("james").unwrap();
         assert_eq!(james.ip, ip(101));
@@ -549,10 +549,10 @@ mod tests {
     #[test]
     fn test_get_node_by_ip() {
         let reg = NodeRegistry::new();
-        reg.upsert_config_node("taylor", ip(100), 51800, 1);
+        reg.upsert_config_node("vinny", ip(100), 51800, 1);
 
         let node = reg.get_node_by_ip(ip(100)).unwrap();
-        assert_eq!(node.config_name.as_deref(), Some("taylor"));
+        assert_eq!(node.config_name.as_deref(), Some("vinny"));
 
         assert!(reg.get_node_by_ip(ip(200)).is_none());
     }
@@ -560,8 +560,8 @@ mod tests {
     #[test]
     fn test_upsert_config_node_updates_existing_by_ip() {
         let reg = NodeRegistry::new();
-        let id1 = reg.upsert_config_node("taylor", ip(100), 51800, 1);
-        let id2 = reg.upsert_config_node("taylor", ip(100), 51801, 1);
+        let id1 = reg.upsert_config_node("vinny", ip(100), 51800, 1);
+        let id2 = reg.upsert_config_node("vinny", ip(100), 51801, 1);
 
         // Same node — should return the same ID.
         assert_eq!(id1, id2);
@@ -574,10 +574,10 @@ mod tests {
     #[test]
     fn test_upsert_config_node_updates_existing_by_name() {
         let reg = NodeRegistry::new();
-        let id1 = reg.upsert_config_node("taylor", ip(100), 51800, 1);
+        let id1 = reg.upsert_config_node("vinny", ip(100), 51800, 1);
 
         // Same name, different IP → should update the IP.
-        let id2 = reg.upsert_config_node("taylor", ip(200), 51800, 1);
+        let id2 = reg.upsert_config_node("vinny", ip(200), 51800, 1);
 
         assert_eq!(id1, id2);
         assert_eq!(reg.len(), 1);
@@ -594,12 +594,12 @@ mod tests {
     #[test]
     fn test_remove_node() {
         let reg = NodeRegistry::new();
-        let id = reg.upsert_config_node("taylor", ip(100), 51800, 1);
+        let id = reg.upsert_config_node("vinny", ip(100), 51800, 1);
 
         let removed = reg.remove_node(id);
         assert!(removed.is_some());
         assert_eq!(reg.len(), 0);
-        assert!(reg.get_node_by_name("taylor").is_none());
+        assert!(reg.get_node_by_name("vinny").is_none());
         assert!(reg.get_node_by_ip(ip(100)).is_none());
     }
 
@@ -623,10 +623,10 @@ mod tests {
     #[test]
     fn test_apply_scan_result_updates_health() {
         let reg = NodeRegistry::new();
-        reg.upsert_config_node("taylor", ip(100), 51800, 1);
+        reg.upsert_config_node("vinny", ip(100), 51800, 1);
 
         let result = NodeScanResult {
-            name: "taylor".into(),
+            name: "vinny".into(),
             host: "192.168.5.100".into(),
             port: 51800,
             status: NodeScanStatus::Online,
@@ -638,7 +638,7 @@ mod tests {
 
         reg.apply_scan_result(&result);
 
-        let node = reg.get_node_by_name("taylor").unwrap();
+        let node = reg.get_node_by_name("vinny").unwrap();
         assert!(node.is_healthy());
         assert!(node.is_online());
         assert_eq!(node.health.as_ref().unwrap().status, HealthStatus::Healthy);
@@ -695,11 +695,11 @@ mod tests {
     #[test]
     fn test_mark_stale_nodes() {
         let reg = NodeRegistry::new();
-        let id = reg.upsert_config_node("taylor", ip(100), 51800, 1);
+        let id = reg.upsert_config_node("vinny", ip(100), 51800, 1);
 
         // Mark as healthy first.
         let result = NodeScanResult {
-            name: "taylor".into(),
+            name: "vinny".into(),
             host: "192.168.5.100".into(),
             port: 51800,
             status: NodeScanStatus::Online,
@@ -717,7 +717,7 @@ mod tests {
         }
 
         let stale = reg.mark_stale_nodes(90);
-        assert_eq!(stale, vec!["taylor".to_string()]);
+        assert_eq!(stale, vec!["vinny".to_string()]);
 
         // Node should now be unreachable.
         let node = reg.get_node(id).unwrap();
@@ -727,7 +727,7 @@ mod tests {
     #[test]
     fn test_mark_stale_nodes_no_false_positives() {
         let reg = NodeRegistry::new();
-        reg.upsert_config_node("taylor", ip(100), 51800, 1);
+        reg.upsert_config_node("vinny", ip(100), 51800, 1);
 
         // Node was just registered (last_seen = now), should not be stale.
         let stale = reg.mark_stale_nodes(90);
@@ -737,12 +737,12 @@ mod tests {
     #[test]
     fn test_node_health_for_election() {
         let reg = NodeRegistry::new();
-        reg.upsert_config_node("taylor", ip(100), 51800, 1);
+        reg.upsert_config_node("vinny", ip(100), 51800, 1);
         reg.upsert_config_node("james", ip(101), 51800, 2);
 
-        // Mark taylor online, james offline.
+        // Mark vinny online, james offline.
         reg.apply_scan_result(&NodeScanResult {
-            name: "taylor".into(),
+            name: "vinny".into(),
             host: "192.168.5.100".into(),
             port: 51800,
             status: NodeScanStatus::Online,
@@ -765,8 +765,8 @@ mod tests {
         let health = reg.node_health_for_election();
         assert_eq!(health.len(), 2);
 
-        let taylor_health = health.iter().find(|(n, _, _)| n == "taylor").unwrap();
-        assert!(taylor_health.1); // is_healthy
+        let vinny_health = health.iter().find(|(n, _, _)| n == "vinny").unwrap();
+        assert!(vinny_health.1); // is_healthy
 
         let james_health = health.iter().find(|(n, _, _)| n == "james").unwrap();
         assert!(!james_health.1); // not healthy
@@ -775,15 +775,15 @@ mod tests {
     #[test]
     fn test_online_node_names() {
         let reg = NodeRegistry::new();
-        reg.upsert_config_node("taylor", ip(100), 51800, 1);
+        reg.upsert_config_node("vinny", ip(100), 51800, 1);
         reg.upsert_config_node("james", ip(101), 51800, 2);
 
         // Both start without health data → neither is online.
         assert!(reg.online_node_names().is_empty());
 
-        // Mark taylor online.
+        // Mark vinny online.
         reg.apply_scan_result(&NodeScanResult {
-            name: "taylor".into(),
+            name: "vinny".into(),
             host: "192.168.5.100".into(),
             port: 51800,
             status: NodeScanStatus::Online,
@@ -794,7 +794,7 @@ mod tests {
         });
 
         let online = reg.online_node_names();
-        assert_eq!(online, vec!["taylor".to_string()]);
+        assert_eq!(online, vec!["vinny".to_string()]);
     }
 
     #[test]
@@ -802,8 +802,8 @@ mod tests {
         let reg = NodeRegistry::new();
         assert!(reg.current_leader().is_none());
 
-        reg.set_leader("taylor".into());
-        assert_eq!(reg.current_leader(), Some("taylor".to_string()));
+        reg.set_leader("vinny".into());
+        assert_eq!(reg.current_leader(), Some("vinny".to_string()));
 
         reg.set_leader("james".into());
         assert_eq!(reg.current_leader(), Some("james".to_string()));
@@ -812,7 +812,7 @@ mod tests {
     #[test]
     fn test_touch_updates_last_seen() {
         let reg = NodeRegistry::new();
-        let id = reg.upsert_config_node("taylor", ip(100), 51800, 1);
+        let id = reg.upsert_config_node("vinny", ip(100), 51800, 1);
 
         let before = reg.get_node(id).unwrap().last_seen;
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -825,12 +825,12 @@ mod tests {
     #[test]
     fn test_touch_by_name() {
         let reg = NodeRegistry::new();
-        reg.upsert_config_node("taylor", ip(100), 51800, 1);
+        reg.upsert_config_node("vinny", ip(100), 51800, 1);
 
-        let before = reg.get_node_by_name("taylor").unwrap().last_seen;
+        let before = reg.get_node_by_name("vinny").unwrap().last_seen;
         std::thread::sleep(std::time::Duration::from_millis(10));
-        reg.touch_by_name("taylor");
-        let after = reg.get_node_by_name("taylor").unwrap().last_seen;
+        reg.touch_by_name("vinny");
+        let after = reg.get_node_by_name("vinny").unwrap().last_seen;
 
         assert!(after > before);
     }
@@ -840,7 +840,7 @@ mod tests {
         let reg = NodeRegistry::new();
 
         // First: register from config.
-        let config_id = reg.upsert_config_node("taylor", ip(100), 51800, 1);
+        let config_id = reg.upsert_config_node("vinny", ip(100), 51800, 1);
 
         // Then: discover the same IP via subnet scan.
         let discovered = DiscoveredNode {
@@ -856,7 +856,7 @@ mod tests {
 
         // Config name should be preserved.
         let node = reg.get_node(config_id).unwrap();
-        assert_eq!(node.config_name.as_deref(), Some("taylor"));
+        assert_eq!(node.config_name.as_deref(), Some("vinny"));
         // Ports should be updated from discovery.
         assert_eq!(node.open_ports, vec![51800, 51801, 51802]);
     }

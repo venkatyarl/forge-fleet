@@ -472,10 +472,10 @@ mod tests {
 
     #[test]
     fn test_route_picks_best_tier() {
-        let nodes = vec![make_node("taylor", NodeStatus::Online, 128)];
+        let nodes = vec![make_node("vinny", NodeStatus::Online, 128)];
         let models = vec![
-            make_model("qwen3-9b", Tier::Tier1, 9.0, "taylor"),
-            make_model("qwen3-32b", Tier::Tier2, 32.0, "taylor"),
+            make_model("qwen3-9b", Tier::Tier1, 9.0, "vinny"),
+            make_model("qwen3-32b", Tier::Tier2, 32.0, "vinny"),
         ];
         let router = TaskRouter::new(nodes, models, HashMap::new());
 
@@ -493,11 +493,11 @@ mod tests {
     #[test]
     fn test_route_skips_offline_nodes() {
         let nodes = vec![
-            make_node("taylor", NodeStatus::Offline, 128),
+            make_node("vinny", NodeStatus::Offline, 128),
             make_node("james", NodeStatus::Online, 64),
         ];
         let models = vec![
-            make_model("m1", Tier::Tier1, 9.0, "taylor"),
+            make_model("m1", Tier::Tier1, 9.0, "vinny"),
             make_model("m2", Tier::Tier1, 9.0, "james"),
         ];
         let router = TaskRouter::new(nodes, models, HashMap::new());
@@ -509,10 +509,10 @@ mod tests {
 
     #[test]
     fn test_route_respects_tier_constraints() {
-        let nodes = vec![make_node("taylor", NodeStatus::Online, 128)];
+        let nodes = vec![make_node("vinny", NodeStatus::Online, 128)];
         let models = vec![
-            make_model("small", Tier::Tier1, 9.0, "taylor"),
-            make_model("big", Tier::Tier3, 72.0, "taylor"),
+            make_model("small", Tier::Tier1, 9.0, "vinny"),
+            make_model("big", Tier::Tier3, 72.0, "vinny"),
         ];
         let router = TaskRouter::new(nodes, models, HashMap::new());
 
@@ -528,16 +528,16 @@ mod tests {
     #[test]
     fn test_route_prefers_less_loaded() {
         let nodes = vec![
-            make_node("taylor", NodeStatus::Online, 128),
+            make_node("vinny", NodeStatus::Online, 128),
             make_node("james", NodeStatus::Online, 128),
         ];
         let models = vec![
-            make_model("m1", Tier::Tier1, 9.0, "taylor"),
+            make_model("m1", Tier::Tier1, 9.0, "vinny"),
             make_model("m2", Tier::Tier1, 9.0, "james"),
         ];
         let mut loads = HashMap::new();
         loads.insert(
-            "taylor".to_string(),
+            "vinny".to_string(),
             NodeLoad {
                 active_requests: 4,
                 max_concurrent: 4,
@@ -570,8 +570,8 @@ mod tests {
 
     #[test]
     fn test_route_batch() {
-        let nodes = vec![make_node("taylor", NodeStatus::Online, 128)];
-        let models = vec![make_model("m1", Tier::Tier2, 32.0, "taylor")];
+        let nodes = vec![make_node("vinny", NodeStatus::Online, 128)];
+        let models = vec![make_model("m1", Tier::Tier2, 32.0, "vinny")];
         let router = TaskRouter::new(nodes, models, HashMap::new());
 
         let subtasks = vec![
@@ -604,10 +604,10 @@ mod tests {
 
     #[test]
     fn test_route_escalates_complex_subtask_to_480b() {
-        let nodes = vec![make_node("taylor", NodeStatus::Online, 1024)];
+        let nodes = vec![make_node("vinny", NodeStatus::Online, 1024)];
         let models = vec![
-            make_model("qwen3-32b", Tier::Tier2, 32.0, "taylor"),
-            make_model("deepseek-v4-480b", Tier::Tier4, 480.0, "taylor"),
+            make_model("qwen3-32b", Tier::Tier2, 32.0, "vinny"),
+            make_model("deepseek-v4-480b", Tier::Tier4, 480.0, "vinny"),
         ];
         let router = TaskRouter::new(nodes, models, HashMap::new());
 
@@ -624,11 +624,11 @@ mod tests {
 
     #[test]
     fn test_route_480b_prefers_large_model() {
-        let nodes = vec![make_node("taylor", NodeStatus::Online, 1024)];
+        let nodes = vec![make_node("vinny", NodeStatus::Online, 1024)];
         let models = vec![
-            make_model("qwen3-32b", Tier::Tier2, 32.0, "taylor"),
-            make_model("qwen3-235b", Tier::Tier4, 235.0, "taylor"),
-            make_model("deepseek-v4-480b", Tier::Tier4, 480.0, "taylor"),
+            make_model("qwen3-32b", Tier::Tier2, 32.0, "vinny"),
+            make_model("qwen3-235b", Tier::Tier4, 235.0, "vinny"),
+            make_model("deepseek-v4-480b", Tier::Tier4, 480.0, "vinny"),
         ];
         let router = TaskRouter::new(nodes, models, HashMap::new());
 
@@ -646,8 +646,8 @@ mod tests {
 
     #[test]
     fn test_route_480b_falls_back_when_no_large_model() {
-        let nodes = vec![make_node("taylor", NodeStatus::Online, 128)];
-        let models = vec![make_model("qwen3-32b", Tier::Tier2, 32.0, "taylor")];
+        let nodes = vec![make_node("vinny", NodeStatus::Online, 128)];
+        let models = vec![make_model("qwen3-32b", Tier::Tier2, 32.0, "vinny")];
         let router = TaskRouter::new(nodes, models, HashMap::new());
 
         let st = SubTask::new(
@@ -664,10 +664,10 @@ mod tests {
 
     #[test]
     fn test_route_batch_escalates_moderate_subtasks() {
-        let nodes = vec![make_node("taylor", NodeStatus::Online, 1024)];
+        let nodes = vec![make_node("vinny", NodeStatus::Online, 1024)];
         let models = vec![
-            make_model("qwen3-9b", Tier::Tier1, 9.0, "taylor"),
-            make_model("deepseek-v4-480b", Tier::Tier4, 480.0, "taylor"),
+            make_model("qwen3-9b", Tier::Tier1, 9.0, "vinny"),
+            make_model("deepseek-v4-480b", Tier::Tier4, 480.0, "vinny"),
         ];
         let router = TaskRouter::new(nodes, models, HashMap::new());
 

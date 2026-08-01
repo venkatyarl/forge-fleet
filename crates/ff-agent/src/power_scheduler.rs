@@ -270,7 +270,7 @@ async fn dispatch_sleep(t: &PowerTarget) -> Result<(), PowerError> {
         "pmset sleepnow"
     } else if os.starts_with("linux") {
         // systemctl suspend works for both systemd + recent Ubuntu; no
-        // sudo prompt required because Taylor-sudo rule is fleet-wide.
+        // sudo prompt required because Vinny-sudo rule is fleet-wide.
         "sudo systemctl suspend"
     } else {
         return Err(PowerError::UnsupportedOs(os));

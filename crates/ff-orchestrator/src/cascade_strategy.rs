@@ -510,7 +510,7 @@ pub trait LlmExec: Send + Sync {
         timeout: Duration,
     ) -> Result<String, String>;
 
-    /// Send `prompt` to the judge endpoint (typically Gemma-4 on Taylor).
+    /// Send `prompt` to the judge endpoint (typically Gemma-4 on Vinny).
     /// Separate from `complete` so the impl can pin the model.
     async fn judge(
         &self,
@@ -591,7 +591,7 @@ pub async fn run_cascade<E: LlmExec>(
             let jp = judge_prompt(user_prompt, &output);
             // 256 tokens for the judge — mlx_lm.server silently truncates
             // to empty when given a small budget, even though the model's
-            // intended reply is just "8". Discovered 2026-05-18 on Taylor's
+            // intended reply is just "8". Discovered 2026-05-18 on Vinny's
             // gemma-4 mlx endpoint.
             match exec.judge(&jp, 256, Duration::from_secs(30)).await {
                 Ok(resp) => judge_score = parse_judge_response(&resp),

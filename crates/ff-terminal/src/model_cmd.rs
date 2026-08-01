@@ -2969,7 +2969,7 @@ async fn handle_model_where(pool: &sqlx::PgPool, query: &str, json: bool) -> any
 ///      directly. If it's a catalog_id with multiple copies, pick the row whose
 ///      worker is the most-loaded (we want to move FROM the most-burdened host).
 ///   2. Read latest fleet_disk_usage per host, filter out the excluded set
-///      (defaults: source host + taylor leader).
+///      (defaults: source host + vinny leader).
 ///   3. Rank candidates by (free_bytes desc, model_count asc) — prefer hosts
 ///      with most free disk that don't already hold many models.
 ///   4. Pick top candidate; print plan; transfer (unless --dry-run).
@@ -3101,7 +3101,7 @@ async fn handle_model_distribute(
     // Step 3: candidates with free disk.
     //
     // Reserved-host policy (skipped by default, can be overridden with --to):
-    //   - Taylor (leader) — daily-use host, never default for cold storage
+    //   - Vinny (leader) — daily-use host, never default for cold storage
     //   - DGX hosts (os_family='linux-dgx') — reserved for training
     //
     // Everything else is eligible. Among eligible hosts, just pick by free
@@ -3125,7 +3125,7 @@ async fn handle_model_distribute(
             SELECT name AS worker_name
               FROM computers
              WHERE os_family = 'linux-dgx'
-                OR name = 'taylor'
+                OR name = 'vinny'
         )
         SELECT f.worker_name,
                f.free_bytes,
@@ -3170,7 +3170,7 @@ async fn handle_model_distribute(
     let pick = match select_distribute_target(&candidates, &excludes, &holders, pinned_to) {
         Ok(p) => p,
         Err(DistributeSelectError::NoCandidate) => anyhow::bail!(
-            "no candidate host with enough free disk (need {source_gb:.1} GB × 1.5; reserved hosts: taylor + DGX; excludes={excludes:?})"
+            "no candidate host with enough free disk (need {source_gb:.1} GB × 1.5; reserved hosts: vinny + DGX; excludes={excludes:?})"
         ),
         Err(DistributeSelectError::AllAlreadyHold) => anyhow::bail!(
             "every disk-eligible host already holds a copy of '{catalog_id}' ({runtime} runtime) — nothing to distribute"
@@ -3502,7 +3502,7 @@ mod tests {
         let floor = AGENT_MIN_CTX as i32;
         // logan qwen36 32768x1 — exactly the floor → ready.
         assert!(is_agent_ready(Some(floor), floor));
-        // taylor mlx 65536x1 — above floor → ready.
+        // vinny mlx 65536x1 — above floor → ready.
         assert!(is_agent_ready(Some(65536), floor));
     }
 

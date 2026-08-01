@@ -461,7 +461,7 @@ mod tests {
     #[tokio::test]
     async fn test_registry_creates_breakers_on_demand() {
         let reg = CircuitBreakerRegistry::new(fast_config());
-        let backend: BackendId = "taylor:51800".into();
+        let backend: BackendId = "vinny:51800".into();
 
         // First access creates the breaker
         assert!(reg.is_allowed(&backend).await);
@@ -491,7 +491,7 @@ mod tests {
     #[tokio::test]
     async fn test_registry_open_backends() {
         let reg = CircuitBreakerRegistry::new(fast_config());
-        let b1: BackendId = "taylor:51800".into();
+        let b1: BackendId = "vinny:51800".into();
         let b2: BackendId = "james:51801".into();
 
         reg.is_allowed(&b1).await;
@@ -510,7 +510,7 @@ mod tests {
     #[tokio::test]
     async fn test_registry_remove() {
         let reg = CircuitBreakerRegistry::new(fast_config());
-        let backend: BackendId = "taylor:51800".into();
+        let backend: BackendId = "vinny:51800".into();
         reg.is_allowed(&backend).await;
 
         assert_eq!(reg.tracked_backends().await.len(), 1);
@@ -521,7 +521,7 @@ mod tests {
     #[tokio::test]
     async fn test_registry_reset() {
         let reg = CircuitBreakerRegistry::new(fast_config());
-        let backend: BackendId = "taylor:51800".into();
+        let backend: BackendId = "vinny:51800".into();
         reg.is_allowed(&backend).await;
 
         for _ in 0..3 {

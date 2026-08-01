@@ -149,7 +149,7 @@ pub async fn bootstrap_script(
     let role = sanitize_bootstrap_value(&role, 32);
     let runtime = sanitize_bootstrap_value(&runtime, 32);
     let ip = sanitize_bootstrap_value(&ip, 64);
-    let is_taylor = if name.eq_ignore_ascii_case("taylor") || ip == "192.168.5.100" {
+    let is_vinny = if name.eq_ignore_ascii_case("vinny") || ip == "192.168.5.100" {
         "true"
     } else {
         "false"
@@ -189,7 +189,7 @@ pub async fn bootstrap_script(
         .replace("{{RUNTIME}}", &runtime)
         .replace("{{GITHUB_OWNER}}", &github_owner)
         .replace("{{GITHUB_PAT_SECRET_KEY}}", "github.venkat_pat")
-        .replace("{{IS_TAYLOR}}", is_taylor);
+        .replace("{{IS_VINNY}}", is_vinny);
 
     (
         StatusCode::OK,
@@ -289,7 +289,7 @@ pub async fn bootstrap_script_ps1(
     let runtime = sanitize_bootstrap_value(&runtime, 32);
     let ip = sanitize_bootstrap_value(&ip, 64);
 
-    let is_taylor = if name.eq_ignore_ascii_case("taylor") || ip == "192.168.5.100" {
+    let is_vinny = if name.eq_ignore_ascii_case("vinny") || ip == "192.168.5.100" {
         "true"
     } else {
         "false"
@@ -325,7 +325,7 @@ pub async fn bootstrap_script_ps1(
         .replace("{{RUNTIME}}", &runtime)
         .replace("{{GITHUB_OWNER}}", &github_owner)
         .replace("{{GITHUB_PAT_SECRET_KEY}}", "github.venkat_pat")
-        .replace("{{IS_TAYLOR}}", is_taylor);
+        .replace("{{IS_VINNY}}", is_vinny);
 
     (
         StatusCode::OK,
@@ -637,7 +637,7 @@ pub async fn self_enroll(
         &mesh_payload,
         "now",
         &json!({}),
-        Some("taylor"), // leader only
+        Some("vinny"), // leader only
         &json!([]),
         Some("self-enroll"),
         Some(5),
@@ -678,7 +678,7 @@ pub async fn self_enroll(
         peer_ssh_identities: peers,
         // #44: never hand out this gateway's own DSN env — it pins the
         // enrolling node to the CURRENT primary's IP outside fleet.toml (the
-        // taylor-death time bomb: 12 nodes carried a dead .100 DSN in their
+        // vinny-death time bomb: 12 nodes carried a dead .100 DSN in their
         // units). Nodes derive the DSN from fleet.toml + dsn_failover; the
         // fields stay for response-shape compatibility but are always None.
         // No client-side consumer reads them (verified 2026-07-17).

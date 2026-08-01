@@ -1455,7 +1455,7 @@ pub async fn list_local_processes() -> Vec<RunningProcess> {
             // RAM-bound). Without a recorded ctx the deployment row keeps
             // usable_agent_ctx NULL forever and the V111 capability router
             // (`usable_agent_ctx >= min_ctx`) is blind to mlx endpoints — which
-            // hid taylor's strongest agent server. Honor --max-kv-size when
+            // hid vinny's strongest agent server. Honor --max-kv-size when
             // passed, else read the model dir's config.json.
             "mlx" => parse_flag_value(rest, "--max-kv-size")
                 .and_then(|v| v.parse::<i32>().ok())

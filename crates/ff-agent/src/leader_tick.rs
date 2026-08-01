@@ -1613,8 +1613,8 @@ mod tests {
 
     #[test]
     fn stale_detection_matches_threshold() {
-        let fresh = fake_leader("taylor", 10, 1);
-        let stale = fake_leader("taylor", STALE_THRESHOLD_SECS + 1, 1);
+        let fresh = fake_leader("vinny", 10, 1);
+        let stale = fake_leader("vinny", STALE_THRESHOLD_SECS + 1, 1);
         assert!(!leader_is_stale(&fresh));
         assert!(leader_is_stale(&stale));
     }
@@ -1622,9 +1622,9 @@ mod tests {
     #[test]
     fn parse_yield_request_extracts_member_and_deadline() {
         let until = Utc::now() + ChronoDuration::minutes(10);
-        let raw = format!("taylor|{}", until.to_rfc3339());
+        let raw = format!("vinny|{}", until.to_rfc3339());
         let (member, parsed) = parse_yield_request(&raw).expect("valid request parses");
-        assert_eq!(member, "taylor");
+        assert_eq!(member, "vinny");
         // Round-trips to within a second (rfc3339 sub-second precision varies).
         assert!((parsed - until).num_seconds().abs() <= 1);
     }
@@ -1641,9 +1641,9 @@ mod tests {
     fn parse_yield_request_rejects_malformed() {
         // No separator, empty member, and a non-timestamp all yield None so a
         // garbled secret can never wedge the election.
-        assert!(parse_yield_request("taylor").is_none());
+        assert!(parse_yield_request("vinny").is_none());
         assert!(parse_yield_request("|2026-06-13T00:00:00Z").is_none());
-        assert!(parse_yield_request("taylor|not-a-date").is_none());
+        assert!(parse_yield_request("vinny|not-a-date").is_none());
         assert!(parse_yield_request("").is_none());
     }
 
@@ -1661,14 +1661,14 @@ mod tests {
     fn candidate_ranking_splits_leader_from_primary_and_softens_never() {
         let mut primary = cand("shakira", 0);
         primary.hosts_postgres_primary = true;
-        let follower = cand("taylor", 50);
+        let follower = cand("vinny", 50);
         let candidates = vec![primary, follower];
-        let alive = alive_all(&["shakira", "taylor"]);
+        let alive = alive_all(&["shakira", "vinny"]);
         assert_eq!(
             pick_best_candidate(&candidates, &alive, &Default::default(), None)
                 .unwrap()
                 .member_name,
-            "taylor"
+            "vinny"
         );
 
         let mut last_resort = cand("laptop", 0);
@@ -1702,35 +1702,35 @@ mod tests {
     #[test]
     fn pick_best_no_yield_is_pre_phase1_behaviour() {
         // Empty yielding set → lowest priority wins, exactly as before.
-        let cands = vec![cand("taylor", 0), cand("james", 10), cand("sophie", 20)];
-        let alive = alive_all(&["taylor", "james", "sophie"]);
+        let cands = vec![cand("vinny", 0), cand("james", 10), cand("sophie", 20)];
+        let alive = alive_all(&["vinny", "james", "sophie"]);
         let yielding = std::collections::HashSet::new();
         let best = pick_best_candidate(&cands, &alive, &yielding, None).unwrap();
-        assert_eq!(best.member_name, "taylor");
+        assert_eq!(best.member_name, "vinny");
     }
 
     #[test]
     fn pick_best_skips_yielding_leader() {
-        // taylor (priority 0) is yielding → next-preferred alive node wins.
-        let cands = vec![cand("taylor", 0), cand("james", 10), cand("sophie", 20)];
-        let alive = alive_all(&["taylor", "james", "sophie"]);
-        let yielding = ["taylor".to_string()].into_iter().collect();
+        // vinny (priority 0) is yielding → next-preferred alive node wins.
+        let cands = vec![cand("vinny", 0), cand("james", 10), cand("sophie", 20)];
+        let alive = alive_all(&["vinny", "james", "sophie"]);
+        let yielding = ["vinny".to_string()].into_iter().collect();
         let best = pick_best_candidate(&cands, &alive, &yielding, None).unwrap();
         assert_eq!(best.member_name, "james");
     }
 
     #[test]
     fn self_yielding_leader_without_lease_yields_to_best_candidate() {
-        let cands = vec![cand("taylor", 0), cand("james", 10)];
-        let alive = alive_all(&["taylor", "james"]);
-        let yielding = ["taylor".to_string()].into_iter().collect();
+        let cands = vec![cand("vinny", 0), cand("james", 10)];
+        let alive = alive_all(&["vinny", "james"]);
+        let yielding = ["vinny".to_string()].into_iter().collect();
         let best = pick_best_candidate(&cands, &alive, &yielding, None).unwrap();
 
         assert_eq!(best.member_name, "james");
         assert!(should_yield_to_best(
             None,
             &yielding,
-            "taylor",
+            "vinny",
             &best.member_name
         ));
     }
@@ -1739,10 +1739,10 @@ mod tests {
     fn pick_best_none_when_all_yield_or_dead() {
         // A yield with no eligible successor → None → caller keeps current
         // leader rather than going leaderless.
-        let cands = vec![cand("taylor", 0), cand("james", 10)];
-        let mut alive = alive_all(&["taylor"]);
+        let cands = vec![cand("vinny", 0), cand("james", 10)];
+        let mut alive = alive_all(&["vinny"]);
         alive.insert("james".to_string(), false); // james dead
-        let yielding = ["taylor".to_string()].into_iter().collect();
+        let yielding = ["vinny".to_string()].into_iter().collect();
         assert!(pick_best_candidate(&cands, &alive, &yielding, None).is_none());
     }
 
@@ -1757,11 +1757,11 @@ mod tests {
 
     #[test]
     fn pick_best_maintenance_lease_prefers_standby_over_priority() {
-        // HA Phase 2: an active lease names `james` standby. Even though taylor
+        // HA Phase 2: an active lease names `james` standby. Even though vinny
         // has lower (more-preferred) election_priority, the designated standby
         // wins outright while the lease is live.
-        let cands = vec![cand("taylor", 0), cand("james", 10), cand("sophie", 20)];
-        let alive = alive_all(&["taylor", "james", "sophie"]);
+        let cands = vec![cand("vinny", 0), cand("james", 10), cand("sophie", 20)];
+        let alive = alive_all(&["vinny", "james", "sophie"]);
         let yielding = std::collections::HashSet::new();
         let best = pick_best_candidate(&cands, &alive, &yielding, Some("james")).unwrap();
         assert_eq!(best.member_name, "james");
@@ -1771,23 +1771,23 @@ mod tests {
     fn pick_best_lease_falls_through_when_standby_unavailable() {
         // A dead/missing standby must NOT strand the fleet — fall through to the
         // normal priority winner (this is the auto-fail-back safety net).
-        let cands = vec![cand("taylor", 0), cand("james", 10)];
-        let mut alive = alive_all(&["taylor"]);
+        let cands = vec![cand("vinny", 0), cand("james", 10)];
+        let mut alive = alive_all(&["vinny"]);
         alive.insert("james".to_string(), false); // designated standby is dead
         let yielding = std::collections::HashSet::new();
         let best = pick_best_candidate(&cands, &alive, &yielding, Some("james")).unwrap();
-        assert_eq!(best.member_name, "taylor");
+        assert_eq!(best.member_name, "vinny");
     }
 
     #[test]
     fn pick_best_expired_lease_is_none_so_priority_wins() {
         // The election reads `prefer = None` for an expired lease (the DB helper
         // returns None past the deadline) → normal priority election → fail-back.
-        let cands = vec![cand("taylor", 0), cand("james", 10)];
-        let alive = alive_all(&["taylor", "james"]);
+        let cands = vec![cand("vinny", 0), cand("james", 10)];
+        let alive = alive_all(&["vinny", "james"]);
         let yielding = std::collections::HashSet::new();
         let best = pick_best_candidate(&cands, &alive, &yielding, None).unwrap();
-        assert_eq!(best.member_name, "taylor");
+        assert_eq!(best.member_name, "vinny");
     }
 
     #[test]
@@ -1796,9 +1796,9 @@ mod tests {
         // decodes. The expiry comparison (`Utc::now() < until`) lives in
         // self_should_yield, so a past deadline still parses cleanly here.
         let past = Utc::now() - ChronoDuration::minutes(1);
-        let raw = format!("taylor|{}", past.to_rfc3339());
+        let raw = format!("vinny|{}", past.to_rfc3339());
         let (member, until) = parse_yield_request(&raw).expect("past deadline still parses");
-        assert_eq!(member, "taylor");
+        assert_eq!(member, "vinny");
         assert!(until < Utc::now());
     }
 

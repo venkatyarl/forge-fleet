@@ -176,21 +176,21 @@ mod tests {
             make_alert(
                 "high_cpu",
                 AlertSeverity::Warning,
-                Some("taylor"),
+                Some("vinny"),
                 None,
                 "CPU at 95%",
             ),
             make_alert(
                 "high_cpu",
                 AlertSeverity::Warning,
-                Some("taylor"),
+                Some("vinny"),
                 None,
                 "CPU at 95%",
             ),
             make_alert(
                 "high_cpu",
                 AlertSeverity::Warning,
-                Some("taylor"),
+                Some("vinny"),
                 None,
                 "CPU at 95%",
             ),
@@ -208,7 +208,7 @@ mod tests {
             make_alert(
                 "high_cpu",
                 AlertSeverity::Warning,
-                Some("taylor"),
+                Some("vinny"),
                 None,
                 "CPU high",
             ),
@@ -232,14 +232,14 @@ mod tests {
             make_alert(
                 "node_down",
                 AlertSeverity::Warning,
-                Some("taylor"),
+                Some("vinny"),
                 None,
                 "node unreachable",
             ),
             make_alert(
                 "node_down",
                 AlertSeverity::Critical,
-                Some("taylor"),
+                Some("vinny"),
                 None,
                 "node unreachable",
             ),
@@ -255,14 +255,14 @@ mod tests {
         aggregator.record(make_alert(
             "high_cpu",
             AlertSeverity::Warning,
-            Some("taylor"),
+            Some("vinny"),
             None,
             "CPU high",
         ));
         aggregator.record(make_alert(
             "high_cpu",
             AlertSeverity::Warning,
-            Some("taylor"),
+            Some("vinny"),
             None,
             "CPU high",
         ));
@@ -280,14 +280,14 @@ mod tests {
             make_alert(
                 "disk_low",
                 AlertSeverity::Warning,
-                Some("taylor"),
+                Some("vinny"),
                 None,
                 "disk low",
             ),
             make_alert(
                 "disk_low",
                 AlertSeverity::Warning,
-                Some("taylor"),
+                Some("vinny"),
                 None,
                 "disk low",
             ),

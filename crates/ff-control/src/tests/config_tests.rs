@@ -27,14 +27,14 @@ fn endpoint_config_accepts_rpc_ring_overrides() {
             "timeout_secs": 900,
             "rpc_shard_id": 2,
             "rpc_shard_count": 4,
-            "rpc_ring_topology": "adele,rihanna,beyonce,taylor"
+            "rpc_ring_topology": "adele,rihanna,beyonce,vinny"
         }"#,
     )
     .expect("RPC ring overrides should deserialize");
 
     assert_eq!(config.rpc_shard_id, 2);
     assert_eq!(config.rpc_shard_count, 4);
-    assert_eq!(config.rpc_ring_topology, "adele,rihanna,beyonce,taylor");
+    assert_eq!(config.rpc_ring_topology, "adele,rihanna,beyonce,vinny");
 }
 
 #[test]

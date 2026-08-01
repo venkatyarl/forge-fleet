@@ -614,7 +614,7 @@ mod tests {
             Some("/local/cache/crg")
         );
         assert_eq!(
-            indexed_source("taylor", &holders).as_deref(),
+            indexed_source("vinny", &holders).as_deref(),
             Some("sophie:/cache/crg")
         );
     }

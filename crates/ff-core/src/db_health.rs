@@ -2,7 +2,7 @@
 //!
 //! Every `ff` command that needs the database calls [`ensure_postgres_up`]
 //! before opening a pool. If Postgres is unreachable and we're on the DB
-//! host (Taylor), we run `docker compose up -d postgres redis` and wait
+//! host (Vinny), we run `docker compose up -d postgres redis` and wait
 //! for the port to come up — so operators don't have to remember the
 //! recovery command.
 
@@ -49,7 +49,7 @@ pub async fn ensure_postgres_up(db_url: &str) -> Result<(), String> {
     if !is_local_host(&host).await {
         return Err(format!(
             "postgres unreachable at {host}:{port} and this isn't the DB host — \
-             start the data plane on Taylor with `docker compose -f deploy/docker-compose.yml up -d`"
+             start the data plane on Vinny with `docker compose -f deploy/docker-compose.yml up -d`"
         ));
     }
 
@@ -134,7 +134,7 @@ async fn is_local_host(host: &str) -> bool {
     drop(bound);
     if let Ok(local_name) = hostname_short() {
         // Allow the DB host either by exact hostname match or a known
-        // alias mapping ("taylor" is Vinny's leader name).
+        // alias mapping ("vinny" is Vinny's leader name).
         if local_name.eq_ignore_ascii_case(host) {
             return true;
         }

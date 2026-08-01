@@ -159,7 +159,7 @@ pub async fn handle_start(leader: bool, config_path: &Path, working_dir: &Path) 
     // Step 3: Check fleet connectivity
     println!("{YELLOW}3/4{RESET} Checking fleet nodes...");
     let nodes = [
-        ("Taylor", "192.168.5.100"),
+        ("Vinny", "192.168.5.100"),
         ("Marcus", "192.168.5.102"),
         ("Sophie", "192.168.5.103"),
         ("Priya", "192.168.5.104"),

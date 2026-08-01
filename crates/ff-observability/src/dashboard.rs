@@ -344,7 +344,7 @@ mod tests {
         state.upsert_node(Node {
             id: Uuid::new_v4(),
             is_offline_autonomy_enabled: false,
-            name: "taylor".into(),
+            name: "vinny".into(),
             host: "192.168.5.100".into(),
             port: 51800,
             role: Role::Leader,
@@ -368,7 +368,7 @@ mod tests {
 
         let nodes = state.node_summaries();
         assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].name, "taylor");
+        assert_eq!(nodes[0].name, "vinny");
 
         let snap = state.fleet_snapshot().await;
         assert_eq!(snap.nodes_total, 1);

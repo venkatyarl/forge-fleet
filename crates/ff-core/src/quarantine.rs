@@ -337,19 +337,19 @@ mod tests {
     async fn test_manual_quarantine_and_release() {
         let q = NodeQuarantine::new(fast_policy());
 
-        assert!(!q.is_quarantined("taylor").await);
+        assert!(!q.is_quarantined("vinny").await);
 
-        q.quarantine_node("taylor", "testing", Duration::from_secs(60))
+        q.quarantine_node("vinny", "testing", Duration::from_secs(60))
             .await;
-        assert!(q.is_quarantined("taylor").await);
+        assert!(q.is_quarantined("vinny").await);
 
         let entries = q.list_quarantined().await;
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].node, "taylor");
+        assert_eq!(entries[0].node, "vinny");
         assert!(!entries[0].auto);
 
-        assert!(q.release_node("taylor").await);
-        assert!(!q.is_quarantined("taylor").await);
+        assert!(q.release_node("vinny").await);
+        assert!(!q.is_quarantined("vinny").await);
         assert!(q.list_quarantined().await.is_empty());
     }
 

@@ -1343,7 +1343,7 @@ pub async fn fleet_route(params: Option<Value>) -> HandlerResult {
 
     // Agent-capability filters (all optional, additive). `tool_calling=true`
     // requires a tool-calling model; `min_ctx` requires that much usable
-    // per-slot ctx; `exclude_hosts` keeps load off named hosts (e.g. taylor).
+    // per-slot ctx; `exclude_hosts` keeps load off named hosts (e.g. vinny).
     // Passing workload="tool_calling" also implies require_tool_calling so the
     // existing tag-based call keeps working AND benefits from the real column.
     let require_tool_calling = params
@@ -2739,7 +2739,7 @@ fn agent_row_to_json(r: &ff_db::FleetAgentRow) -> Value {
 
 /// Thin wrapper over the process-shared pool ([`crate::pool::shared_pg_pool`]).
 /// The pool is built ONCE and cached; this no longer opens a fresh pool per
-/// call (the pool-per-call anti-pattern that caused two Taylor outages). The
+/// call (the pool-per-call anti-pattern that caused two Vinny outages). The
 /// `_config` arg is retained so the ~22 call sites stay untouched; the shared
 /// pool resolves its own config on first init.
 async fn get_pg_pool(_config: &FleetConfig) -> Result<sqlx::PgPool, String> {
@@ -3046,7 +3046,7 @@ impl CrewRouting {
 /// Build the crew [`TeamConfig`] from the V112 `fleet_agents` catalog. Each
 /// agent's endpoint is resolved through the agent-swarm capability router
 /// ([`ff_db::pg_pick_agent_endpoint`]) using the agent's `min_ctx`, so the
-/// crew never hardcodes Taylor and never lands on a non-tool-calling model.
+/// crew never hardcodes Vinny and never lands on a non-tool-calling model.
 ///
 /// Back-compat: if the DB is unreachable, the catalog is empty, or a named
 /// agent is missing, this falls back to the hardcoded [`TeamTemplates`] the

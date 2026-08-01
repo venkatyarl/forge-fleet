@@ -663,11 +663,11 @@ mod tests {
             format!(
                 "{}",
                 SimulationType::NetworkPartition {
-                    node_a: "taylor".into(),
+                    node_a: "vinny".into(),
                     node_b: "james".into()
                 }
             ),
-            "network_partition(taylor <-> james)"
+            "network_partition(vinny <-> james)"
         );
     }
 
@@ -869,21 +869,21 @@ mod tests {
         assert!(matches!(sim, SimulationType::NodeFailure { node } if node == "james"));
         assert_eq!(dur, Duration::from_secs(30));
 
-        let (sim, _) = simulate_model_crash("taylor", "qwen-32b", Duration::from_secs(60));
+        let (sim, _) = simulate_model_crash("vinny", "qwen-32b", Duration::from_secs(60));
         assert!(matches!(
             sim,
             SimulationType::ModelCrash { node, model }
-            if node == "taylor" && model == "qwen-32b"
+            if node == "vinny" && model == "qwen-32b"
         ));
 
         let (sim, _) = simulate_leader_failover(Duration::from_secs(120));
         assert!(matches!(sim, SimulationType::LeaderFailover));
 
-        let (sim, _) = simulate_network_partition("taylor", "james", Duration::from_secs(45));
+        let (sim, _) = simulate_network_partition("vinny", "james", Duration::from_secs(45));
         assert!(matches!(
             sim,
             SimulationType::NetworkPartition { node_a, node_b }
-            if node_a == "taylor" && node_b == "james"
+            if node_a == "vinny" && node_b == "james"
         ));
     }
 

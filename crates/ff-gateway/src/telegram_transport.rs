@@ -1406,7 +1406,7 @@ async fn resolve_llm_endpoint(pool: &PgPool) -> String {
         Err(_) => return DEFAULT_LLM_ENDPOINT.to_string(),
     };
 
-    // Find first deployment with healthy status. Prefer Taylor's local
+    // Find first deployment with healthy status. Prefer Vinny's local
     // mlx (lowest latency for the leader-bound telegram polling task),
     // then any other healthy chat-shaped deployment (skip embedding-only
     // models like bge-m3 that don't speak /v1/chat/completions).
@@ -1418,7 +1418,7 @@ async fn resolve_llm_endpoint(pool: &PgPool) -> String {
         .iter()
         .filter(|d| d.health_status == "healthy" || d.health_status == "ok")
         .filter(chatty)
-        .find(|d| d.worker_name == "taylor" && d.runtime.contains("mlx"))
+        .find(|d| d.worker_name == "vinny" && d.runtime.contains("mlx"))
         .or_else(|| {
             deployments
                 .iter()
@@ -1493,7 +1493,7 @@ mod tests {
         let p = format_grounded_brain_prompt(
             15,
             15,
-            &["taylor".to_string(), "marcus".to_string()],
+            &["vinny".to_string(), "marcus".to_string()],
             17,
             12,
             "Vinny",
@@ -1505,7 +1505,7 @@ mod tests {
         assert!(p.contains("never invent"));
         // Must carry real facts: the computer count, names, and model counts.
         assert!(p.contains("15 computers"));
-        assert!(p.contains("taylor, marcus"));
+        assert!(p.contains("vinny, marcus"));
         assert!(p.contains("17 local models"));
         assert!(p.contains("12 cloud providers"));
         // Points the user at the grounded commands.

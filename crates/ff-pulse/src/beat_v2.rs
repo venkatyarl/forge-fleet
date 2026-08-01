@@ -89,11 +89,11 @@ pub struct PulseBeatV2 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_sha: Option<String>,
     /// Ground-truth absolute path of this node's ForgeFleet source tree —
-    /// the dir the daemon builds/self-upgrades from (Taylor: `~/projects/
+    /// the dir the daemon builds/self-upgrades from (Vinny: `~/projects/
     /// forge-fleet`; workers: `~/.forgefleet/sub-agents/sub-agent-0/forge-fleet`).
     /// The leader's auto-upgrade reads `computers.source_tree_path` to know
     /// what to `cd` into; if it's NULL the leader self-upgrade silently skips
-    /// (surfaced 2026-06-08 — only Taylor had it set, so leadership moving to
+    /// (surfaced 2026-06-08 — only Vinny had it set, so leadership moving to
     /// any other node would break self-upgrade). Reported here so the
     /// materializer heals the column from ground truth, same idiom as
     /// `primary_ip`. `None` from daemons running pre-this-field code.
@@ -557,9 +557,9 @@ mod tests {
 
     #[test]
     fn skeleton_has_protocol_version_2() {
-        let beat = PulseBeatV2::skeleton("taylor");
+        let beat = PulseBeatV2::skeleton("vinny");
         assert_eq!(beat.pulse_protocol_version, 2);
-        assert_eq!(beat.computer_name, "taylor");
+        assert_eq!(beat.computer_name, "vinny");
         assert_eq!(beat.role_claimed, "member");
         assert!(beat.computer_id.is_none());
         assert!(beat.llm_servers.is_empty());

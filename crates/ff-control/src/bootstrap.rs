@@ -201,7 +201,7 @@ mod tests {
         FleetConfig {
             fleet: FleetSettings::default(),
             nodes: [(
-                "taylor".to_string(),
+                "vinny".to_string(),
                 NodeConfig {
                     ip: "192.168.5.100".to_string(),
                     role: Role::Gateway,
@@ -221,7 +221,7 @@ mod tests {
                 path: "/models/qwen3-32b.gguf".to_string(),
                 ctx_size: 32768,
                 runtime: Some(Runtime::LlamaCpp),
-                nodes: vec!["taylor".to_string()],
+                nodes: vec!["vinny".to_string()],
             }],
             leader: LeaderConfig::default(),
             ..Default::default()

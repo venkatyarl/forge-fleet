@@ -84,7 +84,7 @@ impl std::fmt::Display for ModelPreference {
 ///   - `endpoint` — the base URL resolved by the agent-swarm capability
 ///     router (`ff_db::pg_pick_agent_endpoint`) for this agent's `min_ctx`,
 ///     so the crew routes to a tool-calling endpoint with enough per-slot ctx
-///     instead of hardcoding Taylor.
+///     instead of hardcoding Vinny.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentAssignment {
     /// Unique ID for this assignment.
@@ -432,9 +432,9 @@ mod tests {
     #[test]
     fn test_agent_assignment_builder_chain() {
         let a = AgentAssignment::with_tier(AgentRole::Reviewer, Tier::Tier4)
-            .on_node("taylor")
+            .on_node("vinny")
             .with_instructions("Check for security issues");
-        assert_eq!(a.node_preference, Some("taylor".into()));
+        assert_eq!(a.node_preference, Some("vinny".into()));
         assert!(a.full_system_prompt().contains("security"));
     }
 

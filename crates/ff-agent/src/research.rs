@@ -56,7 +56,7 @@ pub struct ResearchConfig {
     pub initiated_by: String,
     /// Model hint for the planner + synthesizer turns. Defaults to "thinking"
     /// which routes to whichever deployment is registered for that pool alias
-    /// (usually Qwen3.5-35B-A3B on Taylor:55001 per fleet_task_coverage).
+    /// (usually Qwen3.5-35B-A3B on Vinny:55001 per fleet_task_coverage).
     pub planner_model: String,
     /// Model hint for the sub-agent turns. Defaults to "coder" (Qwen3.6-35B).
     pub subagent_model: String,
@@ -77,7 +77,7 @@ pub struct ResearchConfig {
     /// `ff research --show <id>`). Default false = run in the foreground.
     pub detached: bool,
     /// Worker names that must NOT receive any sub-agent, e.g.
-    /// `["sia", "adele"]` to keep research off the DGX pairs or `["taylor"]`
+    /// `["sia", "adele"]` to keep research off the DGX pairs or `["vinny"]`
     /// to spare the leader. Passed straight to the routing scorer's
     /// `exclude_hosts` (matched case-insensitively against `worker_name`), so
     /// excluded hosts are dropped from the candidate pool before the

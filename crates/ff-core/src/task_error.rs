@@ -91,7 +91,7 @@ impl TaskErrorClass {
                 "exceeded deadline — raise --timeout or split the work into smaller tasks"
             }
             TaskErrorClass::PermissionDenied => {
-                "permission denied — check sudo/ownership; Taylor lacks passwordless sudo by design"
+                "permission denied — check sudo/ownership; Vinny lacks passwordless sudo by design"
             }
             TaskErrorClass::NotFound => {
                 "command/file missing — install the tool or fix the path, then redispatch"

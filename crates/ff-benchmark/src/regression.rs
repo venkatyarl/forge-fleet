@@ -305,8 +305,8 @@ mod tests {
 
     #[test]
     fn detects_latency_and_throughput_regression() {
-        let baseline = vec![fixture_run("latency", "taylor", 1000.0, 0.01, 90.0)];
-        let candidate = vec![fixture_run("latency", "taylor", 1250.0, 0.01, 72.0)];
+        let baseline = vec![fixture_run("latency", "vinny", 1000.0, 0.01, 90.0)];
+        let candidate = vec![fixture_run("latency", "vinny", 1250.0, 0.01, 72.0)];
 
         let report = detect_regressions(&baseline, &candidate, &RegressionThresholds::default());
 
@@ -327,8 +327,8 @@ mod tests {
 
     #[test]
     fn no_regression_when_changes_within_threshold() {
-        let baseline = vec![fixture_run("latency", "taylor", 1000.0, 0.01, 100.0)];
-        let candidate = vec![fixture_run("latency", "taylor", 1060.0, 0.011, 95.0)];
+        let baseline = vec![fixture_run("latency", "vinny", 1000.0, 0.01, 100.0)];
+        let candidate = vec![fixture_run("latency", "vinny", 1060.0, 0.011, 95.0)];
 
         let report = detect_regressions(&baseline, &candidate, &RegressionThresholds::default());
 

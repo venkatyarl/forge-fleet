@@ -684,7 +684,7 @@ async fn evaluate_current(
             let v = beat.map(|b| b.load.disk_free_gb).unwrap_or(0.0);
             // A live beat reporting exactly 0.0 free disk is a sampling
             // artifact from failed disk-stat collection, not a real full disk
-            // (Taylor false-paged at 2:48 AM with 2.2 TB actually free). Real
+            // (Vinny false-paged at 2:48 AM with 2.2 TB actually free). Real
             // near-full disks still report a small non-zero value and fire.
             if v == 0.0 {
                 return Ok((false, None, None));
@@ -1098,20 +1098,20 @@ mod tests {
             .expect("valid lazy postgres URL");
         let cond = parse_condition("< 20");
 
-        let mut zero_sample = ff_pulse::beat_v2::PulseBeatV2::skeleton("taylor");
+        let mut zero_sample = ff_pulse::beat_v2::PulseBeatV2::skeleton("vinny");
         zero_sample.load.disk_free_gb = 0.0;
         let (matches, numeric_value, string_value) =
-            evaluate_current("disk_free_gb", &cond, "taylor", &[zero_sample], &pg)
+            evaluate_current("disk_free_gb", &cond, "vinny", &[zero_sample], &pg)
                 .await
                 .expect("disk_free_gb evaluation should not hit the DB");
         assert!(!matches);
         assert_eq!(numeric_value, None);
         assert_eq!(string_value, None);
 
-        let mut low_nonzero = ff_pulse::beat_v2::PulseBeatV2::skeleton("taylor");
+        let mut low_nonzero = ff_pulse::beat_v2::PulseBeatV2::skeleton("vinny");
         low_nonzero.load.disk_free_gb = 5.0;
         let (matches, numeric_value, string_value) =
-            evaluate_current("disk_free_gb", &cond, "taylor", &[low_nonzero], &pg)
+            evaluate_current("disk_free_gb", &cond, "vinny", &[low_nonzero], &pg)
                 .await
                 .expect("disk_free_gb evaluation should not hit the DB");
         assert!(matches);
@@ -1129,30 +1129,30 @@ mod tests {
 
     #[test]
     fn parse_alert_metric_node_extracts_fields() {
-        let msg = "[warning] high_cpu: computer=taylor metric=cpu_pct condition=> 90 value=95";
+        let msg = "[warning] high_cpu: computer=vinny metric=cpu_pct condition=> 90 value=95";
         assert_eq!(
             parse_alert_metric_node(msg),
-            Some(("cpu_pct".to_string(), "taylor".to_string()))
+            Some(("cpu_pct".to_string(), "vinny".to_string()))
         );
     }
 
     #[test]
     fn parse_alert_metric_node_returns_none_when_fields_missing() {
         assert!(parse_alert_metric_node("metric=cpu_pct value=95").is_none());
-        assert!(parse_alert_metric_node("computer=taylor value=95").is_none());
+        assert!(parse_alert_metric_node("computer=vinny value=95").is_none());
         assert!(parse_alert_metric_node("plain message").is_none());
     }
 
     #[test]
     fn telegram_alert_dedup_uses_stable_independent_keys() {
         let dedup = AlertDeduplicationState::new(Duration::from_secs(60));
-        let taylor_cpu = telegram_alert_signature("cpu_pct", "taylor");
+        let vinny_cpu = telegram_alert_signature("cpu_pct", "vinny");
         let james_cpu = telegram_alert_signature("cpu_pct", "james");
 
-        assert!(!dedup.is_duplicate(&taylor_cpu));
-        dedup.record(&taylor_cpu);
-        assert!(dedup.is_duplicate(&taylor_cpu));
+        assert!(!dedup.is_duplicate(&vinny_cpu));
+        dedup.record(&vinny_cpu);
+        assert!(dedup.is_duplicate(&vinny_cpu));
         assert!(!dedup.is_duplicate(&james_cpu));
-        assert_ne!(taylor_cpu, james_cpu);
+        assert_ne!(vinny_cpu, james_cpu);
     }
 }

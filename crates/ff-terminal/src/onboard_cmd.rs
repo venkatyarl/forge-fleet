@@ -22,7 +22,7 @@ pub async fn handle_onboard(cmd: crate::OnboardCommand) -> Result<()> {
                 .or_else(|| std::env::var("FORGEFLEET_ENROLLMENT_TOKEN").ok())
                 .unwrap_or_else(|| "<SET-TOKEN-FIRST>".into());
             // Leader host: env override → live DB (elected leader's roster IP)
-            // → legacy taylor fallback only if both fail. Keeps the printed
+            // → legacy vinny fallback only if both fail. Keeps the printed
             // curl correct across failovers instead of pinning dead .100.
             let db_leader: Option<(String,)> = sqlx::query_as(
                 "SELECT w.ip FROM fleet_leader_state ls

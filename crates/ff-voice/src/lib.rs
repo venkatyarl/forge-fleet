@@ -15,7 +15,7 @@
 
 pub mod audio;
 /// Native mic capture (cpal) — macOS only; cpal's Linux backend needs ALSA
-/// headers absent on CI/fleet Linux, and voice runs only on the leader (Taylor).
+/// headers absent on CI/fleet Linux, and voice runs only on the leader (Vinny).
 #[cfg(target_os = "macos")]
 pub mod capture;
 pub mod pipeline;

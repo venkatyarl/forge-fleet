@@ -380,7 +380,7 @@ mod tests {
             .send(
                 NotificationLevel::Critical,
                 "Node went offline",
-                "taylor unreachable",
+                "vinny unreachable",
             )
             .await
             .unwrap();
@@ -389,7 +389,7 @@ mod tests {
             .send(
                 NotificationLevel::Critical,
                 "Node went offline",
-                "taylor unreachable again",
+                "vinny unreachable again",
             )
             .await
             .unwrap();

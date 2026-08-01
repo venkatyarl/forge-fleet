@@ -525,7 +525,7 @@ impl Materializer {
         // and would otherwise never reconcile). The node reports its own tree
         // location as ground truth; the leader's auto-upgrade `cd`s into this
         // column, and a NULL value makes the leader self-upgrade silently skip
-        // (surfaced 2026-06-08: only Taylor had it set, so leadership moving
+        // (surfaced 2026-06-08: only Vinny had it set, so leadership moving
         // to any other node would break self-upgrade). Same idiom as the
         // primary_ip heal below — guarded no-op once the row is correct.
         if let Some(stp) = beat.source_tree_path.as_deref().filter(|s| !s.is_empty()) {
@@ -1726,11 +1726,11 @@ mod tests {
 
     #[test]
     fn snapshot_detects_status_transition_offline_to_online() {
-        let beat = beat_online("taylor");
+        let beat = beat_online("vinny");
         let snap = PersistedSnapshot::from_beat(&beat);
         assert_eq!(snap.status, "online");
 
-        let mut beat2 = beat_online("taylor");
+        let mut beat2 = beat_online("vinny");
         beat2.going_offline = true;
         let snap2 = PersistedSnapshot::from_beat(&beat2);
         assert_eq!(snap2.status, "offline");
@@ -1882,8 +1882,8 @@ mod tests {
 
     #[test]
     fn snapshot_captures_llm_deployment_persistent_fields_only() {
-        let mut a = beat_online("taylor");
-        let mut b = beat_online("taylor");
+        let mut a = beat_online("vinny");
+        let mut b = beat_online("vinny");
         let dep_id = Uuid::new_v4();
         let started = Utc::now();
 

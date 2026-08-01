@@ -227,14 +227,14 @@ display_name = "ForgeFleet"
 repo_url = "https://github.com/venkatyarl/forge-fleet"
 default_branch = "main"
 compose_file = "deploy/docker-compose.yml"
-target_computers = ["taylor", "marcus"]
+target_computers = ["vinny", "marcus"]
 
 [[project]]
 id = "hireflow360"
 display_name = "HireFlow360"
 repo_url = "https://github.com/venkatyarl/hireflow360"
 default_branch = "main"
-target_computers = ["taylor"]
+target_computers = ["vinny"]
 "#;
 
     #[test]
@@ -247,7 +247,7 @@ target_computers = ["taylor"]
         assert_eq!(ff.id, "forge-fleet");
         assert_eq!(ff.display_name, "ForgeFleet");
         assert_eq!(ff.default_branch, "main");
-        assert_eq!(ff.target_computers, vec!["taylor", "marcus"]);
+        assert_eq!(ff.target_computers, vec!["vinny", "marcus"]);
         assert_eq!(
             ff.compose_file.as_deref(),
             Some("deploy/docker-compose.yml")

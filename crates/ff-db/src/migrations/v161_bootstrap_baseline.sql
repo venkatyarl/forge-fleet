@@ -1159,7 +1159,7 @@ CREATE TABLE IF NOT EXISTS port_registry (
     service         TEXT NOT NULL,
     kind            TEXT NOT NULL,       -- control_plane|database|coordination|llm_inference|system
     description     TEXT NOT NULL,
-    exposed_on      TEXT NOT NULL,       -- "all_members" | "leader_only" | "taylor" | ...
+    exposed_on      TEXT NOT NULL,       -- "all_members" | "leader_only" | "vinny" | ...
     scope           TEXT NOT NULL DEFAULT 'lan',  -- lan | public_via_proxy
     managed_by      TEXT,
     status          TEXT NOT NULL DEFAULT 'active', -- active | planned | deprecated
@@ -1319,9 +1319,9 @@ VALUES
    NULL,
    '{"method":"cmd","args":["ff","--version"],"regex":"ff (\\S+)"}'::jsonb,
    '{
-     "macos":"cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p ff && install -m 755 target/release/ff ~/.local/bin/ff && codesign --force --sign - ~/.local/bin/ff",
-     "linux-ubuntu":"cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p ff && install -m 755 target/release/ff ~/.local/bin/ff",
-     "linux-dgx":"cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p ff && install -m 755 target/release/ff ~/.local/bin/ff"
+     "macos":"cd ~/vinnyProjects/forge-fleet && git pull && cargo build --release -p ff && install -m 755 target/release/ff ~/.local/bin/ff && codesign --force --sign - ~/.local/bin/ff",
+     "linux-ubuntu":"cd ~/vinnyProjects/forge-fleet && git pull && cargo build --release -p ff && install -m 755 target/release/ff ~/.local/bin/ff",
+     "linux-dgx":"cd ~/vinnyProjects/forge-fleet && git pull && cargo build --release -p ff && install -m 755 target/release/ff ~/.local/bin/ff"
    }'::jsonb,
    false, false),
 
@@ -1331,9 +1331,9 @@ VALUES
    NULL,
    '{"method":"cmd","args":["forgefleetd","--version"],"regex":"forgefleetd (\\S+)"}'::jsonb,
    '{
-     "macos":"cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p forgefleetd && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && codesign --force --sign - ~/.local/bin/forgefleetd",
-     "linux-ubuntu":"cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p forgefleetd && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd",
-     "linux-dgx":"cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p forgefleetd && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd"
+     "macos":"cd ~/vinnyProjects/forge-fleet && git pull && cargo build --release -p forgefleetd && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && codesign --force --sign - ~/.local/bin/forgefleetd",
+     "linux-ubuntu":"cd ~/vinnyProjects/forge-fleet && git pull && cargo build --release -p forgefleetd && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd",
+     "linux-dgx":"cd ~/vinnyProjects/forge-fleet && git pull && cargo build --release -p forgefleetd && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd"
    }'::jsonb,
    true, false),
 
@@ -1570,7 +1570,7 @@ UPDATE software_registry
 -- of github.com/venkatyarl/forge-fleet before cargo build runs.
 --
 -- Algorithm:
---   - Drop stale ~/taylorProjects/forge-fleet (the repo moved GitHub accounts)
+--   - Drop stale ~/vinnyProjects/forge-fleet (the repo moved GitHub accounts)
 --   - If ~/projects/forge-fleet/.git exists, verify remote; if wrong, wipe
 --   - Clone if missing
 --   - git pull --ff-only
@@ -1578,22 +1578,22 @@ UPDATE software_registry
 UPDATE software_registry
    SET upgrade_playbook = jsonb_build_object(
        'macos',
-       'rm -rf ~/taylorProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && codesign --force --sign - ~/.local/bin/ff',
+       'rm -rf ~/vinnyProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && codesign --force --sign - ~/.local/bin/ff',
        'linux-ubuntu',
-       'export PATH=$HOME/.cargo/bin:$PATH; rm -rf ~/taylorProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && systemctl --user restart forgefleet-daemon.service',
+       'export PATH=$HOME/.cargo/bin:$PATH; rm -rf ~/vinnyProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && systemctl --user restart forgefleet-daemon.service',
        'linux-dgx',
-       'export PATH=$HOME/.cargo/bin:$PATH; rm -rf ~/taylorProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && systemctl --user restart forgefleet-daemon.service'
+       'export PATH=$HOME/.cargo/bin:$PATH; rm -rf ~/vinnyProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && systemctl --user restart forgefleet-daemon.service'
    )
  WHERE id = 'ff_git';
 
 UPDATE software_registry
    SET upgrade_playbook = jsonb_build_object(
        'macos',
-       'rm -rf ~/taylorProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && codesign --force --sign - ~/.local/bin/forgefleetd && launchctl kickstart -k gui/$(id -u)/com.forgefleet.forgefleetd',
+       'rm -rf ~/vinnyProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && codesign --force --sign - ~/.local/bin/forgefleetd && launchctl kickstart -k gui/$(id -u)/com.forgefleet.forgefleetd',
        'linux-ubuntu',
-       'export PATH=$HOME/.cargo/bin:$PATH; rm -rf ~/taylorProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && systemctl --user restart forgefleet-node.service',
+       'export PATH=$HOME/.cargo/bin:$PATH; rm -rf ~/vinnyProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && systemctl --user restart forgefleet-node.service',
        'linux-dgx',
-       'export PATH=$HOME/.cargo/bin:$PATH; rm -rf ~/taylorProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && systemctl --user restart forgefleet-node.service'
+       'export PATH=$HOME/.cargo/bin:$PATH; rm -rf ~/vinnyProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && systemctl --user restart forgefleet-node.service'
    )
  WHERE id = 'forgefleetd_git';
 
@@ -1601,19 +1601,19 @@ UPDATE software_registry
 -- V31: source_tree_path
 
 -- Track where each computer's forge-fleet checkout lives. Default
--- differs by role: leader (Taylor) develops in ~/projects/forge-fleet;
+-- differs by role: leader (Vinny) develops in ~/projects/forge-fleet;
 -- non-leader members clone into their sub-agent-0 workspace.
 
 ALTER TABLE computers ADD COLUMN IF NOT EXISTS source_tree_path TEXT;
 
--- Backfill: Taylor → ~/projects; all others → ~/.forgefleet/sub-agent-0.
+-- Backfill: Vinny → ~/projects; all others → ~/.forgefleet/sub-agent-0.
 UPDATE computers
    SET source_tree_path = '~/projects/forge-fleet'
- WHERE LOWER(name) = 'taylor' AND source_tree_path IS NULL;
+ WHERE LOWER(name) = 'vinny' AND source_tree_path IS NULL;
 
 UPDATE computers
    SET source_tree_path = '~/.forgefleet/sub-agent-0/forge-fleet'
- WHERE LOWER(name) <> 'taylor' AND source_tree_path IS NULL;
+ WHERE LOWER(name) <> 'vinny' AND source_tree_path IS NULL;
 
 -- Replace V30's embedded-migration playbook with a clean template-based
 -- one. `{{source_tree_path}}` is substituted per-target at dispatch time
@@ -1891,10 +1891,10 @@ VALUES
    'Ollama — multi-model runtime on a single port',
    'all_members', 'lan', 'ollama systemd/launchd', 'active'),
 
-  -- Data plane (Docker containers, Taylor hosts primary) --------------------
+  -- Data plane (Docker containers, Vinny hosts primary) --------------------
   (55432, 'postgres_primary', 'database',
    'Postgres primary — exposed port 5432 mapped to host 55432',
-   'taylor', 'lan', 'docker compose', 'active'),
+   'vinny', 'lan', 'docker compose', 'active'),
 
   (55433, 'postgres_replica', 'database',
    'Postgres replica — future, host 55433 on Marcus',
@@ -1902,7 +1902,7 @@ VALUES
 
   (6380, 'redis_primary',     'database',
    'Redis primary — exposed 6379 mapped to 6380',
-   'taylor', 'lan', 'docker compose', 'active'),
+   'vinny', 'lan', 'docker compose', 'active'),
 
   (6381, 'redis_replica',     'database',
    'Redis replica — future, on Marcus',
@@ -1910,7 +1910,7 @@ VALUES
 
   (26380, 'redis_sentinel',   'coordination',
    'Redis Sentinel — DEPRECATED (Pulse v2 replaces this role)',
-   'taylor', 'lan', 'docker compose', 'deprecated'),
+   'vinny', 'lan', 'docker compose', 'deprecated'),
 
   (4222, 'nats_client',       'coordination',
    'NATS client connections — pulse events, agent tasks, KV',
@@ -3348,7 +3348,7 @@ CREATE INDEX IF NOT EXISTS idx_work_outputs_by_session
 ALTER TABLE computers ADD COLUMN IF NOT EXISTS build_archs JSONB NOT NULL DEFAULT '[]'::jsonb;
 
 UPDATE computers SET build_archs = '["darwin-aarch64"]'::jsonb
- WHERE LOWER(name) = 'taylor' AND build_archs = '[]'::jsonb;
+ WHERE LOWER(name) = 'vinny' AND build_archs = '[]'::jsonb;
 
 UPDATE computers SET build_archs = '["linux-x86_64"]'::jsonb
  WHERE LOWER(name) = 'sophie' AND build_archs = '[]'::jsonb;
@@ -4184,9 +4184,9 @@ CREATE TABLE IF NOT EXISTS model_scout_denylist (
 -- Seed projects directly from the retired TOML.
 INSERT INTO projects (id, display_name, repo_url, default_branch, compose_file, target_computers, status)
 VALUES
-  ('forge-fleet', 'ForgeFleet',  'https://github.com/venkatyarl/forge-fleet',  'main', 'deploy/docker-compose.yml', '["taylor","marcus","sophie","priya","james","ace"]'::jsonb, 'active'),
-  ('hireflow360', 'HireFlow360', 'https://github.com/venkatyarl/hireflow360', 'main', 'docker-compose.yml',         '["taylor"]'::jsonb,                                          'active'),
-  ('auraos',      'AuraOS',      'https://github.com/venkatyarl/auraos',      'main', NULL,                          '["taylor"]'::jsonb,                                          'active')
+  ('forge-fleet', 'ForgeFleet',  'https://github.com/venkatyarl/forge-fleet',  'main', 'deploy/docker-compose.yml', '["vinny","marcus","sophie","priya","james","ace"]'::jsonb, 'active'),
+  ('hireflow360', 'HireFlow360', 'https://github.com/venkatyarl/hireflow360', 'main', 'docker-compose.yml',         '["vinny"]'::jsonb,                                          'active'),
+  ('auraos',      'AuraOS',      'https://github.com/venkatyarl/auraos',      'main', NULL,                          '["vinny"]'::jsonb,                                          'active')
 ON CONFLICT (id) DO UPDATE SET
   display_name     = EXCLUDED.display_name,
   repo_url         = EXCLUDED.repo_url,
@@ -5267,7 +5267,7 @@ END $$;
 -- ─── V89: GitHub SSH aliases registry ──────────────────────────────────────
 -- One row per `Host github.com-foo` block that should exist on every fleet
 -- computer's `~/.ssh/config`. Lets a new computer bootstrap the same GitHub
--- identity setup as Taylor on enrollment, without anything hardcoded.
+-- identity setup as Vinny on enrollment, without anything hardcoded.
 --
 -- Private + public key material lives in `fleet_secrets` under well-known
 -- keys (`github_ssh_<file>_priv` / `github_ssh_<file>_pub`) — separating
@@ -5286,13 +5286,13 @@ CREATE TABLE IF NOT EXISTS github_ssh_aliases (
     updated_at       timestamptz NOT NULL DEFAULT now()
 );
 
--- Seed Taylor's existing aliases. ON CONFLICT DO NOTHING keeps the migration
+-- Seed Vinny's existing aliases. ON CONFLICT DO NOTHING keeps the migration
 -- idempotent so we can rerun it without clobbering operator edits.
 INSERT INTO github_ssh_aliases (alias_name, identity_file, description) VALUES
     ('github.com-venkat', '~/.ssh/id_venkat',
      'Primary venkatyarl identity — canonical account post-migration'),
-    ('github.com-taylor', '~/.ssh/id_taylor',
-     'Legacy taylor-oclaw account — kept until full repo migration completes'),
+    ('github.com-vinny', '~/.ssh/id_vinny',
+     'Legacy vinny-oclaw account — kept until full repo migration completes'),
     ('github.com',        '~/.ssh/id_rsa',
      'Default github.com SSH identity used when no -<account> alias is selected')
 ON CONFLICT (alias_name) DO NOTHING;
@@ -5520,7 +5520,7 @@ INSERT INTO port_registry
 VALUES
   (56379, 'redis_primary', 'database',
    'Redis primary — host 56379 maps to container 6379. Canonical 5-digit per port-convention.',
-   'taylor', 'lan', 'docker compose', 'active',
+   'vinny', 'lan', 'docker compose', 'active',
    jsonb_build_object('previous_port', 6380, 'remapped_at', '2026-05-18')),
 
   (56380, 'redis_replica', 'database',
@@ -5540,7 +5540,7 @@ VALUES
 
   (58222, 'nats_monitoring', 'coordination',
    'NATS HTTP monitoring — host 58222 maps to container 8222 (LAN only).',
-   'taylor', 'lan', 'docker compose', 'active',
+   'vinny', 'lan', 'docker compose', 'active',
    jsonb_build_object('previous_port', 8222, 'remapped_at', '2026-05-18'))
 ON CONFLICT (port) DO UPDATE
    SET service     = EXCLUDED.service,
@@ -6256,7 +6256,7 @@ VALUES
 
   ('multi-llm-router', 'Multi-LLM Router / CLI Bridge',
    'Routes a request across local fleet models and bridged cloud CLIs (Claude Code/Codex/Gemini/Kimi), and runs consensus/fanout.',
-   'You are the multi-LLM router and CLI bridge. Pick the cheapest backend that can do the job well, then dispatch and reconcile. Standing policy: route well-scoped, mechanical, or bulk work to the local fleet (Qwen3-Coder-30B coders on sophie/marcus, mlx on Taylor) via ff run/supervise/offload at zero cloud cost; reserve frontier cloud backends (Claude/Codex/Gemini/Kimi via the oauth-bridged cli_executor) for deep multi-file reasoning, load-bearing review, and novel design. When tool-calling is required, only route to tool-capable endpoints with sufficient ctx. Expect ~30% cleanup on local 30B output and verify deliverables actually exist (stat the named artifact files) before declaring success. For consensus, fan the same prompt across distinct models and reconcile disagreements with reasons. Report: backend chosen, why, cost class (local/cloud), and the reconciled result.',
+   'You are the multi-LLM router and CLI bridge. Pick the cheapest backend that can do the job well, then dispatch and reconcile. Standing policy: route well-scoped, mechanical, or bulk work to the local fleet (Qwen3-Coder-30B coders on sophie/marcus, mlx on Vinny) via ff run/supervise/offload at zero cloud cost; reserve frontier cloud backends (Claude/Codex/Gemini/Kimi via the oauth-bridged cli_executor) for deep multi-file reasoning, load-bearing review, and novel design. When tool-calling is required, only route to tool-capable endpoints with sufficient ctx. Expect ~30% cleanup on local 30B output and verify deliverables actually exist (stat the named artifact files) before declaring success. For consensus, fan the same prompt across distinct models and reconcile disagreements with reasons. Report: backend chosen, why, cost class (local/cloud), and the reconciled result.',
    '["Bash", "Read", "Grep", "WebFetch"]'::jsonb,
    '["ff offload", "--backend", "route this to the best model", "dispatch to the cloud CLI from ff", "fanout across LLMs", "consensus voting", "oauth import/distribute/refresh", "replace the cloud CLI with ff"]'::jsonb,
    true, 16384, 'forgefleet', true),
@@ -7143,7 +7143,7 @@ CREATE INDEX IF NOT EXISTS idx_work_item_merge_queue_ready
 -- One local folder attached to a project. `computer_id` NULL = a canonical path
 -- that applies to every host; non-NULL = that specific host's checkout (mirrors
 -- per-host source_tree_path, so the same project can live at different paths on
--- Taylor vs a Linux node).
+-- Vinny vs a Linux node).
 CREATE TABLE IF NOT EXISTS project_folders (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -7730,7 +7730,7 @@ CREATE TABLE IF NOT EXISTS operator_notify_dedup (
 ALTER TABLE github_ssh_aliases
     ADD COLUMN IF NOT EXISTS is_canonical boolean NOT NULL DEFAULT false;
 
--- venkatyarl is the canonical account post-migration (taylor-oclaw retired).
+-- venkatyarl is the canonical account post-migration (vinny-oclaw retired).
 UPDATE github_ssh_aliases SET is_canonical = true  WHERE alias_name = 'github.com-venkat';
 UPDATE github_ssh_aliases SET is_canonical = false WHERE alias_name <> 'github.com-venkat';
 

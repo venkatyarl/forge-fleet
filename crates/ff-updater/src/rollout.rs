@@ -497,10 +497,10 @@ mod tests {
                 current_version: Some("v1".into()),
             },
             FleetComputer {
-                name: "taylor".into(),
+                name: "vinny".into(),
                 priority: 100,
                 is_leader: true,
-                health_url: "http://taylor/health".into(),
+                health_url: "http://vinny/health".into(),
                 current_version: Some("v1".into()),
             },
         ]
@@ -512,8 +512,8 @@ mod tests {
         let canary = vec!["james".to_string()];
         let plan = RolloutPlan::from_fleet(&fleet, &canary, "v2".into());
 
-        // james is canary → excluded.  Remaining: marcus(20), sophie(30), taylor(leader 100)
-        assert_eq!(plan.node_order, vec!["marcus", "sophie", "taylor"]);
+        // james is canary → excluded.  Remaining: marcus(20), sophie(30), vinny(leader 100)
+        assert_eq!(plan.node_order, vec!["marcus", "sophie", "vinny"]);
         assert_eq!(plan.target_version, "v2");
     }
 
@@ -787,8 +787,8 @@ mod tests {
         let canary = vec!["james".to_string(), "marcus".to_string()];
         let plan = RolloutPlan::from_fleet(&fleet, &canary, "v2".into());
 
-        // Only sophie and taylor remain; sophie before taylor (leader)
-        assert_eq!(plan.node_order, vec!["sophie", "taylor"]);
+        // Only sophie and vinny remain; sophie before vinny (leader)
+        assert_eq!(plan.node_order, vec!["sophie", "vinny"]);
     }
 
     #[test]

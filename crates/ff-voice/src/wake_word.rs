@@ -7,7 +7,7 @@ use crate::{Result, VoiceError};
 /// Wake-word detector configuration.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WakeWordConfig {
-    /// Accepted wake phrases (e.g. "hey taylor", "ok forge").
+    /// Accepted wake phrases (e.g. "hey vinny", "ok forge").
     pub phrases: Vec<String>,
     /// If false, matching is case-insensitive.
     pub case_sensitive: bool,
@@ -21,7 +21,7 @@ pub struct WakeWordConfig {
 impl Default for WakeWordConfig {
     fn default() -> Self {
         Self {
-            phrases: vec!["hey taylor".to_string(), "ok taylor".to_string()],
+            phrases: vec!["hey vinny".to_string(), "ok vinny".to_string()],
             case_sensitive: false,
             allow_substring_match: true,
             normalize_punctuation: true,
@@ -120,7 +120,7 @@ mod tests {
     #[test]
     fn matches_ignore_case_and_punctuation() {
         let detector = WakeWordDetector::new(WakeWordConfig::default()).unwrap();
-        assert!(detector.is_wake_phrase("Hey, Taylor can you hear me?"));
+        assert!(detector.is_wake_phrase("Hey, Vinny can you hear me?"));
     }
 
     #[test]
@@ -131,7 +131,7 @@ mod tests {
         })
         .unwrap();
 
-        assert!(detector.is_wake_phrase("ok taylor open the pod bay doors"));
-        assert!(!detector.is_wake_phrase("can you help me ok taylor"));
+        assert!(detector.is_wake_phrase("ok vinny open the pod bay doors"));
+        assert!(!detector.is_wake_phrase("can you help me ok vinny"));
     }
 }

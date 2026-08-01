@@ -56,7 +56,7 @@ impl Default for ProcessMetrics {
 /// Aggregate metrics for a fleet node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeMetrics {
-    /// Node name (e.g. "taylor", "james").
+    /// Node name (e.g. "vinny", "james").
     pub worker_name: String,
     /// Overall CPU usage percentage.
     pub cpu_percent: f64,
@@ -607,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_high_load_detection() {
-        let m = sample_node("taylor", 95.0, 100.0, 128.0);
+        let m = sample_node("vinny", 95.0, 100.0, 128.0);
         assert!(m.is_high_load(90.0, 0.9));
         assert!(!m.is_high_load(99.0, 0.9));
     }
@@ -616,7 +616,7 @@ mod tests {
     fn test_model_error_rate() {
         let m = ModelMetrics {
             model_id: "qwen-9b".into(),
-            worker_name: "taylor".into(),
+            worker_name: "vinny".into(),
             total_requests: 100,
             active_requests: 0,
             avg_latency_ms: 50.0,
@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn test_fleet_aggregate() {
         let collector = MetricsCollector::new();
-        collector.record_node(sample_node("taylor", 50.0, 64.0, 128.0));
+        collector.record_node(sample_node("vinny", 50.0, 64.0, 128.0));
         collector.record_node(sample_node("james", 80.0, 20.0, 24.0));
 
         let agg = collector.fleet_aggregate();

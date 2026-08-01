@@ -223,7 +223,7 @@ pub enum Role {
     /// Standard worker — runs inference and tools (election role)
     #[default]
     Worker,
-    /// Gateway node — primary control plane (fleet.toml role for taylor)
+    /// Gateway node — primary control plane (fleet.toml role for vinny)
     Gateway,
     /// Builder node — runs builds, inference, tools (fleet.toml role for workers)
     Builder,
@@ -358,7 +358,7 @@ pub struct Model {
 pub struct Node {
     /// Unique node ID
     pub id: Uuid,
-    /// Human-readable name (e.g. "taylor", "james", "marcus")
+    /// Human-readable name (e.g. "vinny", "james", "marcus")
     pub name: String,
     /// Hostname or IP address
     pub host: String,
@@ -496,7 +496,7 @@ mod tests {
     fn test_serialize_node_full() {
         let node = Node {
             id: uuid::Uuid::nil(),
-            name: "taylor".into(),
+            name: "vinny".into(),
             host: "192.168.5.100".into(),
             port: 51800,
             role: Role::Leader,
@@ -520,7 +520,7 @@ mod tests {
         };
         let json = serde_json::to_string_pretty(&node).unwrap();
         let rt: Node = serde_json::from_str(&json).unwrap();
-        assert_eq!(rt.name, "taylor");
+        assert_eq!(rt.name, "vinny");
         assert_eq!(rt.role, Role::Leader);
     }
 

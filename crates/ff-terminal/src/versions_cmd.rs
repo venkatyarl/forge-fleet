@@ -150,20 +150,20 @@ mod tests {
     fn json_projection_is_lossless_and_per_node() {
         let cur = "2026.6.13_1 (pushed aaaaaaa111)";
         let newer = "2026.6.13_2 (pushed bbbbbbb222)";
-        let taylor = json!({
+        let vinny = json!({
             "ff": {"current": cur, "latest": cur},
             "forgefleetd": {"current": cur, "latest": newer},
         });
         // marcus is missing forgefleetd and has no `latest` for ff (unknown).
         let marcus = json!({ "ff": {"current": cur} });
-        let filtered = vec![("taylor", &taylor), ("marcus", &marcus)];
+        let filtered = vec![("vinny", &vinny), ("marcus", &marcus)];
         let all_keys = vec!["ff".to_string(), "forgefleetd".to_string()];
         let out = versions_json(filtered, &all_keys);
         let arr = out.as_array().unwrap();
         assert_eq!(arr.len(), 2);
 
-        // taylor: ff current, forgefleetd drift, full current/latest preserved.
-        assert_eq!(arr[0]["node"], "taylor");
+        // vinny: ff current, forgefleetd drift, full current/latest preserved.
+        assert_eq!(arr[0]["node"], "vinny");
         assert_eq!(arr[0]["tools"]["ff"]["status"], "current");
         assert_eq!(arr[0]["tools"]["forgefleetd"]["status"], "drift");
         assert_eq!(arr[0]["tools"]["forgefleetd"]["current"], cur);

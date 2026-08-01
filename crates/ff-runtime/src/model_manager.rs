@@ -424,7 +424,7 @@ mod tests {
             source_url: None,
             downloaded_at: Utc::now(),
             sha256: None,
-            nodes: vec!["taylor".into()],
+            nodes: vec!["vinny".into()],
         };
 
         mm.register(model);
@@ -447,7 +447,7 @@ mod tests {
             source_url: None,
             downloaded_at: Utc::now(),
             sha256: None,
-            nodes: vec!["taylor".into()],
+            nodes: vec!["vinny".into()],
         });
 
         mm.register(ManagedModel {
@@ -482,10 +482,10 @@ mod tests {
             source_url: None,
             downloaded_at: Utc::now(),
             sha256: None,
-            nodes: vec!["taylor".into(), "james".into()],
+            nodes: vec!["vinny".into(), "james".into()],
         });
 
-        assert_eq!(mm.list_for_node("taylor").len(), 1);
+        assert_eq!(mm.list_for_node("vinny").len(), 1);
         assert_eq!(mm.list_for_node("james").len(), 1);
         assert_eq!(mm.list_for_node("marcus").len(), 0);
     }

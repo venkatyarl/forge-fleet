@@ -8,7 +8,7 @@ restapi:
 
 etcd3:
   hosts:
-    - ${TAYLOR_IP}:52379
+    - ${VINNY_IP}:52379
     - ${MARCUS_IP}:52379
     - ${SOPHIE_IP}:52379
 

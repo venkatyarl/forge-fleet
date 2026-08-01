@@ -1,6 +1,6 @@
 //! Per-host build-artifact cleanup.
 //!
-//! Rust incremental-compile caches (`target/*/incremental`) bloat fast — Taylor
+//! Rust incremental-compile caches (`target/*/incremental`) bloat fast — Vinny
 //! hit ~165 GB (task #47). This per-host tick removes the incremental cache under
 //! THIS host's forge-fleet build tree once it's gone STALE (untouched > N days,
 //! so no build is using it; it regenerates on the next build, so removing it is

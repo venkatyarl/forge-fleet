@@ -348,12 +348,12 @@ mod tests {
         let v = secret_list_json_row(
             "huggingface.token",
             Some("HuggingFace API token"),
-            Some("venkat@Taylor-5.local"),
+            Some("venkat@Vinny-5.local"),
             &ts,
         );
         assert_eq!(v["key"], "huggingface.token");
         assert_eq!(v["description"], "HuggingFace API token");
-        assert_eq!(v["updated_by"], "venkat@Taylor-5.local");
+        assert_eq!(v["updated_by"], "venkat@Vinny-5.local");
         // RFC3339, lossless vs the table's coarser minute-granularity render.
         assert_eq!(v["updated_at"], "2026-06-13T10:00:00+00:00");
         // The secret VALUE must never appear in the list projection.

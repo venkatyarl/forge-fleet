@@ -69,7 +69,7 @@ pub async fn handle_fabric_benchmark(
     // 1. Find the fabric IP that A uses to reach B by intersecting both
     //    nodes' all_ips. We pick whichever subnet is shared (10.42.x for
     //    sia↔adele CX-7, 10.43.x for rihanna↔beyonce CX-7, 10.44.x for
-    //    taylor↔james TB, etc.).
+    //    vinny↔james TB, etc.).
     let (a_fabric_ip, b_fabric_ip, fabric_kind, iface_a, iface_b, claimed_gbps) =
         resolve_fabric_endpoints(pg, a, b).await?;
 

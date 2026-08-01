@@ -677,7 +677,7 @@ mod tests {
                 current_version: Some("abc123".into()),
             },
             FleetComputer {
-                name: "taylor".into(),
+                name: "vinny".into(),
                 priority: 100,
                 is_leader: true,
                 health_url: "http://192.168.5.100:51800/health".into(),
@@ -696,9 +696,9 @@ mod tests {
         // Default count = 1, lowest priority non-leader = james (10)
         assert_eq!(canaries, vec!["james"]);
         assert_eq!(orch.progress().canary_nodes, vec!["james"]);
-        // Remaining should be marcus, sophie, taylor
+        // Remaining should be marcus, sophie, vinny
         assert_eq!(orch.progress().remaining_nodes.len(), 3);
-        assert!(orch.progress().remaining_nodes.contains(&"taylor".into()));
+        assert!(orch.progress().remaining_nodes.contains(&"vinny".into()));
         assert!(orch.progress().remaining_nodes.contains(&"marcus".into()));
         assert!(orch.progress().remaining_nodes.contains(&"sophie".into()));
     }
@@ -750,7 +750,7 @@ mod tests {
 
         // Should cap at 3 (all non-leaders) — leader is excluded
         assert_eq!(canaries.len(), 3);
-        assert!(!canaries.contains(&"taylor".into()));
+        assert!(!canaries.contains(&"vinny".into()));
     }
 
     #[test]
@@ -763,7 +763,7 @@ mod tests {
     #[test]
     fn test_select_canary_all_leaders() {
         let fleet = vec![FleetComputer {
-            name: "taylor".into(),
+            name: "vinny".into(),
             priority: 100,
             is_leader: true,
             health_url: "http://localhost/health".into(),

@@ -531,7 +531,7 @@ async fn finalize_external_tool_event(
 /// Strategy: run the user command inside `setsid sh -c '...'` so it gets a
 /// fresh session + process group. Children inherit that group and survive
 /// the parent's exit. `setsid` is ubiquitous on Linux; on macOS it's not
-/// present, so we fall back to plain `sh -c` (Taylor is the only macOS
+/// present, so we fall back to plain `sh -c` (Vinny is the only macOS
 /// defer-worker host, and it's the leader/human-in-loop — operators should
 /// prefer `nohup <cmd> </dev/null >/dev/null 2>&1 & disown` there).
 fn wrap_for_detachment(user_cmd: &str, is_linux_target: bool) -> String {

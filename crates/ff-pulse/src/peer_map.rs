@@ -179,11 +179,11 @@ mod tests {
     fn update_from_beat_replaces_entry() {
         let map = PeerMap::new();
         let now = Utc::now();
-        map.update_from_beat(&beat("taylor", 1, now, false));
-        assert_eq!(map.get("taylor").unwrap().epoch, 1);
+        map.update_from_beat(&beat("vinny", 1, now, false));
+        assert_eq!(map.get("vinny").unwrap().epoch, 1);
 
-        map.update_from_beat(&beat("taylor", 2, now, false));
-        assert_eq!(map.get("taylor").unwrap().epoch, 2);
+        map.update_from_beat(&beat("vinny", 2, now, false));
+        assert_eq!(map.get("vinny").unwrap().epoch, 2);
         assert_eq!(map.all().len(), 1);
     }
 

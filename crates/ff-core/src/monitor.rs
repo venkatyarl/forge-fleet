@@ -512,12 +512,12 @@ mod tests {
 name = "TestFleet"
 api_port = 51800
 
-[nodes.taylor]
+[nodes.vinny]
 ip = "127.0.0.1"
 role = "gateway"
 port = {port}
 
-[nodes.taylor.models.qwen35_35b]
+[nodes.vinny.models.qwen35_35b]
 name = "Qwen3.5-35B"
 port = {port}
 tier = 2
@@ -609,13 +609,13 @@ tier = 2
             mount: "/".to_string(),
             percent_used: 75.0,
         }];
-        assert!(monitor.evaluate_samples("taylor", &first).await.is_empty());
+        assert!(monitor.evaluate_samples("vinny", &first).await.is_empty());
 
         let second = vec![DiskUsageSample {
             mount: "/".to_string(),
             percent_used: 92.0,
         }];
-        let alerts = monitor.evaluate_samples("taylor", &second).await;
+        let alerts = monitor.evaluate_samples("vinny", &second).await;
         assert_eq!(alerts.len(), 1);
         assert!(matches!(
             alerts[0].condition,
@@ -623,7 +623,7 @@ tier = 2
         ));
 
         // Staying critical should not spam.
-        assert!(monitor.evaluate_samples("taylor", &second).await.is_empty());
+        assert!(monitor.evaluate_samples("vinny", &second).await.is_empty());
     }
 
     #[tokio::test]

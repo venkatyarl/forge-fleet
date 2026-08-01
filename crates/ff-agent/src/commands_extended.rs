@@ -456,8 +456,8 @@ impl Command for FleetCommand {
     }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
         let nodes = [
-            ("Taylor", "192.168.5.100:55000"),
-            ("Taylor-2", "192.168.5.100:55001"),
+            ("Vinny", "192.168.5.100:55000"),
+            ("Vinny-2", "192.168.5.100:55001"),
             ("Marcus", "192.168.5.102:55000"),
             ("Sophie", "192.168.5.103:55000"),
             ("Priya", "192.168.5.104:55000"),
@@ -555,7 +555,7 @@ impl Command for NodesCommand {
         "List fleet nodes"
     }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
-        "Fleet nodes: Taylor (M3 Ultra 96GB), James (Intel 64GB), Ace (M4 16GB), Marcus (i7 32GB), Sophie (i5 32GB), Priya (i9 32GB)\nPending: 4× DGX Spark (128GB), 4× GMKtec EVO-X2 (128GB Ryzen AI Max+ 395)".into()
+        "Fleet nodes: Vinny (M3 Ultra 96GB), James (Intel 64GB), Ace (M4 16GB), Marcus (i7 32GB), Sophie (i5 32GB), Priya (i9 32GB)\nPending: 4× DGX Spark (128GB), 4× GMKtec EVO-X2 (128GB Ryzen AI Max+ 395)".into()
     }
 }
 

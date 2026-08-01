@@ -313,7 +313,7 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
 
     // 5b) Unit DSN-env lint (#44): a forgefleetd unit carrying a hardcoded
     //     FORGEFLEET_*_URL Environment= line re-arms the stale-DSN time bomb
-    //     on the next reboot/upgrade (the July taylor-death class: 12 nodes
+    //     on the next reboot/upgrade (the July vinny-death class: 12 nodes
     //     silently pinned to a dead primary). Nodes must read the DSN from
     //     ~/.forgefleet/fleet.toml only.
     let (dsn_status, dsn_detail) = unit_dsn_env_lint();

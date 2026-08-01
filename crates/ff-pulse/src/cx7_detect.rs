@@ -54,15 +54,15 @@ pub fn parse_ethtool_speed_gbps(ethtool_output: &str) -> Option<u32> {
 /// Pairs (subnet → endpoints):
 ///   10.42.0.0/24  CX-7      sia ↔ adele
 ///   10.43.0.0/24  CX-7      rihanna ↔ beyonce
-///   10.44.0.0/24  TB-3      taylor ↔ james
+///   10.44.0.0/24  TB-3      vinny ↔ james
 pub fn paired_peer_for(my_name: &str) -> Option<String> {
     let map: &[(&str, &str)] = &[
         ("sia", "adele"),
         ("adele", "sia"),
         ("rihanna", "beyonce"),
         ("beyonce", "rihanna"),
-        ("taylor", "james"),
-        ("james", "taylor"),
+        ("vinny", "james"),
+        ("james", "vinny"),
     ];
     for (a, b) in map {
         if my_name.eq_ignore_ascii_case(a) {
@@ -119,7 +119,7 @@ mod tests {
     fn paired_peer_for_pairs() {
         assert_eq!(paired_peer_for("sia").as_deref(), Some("adele"));
         assert_eq!(paired_peer_for("ADELE").as_deref(), Some("sia"));
-        assert_eq!(paired_peer_for("taylor").as_deref(), Some("james"));
+        assert_eq!(paired_peer_for("vinny").as_deref(), Some("james"));
         assert_eq!(paired_peer_for("nobody").as_deref(), None);
     }
 }

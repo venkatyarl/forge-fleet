@@ -92,7 +92,7 @@ pub(crate) fn base_family(os_family: &str) -> Option<&'static str> {
 /// `ff fleet deploy` and the leader self-upgrade (auto_upgrade.rs both do
 /// `git fetch origin` + `git reset --hard <ref>`). The `git clean` drops build
 /// artifacts (graphify-out / node-compile-cache) that could shadow the fresh
-/// tree. Fleet worker checkouts are pure deployments (Taylor, the only dev
+/// tree. Fleet worker checkouts are pure deployments (Vinny, the only dev
 /// tree, is excluded from auto-upgrade), so a hard reset never clobbers work.
 const GIT_SYNC_FORGE_FLEET: &str = "cd ~/projects/forge-fleet && git fetch origin --prune && \
      git reset --hard origin/main && git clean -fdx graphify-out node-compile-cache";

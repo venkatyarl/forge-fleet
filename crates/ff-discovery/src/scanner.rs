@@ -159,7 +159,7 @@ fn parse_cidr_prefix(cidr: &str) -> Result<[u8; 3], DiscoveryError> {
 /// A target node to scan, derived from fleet.toml node configuration.
 #[derive(Debug, Clone)]
 pub struct ScanTarget {
-    /// Node name from fleet.toml (e.g. "taylor", "james").
+    /// Node name from fleet.toml (e.g. "vinny", "james").
     pub name: String,
     /// IP address or hostname.
     pub host: String,
@@ -565,14 +565,14 @@ mod tests {
     async fn test_build_scan_targets() {
         let targets = build_scan_targets(
             vec![
-                ("taylor", "192.168.5.100", Some(51800u16), 1u32),
+                ("vinny", "192.168.5.100", Some(51800u16), 1u32),
                 ("james", "192.168.5.101", None, 2),
             ],
             51800,
         );
 
         assert_eq!(targets.len(), 2);
-        assert_eq!(targets[0].name, "taylor");
+        assert_eq!(targets[0].name, "vinny");
         assert_eq!(targets[0].port, 51800);
         assert_eq!(targets[1].name, "james");
         assert_eq!(targets[1].port, 51800); // used default

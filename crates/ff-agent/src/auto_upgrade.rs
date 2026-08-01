@@ -553,7 +553,7 @@ async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str, running_sha: &s
     // column reflects the leader's SOURCE-TREE HEAD (a git pull / build bumps
     // it), which is almost always already current. A leader whose tree is built
     // but whose *process* is stale would then show zero drift and never
-    // restart — the 2026-06-08 bug where taylor ran an 8h-old forgefleetd while
+    // restart — the 2026-06-08 bug where vinny ran an 8h-old forgefleetd while
     // installed_version read latest, so the self-upgrade was a silent no-op and
     // a manual `launchctl kickstart` was required. The running binary's SHA is
     // the only signal that catches a stale process.

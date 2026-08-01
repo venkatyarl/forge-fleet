@@ -108,7 +108,7 @@ async fn load_fleet_nodes_for_health(_c: &AgentSessionConfig) -> Vec<(String, St
     }
 
     vec![
-        ("Taylor".into(), "192.168.5.100".into(), 51000),
+        ("Vinny".into(), "192.168.5.100".into(), 51000),
         ("Marcus".into(), "192.168.5.102".into(), 51000),
         ("Sophie".into(), "192.168.5.103".into(), 51000),
         ("Priya".into(), "192.168.5.104".into(), 51000),

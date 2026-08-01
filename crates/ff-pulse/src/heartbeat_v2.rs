@@ -643,7 +643,7 @@ pub(crate) fn aggregate_disk_bytes(disks: impl IntoIterator<Item = (u64, u64)>) 
 /// Ordered source-tree probe locations, most-preferred first. Pure (no I/O) so
 /// the role precedence is unit-testable. `FORGEFLEET_REPO` always wins (explicit
 /// override). Then by ROLE:
-///   • LEADER (taylor) is the operator's dev box — it keeps ~/projects/forge-fleet
+///   • LEADER (vinny) is the operator's dev box — it keeps ~/projects/forge-fleet
 ///     (alongside all their personal projects), so ~/projects is probed FIRST.
 ///   • WORKERS must hold NOTHING at ~/projects — the fleet-managed checkout under
 ///     ~/.forgefleet is probed FIRST so `source_tree_path` converges there. Before
@@ -1294,7 +1294,7 @@ fn classify_iface(iface: &str, ip: &str) -> String {
         // kind on first beat.
         "cx7-fabric".to_string()
     } else if ip.starts_with("10.44.") {
-        // Thunderbolt fabric subnet — taylor↔james 2026-04-25.
+        // Thunderbolt fabric subnet — vinny↔james 2026-04-25.
         "tb-fabric".to_string()
     } else if ip.starts_with("10.") || ip.starts_with("192.168.") || ip.starts_with("172.") {
         "lan".to_string()

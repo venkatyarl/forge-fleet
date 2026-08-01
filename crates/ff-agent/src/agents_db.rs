@@ -13,7 +13,7 @@
 //! allowed_tools + a routing capability (`require_tool_calling` + `min_ctx`).
 //! The crew / orchestrator reads members from here by name and routes each one
 //! through the V111 agent-swarm capability router (`pg_pick_agent_endpoint`)
-//! rather than hardcoding Taylor.
+//! rather than hardcoding Vinny.
 //!
 //! Two parallel surfaces use this data (mirroring `skills_db`):
 //!   - **CLI** (`ff agents list / show`) reads the DB directly.

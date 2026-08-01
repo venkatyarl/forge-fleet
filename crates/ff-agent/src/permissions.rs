@@ -75,7 +75,7 @@ const BLOCKED_PATHS: &[&str] = &[
 /// True if `lower` (already lowercased) names an SSH *private* key: an `id_*`
 /// file under a `.ssh/` directory, excluding the `.pub` public half. Generalises
 /// the hardcoded `id_rsa`/`id_ed25519` entries so custom-named fleet keys (e.g.
-/// `id_taylor`) and other algorithms (`id_ecdsa`, `id_dsa`) are blocked too.
+/// `id_vinny`) and other algorithms (`id_ecdsa`, `id_dsa`) are blocked too.
 fn is_ssh_private_key(lower: &str) -> bool {
     if lower.ends_with(".pub") {
         return false;
@@ -326,14 +326,14 @@ mod tests {
     #[test]
     fn blocks_all_ssh_private_keys_not_just_rsa_ed25519() {
         // The hardcoded list only had id_rsa/id_ed25519; custom-named fleet
-        // keys (id_taylor) and other algorithms must be blocked too.
-        assert!(is_blocked_path("/home/duncan/.ssh/id_taylor"));
+        // keys (id_vinny) and other algorithms must be blocked too.
+        assert!(is_blocked_path("/home/duncan/.ssh/id_vinny"));
         assert!(is_blocked_path("/home/x/.ssh/id_ecdsa"));
         assert!(is_blocked_path("/home/x/.ssh/id_dsa"));
-        assert!(is_blocked_path(".ssh/id_taylor"));
+        assert!(is_blocked_path(".ssh/id_vinny"));
         assert!(is_blocked_path("/home/x/.ssh/id_rsa")); // still
         // Public keys are not secret — don't block them.
-        assert!(!is_blocked_path("/home/x/.ssh/id_taylor.pub"));
+        assert!(!is_blocked_path("/home/x/.ssh/id_vinny.pub"));
         // An `id_*` file NOT under .ssh/ is not an SSH key.
         assert!(!is_blocked_path("/app/src/id_generator.rs"));
     }

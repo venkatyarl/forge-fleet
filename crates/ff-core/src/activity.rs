@@ -1,6 +1,6 @@
-//! Taylor resource yielding — activity modes and level tracking.
+//! Vinny resource yielding — activity modes and level tracking.
 //!
-//! When Venkat is actively using Taylor (the Mac Studio), ForgeFleet
+//! When Venkat is actively using Vinny (the Mac Studio), ForgeFleet
 //! reduces compute load on that machine. This module defines the
 //! yield modes and activity detection signals.
 
@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 
 // ─── Yield Modes ─────────────────────────────────────────────────────────────
 
-/// Taylor's resource yield mode.
+/// Vinny's resource yield mode.
 ///
-/// Determines how much compute ForgeFleet is allowed to use on Taylor.
+/// Determines how much compute ForgeFleet is allowed to use on Vinny.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum YieldMode {
@@ -23,7 +23,7 @@ pub enum YieldMode {
     /// Medium load okay — single model inference, light processing.
     Assist,
 
-    /// Machine is idle — Taylor rejoins the worker pool fully.
+    /// Machine is idle — Vinny rejoins the worker pool fully.
     /// Heavy jobs, multi-model inference, training all allowed.
     #[default]
     Idle,
@@ -88,7 +88,7 @@ impl std::fmt::Display for YieldMode {
 
 // ─── Activity Signals ────────────────────────────────────────────────────────
 
-/// Signals monitored to determine Taylor's yield mode.
+/// Signals monitored to determine Vinny's yield mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivitySignals {
     /// Keyboard/mouse activity detected in the last N seconds.
@@ -199,7 +199,7 @@ pub fn compute_activity_level(signals: &ActivitySignals) -> ActivityLevel {
 
 /// Resolve the yield mode from signals and thresholds.
 ///
-/// This is the core logic that decides how Taylor behaves.
+/// This is the core logic that decides how Vinny behaves.
 /// Note: `Protected` mode is always set manually and overrides this.
 pub fn resolve_yield_mode(
     signals: &ActivitySignals,
@@ -241,7 +241,7 @@ pub fn resolve_yield_mode(
     }
 }
 
-/// Full activity state snapshot for a Taylor node.
+/// Full activity state snapshot for a Vinny node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityState {
     /// Current yield mode.

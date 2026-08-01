@@ -71,7 +71,7 @@ const IDLE_HEALTH_AGE_SECS: i32 = 180;
 const HOST_RAM_RESERVE_GB: f64 = 4.0;
 /// Hosts kept out of autoscale churn (the leader stays free for orchestration —
 /// same convention as the agent router's exclude_hosts).
-const EXCLUDE_HOSTS: &[&str] = &["taylor"];
+const EXCLUDE_HOSTS: &[&str] = &["vinny"];
 
 /// `fleet_secrets` keys for the per-kind RELIABILITY FLOOR — the minimum number
 /// of agent-capable endpoints of each kind to keep WARM regardless of measured
@@ -1386,8 +1386,8 @@ mod tests {
         let cands = vec![
             // leader-hosted: excluded even though idle + right kind.
             rcand("leader-ep", "logan", true, 0, Some(9999)),
-            // EXCLUDE_HOSTS (taylor): excluded.
-            rcand("excl-ep", "taylor", true, 0, Some(9999)),
+            // EXCLUDE_HOSTS (vinny): excluded.
+            rcand("excl-ep", "vinny", true, 0, Some(9999)),
             // busy (in-flight requests + fresh health): not idle → skipped.
             rcand("busy-ep", "veronica", true, 5, Some(10)),
             // wrong kind for a code request.
@@ -1586,18 +1586,18 @@ mod tests {
 
     #[test]
     fn exclude_leader_supply_drops_only_leader_endpoints() {
-        // The classic P0 shape: floor=2 is "met" by taylor(leader) + logan, but
+        // The classic P0 shape: floor=2 is "met" by vinny(leader) + logan, but
         // the swarm soft-excludes the leader, so only logan is usable. After
         // excluding the leader, code supply reads 1 → the floor will warm a 2nd
         // NON-LEADER endpoint.
         let supply = ff_db::ServingSupply {
             code_count: 2,
             general_count: 1,
-            code_endpoints: vec![endpoint("taylor"), endpoint("logan")],
-            general_endpoints: vec![endpoint("taylor")],
+            code_endpoints: vec![endpoint("vinny"), endpoint("logan")],
+            general_endpoints: vec![endpoint("vinny")],
         };
-        let (filtered, excluded) = exclude_leader_supply(supply, Some("taylor"));
-        assert_eq!(excluded, 2, "both taylor-hosted endpoints dropped");
+        let (filtered, excluded) = exclude_leader_supply(supply, Some("vinny"));
+        assert_eq!(excluded, 2, "both vinny-hosted endpoints dropped");
         assert_eq!(filtered.code_count, 1);
         assert_eq!(filtered.general_count, 0);
         assert_eq!(filtered.code_endpoints.len(), 1);
@@ -1612,7 +1612,7 @@ mod tests {
         let supply = ff_db::ServingSupply {
             code_count: 2,
             general_count: 0,
-            code_endpoints: vec![endpoint("taylor"), endpoint("logan")],
+            code_endpoints: vec![endpoint("vinny"), endpoint("logan")],
             general_endpoints: vec![],
         };
         let (filtered, excluded) = exclude_leader_supply(supply, None);
@@ -1630,7 +1630,7 @@ mod tests {
             code_endpoints: vec![endpoint("logan"), endpoint("lily")],
             general_endpoints: vec![],
         };
-        let (filtered, excluded) = exclude_leader_supply(supply, Some("taylor"));
+        let (filtered, excluded) = exclude_leader_supply(supply, Some("vinny"));
         assert_eq!(excluded, 0);
         assert_eq!(filtered.code_count, 2);
         assert_eq!(filtered.code_endpoints.len(), 2);
@@ -1646,7 +1646,7 @@ mod tests {
             code_endpoints: vec![endpoint("logan"), unready],
             general_endpoints: vec![],
         };
-        let (filtered, excluded) = exclude_leader_supply(supply, Some("taylor"));
+        let (filtered, excluded) = exclude_leader_supply(supply, Some("vinny"));
         assert_eq!(excluded, 0);
         assert_eq!(filtered.code_count, 1);
         assert_eq!(
@@ -1726,7 +1726,7 @@ mod tests {
     #[test]
     fn excluded_leader_is_ineligible() {
         let h = host(
-            "taylor",
+            "vinny",
             "online",
             "macos",
             "apple_silicon",

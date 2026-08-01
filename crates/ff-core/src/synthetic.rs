@@ -1084,10 +1084,10 @@ mod tests {
     fn test_probe_result_metadata() {
         let result = ProbeResult::new("test", ProbeStatus::Pass, Duration::from_millis(42), None)
             .with_meta("key", "value")
-            .with_meta("node", "taylor");
+            .with_meta("node", "vinny");
 
         assert_eq!(result.metadata.get("key").unwrap(), "value");
-        assert_eq!(result.metadata.get("node").unwrap(), "taylor");
+        assert_eq!(result.metadata.get("node").unwrap(), "vinny");
         assert_eq!(result.probe_name, "test");
     }
 
@@ -1099,7 +1099,7 @@ mod tests {
                 reason: "HTTP 503".into(),
             },
             Duration::from_millis(150),
-            Some("taylor".into()),
+            Some("vinny".into()),
         );
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ProbeResult = serde_json::from_str(&json).unwrap();

@@ -883,8 +883,8 @@ impl BackupOrchestrator {
         // to rsync from. REDIS.1 part 2 (2026-05-19): the original code
         // built the source as `<ip>:/path` with no user prefix, so each
         // peer's rsync tried `ssh <peer-local-user>@<my_ip>` (e.g.
-        // `adele@taylor`) and Taylor's sshd rejected with exit-255
-        // because there is no `adele` Unix user on Taylor.
+        // `adele@vinny`) and Vinny's sshd rejected with exit-255
+        // because there is no `adele` Unix user on Vinny.
         // Now we always prefix the leader's `ssh_user` from
         // `computers.ssh_user`, falling back to "root" if unset.
         let row =

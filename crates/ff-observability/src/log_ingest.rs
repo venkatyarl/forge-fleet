@@ -322,10 +322,10 @@ mod tests {
 
     #[test]
     fn test_log_entry_builder() {
-        let entry = LogEntry::new("taylor", "ff-agent", LogLevel::Info, "booted")
+        let entry = LogEntry::new("vinny", "ff-agent", LogLevel::Info, "booted")
             .with_field("version", serde_json::Value::String("0.1.0".into()))
             .with_trace("abc-123");
-        assert_eq!(entry.node, "taylor");
+        assert_eq!(entry.node, "vinny");
         assert_eq!(entry.trace_id.as_deref(), Some("abc-123"));
         assert!(entry.fields.contains_key("version"));
     }
@@ -348,14 +348,14 @@ mod tests {
     async fn test_ingestor_per_node() {
         let ingestor = LogIngestor::new(100, 50);
         ingestor
-            .ingest(LogEntry::new("taylor", "ff-agent", LogLevel::Info, "hello"))
+            .ingest(LogEntry::new("vinny", "ff-agent", LogLevel::Info, "hello"))
             .await;
         ingestor
             .ingest(LogEntry::new("james", "ff-agent", LogLevel::Warn, "hot"))
             .await;
 
-        let taylor_logs = ingestor.logs_for_node("taylor").await;
-        assert_eq!(taylor_logs.len(), 1);
+        let vinny_logs = ingestor.logs_for_node("vinny").await;
+        assert_eq!(vinny_logs.len(), 1);
 
         let nodes = ingestor.known_nodes();
         assert_eq!(nodes.len(), 2);

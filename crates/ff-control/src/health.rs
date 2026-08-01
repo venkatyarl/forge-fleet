@@ -145,7 +145,7 @@ mod tests {
         FleetConfig {
             fleet: FleetSettings::default(),
             nodes: [(
-                "taylor".to_string(),
+                "vinny".to_string(),
                 NodeConfig {
                     ip: "127.0.0.1".to_string(),
                     role: Role::Gateway,

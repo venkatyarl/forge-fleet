@@ -459,7 +459,7 @@ mod tests {
     fn bench_report_with_pass_fields_roundtrips_json() {
         let r = BenchmarkReport {
             model_id: "x".into(),
-            computer: "taylor".into(),
+            computer: "vinny".into(),
             runtime: "mlx_lm".into(),
             endpoint: "http://127.0.0.1:51001".into(),
             tokens_per_sec: 42.5,

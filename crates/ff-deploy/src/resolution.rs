@@ -334,7 +334,7 @@ mod tests {
 
     fn target(primary_ip: &str, ram_gb: i32) -> ResolvedTarget {
         ResolvedTarget {
-            name: "taylor".into(),
+            name: "vinny".into(),
             primary_ip: primary_ip.into(),
             ram_gb,
         }

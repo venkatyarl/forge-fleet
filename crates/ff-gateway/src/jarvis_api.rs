@@ -999,7 +999,7 @@ mod tests {
             "fix the bug in main.rs",
             "implement the cache",
             "refactor this",
-            "deploy to taylor",
+            "deploy to vinny",
             "run the tests",
             "please add a test",               // "please " lead-in
             "go ahead and migrate the schema", // "go ahead" lead-in

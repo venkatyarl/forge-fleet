@@ -10,7 +10,7 @@
 //! modified — this only wires the pieces together.
 //!
 //! **macOS only.** Mic capture goes through cpal's CoreAudio backend, and the loop
-//! runs on the leader (Taylor) where the operator sits. On other platforms the
+//! runs on the leader (Vinny) where the operator sits. On other platforms the
 //! subcommand exists but returns a clear "macOS only" error (the cpal/ALSA stack
 //! isn't compiled on Linux/CI — see `ff-voice/Cargo.toml`).
 
@@ -203,7 +203,7 @@ pub async fn handle_voice(
 }
 
 /// Non-macOS stub: mic capture (cpal/CoreAudio) is macOS-only, so the loop is
-/// unavailable on Linux/Windows fleet nodes. Run `ff voice` on the leader (Taylor).
+/// unavailable on Linux/Windows fleet nodes. Run `ff voice` on the leader (Vinny).
 #[cfg(not(target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_voice(
@@ -216,7 +216,7 @@ pub async fn handle_voice(
 ) -> Result<()> {
     anyhow::bail!(
         "`ff voice` is supported on macOS only (CoreAudio mic capture). \
-         Run it on the leader (Taylor)."
+         Run it on the leader (Vinny)."
     )
 }
 

@@ -76,7 +76,7 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             bind_addr: "127.0.0.1:8787".to_string(),
-            bot_aliases: vec!["forgefleet".to_string(), "taylor".to_string()],
+            bot_aliases: vec!["forgefleet".to_string(), "vinny".to_string()],
             command_prefixes: vec!['/', '!'],
             fleet_config: None,
             backend_registry: None,
@@ -3130,7 +3130,7 @@ fn build_fleet_worker_view(
     // A node is the leader if its live DB role says so, OR if it matches the
     // authoritative leader_hint by any of its names. The role check is the
     // robust path: leader_hint is the member_name from fleet_leader_state
-    // (e.g. "taylor") and a registry-discovered node may carry no config_name/
+    // (e.g. "vinny") and a registry-discovered node may carry no config_name/
     // hostname to match it against — but its db_node.role (now sourced from the
     // live fleet_workers table) does resolve to "leader".
     let is_leader = role == "leader"

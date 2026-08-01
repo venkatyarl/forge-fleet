@@ -194,7 +194,7 @@ pub trait AuditStore: Send + Sync {
 ///
 /// // Log a model starting
 /// logger.log_model_event(
-///     AuditAction::ModelStarted, "system", "qwen-32b", "taylor", None, None,
+///     AuditAction::ModelStarted, "system", "qwen-32b", "vinny", None, None,
 /// ).unwrap();
 ///
 /// // Query recent events
@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn test_audit_event_serde() {
         let event = AuditEvent::new(
-            "taylor",
+            "vinny",
             AuditAction::ModelStarted,
             Some("qwen-32b".to_string()),
             serde_json::json!({"port": 51800}),
@@ -558,7 +558,7 @@ mod tests {
         );
         let json = serde_json::to_string(&event).unwrap();
         let back: AuditEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.actor, "taylor");
+        assert_eq!(back.actor, "vinny");
         assert_eq!(back.action, AuditAction::ModelStarted);
         assert_eq!(back.target.as_deref(), Some("qwen-32b"));
         assert_eq!(back.source_ip.as_deref(), Some("192.168.5.100"));
@@ -591,7 +591,7 @@ mod tests {
                 AuditAction::ModelStarted,
                 "system",
                 "qwen-32b",
-                "taylor",
+                "vinny",
                 None,
                 Some("192.168.5.100"),
             )
@@ -602,7 +602,7 @@ mod tests {
                 AuditAction::ModelStopped,
                 "system",
                 "qwen-32b",
-                "taylor",
+                "vinny",
                 None,
                 None,
             )
@@ -629,7 +629,7 @@ mod tests {
             .log_node_event(
                 AuditAction::LeaderChanged,
                 "system",
-                "taylor",
+                "vinny",
                 Some(serde_json::json!({"reason": "preferred"})),
                 None,
             )
@@ -714,14 +714,14 @@ mod tests {
         let logger = AuditLogger::new(store);
 
         logger
-            .log_leader_changed("taylor", Some("highest priority"), None)
+            .log_leader_changed("vinny", Some("highest priority"), None)
             .unwrap();
 
         let events = logger
             .events_by_action(AuditAction::LeaderChanged, 10)
             .unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].target.as_deref(), Some("taylor"));
+        assert_eq!(events[0].target.as_deref(), Some("vinny"));
     }
 
     #[test]

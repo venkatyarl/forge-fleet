@@ -288,17 +288,17 @@ mod tests {
     #[test]
     fn test_event_summary() {
         let e = FleetEvent::NodeOnline {
-            node: "taylor".into(),
+            node: "vinny".into(),
         };
-        assert_eq!(e.summary(), "Node taylor came online");
+        assert_eq!(e.summary(), "Node vinny came online");
     }
 
     #[test]
     fn test_event_record_builder() {
         let rec = EventRecord::new(FleetEvent::FleetStartup)
-            .with_source("taylor")
+            .with_source("vinny")
             .with_trace("abc-123");
-        assert_eq!(rec.source_node.as_deref(), Some("taylor"));
+        assert_eq!(rec.source_node.as_deref(), Some("vinny"));
         assert_eq!(rec.trace_id.as_deref(), Some("abc-123"));
     }
 

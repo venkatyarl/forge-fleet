@@ -739,8 +739,8 @@ mod tests {
             Some(2),
         );
         let c3 = candidate(
-            "http://test-prefers-taylor:1",
-            "taylor",
+            "http://test-prefers-vinny:1",
+            "vinny",
             Some("coder"),
             Some(2),
         );
@@ -796,8 +796,8 @@ mod tests {
             Some(1),
         );
         let remote_other = candidate(
-            "http://test-fallback-taylor:1",
-            "taylor",
+            "http://test-fallback-vinny:1",
+            "vinny",
             Some("llama"),
             Some(4),
         );
@@ -808,7 +808,7 @@ mod tests {
         let ordered = rank_candidates(&pool, "lily", Some("coder"), false);
 
         // coder family is full, so the free non-family deployment comes first.
-        assert_eq!(ordered[0].endpoint, "http://test-fallback-taylor:1");
+        assert_eq!(ordered[0].endpoint, "http://test-fallback-vinny:1");
 
         set_inflight_for_test("http://test-fallback-lily:1", 0);
         set_inflight_for_test("http://test-fallback-marcus:1", 0);

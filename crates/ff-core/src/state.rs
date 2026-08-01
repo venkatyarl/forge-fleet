@@ -43,7 +43,7 @@ pub struct AppState {
     /// Path to fleet.toml on disk.
     config_path: PathBuf,
 
-    /// This node's name (e.g. "taylor", "marcus").
+    /// This node's name (e.g. "vinny", "marcus").
     worker_name: Arc<String>,
 
     /// This node's role.
@@ -67,7 +67,7 @@ impl AppState {
     /// ```ignore
     /// let config = load_config(&path)?;
     /// let (tx, rx) = hot_reload::new_broadcast(config);
-    /// let state = AppState::new(rx, tx, path, "taylor", Role::Gateway);
+    /// let state = AppState::new(rx, tx, path, "vinny", Role::Gateway);
     /// // Pass state.take_broadcaster() to the watcher.
     /// ```
     pub fn new(
@@ -198,7 +198,7 @@ impl std::fmt::Debug for AppState {
 /// let (tx, rx) = hot_reload::new_broadcast(config);
 /// let state = AppStateBuilder::new(rx, tx)
 ///     .config_path(path)
-///     .worker_name("taylor")
+///     .worker_name("vinny")
 ///     .role(Role::Gateway)
 ///     .build();
 /// ```
@@ -289,11 +289,11 @@ heartbeat_interval_secs = 15
             rx,
             tx,
             PathBuf::from("/tmp/fleet.toml"),
-            "taylor",
+            "vinny",
             Role::Gateway,
         );
 
-        assert_eq!(state.worker_name(), "taylor");
+        assert_eq!(state.worker_name(), "vinny");
         assert_eq!(state.role(), Role::Gateway);
         assert_eq!(state.config().fleet.name, "TestFleet");
         assert!(!state.has_db());
@@ -324,12 +324,12 @@ heartbeat_interval_secs = 15
             rx,
             tx,
             PathBuf::from("/tmp/fleet.toml"),
-            "taylor",
+            "vinny",
             Role::Gateway,
         );
 
         let cloned = state.clone();
-        assert_eq!(cloned.worker_name(), "taylor");
+        assert_eq!(cloned.worker_name(), "vinny");
         assert_eq!(cloned.config().fleet.name, "TestFleet");
     }
 
@@ -347,7 +347,7 @@ heartbeat_interval_secs = 15
             rx,
             tx,
             PathBuf::from("/tmp/fleet.toml"),
-            "taylor",
+            "vinny",
             Role::Gateway,
         )
         .with_db(FakePool {
@@ -371,7 +371,7 @@ heartbeat_interval_secs = 15
             rx,
             tx,
             PathBuf::from("/tmp/fleet.toml"),
-            "taylor",
+            "vinny",
             Role::Gateway,
         );
 
@@ -393,7 +393,7 @@ heartbeat_interval_secs = 15
             rx,
             tx,
             PathBuf::from("/tmp/fleet.toml"),
-            "taylor",
+            "vinny",
             Role::Gateway,
         );
 
@@ -412,7 +412,7 @@ heartbeat_interval_secs = 15
             rx,
             tx,
             PathBuf::from("/tmp/fleet.toml"),
-            "taylor",
+            "vinny",
             Role::Gateway,
         );
 
@@ -437,12 +437,12 @@ heartbeat_interval_secs = 15
             rx,
             tx,
             PathBuf::from("/tmp/fleet.toml"),
-            "taylor",
+            "vinny",
             Role::Gateway,
         );
 
         let debug = format!("{state:?}");
-        assert!(debug.contains("taylor"));
+        assert!(debug.contains("vinny"));
         assert!(debug.contains("Gateway"));
     }
 
@@ -453,7 +453,7 @@ heartbeat_interval_secs = 15
 
         let state = AppStateBuilder::new(rx, tx)
             .config_path("/tmp/fleet.toml")
-            .worker_name("taylor")
+            .worker_name("vinny")
             .role(Role::Gateway)
             .db(42u64)
             .build();

@@ -1,7 +1,7 @@
 //! Leader election types and failover logic.
 //!
 //! ForgeFleet uses a priority-based leader election model:
-//! - Taylor is the **preferred leader** (priority 1)
+//! - Vinny is the **preferred leader** (priority 1)
 //! - Fallback order is configured in fleet.toml
 //! - Election runs periodically or on leader failure
 //! - Leader can yield when Venkat is actively using the machine
@@ -55,7 +55,7 @@ pub struct ElectionCandidate {
     /// Whether this node is online and healthy.
     pub is_healthy: bool,
     /// Whether this node is currently yielding resources
-    /// (Taylor in Interactive/Protected mode).
+    /// (Vinny in Interactive/Protected mode).
     pub is_yielding: bool,
     /// Last known heartbeat.
     pub last_heartbeat: Option<DateTime<Utc>>,
@@ -209,7 +209,7 @@ pub fn check_failover(
     }
 
     // Case 3: A higher-priority node has come online
-    // (e.g., Taylor rebooted and preferred leader is back).
+    // (e.g., Vinny rebooted and preferred leader is back).
     let candidates = build_candidate_list(config, node_health);
     if let Some(best) = candidates.iter().find(|c| c.is_eligible())
         && best.name != current_leader
@@ -244,12 +244,12 @@ mod tests {
 name = "Test"
 
 [leader]
-preferred = "taylor"
+preferred = "vinny"
 fallback_order = ["james", "marcus"]
 
 [database]
 
-[nodes.taylor]
+[nodes.vinny]
 ip = "192.168.5.100"
 role = "gateway"
 election_priority = 1
@@ -272,20 +272,20 @@ election_priority = 50
     fn test_elect_preferred_leader() {
         let config = test_config();
         let health = vec![
-            ("taylor".into(), true, false),
+            ("vinny".into(), true, false),
             ("james".into(), true, false),
             ("marcus".into(), true, false),
         ];
         let result = elect_leader(&config, &health);
-        assert_eq!(result.elected, Some("taylor".into()));
-        assert!(result.reason.contains("taylor"));
+        assert_eq!(result.elected, Some("vinny".into()));
+        assert!(result.reason.contains("vinny"));
     }
 
     #[test]
     fn test_elect_fallback_when_preferred_down() {
         let config = test_config();
         let health = vec![
-            ("taylor".into(), false, false), // offline
+            ("vinny".into(), false, false), // offline
             ("james".into(), true, false),
             ("marcus".into(), true, false),
         ];
@@ -297,7 +297,7 @@ election_priority = 50
     fn test_elect_skip_yielding() {
         let config = test_config();
         let health = vec![
-            ("taylor".into(), true, true), // yielding
+            ("vinny".into(), true, true), // yielding
             ("james".into(), true, false),
             ("marcus".into(), true, false),
         ];
@@ -309,13 +309,13 @@ election_priority = 50
     fn test_elect_yielding_fallback() {
         let config = test_config();
         let health = vec![
-            ("taylor".into(), true, true), // yielding
+            ("vinny".into(), true, true), // yielding
             ("james".into(), true, true),  // yielding
             ("marcus".into(), true, true), // yielding
         ];
         let result = elect_leader(&config, &health);
         // All yielding → pick best priority anyway.
-        assert_eq!(result.elected, Some("taylor".into()));
+        assert_eq!(result.elected, Some("vinny".into()));
         assert!(result.reason.contains("yielding"));
     }
 
@@ -323,7 +323,7 @@ election_priority = 50
     fn test_elect_no_healthy() {
         let config = test_config();
         let health = vec![
-            ("taylor".into(), false, false),
+            ("vinny".into(), false, false),
             ("james".into(), false, false),
             ("marcus".into(), false, false),
         ];
@@ -336,11 +336,11 @@ election_priority = 50
     fn test_failover_leader_offline() {
         let config = test_config();
         let health = vec![
-            ("taylor".into(), false, false),
+            ("vinny".into(), false, false),
             ("james".into(), true, false),
             ("marcus".into(), true, false),
         ];
-        let result = check_failover("taylor", &config, &health);
+        let result = check_failover("vinny", &config, &health);
         assert!(result.is_some());
         assert_eq!(result.unwrap().elected, Some("james".into()));
     }
@@ -349,36 +349,36 @@ election_priority = 50
     fn test_no_failover_when_stable() {
         let config = test_config();
         let health = vec![
-            ("taylor".into(), true, false),
+            ("vinny".into(), true, false),
             ("james".into(), true, false),
             ("marcus".into(), true, false),
         ];
-        let result = check_failover("taylor", &config, &health);
+        let result = check_failover("vinny", &config, &health);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_failover_preferred_returns() {
         let config = test_config();
-        // James is current leader, but Taylor just came back online.
+        // James is current leader, but Vinny just came back online.
         let health = vec![
-            ("taylor".into(), true, false),
+            ("vinny".into(), true, false),
             ("james".into(), true, false),
             ("marcus".into(), true, false),
         ];
         let result = check_failover("james", &config, &health);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().elected, Some("taylor".into()));
+        assert_eq!(result.unwrap().elected, Some("vinny".into()));
     }
 
     #[test]
     fn test_election_state_methods() {
         let stable = ElectionState::Stable {
-            leader: "taylor".into(),
+            leader: "vinny".into(),
             since: Utc::now(),
         };
         assert!(stable.is_stable());
-        assert_eq!(stable.leader(), Some("taylor"));
+        assert_eq!(stable.leader(), Some("vinny"));
 
         let electing = ElectionState::Electing {
             triggered_at: Utc::now(),

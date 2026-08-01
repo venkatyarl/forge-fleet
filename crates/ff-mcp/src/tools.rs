@@ -361,7 +361,7 @@ impl ToolRegistry {
     fn fleet_ssh() -> ToolDefinition {
         ToolDefinition {
             name: "fleet_ssh".to_string(),
-            description: "Run a command on a remote fleet node via SSH. Use node name (taylor, james, marcus, sophie, priya, ace) or IP address.".to_string(),
+            description: "Run a command on a remote fleet node via SSH. Use node name (vinny, james, marcus, sophie, priya, ace) or IP address.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -573,7 +573,7 @@ impl ToolRegistry {
                     "exclude_hosts": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Worker names to exclude (case-insensitive), e.g. [\"taylor\"] to keep agent load off the leader."
+                        "description": "Worker names to exclude (case-insensitive), e.g. [\"vinny\"] to keep agent load off the leader."
                     }
                 },
                 "required": ["workload"]

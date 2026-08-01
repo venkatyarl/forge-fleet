@@ -22,7 +22,7 @@ pub struct RouterEndpoint {
     pub url: String,
     /// Model ID to request (e.g. "auto" or full path for MLX)
     pub model_id: String,
-    /// Human label for logs (e.g. "local", "marcus", "taylor-gemma")
+    /// Human label for logs (e.g. "local", "marcus", "vinny-gemma")
     pub label: String,
     /// Whether this endpoint supports OpenAI-compatible tool calling
     pub supports_tools: bool,
@@ -352,7 +352,7 @@ async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Ve
             // at probe time). Now that we have the catalog, override each local
             // endpoint's tool-capability from its `preferred_workloads` tags —
             // the same source of truth the remote tier uses below. This keeps a
-            // non-tool local model (e.g. gemma-4 on taylor) out of the
+            // non-tool local model (e.g. gemma-4 on vinny) out of the
             // tool-capable tier even if the name heuristic is ever loosened.
             // See feedback_ff_supervise_llm_routing / feedback_gemma4_no_tools.
             let local_db: HashMap<u16, (bool, i32)> = models
@@ -681,7 +681,7 @@ mod tests {
     #[tokio::test]
     async fn require_tools_skips_local_non_tool_endpoint() {
         // Local gemma-4 (non-tool) listed first, remote qwen (tool) second —
-        // exactly the live taylor layout that used to hang the agent.
+        // exactly the live vinny layout that used to hang the agent.
         let router = InferenceRouter::new(vec![
             ep("local-gemma", false, true),
             ep("remote-qwen", true, false),
@@ -783,12 +783,12 @@ mod tests {
         let mut eps = vec![
             ep_t("james-9b", true, false, 1),
             ep_t("sophie-32b", true, false, 2),
-            ep_t("taylor-gemma", false, false, 2), // non-tool, ranks last
+            ep_t("vinny-gemma", false, false, 2), // non-tool, ranks last
         ];
         sort_endpoints(&mut eps);
         assert_eq!(eps[0].label, "sophie-32b");
         assert_eq!(eps[1].label, "james-9b");
-        assert_eq!(eps[2].label, "taylor-gemma");
+        assert_eq!(eps[2].label, "vinny-gemma");
     }
 
     #[tokio::test]

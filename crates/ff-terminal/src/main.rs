@@ -528,7 +528,7 @@ enum Command {
         no_web: bool,
         /// Worker names that must NOT receive any sub-agent, comma-separated
         /// (e.g. "sia,adele,rihanna,beyonce" to keep research off the DGX pairs,
-        /// or "taylor" to spare the leader). Excluded hosts are dropped from the
+        /// or "vinny" to spare the leader). Excluded hosts are dropped from the
         /// routing candidate pool before the round-robin spread; unknown names
         /// are warned about and skipped. Persisted for --detach runs.
         #[arg(long, default_value = "")]
@@ -614,15 +614,15 @@ enum Command {
     /// Resolves the worker's `ssh_user` + IP from Postgres
     /// (`computers` / `fleet_workers`) — never `~/.ssh/config`. The CLI
     /// twin of the `fleet_ssh` MCP tool, and the dogfood path for fleet
-    /// debugging: `ff ssh taylor uptime`, `ff ssh ace "ps aux | grep mlx"`.
+    /// debugging: `ff ssh vinny uptime`, `ff ssh ace "ps aux | grep mlx"`.
     Ssh {
-        /// Worker name (e.g. taylor, ace, sia) or its IP.
+        /// Worker name (e.g. vinny, ace, sia) or its IP.
         worker: String,
         /// Command + args to run remotely. Quote anything with shell
         /// metacharacters: `ff ssh ace "ps aux | grep mlx"`.
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
-        /// Run the command under `sudo -n` (passwordless on all but taylor).
+        /// Run the command under `sudo -n` (passwordless on all but vinny).
         #[arg(long)]
         sudo: bool,
         /// Overall SSH timeout in seconds (connect timeout is min(this, 30)).
@@ -964,7 +964,7 @@ enum RouteCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 enum StackCommand {
-    /// Rank candidate hosts for a docker workload. Skips Taylor (leader) and
+    /// Rank candidate hosts for a docker workload. Skips Vinny (leader) and
     /// DGX (training-reserved) by default. Sorts by free RAM desc (RAM is
     /// usually the binding constraint for docker services).
     HostRank {
@@ -1073,7 +1073,7 @@ enum TasksCommand {
         preferred: Option<String>,
         /// Computer names that must NOT claim this task, comma-separated
         /// (e.g. "sia,adele,rihanna,beyonce" to keep work off the DGX pairs,
-        /// or "taylor" to spare the leader). Sets fleet_tasks.excludes_computer_ids;
+        /// or "vinny" to spare the leader). Sets fleet_tasks.excludes_computer_ids;
         /// the claim query refuses any worker whose computer_id is listed.
         /// Unknown names are warned about and skipped, never silently dropped.
         #[arg(long, default_value = "")]
@@ -1308,7 +1308,7 @@ enum AgentCommand {
     /// Idempotent — existing rows are left alone.
     Seed,
     /// Lift fleet-LLM-produced code from a worker's sub-agent workspace back
-    /// to Taylor's canonical repo via the default feature branch + optional PR
+    /// to Vinny's canonical repo via the default feature branch + optional PR
     /// behavior, or via a project's git policy when `--project` is supplied.
     ///
     /// Looks up the agent session by ID in `work_outputs` (match on
@@ -1753,7 +1753,7 @@ enum FleetCommand {
     /// get tool-calling endpoints with enough per-slot context (never a
     /// non-tool model like gemma).
     ///
-    ///   ff fleet route code --tool-calling --min-ctx 32768 --exclude-host taylor
+    ///   ff fleet route code --tool-calling --min-ctx 32768 --exclude-host vinny
     Route {
         /// The workload tag to route. Common: "code", "chat", "embedding",
         /// "reranking", "reasoning", "tool_calling", "vision". Matched
@@ -1769,7 +1769,7 @@ enum FleetCommand {
         #[arg(long)]
         min_ctx: Option<i32>,
         /// Worker name(s) to exclude (case-insensitive, repeatable), e.g.
-        /// `--exclude-host taylor` to keep agent load off the leader.
+        /// `--exclude-host vinny` to keep agent load off the leader.
         #[arg(long = "exclude-host")]
         exclude_host: Vec<String>,
         /// Preview the live-dispatch ordering: among equal-tier hosts, rank the
@@ -1789,7 +1789,7 @@ enum FleetCommand {
     /// Debug: dump local peer_map + what each member sees.
     Gossip,
     /// Migrate every fleet node to a new GitHub owner + move the repo from
-    /// ~/taylorProjects/forge-fleet → ~/projects/forge-fleet. Enqueues one
+    /// ~/vinnyProjects/forge-fleet → ~/projects/forge-fleet. Enqueues one
     /// idempotent shell task per node via the deferred queue (trigger=node_online),
     /// so offline nodes pick it up when they come back online.
     MigrateGithub {
@@ -1839,7 +1839,7 @@ enum FleetCommand {
     ///
     /// Deletes every DB row tied to the computer (fleet_workers + computers
     /// and their cascades), clears leader state if it was the elected leader,
-    /// and enqueues a deferred `node_online` task on Taylor that fans out an
+    /// and enqueues a deferred `node_online` task on Vinny that fans out an
     /// SSH revocation of the removed node's public key across every remaining
     /// peer's authorized_keys. Publishes `fleet.events.computer_removed` on
     /// NATS best-effort.
@@ -1850,9 +1850,9 @@ enum FleetCommand {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
-    /// EMERGENCY: wipe every non-Taylor computer from the fleet registry.
+    /// EMERGENCY: wipe every non-Vinny computer from the fleet registry.
     ///
-    /// Iterates every computer whose name is not "taylor" and runs the same
+    /// Iterates every computer whose name is not "vinny" and runs the same
     /// removal logic as `remove-computer` against each. Intended for rebuilds
     /// from scratch. Requires BOTH `--yes` and `--i-know-what-im-doing`.
     Disband {
@@ -1863,9 +1863,9 @@ enum FleetCommand {
         #[arg(long = "i-know-what-im-doing", default_value_t = false)]
         i_know_what_im_doing: bool,
     },
-    /// Plan 14 source-tree migration: move `~/taylorProjects/forge-fleet`
+    /// Plan 14 source-tree migration: move `~/vinnyProjects/forge-fleet`
     /// to the canonical path (`computers.source_tree_path`, default
-    /// `~/.forgefleet/sub-agents/sub-agent-0/forge-fleet`) on every non-Taylor node.
+    /// `~/.forgefleet/sub-agents/sub-agent-0/forge-fleet`) on every non-Vinny node.
     ///
     /// Inspects each node over SSH, prints a plan (legacy present / canonical
     /// present / needs clone), and with --yes enqueues one deferred shell task
@@ -1907,7 +1907,7 @@ enum FleetCommand {
     /// `lan` matches every LAN-joined node; tailscale-only laptops and
     /// off-site WAN replicas should be explicitly set.
     SetNetworkScope {
-        /// Computer name, e.g. "taylor".
+        /// Computer name, e.g. "vinny".
         computer: String,
         /// One of: lan | tailscale_only | wan.
         scope: String,
@@ -1929,9 +1929,9 @@ enum FleetCommand {
         /// Required — panic-stop is destructive.
         #[arg(long, default_value_t = false)]
         yes: bool,
-        /// ALSO stop the Taylor-local Docker data-plane stack
+        /// ALSO stop the Vinny-local Docker data-plane stack
         /// (postgres/redis/sentinel/nats) for a true full halt. No-op if
-        /// this isn't Taylor.
+        /// this isn't Vinny.
         #[arg(long, default_value_t = false)]
         halt_dbs: bool,
     },
@@ -1977,7 +1977,7 @@ enum FleetCommand {
         yes: bool,
     },
     /// Recover an ownerless deploy drain and return its sub-agent slots to
-    /// rotation. Refuses Taylor and any operator-owned reservation.
+    /// rotation. Refuses Vinny and any operator-owned reservation.
     Undrain {
         /// Computer name (e.g. "sophie").
         computer: String,
@@ -2070,9 +2070,9 @@ enum FleetCommand {
     /// The Postgres-resolved SSH path is identical to `ff fleet exec`
     /// (user@ip from the `computers` table, never ~/.ssh/config).
     ///
-    /// NOTE: the leader (Taylor) is EXCLUDED from `--all` — it restarts
+    /// NOTE: the leader (Vinny) is EXCLUDED from `--all` — it restarts
     /// itself badly (kills the daemon mid-deploy). Deploy the leader by hand,
-    /// or target it explicitly with `--node taylor` if you accept the risk.
+    /// or target it explicitly with `--node vinny` if you accept the risk.
     Deploy {
         /// Deploy to ALL online non-leader computers (leader excluded).
         #[arg(long, default_value_t = false)]
@@ -2307,7 +2307,7 @@ pub enum FleetDbCommand {
     ///
     /// Runs the exact same `BackupOrchestrator::run_once` the daemon ticks,
     /// so it exercises the real backup → encrypt → catalogue → fan-out
-    /// pipeline. Intended to be run ON the leader (taylor); `--now` passes
+    /// pipeline. Intended to be run ON the leader (vinny); `--now` passes
     /// `force=true` so it doesn't silently no-op if leadership detection is
     /// momentarily flaky. Use it to verify the HA backup path on demand
     /// instead of waiting for the next scheduled tick.
@@ -2427,7 +2427,7 @@ enum SoftwareCommand {
     /// entry added, disk freed, broken playbook patched), use this to
     /// hand the row back to the auto-upgrade tick.
     Unblock {
-        /// Computer name (case-insensitive). E.g. `taylor`.
+        /// Computer name (case-insensitive). E.g. `vinny`.
         computer: String,
         /// Software ID. E.g. `openclaw`, `claude-code`, `ff_git`.
         software_id: String,
@@ -3547,7 +3547,7 @@ pub enum ModelCommand {
     /// build; no-op if nothing was paused.
     ResumeFromBuild,
     /// Scan a node's local models directory and reconcile with fleet_model_library.
-    /// Defaults to the current host (taylor) scanning ~/models.
+    /// Defaults to the current host (vinny) scanning ~/models.
     Scan {
         #[arg(long)]
         node: Option<String>,
@@ -3721,7 +3721,7 @@ pub enum ModelCommand {
     /// the daily ModelUpstreamChecker tick). Use `ff model upgrade <id>` to act.
     UpgradeAvailable,
     /// Auto-distribute a model: pick the best destination host based on free disk +
-    /// runtime fit + current load, then transfer. Default policy: avoid Taylor (leader),
+    /// runtime fit + current load, then transfer. Default policy: avoid Vinny (leader),
     /// prefer hosts with most free disk that aren't already holding lots of models.
     Distribute {
         /// Library UUID OR catalog_id. If catalog_id and multiple copies exist,
@@ -3730,8 +3730,8 @@ pub enum ModelCommand {
         /// Pin the destination host (default: auto-pick).
         #[arg(long)]
         to: Option<String>,
-        /// Exclude these hosts (comma-separated). Default: taylor.
-        #[arg(long, default_value = "taylor")]
+        /// Exclude these hosts (comma-separated). Default: vinny.
+        #[arg(long, default_value = "vinny")]
         exclude: String,
         /// Dry run — show the plan without rsync'ing.
         #[arg(long, default_value_t = false)]
@@ -4058,7 +4058,7 @@ pub enum PowerCommand {
 pub enum PowerScheduleCommand {
     /// Create a sleep / wake / restart schedule for a computer.
     Create {
-        /// Computer name (e.g. "taylor").
+        /// Computer name (e.g. "vinny").
         computer: String,
         /// Schedule kind.
         #[arg(value_parser = ["sleep", "wake", "restart"])]
@@ -4149,7 +4149,7 @@ pub enum AlertCommand {
 pub enum MetricsCommand {
     /// Print recent metrics-history rows for a computer.
     History {
-        /// Computer name (e.g. "taylor").
+        /// Computer name (e.g. "vinny").
         computer: String,
         /// Lookback window (e.g. "5m", "1h", "24h"). Default: 1h.
         #[arg(long, default_value = "1h")]
@@ -4593,7 +4593,7 @@ async fn main() -> Result<()> {
             // `context_window_tokens` (32768): a 16K endpoint overflowed even a
             // 1-file task because the system prompt + tool schemas + file easily
             // exceed 16K, and the loop won't auto-compact until its 32K
-            // threshold. The fleet has ample 32K+ endpoints (taylor 64K,
+            // threshold. The fleet has ample 32K+ endpoints (vinny 64K,
             // james/logan/duncan 32K), so this routes to a model that can
             // actually hold the context instead of overflowing on turn 1.
             // Use it DIRECTLY with NO inference router: the agent loop prefers
@@ -7916,7 +7916,7 @@ async fn run_headless(
 /// `ff stack host-rank` — rank fleet hosts for a docker/long-running workload.
 ///
 /// Policy (encoded so we don't have to remember it every time):
-///   - Skip Taylor (leader; used daily for hands-on work)
+///   - Skip Vinny (leader; used daily for hands-on work)
 ///   - Skip DGX hosts (os_family='linux-dgx'; reserved for training)
 ///   - Require host has total_ram_gb >= min_ram_gb
 ///   - Rank remaining by total_ram_gb DESC then existing-load ASC
@@ -7935,7 +7935,7 @@ async fn handle_stack_host_rank(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    excludes.insert("taylor".to_string());
+    excludes.insert("vinny".to_string());
 
     let rows: Vec<(String, String, Option<String>, Option<i32>, i64)> = sqlx::query_as(
         r#"
@@ -7968,7 +7968,7 @@ async fn handle_stack_host_rank(
 
     if filtered.is_empty() {
         anyhow::bail!(
-            "no eligible host: need {min_ram_gb} GB RAM, not Taylor, not DGX, not in excludes={excludes:?}"
+            "no eligible host: need {min_ram_gb} GB RAM, not Vinny, not DGX, not in excludes={excludes:?}"
         );
     }
 

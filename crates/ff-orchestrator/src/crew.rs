@@ -134,7 +134,7 @@ impl AgentRole {
     // the model be." These methods say "what kind of computer should host
     // it." Both feed into the TaskRouter's hardware_score so we can route
     // a coder agent to a 30B MoE on a 32GB Linux box but route a planner
-    // agent to the 35B-A3B MoE on Taylor's 96GB unified-memory Mac (where
+    // agent to the 35B-A3B MoE on Vinny's 96GB unified-memory Mac (where
     // MoE active-params << total-params and unified memory dominates).
 
     /// Minimum RAM (GB) the host should have to comfortably run this role's
@@ -448,10 +448,10 @@ mod tests {
         let id = Uuid::new_v4();
         let assignment = CrewAssignment::with_role(id, AgentRole::Reviewer)
             .model("qwen3-72b")
-            .node("taylor")
+            .node("vinny")
             .instructions("Focus on security");
         assert_eq!(assignment.model_override, Some("qwen3-72b".into()));
-        assert_eq!(assignment.node_override, Some("taylor".into()));
+        assert_eq!(assignment.node_override, Some("vinny".into()));
         assert!(assignment.full_system_prompt().contains("security"));
     }
 

@@ -21,7 +21,7 @@
 //!
 //! ## Manual setup procedure
 //!
-//! 1. On the host (e.g. `taylor`):
+//! 1. On the host (e.g. `vinny`):
 //!    ```text
 //!    sudo sh -c 'echo "/Users/venkat/models -network 192.168.5.0 -mask 255.255.255.0" >> /etc/exports'
 //!    sudo nfsd update     # macOS
@@ -31,9 +31,9 @@
 //! 2. On each client:
 //!    ```text
 //!    sudo mkdir -p ~/models
-//!    sudo mount -t nfs taylor:/Users/venkat/models ~/models
+//!    sudo mount -t nfs vinny:/Users/venkat/models ~/models
 //!    ```
-//! 3. Then: `ff storage share create --host taylor --path /Users/venkat/models --name fleet-models --purpose models`
+//! 3. Then: `ff storage share create --host vinny --path /Users/venkat/models --name fleet-models --purpose models`
 
 use sqlx::{PgPool, Row};
 use thiserror::Error;
@@ -350,7 +350,7 @@ async fn fetch_computer_by_id(
 
 /// Platform-aware NFS export config. Best-effort; on failure, the error is
 /// logged and operators must configure /etc/exports manually. Requires
-/// passwordless `sudo` on the host (Taylor is the only fleet node without
+/// passwordless `sudo` on the host (Vinny is the only fleet node without
 /// this — see memory).
 async fn configure_nfs_export(host: &ComputerInfo, export_path: &str) -> Result<(), StorageError> {
     let os = host.os_family.to_lowercase();
@@ -742,13 +742,13 @@ mod tests {
 
     #[test]
     fn parse_mount_macos() {
-        let nodes = vec![test_node("taylor", "10.44.0.1", &[])];
+        let nodes = vec![test_node("vinny", "10.44.0.1", &[])];
         let text =
-            "10.44.0.1:/Users/venkat/models on /Volumes/taylor-models (nfs4, read-only, ...)\n";
+            "10.44.0.1:/Users/venkat/models on /Volumes/vinny-models (nfs4, read-only, ...)\n";
         let mounts = parse_mount_text(text, &nodes);
         assert_eq!(mounts.len(), 1);
-        assert_eq!(mounts[0].peer_name, "taylor");
-        assert_eq!(mounts[0].mount_path, "/Volumes/taylor-models");
+        assert_eq!(mounts[0].peer_name, "vinny");
+        assert_eq!(mounts[0].mount_path, "/Volumes/vinny-models");
         assert_eq!(mounts[0].fs_type, "nfs4");
     }
 

@@ -312,21 +312,21 @@ mod tests {
     async fn test_enter_and_exit_maintenance() {
         let mgr = MaintenanceManager::new();
 
-        assert!(mgr.should_accept_work("taylor").await);
+        assert!(mgr.should_accept_work("vinny").await);
 
-        mgr.maintenance_enter("taylor", Duration::from_millis(50), Some("upgrade".into()))
+        mgr.maintenance_enter("vinny", Duration::from_millis(50), Some("upgrade".into()))
             .await;
 
-        assert!(!mgr.should_accept_work("taylor").await);
-        assert!(mgr.is_in_maintenance("taylor").await);
-        assert!(mgr.is_draining("taylor").await);
+        assert!(!mgr.should_accept_work("vinny").await);
+        assert!(mgr.is_in_maintenance("vinny").await);
+        assert!(mgr.is_draining("vinny").await);
 
-        let info = mgr.get_info("taylor").await.unwrap();
+        let info = mgr.get_info("vinny").await.unwrap();
         assert_eq!(info.phase, MaintenancePhase::Draining);
         assert_eq!(info.reason, Some("upgrade".into()));
 
-        assert!(mgr.maintenance_exit("taylor").await);
-        assert!(mgr.should_accept_work("taylor").await);
+        assert!(mgr.maintenance_exit("vinny").await);
+        assert!(mgr.should_accept_work("vinny").await);
     }
 
     #[tokio::test]
@@ -399,7 +399,7 @@ mod tests {
         let mgr = MaintenanceManager::new();
 
         let window = MaintenanceWindow {
-            node: "taylor".to_string(),
+            node: "vinny".to_string(),
             start: Utc::now() - chrono::Duration::seconds(10),
             end: Utc::now() + chrono::Duration::seconds(300),
             drain_timeout: Duration::from_secs(30),
@@ -410,9 +410,9 @@ mod tests {
 
         // Should enter maintenance when we tick.
         let (entered, exited) = mgr.tick_scheduled_windows().await;
-        assert_eq!(entered, vec!["taylor".to_string()]);
+        assert_eq!(entered, vec!["vinny".to_string()]);
         assert!(exited.is_empty());
-        assert!(mgr.is_in_maintenance("taylor").await);
+        assert!(mgr.is_in_maintenance("vinny").await);
     }
 
     #[tokio::test]
@@ -444,7 +444,7 @@ mod tests {
         let mgr = MaintenanceManager::new();
 
         mgr.schedule_window(MaintenanceWindow {
-            node: "taylor".to_string(),
+            node: "vinny".to_string(),
             start: Utc::now() + chrono::Duration::seconds(100),
             end: Utc::now() + chrono::Duration::seconds(200),
             drain_timeout: Duration::from_secs(30),
@@ -453,7 +453,7 @@ mod tests {
         .await;
 
         mgr.schedule_window(MaintenanceWindow {
-            node: "taylor".to_string(),
+            node: "vinny".to_string(),
             start: Utc::now() + chrono::Duration::seconds(300),
             end: Utc::now() + chrono::Duration::seconds(400),
             drain_timeout: Duration::from_secs(30),
@@ -461,7 +461,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(mgr.cancel_windows("taylor").await, 2);
+        assert_eq!(mgr.cancel_windows("vinny").await, 2);
         assert!(mgr.list_windows().await.is_empty());
     }
 

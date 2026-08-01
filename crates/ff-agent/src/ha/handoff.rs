@@ -414,8 +414,8 @@ mod tests {
         PlanInputs {
             target_member: "james".to_string(),
             target_ip: "192.168.5.108".to_string(),
-            current_primary_member: Some("taylor".to_string()),
-            current_leader_member: Some("taylor".to_string()),
+            current_primary_member: Some("vinny".to_string()),
+            current_leader_member: Some("vinny".to_string()),
             new_dsn: "postgres://forgefleet:secret@192.168.5.108:55432/forgefleet".to_string(),
             lease_minutes: 30,
             lag_gate: gate,

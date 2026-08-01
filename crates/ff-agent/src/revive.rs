@@ -277,7 +277,7 @@ impl ReviveManager {
     /// labels (historical drift across onboarding scripts):
     ///   - `com.forgefleet.forgefleetd` — newer ff-daemon installs
     ///   - `com.forgefleet.node`        — older installs (e.g. Ace)
-    ///   - `com.forgefleet.ffdaemon`    — variant used on Taylor
+    ///   - `com.forgefleet.ffdaemon`    — variant used on Vinny
     ///     We try each in order and return on the first success.
     async fn ssh_restart_daemon(&self, target: &ReviveTarget) -> Result<(), ReviveError> {
         match target.os_family.as_str() {

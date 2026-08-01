@@ -317,7 +317,7 @@ pub async fn handle_agent_dispatch_each(
 
 // ─── #118: ff agent commit-back — fleet-LLM work → git integration ─────────
 //
-// Lifts code produced by a fleet LLM in a sub-agent workspace back to Taylor's
+// Lifts code produced by a fleet LLM in a sub-agent workspace back to Vinny's
 // canonical repo via a feature branch + (optional) PR, or a project-policy
 // direct push.
 //
@@ -416,7 +416,7 @@ pub async fn handle_agent_commit_back(
         .filter(|s| !s.is_empty())
         .map(String::from)
         .unwrap_or_else(|| {
-            if worker.eq_ignore_ascii_case("taylor") {
+            if worker.eq_ignore_ascii_case("vinny") {
                 "~/projects/forge-fleet".to_string()
             } else {
                 "~/.forgefleet/sub-agents/sub-agent-0/forge-fleet".to_string()
@@ -472,7 +472,7 @@ pub async fn handle_agent_commit_back(
     //
     // GAP-D-collision: capture the workspace's current branch first and restore
     // it after committing, so commit-back NEVER leaves a shared/live checkout
-    // (e.g. taylor's `~/projects/forge-fleet` dev tree) switched onto the fleet
+    // (e.g. vinny's `~/projects/forge-fleet` dev tree) switched onto the fleet
     // branch — observed switching the operator's working tree mid-session. The
     // commit lives on the new branch ref; the push/PR steps below operate on it
     // by name without it being checked out.

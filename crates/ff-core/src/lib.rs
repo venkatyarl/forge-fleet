@@ -8,7 +8,7 @@
 //! - **db** — Postgres connection pool setup
 //! - **hardware** — Detect OS, CPU, GPU, memory, interconnect at runtime
 //! - **leader** — Leader election types and failover logic
-//! - **activity** — Taylor yield modes and activity level tracking
+//! - **activity** — Vinny yield modes and activity level tracking
 //! - **task** — Agent task and result types
 
 pub mod activity;

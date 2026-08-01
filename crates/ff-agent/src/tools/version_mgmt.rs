@@ -5,11 +5,11 @@
 //!
 //! Release channels:
 //! - **stable**: weekly (Monday) or on-demand, auto-deploys to all fleet nodes overnight
-//! - **nightly**: daily midnight build from passing commits, canary on Taylor (leader)
+//! - **nightly**: daily midnight build from passing commits, canary on Vinny (leader)
 //! - **hotfix**: critical bug fixes, deploy immediately to all nodes
 //!
 //! Release flow:
-//! 1. Commit → tests pass → nightly tag (canary on Taylor)
+//! 1. Commit → tests pass → nightly tag (canary on Vinny)
 //! 2. If healthy 24h → promote to stable
 //! 3. Stable auto-deploys to all fleet nodes
 //! 4. If broken → auto-rollback to previous stable

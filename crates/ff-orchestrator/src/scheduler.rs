@@ -764,14 +764,14 @@ mod tests {
     fn test_schedule_gpu_affinity() {
         let mut scheduler = Scheduler::new(PlacementPolicy::BinPack);
         scheduler.add_node(make_node("james", 16, 64, false)); // no GPU
-        scheduler.add_node(make_node("taylor", 32, 96, true)); // has GPU
+        scheduler.add_node(make_node("vinny", 32, 96, true)); // has GPU
 
         let task = make_task("train model", 8, 32, true);
         let decision = scheduler.schedule_task(&task);
 
         match &decision {
             ScheduleDecision::Assign { worker_name, .. } => {
-                assert_eq!(worker_name, "taylor", "GPU task must go to GPU node");
+                assert_eq!(worker_name, "vinny", "GPU task must go to GPU node");
             }
             other => panic!("Expected Assign, got {other:?}"),
         }

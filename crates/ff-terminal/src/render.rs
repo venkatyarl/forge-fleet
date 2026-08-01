@@ -702,7 +702,7 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
             } else {
                 ("○", Color::Rgb(248, 113, 113))
             };
-            // Header format: `Taylor (macOS) - 192.168.5.100`
+            // Header format: `Vinny (macOS) - 192.168.5.100`
             // Title-case the hostname for readability; pretty-print the
             // stored os_family slug so "linux-dgx" → "DGX OS".
             let pretty_host = {

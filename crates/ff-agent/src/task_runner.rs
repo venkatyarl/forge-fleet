@@ -1564,7 +1564,7 @@ pub async fn compose_node_bootstrap(
     let ip_list = target_ips.join(" ");
     let step1 = format!(
         // ssh -o ConnectTimeout, NOT `timeout 5 ssh`: this step runs on the
-        // LEADER (capability=["leader"]), which is often macOS (taylor/ace)
+        // LEADER (capability=["leader"]), which is often macOS (vinny/ace)
         // where `timeout` is not a default command (it's `gtimeout` via
         // coreutils) — so `timeout 5 ssh` silently breaks the probe on macOS.
         // ssh's built-in ConnectTimeout is portable and covers the hang case.
@@ -2102,7 +2102,7 @@ pub async fn compose_fleet_upgrade_wave_filtered(
     //    claimable as soon as THAT host's build is terminal.
     //
     //    Why no leader gate: leader-only restarts serialized the
-    //    entire restart phase on one worker (Taylor processes one
+    //    entire restart phase on one worker (Vinny processes one
     //    task at a time). With V108 making restarts per-host
     //    eligible the moment their build finishes, any peer can pick
     //    one up. V61 excludes the target from claiming its own

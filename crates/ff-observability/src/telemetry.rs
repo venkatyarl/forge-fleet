@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn test_propagation_context_child() {
-        let parent = PropagationContext::new("gateway", Some("taylor".into()));
+        let parent = PropagationContext::new("gateway", Some("vinny".into()));
         let child = parent.child("agent", Some("james".into()));
         assert_eq!(parent.trace_id, child.trace_id);
         assert_ne!(parent.span_id, child.span_id);

@@ -2,7 +2,7 @@
 //!
 //! Building a fresh `PgPool` (or Redis `ConnectionManager`) on **every** tool
 //! call is the documented pool-per-call anti-pattern that exhausts Postgres
-//! connections under load — it caused two Taylor outages (2026-04-23). Before
+//! connections under load — it caused two Vinny outages (2026-04-23). Before
 //! this module, `brain_tools`, `cortex_tools`, and several `handlers` paths each
 //! called `PgPoolOptions::new().connect()` per invocation, and the fleet-status
 //! handlers opened a new `PulseClient` per call.

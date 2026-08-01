@@ -35,7 +35,7 @@ pub struct MessageRouter {
 impl Default for MessageRouter {
     fn default() -> Self {
         Self::new(
-            vec!["forgefleet".to_string(), "taylor".to_string()],
+            vec!["forgefleet".to_string(), "vinny".to_string()],
             vec!['/', '!'],
         )
     }

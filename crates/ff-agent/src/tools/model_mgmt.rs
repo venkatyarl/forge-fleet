@@ -105,8 +105,8 @@ impl AgentTool for ModelBrowserTool {
             "list_fleet" => {
                 // Query all fleet LLM endpoints
                 let nodes = [
-                    ("Taylor", "192.168.5.100:55000"),
-                    ("Taylor-2", "192.168.5.100:55001"),
+                    ("Vinny", "192.168.5.100:55000"),
+                    ("Vinny-2", "192.168.5.100:55001"),
                     ("Marcus", "192.168.5.102:55000"),
                     ("Sophie", "192.168.5.103:55000"),
                     ("Priya", "192.168.5.104:55000"),

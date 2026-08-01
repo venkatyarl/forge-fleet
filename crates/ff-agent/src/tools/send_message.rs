@@ -103,7 +103,7 @@ async fn resolve_node_url(name: &str) -> String {
     }
     // Fallback to known-good table
     let known: std::collections::HashMap<&str, &str> = [
-        ("taylor", "192.168.5.100"),
+        ("vinny", "192.168.5.100"),
         ("marcus", "192.168.5.102"),
         ("sophie", "192.168.5.103"),
         ("priya", "192.168.5.104"),

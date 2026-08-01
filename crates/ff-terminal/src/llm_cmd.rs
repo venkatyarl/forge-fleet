@@ -125,27 +125,27 @@ mod tests {
     #[test]
     fn sorts_by_numeric_octet_not_alphabetical() {
         let map = HashMap::from([
-            ("taylor", "192.168.5.100"),
+            ("vinny", "192.168.5.100"),
             ("marcus", "192.168.5.102"),
             ("beyonce", "192.168.5.119"),
             ("ace", "192.168.5.9"),
         ]);
-        // Alphabetical would put ace, beyonce, marcus, taylor; octet order is
+        // Alphabetical would put ace, beyonce, marcus, vinny; octet order is
         // .9 < .100 < .102 < .119 (and `.100` must NOT sort before `.9`).
         assert_eq!(
-            order(&map, &["taylor", "beyonce", "marcus", "ace"]),
-            vec!["ace", "taylor", "marcus", "beyonce"]
+            order(&map, &["vinny", "beyonce", "marcus", "ace"]),
+            vec!["ace", "vinny", "marcus", "beyonce"]
         );
     }
 
     #[test]
     fn unknown_ip_sorts_last_with_name_tiebreak() {
-        let map = HashMap::from([("taylor", "192.168.5.100")]);
+        let map = HashMap::from([("vinny", "192.168.5.100")]);
         // "ghost" / "zombie" have no beat → ip rank u32::MAX → sort last, and
         // among themselves fall back to the name tiebreak (ghost before zombie).
         assert_eq!(
-            order(&map, &["zombie", "ghost", "taylor"]),
-            vec!["taylor", "ghost", "zombie"]
+            order(&map, &["zombie", "ghost", "vinny"]),
+            vec!["vinny", "ghost", "zombie"]
         );
     }
 }

@@ -708,7 +708,7 @@ mod tests {
     #[test]
     fn test_is_my_turn_no_order() {
         let config = RollingUpdateConfig::default();
-        let orch = UpdateOrchestrator::new(test_config("taylor", config), RestartSignal::None);
+        let orch = UpdateOrchestrator::new(test_config("vinny", config), RestartSignal::None);
         // No order defined → always my turn
         assert!(orch.is_my_turn(&[]));
     }
@@ -716,10 +716,10 @@ mod tests {
     #[test]
     fn test_is_my_turn_ordered() {
         let config = RollingUpdateConfig {
-            node_order: vec!["james".into(), "marcus".into(), "taylor".into()],
+            node_order: vec!["james".into(), "marcus".into(), "vinny".into()],
             ..Default::default()
         };
-        let orch = UpdateOrchestrator::new(test_config("taylor", config), RestartSignal::None);
+        let orch = UpdateOrchestrator::new(test_config("vinny", config), RestartSignal::None);
 
         // None completed → not my turn
         assert!(!orch.is_my_turn(&[]));
@@ -733,16 +733,16 @@ mod tests {
 
     #[test]
     fn test_update_record_new() {
-        let record = UpdateRecord::new("taylor");
+        let record = UpdateRecord::new("vinny");
         assert_eq!(record.state, UpdateState::Idle);
-        assert_eq!(record.worker_name, "taylor");
+        assert_eq!(record.worker_name, "vinny");
         assert!(record.error.is_none());
     }
 
     #[test]
     fn test_orchestrator_idle_by_default() {
         let orch = UpdateOrchestrator::new(
-            test_config("taylor", RollingUpdateConfig::default()),
+            test_config("vinny", RollingUpdateConfig::default()),
             RestartSignal::None,
         );
 
@@ -759,7 +759,7 @@ mod tests {
         use crate::canary::{CanaryStage, FleetComputer};
 
         let mut orch = UpdateOrchestrator::new(
-            test_config("taylor", RollingUpdateConfig::default()),
+            test_config("vinny", RollingUpdateConfig::default()),
             RestartSignal::None,
         );
 
@@ -779,10 +779,10 @@ mod tests {
                 current_version: Some("v1".into()),
             },
             FleetComputer {
-                name: "taylor".into(),
+                name: "vinny".into(),
                 priority: 100,
                 is_leader: true,
-                health_url: "http://taylor/health".into(),
+                health_url: "http://vinny/health".into(),
                 current_version: Some("v1".into()),
             },
         ];
@@ -801,7 +801,7 @@ mod tests {
         use crate::rollout::RolloutState;
 
         let mut orch = UpdateOrchestrator::new(
-            test_config("taylor", RollingUpdateConfig::default()),
+            test_config("vinny", RollingUpdateConfig::default()),
             RestartSignal::None,
         );
 
@@ -821,10 +821,10 @@ mod tests {
                 current_version: Some("v1".into()),
             },
             FleetComputer {
-                name: "taylor".into(),
+                name: "vinny".into(),
                 priority: 100,
                 is_leader: true,
-                health_url: "http://taylor/health".into(),
+                health_url: "http://vinny/health".into(),
                 current_version: Some("v1".into()),
             },
         ];
@@ -840,7 +840,7 @@ mod tests {
 
         // Promote and start rollout
         let batch = orch.promote_and_start_rollout().unwrap();
-        // Remaining: marcus, taylor (leader last)
+        // Remaining: marcus, vinny (leader last)
         assert_eq!(batch, vec!["marcus"]);
 
         assert_eq!(orch.rollout().unwrap().state(), RolloutState::InProgress);
@@ -851,7 +851,7 @@ mod tests {
         use crate::canary::{CanaryStage, FleetComputer};
 
         let mut orch = UpdateOrchestrator::new(
-            test_config("taylor", RollingUpdateConfig::default()),
+            test_config("vinny", RollingUpdateConfig::default()),
             RestartSignal::None,
         );
 
@@ -864,10 +864,10 @@ mod tests {
                 current_version: None,
             },
             FleetComputer {
-                name: "taylor".into(),
+                name: "vinny".into(),
                 priority: 100,
                 is_leader: true,
-                health_url: "http://taylor/health".into(),
+                health_url: "http://vinny/health".into(),
                 current_version: None,
             },
         ];

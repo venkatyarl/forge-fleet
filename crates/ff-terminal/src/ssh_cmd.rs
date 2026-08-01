@@ -29,7 +29,7 @@ pub async fn handle_ssh(
     json: bool,
 ) -> Result<()> {
     if command.is_empty() {
-        anyhow::bail!("ff ssh requires a command to run, e.g. `ff ssh taylor uptime`");
+        anyhow::bail!("ff ssh requires a command to run, e.g. `ff ssh vinny uptime`");
     }
 
     // Resolve worker → (ip, ssh_user) from Postgres. DB is the source of truth;

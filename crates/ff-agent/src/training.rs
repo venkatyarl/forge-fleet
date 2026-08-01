@@ -184,7 +184,7 @@ pub struct LoraConfig {
     pub lora_alpha: u32,
     /// Batch size (default: 4).
     pub batch_size: u32,
-    /// Which node to train on (default: taylor).
+    /// Which node to train on (default: vinny).
     pub train_node: String,
     /// Training method: mlx (Mac), unsloth (CUDA), torchtune (general).
     pub method: String,
@@ -201,7 +201,7 @@ impl Default for LoraConfig {
             lora_rank: 16,
             lora_alpha: 32,
             batch_size: 4,
-            train_node: "taylor".into(),
+            train_node: "vinny".into(),
             method: "mlx".into(),
         }
     }
@@ -211,7 +211,7 @@ impl Default for LoraConfig {
 pub fn generate_training_command(config: &LoraConfig) -> String {
     match config.method.as_str() {
         "mlx" => {
-            // MLX LoRA (Apple Silicon — for Taylor Mac Studio)
+            // MLX LoRA (Apple Silicon — for Vinny Mac Studio)
             format!(
                 "python3 -m mlx_lm.lora \\\n\
                  --model {base_model} \\\n\
@@ -305,7 +305,7 @@ impl PromptLibrary {
             "ssh" | "fleet_op" => r#"You are ForgeFleet, managing a fleet of computers. When asked to SSH or interact with fleet nodes, ALWAYS use the Bash tool with SSH commands. Never say you can't SSH — you have access.
 
 Fleet nodes:
-- Taylor (192.168.5.100) user:venkat — leader, Mac Studio 96GB
+- Vinny (192.168.5.100) user:venkat — leader, Mac Studio 96GB
 - Marcus (192.168.5.102) user:marcus — Ubuntu 32GB, Qwen3-Coder-30B-A3B
 - Sophie (192.168.5.103) user:sophie — Ubuntu 32GB, Qwen3-Coder-30B-A3B
 - Priya  (192.168.5.104) user:priya  — Ubuntu 32GB, Qwen3-Coder-30B-A3B

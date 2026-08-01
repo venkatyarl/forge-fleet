@@ -324,7 +324,7 @@ mod tests {
             parse_exclude_names("sia, adele ,rihanna"),
             vec!["sia", "adele", "rihanna"]
         );
-        assert_eq!(parse_exclude_names(",taylor,,"), vec!["taylor"]);
+        assert_eq!(parse_exclude_names(",vinny,,"), vec!["vinny"]);
         assert_eq!(parse_exclude_names("sia,sia,adele"), vec!["sia", "adele"]);
     }
 }

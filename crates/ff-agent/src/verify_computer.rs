@@ -124,11 +124,11 @@ pub async fn verify_computer(pool: &PgPool, worker_name: &str) -> Result<VerifyR
     });
     // 9. sudo_passwordless (N/A on Windows — UAC is the equivalent and is
     //    always interactive; Windows daemons run as services, so skip.)
-    details.push(if worker_name == "taylor" {
+    details.push(if worker_name == "vinny" {
         CheckResult {
             check: "sudo_passwordless".into(),
             status: "skip".into(),
-            message: Some("taylor is excluded from passwordless sudo policy".into()),
+            message: Some("vinny is excluded from passwordless sudo policy".into()),
             retry_task_id: None,
         }
     } else if is_windows {

@@ -746,9 +746,9 @@ mod tests {
 
     #[test]
     fn test_am_i_leader() {
-        let mut coordinator = make_leader("taylor");
+        let mut coordinator = make_leader("vinny");
         assert!(coordinator.am_i_leader());
-        assert!(coordinator.is_leader("taylor"));
+        assert!(coordinator.is_leader("vinny"));
         assert!(!coordinator.is_leader("james"));
 
         coordinator.update_election_state(ElectionState::Stable {
@@ -762,7 +762,7 @@ mod tests {
     fn test_non_leader_tick_is_noop() {
         let mut coordinator = LeaderCoordinator::new("james", PlacementPolicy::BinPack);
         coordinator.update_election_state(ElectionState::Stable {
-            leader: "taylor".to_string(),
+            leader: "vinny".to_string(),
             since: Utc::now(),
         });
         coordinator.register_node(make_node("james", 16, 64, false));
@@ -775,7 +775,7 @@ mod tests {
 
     #[test]
     fn test_leader_submits_and_schedules_on_tick() {
-        let mut coordinator = make_leader("taylor");
+        let mut coordinator = make_leader("vinny");
         coordinator.register_node(make_node("james", 16, 64, false));
         coordinator.register_node(make_node("marcus", 16, 64, false));
 
@@ -798,7 +798,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_router_tick_attaches_llm_to_assignment_and_agent_task() {
-        let mut coordinator = make_leader("taylor");
+        let mut coordinator = make_leader("vinny");
         coordinator.register_node(make_node("james", 16, 64, false));
         let router = StaticLlmRouter::new(Some(make_llm_candidate()));
 
@@ -830,7 +830,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_router_tick_leaves_task_queued_without_llm_candidate() {
-        let mut coordinator = make_leader("taylor");
+        let mut coordinator = make_leader("vinny");
         coordinator.register_node(make_node("james", 16, 64, false));
         let router = StaticLlmRouter::new(None);
 
@@ -849,7 +849,7 @@ mod tests {
 
     #[test]
     fn test_heartbeat_confirms_assignment() {
-        let mut coordinator = make_leader("taylor");
+        let mut coordinator = make_leader("vinny");
         coordinator.register_node(make_node("james", 16, 64, false));
 
         let task = make_task("urgent fix", 4, 8);
@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn test_priority_ordering_in_tick() {
-        let mut coordinator = make_leader("taylor");
+        let mut coordinator = make_leader("vinny");
         coordinator.register_node(make_node("james", 16, 64, false));
 
         let low = make_task("low", 4, 8).with_priority(TaskPriority::Low);
@@ -899,7 +899,7 @@ mod tests {
 
     #[test]
     fn test_preemption_through_coordinator() {
-        let mut coordinator = make_leader("taylor");
+        let mut coordinator = make_leader("vinny");
         coordinator.register_node(make_node("james", 8, 32, false));
 
         let bg = make_task("background", 6, 24).with_priority(TaskPriority::Background);
@@ -920,7 +920,7 @@ mod tests {
 
     #[test]
     fn test_complete_task_releases_capacity() {
-        let mut coordinator = make_leader("taylor");
+        let mut coordinator = make_leader("vinny");
         coordinator.register_node(make_node("james", 8, 16, false));
 
         // Fill the node. A worker may have only one unconfirmed assignment
@@ -950,7 +950,7 @@ mod tests {
 
     #[test]
     fn test_offline_node_excluded() {
-        let mut coordinator = make_leader("taylor");
+        let mut coordinator = make_leader("vinny");
         coordinator.register_node(make_node("james", 16, 64, false));
         coordinator.register_node(make_node("marcus", 16, 64, false));
 
@@ -969,13 +969,13 @@ mod tests {
     #[test]
     fn test_stale_assignment_reaped() {
         let mut coordinator = LeaderCoordinator::with_timeouts(
-            "taylor",
+            "vinny",
             PlacementPolicy::BinPack,
             Duration::from_secs(3600),
             Duration::from_secs(0), // immediate stale timeout
         );
         coordinator.update_election_state(ElectionState::Stable {
-            leader: "taylor".to_string(),
+            leader: "vinny".to_string(),
             since: Utc::now(),
         });
         coordinator.register_node(make_node("james", 16, 64, false));
@@ -994,7 +994,7 @@ mod tests {
 
     #[test]
     fn test_tick_dispatches_to_multiple_idle_workers_at_once() {
-        let mut coordinator = make_leader("taylor");
+        let mut coordinator = make_leader("vinny");
         coordinator.register_node(make_node("james", 16, 64, false));
         coordinator.register_node(make_node("marcus", 16, 64, false));
 
@@ -1028,7 +1028,7 @@ mod tests {
         // the old (buggy) behavior would hand both to the same worker in
         // one tick, leaving the second stranded since a worker's heartbeat
         // can only confirm one new assignment at a time.
-        let mut coordinator = make_leader("taylor");
+        let mut coordinator = make_leader("vinny");
         coordinator.register_node(make_node("james", 16, 64, false));
 
         let a = make_task("task-a", 4, 8);
@@ -1057,7 +1057,7 @@ mod tests {
 
     #[test]
     fn test_fail_task_requeues() {
-        let mut coordinator = make_leader("taylor");
+        let mut coordinator = make_leader("vinny");
         coordinator.register_node(make_node("james", 16, 64, false));
 
         let task = make_task("work", 4, 8);
@@ -1072,7 +1072,7 @@ mod tests {
 
     #[test]
     fn test_heartbeat_refreshes_dispatch_tick() {
-        let mut coordinator = make_leader("taylor");
+        let mut coordinator = make_leader("vinny");
         coordinator.register_node(make_node("james", 16, 64, false));
 
         // Age the dispatch tick so we can observe the refresh.

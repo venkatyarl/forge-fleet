@@ -258,7 +258,7 @@ fn build_training_command(job: &ff_db::TrainingJobRow) -> String {
     envs.push(shell_env("FORGEFLEET_TRAINING_JOB_ID", &job.id.to_string()));
 
     format!(
-        "cd ~/taylorProjects/forge-fleet 2>/dev/null || cd ~/projects/forge-fleet; {} ./scripts/train_lora_mlx.sh",
+        "cd ~/vinnyProjects/forge-fleet 2>/dev/null || cd ~/projects/forge-fleet; {} ./scripts/train_lora_mlx.sh",
         envs.join(" ")
     )
 }

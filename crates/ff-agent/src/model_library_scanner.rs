@@ -295,7 +295,7 @@ fn classify_dir(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disco
         //   - everywhere else                → "vllm" (Linux+CUDA pattern)
         //
         // Before this fix, the scanner picked "vllm" for any safetensors dir
-        // regardless of host OS. That caused Taylor's qwen36-35b-a3b
+        // regardless of host OS. That caused Vinny's qwen36-35b-a3b
         // (HF-format dir served by mlx_lm.server) to show up as runtime=vllm
         // — which then blocked `ff model delete` with a false "active
         // deployment" check (deployment was on a different runtime).
