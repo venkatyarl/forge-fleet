@@ -2305,8 +2305,20 @@ pub async fn decrypt_backup_file(
         .ok_or_else(|| {
             BackupError::Cmd("fleet_secrets.backup_encryption_privkey not set".into())
         })?;
+    decrypt_backup_file_with_identity(&privkey_str, encrypted, dest).await
+}
 
-    let identity = age::x25519::Identity::from_str(privkey_str.trim())
+/// Decrypt an `.age` backup file with an explicit X25519 identity string
+/// (`AGE-SECRET-KEY-…`) — no database access. This is the DR-bootstrap
+/// path: on a fresh box `fleet_secrets` lives inside the very database
+/// being restored, so the identity must come from the operator instead
+/// (escrow file / env / `--identity`).
+pub async fn decrypt_backup_file_with_identity(
+    identity_str: &str,
+    encrypted: &Path,
+    dest: &Path,
+) -> Result<(), BackupError> {
+    let identity = age::x25519::Identity::from_str(identity_str.trim())
         .map_err(|e| BackupError::Cmd(format!("parse age identity: {e}")))?;
 
     let ciphertext = tokio::fs::read(encrypted).await?;
@@ -2708,6 +2720,47 @@ mod tests {
         let junk = dir.join("pg-junk.tar.gz.age");
         std::fs::write(&junk, vec![0u8; 4096]).unwrap();
         assert!(check_age_decryptable(&junk, &fleet).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No DB required: this is the pool-free decrypt the `--from-file` DR
+    /// bootstrap relies on when `fleet_secrets` doesn't exist yet.
+    #[tokio::test]
+    async fn decrypt_backup_file_with_identity_roundtrips_without_db() {
+        use secrecy::ExposeSecret;
+        let fleet = age::x25519::Identity::generate();
+        let stranger = age::x25519::Identity::generate();
+
+        let dir = std::env::temp_dir().join(format!("ff-bk-iddec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let enc = dir.join("pg-fake.tar.gz.age");
+        std::fs::write(
+            &enc,
+            age_encrypt_binary(b"pretend this is a base backup", &[fleet.to_public()]),
+        )
+        .unwrap();
+
+        let dest = dir.join("pg-fake.tar.gz");
+        let fleet_str = fleet.to_string().expose_secret().to_string();
+        decrypt_backup_file_with_identity(&fleet_str, &enc, &dest)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"pretend this is a base backup"
+        );
+
+        // A key the archive wasn't encrypted to must fail — and must not
+        // leave a plaintext file behind.
+        let stranger_str = stranger.to_string().expose_secret().to_string();
+        let nope = dir.join("nope.tar.gz");
+        assert!(
+            decrypt_backup_file_with_identity(&stranger_str, &enc, &nope)
+                .await
+                .is_err()
+        );
+        assert!(!nope.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
