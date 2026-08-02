@@ -964,6 +964,63 @@ mod tests {
     use std::sync::Mutex;
     use uuid::Uuid;
 
+    struct IsolatedTestDb {
+        pool: PgPool,
+        admin_url: String,
+        db_name: String,
+    }
+
+    impl IsolatedTestDb {
+        async fn cleanup(self) {
+            self.pool.close().await;
+            if let Ok(admin) = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&self.admin_url)
+                .await
+            {
+                let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{}\"", self.db_name))
+                    .execute(&admin)
+                    .await;
+                admin.close().await;
+            }
+        }
+    }
+
+    /// DB-backed unit tests must skip cleanly in the DB-less `cargo test --lib`
+    /// gate. When a fleet DB URL is available, keep them isolated from live data.
+    async fn isolated_test_db() -> Option<IsolatedTestDb> {
+        let base_url = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()?;
+        let (prefix, _) = base_url.rsplit_once('/')?;
+        let admin_url = format!("{prefix}/postgres");
+        let db_name = format!("ff_project_digests_{}", Uuid::new_v4().simple());
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .ok()?;
+        if sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .is_err()
+        {
+            admin.close().await;
+            return None;
+        }
+        admin.close().await;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&format!("{prefix}/{db_name}"))
+            .await
+            .ok()?;
+        Some(IsolatedTestDb {
+            pool,
+            admin_url,
+            db_name,
+        })
+    }
+
     struct MockSender {
         outcomes: Mutex<VecDeque<crate::telegram::TelegramDigestOutcome>>,
         calls: Mutex<Vec<(String, String, Option<Vec<u8>>)>>,
@@ -1097,8 +1154,12 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
-    async fn event_windows_fallback_status_fences_and_durations(pool: PgPool) {
+    #[tokio::test]
+    async fn event_windows_fallback_status_fences_and_durations() {
+        let Some(test_db) = isolated_test_db().await else {
+            return;
+        };
+        let pool = test_db.pool.clone();
         sqlx::raw_sql(
             "CREATE TABLE project_digest_configs (id text PRIMARY KEY, project_id text NOT NULL, last_sent_at timestamptz);\
              CREATE TABLE work_items (id uuid PRIMARY KEY, project_id text NOT NULL, title text NOT NULL, status text NOT NULL, started_at timestamptz, completed_at timestamptz, last_error text, verified smallint NOT NULL DEFAULT 0, assigned_computer text);\
@@ -1289,10 +1350,15 @@ mod tests {
         assert!(body.contains("new-failure — boom"));
         assert!(body.contains("legacy-failure — legacy boom"));
         assert!(!body.contains("recovered-failure"));
+        test_db.cleanup().await;
     }
 
-    #[sqlx::test]
-    async fn run_once_success_atomically_records_ack_and_cursor(pool: PgPool) {
+    #[tokio::test]
+    async fn run_once_success_atomically_records_ack_and_cursor() {
+        let Some(test_db) = isolated_test_db().await else {
+            return;
+        };
+        let pool = test_db.pool.clone();
         let old_cursor = run_once_fixture(&pool).await;
         let sender = MockSender::new(vec![acknowledged(42)]);
 
@@ -1326,10 +1392,16 @@ mod tests {
         let calls = sender.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].2.as_deref(), Some(&[1, 2, 3][..]));
+        drop(calls);
+        test_db.cleanup().await;
     }
 
-    #[sqlx::test]
-    async fn run_once_definite_failure_retries_same_frozen_payload(pool: PgPool) {
+    #[tokio::test]
+    async fn run_once_definite_failure_retries_same_frozen_payload() {
+        let Some(test_db) = isolated_test_db().await else {
+            return;
+        };
+        let pool = test_db.pool.clone();
         let old_cursor = run_once_fixture(&pool).await;
         let sender = MockSender::new(vec![
             crate::telegram::TelegramDigestOutcome::DefinitelyNotDelivered {
@@ -1362,10 +1434,16 @@ mod tests {
         let calls = sender.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0], calls[1], "retry must reuse title/body/logo");
+        drop(calls);
+        test_db.cleanup().await;
     }
 
-    #[sqlx::test]
-    async fn run_once_ambiguous_and_stranded_sending_never_resend(pool: PgPool) {
+    #[tokio::test]
+    async fn run_once_ambiguous_and_stranded_sending_never_resend() {
+        let Some(test_db) = isolated_test_db().await else {
+            return;
+        };
+        let pool = test_db.pool.clone();
         let old_cursor = run_once_fixture(&pool).await;
         let sender = MockSender::new(vec![crate::telegram::TelegramDigestOutcome::Ambiguous {
             error: "response parse loss".into(),
@@ -1398,10 +1476,15 @@ mod tests {
                 .unwrap();
         assert_eq!(state, "sending");
         assert_eq!(sender.calls.lock().unwrap().len(), 1);
+        test_db.cleanup().await;
     }
 
-    #[sqlx::test]
-    async fn run_once_success_without_message_identity_fails_closed(pool: PgPool) {
+    #[tokio::test]
+    async fn run_once_success_without_message_identity_fails_closed() {
+        let Some(test_db) = isolated_test_db().await else {
+            return;
+        };
+        let pool = test_db.pool.clone();
         let old_cursor = run_once_fixture(&pool).await;
         let sender = MockSender::new(vec![crate::telegram::TelegramDigestOutcome::Acknowledged {
             messages: Vec::new(),
@@ -1422,10 +1505,15 @@ mod tests {
         assert_eq!(state.1, None);
         assert_eq!(state.2, old_cursor);
         assert_eq!(sender.calls.lock().unwrap().len(), 1);
+        test_db.cleanup().await;
     }
 
-    #[sqlx::test]
-    async fn run_once_concurrent_claim_sends_once(pool: PgPool) {
+    #[tokio::test]
+    async fn run_once_concurrent_claim_sends_once() {
+        let Some(test_db) = isolated_test_db().await else {
+            return;
+        };
+        let pool = test_db.pool.clone();
         run_once_fixture(&pool).await;
         let mut sender = MockSender::new(vec![acknowledged(44)]);
         sender.delay = Duration::from_millis(100);
@@ -1443,10 +1531,15 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(state, "delivered");
+        test_db.cleanup().await;
     }
 
-    #[sqlx::test]
-    async fn run_once_stale_fence_cannot_commit_ack_or_cursor(pool: PgPool) {
+    #[tokio::test]
+    async fn run_once_stale_fence_cannot_commit_ack_or_cursor() {
+        let Some(test_db) = isolated_test_db().await else {
+            return;
+        };
+        let pool = test_db.pool.clone();
         let old_cursor = run_once_fixture(&pool).await;
         let mut sender = MockSender::new(vec![acknowledged(45)]);
         sender.interfere = true;
@@ -1463,10 +1556,15 @@ mod tests {
         assert_eq!(row.1, 2);
         assert_eq!(row.2, None);
         assert_eq!(row.3, old_cursor);
+        test_db.cleanup().await;
     }
 
-    #[sqlx::test]
-    async fn run_once_ack_finishes_attempt_without_regressing_later_cursor(pool: PgPool) {
+    #[tokio::test]
+    async fn run_once_ack_finishes_attempt_without_regressing_later_cursor() {
+        let Some(test_db) = isolated_test_db().await else {
+            return;
+        };
+        let pool = test_db.pool.clone();
         run_once_fixture(&pool).await;
         let mut sender = MockSender::new(vec![acknowledged(46)]);
         sender.later_cursor = true;
@@ -1481,10 +1579,15 @@ mod tests {
         .unwrap();
         assert_eq!(row.0, "delivered");
         assert!(row.2 > row.1);
+        test_db.cleanup().await;
     }
 
-    #[sqlx::test]
-    async fn attempt_payload_reuse_ambiguous_dedup_and_atomic_cursor(pool: PgPool) {
+    #[tokio::test]
+    async fn attempt_payload_reuse_ambiguous_dedup_and_atomic_cursor() {
+        let Some(test_db) = isolated_test_db().await else {
+            return;
+        };
+        let pool = test_db.pool.clone();
         sqlx::query("CREATE TABLE project_digest_configs (id text PRIMARY KEY, last_sent_at timestamptz, updated_at timestamptz DEFAULT now())").execute(&pool).await.unwrap();
         sqlx::raw_sql(ff_db::schema::SCHEMA_V283_PROJECT_DIGEST_ATTEMPTS)
             .execute(&pool)
@@ -1564,5 +1667,6 @@ mod tests {
         tx.commit().await.unwrap();
         let final_state: (DateTime<Utc>, String) = sqlx::query_as("SELECT c.last_sent_at,a.delivery_status FROM project_digest_configs c JOIN project_digest_attempts a ON a.config_id=c.id WHERE c.id='cfg'").fetch_one(&pool).await.unwrap();
         assert_eq!(final_state, (end, "delivered".into()));
+        test_db.cleanup().await;
     }
 }

@@ -9,12 +9,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use sqlx::{PgPool, Row};
 use std::{
     ffi::OsStr,
+    io::{self, Read},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
     },
+    thread,
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
@@ -34,6 +37,10 @@ use crate::sub_agents::ensure_workspaces;
 pub(crate) const HEARTBEAT_SECS: u64 = 45;
 const COMMAND_POLL_MS: u64 = 250;
 const CANCEL_GRACE_SECS: u64 = 3;
+/// Per-stream capture ceiling. Backend output can include prompts and tool
+/// transcripts, so keep enough diagnostic context without allowing an
+/// unbounded child to exhaust the daemon.
+const COMMAND_OUTPUT_CAP_BYTES: usize = 8 * 1024 * 1024;
 // 18 min. codex reliably WRITES a complete diff in ~5-8 min but then often fails
 // to EXIT, running until the timeout (dogfooded 2026-06-30/07-01). Since the
 // dispatch now SALVAGES the worktree diff on timeout (worktree_has_diff →
@@ -6777,23 +6784,54 @@ where
     let program = command_display(&cmd);
     let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
     let child_pid = child.id();
+    // Take both handles immediately. Waiting for the leader before reading lets
+    // either pipe fill and blocks the entire process group in pipe_write.
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("missing stdout pipe for {program}"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("missing stderr pipe for {program}"))?;
+    let stdout_reader = spawn_output_reader(stdout);
+    let stderr_reader = spawn_output_reader(stderr);
     if let Err(error) = on_spawn(child_pid) {
         terminate_process_group(&mut child, Duration::ZERO);
+        let _ = stop_output_reader(stdout_reader, "stdout");
+        let _ = stop_output_reader(stderr_reader, "stderr");
         return Err(error);
     }
     if cancellation.is_cancelled() {
         terminate_process_group(&mut child, Duration::from_secs(CANCEL_GRACE_SECS));
+        let _ = stop_output_reader(stdout_reader, "stdout");
+        let _ = stop_output_reader(stderr_reader, "stderr");
         bail!("dispatch authority lost after command spawn: {program}");
     }
     let start = Instant::now();
+    let mut status = None;
     loop {
-        if child.try_wait()?.is_some() {
-            return child
-                .wait_with_output()
-                .with_context(|| format!("collect output for {program}"));
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        if status.is_some()
+            && stdout_reader.handle.is_finished()
+            && stderr_reader.handle.is_finished()
+        {
+            let stdout = finish_output_reader(stdout_reader, "stdout")
+                .with_context(|| format!("collect stdout for {program}"))?;
+            let stderr = finish_output_reader(stderr_reader, "stderr")
+                .with_context(|| format!("collect stderr for {program}"))?;
+            return Ok(Output {
+                status: status.expect("status checked above"),
+                stdout,
+                stderr,
+            });
         }
         if cancellation.is_cancelled() {
             terminate_process_group(&mut child, Duration::from_secs(CANCEL_GRACE_SECS));
+            let _ = stop_output_reader(stdout_reader, "stdout");
+            let _ = stop_output_reader(stderr_reader, "stderr");
             bail!("dispatch authority lost; command cancelled and reaped: {program}");
         }
         if start.elapsed() >= timeout {
@@ -6805,10 +6843,120 @@ where
             }
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stop_output_reader(stdout_reader, "stdout");
+            let _ = stop_output_reader(stderr_reader, "stderr");
             bail!("command timed out after {timeout:?}: {program}");
         }
         std::thread::sleep(Duration::from_millis(COMMAND_POLL_MS));
     }
+}
+
+struct OutputReader {
+    rx: mpsc::Receiver<io::Result<Vec<u8>>>,
+    handle: thread::JoinHandle<()>,
+    stop: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+fn spawn_output_reader<R>(reader: R) -> OutputReader
+where
+    R: Read + Send + std::os::fd::AsRawFd + 'static,
+{
+    let fd = reader.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    let (tx, rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_stop = Arc::clone(&stop);
+    let handle = thread::spawn(move || {
+        let _ = tx.send(read_output_bounded_cancellable(
+            reader,
+            COMMAND_OUTPUT_CAP_BYTES,
+            &reader_stop,
+        ));
+    });
+    OutputReader { rx, handle, stop }
+}
+
+#[cfg(not(unix))]
+fn spawn_output_reader<R>(reader: R) -> OutputReader
+where
+    R: Read + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = thread::spawn(move || {
+        let _ = tx.send(read_output_bounded(reader, COMMAND_OUTPUT_CAP_BYTES));
+    });
+    OutputReader { rx, handle, stop }
+}
+
+fn finish_output_reader(reader: OutputReader, stream: &str) -> Result<Vec<u8>> {
+    reader
+        .handle
+        .join()
+        .map_err(|_| anyhow!("{stream} reader thread panicked"))?;
+    reader
+        .rx
+        .recv()
+        .map_err(|_| anyhow!("{stream} reader thread exited without a result"))?
+        .with_context(|| format!("read command {stream}"))
+}
+
+fn stop_output_reader(reader: OutputReader, stream: &str) -> Result<Vec<u8>> {
+    reader.stop.store(true, Ordering::Release);
+    finish_output_reader(reader, stream)
+}
+
+fn read_output_bounded<R: Read>(mut reader: R, cap: usize) -> io::Result<Vec<u8>> {
+    read_output_bounded_cancellable(&mut reader, cap, &AtomicBool::new(false))
+}
+
+fn read_output_bounded_cancellable<R: Read>(
+    mut reader: R,
+    cap: usize,
+    stop: &AtomicBool,
+) -> io::Result<Vec<u8>> {
+    let mut captured = Vec::with_capacity(cap.min(64 * 1024));
+    let mut total = 0_u64;
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        let read = match reader.read(&mut chunk) {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if captured.len() < cap {
+            let keep = read.min(cap - captured.len());
+            captured.extend_from_slice(&chunk[..keep]);
+        }
+    }
+    if total > cap as u64 {
+        let marker = format!("\n[forgefleet output truncated: captured {cap} of {total} bytes]\n");
+        let marker = marker.as_bytes();
+        if marker.len() >= cap {
+            captured.clear();
+            captured.extend_from_slice(&marker[marker.len() - cap..]);
+        } else {
+            captured.truncate(cap - marker.len());
+            captured.extend_from_slice(marker);
+        }
+    }
+    Ok(captured)
 }
 
 fn terminate_process_group(child: &mut std::process::Child, grace: Duration) {
@@ -6822,13 +6970,15 @@ fn terminate_process_group(child: &mut std::process::Child, grace: Duration) {
     while Instant::now() < deadline {
         if !leader_reaped && child.try_wait().ok().flatten().is_some() {
             leader_reaped = true;
+            break;
         }
         std::thread::sleep(Duration::from_millis(COMMAND_POLL_MS));
     }
     // The direct `ff` group leader may exit on TERM while its vendor CLI
     // grandchild ignores or outlives TERM. Never treat leader exit as proof that
-    // the process group is empty: after the full grace period, kill the group
-    // unconditionally. This is the physical checkout-reuse fence.
+    // the process group is empty: kill the group immediately when the leader is
+    // reaped, avoiding a grace-period window in which its numeric PGID can be
+    // reused. This is the physical checkout-reuse fence.
     #[cfg(unix)]
     unsafe {
         libc::killpg(pid as libc::pid_t, libc::SIGKILL);
@@ -8447,9 +8597,12 @@ mod tests {
         }
     }
     use super::{
-        is_dispatch_authority_error, run_command_capture, run_command_capture_cancellable,
+        COMMAND_OUTPUT_CAP_BYTES, finish_output_reader, is_dispatch_authority_error,
+        read_output_bounded, run_command_capture, run_command_capture_cancellable,
+        spawn_output_reader,
     };
     use anyhow::anyhow;
+    use std::io::{self, Read};
     use std::os::unix::process::ExitStatusExt;
     use std::process::{Command, Output};
 
@@ -8474,6 +8627,75 @@ mod tests {
     }
 
     #[test]
+    fn run_command_capture_drains_large_simultaneous_streams_with_bounded_markers() {
+        let bytes = COMMAND_OUTPUT_CAP_BYTES + 256 * 1024;
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "(head -c {bytes} /dev/zero | tr '\\0' o) & \
+             (head -c {bytes} /dev/zero | tr '\\0' e >&2) & wait"
+        ));
+        let out = run_command_capture(cmd, std::time::Duration::from_secs(20))
+            .expect("large simultaneous streams must not deadlock");
+        assert!(out.status.success());
+        for (name, bytes) in [("stdout", out.stdout), ("stderr", out.stderr)] {
+            assert_eq!(bytes.len(), COMMAND_OUTPUT_CAP_BYTES, "{name} cap");
+            let tail = String::from_utf8_lossy(&bytes[bytes.len() - 128..]);
+            assert!(
+                tail.contains("[forgefleet output truncated: captured"),
+                "{name} missing deterministic truncation marker: {tail}"
+            );
+            assert!(tail.contains("bytes]"), "{name} marker missing total");
+        }
+    }
+
+    #[test]
+    fn run_command_capture_preserves_nonzero_status_and_both_streams() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("printf stdout-value; printf stderr-value >&2; exit 17");
+        let out =
+            run_command_capture(cmd, std::time::Duration::from_secs(10)).expect("nonzero output");
+        assert_eq!(out.status.code(), Some(17));
+        assert_eq!(out.stdout, b"stdout-value");
+        assert_eq!(out.stderr, b"stderr-value");
+    }
+
+    struct ErrorReader;
+
+    impl Read for ErrorReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("injected reader failure"))
+        }
+    }
+
+    struct PanicReader(std::fs::File);
+
+    impl Read for PanicReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            panic!("injected reader panic")
+        }
+    }
+
+    #[cfg(unix)]
+    impl std::os::fd::AsRawFd for PanicReader {
+        fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            std::os::fd::AsRawFd::as_raw_fd(&self.0)
+        }
+    }
+
+    #[test]
+    fn output_reader_reports_io_error_and_panic_without_hanging() {
+        let error = read_output_bounded(ErrorReader, 32).expect_err("reader error");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+
+        let reader = spawn_output_reader(PanicReader(
+            std::fs::File::open("/dev/null").expect("open /dev/null"),
+        ));
+        let error = finish_output_reader(reader, "stdout").expect_err("reader panic");
+        assert!(error.to_string().contains("reader thread panicked"));
+    }
+
+    #[test]
     fn cancelled_before_spawn_never_launches_or_records_a_process() {
         let token = tokio_util::sync::CancellationToken::new();
         token.cancel();
@@ -8492,6 +8714,77 @@ mod tests {
         .expect_err("pre-cancelled command must not launch");
         assert!(is_dispatch_authority_error(&error));
         assert!(!recorded.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timeout_kills_exact_process_group_and_writer_grandchild() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("grandchild.pid");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "sh -c 'trap \"\" TERM; echo $$ > {}; while :; do printf x; done' & exit 0",
+            pid_file.display()
+        ));
+        let error = run_command_capture_cancellable(
+            cmd,
+            std::time::Duration::from_millis(750),
+            &tokio_util::sync::CancellationToken::new(),
+            |pid| {
+                let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+                anyhow::ensure!(
+                    pgid == pid as libc::pid_t,
+                    "child was not exact PGID leader"
+                );
+                Ok(())
+            },
+        )
+        .expect_err("inherited writer must time out");
+        assert!(error.to_string().contains("timed out"));
+        let grandchild_pid: u32 = std::fs::read_to_string(pid_file)
+            .expect("grandchild pid")
+            .trim()
+            .parse()
+            .expect("numeric grandchild pid");
+        let state = Command::new("ps")
+            .args(["-o", "stat=", "-p", &grandchild_pid.to_string()])
+            .output()
+            .expect("poll grandchild");
+        assert!(
+            !state.status.success()
+                || String::from_utf8_lossy(&state.stdout)
+                    .trim_start()
+                    .starts_with('Z'),
+            "writer grandchild survived exact process-group cleanup"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timeout_reader_join_does_not_hang_on_escaped_pipe_holder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("escaped.pid");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "setsid sh -c 'echo $$ > {}; sleep 30' & exit 0",
+            pid_file.display()
+        ));
+        let started = std::time::Instant::now();
+        let error = run_command_capture(cmd, std::time::Duration::from_millis(500))
+            .expect_err("escaped inherited writer must leave capture pending until timeout");
+        assert!(error.to_string().contains("timed out"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "reader join remained blocked by escaped pipe holder"
+        );
+        let escaped_pid: i32 = std::fs::read_to_string(pid_file)
+            .expect("escaped pid")
+            .trim()
+            .parse()
+            .expect("numeric escaped pid");
+        unsafe {
+            libc::kill(escaped_pid, libc::SIGKILL);
+        }
     }
 
     #[cfg(unix)]
