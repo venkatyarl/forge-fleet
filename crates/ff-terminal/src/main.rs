@@ -1079,6 +1079,30 @@ enum FabricCommand {
         #[arg(long, default_value = "cx7-200g")]
         kind: String,
     },
+    /// Canonicalize and transactionally reconcile one interface-level link.
+    Reconcile {
+        #[command(flatten)]
+        link: FabricLinkArgs,
+        /// Persist the plan. Without this flag the transaction is rolled back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Remove one interface-level link in either endpoint orientation.
+    Remove {
+        #[command(flatten)]
+        link: FabricLinkArgs,
+        /// Persist the removal. Without this flag the transaction is rolled back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Prove both declared endpoints, carriers, and bidirectional IP path.
+    Probe {
+        #[command(flatten)]
+        link: FabricLinkArgs,
+        /// Persist verified=true only after every proof succeeds.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Run iperf3 across a fabric pair and record measured throughput.
     /// Stores into `fabric_measurements` table for trend tracking.
     /// Both directions tested by default; pass `--reverse` for B→A only.
@@ -1119,6 +1143,38 @@ enum FabricCommand {
         #[arg(long, default_value = "1")]
         streams: u32,
     },
+}
+
+#[derive(Debug, Clone, Args)]
+struct FabricLinkArgs {
+    #[arg(long)]
+    a: String,
+    #[arg(long)]
+    a_iface: String,
+    #[arg(long)]
+    a_ip: String,
+    #[arg(long)]
+    b: String,
+    #[arg(long)]
+    b_iface: String,
+    #[arg(long)]
+    b_ip: String,
+    #[arg(long, default_value = "cx7-200g")]
+    kind: String,
+}
+
+impl FabricLinkArgs {
+    fn into_spec(self) -> Result<fabric_cmd::FabricLinkSpec> {
+        fabric_cmd::FabricLinkSpec::new(
+            &self.a,
+            &self.a_iface,
+            &self.a_ip,
+            &self.b,
+            &self.b_iface,
+            &self.b_ip,
+            &self.kind,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -5028,6 +5084,15 @@ async fn main() -> Result<()> {
             match command {
                 FabricCommand::Pair { a, b, kind } => {
                     fabric_cmd::handle_fabric_pair(&pool, &a, &b, &kind).await
+                }
+                FabricCommand::Reconcile { link, apply } => {
+                    fabric_cmd::handle_fabric_reconcile(&pool, link.into_spec()?, apply).await
+                }
+                FabricCommand::Remove { link, apply } => {
+                    fabric_cmd::handle_fabric_remove(&pool, link.into_spec()?, apply).await
+                }
+                FabricCommand::Probe { link, apply } => {
+                    fabric_cmd::handle_fabric_probe(&pool, link.into_spec()?, apply).await
                 }
                 FabricCommand::Benchmark {
                     a,

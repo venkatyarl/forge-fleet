@@ -12581,6 +12581,12 @@ FOR EACH ROW EXECUTE FUNCTION guard_project_digest_cursor_regression();
 pub const SCHEMA_V284_MODEL_LOAD_RESERVATIONS: &str =
     include_str!("migrations/20260729160000_model_load_reservations.sql");
 
+/// v285: distinguish operator-reconciled fabric endpoints from pulse hints.
+pub const SCHEMA_V285_RING_SAFE_FABRIC: &str = r#"
+ALTER TABLE fabric_pairs
+    ADD COLUMN IF NOT EXISTS endpoints_explicit BOOLEAN NOT NULL DEFAULT FALSE;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
