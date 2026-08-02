@@ -4036,7 +4036,7 @@ pub async fn pg_purge_deferred(
             "SELECT COUNT(*) FROM fleet_tasks
               WHERE task_class = 'deferred'
                 AND status = $1
-                AND ($2 <= 0 OR created_at < NOW() - make_interval(hours => $2))",
+                AND ($2 <= 0 OR created_at < NOW() - make_interval(hours => $2::int))",
         )
         .bind(status)
         .bind(age_gate)
@@ -4048,7 +4048,7 @@ pub async fn pg_purge_deferred(
         "DELETE FROM fleet_tasks
           WHERE task_class = 'deferred'
             AND status = $1
-            AND ($2 <= 0 OR created_at < NOW() - make_interval(hours => $2))",
+            AND ($2 <= 0 OR created_at < NOW() - make_interval(hours => $2::int))",
     )
     .bind(status)
     .bind(age_gate)
