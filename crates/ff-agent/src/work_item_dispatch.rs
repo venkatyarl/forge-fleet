@@ -8,8 +8,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use sqlx::{PgPool, Row};
 use std::{
+    collections::HashSet,
     ffi::OsStr,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
         Arc,
@@ -6135,6 +6136,7 @@ fn commit_worktree_changes(
     if status_output_is_clean(&pre_fmt_status) {
         return Ok(false); // backend made no edits — nothing to commit
     }
+    let backend_touched_paths = worktree_changed_paths(worktree_path)?;
     // Auto-format BEFORE staging so a fleet-produced Rust PR passes CI
     // `cargo fmt --check` — LLM backends routinely emit un-formatted Rust, which
     // fails the fmt gate and blocks the PR (observed on PR #787). Best-effort +
@@ -6142,9 +6144,8 @@ fn commit_worktree_changes(
     // as non-fatal (commit as-is) so a missing toolchain / non-Rust repo never
     // breaks dispatch — it just falls back to the prior behavior.
     if worktree_path.join("Cargo.toml").exists() {
-        if let Err(e) = run_cargo_fmt(worktree_path) {
-            warn!(error = %e, "commit_worktree_changes: cargo fmt failed (best-effort) — committing as-is");
-        }
+        run_cargo_fmt_scoped(worktree_path, &backend_touched_paths)
+            .context("commit_worktree_changes: could not restore out-of-scope fmt changes")?;
     }
     run_git(worktree_path, ["add", "-A"], Duration::from_secs(60))?;
     let status = run_git(
@@ -6235,15 +6236,107 @@ fn status_output_is_clean(status: &Output) -> bool {
 /// Run `cargo fmt` over the worktree so committed Rust is CI-fmt-clean. Uses a
 /// login-ish shell that sources `~/.cargo/env` first (the daemon's own PATH may
 /// omit `~/.cargo/bin` — the same reason the deploy playbook sources it), tries
-/// the CI-pinned toolchain, then falls back to the default. The base tree is
-/// already fmt-clean (it's origin/main), so this only reformats the agent's own
-/// additions. Bounded; errors bubble up for the best-effort caller to log.
+/// the CI-pinned toolchain, then falls back to the default. The scoped wrapper
+/// below removes workspace-wide changes outside the backend-owned path set.
+/// Bounded; errors bubble up for the best-effort wrapper to log.
 fn run_cargo_fmt(worktree_path: &Path) -> Result<()> {
+    // Cargo sets this for test/build children. The concrete binary remains
+    // usable when another concurrent task temporarily redirects HOME.
+    if let Some(cargo) = std::env::var_os("CARGO") {
+        let mut cmd = Command::new(cargo);
+        cmd.arg("fmt").current_dir(worktree_path);
+        return run_command_timeout(cmd, Duration::from_secs(120)).map(|_| ());
+    }
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(". \"$HOME/.cargo/env\" 2>/dev/null || true; cargo +1.88.0 fmt 2>/dev/null || cargo fmt")
         .current_dir(worktree_path);
     run_command_timeout(cmd, Duration::from_secs(120))?;
+    Ok(())
+}
+
+/// Run workspace formatting without allowing pre-existing fmt drift on the base
+/// branch to leak into the work-item commit. `backend_touched_paths` is captured
+/// before fmt; any tracked path fmt newly dirties is restored individually.
+fn run_cargo_fmt_scoped(
+    worktree_path: &Path,
+    backend_touched_paths: &HashSet<PathBuf>,
+) -> Result<()> {
+    run_cargo_fmt_scoped_with(worktree_path, backend_touched_paths, || {
+        run_cargo_fmt(worktree_path)
+    })
+}
+
+fn run_cargo_fmt_scoped_with(
+    worktree_path: &Path,
+    backend_touched_paths: &HashSet<PathBuf>,
+    formatter: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let fmt_result = formatter();
+    let after_fmt = tracked_changed_paths(worktree_path)?;
+    for path in after_fmt.difference(backend_touched_paths) {
+        validate_worktree_relative_path(path)?;
+        run_git(
+            worktree_path,
+            [
+                OsStr::new("restore"),
+                OsStr::new("--source=HEAD"),
+                OsStr::new("--staged"),
+                OsStr::new("--worktree"),
+                OsStr::new("--"),
+                path.as_os_str(),
+            ],
+            Duration::from_secs(30),
+        )?;
+    }
+    if let Err(error) = fmt_result {
+        warn!(%error, "cargo fmt failed (best-effort) — committing as-is");
+    }
+    Ok(())
+}
+
+fn worktree_changed_paths(worktree_path: &Path) -> Result<HashSet<PathBuf>> {
+    let mut paths = tracked_changed_paths(worktree_path)?;
+    let untracked = run_git(
+        worktree_path,
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+        Duration::from_secs(30),
+    )?;
+    paths.extend(parse_nul_paths(&untracked.stdout)?);
+    Ok(paths)
+}
+
+fn tracked_changed_paths(worktree_path: &Path) -> Result<HashSet<PathBuf>> {
+    let changed = run_git(
+        worktree_path,
+        ["diff", "--name-only", "-z", "HEAD"],
+        Duration::from_secs(30),
+    )?;
+    parse_nul_paths(&changed.stdout)
+}
+
+fn parse_nul_paths(output: &[u8]) -> Result<HashSet<PathBuf>> {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            let path = std::str::from_utf8(path).context("git returned a non-UTF-8 path")?;
+            let path = PathBuf::from(path);
+            validate_worktree_relative_path(&path)?;
+            Ok(path)
+        })
+        .collect()
+}
+
+fn validate_worktree_relative_path(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("refusing unsafe worktree-relative path: {}", path.display());
+    }
     Ok(())
 }
 
@@ -6410,12 +6503,10 @@ fn squash_adopt_worktree_head_onto_branch(
     // Auto-format the agent's changes before recommitting, just like
     // commit_worktree_changes does for dirty trees. Best-effort + Rust-only.
     if worktree_path.join("Cargo.toml").exists() {
-        if let Err(e) = run_cargo_fmt(worktree_path) {
-            warn!(
-                error = %e,
-                "squash_adopt_worktree_head_onto_branch: cargo fmt failed (best-effort) — committing as-is"
-            );
-        }
+        let backend_touched_paths = worktree_changed_paths(worktree_path)?;
+        run_cargo_fmt_scoped(worktree_path, &backend_touched_paths).context(
+            "squash_adopt_worktree_head_onto_branch: could not restore out-of-scope fmt changes",
+        )?;
     }
     // Stage any untracked files the agent left behind so they are folded into the
     // single commit instead of remaining dirty (matches commit_worktree_changes).
@@ -6457,6 +6548,15 @@ async fn self_verify_worktree(
     worktree_path: &Path,
     base_branch: &str,
 ) -> std::result::Result<(), String> {
+    self_verify_worktree_with_database_url(worktree_path, base_branch, resolved_database_url())
+        .await
+}
+
+async fn self_verify_worktree_with_database_url(
+    worktree_path: &Path,
+    base_branch: &str,
+    database_url: Option<String>,
+) -> std::result::Result<(), String> {
     // 1) Reject empty / whitespace-only ADDED files (instant, catches the
     //    empty-stub failure mode directly).
     let range = format!("{base_branch}...HEAD");
@@ -6495,14 +6595,24 @@ async fn self_verify_worktree(
     )
     .await?;
 
-    // 3) Test directly affected workspace crates when that is cheap. Limit the
-    //    fan-out so a broad mechanical change does not monopolize a worker; CI
-    //    remains responsible for the full workspace test matrix.
-    for manifest in affected_crate_manifests(worktree_path, base_branch)?
-        .into_iter()
-        .take(3)
-    {
+    // 3) Every affected crate must compile all library tests and run its full
+    //    ordinary unit suite. PostgreSQL dependencies never exempt a crate.
+    for manifest in affected_crate_manifests(worktree_path, base_branch)? {
         let manifest_arg = manifest.to_string_lossy().into_owned();
+        run_verification_command(
+            worktree_path,
+            &[
+                "test",
+                "--manifest-path",
+                &manifest_arg,
+                "--lib",
+                "--quiet",
+                "--no-run",
+            ],
+            &format!("cargo test --manifest-path {manifest_arg} --lib --no-run"),
+            Duration::from_secs(300),
+        )
+        .await?;
         run_verification_command(
             worktree_path,
             &["test", "--manifest-path", &manifest_arg, "--lib", "--quiet"],
@@ -6510,8 +6620,85 @@ async fn self_verify_worktree(
             Duration::from_secs(300),
         )
         .await?;
+
+        // project_digests' nine PostgreSQL integration tests are ignored in the
+        // ordinary suite. With infrastructure available, run only that module's
+        // ignored tests and give sqlx::test its URL under the name it requires.
+        if is_ff_agent_manifest(&manifest) {
+            if let Some(url) = database_url.as_deref() {
+                run_project_digest_database_tests(
+                    worktree_path,
+                    &manifest_arg,
+                    url,
+                    Duration::from_secs(300),
+                )
+                .await?;
+            }
+        }
     }
     Ok(())
+}
+
+fn resolved_database_url() -> Option<String> {
+    [
+        "DATABASE_URL",
+        "FORGEFLEET_POSTGRES_URL",
+        "FORGEFLEET_DATABASE_URL",
+    ]
+    .into_iter()
+    .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+}
+
+fn is_ff_agent_manifest(manifest: &Path) -> bool {
+    manifest == Path::new("crates/ff-agent/Cargo.toml")
+}
+
+const PROJECT_DIGEST_DB_TEST_FILTER: &str = "project_digests::tests::";
+const PROJECT_DIGEST_DB_TEST_COUNT: usize = 9;
+
+async fn run_project_digest_database_tests(
+    worktree_path: &Path,
+    manifest: &str,
+    database_url: &str,
+    timeout: Duration,
+) -> std::result::Result<(), String> {
+    let args = [
+        "test",
+        "--manifest-path",
+        manifest,
+        "--lib",
+        PROJECT_DIGEST_DB_TEST_FILTER,
+        "--",
+        "--ignored",
+    ];
+    let label = format!(
+        "cargo test --manifest-path {manifest} --lib {PROJECT_DIGEST_DB_TEST_FILTER} -- --ignored"
+    );
+
+    // Fail closed if a future ignored test broadens this filter (or one of the
+    // nine loses #[ignore]). The list command uses the same Cargo selection.
+    let mut list_args = args.to_vec();
+    list_args.push("--list");
+    let listed = run_verification_command_output(
+        worktree_path,
+        &list_args,
+        &format!("{label} --list"),
+        timeout,
+        Some(database_url),
+    )
+    .await?;
+    let selected = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter(|line| line.trim_end().ends_with(": test"))
+        .count();
+    if selected != PROJECT_DIGEST_DB_TEST_COUNT {
+        return Err(format!(
+            "{label} selected {selected} tests; expected exactly {PROJECT_DIGEST_DB_TEST_COUNT}"
+        ));
+    }
+    run_verification_command_output(worktree_path, &args, &label, timeout, Some(database_url))
+        .await
+        .map(|_| ())
 }
 
 async fn run_verification_command(
@@ -6520,29 +6707,79 @@ async fn run_verification_command(
     label: &str,
     timeout: Duration,
 ) -> std::result::Result<(), String> {
-    let output = tokio::time::timeout(
-        timeout,
-        tokio::process::Command::new("cargo")
-            .args(args)
-            .current_dir(worktree_path)
-            .output(),
-    )
-    .await
-    .map_err(|_| format!("{label} timed out after {}s", timeout.as_secs()))?
-    .map_err(|e| format!("could not run {label}: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail: String = stderr
-            .chars()
-            .rev()
-            .take(1200)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        return Err(format!("{label} failed: {}", tail.trim()));
+    run_verification_command_output(worktree_path, args, label, timeout, None)
+        .await
+        .map(|_| ())
+}
+
+async fn run_verification_command_output(
+    worktree_path: &Path,
+    args: &[&str],
+    label: &str,
+    timeout: Duration,
+    database_url: Option<&str>,
+) -> std::result::Result<Output, String> {
+    let mut command = tokio::process::Command::new("cargo");
+    command
+        .args(args)
+        .current_dir(worktree_path)
+        // Dropping a timed-out wait must terminate cargo itself. On Unix cargo
+        // also owns a fresh process group so the timeout path below can kill
+        // rustc/build-script descendants before this worktree is reused.
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Fleet workers may share an outer target directory. Verification must
+        // compile the checked worktree's sources, never a same-named fixture or
+        // crate artifact produced concurrently by another worktree.
+        .env_remove("CARGO_TARGET_DIR");
+    if let Some(url) = database_url {
+        command.env("DATABASE_URL", url);
     }
-    Ok(())
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+    let child = command
+        .spawn()
+        .map_err(|e| format!("could not run {label}: {e}"))?;
+    let child_pid = child.id();
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(result) => result.map_err(|e| format!("could not run {label}: {e}"))?,
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = child_pid {
+                // SAFETY: `pid` is the group leader created immediately above.
+                // ESRCH is harmless when the process exited at the deadline.
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            return Err(format!(
+                "{label} timed out after {}s; process group terminated",
+                timeout.as_secs()
+            ));
+        }
+    };
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail = |text: &str| {
+            text.chars()
+                .rev()
+                .take(1200)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        };
+        return Err(format!(
+            "{label} failed\nstdout:\n{}\nstderr:\n{}",
+            tail(&stdout).trim(),
+            tail(&stderr).trim()
+        ));
+    }
+    Ok(output)
 }
 
 fn affected_crate_manifests(
@@ -7118,7 +7355,7 @@ mod tests {
         try_acquire_lane15_480b_permit, use_local_lane, validate_manifest_fields,
     };
     use sqlx::Row;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -7830,6 +8067,150 @@ mod tests {
 
         assert!(status_output_is_clean(&output("\n")));
         assert!(!status_output_is_clean(&output(" M generated.rs\n")));
+    }
+
+    fn init_fmt_repo(repo: &Path) {
+        super::run_git(repo, ["init"], Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.name", "Test"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.email", "test@example.com"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname='fmt-scope-test'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "mod owned;\npub fn baseline( )->i32 { 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("src/owned.rs"), "pub fn owned( )->i32 { 1 }\n").unwrap();
+        super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["commit", "-m", "base"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["branch", "-M", "main"], Duration::from_secs(10)).unwrap();
+    }
+
+    #[test]
+    fn commit_formats_only_backend_touched_rust_paths_over_dirty_fmt_baseline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_fmt_repo(repo);
+        let baseline = std::fs::read_to_string(repo.join("src/lib.rs")).unwrap();
+        std::fs::write(repo.join("src/owned.rs"), "pub fn owned( )->i32 { 2 }\n").unwrap();
+
+        assert!(
+            super::commit_worktree_changes(repo, "Scoped fmt", "Test", "test@example.com").unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+            baseline,
+            "pre-existing fmt drift outside the backend diff must be restored"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("src/owned.rs")).unwrap(),
+            "pub fn owned() -> i32 {\n    2\n}\n"
+        );
+    }
+
+    #[test]
+    fn commit_preserves_formatted_untracked_rust_file_without_fmt_contamination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_fmt_repo(repo);
+        let baseline = std::fs::read_to_string(repo.join("src/owned.rs")).unwrap();
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "mod owned;\nmod new;\npub fn baseline( )->i32 { 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("src/new.rs"), "pub fn new( )->i32 { 3 }\n").unwrap();
+
+        assert!(
+            super::commit_worktree_changes(repo, "New Rust", "Test", "test@example.com").unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("src/owned.rs")).unwrap(),
+            baseline
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("src/new.rs")).unwrap(),
+            "pub fn new() -> i32 {\n    3\n}\n"
+        );
+    }
+
+    #[test]
+    fn changed_paths_cover_backend_rename_and_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_fmt_repo(repo);
+        std::fs::rename(repo.join("src/owned.rs"), repo.join("src/renamed.rs")).unwrap();
+        std::fs::remove_file(repo.join("src/lib.rs")).unwrap();
+
+        let paths = super::worktree_changed_paths(repo).unwrap();
+        assert!(paths.contains(Path::new("src/renamed.rs")));
+        assert!(paths.contains(Path::new("src/lib.rs")));
+    }
+
+    #[test]
+    fn scoped_fmt_rejects_unsafe_paths_before_git_restore() {
+        for unsafe_path in [b"../escape.rs\0".as_slice(), b"/tmp/escape.rs\0".as_slice()] {
+            let error = super::parse_nul_paths(unsafe_path).unwrap_err();
+            assert!(error.to_string().contains("unsafe worktree-relative path"));
+        }
+    }
+
+    #[test]
+    fn scoped_fmt_fails_closed_when_out_of_scope_restore_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_fmt_repo(repo);
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "mod owned;\npub fn baseline( )->i32 { 2 }\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join(".git/index.lock"), "force restore failure").unwrap();
+
+        let error = super::run_cargo_fmt_scoped(repo, &std::collections::HashSet::new())
+            .expect_err("a failed exact-path restoration must block the commit");
+        assert!(error.to_string().contains("git") || error.to_string().contains("exit"));
+    }
+
+    #[test]
+    fn scoped_fmt_restores_unrelated_changes_when_formatter_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_fmt_repo(repo);
+        let unrelated_baseline = std::fs::read_to_string(repo.join("src/lib.rs")).unwrap();
+        std::fs::write(repo.join("src/owned.rs"), "pub fn owned() -> i32 { 2 }\n").unwrap();
+        let backend_touched_paths = super::worktree_changed_paths(repo).unwrap();
+
+        let result = super::run_cargo_fmt_scoped_with(repo, &backend_touched_paths, || {
+            std::fs::write(repo.join("src/lib.rs"), "pub fn leaked() -> i32 { 99 }\n")?;
+            Err(anyhow::anyhow!("formatter failed"))
+        });
+
+        result.expect("formatter failure remains best-effort after scoped restoration");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+            unrelated_baseline,
+            "the formatter's unrelated partial edit must be restored"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("src/owned.rs")).unwrap(),
+            "pub fn owned() -> i32 { 2 }\n",
+            "the backend-owned change must remain"
+        );
     }
 
     #[test]
@@ -8937,6 +9318,92 @@ mod tests {
         assert!(error.contains("empty.txt"));
     }
 
+    fn init_self_verify_cargo_repo(repo: &Path, manifest_extra: &str, test_body: &str) {
+        super::run_git(repo, ["init"], Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.name", "Test"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.email", "test@example.com"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.join("crates/demo/src")).unwrap();
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[workspace]\nmembers=['crates/demo']\nexclude=['crates/sqlx']\nresolver='2'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("crates/demo/Cargo.toml"),
+            format!("[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n{manifest_extra}"),
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("crates/demo/src/lib.rs"),
+            "pub fn value() -> i32 { 1 }\n",
+        )
+        .unwrap();
+        super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["commit", "-m", "base"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["branch", "-M", "main"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["checkout", "-b", "task"], Duration::from_secs(10)).unwrap();
+        std::fs::write(repo.join("crates/demo/src/lib.rs"), test_body).unwrap();
+        super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["commit", "-m", "change"], Duration::from_secs(10)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn self_verify_runs_ordinary_sqlx_crate_tests_without_database_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_self_verify_cargo_repo(
+            repo,
+            "\n[dependencies]\nsqlx = { path = '../sqlx' }\n",
+            "#[test]\nfn ordinary_unit() { assert_eq!(1, 1); }\n\
+             #[test]\n#[ignore = \"requires PostgreSQL\"]\nfn needs_database() { panic!(\"DATABASE_URL is required\"); }\n",
+        );
+        std::fs::create_dir_all(repo.join("crates/sqlx/src")).unwrap();
+        std::fs::write(
+            repo.join("crates/sqlx/Cargo.toml"),
+            "[package]\nname='sqlx'\nversion='0.0.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("crates/sqlx/src/lib.rs"), "").unwrap();
+
+        super::self_verify_worktree_with_database_url(repo, "main", None)
+            .await
+            .expect("ordinary tests in a SQLx crate must execute without DB credentials");
+    }
+
+    #[tokio::test]
+    async fn self_verify_still_rejects_a_genuinely_failing_unit_test() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_self_verify_cargo_repo(
+            repo,
+            "\n[dependencies]\nsqlx = { path = '../sqlx' }\n",
+            "#[test]\nfn genuine_failure() { assert_eq!(1, 2); }\n",
+        );
+        std::fs::create_dir_all(repo.join("crates/sqlx/src")).unwrap();
+        std::fs::write(
+            repo.join("crates/sqlx/Cargo.toml"),
+            "[package]\nname='sqlx'\nversion='0.0.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("crates/sqlx/src/lib.rs"), "").unwrap();
+
+        let error = super::self_verify_worktree_with_database_url(repo, "main", None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("cargo test") && error.contains("genuine_failure"));
+        assert!(error.contains("stdout:") && error.contains("stderr:"));
+    }
+
     #[test]
     fn affected_tests_select_unique_changed_crate_manifests() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8993,6 +9460,18 @@ mod tests {
         )
         .unwrap();
         std::fs::write(repo.join("base.txt"), "base").unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname='salvage-fmt-test'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "mod owned;\npub fn baseline( )->i32 { 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("src/owned.rs"), "pub fn owned( )->i32 { 1 }\n").unwrap();
         super::run_git(repo, ["add", "-A"], std::time::Duration::from_secs(10)).unwrap();
         super::run_git(
             repo,
@@ -9021,7 +9500,9 @@ mod tests {
             std::time::Duration::from_secs(10),
         )
         .unwrap();
+        let fmt_baseline = std::fs::read_to_string(repo.join("src/lib.rs")).unwrap();
         std::fs::write(repo.join("a.txt"), "a").unwrap();
+        std::fs::write(repo.join("src/owned.rs"), "pub fn owned( )->i32 { 2 }\n").unwrap();
         super::run_git(repo, ["add", "-A"], std::time::Duration::from_secs(10)).unwrap();
         super::run_git(
             repo,
@@ -9071,6 +9552,14 @@ mod tests {
         // Changes from both agent commits are preserved.
         assert!(repo.join("a.txt").exists());
         assert!(repo.join("b.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+            fmt_baseline
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("src/owned.rs")).unwrap(),
+            "pub fn owned() -> i32 {\n    2\n}\n"
+        );
     }
 
     #[test]
