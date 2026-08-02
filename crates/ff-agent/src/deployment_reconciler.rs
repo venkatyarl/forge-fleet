@@ -228,20 +228,50 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
             // persisted OS start marker, and library/model identity must all
             // match; neither health nor a recognizable command line grants
             // adoption authority.
-            let matched_library = proc_info
-                .model_path
+            // Path-consistency, not strict library-id equality: a model can
+            // legitimately have BOTH a directory library row and a file row
+            // inside it (scanner artifacts), and `match_library_to_path`
+            // prefers the exact-file row while the deployment references the
+            // directory row — id equality then rejects our own process
+            // forever. Compare the deployment's library path against the live
+            // process's model path the same way `unload_model` does.
+            let existing_lib_path = existing
+                .library_id
                 .as_deref()
-                .and_then(|path| match_library_to_path(&libs, path).0);
-            let authenticated = existing.pid == Some(proc_info.pid as i32)
+                .and_then(|library_id| libs.iter().find(|lib| lib.id == library_id))
+                .map(|lib| lib.file_path.clone());
+            let model_matches_row = match (existing_lib_path.as_deref(), proc_info.model_path.as_deref()) {
+                (Some(expected), Some(actual)) => {
+                    crate::model_runtime::model_paths_match(expected, actual)
+                }
+                _ => false,
+            };
+            let live_marker = crate::model_runtime::process_start_marker(proc_info.pid);
+            let recorded_identity_matches = existing.pid == Some(proc_info.pid as i32)
                 && existing
                     .process_start_marker
                     .as_deref()
-                    .is_some_and(|expected| {
-                        crate::model_runtime::process_start_marker(proc_info.pid).as_deref()
-                            == Some(expected)
-                    })
-                && matched_library.as_deref() == existing.library_id.as_deref();
-            if !authenticated {
+                    .is_some_and(|expected| live_marker.as_deref() == Some(expected))
+                && model_matches_row;
+            // A ForgeFleet-written systemd unit respawns its server with a new
+            // PID on reboot/crash. That incarnation is still ours: the unit's
+            // MainPID and configured model path are the authority (same
+            // authentication `unload_model` grants). Without this, every host
+            // reboot stranded its rows in health_status='stale' forever —
+            // observed live 2026-08-02 (14 rows fleet-wide).
+            let supervised_restart_matches = model_matches_row
+                && existing
+                    .library_id
+                    .as_deref()
+                    .and_then(|library_id| libs.iter().find(|lib| lib.id == library_id))
+                    .is_some_and(|lib| {
+                        crate::model_runtime::systemd_unit_owns_process(
+                            port,
+                            proc_info.pid,
+                            &lib.file_path,
+                        )
+                    });
+            if !recorded_identity_matches && !supervised_restart_matches {
                 tracing::warn!(
                     deployment = %existing.id,
                     pid = proc_info.pid,
@@ -249,6 +279,15 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
                     "live listener does not match persisted PID/start/model identity; refusing refresh or adoption"
                 );
                 continue;
+            }
+            if !recorded_identity_matches {
+                tracing::info!(
+                    deployment = %existing.id,
+                    old_pid = ?existing.pid,
+                    new_pid = proc_info.pid,
+                    port,
+                    "re-adopting systemd-supervised restart (unit MainPID + model path verified)"
+                );
             }
 
             // Refresh agent-capacity evidence from the authenticated live
@@ -268,10 +307,15 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
                 }
             }
 
+            // Guard on the identity we authenticated against (the previously
+            // recorded pid/marker), and persist the live incarnation — for a
+            // re-adopted supervised restart that rewrites pid + start marker.
             if let Err(e) = sqlx::query(
                 "UPDATE fleet_model_deployments
                     SET health_status = $1,
                         last_health_at = NOW(),
+                        pid = $2,
+                        process_start_marker = $3,
                         context_window = COALESCE($4::int, context_window),
                         parallel_slots = COALESCE($5::int, parallel_slots),
                         usable_agent_ctx = COALESCE($6::int, usable_agent_ctx),
@@ -279,16 +323,18 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
                             CASE WHEN $1 = 'healthy' AND $6::int IS NOT NULL
                                  THEN NOW() ELSE NULL END
                   WHERE id = $7::uuid
-                    AND pid = $2
-                    AND process_start_marker = $3",
+                    AND pid IS NOT DISTINCT FROM $8
+                    AND process_start_marker IS NOT DISTINCT FROM $9",
             )
             .bind(status)
             .bind(proc_info.pid as i32)
-            .bind(existing.process_start_marker.as_deref())
+            .bind(live_marker.as_deref())
             .bind(ctx_total)
             .bind(slots)
             .bind(usable)
             .bind(&existing.id)
+            .bind(existing.pid)
+            .bind(existing.process_start_marker.as_deref())
             .execute(pool)
             .await
             {

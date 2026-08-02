@@ -1844,7 +1844,7 @@ pub(crate) fn process_start_marker(pid: u32) -> Option<String> {
     }
 }
 
-fn model_paths_match(expected: &str, actual: &str) -> bool {
+pub(crate) fn model_paths_match(expected: &str, actual: &str) -> bool {
     let expected = std::path::Path::new(expected);
     let actual = std::path::Path::new(actual);
     actual == expected || actual.starts_with(expected) || expected.starts_with(actual)
@@ -2164,7 +2164,7 @@ pub(crate) async fn stop_systemd_unit(_port: u16) {}
 /// and the unit's configured model path must still match the deployment's
 /// library identity. This grants an explicit operator unload authority to stop
 /// the current incarnation without making arbitrary listeners adoptable.
-fn systemd_unit_owns_process(port: u16, pid: u32, expected_model: &str) -> bool {
+pub(crate) fn systemd_unit_owns_process(port: u16, pid: u32, expected_model: &str) -> bool {
     if !cfg!(target_os = "linux") {
         return false;
     }
