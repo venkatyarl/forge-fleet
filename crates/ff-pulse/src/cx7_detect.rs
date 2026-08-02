@@ -1,6 +1,6 @@
 //! V43: detect CX-7 / IB / RoCE fabric NICs + populate paired_with from
-//! the fleet's known pair map. Called by heartbeat_v2 to annotate beats
-//! with `Ip { kind: "cx7-fabric", paired_with: Some("adele"), link_speed_gbps: Some(200), ... }`.
+//! link metadata. Peer orientation is operator-owned in `fabric_pairs`; a
+//! heartbeat must not guess it because one host can have multiple ring links.
 
 use std::process::Command;
 
@@ -47,49 +47,20 @@ pub fn parse_ethtool_speed_gbps(ethtool_output: &str) -> Option<u32> {
     None
 }
 
-/// Look up the paired-peer name for a fabric IP. Uses static maps for
-/// known pairs; eventually should consult the `fabric_pairs` table for
-/// operator-configured pairings.
-///
-/// Pairs (subnet → endpoints):
-///   10.42.0.0/24  CX-7      sia ↔ adele
-///   10.43.0.0/24  CX-7      rihanna ↔ beyonce
-///   10.44.0.0/24  TB-3      vinny ↔ james
-pub fn paired_peer_for(my_name: &str) -> Option<String> {
-    let map: &[(&str, &str)] = &[
-        ("sia", "adele"),
-        ("adele", "sia"),
-        ("rihanna", "beyonce"),
-        ("beyonce", "rihanna"),
-        ("vinny", "james"),
-        ("james", "vinny"),
-    ];
-    for (a, b) in map {
-        if my_name.eq_ignore_ascii_case(a) {
-            return Some(b.to_string());
-        }
-    }
-    None
-}
-
 /// Enrich an Ip entry with fabric metadata. Handles two fabric types:
 /// - CX-7 (mlx5_core driver) → `cx7-fabric` kind, ethtool speed
 /// - Thunderbolt (10.44.x or `medium=thunderbolt`) → `tb-fabric` kind,
 ///   already classified upstream by classify_iface; this just fills
 ///   paired_with based on the computer's name.
-pub fn enrich_ip(ip: &mut Ip, my_computer_name: &str) {
+pub fn enrich_ip(ip: &mut Ip, _my_computer_name: &str) {
     // CX-7: detected by driver. Overrides kind to cx7-fabric.
     if let Some(kind) = detect_fabric_kind(&ip.iface) {
         ip.kind = kind;
-        ip.paired_with = paired_peer_for(my_computer_name);
+        ip.paired_with = None;
         ip.link_speed_gbps = link_speed_gbps(&ip.iface);
         return;
     }
-    // Thunderbolt: kind=tb-fabric was set upstream by classify_iface for
-    // 10.44.x IPs. Fill paired_with from the static map.
-    if ip.kind == "tb-fabric" {
-        ip.paired_with = paired_peer_for(my_computer_name);
-    }
+    // Thunderbolt classification is retained, but peer identity is not guessed.
 }
 
 #[cfg(test)]
@@ -113,13 +84,5 @@ mod tests {
         assert_eq!(parse_ethtool_speed_gbps("Speed: Unknown!"), None);
         assert_eq!(parse_ethtool_speed_gbps("Duplex: Full"), None);
         assert_eq!(parse_ethtool_speed_gbps("Speed: 400000Mb/s"), Some(400));
-    }
-
-    #[test]
-    fn paired_peer_for_pairs() {
-        assert_eq!(paired_peer_for("sia").as_deref(), Some("adele"));
-        assert_eq!(paired_peer_for("ADELE").as_deref(), Some("sia"));
-        assert_eq!(paired_peer_for("vinny").as_deref(), Some("james"));
-        assert_eq!(paired_peer_for("nobody").as_deref(), None);
     }
 }
