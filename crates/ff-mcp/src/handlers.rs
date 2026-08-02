@@ -39,7 +39,7 @@ use ff_pipeline::step::{Step, StepId, StepKind, StepStatus};
 use ff_runtime::engine::EngineConfig;
 use ff_runtime::model_manager::ModelManager;
 use ff_runtime::process_manager::ProcessManager;
-use ff_ssh::{RemoteExecutor, SshNodeConfig};
+use ff_ssh::{RemoteExecError, RemoteExecutor, SshConnectionError, SshNodeConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tracing::{info, warn};
@@ -530,7 +530,15 @@ pub async fn fleet_ssh(params: Option<Value>) -> HandlerResult {
     let result = executor
         .run_on_node(ssh_node.clone(), command.to_string(), use_sudo)
         .await
-        .map_err(|e| format!("SSH execution failed: {e}"))?;
+        .map_err(|error| match error {
+            RemoteExecError::Ssh(SshConnectionError::TimedOut { timeout_secs }) => format!(
+                "SSH command timed out after {timeout_secs}s; MCP transport remains available for subsequent calls"
+            ),
+            RemoteExecError::Ssh(SshConnectionError::Transport { message }) => {
+                format!("SSH transport failed (MCP transport unaffected): {message}")
+            }
+            other => format!("SSH execution failed (MCP transport unaffected): {other}"),
+        })?;
 
     Ok(json!({
         "node": result.node,

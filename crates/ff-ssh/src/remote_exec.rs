@@ -40,9 +40,6 @@ impl FanoutCommandResult {
 pub enum RemoteExecError {
     #[error("ssh transport error: {0}")]
     Ssh(#[from] SshConnectionError),
-
-    #[error("task join error: {0}")]
-    Join(#[from] tokio::task::JoinError),
 }
 
 /// High-level remote command execution helper.
@@ -76,11 +73,7 @@ impl RemoteExecutor {
         command: impl Into<String>,
         use_sudo: bool,
     ) -> Result<NodeCommandResult, RemoteExecError> {
-        let command = command.into();
-        let exec = self.clone();
-
-        tokio::task::spawn_blocking(move || exec.run_on_node_blocking(node, command, use_sudo))
-            .await?
+        self.run_on_node_async(node, command.into(), use_sudo).await
     }
 
     /// Run a command on all nodes in parallel and collect per-node output.
@@ -133,7 +126,7 @@ impl RemoteExecutor {
         }
     }
 
-    fn run_on_node_blocking(
+    async fn run_on_node_async(
         &self,
         node: SshNodeConfig,
         command: String,
@@ -150,7 +143,7 @@ impl RemoteExecutor {
         };
 
         let connection = SshConnection::new(options);
-        let output = connection.execute(&final_command)?;
+        let output = connection.execute_async(&final_command).await?;
 
         Ok(NodeCommandResult {
             node: node.name,
