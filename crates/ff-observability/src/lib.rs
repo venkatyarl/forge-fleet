@@ -17,6 +17,7 @@ pub mod error_classifier;
 pub mod events;
 pub mod file_logger;
 pub mod log_ingest;
+pub mod log_tailer;
 pub mod metric_writer;
 pub mod metrics;
 pub mod mlx_adapter;
@@ -35,6 +36,9 @@ pub use error_classifier::{
 pub use events::{EventRecord, EventSink, FleetEvent, InMemoryEventSink};
 pub use file_logger::FileLogConfig;
 pub use log_ingest::{LogBuffer, LogEntry, LogIngestor, LogLevel};
+// `log_tailer::LogEntry` intentionally NOT re-exported at crate root to avoid a
+// name collision with `log_ingest::LogEntry`; reach it via `log_tailer::LogEntry`.
+pub use log_tailer::{LogRingBuffer, LogTailer};
 pub use metric_writer::{NormalizedMetricRow, write_metrics};
 pub use metrics::{
     // Prometheus exports
