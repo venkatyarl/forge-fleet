@@ -1098,6 +1098,7 @@ mod tests {
     }
 
     #[sqlx::test]
+    #[ignore = "requires DATABASE_URL for an isolated PostgreSQL test database"]
     async fn event_windows_fallback_status_fences_and_durations(pool: PgPool) {
         sqlx::raw_sql(
             "CREATE TABLE project_digest_configs (id text PRIMARY KEY, project_id text NOT NULL, last_sent_at timestamptz);\
@@ -1292,6 +1293,7 @@ mod tests {
     }
 
     #[sqlx::test]
+    #[ignore = "requires DATABASE_URL for an isolated PostgreSQL test database"]
     async fn run_once_success_atomically_records_ack_and_cursor(pool: PgPool) {
         let old_cursor = run_once_fixture(&pool).await;
         let sender = MockSender::new(vec![acknowledged(42)]);
@@ -1329,6 +1331,7 @@ mod tests {
     }
 
     #[sqlx::test]
+    #[ignore = "requires DATABASE_URL for an isolated PostgreSQL test database"]
     async fn run_once_definite_failure_retries_same_frozen_payload(pool: PgPool) {
         let old_cursor = run_once_fixture(&pool).await;
         let sender = MockSender::new(vec![
@@ -1365,6 +1368,7 @@ mod tests {
     }
 
     #[sqlx::test]
+    #[ignore = "requires DATABASE_URL for an isolated PostgreSQL test database"]
     async fn run_once_ambiguous_and_stranded_sending_never_resend(pool: PgPool) {
         let old_cursor = run_once_fixture(&pool).await;
         let sender = MockSender::new(vec![crate::telegram::TelegramDigestOutcome::Ambiguous {
@@ -1401,6 +1405,7 @@ mod tests {
     }
 
     #[sqlx::test]
+    #[ignore = "requires DATABASE_URL for an isolated PostgreSQL test database"]
     async fn run_once_success_without_message_identity_fails_closed(pool: PgPool) {
         let old_cursor = run_once_fixture(&pool).await;
         let sender = MockSender::new(vec![crate::telegram::TelegramDigestOutcome::Acknowledged {
@@ -1425,6 +1430,7 @@ mod tests {
     }
 
     #[sqlx::test]
+    #[ignore = "requires DATABASE_URL for an isolated PostgreSQL test database"]
     async fn run_once_concurrent_claim_sends_once(pool: PgPool) {
         run_once_fixture(&pool).await;
         let mut sender = MockSender::new(vec![acknowledged(44)]);
@@ -1446,6 +1452,7 @@ mod tests {
     }
 
     #[sqlx::test]
+    #[ignore = "requires DATABASE_URL for an isolated PostgreSQL test database"]
     async fn run_once_stale_fence_cannot_commit_ack_or_cursor(pool: PgPool) {
         let old_cursor = run_once_fixture(&pool).await;
         let mut sender = MockSender::new(vec![acknowledged(45)]);
@@ -1466,6 +1473,7 @@ mod tests {
     }
 
     #[sqlx::test]
+    #[ignore = "requires DATABASE_URL for an isolated PostgreSQL test database"]
     async fn run_once_ack_finishes_attempt_without_regressing_later_cursor(pool: PgPool) {
         run_once_fixture(&pool).await;
         let mut sender = MockSender::new(vec![acknowledged(46)]);
@@ -1484,6 +1492,7 @@ mod tests {
     }
 
     #[sqlx::test]
+    #[ignore = "requires DATABASE_URL for an isolated PostgreSQL test database"]
     async fn attempt_payload_reuse_ambiguous_dedup_and_atomic_cursor(pool: PgPool) {
         sqlx::query("CREATE TABLE project_digest_configs (id text PRIMARY KEY, last_sent_at timestamptz, updated_at timestamptz DEFAULT now())").execute(&pool).await.unwrap();
         sqlx::raw_sql(ff_db::schema::SCHEMA_V283_PROJECT_DIGEST_ATTEMPTS)
