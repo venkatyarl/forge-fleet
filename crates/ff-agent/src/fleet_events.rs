@@ -13,7 +13,7 @@
 //! - `fleet:task_dispatched`  — payload = JSON `{task_id, target_node}`
 //!
 //! The Redis URL is resolved from `~/.forgefleet/fleet.toml` `[redis] url`,
-//! falling back to `redis://192.168.5.100:56379` if unreadable.
+//! falling back to the loopback host-port default if unreadable.
 
 use futures::Stream;
 use redis::AsyncCommands;
@@ -30,9 +30,14 @@ pub const CHANNEL_TASK_DISPATCHED: &str = "fleet:task_dispatched";
 pub const CHANNEL_ROUTING_INVALIDATE: &str = "routing:invalidate";
 
 /// Resolve the Redis URL, reading `~/.forgefleet/fleet.toml` `[redis] url`.
-/// Falls back to `redis://192.168.5.100:56379` on any error.
+/// Environment is authoritative, then fleet.toml, then the safe local default.
 fn resolve_redis_url() -> String {
-    const FALLBACK: &str = "redis://192.168.5.100:56379";
+    const FALLBACK: &str = "redis://127.0.0.1:56379";
+    if let Ok(url) = std::env::var("FORGEFLEET_REDIS_URL")
+        && !url.trim().is_empty()
+    {
+        return url;
+    }
     let Some(home) = dirs::home_dir() else {
         return FALLBACK.to_string();
     };

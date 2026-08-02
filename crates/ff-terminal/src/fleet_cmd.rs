@@ -2132,11 +2132,10 @@ pub async fn handle_fleet_disband(
     )
     .fetch_all(pool)
     .await?;
-    let computer_names: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM computers WHERE LOWER(name) <> 'vinny' ORDER BY name",
-    )
-    .fetch_all(pool)
-    .await?;
+    let computer_names: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM computers WHERE LOWER(name) <> 'vinny' ORDER BY name")
+            .fetch_all(pool)
+            .await?;
 
     let mut targets: Vec<String> = fleet_names.clone();
     for n in &computer_names {
@@ -3094,6 +3093,26 @@ fn pick_version_target(
         .map(|m| (m.to_string(), false))
 }
 
+/// A cached desired SHA is not allowed to make a newer deployed descendant
+/// look drifted. Equality remains the fast path; ancestry is proved against
+/// the configured local ForgeFleet object database and otherwise fails closed.
+fn deployed_satisfies_target(checkout: Option<&Path>, deployed: &str, desired: &str) -> bool {
+    if ff_core::build_version::same_commit(deployed, desired) {
+        return true;
+    }
+    if deployed.is_empty() || desired.is_empty() {
+        return false;
+    }
+    checkout.is_some_and(|checkout| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(checkout)
+            .args(["merge-base", "--is-ancestor", desired, deployed])
+            .status()
+            .is_ok_and(|status| status.success())
+    })
+}
+
 pub async fn handle_fleet_versions(
     pool: &sqlx::PgPool,
     verbose: bool,
@@ -3169,15 +3188,21 @@ pub async fn handle_fleet_versions(
     // first non-empty one. Compare on the normalized short code identity (what
     // the table prints), so a 40-char installed SHA and an 8-char LATEST that
     // are the same commit compare equal.
-    let latest_short: Option<String> = hosts
+    let latest_raw = hosts
         .iter()
         .map(|(_, _, latest)| latest)
-        .find(|l| !l.is_empty())
-        .map(|l| short(l));
+        .find(|l| !l.is_empty());
+    let latest_short: Option<String> = latest_raw.map(|l| short(l));
     let mode_short: Option<String> = mode_sha.as_deref().map(short);
     let target = pick_version_target(latest_short.as_deref(), mode_short.as_deref());
     let target_short: Option<String> = target.as_ref().map(|(t, _)| t.clone());
     let using_latest = target.as_ref().map(|(_, l)| *l).unwrap_or(false);
+    let target_raw = if using_latest {
+        latest_raw
+    } else {
+        mode_sha.as_ref()
+    };
+    let checkout = configured_forgefleet_checkout().ok().map(|(path, _)| path);
 
     if verbose {
         println!(
@@ -3195,7 +3220,14 @@ pub async fn handle_fleet_versions(
         let inst_short = short(installed);
         let lat_short = short(latest);
         let state = match target_short.as_deref() {
-            Some(t) if !inst_short.is_empty() && inst_short != "-" && inst_short == t => {
+            Some(t)
+                if !inst_short.is_empty()
+                    && inst_short != "-"
+                    && (inst_short == t
+                        || target_raw.is_some_and(|desired| {
+                            deployed_satisfies_target(checkout.as_deref(), installed, desired)
+                        })) =>
+            {
                 converged += 1;
                 "✓"
             }
@@ -5113,6 +5145,8 @@ fn deploy_install_restart_playbook(os_family: &str) -> String {
              if command -v systemctl >/dev/null 2>&1 && [ -f deploy/systemd/forgefleetd.service ]; then \
                mkdir -p \"$HOME/.config/systemd/user\"; \
                sed \"s|__COMPUTER_NAME__|$(hostname -s)|g\" deploy/systemd/forgefleetd.service > \"$HOME/.config/systemd/user/forgefleetd.service\"; \
+               mkdir -p \"$HOME/.config/systemd/user/forgefleetd.service.d\"; \
+               [ -f deploy/systemd/forgefleetd.service.d/20-trusted-lan.conf ] && cp deploy/systemd/forgefleetd.service.d/20-trusted-lan.conf \"$HOME/.config/systemd/user/forgefleetd.service.d/20-trusted-lan.conf\"; \
                cp deploy/systemd/forgefleet-mcp.service \"$HOME/.config/systemd/user/forgefleet-mcp.service\"; \
                systemctl --user daemon-reload 2>/dev/null; systemctl --user enable forgefleetd.service forgefleet-mcp.service 2>/dev/null; \
                systemctl --user restart forgefleet-mcp.service 2>/dev/null; \
@@ -5255,6 +5289,8 @@ fn leader_refresh_playbook(os_family: &str, source_tree_path: &str, target_sha: 
              if command -v systemctl >/dev/null 2>&1 && [ -f deploy/systemd/forgefleetd.service ]; then \
                mkdir -p \"$HOME/.config/systemd/user\"; \
                sed \"s|__COMPUTER_NAME__|$(hostname -s)|g\" deploy/systemd/forgefleetd.service > \"$HOME/.config/systemd/user/forgefleetd.service\"; \
+               mkdir -p \"$HOME/.config/systemd/user/forgefleetd.service.d\"; \
+               [ -f deploy/systemd/forgefleetd.service.d/20-trusted-lan.conf ] && cp deploy/systemd/forgefleetd.service.d/20-trusted-lan.conf \"$HOME/.config/systemd/user/forgefleetd.service.d/20-trusted-lan.conf\"; \
                systemctl --user daemon-reload 2>/dev/null; systemctl --user enable forgefleetd.service 2>/dev/null; \
              fi; \
              ( systemctl --user restart --no-block forgefleetd.service 2>/dev/null ) \
@@ -6764,6 +6800,54 @@ mod live_remote_sha_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("missing or malformed"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod deployed_target_ancestry_tests {
+    use std::process::Command;
+
+    use super::deployed_satisfies_target;
+
+    fn git(repo: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn newer_descendant_satisfies_cached_desired_sha_but_older_does_not() {
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init"]);
+        git(temp.path(), &["config", "user.email", "test@example.com"]);
+        git(temp.path(), &["config", "user.name", "ForgeFleet Test"]);
+        std::fs::write(temp.path().join("version"), "one").unwrap();
+        git(temp.path(), &["add", "version"]);
+        git(temp.path(), &["commit", "-m", "desired"]);
+        let desired = git(temp.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(temp.path().join("version"), "two").unwrap();
+        git(temp.path(), &["commit", "-am", "deployed"]);
+        let deployed = git(temp.path(), &["rev-parse", "HEAD"]);
+
+        assert!(deployed_satisfies_target(
+            Some(temp.path()),
+            &deployed,
+            &desired
+        ));
+        assert!(!deployed_satisfies_target(
+            Some(temp.path()),
+            &desired,
+            &deployed
+        ));
+        assert!(!deployed_satisfies_target(None, &deployed, &desired));
     }
 }
 

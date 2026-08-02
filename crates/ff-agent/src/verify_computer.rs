@@ -41,17 +41,15 @@ pub async fn verify_computer(pool: &PgPool, worker_name: &str) -> Result<VerifyR
     };
     details.push(check_ssh_cmd(&ssh_dest, "db_reachable_from_node", db_cmd).await);
     // 3. redis_reachable_from_node
-    // Canonical fleet Redis is host-port 56379 (5-digit convention; container
-    // 6379 → host 56379). The old 6380 was remapped 2026-05-18 — probing it
-    // here made every node fail this check forever (surfaced by the
-    // fleet-integrity sweep, #388). Keep in sync with
-    // `ff_core::config::default_redis_url`.
+    let (redis_host, redis_port) = redis_probe_endpoint()?;
     let redis_cmd = if is_windows {
-        r#"powershell -NoProfile -Command "Test-NetConnection -ComputerName 192.168.5.100 -Port 56379 -InformationLevel Quiet | Out-String | Select-String True | ForEach-Object { exit 0 }; exit 1""#
+        format!(
+            r#"powershell -NoProfile -Command "Test-NetConnection -ComputerName '{redis_host}' -Port {redis_port} -InformationLevel Quiet | Out-String | Select-String True | ForEach-Object {{ exit 0 }}; exit 1""#
+        )
     } else {
-        "nc -z -w 3 192.168.5.100 56379"
+        format!("nc -z -w 3 -- '{}' {}", redis_host, redis_port)
     };
-    details.push(check_ssh_cmd(&ssh_dest, "redis_reachable_from_node", redis_cmd).await);
+    details.push(check_ssh_cmd(&ssh_dest, "redis_reachable_from_node", &redis_cmd).await);
     // 4. sub_agent_dirs_exist
     let want = node.sub_agent_count;
     let subcmd = if is_windows {
@@ -283,6 +281,33 @@ pub async fn verify_computer(pool: &PgPool, worker_name: &str) -> Result<VerifyR
     })
 }
 
+fn redis_probe_endpoint() -> Result<(String, u16), String> {
+    let configured = std::env::var("FORGEFLEET_REDIS_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+        .or_else(|| {
+            ff_core::config::load_config_auto()
+                .ok()
+                .map(|(config, _)| config.redis.url)
+        });
+    redis_endpoint(configured.as_deref().unwrap_or("redis://127.0.0.1:56379"))
+}
+
+fn redis_endpoint(value: &str) -> Result<(String, u16), String> {
+    let url = reqwest::Url::parse(value).map_err(|e| format!("invalid Redis URL: {e}"))?;
+    if !matches!(url.scheme(), "redis" | "rediss") {
+        return Err(format!(
+            "unsupported Redis URL scheme '{}'; expected redis or rediss",
+            url.scheme()
+        ));
+    }
+    let host = url
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| "Redis URL has no host".to_string())?;
+    Ok((host.to_string(), url.port().unwrap_or(6379)))
+}
+
 async fn check_daemon_healthy(node: &ff_db::FleetNodeRow) -> CheckResult {
     if node.status == "offline" {
         return CheckResult {
@@ -361,4 +386,27 @@ async fn ssh_capture(dest: &str, cmd: &str) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redis_endpoint;
+
+    #[test]
+    fn redis_endpoint_uses_configured_authority() {
+        assert_eq!(
+            redis_endpoint("redis://192.168.5.104:56379/0").unwrap(),
+            ("192.168.5.104".to_string(), 56379)
+        );
+        assert_eq!(
+            redis_endpoint("rediss://redis.internal").unwrap(),
+            ("redis.internal".to_string(), 6379)
+        );
+    }
+
+    #[test]
+    fn redis_endpoint_rejects_unsafe_or_malformed_values() {
+        assert!(redis_endpoint("http://192.168.5.104:56379").is_err());
+        assert!(redis_endpoint("not a url").is_err());
+    }
 }
