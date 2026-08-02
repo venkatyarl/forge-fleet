@@ -6723,6 +6723,12 @@ async fn run_verification_command_output(
     command
         .args(args)
         .current_dir(worktree_path)
+        // Dropping a timed-out wait must terminate cargo itself. On Unix cargo
+        // also owns a fresh process group so the timeout path below can kill
+        // rustc/build-script descendants before this worktree is reused.
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         // Fleet workers may share an outer target directory. Verification must
         // compile the checked worktree's sources, never a same-named fixture or
         // crate artifact produced concurrently by another worktree.
@@ -6730,10 +6736,31 @@ async fn run_verification_command_output(
     if let Some(url) = database_url {
         command.env("DATABASE_URL", url);
     }
-    let output = tokio::time::timeout(timeout, command.output())
-        .await
-        .map_err(|_| format!("{label} timed out after {}s", timeout.as_secs()))?
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+    let child = command
+        .spawn()
         .map_err(|e| format!("could not run {label}: {e}"))?;
+    let child_pid = child.id();
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(result) => result.map_err(|e| format!("could not run {label}: {e}"))?,
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = child_pid {
+                // SAFETY: `pid` is the group leader created immediately above.
+                // ESRCH is harmless when the process exited at the deadline.
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            return Err(format!(
+                "{label} timed out after {}s; process group terminated",
+                timeout.as_secs()
+            ));
+        }
+    };
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
