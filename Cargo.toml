@@ -35,6 +35,7 @@ members = [
     "crates/ff-brain",
     "crates/ff-capacity",
     "crates/ff-routing-policy",
+    "crates/ff-github-helperd",
     "crates/ra2a",
     "tui",
 ]
