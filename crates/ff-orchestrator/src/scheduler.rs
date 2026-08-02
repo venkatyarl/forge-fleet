@@ -165,6 +165,7 @@ pub struct NodeCapacity {
     pub online: bool,
     /// Last time the node's work-item dispatch loop ticked, as reported by Pulse.
     /// Hosts whose tick is stale are not safe assignment targets.
+    #[serde(default)]
     pub dispatch_tick_at: Option<DateTime<Utc>>,
     /// IDs of tasks currently running on this node.
     pub running_tasks: Vec<RunningTask>,
