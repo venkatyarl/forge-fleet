@@ -645,6 +645,13 @@ impl BackupOrchestrator {
                 String::from_utf8_lossy(&bgsave.stderr).trim()
             )));
         }
+        let bgsave_reply = String::from_utf8_lossy(&bgsave.stdout);
+        if !bgsave_reply.contains("Background saving started") {
+            return Err(BackupError::Cmd(format!(
+                "falkordb BGSAVE was not accepted: {}",
+                bgsave_reply.trim()
+            )));
+        }
 
         // 2) Wait for LASTSAVE to advance (short poll — 60s max).
         let before_ts = container_lastsave("forgefleet-redis").await.unwrap_or(0);
@@ -744,7 +751,16 @@ impl BackupOrchestrator {
 
         let recipients = self.encryption_recipients(cfg).await?;
 
-        // 1) Ask FalkorDB to write an RDB snapshot.
+        // Discover persistence paths from the running server. These values are
+        // validated before they are ever used as command arguments; images do
+        // not consistently persist under /data (the production image uses
+        // /var/lib/falkordb/data behind a /data symlink).
+        let persistence = falkordb_persistence_config().await?;
+        let before_ts = container_lastsave(FALKORDB_CONTAINER)
+            .await
+            .ok_or_else(|| BackupError::Cmd("falkordb LASTSAVE failed before BGSAVE".into()))?;
+
+        // Ask FalkorDB to write an RDB snapshot.
         let bgsave = Command::new("docker")
             .args(["exec", FALKORDB_CONTAINER, "redis-cli", "BGSAVE"])
             .output()
@@ -757,28 +773,24 @@ impl BackupOrchestrator {
             )));
         }
 
-        // 2) Wait for LASTSAVE to advance (short poll — 60s max).
-        let before_ts = container_lastsave(FALKORDB_CONTAINER).await.unwrap_or(0);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if container_lastsave(FALKORDB_CONTAINER).await.unwrap_or(0) > before_ts {
-                break;
-            }
-        }
+        wait_for_falkordb_bgsave(before_ts).await?;
 
         let ts = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
         let file_name = format!("falkordb-{ts}.tar.zst{}", age_ext(cfg.encrypt));
         let path = out_dir.join(&file_name);
 
-        // 3) tar dump.rdb + AOF dir out of the container, compress, encrypt.
-        let shell_cmd = falkordb_dump_cmd(&recipients, &path.to_string_lossy());
+        // Tar the configured RDB and, when enabled, the Redis 7 multipart AOF
+        // directory (manifest, base and incremental files).
+        let shell_cmd = falkordb_dump_cmd(&persistence, &recipients, &path.to_string_lossy());
         info!(path = %path.display(), "running falkordb tar | zstd | age");
         let status = run_pipeline(&shell_cmd).await?;
         if !status.success() {
             return Err(BackupError::Cmd(format!(
-                "falkordb dump export failed: {status}; \
-                 are the `zstd` and `age` CLIs installed on this host?"
+                "falkordb dump export failed: {status}; source dir={} rdb={} aof={:?}; \
+                 tar reports missing/configured paths explicitly above",
+                persistence.dir,
+                persistence.dbfilename,
+                persistence.aof_dir()
             )));
         }
 
@@ -1677,6 +1689,175 @@ async fn container_lastsave(container: &str) -> Option<u64> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FalkorPersistence {
+    dir: String,
+    dbfilename: String,
+    appendonly: bool,
+    appenddirname: String,
+}
+
+impl FalkorPersistence {
+    fn aof_dir(&self) -> Option<&str> {
+        self.appendonly.then_some(self.appenddirname.as_str())
+    }
+}
+
+fn validate_falkordb_config(
+    dir: String,
+    dbfilename: String,
+    appendonly: String,
+    appenddirname: String,
+) -> Result<FalkorPersistence, BackupError> {
+    if !Path::new(&dir).is_absolute() || dir.contains('\n') || dir.contains('\r') {
+        return Err(BackupError::Cmd(format!(
+            "unsafe FalkorDB CONFIG dir value {dir:?}: expected an absolute path"
+        )));
+    }
+    for (key, value) in [
+        ("dbfilename", dbfilename.as_str()),
+        ("appenddirname", appenddirname.as_str()),
+    ] {
+        if value.is_empty()
+            || Path::new(value).components().count() != 1
+            || value == "."
+            || value == ".."
+            || value.contains(['\n', '\r'])
+        {
+            return Err(BackupError::Cmd(format!(
+                "unsafe FalkorDB CONFIG {key} value {value:?}: expected one filename component"
+            )));
+        }
+    }
+    let appendonly = match appendonly.as_str() {
+        "yes" => true,
+        "no" => false,
+        other => {
+            return Err(BackupError::Cmd(format!(
+                "unexpected FalkorDB CONFIG appendonly value {other:?}"
+            )));
+        }
+    };
+    Ok(FalkorPersistence {
+        dir,
+        dbfilename,
+        appendonly,
+        appenddirname,
+    })
+}
+
+async fn falkordb_config_get(key: &str) -> Result<String, BackupError> {
+    let out = Command::new("docker")
+        .args([
+            "exec",
+            FALKORDB_CONTAINER,
+            "redis-cli",
+            "--raw",
+            "CONFIG",
+            "GET",
+            key,
+        ])
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(BackupError::Cmd(format!(
+            "falkordb CONFIG GET {key} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let text = String::from_utf8(out.stdout)
+        .map_err(|e| BackupError::Cmd(format!("falkordb CONFIG GET {key} was not UTF-8: {e}")))?;
+    let mut lines = text.lines();
+    let returned_key = lines.next().unwrap_or_default();
+    let value = lines.next().unwrap_or_default();
+    if returned_key != key || lines.next().is_some() {
+        return Err(BackupError::Cmd(format!(
+            "malformed falkordb CONFIG GET {key} response: {text:?}"
+        )));
+    }
+    Ok(value.to_string())
+}
+
+async fn falkordb_persistence_config() -> Result<FalkorPersistence, BackupError> {
+    let (dir, dbfilename, appendonly, appenddirname) = tokio::try_join!(
+        falkordb_config_get("dir"),
+        falkordb_config_get("dbfilename"),
+        falkordb_config_get("appendonly"),
+        falkordb_config_get("appenddirname"),
+    )?;
+    validate_falkordb_config(dir, dbfilename, appendonly, appenddirname)
+}
+
+fn parse_persistence_info(text: &str) -> Result<(bool, bool), BackupError> {
+    let mut in_progress = None;
+    let mut ok = None;
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(value) = line.strip_prefix("rdb_bgsave_in_progress:") {
+            in_progress = Some(match value {
+                "0" => false,
+                "1" => true,
+                _ => {
+                    return Err(BackupError::Cmd(format!(
+                        "invalid rdb_bgsave_in_progress: {value}"
+                    )));
+                }
+            });
+        } else if let Some(value) = line.strip_prefix("rdb_last_bgsave_status:") {
+            ok = Some(value == "ok");
+        }
+    }
+    match (in_progress, ok) {
+        (Some(progress), Some(status)) => Ok((progress, status)),
+        _ => Err(BackupError::Cmd(
+            "falkordb INFO persistence omitted BGSAVE status fields".into(),
+        )),
+    }
+}
+
+async fn wait_for_falkordb_bgsave(before_ts: u64) -> Result<(), BackupError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let out = Command::new("docker")
+            .args([
+                "exec",
+                FALKORDB_CONTAINER,
+                "redis-cli",
+                "--raw",
+                "INFO",
+                "persistence",
+            ])
+            .output()
+            .await?;
+        if !out.status.success() {
+            return Err(BackupError::Cmd(format!(
+                "falkordb INFO persistence failed while waiting for BGSAVE: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let (in_progress, ok) = parse_persistence_info(&String::from_utf8_lossy(&out.stdout))?;
+        let lastsave = container_lastsave(FALKORDB_CONTAINER)
+            .await
+            .ok_or_else(|| {
+                BackupError::Cmd("falkordb LASTSAVE failed while waiting for BGSAVE".into())
+            })?;
+        if !in_progress && !ok {
+            return Err(BackupError::Cmd(
+                "falkordb BGSAVE completed with rdb_last_bgsave_status=err".into(),
+            ));
+        }
+        if !in_progress && ok && lastsave > before_ts {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(BackupError::Cmd(format!(
+                "timed out waiting 120s for falkordb BGSAVE (LASTSAVE {lastsave}, baseline {before_ts}, in_progress={in_progress}, status_ok={ok})"
+            )));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 /// Filename prefix the backup writer uses for a kind's artifacts
 /// (`pg-<ts>.tar.gz.age`, `redis-<ts>.rdb.zst.age`,
 /// `falkordb-<ts>.tar.zst.age`). Empty for an unknown kind so the prune
@@ -1970,14 +2151,27 @@ async fn verify_backup_decryptable(pool: &PgPool, path: &Path) -> Result<(), Bac
 
 /// Shell pipeline that streams `dump.rdb` plus the multi-part AOF dir (when
 /// present) out of the FalkorDB container as a tar, compresses with zstd, and
-/// optionally encrypts. The inner `sh -c` runs INSIDE the container; tar'ing
-/// only the two known paths means a stray file in /data is never captured.
+/// optionally encrypts. Redis-provided values are accepted only after
+/// [`validate_falkordb_config`] restricts them to an absolute directory and
+/// single-component filenames; each is then shell-quoted. Tar receives only
+/// those explicit paths, so a stray persistence-directory file is excluded.
 /// Pure — no IO — so the command shape is unit-testable.
-fn falkordb_dump_cmd(recipients: &[String], out_path: &str) -> String {
+fn falkordb_dump_cmd(
+    persistence: &FalkorPersistence,
+    recipients: &[String],
+    out_path: &str,
+) -> String {
+    let aof = persistence
+        .aof_dir()
+        .map(|name| format!(" {}", shell_quote(name)))
+        .unwrap_or_default();
     format!(
-        "docker exec {FALKORDB_CONTAINER} sh -c \
-           'cd /data && tar cf - dump.rdb $(test -d appendonlydir && echo appendonlydir)' \
+        "docker exec {FALKORDB_CONTAINER} tar --sort=name --mtime=@0 \
+           --owner=0 --group=0 --numeric-owner --format=posix \
+           -C {dir} -cf - -- {rdb}{aof} \
          | zstd -q{age} > {out}",
+        dir = shell_quote(&persistence.dir),
+        rdb = shell_quote(&persistence.dbfilename),
         age = age_stage(recipients),
         out = shell_quote(out_path),
     )
@@ -2607,7 +2801,17 @@ mod tests {
 
     #[test]
     fn falkordb_dump_cmd_captures_rdb_and_aof() {
-        let cmd = falkordb_dump_cmd(&["age1abc".to_string()], "/tmp/falkordb-x.tar.zst.age");
+        let persistence = FalkorPersistence {
+            dir: "/var/lib/falkordb/data".into(),
+            dbfilename: "dump.rdb".into(),
+            appendonly: true,
+            appenddirname: "appendonlydir".into(),
+        };
+        let cmd = falkordb_dump_cmd(
+            &persistence,
+            &["age1abc".to_string()],
+            "/tmp/falkordb-x.tar.zst.age",
+        );
         assert!(
             cmd.contains("docker exec forgefleet-falkordb"),
             "cmd: {cmd}"
@@ -2615,6 +2819,8 @@ mod tests {
         // Both the RDB snapshot and the multi-part AOF dir must be in the tar.
         assert!(cmd.contains("dump.rdb"), "cmd: {cmd}");
         assert!(cmd.contains("appendonlydir"), "cmd: {cmd}");
+        assert!(cmd.contains("-C '/var/lib/falkordb/data'"), "cmd: {cmd}");
+        assert!(cmd.contains("--sort=name --mtime=@0"), "cmd: {cmd}");
         assert!(cmd.contains("| zstd -q"), "cmd: {cmd}");
         assert!(cmd.contains("| age -r 'age1abc'"), "cmd: {cmd}");
         assert!(
@@ -2623,9 +2829,48 @@ mod tests {
         );
 
         // encrypt=false policy → no age stage at all.
-        let plain = falkordb_dump_cmd(&[], "/tmp/falkordb-x.tar.zst");
+        let plain = falkordb_dump_cmd(&persistence, &[], "/tmp/falkordb-x.tar.zst");
         assert!(!plain.contains("age -r"), "cmd: {plain}");
         assert!(plain.contains("| zstd -q > "), "cmd: {plain}");
+    }
+
+    #[test]
+    fn falkordb_config_and_persistence_status_are_fail_closed() {
+        let cfg = validate_falkordb_config(
+            "/var/lib/falkordb/data".into(),
+            "dump.rdb".into(),
+            "yes".into(),
+            "appendonlydir".into(),
+        )
+        .unwrap();
+        assert_eq!(cfg.aof_dir(), Some("appendonlydir"));
+        assert!(
+            validate_falkordb_config(
+                "/data".into(),
+                "../dump.rdb".into(),
+                "yes".into(),
+                "appendonlydir".into(),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_falkordb_config(
+                "relative".into(),
+                "dump.rdb".into(),
+                "no".into(),
+                "appendonlydir".into(),
+            )
+            .is_err()
+        );
+
+        assert_eq!(
+            parse_persistence_info(
+                "# Persistence\r\nrdb_bgsave_in_progress:0\r\nrdb_last_bgsave_status:ok\r\n"
+            )
+            .unwrap(),
+            (false, true)
+        );
+        assert!(parse_persistence_info("rdb_bgsave_in_progress:0\n").is_err());
     }
 
     #[test]
