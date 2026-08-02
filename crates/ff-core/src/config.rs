@@ -1543,6 +1543,7 @@ fn default_ctx_size() -> u32 {
 /// - `FORGEFLEET_DATABASE_MODE` → database.mode (`postgres_runtime` | `postgres_full`)
 /// - `FORGEFLEET_DATABASE_URL` → database.url
 /// - `FORGEFLEET_DATABASE_MAX_CONNECTIONS` → database.max_connections
+/// - `FORGEFLEET_REDIS_URL` → redis.url
 /// - `FORGEFLEET_DATABASE_CUTOVER_EVIDENCE` → database.cutover_evidence
 /// - `FORGEFLEET_PREFERRED_LEADER` → leader.preferred
 /// - `FORGEFLEET_AGENT_AUTONOMOUS_MODE` → agent.autonomous_mode
@@ -1562,6 +1563,11 @@ pub fn apply_env_overrides(config: &mut FleetConfig) {
     if let Ok(v) = std::env::var("FORGEFLEET_FLEET_NAME") {
         info!(name = %v, "env override: fleet name");
         config.fleet.name = v;
+    }
+    if let Ok(v) = std::env::var("FORGEFLEET_REDIS_URL")
+        && !v.trim().is_empty()
+    {
+        config.redis.url = v;
     }
     if let Ok(v) = std::env::var("FORGEFLEET_API_PORT")
         && let Ok(port) = v.parse::<u16>()
@@ -2224,10 +2230,7 @@ notes = "Setup started."
         assert_eq!(config.ports.forgefleet, Some(50001));
 
         // Check scheduling.
-        assert_eq!(
-            config.scheduling.canonical_writer.as_deref(),
-            Some("vinny")
-        );
+        assert_eq!(config.scheduling.canonical_writer.as_deref(), Some("vinny"));
         assert_eq!(config.scheduling.project_weights.default_weight, 1.0);
         assert_eq!(
             config.scheduling.project_weights.weight_for("forge-fleet"),

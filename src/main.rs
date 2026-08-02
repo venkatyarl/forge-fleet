@@ -2580,16 +2580,14 @@ fn start_gateway_subsystem(
     operational_store: OperationalStore,
     runtime_registry: RuntimeRegistryStore,
 ) -> JoinHandle<()> {
-    let gateway_host = if std::env::var("FF_GATEWAY_TRUSTED_LAN").is_ok_and(|value| {
+    let trusted_lan = std::env::var("FF_GATEWAY_TRUSTED_LAN").is_ok_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes"
         )
-    }) {
-        "0.0.0.0"
-    } else {
-        "127.0.0.1"
-    };
+    });
+    let authenticated = std::env::var("FF_JWT_SECRET").is_ok_and(|v| !v.trim().is_empty());
+    let gateway_host = gateway_bind_host(trusted_lan, authenticated);
     let gateway_config = GatewayConfig {
         bind_addr: format!("{gateway_host}:{}", config.fleet.api_port.saturating_add(2)), // Web UI on api_port + 2 (51002)
         fleet_config: Some(config.clone()),
@@ -2613,6 +2611,14 @@ fn start_gateway_subsystem(
             error!(error = %err, "gateway subsystem exited with error");
         }
     })
+}
+
+fn gateway_bind_host(trusted_lan: bool, authenticated: bool) -> &'static str {
+    if trusted_lan && authenticated {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    }
 }
 
 fn start_tool_prune_subsystem(
@@ -4054,6 +4060,14 @@ async fn wait_for_shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trusted_lan_binding_requires_authentication() {
+        assert_eq!(gateway_bind_host(false, false), "127.0.0.1");
+        assert_eq!(gateway_bind_host(true, false), "127.0.0.1");
+        assert_eq!(gateway_bind_host(false, true), "127.0.0.1");
+        assert_eq!(gateway_bind_host(true, true), "0.0.0.0");
+    }
 
     #[test]
     fn embedded_agent_config_defaults_to_heartbeat_mode() {

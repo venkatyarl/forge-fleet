@@ -319,11 +319,17 @@ launchctl unload ~/Library/LaunchAgents/com.forgefleet.forgefleetd.plist
 launchctl load ~/Library/LaunchAgents/com.forgefleet.forgefleetd.plist
 ```
 
-For a network-isolated, trusted LAN only, setting
-`FF_GATEWAY_TRUSTED_LAN=1` opts into a wildcard listener and permits anonymous
-reads and LLM dispatch when `FF_JWT_SECRET` is unset. Do not enable this mode on
-an untrusted network or an Internet-reachable host; JWT remains recommended on
-trusted LANs as well.
+For a network-isolated, trusted LAN only, set both `FF_GATEWAY_TRUSTED_LAN=1`
+and a strong `FF_JWT_SECRET`. The daemon binds the gateway to the wildcard
+address only when both are present; without authentication it remains on
+loopback. Put these values in `~/.config/forgefleet/trusted-lan.env`. The
+packaged systemd drop-in reads that file when present, so the same profile is
+installed consistently without embedding credentials in the repository.
+
+Redis and Postgres health probes derive their authority from fleet configuration
+(`FORGEFLEET_REDIS_URL` / `[redis].url` and the configured database URL). Do not
+encode a leader node's address in service units or verification scripts: control-
+plane services may move independently of fleet leadership.
 
 ### Deploy a new model
 
