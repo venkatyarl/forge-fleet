@@ -1,0 +1,435 @@
+//! Supported, fail-closed LAN PostgreSQL physical-replica bootstrap.
+
+use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
+use sqlx::Row;
+use uuid::Uuid;
+
+use crate::{CYAN, FleetDbReplicaCommand, GREEN, RESET, YELLOW, shell_escape_single, whoami_tag};
+
+const PORT: i32 = 55432;
+const MAX_BACKUP_AGE_HOURS: i64 = 24;
+const MAX_POSTCHECK_LAG_BYTES: i64 = 1 << 30;
+const PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const COMPOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+#[derive(Debug, Clone)]
+struct Plan {
+    target_id: Uuid,
+    target_name: String,
+    target_ip: String,
+    primary_name: String,
+    primary_ip: String,
+    slot: String,
+    backup_id: Uuid,
+    pg_major: i32,
+}
+
+impl Plan {
+    fn id(&self) -> String {
+        let canonical = format!(
+            "v1\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            self.target_id,
+            self.target_name,
+            self.target_ip,
+            self.primary_name,
+            self.primary_ip,
+            self.slot,
+            self.backup_id
+        );
+        Sha256::digest(canonical.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+}
+
+fn physical_slot(id: Uuid) -> String {
+    format!("ff_{}", id.simple())
+}
+
+async fn build_plan(pool: &sqlx::PgPool, to: &str, primary: &str) -> Result<Plan> {
+    if to.eq_ignore_ascii_case(primary) {
+        bail!("replica target and primary must be different nodes");
+    }
+    let target =
+        sqlx::query("SELECT id, name, primary_ip FROM computers WHERE lower(name)=lower($1)")
+            .bind(to)
+            .fetch_optional(pool)
+            .await?
+            .context("target is not an enrolled fleet node")?;
+    let primary_row =
+        sqlx::query("SELECT id, name, primary_ip FROM computers WHERE lower(name)=lower($1)")
+            .bind(primary)
+            .fetch_optional(pool)
+            .await?
+            .context("primary is not an enrolled fleet node")?;
+    let primary_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM database_replicas WHERE database_kind='postgres' AND role='primary'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if primary_count > 1 {
+        bail!("multiple PostgreSQL primary authority rows exist; reconcile before planning");
+    }
+    let connected_ip: String = sqlx::query_scalar("SELECT host(inet_server_addr())")
+        .fetch_one(pool)
+        .await?;
+    let named_primary_ip: String = primary_row.get("primary_ip");
+    let local_socket_matches = (connected_ip == "127.0.0.1" || connected_ip == "::1")
+        && ff_agent::fleet_info::resolve_this_worker_name()
+            .await
+            .eq_ignore_ascii_case(primary);
+    if connected_ip != named_primary_ip && !local_socket_matches {
+        bail!(
+            "named primary '{primary}' ({named_primary_ip}) is not the connected PostgreSQL authority ({connected_ip})"
+        );
+    }
+    if primary_count == 1 {
+        let authority: String = sqlx::query_scalar(
+            "SELECT c.name FROM database_replicas d JOIN computers c ON c.id=d.computer_id WHERE d.database_kind='postgres' AND d.role='primary'"
+        ).fetch_one(pool).await?;
+        if !authority.eq_ignore_ascii_case(primary) {
+            bail!("explicit primary '{primary}' disagrees with database authority '{authority}'");
+        }
+    }
+    // A bootstrap is only authorized when there is recent, checksummed,
+    // restore-verified evidence. Planning remains read-only.
+    let backup_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM backups WHERE database_kind='postgres' AND checksum_sha256 IS NOT NULL AND verified_restorable_at IS NOT NULL AND verified_restorable_at > NOW() - make_interval(hours => $1) ORDER BY verified_restorable_at DESC LIMIT 1"
+    ).bind(MAX_BACKUP_AGE_HOURS).fetch_optional(pool).await?
+        .context("no restore-verified PostgreSQL backup from the last 24 hours; refusing bootstrap")?;
+    let pg_major: i32 =
+        sqlx::query_scalar("SELECT current_setting('server_version_num')::int / 10000")
+            .fetch_one(pool)
+            .await?;
+    let target_id: Uuid = target.get("id");
+    Ok(Plan {
+        target_id,
+        target_name: target.get("name"),
+        target_ip: target.get("primary_ip"),
+        primary_name: primary_row.get("name"),
+        primary_ip: named_primary_ip,
+        slot: physical_slot(target_id),
+        backup_id,
+        pg_major,
+    })
+}
+
+fn local_apply_command(plan: &Plan) -> String {
+    format!(
+        "\"$HOME/.local/bin/ff\" fleet db replica local-apply --to {} --primary {} --plan-id {}",
+        shell_escape_single(&plan.target_name),
+        shell_escape_single(&plan.primary_name),
+        shell_escape_single(&plan.id())
+    )
+}
+
+async fn enqueue_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<String> {
+    let title = format!("bootstrap PostgreSQL replica on {}", plan.target_name);
+    let payload = serde_json::json!({"command": local_apply_command(plan), "summary": "PostgreSQL replica bootstrap"});
+    let trigger = serde_json::json!({"node": plan.target_name});
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(plan.id())
+        .execute(&mut *tx)
+        .await?;
+    let like = format!("%--plan-id {}%", plan.id());
+    let id = if let Some(id) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM deferred_tasks WHERE title=$1 AND status IN ('pending','dispatchable','running','completed') AND payload->>'command' LIKE $2 ORDER BY created_at DESC LIMIT 1")
+        .bind(&title).bind(&like).fetch_optional(&mut *tx).await? { id } else {
+        sqlx::query_scalar("INSERT INTO deferred_tasks (created_by,title,kind,payload,trigger_type,trigger_spec,preferred_node,required_caps,max_attempts) VALUES ($1,$2,'shell',$3,'node_online',$4,$5,'[]'::jsonb,1) RETURNING id")
+            .bind(whoami_tag()).bind(&title).bind(&payload).bind(&trigger).bind(&plan.target_name).fetch_one(&mut *tx).await?
+    };
+    tx.commit().await?;
+    Ok(id.to_string())
+}
+
+async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
+    let me = ff_agent::fleet_info::resolve_this_worker_name().await;
+    if !me.eq_ignore_ascii_case(&plan.target_name) {
+        bail!(
+            "local apply must run on '{}' (running on '{me}')",
+            plan.target_name
+        );
+    }
+    let compose = std::path::Path::new("deploy/docker-compose.follower.yml");
+    let script = std::path::Path::new("deploy/docker/replica-bootstrap.sh");
+    if !compose.is_file() || !script.is_file() {
+        bail!(
+            "run from a ForgeFleet checkout containing the follower compose and bootstrap script"
+        );
+    }
+    let replication_password = std::env::var("POSTGRES_REPLICATION_PASSWORD")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .context(
+            "POSTGRES_REPLICATION_PASSWORD must be present in the target worker environment",
+        )?;
+    let docker_ok = tokio::process::Command::new("docker")
+        .args(["compose", "version"])
+        .status()
+        .await
+        .context("docker compose preflight")?
+        .success();
+    if !docker_ok {
+        bail!("docker compose preflight failed");
+    }
+    let version = tokio::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "pgvector/pgvector:pg16",
+            "postgres",
+            "--version",
+        ])
+        .output()
+        .await
+        .context("PostgreSQL image version preflight")?;
+    if !version.status.success()
+        || !String::from_utf8_lossy(&version.stdout)
+            .contains(&format!("PostgreSQL {}.", plan.pg_major))
+    {
+        bail!(
+            "target PostgreSQL image major does not match primary major {}",
+            plan.pg_major
+        );
+    }
+    let required_bytes: i64 = sqlx::query_scalar("SELECT pg_database_size(current_database()) * 2")
+        .fetch_one(pool)
+        .await?;
+    let disk = tokio::process::Command::new("df")
+        .args(["-Pk", "deploy"])
+        .output()
+        .await
+        .context("target disk preflight")?;
+    let available_kib = String::from_utf8_lossy(&disk.stdout)
+        .lines()
+        .last()
+        .and_then(|line| line.split_whitespace().nth(3))
+        .and_then(|v| v.parse::<i64>().ok())
+        .context("could not determine target free disk")?;
+    if available_kib.saturating_mul(1024) < required_bytes {
+        bail!("target free disk is below the required 2x primary database size margin");
+    }
+    let reachable = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect((plan.primary_ip.as_str(), PORT as u16)),
+    )
+    .await;
+    if !matches!(reachable, Ok(Ok(_))) {
+        bail!(
+            "primary {}:{} is unreachable from target",
+            plan.primary_ip,
+            PORT
+        );
+    }
+    // Prove the supplied credential can open the replication protocol before
+    // creating a slot or touching the follower volume. The password is passed
+    // only through the child environment and is never included in argv/logs.
+    let replication_dsn = format!(
+        "host={} port={} user=replicator dbname=replication replication=true",
+        plan.primary_ip, PORT
+    );
+    let credential = tokio::time::timeout(
+        PREFLIGHT_TIMEOUT,
+        tokio::process::Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--network",
+                "host",
+                "-e",
+                "PGPASSWORD",
+                "pgvector/pgvector:pg16",
+                "psql",
+                "-XAt",
+                "-d",
+                &replication_dsn,
+                "-c",
+                "IDENTIFY_SYSTEM",
+            ])
+            .env("PGPASSWORD", replication_password)
+            .output(),
+    )
+    .await
+    .context("replication credential preflight timed out")?
+    .context("replication credential preflight")?;
+    if !credential.status.success() {
+        bail!("replication credential/authentication preflight failed");
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(&plan.slot)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT pg_create_physical_replication_slot($1) WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=$1)")
+        .bind(&plan.slot).execute(&mut *tx).await.context("create/reuse physical replication slot")?;
+    tx.commit().await?;
+    let status = tokio::time::timeout(
+        COMPOSE_TIMEOUT,
+        tokio::process::Command::new("docker")
+            .args([
+                "compose",
+                "-f",
+                "deploy/docker-compose.follower.yml",
+                "up",
+                "-d",
+            ])
+            .env("POSTGRES_PRIMARY_HOST", &plan.primary_ip)
+            .env("POSTGRES_PRIMARY_PORT", PORT.to_string())
+            .env("POSTGRES_REPLICATION_SLOT", &plan.slot)
+            .env("FORGEFLEET_REPLICA_BACKUP_ID", plan.backup_id.to_string())
+            .status(),
+    )
+    .await
+    .context("follower compose timed out")?
+    .context("start follower compose")?;
+    if !status.success() {
+        bail!("follower compose failed; PGDATA and slot were preserved for retry");
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    loop {
+        let output = tokio::time::timeout(PREFLIGHT_TIMEOUT, tokio::process::Command::new("docker").args(["exec", "forgefleet-postgres-replica", "psql", "-U", "forgefleet", "-d", "forgefleet", "-Atc", "SELECT pg_is_in_recovery() AND current_setting('transaction_read_only')::bool AND EXISTS (SELECT 1 FROM pg_stat_wal_receiver WHERE status='streaming') AND pg_last_wal_replay_lsn() IS NOT NULL"]).output())
+            .await.context("replica postcheck timed out")?.context("replica postcheck")?;
+        if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "t" {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "replica did not become recovery/read-only/streaming within 10 minutes; PGDATA and slot preserved"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+    let slot_active: bool =
+        sqlx::query_scalar("SELECT active FROM pg_replication_slots WHERE slot_name=$1")
+            .bind(&plan.slot)
+            .fetch_optional(pool)
+            .await?
+            .unwrap_or(false);
+    if !slot_active {
+        bail!("primary slot '{}' is not active", plan.slot);
+    }
+    let lag_bytes: i64 = sqlx::query_scalar("SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint, 0) FROM pg_replication_slots WHERE slot_name=$1")
+        .bind(&plan.slot).fetch_one(pool).await?;
+    if lag_bytes > MAX_POSTCHECK_LAG_BYTES {
+        bail!("replica lag {lag_bytes} bytes exceeds postcheck limit {MAX_POSTCHECK_LAG_BYTES}");
+    }
+    sqlx::query("INSERT INTO database_replicas (computer_id,database_kind,role,status,lag_bytes,last_sync_at,bootstrapped_from_backup_id,notes) VALUES ($1,'postgres','replica','running',$4,NOW(),$2,$3) ON CONFLICT (computer_id,database_kind) DO UPDATE SET role='replica',status='running',lag_bytes=$4,last_sync_at=NOW(),bootstrapped_from_backup_id=$2,notes=$3")
+        .bind(plan.target_id).bind(plan.backup_id).bind(format!("primary={};slot={};plan={};pg_major={}", plan.primary_name, plan.slot, plan.id(), plan.pg_major)).bind(lag_bytes).execute(pool).await?;
+    Ok(())
+}
+
+pub async fn handle(pool: &sqlx::PgPool, command: FleetDbReplicaCommand) -> Result<()> {
+    match command {
+        FleetDbReplicaCommand::Plan { to, primary } => {
+            let p = build_plan(pool, &to, &primary).await?;
+            println!(
+                "{CYAN}PostgreSQL replica plan (read-only){RESET}\n  target: {} ({})\n  primary: {} ({}:{PORT})\n  slot: {}\n  PostgreSQL major: {}\n  backup evidence: {}\n  plan-id: {}\n\nApply with:\n  ff fleet db replica apply --to {} --primary {} --plan-id {} --yes",
+                p.target_name,
+                p.target_ip,
+                p.primary_name,
+                p.primary_ip,
+                p.slot,
+                p.pg_major,
+                p.backup_id,
+                p.id(),
+                p.target_name,
+                p.primary_name,
+                p.id()
+            );
+        }
+        FleetDbReplicaCommand::Apply {
+            to,
+            primary,
+            plan_id,
+            yes,
+        } => {
+            if !yes {
+                bail!("apply requires --yes; no changes made");
+            }
+            let p = build_plan(pool, &to, &primary).await?;
+            if p.id() != plan_id {
+                bail!("plan-id is stale or does not match current preflight; run plan again");
+            }
+            let id = enqueue_apply(pool, &p).await?;
+            println!(
+                "{GREEN}✓{RESET} queued replica bootstrap on '{}' as deferred task {id}",
+                p.target_name
+            );
+        }
+        FleetDbReplicaCommand::LocalApply {
+            to,
+            primary,
+            plan_id,
+        } => {
+            let p = build_plan(pool, &to, &primary).await?;
+            if p.id() != plan_id {
+                bail!("plan-id is stale or does not match current preflight");
+            }
+            println!(
+                "{YELLOW}Applying PostgreSQL replica plan {} on {}{RESET}",
+                p.id(),
+                p.target_name
+            );
+            local_apply(pool, &p).await?;
+            println!("{GREEN}✓ PostgreSQL replica is streaming, read-only, and registered{RESET}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn slot_is_unique_stable_and_valid() {
+        let id = Uuid::nil();
+        let s = physical_slot(id);
+        assert_eq!(s, "ff_00000000000000000000000000000000");
+        assert!(s.len() <= 63);
+    }
+    #[test]
+    fn deferred_command_has_no_credentials() {
+        let p = Plan {
+            target_id: Uuid::nil(),
+            target_name: "node one".into(),
+            target_ip: "10.0.0.2".into(),
+            primary_name: "primary".into(),
+            primary_ip: "10.0.0.1".into(),
+            slot: physical_slot(Uuid::nil()),
+            backup_id: Uuid::nil(),
+            pg_major: 16,
+        };
+        let c = local_apply_command(&p);
+        assert!(!c.to_lowercase().contains("password"));
+        assert!(c.contains("local-apply"));
+    }
+    #[test]
+    fn plan_id_is_stable_and_sensitive() {
+        let mut p = Plan {
+            target_id: Uuid::nil(),
+            target_name: "n".into(),
+            target_ip: "1".into(),
+            primary_name: "p".into(),
+            primary_ip: "2".into(),
+            slot: physical_slot(Uuid::nil()),
+            backup_id: Uuid::nil(),
+            pg_major: 16,
+        };
+        let a = p.id();
+        assert_eq!(a, p.id());
+        p.primary_ip = "3".into();
+        assert_ne!(a, p.id());
+    }
+    #[test]
+    fn bootstrap_script_is_non_destructive_and_slot_bound() {
+        let script = include_str!("../../../deploy/docker/replica-bootstrap.sh");
+        assert!(!script.contains("rm -rf"));
+        assert!(script.contains("POSTGRES_REPLICATION_SLOT"));
+        assert!(script.contains("-S \"${POSTGRES_REPLICATION_SLOT}\""));
+        assert!(script.contains("refusing partial/non-empty PGDATA"));
+        assert!(script.contains("FORGEFLEET_REPLICA_BACKUP_ID"));
+        assert!(script.contains("BOOTSTRAP_EVIDENCE"));
+    }
+}

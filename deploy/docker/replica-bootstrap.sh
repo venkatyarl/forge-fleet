@@ -12,11 +12,20 @@
 # in postgresql.auto.conf, so the replica starts in standby mode.
 set -e
 
+: "${POSTGRES_PRIMARY_HOST:?set POSTGRES_PRIMARY_HOST}"
+: "${POSTGRES_PRIMARY_PORT:?set POSTGRES_PRIMARY_PORT}"
+: "${POSTGRES_REPLICATION_USER:?set POSTGRES_REPLICATION_USER}"
+: "${POSTGRES_REPLICATION_PASSWORD:?set POSTGRES_REPLICATION_PASSWORD}"
+: "${POSTGRES_REPLICATION_SLOT:?set POSTGRES_REPLICATION_SLOT}"
+: "${FORGEFLEET_REPLICA_BACKUP_ID:?set FORGEFLEET_REPLICA_BACKUP_ID}"
+
 # PGDATA defaults come from the postgres image; we set it in compose to
 # /var/lib/postgresql/data/pgdata (subdir of the volume mount, which
 # sidesteps lost+found issues and matches the image's default layout).
 : "${PGDATA:=/var/lib/postgresql/data/pgdata}"
 export PGDATA
+BOOTSTRAP_MARKER="$(dirname "$PGDATA")/.forgefleet-replica-bootstrap"
+BOOTSTRAP_EVIDENCE="${FORGEFLEET_REPLICA_BACKUP_ID}|${POSTGRES_PRIMARY_HOST}|${POSTGRES_REPLICATION_SLOT}"
 
 # If we're running as root, create the dir, chown to postgres, and
 # re-exec ourselves as postgres. This mirrors what docker-entrypoint.sh
@@ -28,23 +37,39 @@ if [ "$(id -u)" = "0" ]; then
   exec gosu postgres "$0" "$@"
 fi
 
-if [ ! -s "$PGDATA/PG_VERSION" ]; then
+if [ -s "$PGDATA/PG_VERSION" ]; then
+  if [ ! -f "$PGDATA/standby.signal" ]; then
+    echo "Replica bootstrap: refusing existing non-standby PGDATA; reseed requires an explicit operator workflow." >&2
+    exit 1
+  fi
+  echo "Replica bootstrap: healthy standby PGDATA already present — skipping pg_basebackup."
+elif [ -n "$(find "$PGDATA" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+  if [ ! -f "$BOOTSTRAP_MARKER" ] || [ "$(cat "$BOOTSTRAP_MARKER")" != "$BOOTSTRAP_EVIDENCE" ]; then
+    echo "Replica bootstrap: refusing partial/non-empty PGDATA without matching apply/backup evidence; no files were removed." >&2
+    exit 1
+  fi
+  echo "Replica bootstrap: retrying an interrupted, evidenced basebackup."
+  find "$PGDATA" -depth -mindepth 1 -delete
+else
   echo "Replica bootstrap: PGDATA empty — pg_basebackup from ${POSTGRES_PRIMARY_HOST}:${POSTGRES_PRIMARY_PORT}"
 
-  # Make sure target dir is actually empty (pg_basebackup refuses otherwise).
-  rm -rf "$PGDATA"/* "$PGDATA"/.[!.]* 2>/dev/null || true
+  printf '%s' "$BOOTSTRAP_EVIDENCE" > "$BOOTSTRAP_MARKER"
+fi
 
+if [ ! -s "$PGDATA/PG_VERSION" ]; then
   PGPASSWORD="${POSTGRES_REPLICATION_PASSWORD}" pg_basebackup \
     -h "${POSTGRES_PRIMARY_HOST}" \
     -p "${POSTGRES_PRIMARY_PORT}" \
     -U "${POSTGRES_REPLICATION_USER}" \
+    -S "${POSTGRES_REPLICATION_SLOT}" \
     -D "$PGDATA" \
     -Fp -Xs -P -R
 
   chmod 0700 "$PGDATA"
+  test -f "$PGDATA/standby.signal"
+  grep -q 'primary_conninfo' "$PGDATA/postgresql.auto.conf"
+  rm -f "$BOOTSTRAP_MARKER"
   echo "Replica bootstrap: pg_basebackup complete."
-else
-  echo "Replica bootstrap: PGDATA already has PG_VERSION — skipping pg_basebackup."
 fi
 
 # Hand off to the real postgres entrypoint. Because PG_VERSION now

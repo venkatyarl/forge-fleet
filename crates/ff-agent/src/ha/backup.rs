@@ -3,7 +3,7 @@
 //! snapshot to offsite peers via the deferred-task queue (rsync fan-out).
 //!
 //! ## Policy lives in the DB (`fleet_backup_config`, schema V163)
-//! Per kind: `source_host` (NULL = leader), `dest_hosts[]` (empty =
+//! Per kind: `source_host` (NULL = current database authority), `dest_hosts[]` (empty =
 //! auto-pick 2 recently-seen peers — the offsite-2-nodes rule),
 //! `interval_secs`, `retention_count`, `retention_days`, `encrypt`,
 //! `enabled`. Built-in defaults only apply when the row/table is missing.
@@ -272,6 +272,43 @@ pub async fn load_backup_config(pool: &PgPool, kind: &str) -> Option<BackupKindC
     }
 }
 
+/// Resolve the only node allowed to execute a backup for this policy.
+/// Explicit per-kind configuration wins. Otherwise use the DSN-of-record
+/// member, then the host serving this connection; replica inventory is only a
+/// final compatibility fallback because it may lag a promotion.
+async fn resolve_backup_source_host_for_config(
+    pool: &PgPool,
+    cfg: &BackupKindConfig,
+) -> Result<Option<String>, BackupError> {
+    if let Some(host) = cfg.source_host.as_deref().filter(|h| !h.trim().is_empty()) {
+        return Ok(Some(host.to_string()));
+    }
+    sqlx::query_scalar(
+        "SELECT COALESCE(
+             (SELECT NULLIF(primary_member, '') FROM dsn_of_record
+               WHERE singleton_key='current'),
+             (SELECT c.name FROM computers c
+               WHERE c.primary_ip=host(inet_server_addr()) LIMIT 1),
+             (SELECT c.name FROM database_replicas d JOIN computers c ON c.id=d.computer_id
+               WHERE d.database_kind='postgres' AND d.role='primary'
+               ORDER BY d.promoted_at DESC NULLS LAST LIMIT 1))",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(BackupError::from)
+}
+
+/// Resolve a kind's source for CLI dispatch without duplicating policy SQL.
+pub async fn resolve_backup_source_host(
+    pool: &PgPool,
+    kind: &str,
+) -> Result<Option<String>, BackupError> {
+    let cfg = load_backup_config(pool, kind)
+        .await
+        .unwrap_or_else(|| BackupKindConfig::default_for(kind));
+    resolve_backup_source_host_for_config(pool, &cfg).await
+}
+
 /// Result of a single [`BackupOrchestrator::run_once`] cycle.
 #[derive(Debug, Clone)]
 pub struct BackupReport {
@@ -351,13 +388,12 @@ impl BackupOrchestrator {
 
     /// Run a single backup cycle for the given kind (`"postgres"`,
     /// `"redis"`, `"falkordb"`, or `"all"`). Each kind is gated on its
-    /// `fleet_backup_config.source_host` (a pinned host must match this
-    /// node; `NULL` falls back to the historical leader gate) and silently
-    /// short-circuits elsewhere *unless* `force` is true.
+    /// `fleet_backup_config.source_host`, or the current DB authority when it
+    /// is NULL. `force` affects cadence only and never bypasses authority.
     pub async fn run_once(
         &self,
         kind: &str,
-        force: bool,
+        _force: bool,
     ) -> Result<Vec<BackupReport>, BackupError> {
         let kinds: Vec<&str> = match kind {
             "all" => vec!["postgres", "redis", "falkordb"],
@@ -376,11 +412,8 @@ impl BackupOrchestrator {
                 reports.push(BackupReport::not_leader(k));
                 continue;
             }
-            let am_source = match cfg.source_host.as_deref() {
-                Some(h) => h.eq_ignore_ascii_case(&self.my_node_name),
-                None => self.i_am_leader().await?,
-            };
-            if !force && !am_source {
+            let am_source = self.is_backup_source(&cfg).await?;
+            if !am_source {
                 debug!(node = %self.my_node_name, kind = k,
                        "backup skipped — not this kind's source host");
                 reports.push(BackupReport::not_leader(k));
@@ -856,6 +889,16 @@ impl BackupOrchestrator {
         Ok(cur
             .map(|l| l.member_name == self.my_node_name)
             .unwrap_or(false))
+    }
+
+    /// Resolve backup production to the configured host, or (when unset) to
+    /// the node that actually owns the connected PostgreSQL authority. Fleet
+    /// leadership is deliberately not a datastore-location signal.
+    async fn is_backup_source(&self, cfg: &BackupKindConfig) -> Result<bool, BackupError> {
+        let authority = resolve_backup_source_host_for_config(&self.pg, cfg).await?;
+        Ok(authority
+            .as_deref()
+            .is_some_and(|host| host.eq_ignore_ascii_case(&self.my_node_name)))
     }
 
     async fn insert_backup_row(

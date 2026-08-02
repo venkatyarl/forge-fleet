@@ -587,6 +587,9 @@ pub async fn handle_fleet_db(pool: &sqlx::PgPool, cmd: FleetDbCommand) -> Result
             println!();
             println!("Full runbook: deploy/WAN_REPLICATION.md");
         }
+        FleetDbCommand::Replica { command } => {
+            crate::fleet_db_replica::handle(pool, command).await?;
+        }
         FleetDbCommand::Failover { to, force, yes } => {
             handle_fleet_db_failover(pool, &to, force, yes).await?;
         }
@@ -783,6 +786,45 @@ pub async fn handle_fleet_db_backup_now(
 
     // Resolve THIS host's identity the same way the daemon does.
     let my_name = ff_agent::fleet_info::resolve_this_worker_name().await;
+    let requested: &[&str] = if kind == "all" {
+        &["postgres", "redis", "falkordb"]
+    } else {
+        &[kind.as_str()]
+    };
+    let mut dispatched = 0usize;
+    for backup_kind in requested {
+        let source = ff_agent::ha::backup::resolve_backup_source_host(pool, backup_kind)
+            .await
+            .map_err(|e| anyhow::anyhow!("resolve {backup_kind} backup source: {e}"))?;
+        let source = source.ok_or_else(|| anyhow::anyhow!("backup source is unset and current database authority could not be mapped to a fleet node"))?;
+        if !source.eq_ignore_ascii_case(&my_name) {
+            let payload = serde_json::json!({
+                "command": format!("\"$HOME/.local/bin/ff\" fleet db backup --kind {} --now", shell_escape_single(backup_kind)),
+                "summary": format!("forced {backup_kind} backup on source {source}"),
+            });
+            let trigger = serde_json::json!({"node": source});
+            let id = ff_db::pg_enqueue_deferred(
+                pool,
+                &format!("forced {backup_kind} backup on {source}"),
+                "shell",
+                &payload,
+                "node_online",
+                &trigger,
+                Some(&source),
+                &serde_json::json!([]),
+                Some(&whoami_tag()),
+                Some(2),
+            )
+            .await?;
+            println!(
+                "{GREEN}✓{RESET} dispatched {backup_kind} backup to source '{source}' as task {id}"
+            );
+            dispatched += 1;
+        }
+    }
+    if dispatched == requested.len() {
+        return Ok(());
+    }
     let computer_id: Option<uuid::Uuid> =
         sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
             .bind(&my_name)
@@ -792,11 +834,11 @@ pub async fn handle_fleet_db_backup_now(
     let Some(computer_id) = computer_id else {
         anyhow::bail!(
             "no `computers` row for this host ('{my_name}') — run `ff onboard` first. \
-             Backups must originate on an enrolled host (normally the leader)."
+             Backups must originate on an enrolled source host."
         );
     };
 
-    println!("{CYAN}▶ Forcing {kind} backup on '{my_name}' (force={force})...{RESET}");
+    println!("{CYAN}▶ Running {kind} backup on source '{my_name}' (now={force})...{RESET}");
     let orchestrator = ff_agent::ha::backup::BackupOrchestrator::new(
         pool.clone(),
         computer_id,
@@ -813,8 +855,8 @@ pub async fn handle_fleet_db_backup_now(
         if !r.produced {
             any_skipped = true;
             println!(
-                "{YELLOW}⚠ {kind} skipped — '{my_name}' is not the leader. \
-                 Re-run with --now (the default) or on the leader.{RESET}",
+                "{YELLOW}⚠ {kind} skipped — '{my_name}' is not its configured source. \
+                 Check fleet_backup_config.source_host and DB authority.{RESET}",
                 kind = r.kind
             );
         } else {
@@ -2132,11 +2174,10 @@ pub async fn handle_fleet_disband(
     )
     .fetch_all(pool)
     .await?;
-    let computer_names: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM computers WHERE LOWER(name) <> 'vinny' ORDER BY name",
-    )
-    .fetch_all(pool)
-    .await?;
+    let computer_names: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM computers WHERE LOWER(name) <> 'vinny' ORDER BY name")
+            .fetch_all(pool)
+            .await?;
 
     let mut targets: Vec<String> = fleet_names.clone();
     for n in &computer_names {

@@ -59,6 +59,7 @@ mod events_cmd;
 mod ext_cmd;
 mod fabric_cmd;
 mod fleet_cmd;
+mod fleet_db_replica;
 mod github_cmd;
 mod health_cmd;
 mod helpers;
@@ -2341,6 +2342,11 @@ pub enum GithubCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum FleetDbCommand {
+    /// Plan or apply a supported LAN physical streaming replica bootstrap.
+    Replica {
+        #[command(subcommand)]
+        command: FleetDbReplicaCommand,
+    },
     /// Register an off-site Postgres replica reachable via Tailscale (or
     /// another overlay network). Stores a row in `database_replicas` with
     /// role='wan_replica' and prints the compose command to run on the
@@ -2455,22 +2461,19 @@ pub enum FleetDbCommand {
         #[arg(long, default_value_t = false)]
         test_restore: bool,
     },
-    /// Force a backup cycle RIGHT NOW, bypassing the 4h/6h cadence, then
+    /// Run a backup cycle RIGHT NOW, bypassing the 4h/6h cadence, then
     /// catalogue + distribute it via the normal HA path.
     ///
     /// Runs the exact same `BackupOrchestrator::run_once` the daemon ticks,
     /// so it exercises the real backup → encrypt → catalogue → fan-out
-    /// pipeline. Intended to be run ON the leader (vinny); `--now` passes
-    /// `force=true` so it doesn't silently no-op if leadership detection is
-    /// momentarily flaky. Use it to verify the HA backup path on demand
-    /// instead of waiting for the next scheduled tick.
+    /// pipeline. Execution is dispatched to the configured source host, or
+    /// the current database authority when no source is pinned.
     Backup {
         /// Which datastore to back up: `postgres`, `redis`, `falkordb`, or `all`.
         #[arg(long, default_value = "all")]
         kind: String,
-        /// Force the run even if this host isn't detected as leader. On by
-        /// default for this verb (the whole point is an on-demand backup);
-        /// pass `--now=false` to respect the leader gate.
+        /// Run immediately instead of waiting for periodic cadence. Authority
+        /// is always enforced and cannot be bypassed.
         #[arg(long = "now", default_value_t = true)]
         now: bool,
     },
@@ -2491,6 +2494,38 @@ pub enum FleetDbCommand {
     Drill {
         #[arg(long)]
         on: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum FleetDbReplicaCommand {
+    /// Read-only preflight and deterministic plan. Makes no DB or host changes.
+    Plan {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        primary: String,
+    },
+    /// Enqueue the previously planned bootstrap on the named target node.
+    Apply {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        primary: String,
+        #[arg(long)]
+        plan_id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Target-side implementation used only by the deferred-task worker.
+    #[command(hide = true)]
+    LocalApply {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        primary: String,
+        #[arg(long)]
+        plan_id: String,
     },
 }
 
