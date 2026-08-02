@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
@@ -645,6 +646,7 @@ impl ResearchSession {
             .synthesize(&plan, &subtask_rows, &results, &client)
             .await
             .context("synthesizer phase")?;
+        let markdown = append_citation_check(markdown).await;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         sqlx::query(
@@ -874,6 +876,7 @@ impl ResearchSession {
             .synthesize(&plan, &subtask_rows, &results, &client)
             .await
             .context("recover: synthesizer phase")?;
+        let markdown = append_citation_check(markdown).await;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         // 5. Persist the recovered report. Mirror run()'s done/failed rule:
@@ -2093,6 +2096,98 @@ fn strip_json_fences(s: &str) -> &str {
     t.trim()
 }
 
+/// Extract HTTP(S) URLs only from the report's `Citations` section.
+fn citation_urls(markdown: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut in_citations = false;
+
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            let heading = trimmed.trim_start_matches('#').trim().trim_matches('*');
+            if heading.eq_ignore_ascii_case("citations") {
+                in_citations = true;
+                continue;
+            }
+            if in_citations {
+                break;
+            }
+        }
+        if !in_citations {
+            continue;
+        }
+
+        let mut rest = line;
+        while let Some(start) = rest.find("https://").or_else(|| rest.find("http://")) {
+            rest = &rest[start..];
+            let end = rest
+                .find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\''))
+                .unwrap_or(rest.len());
+            let url = rest[..end]
+                .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?'));
+            if !url.is_empty() && !urls.iter().any(|existing| existing == url) {
+                urls.push(url.to_string());
+            }
+            rest = &rest[end..];
+        }
+    }
+    urls
+}
+
+/// Verify synthesized citations without ever making research persistence fail.
+async fn append_citation_check(mut markdown: String) -> String {
+    let urls = citation_urls(&markdown);
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            warn!(%error, "research: could not build citation verification client");
+            markdown.push_str(
+                "\n\n## Citation check\n\nVerification could not run; cited URLs are UNVERIFIED.\n",
+            );
+            return markdown;
+        }
+    };
+
+    let failed: Vec<String> = stream::iter(urls.into_iter().map(|url| {
+        let client = client.clone();
+        async move {
+            let head_ok = client
+                .head(&url)
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success());
+            if head_ok {
+                return None;
+            }
+            let get_ok = client
+                .get(&url)
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success());
+            (!get_ok).then_some(url)
+        }
+    }))
+    .buffer_unordered(8)
+    .filter_map(async move |failed| failed)
+    .collect()
+    .await;
+
+    markdown.push_str("\n\n## Citation check\n\n");
+    if failed.is_empty() {
+        markdown.push_str("All cited URLs responded successfully at synthesis time.\n");
+    } else {
+        markdown.push_str("The following cited URLs could not be verified at synthesis time:\n");
+        for url in failed {
+            markdown.push_str(&format!("\n- UNVERIFIED: {url}"));
+        }
+        markdown.push('\n');
+    }
+    markdown
+}
+
 /// Extract `[confidence] Claim URL` lines from an agent output's Findings
 /// section. Very permissive — if the format isn't exact we just skip.
 /// Returns (claim, confidence, url?).
@@ -2155,7 +2250,7 @@ fn whoami_tag() -> String {
 
 #[cfg(test)]
 mod usage_tests {
-    use super::parse_completion_usage;
+    use super::{citation_urls, parse_completion_usage};
     use serde_json::json;
 
     #[test]
@@ -2175,6 +2270,26 @@ mod usage_tests {
         assert_eq!(
             parse_completion_usage(&json!({"usage": {"prompt_tokens": 7}})),
             (7, 0)
+        );
+    }
+
+    #[test]
+    fn extracts_urls_only_from_citations_section() {
+        let report = r#"## Detailed findings
+Ignore https://example.com/inline.
+
+## Citations
+
+1. [Example](https://example.com/a)
+2. https://example.org/b?x=1
+3. Duplicate: https://example.com/a
+
+## Open questions
+Ignore https://example.net/later
+"#;
+        assert_eq!(
+            citation_urls(report),
+            vec!["https://example.com/a", "https://example.org/b?x=1"]
         );
     }
 }
