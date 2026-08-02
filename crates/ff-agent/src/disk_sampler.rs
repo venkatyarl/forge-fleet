@@ -139,13 +139,22 @@ async fn maybe_alert_over_quota(
     total_bytes: u64,
     quota_pct: u32,
 ) -> Result<(), String> {
-    // De-dupe: see if an alert for this node is already open.
-    let rows = ff_db::pg_list_deferred(pool, Some("pending"), 50)
-        .await
-        .map_err(|e| format!("pg_list_deferred: {e}"))?;
-    let already_alerted = rows
-        .iter()
-        .any(|r| r.title.starts_with("⚠ disk quota exceeded on ") && r.title.contains(worker_name));
+    // De-dupe on a 24h cooldown across ALL statuses. The defer worker
+    // acknowledges these notes (they complete within seconds), so a
+    // pending-only check re-alerted every sample pass — observed live
+    // 2026-08-02 as 1,954 duplicate rows for one node.
+    let already_alerted: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM fleet_tasks
+             WHERE task_class = 'deferred'
+               AND summary LIKE '⚠ disk quota exceeded on ' || $1 || '%'
+               AND created_at > NOW() - INTERVAL '24 hours'
+         )",
+    )
+    .bind(worker_name)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("disk alert de-dupe query: {e}"))?;
     if already_alerted {
         return Ok(());
     }

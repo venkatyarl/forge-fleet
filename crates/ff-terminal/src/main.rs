@@ -1401,6 +1401,19 @@ pub enum DeferCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Bulk-delete terminal (completed/failed/cancelled) tasks, e.g. after a
+    /// failure storm. Never touches pending/dispatchable/running rows.
+    Purge {
+        /// Which terminal status to purge.
+        #[arg(long, default_value = "failed")]
+        status: String,
+        /// Only purge rows created more than this many hours ago (0 = all).
+        #[arg(long = "older-than-hours", default_value_t = 0)]
+        older_than_hours: i64,
+        /// Actually delete. Without this flag, prints the count that WOULD go.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]

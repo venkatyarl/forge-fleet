@@ -1092,10 +1092,12 @@ impl LeaderTick {
                 );
             }
 
-            // De-dupe: is a writer task already in-flight?
+            // De-dupe: is a writer task already in-flight? ('shell_command' is
+            // the legacy kind these were enqueued under before the defer worker
+            // rejected it — match both so old in-flight rows still de-dupe.)
             let inflight = sqlx::query(
                 "SELECT 1 FROM deferred_tasks \
-                 WHERE kind = 'shell_command' \
+                 WHERE kind IN ('shell', 'shell_command') \
                    AND status IN ('pending', 'dispatchable', 'running') \
                    AND title = $1",
             )
@@ -1119,7 +1121,7 @@ impl LeaderTick {
             match ff_db::queries::pg_enqueue_deferred(
                 &self.pg,
                 &title,
-                "shell_command",
+                "shell",
                 &payload,
                 "now",
                 &trigger_spec,

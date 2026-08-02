@@ -178,7 +178,11 @@ async fn execute(
 ) -> (bool, Option<serde_json::Value>, Option<String>) {
     let max_duration = resolve_max_duration(&task.payload);
     match task.kind.as_str() {
-        "shell" => {
+        // 'shell_command' is a legacy alias: the self-heal writer dispatcher
+        // enqueued under that kind while this worker only matched 'shell',
+        // fail-looping every writer task (observed live 2026-08-02, 7k+ failed
+        // rows). Both kinds carry the same payload shape.
+        "shell" | "shell_command" => {
             let Some(command) = task.payload.get("command").and_then(|v| v.as_str()) else {
                 return (
                     false,
@@ -293,6 +297,20 @@ async fn execute(
                 },
                 Err(e) => (false, None, Some(format!("pool: {e}"))),
             }
+        }
+        "manual" => {
+            // Informational operator notes (e.g. disk-sampler quota alerts).
+            // There is nothing to execute; failing them re-armed the producer's
+            // pending-only de-dupe and caused an enqueue/fail storm. Complete
+            // them, carrying the note into `result` for `ff defer list/get`.
+            (
+                true,
+                Some(serde_json::json!({
+                    "acknowledged": true,
+                    "note": task.payload.get("note").cloned().unwrap_or_default(),
+                })),
+                None,
+            )
         }
         other => {
             // Unsupported kinds — leave for the legacy `ff daemon` CLI to

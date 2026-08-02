@@ -255,6 +255,7 @@ pub use queries::{
     pg_reserve_model_load,
     pg_reserve_operation,
     pg_resolve_channel_user,
+    pg_purge_deferred,
     pg_retired_catalog_ids,
     pg_retry_deferred,
     pg_route_deployments,

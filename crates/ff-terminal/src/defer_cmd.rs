@@ -358,6 +358,28 @@ pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
                 print!("{}", render_deferred_stats(&stats));
             }
         }
+        crate::DeferCommand::Purge {
+            status,
+            older_than_hours,
+            yes,
+        } => {
+            let status = status.to_ascii_lowercase();
+            if !is_terminal_defer_status(&status) {
+                eprintln!(
+                    "--status must be a terminal state (completed/failed/cancelled), got '{status}'"
+                );
+                std::process::exit(1);
+            }
+            let purged =
+                ff_db::pg_purge_deferred(&pool, &status, older_than_hours, !yes).await?;
+            if yes {
+                println!("Purged {purged} {status} deferred task(s)");
+            } else {
+                println!(
+                    "{purged} {status} deferred task(s) would be purged — re-run with --yes to delete"
+                );
+            }
+        }
     }
     Ok(())
 }

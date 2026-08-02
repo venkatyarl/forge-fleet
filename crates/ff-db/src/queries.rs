@@ -4020,6 +4020,43 @@ pub async fn pg_retry_deferred(pool: &PgPool, id: &str) -> Result<bool> {
     Ok(r.rows_affected() > 0)
 }
 
+/// Bulk-delete terminal deferred tasks (`completed`/`failed`/`cancelled`),
+/// e.g. to drain a failure storm. `older_than_hours <= 0` means no age gate.
+/// With `dry_run`, counts the matching rows without deleting. Never touches
+/// non-terminal rows — the caller validates `status` is terminal.
+pub async fn pg_purge_deferred(
+    pool: &PgPool,
+    status: &str,
+    older_than_hours: i64,
+    dry_run: bool,
+) -> Result<i64> {
+    let age_gate = older_than_hours.max(0);
+    if dry_run {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fleet_tasks
+              WHERE task_class = 'deferred'
+                AND status = $1
+                AND ($2 <= 0 OR created_at < NOW() - make_interval(hours => $2))",
+        )
+        .bind(status)
+        .bind(age_gate)
+        .fetch_one(pool)
+        .await?;
+        return Ok(n);
+    }
+    let r = sqlx::query(
+        "DELETE FROM fleet_tasks
+          WHERE task_class = 'deferred'
+            AND status = $1
+            AND ($2 <= 0 OR created_at < NOW() - make_interval(hours => $2))",
+    )
+    .bind(status)
+    .bind(age_gate)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() as i64)
+}
+
 /// Promote pending tasks to 'dispatchable' when their trigger conditions are met.
 /// `online_nodes` is the set of node names currently reachable.
 /// `now` is the current UTC time (for at_time triggers).
