@@ -145,6 +145,9 @@ mod serde_duration_secs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn build_config_defaults_to_thirty_minutes() {
@@ -155,6 +158,7 @@ mod tests {
 
     #[test]
     fn build_config_from_env_overrides_default() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         // Set env var, run test, then restore previous value.
         let prev = std::env::var(MAX_BUILD_DURATION_ENV).ok();
         unsafe {
@@ -174,6 +178,7 @@ mod tests {
 
     #[test]
     fn build_config_from_toml_file() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
         std::fs::write(
             tmp.path(),
@@ -214,6 +219,7 @@ mod tests {
 
     #[test]
     fn build_config_from_json_file() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::NamedTempFile::with_suffix(".json").unwrap();
         std::fs::write(tmp.path(), "{\"max_build_duration\": 900}").unwrap();
 
