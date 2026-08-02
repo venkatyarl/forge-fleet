@@ -6262,7 +6262,17 @@ fn run_cargo_fmt_scoped(
     worktree_path: &Path,
     backend_touched_paths: &HashSet<PathBuf>,
 ) -> Result<()> {
-    let fmt_result = run_cargo_fmt(worktree_path);
+    run_cargo_fmt_scoped_with(worktree_path, backend_touched_paths, || {
+        run_cargo_fmt(worktree_path)
+    })
+}
+
+fn run_cargo_fmt_scoped_with(
+    worktree_path: &Path,
+    backend_touched_paths: &HashSet<PathBuf>,
+    formatter: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let fmt_result = formatter();
     let after_fmt = tracked_changed_paths(worktree_path)?;
     for path in after_fmt.difference(backend_touched_paths) {
         validate_worktree_relative_path(path)?;
@@ -8149,11 +8159,8 @@ mod tests {
         assert!(error.to_string().contains("git") || error.to_string().contains("exit"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn scoped_fmt_restores_unrelated_changes_when_formatter_fails() {
-        use std::os::unix::fs::PermissionsExt;
-
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
         init_fmt_repo(repo);
@@ -8161,23 +8168,10 @@ mod tests {
         std::fs::write(repo.join("src/owned.rs"), "pub fn owned() -> i32 { 2 }\n").unwrap();
         let backend_touched_paths = super::worktree_changed_paths(repo).unwrap();
 
-        let fake_cargo = repo.join("fake-cargo");
-        std::fs::write(
-            &fake_cargo,
-            "#!/bin/sh\nprintf 'pub fn leaked() -> i32 { 99 }\\n' > src/lib.rs\nexit 1\n",
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&fake_cargo).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&fake_cargo, permissions).unwrap();
-
-        let previous_cargo = std::env::var_os("CARGO");
-        unsafe { std::env::set_var("CARGO", &fake_cargo) };
-        let result = super::run_cargo_fmt_scoped(repo, &backend_touched_paths);
-        match previous_cargo {
-            Some(value) => unsafe { std::env::set_var("CARGO", value) },
-            None => unsafe { std::env::remove_var("CARGO") },
-        }
+        let result = super::run_cargo_fmt_scoped_with(repo, &backend_touched_paths, || {
+            std::fs::write(repo.join("src/lib.rs"), "pub fn leaked() -> i32 { 99 }\n")?;
+            Err(anyhow::anyhow!("formatter failed"))
+        });
 
         result.expect("formatter failure remains best-effort after scoped restoration");
         assert_eq!(
