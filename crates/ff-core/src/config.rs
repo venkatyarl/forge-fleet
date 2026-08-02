@@ -2224,7 +2224,10 @@ notes = "Setup started."
         assert_eq!(config.ports.forgefleet, Some(50001));
 
         // Check scheduling.
-        assert_eq!(config.scheduling.canonical_writer.as_deref(), Some("vinny"));
+        assert_eq!(
+            config.scheduling.canonical_writer.as_deref(),
+            Some("vinny")
+        );
         assert_eq!(config.scheduling.project_weights.default_weight, 1.0);
         assert_eq!(
             config.scheduling.project_weights.weight_for("forge-fleet"),

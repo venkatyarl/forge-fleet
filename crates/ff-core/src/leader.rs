@@ -309,7 +309,7 @@ election_priority = 50
     fn test_elect_yielding_fallback() {
         let config = test_config();
         let health = vec![
-            ("vinny".into(), true, true),  // yielding
+            ("vinny".into(), true, true), // yielding
             ("james".into(), true, true),  // yielding
             ("marcus".into(), true, true), // yielding
         ];

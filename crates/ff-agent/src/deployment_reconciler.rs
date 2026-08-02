@@ -240,10 +240,7 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
                 .as_deref()
                 .and_then(|library_id| libs.iter().find(|lib| lib.id == library_id))
                 .map(|lib| lib.file_path.clone());
-            let model_matches_row = match (
-                existing_lib_path.as_deref(),
-                proc_info.model_path.as_deref(),
-            ) {
+            let model_matches_row = match (existing_lib_path.as_deref(), proc_info.model_path.as_deref()) {
                 (Some(expected), Some(actual)) => {
                     crate::model_runtime::model_paths_match(expected, actual)
                 }

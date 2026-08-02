@@ -370,7 +370,8 @@ pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
                 );
                 std::process::exit(1);
             }
-            let purged = ff_db::pg_purge_deferred(&pool, &status, older_than_hours, !yes).await?;
+            let purged =
+                ff_db::pg_purge_deferred(&pool, &status, older_than_hours, !yes).await?;
             if yes {
                 println!("Purged {purged} {status} deferred task(s)");
             } else {

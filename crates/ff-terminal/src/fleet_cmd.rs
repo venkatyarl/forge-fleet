@@ -2132,10 +2132,11 @@ pub async fn handle_fleet_disband(
     )
     .fetch_all(pool)
     .await?;
-    let computer_names: Vec<String> =
-        sqlx::query_scalar("SELECT name FROM computers WHERE LOWER(name) <> 'vinny' ORDER BY name")
-            .fetch_all(pool)
-            .await?;
+    let computer_names: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM computers WHERE LOWER(name) <> 'vinny' ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?;
 
     let mut targets: Vec<String> = fleet_names.clone();
     for n in &computer_names {
