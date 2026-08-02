@@ -1469,7 +1469,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_dispatch_tick_is_not_assignment_eligible() {
+    fn scheduler_excludes_stale_computers_by_dispatch_tick() {
         let now = Utc::now();
         assert!(!dispatch_tick_is_fresh(None, now));
         assert!(dispatch_tick_is_fresh(
