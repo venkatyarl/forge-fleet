@@ -4,6 +4,8 @@
 //! with NULL IPs so the materializer can fill them once both daemons
 //! start emitting cx7-fabric Ip entries with `paired_with`.
 
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result, bail};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -463,4 +465,160 @@ fn parse_iperf3_json(body: &str) -> (f64, Option<i32>) {
         .and_then(|n| n.as_i64())
         .map(|n| n as i32);
     (bps / 1e9, retr)
+}
+
+/// One edge of the fabric ring, projected from a `fabric_pairs` row.
+struct FabricEdgeRow {
+    pair_name: String,
+    fabric_kind: String,
+    a_name: String,
+    b_name: String,
+    a_ip: String,
+    b_ip: String,
+    status: String,
+    verified: bool,
+}
+
+/// `ff fabric topology` — print the current private-fabric ring: every
+/// configured `fabric_pairs` edge with its verification state, plus a
+/// summary of the pending cables that have not yet been verified.
+pub async fn handle_fabric_topology(pg: &PgPool) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT fp.pair_name, fp.fabric_kind, \
+                COALESCE(ca.name, '?') AS a_name, COALESCE(cb.name, '?') AS b_name, \
+                fp.a_ip, fp.b_ip, fp.status, fp.verified \
+           FROM fabric_pairs fp \
+           LEFT JOIN computers ca ON ca.id = fp.computer_a_id \
+           LEFT JOIN computers cb ON cb.id = fp.computer_b_id \
+          ORDER BY fp.pair_name, fp.id",
+    )
+    .fetch_all(pg)
+    .await?;
+
+    let mut edges = Vec::with_capacity(rows.len());
+    for r in rows {
+        edges.push(FabricEdgeRow {
+            pair_name: r.try_get("pair_name")?,
+            fabric_kind: r.try_get("fabric_kind")?,
+            a_name: r.try_get("a_name")?,
+            b_name: r.try_get("b_name")?,
+            a_ip: r.try_get("a_ip")?,
+            b_ip: r.try_get("b_ip")?,
+            status: r.try_get("status")?,
+            verified: r.try_get("verified")?,
+        });
+    }
+
+    print!("{}", format_fabric_topology(&edges));
+    Ok(())
+}
+
+/// Derive a human-readable edge state: a verified link reads "verified",
+/// otherwise fall back to the stored lifecycle status (pending / dead).
+fn edge_state(edge: &FabricEdgeRow) -> &str {
+    if edge.verified {
+        "verified"
+    } else if edge.status.is_empty() {
+        "unknown"
+    } else {
+        edge.status.as_str()
+    }
+}
+
+/// Render the fabric ring as plain text (pure — no DB — so it is unit
+/// testable without a Postgres connection).
+fn format_fabric_topology(edges: &[FabricEdgeRow]) -> String {
+    if edges.is_empty() {
+        return "(no fabric_pairs configured — run `ff fabric pair <a> <b>` to add an edge)\n"
+            .to_string();
+    }
+
+    let mut nodes = BTreeSet::new();
+    for e in edges {
+        nodes.insert(e.a_name.as_str());
+        nodes.insert(e.b_name.as_str());
+    }
+    let verified = edges.iter().filter(|e| e.verified).count();
+    let pending: Vec<&FabricEdgeRow> = edges.iter().filter(|e| e.status == "pending").collect();
+
+    let ip_or = |ip: &str| -> String {
+        if ip.is_empty() {
+            "?".to_string()
+        } else {
+            ip.to_string()
+        }
+    };
+
+    let mut out = format!(
+        "Fabric ring: {} node(s), {} edge(s) — {} verified, {} pending\n\nEdges:\n",
+        nodes.len(),
+        edges.len(),
+        verified,
+        pending.len(),
+    );
+    for e in edges {
+        out.push_str(&format!(
+            "  {:<22} [{:<10}] {:<9} {} ({}) <-> {} ({})\n",
+            e.pair_name,
+            e.fabric_kind,
+            edge_state(e),
+            e.a_name,
+            ip_or(&e.a_ip),
+            e.b_name,
+            ip_or(&e.b_ip),
+        ));
+    }
+    if pending.is_empty() {
+        out.push_str("\nPending cables: none — every edge is verified.\n");
+    } else {
+        out.push_str("\nPending cables (awaiting verification):\n");
+        for e in &pending {
+            out.push_str(&format!("  {} ({})\n", e.pair_name, e.fabric_kind));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn edge(pair: &str, status: &str, verified: bool) -> FabricEdgeRow {
+        FabricEdgeRow {
+            pair_name: pair.to_string(),
+            fabric_kind: "cx7-200g".to_string(),
+            a_name: "sia".to_string(),
+            b_name: "adele".to_string(),
+            a_ip: "10.42.0.1".to_string(),
+            b_ip: "10.42.0.2".to_string(),
+            status: status.to_string(),
+            verified,
+        }
+    }
+
+    #[test]
+    fn empty_topology_hints_at_pairing() {
+        assert!(format_fabric_topology(&[]).contains("no fabric_pairs configured"));
+    }
+
+    #[test]
+    fn reports_edge_state_and_pending_cables() {
+        let edges = vec![
+            edge("sia-adele", "verified", true),
+            edge("adele-rihanna", "pending", false),
+        ];
+        let out = format_fabric_topology(&edges);
+        assert!(out.contains("2 node(s), 2 edge(s) — 1 verified, 1 pending"));
+        assert!(out.contains("sia-adele"));
+        assert!(out.contains("verified"));
+        assert!(out.contains("Pending cables (awaiting verification):"));
+        assert!(out.contains("adele-rihanna"));
+    }
+
+    #[test]
+    fn unverified_falls_back_to_status() {
+        assert_eq!(edge_state(&edge("x-y", "dead", false)), "dead");
+        assert_eq!(edge_state(&edge("x-y", "", false)), "unknown");
+        assert_eq!(edge_state(&edge("x-y", "pending", true)), "verified");
+    }
 }
