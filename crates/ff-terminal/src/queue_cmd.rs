@@ -6,7 +6,7 @@ use sqlx::Row;
 use crate::{CYAN, RESET, truncate_for_col};
 
 const FLEET_TASK_STATUSES: &[&str] = &["pending", "running", "completed", "failed"];
-const FLEET_TASK_CLASSES: &[&str] = &["build", "deferred", "research", "self_heal", "-"];
+const FLEET_TASK_CLASSES: &[&str] = &["build", "deferred", "oauth", "research", "self_heal", "-"];
 const WORK_ITEM_STATUSES: &[&str] = &["idea", "ready", "building", "in_review", "done", "failed"];
 
 pub async fn handle_queue() -> Result<()> {

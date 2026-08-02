@@ -1607,6 +1607,21 @@ enum OauthCommand {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
+    /// Reconcile the OAuth task queue. Dry-run is the default; `--apply`
+    /// cancels only superseded pending rows and creates missing target tasks.
+    QueueReconcile {
+        /// Provider name or `all`.
+        #[arg(default_value = "all")]
+        provider: String,
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        /// Explicit TOS acknowledgement required with `--apply`.
+        #[arg(long, default_value_t = false, requires = "apply")]
+        yes: bool,
+    },
+    /// Internal worker verb: resolve a credential reference on its target.
+    #[command(hide = true)]
+    InstallRef { provider: String },
     /// Show per-provider OAuth state: cred-file present on leader,
     /// mtime, token-in-fleet_secrets, token-preview.
     Status,
@@ -5442,8 +5457,9 @@ async fn main() -> Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
             use ff_agent::oauth_distributor::{
-                OAUTH_PROVIDERS, distribute_token, import_token, provider_by_name,
-                spawn_refresh_watch, status,
+                OAUTH_PROVIDERS, distribute_token, import_token, install_secret_ref,
+                provider_by_name, reconcile_queue, spawn_refresh_watch, status,
+                validate_provider_for_distribution,
             };
             // Resolve `all` to every catalog entry; otherwise look up the
             // single named provider.
@@ -5512,12 +5528,68 @@ async fn main() -> Result<()> {
                     }
                     Ok(())
                 }
+                OauthCommand::QueueReconcile {
+                    provider,
+                    apply,
+                    yes,
+                } => {
+                    if apply && !yes {
+                        anyhow::bail!(
+                            "--apply requires --yes to acknowledge the OAuth distribution TOS boundary"
+                        );
+                    }
+                    let scope = resolve(&provider)?;
+                    let mut valid = Vec::new();
+                    for p in &scope {
+                        match validate_provider_for_distribution(&pool, p).await {
+                            Ok(bytes) => {
+                                if apply {
+                                    let document =
+                                        std::str::from_utf8(&bytes).with_context(|| {
+                                            format!("{} credential is not UTF-8", p.name)
+                                        })?;
+                                    ff_db::pg_set_secret(
+                                        &pool,
+                                        &format!("{}.credentials", p.secret_key),
+                                        document,
+                                        Some("OAuth credential document resolved only by target workers"),
+                                        Some("ff oauth queue-reconcile"),
+                                    )
+                                    .await?;
+                                }
+                                valid.push(*p)
+                            }
+                            Err(error) => {
+                                eprintln!("{YELLOW}!{RESET} {} skipped: {}", p.name, error)
+                            }
+                        }
+                    }
+                    let report = reconcile_queue(&pool, &scope, &valid, apply).await?;
+                    println!(
+                        "{}: pending={} cancel={} enqueue={} active-preserved={} terminal-preserved={}",
+                        if apply { "applied" } else { "dry-run" },
+                        report.pending_found,
+                        report.would_cancel,
+                        report.would_enqueue,
+                        report.preserved_active,
+                        report.preserved_terminal,
+                    );
+                    if !apply {
+                        println!("dry-run only; pass --apply --yes to execute this reconciliation");
+                    }
+                    Ok(())
+                }
+                OauthCommand::InstallRef { provider } => {
+                    let p = provider_by_name(&provider)
+                        .ok_or_else(|| anyhow::anyhow!("unknown OAuth provider"))?;
+                    install_secret_ref(&pool, p).await
+                }
                 OauthCommand::Status => {
                     let snap = status(&pool)
                         .await
                         .map_err(|e| anyhow::anyhow!("status: {e}"))?;
                     println!(
-                        "{:<10} {:<14} {:<18} {:<10} TOKEN PREVIEW",
+                        "{:<10} {:<14} {:<18} {:<10}",
                         "PROVIDER", "CRED FILE", "FILE MTIME", "IN SECRETS"
                     );
                     for s in snap {
@@ -5536,7 +5608,7 @@ async fn main() -> Result<()> {
                             })
                             .unwrap_or_else(|| "-".into());
                         println!(
-                            "{:<10} {:<14} {:<18} {:<10} {}",
+                            "{:<10} {:<14} {:<18} {:<10}",
                             s.name,
                             if s.cred_file_present {
                                 "present"
@@ -5545,7 +5617,6 @@ async fn main() -> Result<()> {
                             },
                             mtime,
                             if s.token_in_secrets { "yes" } else { "no" },
-                            s.token_preview.unwrap_or_else(|| "-".into()),
                         );
                     }
                     let setup_token = ff_db::pg_get_secret(&pool, "claude.setup_token")
