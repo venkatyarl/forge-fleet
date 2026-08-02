@@ -4334,6 +4334,15 @@ async fn proxy_chat_completions(
     }
 
     debug!(model = %_trace_model, "GW.2: pre-cloud_llm");
+    let provider_plan = if let Some(pool) =
+        state.operational_store.as_ref().and_then(|s| s.pg_pool())
+        && let Some(model) = raw_payload.get("model").and_then(|v| v.as_str())
+    {
+        crate::cloud_llm::gateway_provider_plan(pool, model, &raw_payload).await
+    } else {
+        Vec::new()
+    };
+
     // ── Cloud-LLM routing (first pass) ───────────────────────────────
     //
     // If the `model` field matches a row in `cloud_llm_providers`
@@ -4341,24 +4350,13 @@ async fn proxy_chat_completions(
     // public API (OpenAI/Anthropic/Moonshot/Google). This only fires
     // when we have a Postgres pool available; otherwise we quietly
     // skip straight to Pulse.
-    if let Some(store) = state.operational_store.as_ref()
-        && let Some(pool) = store.pg_pool()
-        && let Some(model) = raw_payload.get("model").and_then(|v| v.as_str())
-        && let Some(result) = crate::cloud_llm::try_route_to_cloud(
-            pool,
-            model,
-            &raw_payload,
-            None,
-            &state.http_client,
-        )
-        .await
+    if provider_plan
+        .first()
+        .is_some_and(|attempt| attempt.kind == crate::cloud_llm::GatewayProviderKind::CloudBackend)
+        && let Some(resp) = try_cloud_provider_plan(&state, &provider_plan, &raw_payload).await
     {
-        match result {
-            Ok(resp) => return Ok(resp),
-            Err(resp) => return Ok(resp),
-        }
+        return Ok(resp);
     }
-
     // ── Qwen3 thinking-mode max_tokens floor ─────────────────────────
     //
     // Qwen3-family models (Qwen3, Qwen3-Coder, Qwen3-Omni, Qwen3-VL,
@@ -4521,7 +4519,7 @@ async fn proxy_chat_completions(
     // ── Legacy tier-router fallback ──────────────────────────────────
     // Re-parse the raw payload into the typed ChatCompletionRequest the
     // legacy path expects. Any schema-level error becomes a 400 here.
-    let payload: ChatCompletionRequest = match serde_json::from_value(raw_payload) {
+    let payload: ChatCompletionRequest = match serde_json::from_value(raw_payload.clone()) {
         Ok(p) => p,
         Err(e) => {
             return Err((
@@ -4753,6 +4751,9 @@ async fn proxy_chat_completions(
             }
         }
 
+        if let Some(resp) = try_cloud_provider_plan(&state, &provider_plan, &raw_payload).await {
+            return Ok(resp);
+        }
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": {
@@ -4827,6 +4828,10 @@ async fn proxy_chat_completions(
         }
     }
 
+    if let Some(resp) = try_cloud_provider_plan(&state, &provider_plan, &raw_payload).await {
+        return Ok(resp);
+    }
+
     Err((
         StatusCode::BAD_GATEWAY,
         Json(json!({"error": {
@@ -4834,6 +4839,53 @@ async fn proxy_chat_completions(
             "type": "upstream_error"
         }})),
     ))
+}
+
+async fn try_cloud_provider_plan(
+    state: &GatewayState,
+    provider_plan: &[crate::cloud_llm::GatewayProviderAttempt],
+    raw_payload: &Value,
+) -> Option<Response<Body>> {
+    let pool = state.operational_store.as_ref().and_then(|s| s.pg_pool())?;
+    let model = raw_payload
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let mut last_budget_error = None;
+    for attempt in provider_plan
+        .iter()
+        .filter(|attempt| attempt.kind == crate::cloud_llm::GatewayProviderKind::CloudBackend)
+    {
+        if let Some(reason) = &attempt.rejected_reason {
+            last_budget_error = Some(format!("{}: {reason}", attempt.target));
+            continue;
+        }
+        if let Some(result) = crate::cloud_llm::try_route_to_cloud_backend(
+            pool,
+            &attempt.target,
+            model,
+            raw_payload,
+            None,
+            &state.http_client,
+        )
+        .await
+        {
+            match result {
+                Ok(resp) => return Some(resp),
+                Err(resp) if resp.status().is_server_error() => continue,
+                Err(resp) => return Some(resp),
+            }
+        }
+    }
+    last_budget_error.map(|message| {
+        Response::builder()
+            .status(StatusCode::PAYMENT_REQUIRED)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"error": {"message": message, "type": "budget_cap_reached"}}).to_string(),
+            ))
+            .unwrap_or_else(|_| Response::new(Body::empty()))
+    })
 }
 
 /// Record token usage from a non-streaming upstream response.
