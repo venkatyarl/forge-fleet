@@ -3825,12 +3825,17 @@ pub(crate) async fn explain_community_postgres(
     // The chosen symbol's CODE community (assigned by `detect_code_communities`
     // — label propagation over the `calls` subgraph, not the brain-KG
     // connected-components `community_id`).
-    let community_id: Option<i32> =
-        sqlx::query_scalar("SELECT code_community_id FROM brain_vault_nodes WHERE id = $1")
-            .bind(chosen.id)
-            .fetch_optional(pool)
-            .await?
-            .flatten();
+    let community_id: Option<i32> = sqlx::query_scalar(
+        "SELECT a.community_id
+           FROM brain_code_community_refreshes r
+           JOIN brain_code_community_assignments a
+             ON a.project = r.project AND a.refresh_id = r.active_refresh_id
+          WHERE r.project = $1 AND a.node_id = $2",
+    )
+    .bind(corpus_slug)
+    .bind(chosen.id)
+    .fetch_optional(pool)
+    .await?;
 
     let Some(cid) = community_id else {
         return Ok(Some(CommunityExplanation {
@@ -3846,17 +3851,23 @@ pub(crate) async fn explain_community_postgres(
         }));
     };
 
-    // The registry row, located via the god node (which carries the same
-    // code_community_id). Detection is global, so we match on code_community_id,
-    // not corpus.
+    // The registry row, located via the god node within this corpus. Community
+    // refreshes are corpus-scoped, so the project predicate prevents even a
+    // theoretical stable-id hash collision from crossing corpus boundaries.
     let reg = sqlx::query(
         r#"SELECT bc.member_hash, bc.summary, bc.summary_model, bc.member_count, gn.title AS god_title
              FROM brain_code_communities bc
              JOIN brain_vault_nodes gn ON gn.id = bc.god_node_id
-            WHERE gn.code_community_id = $1 AND gn.valid_until IS NULL
+             JOIN brain_code_community_refreshes r ON r.project = gn.project
+             JOIN brain_code_community_assignments a
+               ON a.project = r.project AND a.refresh_id = r.active_refresh_id
+              AND a.node_id = gn.id
+            WHERE a.community_id = $1 AND gn.project = $2
+              AND gn.valid_until IS NULL
             LIMIT 1"#,
     )
     .bind(cid)
+    .bind(corpus_slug)
     .fetch_optional(pool)
     .await?;
 
@@ -3918,12 +3929,15 @@ pub(crate) async fn explain_community_postgres(
         r#"SELECT n.title, n.node_type,
                   (SELECT count(*) FROM brain_vault_edges e
                     WHERE e.edge_type = 'calls' AND e.dst_id = n.id) AS fan_in
-             FROM brain_vault_nodes n
-            WHERE n.code_community_id = $1
+             FROM brain_code_community_refreshes r
+             JOIN brain_code_community_assignments a
+               ON a.project = r.project AND a.refresh_id = r.active_refresh_id
+             JOIN brain_vault_nodes n ON n.id = a.node_id
+            WHERE a.community_id = $1
               AND n.valid_until IS NULL
               AND n.node_type LIKE 'code:%'
               AND n.node_type <> 'code:extern'
-              AND n.project = $2
+              AND r.project = $2
             ORDER BY fan_in DESC, n.title COLLATE "C"
             LIMIT $3"#,
     )

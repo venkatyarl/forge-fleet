@@ -115,13 +115,17 @@ pub async fn summarize_communities<F: Fn(usize, usize)>(
     // community_id (union-find renumbers each detection run), so join through it
     // to get both the anchor symbol and the id used to fetch members. Biggest
     // communities first = best ROI under the `max` cap.
-    let rows: Vec<(i32, i32, i32, String, String)> = sqlx::query_as(
-        "SELECT c.id, g.code_community_id, c.member_count, g.title, g.path
+    let rows: Vec<(i32, i32, i32, String, String, String)> = sqlx::query_as(
+        "SELECT c.id, a.community_id, c.member_count, g.title, g.path, g.project
          FROM brain_code_communities c
          JOIN brain_vault_nodes g ON g.id = c.god_node_id
+         JOIN brain_code_community_refreshes r
+           ON r.project = g.project AND r.active_refresh_id IS NOT NULL
+         JOIN brain_code_community_assignments a
+           ON a.project = r.project AND a.refresh_id = r.active_refresh_id
+          AND a.node_id = g.id
          WHERE c.member_count >= $1
            AND ($2 OR c.summary IS NULL)
-           AND g.code_community_id IS NOT NULL
            AND g.valid_until IS NULL
            -- level 0 only: this summarizer resolves members via the god node's
            -- code_community_id (a level-0 label), so it can only correctly
@@ -165,19 +169,23 @@ pub async fn summarize_communities<F: Fn(usize, usize)>(
 
     let url = format!("{endpoint}/v1/chat/completions");
 
-    for (i, (comm_id, cid, member_count, god_title, god_path)) in rows.iter().enumerate() {
+    for (i, (comm_id, cid, member_count, god_title, god_path, project)) in rows.iter().enumerate() {
         stats.attempted += 1;
 
         // Representative members (most-referenced first), titles + types for the prompt.
         let members: Vec<(String, String)> = sqlx::query_as(
-            "SELECT title, COALESCE(node_type, '')
-             FROM brain_vault_nodes
-             WHERE code_community_id = $1 AND valid_until IS NULL
-             ORDER BY references_ DESC, hits DESC, title ASC
+            "SELECT n.title, COALESCE(n.node_type, '')
+             FROM brain_code_community_refreshes r
+             JOIN brain_code_community_assignments a
+               ON a.project = r.project AND a.refresh_id = r.active_refresh_id
+             JOIN brain_vault_nodes n ON n.id = a.node_id
+             WHERE a.community_id = $1 AND r.project = $3 AND n.valid_until IS NULL
+             ORDER BY n.references_ DESC, n.hits DESC, n.title ASC
              LIMIT $2",
         )
         .bind(cid)
         .bind(MAX_PROMPT_MEMBERS)
+        .bind(project)
         .fetch_all(pool)
         .await
         .unwrap_or_default();
@@ -683,9 +691,13 @@ async fn communities_needing_summary(pool: &PgPool, min_members: usize) -> Resul
         "SELECT count(*)
            FROM brain_code_communities c
            JOIN brain_vault_nodes g ON g.id = c.god_node_id
+           JOIN brain_code_community_refreshes r
+             ON r.project = g.project AND r.active_refresh_id IS NOT NULL
+           JOIN brain_code_community_assignments a
+             ON a.project = r.project AND a.refresh_id = r.active_refresh_id
+            AND a.node_id = g.id
           WHERE c.member_count >= $1
             AND c.summary IS NULL
-            AND g.code_community_id IS NOT NULL
             AND g.valid_until IS NULL
             AND c.level = 0",
     )

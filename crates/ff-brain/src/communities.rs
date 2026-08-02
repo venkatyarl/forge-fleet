@@ -5,8 +5,68 @@
 //! enough nodes to warrant it.
 
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+const CODE_COMMUNITY_BATCH_SIZE: usize = 2_000;
+const CODE_COMMUNITY_MAX_RETRIES: usize = 4;
+
+fn retryable_community_write_error(error: &sqlx::Error) -> bool {
+    matches!(
+        error.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("55P03" | "57014" | "40P01" | "40001")
+    )
+}
+
+/// Observable state for an in-flight code-community refresh. The worker encodes
+/// progress in its dedicated connection's `application_name`, so status remains
+/// available without adding another fleet-wide bookkeeping table.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CodeCommunityRefreshStatus {
+    pub project: String,
+    pub rows_persisted: i64,
+    pub rows_total: i64,
+    pub age_seconds: i64,
+    pub blockers: Vec<i32>,
+    pub wait_event: Option<String>,
+}
+
+pub async fn code_community_refresh_status(
+    pool: &PgPool,
+) -> Result<Vec<CodeCommunityRefreshStatus>, sqlx::Error> {
+    let rows: Vec<(String, i64, i64, i64, Vec<i32>, Option<String>)> = sqlx::query_as(
+        r#"SELECT r.project,
+                  r.rows_persisted,
+                  r.rows_total,
+                  EXTRACT(EPOCH FROM clock_timestamp() - r.started_at)::bigint,
+                  COALESCE(pg_blocking_pids(a.pid), ARRAY[]::int[]),
+                  a.wait_event
+             FROM brain_code_community_refreshes r
+             LEFT JOIN pg_stat_activity a
+               ON a.application_name LIKE
+                  ('ffcc|' || left(r.project, 28) || '|%')
+            WHERE r.working_refresh_id IS NOT NULL
+            ORDER BY r.started_at"#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(project, rows_persisted, rows_total, age_seconds, blockers, wait_event)| {
+                CodeCommunityRefreshStatus {
+                    project,
+                    rows_persisted,
+                    rows_total,
+                    age_seconds,
+                    blockers,
+                    wait_event,
+                }
+            },
+        )
+        .collect())
+}
 
 /// Summary of community detection results.
 pub struct CommunitySummary {
@@ -30,6 +90,19 @@ pub fn community_member_hash(member_paths: &[String]) -> String {
         h.update(p.as_bytes());
         h.update(b"\n");
     }
+    format!("{:x}", h.finalize())
+}
+
+fn stable_code_community_id(project: &str, member_paths: &[String]) -> i32 {
+    let digest = Sha256::digest(code_community_member_hash(project, member_paths));
+    i32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) & i32::MAX
+}
+
+fn code_community_member_hash(project: &str, member_paths: &[String]) -> String {
+    let mut h = Sha256::new();
+    h.update(project.as_bytes());
+    h.update(b"\0");
+    h.update(community_member_hash(member_paths).as_bytes());
     format!("{:x}", h.finalize())
 }
 
@@ -447,23 +520,178 @@ pub fn community_parents(levels: &[Vec<usize>]) -> HashMap<(usize, usize), Optio
 /// aren't worth an LLM summary. Leaves `community_id`/`brain_communities`
 /// (the brain KG view) completely untouched.
 pub async fn detect_code_communities(pool: &PgPool) -> Result<CommunitySummary, String> {
+    let projects: Vec<String> = sqlx::query_scalar(
+        "SELECT project FROM (
+             SELECT DISTINCT project FROM brain_vault_nodes
+              WHERE valid_until IS NULL AND project IS NOT NULL
+                AND node_type LIKE 'code:%' AND node_type <> 'code:extern'
+             UNION
+             SELECT project FROM brain_code_community_refreshes
+         ) projects
+         ORDER BY project",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("DB error listing code-community projects: {e}"))?;
+
+    let mut total = CommunitySummary {
+        communities_found: 0,
+        largest_community: 0,
+        communities_persisted: 0,
+    };
+    for project in projects {
+        let mut attempt = 0;
+        let summary = loop {
+            attempt += 1;
+            match detect_code_communities_project(pool, &project).await {
+                Ok(summary) => break summary,
+                Err(error)
+                    if error.contains("retry required") && attempt < CODE_COMMUNITY_MAX_RETRIES =>
+                {
+                    tracing::warn!(project, attempt, error, "retrying community refresh");
+                    tokio::time::sleep(Duration::from_millis(100 * (1 << attempt))).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        total.communities_found += summary.communities_found;
+        total.largest_community = total.largest_community.max(summary.largest_community);
+        total.communities_persisted += summary.communities_persisted;
+    }
+    Ok(total)
+}
+
+async fn detect_code_communities_project(
+    pool: &PgPool,
+    project: &str,
+) -> Result<CommunitySummary, String> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| format!("DB error acquiring refresh lease connection: {e}"))?;
+    let lock_key = format!("cortex-community:{project}");
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
+        .bind(&lock_key)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| format!("DB error acquiring community refresh lease: {e}"))?;
+    if !acquired {
+        tracing::info!(project, "code-community refresh already active; skipping");
+        return Ok(CommunitySummary {
+            communities_found: 0,
+            largest_community: 0,
+            communities_persisted: 0,
+        });
+    }
+    let result = async {
+        sqlx::query(
+            "SELECT set_config('lock_timeout', '1s', false),
+                    set_config('statement_timeout', '120s', false)",
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| format!("DB error setting community refresh timeouts: {e}"))?;
+
+        let started = chrono::Utc::now().timestamp();
+        let app_name = format!(
+            "ffcc|{}|0|0|{}",
+            project.chars().take(28).collect::<String>(),
+            started
+        );
+        sqlx::query("SELECT set_config('application_name', $1, false)")
+            .bind(app_name)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| format!("DB error publishing community refresh start: {e}"))?;
+
+        detect_code_communities_project_locked(pool, project, started, &mut *conn).await
+    }
+    .await;
+    if let Err(error) = &result {
+        let _ = sqlx::query(
+            "UPDATE brain_code_community_refreshes
+                SET working_refresh_id = NULL, last_error = $2, updated_at = NOW()
+              WHERE project = $1",
+        )
+        .bind(project)
+        .bind(error)
+        .execute(&mut *conn)
+        .await;
+    }
+    let cleanup = sqlx::query(
+        "SELECT set_config('application_name', '', false),
+                set_config('lock_timeout', '0', false),
+                set_config('statement_timeout', '0', false)",
+    )
+    .execute(&mut *conn)
+    .await;
+    let unlock = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock(hashtext($1))")
+        .bind(&lock_key)
+        .fetch_one(&mut *conn)
+        .await;
+    match unlock {
+        Err(e) => return Err(format!("DB error releasing community refresh lease: {e}")),
+        Ok(false) => return Err("community refresh lease was not held at release".to_string()),
+        Ok(true) => {}
+    }
+    if let Err(e) = cleanup {
+        return Err(format!(
+            "DB error clearing community refresh session state: {e}"
+        ));
+    }
+    result
+}
+
+async fn detect_code_communities_project_locked(
+    _pool: &PgPool,
+    project: &str,
+    started: i64,
+    conn: &mut PgConnection,
+) -> Result<CommunitySummary, String> {
+    let refresh_id = uuid::Uuid::new_v4();
+    let source_signature: (i64, Option<chrono::DateTime<chrono::Utc>>, Option<i64>) =
+        sqlx::query_as(
+            "SELECT COUNT(*), MAX(updated_at), MAX(generation)
+             FROM brain_vault_nodes
+             WHERE valid_until IS NULL AND project = $1
+               AND node_type LIKE 'code:%' AND node_type <> 'code:extern'",
+        )
+        .bind(project)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| format!("DB error reading code graph generation: {e}"))?;
     // Non-extern code nodes only — the universe we cluster.
     let node_rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
         "SELECT id, path FROM brain_vault_nodes
          WHERE valid_until IS NULL
+           AND project = $1
            AND node_type LIKE 'code:%'
            AND node_type <> 'code:extern'",
     )
-    .fetch_all(pool)
+    .bind(project)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|e| format!("DB error fetching code nodes: {e}"))?;
 
     if node_rows.is_empty() {
-        // Clear any stale registry so callers see an honest empty state.
-        sqlx::query("DELETE FROM brain_code_communities")
-            .execute(pool)
-            .await
-            .map_err(|e| format!("DB error clearing code communities: {e}"))?;
+        sqlx::query(
+            "INSERT INTO brain_code_community_refreshes
+                 (project, active_refresh_id, working_refresh_id, source_generation,
+                  rows_persisted, rows_total, started_at, completed_at, last_error, updated_at)
+             VALUES ($1, $2, NULL, $3, 0, 0, to_timestamp($4), NOW(), NULL, NOW())
+             ON CONFLICT (project) DO UPDATE
+               SET active_refresh_id = EXCLUDED.active_refresh_id,
+                   working_refresh_id = NULL, source_generation = EXCLUDED.source_generation,
+                   rows_persisted = 0, rows_total = 0, completed_at = NOW(),
+                   last_error = NULL, updated_at = NOW()",
+        )
+        .bind(project)
+        .bind(refresh_id)
+        .bind(source_signature.2)
+        .bind(started)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| format!("DB error publishing empty code communities: {e}"))?;
         return Ok(CommunitySummary {
             communities_found: 0,
             largest_community: 0,
@@ -479,11 +707,17 @@ pub async fn detect_code_communities(pool: &PgPool) -> Result<CommunitySummary, 
 
     // `calls` edges among code nodes → undirected adjacency + directed in-degree
     // (callers) for the god-node pick.
-    let edge_rows: Vec<(uuid::Uuid, uuid::Uuid)> =
-        sqlx::query_as("SELECT src_id, dst_id FROM brain_vault_edges WHERE edge_type = 'calls'")
-            .fetch_all(pool)
-            .await
-            .map_err(|e| format!("DB error fetching call edges: {e}"))?;
+    let edge_rows: Vec<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
+        "SELECT e.src_id, e.dst_id FROM brain_vault_edges e
+         JOIN brain_vault_nodes s ON s.id = e.src_id
+         JOIN brain_vault_nodes d ON d.id = e.dst_id
+         WHERE e.edge_type = 'calls' AND s.project = $1 AND d.project = $1
+           AND s.valid_until IS NULL AND d.valid_until IS NULL",
+    )
+    .bind(project)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| format!("DB error fetching call edges: {e}"))?;
 
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut in_degree: Vec<usize> = vec![0; n];
@@ -508,34 +742,49 @@ pub async fn detect_code_communities(pool: &PgPool) -> Result<CommunitySummary, 
     let label = &levels[0];
 
     // Relabel raw labels → dense community ids; group members.
-    let mut label_to_cid: HashMap<usize, i32> = HashMap::new();
-    let mut next_cid: i32 = 0;
     let mut members: HashMap<i32, Vec<usize>> = HashMap::new();
     let mut cid_of: Vec<i32> = vec![0; n];
-    for i in 0..n {
-        let cid = *label_to_cid.entry(label[i]).or_insert_with(|| {
-            let c = next_cid;
-            next_cid += 1;
-            c
-        });
-        cid_of[i] = cid;
-        members.entry(cid).or_default().push(i);
+    let mut raw_members: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, &raw) in label.iter().enumerate() {
+        raw_members.entry(raw).or_default().push(i);
+    }
+    let mut used_ids = HashSet::new();
+    for idxs in raw_members.values() {
+        let paths: Vec<String> = idxs.iter().map(|&i| node_rows[i].1.clone()).collect();
+        let mut cid = stable_code_community_id(project, &paths);
+        while !used_ids.insert(cid) {
+            cid = cid.wrapping_add(1) & i32::MAX;
+        }
+        for &i in idxs {
+            cid_of[i] = cid;
+        }
+        members.insert(cid, idxs.clone());
     }
 
     // Batch-write code_community_id by node id (code paths are unique, but id is
     // the safe key). Clear it first on any code node not in this run is implicit:
     // every current code node is in node_rows and gets a value here.
-    let ids: Vec<uuid::Uuid> = node_rows.iter().map(|(id, _)| *id).collect();
     sqlx::query(
-        "UPDATE brain_vault_nodes AS bn SET code_community_id = t.cid
-         FROM UNNEST($1::uuid[], $2::int[]) AS t(id, cid)
-         WHERE bn.id = t.id",
+        "INSERT INTO brain_code_community_refreshes
+             (project, working_refresh_id, source_generation, rows_persisted,
+              rows_total, started_at, last_error, updated_at)
+         VALUES ($1, $2, $3, 0, $4, to_timestamp($5), NULL, NOW())
+         ON CONFLICT (project) DO UPDATE
+           SET working_refresh_id = EXCLUDED.working_refresh_id,
+               source_generation = EXCLUDED.source_generation,
+               rows_persisted = 0, rows_total = EXCLUDED.rows_total,
+               started_at = EXCLUDED.started_at, last_error = NULL, updated_at = NOW()",
     )
-    .bind(&ids)
-    .bind(&cid_of)
-    .execute(pool)
+    .bind(project)
+    .bind(refresh_id)
+    .bind(source_signature.2)
+    .bind(n as i64)
+    .bind(started)
+    .execute(&mut *conn)
     .await
-    .map_err(|e| format!("DB error batch-updating code_community_id: {e}"))?;
+    .map_err(|e| format!("DB error recording community refresh: {e}"))?;
+    persist_code_community_assignments(conn, project, refresh_id, started, &node_rows, &cid_of)
+        .await?;
 
     let communities_found = members.len();
     let largest_community = members.values().map(|m| m.len()).max().unwrap_or(0);
@@ -564,7 +813,7 @@ pub async fn detect_code_communities(pool: &PgPool) -> Result<CommunitySummary, 
                 continue;
             }
             let paths: Vec<String> = idxs.iter().map(|&i| node_rows[i].1.clone()).collect();
-            group_hash.insert((lvl, label), community_member_hash(&paths));
+            group_hash.insert((lvl, label), code_community_member_hash(project, &paths));
         }
     }
     let parents = community_parents(&levels);
@@ -608,21 +857,8 @@ pub async fn detect_code_communities(pool: &PgPool) -> Result<CommunitySummary, 
         }
     }
 
-    // GC stale rows (and legacy NULL-hash), then upsert — preserving summaries on
-    // unchanged (member_hash, level) rows.
-    sqlx::query(
-        "DELETE FROM brain_code_communities
-          WHERE member_hash IS NULL
-             OR (member_hash, level) NOT IN (
-                 SELECT h, l FROM UNNEST($1::text[], $2::int[]) AS t(h, l)
-             )",
-    )
-    .bind(&hashes)
-    .bind(&row_levels)
-    .execute(pool)
-    .await
-    .map_err(|e| format!("DB error pruning stale code communities: {e}"))?;
-
+    // Upsert before publication. Readers select assignments through the active
+    // refresh pointer, so these rows remain invisible until the one-row swap.
     sqlx::query(
         "INSERT INTO brain_code_communities
              (member_hash, god_node_id, member_count, level, parent_member_hash, updated_at)
@@ -639,9 +875,61 @@ pub async fn detect_code_communities(pool: &PgPool) -> Result<CommunitySummary, 
     .bind(&counts)
     .bind(&row_levels)
     .bind(&parent_hashes)
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .map_err(|e| format!("DB error upserting code communities: {e}"))?;
+
+    let published = sqlx::query(
+        "UPDATE brain_code_community_refreshes
+            SET active_refresh_id = $2, working_refresh_id = NULL,
+                rows_persisted = rows_total, completed_at = NOW(),
+                last_error = NULL, updated_at = NOW()
+          WHERE project = $1 AND working_refresh_id = $2
+            AND ROW($3::bigint, $4::timestamptz, $5::bigint)
+                IS NOT DISTINCT FROM (
+                    SELECT ROW(COUNT(*), MAX(updated_at), MAX(generation))
+                      FROM brain_vault_nodes
+                     WHERE valid_until IS NULL AND project = $1
+                       AND node_type LIKE 'code:%' AND node_type <> 'code:extern'
+                )",
+    )
+    .bind(project)
+    .bind(refresh_id)
+    .bind(source_signature.0)
+    .bind(source_signature.1)
+    .bind(source_signature.2)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| format!("DB error publishing code communities: {e}"))?;
+    if published.rows_affected() != 1 {
+        return Err(format!(
+            "code graph changed or publication fence was lost for {project}; retry required (updated {} rows)",
+            published.rows_affected()
+        ));
+    }
+
+    // Retire superseded snapshots without ever locking vault rows. Each delete
+    // is its own bounded statement; an interrupted cleanup is harmless and the
+    // next successful refresh resumes it.
+    loop {
+        let deleted = sqlx::query(
+            "DELETE FROM brain_code_community_assignments
+              WHERE ctid IN (
+                    SELECT ctid FROM brain_code_community_assignments
+                     WHERE project = $1 AND refresh_id <> $2
+                     LIMIT $3
+              )",
+        )
+        .bind(project)
+        .bind(refresh_id)
+        .bind(CODE_COMMUNITY_BATCH_SIZE as i64)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| format!("DB error pruning old community assignments: {e}"))?;
+        if deleted.rows_affected() == 0 {
+            break;
+        }
+    }
 
     Ok(CommunitySummary {
         communities_found,
@@ -650,11 +938,189 @@ pub async fn detect_code_communities(pool: &PgPool) -> Result<CommunitySummary, 
     })
 }
 
+async fn persist_code_community_assignments(
+    conn: &mut PgConnection,
+    project: &str,
+    refresh_id: uuid::Uuid,
+    started: i64,
+    node_rows: &[(uuid::Uuid, String)],
+    assignments: &[i32],
+) -> Result<(), String> {
+    let total = node_rows.len();
+    sqlx::query("SELECT set_config('statement_timeout', '15s', false)")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| format!("DB error setting community write timeout: {e}"))?;
+    for (batch_index, rows) in node_rows.chunks(CODE_COMMUNITY_BATCH_SIZE).enumerate() {
+        let offset = batch_index * CODE_COMMUNITY_BATCH_SIZE;
+        let ids: Vec<uuid::Uuid> = rows.iter().map(|(id, _)| *id).collect();
+        let cids = &assignments[offset..offset + rows.len()];
+        let app_name = format!(
+            "ffcc|{}|{}|{}|{}",
+            project.chars().take(28).collect::<String>(),
+            offset,
+            total,
+            started
+        );
+        sqlx::query("SELECT set_config('application_name', $1, false)")
+            .bind(app_name)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| format!("DB error publishing community refresh progress: {e}"))?;
+
+        let mut last_error = None;
+        for attempt in 0..CODE_COMMUNITY_MAX_RETRIES {
+            match sqlx::query(
+                "INSERT INTO brain_code_community_assignments
+                     (project, refresh_id, node_id, community_id)
+                 SELECT $3, $4, t.id, t.cid
+                 FROM UNNEST($1::uuid[], $2::int[]) AS t(id, cid)
+                 JOIN brain_vault_nodes bn ON bn.id = t.id
+                 WHERE bn.project = $3 AND bn.valid_until IS NULL
+                 ON CONFLICT (project, refresh_id, node_id) DO UPDATE
+                   SET community_id = EXCLUDED.community_id",
+            )
+            .bind(&ids)
+            .bind(cids)
+            .bind(project)
+            .bind(refresh_id)
+            .execute(&mut *conn)
+            .await
+            {
+                Ok(_) => {
+                    last_error = None;
+                    break;
+                }
+                Err(e) => {
+                    let retryable = retryable_community_write_error(&e);
+                    last_error = Some(e);
+                    if retryable && attempt + 1 < CODE_COMMUNITY_MAX_RETRIES {
+                        tokio::time::sleep(Duration::from_millis(100 * (1 << attempt))).await;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(e) = last_error {
+            return Err(format!(
+                "DB error persisting code-community batch {batch_index} for {project}: {e}"
+            ));
+        }
+        let persisted = offset + rows.len();
+        let app_name = format!(
+            "ffcc|{}|{}|{}|{}",
+            project.chars().take(28).collect::<String>(),
+            persisted,
+            total,
+            started
+        );
+        sqlx::query("SELECT set_config('application_name', $1, false)")
+            .bind(app_name)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| format!("DB error publishing community refresh progress: {e}"))?;
+        sqlx::query(
+            "UPDATE brain_code_community_refreshes
+                SET rows_persisted = $3, updated_at = NOW()
+              WHERE project = $1 AND working_refresh_id = $2",
+        )
+        .bind(project)
+        .bind(refresh_id)
+        .bind(persisted as i64)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| format!("DB error recording community refresh progress: {e}"))?;
+        tracing::info!(project, persisted, total, "code-community refresh progress");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        cluster_calls_graph, cluster_calls_graph_levels, community_member_hash, community_parents,
+        CODE_COMMUNITY_BATCH_SIZE, cluster_calls_graph, cluster_calls_graph_levels,
+        community_member_hash, community_parents, stable_code_community_id,
     };
+
+    #[test]
+    fn stable_code_ids_are_project_scoped_and_order_independent() {
+        let a = vec!["b::f".to_string(), "a::f".to_string()];
+        let b = vec!["a::f".to_string(), "b::f".to_string()];
+        assert_eq!(
+            stable_code_community_id("alpha", &a),
+            stable_code_community_id("alpha", &b)
+        );
+        assert_ne!(
+            stable_code_community_id("alpha", &a),
+            stable_code_community_id("beta", &a)
+        );
+    }
+
+    #[test]
+    fn five_hundred_thousand_rows_are_split_into_bounded_writes() {
+        let ranges: Vec<_> = (0usize..500_000)
+            .collect::<Vec<_>>()
+            .chunks(CODE_COMMUNITY_BATCH_SIZE)
+            .map(|chunk| (chunk[0], chunk.len()))
+            .collect();
+        assert_eq!(ranges.len(), 250);
+        assert!(ranges.iter().all(|(_, len)| *len <= 2_000));
+        assert_eq!(ranges.last(), Some(&(498_000, 2_000)));
+    }
+
+    #[tokio::test]
+    async fn community_lease_does_not_block_generation_or_embed_reads() {
+        let Some(url) = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .ok()
+            .or_else(|| std::env::var("FORGEFLEET_DATABASE_URL").ok())
+        else {
+            return;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .connect(&url)
+            .await
+            .expect("connect test postgres");
+        let mut refresh = pool.acquire().await.expect("refresh connection");
+        let mut generation = pool.acquire().await.expect("generation connection");
+        let project = format!("community-test-{}", uuid::Uuid::new_v4());
+        let community_key = format!("cortex-community:{project}");
+        let generation_key = format!("cortex:{project}");
+        let held: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
+            .bind(&community_key)
+            .fetch_one(&mut *refresh)
+            .await
+            .expect("take community lease");
+        assert!(held);
+
+        let generation_proceeded: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
+                .bind(&generation_key)
+                .fetch_one(&mut *generation)
+                .await
+                .expect("generation lease remains independent");
+        assert!(generation_proceeded);
+        let _: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM brain_vault_nodes
+             WHERE valid_until IS NULL AND embedding IS NULL LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("embed candidate read remains available");
+
+        for (conn, key) in [
+            (&mut *refresh, &community_key),
+            (&mut *generation, &generation_key),
+        ] {
+            let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock(hashtext($1))")
+                .bind(key)
+                .fetch_one(conn)
+                .await
+                .expect("release test lease");
+            assert!(unlocked);
+        }
+    }
 
     #[test]
     fn community_parents_walks_to_first_strictly_larger() {

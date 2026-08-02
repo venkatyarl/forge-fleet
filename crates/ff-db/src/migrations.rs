@@ -1270,6 +1270,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_load_reservations",
         sql: schema::SCHEMA_V284_MODEL_LOAD_RESERVATIONS,
     },
+    PgMigration {
+        version: 285,
+        name: "cortex_community_refreshes",
+        sql: schema::SCHEMA_V285_CORTEX_COMMUNITY_REFRESHES,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -3058,5 +3063,18 @@ mod tests {
                 .sql
                 .contains("guard_project_digest_cursor_regression")
         );
+    }
+
+    #[test]
+    fn v285_stages_and_atomically_publishes_cortex_communities() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 285)
+            .expect("V285 must be registered");
+        assert_eq!(migration.name, "cortex_community_refreshes");
+        assert!(migration.sql.contains("brain_code_community_refreshes"));
+        assert!(migration.sql.contains("brain_code_community_assignments"));
+        assert!(migration.sql.contains("active_refresh_id"));
+        assert!(migration.sql.contains("working_refresh_id"));
     }
 }
