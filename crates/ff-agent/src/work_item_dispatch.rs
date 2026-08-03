@@ -10,6 +10,7 @@ use sqlx::{PgPool, Row};
 use std::{
     collections::HashSet,
     ffi::OsStr,
+    io::Read,
     path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
@@ -7013,24 +7014,38 @@ where
     }
     let program = command_display(&cmd);
     let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
+    let stdout = child.stdout.take().expect("stdout configured as piped");
+    let stderr = child.stderr.take().expect("stderr configured as piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut stream = stdout;
+        stream.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut stream = stderr;
+        stream.read_to_end(&mut bytes).map(|_| bytes)
+    });
     let child_pid = child.id();
     if let Err(error) = on_spawn(child_pid) {
         terminate_process_group(&mut child, Duration::ZERO);
+        let _ = collect_drained_output(child.wait().ok(), stdout_reader, stderr_reader, &program);
         return Err(error);
     }
     if cancellation.is_cancelled() {
         terminate_process_group(&mut child, Duration::from_secs(CANCEL_GRACE_SECS));
+        let _ = collect_drained_output(child.wait().ok(), stdout_reader, stderr_reader, &program);
         bail!("dispatch authority lost after command spawn: {program}");
     }
     let start = Instant::now();
     loop {
-        if child.try_wait()?.is_some() {
-            return child
-                .wait_with_output()
-                .with_context(|| format!("collect output for {program}"));
+        if let Some(status) = child.try_wait()? {
+            return collect_drained_output(Some(status), stdout_reader, stderr_reader, &program);
         }
         if cancellation.is_cancelled() {
             terminate_process_group(&mut child, Duration::from_secs(CANCEL_GRACE_SECS));
+            let _ =
+                collect_drained_output(child.wait().ok(), stdout_reader, stderr_reader, &program);
             bail!("dispatch authority lost; command cancelled and reaped: {program}");
         }
         if start.elapsed() >= timeout {
@@ -7041,11 +7056,34 @@ where
                 libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
             }
             let _ = child.kill();
-            let _ = child.wait();
+            let status = child.wait().ok();
+            let _ = collect_drained_output(status, stdout_reader, stderr_reader, &program);
             bail!("command timed out after {timeout:?}: {program}");
         }
         std::thread::sleep(Duration::from_millis(COMMAND_POLL_MS));
     }
+}
+
+fn collect_drained_output(
+    status: Option<std::process::ExitStatus>,
+    stdout_reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr_reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    program: &str,
+) -> Result<Output> {
+    let status = status.ok_or_else(|| anyhow!("failed to reap {program}"))?;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("stdout reader panicked for {program}"))?
+        .with_context(|| format!("read stdout for {program}"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("stderr reader panicked for {program}"))?
+        .with_context(|| format!("read stderr for {program}"))?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn terminate_process_group(child: &mut std::process::Child, grace: Duration) {
@@ -7076,39 +7114,21 @@ fn terminate_process_group(child: &mut std::process::Child, grace: Duration) {
     }
 }
 
-fn run_command_timeout(mut cmd: Command, timeout: Duration) -> Result<Output> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+fn run_command_timeout(cmd: Command, timeout: Duration) -> Result<Output> {
     let program = command_display(&cmd);
-    let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
-    let start = Instant::now();
-
-    loop {
-        if child.try_wait()?.is_some() {
-            let output = child
-                .wait_with_output()
-                .with_context(|| format!("collect output for {program}"))?;
-            if output.status.success() {
-                return Ok(output);
-            }
-
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            bail!(
-                "command failed: {program}\nstatus: {}\nstdout: {}\nstderr: {}",
-                output.status,
-                truncate_for_log(&stdout),
-                truncate_for_log(&stderr)
-            );
-        }
-
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("command timed out after {timeout:?}: {program}");
-        }
-
-        std::thread::sleep(Duration::from_millis(COMMAND_POLL_MS));
+    let output = run_command_capture(cmd, timeout)?;
+    if output.status.success() {
+        return Ok(output);
     }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    bail!(
+        "command failed: {program}\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        truncate_for_log(&stdout),
+        truncate_for_log(&stderr)
+    );
 }
 
 fn truncate_for_db(s: &str) -> String {
@@ -8852,6 +8872,20 @@ mod tests {
         cmd.arg("-c").arg("exit 0");
         let out = run_command_capture(cmd, std::time::Duration::from_secs(10)).expect("clean run");
         assert!(out.status.success());
+    }
+
+    #[test]
+    fn run_command_capture_drains_large_stdout_and_stderr_before_exit() {
+        const STREAM_BYTES: usize = 1024 * 1024;
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "head -c {STREAM_BYTES} /dev/zero; head -c {STREAM_BYTES} /dev/zero >&2; exit 7"
+        ));
+        let out = run_command_capture(cmd, std::time::Duration::from_secs(10))
+            .expect("full pipes must be drained while the child is running");
+        assert_eq!(out.status.code(), Some(7));
+        assert_eq!(out.stdout.len(), STREAM_BYTES);
+        assert_eq!(out.stderr.len(), STREAM_BYTES);
     }
 
     #[test]
