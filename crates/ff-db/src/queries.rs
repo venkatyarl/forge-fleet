@@ -1680,6 +1680,34 @@ pub struct RouteCandidate {
 ///
 /// Clusters must list only TRULY bidirectional synonyms — if A is a safe
 /// substitute for B but not vice-versa, do not cluster them.
+const CODE_WORKLOAD_SYNONYMS: &[&str] = &[
+    "code",
+    "code-gen",
+    "codegen",
+    "coder",
+    "coding",
+    "code-generation",
+    "review",
+    "code-review",
+    "reviewer",
+];
+
+/// Fail-closed, exact-element code-workload classifier shared by every
+/// autoscaler/readiness query. `$1` is always [`CODE_WORKLOAD_SYNONYMS`].
+const CODE_WORKLOAD_SQL_PREDICATE: &str = r#"
+    EXISTS (
+        SELECT 1
+          FROM jsonb_array_elements_text(
+                   CASE
+                     WHEN jsonb_typeof(cat.preferred_workloads) = 'array'
+                     THEN cat.preferred_workloads
+                     ELSE '[]'::jsonb
+                   END
+               ) AS code_workload(value)
+         WHERE LOWER(code_workload.value) = ANY($1::text[])
+    )
+"#;
+
 const WORKLOAD_SYNONYM_CLUSTERS: &[&[&str]] = &[
     &["embedding", "embeddings", "feature-extraction"],
     &["rerank", "reranking"],
@@ -1690,21 +1718,11 @@ const WORKLOAD_SYNONYM_CLUSTERS: &[&[&str]] = &[
     // returned "no healthy deployment" while a whole glm coder fleet was up
     // (HireFlow360 gap #3, 2026-07-26). Keep this list == the spellings any
     // caller uses, all mapping to the single catalog tag "code".
-    &[
-        "code",
-        "code-gen",
-        "codegen",
-        "coder",
-        "coding",
-        "code-generation",
-        // Code-review is code work — route it to the same coder models (glm/devstral)
-        // that declare "code". `ff fleet route review` returned "no healthy
-        // deployment" otherwise (HireFlow360, 2026-07-26). The review-GATE also
-        // asks the router for a "review"/"reviewer" model.
-        "review",
-        "code-review",
-        "reviewer",
-    ],
+    // Code-review is code work — route it to the same coder models (glm/devstral)
+    // that declare "code". `ff fleet route review` returned "no healthy
+    // deployment" otherwise (HireFlow360, 2026-07-26). The review-GATE also
+    // asks the router for a "review"/"reviewer" model.
+    CODE_WORKLOAD_SYNONYMS,
     &["agent", "tool_calling", "agentic"],
     &["reason", "reasoning", "thinking", "chain-of-thought"],
     &["chat", "general", "text-generation", "default-chat"],
@@ -2317,8 +2335,9 @@ pub async fn pg_recent_demand_snapshots(
 // See `ff_agent::autoscaler` for the control loop + safety gate.
 
 /// How many healthy, agent-capable inference endpoints currently serve each
-/// "kind". A row counts toward `code` when its catalog
-/// `preferred_workloads @> '["code-gen"]'`, else toward `general`. Only
+/// "kind". A row counts toward `code` when an exact, case-insensitive element
+/// of its catalog `preferred_workloads` belongs to the canonical code synonym
+/// set, else toward `general`. Only
 /// agent-capable rows count: `cat.tool_calling = TRUE` AND the deployment's
 /// `usable_agent_ctx >= min_ctx` (the same floor the agent router enforces, so
 /// the autoscaler's "supply" matches what dispatch can actually use).
@@ -2350,7 +2369,7 @@ pub struct ServingEndpoint {
 
 /// Bucket the healthy agent-capable deployments into code vs general supply.
 pub async fn pg_supplied_slots_by_kind(pool: &PgPool, min_ctx: i32) -> Result<ServingSupply> {
-    let rows = sqlx::query(
+    let sql = format!(
         r#"
         SELECT d.id              AS id,
                d.worker_name     AS worker_name,
@@ -2358,20 +2377,27 @@ pub async fn pg_supplied_slots_by_kind(pool: &PgPool, min_ctx: i32) -> Result<Se
                d.catalog_id      AS catalog_id,
                d.request_count   AS request_count,
                EXTRACT(EPOCH FROM (NOW() - d.last_health_at))::int AS health_age_sec,
-               (cat.preferred_workloads @> '["code-gen"]'::jsonb)  AS is_code,
+               ({CODE_WORKLOAD_SQL_PREDICATE}) AS is_code,
                (d.health_status = 'healthy'
                 AND d.usable_agent_ctx IS NOT NULL
-                AND d.usable_agent_ctx >= $1
+                AND d.usable_agent_ctx >= $2
                 AND d.agent_profile_verified_at >= NOW() - INTERVAL '3 minutes') AS agent_ready
           FROM fleet_model_deployments d
           JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
          WHERE d.desired_state = 'active'
            AND cat.tool_calling = TRUE
-        "#,
-    )
-    .bind(min_ctx)
-    .fetch_all(pool)
-    .await?;
+        "#
+    );
+    let rows = sqlx::query(&sql)
+        .bind(
+            CODE_WORKLOAD_SYNONYMS
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .bind(min_ctx)
+        .fetch_all(pool)
+        .await?;
 
     let mut supply = ServingSupply::default();
     for r in &rows {
@@ -2414,8 +2440,8 @@ pub struct AgentReadinessRow {
     pub context_window: Option<i32>,
     pub parallel_slots: Option<i32>,
     pub usable_agent_ctx: Option<i32>,
-    /// True when the catalog model is tagged `code-gen` (else it buckets as
-    /// `general`), matching the autoscaler's code/general split.
+    /// True when the catalog model has an exact code-workload synonym (else it
+    /// buckets as `general`), matching the autoscaler's code/general split.
     pub is_code: bool,
 }
 
@@ -2426,7 +2452,7 @@ pub async fn pg_agent_readiness(
     pool: &PgPool,
     worker_name: Option<&str>,
 ) -> Result<Vec<AgentReadinessRow>> {
-    let rows = sqlx::query(
+    let sql = format!(
         r#"
         SELECT d.worker_name      AS worker_name,
                d.catalog_id       AS catalog_id,
@@ -2435,19 +2461,26 @@ pub async fn pg_agent_readiness(
                d.context_window   AS context_window,
                d.parallel_slots   AS parallel_slots,
                d.usable_agent_ctx AS usable_agent_ctx,
-               (cat.preferred_workloads @> '["code-gen"]'::jsonb) AS is_code
+               ({CODE_WORKLOAD_SQL_PREDICATE}) AS is_code
           FROM fleet_model_deployments d
           JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
          WHERE d.health_status = 'healthy'
            AND d.desired_state = 'active'
            AND cat.tool_calling = TRUE
-           AND ($1::text IS NULL OR d.worker_name = $1)
+           AND ($2::text IS NULL OR d.worker_name = $2)
          ORDER BY d.worker_name, d.port
-        "#,
-    )
-    .bind(worker_name)
-    .fetch_all(pool)
-    .await?;
+        "#
+    );
+    let rows = sqlx::query(&sql)
+        .bind(
+            CODE_WORKLOAD_SYNONYMS
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .bind(worker_name)
+        .fetch_all(pool)
+        .await?;
 
     Ok(rows
         .iter()
@@ -2483,8 +2516,8 @@ pub struct ReprofileCandidate {
     pub request_count: i64,
     /// Seconds since the last health ping (NULL → very old / unknown).
     pub health_age_sec: Option<i32>,
-    /// True when the catalog model is tagged `code-gen` (else `general`), matching
-    /// the autoscaler's code/general split.
+    /// True when the catalog model has an exact code-workload synonym (else
+    /// `general`), matching the autoscaler's code/general split.
     pub is_code: bool,
 }
 
@@ -2500,7 +2533,7 @@ pub async fn pg_reprofile_candidates(
     pool: &PgPool,
     min_ctx: i32,
 ) -> Result<Vec<ReprofileCandidate>> {
-    let rows = sqlx::query(
+    let sql = format!(
         r#"
         SELECT d.id              AS id,
                d.worker_name     AS worker_name,
@@ -2511,19 +2544,26 @@ pub async fn pg_reprofile_candidates(
                d.parallel_slots  AS parallel_slots,
                d.request_count   AS request_count,
                EXTRACT(EPOCH FROM (NOW() - d.last_health_at))::int AS health_age_sec,
-               (cat.preferred_workloads @> '["code-gen"]'::jsonb) AS is_code
+               ({CODE_WORKLOAD_SQL_PREDICATE}) AS is_code
           FROM fleet_model_deployments d
           JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
          WHERE d.health_status = 'healthy'
            AND d.desired_state = 'active'
            AND cat.tool_calling = TRUE
-           AND (d.usable_agent_ctx IS NULL OR d.usable_agent_ctx < $1)
+           AND (d.usable_agent_ctx IS NULL OR d.usable_agent_ctx < $2)
            AND COALESCE(d.parallel_slots, 0) > 1
-        "#,
-    )
-    .bind(min_ctx)
-    .fetch_all(pool)
-    .await?;
+        "#
+    );
+    let rows = sqlx::query(&sql)
+        .bind(
+            CODE_WORKLOAD_SYNONYMS
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .bind(min_ctx)
+        .fetch_all(pool)
+        .await?;
 
     Ok(rows
         .iter()
@@ -2648,15 +2688,15 @@ pub async fn pg_placement_candidates(pool: &PgPool) -> Result<Vec<PlacementCandi
 
 /// The best library row on a host for a given kind that is NOT already deployed
 /// there — what the autoscaler would `load`. `want_code = true` requires the
-/// catalog `preferred_workloads @> '["code-gen"]'`; either way the model must be
-/// tool-calling. Cheapest tier first (smallest appropriate model), then smallest
-/// on-disk size. Returns `(library_id, catalog_id, runtime, size_gb)`.
+/// catalog has an exact, case-insensitive code-workload synonym; either way the
+/// model must be tool-calling. Cheapest tier first (smallest appropriate model),
+/// then smallest on-disk size. Returns `(library_id, catalog_id, runtime, size_gb)`.
 pub async fn pg_loadable_library_for_kind(
     pool: &PgPool,
     worker_name: &str,
     want_code: bool,
 ) -> Result<Option<(String, String, String, f64)>> {
-    let row = sqlx::query(
+    let sql = format!(
         r#"
         SELECT lib.id          AS lib_id,
                lib.catalog_id  AS catalog_id,
@@ -2664,10 +2704,10 @@ pub async fn pg_loadable_library_for_kind(
                (lib.size_bytes::float8 / 1e9) AS size_gb
           FROM fleet_model_library lib
           JOIN fleet_model_catalog cat ON cat.id = lib.catalog_id
-         WHERE lib.worker_name = $1
+         WHERE lib.worker_name = $2
            AND cat.tool_calling = TRUE
            AND lib.pinned = TRUE
-           AND ($2 = (cat.preferred_workloads @> '["code-gen"]'::jsonb))
+           AND ($3 = ({CODE_WORKLOAD_SQL_PREDICATE}))
            AND NOT EXISTS (
                SELECT 1 FROM fleet_model_deployments d
                 WHERE d.library_id = lib.id
@@ -2681,12 +2721,19 @@ pub async fn pg_loadable_library_for_kind(
                   cat.tier ASC,
                   lib.size_bytes ASC
          LIMIT 1
-        "#,
-    )
-    .bind(worker_name)
-    .bind(want_code)
-    .fetch_optional(pool)
-    .await?;
+        "#
+    );
+    let row = sqlx::query(&sql)
+        .bind(
+            CODE_WORKLOAD_SYNONYMS
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .bind(worker_name)
+        .bind(want_code)
+        .fetch_optional(pool)
+        .await?;
 
     Ok(row.map(|r| {
         let lib_id: sqlx::types::Uuid = r.get("lib_id");
@@ -5046,6 +5093,178 @@ mod tests {
         );
         // No workload filter → empty set (the SQL guard disables the clause).
         assert!(route_workload_synonyms(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn code_workload_authority_is_exact_case_insensitive_and_shared() {
+        let Some((admin_url, db_url, db_name)) = temp_db_urls("ff_code_kind") else {
+            return;
+        };
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("connect admin db");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create temp db");
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&db_url)
+            .await
+            .expect("connect temp db");
+
+        let predicate_sql = format!(
+            "SELECT ({CODE_WORKLOAD_SQL_PREDICATE}) \
+               FROM (SELECT $2::jsonb AS preferred_workloads) cat"
+        );
+        let synonyms = CODE_WORKLOAD_SYNONYMS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        for synonym in CODE_WORKLOAD_SYNONYMS {
+            let mixed_case = synonym
+                .chars()
+                .enumerate()
+                .map(|(index, ch)| {
+                    if index % 2 == 0 {
+                        ch.to_ascii_uppercase()
+                    } else {
+                        ch
+                    }
+                })
+                .collect::<String>();
+            let is_code: bool = sqlx::query_scalar(&predicate_sql)
+                .bind(&synonyms)
+                .bind(serde_json::json!([mixed_case]))
+                .fetch_one(&pool)
+                .await
+                .expect("classify synonym");
+            assert!(is_code, "{synonym} must classify as code work");
+        }
+        for near_miss in [
+            serde_json::json!(["codec"]),
+            serde_json::json!(["decode"]),
+            serde_json::json!(["code gen"]),
+            serde_json::json!(["coderx"]),
+            serde_json::json!([]),
+            serde_json::json!("code"),
+            serde_json::json!({"code": true}),
+            serde_json::Value::Null,
+        ] {
+            let is_code: bool = sqlx::query_scalar(&predicate_sql)
+                .bind(&synonyms)
+                .bind(near_miss)
+                .fetch_one(&pool)
+                .await
+                .expect("classify fail-closed value");
+            assert!(!is_code);
+        }
+        let sql_null_is_code: bool = sqlx::query_scalar(&predicate_sql)
+            .bind(&synonyms)
+            .bind(Option::<serde_json::Value>::None)
+            .fetch_one(&pool)
+            .await
+            .expect("classify SQL NULL");
+        assert!(!sql_null_is_code);
+
+        sqlx::raw_sql(
+            "CREATE EXTENSION IF NOT EXISTS pgcrypto;
+             CREATE TABLE fleet_model_catalog (
+                 id TEXT PRIMARY KEY,
+                 preferred_workloads JSONB,
+                 tool_calling BOOLEAN NOT NULL,
+                 tier INT NOT NULL
+             );
+             CREATE TABLE fleet_model_library (
+                 id UUID PRIMARY KEY,
+                 catalog_id TEXT NOT NULL,
+                 worker_name TEXT NOT NULL,
+                 runtime TEXT NOT NULL,
+                 size_bytes BIGINT NOT NULL,
+                 pinned BOOLEAN NOT NULL
+             );
+             CREATE TABLE fleet_model_deployments (
+                 id UUID PRIMARY KEY,
+                 worker_name TEXT NOT NULL,
+                 port INT NOT NULL,
+                 catalog_id TEXT,
+                 library_id UUID,
+                 request_count BIGINT NOT NULL,
+                 last_health_at TIMESTAMPTZ,
+                 health_status TEXT NOT NULL,
+                 desired_state TEXT NOT NULL,
+                 usable_agent_ctx INT,
+                 agent_profile_verified_at TIMESTAMPTZ,
+                 runtime TEXT NOT NULL,
+                 context_window INT,
+                 parallel_slots INT
+             );
+             CREATE TABLE fleet_task_coverage (preferred_model_ids JSONB);
+
+             INSERT INTO fleet_model_catalog VALUES
+                 ('mixed', '[\"CoDe-ReViEw\"]', TRUE, 1),
+                 ('near',  '[\"coderx\"]', TRUE, 2);
+             INSERT INTO fleet_model_deployments VALUES
+                 (gen_random_uuid(), 'code-host', 55000, 'mixed', NULL, 0, NOW(),
+                  'healthy', 'active', 8192, NOW(), 'llama.cpp', 32768, 2),
+                 (gen_random_uuid(), 'near-host', 55001, 'near', NULL, 0, NOW(),
+                  'healthy', 'active', 8192, NOW(), 'llama.cpp', 32768, 2);
+             INSERT INTO fleet_model_library VALUES
+                 (gen_random_uuid(), 'mixed', 'load-host', 'llama.cpp', 100, TRUE),
+                 (gen_random_uuid(), 'near', 'load-host', 'llama.cpp', 200, TRUE);",
+        )
+        .execute(&pool)
+        .await
+        .expect("create code-kind fixtures");
+
+        let supply = pg_supplied_slots_by_kind(&pool, 16_384)
+            .await
+            .expect("read supply");
+        assert_eq!(supply.code_endpoints.len(), 1);
+        assert_eq!(
+            supply.code_endpoints[0].catalog_id.as_deref(),
+            Some("mixed")
+        );
+        assert_eq!(supply.general_endpoints.len(), 1);
+        assert_eq!(
+            supply.general_endpoints[0].catalog_id.as_deref(),
+            Some("near")
+        );
+
+        let readiness = pg_agent_readiness(&pool, None)
+            .await
+            .expect("read readiness");
+        assert_eq!(readiness.iter().filter(|row| row.is_code).count(), 1);
+        assert!(
+            readiness
+                .iter()
+                .any(|row| row.catalog_id.as_deref() == Some("mixed") && row.is_code)
+        );
+
+        let reprofile = pg_reprofile_candidates(&pool, 16_384)
+            .await
+            .expect("read reprofile candidates");
+        assert_eq!(reprofile.iter().filter(|row| row.is_code).count(), 1);
+        assert!(
+            reprofile
+                .iter()
+                .any(|row| row.catalog_id.as_deref() == Some("near") && !row.is_code)
+        );
+
+        let code_library = pg_loadable_library_for_kind(&pool, "load-host", true)
+            .await
+            .expect("read code library")
+            .expect("code library");
+        assert_eq!(code_library.1, "mixed");
+        let general_library = pg_loadable_library_for_kind(&pool, "load-host", false)
+            .await
+            .expect("read general library")
+            .expect("general library");
+        assert_eq!(general_library.1, "near");
+
+        drop_temp_db(admin, pool, &db_name).await;
     }
 
     #[test]
