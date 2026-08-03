@@ -1956,7 +1956,7 @@ disabled_backends = ["claude"]
 
 [nodes.vinny]
 ip = "192.168.5.100"
-ssh_user = "venkat"
+ssh_user = "vinny"
 ram_gb = 96
 cpu_cores = 32
 os = "macOS 26.3"
@@ -2152,7 +2152,7 @@ notes = "Setup started."
         let vinny = config.nodes.get("vinny").expect("vinny node");
         assert_eq!(vinny.ip, "192.168.5.100");
         assert_eq!(vinny.role, Role::Gateway);
-        assert_eq!(vinny.ssh_user.as_deref(), Some("venkat"));
+        assert_eq!(vinny.ssh_user.as_deref(), Some("vinny"));
         assert_eq!(vinny.ram_gb, Some(96));
         assert_eq!(vinny.os.as_deref(), Some("macOS 26.3"));
         assert_eq!(vinny.alt_ips, vec!["192.168.5.101".to_string()]);

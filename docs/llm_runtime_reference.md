@@ -117,7 +117,7 @@ If you have a local path instead of an HF repo id:
 
 ```bash
 mlx_lm.server \
-  --model /Users/venkat/models/qwen2.5-coder-32b-mlx-4bit \
+  --model /Users/vinny/models/qwen2.5-coder-32b-mlx-4bit \
   --host 0.0.0.0 \
   --port 8081
 ```
@@ -171,7 +171,7 @@ convert from the original HF safetensors:
 ```bash
 mlx_lm.convert \
   --hf-path Qwen/Qwen2.5-Coder-32B-Instruct \
-  --mlx-path /Users/venkat/models/qwen2.5-coder-32b-mlx-4bit \
+  --mlx-path /Users/vinny/models/qwen2.5-coder-32b-mlx-4bit \
   --quantize \
   --q-bits 4
 ```
@@ -188,7 +188,7 @@ Flags:
 
 Conversion time for a 32B model on M3 Ultra: ~4 minutes. Output
 directory is ~17 GB at 4-bit. After conversion, launch with
-`mlx_lm.server --model /Users/venkat/models/qwen2.5-coder-32b-mlx-4bit`.
+`mlx_lm.server --model /Users/vinny/models/qwen2.5-coder-32b-mlx-4bit`.
 
 ---
 

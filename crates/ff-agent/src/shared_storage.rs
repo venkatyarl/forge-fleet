@@ -23,7 +23,7 @@
 //!
 //! 1. On the host (e.g. `vinny`):
 //!    ```text
-//!    sudo sh -c 'echo "/Users/venkat/models -network 192.168.5.0 -mask 255.255.255.0" >> /etc/exports'
+//!    sudo sh -c 'echo "/Users/vinny/models -network 192.168.5.0 -mask 255.255.255.0" >> /etc/exports'
 //!    sudo nfsd update     # macOS
 //!    # or:
 //!    sudo exportfs -ra    # Linux
@@ -31,9 +31,9 @@
 //! 2. On each client:
 //!    ```text
 //!    sudo mkdir -p ~/models
-//!    sudo mount -t nfs vinny:/Users/venkat/models ~/models
+//!    sudo mount -t nfs vinny:/Users/vinny/models ~/models
 //!    ```
-//! 3. Then: `ff storage share create --host vinny --path /Users/venkat/models --name fleet-models --purpose models`
+//! 3. Then: `ff storage share create --host vinny --path /Users/vinny/models --name fleet-models --purpose models`
 
 use sqlx::{PgPool, Row};
 use thiserror::Error;
@@ -744,7 +744,7 @@ mod tests {
     fn parse_mount_macos() {
         let nodes = vec![test_node("vinny", "10.44.0.1", &[])];
         let text =
-            "10.44.0.1:/Users/venkat/models on /Volumes/vinny-models (nfs4, read-only, ...)\n";
+            "10.44.0.1:/Users/vinny/models on /Volumes/vinny-models (nfs4, read-only, ...)\n";
         let mounts = parse_mount_text(text, &nodes);
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].peer_name, "vinny");

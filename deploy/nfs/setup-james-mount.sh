@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TB.4 setup — James side. Run as: sudo bash deploy/nfs/setup-james-mount.sh
 #
-# Mounts Vinny's /Users/venkat/models read-only at /Volumes/vinny-models
+# Mounts Vinny's /Users/vinny/models read-only at /Volumes/vinny-models
 # over Thunderbolt (10.44.0.1).
 
 set -euo pipefail
@@ -13,7 +13,7 @@ fi
 
 MOUNT=/Volumes/vinny-models
 SERVER=10.44.0.1
-EXPORT=/Users/venkat/models
+EXPORT=/Users/vinny/models
 
 mkdir -p "$MOUNT"
 

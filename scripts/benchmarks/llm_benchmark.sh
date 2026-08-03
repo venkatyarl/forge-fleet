@@ -89,8 +89,8 @@ export PROMPT OUTDIR TESTDIR BASH5
 echo "=== Querying all LLMs in parallel ==="
 
 # Vinny local (only real deployments)
-query_llm "vinny-mlx-gemma4"    "http://localhost:55000"         "/Users/venkat/models/gemma-4-31b-it-4bit"       1500 90 &
-query_llm "vinny-mlx-qwen36"    "http://localhost:55001"         "/Users/venkat/models/qwen36-35b-a3b"           6000 180 &
+query_llm "vinny-mlx-gemma4"    "http://localhost:55000"         "/Users/vinny/models/gemma-4-31b-it-4bit"       1500 90 &
+query_llm "vinny-mlx-qwen36"    "http://localhost:55001"         "/Users/vinny/models/qwen36-35b-a3b"           6000 180 &
 
 # Worker fleet (qwen3.5-9b)
 query_llm "ace-qwen3.5-9b"       "http://192.168.5.105:55000"     "qwen3.5-9b"          1500 60 &

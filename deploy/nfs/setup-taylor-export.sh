@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TB.4 setup — Vinny side. Run as: sudo bash deploy/nfs/setup-vinny-export.sh
 #
-# Exports /Users/venkat/models read-only over Thunderbolt (10.44.0.0/24)
+# Exports /Users/vinny/models read-only over Thunderbolt (10.44.0.0/24)
 # so James can mount it without duplicating the 50GB model directory.
 
 set -euo pipefail
@@ -12,7 +12,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 EXPORTS=/etc/exports
-LINE='/Users/venkat/models -ro -alldirs -network 10.44.0.0 -mask 255.255.255.0'
+LINE='/Users/vinny/models -ro -alldirs -network 10.44.0.0 -mask 255.255.255.0'
 
 if [[ -f $EXPORTS ]] && grep -qF "$LINE" "$EXPORTS"; then
     echo "/etc/exports already contains the line — no edit"
@@ -35,7 +35,7 @@ cat <<'NEXT'
 ----
 On James, run:
   sudo mkdir -p /Volumes/vinny-models
-  sudo mount -t nfs -o resvport,ro,nolocks,soft,intr,timeo=50,retrans=3 10.44.0.1:/Users/venkat/models /Volumes/vinny-models
+  sudo mount -t nfs -o resvport,ro,nolocks,soft,intr,timeo=50,retrans=3 10.44.0.1:/Users/vinny/models /Volumes/vinny-models
   ls /Volumes/vinny-models
 
 Then on Vinny:

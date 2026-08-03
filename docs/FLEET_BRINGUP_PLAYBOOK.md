@@ -1,7 +1,7 @@
 # Fleet Bring-Up Playbook (Phase 26)
 
 Date: 2026-04-05  
-Repo: `/Users/venkat/projects/forge-fleet`
+Repo: `/Users/vinny/projects/forge-fleet`
 
 Goal: make real multi-node bring-up repeatable so James, Marcus, Sophie, Priya, and Ace can be brought online quickly once reachable.
 
@@ -12,7 +12,7 @@ Goal: make real multi-node bring-up repeatable so James, Marcus, Sophie, Priya, 
 ### Config source of truth
 - Repo-local `fleet.toml`: **not present**.
 - Active config used by daemon/CLI: `~/.forgefleet/fleet.toml`.
-- On this machine, current config file: `/Users/venkat/.forgefleet/fleet.toml`.
+- On this machine, current config file: `/Users/vinny/.forgefleet/fleet.toml`.
 
 ### Service/install paths (from current repo artifacts)
 - Installer script: `deploy/install.sh`
@@ -87,8 +87,8 @@ tools/fleet_preflight.sh
 ## 3) Standard bring-up sequence (controller machine)
 
 ```bash
-export FLEET_REPO=/Users/venkat/projects/forge-fleet
-export FLEET_CONFIG=/Users/venkat/.forgefleet/fleet.toml
+export FLEET_REPO=/Users/vinny/projects/forge-fleet
+export FLEET_CONFIG=/Users/vinny/.forgefleet/fleet.toml
 cd "$FLEET_REPO"
 
 git fetch origin
