@@ -386,7 +386,12 @@ fn shard_prefixes_from_variants(variants: &Value) -> BTreeSet<String> {
     prefixes
 }
 
-async fn resolved_target_with_library_identities(
+/// Resolve a router candidate into the canonical endpoint/model identity used
+/// by every local dispatch path. This enriches the candidate with exact local
+/// library filenames and catalog shard identities, but does not perform the
+/// live `/v1/models` attestation; callers must pass the result through
+/// [`attest_resolved_target`] immediately before chat dispatch.
+pub async fn resolve_candidate_target(
     pool: &PgPool,
     candidate: &RouteCandidate,
     provenance: ResolvedTargetProvenance,
@@ -558,8 +563,10 @@ pub async fn fleet_oneshot_for(
 /// context to be at least `min_ctx` tokens. Codegen passes
 /// prompt-estimate + reasoning reserve + max_tokens so a reasoning coder
 /// (glm-4.5-air) never receives a prompt its slot can't hold — the overflow
-/// truncates the reply into unusable prose. Falls back to unfloored routing
-/// when nothing satisfies the floor (a truncated answer beats no build).
+/// truncates the reply into unusable prose. When `workload` is set, both it and
+/// the context floor are hard requirements; an empty capable pool returns an
+/// error for explicit cloud escalation. Only unfiltered conversational callers
+/// retain the historical best-effort retry without a context floor.
 ///
 /// `system` carries the output contract as a SYSTEM message (reasoning coders
 /// obey it far better than mid-user-message instructions — the difference
@@ -650,7 +657,7 @@ pub async fn resolve_explicit_catalog_target(
     catalog_id: &str,
 ) -> Result<ResolvedFleetTarget> {
     let candidate = resolve_route_candidate(pool, catalog_id).await?;
-    resolved_target_with_library_identities(
+    resolve_candidate_target(
         pool,
         &candidate,
         ResolvedTargetProvenance::ExplicitCatalog,
@@ -675,8 +682,7 @@ pub async fn resolve_auto_agent_target(pool: &PgPool, min_ctx: i32) -> Result<Re
         .into_iter()
         .find(has_model_name)
         .ok_or_else(|| anyhow!("no healthy canonical agent-capable fleet deployment"))?;
-    resolved_target_with_library_identities(pool, &candidate, ResolvedTargetProvenance::Auto, false)
-        .await
+    resolve_candidate_target(pool, &candidate, ResolvedTargetProvenance::Auto, false).await
 }
 
 pub async fn resolve_endpoint_target(
@@ -710,7 +716,7 @@ pub async fn resolve_endpoint_target(
             "explicit --llm endpoint {normalized} is ambiguous in fleet_model_deployments"
         ));
     }
-    let target = resolved_target_with_library_identities(
+    let target = resolve_candidate_target(
         pool,
         &candidate,
         ResolvedTargetProvenance::ExplicitUrl,
@@ -752,6 +758,23 @@ pub fn normalize_base_endpoint(endpoint: &str) -> String {
     trimmed.trim_end_matches('/').to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyRoutePolicy {
+    RelaxUnfilteredContext,
+    FailRequiredWorkload,
+    FailUnavailable,
+}
+
+fn empty_route_policy(workload: Option<&str>, min_ctx: Option<i32>) -> EmptyRoutePolicy {
+    if workload.is_some() {
+        EmptyRoutePolicy::FailRequiredWorkload
+    } else if min_ctx.is_some() {
+        EmptyRoutePolicy::RelaxUnfilteredContext
+    } else {
+        EmptyRoutePolicy::FailUnavailable
+    }
+}
+
 async fn resolve_route_candidates(
     pool: &PgPool,
     model_hint: Option<&str>,
@@ -779,38 +802,30 @@ async fn resolve_route_candidates(
         // tier coder deployment), and we'd silently fall back. No hint → top-8.
         limit: if model_hint.is_some() { 64 } else { 8 },
     };
-    let mut all_candidates = pg_route_deployments(pool, &filter)
+    let all_candidates = pg_route_deployments(pool, &filter)
         .await
         .map_err(|e| anyhow!("route deployments: {e}"))?;
-    // FAIL-OPEN on the ctx floor: an over-large prompt must not hard-fail the
-    // build when only smaller slots exist — retry unfloored (the response may
-    // still truncate, but a truncated answer beats no build at all).
-    if all_candidates.is_empty() && min_ctx.is_some() {
-        tracing::warn!(
-            min_ctx,
-            "fleet_oneshot: no deployment satisfies the ctx floor — retrying without it"
-        );
-        return Box::pin(resolve_route_candidates(pool, model_hint, workload, None)).await;
-    }
-    // FAIL-OPEN on the capability filter: if a workload was requested but no
-    // deployment declares it (e.g. every coder is momentarily unhealthy), retry
-    // unfiltered rather than hard-failing the build. Correctness (prefer a coder)
-    // without a new starvation mode (never a coder → error). Only the capability
-    // filter is relaxed; the health/freshness filter still applies.
-    if all_candidates.is_empty() && workload.is_some() {
-        tracing::warn!(
-            workload = workload.unwrap_or(""),
-            "fleet_oneshot: no deployment declares this workload — retrying unfiltered (fail-open)"
-        );
-        let relaxed = RouteFilter {
-            workload: None,
-            ..filter
-        };
-        all_candidates = pg_route_deployments(pool, &relaxed)
-            .await
-            .map_err(|e| anyhow!("route deployments (relaxed): {e}"))?;
-    }
+    // Unfiltered conversational/council callers retain the historical
+    // best-effort context fallback. A requested workload (especially code) is
+    // a hard capability contract: never discard either its workload or its
+    // context floor merely to find some endpoint.
     if all_candidates.is_empty() {
+        match empty_route_policy(workload, min_ctx) {
+            EmptyRoutePolicy::RelaxUnfilteredContext => {
+                tracing::warn!(
+                    min_ctx,
+                    "fleet_oneshot: no unfiltered deployment satisfies the ctx floor — retrying without it"
+                );
+                return Box::pin(resolve_route_candidates(pool, model_hint, workload, None)).await;
+            }
+            EmptyRoutePolicy::FailRequiredWorkload => {
+                return Err(anyhow!(
+                    "no healthy fleet deployment satisfies required workload {:?} and min_ctx {min_ctx:?}",
+                    workload.unwrap_or_default()
+                ));
+            }
+            EmptyRoutePolicy::FailUnavailable => {}
+        }
         return Err(anyhow!(
             "no healthy fleet deployment to serve a local council member"
         ));
@@ -856,8 +871,7 @@ async fn dispatch_to_candidate(
     max_tokens: u32,
 ) -> anyhow::Result<FleetOneshot> {
     let target =
-        resolved_target_with_library_identities(pool, cand, ResolvedTargetProvenance::Auto, false)
-            .await?;
+        resolve_candidate_target(pool, cand, ResolvedTargetProvenance::Auto, false).await?;
     let target = attest_resolved_target(client, target, Duration::from_secs(5)).await?;
     let worker_name = target.worker_name.clone();
     let endpoint = target.endpoint.clone();
@@ -1419,6 +1433,28 @@ mod tests {
             &target,
             "zai-org_GLM-4.5-Air-Q4_K_M-extra.gguf"
         ));
+    }
+
+    #[test]
+    fn explicit_workload_never_relaxes_capability_or_context() {
+        for workload in ["code", "codegen", "review"] {
+            assert_eq!(
+                empty_route_policy(Some(workload), Some(32_768)),
+                EmptyRoutePolicy::FailRequiredWorkload
+            );
+            assert_eq!(
+                empty_route_policy(Some(workload), None),
+                EmptyRoutePolicy::FailRequiredWorkload
+            );
+        }
+        assert_eq!(
+            empty_route_policy(None, Some(32_768)),
+            EmptyRoutePolicy::RelaxUnfilteredContext
+        );
+        assert_eq!(
+            empty_route_policy(None, None),
+            EmptyRoutePolicy::FailUnavailable
+        );
     }
 
     #[test]

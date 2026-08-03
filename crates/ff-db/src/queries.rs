@@ -2050,11 +2050,13 @@ fn offload_workload_for_kind(kind: Option<&str>) -> Option<&'static str> {
 /// (which agents/crew use) so their default ranking is untouched — but built on
 /// the SAME [`pg_route_deployments`] scorer so there's still no parallel router.
 ///
-/// Selection order: (1) prefer a warm tool-capable model whose workload matches
-/// the task `kind` (codegen/edits/tests/code -> a `code-gen` coder); (2) fall
-/// back to any warm tool-capable model; (3) rank by smaller tier first (cheapest
-/// appropriate model), then least-loaded host as a tiebreak among equal tiers.
-/// Both `ff offload` and the `fleet_offload` MCP tool call this.
+/// Code-shaped kinds (codegen/edits/tests/code) require a matching coder and
+/// preserve the caller's context floor. If none qualifies, this returns `None`
+/// so the caller can make the cloud fallback explicit; it never silently
+/// downgrades code work to an arbitrary tool model. Non-code kinds select from
+/// any warm tool-capable model. Candidates are ranked by smaller tier first
+/// (cheapest appropriate model), then least-loaded host as a tiebreak among
+/// equal tiers. Both `ff offload` and the `fleet_offload` MCP tool call this.
 pub async fn pg_pick_offload_endpoint(
     pool: &PgPool,
     min_ctx: i32,
@@ -2072,15 +2074,11 @@ pub async fn pg_pick_offload_endpoint(
         limit: 8,
     };
 
-    // 1) workload-matching candidates (e.g. coders for code kinds).
-    let mut cands = match offload_workload_for_kind(kind) {
-        Some(w) => pg_route_deployments(pool, &mk(Some(w))).await?,
-        None => Vec::new(),
-    };
-    // 2) fall back to any warm tool-capable endpoint.
-    if cands.is_empty() {
-        cands = pg_route_deployments(pool, &mk(None)).await?;
-    }
+    let required_workload = offload_workload_for_kind(kind);
+    // A code workload is a hard capability requirement. Passing it directly to
+    // the canonical router means an empty result stays empty; only non-code
+    // work intentionally queries the general tool-capable pool.
+    let mut cands = pg_route_deployments(pool, &mk(required_workload)).await?;
     if cands.is_empty() {
         return Ok(None);
     }
@@ -2090,7 +2088,7 @@ pub async fn pg_pick_offload_endpoint(
     //    least-loaded host as a final tiebreak so two same-tier endpoints spread
     //    load instead of always hammering the same one. (Hard saturation
     //    avoidance — skipping an overloaded host outright — is P3's job, not P1's.)
-    let penalize_mlx = offload_workload_for_kind(kind).is_none();
+    let penalize_mlx = required_workload.is_none();
     let load = pg_active_deployment_counts(pool).await.unwrap_or_default();
     cands.sort_by_key(|c| offload_sort_key(c, &load, penalize_mlx));
 
@@ -5171,8 +5169,26 @@ mod tests {
 
         sqlx::raw_sql(
             "CREATE EXTENSION IF NOT EXISTS pgcrypto;
+             CREATE TABLE fleet_workers (name TEXT PRIMARY KEY);
+             CREATE TABLE computers (
+                 id UUID PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 primary_ip TEXT,
+                 os_family TEXT,
+                 has_gpu BOOLEAN,
+                 gpu_kind TEXT,
+                 total_ram_gb INT
+             );
+             CREATE TABLE computer_metrics_history_retained (
+                 computer_id UUID,
+                 recorded_at TIMESTAMPTZ,
+                 cpu_pct DOUBLE PRECISION,
+                 llm_active_requests INT
+             );
              CREATE TABLE fleet_model_catalog (
                  id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 family TEXT NOT NULL,
                  preferred_workloads JSONB,
                  tool_calling BOOLEAN NOT NULL,
                  tier INT NOT NULL
@@ -5204,8 +5220,9 @@ mod tests {
              CREATE TABLE fleet_task_coverage (preferred_model_ids JSONB);
 
              INSERT INTO fleet_model_catalog VALUES
-                 ('mixed', '[\"CoDe-ReViEw\"]', TRUE, 1),
-                 ('near',  '[\"coderx\"]', TRUE, 2);
+                 ('mixed', 'Mixed Coder', 'coder', '[\"CoDe-ReViEw\"]', TRUE, 1),
+                 ('near', 'Lucy-like General', 'general', '[\"coderx\"]', TRUE, 2);
+             INSERT INTO fleet_workers VALUES ('code-host'), ('near-host');
              INSERT INTO fleet_model_deployments VALUES
                  (gen_random_uuid(), 'code-host', 55000, 'mixed', NULL, 0, NOW(),
                   'healthy', 'active', 8192, NOW(), 'llama.cpp', 32768, 2),
@@ -5263,6 +5280,72 @@ mod tests {
             .expect("read general library")
             .expect("general library");
         assert_eq!(general_library.1, "near");
+
+        // The canonical router's vocabulary array is lowercase in live catalog
+        // authority. The mixed-case fixture above already proved the four
+        // case-insensitive classifier consumers; normalize it before exercising
+        // pg_route_deployments itself.
+        sqlx::query(
+            "UPDATE fleet_model_catalog
+                SET preferred_workloads = '[\"code\"]'::jsonb
+              WHERE id = 'mixed'",
+        )
+        .execute(&pool)
+        .await
+        .expect("normalize router fixture");
+
+        // A code request preserves both requirements: neither the canonical
+        // coder nor the general near-match has enough context yet.
+        assert!(
+            pg_pick_offload_endpoint(&pool, 16_384, Some("codegen"), &[])
+                .await
+                .expect("route undersized code request")
+                .is_none()
+        );
+
+        // Once only the general model has enough context, general work may use
+        // it, but code work still cannot downgrade to it (the Logan/Lucy bug).
+        sqlx::query(
+            "UPDATE fleet_model_deployments
+                SET usable_agent_ctx = 32768
+              WHERE worker_name = 'near-host'",
+        )
+        .execute(&pool)
+        .await
+        .expect("make general endpoint context-capable");
+        let general = pg_pick_offload_endpoint(&pool, 16_384, Some("research"), &[])
+            .await
+            .expect("route general request")
+            .expect("general endpoint");
+        assert_eq!(general.catalog_id.as_deref(), Some("near"));
+        assert!(
+            pg_pick_offload_endpoint(&pool, 16_384, Some("code"), &[])
+                .await
+                .expect("route code without capable coder")
+                .is_none()
+        );
+
+        // A sufficiently sized canonical coder remains selectable. Excluding
+        // that coder yields None instead of silently selecting the general row.
+        sqlx::query(
+            "UPDATE fleet_model_deployments
+                SET usable_agent_ctx = 32768
+              WHERE worker_name = 'code-host'",
+        )
+        .execute(&pool)
+        .await
+        .expect("make coder context-capable");
+        let code = pg_pick_offload_endpoint(&pool, 16_384, Some("tests"), &[])
+            .await
+            .expect("route capable code request")
+            .expect("coder endpoint");
+        assert_eq!(code.catalog_id.as_deref(), Some("mixed"));
+        assert!(
+            pg_pick_offload_endpoint(&pool, 16_384, Some("edits"), &["CODE-HOST".to_string()],)
+                .await
+                .expect("route code with only general endpoint available")
+                .is_none()
+        );
 
         drop_temp_db(admin, pool, &db_name).await;
     }
