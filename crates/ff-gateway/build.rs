@@ -1,4 +1,4 @@
-// Ensure dashboard/dist/ contains at least a placeholder index.html so the
+// Ensure web-forge-fleet/out/ contains at least a placeholder index.html so the
 // rust-embed proc macro in static_files.rs can resolve the folder at compile
 // time. On a fresh clone the JS build hasn't run yet and the folder is absent,
 // which causes a compile error: "no function `get` found for DashboardAssets".
@@ -8,20 +8,20 @@ use std::fs;
 use std::path::Path;
 
 fn main() {
-    let dist = Path::new("../../dashboard/dist");
+    let dist = Path::new("../../web-forge-fleet/out");
     if !dist.exists() {
-        fs::create_dir_all(dist).expect("failed to create dashboard/dist");
+        fs::create_dir_all(dist).expect("failed to create web-forge-fleet/out");
     }
     let index = dist.join("index.html");
     if !index.exists() {
         fs::write(
             &index,
-            "ForgeFleet dashboard — build with `cd dashboard && npm install && npm run build` to replace this placeholder.\n",
+            "ForgeFleet web — build with `cd web-forge-fleet && npm install && npm run build` to replace this placeholder.\n",
         )
-        .expect("failed to write dashboard/dist/index.html placeholder");
+        .expect("failed to write web-forge-fleet/out/index.html placeholder");
     }
-    // Re-run if the placeholder or the real dist output changes.
-    println!("cargo:rerun-if-changed=../../dashboard/dist");
+    // Re-run if the placeholder or the real export output changes.
+    println!("cargo:rerun-if-changed=../../web-forge-fleet/out");
 
     // Bake the build-time git SHA so the gateway's /health endpoint can report
     // the code the RUNNING daemon was compiled from. The forgefleetd binary

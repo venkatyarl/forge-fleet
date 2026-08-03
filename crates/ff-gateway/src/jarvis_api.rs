@@ -2,7 +2,7 @@
 //!
 //! Mounted in server.rs as `GET /api/jarvis/state`. Returns a single,
 //! version-tagged JSON snapshot that the standalone HUD
-//! (`dashboard/public/jarvis.html`) polls every few seconds to drive its
+//! (`web-forge-fleet/public/jarvis.html`) polls every few seconds to drive its
 //! gauges, node dots, subsystem rows, and section cards.
 //!
 //! Design contract (`schema_version: "1"`):
@@ -978,13 +978,13 @@ fn strip_think_block(s: &str) -> String {
 }
 
 /// Serve the JARVIS HUD itself, compile-time-embedded from the git-tracked
-/// `dashboard/public/jarvis.html`. Served same-origin as `/api/jarvis/state`
+/// `web-forge-fleet/public/jarvis.html`. Served same-origin as `/api/jarvis/state`
 /// so the live-data poller needs no CORS. We embed via `include_str!` (not the
-/// rust-embed dashboard/dist path) because `dist/` is gitignored and the deploy
-/// runs `cargo build` only — so dist/ is never present on remote hosts at
-/// compile time, but `public/` always is.
+/// rust-embed web-forge-fleet/out path) because `out/` is a build artifact and
+/// the deploy runs `cargo build` only — so out/ is never present on remote hosts
+/// at compile time, but `public/` always is.
 pub async fn jarvis_hud() -> impl IntoResponse {
-    axum::response::Html(include_str!("../../../dashboard/public/jarvis.html"))
+    axum::response::Html(include_str!("../../../web-forge-fleet/public/jarvis.html"))
 }
 
 #[cfg(test)]

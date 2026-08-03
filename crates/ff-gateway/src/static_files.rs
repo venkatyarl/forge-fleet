@@ -1,8 +1,9 @@
-//! Dashboard static file serving.
+//! Web console static file serving.
 //!
-//! Uses `rust-embed` to embed `dashboard/dist/*` at compile time so the
-//! gateway binary is fully self-contained.  Falls back to reading from the
-//! filesystem when the embed folder is empty (development mode).
+//! Uses `rust-embed` to embed `web-forge-fleet/out/*` (the Next.js static
+//! export) at compile time so the gateway binary is fully self-contained.
+//! Falls back to reading from the filesystem when the embed folder is empty
+//! (development mode).
 
 use axum::{
     body::Body,
@@ -11,12 +12,12 @@ use axum::{
 };
 use rust_embed::Embed;
 
-/// Embedded dashboard assets (compiled from `dashboard/dist/`).
+/// Embedded web assets (compiled from `web-forge-fleet/out/`).
 ///
 /// In release builds the files are baked into the binary.
 /// In debug builds the folder is read at runtime.
 #[derive(Embed)]
-#[folder = "../../dashboard/dist/"]
+#[folder = "../../web-forge-fleet/out/"]
 struct DashboardAssets;
 
 // ─── Axum handler ────────────────────────────────────────────────────────────
@@ -25,7 +26,7 @@ struct DashboardAssets;
 ///
 /// Intended to be used as an Axum fallback handler so that:
 /// - Known API / WS routes are handled first.
-/// - Any remaining path is tried against the embedded dashboard files.
+/// - Any remaining path is tried against the embedded web files.
 /// - If the path doesn't match a real file, serve `index.html` (SPA fallback).
 pub async fn serve_dashboard(req: Request<Body>) -> impl IntoResponse {
     let path = req.uri().path().trim_start_matches('/');
@@ -39,22 +40,29 @@ pub async fn serve_dashboard(req: Request<Body>) -> impl IntoResponse {
             .unwrap_or_else(|_| Response::new(Body::from("not found")));
     }
 
-    // 1. Try the exact path.
+    // 1. Try the exact path (files: /_next/static/*, /console.html, …).
     if let Some(resp) = serve_embedded(path) {
         return resp;
     }
 
-    // 2. SPA fallback — any non-file path returns index.html.
+    // 2. Directory index — the Next.js export uses trailingSlash, so routes
+    //    live at `<route>/index.html` ("" resolves to the root index.html).
+    let dir_index = format!("{}/index.html", path.trim_end_matches('/'));
+    if let Some(resp) = serve_embedded(&dir_index) {
+        return resp;
+    }
+
+    // 3. SPA fallback — any non-file path returns index.html.
     if let Some(resp) = serve_embedded("index.html") {
         return resp;
     }
 
-    // 3. Nothing at all (shouldn't happen if dashboard was built).
+    // 4. Nothing at all (shouldn't happen if the web app was built).
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .header(header::CONTENT_TYPE, "text/plain")
         .body(Body::from(
-            "Dashboard not built — run `npm run build` in dashboard/",
+            "web-forge-fleet not built — run `npm run build` in web-forge-fleet/",
         ))
         .unwrap_or_else(|_| Response::new(Body::from("not found")))
 }
@@ -68,9 +76,9 @@ fn serve_embedded(path: &str) -> Option<Response<Body>> {
         .to_string();
 
     // Cache policy:
-    //   - Hashed assets (JS/CSS in assets/) → immutable, 1 year
+    //   - Hashed assets (JS/CSS under _next/static/) → immutable, 1 year
     //   - index.html and other root files → no-store (avoid stale shell/version mismatch)
-    let cache = if path.starts_with("assets/") {
+    let cache = if path.starts_with("_next/static/") {
         "public, max-age=31536000, immutable"
     } else {
         "no-store, max-age=0, must-revalidate"

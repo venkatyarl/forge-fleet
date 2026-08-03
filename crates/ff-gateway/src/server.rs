@@ -736,6 +736,16 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         .route("/api/settings/runtime", get(settings_runtime))
         .route("/api/brain/status", get(brain_status))
         .route(
+            "/api/workstreams",
+            get(crate::workstreams_api::list_workstreams),
+        )
+        .route("/api/cortex/{tool}", get(crate::explorer_api::cortex_tool))
+        .route(
+            "/api/training/jobs",
+            get(crate::explorer_api::training_jobs),
+        )
+        .route("/api/jira/status", get(crate::explorer_api::jira_status))
+        .route(
             "/api/brain/search",
             get(crate::brain_api::hybrid_search_handler),
         )

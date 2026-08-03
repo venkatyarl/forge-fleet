@@ -38,6 +38,8 @@ pub mod telegram;
 pub mod telegram_commands;
 pub mod telegram_grounding;
 pub mod telegram_transport;
+pub mod workstreams_api;
+pub mod explorer_api;
 pub mod tool_registry_api;
 pub mod voice_api;
 pub mod webhook;

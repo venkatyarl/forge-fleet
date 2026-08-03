@@ -25,6 +25,18 @@ The kimi-style agent TUI lives at repo-root `tui/` (crate `ff-tui`, binary
 attaches to any LLM: `--backend router|local|endpoint <url> [model]|claude|codex|kimi`
 (live-switch with `/backend`). Build: `cargo build -p ff-tui`.
 
+## Web console (`web-forge-fleet/`)
+
+The web home is `web-forge-fleet/` — Next.js (App Router, TS, Tailwind v4),
+static export (`npm run build` → `out/`) rust-embedded and served by
+ff-gateway (`crates/ff-gateway/src/static_files.rs`). It consolidates the old
+Vite `dashboard/` (retired; all routes ported) and the deleted `web/` stub,
+and adds a landing presence page, `/workstreams` (backed by
+`GET /api/workstreams`), and `/playground`. All data fetching is client-side
+against same-origin gateway endpoints — no Next server features. Dev:
+`npm run dev` proxies `/api/*`/`/v1/*` to `FF_GATEWAY_URL` (default
+127.0.0.1:8787); WS/SSE connect direct via `NEXT_PUBLIC_FF_GATEWAY_URL`.
+
 <!-- forgefleet MCP tools -->
 ## MCP Tools: forgefleet
 
