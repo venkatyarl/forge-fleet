@@ -1710,6 +1710,24 @@ async fn docker_run_oneoff(image: &str, volume: &str, pgdata: &str, cmd: &[Strin
     Ok(())
 }
 
+fn backup_verification_payload(
+    backup_id: uuid::Uuid,
+    evidence_tier: &str,
+    expected_computer: &str,
+    run_id: uuid::Uuid,
+    database_kind: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "operation": "verify_backup_artifact",
+        "backup_id": backup_id,
+        "evidence_tier": evidence_tier,
+        "expected_computer": expected_computer,
+        "run_id": run_id,
+        "lease_identity": expected_computer,
+        "metadata": { "database_kind": database_kind },
+    })
+}
+
 pub async fn handle_fleet_db_verify_backups(
     pool: &sqlx::PgPool,
     limit: i64,
@@ -1718,28 +1736,6 @@ pub async fn handle_fleet_db_verify_backups(
     println!(
         "{CYAN}▶ ff fleet db verify-backups (limit={limit} test-restore={test_restore}){RESET}"
     );
-
-    // Confirm the decryption key exists — the whole audit is meaningless
-    // without it.
-    let privkey = ff_db::pg_get_secret(pool, ff_agent::ha::backup::BACKUP_ENC_PRIVKEY)
-        .await
-        .map_err(|e| anyhow::anyhow!("fleet_secrets lookup: {e}"))?;
-    match privkey {
-        Some(_) => println!(
-            "{GREEN}✓{RESET} fleet_secrets.{} present",
-            ff_agent::ha::backup::BACKUP_ENC_PRIVKEY
-        ),
-        None => {
-            println!(
-                "{YELLOW}warning:{RESET} fleet_secrets.{} is NOT set. No real \
-                 backup encryption has happened yet — .age files on disk \
-                 are likely 0-byte stubs from failed `age` CLI runs. \
-                 Install `age` (brew install age) and let the orchestrator \
-                 produce a real backup first.",
-                ff_agent::ha::backup::BACKUP_ENC_PRIVKEY
-            );
-        }
-    }
 
     let rows = sqlx::query_as::<
         _,
@@ -1751,11 +1747,12 @@ pub async fn handle_fleet_db_verify_backups(
             String,
             chrono::DateTime<chrono::Utc>,
             String,
+            String,
         ),
     >(
         "SELECT id, database_kind, file_name, size_bytes, checksum_sha256,
-                created_at, retention_tier
-           FROM backups
+                created_at, retention_tier, c.name
+           FROM backups b JOIN computers c ON c.id = b.source_computer_id
           ORDER BY created_at DESC
           LIMIT $1",
     )
@@ -1771,104 +1768,103 @@ pub async fn handle_fleet_db_verify_backups(
 
     println!();
     println!(
-        "{:<38} {:<8} {:<10} {:<20} {:<8} {:<8} FILE",
-        "ID", "KIND", "SIZE", "CREATED", "CHKSUM", "DECRYPT"
+        "{:<38} {:<10} {:<14} {:<10} HOST",
+        "ID", "KIND", "RSYNC", "VERIFY"
     );
-    let mut most_recent_pg: Option<BackupRow> = None;
-    for (id, kind, file_name, size_bytes, checksum_sha256, created_at, tier) in rows {
-        let br = BackupRow {
-            id,
-            database_kind: kind.clone(),
-            file_name: file_name.clone(),
-            size_bytes,
-            checksum_sha256: checksum_sha256.clone(),
-            created_at,
-            retention_tier: tier,
-        };
-        let path = backup_path_on_disk(&br);
-        let (chk_str, dec_str) = if !path.exists() {
-            ("missing".to_string(), "n/a".to_string())
-        } else {
-            let chk = verify_checksum(&path, &checksum_sha256)
-                .await
-                .unwrap_or(false);
-            let dec = has_age_header(&path).await.unwrap_or(false);
-            let dec_str = if tokio::fs::metadata(&path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0)
-                == 0
-            {
-                "empty".to_string()
-            } else if dec {
-                "yes".to_string()
-            } else {
-                "no".to_string()
+    let evidence_tier = if test_restore {
+        "restore"
+    } else {
+        "checksum_decrypt"
+    };
+    for (id, kind, file_name, _size, checksum, _created, _tier, source) in rows {
+        use sqlx::Row;
+        use std::collections::BTreeSet;
+        let tasks = sqlx::query(
+            "SELECT id, preferred_node, status, completed_at, result
+               FROM deferred_tasks
+              WHERE kind = 'shell'
+                AND ((payload #>> '{meta,backup_rsync,backup_id}') = $1
+                     OR title LIKE 'rsync % backup ' || $2 || ' → %')
+              ORDER BY created_at",
+        )
+        .bind(id.to_string())
+        .bind(&file_name)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("query backup rsync tasks: {e}"))?;
+        let mut hosts = BTreeSet::from([source.clone()]);
+        for task in tasks {
+            let Some(host) = task.get::<Option<String>, _>("preferred_node") else {
+                continue;
             };
-            (
-                if chk {
-                    "ok".to_string()
-                } else {
-                    "BAD".to_string()
-                },
-                dec_str,
-            )
-        };
-        println!(
-            "{:<38} {:<8} {:<10} {:<20} {:<8} {:<8} {}",
-            id.to_string(),
-            kind,
-            size_bytes,
-            created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-            chk_str,
-            dec_str,
-            file_name,
-        );
-        if kind == "postgres" && most_recent_pg.is_none() {
-            most_recent_pg = Some(br);
-        }
-    }
-
-    if test_restore {
-        println!();
-        let Some(target) = most_recent_pg else {
-            println!("{YELLOW}--test-restore:{RESET} no postgres backups found, skipping");
-            return Ok(());
-        };
-        println!(
-            "{CYAN}▶ --test-restore:{RESET} most recent postgres backup = {} ({})",
-            target.id, target.file_name
-        );
-        let scratch = format!("forgefleet_verify_{}", &target.id.simple().to_string()[..8]);
-        println!("    scratch db: {scratch}");
-        // Invoke the same restore path, then drop the DB.
-        let restore_res =
-            handle_fleet_db_restore(pool, &target.id.to_string(), None, &scratch, true, false)
+            hosts.insert(host.clone());
+            let status: String = task.get("status");
+            if status == "completed" {
+                let completed = task
+                    .get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at")
+                    .unwrap_or_else(chrono::Utc::now);
+                let result: Option<serde_json::Value> = task.get("result");
+                let observed = result
+                    .as_ref()
+                    .and_then(|v| v.get("stdout"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.split_whitespace().next())
+                    .filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()));
+                let task_id: uuid::Uuid = task.get("id");
+                let evidence = serde_json::json!({
+                    "observed_at": completed,
+                    "run_id": task_id,
+                    "rsync": "completed",
+                    "expected_checksum": checksum,
+                    "observed_checksum": observed,
+                    "checksum": observed.map(|v| if v.eq_ignore_ascii_case(&checksum) { "ok" } else { "mismatch" }).unwrap_or("unavailable"),
+                });
+                let _ = ff_db::pg_update_backup_host_evidence(
+                    pool, id, &checksum, &host, completed, &evidence, false,
+                )
                 .await;
-        // Always attempt cleanup, even on error.
-        let drop_out = tokio::process::Command::new("docker")
-            .args([
-                "exec",
-                "-u",
-                "postgres",
-                "forgefleet-postgres",
-                "dropdb",
-                "--if-exists",
-                &scratch,
-            ])
-            .output()
-            .await;
-        match drop_out {
-            Ok(o) if o.status.success() => {
-                println!("{GREEN}✓{RESET} scratch db '{scratch}' dropped")
             }
-            Ok(o) => println!(
-                "{YELLOW}note:{RESET} dropdb '{scratch}' non-zero: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            ),
-            Err(e) => println!("{YELLOW}note:{RESET} dropdb '{scratch}' failed to spawn: {e}"),
         }
-        restore_res?;
+        for host in hosts {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM deferred_tasks
+                  WHERE kind = 'internal'
+                    AND payload->>'operation' = 'verify_backup_artifact'
+                    AND payload->>'backup_id' = $1
+                    AND preferred_node = $2
+                    AND status IN ('pending','dispatchable','running')",
+            )
+            .bind(id.to_string())
+            .bind(&host)
+            .fetch_one(pool)
+            .await?;
+            if exists > 0 {
+                println!(
+                    "{:<38} {:<10} {:<14} {:<10} {}",
+                    id, kind, "known", "pending", host
+                );
+                continue;
+            }
+            let run_id = uuid::Uuid::new_v4();
+            let payload = backup_verification_payload(id, evidence_tier, &host, run_id, &kind);
+            ff_db::pg_enqueue_deferred(
+                pool,
+                &format!("verify backup {id} on {host}"),
+                "internal",
+                &payload,
+                "node_online",
+                &serde_json::json!({"node": host}),
+                Some(&host),
+                &serde_json::json!([]),
+                Some(&whoami_tag()),
+                Some(3),
+            )
+            .await?;
+            println!(
+                "{:<38} {:<10} {:<14} {:<10} {}",
+                id, kind, "known", "queued", host
+            );
+        }
     }
 
     Ok(())
@@ -2132,11 +2128,10 @@ pub async fn handle_fleet_disband(
     )
     .fetch_all(pool)
     .await?;
-    let computer_names: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM computers WHERE LOWER(name) <> 'vinny' ORDER BY name",
-    )
-    .fetch_all(pool)
-    .await?;
+    let computer_names: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM computers WHERE LOWER(name) <> 'vinny' ORDER BY name")
+            .fetch_all(pool)
+            .await?;
 
     let mut targets: Vec<String> = fleet_names.clone();
     for n in &computer_names {
@@ -7440,5 +7435,26 @@ mod gates_tests {
         assert!(out.contains("autoscaler_mode"));
         assert!(out.contains("active"));
         assert!(out.contains("1 gate(s) explicitly set"));
+    }
+}
+
+#[cfg(test)]
+mod backup_authority_tests {
+    use super::*;
+
+    #[test]
+    fn adele_coordinator_routes_priya_without_paths_or_secrets() {
+        let id = uuid::Uuid::new_v4();
+        let run = uuid::Uuid::new_v4();
+        let payload = backup_verification_payload(id, "checksum_decrypt", "priya", run, "postgres");
+        assert_eq!(payload["expected_computer"], "priya");
+        assert_eq!(payload["lease_identity"], "priya");
+        assert_eq!(payload["backup_id"], id.to_string());
+        let encoded = payload.to_string();
+        assert!(!encoded.contains("adele"));
+        assert!(!encoded.contains(".forgefleet/backups"));
+        assert!(!encoded.contains("private"));
+        assert!(!encoded.contains("secret"));
+        assert!(!encoded.contains("AGE-SECRET-KEY"));
     }
 }

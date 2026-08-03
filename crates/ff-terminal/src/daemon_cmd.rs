@@ -82,7 +82,14 @@ async fn execute_deferred(
         "internal" => {
             // Internal ForgeFleet tasks dispatched by title. Requires DB pool —
             // we open a short-lived one here so execute_deferred stays pure.
-            if task.title.starts_with("Mesh propagate SSH for ") {
+            if task.payload.get("operation").and_then(|v| v.as_str())
+                == Some("verify_backup_artifact")
+            {
+                match ff_agent::fleet_info::get_fleet_pool().await {
+                    Ok(pool) => execute_backup_verification(&pool, task).await,
+                    Err(e) => (false, None, Some(format!("pool: {e}"))),
+                }
+            } else if task.title.starts_with("Mesh propagate SSH for ") {
                 match ff_agent::fleet_info::get_fleet_pool().await {
                     Ok(pool) => match ff_agent::mesh_check::mesh_propagate(&pool, &task.payload)
                         .await
@@ -159,6 +166,193 @@ async fn execute_deferred(
         }
         other => (false, None, Some(format!("unknown task kind: {other}"))),
     }
+}
+
+async fn execute_backup_verification(
+    pool: &sqlx::PgPool,
+    task: &ff_db::DeferredTaskRow,
+) -> (bool, Option<serde_json::Value>, Option<String>) {
+    use sqlx::Row;
+    let expected_host = task
+        .payload
+        .get("expected_computer")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let run_id = task
+        .payload
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if expected_host.is_empty()
+        || run_id.is_empty()
+        || task.preferred_node.as_deref() != Some(expected_host)
+        || task.claimed_by.as_deref() != Some(expected_host)
+    {
+        return (
+            false,
+            None,
+            Some("backup verification assignment mismatch".into()),
+        );
+    }
+    let backup_id = match task
+        .payload
+        .get("backup_id")
+        .and_then(|v| v.as_str())
+        .and_then(|v| uuid::Uuid::parse_str(v).ok())
+    {
+        Some(id) => id,
+        None => return (false, None, Some("invalid backup_id".into())),
+    };
+    let task_id = match uuid::Uuid::parse_str(&task.id) {
+        Ok(id) => id,
+        Err(_) => return (false, None, Some("invalid verification task id".into())),
+    };
+    let row = match sqlx::query(
+        "SELECT b.database_kind, b.file_name, b.checksum_sha256, c.name AS source_name,
+                EXISTS (
+                  SELECT 1 FROM deferred_tasks d
+                   WHERE d.preferred_node = $2
+                     AND d.status IN ('pending','dispatchable','running','completed')
+                     AND ((d.payload #>> '{meta,backup_rsync,backup_id}') = $3
+                          OR (d.title LIKE 'rsync % backup ' || b.file_name || ' → %'))
+                ) AS destination_authorized,
+                t.status AS task_status, t.claimed_by
+           FROM backups b
+           JOIN computers c ON c.id = b.source_computer_id
+           JOIN deferred_tasks t ON t.id = $4
+          WHERE b.id = $1",
+    )
+    .bind(backup_id)
+    .bind(expected_host)
+    .bind(backup_id.to_string())
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => return (false, None, Some("backup/task no longer exists".into())),
+        Err(e) => return (false, None, Some(format!("resolve backup authority: {e}"))),
+    };
+    let source: String = row.get("source_name");
+    let destination_authorized: bool = row.get("destination_authorized");
+    let task_status: String = row.get("task_status");
+    let claimed_by: Option<String> = row.get("claimed_by");
+    if (source != expected_host && !destination_authorized)
+        || task_status != "running"
+        || claimed_by.as_deref() != Some(expected_host)
+    {
+        return (
+            false,
+            None,
+            Some("stale or unauthorized backup verification".into()),
+        );
+    }
+    let kind: String = row.get("database_kind");
+    let file_name: String = row.get("file_name");
+    let checksum: String = row.get("checksum_sha256");
+    let local =
+        ff_agent::ha::backup::verify_local_backup_artifact(pool, &kind, &file_name, &checksum)
+            .await;
+    let observed_at = chrono::Utc::now();
+    let mut evidence = serde_json::json!({
+        "observed_at": observed_at,
+        "run_id": run_id,
+        "evidence_tier": task.payload.get("evidence_tier").and_then(|v| v.as_str()).unwrap_or("checksum_decrypt"),
+        "checksum": local.checksum,
+        "observed_checksum": local.observed_checksum,
+        "decrypt": local.decrypt,
+        "age_format": local.age_format,
+        "restore": "unsupported",
+    });
+    if evidence.get("checksum").and_then(|v| v.as_str()) == Some("ok") {
+        evidence["last_ok"] = serde_json::json!(observed_at);
+    }
+    match ff_db::pg_update_backup_host_evidence(
+        pool,
+        backup_id,
+        &checksum,
+        expected_host,
+        observed_at,
+        &evidence,
+        false,
+    )
+    .await
+    {
+        Ok(true) => (true, Some(evidence), None),
+        Ok(false) => (
+            false,
+            Some(evidence),
+            Some("stale backup evidence write rejected".into()),
+        ),
+        Err(e) => (
+            false,
+            Some(evidence),
+            Some(format!("persist backup evidence: {e}")),
+        ),
+    }
+}
+
+async fn finalize_backup_rsync(
+    pool: &sqlx::PgPool,
+    task: &ff_db::DeferredTaskRow,
+    ok: bool,
+    meta: &serde_json::Value,
+    result: Option<&serde_json::Value>,
+) {
+    let Some(backup_id) = meta
+        .get("backup_id")
+        .and_then(|v| v.as_str())
+        .and_then(|v| uuid::Uuid::parse_str(v).ok())
+    else {
+        return;
+    };
+    let Some(target) = meta.get("target_computer").and_then(|v| v.as_str()) else {
+        return;
+    };
+    if task.preferred_node.as_deref() != Some(target) || task.claimed_by.as_deref() != Some(target)
+    {
+        return;
+    }
+    let expected = meta
+        .get("expected_checksum")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let observed = result
+        .and_then(|v| v.get("stdout"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.split_whitespace().next())
+        .filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()));
+    let observed_at = chrono::Utc::now();
+    let checksum_state = if !ok {
+        "unavailable"
+    } else if expected.is_empty() {
+        "checksum_absent"
+    } else if observed.is_some_and(|v| v.eq_ignore_ascii_case(expected)) {
+        "ok"
+    } else {
+        "mismatch"
+    };
+    let mut evidence = serde_json::json!({
+        "observed_at": observed_at,
+        "run_id": task.id,
+        "rsync": if ok { "completed" } else { "failed" },
+        "checksum": checksum_state,
+        "expected_checksum": expected,
+        "observed_checksum": observed,
+    });
+    if checksum_state == "ok" {
+        evidence["last_ok"] = serde_json::json!(observed_at);
+    }
+    let _ = ff_db::pg_update_backup_host_evidence(
+        pool,
+        backup_id,
+        expected,
+        target,
+        observed_at,
+        &evidence,
+        false,
+    )
+    .await;
 }
 
 /// Threshold for auto-upgrade `consecutive_failures` → `upgrade_blocked`.
@@ -1021,6 +1215,13 @@ async fn defer_pass(
                 .and_then(|v| v.get("auto_upgrade"))
             {
                 finalize_upgrade_event(&pool2, &claimed, ok, meta, err.as_deref()).await;
+            }
+            if let Some(meta) = claimed
+                .payload
+                .get("meta")
+                .and_then(|v| v.get("backup_rsync"))
+            {
+                finalize_backup_rsync(&pool2, &claimed, ok, meta, result.as_ref()).await;
             }
 
             // External-tool finalizer: `ff ext install` / auto drift →
