@@ -602,7 +602,7 @@ impl BackupOrchestrator {
             .await?;
 
         let targets = self
-            .enqueue_distribution("postgres", &file_name, cfg)
+            .enqueue_distribution("postgres", &file_name, backup_id, &sha256, cfg)
             .await?;
         if let Err(e) = self.enqueue_wal_archive_distribution(cfg).await {
             warn!(error = %e, "postgres WAL archive fan-out failed");
@@ -700,7 +700,7 @@ impl BackupOrchestrator {
                 .insert_backup_row("redis", &file_name_gz, size_bytes, &sha256)
                 .await?;
             let targets = self
-                .enqueue_distribution("redis", &file_name_gz, cfg)
+                .enqueue_distribution("redis", &file_name_gz, backup_id, &sha256, cfg)
                 .await?;
             return Ok(BackupReport {
                 kind: "redis".into(),
@@ -722,7 +722,9 @@ impl BackupOrchestrator {
         let backup_id = self
             .insert_backup_row("redis", &file_name, size_bytes, &sha256)
             .await?;
-        let targets = self.enqueue_distribution("redis", &file_name, cfg).await?;
+        let targets = self
+            .enqueue_distribution("redis", &file_name, backup_id, &sha256, cfg)
+            .await?;
 
         Ok(BackupReport {
             kind: "redis".into(),
@@ -803,7 +805,7 @@ impl BackupOrchestrator {
             .insert_backup_row("falkordb", &file_name, size_bytes, &sha256)
             .await?;
         let targets = self
-            .enqueue_distribution("falkordb", &file_name, cfg)
+            .enqueue_distribution("falkordb", &file_name, backup_id, &sha256, cfg)
             .await?;
 
         Ok(BackupReport {
@@ -889,6 +891,8 @@ impl BackupOrchestrator {
         &self,
         kind: &str,
         file_name: &str,
+        backup_id: Uuid,
+        expected_checksum: &str,
         cfg: &BackupKindConfig,
     ) -> Result<Vec<String>, BackupError> {
         // Look up my own IP + SSH user so peers know where + as whom
@@ -994,10 +998,21 @@ impl BackupOrchestrator {
             }
 
             let title = format!("rsync {kind} backup {file_name} → {name}");
-            let script = backup_rsync_script(&kind_safe, &shell_quote(&source_path));
+            let script = backup_rsync_script(&kind_safe, &shell_quote(&source_path), file_name);
             let payload = serde_json::json!({
                 "command": script,
                 "summary": title,
+                "meta": {
+                    "backup_rsync": {
+                        "backup_id": backup_id,
+                        "source_computer_id": self.my_computer_id,
+                        "source_computer": self.my_node_name,
+                        "target_computer": name,
+                        "expected_checksum": expected_checksum,
+                        "file_name": file_name,
+                        "database_kind": kind,
+                    }
+                }
             });
             let trigger_spec = serde_json::json!({ "node": name });
             let required_caps = serde_json::json!([]);
@@ -2117,6 +2132,177 @@ fn check_age_decryptable(path: &Path, identity: &age::x25519::Identity) -> Resul
     Ok(())
 }
 
+/// Host-local evidence returned to the coordinator.  These strings are kept
+/// deliberately stable because they are persisted in `distribution_status`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct LocalBackupEvidence {
+    pub checksum: String,
+    pub observed_checksum: Option<String>,
+    pub decrypt: String,
+    pub age_format: bool,
+}
+
+/// Verify ciphertext on the daemon that owns the artifact.  The artifact is
+/// opened descriptor-relatively beneath the fixed backup root, with no symlink
+/// following at any component; the returned bytes come from that already-open
+/// descriptor, so a pathname swap cannot change what is hashed/decrypted.
+pub async fn verify_local_backup_artifact(
+    pool: &PgPool,
+    database_kind: &str,
+    file_name: &str,
+    expected_checksum: &str,
+) -> LocalBackupEvidence {
+    let root = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".forgefleet/backups");
+    let kind = kind_dir(database_kind).to_string();
+    let name = file_name.to_string();
+    let bytes = match tokio::task::spawn_blocking(move || read_backup_nofollow(&root, &kind, &name))
+        .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        _ => {
+            return LocalBackupEvidence {
+                checksum: "unavailable".into(),
+                observed_checksum: None,
+                decrypt: "unavailable".into(),
+                age_format: false,
+            };
+        }
+    };
+
+    let observed = format!("{:x}", Sha256::digest(&bytes));
+    let checksum = if expected_checksum.trim().is_empty() {
+        "checksum_absent"
+    } else if observed.eq_ignore_ascii_case(expected_checksum) {
+        "ok"
+    } else {
+        "mismatch"
+    };
+    let age_format = bytes.starts_with(b"age-encryption.org/v1")
+        || bytes.starts_with(b"-----BEGIN AGE ENCRYPTED FILE-----");
+    let decrypt = if !age_format {
+        "decrypt_unavailable".to_string()
+    } else {
+        match pg_get_secret(pool, BACKUP_ENC_PRIVKEY).await {
+            Ok(Some(key)) => match age::x25519::Identity::from_str(key.trim()) {
+                Ok(identity) => check_age_bytes_decryptable(&bytes, &identity)
+                    .map(|_| "ok".to_string())
+                    .unwrap_or_else(|_| "fail".to_string()),
+                Err(_) => "fail".to_string(),
+            },
+            _ => "decrypt_unavailable".to_string(),
+        }
+    };
+    LocalBackupEvidence {
+        checksum: checksum.into(),
+        observed_checksum: Some(observed),
+        decrypt,
+        age_format,
+    }
+}
+
+fn check_age_bytes_decryptable(
+    bytes: &[u8],
+    identity: &age::x25519::Identity,
+) -> Result<(), String> {
+    use std::io::Read;
+    let decryptor = age::Decryptor::new(bytes).map_err(|e| format!("age header: {e}"))?;
+    let mut reader = decryptor
+        .decrypt(std::iter::once(identity as &dyn age::Identity))
+        .map_err(|e| format!("age unwrap: {e}"))?;
+    let mut probe = [0u8; 64];
+    reader
+        .read(&mut probe)
+        .map_err(|e| format!("payload read: {e}"))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_backup_nofollow(root: &Path, kind: &str, file_name: &str) -> std::io::Result<Vec<u8>> {
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    fn component(value: &str) -> std::io::Result<CString> {
+        if value.is_empty()
+            || value == "."
+            || value == ".."
+            || value.contains('/')
+            || value.contains('\\')
+            || Path::new(value).is_absolute()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "backup path must be one relative component",
+            ));
+        }
+        CString::new(value).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in backup path")
+        })
+    }
+    fn open_dir_at(parent: RawFd, name: &CString) -> std::io::Result<RawFd> {
+        let fd = unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(fd)
+        }
+    }
+
+    let root_c = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in root"))?;
+    let root_fd = unsafe {
+        libc::open(
+            root_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if root_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let root_file = unsafe { std::fs::File::from_raw_fd(root_fd) };
+    let kind_c = component(kind)?;
+    let kind_fd = open_dir_at(root_file.as_raw_fd(), &kind_c)?;
+    let kind_file = unsafe { std::fs::File::from_raw_fd(kind_fd) };
+    let name_c = component(file_name)?;
+    let fd = unsafe {
+        libc::openat(
+            kind_file.as_raw_fd(),
+            name_c.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "backup artifact is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_backup_nofollow(_root: &Path, _kind: &str, _file_name: &str) -> std::io::Result<Vec<u8>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "descriptor-safe backup verification requires unix",
+    ))
+}
+
 /// Decryptability gate run on every encrypted artifact BEFORE it reaches the
 /// catalog or the rsync fan-out. Failure unlinks the artifact (mirroring
 /// [`validate_backup_size`]) and errors the cycle loudly — an undecryptable
@@ -2286,14 +2472,23 @@ async fn validate_backup_size(kind: &str, path: &Path, size_bytes: i64) -> Resul
 /// non-interactive (never blocks on a prompt). Proven live on sophie: with the
 /// inherited agent the transfer hangs to the timeout; with these two options it
 /// completes in 0.3s.
-fn backup_rsync_script(kind_safe: &str, source_quoted: &str) -> String {
+fn backup_rsync_script(kind_safe: &str, source_quoted: &str, file_name: &str) -> String {
+    // Backup names are generated internally, but keep the shell post-check
+    // fail-closed if a future caller ever passes a path rather than a name.
+    let file_safe = file_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !file_safe {
+        return "exit 64".to_string();
+    }
     format!(
         "mkdir -p \"$HOME/.forgefleet/backups/{kind_safe}/\" && \
          rsync -a \
            -e 'ssh -o IdentityAgent=none -o BatchMode=yes -o ServerAliveInterval=60 -o ServerAliveCountMax=10 -o ConnectTimeout=30' \
            --timeout=300 \
            --partial \
-           {source_quoted} \"$HOME/.forgefleet/backups/{kind_safe}/\""
+           {source_quoted} \"$HOME/.forgefleet/backups/{kind_safe}/\" && \
+         sha256sum \"$HOME/.forgefleet/backups/{kind_safe}/{file_name}\""
     )
 }
 
@@ -2540,6 +2735,28 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_safe_backup_open_rejects_traversal_and_symlinks() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("ff-backup-open-{}", Uuid::new_v4()));
+        let kind = root.join("postgres");
+        std::fs::create_dir_all(&kind).unwrap();
+        std::fs::write(kind.join("good.age"), b"ciphertext").unwrap();
+        assert_eq!(
+            read_backup_nofollow(&root, "postgres", "good.age").unwrap(),
+            b"ciphertext"
+        );
+        for attack in ["../good.age", "/tmp/good.age", "a/b", ".", ".."] {
+            assert!(read_backup_nofollow(&root, "postgres", attack).is_err());
+        }
+        symlink(kind.join("good.age"), kind.join("linked.age")).unwrap();
+        assert!(read_backup_nofollow(&root, "postgres", "linked.age").is_err());
+        symlink(&kind, root.join("linked-kind")).unwrap();
+        assert!(read_backup_nofollow(&root, "linked-kind", "good.age").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn not_leader_report_marks_produced_false() {
         let r = BackupReport::not_leader("postgres");
@@ -2656,7 +2873,7 @@ mod tests {
         // Lock the flag invariants so a future edit can't silently reintroduce
         // `-z` or balloon the inactivity timeout back to an hour.
         let src = "'venkat@192.168.5.100:/Users/venkat/.forgefleet/backups/postgres/pg.tar.gz.age'";
-        let script = backup_rsync_script("postgres", src);
+        let script = backup_rsync_script("postgres", src, "pg-20260614.tar.gz.age");
 
         // Must invoke rsync WITHOUT zlib compression.
         assert!(script.contains("rsync -a "), "script: {script}");

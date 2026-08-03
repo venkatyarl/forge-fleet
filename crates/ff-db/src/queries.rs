@@ -3906,6 +3906,58 @@ pub async fn pg_get_deferred(pool: &PgPool, id: &str) -> Result<Option<DeferredT
     Ok(row.as_ref().map(row_to_deferred))
 }
 
+/// Merge one host's backup evidence without replacing evidence written by
+/// other daemons.  The checksum and observation-time predicates bind the
+/// write to the catalog version and reject a late result from an older run.
+/// `last_ok` is intentionally preserved when the incoming object omits it.
+pub async fn pg_update_backup_host_evidence(
+    pool: &PgPool,
+    backup_id: sqlx::types::Uuid,
+    expected_checksum: &str,
+    host: &str,
+    observed_at: chrono::DateTime<chrono::Utc>,
+    evidence: &JsonValue,
+    verified_restorable: bool,
+) -> Result<bool> {
+    if host.is_empty() || host.contains(['/', '\\']) || host == "." || host == ".." {
+        return Ok(false);
+    }
+    let path = vec!["hosts".to_string(), host.to_string()];
+    let affected = sqlx::query(
+        "UPDATE backups
+            SET distribution_status = jsonb_set(
+                    jsonb_set(
+                      COALESCE(distribution_status, '{}'::jsonb),
+                      '{hosts}',
+                      COALESCE(distribution_status->'hosts', '{}'::jsonb),
+                      true),
+                    $1::text[],
+                    COALESCE(distribution_status #> $1::text[], '{}'::jsonb) || $2::jsonb,
+                    true),
+                verified_restorable_at = CASE
+                    WHEN $3
+                     AND $2->>'checksum' = 'ok'
+                     AND $2->>'decrypt' = 'ok'
+                     AND $2->>'restore' = 'ok'
+                    THEN $4 ELSE verified_restorable_at END
+          WHERE id = $5
+            AND checksum_sha256 = $6
+            AND COALESCE(
+                  (distribution_status #>> ($1::text[] || ARRAY['observed_at']))::timestamptz,
+                  'epoch'::timestamptz) <= $4",
+    )
+    .bind(path)
+    .bind(evidence)
+    .bind(verified_restorable)
+    .bind(observed_at)
+    .bind(backup_id)
+    .bind(expected_checksum)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
 /// Cancel a deferred task by id. Only allowed from pending/dispatchable/failed states.
 /// Returns true if a row was updated.
 pub async fn pg_cancel_deferred(pool: &PgPool, id: &str) -> Result<bool> {
@@ -6301,6 +6353,112 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod backup_evidence_db_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn backup_host_json_updates_are_atomic_fresh_and_checksum_bound() {
+        let url = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"));
+        let Ok(url) = url else { return };
+        let pool = PgPool::connect(&url).await.expect("connect test Postgres");
+        let Some(source): Option<sqlx::types::Uuid> =
+            sqlx::query_scalar("SELECT id FROM computers LIMIT 1")
+                .fetch_optional(&pool)
+                .await
+                .expect("read source computer")
+        else {
+            return;
+        };
+        let id = sqlx::types::Uuid::new_v4();
+        let checksum = format!("{:0>64}", id.simple());
+        sqlx::query(
+            "INSERT INTO backups
+                (id,database_kind,size_bytes,source_computer_id,checksum_sha256,file_name)
+             VALUES ($1,'postgres',1,$2,$3,$4)",
+        )
+        .bind(id)
+        .bind(source)
+        .bind(&checksum)
+        .bind(format!("test-{id}.age"))
+        .execute(&pool)
+        .await
+        .expect("insert backup evidence test row");
+
+        let at = chrono::Utc::now();
+        let a =
+            serde_json::json!({"observed_at": at, "run_id": "a", "checksum": "ok", "last_ok": at});
+        let b =
+            serde_json::json!({"observed_at": at, "run_id": "b", "checksum": "ok", "last_ok": at});
+        let (ra, rb) = tokio::join!(
+            pg_update_backup_host_evidence(&pool, id, &checksum, "duncan", at, &a, false),
+            pg_update_backup_host_evidence(&pool, id, &checksum, "logan", at, &b, false),
+        );
+        assert!(ra.unwrap() && rb.unwrap());
+        let status: JsonValue =
+            sqlx::query_scalar("SELECT distribution_status FROM backups WHERE id=$1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(status["hosts"]["duncan"].is_object());
+        assert!(status["hosts"]["logan"].is_object());
+
+        let stale_at = at - chrono::Duration::minutes(1);
+        let stale = serde_json::json!({"observed_at": stale_at, "run_id": "stale", "checksum": "unavailable"});
+        assert!(
+            !pg_update_backup_host_evidence(
+                &pool, id, &checksum, "duncan", stale_at, &stale, false,
+            )
+            .await
+            .unwrap()
+        );
+        let restore = serde_json::json!({
+            "observed_at": at + chrono::Duration::seconds(1),
+            "run_id": "restore", "checksum": "ok", "decrypt": "ok", "restore": "ok"
+        });
+        assert!(
+            !pg_update_backup_host_evidence(
+                &pool,
+                id,
+                "wrong-checksum",
+                "duncan",
+                at + chrono::Duration::seconds(1),
+                &restore,
+                true,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            pg_update_backup_host_evidence(
+                &pool,
+                id,
+                &checksum,
+                "duncan",
+                at + chrono::Duration::seconds(1),
+                &restore,
+                true,
+            )
+            .await
+            .unwrap()
+        );
+        let verified: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT verified_restorable_at FROM backups WHERE id=$1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(verified.is_some());
+        sqlx::query("DELETE FROM backups WHERE id=$1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }
 
