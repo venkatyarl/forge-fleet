@@ -47,6 +47,15 @@ pub struct FleetOneshot {
     pub tokens_out: i32,
 }
 
+/// Exact canonical deployment identity used by CLI callers before inference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFleetTarget {
+    pub endpoint: String,
+    pub worker_name: String,
+    pub catalog_id: String,
+    pub model_label: String,
+}
+
 /// In-memory, per-process count of in-flight `fleet_oneshot` requests keyed by
 /// deployment endpoint. This lets us treat a catalog family as a pool and
 /// respect each deployment's `parallel_slots` cap without relying on the DB's
@@ -239,6 +248,70 @@ pub async fn resolve_route_candidate(pool: &PgPool, model_hint: &str) -> Result<
         .ok_or_else(|| anyhow!("no healthy fleet deployment matches local:{model_hint}"))
 }
 
+/// Resolve an explicit catalog id to a healthy deployment of exactly that
+/// catalog. No substring/family matching and no cross-catalog failover.
+pub async fn resolve_explicit_catalog_target(
+    pool: &PgPool,
+    catalog_id: &str,
+) -> Result<ResolvedFleetTarget> {
+    let candidate = resolve_route_candidate(pool, catalog_id).await?;
+    resolved_target_from_candidate(&candidate)
+}
+
+/// Resolve an explicitly supplied endpoint to its canonical healthy deployment.
+/// If `requested_catalog_id` is present it must exactly match the deployment's
+/// catalog identity at the same normalized endpoint, or inference is refused.
+pub async fn resolve_explicit_endpoint_target(
+    pool: &PgPool,
+    endpoint: &str,
+    requested_catalog_id: Option<&str>,
+) -> Result<ResolvedFleetTarget> {
+    let candidates = canonical_route_candidates(pool, 64, Some(180), None).await?;
+    let normalized = normalize_endpoint_base(endpoint);
+    let mut endpoint_matches: Vec<RouteCandidate> = candidates
+        .into_iter()
+        .filter(|candidate| normalize_endpoint_base(&candidate.endpoint) == normalized)
+        .collect();
+    if endpoint_matches.is_empty() {
+        return Err(anyhow!(
+            "explicit --llm endpoint {endpoint} is not a canonical healthy fleet deployment"
+        ));
+    }
+    if endpoint_matches.len() > 1 {
+        endpoint_matches.sort_by(|a, b| {
+            a.catalog_id
+                .cmp(&b.catalog_id)
+                .then(a.catalog_name.cmp(&b.catalog_name))
+                .then(a.worker_name.cmp(&b.worker_name))
+        });
+    }
+    let candidate = if let Some(requested) = requested_catalog_id {
+        endpoint_matches
+            .into_iter()
+            .find(|candidate| candidate_catalog_id_matches(candidate, requested))
+            .ok_or_else(|| {
+                anyhow!(
+                    "explicit --llm endpoint {endpoint} does not serve requested catalog {requested}"
+                )
+            })?
+    } else {
+        endpoint_matches
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("explicit --llm endpoint {endpoint} is ambiguous"))?
+    };
+    resolved_target_from_candidate(&candidate)
+}
+
+/// Resolve the default agent-capable target used by `ff run` auto routing.
+pub async fn resolve_auto_agent_target(pool: &PgPool, min_ctx: i32) -> Result<ResolvedFleetTarget> {
+    let candidate = ff_db::pg_pick_agent_endpoint(pool, min_ctx, &[])
+        .await
+        .map_err(|e| anyhow!("pick agent endpoint: {e}"))?
+        .ok_or_else(|| anyhow!("no healthy agent-capable fleet deployment"))?;
+    resolved_target_from_candidate(&candidate)
+}
+
 async fn resolve_route_candidates(
     pool: &PgPool,
     model_hint: Option<&str>,
@@ -320,6 +393,26 @@ async fn resolve_route_candidates(
     } else {
         &named
     };
+    let exact_catalog_matches: Vec<RouteCandidate> = if let Some(model_hint) = model_hint {
+        candidates
+            .iter()
+            .filter(|candidate| candidate_catalog_id_matches(candidate, model_hint))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let candidates: &[RouteCandidate] = if model_hint.is_some() {
+        if exact_catalog_matches.is_empty() {
+            return Err(anyhow!(
+                "no healthy fleet deployment matches requested catalog id {}",
+                model_hint.unwrap_or_default()
+            ));
+        }
+        &exact_catalog_matches
+    } else {
+        candidates
+    };
 
     let this_worker = crate::fleet_info::resolve_this_worker_name().await;
     let prefer_non_local = this_node_has_active_build_lease(pool).await;
@@ -333,22 +426,39 @@ async fn resolve_route_candidates(
     Ok(ordered.into_iter().cloned().collect())
 }
 
+async fn canonical_route_candidates(
+    pool: &PgPool,
+    limit: i64,
+    max_health_age_sec: Option<i32>,
+    min_ctx: Option<i32>,
+) -> Result<Vec<RouteCandidate>> {
+    let filter = RouteFilter {
+        workload: None,
+        require_tool_calling: false,
+        min_ctx,
+        exclude_hosts: Vec::new(),
+        max_health_age_sec,
+        prefer_least_loaded: true,
+        limit,
+    };
+    pg_route_deployments(pool, &filter)
+        .await
+        .map_err(|e| anyhow!("route deployments: {e}"))
+}
+
 async fn dispatch_to_candidate(
     cand: &RouteCandidate,
     client: &reqwest::Client,
     prompt: &str,
-    model_hint: Option<&str>,
+    _model_hint: Option<&str>,
     system: Option<&str>,
     max_tokens: u32,
 ) -> anyhow::Result<FleetOneshot> {
     let worker_name = cand.worker_name.clone();
     let endpoint = cand.endpoint.clone();
     let catalog_id = cand.catalog_id.clone();
-    let model = cand
-        .catalog_name
-        .clone()
-        .or_else(|| model_hint.map(|s| s.to_string()))
-        .unwrap_or_else(|| "local".to_string());
+    let model = canonical_candidate_model_label(cand)
+        .ok_or_else(|| anyhow!("{worker_name} has no canonical model identity"))?;
     let url = ff_core::url::normalize_chat_completions_url(&endpoint);
     // Reasoning coders (glm-4.5-air) start "thinking out loud" in `content`
     // when the format contract lives mid-user-message — and the prose eats
@@ -413,6 +523,34 @@ async fn dispatch_to_candidate(
     })
 }
 
+fn resolved_target_from_candidate(candidate: &RouteCandidate) -> Result<ResolvedFleetTarget> {
+    let catalog_id = candidate
+        .catalog_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "{} at {} has no canonical catalog id",
+                candidate.worker_name,
+                candidate.endpoint
+            )
+        })?
+        .to_string();
+    let model_label = canonical_candidate_model_label(candidate).ok_or_else(|| {
+        anyhow!(
+            "{} at {} has no canonical model label",
+            candidate.worker_name,
+            candidate.endpoint
+        )
+    })?;
+    Ok(ResolvedFleetTarget {
+        endpoint: normalize_endpoint_base(&candidate.endpoint),
+        worker_name: candidate.worker_name.clone(),
+        catalog_id,
+        model_label,
+    })
+}
+
 /// True when this node currently holds an unreleased work-item build lease.
 /// That means its cores are busy compiling, so local inference should be a
 /// tiebreak loser when a non-local deployment is equally available.
@@ -471,7 +609,28 @@ fn candidate_catalog_id_matches(candidate: &RouteCandidate, catalog_id: &str) ->
     candidate
         .catalog_id
         .as_deref()
-        .is_some_and(|id| id.eq_ignore_ascii_case(catalog_id))
+        .is_some_and(|id| id.eq_ignore_ascii_case(catalog_id.trim()))
+}
+
+fn canonical_candidate_model_label(candidate: &RouteCandidate) -> Option<String> {
+    [
+        candidate.catalog_id.as_deref(),
+        candidate.catalog_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+    .map(str::to_string)
+}
+
+fn normalize_endpoint_base(endpoint: &str) -> String {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    let without_chat = trimmed
+        .strip_suffix("/v1/chat/completions")
+        .unwrap_or(trimmed);
+    let without_v1 = without_chat.strip_suffix("/v1").unwrap_or(without_chat);
+    without_v1.trim_end_matches('/').to_string()
 }
 
 /// Order candidates for dispatch.
@@ -782,36 +941,118 @@ mod tests {
     }
 
     #[test]
-    fn rank_falls_back_outside_family_when_family_is_full() {
-        let local = candidate(
+    fn rank_keeps_same_catalog_failover_without_model_change() {
+        let mut local = candidate(
             "http://test-fallback-lily:1",
             "lily",
             Some("coder"),
             Some(1),
         );
-        let remote_coder = candidate(
+        let mut remote_coder = candidate(
             "http://test-fallback-marcus:1",
             "marcus",
             Some("coder"),
             Some(1),
         );
-        let remote_other = candidate(
+        let mut remote_other = candidate(
             "http://test-fallback-vinny:1",
             "vinny",
             Some("llama"),
             Some(4),
         );
+        local.catalog_id = Some("glm-4.5-air".to_string());
+        remote_coder.catalog_id = Some("glm-4.5-air".to_string());
+        remote_other.catalog_id = Some("lucy-1-7b".to_string());
         set_inflight_for_test("http://test-fallback-lily:1", 1);
-        set_inflight_for_test("http://test-fallback-marcus:1", 1);
 
         let pool = vec![local, remote_coder, remote_other];
-        let ordered = rank_candidates(&pool, "lily", Some("coder"), false);
+        let same_catalog: Vec<RouteCandidate> = pool
+            .iter()
+            .filter(|candidate| candidate_catalog_id_matches(candidate, "glm-4.5-air"))
+            .cloned()
+            .collect();
+        let ordered = rank_candidates(&same_catalog, "lily", Some("coder"), false);
 
-        // coder family is full, so the free non-family deployment comes first.
-        assert_eq!(ordered[0].endpoint, "http://test-fallback-vinny:1");
+        assert_eq!(ordered[0].endpoint, "http://test-fallback-marcus:1");
+        assert!(
+            ordered
+                .iter()
+                .all(|candidate| candidate_catalog_id_matches(candidate, "glm-4.5-air"))
+        );
 
         set_inflight_for_test("http://test-fallback-lily:1", 0);
-        set_inflight_for_test("http://test-fallback-marcus:1", 0);
+    }
+
+    #[test]
+    fn normalizes_endpoint_base_for_explicit_url_match() {
+        assert_eq!(
+            normalize_endpoint_base("http://192.168.5.111:55004/v1/chat/completions/"),
+            "http://192.168.5.111:55004"
+        );
+        assert_eq!(
+            normalize_endpoint_base("http://192.168.5.111:55004/v1"),
+            "http://192.168.5.111:55004"
+        );
+    }
+
+    #[test]
+    fn canonical_model_label_requires_candidate_identity() {
+        let mut glm = candidate("http://glm:1", "lily", Some("coder"), Some(1));
+        glm.catalog_id = Some("glm-4.5-air".to_string());
+        glm.catalog_name = Some("GLM 4.5 Air".to_string());
+        assert_eq!(
+            canonical_candidate_model_label(&glm).as_deref(),
+            Some("glm-4.5-air")
+        );
+
+        let unknown = candidate("http://unknown:1", "ace", None, Some(1));
+        assert!(canonical_candidate_model_label(&unknown).is_none());
+        assert!(resolved_target_from_candidate(&unknown).is_err());
+    }
+
+    #[tokio::test]
+    async fn db_gated_logan_glm_request_rejects_and_model_resolves() {
+        let Some(database_url) = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+        else {
+            return;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("connect test Postgres");
+
+        let logan_glm = resolve_explicit_endpoint_target(
+            &pool,
+            "http://192.168.5.111:55004",
+            Some("glm-4.5-air"),
+        )
+        .await;
+        assert!(logan_glm.is_err(), "Logan :55004 must not resolve as GLM");
+
+        let glm = resolve_explicit_catalog_target(&pool, "glm-4.5-air")
+            .await
+            .expect("resolve healthy GLM deployment");
+        assert_eq!(glm.catalog_id, "glm-4.5-air");
+        assert_ne!(glm.endpoint, "http://192.168.5.111:55004");
+
+        let logan_auto =
+            resolve_explicit_endpoint_target(&pool, "http://192.168.5.111:55004", None)
+                .await
+                .expect("resolve Logan canonical endpoint");
+        assert_eq!(logan_auto.endpoint, "http://192.168.5.111:55004");
+        assert_eq!(logan_auto.catalog_id, "lucy-1-7b");
+
+        let explicit_wrong = resolve_explicit_endpoint_target(
+            &pool,
+            "http://192.168.5.111:55004/v1/chat/completions",
+            Some("glm-4.5-air"),
+        )
+        .await;
+        assert!(explicit_wrong.is_err());
     }
 
     #[cfg(test)]

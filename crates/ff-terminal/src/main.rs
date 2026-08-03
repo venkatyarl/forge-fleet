@@ -4577,88 +4577,19 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
-    // Build the local-first inference router (probes localhost + fleet from DB).
-    // If the user explicitly passed --llm, skip auto-routing and use that URL directly.
-    let (llm, router, routed_model) =
-        if let Some(explicit_url) = cli.llm.or_else(|| env::var("FORGEFLEET_LLM_URL").ok()) {
-            if let Some(model_hint) = explicit_url.strip_prefix("local:") {
-                if model_hint.is_empty() {
-                    anyhow::bail!("--llm local:<catalog-id> requires a catalog id");
-                }
-                let pool = ff_agent::fleet_info::get_fleet_pool()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("resolve --llm {explicit_url}: {e}"))?;
-                let candidate = ff_agent::fleet_oneshot::resolve_route_candidate(&pool, model_hint)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("resolve --llm {explicit_url}: {e}"))?;
-                let model = [candidate.catalog_name, candidate.catalog_id]
-                    .into_iter()
-                    .flatten()
-                    .find(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| model_hint.to_string());
-                (candidate.endpoint, None, Some(model))
-            } else {
-                (explicit_url, None, None)
-            }
-        } else if let Some(url) = helpers::pick_agent_capable_url(&config_path, 32_768).await {
-            // Agent-capable endpoint (tool-calling + usable_agent_ctx >= 32K).
-            // 32K (not 16K) MATCHES the agent loop's default
-            // `context_window_tokens` (32768): a 16K endpoint overflowed even a
-            // 1-file task because the system prompt + tool schemas + file easily
-            // exceed 16K, and the loop won't auto-compact until its 32K
-            // threshold. The fleet has ample 32K+ endpoints (vinny 64K,
-            // james/logan/duncan 32K), so this routes to a model that can
-            // actually hold the context instead of overflowing on turn 1.
-            // Use it DIRECTLY with NO inference router: the agent loop prefers
-            // router.active_url() (local-first) over llm_base_url, so attaching
-            // the router would override this pick back to a small-per-slot-ctx
-            // endpoint and the agent overflows on turn 1 (P0.1). Failover to a
-            // small-ctx endpoint would just overflow anyway, so direct is right.
-            (url, None, None)
-        } else {
-            // No agent-capable deployment — fall back to the local-first
-            // inference router (with failover), exactly as before. Fail-closed.
-            let r = ff_agent::inference_router::InferenceRouter::from_config(&config_path).await;
-            let primary = if let Some(url) = r.active_url().await {
-                url
-            } else {
-                helpers::detect_llm_from_db_or_local(&config_path).await
-            };
-            (primary, Some(std::sync::Arc::new(r)), None)
-        };
-
-    let mut model = cli
+    let requested_llm = cli
+        .llm
+        .clone()
+        .or_else(|| env::var("FORGEFLEET_LLM_URL").ok());
+    let requested_model = cli
         .model
-        .or_else(|| env::var("FORGEFLEET_MODEL").ok())
-        .or(routed_model)
-        .unwrap_or_else(|| "auto".into());
-
-    // If model is "auto", query the LLM server for its actual model name
-    static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
-        std::sync::LazyLock::new(reqwest::Client::new);
-
-    if model == "auto" {
-        let detect_url = format!("{}/v1/models", llm.trim_end_matches('/'));
-        match SHARED_HTTP.get(&detect_url).send().await {
-            Ok(resp) => {
-                if let Ok(body) = resp.json::<serde_json::Value>().await
-                    && let Some(id) = body
-                        .get("data")
-                        .and_then(|d| d.as_array())
-                        .and_then(|arr| arr.last())
-                        .and_then(|m| m.get("id"))
-                        .and_then(|id| id.as_str())
-                {
-                    model = id.to_string();
-                }
-            }
-            Err(_) => {
-                if llm.contains("51005") {
-                    model = "ForgeFleet-LoRA".into();
-                }
-            }
-        }
-    }
+        .clone()
+        .or_else(|| env::var("FORGEFLEET_MODEL").ok());
+    let resolved_target =
+        resolve_cli_llm_target(&config_path, requested_llm, requested_model).await?;
+    let model = resolved_target.model.clone();
+    let llm = resolved_target.endpoint.clone();
+    let router = resolved_target.router.clone();
     let working_dir = cli
         .cwd
         .clone()
@@ -4778,8 +4709,17 @@ async fn main() -> Result<()> {
             // Edit/Write are on disk (the checkpoint); commit-back lifts those.
             match run_timeout {
                 Some(dur) => {
-                    match tokio::time::timeout(dur, run_headless(&prompt, cfg, &output, oneshot))
-                        .await
+                    match tokio::time::timeout(
+                        dur,
+                        run_headless(
+                            &prompt,
+                            cfg,
+                            &output,
+                            oneshot,
+                            Some(resolved_target.clone()),
+                        ),
+                    )
+                    .await
                     {
                         Ok(res) => res,
                         Err(_) => {
@@ -4792,7 +4732,16 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                None => run_headless(&prompt, cfg, &output, oneshot).await,
+                None => {
+                    run_headless(
+                        &prompt,
+                        cfg,
+                        &output,
+                        oneshot,
+                        Some(resolved_target.clone()),
+                    )
+                    .await
+                }
             }
         }
         Some(Command::Codegen {
@@ -5958,7 +5907,7 @@ async fn main() -> Result<()> {
                     eprintln!("{hint}");
                     std::process::exit(2);
                 }
-                run_headless(&prompt_text, agent_config, "text", false).await
+                run_headless(&prompt_text, agent_config, "text", false, None).await
             } else {
                 run_tui(agent_config).await
             }
@@ -6232,6 +6181,52 @@ mod free_prompt_guard_tests {
         // the multi-arg form does. Quoting must not change the verdict.
         assert!(guard(&["summarize the fleet state"]).is_none());
         assert!(guard(&["what is running on the fleet"]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod cli_llm_target_tests {
+    use super::*;
+
+    #[test]
+    fn precedence_matrix_keeps_explicit_model_out_of_auto_pick() {
+        assert_eq!(
+            cli_target_precedence(Some("local:glm-4.5-air"), None),
+            "explicit_catalog"
+        );
+        assert_eq!(
+            cli_target_precedence(Some("http://192.168.5.111:55004"), Some("glm-4.5-air")),
+            "explicit_url"
+        );
+        assert_eq!(
+            cli_target_precedence(None, Some("glm-4.5-air")),
+            "explicit_catalog"
+        );
+        assert_eq!(cli_target_precedence(None, Some("auto")), "auto");
+        assert_eq!(cli_target_precedence(None, None), "auto");
+    }
+
+    #[test]
+    fn interaction_route_decision_uses_canonical_target() {
+        let target = ResolvedCliLlmTarget {
+            endpoint: "http://192.168.5.111:55004".to_string(),
+            model: "lucy-1-7b".to_string(),
+            catalog_id: Some("lucy-1-7b".to_string()),
+            worker_name: Some("logan".to_string()),
+            provenance: "explicit_url",
+            router: None,
+            attestation: Some("unverified:v1_models_id=Lucy-Q4_K_M.gguf".to_string()),
+        };
+        let decision = cli_route_decision(Some(&target));
+        assert_eq!(decision["provenance"], "explicit_url");
+        assert_eq!(decision["catalog_id"], "lucy-1-7b");
+        assert_eq!(decision["model"], "lucy-1-7b");
+        assert_eq!(decision["worker_name"], "logan");
+        assert_eq!(decision["endpoint"], "http://192.168.5.111:55004");
+        assert_eq!(
+            decision["attestation"],
+            "unverified:v1_models_id=Lucy-Q4_K_M.gguf"
+        );
     }
 }
 
@@ -7704,11 +7699,197 @@ fn non_empty(s: &str) -> Option<String> {
     }
 }
 
+#[derive(Clone)]
+struct ResolvedCliLlmTarget {
+    endpoint: String,
+    model: String,
+    catalog_id: Option<String>,
+    worker_name: Option<String>,
+    provenance: &'static str,
+    router: Option<std::sync::Arc<ff_agent::inference_router::InferenceRouter>>,
+    attestation: Option<String>,
+}
+
+impl ResolvedCliLlmTarget {
+    fn from_fleet_target(
+        target: ff_agent::fleet_oneshot::ResolvedFleetTarget,
+        provenance: &'static str,
+        attestation: Option<String>,
+    ) -> Self {
+        Self {
+            endpoint: target.endpoint,
+            model: target.model_label,
+            catalog_id: Some(target.catalog_id),
+            worker_name: Some(target.worker_name),
+            provenance,
+            router: None,
+            attestation,
+        }
+    }
+}
+
+async fn resolve_cli_llm_target(
+    config_path: &std::path::Path,
+    requested_llm: Option<String>,
+    requested_model: Option<String>,
+) -> Result<ResolvedCliLlmTarget> {
+    let precedence = cli_target_precedence(requested_llm.as_deref(), requested_model.as_deref());
+    if let Some(llm) = requested_llm {
+        if let Some(catalog_id) = llm.strip_prefix("local:") {
+            if catalog_id.trim().is_empty() {
+                anyhow::bail!("--llm local:<catalog-id> requires a catalog id");
+            }
+            if let Some(model) = requested_model.as_deref()
+                && model != "auto"
+                && !model.eq_ignore_ascii_case(catalog_id)
+            {
+                anyhow::bail!("--llm local:{catalog_id} conflicts with requested --model {model}");
+            }
+            let pool = ff_agent::fleet_info::get_fleet_pool()
+                .await
+                .map_err(|e| anyhow::anyhow!("resolve --llm {llm}: {e}"))?;
+            let target =
+                ff_agent::fleet_oneshot::resolve_explicit_catalog_target(&pool, catalog_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("resolve --llm {llm}: {e}"))?;
+            return Ok(ResolvedCliLlmTarget::from_fleet_target(
+                target, precedence, None,
+            ));
+        }
+
+        let pool = ff_agent::fleet_info::get_fleet_pool()
+            .await
+            .map_err(|e| anyhow::anyhow!("resolve --llm {llm}: {e}"))?;
+        let target = ff_agent::fleet_oneshot::resolve_explicit_endpoint_target(
+            &pool,
+            &llm,
+            requested_model.as_deref().filter(|m| *m != "auto"),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("resolve --llm {llm}: {e}"))?;
+        let attestation = attest_endpoint_model(&target.endpoint, &target.catalog_id).await;
+        return Ok(ResolvedCliLlmTarget::from_fleet_target(
+            target,
+            precedence,
+            attestation,
+        ));
+    }
+
+    if let Some(model) = requested_model.as_deref().filter(|m| *m != "auto") {
+        let pool = ff_agent::fleet_info::get_fleet_pool()
+            .await
+            .map_err(|e| anyhow::anyhow!("resolve --model {model}: {e}"))?;
+        let target = ff_agent::fleet_oneshot::resolve_explicit_catalog_target(&pool, model)
+            .await
+            .map_err(|e| anyhow::anyhow!("resolve --model {model}: {e}"))?;
+        return Ok(ResolvedCliLlmTarget::from_fleet_target(
+            target, precedence, None,
+        ));
+    }
+
+    if let Ok(pool) = ff_agent::fleet_info::get_fleet_pool().await
+        && let Ok(target) = ff_agent::fleet_oneshot::resolve_auto_agent_target(&pool, 32_768).await
+    {
+        return Ok(ResolvedCliLlmTarget::from_fleet_target(
+            target, "auto", None,
+        ));
+    }
+
+    let router = ff_agent::inference_router::InferenceRouter::from_config(config_path).await;
+    let endpoint = if let Some(url) = router.active_url().await {
+        url
+    } else {
+        helpers::detect_llm_from_db_or_local(config_path).await
+    };
+    let model = detect_endpoint_model(&endpoint)
+        .await
+        .unwrap_or_else(|| "auto".to_string());
+    Ok(ResolvedCliLlmTarget {
+        endpoint,
+        model,
+        catalog_id: None,
+        worker_name: None,
+        provenance: precedence,
+        router: Some(std::sync::Arc::new(router)),
+        attestation: Some("unverified:no_canonical_deployment".to_string()),
+    })
+}
+
+fn cli_target_precedence(
+    requested_llm: Option<&str>,
+    requested_model: Option<&str>,
+) -> &'static str {
+    match (
+        requested_llm,
+        requested_model.filter(|model| *model != "auto"),
+    ) {
+        (Some(llm), _) if llm.strip_prefix("local:").is_some() => "explicit_catalog",
+        (Some(_), _) => "explicit_url",
+        (None, Some(_)) => "explicit_catalog",
+        (None, None) => "auto",
+    }
+}
+
+async fn attest_endpoint_model(endpoint: &str, catalog_id: &str) -> Option<String> {
+    let Some(served_id) = detect_endpoint_model(endpoint).await else {
+        return Some("unverified:v1_models_unavailable".to_string());
+    };
+    if served_id.eq_ignore_ascii_case(catalog_id) {
+        return Some("verified".to_string());
+    }
+    // llama.cpp often reports shard filenames (for example GLM GGUF shards)
+    // rather than the fleet catalog id. Record but do not relabel or reject.
+    Some(format!("unverified:v1_models_id={served_id}"))
+}
+
+async fn detect_endpoint_model(endpoint: &str) -> Option<String> {
+    static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(reqwest::Client::new);
+    let detect_url = format!("{}/v1/models", endpoint.trim_end_matches('/'));
+    let body = SHARED_HTTP
+        .get(&detect_url)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    body.get("data")
+        .and_then(|d| d.as_array())
+        .and_then(|arr| arr.last())
+        .and_then(|m| m.get("id"))
+        .and_then(|id| id.as_str())
+        .or_else(|| {
+            body.get("models")
+                .and_then(|d| d.as_array())
+                .and_then(|arr| arr.last())
+                .and_then(|m| m.get("model").or_else(|| m.get("name")))
+                .and_then(|id| id.as_str())
+        })
+        .map(str::to_string)
+}
+
+fn cli_route_decision(target: Option<&ResolvedCliLlmTarget>) -> serde_json::Value {
+    match target {
+        Some(target) => serde_json::json!({
+            "provenance": target.provenance,
+            "catalog_id": target.catalog_id,
+            "model": target.model,
+            "worker_name": target.worker_name,
+            "endpoint": target.endpoint,
+            "attestation": target.attestation,
+        }),
+        None => serde_json::json!({}),
+    }
+}
+
 async fn run_headless(
     prompt: &str,
     config: AgentSessionConfig,
     output_format: &str,
     oneshot: bool,
+    resolved_target: Option<ResolvedCliLlmTarget>,
 ) -> Result<()> {
     let is_json = output_format == "json";
 
@@ -7726,6 +7907,7 @@ async fn run_headless(
     // Capture identity before `config` is moved into the session — used by the
     // fire-and-forget interaction capture (channel="cli") at the end.
     let capture_model = config.model.clone();
+    let capture_target = resolved_target.clone();
 
     let mut session = AgentSession::new(config);
     if oneshot {
@@ -7848,7 +8030,11 @@ async fn run_headless(
         };
         let latency_ms = capture_started.elapsed().as_millis().min(i32::MAX as u128) as i32;
         let request_text = capture_prompt.clone();
-        let engine = capture_model.clone();
+        let engine = capture_target
+            .as_ref()
+            .and_then(|target| target.catalog_id.clone())
+            .unwrap_or_else(|| capture_model.clone());
+        let target_for_log = capture_target.clone();
         tokio::spawn(async move {
             if let Some(pool) = cli_interaction_pool().await {
                 // Canonical engine (vendor CLI name passes through, local
@@ -7867,6 +8053,7 @@ async fn run_headless(
                     channel: "cli".to_string(),
                     request_text,
                     request_meta: serde_json::json!({ "tokens_estimated": tokens_estimated }),
+                    route_decision: cli_route_decision(target_for_log.as_ref()),
                     engine: Some(engine),
                     response_text,
                     tokens_in,
@@ -7874,6 +8061,12 @@ async fn run_headless(
                     cost_usd,
                     latency_ms: Some(latency_ms),
                     outcome: capture_outcome.to_string(),
+                    worker_name: target_for_log
+                        .as_ref()
+                        .and_then(|target| target.worker_name.clone()),
+                    endpoint: target_for_log
+                        .as_ref()
+                        .map(|target| target.endpoint.clone()),
                     ..Default::default()
                 };
                 let _ = ff_db::pg_record_interaction(&pool, &rec).await;
