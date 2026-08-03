@@ -23,7 +23,7 @@ use ff_db::{ModelDeploymentRow, OperationalStore};
 use ff_discovery::health::{HealthMonitor, HealthStatus, HealthTarget};
 use ff_discovery::ports::known_llm_ports;
 use ff_discovery::scanner::{
-    build_scan_targets, scan_subnet, NodeScanResult, NodeScanStatus, NodeScanner, ScannerConfig,
+    NodeScanResult, NodeScanStatus, NodeScanner, ScannerConfig, build_scan_targets, scan_subnet,
 };
 use ff_orchestrator::decomposer::SubTaskType;
 use ff_orchestrator::planner::Planner;
@@ -41,7 +41,7 @@ use ff_runtime::model_manager::ModelManager;
 use ff_runtime::process_manager::ProcessManager;
 use ff_ssh::{RemoteExecutor, SshNodeConfig};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tracing::{info, warn};
 
 use crate::federation;
@@ -4242,7 +4242,7 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
 
-    use axum::{http::StatusCode, routing::post, Json, Router};
+    use axum::{Json, Router, http::StatusCode, routing::post};
     use tokio::net::TcpListener;
 
     // GatewayLlmExec resolver tests moved to `llm_exec::tests` as part of

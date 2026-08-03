@@ -16,7 +16,7 @@
 use crate::{CYAN, GREEN, RED, RESET, YELLOW};
 use anyhow::Result;
 use ff_agent::fleet_oneshot::{
-    attest_resolved_target, resolve_candidate_target, ResolvedFleetTarget, ResolvedTargetProvenance,
+    ResolvedFleetTarget, ResolvedTargetProvenance, attest_resolved_target, resolve_candidate_target,
 };
 use std::time::{Duration, Instant};
 

@@ -1808,11 +1808,7 @@ async fn newest_local_backup_age(
 
 /// `.age` filename suffix when a kind's policy enables encryption.
 fn age_ext(encrypt: bool) -> &'static str {
-    if encrypt {
-        ".age"
-    } else {
-        ""
-    }
+    if encrypt { ".age" } else { "" }
 }
 
 /// The ` | age -r <r1> -r <r2> ...` pipeline stage encrypting to every
@@ -2756,14 +2752,16 @@ mod tests {
         let malformed = b"age-encryption.org/v1\nnot a valid age header";
         let (bad_root, bad_checksum) =
             write_verifier_fixture("redis", "redis-malformed.rdb.age", malformed);
-        assert!(verify_backup_artifact(
-            bad_root.path(),
-            "redis",
-            "redis-malformed.rdb.age",
-            &bad_checksum,
-            Some(&identity),
-        )
-        .is_err());
+        assert!(
+            verify_backup_artifact(
+                bad_root.path(),
+                "redis",
+                "redis-malformed.rdb.age",
+                &bad_checksum,
+                Some(&identity),
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -2791,14 +2789,16 @@ mod tests {
                 "unsafe component unexpectedly accepted: {unsafe_name}"
             );
         }
-        assert!(verify_backup_artifact(
-            root.path(),
-            "postgres",
-            &"a".repeat(BACKUP_COMPONENT_MAX_BYTES + 1),
-            &expected,
-            None,
-        )
-        .is_err());
+        assert!(
+            verify_backup_artifact(
+                root.path(),
+                "postgres",
+                &"a".repeat(BACKUP_COMPONENT_MAX_BYTES + 1),
+                &expected,
+                None,
+            )
+            .is_err()
+        );
         assert!(
             verify_backup_artifact(root.path(), "unknown", "pg-safe.tar.gz", &expected, None,)
                 .is_err()
@@ -2815,25 +2815,29 @@ mod tests {
                 .is_err()
         );
         std::fs::create_dir(postgres.join("pg-directory.tar.gz")).unwrap();
-        assert!(verify_backup_artifact(
-            root.path(),
-            "postgres",
-            "pg-directory.tar.gz",
-            &expected,
-            None,
-        )
-        .is_err());
+        assert!(
+            verify_backup_artifact(
+                root.path(),
+                "postgres",
+                "pg-directory.tar.gz",
+                &expected,
+                None,
+            )
+            .is_err()
+        );
 
         let linked_kind_root = tempfile::tempdir().unwrap();
         symlink(&postgres, linked_kind_root.path().join("postgres")).unwrap();
-        assert!(verify_backup_artifact(
-            linked_kind_root.path(),
-            "postgres",
-            "pg-safe.tar.gz",
-            &expected,
-            None,
-        )
-        .is_err());
+        assert!(
+            verify_backup_artifact(
+                linked_kind_root.path(),
+                "postgres",
+                "pg-safe.tar.gz",
+                &expected,
+                None,
+            )
+            .is_err()
+        );
 
         let root_parent = tempfile::tempdir().unwrap();
         let root_link = root_parent.path().join("backups-link");
@@ -2974,9 +2978,11 @@ mod tests {
         // A plausibly-sized artifact passes and is left in place.
         let ok_path = dir.join("pg-ok.tar.gz.age");
         tokio::fs::write(&ok_path, vec![0u8; 8192]).await.unwrap();
-        assert!(validate_backup_size("postgres", &ok_path, 8192)
-            .await
-            .is_ok());
+        assert!(
+            validate_backup_size("postgres", &ok_path, 8192)
+                .await
+                .is_ok()
+        );
         assert!(ok_path.exists());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;

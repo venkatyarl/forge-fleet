@@ -24,10 +24,10 @@ use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
-use ff_db::queries::{pg_route_deployments, RouteCandidate, RouteFilter};
+use anyhow::{Result, anyhow};
+use ff_db::queries::{RouteCandidate, RouteFilter, pg_route_deployments};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 
 /// The outcome of a one-shot fleet dispatch — the text plus who served it.
@@ -1165,8 +1165,8 @@ pub(crate) fn strip_think_block(s: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     fn candidate(
@@ -1704,12 +1704,14 @@ mod tests {
         // With an active build lease, the local node loses ties.
         let ordered = rank_candidates(&pool, "lily", Some("coder"), true);
         assert_eq!(ordered[0].endpoint, "http://test-prefers-marcus:1");
-        assert!(ordered
-            .iter()
-            .last()
-            .unwrap()
-            .worker_name
-            .eq_ignore_ascii_case("lily"));
+        assert!(
+            ordered
+                .iter()
+                .last()
+                .unwrap()
+                .worker_name
+                .eq_ignore_ascii_case("lily")
+        );
     }
 
     #[test]
