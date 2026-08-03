@@ -509,7 +509,9 @@ pub(crate) async fn is_leader(_pool: &PgPool, _my_name: &str) -> bool {
 pub async fn is_durable_leader(pool: &PgPool, my_name: &str) -> Result<bool> {
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM fleet_leader_state \
-         WHERE singleton_key = 'current' AND LOWER(member_name) = LOWER($1))",
+         WHERE singleton_key = 'current' \
+           AND LOWER(member_name) = LOWER($1) \
+           AND heartbeat_at > NOW() - INTERVAL '60 seconds')",
     )
     .bind(my_name)
     .fetch_one(pool)
@@ -817,7 +819,7 @@ impl AutoUpgradeTick {
     pub async fn run_once_durable(&self, force: bool) -> Result<AutoUpgradeRunOnceOutcome> {
         if !is_durable_leader(&self.pool, &self.my_name).await? {
             anyhow::bail!(
-                "worker '{}' is not the current leader in fleet_leader_state",
+                "worker '{}' is not the fresh current leader in fleet_leader_state",
                 self.my_name
             );
         }
