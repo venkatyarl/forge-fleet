@@ -51,6 +51,7 @@ report() {
 
 die() {
   local msg="$*"
+  FF_FATAL_REPORTED=1
   report "fatal" failed "$msg"
   echo "ERROR: $msg" >&2
   exit 1
@@ -66,7 +67,8 @@ peek_secret() {
 }
 
 # Run as the target user (not as root). Used for cargo, git, etc. When
-# invoked by `sudo bash`, we drop to the real invoker.
+# invoked by `sudo bash`, we drop to the real invoker; when invoked directly
+# as the user (the sudo-less path), we run commands straight through.
 SUDO_INVOKER="${SUDO_USER:-$SSH_USER}"
 run_as_user() {
   if [ "$(id -un)" = "$SUDO_INVOKER" ]; then
@@ -75,6 +77,31 @@ run_as_user() {
     sudo -u "$SUDO_INVOKER" -H "$@"
   fi
 }
+
+# Run a command with root privileges: directly when already root (legacy
+# `curl | sudo bash` flow), or via sudo when run as a normal user (sudo-less
+# flow — sudo prompts once and caches). Root is only needed for a handful of
+# Linux steps (apt, /etc/hosts, sudoers, loginctl); the macOS path never
+# touches this.
+as_root() {
+  if [ "$(id -u)" = "0" ]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+# Report unexpected early exits — previously a truncated/aborted run died
+# silently and the operator stared at a stuck "running" step forever.
+FF_COMPLETED=""
+FF_FATAL_REPORTED=""
+on_bootstrap_exit() {
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ -z "$FF_COMPLETED" ] && [ -z "$FF_FATAL_REPORTED" ]; then
+    report "fatal" failed "bootstrap aborted (exit $rc) — re-run to resume; every phase is idempotent"
+  fi
+}
+trap on_bootstrap_exit EXIT
 
 # Resolve USER_HOME upfront — multiple later stages reference it (install
 # target, vllm venv path, ssh keypair, sub-agent workspaces). Leaving this
@@ -86,6 +113,16 @@ USER_HOME="$(eval echo ~${SUDO_INVOKER})"
 run_as_user mkdir -p "$USER_HOME/.local/bin" "$USER_HOME/.forgefleet/logs"
 
 say "ForgeFleet onboarding for $NAME ($IP) — runtime hint: $RUNTIME_HINT"
+
+# ─── Preflight: the leader must be reachable BEFORE doing any work ────────
+# A wrong subnet/VLAN (e.g. Wi-Fi on 192.168.4.x vs fleet LAN 192.168.5.x)
+# used to surface as a dead curl with no explanation an hour in.
+if ! curl -fsS -m 5 "$LEADER/health" >/dev/null 2>&1; then
+  echo "ERROR: cannot reach the ForgeFleet leader at $LEADER" >&2
+  echo "  → check this computer is on the fleet LAN (correct subnet/VLAN; on a Mac, try turning Wi-Fi off)" >&2
+  exit 1
+fi
+
 report "start" running
 
 # ─── 0. Non-interactive PATH header in ~/.bashrc ─────────────────────────
@@ -156,7 +193,7 @@ report "detect_os" ok "$OS_FULL / $RUNTIME"
 if [ "$OS_ID" != "macos" ]; then
   report "hosts" running
   HOSTS_BACKUP="/etc/hosts.forgefleet-before-$(date +%s)"
-  cp /etc/hosts "$HOSTS_BACKUP"
+  as_root cp /etc/hosts "$HOSTS_BACKUP"
 
   if ! awk -v name="$NAME" '
     BEGIN { found=0 }
@@ -174,12 +211,12 @@ if [ "$OS_ID" != "macos" ]; then
   fi
 
   if ! awk -v name="$NAME" '$1 == "127.0.1.1" && $2 == name { found=1 } END { exit !found }' /tmp/forgefleet-hosts.new; then
-    cp "$HOSTS_BACKUP" /etc/hosts
+    as_root cp "$HOSTS_BACKUP" /etc/hosts
     rm -f /tmp/forgefleet-hosts.new "$HOSTS_BACKUP"
     die "failed to ensure 127.0.1.1 $NAME in /etc/hosts"
   fi
 
-  mv /tmp/forgefleet-hosts.new /etc/hosts
+  as_root mv /tmp/forgefleet-hosts.new /etc/hosts
   rm -f "$HOSTS_BACKUP"
   report "hosts" ok
 fi
@@ -232,7 +269,7 @@ if [ -f /etc/gdm3/custom.conf ]; then
     rm -f "$GDM_TMP"
     die "failed to configure GDM autologin"
   fi
-  install -m 0644 "$GDM_TMP" "$GDM_CONFIG"
+  as_root install -m 0644 "$GDM_TMP" "$GDM_CONFIG"
   rm -f "$GDM_TMP"
   report "gdm_autologin" ok "$SUDO_INVOKER"
 fi
@@ -247,8 +284,8 @@ case "$OS_ID" in
   *)
     # Ubuntu/DGX OS/Debian — install build toolchain.
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y >/dev/null 2>&1 || die "apt-get update failed"
-    apt-get install -y --no-install-recommends \
+    as_root apt-get update -y >/dev/null 2>&1 || die "apt-get update failed"
+    as_root apt-get install -y --no-install-recommends \
       build-essential pkg-config libssl-dev git curl ca-certificates openssh-client openssh-server \
       >/dev/null 2>&1 || die "apt-get install (prereqs) failed"
     systemctl enable --now ssh >/dev/null 2>&1 || true
@@ -271,9 +308,9 @@ report "rust" ok
 if [ "$IS_VINNY" != "true" ]; then
   report "sudoers" running
   SUDOERS_FILE="/etc/sudoers.d/forgefleet-${SUDO_INVOKER}"
-  echo "${SUDO_INVOKER} ALL=(ALL) NOPASSWD:ALL" > "$SUDOERS_FILE"
-  chmod 0440 "$SUDOERS_FILE"
-  visudo -c -f "$SUDOERS_FILE" >/dev/null 2>&1 || die "sudoers syntax invalid"
+  echo "${SUDO_INVOKER} ALL=(ALL) NOPASSWD:ALL" | as_root tee "$SUDOERS_FILE" >/dev/null
+  as_root chmod 0440 "$SUDOERS_FILE"
+  as_root visudo -c -f "$SUDOERS_FILE" >/dev/null 2>&1 || die "sudoers syntax invalid"
   # Verify from the user's shell.
   run_as_user sudo -n true || die "passwordless sudo not working"
   report "sudoers" ok
@@ -294,8 +331,8 @@ case "$OS_ID" in
              echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] \
                https://cli.github.com/packages stable main" \
                | tee /etc/apt/sources.list.d/github-cli.list >/dev/null
-             apt-get update -y >/dev/null 2>&1
-             apt-get install -y gh >/dev/null 2>&1 || die "gh install failed"
+             as_root apt-get update -y >/dev/null 2>&1
+             as_root apt-get install -y gh >/dev/null 2>&1 || die "gh install failed"
            fi ;;
 esac
 report "gh" ok
@@ -430,10 +467,10 @@ case "$OS_ID" in
       report "nodejs" running
       # Ubuntu's default nodejs is 18 on 24.04; wipe it first so NodeSource's
       # install doesn't conflict.
-      apt-get remove -y nodejs npm libnode-dev >/dev/null 2>&1 || true
-      curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null 2>&1 \
+      as_root apt-get remove -y nodejs npm libnode-dev >/dev/null 2>&1 || true
+      curl -fsSL https://deb.nodesource.com/setup_22.x | as_root bash - >/dev/null 2>&1 \
         || die "NodeSource setup_22 failed"
-      apt-get install -y nodejs >/dev/null 2>&1 \
+      as_root apt-get install -y nodejs >/dev/null 2>&1 \
         || die "apt-get install nodejs (NodeSource) failed"
 report "nodejs" ok "$(node --version)"
     fi ;;
@@ -505,7 +542,7 @@ if [ "$RUNTIME" = "vllm" ]; then
     run_as_user mkdir -p "$USER_HOME/.forgefleet"
     if ! run_as_user python3 -m venv "$VENV" >/dev/null 2>&1; then
       # DGX / Ubuntu often need python3-venv installed separately.
-      apt-get install -y python3-venv >/dev/null 2>&1 || true
+      as_root apt-get install -y python3-venv >/dev/null 2>&1 || true
       run_as_user python3 -m venv "$VENV" || die "python3 -m venv failed (install python3-venv)"
     fi
   fi
@@ -759,7 +796,7 @@ if [ "$OS_ID" != "macos" ]; then
   # /run/user/<uid>, which `systemctl --user` from a sudo context needs).
   USER_UID="$(run_as_user id -u)"
   [ "$USER_UID" -ne 0 ] || die "refusing to install the user service for root; set SUDO_USER or SSH_USER to the fleet account"
-  loginctl enable-linger "$SUDO_INVOKER" \
+  as_root loginctl enable-linger "$SUDO_INVOKER" \
     || die "loginctl enable-linger failed for $SUDO_INVOKER"
   [ "$(loginctl show-user "$SUDO_INVOKER" -p Linger --value 2>/dev/null)" = "yes" ] \
     || die "lingering is not enabled for $SUDO_INVOKER; run: sudo loginctl enable-linger $SUDO_INVOKER"
@@ -933,4 +970,5 @@ fi
 # ─── Done ────────────────────────────────────────────────────────────────
 
 report "done" ok "$NAME is now a ForgeFleet computer"
+FF_COMPLETED=1
 say "✓ Onboarding complete: $NAME"

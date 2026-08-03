@@ -40,10 +40,14 @@ pub async fn handle_onboard(cmd: crate::OnboardCommand) -> Result<()> {
             let ssh_user = ssh_user.unwrap_or_else(|| name.clone());
             let ip_q = ip.unwrap_or_else(|| "auto".into());
             println!("{CYAN}▶ On the new computer, paste:{RESET}\n");
-            println!("curl -fsSL 'http://{leader}:51002/onboard/bootstrap.sh\\");
+            // Download-first form: `curl | bash` streaming can truncate
+            // mid-script and abort silently (vinny 2026-08-03). The script
+            // elevates via sudo internally only where needed (macOS: never).
+            println!("curl -fsSL -o /tmp/ff-bootstrap.sh 'http://{leader}:51002/onboard/bootstrap.sh\\");
             println!("    ?token={token}&name={name}&ip={ip_q}\\");
             println!("    &ssh_user={ssh_user}&role={role}&runtime={runtime}' \\");
-            println!("  | sudo bash");
+            println!("  && bash -n /tmp/ff-bootstrap.sh && echo SYNTAX_OK \\");
+            println!("  && bash /tmp/ff-bootstrap.sh");
             println!("\n  (Or open http://{leader}:51002/onboard in the browser.)");
         }
         crate::OnboardCommand::List { limit } => {

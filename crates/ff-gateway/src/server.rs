@@ -2463,7 +2463,7 @@ async fn fleet_enroll(
     let config = config_lock.read().await.clone();
     let enrollment = config.enrollment.clone();
 
-    let policy = enrollment.enforcement_policy();
+    let policy = crate::onboard::resolve_enrollment_policy(&state).await;
     if matches!(
         &policy,
         ff_core::config::EnrollmentEnforcement::MisconfiguredRequired
