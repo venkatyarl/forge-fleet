@@ -16,6 +16,7 @@
 use anyhow::Result;
 use regex::Regex;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// Idempotent: unique key on project_key so exactly one workstream exists per
@@ -557,6 +558,466 @@ pub struct AttachedClient {
     pub last_report_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// One explicit attached-client freshness window for coordination snapshots.
+///
+/// This is intentionally the same 15-minute presence window used by
+/// [`derive_working_summaries`], but exposed as typed snapshot metadata instead
+/// of hard-coded into board readers.
+pub const COORDINATION_CLIENT_FRESHNESS_SECS: i64 = 15 * 60;
+
+#[derive(Debug, Clone)]
+pub struct WorkstreamCoordinationSnapshot {
+    pub workstream: Workstream,
+    pub generated_at: chrono::DateTime<chrono::Utc>,
+    pub client_freshness_secs: i64,
+    pub live_clients: Vec<CoordinationClient>,
+    pub stale_clients: Vec<CoordinationClient>,
+    pub agent_sessions: Vec<CoordinationAgentSession>,
+    pub work_items: Vec<CoordinationWorkItem>,
+    pub merge_queue: Vec<CoordinationMergeQueueEntry>,
+    pub diagnostics: Vec<CoordinationDiagnostic>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CoordinationClient {
+    pub session_id: String,
+    pub worker_name: String,
+    pub tool: String,
+    pub cwd: Option<String>,
+    pub goal: Option<String>,
+    pub status: String,
+    pub attached_at: chrono::DateTime<chrono::Utc>,
+    pub last_report_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_active_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoordinationAgentSession {
+    pub id: uuid::Uuid,
+    pub goal: String,
+    pub status: String,
+    pub created_by: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub steps: Vec<CoordinationAgentStep>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct CoordinationAgentSessionRow {
+    pub id: uuid::Uuid,
+    pub goal: String,
+    pub status: String,
+    pub created_by: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CoordinationAgentStep {
+    pub id: uuid::Uuid,
+    pub session_id: uuid::Uuid,
+    pub name: String,
+    pub role: Option<String>,
+    pub depends_on: serde_json::Value,
+    pub status: String,
+    pub fleet_task_id: Option<uuid::Uuid>,
+    pub retry_count: i32,
+    pub error: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoordinationWorkItem {
+    pub id: uuid::Uuid,
+    pub parent_id: Option<uuid::Uuid>,
+    pub title: String,
+    pub status: String,
+    pub priority: Option<String>,
+    pub assigned_to: Option<String>,
+    pub assigned_computer: Option<String>,
+    pub branch_name: Option<String>,
+    pub pr_url: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub projected_status: CoordinationProjectedStatus,
+    pub leases: Vec<CoordinationLease>,
+    pub merge_queue: Vec<CoordinationMergeQueueEntry>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct CoordinationWorkItemRow {
+    pub id: uuid::Uuid,
+    pub parent_id: Option<uuid::Uuid>,
+    pub title: String,
+    pub status: String,
+    pub priority: Option<String>,
+    pub assigned_to: Option<String>,
+    pub assigned_computer: Option<String>,
+    pub branch_name: Option<String>,
+    pub pr_url: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CoordinationLease {
+    pub id: uuid::Uuid,
+    pub work_item_id: uuid::Uuid,
+    pub sub_agent_id: Option<uuid::Uuid>,
+    pub computer_id: Option<uuid::Uuid>,
+    pub session_id: Option<uuid::Uuid>,
+    pub endpoint: Option<String>,
+    pub lease_state: String,
+    pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub attempt: i32,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub released_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub release_reason: Option<String>,
+    pub dispatch_tick_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub build_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub sub_agent_status: Option<String>,
+    pub workspace_dir: Option<String>,
+    pub sub_agent_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CoordinationMergeQueueEntry {
+    pub id: uuid::Uuid,
+    pub work_item_id: uuid::Uuid,
+    pub position: i64,
+    pub status: String,
+    pub branch_name: Option<String>,
+    pub pr_url: Option<String>,
+    pub head_sha: Option<String>,
+    pub merge_attempts: i32,
+    pub enqueued_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub merged_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub failed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub failure_reason: Option<String>,
+    pub builder: Option<String>,
+    pub reviewer: Option<String>,
+    pub review_verdict: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinationProjectedStatus {
+    Queued,
+    Claimed,
+    Building,
+    ReadyForReview,
+    Integrating,
+    Completed,
+    Failed,
+    Cancelled,
+    Inconsistent,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinationDiagnosticKind {
+    BuildingWithoutLiveLease,
+    LeaseStatusMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinationDiagnostic {
+    pub kind: CoordinationDiagnosticKind,
+    pub work_item_id: uuid::Uuid,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoordinationStatusInput {
+    pub work_item_id: uuid::Uuid,
+    pub work_item_status: String,
+    pub live_lease_count: usize,
+    pub merge_statuses: Vec<String>,
+}
+
+/// Read-only authoritative coordination snapshot for one workstream/project.
+///
+/// Ownership is derived only from live `work_item_leases` joined to
+/// `sub_agents.workspace_dir`; workstream notes/threads are deliberately not
+/// consulted because they are narrative/presence surfaces, not execution
+/// authority.
+pub async fn coordination_snapshot(
+    pg: &PgPool,
+    project_key: &str,
+) -> Result<Option<WorkstreamCoordinationSnapshot>> {
+    ensure_client_schema(pg).await?;
+    let Some(workstream) = workstream_for_project(pg, project_key).await? else {
+        return Ok(None);
+    };
+
+    let generated_at = chrono::Utc::now();
+    let fresh_after = generated_at - chrono::Duration::seconds(COORDINATION_CLIENT_FRESHNESS_SECS);
+
+    let clients = sqlx::query_as::<_, CoordinationClient>(
+        "SELECT session_id, worker_name, tool, cwd, goal, status, attached_at, last_report_at, \
+                COALESCE(last_report_at, attached_at) AS last_active_at \
+           FROM workstream_clients \
+          WHERE workstream_id = $1 AND status = 'attached' \
+          ORDER BY COALESCE(last_report_at, attached_at) DESC, attached_at DESC",
+    )
+    .bind(workstream.id)
+    .fetch_all(pg)
+    .await?;
+    let (live_clients, stale_clients): (Vec<_>, Vec<_>) = clients
+        .into_iter()
+        .partition(|client| client.last_active_at >= fresh_after);
+
+    let work_item_rows = sqlx::query_as::<_, CoordinationWorkItemRow>(
+        "SELECT id, parent_id, title, status, priority, assigned_to, assigned_computer, \
+                branch_name, pr_url, created_at, started_at, completed_at \
+           FROM work_items w \
+          WHERE w.project_id = $1 \
+            AND (w.status NOT IN ('completed', 'done', 'cancelled', 'closed') \
+                 OR EXISTS (SELECT 1 FROM work_item_leases l \
+                              WHERE l.work_item_id = w.id AND l.released_at IS NULL) \
+                 OR EXISTS (SELECT 1 FROM work_item_merge_queue q \
+                              WHERE q.work_item_id = w.id \
+                                AND q.status NOT IN ('merged', 'failed', 'cancelled'))) \
+          ORDER BY created_at, id",
+    )
+    .bind(&workstream.project_id)
+    .fetch_all(pg)
+    .await?;
+
+    let leases = sqlx::query_as::<_, CoordinationLease>(
+        "SELECT l.id, l.work_item_id, l.sub_agent_id, l.computer_id, l.session_id, \
+                l.endpoint, l.lease_state, l.lease_expires_at, l.heartbeat_at, \
+                l.attempt, l.created_at, l.released_at, l.release_reason, \
+                l.dispatch_tick_at, l.build_started_at, \
+                sa.status AS sub_agent_status, sa.workspace_dir, sa.kind AS sub_agent_kind \
+           FROM work_item_leases l \
+           JOIN work_items w ON w.id = l.work_item_id \
+           LEFT JOIN sub_agents sa ON sa.id = l.sub_agent_id \
+          WHERE w.project_id = $1 \
+            AND (l.released_at IS NULL OR l.created_at > now() - interval '1 day') \
+          ORDER BY l.created_at, l.id",
+    )
+    .bind(&workstream.project_id)
+    .fetch_all(pg)
+    .await?;
+
+    let merge_queue = sqlx::query_as::<_, CoordinationMergeQueueEntry>(
+        "SELECT id, work_item_id, position, status, branch_name, pr_url, head_sha, \
+                merge_attempts, enqueued_at, started_at, merged_at, failed_at, \
+                failure_reason, builder, reviewer, review_verdict \
+           FROM work_item_merge_queue \
+          WHERE project_id = $1 \
+            AND status NOT IN ('merged', 'failed', 'cancelled') \
+          ORDER BY position, enqueued_at, id",
+    )
+    .bind(&workstream.project_id)
+    .fetch_all(pg)
+    .await?;
+
+    let session_ids = leases
+        .iter()
+        .filter_map(|lease| lease.session_id)
+        .collect::<Vec<_>>();
+    let mut agent_sessions = if session_ids.is_empty() {
+        Vec::new()
+    } else {
+        let session_rows = sqlx::query_as::<_, CoordinationAgentSessionRow>(
+            "SELECT id, goal, status, created_by, created_at, started_at, completed_at \
+               FROM agent_sessions \
+              WHERE id = ANY($1) \
+              ORDER BY created_at, id",
+        )
+        .bind(&session_ids)
+        .fetch_all(pg)
+        .await?;
+        let steps = sqlx::query_as::<_, CoordinationAgentStep>(
+            "SELECT id, session_id, name, role, depends_on, status, fleet_task_id, \
+                    retry_count, error, created_at, started_at, completed_at \
+               FROM agent_steps \
+              WHERE session_id = ANY($1) \
+              ORDER BY created_at, id",
+        )
+        .bind(&session_ids)
+        .fetch_all(pg)
+        .await?;
+        let mut steps_by_session: HashMap<uuid::Uuid, Vec<CoordinationAgentStep>> = HashMap::new();
+        for step in steps {
+            steps_by_session
+                .entry(step.session_id)
+                .or_default()
+                .push(step);
+        }
+        session_rows
+            .into_iter()
+            .map(|row| CoordinationAgentSession {
+                id: row.id,
+                goal: row.goal,
+                status: row.status,
+                created_by: row.created_by,
+                created_at: row.created_at,
+                started_at: row.started_at,
+                completed_at: row.completed_at,
+                steps: steps_by_session.remove(&row.id).unwrap_or_default(),
+            })
+            .collect()
+    };
+    agent_sessions.sort_by_key(|session| session.created_at);
+
+    let mut leases_by_item: HashMap<uuid::Uuid, Vec<CoordinationLease>> = HashMap::new();
+    for lease in leases {
+        leases_by_item
+            .entry(lease.work_item_id)
+            .or_default()
+            .push(lease);
+    }
+    let mut queue_by_item: HashMap<uuid::Uuid, Vec<CoordinationMergeQueueEntry>> = HashMap::new();
+    for entry in merge_queue.iter().cloned() {
+        queue_by_item
+            .entry(entry.work_item_id)
+            .or_default()
+            .push(entry);
+    }
+
+    let mut projection_inputs = Vec::with_capacity(work_item_rows.len());
+    let mut work_items = Vec::with_capacity(work_item_rows.len());
+    for row in work_item_rows {
+        let leases = leases_by_item.remove(&row.id).unwrap_or_default();
+        let item_queue = queue_by_item.remove(&row.id).unwrap_or_default();
+        let live_lease_count = leases
+            .iter()
+            .filter(|lease| coordination_lease_is_live(lease, generated_at))
+            .count();
+        let merge_statuses = item_queue
+            .iter()
+            .map(|entry| entry.status.clone())
+            .collect::<Vec<_>>();
+        let input = CoordinationStatusInput {
+            work_item_id: row.id,
+            work_item_status: row.status.clone(),
+            live_lease_count,
+            merge_statuses,
+        };
+        let projected_status = project_coordination_status(&input);
+        projection_inputs.push(input);
+        work_items.push(CoordinationWorkItem {
+            id: row.id,
+            parent_id: row.parent_id,
+            title: row.title,
+            status: row.status,
+            priority: row.priority,
+            assigned_to: row.assigned_to,
+            assigned_computer: row.assigned_computer,
+            branch_name: row.branch_name,
+            pr_url: row.pr_url,
+            created_at: row.created_at,
+            started_at: row.started_at,
+            completed_at: row.completed_at,
+            projected_status,
+            leases,
+            merge_queue: item_queue,
+        });
+    }
+
+    let diagnostics = coordination_diagnostics(&projection_inputs);
+    Ok(Some(WorkstreamCoordinationSnapshot {
+        workstream,
+        generated_at,
+        client_freshness_secs: COORDINATION_CLIENT_FRESHNESS_SECS,
+        live_clients,
+        stale_clients,
+        agent_sessions,
+        work_items,
+        merge_queue,
+        diagnostics,
+    }))
+}
+
+fn coordination_lease_is_live(
+    lease: &CoordinationLease,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if lease.released_at.is_some() {
+        return false;
+    }
+    if lease
+        .lease_expires_at
+        .is_some_and(|lease_expires_at| lease_expires_at <= now)
+    {
+        return false;
+    }
+    matches!(
+        lease.lease_state.as_str(),
+        "claimed" | "building" | "reviewing"
+    )
+}
+
+pub fn project_coordination_status(input: &CoordinationStatusInput) -> CoordinationProjectedStatus {
+    if input.work_item_status == "building" && input.live_lease_count == 0 {
+        return CoordinationProjectedStatus::Inconsistent;
+    }
+    if input.live_lease_count > 0 && !status_allows_live_lease(&input.work_item_status) {
+        return CoordinationProjectedStatus::Inconsistent;
+    }
+    if input.merge_statuses.iter().any(|status| {
+        matches!(
+            status.as_str(),
+            "queued" | "reviewing" | "merging" | "running"
+        )
+    }) {
+        return CoordinationProjectedStatus::Integrating;
+    }
+    match input.work_item_status.as_str() {
+        "open" | "ready" | "queued" => CoordinationProjectedStatus::Queued,
+        "claimed" => CoordinationProjectedStatus::Claimed,
+        "building" => CoordinationProjectedStatus::Building,
+        "ready_for_review" | "reviewing" => CoordinationProjectedStatus::ReadyForReview,
+        "completed" | "done" | "closed" => CoordinationProjectedStatus::Completed,
+        "failed" | "error" => CoordinationProjectedStatus::Failed,
+        "cancelled" | "canceled" => CoordinationProjectedStatus::Cancelled,
+        _ => CoordinationProjectedStatus::Other,
+    }
+}
+
+pub fn coordination_diagnostics(inputs: &[CoordinationStatusInput]) -> Vec<CoordinationDiagnostic> {
+    let mut diagnostics = Vec::new();
+    for input in inputs {
+        if input.work_item_status == "building" && input.live_lease_count == 0 {
+            diagnostics.push(CoordinationDiagnostic {
+                kind: CoordinationDiagnosticKind::BuildingWithoutLiveLease,
+                work_item_id: input.work_item_id,
+                message: "work item is building without a live work_item_leases owner".to_string(),
+            });
+        }
+        if (input.work_item_status == "building" && input.live_lease_count == 0)
+            || (input.live_lease_count > 0 && !status_allows_live_lease(&input.work_item_status))
+        {
+            diagnostics.push(CoordinationDiagnostic {
+                kind: CoordinationDiagnosticKind::LeaseStatusMismatch,
+                work_item_id: input.work_item_id,
+                message: format!(
+                    "work item status '{}' does not match {} live lease(s)",
+                    input.work_item_status, input.live_lease_count
+                ),
+            });
+        }
+    }
+    diagnostics
+}
+
+fn status_allows_live_lease(status: &str) -> bool {
+    matches!(
+        status,
+        "claimed" | "building" | "ready_for_review" | "reviewing"
+    )
+}
+
 /// List the sessions attached to a workstream, most-recently-active first.
 /// Detached (pruned) seats are hidden — re-attach or any heartbeat revives one.
 pub async fn attached_clients(
@@ -736,5 +1197,85 @@ mod tests {
         for secret in ["abc.def-123", "top-secret", "eyJabc.def.ghi"] {
             assert!(!redacted.contains(secret), "secret leaked: {secret}");
         }
+    }
+
+    fn status_input(
+        status: &str,
+        live_lease_count: usize,
+        merge_statuses: &[&str],
+    ) -> CoordinationStatusInput {
+        CoordinationStatusInput {
+            work_item_id: uuid::Uuid::nil(),
+            work_item_status: status.to_string(),
+            live_lease_count,
+            merge_statuses: merge_statuses
+                .iter()
+                .map(|status| status.to_string())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn projection_marks_building_with_live_lease_as_building() {
+        let input = status_input("building", 1, &[]);
+        assert_eq!(
+            project_coordination_status(&input),
+            CoordinationProjectedStatus::Building
+        );
+        assert!(coordination_diagnostics(&[input]).is_empty());
+    }
+
+    #[test]
+    fn projection_flags_building_without_live_lease() {
+        let input = status_input("building", 0, &[]);
+        assert_eq!(
+            project_coordination_status(&input),
+            CoordinationProjectedStatus::Inconsistent
+        );
+        let diagnostics = coordination_diagnostics(&[input]);
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            diagnostics[0].kind,
+            CoordinationDiagnosticKind::BuildingWithoutLiveLease
+        );
+        assert_eq!(
+            diagnostics[1].kind,
+            CoordinationDiagnosticKind::LeaseStatusMismatch
+        );
+    }
+
+    #[test]
+    fn projection_flags_live_lease_on_terminal_status() {
+        let input = status_input("completed", 1, &[]);
+        assert_eq!(
+            project_coordination_status(&input),
+            CoordinationProjectedStatus::Inconsistent
+        );
+        let diagnostics = coordination_diagnostics(&[input]);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].kind,
+            CoordinationDiagnosticKind::LeaseStatusMismatch
+        );
+    }
+
+    #[test]
+    fn projection_allows_review_state_to_hold_live_lease() {
+        let input = status_input("ready_for_review", 1, &[]);
+        assert_eq!(
+            project_coordination_status(&input),
+            CoordinationProjectedStatus::ReadyForReview
+        );
+        assert!(coordination_diagnostics(&[input]).is_empty());
+    }
+
+    #[test]
+    fn projection_prefers_integration_for_active_merge_queue() {
+        let input = status_input("ready_for_review", 0, &["queued"]);
+        assert_eq!(
+            project_coordination_status(&input),
+            CoordinationProjectedStatus::Integrating
+        );
+        assert!(coordination_diagnostics(&[input]).is_empty());
     }
 }
