@@ -42,8 +42,8 @@ const PERSISTED_SNAPSHOT_TTL_SECS: u64 = 3600;
 /// of the bind values, so replaying the same beat converges to the same row.
 const UPSERT_COMPUTER_ROW_SQL: &str = "INSERT INTO computers (\
     id, name, primary_ip, all_ips, cpu_cores, total_ram_gb, total_disk_gb, \
-    gpu_kind, gpu_count, gpu_total_vram_gb, has_gpu, os_family, ssh_user, last_seen_at\
-) VALUES ($1, $2, $10, $3::jsonb, $4, $5, $6, $7, $8, $9, ($8 > 0), $11, $12, NOW()) \
+    gpu_kind, gpu_count, gpu_total_vram_gb, has_gpu, os_family, ssh_user, mac_addresses, last_seen_at\
+) VALUES ($1, $2, $10, $3::jsonb, $4, $5, $6, $7, $8, $9, ($8 > 0), $11, $12, $13::jsonb, NOW()) \
 ON CONFLICT (id) DO UPDATE SET \
     last_seen_at = EXCLUDED.last_seen_at, \
     primary_ip = EXCLUDED.primary_ip, \
@@ -54,7 +54,9 @@ ON CONFLICT (id) DO UPDATE SET \
     gpu_kind = EXCLUDED.gpu_kind, \
     gpu_count = EXCLUDED.gpu_count, \
     gpu_total_vram_gb = EXCLUDED.gpu_total_vram_gb, \
-    has_gpu = EXCLUDED.has_gpu";
+    has_gpu = EXCLUDED.has_gpu, \
+    mac_addresses = CASE WHEN jsonb_array_length(EXCLUDED.mac_addresses) > 0 \
+        THEN EXCLUDED.mac_addresses ELSE computers.mac_addresses END";
 
 // -----------------------------------------------------------------------------
 // Errors
@@ -106,6 +108,8 @@ pub(crate) struct PersistedSnapshot {
     pub computer_name: String,
     pub status: String,
     pub all_ips_json: String,
+    #[serde(default)]
+    pub mac_addresses: Vec<String>,
     pub hardware: PersistedHardware,
     pub capabilities: PersistedCapabilities,
     pub installed_software: Vec<PersistedSoftware>,
@@ -255,6 +259,7 @@ impl PersistedSnapshot {
                 "online".to_string()
             },
             all_ips_json,
+            mac_addresses: beat.network.mac_addresses.clone(),
             hardware,
             capabilities,
             installed_software,
@@ -432,7 +437,7 @@ impl Materializer {
         // Q1: look up computer row
         let row = sqlx::query(
             "SELECT id, status, primary_ip, all_ips::text AS all_ips_text, cpu_cores, \
-             total_ram_gb, total_disk_gb, gpu_kind, gpu_count, gpu_total_vram_gb \
+             total_ram_gb, total_disk_gb, gpu_kind, gpu_count, gpu_total_vram_gb, mac_addresses \
              , os_family, ssh_user \
              FROM computers WHERE name = $1",
         )
@@ -453,6 +458,10 @@ impl Materializer {
         let prev_gpu_kind: Option<String> = row.try_get("gpu_kind").ok();
         let prev_gpu_count: Option<i32> = row.try_get("gpu_count").ok();
         let prev_gpu_total_vram_gb: Option<f64> = row.try_get("gpu_total_vram_gb").ok();
+        let prev_mac_addresses: Vec<String> = row
+            .try_get::<sqlx::types::Json<Vec<String>>, _>("mac_addresses")
+            .map(|value| value.0)
+            .unwrap_or_default();
         let os_family: String = row.try_get("os_family")?;
         let ssh_user: String = row.try_get("ssh_user")?;
 
@@ -572,8 +581,15 @@ impl Materializer {
             || prev_gpu_total_vram_gb != beat.capabilities.gpu_total_vram_gb;
         let primary_ip_differ =
             prev_primary_ip.as_deref() != Some(beat.network.primary_ip.as_str());
-        let persistent_row_differ =
-            persistent_fields_changed(ips_differ, hw_differ, cap_differ, primary_ip_differ);
+        let mac_addresses_differ = !beat.network.mac_addresses.is_empty()
+            && prev_mac_addresses != beat.network.mac_addresses;
+        let persistent_row_differ = persistent_fields_changed(
+            ips_differ,
+            hw_differ,
+            cap_differ,
+            primary_ip_differ,
+            mac_addresses_differ,
+        );
 
         // Fast path: if both cached and durable state match exactly AND no
         // status transition, only update last_seen_at.
@@ -684,6 +700,7 @@ impl Materializer {
                 .bind(&beat.network.primary_ip)
                 .bind(&os_family)
                 .bind(&ssh_user)
+                .bind(serde_json::to_string(&beat.network.mac_addresses)?)
                 .execute(&self.pg)
                 .await?;
             report.wrote_computer_row = persistent_row_differ;
@@ -1597,8 +1614,9 @@ fn persistent_fields_changed(
     hw_differ: bool,
     cap_differ: bool,
     primary_ip_differ: bool,
+    mac_addresses_differ: bool,
 ) -> bool {
-    ips_differ || hw_differ || cap_differ || primary_ip_differ
+    ips_differ || hw_differ || cap_differ || primary_ip_differ || mac_addresses_differ
 }
 
 fn can_use_last_seen_fast_path(
@@ -1699,6 +1717,7 @@ mod tests {
         b.network = NetworkInfo {
             primary_ip: "10.0.0.1".to_string(),
             all_ips: vec![],
+            mac_addresses: vec![],
         };
         b.hardware = HardwareInfo {
             cpu_cores: 8,
@@ -1959,7 +1978,7 @@ mod tests {
         // write even when IPs/hardware/capabilities are otherwise identical.
         // Regression guard for the aura wifi→ethernet freeze + the 9/15
         // fleet_workers.ip drift.
-        assert!(persistent_fields_changed(false, false, false, true));
+        assert!(persistent_fields_changed(false, false, false, true, false));
     }
 
     #[test]
@@ -2014,7 +2033,9 @@ mod tests {
 
     #[test]
     fn no_rewrite_when_nothing_changed() {
-        assert!(!persistent_fields_changed(false, false, false, false));
+        assert!(!persistent_fields_changed(
+            false, false, false, false, false
+        ));
     }
 
     #[test]
@@ -2063,10 +2084,68 @@ mod tests {
 
     #[test]
     fn any_single_drift_signal_forces_a_rewrite() {
-        assert!(persistent_fields_changed(true, false, false, false)); // ips
-        assert!(persistent_fields_changed(false, true, false, false)); // hardware
-        assert!(persistent_fields_changed(false, false, true, false)); // capabilities
-        assert!(persistent_fields_changed(false, false, false, true)); // primary_ip
+        assert!(persistent_fields_changed(true, false, false, false, false)); // ips
+        assert!(persistent_fields_changed(false, true, false, false, false)); // hardware
+        assert!(persistent_fields_changed(false, false, true, false, false)); // capabilities
+        assert!(persistent_fields_changed(false, false, false, true, false)); // primary_ip
+        assert!(persistent_fields_changed(false, false, false, false, true)); // MACs
+    }
+
+    #[test]
+    fn mac_inventory_populates_converges_and_empty_old_beats_preserve() {
+        assert!(UPSERT_COMPUTER_ROW_SQL.contains("jsonb_array_length(EXCLUDED.mac_addresses) > 0"));
+        assert!(UPSERT_COMPUTER_ROW_SQL.contains("ELSE computers.mac_addresses"));
+
+        let mut beat = beat_online("thalia");
+        beat.network.mac_addresses = vec!["aa:bb:cc:dd:ee:fe".into()];
+        let initial = PersistedSnapshot::from_beat(&beat);
+        assert_eq!(initial.mac_addresses, beat.network.mac_addresses);
+
+        beat.network.mac_addresses = vec!["02:11:22:33:44:66".into()];
+        let updated = PersistedSnapshot::from_beat(&beat);
+        assert_ne!(initial, updated);
+
+        beat.network.mac_addresses.clear();
+        assert!(PersistedSnapshot::from_beat(&beat).mac_addresses.is_empty());
+        assert!(!persistent_fields_changed(
+            false, false, false, false, false
+        ));
+    }
+
+    #[tokio::test]
+    async fn db_mac_inventory_merge_semantics() {
+        let Some(url) = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .ok()
+            .or_else(|| std::env::var("FORGEFLEET_DATABASE_URL").ok())
+        else {
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&url).await.expect("connect test db");
+        let merge = |observed: &str, existing: &str| {
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT CASE WHEN jsonb_array_length($1::jsonb) > 0 \
+                 THEN $1::jsonb ELSE $2::jsonb END",
+            )
+            .bind(observed.to_string())
+            .bind(existing.to_string())
+            .fetch_one(&pool)
+        };
+
+        let empty = "[]";
+        let first = r#"["aa:bb:cc:dd:ee:fe"]"#;
+        let second = r#"["02:11:22:33:44:66"]"#;
+        assert_eq!(
+            merge(first, empty).await.unwrap(),
+            serde_json::from_str(first).unwrap()
+        );
+        assert_eq!(
+            merge(second, first).await.unwrap(),
+            serde_json::from_str(second).unwrap()
+        );
+        assert_eq!(
+            merge(empty, first).await.unwrap(),
+            serde_json::from_str(first).unwrap()
+        );
     }
 
     #[test]

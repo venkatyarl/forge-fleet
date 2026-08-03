@@ -287,13 +287,16 @@ impl HeartbeatV2Publisher {
 
                 // ── Network identity ─────────────────────────────────────────
                 let mut all_ips = detect_all_ips();
+                let primary_ip = detect_primary_ip(&all_ips);
+                let mac_addresses = detect_physical_macs(&all_ips);
                 // V43: annotate mlx5_core NICs with cx7-fabric kind + paired_with + link_speed.
                 for ip in all_ips.iter_mut() {
                     crate::cx7_detect::enrich_ip(ip, &computer_name);
                 }
                 beat.network = NetworkInfo {
-                    primary_ip: detect_primary_ip(),
+                    primary_ip,
                     all_ips,
+                    mac_addresses,
                 };
 
                 // ── OS classification (V87+) ─────────────────────────────────
@@ -953,14 +956,14 @@ fn detect_gpu_model() -> Option<String> {
     }
 }
 
-fn detect_primary_ip() -> String {
+fn detect_primary_ip(ips: &[Ip]) -> String {
     // Try env override first.
     if let Ok(ip) = std::env::var("FORGEFLEET_PRIMARY_IP")
         && !ip.is_empty()
     {
         return ip;
     }
-    pick_primary_lan_ip(&detect_all_ips()).unwrap_or_else(|| "127.0.0.1".to_string())
+    pick_primary_lan_ip(ips).unwrap_or_else(|| "127.0.0.1".to_string())
 }
 
 /// Pick the most-stable LAN IP from a list of detected interfaces.
@@ -1143,6 +1146,134 @@ fn detect_all_ips() -> Vec<Ip> {
         }
     }
     result
+}
+
+fn is_virtual_iface(iface: &str) -> bool {
+    let iface = iface.trim_end_matches(|c: char| c.is_ascii_digit());
+    matches!(
+        iface,
+        "lo" | "docker"
+            | "br-"
+            | "br"
+            | "virbr"
+            | "veth"
+            | "cni"
+            | "flannel"
+            | "cali"
+            | "tap"
+            | "tun"
+            | "utun"
+            | "tailscale"
+            | "wg"
+            | "zt"
+    )
+}
+
+fn normalize_physical_mac(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase().replace('-', ":");
+    let octets: Vec<u8> = value
+        .split(':')
+        .map(|part| {
+            if part.len() != 2 {
+                return None;
+            }
+            u8::from_str_radix(part, 16).ok()
+        })
+        .collect::<Option<_>>()?;
+    if octets.len() != 6
+        || octets.iter().all(|octet| *octet == 0)
+        || octets.iter().all(|octet| *octet == 0xff)
+        || octets[0] & 1 != 0
+    {
+        return None;
+    }
+    Some(
+        octets
+            .iter()
+            .map(|octet| format!("{octet:02x}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
+}
+
+fn parse_link_macs(output: &str, accepted_ifaces: &std::collections::HashSet<&str>) -> Vec<String> {
+    let mut macs = std::collections::BTreeSet::new();
+    let mut current_iface = "";
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        if !line.starts_with(char::is_whitespace) && line.contains(':') {
+            current_iface = line.split(':').next().unwrap_or("");
+        }
+        let fields: Vec<&str> = trimmed.split_whitespace().collect();
+        let (iface, candidate) =
+            if let Some(link_pos) = fields.iter().position(|v| *v == "link/ether") {
+                (
+                    fields.get(1).copied().unwrap_or("").trim_end_matches(':'),
+                    fields.get(link_pos + 1).copied(),
+                )
+            } else if fields.first() == Some(&"ether") {
+                (current_iface, fields.get(1).copied())
+            } else {
+                continue;
+            };
+        let iface = iface.split('@').next().unwrap_or(iface);
+        if accepted_ifaces.contains(iface)
+            && !is_virtual_iface(iface)
+            && let Some(mac) = candidate.and_then(normalize_physical_mac)
+        {
+            macs.insert(mac);
+        }
+    }
+    macs.into_iter().collect()
+}
+
+fn detect_physical_macs(ips: &[Ip]) -> Vec<String> {
+    let accepted: std::collections::HashSet<&str> = ips
+        .iter()
+        .filter(|ip| !ip.ip.starts_with("127.") && !ip.ip.starts_with("169.254."))
+        .map(|ip| ip.iface.as_str())
+        .collect();
+    let mut macs = std::collections::BTreeSet::new();
+
+    if std::env::consts::OS == "linux" {
+        for iface in &accepted {
+            if is_virtual_iface(iface) {
+                continue;
+            }
+            if let Ok(value) = std::fs::read_to_string(
+                std::path::Path::new("/sys/class/net")
+                    .join(iface)
+                    .join("address"),
+            ) && let Some(mac) = normalize_physical_mac(&value)
+            {
+                macs.insert(mac);
+            }
+        }
+        if macs.is_empty()
+            && let Some(output) = command_output_with_timeout(
+                std::process::Command::new("ip")
+                    .args(["-o", "link", "show"])
+                    .env("PATH", "/usr/sbin:/sbin:/usr/bin:/bin"),
+                3,
+            )
+            .filter(|output| output.status.success())
+        {
+            macs.extend(parse_link_macs(
+                &String::from_utf8_lossy(&output.stdout),
+                &accepted,
+            ));
+        }
+    } else if std::env::consts::OS == "macos"
+        && let Some(output) =
+            command_output_with_timeout(&mut std::process::Command::new("/sbin/ifconfig"), 3)
+                .filter(|output| output.status.success())
+    {
+        macs.extend(parse_link_macs(
+            &String::from_utf8_lossy(&output.stdout),
+            &accepted,
+        ));
+    }
+    macs.into_iter().collect()
 }
 
 /// Linux: read `/sys/class/net/<iface>/speed` (Mbps for ethernet) and
@@ -1482,5 +1613,36 @@ mod tests {
     #[test]
     fn pick_primary_lan_ip_returns_none_for_empty() {
         assert_eq!(pick_primary_lan_ip(&[]), None);
+    }
+
+    #[test]
+    fn physical_mac_normalization_rejects_unsafe_values() {
+        assert_eq!(
+            normalize_physical_mac("AA-BB-CC-DD-EE-FE\n"),
+            Some("aa:bb:cc:dd:ee:fe".to_string())
+        );
+        for invalid in [
+            "00:00:00:00:00:00",
+            "ff:ff:ff:ff:ff:ff",
+            "01:00:5e:00:00:01",
+            "not-a-mac",
+            "aa:bb:cc:dd:ee",
+        ] {
+            assert_eq!(normalize_physical_mac(invalid), None, "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn link_mac_parser_filters_interfaces_and_deduplicates() {
+        let accepted = std::collections::HashSet::from(["eth0", "en0"]);
+        let output = "2: eth0: <UP> mtu 1500 link/ether AA:BB:CC:DD:EE:FE brd ff:ff:ff:ff:ff:ff\n\
+en0: flags=8863<UP> mtu 1500\n\
+\tether aa:bb:cc:dd:ee:fe\n\
+docker0: flags=4099<UP> mtu 1500\n\
+\tether 02:42:00:00:00:01\n";
+        assert_eq!(
+            parse_link_macs(output, &accepted),
+            vec!["aa:bb:cc:dd:ee:fe"]
+        );
     }
 }
