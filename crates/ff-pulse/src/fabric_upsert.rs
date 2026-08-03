@@ -60,7 +60,8 @@ pub async fn upsert_fabric_pairs(
                 a_iface = CASE WHEN EXCLUDED.a_iface <> '' THEN EXCLUDED.a_iface ELSE fabric_pairs.a_iface END, \
                 a_ip    = CASE WHEN EXCLUDED.a_ip    <> '' THEN EXCLUDED.a_ip    ELSE fabric_pairs.a_ip    END, \
                 b_iface = CASE WHEN EXCLUDED.b_iface <> '' THEN EXCLUDED.b_iface ELSE fabric_pairs.b_iface END, \
-                b_ip    = CASE WHEN EXCLUDED.b_ip    <> '' THEN EXCLUDED.b_ip    ELSE fabric_pairs.b_ip    END",
+                b_ip    = CASE WHEN EXCLUDED.b_ip    <> '' THEN EXCLUDED.b_ip    ELSE fabric_pairs.b_ip    END \
+             WHERE NOT fabric_pairs.endpoints_explicit",
         )
         .bind(&pair_name)
         .bind(&ip_entry.kind)

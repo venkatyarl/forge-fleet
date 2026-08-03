@@ -4,9 +4,314 @@
 //! with NULL IPs so the materializer can fill them once both daemons
 //! start emitting cx7-fabric Ip entries with `paired_with`.
 
+use std::net::{IpAddr, Ipv4Addr};
+use std::process::Command as StdCommand;
+
 use anyhow::{Context, Result, bail};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FabricEndpoint {
+    pub node: String,
+    pub iface: String,
+    pub ip: IpAddr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FabricLinkSpec {
+    pub a: FabricEndpoint,
+    pub b: FabricEndpoint,
+    pub kind: String,
+}
+
+impl FabricLinkSpec {
+    pub fn new(
+        a: &str,
+        a_iface: &str,
+        a_ip: &str,
+        b: &str,
+        b_iface: &str,
+        b_ip: &str,
+        kind: &str,
+    ) -> Result<Self> {
+        let endpoint = |node: &str, iface: &str, ip: &str| -> Result<FabricEndpoint> {
+            if node.trim().is_empty() || iface.trim().is_empty() {
+                bail!("node and interface must be non-empty");
+            }
+            if !node
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                || !iface
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            {
+                bail!("node and interface contain unsupported characters");
+            }
+            Ok(FabricEndpoint {
+                node: node.trim().to_ascii_lowercase(),
+                iface: iface.trim().to_string(),
+                ip: ip.parse().with_context(|| format!("invalid IP '{ip}'"))?,
+            })
+        };
+        let mut a = endpoint(a, a_iface, a_ip)?;
+        let mut b = endpoint(b, b_iface, b_ip)?;
+        if a.node == b.node || a.ip == b.ip {
+            bail!("fabric endpoints must be distinct");
+        }
+        if (&a.node, &a.iface, a.ip) > (&b.node, &b.iface, b.ip) {
+            std::mem::swap(&mut a, &mut b);
+        }
+        Ok(Self {
+            a,
+            b,
+            kind: kind.trim().to_ascii_lowercase(),
+        })
+    }
+
+    fn pair_name(&self) -> String {
+        format!("{}-{}", self.a.node, self.b.node)
+    }
+
+    fn subnet_key(ip: IpAddr) -> Result<String> {
+        match ip {
+            IpAddr::V4(ip) => {
+                let raw = u32::from(ip) & !3;
+                Ok(format!("{}/30", Ipv4Addr::from(raw)))
+            }
+            IpAddr::V6(_) => bail!("fabric reconciliation currently requires IPv4 /30 links"),
+        }
+    }
+
+    fn validate_link_subnet(&self) -> Result<String> {
+        let a = Self::subnet_key(self.a.ip)?;
+        let b = Self::subnet_key(self.b.ip)?;
+        if a != b {
+            bail!("endpoints are not in the same /30 subnet ({a} vs {b})");
+        }
+        Ok(a)
+    }
+}
+
+pub async fn handle_fabric_reconcile(pg: &PgPool, spec: FabricLinkSpec, apply: bool) -> Result<()> {
+    let subnet = spec.validate_link_subnet()?;
+    let mut tx = pg.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('ff-fabric-reconcile'))")
+        .execute(&mut *tx)
+        .await?;
+
+    let a_id = computer_id(&mut tx, &spec.a.node).await?;
+    let b_id = computer_id(&mut tx, &spec.b.node).await?;
+    let pair_name = spec.pair_name();
+    let conflict = sqlx::query(
+        "SELECT pair_name FROM fabric_pairs
+          WHERE pair_name <> $1
+            AND NOT ((computer_a_id = $2 AND computer_b_id = $4)
+                  OR (computer_a_id = $4 AND computer_b_id = $2))
+            AND (
+            (computer_a_id = $2 AND a_iface = $3) OR
+            (computer_b_id = $2 AND b_iface = $3) OR
+            (computer_a_id = $4 AND a_iface = $5) OR
+            (computer_b_id = $4 AND b_iface = $5) OR
+            NULLIF(a_ip, '') = $6 OR NULLIF(b_ip, '') = $6 OR
+            NULLIF(a_ip, '') = $7 OR NULLIF(b_ip, '') = $7 OR
+            cidr = $8)
+          LIMIT 1",
+    )
+    .bind(&pair_name)
+    .bind(a_id)
+    .bind(&spec.a.iface)
+    .bind(b_id)
+    .bind(&spec.b.iface)
+    .bind(spec.a.ip.to_string())
+    .bind(spec.b.ip.to_string())
+    .bind(&subnet)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(row) = conflict {
+        let owner: String = row.try_get("pair_name")?;
+        bail!("endpoint or subnet is already used by fabric link '{owner}'");
+    }
+
+    // Remove every legacy orientation for these two nodes before the canonical
+    // upsert. Measurements referencing the surviving canonical ID are retained.
+    sqlx::query(
+        "DELETE FROM fabric_pairs
+          WHERE pair_name <> $1
+            AND ((computer_a_id = $2 AND computer_b_id = $3)
+              OR (computer_a_id = $3 AND computer_b_id = $2))",
+    )
+    .bind(&pair_name)
+    .bind(a_id)
+    .bind(b_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO fabric_pairs
+          (pair_name, fabric_kind, computer_a_id, computer_b_id,
+           a_iface, a_ip, b_iface, b_ip, endpoints_explicit, verified, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,FALSE,'pending')
+         ON CONFLICT (pair_name) DO UPDATE SET
+           fabric_kind=EXCLUDED.fabric_kind, computer_a_id=EXCLUDED.computer_a_id,
+           computer_b_id=EXCLUDED.computer_b_id, a_iface=EXCLUDED.a_iface,
+           a_ip=EXCLUDED.a_ip, b_iface=EXCLUDED.b_iface, b_ip=EXCLUDED.b_ip,
+           endpoints_explicit=TRUE, verified=FALSE, status='pending'",
+    )
+    .bind(&pair_name)
+    .bind(&spec.kind)
+    .bind(a_id)
+    .bind(b_id)
+    .bind(&spec.a.iface)
+    .bind(spec.a.ip.to_string())
+    .bind(&spec.b.iface)
+    .bind(spec.b.ip.to_string())
+    .execute(&mut *tx)
+    .await?;
+
+    if apply {
+        tx.commit().await?;
+        println!("Applied canonical fabric link {pair_name} ({subnet})");
+    } else {
+        tx.rollback().await?;
+        println!("Dry run: would reconcile canonical fabric link {pair_name} ({subnet})");
+    }
+    Ok(())
+}
+
+async fn computer_id(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, name: &str) -> Result<Uuid> {
+    sqlx::query_scalar("SELECT id FROM computers WHERE lower(name) = $1")
+        .bind(name)
+        .fetch_optional(&mut **tx)
+        .await?
+        .with_context(|| format!("computer '{name}' not found"))
+}
+
+pub async fn handle_fabric_remove(pg: &PgPool, spec: FabricLinkSpec, apply: bool) -> Result<()> {
+    let mut tx = pg.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('ff-fabric-reconcile'))")
+        .execute(&mut *tx)
+        .await?;
+    let a_id = computer_id(&mut tx, &spec.a.node).await?;
+    let b_id = computer_id(&mut tx, &spec.b.node).await?;
+    let result = sqlx::query(
+        "DELETE FROM fabric_pairs WHERE
+         (computer_a_id=$1 AND computer_b_id=$2 AND a_iface=$3 AND b_iface=$4)
+         OR (computer_a_id=$2 AND computer_b_id=$1 AND a_iface=$4 AND b_iface=$3)",
+    )
+    .bind(a_id)
+    .bind(b_id)
+    .bind(&spec.a.iface)
+    .bind(&spec.b.iface)
+    .execute(&mut *tx)
+    .await?;
+    let count = result.rows_affected();
+    if apply {
+        tx.commit().await?;
+        println!("Removed {count} matching fabric link row(s)");
+    } else {
+        tx.rollback().await?;
+        println!("Dry run: would remove {count} matching fabric link row(s)");
+    }
+    Ok(())
+}
+
+pub async fn handle_fabric_probe(pg: &PgPool, spec: FabricLinkSpec, apply: bool) -> Result<()> {
+    spec.validate_link_subnet()?;
+    let declared: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM fabric_pairs
+         WHERE pair_name=$1 AND endpoints_explicit AND fabric_kind=$2
+           AND a_iface=$3 AND a_ip=$4 AND b_iface=$5 AND b_ip=$6)",
+    )
+    .bind(spec.pair_name())
+    .bind(&spec.kind)
+    .bind(&spec.a.iface)
+    .bind(spec.a.ip.to_string())
+    .bind(&spec.b.iface)
+    .bind(spec.b.ip.to_string())
+    .fetch_one(pg)
+    .await?;
+    if !declared {
+        bail!("no matching explicit canonical link; reconcile it before probing");
+    }
+    probe_endpoint(&spec.a).await?;
+    probe_endpoint(&spec.b).await?;
+    // The physical path is proven independently of carrier by an IP packet in
+    // each direction, sourced from the declared interface.
+    probe_ping(&spec.a, &spec.b).await?;
+    probe_ping(&spec.b, &spec.a).await?;
+    println!(
+        "Proved both endpoints and bidirectional physical link for {}",
+        spec.pair_name()
+    );
+    if apply {
+        let result = sqlx::query(
+            "UPDATE fabric_pairs SET verified=TRUE,status='healthy',last_probed_at=NOW()
+             WHERE pair_name=$1 AND endpoints_explicit AND fabric_kind=$2
+               AND a_iface=$3 AND a_ip=$4 AND b_iface=$5 AND b_ip=$6",
+        )
+        .bind(spec.pair_name())
+        .bind(&spec.kind)
+        .bind(&spec.a.iface)
+        .bind(spec.a.ip.to_string())
+        .bind(&spec.b.iface)
+        .bind(spec.b.ip.to_string())
+        .execute(pg)
+        .await?;
+        if result.rows_affected() != 1 {
+            bail!("no matching explicit canonical link; reconcile it before probing");
+        }
+    } else {
+        println!("Dry run: verification was not persisted");
+    }
+    Ok(())
+}
+
+async fn probe_endpoint(endpoint: &FabricEndpoint) -> Result<()> {
+    let node = ff_agent::fleet_info::fetch_node_by_name(&endpoint.node)
+        .await
+        .map_err(anyhow::Error::msg)?
+        .context("computer not found")?;
+    let command = format!(
+        "ip -o addr show dev '{}' | grep -F '{}' >/dev/null && test \"$(cat /sys/class/net/'{}'/carrier)\" = 1",
+        endpoint.iface, endpoint.ip, endpoint.iface
+    );
+    let ok = StdCommand::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            &format!("{}@{}", node.ssh_user, node.ip),
+            &command,
+        ])
+        .status()?
+        .success();
+    if !ok {
+        bail!(
+            "{} endpoint/interface/link-carrier proof failed",
+            endpoint.node
+        );
+    }
+    Ok(())
+}
+
+async fn probe_ping(from: &FabricEndpoint, to: &FabricEndpoint) -> Result<()> {
+    let node = ff_agent::fleet_info::fetch_node_by_name(&from.node)
+        .await
+        .map_err(anyhow::Error::msg)?
+        .context("computer not found")?;
+    let ok = StdCommand::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            &format!("{}@{}", node.ssh_user, node.ip),
+            &format!("ping -I '{}' -c 1 -W 2 '{}'", from.iface, to.ip),
+        ])
+        .status()?
+        .success();
+    if !ok {
+        bail!("physical link probe {} -> {} failed", from.node, to.node);
+    }
+    Ok(())
+}
 
 pub async fn handle_fabric_pair(pg: &PgPool, a: &str, b: &str, kind: &str) -> Result<()> {
     if a == b {
@@ -463,4 +768,61 @@ fn parse_iperf3_json(body: &str) -> (f64, Option<i32>) {
         .and_then(|n| n.as_i64())
         .map(|n| n as i32);
     (bps / 1e9, retr)
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    fn link(a: &str, ai: &str, aip: &str, b: &str, bi: &str, bip: &str) -> FabricLinkSpec {
+        FabricLinkSpec::new(a, ai, aip, b, bi, bip, "cx7-200g").unwrap()
+    }
+
+    fn assert_topology_is_unambiguous(links: &[FabricLinkSpec]) -> Result<()> {
+        let mut endpoints = HashSet::new();
+        let mut subnets = HashSet::new();
+        for link in links {
+            for endpoint in [&link.a, &link.b] {
+                if !endpoints.insert((endpoint.node.clone(), endpoint.iface.clone())) {
+                    bail!("duplicate endpoint");
+                }
+            }
+            if !subnets.insert(link.validate_link_subnet()?) {
+                bail!("duplicate subnet");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn supports_two_independent_three_node_rings() {
+        let rings = [
+            link("a", "cx0", "10.80.0.1", "b", "cx0", "10.80.0.2"),
+            link("b", "cx1", "10.80.0.5", "c", "cx0", "10.80.0.6"),
+            link("c", "cx1", "10.80.0.9", "a", "cx1", "10.80.0.10"),
+            link("d", "cx0", "10.81.0.1", "e", "cx0", "10.81.0.2"),
+            link("e", "cx1", "10.81.0.5", "f", "cx0", "10.81.0.6"),
+            link("f", "cx1", "10.81.0.9", "d", "cx1", "10.81.0.10"),
+        ];
+        assert_topology_is_unambiguous(&rings).unwrap();
+    }
+
+    #[test]
+    fn reversed_orientation_has_one_canonical_identity() {
+        let forward = link("sia", "cx0", "10.90.0.1", "adele", "cx1", "10.90.0.2");
+        let reversed = link("ADELE", "cx1", "10.90.0.2", "SIA", "cx0", "10.90.0.1");
+        assert_eq!(forward, reversed);
+        assert_eq!(forward.pair_name(), "adele-sia");
+    }
+
+    #[test]
+    fn rejects_crossed_endpoint_and_duplicate_subnet_rows() {
+        let base = link("a", "cx0", "10.91.0.1", "b", "cx0", "10.91.0.2");
+        let crossed = link("a", "cx0", "10.92.0.1", "c", "cx0", "10.92.0.2");
+        assert!(assert_topology_is_unambiguous(&[base.clone(), crossed]).is_err());
+        let duplicate_subnet = link("c", "cx0", "10.91.0.1", "d", "cx0", "10.91.0.2");
+        assert!(assert_topology_is_unambiguous(&[base, duplicate_subnet]).is_err());
+    }
 }
