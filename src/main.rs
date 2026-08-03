@@ -4019,6 +4019,51 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
                 }
             }
         }
+
+        // 4) Live deployment registry: fleet_model_deployments ⋈ model_catalog.
+        //    This is the authoritative per-node serving state (written by the
+        //    deployment reconciler); `fleet_models` above is the legacy static
+        //    registry and is empty in practice, which left /v1/models and the
+        //    web console's model pages blank.
+        if let Ok(deployments) = sqlx::query(
+            "SELECT d.worker_name, d.catalog_id, d.port, \
+                    COALESCE(c.tier, 2) AS tier \
+               FROM fleet_model_deployments d \
+               LEFT JOIN model_catalog c ON c.id = d.catalog_id \
+              WHERE d.desired_state = 'active' AND d.health_status = 'healthy'",
+        )
+        .fetch_all(pool)
+        .await
+        {
+            for row in &deployments {
+                use sqlx::Row;
+                let worker_name: String = row.get("worker_name");
+                let catalog_id: String = row.get("catalog_id");
+                let port = row.get::<i32, _>("port") as u16;
+                let tier = row.get::<i32, _>("tier") as u8;
+                let id = format!("{worker_name}:{catalog_id}:{port}");
+                if backends.iter().any(|b| b.id == id) {
+                    continue;
+                }
+                let Some(host) = node_ips.get(&worker_name) else {
+                    continue;
+                };
+                backends.push(BackendEndpoint {
+                    id,
+                    node: worker_name,
+                    host: host.clone(),
+                    port,
+                    model: catalog_id,
+                    tier,
+                    healthy: true,
+                    busy: false,
+                    scheme: "http".to_string(),
+                    is_local: true,
+                    cost_per_1k_input: 0.0,
+                    cost_per_1k_output: 0.0,
+                });
+            }
+        }
     }
 
     info!(backend_count = backends.len(), "built API backend registry");
