@@ -2022,7 +2022,18 @@ pub async fn pg_active_deployment_counts(
 /// preference and routes to the cheapest warm tool-capable model.
 fn offload_workload_for_kind(kind: Option<&str>) -> Option<&'static str> {
     match kind.map(|k| k.to_ascii_lowercase()).as_deref() {
-        Some("codegen") | Some("edits") | Some("tests") | Some("code") => Some("code-gen"),
+        Some("code")
+        | Some("code-gen")
+        | Some("codegen")
+        | Some("coder")
+        | Some("coding")
+        | Some("code-generation")
+        | Some("edits")
+        | Some("tests")
+        | Some("review")
+        | Some("code-review")
+        | Some("reviewer")
+        | Some("build") => Some("code-gen"),
         _ => None,
     }
 }
@@ -5077,14 +5088,36 @@ mod tests {
 
     #[test]
     fn test_offload_workload_for_kind() {
-        for k in ["codegen", "edits", "tests", "code", "CODE", "Edits"] {
+        for k in [
+            "code",
+            "code-gen",
+            "codegen",
+            "coder",
+            "coding",
+            "code-generation",
+            "edits",
+            "tests",
+            "review",
+            "code-review",
+            "reviewer",
+            "build",
+            "CODE",
+            "Code-Review",
+        ] {
             assert_eq!(
                 offload_workload_for_kind(Some(k)),
                 Some("code-gen"),
                 "{k} should map to code-gen"
             );
         }
-        for k in ["research", "chat", "synthesis", "summary"] {
+        for k in [
+            "research",
+            "chat",
+            "synthesis",
+            "summary",
+            "docs",
+            "extract",
+        ] {
             assert_eq!(
                 offload_workload_for_kind(Some(k)),
                 None,
