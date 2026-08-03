@@ -502,6 +502,21 @@ pub(crate) async fn is_leader(_pool: &PgPool, _my_name: &str) -> bool {
     crate::leader_cache::is_current_leader()
 }
 
+/// Read leadership from the durable singleton instead of the daemon's hot-path
+/// cache. Short-lived operator processes never initialize `LeaderCache`, so
+/// explicit/run-once entry points must use this authority and fail closed when
+/// it cannot be read.
+pub async fn is_durable_leader(pool: &PgPool, my_name: &str) -> Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM fleet_leader_state \
+         WHERE singleton_key = 'current' AND LOWER(member_name) = LOWER($1))",
+    )
+    .bind(my_name)
+    .fetch_one(pool)
+    .await
+    .context("read durable fleet leader authority")
+}
+
 /// Is the auto-upgrade feature turned on via `fleet_secrets`?
 ///
 /// Treated as a self-expiring safety gate (V58): if an operator flipped
@@ -763,6 +778,13 @@ pub struct AutoUpgradeTick {
     running_sha: String,
 }
 
+/// Observable result for an operator-triggered tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoUpgradeRunOnceOutcome {
+    pub refreshed_self_built: u64,
+    pub enqueued: usize,
+}
+
 impl AutoUpgradeTick {
     pub fn new(pool: PgPool, my_name: String, running_sha: String) -> Self {
         let client = reqwest::Client::builder()
@@ -786,11 +808,35 @@ impl AutoUpgradeTick {
         if !is_leader(&self.pool, &self.my_name).await {
             return Ok(0);
         }
+        Ok(self.run_once_authorized(force, false).await?.enqueued)
+    }
+
+    /// Operator/CLI run-once path. Unlike the daemon hot path, leadership is
+    /// read directly from `fleet_leader_state` and self-built refresh failures
+    /// are returned to the caller instead of becoming a false zero-success.
+    pub async fn run_once_durable(&self, force: bool) -> Result<AutoUpgradeRunOnceOutcome> {
+        if !is_durable_leader(&self.pool, &self.my_name).await? {
+            anyhow::bail!(
+                "worker '{}' is not the current leader in fleet_leader_state",
+                self.my_name
+            );
+        }
+        self.run_once_authorized(force, true).await
+    }
+
+    async fn run_once_authorized(
+        &self,
+        force: bool,
+        surface_self_built_refresh: bool,
+    ) -> Result<AutoUpgradeRunOnceOutcome> {
         if !force && !is_enabled(&self.pool).await {
             tracing::debug!(
                 "auto-upgrade disabled (fleet_secrets.auto_upgrade_enabled not truthy)"
             );
-            return Ok(0);
+            return Ok(AutoUpgradeRunOnceOutcome {
+                refreshed_self_built: 0,
+                enqueued: 0,
+            });
         }
 
         // Self-built tools (ff_git, forgefleetd_git, etc.) use method=self_built
@@ -799,7 +845,16 @@ impl AutoUpgradeTick {
         // but that's too slow for active dev. Do an inline refresh here on every
         // auto-upgrade tick — one SQL UPDATE per row. If leader's row just flipped,
         // the next line (drift check) will see upgrade_available immediately.
-        let _ = refresh_self_built_latest_versions(&self.pool).await;
+        let refreshed_self_built = if surface_self_built_refresh {
+            refresh_self_built_latest_versions(&self.pool).await?
+        } else {
+            refresh_self_built_latest_versions(&self.pool)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "auto-upgrade: self-built refresh failed");
+                    0
+                })
+        };
         // npm-distributed tools (codex, context-mode, …): query
         // registry.npmjs.org/<pkg>/latest. Same-tick refresh for parity with
         // self_built — without this, npm releases sit unnoticed indefinitely.
@@ -859,7 +914,10 @@ impl AutoUpgradeTick {
 
         let ids = software_ids_with_drift(&self.pool).await?;
         if ids.is_empty() {
-            return Ok(0);
+            return Ok(AutoUpgradeRunOnceOutcome {
+                refreshed_self_built,
+                enqueued: 0,
+            });
         }
 
         let who = format!("auto-upgrade@{}", self.my_name);
@@ -1078,7 +1136,10 @@ impl AutoUpgradeTick {
             }
         }
 
-        Ok(total)
+        Ok(AutoUpgradeRunOnceOutcome {
+            refreshed_self_built,
+            enqueued: total,
+        })
     }
 
     /// Spawn the hourly tick. First tick fires ~90s after spawn so the
@@ -1307,18 +1368,16 @@ pub async fn refresh_self_built_latest_versions(pool: &PgPool) -> Result<u64> {
 
     let repo = expand_tilde(&source_tree);
     let fetch_repo = repo.clone();
-    let candidate = match tokio::task::spawn_blocking(move || {
-        fetch_canonical_origin_main(&fetch_repo)
-    })
-    .await
-    .context("join canonical origin/main fetch")?
-    {
-        Ok(candidate) => candidate,
-        Err(reason) => {
-            tracing::warn!(%reason, "refresh_self_built: canonical fetch unavailable; holding authority");
-            return Ok(0);
-        }
-    };
+    let candidate =
+        match tokio::task::spawn_blocking(move || fetch_canonical_origin_main(&fetch_repo))
+            .await
+            .context("join canonical origin/main fetch")?
+        {
+            Ok(candidate) => candidate,
+            Err(reason) => anyhow::bail!(
+                "refresh_self_built: canonical origin/main fetch unavailable: {reason}"
+            ),
+        };
 
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
         "SELECT id, latest_version FROM software_registry \
@@ -1344,11 +1403,9 @@ pub async fn refresh_self_built_latest_versions(pool: &PgPool) -> Result<u64> {
     .context("join self-built ancestry plan")?
     {
         Ok(plan) => plan,
-        Err(reason) => {
-            tracing::warn!(%reason, candidate = %candidate,
-                "refresh_self_built: monotonic proof failed; holding every self-built row");
-            return Ok(0);
-        }
+        Err(reason) => anyhow::bail!(
+            "refresh_self_built: candidate {candidate} failed monotonic proof: {reason}"
+        ),
     };
 
     if !plan.iter().any(|row| row.change) {
@@ -1949,6 +2006,71 @@ mod tests {
     fn self_built_fetch_unavailable_never_invents_a_candidate() {
         let (dir, _, _) = temp_git_repo();
         assert!(fetch_canonical_origin_main(dir.path().to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn canonical_remote_main_fetch_advances_a_stale_checkout() {
+        fn git(repo: &std::path::Path, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("remote.git");
+        let source = root.path().join("source");
+        let checkout = root.path().join("checkout");
+        std::fs::create_dir(&remote).unwrap();
+        git(&remote, &["init", "--bare", "-q"]);
+        std::fs::create_dir(&source).unwrap();
+        git(&source, &["init", "-q", "-b", "main"]);
+        git(&source, &["config", "user.email", "tests@forgefleet.local"]);
+        git(&source, &["config", "user.name", "ForgeFleet Tests"]);
+        std::fs::write(source.join("authority.txt"), "one\n").unwrap();
+        git(&source, &["add", "authority.txt"]);
+        git(&source, &["commit", "-qm", "first"]);
+        git(
+            &source,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&source, &["push", "-qu", "origin", "main"]);
+        git(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                "--branch",
+                "main",
+                remote.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+
+        std::fs::write(source.join("authority.txt"), "two\n").unwrap();
+        git(&source, &["commit", "-qam", "second"]);
+        let second = git(&source, &["rev-parse", "HEAD"]);
+        git(&source, &["push", "-q", "origin", "main"]);
+
+        let fetched = fetch_canonical_origin_main(checkout.to_str().unwrap()).unwrap();
+        assert_eq!(
+            fetched, second,
+            "authority must be fetched from remote main"
+        );
+        assert_ne!(
+            git(&checkout, &["rev-parse", "HEAD"]),
+            fetched,
+            "the stale working-tree HEAD must not be mistaken for authority"
+        );
     }
 
     #[test]
