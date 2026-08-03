@@ -1045,10 +1045,10 @@ async fn run_agent_loop(
         }
 
         // --- Parse response ---
-        let choice = match response.choices.first() {
-            Some(c) => c,
-            None => {
-                let msg = "LLM returned empty choices".to_string();
+        let choice = match first_response_choice(&response) {
+            Ok(choice) => choice,
+            Err(error) => {
+                let msg = error.to_string();
                 emit(
                     &event_tx,
                     AgentEvent::Error {
@@ -1066,10 +1066,10 @@ async fn run_agent_loop(
             .unwrap_or("stop")
             .to_string();
 
-        let assistant_msg = match &choice.message {
-            Some(msg) => msg.clone(),
-            None => {
-                let msg = "LLM response missing message".to_string();
+        let assistant_msg = match response_message(choice) {
+            Ok(msg) => msg.clone(),
+            Err(error) => {
+                let msg = error.to_string();
                 emit(
                     &event_tx,
                     AgentEvent::Error {
@@ -1112,7 +1112,20 @@ async fn run_agent_loop(
 
         if tool_calls.is_empty() {
             // No tool calls — agent is done
-            let final_text = assistant_msg.text_content().unwrap_or("").to_string();
+            let final_text = match final_answer(&assistant_msg) {
+                Ok(text) => text.to_string(),
+                Err(error) => {
+                    let msg = error.to_string();
+                    emit(
+                        &event_tx,
+                        AgentEvent::Error {
+                            session_id: session_id.clone(),
+                            message: msg.clone(),
+                        },
+                    );
+                    return AgentOutcome::Error(msg);
+                }
+            };
 
             emit(
                 &event_tx,
@@ -1701,6 +1714,27 @@ async fn send_request<T: serde::Serialize>(
     Ok(parsed)
 }
 
+fn first_response_choice(
+    response: &ToolChatCompletionResponse,
+) -> Result<&ff_api::tool_calling::ToolChatChoice, &'static str> {
+    response.choices.first().ok_or("LLM returned empty choices")
+}
+
+fn response_message(
+    choice: &ff_api::tool_calling::ToolChatChoice,
+) -> Result<&ToolChatMessage, &'static str> {
+    choice
+        .message
+        .as_ref()
+        .ok_or("LLM response missing message")
+}
+
+fn final_answer(message: &ToolChatMessage) -> Result<&str, &'static str> {
+    message
+        .answer_content()
+        .ok_or("LLM returned empty content without tool calls")
+}
+
 /// Execute a single tool call (used by parallel executor).
 /// Returns `(tool_id, content, is_error, should_end_turn)`.
 /// `should_end_turn` is set by tools that need to pause the agent loop
@@ -2060,5 +2094,107 @@ mod commit_back_provenance_tests {
             r#"{"file_path":"x.rs"}"#,
         )])];
         assert!(collect_modified_files(&msgs).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod router_empty_tests {
+    use super::{final_answer, first_response_choice, response_message};
+    use ff_api::tool_calling::{
+        FunctionCall, ToolCall, ToolChatChoice, ToolChatCompletionResponse, ToolChatMessage,
+    };
+
+    fn response(choices: Vec<ToolChatChoice>) -> ToolChatCompletionResponse {
+        ToolChatCompletionResponse {
+            id: "test".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: "test-model".into(),
+            choices,
+            usage: None,
+        }
+    }
+
+    fn choice(message: Option<ToolChatMessage>) -> ToolChatChoice {
+        ToolChatChoice {
+            index: 0,
+            message,
+            finish_reason: Some("stop".into()),
+        }
+    }
+
+    #[test]
+    fn accepts_content_answer() {
+        assert_eq!(
+            final_answer(&ToolChatMessage::assistant("answer")),
+            Ok("answer")
+        );
+    }
+
+    #[test]
+    fn accepts_reasoning_only_answer() {
+        let message: ToolChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "reasoning answer"
+        }))
+        .unwrap();
+
+        assert_eq!(final_answer(&message), Ok("reasoning answer"));
+    }
+
+    #[test]
+    fn rejects_whitespace_content_without_tools() {
+        assert_eq!(
+            final_answer(&ToolChatMessage::assistant(" \n\t ")),
+            Err("LLM returned empty content without tool calls")
+        );
+    }
+
+    #[test]
+    fn rejects_null_content_without_tools() {
+        let message: ToolChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": null
+        }))
+        .unwrap();
+
+        assert_eq!(
+            final_answer(&message),
+            Err("LLM returned empty content without tool calls")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_choices() {
+        assert_eq!(
+            first_response_choice(&response(vec![])).unwrap_err(),
+            "LLM returned empty choices"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_message() {
+        assert_eq!(
+            response_message(first_response_choice(&response(vec![choice(None)])).unwrap())
+                .unwrap_err(),
+            "LLM response missing message"
+        );
+    }
+
+    #[test]
+    fn preserves_null_content_with_valid_tools() {
+        let message = ToolChatMessage::assistant_tool_calls(vec![ToolCall {
+            id: "call-1".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "Read".into(),
+                arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
+            },
+        }]);
+
+        assert_eq!(message.text_content(), None);
+        assert!(message.has_tool_calls());
+        assert_eq!(crate::openai_bridge::extract_tool_calls(&message).len(), 1);
     }
 }
