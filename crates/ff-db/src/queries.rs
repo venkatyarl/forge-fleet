@@ -1861,6 +1861,8 @@ pub async fn pg_route_deployments(
           LEFT JOIN computers c         ON LOWER(c.name) = LOWER(d.worker_name)
           {load_join}
          WHERE d.health_status = 'healthy'
+           AND d.desired_state = 'active'
+           AND COALESCE(cat.lifecycle, 'active') <> 'retired'
            -- Never route a CHAT/codegen call to an embedding/reranker model.
            -- bge-m3 / bge-reranker-v2-m3 etc. are healthy deployments but 500
            -- on a chat completion ("context does not logits computation"); with
@@ -2401,6 +2403,7 @@ pub async fn pg_supplied_slots_by_kind(pool: &PgPool, min_ctx: i32) -> Result<Se
           FROM fleet_model_deployments d
           JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
          WHERE d.desired_state = 'active'
+           AND COALESCE(cat.lifecycle, 'active') <> 'retired'
            AND cat.tool_calling = TRUE
         "#
     );
@@ -2482,6 +2485,7 @@ pub async fn pg_agent_readiness(
           JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
          WHERE d.health_status = 'healthy'
            AND d.desired_state = 'active'
+           AND COALESCE(cat.lifecycle, 'active') <> 'retired'
            AND cat.tool_calling = TRUE
            AND ($2::text IS NULL OR d.worker_name = $2)
          ORDER BY d.worker_name, d.port
@@ -2565,6 +2569,7 @@ pub async fn pg_reprofile_candidates(
           JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
          WHERE d.health_status = 'healthy'
            AND d.desired_state = 'active'
+           AND COALESCE(cat.lifecycle, 'active') <> 'retired'
            AND cat.tool_calling = TRUE
            AND (d.usable_agent_ctx IS NULL OR d.usable_agent_ctx < $2)
            AND COALESCE(d.parallel_slots, 0) > 1
@@ -2721,6 +2726,7 @@ pub async fn pg_loadable_library_for_kind(
           FROM fleet_model_library lib
           JOIN fleet_model_catalog cat ON cat.id = lib.catalog_id
          WHERE lib.worker_name = $2
+           AND COALESCE(cat.lifecycle, 'active') <> 'retired'
            AND cat.tool_calling = TRUE
            AND lib.pinned = TRUE
            AND ($3 = ({CODE_WORKLOAD_SQL_PREDICATE}))
@@ -5381,7 +5387,8 @@ mod tests {
                  family TEXT NOT NULL,
                  preferred_workloads JSONB,
                  tool_calling BOOLEAN NOT NULL,
-                 tier INT NOT NULL
+                 tier INT NOT NULL,
+                 lifecycle TEXT
              );
              CREATE TABLE fleet_model_library (
                  id UUID PRIMARY KEY,
@@ -5410,17 +5417,30 @@ mod tests {
              CREATE TABLE fleet_task_coverage (preferred_model_ids JSONB);
 
              INSERT INTO fleet_model_catalog VALUES
-                 ('mixed', 'Mixed Coder', 'coder', '[\"CoDe-ReViEw\"]', TRUE, 1),
-                 ('near', 'Lucy-like General', 'general', '[\"coderx\"]', TRUE, 2);
-             INSERT INTO fleet_workers VALUES ('code-host'), ('near-host');
+                 ('mixed', 'Mixed Coder', 'coder', '[\"CoDe-ReViEw\"]', TRUE, 1, NULL),
+                 ('near', 'Lucy-like General', 'general', '[\"coderx\"]', TRUE, 2, 'active'),
+                 ('retired-code', 'Retired Coder', 'coder', '[\"code\"]', TRUE, 0, 'retired'),
+                 ('retired-general', 'Retired General', 'general', '[\"research\"]', TRUE, 0, 'retired'),
+                 ('inactive-code', 'Inactive Coder', 'coder', '[\"code\"]', TRUE, 0, 'active');
+             INSERT INTO fleet_workers VALUES
+                 ('code-host'), ('near-host'), ('retired-code-host'),
+                 ('retired-general-host'), ('inactive-code-host');
              INSERT INTO fleet_model_deployments VALUES
                  (gen_random_uuid(), 'code-host', 55000, 'mixed', NULL, 0, NOW(),
                   'healthy', 'active', 8192, NOW(), 'llama.cpp', 32768, 2),
                  (gen_random_uuid(), 'near-host', 55001, 'near', NULL, 0, NOW(),
-                  'healthy', 'active', 8192, NOW(), 'llama.cpp', 32768, 2);
+                  'healthy', 'active', 8192, NOW(), 'llama.cpp', 32768, 2),
+                 (gen_random_uuid(), 'retired-code-host', 55002, 'retired-code', NULL, 0, NOW(),
+                  'healthy', 'active', 8192, NOW(), 'llama.cpp', 32768, 2),
+                 (gen_random_uuid(), 'retired-general-host', 55003, 'retired-general', NULL, 0, NOW(),
+                  'healthy', 'active', 8192, NOW(), 'llama.cpp', 32768, 2),
+                 (gen_random_uuid(), 'inactive-code-host', 55004, 'inactive-code', NULL, 0, NOW(),
+                  'healthy', 'stopped', 32768, NOW(), 'llama.cpp', 32768, 1);
              INSERT INTO fleet_model_library VALUES
                  (gen_random_uuid(), 'mixed', 'load-host', 'llama.cpp', 100, TRUE),
-                 (gen_random_uuid(), 'near', 'load-host', 'llama.cpp', 200, TRUE);",
+                 (gen_random_uuid(), 'near', 'load-host', 'llama.cpp', 200, TRUE),
+                 (gen_random_uuid(), 'retired-code', 'load-host', 'llama.cpp', 1, TRUE),
+                 (gen_random_uuid(), 'retired-general', 'load-host', 'llama.cpp', 1, TRUE);",
         )
         .execute(&pool)
         .await
@@ -5439,27 +5459,43 @@ mod tests {
             supply.general_endpoints[0].catalog_id.as_deref(),
             Some("near")
         );
+        assert!(supply
+            .code_endpoints
+            .iter()
+            .chain(&supply.general_endpoints)
+            .all(|row| !matches!(
+                row.catalog_id.as_deref(),
+                Some("retired-code" | "retired-general" | "inactive-code")
+            )));
 
         let readiness = pg_agent_readiness(&pool, None)
             .await
             .expect("read readiness");
+        assert_eq!(readiness.len(), 2);
         assert_eq!(readiness.iter().filter(|row| row.is_code).count(), 1);
-        assert!(
-            readiness
-                .iter()
-                .any(|row| row.catalog_id.as_deref() == Some("mixed") && row.is_code)
-        );
+        assert!(readiness
+            .iter()
+            .any(|row| row.catalog_id.as_deref() == Some("mixed") && row.is_code));
+        assert!(readiness.iter().all(|row| !matches!(
+            row.catalog_id.as_deref(),
+            Some("retired-code" | "retired-general" | "inactive-code")
+        )));
 
         let reprofile = pg_reprofile_candidates(&pool, 16_384)
             .await
             .expect("read reprofile candidates");
+        assert_eq!(reprofile.len(), 2);
         assert_eq!(reprofile.iter().filter(|row| row.is_code).count(), 1);
-        assert!(
-            reprofile
-                .iter()
-                .any(|row| row.catalog_id.as_deref() == Some("near") && !row.is_code)
-        );
+        assert!(reprofile
+            .iter()
+            .any(|row| row.catalog_id.as_deref() == Some("near") && !row.is_code));
+        assert!(reprofile.iter().all(|row| !matches!(
+            row.catalog_id.as_deref(),
+            Some("retired-code" | "retired-general" | "inactive-code")
+        )));
 
+        // The retired tier-0 / one-byte fixtures would win both queries without
+        // the lifecycle fence. The active/legacy-NULL rows must win instead.
         let code_library = pg_loadable_library_for_kind(&pool, "load-host", true)
             .await
             .expect("read code library")
@@ -5484,8 +5520,21 @@ mod tests {
         .await
         .expect("normalize router fixture");
 
+        // A retired model and a healthy deployment whose desired state is no
+        // longer active must not leak through the canonical router, even when
+        // both otherwise outrank and outsize the live coder.
+        sqlx::query(
+            "UPDATE fleet_model_deployments
+                SET usable_agent_ctx = 32768
+              WHERE catalog_id = 'retired-code'",
+        )
+        .execute(&pool)
+        .await
+        .expect("make retired coder context-capable");
+
         // A code request preserves both requirements: neither the canonical
-        // coder nor the general near-match has enough context yet.
+        // coder nor the general near-match has enough context yet. The retired
+        // and inactive coders are deliberately capable but remain ineligible.
         assert!(
             pg_pick_offload_endpoint(&pool, 16_384, Some("codegen"), &[])
                 .await
