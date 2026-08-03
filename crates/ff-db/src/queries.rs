@@ -982,7 +982,7 @@ pub async fn pg_get_catalog(pool: &PgPool, id: &str) -> Result<Option<ModelCatal
 /// nobody wants it back. Best-effort: returns an empty set if the lifecycle
 /// table is missing (older DB) rather than erroring.
 pub async fn pg_retired_catalog_ids(pool: &PgPool) -> Result<std::collections::HashSet<String>> {
-    let rows = match sqlx::query("SELECT id FROM model_catalog WHERE lifecycle_status = 'retired'")
+    let rows = match sqlx::query("SELECT id FROM fleet_model_catalog WHERE lifecycle = 'retired'")
         .fetch_all(pool)
         .await
     {
