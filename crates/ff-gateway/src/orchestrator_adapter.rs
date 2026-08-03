@@ -499,6 +499,7 @@ mod tests {
             network: NetworkInfo {
                 primary_ip: "192.168.1.100".to_string(),
                 all_ips: vec![],
+                mac_addresses: vec![],
             },
             hardware: HardwareInfo {
                 cpu_cores: 8,
