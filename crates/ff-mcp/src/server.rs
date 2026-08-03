@@ -15,6 +15,35 @@ use crate::handlers;
 use crate::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::tools::ToolRegistry;
 
+fn safe_tool_error_summary(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if let Some(index) = lower.find("missing required parameter:") {
+        return error[index..].chars().take(240).collect();
+    }
+    if lower.contains("requires '") {
+        return error
+            .lines()
+            .next()
+            .unwrap_or("invalid tool arguments")
+            .chars()
+            .take(240)
+            .collect();
+    }
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return "tool execution timed out".to_string();
+    }
+    if lower.contains("permission denied") || lower.contains("authentication") {
+        return "tool execution failed: authentication or permission denied".to_string();
+    }
+    if lower.contains("connection refused")
+        || lower.contains("unreachable")
+        || lower.contains("transport error")
+    {
+        return "tool execution failed: dependency unavailable".to_string();
+    }
+    "tool execution failed; inspect ForgeFleet server logs for details".to_string()
+}
+
 // ─── MCP Server ──────────────────────────────────────────────────────────────
 
 /// The core MCP server. Holds the tool registry and dispatches requests.
@@ -227,7 +256,8 @@ impl McpServer {
         // Extract the arguments for the tool
         let arguments = params.and_then(|p| p.get("arguments").cloned());
 
-        let result = if self.registry.contains(&tool_name) {
+        let known_locally = self.registry.contains(&tool_name);
+        let result = if known_locally {
             handlers::dispatch(&tool_name, arguments.clone()).await
         } else {
             self.try_federated_tool_call(&tool_name, arguments.clone())
@@ -244,12 +274,24 @@ impl McpServer {
                     }]
                 }),
             ),
+            Err(e)
+                if !known_locally
+                    && !e.starts_with(federation::FEDERATED_TOOL_EXECUTION_ERROR_PREFIX) =>
+            {
+                JsonRpcResponse::error(id, JsonRpcError::method_not_found(&tool_name))
+            }
             Err(e) => {
-                if e.contains("not found") {
-                    JsonRpcResponse::error(id, JsonRpcError::method_not_found(&tool_name))
-                } else {
-                    JsonRpcResponse::error(id, JsonRpcError::internal_error(e))
-                }
+                warn!(tool = %tool_name, error = %e, "MCP tool execution failed");
+                JsonRpcResponse::success(
+                    id,
+                    json!({
+                        "content": [{
+                            "type": "text",
+                            "text": safe_tool_error_summary(&e)
+                        }],
+                        "isError": true
+                    }),
+                )
             }
         }
     }
@@ -371,12 +413,38 @@ mod tests {
             })),
         );
         let resp = server.handle_request(req).await.unwrap();
-        let detail = resp.error.unwrap().data.unwrap();
-        assert!(
-            detail
-                .as_str()
-                .unwrap()
-                .contains("missing required parameter: corpus")
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        let detail = result["content"][0]["text"].as_str().unwrap();
+        assert!(detail.contains("missing required parameter: corpus"));
+    }
+
+    #[tokio::test]
+    async fn unknown_tools_call_name_remains_a_protocol_error() {
+        let server = McpServer::new();
+        let req = make_request(
+            "tools/call",
+            Some(json!({ "name": "definitely_not_a_forgefleet_tool", "arguments": {} })),
+        );
+        let resp = server.handle_request(req).await.unwrap();
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.unwrap().code, -32601);
+    }
+
+    #[test]
+    fn tool_error_summary_redacts_runtime_details() {
+        assert_eq!(
+            safe_tool_error_summary(
+                "SSH execution failed: ssh transport error: ssh command timed out after 30s"
+            ),
+            "tool execution timed out"
+        );
+        assert_eq!(
+            safe_tool_error_summary(
+                "database error at postgres://user:password@192.0.2.5/private/path"
+            ),
+            "tool execution failed; inspect ForgeFleet server logs for details"
         );
     }
 

@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+pub const FEDERATED_TOOL_EXECUTION_ERROR_PREFIX: &str = "federated tool execution failed:";
+
 /// Tool discovered from a federated MCP endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FederatedToolDefinition {
@@ -210,7 +212,8 @@ pub async fn call_federated_tool(
                 "arguments": arguments.clone().unwrap_or_else(|| json!({}))
             })),
         )
-        .await?;
+        .await
+        .map_err(|error| format!("{FEDERATED_TOOL_EXECUTION_ERROR_PREFIX} {error}"))?;
 
         return Ok(parse_tools_call_result(
             &target.name,
