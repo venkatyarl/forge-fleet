@@ -3974,6 +3974,15 @@ pub enum ModelCommand {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Read-only orchestrator benchmark and recommendation plan. Evaluates
+    /// candidates but never downloads, loads, promotes, or writes to Postgres.
+    OrchestratorPlan {
+        /// Workload to optimize (orchestrator, code, reasoning, chat, review).
+        #[arg(long, default_value = "orchestrator")]
+        task_type: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 // ─── Phase 12: storage / power / train subcommands ─────────────────────────

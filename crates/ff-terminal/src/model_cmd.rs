@@ -1080,8 +1080,9 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             } else {
                 let rows = sqlx::query(
                     "SELECT id, display_name, family, license
-                     FROM model_catalog
-                     WHERE lifecycle_status = 'candidate' AND added_by = 'scout'
+                     FROM fleet_model_catalog
+                     WHERE lifecycle = 'watch'
+                       AND description LIKE 'Discovered by model scout;%'
                      ORDER BY id
                      LIMIT 100",
                 )
@@ -1122,10 +1123,10 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
         }
         crate::ModelCommand::ReviewCandidates { json } => {
             let rows = sqlx::query(
-                "SELECT id, display_name, family, license, added_by, tasks
-                 FROM model_catalog
-                 WHERE lifecycle_status = 'candidate'
-                 ORDER BY added_by, id",
+                "SELECT id, display_name, family, license, lifecycle, tasks
+                 FROM fleet_model_catalog
+                 WHERE lifecycle IN ('watch', 'adopt-pending-benchmark')
+                 ORDER BY lifecycle, id",
             )
             .fetch_all(&pool)
             .await?;
@@ -1138,7 +1139,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                             "display_name": sqlx::Row::get::<String, _>(r, "display_name"),
                             "family": sqlx::Row::get::<String, _>(r, "family"),
                             "license": sqlx::Row::get::<Option<String>, _>(r, "license"),
-                            "added_by": sqlx::Row::get::<Option<String>, _>(r, "added_by"),
+                            "lifecycle": sqlx::Row::get::<Option<String>, _>(r, "lifecycle"),
                             "tasks": sqlx::Row::get::<serde_json::Value, _>(r, "tasks"),
                         })
                     })
@@ -1155,7 +1156,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                     let id: String = sqlx::Row::get(r, "id");
                     let fam: String = sqlx::Row::get(r, "family");
                     let lic: Option<String> = sqlx::Row::get(r, "license");
-                    let added: Option<String> = sqlx::Row::get(r, "added_by");
+                    let added: Option<String> = sqlx::Row::get(r, "lifecycle");
                     let tasks: serde_json::Value = sqlx::Row::get(r, "tasks");
                     let tasks_str = tasks
                         .as_array()
@@ -1352,6 +1353,93 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 }
             }
         }
+        crate::ModelCommand::OrchestratorPlan { task_type, json } => {
+            handle_orchestrator_plan(&pool, &task_type, json).await?;
+        }
+    }
+    Ok(())
+}
+
+fn orchestrator_task_score(task_type: &str, workloads: &[String]) -> i32 {
+    let wanted = task_type.trim().to_ascii_lowercase();
+    let has = |needle: &str| workloads.iter().any(|w| w == needle);
+    let mut score = if has(&wanted) { 40 } else { 0 };
+    if has("orchestrator") {
+        score += 25;
+    }
+    if has("tool_calling") {
+        score += 20;
+    }
+    if matches!(wanted.as_str(), "code" | "review" | "debug") && has("code") {
+        score += 25;
+    }
+    if wanted == "reasoning" && has("reasoning") {
+        score += 25;
+    }
+    if wanted == "chat" && has("chat") {
+        score += 25;
+    }
+    score
+}
+
+async fn handle_orchestrator_plan(pool: &sqlx::PgPool, task_type: &str, json: bool) -> Result<()> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT id, display_name, preferred_workloads, variants, benchmarks, lifecycle
+           FROM fleet_model_catalog
+          WHERE preferred_workloads ? 'orchestrator'
+             OR tasks ? 'orchestrator'",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut candidates: Vec<_> = rows
+        .into_iter()
+        .map(|row| {
+            let workloads_json: serde_json::Value = row.get("preferred_workloads");
+            let workloads: Vec<String> = workloads_json
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
+            let score = orchestrator_task_score(task_type, &workloads);
+            serde_json::json!({
+                "id": row.get::<String,_>("id"),
+                "display_name": row.get::<Option<String>,_>("display_name"),
+                "lifecycle": row.get::<Option<String>,_>("lifecycle"),
+                "task_score": score,
+                "workloads": workloads,
+                "runtime": row.get::<serde_json::Value,_>("variants"),
+                "existing_benchmarks": row.get::<Option<serde_json::Value>,_>("benchmarks"),
+                "evaluation_plan": [
+                    "tool_calling", "long_horizon_recovery", "usable_context",
+                    "throughput", "memory", "multi_node_runtime_support"
+                ]
+            })
+        })
+        .collect();
+    candidates.sort_by(|a, b| b["task_score"].as_i64().cmp(&a["task_score"].as_i64()));
+    let plan = serde_json::json!({
+        "mode": "plan_only",
+        "task_type": task_type,
+        "recommended_for_benchmark": candidates.first().and_then(|v| v.get("id")),
+        "candidates": candidates,
+        "safety": "No database writes, promotion, download, or model load. Use a separate explicit apply/deploy command only after benchmark review."
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        println!("{CYAN}Orchestrator benchmark plan (read-only){RESET}");
+        println!("task: {task_type}");
+        for c in plan["candidates"].as_array().into_iter().flatten() {
+            println!(
+                "  {:<38} score={} lifecycle={}",
+                c["id"].as_str().unwrap_or("-"),
+                c["task_score"],
+                c["lifecycle"].as_str().unwrap_or("unset")
+            );
+        }
+        println!("No models were loaded or promoted and no database rows were changed.");
     }
     Ok(())
 }
@@ -3622,6 +3710,18 @@ mod tests {
         assert!(!ram_headroom_ok(floor - 0.1, floor));
         // A memory-tight host (negative conservative free RAM) is refused.
         assert!(!ram_headroom_ok(-2.0, floor));
+    }
+
+    #[test]
+    fn orchestrator_recommendation_is_task_specific() {
+        let coding = vec!["orchestrator".into(), "tool_calling".into(), "code".into()];
+        let general = vec!["orchestrator".into(), "tool_calling".into(), "chat".into()];
+        assert!(
+            orchestrator_task_score("code", &coding) > orchestrator_task_score("code", &general)
+        );
+        assert!(
+            orchestrator_task_score("chat", &general) > orchestrator_task_score("chat", &coding)
+        );
     }
 
     #[test]

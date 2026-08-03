@@ -407,16 +407,22 @@ fn short_id(hf_id: &str) -> String {
 }
 
 async fn load_existing_catalog_keys(pg: &PgPool) -> Result<HashSet<String>, sqlx::Error> {
-    let rows = sqlx::query("SELECT id, upstream_id FROM model_catalog")
+    let rows = sqlx::query("SELECT id, variants FROM fleet_model_catalog")
         .fetch_all(pg)
         .await?;
     let mut set = HashSet::with_capacity(rows.len() * 2);
     for r in rows {
         let id: String = r.get("id");
         set.insert(id);
-        let upstream: Option<String> = r.get("upstream_id");
-        if let Some(u) = upstream {
-            set.insert(u);
+        let variants: serde_json::Value = r.get("variants");
+        if let Some(items) = variants.as_array() {
+            for upstream in items
+                .iter()
+                .filter_map(|v| v.get("hf_repo"))
+                .filter_map(|v| v.as_str())
+            {
+                set.insert(upstream.to_string());
+            }
         }
     }
     Ok(set)
@@ -445,12 +451,12 @@ async fn insert_candidate(
 ) -> Result<bool, sqlx::Error> {
     let tasks = json!(entry.tasks);
     let result = sqlx::query(
-        "INSERT INTO model_catalog
-             (id, display_name, family, license, tasks,
-              upstream_source, upstream_id,
-              file_size_gb,
-              lifecycle_status, added_by)
-         VALUES ($1, $2, $3, $4, $5, 'huggingface', $6, $7, 'candidate', 'scout')
+        "INSERT INTO fleet_model_catalog
+             (id, name, display_name, family, parameters, tier, description,
+              preferred_workloads, variants, tasks, modalities, license, lifecycle)
+         VALUES ($1, $2, $2, $3, 'unknown', 1, 'Discovered by model scout; benchmark before adoption',
+                 $5, jsonb_build_array(jsonb_build_object('hf_repo', $6::text, 'artifact_status', 'not_acquired', 'size_gb', $7::float8)),
+                 $5, '[\"text\"]'::jsonb, $4, 'watch')
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(&entry.id)

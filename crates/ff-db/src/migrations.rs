@@ -1270,6 +1270,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_load_reservations",
         sql: schema::SCHEMA_V284_MODEL_LOAD_RESERVATIONS,
     },
+    PgMigration {
+        version: 285,
+        name: "orchestrator_candidates",
+        sql: schema::SCHEMA_V285_ORCHESTRATOR_CANDIDATES,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -2563,6 +2568,32 @@ mod tests {
         assert!(row.modalities.is_some());
         assert!(row.benchmarks.is_some());
 
+        let live_columns: Vec<(String, String)> = sqlx::query_as(
+            "SELECT column_name, is_nullable FROM information_schema.columns
+              WHERE table_schema='public' AND table_name='fleet_model_catalog'
+              ORDER BY ordinal_position",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("inspect canonical live catalog contract");
+        let expected = crate::models::model_catalog::FLEET_MODEL_CATALOG_COLUMNS
+            .split(", ")
+            .collect::<Vec<_>>();
+        assert_eq!(live_columns.len(), 17);
+        assert_eq!(
+            live_columns
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for required in 0..=4 {
+            assert_eq!(live_columns[required].1, "NO");
+        }
+        for required in [6_usize, 7, 8, 9, 10] {
+            assert_eq!(live_columns[required].1, "NO");
+        }
+
         let existing_row_defaults: (Option<String>, Option<String>) = sqlx::query_as(
             "SELECT display_name, lifecycle FROM fleet_model_catalog
               WHERE id = 'qwen3-4b-instruct-2507'",
@@ -2573,6 +2604,28 @@ mod tests {
         assert_eq!(existing_row_defaults, (None, None));
 
         drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[test]
+    fn v285_seeds_only_benchmark_gated_orchestrator_candidates() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|m| m.version == 285)
+            .expect("V285 registered");
+        for id in [
+            "kimi-k3",
+            "deepseek-v4-flash",
+            "nemotron-3-super-120b-a12b-nvfp4",
+            "qwen3-coder-next",
+            "qwen3.6-35b-a3b",
+            "gpt-oss-120b",
+        ] {
+            assert!(migration.sql.contains(id));
+        }
+        assert!(migration.sql.contains("not_benchmarked"));
+        assert!(migration.sql.contains("adopt-pending-benchmark"));
+        assert!(!migration.sql.contains("lifecycle_status"));
+        assert!(!migration.sql.contains("DELETE FROM"));
     }
 
     #[tokio::test]

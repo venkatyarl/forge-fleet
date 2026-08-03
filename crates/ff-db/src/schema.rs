@@ -12272,6 +12272,49 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_work_item
 pub const SCHEMA_V258_MODEL_CATALOG_VIEW: &str =
     include_str!("migrations/20260724000000_create_model_catalog_view.sql");
 
+/// Data-only candidate watchlist. Rich provenance and runtime constraints fit
+/// the existing 17-column contract; no schema expansion is needed. None of
+/// these rows is deployable by lifecycle until benchmarked and explicitly
+/// adopted. Existing active rows (notably Qwen3.6/GPT-OSS) keep their status.
+pub const SCHEMA_V285_ORCHESTRATOR_CANDIDATES: &str = r#"
+INSERT INTO fleet_model_catalog
+ (id,name,family,parameters,tier,description,gated,preferred_workloads,variants,
+  tool_calling,display_name,tasks,modalities,benchmarks,license,lifecycle)
+VALUES
+ ('kimi-k3','Kimi K3','kimi','2.8T (16/896 experts active)',4,'Provider/global candidate; benchmark the hosted endpoint rather than fleet-loading weights.',false,
+  '["orchestrator","reasoning","code","tool_calling","vision"]',
+  '[{"runtime":"provider","source_url":"https://huggingface.co/moonshotai/Kimi-K3","context_tokens":1000000,"runtime_constraints":"provider/global only; do not fleet-load","artifact_status":"official open weights; not acquired","quantization_status":"upstream compressed tensors"}]',true,'Kimi K3','["orchestrator","code","reasoning","tool_calling"]','["text","vision"]',
+  '{"evaluation_status":"not_benchmarked","target":"provider-global"}','kimi-k3','watch'),
+ ('deepseek-v4-flash','DeepSeek-V4-Flash','deepseek','284B-A13B',4,'Fleet-global future candidate; requires verified multi-node runtime before adoption.',false,
+  '["orchestrator","reasoning","code","tool_calling"]',
+  '[{"runtime":"future-multinode","hf_repo":"deepseek-ai/DeepSeek-V4-Flash","source_url":"https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash","context_tokens":1000000,"runtime_constraints":"multi-node support unverified; do not load","artifact_status":"official safetensors; not acquired","quantization_status":"mixed FP4/FP8"}]',true,'DeepSeek-V4-Flash','["orchestrator","code","reasoning","tool_calling"]','["text"]',
+  '{"evaluation_status":"not_benchmarked","target":"fleet-global-future"}','mit','watch'),
+ ('nemotron-3-super-120b-a12b-nvfp4','NVIDIA Nemotron-3-Super-120B-A12B-NVFP4','nemotron','120B-A12B',4,'Single-DGX general-agent candidate; requires the NVIDIA parser/runtime recipe.',false,
+  '["orchestrator","reasoning","tool_calling","chat"]',
+  '[{"runtime":"vllm","hf_repo":"nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4","source_url":"https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4","context_tokens":1000000,"runtime_constraints":"single DGX Spark; vLLM >=0.20; trust_remote_code and super_v3 parser","artifact_status":"official NVFP4; not acquired","quantization_status":"NVFP4"}]',true,'NVIDIA Nemotron 3 Super','["orchestrator","reasoning","tool_calling","chat"]','["text"]',
+  '{"evaluation_status":"not_benchmarked","target":"single-dgx-general-agent"}','nvidia-nemotron-open-model-license','adopt-pending-benchmark'),
+ ('qwen3-coder-next','Qwen3-Coder-Next','qwen','80B-A3B',4,'Single-DGX coding-orchestrator candidate.',false,
+  '["orchestrator","code","tool_calling"]',
+  '[{"runtime":"vllm","hf_repo":"Qwen/Qwen3-Coder-Next","source_url":"https://huggingface.co/Qwen/Qwen3-Coder-Next","context_tokens":262144,"runtime_constraints":"single DGX target; validate tool parser and memory","artifact_status":"official safetensors; not acquired","quantization_status":"upstream weights"}]',true,'Qwen3-Coder-Next','["orchestrator","code","tool_calling"]','["text"]',
+  '{"evaluation_status":"not_benchmarked","target":"single-dgx-coding"}','apache-2.0','adopt-pending-benchmark'),
+ ('qwen3.6-35b-a3b','Qwen3.6-35B-A3B','qwen','35B-A3B',3,'Light-local orchestrator candidate; preserve any existing active deployment status.',false,
+  '["orchestrator","code","reasoning","tool_calling","chat"]',
+  '[{"runtime":"vllm","hf_repo":"Qwen/Qwen3.6-35B-A3B","source_url":"https://huggingface.co/Qwen/Qwen3.6-35B-A3B","context_tokens":262144,"runtime_constraints":"light local target; benchmark usable context under concurrency","artifact_status":"official safetensors","quantization_status":"benchmark installed artifact"}]',true,'Qwen3.6-35B-A3B','["orchestrator","code","reasoning","tool_calling","chat"]','["text","vision"]',
+  '{"evaluation_status":"not_benchmarked","target":"light-local"}','apache-2.0','adopt-pending-benchmark'),
+ ('gpt-oss-120b','GPT-OSS-120B','gpt-oss','117B-A5.1B',4,'Single-accelerator general orchestrator candidate using the Harmony response format.',false,
+  '["orchestrator","reasoning","tool_calling","code"]',
+  '[{"runtime":"vllm","hf_repo":"openai/gpt-oss-120b","source_url":"https://huggingface.co/openai/gpt-oss-120b","context_tokens":131072,"runtime_constraints":"single 80GB accelerator; Harmony format required","artifact_status":"official MXFP4; benchmark local artifact","quantization_status":"MXFP4"}]',true,'GPT-OSS-120B','["orchestrator","reasoning","tool_calling","code"]','["text"]',
+  '{"evaluation_status":"not_benchmarked","target":"single-accelerator-general"}','apache-2.0','adopt-pending-benchmark')
+ON CONFLICT (id) DO UPDATE SET
+ display_name=EXCLUDED.display_name, description=EXCLUDED.description,
+ preferred_workloads=EXCLUDED.preferred_workloads, tasks=EXCLUDED.tasks,
+ modalities=EXCLUDED.modalities, benchmarks=EXCLUDED.benchmarks,
+ license=EXCLUDED.license, variants=EXCLUDED.variants,
+ lifecycle=CASE WHEN fleet_model_catalog.lifecycle IN ('active','adopt','ga')
+                THEN fleet_model_catalog.lifecycle ELSE EXCLUDED.lifecycle END,
+ updated_at=NOW();
+"#;
+
 /// Cloud-fixes-local learning loop. A row is written when a cloud builder
 /// succeeds after the local retry budget was exhausted.
 pub const SCHEMA_V271_LOCAL_FAILURE_DIAGNOSES: &str = r#"
