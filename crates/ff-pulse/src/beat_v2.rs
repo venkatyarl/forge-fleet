@@ -144,6 +144,9 @@ pub struct PulseBeatV2 {
 pub struct NetworkInfo {
     pub primary_ip: String,
     pub all_ips: Vec<Ip>,
+    /// Validated physical NIC identities used for wake-on-LAN recovery.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mac_addresses: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -480,6 +483,7 @@ impl PulseBeatV2 {
             network: NetworkInfo {
                 primary_ip: String::new(),
                 all_ips: Vec::new(),
+                mac_addresses: Vec::new(),
             },
             os: OsInfo::default(),
             build_sha: None,
