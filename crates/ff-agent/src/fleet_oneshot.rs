@@ -24,10 +24,10 @@ use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
-use ff_db::queries::{RouteCandidate, RouteFilter, pg_route_deployments};
+use anyhow::{anyhow, Result};
+use ff_db::queries::{pg_route_deployments, RouteCandidate, RouteFilter};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sqlx::PgPool;
 
 /// The outcome of a one-shot fleet dispatch — the text plus who served it.
@@ -325,6 +325,15 @@ pub async fn attest_resolved_target(
 }
 
 fn matches_strict_gguf_identity(identity: &str, prefix: &str) -> bool {
+    // llama.cpp commonly reports the absolute path of the loaded first shard.
+    // Match only the final path component so directory names cannot satisfy the
+    // catalog-derived prefix. The basename rule remains exact and case-sensitive.
+    let Some(identity) = Path::new(identity.trim())
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
     if identity == format!("{prefix}.gguf") {
         return true;
     }
@@ -338,8 +347,8 @@ fn matches_strict_gguf_identity(identity: &str, prefix: &str) -> bool {
     let Some((part, total)) = shard.split_once("-of-") else {
         return false;
     };
-    if part.is_empty()
-        || total.is_empty()
+    if part.len() != 5
+        || total.len() != 5
         || !part.bytes().all(|byte| byte.is_ascii_digit())
         || !total.bytes().all(|byte| byte.is_ascii_digit())
     {
@@ -351,7 +360,7 @@ fn matches_strict_gguf_identity(identity: &str, prefix: &str) -> bool {
     let Ok(total) = total.parse::<u32>() else {
         return false;
     };
-    part > 0 && total > 0 && part <= total
+    part > 0 && total >= 2 && part <= total
 }
 
 fn shard_prefixes_from_variants(variants: &Value) -> BTreeSet<String> {
@@ -1156,8 +1165,8 @@ pub(crate) fn strip_think_block(s: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     };
 
     fn candidate(
@@ -1252,6 +1261,10 @@ mod tests {
             "zai-org_GLM-4.5-Air-Q4_K_M"
         ));
         assert!(matches_strict_gguf_identity(
+            "/home/shakira/models/llama-cpp/glm-4.5-air/zai-org_GLM-4.5-Air-Q4_K_M/zai-org_GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf",
+            "zai-org_GLM-4.5-Air-Q4_K_M"
+        ));
+        assert!(matches_strict_gguf_identity(
             "Devstral-Small-2-24B-Instruct-2512-UD-Q4_K_XL.gguf",
             "Devstral-Small-2-24B-Instruct-2512-UD-Q4_K_XL"
         ));
@@ -1263,6 +1276,21 @@ mod tests {
             "zai-org_GLM-4.5-Air-Q4_K_M-extra.gguf",
             "zai-org_GLM-4.5-Air-Q4_K_M"
         ));
+        for rejected in [
+            "/models/zai-org_GLM-4.5-Air-Q4_K_M/unrelated.gguf",
+            "evil-zai-org_GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf",
+            "zai-org_GLM-4.5-Air-Q5_K_M-00001-of-00002.gguf",
+            "zai-org_GLM-4.5-Air-Q4_K_M-0001-of-0002.gguf",
+            "zai-org_GLM-4.5-Air-Q4_K_M-00000-of-00002.gguf",
+            "zai-org_GLM-4.5-Air-Q4_K_M-00003-of-00002.gguf",
+            "zai-org_GLM-4.5-Air-Q4_K_M-00001-of-00001.gguf",
+            "zai-org_GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf.bak",
+        ] {
+            assert!(
+                !matches_strict_gguf_identity(rejected, "zai-org_GLM-4.5-Air-Q4_K_M"),
+                "unexpectedly accepted {rejected}"
+            );
+        }
     }
 
     #[test]
@@ -1341,6 +1369,30 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.served_model_id.as_deref(), Some("right.gguf"));
+        assert_eq!(result.state, EndpointAttestationState::Verified);
+        assert_eq!(chat_calls.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn attestation_accepts_exact_split_gguf_basename_from_absolute_path() {
+        let served = concat!(
+            "/home/shakira/models/llama-cpp/glm-4.5-air/",
+            "zai-org_GLM-4.5-Air-Q4_K_M/",
+            "zai-org_GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf"
+        );
+        let (endpoint, chat_calls, server) =
+            spawn_attestation_server(json!({"data": [{"id": served}]}), Duration::ZERO).await;
+        let result = attest_endpoint(
+            &reqwest::Client::new(),
+            &endpoint,
+            &BTreeSet::new(),
+            &BTreeSet::from(["zai-org_GLM-4.5-Air-Q4_K_M".to_string()]),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.served_model_id.as_deref(), Some(served));
         assert_eq!(result.state, EndpointAttestationState::Verified);
         assert_eq!(chat_calls.load(Ordering::SeqCst), 0);
         server.abort();
@@ -1652,14 +1704,12 @@ mod tests {
         // With an active build lease, the local node loses ties.
         let ordered = rank_candidates(&pool, "lily", Some("coder"), true);
         assert_eq!(ordered[0].endpoint, "http://test-prefers-marcus:1");
-        assert!(
-            ordered
-                .iter()
-                .last()
-                .unwrap()
-                .worker_name
-                .eq_ignore_ascii_case("lily")
-        );
+        assert!(ordered
+            .iter()
+            .last()
+            .unwrap()
+            .worker_name
+            .eq_ignore_ascii_case("lily"));
     }
 
     #[test]
