@@ -12581,6 +12581,26 @@ FOR EACH ROW EXECUTE FUNCTION guard_project_digest_cursor_regression();
 pub const SCHEMA_V284_MODEL_LOAD_RESERVATIONS: &str =
     include_str!("migrations/20260729160000_model_load_reservations.sql");
 
+/// v286: nullable correlation links from the global session DAG into durable
+/// workstreams and PM work items. Active `work_item_leases` remain the sole
+/// execution authority; these columns carry no ownership constraints.
+pub const SCHEMA_V286_SESSION_DAG_PM_LINKS: &str = r#"
+ALTER TABLE agent_sessions
+    ADD COLUMN IF NOT EXISTS workstream_id UUID REFERENCES ff_workstreams(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS project_id TEXT;
+
+ALTER TABLE agent_steps
+    ADD COLUMN IF NOT EXISTS work_item_id UUID REFERENCES work_items(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS checkpoint JSONB DEFAULT '{}'::jsonb;
+
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_workstream_id
+    ON agent_sessions (workstream_id);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_project_id
+    ON agent_sessions (project_id);
+CREATE INDEX IF NOT EXISTS idx_agent_steps_work_item_id
+    ON agent_steps (work_item_id);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
