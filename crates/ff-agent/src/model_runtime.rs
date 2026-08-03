@@ -6,6 +6,252 @@
 
 use std::io::Seek;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
+
+const STARTUP_TIMEOUT_ENV: &str = "FORGEFLEET_MODEL_STARTUP_TIMEOUT_SECS";
+const STARTUP_TIMEOUT_FLOOR_SECS: u64 = 120;
+const STARTUP_TIMEOUT_CAP_SECS: u64 = 1_800;
+const STARTUP_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1_500);
+const FOOTPRINT_MAX_DEPTH: usize = 6;
+const FOOTPRINT_MAX_ENTRIES: usize = 20_000;
+const FOOTPRINT_MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024 * 1024;
+const SPLIT_MAX_SHARDS: usize = 1_024;
+const CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupTimeoutSource {
+    Override,
+    ModelBytes,
+    RuntimeDefault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StartupTimeoutPolicy {
+    timeout: std::time::Duration,
+    source: StartupTimeoutSource,
+}
+
+/// Large weights can spend minutes faulting into RAM before their HTTP endpoint
+/// becomes ready. Keep the policy pure so the bounds cannot drift between the
+/// launcher and deterministic tests. The byte fallback intentionally budgets
+/// four seconds/GiB in addition to runtime setup time.
+fn startup_timeout_policy(
+    override_secs: Option<u64>,
+    model_bytes: Option<u64>,
+    runtime: &str,
+) -> StartupTimeoutPolicy {
+    let (raw_secs, source) = if let Some(secs) = override_secs {
+        (secs, StartupTimeoutSource::Override)
+    } else if let Some(bytes) = model_bytes {
+        let gib = bytes.saturating_add((1 << 30) - 1) / (1 << 30);
+        let runtime_setup = match runtime {
+            "vllm" => 120,
+            "mlx" => 45,
+            _ => 60,
+        };
+        (
+            runtime_setup + gib.saturating_mul(4),
+            StartupTimeoutSource::ModelBytes,
+        )
+    } else {
+        let secs = match runtime {
+            "vllm" => 600,
+            "mlx" => 240,
+            _ => 360,
+        };
+        (secs, StartupTimeoutSource::RuntimeDefault)
+    };
+    StartupTimeoutPolicy {
+        timeout: std::time::Duration::from_secs(
+            raw_secs.clamp(STARTUP_TIMEOUT_FLOOR_SECS, STARTUP_TIMEOUT_CAP_SECS),
+        ),
+        source,
+    }
+}
+
+fn split_gguf_parts(path: &Path) -> Option<(String, usize, usize)> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".gguf")?;
+    let (prefix_and_index, count) = stem.rsplit_once("-of-")?;
+    let (prefix, index) = prefix_and_index.rsplit_once('-')?;
+    if index.len() != 5 || count.len() != 5 {
+        return None;
+    }
+    let index = index.parse::<usize>().ok()?;
+    let count = count.parse::<usize>().ok()?;
+    (index > 0 && index <= count && count <= SPLIT_MAX_SHARDS)
+        .then(|| (prefix.to_string(), index, count))
+}
+
+fn looks_like_split_gguf(path: &Path) -> bool {
+    let Some(stem) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".gguf"))
+    else {
+        return false;
+    };
+    let Some((prefix_and_index, count)) = stem.rsplit_once("-of-") else {
+        return false;
+    };
+    let Some((_, index)) = prefix_and_index.rsplit_once('-') else {
+        return false;
+    };
+    index.len() == 5
+        && count.len() == 5
+        && index.chars().all(|c| c.is_ascii_digit())
+        && count.chars().all(|c| c.is_ascii_digit())
+}
+
+fn bounded_model_bytes_on_disk(path: &Path) -> Option<u64> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() {
+        return None;
+    }
+    if metadata.is_file() {
+        if let Some((prefix, _, count)) = split_gguf_parts(path) {
+            let parent = path.parent()?;
+            let mut total = 0u64;
+            for index in 1..=count {
+                let shard = parent.join(format!("{prefix}-{index:05}-of-{count:05}.gguf"));
+                let shard_meta = std::fs::symlink_metadata(shard).ok()?;
+                if !shard_meta.is_file() || shard_meta.file_type().is_symlink() {
+                    return None;
+                }
+                total = total.checked_add(shard_meta.len())?;
+                if total > FOOTPRINT_MAX_BYTES {
+                    return None;
+                }
+            }
+            return Some(total);
+        }
+        if looks_like_split_gguf(path) {
+            return None;
+        }
+        return Some(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return None;
+    }
+    let mut total = 0u64;
+    let mut entries = 0usize;
+    let mut stack = vec![(path.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > FOOTPRINT_MAX_DEPTH {
+            return None;
+        }
+        for entry in std::fs::read_dir(dir).ok()? {
+            let entry = entry.ok()?;
+            entries = entries.checked_add(1)?;
+            if entries > FOOTPRINT_MAX_ENTRIES {
+                return None;
+            }
+            let metadata = std::fs::symlink_metadata(entry.path()).ok()?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                let name = entry.file_name();
+                if matches!(
+                    name.to_str(),
+                    Some(".cache" | "cache" | ".git" | "__pycache__")
+                ) {
+                    continue;
+                }
+                if depth == FOOTPRINT_MAX_DEPTH {
+                    return None;
+                }
+                stack.push((entry.path(), depth + 1));
+            } else if metadata.is_file() {
+                total = total.checked_add(metadata.len())?;
+                if total > FOOTPRINT_MAX_BYTES {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(total)
+}
+
+async fn model_bytes_on_disk(path: PathBuf) -> Option<u64> {
+    tokio::task::spawn_blocking(move || bounded_model_bytes_on_disk(&path))
+        .await
+        .ok()
+        .flatten()
+}
+
+type CleanupFuture = Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+type CleanupAction = Arc<dyn Fn() -> CleanupFuture + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FencedCleanupDisposition {
+    Released,
+    Retained,
+}
+
+async fn finish_fenced_cleanup<F>(terminated: bool, release: F) -> FencedCleanupDisposition
+where
+    F: std::future::Future<Output = ()>,
+{
+    if terminated {
+        release.await;
+        FencedCleanupDisposition::Released
+    } else {
+        FencedCleanupDisposition::Retained
+    }
+}
+
+/// Owns a launched process until deployment activation takes over. Dropping
+/// the load future at any await schedules the same bounded, incarnation-fenced
+/// cleanup used by explicit failures.
+struct LaunchOwnershipGuard {
+    cleanup: Option<CleanupAction>,
+}
+
+impl LaunchOwnershipGuard {
+    fn new(cleanup: CleanupAction) -> Self {
+        Self {
+            cleanup: Some(cleanup),
+        }
+    }
+
+    async fn cleanup_now(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            // Detach cleanup before awaiting it: cancellation of the caller
+            // cannot cancel the cleanup operation it just initiated.
+            let _ = tokio::spawn(cleanup()).await;
+        }
+    }
+
+    fn disarm(&mut self) {
+        let _ = self.cleanup.take();
+    }
+}
+
+impl Drop for LaunchOwnershipGuard {
+    fn drop(&mut self) {
+        let Some(cleanup) = self.cleanup.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(cleanup());
+            }
+            Err(error) => tracing::error!(%error, "model launch guard could not schedule cleanup"),
+        }
+    }
+}
+
+async fn await_owned_startup<F, T>(guard: &mut LaunchOwnershipGuard, startup: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    // Keeping the mutable borrow across the await documents and enforces that
+    // the production ownership guard spans the complete startup operation.
+    let _ = guard;
+    startup.await
+}
 
 static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(reqwest::Client::new);
@@ -316,15 +562,31 @@ async fn load_model_with_authority(
     }
 
     let port = opts.port;
+    let timeout_override = std::env::var(STARTUP_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let model_bytes = model_bytes_on_disk(PathBuf::from(&lib.file_path)).await;
+    let startup_policy = startup_timeout_policy(timeout_override, model_bytes, &lib.runtime);
 
     // Reserve both launch identities in one short transaction and commit
     // before touching the kernel or waiting for health. The expiry is longer
     // than the bounded health wait; cleanup is token-fenced on every path.
     let reservation_token = uuid::Uuid::new_v4();
-    let reserved =
-        ff_db::pg_reserve_model_load(pool, &worker_name, port, &lib.id, reservation_token, 180)
-            .await
-            .map_err(|e| format!("reserve model load {worker_name}:{port}: {e}"))?;
+    let reservation_ttl = startup_policy
+        .timeout
+        .as_secs()
+        .saturating_add(120)
+        .min(i64::MAX as u64) as i64;
+    let reserved = ff_db::pg_reserve_model_load(
+        pool,
+        &worker_name,
+        port,
+        &lib.id,
+        reservation_token,
+        reservation_ttl,
+    )
+    .await
+    .map_err(|e| format!("reserve model load {worker_name}:{port}: {e}"))?;
     if !reserved {
         return Err(format!(
             "EADDRINUSE: {worker_name}:{port} or library {} already has an active launch reservation",
@@ -824,25 +1086,74 @@ async fn load_model_with_authority(
             ));
         }
     };
+    let cleanup_pool = pool.clone();
+    let cleanup_worker = worker_name.clone();
+    let cleanup_library = lib.id.clone();
+    let cleanup_start = launched_start.clone();
+    let cleanup_action: CleanupAction = Arc::new(move || {
+        let pool = cleanup_pool.clone();
+        let worker = cleanup_worker.clone();
+        let library = cleanup_library.clone();
+        let start = cleanup_start.clone();
+        Box::pin(async move {
+            let terminated = tokio::time::timeout(
+                CLEANUP_DEADLINE,
+                cleanup_launched_process(pid, &start, port, systemd_pid.is_some()),
+            )
+            .await
+            .unwrap_or(false);
+            let disposition = finish_fenced_cleanup(terminated, async {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    ff_db::pg_release_model_load_reservation(
+                        &pool, &worker, port, &library, reservation_token,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => tracing::warn!(%error, token = %reservation_token, "cleanup could not release model-load reservation"),
+                    Err(_) => tracing::warn!(token = %reservation_token, "timed out releasing model-load reservation; bounded expiry will recover it"),
+                }
+            })
+            .await;
+            if disposition == FencedCleanupDisposition::Retained {
+                tracing::error!(pid, port, token = %reservation_token, "termination unconfirmed; retaining fenced reservation until expiry");
+            }
+        })
+    });
+    let mut launch_guard = LaunchOwnershipGuard::new(cleanup_action);
 
-    // Wait for health endpoint to come up (up to 90s).
-    let health_ok = wait_for_health(
+    let startup_started = std::time::Instant::now();
+    tracing::info!(
+        runtime = runtime_label,
+        model_bytes,
+        override_secs = timeout_override,
+        source = ?startup_policy.source,
+        timeout_secs = startup_policy.timeout.as_secs(),
+        deadline_in_ms = startup_policy.timeout.as_millis(),
+        pid,
+        port,
+        "model_runtime: waiting for bounded model startup"
+    );
+    let health = await_owned_startup(&mut launch_guard, wait_for_startup_health(
         runtime_label,
         port,
-        std::time::Duration::from_secs(90),
+        startup_policy.timeout,
         &SHARED_HTTP,
-    )
+        pid,
+        &launched_start,
+        &launched_model_path,
+    ))
     .await;
-    let identity = inspect_listener_identity(port, pid, &launched_start, &launched_model_path).await;
-    if !health_ok || identity.is_err() {
-        let identity_error = identity
-            .err()
-            .unwrap_or_else(|| "launched endpoint did not become healthy".to_string());
-        if !cleanup_launched_process(pid, &launched_start, port, systemd_pid.is_some()).await {
-            release_reservation = false;
-        }
+    if let Err(startup_error) = health {
+        // Never signal from a stale observation. cleanup_launched_process
+        // rechecks the exact PID incarnation and confirms its termination.
+        launch_guard.cleanup_now().await;
+        release_reservation = false;
         return Err(format!(
-            "EADDRINUSE: refusing to activate {worker_name}:{port}: {identity_error}"
+            "refusing to activate {worker_name}:{port} after {}ms: {startup_error}",
+            startup_started.elapsed().as_millis()
         ));
     }
 
@@ -912,42 +1223,22 @@ async fn load_model_with_authority(
     let deployment_id = match activated {
         Ok(Some(id)) => id,
         Ok(None) => {
-            if !cleanup_launched_process(pid, &launched_start, port, systemd_pid.is_some()).await {
-                release_reservation = false;
-            }
+            launch_guard.cleanup_now().await;
+            release_reservation = false;
             return Err(format!(
                 "EADDRINUSE: placement authority changed while launching \
                  {worker_name}:{port}; preserving incumbent"
             ));
         }
         Err(e) => {
-            if !cleanup_launched_process(pid, &launched_start, port, systemd_pid.is_some()).await {
-                release_reservation = false;
-            }
+            launch_guard.cleanup_now().await;
+            release_reservation = false;
             return Err(format!("activate deployment: {e}"));
         }
     };
-
-    if !health_ok {
-        tracing::warn!(
-            pid,
-            port,
-            "inference server did not become healthy within 90s"
-        );
-        log_model_error(
-            pool,
-            &worker_name,
-            Some(&deployment_id),
-            Some(&lib.id),
-            Some(&lib.catalog_id),
-            runtime_label,
-            ModelErrorKind::Load,
-            "inference server did not become healthy within 90s",
-            serde_json::json!({"port": port, "pid": pid}),
-            tail_log_file(&log_path, 16_384).as_deref(),
-        )
-        .await;
-    }
+    // Deployment activation now owns this exact process incarnation. This is
+    // the sole success transition that disarms cancellation cleanup.
+    launch_guard.disarm();
 
     // V106: mark this library row as hot + bump last_used_at. Single
     // UPDATE per load event — no periodic ticker writes.
@@ -1651,20 +1942,85 @@ fn llama_server_binary() -> String {
     "llama-server".to_string()
 }
 
-async fn wait_for_health(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupObservation {
+    Transient,
+    Ready,
+    ProcessExited,
+    IdentityChanged,
+}
+
+fn classify_startup_observation(
+    now: std::time::Duration,
+    deadline: std::time::Duration,
+    observation: StartupObservation,
+) -> Result<bool, &'static str> {
+    match observation {
+        StartupObservation::Ready if now <= deadline => Ok(true),
+        StartupObservation::ProcessExited => Err("launched process exited during startup"),
+        StartupObservation::IdentityChanged => Err("launched process/listener identity changed"),
+        _ if now >= deadline => Err("startup health deadline expired"),
+        _ => Ok(false),
+    }
+}
+
+async fn wait_for_startup_health(
     runtime: &str,
     port: u16,
     timeout: std::time::Duration,
     client: &reqwest::Client,
-) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if probe_health(runtime, port, std::time::Duration::from_secs(2), client).await {
-            return true;
+    pid: u32,
+    start: &str,
+    model_path: &str,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let deadline = started + timeout;
+    loop {
+        if process_start_marker(pid).as_deref() != Some(start) {
+            return classify_startup_observation(
+                started.elapsed(),
+                timeout,
+                StartupObservation::ProcessExited,
+            )
+            .map(|_| ())
+            .map_err(str::to_string);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let listeners = pids_listening_on_port(port).await;
+        if !listeners.is_empty()
+            && inspect_listener_identity(port, pid, start, model_path)
+                .await
+                .is_err()
+        {
+            return classify_startup_observation(
+                started.elapsed(),
+                timeout,
+                StartupObservation::IdentityChanged,
+            )
+            .map(|_| ())
+            .map_err(|reason| format!("{reason}: kernel reports {listeners:?}"));
+        }
+
+        // Non-success responses (including llama.cpp's 503 Loading model) and
+        // connection refusal are deliberately transient until the deadline.
+        if probe_health(runtime, port, std::time::Duration::from_secs(2), client).await {
+            inspect_listener_identity(port, pid, start, model_path).await?;
+            return classify_startup_observation(
+                started.elapsed(),
+                timeout,
+                StartupObservation::Ready,
+            )
+            .map(|_| ())
+            .map_err(str::to_string);
+        }
+        let now = std::time::Instant::now();
+        if let Err(reason) =
+            classify_startup_observation(started.elapsed(), timeout, StartupObservation::Transient)
+        {
+            return Err(format!("{reason} after {}s", timeout.as_secs()));
+        }
+        tokio::time::sleep(STARTUP_PROBE_INTERVAL.min(deadline.saturating_duration_since(now)))
+            .await;
     }
-    false
 }
 
 /// Public re-export of [`probe_health`] for other modules (e.g. reconciler).
@@ -1916,6 +2272,20 @@ async fn cleanup_launched_process(pid: u32, start: &str, port: u16, systemd_owne
         return true;
     }
     if systemd_owned {
+        // The unit name is port-derived and may have been replaced while this
+        // future was cancelled. Never stop a unit whose current MainPID is a
+        // different incarnation.
+        if let Some(main_pid) = systemd_main_pid(port).await
+            && main_pid != pid
+        {
+            tracing::error!(
+                pid,
+                main_pid,
+                port,
+                "systemd launch ownership changed; retaining fence"
+            );
+            return false;
+        }
         stop_systemd_unit(port).await;
         if wait_for_process_incarnation_exit(pid, start).await {
             return true;
@@ -1935,6 +2305,23 @@ async fn cleanup_launched_process(pid: u32, start: &str, port: u16, systemd_owne
             .await;
     }
     wait_for_process_incarnation_exit(pid, start).await
+}
+
+#[cfg(target_os = "linux")]
+async fn systemd_main_pid(port: u16) -> Option<u32> {
+    let unit = format!("llama-{port}.service");
+    let output = tokio::process::Command::new("systemctl")
+        .args(["--user", "show", "-p", "MainPID", "--value", &unit])
+        .output()
+        .await
+        .ok()?;
+    output.status.success().then_some(())?;
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn systemd_main_pid(_port: u16) -> Option<u32> {
+    None
 }
 
 /// Cleanup for the narrow failure where a just-launched PID could not be
@@ -2402,6 +2789,328 @@ async fn write_systemd_unit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_timeout_override_precedes_fallback_and_clamps() {
+        assert_eq!(
+            startup_timeout_policy(Some(300), Some(u64::MAX), "vllm")
+                .timeout
+                .as_secs(),
+            300
+        );
+        assert_eq!(
+            startup_timeout_policy(Some(1), None, "llama.cpp")
+                .timeout
+                .as_secs(),
+            STARTUP_TIMEOUT_FLOOR_SECS
+        );
+        assert_eq!(
+            startup_timeout_policy(Some(u64::MAX), None, "mlx")
+                .timeout
+                .as_secs(),
+            STARTUP_TIMEOUT_CAP_SECS
+        );
+        assert_eq!(
+            startup_timeout_policy(Some(300), None, "mlx").source,
+            StartupTimeoutSource::Override
+        );
+    }
+
+    #[test]
+    fn startup_timeout_byte_fallback_obeys_floor_and_cap() {
+        let tiny = startup_timeout_policy(None, Some(1), "llama.cpp");
+        let huge = startup_timeout_policy(None, Some(u64::MAX), "vllm");
+        assert_eq!(tiny.timeout.as_secs(), STARTUP_TIMEOUT_FLOOR_SECS);
+        assert_eq!(huge.timeout.as_secs(), STARTUP_TIMEOUT_CAP_SECS);
+        assert_eq!(tiny.source, StartupTimeoutSource::ModelBytes);
+    }
+
+    #[test]
+    fn direct_split_gguf_footprint_sums_every_expected_shard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("model-00001-of-00003.gguf");
+        std::fs::write(&first, vec![0u8; 11]).unwrap();
+        std::fs::write(tmp.path().join("model-00002-of-00003.gguf"), vec![0u8; 13]).unwrap();
+        std::fs::write(tmp.path().join("model-00003-of-00003.gguf"), vec![0u8; 17]).unwrap();
+        assert_eq!(bounded_model_bytes_on_disk(&first), Some(41));
+
+        std::fs::remove_file(tmp.path().join("model-00002-of-00003.gguf")).unwrap();
+        assert_eq!(bounded_model_bytes_on_disk(&first), None);
+
+        let invalid = tmp.path().join("model-00001-of-00000.gguf");
+        std::fs::write(&invalid, vec![0u8; 99]).unwrap();
+        assert_eq!(bounded_model_bytes_on_disk(&invalid), None);
+    }
+
+    #[test]
+    fn footprint_traversal_is_depth_bounded_and_does_not_follow_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("cache.bin"), vec![0u8; 100]).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("cache-link")).unwrap();
+        std::fs::write(tmp.path().join("weights.bin"), vec![0u8; 7]).unwrap();
+        assert_eq!(bounded_model_bytes_on_disk(tmp.path()), Some(7));
+
+        let mut deep = tmp.path().join("deep");
+        for _ in 0..=FOOTPRINT_MAX_DEPTH {
+            std::fs::create_dir_all(&deep).unwrap();
+            deep = deep.join("next");
+        }
+        assert_eq!(bounded_model_bytes_on_disk(tmp.path()), None);
+    }
+
+    #[tokio::test]
+    async fn production_launch_guard_cleans_once_on_future_cancellation() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notified = Arc::new(tokio::sync::Notify::new());
+        let armed = Arc::new(tokio::sync::Notify::new());
+        let action: CleanupAction = {
+            let calls = calls.clone();
+            let notified = notified.clone();
+            Arc::new(move || {
+                let calls = calls.clone();
+                let notified = notified.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    notified.notify_one();
+                })
+            })
+        };
+        let task = tokio::spawn({
+            let armed = armed.clone();
+            async move {
+                let mut guard = LaunchOwnershipGuard::new(action);
+                armed.notify_one();
+                await_owned_startup(&mut guard, std::future::pending::<()>()).await;
+            }
+        });
+        armed.notified().await;
+        task.abort();
+        notified.notified().await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn production_launch_guard_disarms_only_after_ready_activation() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let action: CleanupAction = {
+            let calls = calls.clone();
+            Arc::new(move || {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+        };
+        let mut guard = LaunchOwnershipGuard::new(action);
+        let ready = await_owned_startup(&mut guard, async { Ok::<_, String>(()) }).await;
+        assert!(ready.is_ok());
+        guard.disarm();
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn production_launch_guard_explicit_cleanup_is_exactly_once() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let action: CleanupAction = {
+            let calls = calls.clone();
+            Arc::new(move || {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+        };
+        let mut guard = LaunchOwnershipGuard::new(action);
+        guard.cleanup_now().await;
+        guard.cleanup_now().await;
+        drop(guard);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn production_guard_covers_ready_503_early_exit_and_stale_identity() {
+        async fn run(
+            observation: StartupObservation,
+            elapsed: u64,
+        ) -> (Result<bool, &'static str>, usize) {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let action: CleanupAction = {
+                let calls = calls.clone();
+                Arc::new(move || {
+                    let calls = calls.clone();
+                    Box::pin(async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    })
+                })
+            };
+            let mut guard = LaunchOwnershipGuard::new(action);
+            let result = await_owned_startup(&mut guard, async move {
+                classify_startup_observation(
+                    std::time::Duration::from_secs(elapsed),
+                    std::time::Duration::from_secs(120),
+                    observation,
+                )
+            })
+            .await;
+            if result == Ok(true) {
+                guard.disarm();
+            }
+            drop(guard);
+            tokio::task::yield_now().await;
+            (result, calls.load(std::sync::atomic::Ordering::SeqCst))
+        }
+
+        assert_eq!(run(StartupObservation::Ready, 119).await, (Ok(true), 0));
+        assert_eq!(
+            run(StartupObservation::Transient, 119).await,
+            (Ok(false), 1)
+        );
+        assert_eq!(
+            run(StartupObservation::Transient, 120).await,
+            (Err("startup health deadline expired"), 1)
+        );
+        assert_eq!(
+            run(StartupObservation::ProcessExited, 1).await,
+            (Err("launched process exited during startup"), 1)
+        );
+        assert_eq!(
+            run(StartupObservation::IdentityChanged, 1).await,
+            (Err("launched process/listener identity changed"), 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn production_cleanup_retains_fence_when_termination_is_unconfirmed() {
+        let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release_count = releases.clone();
+        let disposition = finish_fenced_cleanup(false, async move {
+            release_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(disposition, FencedCleanupDisposition::Retained);
+        assert_eq!(releases.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn production_cleanup_is_graceful_then_escalates_and_fences_stale_marker() {
+        fn spawn_ignoring_term() -> (std::process::Child, u32, String) {
+            let child = std::process::Command::new("sh")
+                .args(["-c", "trap '' TERM; exec sleep 30"])
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let start = process_start_marker(pid).unwrap();
+            (child, pid, start)
+        }
+
+        let (mut child, pid, start) = spawn_ignoring_term();
+        let reaper = std::thread::spawn(move || child.wait());
+        assert!(cleanup_launched_process(pid, &start, 0, false).await);
+        let _ = reaper.join();
+
+        let (mut replacement, replacement_pid, replacement_start) = spawn_ignoring_term();
+        assert!(cleanup_launched_process(replacement_pid, "stale-marker", 0, false).await);
+        assert_eq!(
+            process_start_marker(replacement_pid).as_deref(),
+            Some(replacement_start.as_str())
+        );
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &replacement_pid.to_string()])
+            .status();
+        let _ = replacement.wait();
+    }
+
+    #[test]
+    fn startup_observations_are_deadline_and_identity_fenced() {
+        let deadline = std::time::Duration::from_secs(300);
+        assert_eq!(
+            classify_startup_observation(
+                deadline - std::time::Duration::from_nanos(1),
+                deadline,
+                StartupObservation::Ready
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            classify_startup_observation(deadline, deadline, StartupObservation::Transient),
+            Err("startup health deadline expired")
+        );
+        assert_eq!(
+            classify_startup_observation(
+                std::time::Duration::ZERO,
+                deadline,
+                StartupObservation::ProcessExited
+            ),
+            Err("launched process exited during startup")
+        );
+        assert_eq!(
+            classify_startup_observation(
+                std::time::Duration::ZERO,
+                deadline,
+                StartupObservation::IdentityChanged
+            ),
+            Err("launched process/listener identity changed")
+        );
+    }
+
+    #[test]
+    fn persistent_503_is_transient_until_timeout() {
+        let deadline = std::time::Duration::from_secs(120);
+        assert_eq!(
+            classify_startup_observation(
+                std::time::Duration::from_secs(119),
+                deadline,
+                StartupObservation::Transient
+            ),
+            Ok(false)
+        );
+        assert!(
+            classify_startup_observation(deadline, deadline, StartupObservation::Transient)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cleanup_outcomes_escalate_retain_and_delete_exactly_once() {
+        #[derive(Default)]
+        struct CleanupOutcome {
+            term: usize,
+            kill: usize,
+            delete: usize,
+            retained: bool,
+        }
+        fn simulate(alive_after_term: bool, alive_after_kill: bool) -> CleanupOutcome {
+            let mut out = CleanupOutcome {
+                term: 1,
+                ..CleanupOutcome::default()
+            };
+            if alive_after_term {
+                out.kill += 1;
+            }
+            if alive_after_term && alive_after_kill {
+                out.retained = true;
+            } else {
+                out.delete += 1;
+            }
+            out
+        }
+
+        let graceful = simulate(false, false);
+        assert_eq!((graceful.term, graceful.kill, graceful.delete), (1, 0, 1));
+        let escalated = simulate(true, false);
+        assert_eq!(
+            (escalated.term, escalated.kill, escalated.delete),
+            (1, 1, 1)
+        );
+        let unconfirmed = simulate(true, true);
+        assert_eq!((unconfirmed.delete, unconfirmed.retained), (0, true));
+    }
 
     #[test]
     fn systemd_ld_library_path_prepends_bindir_and_preserves_prev() {
