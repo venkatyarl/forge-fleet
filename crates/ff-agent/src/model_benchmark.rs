@@ -1,6 +1,6 @@
 //! Model benchmarker — measures tokens/sec and TTFT for a loaded model on
 //! a specific computer and writes the result into
-//! `model_catalog.benchmark_results` (a JSONB column that accumulates runs
+//! `fleet_model_catalog.benchmarks` (a JSONB column that accumulates runs
 //! keyed by `"<computer>:<iso-timestamp>"`).
 //!
 //! How it works:
@@ -11,7 +11,7 @@
 //!      against `/v1/chat/completions` with `stream=true` so we can
 //!      capture time-to-first-token.
 //!   3. Roll up: mean tokens/sec, mean TTFT, max context seen, etc.
-//!   4. Append the result to `model_catalog.benchmark_results`.
+//!   4. Append the result to `fleet_model_catalog.benchmarks`.
 //!
 //! v1 scope: latency + throughput only. MMLU accuracy / perplexity /
 //! out-of-distribution generalization are explicitly out of scope.
@@ -96,7 +96,7 @@ impl ModelBenchmarker {
     }
 
     /// Benchmark a specific model on a specific computer. Writes into
-    /// `model_catalog.benchmark_results`. Fails with `BenchError::NotLoaded`
+    /// `fleet_model_catalog.benchmarks`. Fails with `BenchError::NotLoaded`
     /// if the model isn't actively serving there.
     pub async fn benchmark(
         &self,
@@ -290,11 +290,16 @@ fn standard_prompt_suite() -> Vec<String> {
     ]
 }
 
-/// Row shape we need to decide whether a model can run on a given node.
+/// One canonical runtime artifact that can make a model benchmarkable.
+#[derive(Debug, Clone, PartialEq)]
+struct CatalogVariantReq {
+    runtime: String,
+    size_gb: f64,
+}
+
+/// Canonical row shape used to decide whether a model can run on a node.
 struct CatalogReqs {
-    required_gpu_kind: Option<String>,
-    min_vram_gb: Option<f64>,
-    file_size_gb: Option<f64>,
+    variants: Vec<CatalogVariantReq>,
 }
 
 async fn fetch_catalog_reqs(
@@ -302,21 +307,81 @@ async fn fetch_catalog_reqs(
     model_id: &str,
 ) -> Result<Option<CatalogReqs>, BenchError> {
     let row = sqlx::query(
-        "SELECT required_gpu_kind, min_vram_gb, file_size_gb
-           FROM model_catalog
-          WHERE id = $1",
+        "SELECT variants
+           FROM fleet_model_catalog
+          WHERE id = $1
+            AND COALESCE(lifecycle, 'active') <> 'retired'",
     )
     .bind(model_id)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|r| {
         use sqlx::Row as _;
+        let variants: serde_json::Value = r.get("variants");
         CatalogReqs {
-            required_gpu_kind: r.get("required_gpu_kind"),
-            min_vram_gb: r.get("min_vram_gb"),
-            file_size_gb: r.get("file_size_gb"),
+            variants: catalog_variant_requirements(&variants),
         }
     }))
+}
+
+fn catalog_variant_requirements(variants: &serde_json::Value) -> Vec<CatalogVariantReq> {
+    variants
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|variant| {
+            let runtime = variant
+                .get("runtime")
+                .and_then(serde_json::Value::as_str)?
+                .trim()
+                .to_ascii_lowercase();
+            let size_gb = variant
+                .get("size_gb")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|size| size.is_finite() && *size > 0.0)?;
+            matches!(runtime.as_str(), "llama.cpp" | "mlx" | "vllm")
+                .then_some(CatalogVariantReq { runtime, size_gb })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn variant_fits_host(
+    variant: &CatalogVariantReq,
+    gpu_kind: &str,
+    can_run_cuda: bool,
+    can_run_metal: bool,
+    max_runnable_model_gb: Option<f64>,
+    ram_available_gb: f64,
+    vram_free_gb: Option<f64>,
+    disk_free_gb: f64,
+) -> bool {
+    const CAPACITY_SLACK_GB: f64 = 2.0;
+    const DISK_SLACK_GB: f64 = 5.0;
+    if disk_free_gb < variant.size_gb + DISK_SLACK_GB {
+        return false;
+    }
+
+    let runtime_compatible = match variant.runtime.as_str() {
+        "llama.cpp" => true,
+        "mlx" => can_run_metal || gpu_kind == "apple_silicon",
+        "vllm" => can_run_cuda || gpu_kind == "nvidia_cuda",
+        _ => false,
+    };
+    if !runtime_compatible {
+        return false;
+    }
+
+    let live_capacity_gb = match variant.runtime.as_str() {
+        // A vLLM artifact is GPU-resident. Do not treat ordinary host RAM as
+        // evidence that the node has enough free CUDA memory.
+        "vllm" => vram_free_gb.unwrap_or(0.0),
+        _ => ram_available_gb.max(vram_free_gb.unwrap_or(0.0)),
+    };
+    let proven_capacity_gb = max_runnable_model_gb
+        .map(|capacity| capacity.min(live_capacity_gb))
+        .unwrap_or(live_capacity_gb);
+    proven_capacity_gb >= variant.size_gb + CAPACITY_SLACK_GB
 }
 
 fn gpu_priority(kind: &str) -> u8 {
@@ -333,13 +398,13 @@ fn gpu_priority(kind: &str) -> u8 {
 
 /// Pick the best node in the fleet to run a benchmark for `model_id`.
 ///
-/// Filters (per spec):
-///   - `gpu_kind` matches `model_catalog.required_gpu_kind` if one is set;
-///     otherwise prefers GPU members over CPU-only ones.
-///   - `ram_gb` is at least `min_vram_gb` (used as a coarse "does it fit
-///     in memory" check for CPU-only runs when `required_gpu_kind IS NULL`).
-///   - `disk_free_gb` is at least `file_size_gb + 5` so the model can be
-///     staged on disk if it isn't already.
+/// Filters (per canonical variant):
+///   - runtime is one of the chat-serving runtimes (`llama.cpp`, `mlx`, `vllm`)
+///     and is compatible with the node's live capabilities;
+///   - live available RAM/VRAM plus `max_runnable_model_gb` prove the artifact
+///     fits with 2 GiB of headroom;
+///   - `disk_free_gb` is at least variant `size_gb + 5` so the model can be
+///     staged if it is not already resident.
 ///
 /// Ordering:
 ///   1. GPU priority (apple_silicon < nvidia_cuda < amd_rocm < integrated < none).
@@ -352,8 +417,9 @@ pub async fn pick_benchmark_target(
     model_id: &str,
 ) -> Result<Option<String>, BenchError> {
     let reqs = match fetch_catalog_reqs(pool, model_id).await? {
-        Some(r) => r,
+        Some(r) if !r.variants.is_empty() => r,
         None => return Ok(None),
+        Some(_) => return Ok(None),
     };
 
     let beats = pulse
@@ -370,31 +436,19 @@ pub async fn pick_benchmark_target(
         }
 
         let gpu_kind = b.capabilities.gpu_kind.as_str();
-
-        // GPU-kind filter.
-        match reqs.required_gpu_kind.as_deref() {
-            Some(required) if !required.is_empty() => {
-                if gpu_kind != required {
-                    continue;
-                }
-            }
-            _ => {
-                // No hard requirement — we'll still rank by gpu_priority
-                // below so GPU nodes naturally win ties against CPU nodes.
-            }
-        }
-
-        // RAM fit check (used as "does the model fit?").
-        if let Some(min_vram) = reqs.min_vram_gb
-            && (b.hardware.ram_gb as f64) < min_vram
-        {
-            continue;
-        }
-
-        // Disk headroom check: file_size + 5GB slack.
-        if let Some(fs_gb) = reqs.file_size_gb
-            && b.load.disk_free_gb < fs_gb + 5.0
-        {
+        let fits = reqs.variants.iter().any(|variant| {
+            variant_fits_host(
+                variant,
+                gpu_kind,
+                b.capabilities.can_run_cuda,
+                b.capabilities.can_run_metal,
+                b.capabilities.max_runnable_model_gb,
+                b.memory.ram_available_for_new_llm_gb,
+                b.memory.vram_free_gb,
+                b.load.disk_free_gb,
+            )
+        });
+        if !fits {
             continue;
         }
 
@@ -477,5 +531,91 @@ mod tests {
         let back: BenchmarkReport = serde_json::from_str(&s).unwrap();
         assert!(back.bench_pass);
         assert_eq!(back.tokens_per_sec, 42.5);
+    }
+
+    #[test]
+    fn canonical_variant_requirements_reject_unknown_or_unbounded_artifacts() {
+        let variants = serde_json::json!([
+            {"runtime": "llama.cpp", "size_gb": 12.5},
+            {"runtime": "MLX", "size_gb": 8.0},
+            {"runtime": "diffusers", "size_gb": 4.0},
+            {"runtime": "vllm"},
+            {"runtime": "vllm", "size_gb": -1.0}
+        ]);
+        assert_eq!(
+            catalog_variant_requirements(&variants),
+            vec![
+                CatalogVariantReq {
+                    runtime: "llama.cpp".to_string(),
+                    size_gb: 12.5
+                },
+                CatalogVariantReq {
+                    runtime: "mlx".to_string(),
+                    size_gb: 8.0
+                }
+            ]
+        );
+        assert!(catalog_variant_requirements(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn canonical_variant_fit_is_runtime_and_capacity_aware() {
+        let vllm = CatalogVariantReq {
+            runtime: "vllm".to_string(),
+            size_gb: 20.0,
+        };
+        assert!(variant_fits_host(
+            &vllm,
+            "nvidia_cuda",
+            true,
+            false,
+            Some(100.0),
+            100.0,
+            Some(30.0),
+            100.0
+        ));
+        assert!(!variant_fits_host(
+            &vllm,
+            "none",
+            false,
+            false,
+            Some(100.0),
+            100.0,
+            None,
+            100.0
+        ));
+        assert!(!variant_fits_host(
+            &vllm,
+            "nvidia_cuda",
+            true,
+            false,
+            Some(10.0),
+            100.0,
+            Some(30.0),
+            100.0
+        ));
+        assert!(!variant_fits_host(
+            &vllm,
+            "nvidia_cuda",
+            true,
+            false,
+            Some(100.0),
+            100.0,
+            Some(30.0),
+            24.0
+        ));
+        assert!(!variant_fits_host(
+            &CatalogVariantReq {
+                runtime: "vllm".to_string(),
+                size_gb: 40.0,
+            },
+            "nvidia_cuda",
+            true,
+            false,
+            Some(100.0),
+            100.0,
+            Some(30.0),
+            100.0
+        ));
     }
 }
