@@ -3611,13 +3611,20 @@ async fn healthy_backends_from_config(config: &FleetConfig) -> Vec<BackendEndpoi
 }
 
 fn parse_task_type(raw: &str) -> TaskType {
-    match raw.trim().to_ascii_lowercase().as_str() {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
         "code" => TaskType::Code,
         "reasoning" => TaskType::Reasoning,
         "summary" => TaskType::Summary,
         "translation" => TaskType::Translation,
         "review" => TaskType::Review,
         "debug" => TaskType::Debug,
+        _ if normalized.contains("code") || normalized.contains("coding") => TaskType::Code,
+        _ if normalized.contains("debug") || normalized.contains("recovery") => TaskType::Debug,
+        _ if normalized.contains("review") => TaskType::Review,
+        _ if normalized.contains("reason") || normalized.contains("orchestrat") => {
+            TaskType::Reasoning
+        }
         _ => TaskType::Chat,
     }
 }
@@ -4218,6 +4225,14 @@ mod tests {
         assert_eq!(parse_task_type("review"), TaskType::Review);
         assert_eq!(parse_task_type("debug"), TaskType::Debug);
         assert_eq!(parse_task_type("unknown"), TaskType::Chat);
+        assert_eq!(
+            parse_task_type("long-horizon coding orchestrator"),
+            TaskType::Code
+        );
+        assert_eq!(
+            parse_task_type("tool-using orchestrator"),
+            TaskType::Reasoning
+        );
     }
 
     #[test]

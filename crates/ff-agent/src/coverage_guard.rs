@@ -310,7 +310,7 @@ impl CoverageGuard {
         // so crediting them produces false coverage. `deprecated` rows are on
         // the way out. Operator-blessed `active` rows are the source of truth.
         let cat_rows =
-            sqlx::query("SELECT id, tasks FROM model_catalog WHERE lifecycle_status = 'active'")
+            sqlx::query("SELECT id, tasks FROM fleet_model_catalog WHERE lifecycle IN ('active', 'adopt', 'ga')")
                 .fetch_all(&self.pg)
                 .await?;
 
@@ -457,20 +457,18 @@ impl CoverageGuard {
         true
     }
 
-    /// Rank candidate catalog rows for a task. Preferred ids from the
-    /// coverage row sort first; then `quality_tier='flagship'` ahead
-    /// of `'standard'`; then smallest `file_size_gb` (so low-RAM boxes
-    /// get a shot); Q4 quants tie-break ahead of larger quants.
+    /// Rank adopted canonical catalog rows for a task. Preferred ids sort
+    /// first, then higher catalog tier, then stable id order.
     async fn rank_candidates(
         &self,
         task: &str,
         preferred: &[String],
     ) -> Result<Vec<Candidate>, sqlx::Error> {
         let rows = sqlx::query(
-            "SELECT id, quality_tier, quantization, file_size_gb, min_vram_gb
-             FROM model_catalog
+            "SELECT id, tier
+             FROM fleet_model_catalog
              WHERE tasks @> to_jsonb(ARRAY[$1]::text[])
-               AND lifecycle_status = 'active'",
+               AND lifecycle IN ('active', 'adopt', 'ga')",
         )
         .bind(task)
         .fetch_all(&self.pg)
@@ -483,10 +481,8 @@ impl CoverageGuard {
                 Candidate {
                     preferred: preferred.iter().any(|p| p == &id),
                     id,
-                    quality_tier: r.get("quality_tier"),
-                    quantization: r.get("quantization"),
-                    file_size_gb: r.get("file_size_gb"),
-                    min_vram_gb: r.get("min_vram_gb"),
+                    tier: r.get("tier"),
+                    min_vram_gb: None,
                 }
             })
             .collect();
@@ -495,32 +491,10 @@ impl CoverageGuard {
             let a_pref = if a.preferred { 0 } else { 1 };
             let b_pref = if b.preferred { 0 } else { 1 };
 
-            let a_tier = tier_rank(a.quality_tier.as_deref());
-            let b_tier = tier_rank(b.quality_tier.as_deref());
-
-            let a_q4 = if is_q4(a.quantization.as_deref()) {
-                0
-            } else {
-                1
-            };
-            let b_q4 = if is_q4(b.quantization.as_deref()) {
-                0
-            } else {
-                1
-            };
-
-            let a_size = a.file_size_gb.unwrap_or(f64::MAX);
-            let b_size = b.file_size_gb.unwrap_or(f64::MAX);
-
             a_pref
                 .cmp(&b_pref)
-                .then(a_tier.cmp(&b_tier))
-                .then(a_q4.cmp(&b_q4))
-                .then(
-                    a_size
-                        .partial_cmp(&b_size)
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
+                .then(b.tier.cmp(&a.tier))
+                .then(a.id.cmp(&b.id))
         });
 
         Ok(candidates)
@@ -600,9 +574,7 @@ impl CoverageGuard {
 struct Candidate {
     id: String,
     preferred: bool,
-    quality_tier: Option<String>,
-    quantization: Option<String>,
-    file_size_gb: Option<f64>,
+    tier: i32,
     min_vram_gb: Option<f64>,
 }
 
@@ -779,33 +751,9 @@ pub fn catalog_matches(dep_norm: &str, cat_norm: &str) -> bool {
     dep_norm == cat_norm || dep_norm.starts_with(&format!("{cat_norm}-"))
 }
 
-fn tier_rank(tier: Option<&str>) -> u8 {
-    match tier {
-        Some("flagship") => 0,
-        Some("standard") => 1,
-        Some("experimental") => 2,
-        _ => 3,
-    }
-}
-
-fn is_q4(q: Option<&str>) -> bool {
-    q.map(|s| {
-        let lo = s.to_ascii_lowercase();
-        lo.contains("q4") || lo.contains("4bit") || lo.contains("int4")
-    })
-    .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tier_ranks_flagship_first() {
-        assert!(tier_rank(Some("flagship")) < tier_rank(Some("standard")));
-        assert!(tier_rank(Some("standard")) < tier_rank(Some("experimental")));
-        assert!(tier_rank(None) > tier_rank(Some("experimental")));
-    }
 
     #[test]
     fn loadable_gap_count_counts_only_gaps_with_candidates() {
@@ -1046,14 +994,5 @@ mod tests {
         );
         assert!(json_str_array(serde_json::json!(null)).is_empty());
         assert!(json_str_array(serde_json::json!("notarray")).is_empty());
-    }
-
-    #[test]
-    fn q4_detected() {
-        assert!(is_q4(Some("Q4_K_M")));
-        assert!(is_q4(Some("q4_0")));
-        assert!(is_q4(Some("4bit")));
-        assert!(!is_q4(Some("Q8_0")));
-        assert!(!is_q4(None));
     }
 }
