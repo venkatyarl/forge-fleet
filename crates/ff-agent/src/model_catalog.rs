@@ -127,7 +127,7 @@ pub async fn sync_catalog(pool: &PgPool) -> Result<usize, String> {
                 "model_catalog.sync_catalog: TOML retired; canonical V14 rows come from migration V39"
             );
         }
-        return Ok(0);
+        return reconcile_canonical_capabilities(pool).await;
     }
 
     // Dev path: a TOML override exists — replay it into the legacy table.
@@ -138,5 +138,57 @@ pub async fn sync_catalog(pool: &PgPool) -> Result<usize, String> {
             .map_err(|e| format!("upsert {}: {}", row.id, e))?;
         synced += 1;
     }
-    Ok(synced)
+    Ok(synced + reconcile_canonical_capabilities(pool).await?)
+}
+
+/// Repair canonical capabilities without replacing malformed or absent data.
+/// The guarded UPDATE is idempotent and preserves every existing JSON element.
+async fn reconcile_canonical_capabilities(pool: &PgPool) -> Result<usize, String> {
+    let result = sqlx::query(
+        r#"
+        UPDATE model_catalog
+           SET preferred_workloads = preferred_workloads || jsonb_build_array('code'),
+               tool_calling = TRUE
+         WHERE id = 'devstral-small-2-24b'
+           AND CASE WHEN jsonb_typeof(preferred_workloads) = 'array' THEN NOT EXISTS (
+               SELECT 1 FROM jsonb_array_elements_text(preferred_workloads) workload
+                WHERE workload = 'code'
+           ) ELSE FALSE END
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("reconcile devstral-small-2-24b capabilities: {e}"))?;
+    Ok(result.rows_affected() as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn database_url() -> Option<String> {
+        std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()
+    }
+
+    #[tokio::test]
+    async fn devstral_reconciliation_is_idempotent_and_preserves_metadata() {
+        let Some(url) = database_url() else { return };
+        let pool = PgPool::connect(&url).await.expect("connect test Postgres");
+        let mut tx = pool.begin().await.expect("begin");
+        sqlx::query("UPDATE model_catalog SET preferred_workloads = '[\"reasoning\",\"tool_calling\"]'::jsonb, tool_calling = TRUE WHERE id = 'devstral-small-2-24b'")
+            .execute(&mut *tx).await.expect("seed");
+        let before: serde_json::Value = sqlx::query_scalar("SELECT to_jsonb(m) - 'preferred_workloads' FROM model_catalog m WHERE id = 'devstral-small-2-24b'")
+            .fetch_one(&mut *tx).await.expect("snapshot");
+        let first = sqlx::query("UPDATE model_catalog SET preferred_workloads = preferred_workloads || jsonb_build_array('code'), tool_calling = TRUE WHERE id = 'devstral-small-2-24b' AND jsonb_typeof(preferred_workloads) = 'array' AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(preferred_workloads) w WHERE w = 'code')")
+            .execute(&mut *tx).await.expect("first").rows_affected();
+        let second = sqlx::query("UPDATE model_catalog SET preferred_workloads = preferred_workloads || jsonb_build_array('code'), tool_calling = TRUE WHERE id = 'devstral-small-2-24b' AND jsonb_typeof(preferred_workloads) = 'array' AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(preferred_workloads) w WHERE w = 'code')")
+            .execute(&mut *tx).await.expect("second").rows_affected();
+        let after: serde_json::Value = sqlx::query_scalar("SELECT to_jsonb(m) - 'preferred_workloads' FROM model_catalog m WHERE id = 'devstral-small-2-24b'")
+            .fetch_one(&mut *tx).await.expect("snapshot");
+        assert_eq!((first, second), (1, 0));
+        assert_eq!(before, after);
+        tx.rollback().await.expect("rollback");
+    }
 }
