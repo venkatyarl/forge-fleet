@@ -1418,6 +1418,24 @@ fn expand_tilde(s: &str) -> String {
 /// per-method refresh fns so `latest_version` is current. Method-agnostic —
 /// handles self_built, npm_registry, pypi, github_release, etc. uniformly.
 async fn flip_drift_status(pool: &PgPool) -> Result<u64> {
+    // Exact equality for ordinary package versions, plus guarded SHA-prefix
+    // equality for Git collectors that still report a 7-39 character commit.
+    // The hex/length guards keep values such as semver and release tags from
+    // being treated as prefixes of one another.
+    const VERSIONS_MATCH_SQL: &str = r#"
+        (
+          cs.installed_version = sr.latest_version
+          OR (
+            btrim(cs.installed_version) ~* '^[0-9a-f]{7,40}$'
+            AND btrim(sr.latest_version) ~* '^[0-9a-f]{7,40}$'
+            AND (
+              lower(btrim(cs.installed_version)) LIKE lower(btrim(sr.latest_version)) || '%'
+              OR lower(btrim(sr.latest_version)) LIKE lower(btrim(cs.installed_version)) || '%'
+            )
+          )
+        )
+    "#;
+
     // Rewrites status from authoritative inputs (installed_version,
     // latest_version, leader's git_state) so the field stays accurate
     // tick-to-tick instead of drifting after a transient leader-dirty
@@ -1434,7 +1452,7 @@ async fn flip_drift_status(pool: &PgPool) -> Result<u64> {
     // Both clauses are scoped to status IN ('ok', 'upgrade_available',
     // 'upgrade_blocked_dirty') so we never clobber `upgrading` /
     // `failed` / other in-flight terminal states.
-    let unblocked = sqlx::query(
+    let unblocked_sql = format!(
         r#"
         UPDATE computer_software cs
            SET status = 'upgrade_available'
@@ -1443,7 +1461,7 @@ async fn flip_drift_status(pool: &PgPool) -> Result<u64> {
            AND sr.latest_version IS NOT NULL
            AND sr.latest_version <> ''
            AND cs.installed_version IS NOT NULL
-           AND cs.installed_version <> sr.latest_version
+           AND NOT {VERSIONS_MATCH_SQL}
            AND cs.status IN ('ok', 'upgrade_blocked_dirty')
            AND (
              sr.id NOT IN ('ff_git', 'forgefleetd_git')
@@ -1456,10 +1474,11 @@ async fn flip_drift_status(pool: &PgPool) -> Result<u64> {
              )
            )
         "#,
-    )
-    .execute(pool)
-    .await
-    .context("flip drift status — unblock")?;
+    );
+    let unblocked = sqlx::query(&unblocked_sql)
+        .execute(pool)
+        .await
+        .context("flip drift status — unblock")?;
 
     let blocked = sqlx::query(
         r#"
@@ -1489,7 +1508,7 @@ async fn flip_drift_status(pool: &PgPool) -> Result<u64> {
     // `installed_version <> latest_version` (drift), and after a successful
     // wave there is no drift. Observed on 2026-05-20 after two-round
     // forgefleetd_git upgrade left 14/14 hosts at HEAD but still flagged.
-    let converged = sqlx::query(
+    let converged_sql = format!(
         r#"
         UPDATE computer_software cs
            SET status = 'ok'
@@ -1497,7 +1516,7 @@ async fn flip_drift_status(pool: &PgPool) -> Result<u64> {
          WHERE sr.id = cs.software_id
            AND sr.latest_version IS NOT NULL
            AND sr.latest_version <> ''
-           AND cs.installed_version = sr.latest_version
+           AND {VERSIONS_MATCH_SQL}
            AND cs.status = 'upgrade_blocked_dirty'
            AND (
              sr.id NOT IN ('ff_git', 'forgefleetd_git')
@@ -1510,10 +1529,11 @@ async fn flip_drift_status(pool: &PgPool) -> Result<u64> {
              )
            )
         "#,
-    )
-    .execute(pool)
-    .await
-    .context("flip drift status — clear converged stale dirty")?;
+    );
+    let converged = sqlx::query(&converged_sql)
+        .execute(pool)
+        .await
+        .context("flip drift status — clear converged stale dirty")?;
 
     Ok(unblocked.rows_affected() + blocked.rows_affected() + converged.rows_affected())
 }
