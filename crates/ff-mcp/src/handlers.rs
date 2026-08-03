@@ -39,7 +39,9 @@ use ff_pipeline::step::{Step, StepId, StepKind, StepStatus};
 use ff_runtime::engine::EngineConfig;
 use ff_runtime::model_manager::ModelManager;
 use ff_runtime::process_manager::ProcessManager;
-use ff_ssh::{RemoteExecutor, SshNodeConfig};
+use ff_ssh::{
+    RemoteExecutor, SshConnection, SshConnectionError, SshConnectionOptions, SshNodeConfig,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tracing::{info, warn};
@@ -526,16 +528,31 @@ pub async fn fleet_ssh(params: Option<Value>) -> HandlerResult {
         ssh_node.username = u;
     }
 
-    let executor = RemoteExecutor::new(timeout_secs, true);
-    let result = executor
-        .run_on_node(ssh_node.clone(), command.to_string(), use_sudo)
+    let mut options = SshConnectionOptions::from_node(&ssh_node);
+    options.batch_mode = true;
+    options.command_timeout_secs = Some(timeout_secs);
+    let final_command = if use_sudo {
+        format!("sudo -n sh -c '{}'", command.replace('\'', "'\\''"))
+    } else {
+        command.to_string()
+    };
+    let result = SshConnection::new(options)
+        .execute_async(&final_command)
         .await
-        .map_err(|e| format!("SSH execution failed: {e}"))?;
+        .map_err(|error| match error {
+            SshConnectionError::TimedOut { timeout_secs } => {
+                format!("SSH command timed out after {timeout_secs}s")
+            }
+            SshConnectionError::Transport { message } => {
+                format!("SSH transport failed: {message}")
+            }
+            other => format!("SSH execution failed: {other}"),
+        })?;
 
     Ok(json!({
-        "node": result.node,
-        "host": result.host,
-        "command": result.command,
+        "node": ssh_node.name,
+        "host": ssh_node.host,
+        "command": final_command,
         "started_at": result.started_at,
         "duration_ms": result.duration_ms,
         "success": result.success,
