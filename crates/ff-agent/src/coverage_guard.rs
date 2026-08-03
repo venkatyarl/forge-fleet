@@ -212,7 +212,7 @@ impl CoverageGuard {
             let mut enqueued = None;
             if remediate {
                 for cand in &candidates {
-                    match self.pick_host_for(&cand.id, cand.min_vram_gb).await? {
+                    match self.pick_host_for(&cand.id).await? {
                         Some(host) => {
                             let defer_id = self.enqueue_load(&cand.id, &host).await?;
                             info!(
@@ -298,39 +298,42 @@ impl CoverageGuard {
         ),
         sqlx::Error,
     > {
-        let dep_rows =
-            sqlx::query("SELECT model_id FROM computer_model_deployments WHERE status = 'active'")
-                .fetch_all(&self.pg)
-                .await?;
+        // Use a single canonical query to get all healthy, active deployments
+        // with their coverage tasks, regardless of catalog lifecycle status
+        let rows = sqlx::query(
+            "SELECT d.catalog_id, COALESCE(NULLIF(mc.tasks,'[]'::jsonb),mc.preferred_workloads,'[]'::jsonb) AS coverage_tasks
+             FROM fleet_model_deployments d
+             JOIN computers c ON lower(c.name)=lower(d.worker_name)
+             JOIN fleet_model_catalog mc ON lower(mc.id)=lower(d.catalog_id)
+             WHERE d.desired_state='active'
+             AND d.health_status='healthy'
+             AND c.status='online'
+             AND c.last_seen_at >= NOW()-INTERVAL '5 minutes'"
+        )
+        .fetch_all(&self.pg)
+        .await?;
 
-        // Only `active` catalog rows count toward coverage. `candidate` rows
-        // are unreviewed model-scout discoveries whose `tasks` come straight
-        // from the HF `pipeline_tag` and are frequently mislabeled (e.g. the
-        // text/code MoE `qwen3-6-35b-a3b` was scouted as `image-text-to-text`),
-        // so crediting them produces false coverage. `deprecated` rows are on
-        // the way out. Operator-blessed `active` rows are the source of truth.
-        let cat_rows =
-            sqlx::query("SELECT id, tasks FROM model_catalog WHERE lifecycle_status = 'active'")
-                .fetch_all(&self.pg)
-                .await?;
+        let deploy_norm: Vec<String> = rows
+            .iter()
+            .map(|r| normalize_model_id(&r.get::<String, _>("catalog_id")))
+            .collect();
 
+        // (normalized catalog id, coverage_tasks) for each healthy deployment
+        let catalog: Vec<(String, Vec<String>)> = rows
+            .iter()
+            .map(|r| {
+                let id: String = r.get("catalog_id");
+                (
+                    normalize_model_id(&id),
+                    json_str_array(r.get("coverage_tasks")),
+                )
+            })
+            .collect();
+
+        // Load preferred_model_ids unchanged from the fleet_task_coverage table
         let pref_rows = sqlx::query("SELECT task, preferred_model_ids FROM fleet_task_coverage")
             .fetch_all(&self.pg)
             .await?;
-
-        let deploy_norm: Vec<String> = dep_rows
-            .iter()
-            .map(|r| normalize_model_id(&r.get::<String, _>("model_id")))
-            .collect();
-
-        // (normalized catalog id, tasks) for each active catalog row.
-        let catalog: Vec<(String, Vec<String>)> = cat_rows
-            .iter()
-            .map(|r| {
-                let id: String = r.get("id");
-                (normalize_model_id(&id), json_str_array(r.get("tasks")))
-            })
-            .collect();
 
         // (task, [normalized preferred model ids]) from the operator-curated
         // coverage table. These are an explicit "this model serves this task"
@@ -457,22 +460,28 @@ impl CoverageGuard {
         true
     }
 
-    /// Rank candidate catalog rows for a task. Preferred ids from the
-    /// coverage row sort first; then `quality_tier='flagship'` ahead
-    /// of `'standard'`; then smallest `file_size_gb` (so low-RAM boxes
-    /// get a shot); Q4 quants tie-break ahead of larger quants.
+    /// Rank active catalog candidates using only the canonical V258 fields.
+    /// Preferred ids sort first, then lower numeric tier, then Q4 variants,
+    /// then the smallest positive artifact size.
     async fn rank_candidates(
         &self,
         task: &str,
         preferred: &[String],
     ) -> Result<Vec<Candidate>, sqlx::Error> {
+        let preferred_lower: Vec<String> =
+            preferred.iter().map(|id| id.to_ascii_lowercase()).collect();
         let rows = sqlx::query(
-            "SELECT id, quality_tier, quantization, file_size_gb, min_vram_gb
-             FROM model_catalog
-             WHERE tasks @> to_jsonb(ARRAY[$1]::text[])
-               AND lifecycle_status = 'active'",
+            "SELECT id, tier, variants
+             FROM fleet_model_catalog
+             WHERE lifecycle = 'active'
+               AND (
+                   lower(id) = ANY($2::text[])
+                   OR COALESCE(tasks, '[]'::jsonb) ? $1
+                   OR COALESCE(preferred_workloads, '[]'::jsonb) ? $1
+               )",
         )
         .bind(task)
+        .bind(&preferred_lower)
         .fetch_all(&self.pg)
         .await?;
 
@@ -480,13 +489,12 @@ impl CoverageGuard {
             .iter()
             .map(|r| {
                 let id: String = r.get("id");
+                let variants: serde_json::Value = r.get("variants");
                 Candidate {
-                    preferred: preferred.iter().any(|p| p == &id),
+                    preferred: preferred.iter().any(|p| p.eq_ignore_ascii_case(&id)),
                     id,
-                    quality_tier: r.get("quality_tier"),
-                    quantization: r.get("quantization"),
-                    file_size_gb: r.get("file_size_gb"),
-                    min_vram_gb: r.get("min_vram_gb"),
+                    tier: r.get("tier"),
+                    variants,
                 }
             })
             .collect();
@@ -495,26 +503,12 @@ impl CoverageGuard {
             let a_pref = if a.preferred { 0 } else { 1 };
             let b_pref = if b.preferred { 0 } else { 1 };
 
-            let a_tier = tier_rank(a.quality_tier.as_deref());
-            let b_tier = tier_rank(b.quality_tier.as_deref());
-
-            let a_q4 = if is_q4(a.quantization.as_deref()) {
-                0
-            } else {
-                1
-            };
-            let b_q4 = if is_q4(b.quantization.as_deref()) {
-                0
-            } else {
-                1
-            };
-
-            let a_size = a.file_size_gb.unwrap_or(f64::MAX);
-            let b_size = b.file_size_gb.unwrap_or(f64::MAX);
+            let (a_q4, a_size) = variant_rank(&a.variants);
+            let (b_q4, b_size) = variant_rank(&b.variants);
 
             a_pref
                 .cmp(&b_pref)
-                .then(a_tier.cmp(&b_tier))
+                .then(a.tier.cmp(&b.tier))
                 .then(a_q4.cmp(&b_q4))
                 .then(
                     a_size
@@ -529,46 +523,52 @@ impl CoverageGuard {
     /// Pick a computer that can host `model_id`:
     /// - online (`computers.status = 'online'`),
     /// - no active deployment of this model already,
-    /// - enough RAM (`total_ram_gb >= min_vram_gb`, or `has_gpu` with sufficient VRAM).
-    async fn pick_host_for(
-        &self,
-        model_id: &str,
-        min_vram_gb: Option<f64>,
-    ) -> Result<Option<String>, sqlx::Error> {
-        let required = min_vram_gb.unwrap_or(0.0);
-
+    /// - a fresh heartbeat and a canonical library variant with a nonzero size,
+    /// - enough runtime-appropriate RAM/VRAM for that variant.
+    async fn pick_host_for(&self, model_id: &str) -> Result<Option<String>, sqlx::Error> {
         // Only consider hosts that ALREADY have the model file in their
         // library — otherwise `ff model load <id>` fails on the chosen host
         // with `no library entry with id '<id>'`. Auto-download is a
         // separate concern (handled by hf_download / model_library_scanner).
-        let row = sqlx::query(
-            "SELECT c.name AS name
+        let rows = sqlx::query(
+            "SELECT c.name, c.os_family, c.has_gpu, c.gpu_total_vram_gb,
+                    c.total_ram_gb, c.metal_version, lib.runtime, lib.quant,
+                    lib.size_bytes, mc.variants
              FROM computers c
+             JOIN fleet_model_library lib
+               ON lower(lib.worker_name) = lower(c.name)
+              AND lower(lib.catalog_id) = lower($1)
+             JOIN fleet_model_catalog mc ON lower(mc.id) = lower(lib.catalog_id)
              WHERE c.status = 'online'
-               AND EXISTS (
-                   SELECT 1 FROM fleet_model_library lib
-                    WHERE lib.worker_name = c.name
-                      AND lib.catalog_id = $1
-               )
+               AND c.last_seen_at >= NOW() - INTERVAL '5 minutes'
                AND NOT EXISTS (
-                   SELECT 1 FROM computer_model_deployments d
-                    WHERE d.computer_id = c.id
-                      AND d.model_id = $1
-                      AND d.status IN ('active', 'loading')
+                   SELECT 1 FROM fleet_model_deployments d
+                    WHERE lower(d.worker_name) = lower(c.name)
+                      AND lower(d.catalog_id) = lower($1)
+                      AND d.desired_state = 'active'
                )
-               AND (
-                   (c.has_gpu AND COALESCE(c.gpu_total_vram_gb, 0) >= $2)
-                   OR COALESCE(c.total_ram_gb, 0) >= $2
-               )
-             ORDER BY COALESCE(c.gpu_total_vram_gb, c.total_ram_gb::float, 0) DESC
-             LIMIT 1",
+             ORDER BY COALESCE(c.gpu_total_vram_gb, c.total_ram_gb::float, 0) DESC",
         )
         .bind(model_id)
-        .bind(required)
-        .fetch_optional(&self.pg)
+        .fetch_all(&self.pg)
         .await?;
 
-        Ok(row.map(|r| r.get("name")))
+        Ok(rows.into_iter().find_map(|row| {
+            let runtime: String = row.get("runtime");
+            let quant: Option<String> = row.get("quant");
+            let size_bytes: Option<i64> = row.get("size_bytes");
+            let variants: serde_json::Value = row.get("variants");
+            let quant = quant.as_deref()?;
+            let size_gb = library_variant_size_gb(&runtime, quant, size_bytes, &variants)?;
+            let host = HostFit {
+                os_family: row.get("os_family"),
+                has_gpu: row.get("has_gpu"),
+                gpu_vram_gb: row.get("gpu_total_vram_gb"),
+                ram_gb: row.get::<Option<i32>, _>("total_ram_gb").map(f64::from),
+                has_metal: row.get::<Option<String>, _>("metal_version").is_some(),
+            };
+            runtime_host_compatible(&runtime, size_gb, &host).then(|| row.get::<String, _>("name"))
+        }))
     }
 
     /// Enqueue a deferred shell task that invokes `ff model load <id>` on
@@ -600,10 +600,82 @@ impl CoverageGuard {
 struct Candidate {
     id: String,
     preferred: bool,
-    quality_tier: Option<String>,
-    quantization: Option<String>,
-    file_size_gb: Option<f64>,
-    min_vram_gb: Option<f64>,
+    tier: i32,
+    variants: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct HostFit {
+    os_family: Option<String>,
+    has_gpu: bool,
+    gpu_vram_gb: Option<f64>,
+    ram_gb: Option<f64>,
+    has_metal: bool,
+}
+
+fn variant_rank(variants: &serde_json::Value) -> (u8, f64) {
+    variants
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|variant| {
+            let quant = variant.get("quant")?.as_str()?;
+            let size = variant.get("size_gb")?.as_f64()?;
+            (size > 0.0 && size.is_finite())
+                .then_some((if is_q4(Some(quant)) { 0 } else { 1 }, size))
+        })
+        .min_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        })
+        .unwrap_or((1, f64::MAX))
+}
+
+fn library_variant_size_gb(
+    runtime: &str,
+    quant: &str,
+    size_bytes: Option<i64>,
+    variants: &serde_json::Value,
+) -> Option<f64> {
+    let library_size = size_bytes.filter(|size| *size > 0)? as f64 / 1_000_000_000.0;
+    let catalog_size = variants.as_array()?.iter().find_map(|variant| {
+        let variant_runtime = variant.get("runtime")?.as_str()?;
+        let variant_quant = variant.get("quant")?.as_str()?;
+        if !variant_runtime.eq_ignore_ascii_case(runtime)
+            || !variant_quant.eq_ignore_ascii_case(quant)
+        {
+            return None;
+        }
+        variant
+            .get("size_gb")?
+            .as_f64()
+            .filter(|size| *size > 0.0 && size.is_finite())
+    })?;
+    // A truncated or wrong artifact must never qualify. Allow modest metadata
+    // drift for filesystem units and manifests while requiring near-complete
+    // bytes relative to the catalog's declared variant.
+    (library_size >= catalog_size * 0.9).then_some(library_size.max(catalog_size))
+}
+
+fn runtime_host_compatible(runtime: &str, size_gb: f64, host: &HostFit) -> bool {
+    if size_gb <= 0.0 || !size_gb.is_finite() {
+        return false;
+    }
+    let gpu_fits = host.has_gpu && host.gpu_vram_gb.unwrap_or(0.0) >= size_gb;
+    let ram_fits = host.ram_gb.unwrap_or(0.0) >= size_gb;
+    match runtime.to_ascii_lowercase().as_str() {
+        "vllm" => gpu_fits,
+        "mlx" => {
+            host.has_metal
+                && host
+                    .os_family
+                    .as_deref()
+                    .is_some_and(|os| os.eq_ignore_ascii_case("macos"))
+                && ram_fits
+        }
+        "llama.cpp" => gpu_fits || ram_fits,
+        _ => false,
+    }
 }
 
 /// Count gaps that have at least one catalog candidate — i.e. gaps that
@@ -779,15 +851,6 @@ pub fn catalog_matches(dep_norm: &str, cat_norm: &str) -> bool {
     dep_norm == cat_norm || dep_norm.starts_with(&format!("{cat_norm}-"))
 }
 
-fn tier_rank(tier: Option<&str>) -> u8 {
-    match tier {
-        Some("flagship") => 0,
-        Some("standard") => 1,
-        Some("experimental") => 2,
-        _ => 3,
-    }
-}
-
 fn is_q4(q: Option<&str>) -> bool {
     q.map(|s| {
         let lo = s.to_ascii_lowercase();
@@ -799,13 +862,6 @@ fn is_q4(q: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tier_ranks_flagship_first() {
-        assert!(tier_rank(Some("flagship")) < tier_rank(Some("standard")));
-        assert!(tier_rank(Some("standard")) < tier_rank(Some("experimental")));
-        assert!(tier_rank(None) > tier_rank(Some("experimental")));
-    }
 
     #[test]
     fn loadable_gap_count_counts_only_gaps_with_candidates() {
@@ -1055,5 +1111,75 @@ mod tests {
         assert!(is_q4(Some("4bit")));
         assert!(!is_q4(Some("Q8_0")));
         assert!(!is_q4(None));
+    }
+
+    #[test]
+    fn variant_ranking_prefers_q4_then_smallest_positive_size() {
+        let variants = serde_json::json!([
+            {"quant":"Q8_0", "size_gb": 12.0},
+            {"quant":"Q4_K_M", "size_gb": 8.0},
+            {"quant":"Q4_0", "size_gb": 6.0}
+        ]);
+        assert_eq!(variant_rank(&variants), (0, 6.0));
+    }
+
+    #[test]
+    fn variant_ranking_fails_closed_on_missing_or_invalid_sizes() {
+        assert_eq!(variant_rank(&serde_json::json!(null)), (1, f64::MAX));
+        assert_eq!(
+            variant_rank(&serde_json::json!([
+                {"quant":"Q4_K_M"},
+                {"quant":"Q4_0", "size_gb": 0.0},
+                {"quant":"Q8_0", "size_gb": -1.0}
+            ])),
+            (1, f64::MAX)
+        );
+    }
+
+    fn host(os: &str, gpu: bool, vram: f64, ram: f64, metal: bool) -> HostFit {
+        HostFit {
+            os_family: Some(os.to_string()),
+            has_gpu: gpu,
+            gpu_vram_gb: Some(vram),
+            ram_gb: Some(ram),
+            has_metal: metal,
+        }
+    }
+
+    #[test]
+    fn library_variant_fit_requires_matching_complete_artifact() {
+        let variants = serde_json::json!([
+            {"runtime":"llama.cpp", "quant":"Q4_K_M", "size_gb":20.0}
+        ]);
+        assert_eq!(
+            library_variant_size_gb("llama.cpp", "Q4_K_M", None, &variants),
+            None
+        );
+        assert_eq!(
+            library_variant_size_gb("llama.cpp", "Q8_0", Some(20_000_000_000), &variants),
+            None
+        );
+        assert_eq!(
+            library_variant_size_gb("llama.cpp", "Q4_K_M", Some(10_000_000_000), &variants),
+            None
+        );
+        assert_eq!(
+            library_variant_size_gb("LLAMA.CPP", "q4_k_m", Some(20_000_000_000), &variants),
+            Some(20.0)
+        );
+    }
+
+    #[test]
+    fn runtime_fit_is_specific_and_fail_closed() {
+        let linux_gpu = host("linux", true, 48.0, 64.0, false);
+        let linux_cpu = host("linux", false, 0.0, 64.0, false);
+        let mac = host("macos", true, 32.0, 64.0, true);
+        assert!(runtime_host_compatible("vllm", 40.0, &linux_gpu));
+        assert!(!runtime_host_compatible("vllm", 40.0, &linux_cpu));
+        assert!(runtime_host_compatible("mlx", 40.0, &mac));
+        assert!(!runtime_host_compatible("mlx", 40.0, &linux_gpu));
+        assert!(runtime_host_compatible("llama.cpp", 40.0, &linux_cpu));
+        assert!(!runtime_host_compatible("unknown", 1.0, &linux_gpu));
+        assert!(!runtime_host_compatible("llama.cpp", 0.0, &linux_gpu));
     }
 }
