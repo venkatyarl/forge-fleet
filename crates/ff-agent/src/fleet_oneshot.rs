@@ -386,10 +386,33 @@ fn shard_prefixes_from_variants(variants: &Value) -> BTreeSet<String> {
     prefixes
 }
 
+const CATALOG_LIBRARY_IDENTITIES_SQL: &str = "SELECT file_path \
+       FROM fleet_model_library \
+      WHERE catalog_id = $1 \
+        AND file_path IS NOT NULL \
+        AND BTRIM(file_path) <> ''";
+
+fn library_path_basenames(paths: impl IntoIterator<Item = String>) -> BTreeSet<String> {
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            Path::new(path.trim())
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 /// Resolve a router candidate into the canonical endpoint/model identity used
 /// by every local dispatch path. This enriches the candidate with exact local
-/// library filenames and catalog shard identities, but does not perform the
-/// live `/v1/models` attestation; callers must pass the result through
+/// library filenames from every worker holding the same canonical catalog id,
+/// plus catalog shard identities. Cross-worker paths matter when one worker's
+/// library row is a directory label while another records the exact GGUF name.
+/// Identity never crosses catalog ids and matching remains exact. This does not
+/// perform live `/v1/models` attestation; callers must pass the result through
 /// [`attest_resolved_target`] immediately before chat dispatch.
 pub async fn resolve_candidate_target(
     pool: &PgPool,
@@ -398,41 +421,23 @@ pub async fn resolve_candidate_target(
     router_enabled: bool,
 ) -> Result<ResolvedFleetTarget> {
     let mut target = resolved_target_from_candidate(candidate, provenance, router_enabled)?;
-    let paths = sqlx::query_scalar::<_, String>(
-        "SELECT file_path \
-           FROM fleet_model_library \
-          WHERE LOWER(worker_name) = LOWER($1) \
-            AND catalog_id = $2 \
-            AND file_path IS NOT NULL \
-            AND BTRIM(file_path) <> ''",
-    )
-    .bind(&candidate.worker_name)
-    .bind(&target.catalog_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|error| {
-        anyhow!(
-            "load accepted model identities for {}:{}: {error}",
-            candidate.worker_name,
-            candidate.port
-        )
-    })?;
+    let paths = sqlx::query_scalar::<_, String>(CATALOG_LIBRARY_IDENTITIES_SQL)
+        .bind(&target.catalog_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "load accepted library identities for catalog {}: {error}",
+                target.catalog_id
+            )
+        })?;
 
     let mut accepted = target
         .accepted_model_ids
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    for path in paths {
-        if let Some(basename) = Path::new(path.trim())
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        {
-            accepted.insert(basename.to_string());
-        }
-    }
+    accepted.extend(library_path_basenames(paths));
     target.accepted_model_ids = accepted.into_iter().collect();
     let variants = sqlx::query_scalar::<_, Value>(
         "SELECT COALESCE(variants, '[]'::jsonb) \
@@ -1258,6 +1263,30 @@ mod tests {
             "zai-org_GLM-4.5-Air-Q4_K_M-extra.gguf",
             "zai-org_GLM-4.5-Air-Q4_K_M"
         ));
+    }
+
+    #[test]
+    fn catalog_library_identity_authority_is_cross_worker_but_exact() {
+        assert!(CATALOG_LIBRARY_IDENTITIES_SQL.contains("catalog_id = $1"));
+        assert!(!CATALOG_LIBRARY_IDENTITIES_SQL.contains("worker_name"));
+
+        let basenames = library_path_basenames([
+            "/home/logan/models/lucy-1.7b".to_string(),
+            "/home/aura/models/Lucy-Q4_K_M.gguf".to_string(),
+            "  /models/Devstral-Exact.gguf  ".to_string(),
+            "   ".to_string(),
+        ]);
+        assert_eq!(
+            basenames,
+            BTreeSet::from([
+                "Devstral-Exact.gguf".to_string(),
+                "Lucy-Q4_K_M.gguf".to_string(),
+                "lucy-1.7b".to_string(),
+            ])
+        );
+        assert!(basenames.contains("Lucy-Q4_K_M.gguf"));
+        assert!(!basenames.contains("Lucy"));
+        assert!(!basenames.contains("Lucy-Q4_K_M-extra.gguf"));
     }
 
     async fn spawn_attestation_server(
