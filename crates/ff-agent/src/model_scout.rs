@@ -1,12 +1,12 @@
-//! Model scout (Phase 7 v1).
+//! Model scout (Phase 7 v2).
 //!
 //! Once a week, walks every entry in `fleet_task_coverage`, queries the
 //! HuggingFace model API for the top-N most-downloaded models for that
 //! pipeline tag, filters by license / size / denylist / existing-catalog,
-//! and inserts surviving rows into `model_catalog` with
-//! `lifecycle_status = 'candidate'` + `added_by = 'scout'`.
+//! and inserts surviving rows into `fleet_model_catalog` with
+//! `lifecycle = 'candidate'`.
 //!
-//! This is a deliberately simple v1:
+//! This is a deliberately simple v2:
 //!   - Discovery only; no benchmarking.
 //!   - Candidates are inert until an operator runs `ff model approve <id>`.
 //!   - Filters are conservative (apache/mit/openrail/llama-3/gemma) so the
@@ -74,7 +74,7 @@ pub enum ScoutError {
 pub struct ScoutReport {
     /// Raw HF responses we pulled down.
     pub discovered: usize,
-    /// Rows added to `model_catalog` as `lifecycle_status='candidate'`.
+    /// Rows added to `fleet_model_catalog` as `lifecycle='candidate'`.
     pub added_as_candidates: usize,
     /// Rows rejected by license/size/duplicate/deny checks.
     pub filtered_out: usize,
@@ -204,6 +204,7 @@ struct HfModel {
     tasks: Vec<String>,
     downloads: u64,
     size_gb: Option<f64>,
+    gated: bool,
 }
 
 async fn fetch_hf_models_for_task(
@@ -274,6 +275,14 @@ async fn fetch_hf_models_for_task(
             .and_then(|v| v.as_u64())
             .map(|b| b as f64 / 1_073_741_824.0);
 
+        let gated = match item.get("gated") {
+            Some(JsonValue::Bool(value)) => *value,
+            Some(JsonValue::String(value)) => {
+                !value.is_empty() && !value.eq_ignore_ascii_case("false")
+            }
+            _ => false,
+        };
+
         out.push(HfModel {
             model_id,
             author,
@@ -281,6 +290,7 @@ async fn fetch_hf_models_for_task(
             tasks,
             downloads,
             size_gb,
+            gated,
         });
     }
     Ok(out)
@@ -335,6 +345,7 @@ struct CandidateEntry {
     tasks: Vec<String>,
     size_gb: Option<f64>,
     upstream_id: String,
+    gated: bool,
 }
 
 fn evaluate(
@@ -366,7 +377,9 @@ fn evaluate(
 
     // Synthesize a compact catalog id from org/name.
     let compact = short_id(&m.model_id);
-    if existing.contains(&m.model_id) || existing.contains(&compact) {
+    if existing.contains(&m.model_id.to_ascii_lowercase())
+        || existing.contains(&compact.to_ascii_lowercase())
+    {
         debug!(id = %m.model_id, "scout filter: already in catalog");
         return None;
     }
@@ -389,6 +402,7 @@ fn evaluate(
         tasks: m.tasks.clone(),
         size_gb: m.size_gb,
         upstream_id: m.model_id.clone(),
+        gated: m.gated,
     })
 }
 
@@ -407,16 +421,19 @@ fn short_id(hf_id: &str) -> String {
 }
 
 async fn load_existing_catalog_keys(pg: &PgPool) -> Result<HashSet<String>, sqlx::Error> {
-    let rows = sqlx::query("SELECT id, upstream_id FROM model_catalog")
+    let rows = sqlx::query("SELECT id, variants FROM fleet_model_catalog")
         .fetch_all(pg)
         .await?;
     let mut set = HashSet::with_capacity(rows.len() * 2);
     for r in rows {
         let id: String = r.get("id");
-        set.insert(id);
-        let upstream: Option<String> = r.get("upstream_id");
-        if let Some(u) = upstream {
-            set.insert(u);
+        set.insert(id.to_ascii_lowercase());
+
+        let variants: JsonValue = r.get("variants");
+        for variant in variants.as_array().into_iter().flatten() {
+            if let Some(hf_repo) = variant.get("hf_repo").and_then(JsonValue::as_str) {
+                set.insert(hf_repo.to_ascii_lowercase());
+            }
         }
     }
     Ok(set)
@@ -441,28 +458,55 @@ async fn load_denylist(pool: &PgPool) -> HashSet<String> {
 async fn insert_candidate(
     pg: &PgPool,
     entry: &CandidateEntry,
-    _origin_task: &str,
+    origin_task: &str,
 ) -> Result<bool, sqlx::Error> {
-    let tasks = json!(entry.tasks);
+    let mut workloads = entry.tasks.clone();
+    if !workloads.iter().any(|task| task == origin_task) {
+        workloads.push(origin_task.to_string());
+    }
+    workloads.sort();
+    workloads.dedup();
+
+    let workloads = json!(workloads);
+    let variants = candidate_variants(entry);
+    let name = entry
+        .display_name
+        .rsplit('/')
+        .next()
+        .unwrap_or(&entry.display_name);
+    let description = format!(
+        "Discovered by model scout from Hugging Face for task {origin_task}; requires operator review before activation"
+    );
     let result = sqlx::query(
-        "INSERT INTO model_catalog
-             (id, display_name, family, license, tasks,
-              upstream_source, upstream_id,
-              file_size_gb,
-              lifecycle_status, added_by)
-         VALUES ($1, $2, $3, $4, $5, 'huggingface', $6, $7, 'candidate', 'scout')
+        "INSERT INTO fleet_model_catalog
+             (id, name, family, parameters, tier, description, gated,
+              preferred_workloads, variants, tool_calling, display_name,
+              tasks, modalities, license, lifecycle)
+         VALUES ($1, $2, $3, 'unknown', 4, $4, $5,
+                 $6, $7, FALSE, $8, $6, '[]'::jsonb, $9, 'candidate')
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(&entry.id)
-    .bind(&entry.display_name)
+    .bind(name)
     .bind(&entry.family)
+    .bind(description)
+    .bind(entry.gated)
+    .bind(&workloads)
+    .bind(&variants)
+    .bind(&entry.display_name)
     .bind(&entry.license)
-    .bind(&tasks)
-    .bind(&entry.upstream_id)
-    .bind(entry.size_gb)
     .execute(pg)
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+fn candidate_variants(entry: &CandidateEntry) -> JsonValue {
+    let mut variant = serde_json::Map::new();
+    variant.insert("hf_repo".to_string(), json!(entry.upstream_id));
+    if let Some(size_gb) = entry.size_gb.filter(|size| size.is_finite() && *size > 0.0) {
+        variant.insert("size_gb".to_string(), json!(size_gb));
+    }
+    JsonValue::Array(vec![JsonValue::Object(variant)])
 }
 
 #[cfg(test)]
@@ -477,5 +521,40 @@ mod tests {
             short_id("meta-llama/Llama-3.3-70B-Instruct"),
             "llama-3-3-70b-instruct"
         );
+    }
+
+    #[test]
+    fn candidate_variant_preserves_canonical_hf_identity_and_valid_size() {
+        let entry = CandidateEntry {
+            id: "example-model".to_string(),
+            display_name: "Org/Example-Model".to_string(),
+            family: "Org".to_string(),
+            license: "apache-2.0".to_string(),
+            tasks: vec!["text-generation".to_string()],
+            size_gb: Some(12.5),
+            upstream_id: "Org/Example-Model".to_string(),
+            gated: false,
+        };
+
+        assert_eq!(
+            candidate_variants(&entry),
+            json!([{"hf_repo": "Org/Example-Model", "size_gb": 12.5}])
+        );
+    }
+
+    #[test]
+    fn evaluate_deduplicates_catalog_identity_case_insensitively() {
+        let model = HfModel {
+            model_id: "Org/Example-Model".to_string(),
+            author: Some("Org".to_string()),
+            license: Some("apache-2.0".to_string()),
+            tasks: vec!["text-generation".to_string()],
+            downloads: 1,
+            size_gb: Some(12.5),
+            gated: false,
+        };
+        let existing = HashSet::from(["org/example-model".to_string()]);
+
+        assert!(evaluate(&model, &existing, &HashSet::new()).is_none());
     }
 }
