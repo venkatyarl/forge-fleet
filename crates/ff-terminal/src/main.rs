@@ -1099,7 +1099,7 @@ enum FabricCommand {
     Probe {
         #[command(flatten)]
         link: FabricLinkArgs,
-        /// Persist verified=true only after every proof succeeds.
+        /// Persist verified/dead only after running every proof.
         #[arg(long)]
         apply: bool,
     },

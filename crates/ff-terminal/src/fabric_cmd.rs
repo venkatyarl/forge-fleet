@@ -59,14 +59,18 @@ impl FabricLinkSpec {
         if a.node == b.node || a.ip == b.ip {
             bail!("fabric endpoints must be distinct");
         }
+        let kind = kind.trim().to_ascii_lowercase();
+        if kind.is_empty()
+            || !kind
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            bail!("fabric kind must be non-empty and contain only safe characters");
+        }
         if (&a.node, &a.iface, a.ip) > (&b.node, &b.iface, b.ip) {
             std::mem::swap(&mut a, &mut b);
         }
-        Ok(Self {
-            a,
-            b,
-            kind: kind.trim().to_ascii_lowercase(),
-        })
+        Ok(Self { a, b, kind })
     }
 
     fn pair_name(&self) -> String {
@@ -76,8 +80,11 @@ impl FabricLinkSpec {
     fn subnet_key(ip: IpAddr) -> Result<String> {
         match ip {
             IpAddr::V4(ip) => {
-                let raw = u32::from(ip) & !3;
-                Ok(format!("{}/30", Ipv4Addr::from(raw)))
+                let raw = u32::from(ip);
+                if !matches!(raw & 3, 1 | 2) {
+                    bail!("fabric endpoint {ip} is not a usable host address in its /30");
+                }
+                Ok(format!("{}/30", Ipv4Addr::from(raw & !3)))
             }
             IpAddr::V6(_) => bail!("fabric reconciliation currently requires IPv4 /30 links"),
         }
@@ -155,7 +162,8 @@ pub async fn handle_fabric_reconcile(pg: &PgPool, spec: FabricLinkSpec, apply: b
            fabric_kind=EXCLUDED.fabric_kind, computer_a_id=EXCLUDED.computer_a_id,
            computer_b_id=EXCLUDED.computer_b_id, a_iface=EXCLUDED.a_iface,
            a_ip=EXCLUDED.a_ip, b_iface=EXCLUDED.b_iface, b_ip=EXCLUDED.b_ip,
-           endpoints_explicit=TRUE, verified=FALSE, status='pending'",
+           endpoints_explicit=TRUE, verified=FALSE, status='pending',
+           measured_bandwidth_gbps=NULL, last_probed_at=NULL",
     )
     .bind(&pair_name)
     .bind(&spec.kind)
@@ -194,14 +202,19 @@ pub async fn handle_fabric_remove(pg: &PgPool, spec: FabricLinkSpec, apply: bool
     let a_id = computer_id(&mut tx, &spec.a.node).await?;
     let b_id = computer_id(&mut tx, &spec.b.node).await?;
     let result = sqlx::query(
-        "DELETE FROM fabric_pairs WHERE
-         (computer_a_id=$1 AND computer_b_id=$2 AND a_iface=$3 AND b_iface=$4)
-         OR (computer_a_id=$2 AND computer_b_id=$1 AND a_iface=$4 AND b_iface=$3)",
+        "DELETE FROM fabric_pairs
+          WHERE pair_name=$1 AND endpoints_explicit AND fabric_kind=$2
+            AND computer_a_id=$3 AND computer_b_id=$4
+            AND a_iface=$5 AND a_ip=$6 AND b_iface=$7 AND b_ip=$8",
     )
+    .bind(spec.pair_name())
+    .bind(&spec.kind)
     .bind(a_id)
     .bind(b_id)
     .bind(&spec.a.iface)
+    .bind(spec.a.ip.to_string())
     .bind(&spec.b.iface)
+    .bind(spec.b.ip.to_string())
     .execute(&mut *tx)
     .await?;
     let count = result.rows_affected();
@@ -233,35 +246,59 @@ pub async fn handle_fabric_probe(pg: &PgPool, spec: FabricLinkSpec, apply: bool)
     if !declared {
         bail!("no matching explicit canonical link; reconcile it before probing");
     }
-    probe_endpoint(&spec.a).await?;
-    probe_endpoint(&spec.b).await?;
-    // The physical path is proven independently of carrier by an IP packet in
-    // each direction, sourced from the declared interface.
-    probe_ping(&spec.a, &spec.b).await?;
-    probe_ping(&spec.b, &spec.a).await?;
+    let proof = async {
+        probe_endpoint(&spec.a).await?;
+        probe_endpoint(&spec.b).await?;
+        // The physical path is proven independently of carrier by an IP packet
+        // in each direction, sourced from the declared interface.
+        probe_ping(&spec.a, &spec.b).await?;
+        probe_ping(&spec.b, &spec.a).await
+    }
+    .await;
+    if let Err(error) = proof {
+        if apply {
+            persist_probe_status(pg, &spec, false, "dead").await?;
+        }
+        return Err(error);
+    }
     println!(
         "Proved both endpoints and bidirectional physical link for {}",
         spec.pair_name()
     );
     if apply {
-        let result = sqlx::query(
-            "UPDATE fabric_pairs SET verified=TRUE,status='healthy',last_probed_at=NOW()
-             WHERE pair_name=$1 AND endpoints_explicit AND fabric_kind=$2
-               AND a_iface=$3 AND a_ip=$4 AND b_iface=$5 AND b_ip=$6",
-        )
-        .bind(spec.pair_name())
-        .bind(&spec.kind)
-        .bind(&spec.a.iface)
-        .bind(spec.a.ip.to_string())
-        .bind(&spec.b.iface)
-        .bind(spec.b.ip.to_string())
-        .execute(pg)
-        .await?;
-        if result.rows_affected() != 1 {
-            bail!("no matching explicit canonical link; reconcile it before probing");
-        }
+        persist_probe_status(pg, &spec, true, "verified").await?;
     } else {
         println!("Dry run: verification was not persisted");
+    }
+    Ok(())
+}
+
+async fn persist_probe_status(
+    pg: &PgPool,
+    spec: &FabricLinkSpec,
+    verified: bool,
+    status: &str,
+) -> Result<()> {
+    let result = sqlx::query(
+        "UPDATE fabric_pairs
+            SET verified=$7, status=$8, last_probed_at=NOW(),
+                measured_bandwidth_gbps =
+                    CASE WHEN $7 THEN measured_bandwidth_gbps ELSE NULL END
+         WHERE pair_name=$1 AND endpoints_explicit AND fabric_kind=$2
+           AND a_iface=$3 AND a_ip=$4 AND b_iface=$5 AND b_ip=$6",
+    )
+    .bind(spec.pair_name())
+    .bind(&spec.kind)
+    .bind(&spec.a.iface)
+    .bind(spec.a.ip.to_string())
+    .bind(&spec.b.iface)
+    .bind(spec.b.ip.to_string())
+    .bind(verified)
+    .bind(status)
+    .execute(pg)
+    .await?;
+    if result.rows_affected() != 1 {
+        bail!("no matching explicit canonical link; reconcile it before probing");
     }
     Ok(())
 }
@@ -272,13 +309,21 @@ async fn probe_endpoint(endpoint: &FabricEndpoint) -> Result<()> {
         .map_err(anyhow::Error::msg)?
         .context("computer not found")?;
     let command = format!(
-        "ip -o addr show dev '{}' | grep -F '{}' >/dev/null && test \"$(cat /sys/class/net/'{}'/carrier)\" = 1",
+        "ip -o addr show dev '{}' | awk '{{print $4}}' | cut -d/ -f1 | grep -Fx '{}' >/dev/null && test \"$(cat /sys/class/net/'{}'/carrier)\" = 1",
         endpoint.iface, endpoint.ip, endpoint.iface
     );
     let ok = StdCommand::new("ssh")
         .args([
             "-o",
             "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "ConnectionAttempts=1",
+            "-o",
+            "ServerAliveInterval=3",
+            "-o",
+            "ServerAliveCountMax=1",
             &format!("{}@{}", node.ssh_user, node.ip),
             &command,
         ])
@@ -302,6 +347,14 @@ async fn probe_ping(from: &FabricEndpoint, to: &FabricEndpoint) -> Result<()> {
         .args([
             "-o",
             "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "ConnectionAttempts=1",
+            "-o",
+            "ServerAliveInterval=3",
+            "-o",
+            "ServerAliveCountMax=1",
             &format!("{}@{}", node.ssh_user, node.ip),
             &format!("ping -I '{}' -c 1 -W 2 '{}'", from.iface, to.ip),
         ])
@@ -338,7 +391,8 @@ pub async fn handle_fabric_pair(pg: &PgPool, a: &str, b: &str, kind: &str) -> Re
             (pair_name, fabric_kind, computer_a_id, computer_b_id, \
              a_iface, b_iface, a_ip, b_ip) \
          VALUES ($1, $2, $3, $4, '', '', '', '') \
-         ON CONFLICT (pair_name) DO UPDATE SET fabric_kind = EXCLUDED.fabric_kind",
+         ON CONFLICT (pair_name) DO UPDATE SET fabric_kind = EXCLUDED.fabric_kind \
+          WHERE NOT fabric_pairs.endpoints_explicit",
     )
     .bind(&pair_name)
     .bind(kind)
@@ -824,5 +878,13 @@ mod ring_tests {
         assert!(assert_topology_is_unambiguous(&[base.clone(), crossed]).is_err());
         let duplicate_subnet = link("c", "cx0", "10.91.0.1", "d", "cx0", "10.91.0.2");
         assert!(assert_topology_is_unambiguous(&[base, duplicate_subnet]).is_err());
+    }
+
+    #[test]
+    fn rejects_network_and_broadcast_addresses_for_slash_30_links() {
+        let network = link("a", "cx0", "10.91.0.0", "b", "cx0", "10.91.0.1");
+        assert!(network.validate_link_subnet().is_err());
+        let broadcast = link("a", "cx0", "10.91.0.2", "b", "cx0", "10.91.0.3");
+        assert!(broadcast.validate_link_subnet().is_err());
     }
 }
