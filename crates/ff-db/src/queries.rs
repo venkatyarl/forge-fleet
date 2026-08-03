@@ -5091,6 +5091,71 @@ mod tests {
         assert_eq!(classify_collision(9), SuspiciousBucket::GenericLeaf);
     }
 
+    #[tokio::test]
+    async fn canonical_benchmark_results_distinguish_missing_and_empty_rows() {
+        let Some((admin_url, db_url, db_name)) = temp_db_urls("ff_model_benchmarks") else {
+            return;
+        };
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("connect admin db");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create temp db");
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&db_url)
+            .await
+            .expect("connect temp db");
+        sqlx::raw_sql(
+            "CREATE TABLE fleet_model_catalog (
+                 id TEXT PRIMARY KEY,
+                 benchmarks JSONB,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );
+             INSERT INTO fleet_model_catalog (id) VALUES ('model-a');",
+        )
+        .execute(&pool)
+        .await
+        .expect("create benchmark fixture");
+
+        assert_eq!(
+            pg_get_benchmark_results(&pool, "model-a")
+                .await
+                .expect("read empty benchmark row"),
+            Some(serde_json::json!({}))
+        );
+        assert_eq!(
+            pg_get_benchmark_results(&pool, "missing")
+                .await
+                .expect("read missing benchmark row"),
+            None
+        );
+
+        let result = serde_json::json!({"tokens_per_sec": 42.5, "ttft_ms": 80});
+        pg_append_benchmark_result(&pool, "model-a", "thalia", &result)
+            .await
+            .expect("append canonical benchmark");
+        let stored = pg_get_benchmark_results(&pool, "model-a")
+            .await
+            .expect("read stored benchmarks")
+            .expect("catalog row");
+        let entries = stored.as_object().expect("benchmark history object");
+        assert_eq!(entries.len(), 1);
+        assert!(entries.keys().next().unwrap().starts_with("thalia:"));
+        assert_eq!(entries.values().next(), Some(&result));
+        assert!(
+            pg_append_benchmark_result(&pool, "missing", "thalia", &result)
+                .await
+                .is_err()
+        );
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
     // ── Pure router-decision helpers (no DB) ──────────────────────────────
     // These back the SQL selector in `pg_route_deployments` /
     // `pg_pick_offload_endpoint`; the SQL ORDER BY itself needs Postgres, but
@@ -8597,9 +8662,9 @@ pub async fn pg_append_training_loss_sample(
     Ok(())
 }
 
-// ─── Benchmark results (helpers around model_catalog.benchmark_results) ────
+// ─── Benchmark results (helpers around fleet_model_catalog.benchmarks) ────
 
-/// Append one benchmark result to `model_catalog.benchmark_results`. The
+/// Append one benchmark result to `fleet_model_catalog.benchmarks`. The
 /// column is a JSON object keyed by `"<computer>:<iso-timestamp>"`; new runs
 /// merge in without overwriting history.
 pub async fn pg_append_benchmark_result(
@@ -8611,15 +8676,19 @@ pub async fn pg_append_benchmark_result(
     let ts = chrono::Utc::now().to_rfc3339();
     let key = format!("{computer_name}:{ts}");
     let merge = serde_json::json!({ key: result });
-    sqlx::query(
-        "UPDATE model_catalog
-         SET benchmark_results = benchmark_results || $2::jsonb
-         WHERE id = $1",
+    let updated = sqlx::query(
+        "UPDATE fleet_model_catalog
+            SET benchmarks = COALESCE(benchmarks, '{}'::jsonb) || $2::jsonb,
+                updated_at = NOW()
+          WHERE id = $1",
     )
     .bind(catalog_id)
     .bind(merge)
     .execute(pool)
     .await?;
+    if updated.rows_affected() == 0 {
+        return Err(sqlx::Error::RowNotFound.into());
+    }
     Ok(())
 }
 
@@ -8627,11 +8696,14 @@ pub async fn pg_get_benchmark_results(
     pool: &PgPool,
     catalog_id: &str,
 ) -> Result<Option<JsonValue>> {
-    let row = sqlx::query("SELECT benchmark_results FROM model_catalog WHERE id = $1")
+    let row = sqlx::query("SELECT benchmarks FROM fleet_model_catalog WHERE id = $1")
         .bind(catalog_id)
         .fetch_optional(pool)
         .await?;
-    Ok(row.map(|r| r.get("benchmark_results")))
+    Ok(row.map(|r| {
+        r.get::<Option<JsonValue>, _>("benchmarks")
+            .unwrap_or_else(|| serde_json::json!({}))
+    }))
 }
 
 // ─── V119 Resource arbiter — work_intents registry + set-atomic lease ────────
