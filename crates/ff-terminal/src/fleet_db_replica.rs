@@ -3,7 +3,9 @@
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use sqlx::postgres::PgConnectOptions;
 use std::io::Write;
+use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::{CYAN, FleetDbReplicaCommand, GREEN, RESET, YELLOW, shell_escape_single, whoami_tag};
@@ -52,14 +54,37 @@ fn physical_slot(id: Uuid) -> String {
 
 fn connected_primary_matches(
     connected_ip: Option<&str>,
+    configured_host: Option<&str>,
     named_primary_ip: &str,
     local_worker_matches: bool,
+    server_is_primary: bool,
 ) -> bool {
+    if !server_is_primary {
+        return false;
+    }
+    if configured_host.is_some_and(|host| host.eq_ignore_ascii_case(named_primary_ip)) {
+        return true;
+    }
     match connected_ip {
         Some(ip) if ip == named_primary_ip => true,
         Some("127.0.0.1" | "::1") | None => local_worker_matches,
         Some(_) => false,
     }
+}
+
+fn configured_database_host() -> Result<String> {
+    let config_root = std::env::var_os("FORGEFLEET_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".forgefleet")))
+        .context("no ForgeFleet home directory")?;
+    let config_path = config_root.join("fleet.toml");
+    let raw = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("read {}", config_path.display()))?;
+    let config: ff_core::config::FleetConfig =
+        toml::from_str(&raw).with_context(|| format!("parse {}", config_path.display()))?;
+    let options = PgConnectOptions::from_str(config.database.url.trim())
+        .context("parse configured PostgreSQL URL")?;
+    Ok(options.get_host().to_string())
 }
 
 fn pgpass_field(value: &str) -> Result<String> {
@@ -141,6 +166,10 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary: &str) -> Result<Plan
     let connected_ip: Option<String> = sqlx::query_scalar("SELECT host(inet_server_addr())")
         .fetch_one(pool)
         .await?;
+    let server_is_primary: bool = sqlx::query_scalar("SELECT NOT pg_is_in_recovery()")
+        .fetch_one(pool)
+        .await?;
+    let configured_host = configured_database_host()?;
     let named_primary_ip: String = primary_row
         .try_get::<Option<String>, _>("primary_ip")?
         .filter(|ip| !ip.trim().is_empty())
@@ -150,8 +179,10 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary: &str) -> Result<Plan
         .eq_ignore_ascii_case(primary);
     if !connected_primary_matches(
         connected_ip.as_deref(),
+        Some(&configured_host),
         &named_primary_ip,
         local_worker_matches,
+        server_is_primary,
     ) {
         let connected_authority = connected_ip.as_deref().unwrap_or("local Unix socket");
         bail!(
@@ -174,8 +205,8 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary: &str) -> Result<Plan
           WHERE database_kind='postgres' AND source_computer_id=$2
             AND size_bytes > 0
             AND checksum_sha256 ~ '^[0-9a-fA-F]{64}$'
-            AND created_at BETWEEN NOW() - make_interval(hours => $1) AND NOW()
-            AND verified_restorable_at BETWEEN NOW() - make_interval(hours => $1) AND NOW()
+            AND created_at BETWEEN NOW() - make_interval(hours => $1::int) AND NOW()
+            AND verified_restorable_at BETWEEN NOW() - make_interval(hours => $1::int) AND NOW()
           ORDER BY verified_restorable_at DESC LIMIT 1",
     )
     .bind(MAX_BACKUP_AGE_HOURS)
@@ -516,20 +547,67 @@ mod tests {
     fn connected_primary_authority_is_fail_closed() {
         assert!(connected_primary_matches(
             Some("192.168.5.104"),
+            Some("192.168.5.104"),
             "192.168.5.104",
-            false
+            false,
+            true,
         ));
         assert!(connected_primary_matches(
             Some("127.0.0.1"),
+            Some("127.0.0.1"),
             "192.168.5.104",
-            true
+            true,
+            true,
         ));
-        assert!(connected_primary_matches(None, "192.168.5.104", true));
-        assert!(!connected_primary_matches(None, "192.168.5.104", false));
+        assert!(connected_primary_matches(
+            None,
+            None,
+            "192.168.5.104",
+            true,
+            true,
+        ));
+        assert!(!connected_primary_matches(
+            None,
+            None,
+            "192.168.5.104",
+            false,
+            true,
+        ));
         assert!(!connected_primary_matches(
             Some("192.168.5.100"),
+            Some("192.168.5.100"),
             "192.168.5.104",
-            true
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn connected_primary_accepts_configured_host_through_container_nat() {
+        assert!(connected_primary_matches(
+            Some("172.18.0.4"),
+            Some("192.168.5.104"),
+            "192.168.5.104",
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn connected_primary_rejects_standby_and_configured_host_mismatch() {
+        assert!(!connected_primary_matches(
+            Some("172.18.0.4"),
+            Some("192.168.5.104"),
+            "192.168.5.104",
+            false,
+            false,
+        ));
+        assert!(!connected_primary_matches(
+            Some("172.18.0.4"),
+            Some("192.168.5.103"),
+            "192.168.5.104",
+            false,
+            true,
         ));
     }
     #[test]
