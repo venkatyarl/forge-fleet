@@ -3526,6 +3526,70 @@ pub async fn pg_list_mesh_status(pool: &PgPool, node: Option<&str>) -> Result<Ve
         .collect())
 }
 
+pub fn mesh_edge_dispatch_eligible(
+    src_status: &str,
+    src_reservation: &str,
+    dst_status: &str,
+    dst_reservation: &str,
+) -> bool {
+    src_status.eq_ignore_ascii_case("online")
+        && src_reservation.eq_ignore_ascii_case("available")
+        && dst_status.eq_ignore_ascii_case("online")
+        && dst_reservation.eq_ignore_ascii_case("available")
+}
+
+/// Return only mesh evidence whose two endpoints are dispatch-eligible now.
+/// Historical rows remain in `fleet_mesh_status`; retired, reserved, offline,
+/// or quarantined endpoints simply cannot degrade an active-node integrity
+/// report.
+pub async fn pg_list_active_mesh_status(
+    pool: &PgPool,
+    node: Option<&str>,
+) -> Result<Vec<MeshStatusRow>> {
+    let select = "SELECT s.*, src.status AS src_status, \
+                src.reservation_state AS src_reservation, \
+                dst.status AS dst_status, \
+                dst.reservation_state AS dst_reservation \
+           FROM fleet_mesh_status s \
+           JOIN computers src ON LOWER(src.name) = LOWER(s.src_node) \
+           JOIN computers dst ON LOWER(dst.name) = LOWER(s.dst_node)";
+    let rows = if let Some(node) = node {
+        sqlx::query(&format!(
+            "{select} \
+             WHERE LOWER(s.src_node) = LOWER($1) \
+                OR LOWER(s.dst_node) = LOWER($1) \
+             ORDER BY s.src_node, s.dst_node"
+        ))
+        .bind(node)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(&format!("{select} ORDER BY s.src_node, s.dst_node"))
+            .fetch_all(pool)
+            .await?
+    };
+
+    Ok(rows
+        .iter()
+        .filter(|row| {
+            mesh_edge_dispatch_eligible(
+                row.get::<String, _>("src_status").as_str(),
+                row.get::<String, _>("src_reservation").as_str(),
+                row.get::<String, _>("dst_status").as_str(),
+                row.get::<String, _>("dst_reservation").as_str(),
+            )
+        })
+        .map(|row| MeshStatusRow {
+            src_node: row.get("src_node"),
+            dst_node: row.get("dst_node"),
+            status: row.get("status"),
+            last_checked: row.get("last_checked"),
+            last_error: row.get("last_error"),
+            attempts: row.get("attempts"),
+        })
+        .collect())
+}
+
 /// Remove all mesh-status rows involving a given node (used during revoke).
 pub async fn pg_delete_mesh_status_for_node(pool: &PgPool, node: &str) -> Result<u64> {
     let r = sqlx::query("DELETE FROM fleet_mesh_status WHERE src_node = $1 OR dst_node = $1")
@@ -4885,6 +4949,48 @@ mod tests {
     use std::env;
 
     use sqlx::postgres::PgPoolOptions;
+
+    #[test]
+    fn active_mesh_keeps_online_available_failure_visible() {
+        assert!(mesh_edge_dispatch_eligible(
+            "online",
+            "available",
+            "ONLINE",
+            "AVAILABLE"
+        ));
+    }
+
+    #[test]
+    fn active_mesh_ignores_retained_edge_to_reserved_vinny() {
+        assert!(!mesh_edge_dispatch_eligible(
+            "online",
+            "available",
+            "reserved",
+            "available"
+        ));
+    }
+
+    #[test]
+    fn active_mesh_rejects_offline_quarantined_or_reserved_endpoints() {
+        assert!(!mesh_edge_dispatch_eligible(
+            "offline",
+            "available",
+            "online",
+            "available"
+        ));
+        assert!(!mesh_edge_dispatch_eligible(
+            "quarantined",
+            "available",
+            "online",
+            "available"
+        ));
+        assert!(!mesh_edge_dispatch_eligible(
+            "online",
+            "reserved",
+            "online",
+            "available"
+        ));
+    }
 
     /// Round-trips `db_exec` through a scratch table: insert/update/delete return
     /// the affected-row count, the write is committed (visible on a fresh pool
