@@ -405,15 +405,15 @@ run_as_user ln -sf "$USER_HOME/.local/bin/ff" "$USER_HOME/.local/bin/forgefleet"
 run_as_user ln -sf "$USER_HOME/.local/bin/ff" "$USER_HOME/.local/bin/ForgeFleet"
 report "build" ok
 
-# ─── 6a. Node 22 + real dashboard build + forgefleetd ─────────────────────
+# ─── 6a. Node 22 + real web-forge-fleet build + forgefleetd ───────────────
 # Pulse publishing lives in forgefleetd (not ff daemon). Sia's first
 # enrollment skipped this and stayed dark in `ff fleet health`.
 # The `forge-fleet` crate's ff-gateway uses `#[derive(RustEmbed)]` pointing
-# at `dashboard/dist/` — the folder must exist at build time with the
-# compiled React assets. Operator directive: NEVER stub the dashboard —
-# every computer must serve the real UI. Vite needs Node ≥ 20.19 / 22.12;
-# Ubuntu 24.04 apt ships Node 18 (too old), so we install Node 22 from
-# NodeSource on Linux and assume brew on macOS.
+# at `web-forge-fleet/out/` — the folder must exist at build time with the
+# compiled Next.js static export. Operator directive: NEVER stub the web
+# console — every computer must serve the real UI. Next.js needs
+# Node ≥ 20.19 / 22.12; Ubuntu 24.04 apt ships Node 18 (too old), so we
+# install Node 22 from NodeSource on Linux and assume brew on macOS.
 case "$OS_ID" in
   macos)
     if ! command -v node >/dev/null 2>&1 || [ "$(node --version | cut -dv -f2 | cut -d. -f1)" -lt 20 ] 2>/dev/null; then
@@ -485,11 +485,11 @@ if [ -n "$KIMI_CREDENTIALS" ]; then
 fi
 report "cloud_clis" ok "claude, codex, kimi"
 
-report "dashboard_build" running
-run_as_user bash -lc "cd '$REPO_DIR/dashboard' && npm install --no-audit --no-fund --silent 2>&1 | tail -2 && npm run build 2>&1 | tail -3" \
-  || die "dashboard build failed"
-[ -f "$REPO_DIR/dashboard/dist/index.html" ] || die "dashboard build produced no dist/index.html"
-report "dashboard_build" ok
+report "web_build" running
+run_as_user bash -lc "cd '$REPO_DIR/web-forge-fleet' && npm install --no-audit --no-fund --silent 2>&1 | tail -2 && npm run build 2>&1 | tail -3" \
+  || die "web-forge-fleet build failed"
+[ -f "$REPO_DIR/web-forge-fleet/out/index.html" ] || die "web-forge-fleet build produced no out/index.html"
+report "web_build" ok
 
 report "forgefleetd_build" running
 run_as_user bash -lc "cd '$REPO_DIR' && cargo build -p forge-fleet --release 2>&1 | tail -2" \

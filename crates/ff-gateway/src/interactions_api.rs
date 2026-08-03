@@ -72,9 +72,9 @@ pub async fn interactions_summary(State(state): State<Arc<GatewayState>>) -> imp
 }
 
 /// Serve the console page, compile-time-embedded from the git-tracked
-/// `dashboard/public/console.html` (same `include_str!` approach as the JARVIS
-/// HUD — `dist/` is gitignored and absent on remote hosts at build time, but
-/// `public/` is always present).
+/// `web-forge-fleet/public/console.html` (same `include_str!` approach as the
+/// JARVIS HUD — `out/` is a build artifact and absent on remote hosts at build
+/// time, but `public/` is always present).
 pub async fn console_page() -> impl IntoResponse {
-    Html(include_str!("../../../dashboard/public/console.html"))
+    Html(include_str!("../../../web-forge-fleet/public/console.html"))
 }
