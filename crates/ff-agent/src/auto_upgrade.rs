@@ -1112,34 +1112,181 @@ impl AutoUpgradeTick {
     }
 }
 
-/// For every `software_registry` row with `version_source.method='self_built'`,
-/// set `latest_version` to the canonical git ref's HEAD SHA in the leader's
-/// source tree (default ref: `origin/main`). Runs inline on every
-/// auto-upgrade tick so same-day drift gets caught within the tick interval,
-/// not the 6h upstream interval.
-///
-/// Reads the ref from `version_source.git_ref` (default `origin/main`) and
-/// the path from `computers.source_tree_path` for the leader. Shells out to
-/// `git -C <path> rev-parse <ref>` — a single fast read.
-///
-/// **Why this is correct.** Treating the leader's currently-installed binary
-/// as upstream truth was a chicken-and-egg: the leader could never detect
-/// drift against itself, so the leader could never auto-upgrade itself, and
-/// since `latest_version` flows from the leader, no other member could
-/// either. Reading from git decouples the source of truth from any node's
-/// current binary; drift now fires on the leader too.
-/// Recompute the "latest" SHA for self-built software (and the fleet's own
-/// `ff_git` / `forgefleetd_git`) from the leader's checkout of origin/main, and
-/// write it to `software_registry.latest_version`. `pub` + leader-safe so the
-/// UN-GATED version-check tick can call it — version *checking* must not be
-/// gated behind the auto-*upgrade* secret, or `ff fleet versions` shows a frozen
-/// phantom LATEST whenever auto-upgrade is paused (the recurring "why aren't all
-/// my machines the same version"). MUST run on the leader (it `git`s the leader's
-/// source tree).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelfBuiltDecision {
+    Seed,
+    Unchanged,
+    Advance,
+    Hold,
+}
+
+fn parse_full_lower_git_sha(raw: &str) -> std::result::Result<String, String> {
+    let sha = raw.trim();
+    if sha.len() == 40
+        && sha.bytes().all(|b| b.is_ascii_hexdigit())
+        && !sha.bytes().any(|b| b.is_ascii_uppercase())
+    {
+        Ok(sha.to_string())
+    } else {
+        Err(format!(
+            "expected one lowercase 40-hex commit SHA, got {sha:?}"
+        ))
+    }
+}
+
+fn decide_self_built_update(
+    stored_present: bool,
+    resolved_stored: Option<&str>,
+    candidate: &str,
+    stored_is_ancestor: Option<bool>,
+) -> SelfBuiltDecision {
+    if !stored_present {
+        return SelfBuiltDecision::Seed;
+    }
+    let Some(resolved) = resolved_stored else {
+        return SelfBuiltDecision::Hold;
+    };
+    if resolved == candidate {
+        return SelfBuiltDecision::Unchanged;
+    }
+    match stored_is_ancestor {
+        Some(true) => SelfBuiltDecision::Advance,
+        _ => SelfBuiltDecision::Hold,
+    }
+}
+
+fn git_output(repo: &str, args: &[&str]) -> std::result::Result<std::process::Output, String> {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|e| format!("git {}: {e}", args.join(" ")))
+}
+
+fn git_full_sha(repo: &str, spec: &str) -> std::result::Result<String, String> {
+    let output = git_output(repo, &["rev-parse", "--verify", spec])?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse --verify {spec}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_full_lower_git_sha(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn fetch_canonical_origin_main(repo: &str) -> std::result::Result<String, String> {
+    let output = git_output(
+        repo,
+        &[
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "origin",
+            "+refs/heads/main:refs/remotes/origin/main",
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "git fetch origin main: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    git_full_sha(repo, "refs/remotes/origin/main^{commit}")
+}
+
+fn resolve_stored_commit(repo: &str, stored: &str) -> std::result::Result<String, String> {
+    let stored = stored.trim();
+    if !(7..=40).contains(&stored.len()) || !stored.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("stored self-built SHA is malformed: {stored:?}"));
+    }
+    let spec = format!("{stored}^{{commit}}");
+    git_full_sha(repo, &spec)
+}
+
+fn stored_is_ancestor(
+    repo: &str,
+    stored: &str,
+    candidate: &str,
+) -> std::result::Result<bool, String> {
+    let output = git_output(repo, &["merge-base", "--is-ancestor", stored, candidate])?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        code => Err(format!(
+            "git merge-base --is-ancestor exited {code:?}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelfBuiltUpdate {
+    id: String,
+    observed: Option<String>,
+    change: bool,
+}
+
+fn plan_self_built_updates(
+    repo: &str,
+    candidate: &str,
+    rows: &[(String, Option<String>)],
+) -> std::result::Result<Vec<SelfBuiltUpdate>, String> {
+    let mut plan = Vec::with_capacity(rows.len());
+    for (id, observed) in rows {
+        let decision = match observed.as_deref() {
+            None => decide_self_built_update(false, None, candidate, None),
+            Some(stored) => {
+                let resolved =
+                    resolve_stored_commit(repo, stored).map_err(|e| format!("{id}: {e}"))?;
+                let ancestor = if resolved == candidate {
+                    None
+                } else {
+                    Some(
+                        stored_is_ancestor(repo, &resolved, candidate)
+                            .map_err(|e| format!("{id}: {e}"))?,
+                    )
+                };
+                decide_self_built_update(true, Some(&resolved), candidate, ancestor)
+            }
+        };
+        match decision {
+            SelfBuiltDecision::Seed | SelfBuiltDecision::Advance => {
+                plan.push(SelfBuiltUpdate {
+                    id: id.clone(),
+                    observed: observed.clone(),
+                    change: true,
+                });
+            }
+            SelfBuiltDecision::Unchanged => plan.push(SelfBuiltUpdate {
+                id: id.clone(),
+                observed: observed.clone(),
+                // A uniquely resolved legacy prefix denotes the same commit,
+                // but authority itself is always persisted as the full SHA.
+                change: observed.as_deref().map(str::trim) != Some(candidate),
+            }),
+            SelfBuiltDecision::Hold => {
+                return Err(format!(
+                    "{id}: candidate {candidate} is not a verified fast-forward from {observed:?}"
+                ));
+            }
+        }
+    }
+    Ok(plan)
+}
+
+fn self_built_snapshot_unchanged(
+    observed: &[(String, Option<String>)],
+    locked: &[(String, Option<String>)],
+) -> bool {
+    observed == locked
+}
+
+/// Refresh the self-built registry from one canonical, fetched remote-main
+/// commit. Installed versions and the checkout's current HEAD are observations,
+/// never writers of upstream truth. Any malformed, missing, ambiguous,
+/// unavailable, rollback, or divergent row holds the entire set unchanged.
 pub async fn refresh_self_built_latest_versions(pool: &PgPool) -> Result<u64> {
-    // 1. Resolve the leader's source_tree_path. If we can't (no leader
-    //    elected, no source_tree set), bail with 0 affected rather than
-    //    erroring the whole upgrade tick.
     let source_tree: Option<String> = sqlx::query_scalar(
         r#"
         SELECT c.source_tree_path
@@ -1158,75 +1305,99 @@ pub async fn refresh_self_built_latest_versions(pool: &PgPool) -> Result<u64> {
         return Ok(0);
     };
 
-    // 2. For each self_built row, run `git -C <source_tree> rev-parse <ref>`
-    //    and write the SHA back. ref defaults to origin/main.
-    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, version_source FROM software_registry \
+    let repo = expand_tilde(&source_tree);
+    let fetch_repo = repo.clone();
+    let candidate = match tokio::task::spawn_blocking(move || {
+        fetch_canonical_origin_main(&fetch_repo)
+    })
+    .await
+    .context("join canonical origin/main fetch")?
+    {
+        Ok(candidate) => candidate,
+        Err(reason) => {
+            tracing::warn!(%reason, "refresh_self_built: canonical fetch unavailable; holding authority");
+            return Ok(0);
+        }
+    };
+
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT id, latest_version FROM software_registry \
          WHERE version_source->>'method' = 'self_built' \
-            OR id IN ('ff_git', 'forgefleetd_git')",
+            OR id IN ('ff_git', 'forgefleetd_git') \
+         ORDER BY id",
     )
     .fetch_all(pool)
     .await
     .context("list self_built software")?;
 
-    let expanded_path = expand_tilde(&source_tree);
-    let mut updated: u64 = 0;
-    for (sw_id, vs) in rows {
-        let git_ref = vs
-            .get("git_ref")
-            .and_then(|v| v.as_str())
-            .unwrap_or("origin/main")
-            .to_string();
-        let path = expanded_path.clone();
-        let sha = match tokio::task::spawn_blocking(move || {
-            std::process::Command::new("git")
-                .args(["-C", &path, "rev-parse", &git_ref])
-                .output()
-        })
-        .await
-        {
-            Ok(Ok(out)) if out.status.success() => {
-                String::from_utf8_lossy(&out.stdout).trim().to_string()
-            }
-            Ok(Ok(out)) => {
-                tracing::warn!(
-                    sw = %sw_id,
-                    stderr = %String::from_utf8_lossy(&out.stderr),
-                    "refresh_self_built: git rev-parse failed"
-                );
-                continue;
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(sw = %sw_id, error = %e, "refresh_self_built: git spawn failed");
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(sw = %sw_id, error = %e, "refresh_self_built: join error");
-                continue;
-            }
-        };
-        if sha.is_empty() {
-            continue;
-        }
-        let res = sqlx::query(
-            r#"
-            UPDATE software_registry
-               SET latest_version    = $1,
-                   latest_version_at = NOW()
-             WHERE id = $2
-               AND (latest_version IS NULL OR latest_version <> $1)
-            "#,
-        )
-        .bind(&sha)
-        .bind(&sw_id)
-        .execute(pool)
-        .await
-        .with_context(|| format!("update latest_version for {sw_id}"))?;
-        if res.rows_affected() > 0 {
-            tracing::info!(sw = %sw_id, sha = %sha, "refresh_self_built: latest_version advanced");
-            updated += 1;
-        }
+    if rows.is_empty() {
+        return Ok(0);
     }
+
+    let plan_repo = repo.clone();
+    let plan_candidate = candidate.clone();
+    let plan_rows = rows.clone();
+    let plan = match tokio::task::spawn_blocking(move || {
+        plan_self_built_updates(&plan_repo, &plan_candidate, &plan_rows)
+    })
+    .await
+    .context("join self-built ancestry plan")?
+    {
+        Ok(plan) => plan,
+        Err(reason) => {
+            tracing::warn!(%reason, candidate = %candidate,
+                "refresh_self_built: monotonic proof failed; holding every self-built row");
+            return Ok(0);
+        }
+    };
+
+    if !plan.iter().any(|row| row.change) {
+        return Ok(0);
+    }
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin self-built authority update")?;
+    sqlx::query("LOCK TABLE software_registry IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await
+        .context("lock software_registry for self-built authority update")?;
+    let locked_rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT id, latest_version FROM software_registry \
+         WHERE version_source->>'method' = 'self_built' \
+            OR id IN ('ff_git', 'forgefleetd_git') \
+         ORDER BY id",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .context("recheck self-built rows under lock")?;
+    if !self_built_snapshot_unchanged(&rows, &locked_rows) {
+        anyhow::bail!("self-built authority changed concurrently; refusing partial update");
+    }
+
+    let mut updated = 0u64;
+    for row in plan.iter().filter(|row| row.change) {
+        let result = sqlx::query(
+            "UPDATE software_registry \
+                SET latest_version = $1, latest_version_at = NOW() \
+              WHERE id = $2 AND latest_version IS NOT DISTINCT FROM $3",
+        )
+        .bind(&candidate)
+        .bind(&row.id)
+        .bind(&row.observed)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("update self-built authority for {}", row.id))?;
+        if result.rows_affected() != 1 {
+            anyhow::bail!("self-built authority CAS failed for {}", row.id);
+        }
+        updated += 1;
+    }
+    tx.commit()
+        .await
+        .context("commit self-built authority update")?;
+    tracing::info!(candidate = %candidate, updated, "refresh_self_built: authority advanced atomically");
     Ok(updated)
 }
 
@@ -1452,8 +1623,8 @@ async fn refresh_github_release_latest_versions(
 /// `version_source = {"method":"git_head","repo":"https://github.com/nexu-io/open-design","ref_kind":"main"}`.
 /// Used for tools we install by git-clone but that don't ship npm/pypi/github
 /// releases (e.g. open-design as of 2026-04-30 — `latestRelease: null`).
-/// Returns the SHA of the named branch's HEAD, truncated to 10 chars to match
-/// what `software_collector` reports for `*_git` rows.
+/// Returns the full SHA of the named branch's HEAD. Installed-version drift
+/// comparison remains prefix tolerant; authority writes never abbreviate.
 async fn refresh_git_head_latest_versions(client: &reqwest::Client, pool: &PgPool) -> Result<u64> {
     refresh_via_http(
         client,
@@ -1473,14 +1644,19 @@ async fn refresh_git_head_latest_versions(client: &reqwest::Client, pool: &PgPoo
                 "https://api.github.com/repos/{repo}/commits/{ref_kind}"
             ))
         },
-        |body| {
-            let v: serde_json::Value = serde_json::from_str(body).ok()?;
-            let sha = v.get("sha")?.as_str()?;
-            // Match SoftwareCollector's 10-char truncation for ff_git/forgefleetd_git.
-            Some(sha.chars().take(10).collect())
-        },
+        parse_git_head_response,
     )
     .await
+}
+
+fn parse_git_head_response(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let sha = value.get("sha")?.as_str()?.trim();
+    if sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(sha.to_ascii_lowercase())
+    } else {
+        None
+    }
 }
 
 /// Shared HTTP-based refresher. Walks every software_registry row whose
@@ -1606,6 +1782,166 @@ mod tests {
     // The same-commit / prefix-length regression guard moved to
     // ff_core::build_version::tests (same_commit_is_hex_guarded_and_prefix_agnostic
     // + is_same_version_covers_every_path) when the predicate was consolidated.
+
+    fn temp_git_repo() -> (tempfile::TempDir, String, String) {
+        fn run(repo: &str, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        run(repo, &["init", "-q"]);
+        run(repo, &["config", "user.email", "tests@forgefleet.local"]);
+        run(repo, &["config", "user.name", "ForgeFleet Tests"]);
+        std::fs::write(dir.path().join("authority.txt"), "one\n").unwrap();
+        run(repo, &["add", "authority.txt"]);
+        run(repo, &["commit", "-qm", "first"]);
+        let first = run(repo, &["rev-parse", "HEAD"]);
+        std::fs::write(dir.path().join("authority.txt"), "two\n").unwrap();
+        run(repo, &["commit", "-qam", "second"]);
+        let second = run(repo, &["rev-parse", "HEAD"]);
+        (dir, first, second)
+    }
+
+    #[test]
+    fn self_built_sha_parser_requires_full_lowercase_commit_identity() {
+        let valid = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(parse_full_lower_git_sha(valid).unwrap(), valid);
+        assert!(parse_full_lower_git_sha(&valid.to_ascii_uppercase()).is_err());
+        assert!(parse_full_lower_git_sha(&valid[..39]).is_err());
+        assert!(parse_full_lower_git_sha("not-a-commit").is_err());
+    }
+
+    #[test]
+    fn self_built_policy_seeds_equals_advances_and_holds_fail_closed() {
+        let old = "1111111111111111111111111111111111111111";
+        let candidate = "2222222222222222222222222222222222222222";
+        assert_eq!(
+            decide_self_built_update(false, None, candidate, None),
+            SelfBuiltDecision::Seed
+        );
+        assert_eq!(
+            decide_self_built_update(true, Some(candidate), candidate, None),
+            SelfBuiltDecision::Unchanged
+        );
+        assert_eq!(
+            decide_self_built_update(true, Some(old), candidate, Some(true)),
+            SelfBuiltDecision::Advance
+        );
+        assert_eq!(
+            decide_self_built_update(true, Some(old), candidate, Some(false)),
+            SelfBuiltDecision::Hold
+        );
+        assert_eq!(
+            decide_self_built_update(true, None, candidate, None),
+            SelfBuiltDecision::Hold
+        );
+    }
+
+    #[test]
+    fn self_built_plan_resolves_legacy_prefix_and_rejects_rollback_or_bad_row() {
+        let (dir, first, second) = temp_git_repo();
+        let repo = dir.path().to_str().unwrap();
+        let legacy = first[..10].to_string();
+        let rows = vec![("ff_git".to_string(), Some(legacy))];
+        let plan = plan_self_built_updates(repo, &second, &rows).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].change);
+
+        let equal_legacy = vec![("ff_git".to_string(), Some(second[..10].to_string()))];
+        let normalization = plan_self_built_updates(repo, &second, &equal_legacy).unwrap();
+        assert!(
+            normalization[0].change,
+            "an equal legacy prefix must be normalized to full authority"
+        );
+
+        let equal_full = vec![("ff_git".to_string(), Some(second.clone()))];
+        let no_change = plan_self_built_updates(repo, &second, &equal_full).unwrap();
+        assert!(!no_change[0].change);
+
+        let rollback_rows = vec![("ff_git".to_string(), Some(second.clone()))];
+        assert!(plan_self_built_updates(repo, &first, &rollback_rows).is_err());
+
+        let mixed = vec![
+            ("ff_git".to_string(), Some(first)),
+            ("forgefleetd_git".to_string(), Some("not-a-sha".into())),
+        ];
+        assert!(
+            plan_self_built_updates(repo, &second, &mixed).is_err(),
+            "one malformed row must hold the entire set"
+        );
+    }
+
+    #[test]
+    fn self_built_plan_rejects_a_divergent_commit() {
+        let (dir, _, second) = temp_git_repo();
+        let repo = dir.path().to_str().unwrap();
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["checkout", "--orphan", "divergent"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        std::fs::write(dir.path().join("authority.txt"), "divergent\n").unwrap();
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["commit", "-qam", "divergent"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let divergent = git_full_sha(repo, "HEAD^{commit}").unwrap();
+
+        let rows = vec![("ff_git".to_string(), Some(second))];
+        assert!(plan_self_built_updates(repo, &divergent, &rows).is_err());
+    }
+
+    #[test]
+    fn self_built_snapshot_guard_prevents_atomic_two_row_partial_update() {
+        let observed = vec![
+            ("ff_git".to_string(), Some("1111111".to_string())),
+            ("forgefleetd_git".to_string(), Some("1111111".to_string())),
+        ];
+        assert!(self_built_snapshot_unchanged(&observed, &observed));
+
+        let mut concurrently_changed = observed.clone();
+        concurrently_changed[1].1 = Some("2222222".to_string());
+        assert!(!self_built_snapshot_unchanged(
+            &observed,
+            &concurrently_changed
+        ));
+    }
+
+    #[test]
+    fn self_built_fetch_unavailable_never_invents_a_candidate() {
+        let (dir, _, _) = temp_git_repo();
+        assert!(fetch_canonical_origin_main(dir.path().to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn git_head_authority_keeps_full_sha_and_normalizes_case() {
+        let sha = "ABCDEF0123456789ABCDEF0123456789ABCDEF01";
+        let body = format!(r#"{{"sha":"{sha}"}}"#);
+        assert_eq!(
+            parse_git_head_response(&body).unwrap(),
+            sha.to_ascii_lowercase()
+        );
+        assert!(parse_git_head_response(r#"{"sha":"abcdef0123"}"#).is_none());
+        assert!(parse_git_head_response(r#"{"sha":"not-a-sha"}"#).is_none());
+    }
 
     #[test]
     fn daemon_self_software_matches_the_family_const() {

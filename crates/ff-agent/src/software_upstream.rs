@@ -308,35 +308,15 @@ enum UpstreamResult {
     Error(String),
 }
 
-/// Resolve the "latest" version for a self-built binary (e.g. `ff_git`,
-/// `forgefleetd_git`). The leader-of-truth's installed version IS the
-/// canonical version — by definition it's the freshest build in the fleet.
-/// Any computer whose install differs from the leader's will get flipped
-/// to `upgrade_available` by the normal drift loop.
-///
-/// Returns `Skipped` when no leader has recorded an install yet (first
-/// boot) — prevents a half-initialized fleet from flagging every node
-/// as out-of-date.
-async fn query_self_built(pool: &PgPool, id: &str) -> UpstreamResult {
-    let latest: Option<String> = sqlx::query_scalar(
-        "SELECT cs.installed_version
-           FROM computer_software cs
-           JOIN computers c ON c.id = cs.computer_id
-           JOIN fleet_leader_state ls ON ls.computer_id = c.id
-          WHERE cs.software_id = $1
-            AND cs.installed_version IS NOT NULL
-          LIMIT 1",
+/// Self-built upstream truth has exactly one writer:
+/// `auto_upgrade::refresh_self_built_latest_versions`, which fetches and
+/// monotonic-checks canonical `origin/main`. Installed versions are only
+/// observations and must never overwrite that authority from this generic
+/// upstream-check path.
+async fn query_self_built(_pool: &PgPool, _id: &str) -> UpstreamResult {
+    UpstreamResult::Skipped(
+        "self_built authority is managed by the canonical origin/main refresher".into(),
     )
-    .bind(id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
-
-    match latest {
-        Some(v) if !v.is_empty() => UpstreamResult::Version(v),
-        _ => UpstreamResult::Skipped("no leader install recorded yet".into()),
-    }
 }
 
 /// The locally-authenticated `gh` CLI's token, if available. Lets check-upstream
