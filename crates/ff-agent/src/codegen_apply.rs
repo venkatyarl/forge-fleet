@@ -477,15 +477,6 @@ fn build_prompt(
     // file's #[cfg(test)] module (2026-07-29 hallucination root cause).
     let wants_test = task.to_ascii_lowercase().contains("test");
 
-    // Repo structure anchor: without a listing of what files ACTUALLY exist, the model invents
-    // plausible-but-wrong paths (e.g. a Python `src/work_item/relations.py` in a Rust repo) and
-    // every edit fails to apply. Inject the real crate layout + task-relevant tracked files so
-    // SEARCH/REPLACE edits target files that exist. (build_prompt runs inside spawn_blocking.)
-    if let Some(tree) = repo_structure_context(repo_path, &identifiers) {
-        prompt.push_str("\n\nThis repository's actual structure (edit ONLY files that exist here; do not invent paths):\n");
-        prompt.push_str(&tree);
-    }
-
     for path in task_context_paths(repo_path, task)? {
         let abs = repo_path.join(&path);
         let content =
@@ -505,6 +496,15 @@ fn build_prompt(
                 &extract_relevant_regions(&content, &identifiers, wants_test),
             ));
         }
+    }
+
+    // Repo structure anchor: without a listing of what files ACTUALLY exist, the model invents
+    // plausible-but-wrong paths (e.g. a Python `src/work_item/relations.py` in a Rust repo) and
+    // every edit fails to apply. Keep grounded source regions first, then add lower-value
+    // repository listings as path guardrails. (build_prompt runs inside spawn_blocking.)
+    if let Some(tree) = repo_structure_context(repo_path, &identifiers) {
+        prompt.push_str("\n\nThis repository's actual structure (edit ONLY files that exist here; do not invent paths):\n");
+        prompt.push_str(&tree);
     }
 
     if let Some(edits) = previous_edits {
@@ -599,6 +599,11 @@ fn task_identifiers(task: &str) -> Vec<String> {
         "existing",
         "large",
         "small",
+        "test",
+        "tests",
+        "testing",
+        "unit",
+        "integration",
     ]
     .into_iter()
     .collect();
@@ -674,7 +679,9 @@ fn extract_relevant_regions(content: &str, identifiers: &[String], wants_test: b
         return "No content.\n".to_string();
     }
 
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let test_spans = cfg_test_line_spans(&lines);
+    let mut implementation_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut test_ranges: Vec<(usize, usize)> = Vec::new();
     if !identifiers.is_empty() {
         for (idx, line) in lines.iter().enumerate() {
             let lower = line.to_ascii_lowercase();
@@ -684,45 +691,404 @@ fn extract_relevant_regions(content: &str, identifiers: &[String], wants_test: b
             {
                 let start = idx.saturating_sub(REGION_CONTEXT_LINES);
                 let end = (idx + REGION_CONTEXT_LINES).min(lines.len() - 1);
-                if let Some((_, last_end)) = ranges.last_mut()
-                    && start <= *last_end + 1
-                {
-                    *last_end = (*last_end).max(end);
-                    continue;
+                if line_in_spans(idx, &test_spans) {
+                    push_merged_range(&mut test_ranges, (start, end));
+                } else {
+                    push_merged_range(&mut implementation_ranges, (start, end));
                 }
-                ranges.push((start, end));
             }
         }
     }
 
-    // Test tasks ground on the test module: when the task mentions tests,
-    // the `#[cfg(test)]` module is the FIRST region so the char cap can never
-    // truncate it away (2026-07-29: the cap silently dropped the tests module
-    // and the model invented a `test_utils` helper that doesn't exist).
-    if wants_test && let Some(idx) = lines.iter().position(|l| l.contains("#[cfg(test)]")) {
-        let tr = (idx, lines.len() - 1);
-        // Keep/clamp identifier ranges that start before the test module;
-        // drop ones fully inside it (it is shown in full anyway).
-        ranges = ranges
-            .into_iter()
-            .filter_map(|(s, e)| {
-                if e < tr.0 {
-                    Some((s, e))
-                } else if s < tr.0 {
-                    Some((s, tr.0 - 1))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        ranges.insert(0, tr);
+    // Test intent still benefits from cfg(test) grounding, but every module is
+    // bounded independently. Never treat "first #[cfg(test)] through EOF" as
+    // tests: large Rust files commonly interleave helpers, nested modules, and
+    // multiple unrelated test modules.
+    if wants_test {
+        for &(start, end) in &test_spans {
+            let bounded_end = end.min(start + REGION_CONTEXT_LINES);
+            push_merged_range(&mut test_ranges, (start, bounded_end));
+        }
     }
 
-    if ranges.is_empty() {
+    // An exact named implementation and an exact named test/helper are the
+    // two highest-value regions for an edit model. Put those ranges first in
+    // their respective partitions so earlier incidental substring matches
+    // cannot evict either one from a fixed context budget.
+    if let Some(range) = named_function_range(&lines, &test_spans, identifiers, false) {
+        implementation_ranges.insert(0, range);
+    }
+    if let Some(range) = named_function_range(&lines, &test_spans, identifiers, true) {
+        test_ranges.insert(0, range);
+    }
+    prioritize_named_function_range(&mut implementation_ranges, &lines, identifiers, false);
+    prioritize_named_function_range(&mut test_ranges, &lines, identifiers, true);
+
+    let mut implementation = Vec::new();
+    for range in implementation_ranges {
+        push_non_overlapping_range(&mut implementation, range);
+    }
+    let mut tests = Vec::new();
+    for range in test_ranges {
+        push_non_overlapping_range(&mut tests, range);
+    }
+
+    if implementation.is_empty() && tests.is_empty() {
         return fallback_head_tail_regions(&lines);
     }
 
-    render_ranges(&lines, &ranges)
+    if wants_test && !implementation.is_empty() && !tests.is_empty() {
+        return render_partitioned_ranges(&lines, &implementation, &tests);
+    }
+
+    implementation.extend(tests);
+    render_ranges(&lines, &implementation)
+}
+
+fn named_function_range(
+    lines: &[&str],
+    test_spans: &[(usize, usize)],
+    identifiers: &[String],
+    test_function: bool,
+) -> Option<(usize, usize)> {
+    lines.iter().enumerate().find_map(|(idx, line)| {
+        if line_in_spans(idx, test_spans) != test_function {
+            return None;
+        }
+        let matched = identifiers.iter().any(|identifier| {
+            identifier.starts_with("test_") == test_function
+                && line_contains_named_function(line, identifier)
+        });
+        matched.then(|| {
+            (
+                idx.saturating_sub(REGION_CONTEXT_LINES),
+                (idx + REGION_CONTEXT_LINES).min(lines.len() - 1),
+            )
+        })
+    })
+}
+
+fn prioritize_named_function_range(
+    ranges: &mut Vec<(usize, usize)>,
+    lines: &[&str],
+    identifiers: &[String],
+    test_function: bool,
+) {
+    let Some(priority_idx) = ranges.iter().position(|(start, end)| {
+        lines[*start..=*end].iter().any(|line| {
+            identifiers.iter().any(|identifier| {
+                identifier.starts_with("test_") == test_function
+                    && line_contains_named_function(line, identifier)
+            })
+        })
+    }) else {
+        return;
+    };
+
+    ranges.swap(0, priority_idx);
+}
+
+fn line_contains_named_function(line: &str, identifier: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let needle = format!("fn {identifier}");
+    lower.match_indices(&needle).any(|(start, _)| {
+        lower
+            .as_bytes()
+            .get(start + needle.len())
+            .is_some_and(|next| matches!(next, b'(' | b'<' | b' ' | b'\t'))
+    })
+}
+
+fn line_in_spans(line: usize, spans: &[(usize, usize)]) -> bool {
+    spans
+        .iter()
+        .any(|(start, end)| *start <= line && line <= *end)
+}
+
+fn push_merged_range(ranges: &mut Vec<(usize, usize)>, range: (usize, usize)) {
+    if let Some((_, last_end)) = ranges.last_mut()
+        && range.0 <= *last_end + 1
+    {
+        *last_end = (*last_end).max(range.1);
+        return;
+    }
+    ranges.push(range);
+}
+
+fn push_non_overlapping_range(ranges: &mut Vec<(usize, usize)>, range: (usize, usize)) {
+    let mut pending = vec![range];
+    for &(existing_start, existing_end) in ranges.iter() {
+        let mut next = Vec::new();
+        for (start, end) in pending {
+            if end < existing_start || existing_end < start {
+                next.push((start, end));
+                continue;
+            }
+            if start < existing_start {
+                next.push((start, existing_start - 1));
+            }
+            if existing_end < end {
+                next.push((existing_end + 1, end));
+            }
+        }
+        pending = next;
+        if pending.is_empty() {
+            return;
+        }
+    }
+    ranges.extend(pending);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustLexMode {
+    Code,
+    BlockComment(usize),
+    String,
+    RawString(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RustBraceScanner {
+    mode: RustLexMode,
+}
+
+impl Default for RustBraceScanner {
+    fn default() -> Self {
+        Self {
+            mode: RustLexMode::Code,
+        }
+    }
+}
+
+impl RustBraceScanner {
+    fn is_code(self) -> bool {
+        self.mode == RustLexMode::Code
+    }
+
+    fn scan_line(&mut self, line: &str, mut on_brace: impl FnMut(u8)) {
+        let bytes = line.as_bytes();
+        let mut idx = 0usize;
+
+        while idx < bytes.len() {
+            match self.mode {
+                RustLexMode::Code => {
+                    if bytes[idx..].starts_with(b"//") {
+                        return;
+                    }
+                    if bytes[idx..].starts_with(b"/*") {
+                        self.mode = RustLexMode::BlockComment(1);
+                        idx += 2;
+                        continue;
+                    }
+                    if let Some((hashes, content_start)) = raw_string_open(bytes, idx) {
+                        self.mode = RustLexMode::RawString(hashes);
+                        idx = content_start;
+                        continue;
+                    }
+                    if literal_prefix_boundary(bytes, idx) && bytes[idx..].starts_with(b"b\"") {
+                        self.mode = RustLexMode::String;
+                        idx += 2;
+                        continue;
+                    }
+                    if bytes[idx] == b'"' {
+                        self.mode = RustLexMode::String;
+                        idx += 1;
+                        continue;
+                    }
+                    if literal_prefix_boundary(bytes, idx)
+                        && bytes[idx..].starts_with(b"b'")
+                        && let Some(end) = char_literal_end(line, idx + 1)
+                    {
+                        idx = end;
+                        continue;
+                    }
+                    if bytes[idx] == b'\''
+                        && let Some(end) = char_literal_end(line, idx)
+                    {
+                        idx = end;
+                        continue;
+                    }
+                    if matches!(bytes[idx], b'{' | b'}') {
+                        on_brace(bytes[idx]);
+                    }
+                    idx += 1;
+                }
+                RustLexMode::BlockComment(mut depth) => {
+                    if bytes[idx..].starts_with(b"/*") {
+                        depth += 1;
+                        self.mode = RustLexMode::BlockComment(depth);
+                        idx += 2;
+                    } else if bytes[idx..].starts_with(b"*/") {
+                        depth -= 1;
+                        self.mode = if depth == 0 {
+                            RustLexMode::Code
+                        } else {
+                            RustLexMode::BlockComment(depth)
+                        };
+                        idx += 2;
+                    } else {
+                        idx += 1;
+                    }
+                }
+                RustLexMode::String => match bytes[idx] {
+                    b'\\' => idx = (idx + 2).min(bytes.len()),
+                    b'"' => {
+                        self.mode = RustLexMode::Code;
+                        idx += 1;
+                    }
+                    _ => idx += 1,
+                },
+                RustLexMode::RawString(hashes) => {
+                    if bytes[idx] == b'"'
+                        && bytes
+                            .get(idx + 1..idx + 1 + hashes)
+                            .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#'))
+                    {
+                        self.mode = RustLexMode::Code;
+                        idx += 1 + hashes;
+                    } else {
+                        idx += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn literal_prefix_boundary(bytes: &[u8], idx: usize) -> bool {
+    idx == 0
+        || !matches!(bytes[idx - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+            && bytes[idx - 1].is_ascii()
+}
+
+/// Return `(hash_count, content_start)` for a Rust `r#"..."#` or
+/// `br#"..."#` opener beginning at `idx`.
+fn raw_string_open(bytes: &[u8], idx: usize) -> Option<(usize, usize)> {
+    if !literal_prefix_boundary(bytes, idx) {
+        return None;
+    }
+
+    let mut cursor = if bytes[idx..].starts_with(b"br") {
+        idx + 2
+    } else if bytes[idx] == b'r' {
+        idx + 1
+    } else {
+        return None;
+    };
+    let hash_start = cursor;
+    while bytes.get(cursor) == Some(&b'#') {
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b'"') {
+        return None;
+    }
+    Some((cursor - hash_start, cursor + 1))
+}
+
+/// Confirm a complete Rust character literal rather than treating every
+/// apostrophe (including lifetimes and labels) as a character delimiter.
+fn char_literal_end(line: &str, quote: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let content = quote.checked_add(1)?;
+    let first = *bytes.get(content)?;
+
+    let close = if first == b'\\' {
+        match *bytes.get(content + 1)? {
+            b'x' => {
+                let digits = bytes.get(content + 2..content + 4)?;
+                if !digits.iter().all(u8::is_ascii_hexdigit) {
+                    return None;
+                }
+                let value =
+                    (digits[0] as char).to_digit(16)? * 16 + (digits[1] as char).to_digit(16)?;
+                if value > 0x7f {
+                    return None;
+                }
+                content + 4
+            }
+            b'u' if bytes.get(content + 2) == Some(&b'{') => {
+                let mut cursor = content + 3;
+                let mut digits = 0usize;
+                let mut value = 0u32;
+                while let Some(byte) = bytes.get(cursor) {
+                    match byte {
+                        b'}' if digits > 0 && char::from_u32(value).is_some() => break,
+                        b'_' => {}
+                        byte if byte.is_ascii_hexdigit() && digits < 6 => {
+                            value = value.checked_mul(16)? + (*byte as char).to_digit(16)?;
+                            digits += 1;
+                        }
+                        _ => return None,
+                    }
+                    cursor += 1;
+                }
+                if bytes.get(cursor) != Some(&b'}') {
+                    return None;
+                }
+                cursor + 1
+            }
+            b'n' | b'r' | b't' | b'0' | b'\\' | b'\'' | b'"' => content + 2,
+            _ => return None,
+        }
+    } else {
+        let character = line.get(content..)?.chars().next()?;
+        if matches!(character, '\'' | '\n' | '\r') {
+            return None;
+        }
+        content + character.len_utf8()
+    };
+
+    (bytes.get(close) == Some(&b'\'')).then_some(close + 1)
+}
+
+fn cfg_test_attribute_lines(lines: &[&str]) -> Vec<usize> {
+    let mut scanner = RustBraceScanner::default();
+    let mut attributes = Vec::new();
+
+    for (idx, line) in lines.iter().enumerate() {
+        if scanner.is_code() && line.trim_start().starts_with("#[cfg(test)]") {
+            attributes.push(idx);
+        }
+        scanner.scan_line(line, |_| {});
+    }
+    attributes
+}
+
+fn cfg_test_line_spans(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+
+    for start in cfg_test_attribute_lines(lines) {
+        if spans.last().is_some_and(|(_, end)| start <= *end) {
+            continue;
+        }
+
+        let mut scanner = RustBraceScanner::default();
+        let mut end = start;
+        let mut depth = 0isize;
+        let mut opened = false;
+
+        while end < lines.len() {
+            scanner.scan_line(lines[end], |brace| match brace {
+                b'{' => {
+                    depth += 1;
+                    opened = true;
+                }
+                b'}' if opened => depth -= 1,
+                _ => {}
+            });
+            if opened && depth <= 0 {
+                break;
+            }
+            end += 1;
+        }
+
+        if end >= lines.len() {
+            end = (start + REGION_CONTEXT_LINES).min(lines.len() - 1);
+        }
+        spans.push((start, end));
+    }
+
+    spans
 }
 
 fn fallback_head_tail_regions(lines: &[&str]) -> String {
@@ -744,8 +1110,27 @@ fn fallback_head_tail_regions(lines: &[&str]) -> String {
 }
 
 fn render_ranges(lines: &[&str], ranges: &[(usize, usize)]) -> String {
+    render_ranges_capped(lines, ranges, LARGE_CONTEXT_FILE_CHARS)
+}
+
+fn render_partitioned_ranges(
+    lines: &[&str],
+    implementation: &[(usize, usize)],
+    tests: &[(usize, usize)],
+) -> String {
+    let implementation_budget = LARGE_CONTEXT_FILE_CHARS / 2;
+    let mut out = render_ranges_capped(lines, implementation, implementation_budget);
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    let test_budget = LARGE_CONTEXT_FILE_CHARS.saturating_sub(char_count(&out));
+    let rendered_tests = render_ranges_capped(lines, tests, test_budget);
+    push_str_capped(&mut out, &rendered_tests, LARGE_CONTEXT_FILE_CHARS);
+    out
+}
+
+fn render_ranges_capped(lines: &[&str], ranges: &[(usize, usize)], cap: usize) -> String {
     let mut out = String::new();
-    let mut omitted = 0usize;
 
     for (idx, (start, end)) in ranges.iter().enumerate() {
         let mut block = String::new();
@@ -760,25 +1145,69 @@ fn render_ranges(lines: &[&str], ranges: &[(usize, usize)]) -> String {
             block.push('\n');
         }
 
-        if out.len() + block.len() > LARGE_CONTEXT_FILE_CHARS {
-            omitted = ranges.len() - idx;
-            // Name what the model CANNOT see: unnamed truncation invites the
-            // model to invent the missing content (2026-07-29 hallucination).
-            let spans: Vec<String> = ranges[idx..]
-                .iter()
-                .map(|(s, e)| format!("lines {}-{}", s + 1, e + 1))
-                .collect();
-            out.push_str(&format!(
-                "\n... omitted {omitted} later region(s) ({}) after ~{LARGE_CONTEXT_FILE_CHARS} chars. \
-                 Those lines are INVISIBLE to you — do NOT invent their content; SEARCH only from lines shown above.\n",
-                spans.join(", ")
-            ));
+        if char_count(&out) + char_count(&block) > cap {
+            render_truncated_range(lines, ranges, idx, *start, *end, cap, &mut out);
             break;
         }
         out.push_str(&block);
     }
 
     out
+}
+
+fn render_truncated_range(
+    lines: &[&str],
+    ranges: &[(usize, usize)],
+    idx: usize,
+    start: usize,
+    end: usize,
+    cap: usize,
+    out: &mut String,
+) {
+    let omitted = ranges.len() - idx;
+    let notice = format!(
+        "\n... omitted {omitted} later/truncated region(s) after ~{cap} chars. \
+         Those lines are INVISIBLE to you — do NOT invent their content; SEARCH only from lines shown above.\n"
+    );
+    let reserve = char_count(&notice);
+    if char_count(out) + reserve >= cap {
+        return;
+    }
+
+    if idx > 0 {
+        push_str_capped(out, "\n", cap - reserve);
+    }
+    push_str_capped(
+        out,
+        &format!("Region (lines {}-{}):\n", start + 1, end + 1),
+        cap - reserve,
+    );
+    for line in &lines[start..=end] {
+        if char_count(out) + char_count(line) + reserve <= cap {
+            out.push_str(line);
+        } else {
+            push_str_capped(out, line, cap - reserve);
+            break;
+        }
+    }
+    if !out.ends_with('\n') && char_count(out) + reserve < cap {
+        out.push('\n');
+    }
+    if char_count(out) + reserve <= cap {
+        out.push_str(&notice);
+    }
+}
+
+fn char_count(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn push_str_capped(out: &mut String, text: &str, cap: usize) {
+    let remaining = cap.saturating_sub(char_count(out));
+    if remaining == 0 {
+        return;
+    }
+    out.extend(text.chars().take(remaining));
 }
 
 fn task_context_paths(repo_path: &Path, task: &str) -> Result<Vec<PathBuf>> {
@@ -1424,9 +1853,10 @@ mod tests {
         assert!(!regions.contains("No task identifiers matched"));
     }
     #[test]
-    fn codegen_regions_test_module_first_when_task_wants_test() {
-        // Large file: identifier hit early, tests module at the end. With
-        // wants_test the cfg(test) module must lead (cap can't drop it).
+    fn codegen_regions_keep_implementation_before_bounded_tests() {
+        // Large file: identifier hit early, tests module at the end. Test
+        // grounding must not bury the exact implementation region behind a
+        // lower-value cfg(test) module.
         let mut content = String::new();
         for i in 1..40 {
             content.push_str(&format!("fn filler_{i}() {{}}\n"));
@@ -1440,10 +1870,188 @@ mod tests {
             .find("fn special_handler")
             .expect("identifier shown");
         assert!(
-            tests_pos < handler_pos,
-            "tests module must be the first region"
+            handler_pos < tests_pos,
+            "implementation region must precede bounded test grounding"
         );
         assert!(regions.contains("fn real_helper()"));
+    }
+
+    #[test]
+    fn codegen_extract_regions_preserves_exact_impl_and_named_test_under_cap() {
+        let content = include_str!("../../ff-db/src/queries.rs");
+        let identifiers = task_identifiers(
+            "add tests for offload_workload_for_kind and test_offload_workload_for_kind",
+        );
+        let regions = extract_relevant_regions(content, &identifiers, true);
+
+        let impl_pos = regions
+            .find("fn offload_workload_for_kind(kind: Option<&str>) -> Option<&'static str>")
+            .expect("byte-exact real implementation signature shown");
+        let test_pos = regions
+            .find("fn test_offload_workload_for_kind")
+            .expect("byte-exact real test signature shown");
+        assert!(
+            impl_pos < test_pos,
+            "implementation should be grounded before named test/helper"
+        );
+        assert!(
+            !regions.contains("fn deployment_health_fresh"),
+            "the first unrelated cfg(test) item must not become an unbounded test tail"
+        );
+        assert!(
+            char_count(&regions) <= LARGE_CONTEXT_FILE_CHARS,
+            "regions exceeded declared cap: {}",
+            char_count(&regions)
+        );
+    }
+
+    #[test]
+    fn codegen_exact_impl_and_test_have_reserved_budget_after_many_earlier_hits() {
+        let mut content = String::new();
+        for idx in 0..900 {
+            content.push_str(&format!(
+                "const OFFLOAD_WORKLOAD_FOR_KIND_REFERENCE_{idx}: &str = \"noise\";\n"
+            ));
+        }
+        content.push_str(
+            "fn offload_workload_for_kind(kind: Option<&str>) -> Option<&'static str> {\n    kind.map(|_| \"code-gen\")\n}\n",
+        );
+        content.push_str("#[cfg(test)]\nmod noisy_tests {\n");
+        for idx in 0..900 {
+            content.push_str(&format!(
+                "    fn offload_workload_for_kind_noise_{idx}() {{}}\n"
+            ));
+        }
+        content.push_str("}\n#[cfg(test)]\nmod exact_tests {\n");
+        content.push_str("    fn test_offload_workload_for_kind() {}\n}\n");
+
+        let identifiers =
+            task_identifiers("repair offload_workload_for_kind and test_offload_workload_for_kind");
+        let regions = extract_relevant_regions(&content, &identifiers, true);
+
+        let impl_pos = regions
+            .find("fn offload_workload_for_kind(kind: Option<&str>)")
+            .expect("reserved implementation region");
+        let test_pos = regions
+            .find("fn test_offload_workload_for_kind()")
+            .expect("reserved exact test region");
+        assert!(impl_pos < test_pos);
+        assert!(char_count(&regions) <= LARGE_CONTEXT_FILE_CHARS);
+    }
+
+    #[test]
+    fn codegen_task_identifiers_drop_generic_test_words_not_exact_symbols() {
+        let identifiers =
+            task_identifiers("unit testing for tests test_offload_workload_for_kind integration");
+
+        assert!(!identifiers.iter().any(|id| id == "unit"));
+        assert!(!identifiers.iter().any(|id| id == "testing"));
+        assert!(!identifiers.iter().any(|id| id == "tests"));
+        assert!(!identifiers.iter().any(|id| id == "integration"));
+        assert!(
+            identifiers
+                .iter()
+                .any(|id| id == "test_offload_workload_for_kind")
+        );
+    }
+
+    #[test]
+    fn codegen_named_function_anchor_requires_identifier_boundary() {
+        assert!(line_contains_named_function(
+            "pub async fn target_name<T>() {}",
+            "target_name"
+        ));
+        assert!(!line_contains_named_function(
+            "fn target_name_suffix() {}",
+            "target_name"
+        ));
+    }
+
+    #[test]
+    fn codegen_char_literal_recognizer_validates_unicode_and_ignores_lifetimes() {
+        assert_eq!(char_literal_end(r#"'\u{1f600}'"#, 0), Some(11));
+        assert_eq!(char_literal_end("'😀'", 0), Some(6));
+        assert_eq!(char_literal_end(r#"'\u{d800}'"#, 0), None);
+        assert_eq!(char_literal_end("'static", 0), None);
+        assert_eq!(char_literal_end("'outer:", 0), None);
+    }
+
+    #[test]
+    fn codegen_render_ranges_keeps_source_for_oversized_first_region() {
+        let huge_line = format!("fn target() {{ /* {} */ }}\n", "x".repeat(40_000));
+        let lines = vec![huge_line.as_str()];
+
+        let regions = render_ranges(&lines, &[(0, 0)]);
+
+        assert!(regions.contains("Region (lines 1-1):"));
+        assert!(regions.contains("fn target()"));
+        assert!(regions.contains("omitted"));
+        assert!(char_count(&regions) <= LARGE_CONTEXT_FILE_CHARS);
+    }
+
+    #[test]
+    fn codegen_render_ranges_preserves_multiline_boundaries_before_notice() {
+        let owned = (0..400)
+            .map(|idx| format!("let value_{idx} = \"{}\";\n", "x".repeat(80)))
+            .collect::<Vec<_>>();
+        let lines = owned.iter().map(String::as_str).collect::<Vec<_>>();
+
+        let regions = render_ranges(&lines, &[(0, lines.len() - 1)]);
+
+        assert!(regions.contains(&format!(
+            "let value_0 = \"{}\";\nlet value_1 =",
+            "x".repeat(80)
+        )));
+        assert!(regions.contains("\n... omitted"));
+        assert!(char_count(&regions) <= LARGE_CONTEXT_FILE_CHARS);
+    }
+
+    #[test]
+    fn codegen_cfg_test_spans_ignore_comments_strings_chars_and_lifetimes() {
+        let lines = [
+            "const IGNORED: &str = r##\"",
+            "#[cfg(test)]",
+            "mod fake { }",
+            "\"##;",
+            "/* outer {",
+            "   /* nested } */",
+            "#[cfg(test)]",
+            "*/",
+            "#[cfg(test)]",
+            "mod real_tests {",
+            "    let normal = \"{ }\\\"still string\";",
+            "    let bytes = b\"{ }\";",
+            "    let raw = r###\"{ }\"###;",
+            "    let byte_raw = br##\"{ }\"##;",
+            "    let open = '{';",
+            "    let quote = '\\'';",
+            "    let value: &'static str = \"}\";",
+            "    'outer: loop { break 'outer; }",
+            "    // } ignored",
+            "    /* nested comment {",
+            "       /* } */",
+            "       } still comment */",
+            "}",
+        ];
+
+        assert_eq!(cfg_test_line_spans(&lines), vec![(8, 22)]);
+    }
+
+    #[test]
+    fn codegen_cfg_test_spans_handle_multiple_items_and_unclosed_fallback() {
+        let lines = [
+            "#[cfg(test)]",
+            "mod one {",
+            "    let unicode = '😀';",
+            "}",
+            "#[cfg(test)]",
+            "fn two() { let escaped = '\\u{1f600}'; }",
+            "#[cfg(test)]",
+            "mod unclosed {",
+            "    let raw = r#\"} never closes;",
+        ];
+
+        assert_eq!(cfg_test_line_spans(&lines), vec![(0, 3), (4, 5), (6, 8)]);
     }
 
     #[test]
