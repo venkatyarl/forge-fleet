@@ -1257,25 +1257,104 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             replace_with,
             reason,
         } => {
-            let result = sqlx::query(
-                "UPDATE model_catalog
-                    SET lifecycle_status   = 'retired',
-                        replaced_by        = COALESCE($2, replaced_by),
-                        retirement_reason  = $3,
-                        retirement_date    = CURRENT_DATE
-                  WHERE id = $1",
+            let reason = reason.trim();
+            if reason.is_empty() {
+                anyhow::bail!("--reason must not be empty");
+            }
+            if replace_with
+                .as_deref()
+                .is_some_and(|replacement| replacement.eq_ignore_ascii_case(&id))
+            {
+                anyhow::bail!("replacement model must differ from retired model '{id}'");
+            }
+
+            let mut locked_ids = vec![id.clone()];
+            if let Some(replacement) = &replace_with {
+                locked_ids.push(replacement.clone());
+            }
+            locked_ids.sort();
+            locked_ids.dedup();
+
+            let mut tx = pool.begin().await?;
+            let rows = sqlx::query(
+                "SELECT id, lifecycle, description
+                   FROM fleet_model_catalog
+                  WHERE id = ANY($1)
+                  ORDER BY id
+                  FOR UPDATE",
+            )
+            .bind(&locked_ids)
+            .fetch_all(&mut *tx)
+            .await?;
+
+            let target = rows
+                .iter()
+                .find(|row| sqlx::Row::get::<String, _>(*row, "id") == id)
+                .ok_or_else(|| anyhow::anyhow!("no canonical catalog row for id '{id}'"))?;
+            let target_lifecycle: Option<String> = sqlx::Row::get(target, "lifecycle");
+            if target_lifecycle.as_deref() == Some("retired") {
+                anyhow::bail!("model '{id}' is already retired");
+            }
+
+            if let Some(replacement) = &replace_with {
+                let replacement_row = rows
+                    .iter()
+                    .find(|row| sqlx::Row::get::<String, _>(*row, "id") == *replacement)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("replacement model '{replacement}' is not in the catalog")
+                    })?;
+                let lifecycle: Option<String> = sqlx::Row::get(replacement_row, "lifecycle");
+                if lifecycle.as_deref().unwrap_or("active") != "active" {
+                    anyhow::bail!(
+                        "replacement model '{replacement}' must have lifecycle='active' (found '{}')",
+                        lifecycle.as_deref().unwrap_or("active")
+                    );
+                }
+            }
+
+            let existing_description: Option<String> = sqlx::Row::get(target, "description");
+            let description = append_retirement_history(
+                existing_description.as_deref(),
+                replace_with.as_deref(),
+                reason,
+                &whoami_tag(),
+                chrono::Utc::now(),
+            );
+            let updated = sqlx::query(
+                "UPDATE fleet_model_catalog
+                    SET lifecycle = 'retired',
+                        description = $2,
+                        updated_at = NOW()
+                  WHERE id = $1
+                    AND COALESCE(lifecycle, 'active') <> 'retired'",
             )
             .bind(&id)
-            .bind(replace_with.as_deref())
-            .bind(&reason)
-            .execute(&pool)
+            .bind(&description)
+            .execute(&mut *tx)
             .await?;
-            if result.rows_affected() == 0 {
-                anyhow::bail!("no catalog row for id '{id}'");
+            if updated.rows_affected() != 1 {
+                anyhow::bail!("race: model '{id}' changed during retirement");
             }
-            match replace_with {
-                Some(rep) => println!("{GREEN}✓{RESET} Retired '{id}' (replaced by '{rep}')"),
-                None => println!("{GREEN}✓{RESET} Retired '{id}'"),
+            let deployments = sqlx::query(
+                "UPDATE fleet_model_deployments
+                    SET desired_state = 'retired'
+                  WHERE catalog_id = $1
+                    AND desired_state = 'active'",
+            )
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            tx.commit().await?;
+
+            match &replace_with {
+                Some(rep) => println!(
+                    "{GREEN}✓{RESET} Retired '{id}' (replaced by '{rep}'); \
+                     marked {deployments} deployment(s) non-active"
+                ),
+                None => println!(
+                    "{GREEN}✓{RESET} Retired '{id}'; marked {deployments} deployment(s) non-active"
+                ),
             }
         }
         crate::ModelCommand::Benchmark {
@@ -2173,12 +2252,14 @@ async fn handle_model_approve(
         variant_objs.push(parse_variant_spec(spec)?);
     }
 
-    // 1. Verify the candidate exists and is still in review, and grab
-    //    the metadata we'll copy into the runtime catalog row.
+    // 1. Snapshot the canonical candidate. The final UPDATE also compares
+    //    updated_at so an operator/scout edit made during the benchmark cannot
+    //    be silently overwritten.
     let row = sqlx::query(
-        "SELECT lifecycle_status, display_name, family, parameter_count,
-                        tasks, quality_tier, notes
-                   FROM model_catalog WHERE id = $1",
+        "SELECT lifecycle, variants, preferred_workloads, tasks, tier,
+                tool_calling, updated_at
+           FROM fleet_model_catalog
+          WHERE id = $1",
     )
     .bind(&id)
     .fetch_optional(&pool)
@@ -2186,18 +2267,33 @@ async fn handle_model_approve(
     let Some(row) = row else {
         anyhow::bail!("no catalog row found for id '{id}'");
     };
-    let status: String = sqlx::Row::get(&row, "lifecycle_status");
+    let status: Option<String> = sqlx::Row::get(&row, "lifecycle");
+    let status = status.unwrap_or_else(|| "active".to_string());
     if status != "candidate" {
         anyhow::bail!(
-            "model '{id}' is in lifecycle_status='{status}' — only 'candidate' rows can be approved"
+            "model '{id}' is in lifecycle='{status}' — only 'candidate' rows can be approved"
         );
     }
-    let cand_display_name: String = sqlx::Row::get(&row, "display_name");
-    let cand_family: String = sqlx::Row::get(&row, "family");
-    let cand_params: Option<String> = sqlx::Row::get(&row, "parameter_count");
-    let cand_tasks: serde_json::Value = sqlx::Row::get(&row, "tasks");
-    let cand_quality_tier: String = sqlx::Row::get(&row, "quality_tier");
-    let cand_notes: Option<String> = sqlx::Row::get(&row, "notes");
+    let existing_variants: serde_json::Value = sqlx::Row::get(&row, "variants");
+    let existing_workloads: serde_json::Value = sqlx::Row::get(&row, "preferred_workloads");
+    let cand_tasks: Option<serde_json::Value> = sqlx::Row::get(&row, "tasks");
+    let cand_tasks = cand_tasks.unwrap_or_else(|| serde_json::json!([]));
+    let existing_tier: i32 = sqlx::Row::get(&row, "tier");
+    let existing_tool_calling: bool = sqlx::Row::get(&row, "tool_calling");
+    let snapshot_updated_at: chrono::DateTime<chrono::Utc> = sqlx::Row::get(&row, "updated_at");
+
+    let variants_json = merge_catalog_variants(&existing_variants, &variant_objs);
+    let workloads_json = approved_workloads(&existing_workloads, &cand_tasks, workloads.as_deref());
+    let tool_calling_val = existing_tool_calling
+        || tool_calling
+        || workloads_json.as_array().is_some_and(|values| {
+            values.iter().any(|value| {
+                value
+                    .as_str()
+                    .is_some_and(|workload| workload.eq_ignore_ascii_case("tool_calling"))
+            })
+        });
+    let tier_val = tier.unwrap_or(existing_tier);
 
     let skip = skip_benchmark || force;
     let mut bench_summary: Option<ff_agent::model_benchmark::BenchmarkReport> = None;
@@ -2227,8 +2323,8 @@ async fn handle_model_approve(
                 Ok(None) => {
                     anyhow::bail!(
                         "no compatible node found to benchmark '{id}' \
-                                 (check required_gpu_kind / min_vram_gb / file_size_gb \
-                                 vs live Pulse beats). \
+                                 (check canonical runtime variants and their size_gb \
+                                 against live Pulse capacity). \
                                  Use --on-computer <name> to force one, or \
                                  --skip-benchmark to approve without benchmarking."
                     );
@@ -2274,114 +2370,48 @@ async fn handle_model_approve(
         }
     }
 
-    // 3. Promote to active (idempotent-safe: we re-check the gate).
+    // 3. Promote the same canonical row. There is no second runtime catalog to
+    //    materialize: fleet_model_catalog is the loader/router authority.
     let result = sqlx::query(
-        "UPDATE model_catalog
-                    SET lifecycle_status = 'active'
-                  WHERE id = $1 AND lifecycle_status = 'candidate'",
+        "UPDATE fleet_model_catalog
+            SET lifecycle = 'active',
+                variants = $2,
+                tier = $3,
+                preferred_workloads = $4,
+                tool_calling = $5,
+                updated_at = NOW()
+          WHERE id = $1
+            AND lifecycle = 'candidate'
+            AND updated_at = $6",
     )
     .bind(&id)
+    .bind(&variants_json)
+    .bind(tier_val)
+    .bind(&workloads_json)
+    .bind(tool_calling_val)
+    .bind(snapshot_updated_at)
     .execute(&pool)
     .await?;
     if result.rows_affected() == 0 {
-        anyhow::bail!("race: candidate '{id}' was changed by someone else during approval");
+        anyhow::bail!(
+            "race: candidate '{id}' was changed by another session during approval; review it again"
+        );
     }
 
-    // 3b. Materialize the runtime catalog row so the loader/router can
-    //     actually see the approved model. The two catalogs share the
-    //     `id` keyspace but were never kept in sync — without this an
-    //     "approved" model still wasn't servable. ON CONFLICT DO NOTHING
-    //     so an existing operator-tuned runtime row is never clobbered.
-    //     Failure here is non-fatal: the lifecycle flip already
-    //     committed, so we warn loudly with the manual recovery command
-    //     rather than reporting a misleading "approve failed".
-    let mut runtime_row_note: Option<String> = None;
-    if !no_runtime_row {
-        let tier_val = tier.unwrap_or_else(|| quality_tier_to_int(&cand_quality_tier));
-        let params_val = cand_params
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("unknown")
-            .to_string();
-        // Workloads: explicit override (csv) else the candidate's HF tasks.
-        let workloads_json = match workloads.as_deref() {
-            Some(csv) => serde_json::json!(
-                csv.split(',')
-                    .map(str::trim)
-                    .filter(|t| !t.is_empty())
-                    .collect::<Vec<_>>()
-            ),
-            None => {
-                if cand_tasks.is_array() {
-                    cand_tasks.clone()
-                } else {
-                    serde_json::json!([])
-                }
-            }
-        };
-        let tool_calling_val = tool_calling
-            || workloads_json
-                .as_array()
-                .map(|a| a.iter().any(|w| w.as_str() == Some("tool_calling")))
-                .unwrap_or(false);
-        let variants_json = serde_json::Value::Array(variant_objs.clone());
-
-        let res = sqlx::query(
-            "INSERT INTO fleet_model_catalog
-                         (id, name, family, parameters, tier, description,
-                          gated, preferred_workloads, variants, tool_calling)
-                     VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7, $8, $9)
-                     ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(&id)
-        .bind(&cand_display_name)
-        .bind(&cand_family)
-        .bind(&params_val)
-        .bind(tier_val)
-        .bind(&cand_notes)
-        .bind(&workloads_json)
-        .bind(&variants_json)
-        .bind(tool_calling_val)
-        .execute(&pool)
-        .await;
-        match res {
-            Ok(r) if r.rows_affected() == 1 => {
-                runtime_row_note = Some(if variant_objs.is_empty() {
-                    format!(
-                        "runtime row created (tier {tier_val}, tool_calling={tool_calling_val}); \
-                                 router/loader-visible but NOT yet downloadable — scout candidates carry \
-                                 no runtime info. Tip: pass `--variant runtime:hf_repo[:quant[:size_gb]]` \
-                                 to `ff model approve` to make it servable in one step."
-                    )
-                } else {
-                    format!(
-                        "runtime row created (tier {tier_val}, tool_calling={tool_calling_val}, \
-                                 {} variant(s)); download with: ff model download {id}",
-                        variant_objs.len()
-                    )
-                });
-            }
-            Ok(_) => {
-                runtime_row_note = Some("runtime row already existed (left untouched)".into());
-            }
-            Err(e) => {
-                eprintln!(
-                    "{YELLOW}⚠ Promoted, but could NOT materialize the fleet_model_catalog \
-                             runtime row:{RESET} {e}\n  \
-                             The model is active but not yet loader/router-visible. Add it manually:\n  \
-                             ff model catalog-add {id} --name '{cand_display_name}' --family {cand_family} \
-                             --params {params_val} [--variant ...]"
-                );
-            }
-        }
+    if no_runtime_row {
+        eprintln!(
+            "{YELLOW}⚠ --no-runtime-row is deprecated and has no effect:{RESET} \
+             fleet_model_catalog is already the canonical runtime row"
+        );
     }
 
     // 4. Report.
-    println!("{GREEN}✓{RESET} Promoted '{id}' to lifecycle_status='active'");
-    if let Some(note) = &runtime_row_note {
-        println!("  {CYAN}↳{RESET} {note}");
-    }
+    println!("{GREEN}✓{RESET} Promoted '{id}' to lifecycle='active'");
+    println!(
+        "  {CYAN}↳{RESET} canonical runtime row updated (tier {tier_val}, \
+         tool_calling={tool_calling_val}, {} variant(s))",
+        variants_json.as_array().map_or(0, Vec::len)
+    );
     if let Some(r) = bench_summary {
         println!("  benchmark pass:   yes");
         println!("  computer:         {}", r.computer);
@@ -3318,6 +3348,122 @@ fn candidate_hf_repos(variants: &serde_json::Value) -> Vec<String> {
     repos
 }
 
+fn variant_field_matches_or_missing(
+    existing: &serde_json::Map<String, serde_json::Value>,
+    incoming: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> bool {
+    match (
+        existing.get(field).and_then(serde_json::Value::as_str),
+        incoming.get(field).and_then(serde_json::Value::as_str),
+    ) {
+        (Some(left), Some(right)) => left.trim().eq_ignore_ascii_case(right.trim()),
+        _ => true,
+    }
+}
+
+/// Merge operator-supplied serving data into scout variants without discarding
+/// metadata such as upstream revisions, download counts, or gating evidence.
+/// A matching HF repository is the stable identity; runtime/quant only split
+/// the identity when both sides specify conflicting values.
+fn merge_catalog_variants(
+    existing: &serde_json::Value,
+    additions: &[serde_json::Value],
+) -> serde_json::Value {
+    let mut merged = existing.as_array().cloned().unwrap_or_default();
+    for addition in additions {
+        let Some(incoming) = addition.as_object() else {
+            continue;
+        };
+        let incoming_repo = incoming
+            .get("hf_repo")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|repo| !repo.is_empty());
+        let matching_index = incoming_repo.and_then(|repo| {
+            merged.iter().position(|candidate| {
+                let Some(current) = candidate.as_object() else {
+                    return false;
+                };
+                current
+                    .get("hf_repo")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|current_repo| current_repo.trim().eq_ignore_ascii_case(repo))
+                    && variant_field_matches_or_missing(current, incoming, "runtime")
+                    && variant_field_matches_or_missing(current, incoming, "quant")
+            })
+        });
+
+        if let Some(index) = matching_index
+            && let Some(current) = merged[index].as_object_mut()
+        {
+            for (key, value) in incoming {
+                current.insert(key.clone(), value.clone());
+            }
+        } else {
+            merged.push(addition.clone());
+        }
+    }
+    serde_json::Value::Array(merged)
+}
+
+fn normalized_workload_values<'a>(values: impl IntoIterator<Item = &'a str>) -> serde_json::Value {
+    let mut normalized = Vec::<String>::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty()
+            || normalized
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(value))
+        {
+            continue;
+        }
+        normalized.push(value.to_string());
+    }
+    serde_json::json!(normalized)
+}
+
+fn approved_workloads(
+    existing: &serde_json::Value,
+    tasks: &serde_json::Value,
+    explicit_csv: Option<&str>,
+) -> serde_json::Value {
+    if let Some(csv) = explicit_csv {
+        return normalized_workload_values(csv.split(','));
+    }
+    let source = if existing.is_array() { existing } else { tasks };
+    normalized_workload_values(
+        source
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str),
+    )
+}
+
+fn append_retirement_history(
+    description: Option<&str>,
+    replaced_by: Option<&str>,
+    reason: &str,
+    actor: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    const MARKER: &str = "[forgefleet-retirement]";
+    let entry = serde_json::json!({
+        "at": at.to_rfc3339(),
+        "reason": reason,
+        "replaced_by": replaced_by,
+        "actor": actor,
+    });
+    match description
+        .map(str::trim_end)
+        .filter(|value| !value.is_empty())
+    {
+        Some(existing) => format!("{existing}\n\n{MARKER} {entry}"),
+        None => format!("{MARKER} {entry}"),
+    }
+}
+
 /// Parse a `--variant` spec `runtime:hf_repo[:quant[:size_gb]]` into the
 /// `fleet_model_catalog.variants` element shape `{runtime, hf_repo, quant,
 /// size_gb}`. `runtime` and `hf_repo` are required; an `hf_repo` containing
@@ -3355,29 +3501,6 @@ fn parse_variant_spec(spec: &str) -> Result<serde_json::Value> {
         }
     }
     Ok(serde_json::Value::Object(obj))
-}
-
-/// Map a `model_catalog.quality_tier` (free text) to the integer
-/// `fleet_model_catalog.tier` (1..4). Grounded in the live values
-/// (`experimental`/`standard`/`flagship`/`legacy`) plus a numeric/`tierN`
-/// fallback; anything unknown defaults to the mid tier 2. Used to materialize
-/// a runtime catalog row when a scout candidate is approved.
-fn quality_tier_to_int(quality_tier: &str) -> i32 {
-    let t = quality_tier.trim().to_ascii_lowercase();
-    match t.as_str() {
-        "experimental" | "legacy" => 1,
-        "standard" => 2,
-        "flagship" => 3,
-        // `tier1`..`tier4` or a bare `1`..`4` → that number (clamped 1..4).
-        other => {
-            let digits: String = other.chars().filter(|c| c.is_ascii_digit()).collect();
-            digits
-                .parse::<i32>()
-                .ok()
-                .map(|n| n.clamp(1, 4))
-                .unwrap_or(2)
-        }
-    }
 }
 
 fn truncate_str(s: &str, n: usize) -> String {
@@ -3524,21 +3647,85 @@ mod tests {
     }
 
     #[test]
-    fn quality_tier_maps_to_int() {
-        // Live model_catalog.quality_tier values.
-        assert_eq!(quality_tier_to_int("standard"), 2);
-        assert_eq!(quality_tier_to_int("flagship"), 3);
-        assert_eq!(quality_tier_to_int("experimental"), 1);
-        assert_eq!(quality_tier_to_int("legacy"), 1);
-        // Case-insensitive + whitespace tolerant.
-        assert_eq!(quality_tier_to_int("  Flagship "), 3);
-        // tierN / bare-number forms, clamped 1..4.
-        assert_eq!(quality_tier_to_int("tier4"), 4);
-        assert_eq!(quality_tier_to_int("3"), 3);
-        assert_eq!(quality_tier_to_int("tier9"), 4);
-        // Unknown → mid tier.
-        assert_eq!(quality_tier_to_int("premium"), 2);
-        assert_eq!(quality_tier_to_int(""), 2);
+    fn approve_variant_merge_preserves_scout_metadata_and_deduplicates() {
+        let existing = serde_json::json!([
+            {
+                "hf_repo": "Org/Example-Model",
+                "downloads": 42,
+                "upstream_latest_rev": "abc123"
+            },
+            {
+                "runtime": "vllm",
+                "hf_repo": "Org/Example-Model",
+                "quant": "FP8",
+                "size_gb": 30.0
+            }
+        ]);
+        let additions = vec![
+            serde_json::json!({
+                "runtime": "llama.cpp",
+                "hf_repo": "org/example-model",
+                "quant": "Q4_K_M",
+                "size_gb": 18.0
+            }),
+            serde_json::json!({
+                "runtime": "llama.cpp",
+                "hf_repo": "ORG/EXAMPLE-MODEL",
+                "quant": "Q4_K_M",
+                "size_gb": 19.0
+            }),
+        ];
+        let merged = merge_catalog_variants(&existing, &additions);
+        let variants = merged.as_array().unwrap();
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0]["downloads"], 42);
+        assert_eq!(variants[0]["upstream_latest_rev"], "abc123");
+        assert_eq!(variants[0]["runtime"], "llama.cpp");
+        assert_eq!(variants[0]["quant"], "Q4_K_M");
+        assert_eq!(variants[0]["size_gb"], 19.0);
+        assert_eq!(variants[1]["quant"], "FP8");
+    }
+
+    #[test]
+    fn approve_workloads_preserve_canonical_values_unless_overridden() {
+        let existing = serde_json::json!(["code", "Tool_Calling", "code"]);
+        let tasks = serde_json::json!(["fallback"]);
+        assert_eq!(
+            approved_workloads(&existing, &tasks, None),
+            serde_json::json!(["code", "Tool_Calling"])
+        );
+        assert_eq!(
+            approved_workloads(&existing, &tasks, Some("reasoning, tool_calling,reasoning")),
+            serde_json::json!(["reasoning", "tool_calling"])
+        );
+        assert_eq!(
+            approved_workloads(&serde_json::json!({}), &tasks, None),
+            tasks
+        );
+    }
+
+    #[test]
+    fn retirement_history_preserves_description_and_records_structured_evidence() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-08-03T20:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let description = append_retirement_history(
+            Some("Original operator description"),
+            Some("successor-model"),
+            "superseded after evaluation",
+            "adele",
+            at,
+        );
+        assert!(description.starts_with("Original operator description\n\n"));
+        let payload = description
+            .split_once("[forgefleet-retirement] ")
+            .unwrap()
+            .1;
+        let entry: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(entry["at"], "2026-08-03T20:00:00+00:00");
+        assert_eq!(entry["replaced_by"], "successor-model");
+        assert_eq!(entry["reason"], "superseded after evaluation");
+        assert_eq!(entry["actor"], "adele");
     }
 
     #[test]

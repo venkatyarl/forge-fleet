@@ -3954,7 +3954,7 @@ pub enum ModelCommand {
     },
     /// Model scout — walk fleet_task_coverage, query HF for the top-N
     /// downloaded models per task, filter by license/size/denylist, and
-    /// insert survivors as `lifecycle_status='candidate'`.
+    /// insert survivors as canonical `lifecycle='candidate'` rows.
     Scout {
         /// Trigger a scout pass right now (otherwise just prints
         /// recently-discovered candidates from the DB).
@@ -3963,13 +3963,13 @@ pub enum ModelCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// List catalog rows with `lifecycle_status='candidate'` awaiting
+    /// List canonical catalog rows with `lifecycle='candidate'` awaiting
     /// operator review.
     ReviewCandidates {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Promote a candidate row to `lifecycle_status='active'`.
+    /// Promote a canonical candidate row to `lifecycle='active'`.
     ///
     /// Default behavior: picks a compatible node (GPU first, then CPU) and
     /// runs the benchmark suite. The candidate is only promoted if the
@@ -3977,12 +3977,9 @@ pub enum ModelCommand {
     /// no errors). Pass `--skip-benchmark` (or `--force`) to bypass and
     /// promote immediately.
     ///
-    /// On promotion this ALSO materializes a `fleet_model_catalog` runtime row
-    /// (metadata copied from the candidate) so the model becomes visible to the
-    /// model loader/router — the two catalogs were previously disconnected, so
-    /// an "approved" model still couldn't be served. Pass `--variant ...` to
-    /// make it `ff model download`-able in the same step (scout candidates
-    /// carry no runtime info). Existing runtime rows are never overwritten.
+    /// Promotion updates the existing `fleet_model_catalog` row in place. Pass
+    /// `--variant ...` to merge serving details into its scout metadata and
+    /// make it `ff model download`-able in the same step.
     Approve {
         /// Catalog id.
         id: String,
@@ -3996,30 +3993,26 @@ pub enum ModelCommand {
         /// auto-picking. Ignored when `--skip-benchmark` is set.
         #[arg(long)]
         on_computer: Option<String>,
-        /// A downloadable runtime variant for the materialized
-        /// `fleet_model_catalog` row, repeatable. Format:
+        /// A downloadable runtime variant to merge into the canonical row,
+        /// repeatable. Format:
         /// `runtime:hf_repo[:quant[:size_gb]]`
         /// (e.g. `llama.cpp:Qwen/Qwen3-8B-GGUF:Q4_K_M:5`). Without at least
-        /// one variant the approved model is router/loader-visible but not
-        /// yet `ff model download`-able (scout candidates carry no runtime
-        /// info). This is how approve→servable becomes one step.
+        /// one valid variant the approved model is not yet downloadable.
         #[arg(long = "variant")]
         variants: Vec<String>,
-        /// Override the runtime-row tier (1..4). Default: derived from the
-        /// candidate's `quality_tier`.
+        /// Override the canonical tier (1..4). Default: preserve the candidate.
         #[arg(long)]
         tier: Option<i32>,
-        /// Override preferred workloads for the runtime row (comma-separated,
-        /// e.g. `code-gen,tool_calling,reasoning`). Default: the candidate's
-        /// HF `tasks`.
+        /// Override preferred workloads (comma-separated, e.g.
+        /// `code-gen,tool_calling,reasoning`). Default: preserve the candidate.
         #[arg(long)]
         workloads: Option<String>,
-        /// Force the runtime row's tool-calling flag on (otherwise derived
-        /// from the workloads containing `tool_calling`).
+        /// Force tool calling on. Approval never silently disables an existing
+        /// tool-calling capability.
         #[arg(long, default_value_t = false)]
         tool_calling: bool,
-        /// Skip materializing the `fleet_model_catalog` runtime row; only flip
-        /// the lifecycle status to active.
+        /// Deprecated compatibility flag. The canonical row is already the
+        /// runtime row, so this has no effect.
         #[arg(long, default_value_t = false)]
         no_runtime_row: bool,
     },
@@ -4029,12 +4022,12 @@ pub enum ModelCommand {
         /// Catalog id.
         id: String,
     },
-    /// Retire a model: flip `lifecycle_status='retired'` and optionally
-    /// record which model supersedes it.
+    /// Retire a canonical model, stop routing its deployments, and optionally
+    /// record a validated active successor in append-only retirement history.
     Retire {
         /// Catalog id.
         id: String,
-        /// Optional successor catalog id (populates `replaced_by`).
+        /// Optional successor catalog id. It must be active.
         #[arg(long)]
         replace_with: Option<String>,
         /// Human-readable retirement reason.
@@ -4042,7 +4035,7 @@ pub enum ModelCommand {
         reason: String,
     },
     /// Benchmark a model against a standard prompt suite. Writes results
-    /// into `model_catalog.benchmark_results` keyed by computer + timestamp.
+    /// into `fleet_model_catalog.benchmarks` keyed by computer + timestamp.
     Benchmark {
         /// Catalog id of the model to benchmark (e.g. `qwen3-coder`).
         model_id: String,
