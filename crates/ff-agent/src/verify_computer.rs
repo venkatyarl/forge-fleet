@@ -355,9 +355,9 @@ async fn ssh_capture(dest: &str, cmd: &str) -> Result<String, String> {
 
 fn redis_check_command(is_windows: bool) -> &'static str {
     if is_windows {
-        r#"powershell -NoProfile -Command "$out = & \"$env:USERPROFILE\.local\bin\ff.exe\" status --no-color 2>&1 | Out-String; if ($out -match 'Redis.*PONG') { exit 0 } else { exit 1 }""#
+        r#"powershell -NoProfile -Command "$out = & \"$env:USERPROFILE\.local\bin\ff.exe\" status 2>&1 | Out-String; if ($out -match 'Redis.*PONG') { exit 0 } else { exit 1 }""#
     } else {
-        "PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\" && ff status --no-color 2>&1 | grep -q 'Redis.*PONG'"
+        "PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\" && ff status 2>&1 | grep -q 'Redis.*PONG'"
     }
 }
 
@@ -382,6 +382,7 @@ mod tests {
         assert!(cmd.contains("Redis.*PONG"));
         assert!(cmd.contains("$HOME/.local/bin"));
         assert!(cmd.contains("$HOME/.cargo/bin"));
+        assert!(!cmd.contains("--no-color"));
     }
 
     #[test]
@@ -391,6 +392,7 @@ mod tests {
         assert!(!cmd.contains("nc"));
         assert!(cmd.contains("ff.exe"));
         assert!(cmd.contains("Redis.*PONG"));
+        assert!(!cmd.contains("--no-color"));
     }
 
     #[test]
