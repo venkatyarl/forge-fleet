@@ -599,6 +599,15 @@ fn task_identifiers(task: &str) -> Vec<String> {
         "existing",
         "large",
         "small",
+        // Generic test-intent words describe the kind of work, not a source
+        // region. Keeping them makes nearly every line in a large cfg(test)
+        // tail look relevant. Compound symbols remain intact tokens, so names
+        // such as `test_specific_behavior` are still selected exactly.
+        "test",
+        "tests",
+        "testing",
+        "unit",
+        "integration",
     ]
     .into_iter()
     .collect();
@@ -674,6 +683,9 @@ fn extract_relevant_regions(content: &str, identifiers: &[String], wants_test: b
         return "No content.\n".to_string();
     }
 
+    let test_module_start = wants_test
+        .then(|| lines.iter().position(|line| line.contains("#[cfg(test)]")))
+        .flatten();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     if !identifiers.is_empty() {
         for (idx, line) in lines.iter().enumerate() {
@@ -695,27 +707,46 @@ fn extract_relevant_regions(content: &str, identifiers: &[String], wants_test: b
         }
     }
 
-    // Test tasks ground on the test module: when the task mentions tests,
-    // the `#[cfg(test)]` module is the FIRST region so the char cap can never
-    // truncate it away (2026-07-29: the cap silently dropped the tests module
-    // and the model invented a `test_utils` helper that doesn't exist).
-    if wants_test && let Some(idx) = lines.iter().position(|l| l.contains("#[cfg(test)]")) {
-        let tr = (idx, lines.len() - 1);
-        // Keep/clamp identifier ranges that start before the test module;
-        // drop ones fully inside it (it is shown in full anyway).
-        ranges = ranges
-            .into_iter()
-            .filter_map(|(s, e)| {
-                if e < tr.0 {
-                    Some((s, e))
-                } else if s < tr.0 {
-                    Some((s, tr.0 - 1))
-                } else {
-                    None
+    if let Some(test_start) = test_module_start {
+        let has_implementation_match = lines[..test_start].iter().any(|line| {
+            let lower = line.to_ascii_lowercase();
+            identifiers
+                .iter()
+                .any(|identifier| lower.contains(identifier))
+        });
+
+        if has_implementation_match {
+            // Keep named implementation regions ahead of test context so a large
+            // test module cannot consume the budget before the edit target. Test
+            // matches remain bounded, with a small module anchor for orientation.
+            let mut implementation_ranges = Vec::new();
+            let mut test_ranges = vec![(test_start, (test_start + 2).min(lines.len() - 1))];
+            for (start, end) in ranges {
+                if start < test_start {
+                    implementation_ranges.push((start, end.min(test_start - 1)));
                 }
-            })
-            .collect();
-        ranges.insert(0, tr);
+                if end >= test_start {
+                    test_ranges.push((start.max(test_start), end));
+                }
+            }
+            test_ranges.sort_unstable();
+            let mut bounded_test_ranges: Vec<(usize, usize)> = Vec::new();
+            for (start, end) in test_ranges {
+                if let Some((_, last_end)) = bounded_test_ranges.last_mut()
+                    && start <= *last_end + 1
+                {
+                    *last_end = (*last_end).max(end);
+                } else {
+                    bounded_test_ranges.push((start, end));
+                }
+            }
+            implementation_ranges.extend(bounded_test_ranges);
+            ranges = implementation_ranges;
+        } else {
+            // Preserve the full-module grounding used by pure test-only tasks.
+            ranges.clear();
+            ranges.push((test_start, lines.len() - 1));
+        }
     }
 
     if ranges.is_empty() {
@@ -1423,27 +1454,72 @@ mod tests {
         assert!(regions.contains("fn special_handler() {}\n"));
         assert!(!regions.contains("No task identifiers matched"));
     }
-    #[test]
-    fn codegen_regions_test_module_first_when_task_wants_test() {
-        // Large file: identifier hit early, tests module at the end. With
-        // wants_test the cfg(test) module must lead (cap can't drop it).
-        let mut content = String::new();
-        for i in 1..40 {
-            content.push_str(&format!("fn filler_{i}() {{}}\n"));
-        }
-        content.push_str("fn special_handler() {}\n");
-        content.push_str("#[cfg(test)]\nmod tests {\n    fn real_helper() {}\n}\n");
 
-        let regions = extract_relevant_regions(&content, &["special_handler".to_string()], true);
+    #[test]
+    fn codegen_task_identifiers_filter_generic_test_intent_but_keep_exact_symbols() {
+        let task = "Add integration tests for cafe_parser and test_specific_behavior; unit testing must stay deterministic — UTF-8 café";
+
+        let identifiers = task_identifiers(task);
+
+        let parser_pos = identifiers
+            .iter()
+            .position(|identifier| identifier == "cafe_parser")
+            .expect("named implementation retained");
+        let helper_pos = identifiers
+            .iter()
+            .position(|identifier| identifier == "test_specific_behavior")
+            .expect("exact test helper retained");
+        assert!(parser_pos < helper_pos, "task order remains deterministic");
+        assert!(!identifiers.iter().any(|identifier| matches!(
+            identifier.as_str(),
+            "test" | "tests" | "testing" | "unit" | "integration"
+        )));
+        assert_eq!(identifiers, task_identifiers(task));
+    }
+
+    #[test]
+    fn codegen_regions_preserve_target_before_bounded_test_context() {
+        let mut content = String::new();
+        content.push_str("fn run_command_capture_cancellable() {}\n");
+        content.push_str("#[cfg(test)]\nmod tests {\n");
+        for i in 0..100 {
+            content.push_str(&format!("    fn unrelated_test_{i}() {{}}\n"));
+        }
+        content.push_str("    fn test_specific_behavior() {}\n");
+        for i in 100..2_000 {
+            content.push_str(&format!(
+                "    fn unrelated_test_tail_{i}() {{ let padding = \"{i:08}\"; }}\n"
+            ));
+        }
+        content.push_str("    fn unmatched_tail_sentinel() {}\n}\n");
+        assert!(content.len() > LARGE_CONTEXT_FILE_CHARS);
+
+        let identifiers = task_identifiers(
+            "Add integration tests for run_command_capture_cancellable and test_specific_behavior",
+        );
+        let regions = extract_relevant_regions(&content, &identifiers, true);
         let tests_pos = regions.find("#[cfg(test)]").expect("tests module shown");
         let handler_pos = regions
-            .find("fn special_handler")
+            .find("fn run_command_capture_cancellable")
             .expect("identifier shown");
         assert!(
-            tests_pos < handler_pos,
-            "tests module must be the first region"
+            handler_pos < tests_pos,
+            "implementation target must precede test context"
         );
-        assert!(regions.contains("fn real_helper()"));
+        assert!(regions.contains("fn test_specific_behavior()"));
+        assert!(!regions.contains("unmatched_tail_sentinel"));
+        assert!(regions.len() <= LARGE_CONTEXT_FILE_CHARS);
+    }
+
+    #[test]
+    fn codegen_regions_preserve_full_module_for_pure_test_tasks() {
+        let content = "fn implementation() {}\n#[cfg(test)]\nmod tests {\n    fn test_only_target() {}\n    fn tail_helper() {}\n}\n";
+
+        let regions = extract_relevant_regions(content, &["test_only_target".to_string()], true);
+
+        assert!(regions.starts_with("Region (lines 2-6):"));
+        assert!(regions.contains("fn test_only_target()"));
+        assert!(regions.contains("fn tail_helper()"));
     }
 
     #[test]
