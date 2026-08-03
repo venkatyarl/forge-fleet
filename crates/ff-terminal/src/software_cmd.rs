@@ -75,11 +75,14 @@ pub async fn handle_auto_upgrade_run_once(pool: &sqlx::PgPool, force: bool) -> R
         worker,
         env!("FF_GIT_SHA").to_string(),
     );
-    let enqueued = tick
-        .run_once(force)
+    let outcome = tick
+        .run_once_durable(force)
         .await
         .map_err(|e| anyhow::anyhow!("auto_upgrade run_once: {e}"))?;
-    println!("{GREEN}✓ dispatched {enqueued} upgrade task(s){RESET}");
+    println!(
+        "{GREEN}✓ refreshed {} self-built version row(s); dispatched {} upgrade task(s){RESET}",
+        outcome.refreshed_self_built, outcome.enqueued
+    );
     Ok(())
 }
 
