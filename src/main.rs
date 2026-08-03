@@ -2444,6 +2444,10 @@ fn seed_registry_from_config(config: &FleetConfig, registry: &NodeRegistry) {
 /// post-website-onboarding, since the source of truth is Postgres — the
 /// discovery loop scanned an empty list and reported `total=0` indefinitely.
 async fn build_fleet_scan_targets(config: &FleetConfig) -> Vec<ScanTarget> {
+    // The gateway (which serves /health) binds api_port + 2 (see the
+    // GatewayConfig bind_addr in start_gateway). Scanning api_port itself
+    // probes a port nothing listens on and marks the whole fleet offline.
+    let gateway_port = config.fleet.api_port.saturating_add(2);
     let resolver = ff_core::FleetResolver::new();
     let computers = match resolver.resolve().await {
         Ok(c) => c,
@@ -2454,7 +2458,7 @@ async fn build_fleet_scan_targets(config: &FleetConfig) -> Vec<ScanTarget> {
                     .nodes
                     .iter()
                     .map(|(n, node)| (n.as_str(), node.ip.as_str(), node.port, node.priority())),
-                config.fleet.api_port,
+                gateway_port,
             );
         }
     };
@@ -2468,7 +2472,7 @@ async fn build_fleet_scan_targets(config: &FleetConfig) -> Vec<ScanTarget> {
             };
             (c.name.as_str(), c.ip.as_str(), None, prio)
         }),
-        config.fleet.api_port,
+        gateway_port,
     )
 }
 
