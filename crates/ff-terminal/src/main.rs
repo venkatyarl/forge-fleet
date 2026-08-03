@@ -154,6 +154,41 @@ fn print_ff_version_long() {
     println!("Cargo version:    {}", env!("CARGO_PKG_VERSION"));
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LlmTargetRequest {
+    ExplicitLocalCatalog(String),
+    ExplicitUrl {
+        url: String,
+        requested_model: Option<String>,
+    },
+    ExplicitCatalog(String),
+    Auto,
+}
+
+fn classify_llm_target_request(
+    explicit_llm: Option<&str>,
+    requested_model: Option<&str>,
+) -> Result<LlmTargetRequest> {
+    if let Some(llm) = explicit_llm {
+        if let Some(catalog_id) = llm.strip_prefix("local:") {
+            if catalog_id.is_empty() {
+                anyhow::bail!("--llm local:<catalog-id> requires a catalog id");
+            }
+            return Ok(LlmTargetRequest::ExplicitLocalCatalog(
+                catalog_id.to_string(),
+            ));
+        }
+        return Ok(LlmTargetRequest::ExplicitUrl {
+            url: llm.to_string(),
+            requested_model: requested_model.map(str::to_string),
+        });
+    }
+    if let Some(model) = requested_model {
+        return Ok(LlmTargetRequest::ExplicitCatalog(model.to_string()));
+    }
+    Ok(LlmTargetRequest::Auto)
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "ff", version = FF_LONG_VERSION, about = "ForgeFleet — distributed AI agent platform")]
 struct Cli {
@@ -4574,91 +4609,116 @@ async fn main() -> Result<()> {
         Some(Command::Social { command }) => {
             return social_cmd::handle_social(command.clone()).await;
         }
+        // A cloud/vendor backend does not consume a fleet model. Keep it off
+        // the local attestation path so an unavailable local control plane
+        // cannot prevent an explicitly requested Codex/Kimi/Claude run.
+        Some(Command::Run {
+            prompt,
+            backend,
+            backend_args,
+            timeout,
+            ..
+        }) if !backend.eq_ignore_ascii_case("local") => {
+            let working_dir = cli
+                .cwd
+                .clone()
+                .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+            let result = ff_agent::cli_executor::execute_cli_in_dir(
+                backend,
+                prompt,
+                backend_args,
+                Some(working_dir.as_path()),
+                timeout.map(std::time::Duration::from_secs),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("backend {backend}: {error}"))?;
+            if !result.stderr.is_empty() {
+                eprintln!("{}", result.stderr);
+            }
+            println!("{}", result.stdout);
+            if result.exit_code != 0 {
+                std::process::exit(result.exit_code as i32);
+            }
+            return Ok(());
+        }
         _ => {}
     }
 
-    // Build the local-first inference router (probes localhost + fleet from DB).
-    // If the user explicitly passed --llm, skip auto-routing and use that URL directly.
-    let (llm, router, routed_model) =
-        if let Some(explicit_url) = cli.llm.or_else(|| env::var("FORGEFLEET_LLM_URL").ok()) {
-            if let Some(model_hint) = explicit_url.strip_prefix("local:") {
-                if model_hint.is_empty() {
-                    anyhow::bail!("--llm local:<catalog-id> requires a catalog id");
-                }
-                let pool = ff_agent::fleet_info::get_fleet_pool()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("resolve --llm {explicit_url}: {e}"))?;
-                let candidate = ff_agent::fleet_oneshot::resolve_route_candidate(&pool, model_hint)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("resolve --llm {explicit_url}: {e}"))?;
-                let model = [candidate.catalog_name, candidate.catalog_id]
-                    .into_iter()
-                    .flatten()
-                    .find(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| model_hint.to_string());
-                (candidate.endpoint, None, Some(model))
-            } else {
-                (explicit_url, None, None)
-            }
-        } else if let Some(url) = helpers::pick_agent_capable_url(&config_path, 32_768).await {
-            // Agent-capable endpoint (tool-calling + usable_agent_ctx >= 32K).
-            // 32K (not 16K) MATCHES the agent loop's default
-            // `context_window_tokens` (32768): a 16K endpoint overflowed even a
-            // 1-file task because the system prompt + tool schemas + file easily
-            // exceed 16K, and the loop won't auto-compact until its 32K
-            // threshold. The fleet has ample 32K+ endpoints (vinny 64K,
-            // james/logan/duncan 32K), so this routes to a model that can
-            // actually hold the context instead of overflowing on turn 1.
-            // Use it DIRECTLY with NO inference router: the agent loop prefers
-            // router.active_url() (local-first) over llm_base_url, so attaching
-            // the router would override this pick back to a small-per-slot-ctx
-            // endpoint and the agent overflows on turn 1 (P0.1). Failover to a
-            // small-ctx endpoint would just overflow anyway, so direct is right.
-            (url, None, None)
-        } else {
-            // No agent-capable deployment — fall back to the local-first
-            // inference router (with failover), exactly as before. Fail-closed.
-            let r = ff_agent::inference_router::InferenceRouter::from_config(&config_path).await;
-            let primary = if let Some(url) = r.active_url().await {
-                url
-            } else {
-                helpers::detect_llm_from_db_or_local(&config_path).await
-            };
-            (primary, Some(std::sync::Arc::new(r)), None)
-        };
-
-    let mut model = cli
+    let explicit_llm = cli
+        .llm
+        .clone()
+        .or_else(|| env::var("FORGEFLEET_LLM_URL").ok());
+    let requested_model = cli
         .model
+        .clone()
         .or_else(|| env::var("FORGEFLEET_MODEL").ok())
-        .or(routed_model)
-        .unwrap_or_else(|| "auto".into());
+        .filter(|model| model.trim() != "auto");
 
-    // If model is "auto", query the LLM server for its actual model name
+    let pool_for_target = ff_agent::fleet_info::get_fleet_pool().await.ok();
+    let target_request =
+        classify_llm_target_request(explicit_llm.as_deref(), requested_model.as_deref())?;
     static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
         std::sync::LazyLock::new(reqwest::Client::new);
 
-    if model == "auto" {
-        let detect_url = format!("{}/v1/models", llm.trim_end_matches('/'));
-        match SHARED_HTTP.get(&detect_url).send().await {
-            Ok(resp) => {
-                if let Ok(body) = resp.json::<serde_json::Value>().await
-                    && let Some(id) = body
-                        .get("data")
-                        .and_then(|d| d.as_array())
-                        .and_then(|arr| arr.last())
-                        .and_then(|m| m.get("id"))
-                        .and_then(|id| id.as_str())
-                {
-                    model = id.to_string();
-                }
-            }
-            Err(_) => {
-                if llm.contains("51005") {
-                    model = "ForgeFleet-LoRA".into();
-                }
-            }
+    // Resolve endpoint and model identity atomically before any inference call.
+    // Caller text is not allowed to relabel an arbitrary endpoint.
+    let (llm, router, target) = match target_request {
+        LlmTargetRequest::ExplicitLocalCatalog(model_hint) => {
+            let pool = pool_for_target.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("resolve --llm local:{model_hint}: Postgres unavailable")
+            })?;
+            let target =
+                ff_agent::fleet_oneshot::resolve_explicit_catalog_target(pool, &model_hint)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("resolve --llm local:{model_hint}: {e}"))?;
+            (target.endpoint.clone(), None, target)
         }
-    }
+        LlmTargetRequest::ExplicitUrl {
+            url: explicit_url,
+            requested_model,
+        } => {
+            let pool = pool_for_target.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("resolve explicit --llm {explicit_url}: Postgres unavailable")
+            })?;
+            let target = ff_agent::fleet_oneshot::resolve_endpoint_target(
+                pool,
+                &explicit_url,
+                requested_model.as_deref(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("resolve explicit --llm {explicit_url}: {e}"))?;
+            (target.endpoint.clone(), None, target)
+        }
+        LlmTargetRequest::ExplicitCatalog(model_hint) => {
+            let pool = pool_for_target.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("resolve --model {model_hint}: Postgres unavailable")
+            })?;
+            let target =
+                ff_agent::fleet_oneshot::resolve_explicit_catalog_target(pool, &model_hint)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("resolve --model {model_hint}: {e}"))?;
+            (target.endpoint.clone(), None, target)
+        }
+        LlmTargetRequest::Auto => {
+            let pool = pool_for_target.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("resolve automatic LLM target: Postgres unavailable")
+            })?;
+            let target = ff_agent::fleet_oneshot::resolve_auto_agent_target(pool, 32_768)
+                .await
+                .map_err(|error| anyhow::anyhow!("resolve automatic LLM target: {error}"))?;
+            (target.endpoint.clone(), None, target)
+        }
+    };
+
+    let target = ff_agent::fleet_oneshot::attest_resolved_target(
+        &SHARED_HTTP,
+        target,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("attest LLM endpoint {llm}: {error}"))?;
+    let model = target.inference_model().to_string();
+    let resolved_target = Some(target);
     let working_dir = cli
         .cwd
         .clone()
@@ -4677,7 +4737,7 @@ async fn main() -> Result<()> {
         // commit-back-able work_output for runs that edit files (GAP-D0), and
         // so DB-backed tools work. None when Postgres is unreachable — the run
         // still proceeds, just without provenance recording.
-        pg_pool: ff_agent::fleet_info::get_fleet_pool().await.ok(),
+        pg_pool: pool_for_target.clone(),
         ..Default::default()
     };
 
@@ -4778,8 +4838,11 @@ async fn main() -> Result<()> {
             // Edit/Write are on disk (the checkpoint); commit-back lifts those.
             match run_timeout {
                 Some(dur) => {
-                    match tokio::time::timeout(dur, run_headless(&prompt, cfg, &output, oneshot))
-                        .await
+                    match tokio::time::timeout(
+                        dur,
+                        run_headless(&prompt, cfg, &output, oneshot, resolved_target.clone()),
+                    )
+                    .await
                     {
                         Ok(res) => res,
                         Err(_) => {
@@ -4792,7 +4855,7 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                None => run_headless(&prompt, cfg, &output, oneshot).await,
+                None => run_headless(&prompt, cfg, &output, oneshot, resolved_target.clone()).await,
             }
         }
         Some(Command::Codegen {
@@ -5958,7 +6021,7 @@ async fn main() -> Result<()> {
                     eprintln!("{hint}");
                     std::process::exit(2);
                 }
-                run_headless(&prompt_text, agent_config, "text", false).await
+                run_headless(&prompt_text, agent_config, "text", false, resolved_target).await
             } else {
                 run_tui(agent_config).await
             }
@@ -6232,6 +6295,48 @@ mod free_prompt_guard_tests {
         // the multi-arg form does. Quoting must not change the verdict.
         assert!(guard(&["summarize the fleet state"]).is_none());
         assert!(guard(&["what is running on the fleet"]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod llm_target_request_tests {
+    use super::{LlmTargetRequest, classify_llm_target_request};
+
+    #[test]
+    fn precedence_matrix_classifies_explicit_url_before_model() {
+        assert_eq!(
+            classify_llm_target_request(Some("http://192.168.5.111:55004"), Some("glm-4.5-air"))
+                .unwrap(),
+            LlmTargetRequest::ExplicitUrl {
+                url: "http://192.168.5.111:55004".to_string(),
+                requested_model: Some("glm-4.5-air".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn precedence_matrix_preserves_local_catalog_behavior() {
+        assert_eq!(
+            classify_llm_target_request(Some("local:glm-4.5-air"), Some("ignored")).unwrap(),
+            LlmTargetRequest::ExplicitLocalCatalog("glm-4.5-air".to_string())
+        );
+        assert!(classify_llm_target_request(Some("local:"), None).is_err());
+    }
+
+    #[test]
+    fn precedence_matrix_model_without_url_is_catalog_request() {
+        assert_eq!(
+            classify_llm_target_request(None, Some("glm-4.5-air")).unwrap(),
+            LlmTargetRequest::ExplicitCatalog("glm-4.5-air".to_string())
+        );
+    }
+
+    #[test]
+    fn precedence_matrix_absent_model_is_auto() {
+        assert_eq!(
+            classify_llm_target_request(None, None).unwrap(),
+            LlmTargetRequest::Auto
+        );
     }
 }
 
@@ -7709,6 +7814,7 @@ async fn run_headless(
     config: AgentSessionConfig,
     output_format: &str,
     oneshot: bool,
+    resolved_target: Option<ff_agent::fleet_oneshot::ResolvedFleetTarget>,
 ) -> Result<()> {
     let is_json = output_format == "json";
 
@@ -7726,6 +7832,7 @@ async fn run_headless(
     // Capture identity before `config` is moved into the session — used by the
     // fire-and-forget interaction capture (channel="cli") at the end.
     let capture_model = config.model.clone();
+    let capture_target = resolved_target.clone();
 
     let mut session = AgentSession::new(config);
     if oneshot {
@@ -7849,12 +7956,16 @@ async fn run_headless(
         let latency_ms = capture_started.elapsed().as_millis().min(i32::MAX as u128) as i32;
         let request_text = capture_prompt.clone();
         let engine = capture_model.clone();
+        let target = capture_target.clone();
         tokio::spawn(async move {
             if let Some(pool) = cli_interaction_pool().await {
                 // Canonical engine (vendor CLI name passes through, local
                 // models become local:<catalog_id>) + flagged chars/4 token
                 // estimate — the agent loop doesn't surface a usage block.
-                let engine = ff_agent::llm_attribution::engine_label(&engine);
+                let engine = target
+                    .as_ref()
+                    .map(|target| target.engine_label())
+                    .unwrap_or_else(|| ff_agent::llm_attribution::engine_label(&engine));
                 let (tokens_in, tokens_out, tokens_estimated) =
                     ff_agent::llm_attribution::tokens_or_estimate(
                         0,
@@ -7867,6 +7978,20 @@ async fn run_headless(
                     channel: "cli".to_string(),
                     request_text,
                     request_meta: serde_json::json!({ "tokens_estimated": tokens_estimated }),
+                    route_decision: target
+                        .as_ref()
+                        .map(|target| target.route_decision())
+                        .unwrap_or_else(|| serde_json::json!({})),
+                    model_versions: target
+                        .as_ref()
+                        .map(|target| {
+                            serde_json::json!({
+                                "catalog_id": target.catalog_id,
+                                "served_model_id": target.served_model_id,
+                                "served_model_ids": target.served_model_ids,
+                            })
+                        })
+                        .unwrap_or_else(|| serde_json::json!({})),
                     engine: Some(engine),
                     response_text,
                     tokens_in,
@@ -7874,6 +7999,8 @@ async fn run_headless(
                     cost_usd,
                     latency_ms: Some(latency_ms),
                     outcome: capture_outcome.to_string(),
+                    worker_name: target.as_ref().map(|target| target.worker_name.clone()),
+                    endpoint: target.as_ref().map(|target| target.endpoint.clone()),
                     ..Default::default()
                 };
                 let _ = ff_db::pg_record_interaction(&pool, &rec).await;
