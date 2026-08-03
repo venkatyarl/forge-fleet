@@ -1,8 +1,8 @@
 //! Model upstream revision checker (Phase 7).
 //!
-//! Polls the HuggingFace API for every `model_catalog` row that has
-//! `upstream_source = 'huggingface'` and a non-null `upstream_id`, and
-//! updates `upstream_latest_rev` + `upstream_checked_at` whenever the
+//! Polls the HuggingFace API for every non-retired `fleet_model_catalog`
+//! variant that declares an `hf_repo`, and updates that variant's
+//! `upstream_latest_rev` + `upstream_checked_at` metadata whenever the
 //! upstream SHA changes. When a new revision lands we also flip any
 //! per-computer `computer_models` row whose `last_seen_at` is more than
 //! a day old into `status = 'revision_available'`, so the operator/CLI
@@ -16,8 +16,10 @@
 //! for operational consistency (same error categories, same spawn
 //! lifecycle).
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::{PgPool, Row};
@@ -51,14 +53,16 @@ pub enum ModelUpstreamError {
 /// Report returned by [`ModelUpstreamChecker::check_all`].
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct UpstreamReport {
-    /// Rows considered (HF-sourced, with a non-null `upstream_id`).
+    /// Unique Hugging Face repositories considered.
     pub checked: usize,
-    /// Rows whose upstream SHA changed in this pass.
+    /// Repositories whose upstream SHA changed in this pass.
     pub updated: usize,
-    /// Rows whose upstream SHA was already current.
+    /// Repositories whose upstream SHA was already current.
     pub unchanged: usize,
-    /// Rows we intentionally skipped (unsupported upstream_source etc.).
+    /// Catalog rows skipped because they had no usable `hf_repo` variant.
     pub skipped: usize,
+    /// Optimistic catalog-update conflicts deferred to the next pass.
+    pub conflicts: usize,
     /// Per-row errors: `(catalog_id, message)`.
     pub errors: Vec<(String, String)>,
     /// How many `computer_models` rows we flipped to `revision_available`
@@ -66,7 +70,7 @@ pub struct UpstreamReport {
     pub computer_rows_flagged: usize,
 }
 
-/// Upstream revision checker for `model_catalog`.
+/// Upstream revision checker for canonical catalog variants.
 pub struct ModelUpstreamChecker {
     pg: PgPool,
     client: reqwest::Client,
@@ -83,7 +87,7 @@ impl ModelUpstreamChecker {
         Self { pg, client }
     }
 
-    /// Run one pass over every eligible `model_catalog` row.
+    /// Run one pass over every eligible canonical catalog row.
     pub async fn check_all(&self) -> Result<UpstreamReport, ModelUpstreamError> {
         let http = &self.client;
 
@@ -96,86 +100,119 @@ impl ModelUpstreamChecker {
             .unwrap_or(None);
 
         let rows = sqlx::query(
-            "SELECT id, upstream_source, upstream_id, upstream_latest_rev
-             FROM model_catalog
-             WHERE upstream_id IS NOT NULL
+            "SELECT id, variants
+             FROM fleet_model_catalog
+             WHERE COALESCE(lifecycle, 'active') <> 'retired'
              ORDER BY id",
         )
         .fetch_all(&self.pg)
         .await?;
 
-        let mut report = UpstreamReport {
-            checked: rows.len(),
-            ..UpstreamReport::default()
-        };
+        let mut report = UpstreamReport::default();
 
         for row in rows {
             let id: String = row.get("id");
-            let source: String = row.get("upstream_source");
-            let upstream_id: String = row.get("upstream_id");
-            let old_rev: Option<String> = row.get("upstream_latest_rev");
+            let original_variants: JsonValue = row.get("variants");
+            let repos = match unique_hf_repos(&original_variants) {
+                Ok(repos) if !repos.is_empty() => repos,
+                Ok(_) => {
+                    report.skipped += 1;
+                    continue;
+                }
+                Err(message) => {
+                    report.skipped += 1;
+                    report.errors.push((id, message.to_string()));
+                    continue;
+                }
+            };
 
-            if source != "huggingface" {
-                report.skipped += 1;
+            let mut next_variants = original_variants.clone();
+            let checked_at = Utc::now().to_rfc3339();
+            let mut changed_repos = 0_usize;
+            let mut unchanged_repos = 0_usize;
+            let mut successful_repos = 0_usize;
+
+            for upstream_id in repos {
+                report.checked += 1;
+                match fetch_hf_latest_sha(http, &upstream_id, hf_token.as_deref()).await {
+                    Ok(new_rev) => {
+                        match apply_hf_revision(
+                            &mut next_variants,
+                            &upstream_id,
+                            &new_rev,
+                            &checked_at,
+                        ) {
+                            Ok(true) => changed_repos += 1,
+                            Ok(false) => unchanged_repos += 1,
+                            Err(message) => {
+                                report
+                                    .errors
+                                    .push((format!("{id}:{upstream_id}"), message.to_string()));
+                                continue;
+                            }
+                        }
+                        successful_repos += 1;
+                    }
+                    Err(message) => {
+                        warn!(catalog_id = %id, hf_repo = %upstream_id, error = %message,
+                              "model upstream check failed");
+                        report.errors.push((format!("{id}:{upstream_id}"), message));
+                    }
+                }
+            }
+
+            if successful_repos == 0 {
                 continue;
             }
 
-            match fetch_hf_latest_sha(http, &upstream_id, hf_token.as_deref()).await {
-                Ok(new_rev) => {
-                    let changed = match &old_rev {
-                        Some(cur) => cur != &new_rev,
-                        None => true,
-                    };
+            let mut tx = self.pg.begin().await?;
+            let updated = sqlx::query(
+                "UPDATE fleet_model_catalog
+                    SET variants = $1,
+                        updated_at = NOW()
+                  WHERE id = $2
+                    AND variants = $3",
+            )
+            .bind(&next_variants)
+            .bind(&id)
+            .bind(&original_variants)
+            .execute(&mut *tx)
+            .await?;
 
-                    if changed {
-                        sqlx::query(
-                            "UPDATE model_catalog
-                                SET upstream_latest_rev = $1,
-                                    upstream_checked_at = NOW()
-                              WHERE id = $2",
-                        )
-                        .bind(&new_rev)
-                        .bind(&id)
-                        .execute(&self.pg)
-                        .await?;
-
-                        // Flag stale per-computer files as `revision_available`.
-                        // Rows scanned within the last day are presumed fresh
-                        // (the library scanner just touched them) and are left
-                        // alone so we don't spam spurious alerts.
-                        let flagged = sqlx::query(
-                            "UPDATE computer_models
-                                SET status = 'revision_available'
-                              WHERE model_id = $1
-                                AND status = 'ok'
-                                AND last_seen_at < NOW() - make_interval(secs => $2)",
-                        )
-                        .bind(&id)
-                        .bind(STALE_FILE_SECS as f64)
-                        .execute(&self.pg)
-                        .await?;
-
-                        report.computer_rows_flagged += flagged.rows_affected() as usize;
-                        report.updated += 1;
-                    } else {
-                        // Record that we checked even if nothing changed.
-                        sqlx::query(
-                            "UPDATE model_catalog
-                                SET upstream_checked_at = NOW()
-                              WHERE id = $1",
-                        )
-                        .bind(&id)
-                        .execute(&self.pg)
-                        .await?;
-
-                        report.unchanged += 1;
-                    }
-                }
-                Err(msg) => {
-                    warn!(catalog_id = %id, error = %msg, "model upstream check failed");
-                    report.errors.push((id, msg));
-                }
+            if updated.rows_affected() == 0 {
+                tx.rollback().await?;
+                warn!(catalog_id = %id, "catalog variants changed concurrently; deferring upstream metadata update");
+                report.conflicts += 1;
+                report.errors.push((
+                    id,
+                    "catalog variants changed concurrently; retry on next pass".to_string(),
+                ));
+                continue;
             }
+
+            if changed_repos > 0 {
+                // Flag stale per-computer files as `revision_available`.
+                // Rows scanned within the last day are presumed fresh
+                // (the library scanner just touched them) and are left
+                // alone so we don't spam spurious alerts.
+                let flagged = sqlx::query(
+                    "UPDATE computer_models
+                        SET status = 'revision_available'
+                      WHERE model_id = $1
+                        AND status = 'ok'
+                        AND last_seen_at < NOW() - make_interval(secs => $2)",
+                )
+                .bind(&id)
+                .bind(STALE_FILE_SECS as f64)
+                .execute(&mut *tx)
+                .await?;
+
+                report.computer_rows_flagged += flagged.rows_affected() as usize;
+            }
+
+            tx.commit().await?;
+            report.updated += changed_repos;
+            report.unchanged += unchanged_repos;
         }
 
         info!(
@@ -183,6 +220,7 @@ impl ModelUpstreamChecker {
             updated = report.updated,
             unchanged = report.unchanged,
             skipped = report.skipped,
+            conflicts = report.conflicts,
             errors = report.errors.len(),
             flagged = report.computer_rows_flagged,
             "model upstream check complete"
@@ -225,6 +263,67 @@ impl ModelUpstreamChecker {
             }
         })
     }
+}
+
+fn unique_hf_repos(variants: &JsonValue) -> Result<Vec<String>, &'static str> {
+    let Some(variants) = variants.as_array() else {
+        return Err("catalog variants must be a JSON array");
+    };
+    let mut repos = BTreeMap::new();
+    for variant in variants {
+        let Some(repo) = variant.get("hf_repo").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let repo = repo.trim();
+        if !repo.is_empty() {
+            repos
+                .entry(repo.to_ascii_lowercase())
+                .or_insert_with(|| repo.to_string());
+        }
+    }
+    Ok(repos.into_values().collect())
+}
+
+fn apply_hf_revision(
+    variants: &mut JsonValue,
+    hf_repo: &str,
+    new_rev: &str,
+    checked_at: &str,
+) -> Result<bool, &'static str> {
+    let Some(variants) = variants.as_array_mut() else {
+        return Err("catalog variants must be a JSON array");
+    };
+    let mut matched = false;
+    let mut changed = false;
+    for variant in variants {
+        let Some(object) = variant.as_object_mut() else {
+            continue;
+        };
+        let matches_repo = object
+            .get("hf_repo")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|repo| repo.trim().eq_ignore_ascii_case(hf_repo));
+        if !matches_repo {
+            continue;
+        }
+        matched = true;
+        let old_rev = object
+            .get("upstream_latest_rev")
+            .and_then(JsonValue::as_str)
+            .filter(|revision| !revision.is_empty())
+            .map(str::to_string);
+        if old_rev.as_deref() != Some(new_rev) {
+            if let Some(old_rev) = old_rev {
+                object.insert("upstream_previous_rev".to_string(), old_rev.into());
+            }
+            object.insert("upstream_latest_rev".to_string(), new_rev.into());
+            changed = true;
+        }
+        object.insert("upstream_checked_at".to_string(), checked_at.into());
+    }
+    matched
+        .then_some(changed)
+        .ok_or("hf_repo disappeared from catalog variants")
 }
 
 /// Fetch the latest commit SHA for an HF repo id (`org/name`).
@@ -285,6 +384,44 @@ mod tests {
         let r = UpstreamReport::default();
         assert_eq!(r.checked, 0);
         assert_eq!(r.updated, 0);
+        assert_eq!(r.conflicts, 0);
         assert_eq!(r.errors.len(), 0);
+    }
+
+    #[test]
+    fn canonical_variants_deduplicate_hf_repos_case_insensitively() {
+        let variants = serde_json::json!([
+            {"hf_repo": "Org/Model", "quant": "Q4_K_M"},
+            {"hf_repo": "org/model", "quant": "Q8_0"},
+            {"runtime": "llama.cpp"}
+        ]);
+        assert_eq!(unique_hf_repos(&variants).unwrap(), vec!["Org/Model"]);
+        assert!(unique_hf_repos(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn revision_update_preserves_metadata_and_previous_revision() {
+        let mut variants = serde_json::json!([{
+            "hf_repo": "Org/Model",
+            "quant": "Q4_K_M",
+            "upstream_latest_rev": "old"
+        }]);
+        assert!(apply_hf_revision(&mut variants, "org/model", "new", "checked").unwrap());
+        assert_eq!(variants[0]["quant"], "Q4_K_M");
+        assert_eq!(variants[0]["upstream_previous_rev"], "old");
+        assert_eq!(variants[0]["upstream_latest_rev"], "new");
+        assert_eq!(variants[0]["upstream_checked_at"], "checked");
+    }
+
+    #[test]
+    fn unchanged_revision_only_refreshes_checked_at() {
+        let mut variants = serde_json::json!([{
+            "hf_repo": "Org/Model",
+            "upstream_latest_rev": "same"
+        }]);
+        assert!(!apply_hf_revision(&mut variants, "Org/Model", "same", "later").unwrap());
+        assert_eq!(variants[0]["upstream_latest_rev"], "same");
+        assert_eq!(variants[0]["upstream_checked_at"], "later");
+        assert!(variants[0].get("upstream_previous_rev").is_none());
     }
 }
