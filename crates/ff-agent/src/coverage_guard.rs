@@ -512,7 +512,7 @@ impl CoverageGuard {
         // library — otherwise `ff model load <id>` fails on the chosen host
         // with `no library entry with id '<id>'`. Auto-download is a
         // separate concern (handled by hf_download / model_library_scanner).
-        let row = sqlx::query(
+        let rows = sqlx::query(
             "SELECT c.name, c.has_gpu, c.gpu_total_vram_gb, c.total_ram_gb,
                     lib.runtime, lib.quant, lib.size_bytes
              FROM computers c
