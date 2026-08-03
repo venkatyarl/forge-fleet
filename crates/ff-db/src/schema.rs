@@ -12581,6 +12581,34 @@ FOR EACH ROW EXECUTE FUNCTION guard_project_digest_cursor_regression();
 pub const SCHEMA_V284_MODEL_LOAD_RESERVATIONS: &str =
     include_str!("migrations/20260729160000_model_load_reservations.sql");
 
+/// V285: bounded, atomically published Cortex code-community refreshes.
+/// Assignments are staged in small committed batches under a refresh UUID; a
+/// single-row pointer swap publishes the complete project snapshot to readers.
+pub const SCHEMA_V285_CORTEX_COMMUNITY_REFRESHES: &str = r#"
+CREATE TABLE IF NOT EXISTS brain_code_community_refreshes (
+    project           TEXT PRIMARY KEY,
+    active_refresh_id UUID,
+    working_refresh_id UUID,
+    source_generation BIGINT,
+    rows_persisted    BIGINT NOT NULL DEFAULT 0,
+    rows_total        BIGINT NOT NULL DEFAULT 0,
+    started_at        TIMESTAMPTZ,
+    completed_at      TIMESTAMPTZ,
+    last_error        TEXT,
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS brain_code_community_assignments (
+    project      TEXT NOT NULL,
+    refresh_id   UUID NOT NULL,
+    node_id      UUID NOT NULL REFERENCES brain_vault_nodes(id) ON DELETE CASCADE,
+    community_id INT NOT NULL,
+    PRIMARY KEY (project, refresh_id, node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bcca_active_lookup
+    ON brain_code_community_assignments (project, refresh_id, community_id);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

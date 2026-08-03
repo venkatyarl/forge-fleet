@@ -772,6 +772,7 @@ async fn print_corpora(pool: &PgPool, target: Option<String>, format: &str) -> R
     for r in &filtered {
         code_symbols.push(ff_db::pg_count_corpus_code_symbols(pool, &r.slug).await?);
     }
+    let refreshes = ff_brain::code_community_refresh_status(pool).await?;
 
     if format == "json" {
         let v: Vec<_> = filtered
@@ -782,6 +783,7 @@ async fn print_corpora(pool: &PgPool, target: Option<String>, format: &str) -> R
                     "slug": r.slug, "title": r.title, "sources": r.sources,
                     "entities": r.entities, "facets": r.facets, "content": r.content,
                     "code_symbols": code,
+                    "community_refresh": refreshes.iter().find(|s| s.project == r.slug),
                 })
             })
             .collect();
@@ -801,6 +803,17 @@ async fn print_corpora(pool: &PgPool, target: Option<String>, format: &str) -> R
             println!(
                 "{:<22} {:<22} {:>7} {:>8} {:>9} {:>8}",
                 r.slug, r.title, r.sources, r.content, code, r.facets
+            );
+        }
+        for refresh in refreshes {
+            println!(
+                "  community refresh: project={} age={}s rows={}/{} blockers={:?} wait={}",
+                refresh.project,
+                refresh.age_seconds,
+                refresh.rows_persisted,
+                refresh.rows_total,
+                refresh.blockers,
+                refresh.wait_event.as_deref().unwrap_or("none")
             );
         }
     }
