@@ -2183,11 +2183,10 @@ pub async fn handle_fleet_disband(
     )
     .fetch_all(pool)
     .await?;
-    let computer_names: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM computers WHERE LOWER(name) <> 'vinny' ORDER BY name",
-    )
-    .fetch_all(pool)
-    .await?;
+    let computer_names: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM computers WHERE LOWER(name) <> 'vinny' ORDER BY name")
+            .fetch_all(pool)
+            .await?;
 
     let mut targets: Vec<String> = fleet_names.clone();
     for n in &computer_names {
@@ -4873,6 +4872,26 @@ const DEPLOY_LEADER_HANDOFF_POLL_SECS: u64 = 2;
 // verification, while remaining bounded for automatic fail-back.
 const DEPLOY_LEADER_YIELD_MINUTES: i64 = 120;
 
+async fn cleanup_owned_deploy_handoff(
+    pool: &sqlx::PgPool,
+    yield_value: &str,
+    maintenance_value: &str,
+) {
+    // Compare-and-delete both values installed by this deploy. A replacement
+    // request written by an operator or a newer deploy is never removed.
+    for (key, value) in [
+        ("leader_yield_request", yield_value),
+        ("leader_maintenance_lease", maintenance_value),
+    ] {
+        sqlx::query("DELETE FROM fleet_secrets WHERE key = $1 AND value = $2")
+            .bind(key)
+            .bind(value)
+            .execute(pool)
+            .await
+            .ok();
+    }
+}
+
 /// If a deploy target is the current leader, explicitly hand leadership to the
 /// next-priority healthy node and wait for its fresh heartbeat before allowing
 /// the deploy to proceed. The yield lease remains active across the restart so
@@ -4914,6 +4933,7 @@ async fn handoff_deploy_leader(
 
     let until = chrono::Utc::now() + chrono::Duration::minutes(DEPLOY_LEADER_YIELD_MINUTES);
     let yield_value = format!("{}|{}", current.member_name, until.to_rfc3339());
+    let maintenance_value = format!("{}|{}", successor, until.to_rfc3339());
     if let Some(active) = ff_db::pg_get_secret(pool, "leader_yield_request").await?
         && active != yield_value
         && active
@@ -4923,6 +4943,20 @@ async fn handoff_deploy_leader(
     {
         anyhow::bail!("refusing to overwrite an active leader handoff request");
     }
+    if let Some(active) = ff_db::pg_get_secret(pool, "leader_maintenance_lease").await?
+        && active != maintenance_value
+        && active
+            .split_once('|')
+            .and_then(|(_, expires)| chrono::DateTime::parse_from_rfc3339(expires.trim()).ok())
+            .is_some_and(|expires| expires.with_timezone(&chrono::Utc) > chrono::Utc::now())
+    {
+        anyhow::bail!("refusing to overwrite an active leader maintenance lease");
+    }
+    // Publish the designated successor before asking the old leader to yield.
+    // The lease survives the target restart for bounded automatic fail-back.
+    ff_db::pg_set_maintenance_lease(pool, &successor, until)
+        .await
+        .map_err(|e| anyhow::anyhow!("set deploy maintenance lease: {e}"))?;
     if let Err(error) = ff_db::pg_set_secret(
         pool,
         "leader_yield_request",
@@ -4932,6 +4966,7 @@ async fn handoff_deploy_leader(
     )
     .await
     {
+        cleanup_owned_deploy_handoff(pool, &yield_value, &maintenance_value).await;
         return Err(error.into());
     }
 
@@ -4955,13 +4990,7 @@ async fn handoff_deploy_leader(
         if tokio::time::Instant::now() >= deadline {
             // Undo only the request values installed by this deploy. A newer
             // operator handoff must not be cleared by our timeout cleanup.
-            sqlx::query(
-                "DELETE FROM fleet_secrets WHERE key = 'leader_yield_request' AND value = $1",
-            )
-            .bind(&yield_value)
-            .execute(pool)
-            .await
-            .ok();
+            cleanup_owned_deploy_handoff(pool, &yield_value, &maintenance_value).await;
             anyhow::bail!(
                 "refusing to restart leader '{}': '{}' did not take over within {}s",
                 current.member_name,
@@ -7111,6 +7140,39 @@ mod route_tests {
             .find("leader_refresh_playbook")
             .expect("leader refresh must restart");
         assert!(handoff < drain && drain < restart);
+    }
+
+    #[test]
+    fn deploy_handoff_sets_successor_lease_before_yield_request() {
+        let source = include_str!("fleet_cmd.rs");
+        let handoff = source
+            .split("async fn handoff_deploy_leader")
+            .nth(1)
+            .expect("deploy handoff helper");
+        let lease = handoff
+            .find("pg_set_maintenance_lease(pool, &successor, until)")
+            .expect("deploy must publish the successor lease");
+        let yielding = handoff
+            .find("pg_set_secret(\n        pool,\n        \"leader_yield_request\"")
+            .expect("deploy must publish the yield request");
+        assert!(
+            lease < yielding,
+            "successor lease must precede leader yield"
+        );
+    }
+
+    #[test]
+    fn timeout_cleanup_is_compare_and_delete_for_both_owned_values() {
+        let source = include_str!("fleet_cmd.rs");
+        let cleanup = source
+            .split("async fn cleanup_owned_deploy_handoff")
+            .nth(1)
+            .and_then(|s| s.split("async fn handoff_deploy_leader").next())
+            .expect("owned handoff cleanup helper");
+        assert!(cleanup.contains("WHERE key = $1 AND value = $2"));
+        assert!(cleanup.contains("leader_yield_request"));
+        assert!(cleanup.contains("leader_maintenance_lease"));
+        assert!(!cleanup.contains("pg_clear_maintenance_lease"));
     }
 
     #[test]

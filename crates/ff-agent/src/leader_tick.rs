@@ -584,7 +584,9 @@ impl LeaderTick {
             (None, Some(best)) if best.member_name == self.my_name => {
                 let mut since = self.leaderless_since.lock().await;
                 let started = since.get_or_insert_with(std::time::Instant::now);
-                if started.elapsed() < leaderless_wait(self.my_computer_id) {
+                if should_wait_for_leaderless_grace(prefer, &self.my_name, &best.member_name)
+                    && started.elapsed() < leaderless_wait(self.my_computer_id)
+                {
                     self.update_leader_cache(false, LeaderInfo::default()).await;
                     return Ok(TickOutcome::NoOp);
                 }
@@ -1560,6 +1562,14 @@ fn leaderless_wait(computer_id: Uuid) -> Duration {
     Duration::from_secs(MIN_LEADERLESS_WAIT_SECS + hash % LEADERLESS_JITTER_SECS)
 }
 
+/// Planned handoffs are already fenced by a bounded maintenance lease and may
+/// claim immediately. Every other empty-leader observation retains the normal
+/// split-brain grace period. `best_name == my_name` proves that the designated
+/// node was present in the eligible, alive, non-yielding candidate set.
+fn should_wait_for_leaderless_grace(prefer: Option<&str>, my_name: &str, best_name: &str) -> bool {
+    !(prefer == Some(my_name) && best_name == my_name)
+}
+
 async fn advertised_endpoints(
     pool: &PgPool,
     computer_id: Uuid,
@@ -1695,6 +1705,31 @@ mod tests {
         assert_eq!(wait, leaderless_wait(id));
         assert!(wait >= Duration::from_secs(300));
         assert!(wait < Duration::from_secs(600));
+    }
+
+    #[test]
+    fn planned_handoff_to_local_candidate_bypasses_leaderless_grace() {
+        assert!(!should_wait_for_leaderless_grace(
+            Some("james"),
+            "james",
+            "james"
+        ));
+    }
+
+    #[test]
+    fn normal_empty_leader_state_waits_for_grace() {
+        assert!(should_wait_for_leaderless_grace(None, "james", "james"));
+    }
+
+    #[test]
+    fn expired_or_mismatched_lease_does_not_bypass_grace() {
+        // Expired leases are returned as None by pg_get_active_maintenance_lease.
+        assert!(should_wait_for_leaderless_grace(None, "james", "james"));
+        assert!(should_wait_for_leaderless_grace(
+            Some("sophie"),
+            "james",
+            "james"
+        ));
     }
 
     fn alive_all(names: &[&str]) -> std::collections::HashMap<String, bool> {
