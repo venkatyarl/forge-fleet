@@ -165,6 +165,48 @@ enum LlmTargetRequest {
     Auto,
 }
 
+impl LlmTargetRequest {
+    fn is_explicit(&self) -> bool {
+        !matches!(self, Self::Auto)
+    }
+}
+
+fn reconcile_requested_models(
+    global_model: Option<&str>,
+    codegen_model: Option<&str>,
+) -> Result<Option<String>> {
+    fn normalize(value: Option<&str>) -> Option<&str> {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("auto"))
+    }
+    let global_model = normalize(global_model);
+    let codegen_model = normalize(codegen_model);
+    if let (Some(global), Some(codegen)) = (global_model, codegen_model)
+        && !global.eq_ignore_ascii_case(codegen)
+    {
+        anyhow::bail!(
+            "conflicting model pins: global --model {global} differs from codegen --model {codegen}"
+        );
+    }
+    Ok(global_model.or(codegen_model).map(str::to_string))
+}
+
+fn resolve_requested_model(
+    global_model: Option<&str>,
+    codegen_model: Option<&str>,
+    environment_model: Option<&str>,
+) -> Result<Option<String>> {
+    let cli_model = reconcile_requested_models(global_model, codegen_model)?;
+    if global_model.is_some() || codegen_model.is_some() {
+        return Ok(cli_model);
+    }
+    Ok(environment_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && !model.eq_ignore_ascii_case("auto"))
+        .map(str::to_string))
+}
+
 fn classify_llm_target_request(
     explicit_llm: Option<&str>,
     requested_model: Option<&str>,
@@ -173,6 +215,13 @@ fn classify_llm_target_request(
         if let Some(catalog_id) = llm.strip_prefix("local:") {
             if catalog_id.is_empty() {
                 anyhow::bail!("--llm local:<catalog-id> requires a catalog id");
+            }
+            if let Some(requested) = requested_model
+                && !catalog_id.eq_ignore_ascii_case(requested)
+            {
+                anyhow::bail!(
+                    "conflicting model pins: --llm local:{catalog_id} differs from --model {requested}"
+                );
             }
             return Ok(LlmTargetRequest::ExplicitLocalCatalog(
                 catalog_id.to_string(),
@@ -4648,15 +4697,21 @@ async fn main() -> Result<()> {
         .llm
         .clone()
         .or_else(|| env::var("FORGEFLEET_LLM_URL").ok());
-    let requested_model = cli
-        .model
-        .clone()
-        .or_else(|| env::var("FORGEFLEET_MODEL").ok())
-        .filter(|model| model.trim() != "auto");
+    let codegen_model = match cli.command.as_ref() {
+        Some(Command::Codegen { model, .. }) => model.as_deref(),
+        _ => None,
+    };
+    let environment_model = env::var("FORGEFLEET_MODEL").ok();
+    let requested_model = resolve_requested_model(
+        cli.model.as_deref(),
+        codegen_model,
+        environment_model.as_deref(),
+    )?;
 
     let pool_for_target = ff_agent::fleet_info::get_fleet_pool().await.ok();
     let target_request =
         classify_llm_target_request(explicit_llm.as_deref(), requested_model.as_deref())?;
+    let explicit_target_requested = target_request.is_explicit();
     static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
         std::sync::LazyLock::new(reqwest::Client::new);
 
@@ -4718,6 +4773,7 @@ async fn main() -> Result<()> {
     .await
     .map_err(|error| anyhow::anyhow!("attest LLM endpoint {llm}: {error}"))?;
     let model = target.inference_model().to_string();
+    let explicit_target = explicit_target_requested.then(|| target.clone());
     let resolved_target = Some(target);
     let working_dir = cli
         .cwd
@@ -4864,7 +4920,17 @@ async fn main() -> Result<()> {
             model,
             rounds,
             no_backstop,
-        }) => codegen_cmd::handle_codegen(task, repo, model, rounds, no_backstop).await,
+        }) => {
+            codegen_cmd::handle_codegen(
+                task,
+                repo,
+                model,
+                rounds,
+                no_backstop,
+                explicit_target.clone(),
+            )
+            .await
+        }
         Some(Command::Build {
             goal,
             project,
@@ -4883,6 +4949,7 @@ async fn main() -> Result<()> {
                 kind.as_deref(),
                 est_output_tokens,
                 min_ctx,
+                explicit_target.clone(),
             )
             .await
         }
@@ -6300,7 +6367,99 @@ mod free_prompt_guard_tests {
 
 #[cfg(test)]
 mod llm_target_request_tests {
-    use super::{LlmTargetRequest, classify_llm_target_request};
+    use super::{
+        Cli, Command, LlmTargetRequest, classify_llm_target_request, reconcile_requested_models,
+        resolve_requested_model,
+    };
+    use clap::Parser;
+
+    #[test]
+    fn parser_preserves_codegen_local_model_spelling() {
+        let cli = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                Cli::try_parse_from([
+                    "ff",
+                    "codegen",
+                    "make the change",
+                    "--model",
+                    "qwen3-coder-30b",
+                ])
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+        let command_model = match cli.command.as_ref().unwrap() {
+            Command::Codegen { model, .. } => model.as_deref(),
+            other => panic!("unexpected command: {other:?}"),
+        };
+        assert_eq!(command_model, Some("qwen3-coder-30b"));
+        assert_eq!(cli.model.as_deref(), Some("qwen3-coder-30b"));
+    }
+
+    #[test]
+    fn parser_preserves_global_model_spelling() {
+        let cli = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                Cli::try_parse_from(["ff", "--model", "glm-4.5-air", "codegen", "make the change"])
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+        let command_model = match cli.command.as_ref().unwrap() {
+            Command::Codegen { model, .. } => model.as_deref(),
+            other => panic!("unexpected command: {other:?}"),
+        };
+        assert_eq!(command_model, Some("glm-4.5-air"));
+        assert_eq!(cli.model.as_deref(), Some("glm-4.5-air"));
+    }
+
+    #[test]
+    fn codegen_model_becomes_the_effective_pin() {
+        assert_eq!(
+            reconcile_requested_models(None, Some("qwen3-coder-30b")).unwrap(),
+            Some("qwen3-coder-30b".to_string())
+        );
+    }
+
+    #[test]
+    fn matching_global_and_codegen_models_are_accepted() {
+        assert_eq!(
+            reconcile_requested_models(Some("qwen3-coder-30b"), Some("QWEN3-CODER-30B")).unwrap(),
+            Some("qwen3-coder-30b".to_string())
+        );
+    }
+
+    #[test]
+    fn conflicting_global_and_codegen_models_fail_closed() {
+        let error = reconcile_requested_models(Some("glm-4.5-air"), Some("qwen3-coder-30b"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("conflicting model pins"), "{error}");
+    }
+
+    #[test]
+    fn auto_does_not_create_an_explicit_pin() {
+        assert_eq!(
+            reconcile_requested_models(Some("auto"), None).unwrap(),
+            None
+        );
+        assert_eq!(
+            reconcile_requested_models(None, Some("AUTO")).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_requested_model(Some("auto"), None, Some("glm-4.5-air")).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_requested_model(None, None, Some("glm-4.5-air")).unwrap(),
+            Some("glm-4.5-air".to_string())
+        );
+    }
 
     #[test]
     fn precedence_matrix_classifies_explicit_url_before_model() {
@@ -6315,12 +6474,20 @@ mod llm_target_request_tests {
     }
 
     #[test]
-    fn precedence_matrix_preserves_local_catalog_behavior() {
+    fn precedence_matrix_preserves_matching_local_catalog_behavior() {
         assert_eq!(
-            classify_llm_target_request(Some("local:glm-4.5-air"), Some("ignored")).unwrap(),
+            classify_llm_target_request(Some("local:glm-4.5-air"), Some("GLM-4.5-AIR")).unwrap(),
             LlmTargetRequest::ExplicitLocalCatalog("glm-4.5-air".to_string())
         );
         assert!(classify_llm_target_request(Some("local:"), None).is_err());
+    }
+
+    #[test]
+    fn local_catalog_and_different_model_fail_closed() {
+        let error = classify_llm_target_request(Some("local:glm-4.5-air"), Some("qwen3-coder-30b"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("conflicting model pins"), "{error}");
     }
 
     #[test]

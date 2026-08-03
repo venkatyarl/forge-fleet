@@ -144,7 +144,19 @@ fn round_interaction(
     ff_db::InteractionRecord {
         channel: "codegen_apply".to_string(),
         request_text: prompt.chars().take(16000).collect(),
-        request_meta: serde_json::json!({ "round": round, "tokens_estimated": tokens_estimated }),
+        request_meta: serde_json::json!({
+            "round": round,
+            "tokens_estimated": tokens_estimated,
+            "route_provenance": resp.provenance.as_str(),
+        }),
+        route_decision: serde_json::json!({
+            "deployment_id": resp.deployment_id,
+            "endpoint": resp.endpoint,
+            "worker_name": resp.worker_name,
+            "catalog_id": resp.catalog_id,
+            "model": resp.model,
+            "provenance": resp.provenance.as_str(),
+        }),
         engine: Some(engine),
         response_text: resp.text.chars().take(16000).collect(),
         tokens_in,
@@ -187,6 +199,31 @@ pub async fn codegen_apply(
     model_hint: Option<&str>,
     max_rounds: u32,
     work_item_id: Option<uuid::Uuid>,
+) -> Result<CodegenOutcome> {
+    codegen_apply_with_target(
+        pool,
+        repo_path,
+        task,
+        model_hint,
+        max_rounds,
+        work_item_id,
+        None,
+    )
+    .await
+}
+
+/// Run codegen with an optional explicit fleet target. The legacy entry point
+/// above is deliberately just the unpinned wrapper so routing logic cannot
+/// diverge between callers.
+#[allow(clippy::too_many_arguments)]
+pub async fn codegen_apply_with_target(
+    pool: &PgPool,
+    repo_path: &Path,
+    task: &str,
+    model_hint: Option<&str>,
+    max_rounds: u32,
+    work_item_id: Option<uuid::Uuid>,
+    explicit_target: Option<&crate::fleet_oneshot::ResolvedFleetTarget>,
 ) -> Result<CodegenOutcome> {
     let run_deadline = tokio::time::Instant::now() + CODEGEN_RUN_BUDGET;
     let mut last_edits: Option<String> = None;
@@ -268,7 +305,7 @@ pub async fn codegen_apply(
         // reasoning model thinks out loud in `content` and burns the completion
         // budget before any edit block. Strict SYSTEM contract (lab-proven on
         // thalia) plus the admitted completion budget keeps the reply usable.
-        let request = crate::fleet_oneshot::fleet_oneshot_for_ctx(
+        let request = crate::fleet_oneshot::fleet_oneshot_for_ctx_with_target(
             pool,
             &prompt,
             model_hint,
@@ -277,6 +314,7 @@ pub async fn codegen_apply(
             min_ctx,
             Some(CODEGEN_SYSTEM_CONTRACT),
             plan.max_tokens,
+            explicit_target,
         );
         let response = match tokio::time::timeout(plan.request_timeout, request).await {
             Ok(Ok(response)) => response,
@@ -287,6 +325,9 @@ pub async fn codegen_apply(
                 diagnostics.push(diagnostic.clone());
                 last_edits = None;
                 last_error = Some(diagnostic);
+                if explicit_target.is_some() {
+                    break;
+                }
                 continue;
             }
             Err(_) => {
@@ -299,6 +340,9 @@ pub async fn codegen_apply(
                 diagnostics.push(diagnostic.clone());
                 last_edits = None;
                 last_error = Some(diagnostic);
+                if explicit_target.is_some() {
+                    break;
+                }
                 continue;
             }
         };
@@ -1976,10 +2020,12 @@ mod tests {
         let work_item_id = uuid::Uuid::new_v4();
         let resp = crate::fleet_oneshot::FleetOneshot {
             text: "*** FILE: src/lib.rs".to_string(),
+            deployment_id: uuid::Uuid::new_v4(),
             endpoint: "http://192.168.5.103:55000".to_string(),
             worker_name: "worker-a".to_string(),
             catalog_id: Some("glm-4.5-air".to_string()),
             model: "qwen3-coder-30b".to_string(),
+            provenance: crate::fleet_oneshot::ResolvedTargetProvenance::ExplicitCatalog,
             latency_ms: 1234,
             tokens_in: 100,
             tokens_out: 50,
@@ -1991,6 +2037,12 @@ mod tests {
         assert_eq!(rec.work_item_id, Some(work_item_id));
         assert_eq!(rec.purpose.as_deref(), Some("build"));
         assert_eq!(rec.request_meta["round"], 2);
+        assert_eq!(rec.request_meta["route_provenance"], "explicit_catalog");
+        assert_eq!(
+            rec.route_decision["deployment_id"],
+            resp.deployment_id.to_string()
+        );
+        assert_eq!(rec.route_decision["provenance"], "explicit_catalog");
         assert_eq!(rec.worker_name.as_deref(), Some("worker-a"));
         assert_eq!(rec.endpoint.as_deref(), Some("http://192.168.5.103:55000"));
         assert_eq!(rec.engine.as_deref(), Some("local:glm-4.5-air"));

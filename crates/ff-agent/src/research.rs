@@ -1736,6 +1736,7 @@ mod backend_pick_tests {
 
     fn candidate(computer: &str, model: &str, port: i32) -> ff_db::RouteCandidate {
         ff_db::RouteCandidate {
+            deployment_id: sqlx::types::Uuid::nil(),
             worker_name: computer.into(),
             endpoint: format!("http://{computer}:{port}"),
             port,

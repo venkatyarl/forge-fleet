@@ -16,8 +16,10 @@
 use crate::{CYAN, GREEN, RED, RESET, YELLOW};
 use anyhow::Result;
 use ff_agent::fleet_oneshot::{
-    ResolvedFleetTarget, ResolvedTargetProvenance, attest_resolved_target, resolve_candidate_target,
+    EndpointAttestationState, ResolvedFleetTarget, ResolvedTargetProvenance,
+    attest_resolved_target, resolve_candidate_target, revalidate_explicit_target,
 };
+use ff_db::queries::offload_workload_for_kind;
 use std::time::{Duration, Instant};
 
 const DEFAULT_MAX_TOKENS: u32 = 4096;
@@ -33,6 +35,7 @@ pub async fn handle_offload(
     kind: Option<&str>,
     est_output_tokens: Option<u32>,
     min_ctx: i32,
+    explicit_target: Option<ResolvedFleetTarget>,
 ) -> Result<()> {
     let json_out = output.eq_ignore_ascii_case("json");
     let min_ctx = min_ctx.max(1);
@@ -51,56 +54,94 @@ pub async fn handle_offload(
         );
     }
 
-    // ── Step 1: pick the best WARM endpoint, capability+kind-aware.
-    // Code-shaped kinds require a coder; general kinds use any tool-capable
-    // model. The shared selector breaks ties by least-loaded host.
-    let candidate = ff_db::pg_pick_offload_endpoint(&pool, min_ctx, kind, &[])
-        .await
-        .map_err(|e| anyhow::anyhow!("offload router query failed: {e}"))?;
-
-    let candidate = match candidate {
-        Some(c) => c,
+    // ── Step 1: either revalidate the exact operator-pinned deployment or
+    // pick the best WARM endpoint. Explicit requests never enter the automatic
+    // fallback path and never relax workload/tool/context constraints.
+    let (candidate, unresolved_target) = match explicit_target {
+        Some(target) => {
+            let workload = offload_workload_for_kind(kind);
+            let candidate =
+                match revalidate_explicit_target(&pool, &target, workload, true, Some(min_ctx))
+                    .await
+                {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        let error_text = format!("validate explicit offload target: {error}");
+                        record_offload_turn(
+                            &pool,
+                            prompt,
+                            kind,
+                            min_ctx,
+                            max_tokens,
+                            &target,
+                            "",
+                            0,
+                            0,
+                            None,
+                            "error",
+                            Some(&error_text),
+                        )
+                        .await;
+                        return Err(anyhow::anyhow!(error_text));
+                    }
+                };
+            (candidate, target)
+        }
         None => {
-            // ── No warm endpoint → do_in_cloud fallback. First record the UNMET
-            // demand so the P3 autoscaler can warm capacity for next time —
-            // unmet offload demand (cold → cloud) is exactly what it must see to
-            // scale up. Recording only on the warm happy path (below) leaves the
-            // autoscaler blind to demand it didn't serve. Distinct `_unmet`
-            // source keeps satisfied vs unmet offload demand separable in
-            // telemetry; both count toward the demand vector. Fire-and-forget.
-            let signaled = ff_db::record_session_work_signal(
-                &pool,
-                None,
-                kind.unwrap_or("general"),
-                "offload_unmet",
-            )
-            .await
-            .map_err(|e| tracing::warn!(error = %e, "unmet demand signal write failed (offload)"))
-            .is_ok();
-            let reason = format!(
-                "no warm tool-capable endpoint (require_tool_calling=true, \
+            // Code-shaped kinds prefer a coder; general kinds use any
+            // tool-capable model. The shared selector breaks ties by load.
+            let candidate = ff_db::pg_pick_offload_endpoint(&pool, min_ctx, kind, &[])
+                .await
+                .map_err(|e| anyhow::anyhow!("offload router query failed: {e}"))?;
+            let Some(candidate) = candidate else {
+                // ── No warm endpoint → do_in_cloud fallback. First record the UNMET
+                // demand so the P3 autoscaler can warm capacity for next time —
+                // unmet offload demand (cold → cloud) is exactly what it must see to
+                // scale up. Recording only on the warm happy path (below) leaves the
+                // autoscaler blind to demand it didn't serve. Distinct `_unmet`
+                // source keeps satisfied vs unmet offload demand separable in
+                // telemetry; both count toward the demand vector. Fire-and-forget.
+                let signaled = ff_db::record_session_work_signal(
+                    &pool,
+                    None,
+                    kind.unwrap_or("general"),
+                    "offload_unmet",
+                )
+                .await
+                .map_err(
+                    |e| tracing::warn!(error = %e, "unmet demand signal write failed (offload)"),
+                )
+                .is_ok();
+                let reason = format!(
+                    "no warm tool-capable endpoint (require_tool_calling=true, \
                  usable_agent_ctx>={min_ctx}). Do it in cloud — the P3 autoscaler \
                  has been signaled and will warm a matching endpoint if enabled; \
                  retry later to run it locally. Or warm one now with: \
                  ff model load <library_id> --agent"
-            );
-            if json_out {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "offloaded": false,
-                        "decision": "do_in_cloud",
-                        "reason": reason,
-                        "autoscaler_signaled": signaled,
-                        "kind": kind,
-                        "min_ctx": min_ctx,
-                    }))?
                 );
-            } else {
-                eprintln!("{YELLOW}● decision: do_in_cloud{RESET}");
-                eprintln!("\x1b[2m  {reason}{RESET}");
-            }
-            return Ok(());
+                if json_out {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "offloaded": false,
+                            "decision": "do_in_cloud",
+                            "reason": reason,
+                            "autoscaler_signaled": signaled,
+                            "kind": kind,
+                            "min_ctx": min_ctx,
+                        }))?
+                    );
+                } else {
+                    eprintln!("{YELLOW}● decision: do_in_cloud{RESET}");
+                    eprintln!("\x1b[2m  {reason}{RESET}");
+                }
+                return Ok(());
+            };
+            let target =
+                resolve_candidate_target(&pool, &candidate, ResolvedTargetProvenance::Auto, false)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("resolve offload target: {error}"))?;
+            (candidate, target)
         }
     };
 
@@ -115,13 +156,10 @@ pub async fn handle_offload(
     }
 
     // ── Step 2: resolve and attest the canonical endpoint identity before chat.
-    // Reachable identity errors fail closed; only a /v1/models timeout proceeds
-    // as explicitly unverified under the shared ff-agent policy.
+    // Reachable identity errors fail closed. Automatic routing retains the
+    // shared timeout policy; an explicit pin additionally requires a verified
+    // identity and fails if /v1/models times out.
     let client = reqwest::Client::new();
-    let unresolved_target =
-        resolve_candidate_target(&pool, &candidate, ResolvedTargetProvenance::Auto, false)
-            .await
-            .map_err(|error| anyhow::anyhow!("resolve offload target: {error}"))?;
     let target =
         match attest_resolved_target(&client, unresolved_target.clone(), Duration::from_secs(5))
             .await
@@ -147,6 +185,28 @@ pub async fn handle_offload(
                 return Err(anyhow::anyhow!("attest offload target: {error}"));
             }
         };
+    if target.provenance.is_explicit() && target.attestation != EndpointAttestationState::Verified {
+        let error_text = format!(
+            "explicit offload target {} could not be identity-attested ({:?})",
+            target.endpoint, target.attestation
+        );
+        record_offload_turn(
+            &pool,
+            prompt,
+            kind,
+            min_ctx,
+            max_tokens,
+            &target,
+            "",
+            0,
+            0,
+            None,
+            "error",
+            Some(&error_text),
+        )
+        .await;
+        return Err(anyhow::anyhow!(error_text));
+    }
     let model = target.inference_model().to_string();
     let url = ff_core::url::normalize_chat_completions_url(&target.endpoint);
 

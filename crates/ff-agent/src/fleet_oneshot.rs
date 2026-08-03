@@ -34,6 +34,8 @@ use sqlx::PgPool;
 #[derive(Debug, Clone)]
 pub struct FleetOneshot {
     pub text: String,
+    /// Immutable deployment row that served this request.
+    pub deployment_id: sqlx::types::Uuid,
     /// Base endpoint that served the call (e.g. `http://192.168.5.103:55000`).
     pub endpoint: String,
     pub worker_name: String,
@@ -41,6 +43,8 @@ pub struct FleetOneshot {
     pub catalog_id: Option<String>,
     /// The catalog model name that answered (best-effort).
     pub model: String,
+    /// Whether the caller pinned this target or the router selected it.
+    pub provenance: ResolvedTargetProvenance,
     pub latency_ms: u128,
     /// Prompt/completion tokens from the response `usage` block (0 when the
     /// server omits it), so callers can attribute the turn's cost in
@@ -85,11 +89,18 @@ impl ResolvedTargetProvenance {
             Self::Auto => "auto",
         }
     }
+
+    pub fn is_explicit(self) -> bool {
+        !matches!(self, Self::Auto)
+    }
 }
 
 /// Canonical endpoint identity resolved before inference starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedFleetTarget {
+    /// Immutable identity of the canonical fleet_model_deployments row.
+    #[serde(default)]
+    pub deployment_id: sqlx::types::Uuid,
     pub endpoint: String,
     pub catalog_id: String,
     pub model_label: String,
@@ -130,6 +141,7 @@ impl ResolvedFleetTarget {
 
     pub fn route_decision(&self) -> Value {
         json!({
+            "deployment_id": self.deployment_id,
             "endpoint": self.endpoint,
             "worker_name": self.worker_name,
             "catalog_id": self.catalog_id,
@@ -165,6 +177,7 @@ pub fn resolved_target_from_candidate(
         .filter(|name| !name.is_empty())
         .unwrap_or(catalog_id);
     Ok(ResolvedFleetTarget {
+        deployment_id: candidate.deployment_id,
         endpoint: normalize_base_endpoint(&candidate.endpoint),
         catalog_id: catalog_id.to_string(),
         model_label: model_label.to_string(),
@@ -597,12 +610,40 @@ pub async fn fleet_oneshot_for_ctx(
     system: Option<&str>,
     max_tokens: u32,
 ) -> Result<FleetOneshot> {
-    let ordered = resolve_route_candidates(pool, model_hint, workload, min_ctx).await?;
+    fleet_oneshot_for_ctx_with_target(
+        pool, prompt, model_hint, timeout, workload, min_ctx, system, max_tokens, None,
+    )
+    .await
+}
 
+/// Exact-target variant used when the operator supplied an explicit endpoint
+/// or catalog. It revalidates the immutable deployment immediately before the
+/// request and never enters the automatic candidate/failover loop.
+#[allow(clippy::too_many_arguments)]
+pub async fn fleet_oneshot_for_ctx_with_target(
+    pool: &PgPool,
+    prompt: &str,
+    model_hint: Option<&str>,
+    timeout: Option<Duration>,
+    workload: Option<&str>,
+    min_ctx: Option<i32>,
+    system: Option<&str>,
+    max_tokens: u32,
+    explicit_target: Option<&ResolvedFleetTarget>,
+) -> Result<FleetOneshot> {
     let client = reqwest::Client::builder()
         .timeout(timeout.unwrap_or(Duration::from_secs(180)))
         .build()
         .map_err(|e| anyhow!("build http client: {e}"))?;
+
+    if let Some(target) = explicit_target {
+        revalidate_explicit_target(pool, target, workload, false, min_ctx).await?;
+        let _guard = InFlightGuard::acquire(&target.endpoint);
+        return dispatch_to_resolved_target(target.clone(), &client, prompt, system, max_tokens)
+            .await;
+    }
+
+    let ordered = resolve_route_candidates(pool, model_hint, workload, min_ctx).await?;
 
     let mut last_err: Option<anyhow::Error> = None;
     let mut attempted = false;
@@ -750,6 +791,94 @@ pub async fn resolve_endpoint_target(
     Ok(target)
 }
 
+/// Revalidate an explicitly pinned deployment immediately before dispatch.
+///
+/// The immutable deployment UUID, endpoint, worker, and catalog must still
+/// identify the same canonical row, and that row must satisfy every requested
+/// capability and context constraint. Unlike automatic routing this never
+/// relaxes a constraint and never substitutes another deployment.
+pub async fn revalidate_explicit_target(
+    pool: &PgPool,
+    target: &ResolvedFleetTarget,
+    workload: Option<&str>,
+    require_tool_calling: bool,
+    min_ctx: Option<i32>,
+) -> Result<RouteCandidate> {
+    if !target.provenance.is_explicit() {
+        return Err(anyhow!(
+            "exact-target validation requires explicit provenance, got {}",
+            target.provenance.as_str()
+        ));
+    }
+    if target.deployment_id.is_nil() {
+        return Err(anyhow!(
+            "explicit target {} has no immutable deployment id",
+            target.endpoint
+        ));
+    }
+
+    let filter = explicit_target_filter(workload, require_tool_calling, min_ctx);
+    let candidates = pg_route_deployments(pool, &filter)
+        .await
+        .map_err(|error| anyhow!("revalidate pinned deployment: {error}"))?;
+    let candidate = candidates
+        .into_iter()
+        .find(|candidate| candidate.deployment_id == target.deployment_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "pinned deployment {} is unavailable or ineligible: required health=healthy/fresh<=180s, workload={workload:?}, tool_calling={require_tool_calling}, min_ctx={min_ctx:?}",
+                target.deployment_id
+            )
+        })?;
+
+    validate_candidate_identity(&candidate, target)?;
+    Ok(candidate)
+}
+
+fn explicit_target_filter(
+    workload: Option<&str>,
+    require_tool_calling: bool,
+    min_ctx: Option<i32>,
+) -> RouteFilter {
+    RouteFilter {
+        workload: workload.map(str::to_string),
+        require_tool_calling,
+        min_ctx,
+        exclude_hosts: Vec::new(),
+        max_health_age_sec: Some(180),
+        prefer_least_loaded: false,
+        // This is an identity lookup after capability filtering, not a top-N
+        // routing choice. Keep the requested deployment from being truncated.
+        limit: 10_000,
+    }
+}
+
+fn validate_candidate_identity(
+    candidate: &RouteCandidate,
+    target: &ResolvedFleetTarget,
+) -> Result<()> {
+    let candidate_catalog = candidate.catalog_id.as_deref().unwrap_or_default();
+    if candidate.deployment_id != target.deployment_id
+        || normalize_base_endpoint(&candidate.endpoint) != normalize_base_endpoint(&target.endpoint)
+        || !candidate_catalog.eq_ignore_ascii_case(&target.catalog_id)
+        || !candidate
+            .worker_name
+            .eq_ignore_ascii_case(&target.worker_name)
+    {
+        return Err(anyhow!(
+            "pinned deployment {} changed identity: expected worker={} endpoint={} catalog={}, now worker={} endpoint={} catalog={}",
+            target.deployment_id,
+            target.worker_name,
+            target.endpoint,
+            target.catalog_id,
+            candidate.worker_name,
+            candidate.endpoint,
+            candidate_catalog
+        ));
+    }
+    Ok(())
+}
+
 fn resolved_target_accepts_request(target: &ResolvedFleetTarget, requested: &str) -> bool {
     target.catalog_id.eq_ignore_ascii_case(requested)
         || target
@@ -886,7 +1015,18 @@ async fn dispatch_to_candidate(
 ) -> anyhow::Result<FleetOneshot> {
     let target =
         resolve_candidate_target(pool, cand, ResolvedTargetProvenance::Auto, false).await?;
+    dispatch_to_resolved_target(target, client, prompt, system, max_tokens).await
+}
+
+async fn dispatch_to_resolved_target(
+    target: ResolvedFleetTarget,
+    client: &reqwest::Client,
+    prompt: &str,
+    system: Option<&str>,
+    max_tokens: u32,
+) -> anyhow::Result<FleetOneshot> {
     let target = attest_resolved_target(client, target, Duration::from_secs(5)).await?;
+    enforce_dispatch_attestation(&target)?;
     let worker_name = target.worker_name.clone();
     let endpoint = target.endpoint.clone();
     let catalog_id = Some(target.catalog_id.clone());
@@ -945,14 +1085,27 @@ async fn dispatch_to_candidate(
     let (tokens_in, tokens_out) = usage_tokens_i32(&payload);
     Ok(FleetOneshot {
         text,
+        deployment_id: target.deployment_id,
         endpoint: endpoint.clone(),
         worker_name: worker_name.clone(),
         catalog_id,
         model: model.clone(),
+        provenance: target.provenance,
         latency_ms: start.elapsed().as_millis(),
         tokens_in,
         tokens_out,
     })
+}
+
+fn enforce_dispatch_attestation(target: &ResolvedFleetTarget) -> Result<()> {
+    if target.provenance.is_explicit() && target.attestation != EndpointAttestationState::Verified {
+        return Err(anyhow!(
+            "explicit target {} could not be identity-attested ({})",
+            target.endpoint,
+            target.attestation.as_str()
+        ));
+    }
+    Ok(())
 }
 
 /// True when this node currently holds an unreleased work-item build lease.
@@ -1176,6 +1329,7 @@ mod tests {
         slots: Option<i32>,
     ) -> RouteCandidate {
         RouteCandidate {
+            deployment_id: sqlx::types::Uuid::nil(),
             worker_name: worker.to_string(),
             endpoint: endpoint.to_string(),
             port: 0,
@@ -1213,6 +1367,72 @@ mod tests {
             normalize_base_endpoint("http://192.168.5.111:55004/v1/chat/completions"),
             "http://192.168.5.111:55004"
         );
+    }
+
+    #[test]
+    fn explicit_target_filter_preserves_every_hard_constraint() {
+        let filter = explicit_target_filter(Some("code"), true, Some(32_768));
+        assert_eq!(filter.workload.as_deref(), Some("code"));
+        assert!(filter.require_tool_calling);
+        assert_eq!(filter.min_ctx, Some(32_768));
+        assert_eq!(filter.max_health_age_sec, Some(180));
+        assert!(!filter.prefer_least_loaded);
+        assert!(filter.limit >= 10_000);
+    }
+
+    #[test]
+    fn explicit_target_identity_rejects_spoofed_or_replaced_deployment() {
+        let mut original = candidate(
+            "http://192.168.5.122:55008",
+            "thalia",
+            Some("qwen"),
+            Some(1),
+        );
+        original.deployment_id = sqlx::types::Uuid::new_v4();
+        original.catalog_id = Some("qwen3-coder-30b".to_string());
+        original.catalog_name = Some("Qwen3 Coder 30B".to_string());
+        let target =
+            resolved_target_from_candidate(&original, ResolvedTargetProvenance::ExplicitUrl, false)
+                .unwrap();
+        validate_candidate_identity(&original, &target).unwrap();
+
+        let mut replaced = original.clone();
+        replaced.deployment_id = sqlx::types::Uuid::new_v4();
+        assert!(validate_candidate_identity(&replaced, &target).is_err());
+
+        let mut spoofed = original.clone();
+        spoofed.endpoint = "http://192.168.5.119:55000".to_string();
+        assert!(validate_candidate_identity(&spoofed, &target).is_err());
+
+        let mut relabeled = original.clone();
+        relabeled.catalog_id = Some("glm-4.5-air".to_string());
+        assert!(validate_candidate_identity(&relabeled, &target).is_err());
+    }
+
+    #[test]
+    fn explicit_dispatch_requires_verified_attestation_while_auto_keeps_timeout_policy() {
+        let mut original = candidate(
+            "http://192.168.5.122:55008",
+            "thalia",
+            Some("qwen"),
+            Some(1),
+        );
+        original.deployment_id = sqlx::types::Uuid::new_v4();
+        original.catalog_id = Some("qwen3-coder-30b".to_string());
+
+        let mut explicit =
+            resolved_target_from_candidate(&original, ResolvedTargetProvenance::ExplicitUrl, false)
+                .unwrap();
+        explicit.attestation = EndpointAttestationState::UnverifiedTimeout;
+        assert!(enforce_dispatch_attestation(&explicit).is_err());
+        explicit.attestation = EndpointAttestationState::Verified;
+        enforce_dispatch_attestation(&explicit).unwrap();
+
+        let mut automatic =
+            resolved_target_from_candidate(&original, ResolvedTargetProvenance::Auto, false)
+                .unwrap();
+        automatic.attestation = EndpointAttestationState::UnverifiedTimeout;
+        enforce_dispatch_attestation(&automatic).unwrap();
     }
 
     #[test]

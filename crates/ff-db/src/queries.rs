@@ -1623,6 +1623,10 @@ pub const DISPATCH_HEALTH_MAX_AGE_SEC: i32 = 300;
 /// (smaller tier wins, then most-recently-healthy).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteCandidate {
+    /// Immutable deployment row identity. Exact-target dispatch pins this UUID
+    /// so an endpoint/catalog row cannot be silently replaced between resolve
+    /// and dispatch.
+    pub deployment_id: sqlx::types::Uuid,
     pub worker_name: String,
     /// `http://<host_or_ip>:<port>` ready to use as an OpenAI base URL.
     pub endpoint: String,
@@ -1830,7 +1834,8 @@ pub async fn pg_route_deployments(
 
     let sql = format!(
         r#"
-        SELECT d.worker_name,
+        SELECT d.id            AS deployment_id,
+               d.worker_name,
                d.port,
                d.runtime       AS runtime,
                d.catalog_id,
@@ -1915,11 +1920,13 @@ pub async fn pg_route_deployments(
 
     Ok(rows
         .iter()
-        .map(|r| {
+        .map(|r| -> std::result::Result<RouteCandidate, sqlx::Error> {
+            let deployment_id = r.try_get("deployment_id")?;
             let worker_name: String = r.try_get("worker_name").unwrap_or_default();
             let port: i32 = r.try_get("port").unwrap_or(0);
             let host: String = r.try_get("host_or_name").unwrap_or_default();
-            RouteCandidate {
+            Ok(RouteCandidate {
+                deployment_id,
                 endpoint: format!("http://{host}:{port}"),
                 worker_name,
                 port,
@@ -1940,9 +1947,9 @@ pub async fn pg_route_deployments(
                 total_ram_gb: r.try_get("total_ram_gb").ok(),
                 cpu_pct: r.try_get("load_cpu_pct").ok(),
                 llm_active_requests: r.try_get("load_active_requests").ok(),
-            }
+            })
         })
-        .collect())
+        .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?)
 }
 
 /// Pick the best agent-capable deployment: tool-calling model + enough per-slot
@@ -2038,7 +2045,7 @@ pub async fn pg_active_deployment_counts(
 /// Map an offload task `kind` to a preferred catalog workload tag. Code-shaped
 /// work prefers a coder-family model (`code-gen`); every other kind has no
 /// preference and routes to the cheapest warm tool-capable model.
-fn offload_workload_for_kind(kind: Option<&str>) -> Option<&'static str> {
+pub fn offload_workload_for_kind(kind: Option<&str>) -> Option<&'static str> {
     match kind.map(|k| k.to_ascii_lowercase()).as_deref() {
         Some("code")
         | Some("code-gen")
@@ -5129,6 +5136,7 @@ mod tests {
 
     fn route_candidate_rt(worker: &str, tier: i32, runtime: &str) -> RouteCandidate {
         RouteCandidate {
+            deployment_id: sqlx::types::Uuid::nil(),
             worker_name: worker.into(),
             endpoint: format!("http://{worker}:55000"),
             port: 55000,
