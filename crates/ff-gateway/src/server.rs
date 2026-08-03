@@ -3842,8 +3842,39 @@ async fn load_db_fleet_snapshot(state: &GatewayState) -> Option<DbFleetSnapshot>
                 let mut nodes_by_name = HashMap::new();
                 let mut nodes_by_host = HashMap::new();
 
+                // Per-node loaded models: fleet_workers.models_json is a legacy
+                // field nothing populates anymore — source the authoritative
+                // serving state from fleet_model_deployments so models_loaded,
+                // the top-level models list, and summary.model_count are real.
+                let mut deployed_models: HashMap<String, Vec<String>> = HashMap::new();
+                if let Some(pool) = store.pg_pool() {
+                    if let Ok(rows) = sqlx::query(
+                        "SELECT worker_name, catalog_id FROM fleet_model_deployments \
+                          WHERE desired_state = 'active' AND health_status = 'healthy' \
+                          ORDER BY worker_name, catalog_id",
+                    )
+                    .fetch_all(pool)
+                    .await
+                    {
+                        for row in &rows {
+                            use sqlx::Row;
+                            deployed_models
+                                .entry(row.get::<String, _>("worker_name"))
+                                .or_default()
+                                .push(row.get::<String, _>("catalog_id"));
+                        }
+                    }
+                }
+
                 for row in &node_rows {
-                    let parsed = parse_db_node_snapshot(row);
+                    let mut parsed = parse_db_node_snapshot(row);
+                    if let Some(models) = deployed_models.get(&row.name) {
+                        for model in models {
+                            if !parsed.models.contains(model) {
+                                parsed.models.push(model.clone());
+                            }
+                        }
+                    }
                     nodes_by_name.insert(row.name.clone(), parsed.clone());
                     nodes_by_host.insert(row.host.clone(), parsed);
                 }
