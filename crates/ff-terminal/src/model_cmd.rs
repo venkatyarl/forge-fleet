@@ -1201,51 +1201,55 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             .await?
         }
         crate::ModelCommand::Reject { id } => {
+            let mut tx = pool.begin().await?;
             let row = sqlx::query(
-                "SELECT upstream_id FROM model_catalog
-                  WHERE id = $1 AND lifecycle_status = 'candidate'",
+                "SELECT variants FROM fleet_model_catalog
+                  WHERE id = $1 AND lifecycle = 'candidate'
+                  FOR UPDATE",
             )
             .bind(&id)
-            .fetch_optional(&pool)
+            .fetch_optional(&mut *tx)
             .await?;
             let Some(row) = row else {
                 anyhow::bail!("no candidate row found for id '{id}'");
             };
-            let upstream_id: Option<String> = sqlx::Row::get(&row, "upstream_id");
+            let variants: serde_json::Value = sqlx::Row::get(&row, "variants");
+            let upstream_ids = candidate_hf_repos(&variants);
 
             let deleted = sqlx::query(
-                "DELETE FROM model_catalog
-                  WHERE id = $1 AND lifecycle_status = 'candidate'",
+                "DELETE FROM fleet_model_catalog
+                  WHERE id = $1 AND lifecycle = 'candidate'",
             )
             .bind(&id)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await?;
             if deleted.rows_affected() == 0 {
                 anyhow::bail!("failed to delete candidate '{id}'");
             }
 
-            if let Some(up) = upstream_id {
+            let mut denylist_added = 0_u64;
+            for upstream_id in &upstream_ids {
                 let inserted = sqlx::query(
                     "INSERT INTO model_scout_denylist (model_id, reason, added_by)
                      VALUES ($1, $2, $3)
                      ON CONFLICT (model_id) DO NOTHING",
                 )
-                .bind(up.to_ascii_lowercase())
+                .bind(upstream_id)
                 .bind(Some("ff model reject"))
                 .bind(whoami_tag())
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await?;
-                if inserted.rows_affected() == 1 {
-                    println!(
-                        "{GREEN}✓{RESET} Rejected '{id}' and added upstream_id '{up}' to denylist"
-                    );
-                } else {
-                    println!(
-                        "{GREEN}✓{RESET} Rejected '{id}' (upstream '{up}' already in denylist)"
-                    );
-                }
+                denylist_added += inserted.rows_affected();
+            }
+            tx.commit().await?;
+
+            if upstream_ids.is_empty() {
+                println!("{GREEN}✓{RESET} Rejected '{id}' (no Hugging Face identity to denylist)");
             } else {
-                println!("{GREEN}✓{RESET} Rejected '{id}' (no upstream_id to denylist)");
+                println!(
+                    "{GREEN}✓{RESET} Rejected '{id}'; {denylist_added} of {} Hugging Face identities added to denylist",
+                    upstream_ids.len()
+                );
             }
         }
         crate::ModelCommand::Retire {
@@ -3286,6 +3290,20 @@ async fn handle_model_upgrade_available(pool: &sqlx::PgPool) -> anyhow::Result<(
     Ok(())
 }
 
+fn candidate_hf_repos(variants: &serde_json::Value) -> Vec<String> {
+    let mut repos = variants
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|variant| variant.get("hf_repo").and_then(serde_json::Value::as_str))
+        .map(|repo| repo.trim().to_ascii_lowercase())
+        .filter(|repo| !repo.is_empty())
+        .collect::<Vec<_>>();
+    repos.sort();
+    repos.dedup();
+    repos
+}
+
 /// Parse a `--variant` spec `runtime:hf_repo[:quant[:size_gb]]` into the
 /// `fleet_model_catalog.variants` element shape `{runtime, hf_repo, quant,
 /// size_gb}`. `runtime` and `hf_repo` are required; an `hf_repo` containing
@@ -3473,6 +3491,22 @@ mod tests {
         assert!(parse_variant_spec("vllm").is_err());
         assert!(parse_variant_spec(":repo").is_err());
         assert!(parse_variant_spec("vllm:repo:Q4:notanumber").is_err());
+    }
+
+    #[test]
+    fn candidate_hf_repos_are_normalized_and_deduplicated() {
+        let variants = serde_json::json!([
+            {"hf_repo": "Org/Example-Model", "quant": "Q4_K_M"},
+            {"hf_repo": "org/example-model", "quant": "Q8_0"},
+            {"runtime": "llama.cpp"},
+            {"hf_repo": "  Other/Model  "}
+        ]);
+
+        assert_eq!(
+            candidate_hf_repos(&variants),
+            vec!["org/example-model", "other/model"]
+        );
+        assert!(candidate_hf_repos(&serde_json::json!({})).is_empty());
     }
 
     #[test]
