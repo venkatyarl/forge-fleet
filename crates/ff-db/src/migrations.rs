@@ -1270,6 +1270,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_load_reservations",
         sql: schema::SCHEMA_V284_MODEL_LOAD_RESERVATIONS,
     },
+    PgMigration {
+        version: 286,
+        name: "session_dag_pm_links",
+        sql: schema::SCHEMA_V286_SESSION_DAG_PM_LINKS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -2812,6 +2817,30 @@ mod tests {
                 .sql
                 .contains("agent_profile_verified_at TIMESTAMPTZ")
         );
+    }
+
+    #[test]
+    fn v286_links_session_dag_to_pm_without_execution_authority() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 286)
+            .expect("V286 must be registered");
+        assert_eq!(migration.name, "session_dag_pm_links");
+        for column in [
+            "ADD COLUMN IF NOT EXISTS workstream_id UUID",
+            "ADD COLUMN IF NOT EXISTS project_id TEXT",
+            "ADD COLUMN IF NOT EXISTS work_item_id UUID",
+            "ADD COLUMN IF NOT EXISTS checkpoint JSONB DEFAULT '{}'::jsonb",
+        ] {
+            assert!(migration.sql.contains(column), "missing {column}");
+        }
+        assert!(migration.sql.contains("REFERENCES ff_workstreams(id)"));
+        assert!(migration.sql.contains("REFERENCES work_items(id)"));
+        assert!(migration.sql.contains("idx_agent_sessions_workstream_id"));
+        assert!(migration.sql.contains("idx_agent_sessions_project_id"));
+        assert!(migration.sql.contains("idx_agent_steps_work_item_id"));
+        assert!(!migration.sql.contains("UNIQUE"));
+        assert!(!migration.sql.contains("work_item_leases"));
     }
 
     #[tokio::test]
