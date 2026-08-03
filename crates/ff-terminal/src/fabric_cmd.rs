@@ -11,6 +11,37 @@ use anyhow::{Context, Result, bail};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+const RECONCILE_CONFLICT_SQL: &str = "SELECT pair_name FROM fabric_pairs
+      WHERE (pair_name = $1
+             AND NOT ((computer_a_id = $2 AND computer_b_id = $4)
+                   OR (computer_a_id = $4 AND computer_b_id = $2)))
+         OR (endpoints_explicit
+             AND pair_name <> $1
+             AND (
+               ((computer_a_id = $2 AND computer_b_id = $4)
+                 OR (computer_a_id = $4 AND computer_b_id = $2))
+               OR (computer_a_id = $2 AND a_iface = $3)
+               OR (computer_b_id = $2 AND b_iface = $3)
+               OR (computer_a_id = $4 AND a_iface = $5)
+               OR (computer_b_id = $4 AND b_iface = $5)
+               OR NULLIF(a_ip, '') = $6 OR NULLIF(b_ip, '') = $6
+               OR NULLIF(a_ip, '') = $7 OR NULLIF(b_ip, '') = $7
+               OR cidr = $8))
+      LIMIT 1";
+
+const RECONCILE_LEGACY_CLEANUP_SQL: &str = "DELETE FROM fabric_pairs
+      WHERE NOT endpoints_explicit
+        AND pair_name <> $1
+        AND ((computer_a_id = $2 AND computer_b_id = $3)
+          OR (computer_a_id = $3 AND computer_b_id = $2))";
+
+const REMOVE_EXACT_LINK_SQL: &str = "DELETE FROM fabric_pairs
+      WHERE fabric_kind=$1
+        AND ((computer_a_id=$2 AND computer_b_id=$3
+              AND a_iface=$4 AND a_ip=$5 AND b_iface=$6 AND b_ip=$7)
+          OR (computer_a_id=$3 AND computer_b_id=$2
+              AND a_iface=$6 AND a_ip=$7 AND b_iface=$4 AND b_ip=$5))";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FabricEndpoint {
     pub node: String,
@@ -110,49 +141,36 @@ pub async fn handle_fabric_reconcile(pg: &PgPool, spec: FabricLinkSpec, apply: b
     let a_id = computer_id(&mut tx, &spec.a.node).await?;
     let b_id = computer_id(&mut tx, &spec.b.node).await?;
     let pair_name = spec.pair_name();
-    let conflict = sqlx::query(
-        "SELECT pair_name FROM fabric_pairs
-          WHERE pair_name <> $1
-            AND NOT ((computer_a_id = $2 AND computer_b_id = $4)
-                  OR (computer_a_id = $4 AND computer_b_id = $2))
-            AND (
-            (computer_a_id = $2 AND a_iface = $3) OR
-            (computer_b_id = $2 AND b_iface = $3) OR
-            (computer_a_id = $4 AND a_iface = $5) OR
-            (computer_b_id = $4 AND b_iface = $5) OR
-            NULLIF(a_ip, '') = $6 OR NULLIF(b_ip, '') = $6 OR
-            NULLIF(a_ip, '') = $7 OR NULLIF(b_ip, '') = $7 OR
-            cidr = $8)
-          LIMIT 1",
-    )
-    .bind(&pair_name)
-    .bind(a_id)
-    .bind(&spec.a.iface)
-    .bind(b_id)
-    .bind(&spec.b.iface)
-    .bind(spec.a.ip.to_string())
-    .bind(spec.b.ip.to_string())
-    .bind(&subnet)
-    .fetch_optional(&mut *tx)
-    .await?;
+    // Only operator-explicit rows have authority to veto endpoint/subnet reuse.
+    // Legacy hints can contain crossed endpoints and stale subnets, so they do
+    // not block a correct declaration. A canonical-name collision owned by an
+    // unrelated node pair and a second explicit row for this pair both fail
+    // closed instead of being overwritten or auto-deleted.
+    let conflict = sqlx::query(RECONCILE_CONFLICT_SQL)
+        .bind(&pair_name)
+        .bind(a_id)
+        .bind(&spec.a.iface)
+        .bind(b_id)
+        .bind(&spec.b.iface)
+        .bind(spec.a.ip.to_string())
+        .bind(spec.b.ip.to_string())
+        .bind(&subnet)
+        .fetch_optional(&mut *tx)
+        .await?;
     if let Some(row) = conflict {
         let owner: String = row.try_get("pair_name")?;
         bail!("endpoint or subnet is already used by fabric link '{owner}'");
     }
 
-    // Remove every legacy orientation for these two nodes before the canonical
-    // upsert. Measurements referencing the surviving canonical ID are retained.
-    sqlx::query(
-        "DELETE FROM fabric_pairs
-          WHERE pair_name <> $1
-            AND ((computer_a_id = $2 AND computer_b_id = $3)
-              OR (computer_a_id = $3 AND computer_b_id = $2))",
-    )
-    .bind(&pair_name)
-    .bind(a_id)
-    .bind(b_id)
-    .execute(&mut *tx)
-    .await?;
+    // Remove only non-authoritative legacy orientations for this exact
+    // unordered node pair before the canonical upsert. Never delete an
+    // operator-explicit link or a hint belonging to an unrelated pair.
+    sqlx::query(RECONCILE_LEGACY_CLEANUP_SQL)
+        .bind(&pair_name)
+        .bind(a_id)
+        .bind(b_id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
         "INSERT INTO fabric_pairs
           (pair_name, fabric_kind, computer_a_id, computer_b_id,
@@ -201,22 +219,21 @@ pub async fn handle_fabric_remove(pg: &PgPool, spec: FabricLinkSpec, apply: bool
         .await?;
     let a_id = computer_id(&mut tx, &spec.a.node).await?;
     let b_id = computer_id(&mut tx, &spec.b.node).await?;
-    let result = sqlx::query(
-        "DELETE FROM fabric_pairs
-          WHERE pair_name=$1 AND endpoints_explicit AND fabric_kind=$2
-            AND computer_a_id=$3 AND computer_b_id=$4
-            AND a_iface=$5 AND a_ip=$6 AND b_iface=$7 AND b_ip=$8",
-    )
-    .bind(spec.pair_name())
-    .bind(&spec.kind)
-    .bind(a_id)
-    .bind(b_id)
-    .bind(&spec.a.iface)
-    .bind(spec.a.ip.to_string())
-    .bind(&spec.b.iface)
-    .bind(spec.b.ip.to_string())
-    .execute(&mut *tx)
-    .await?;
+    // `pair_name` and `endpoints_explicit` cannot identify legacy rows: old
+    // materializer hints may have a reversed name and are intentionally marked
+    // non-explicit. Removal therefore requires the complete endpoint tuples and
+    // kind in either orientation. This remains an operator-requested exact
+    // removal; automatic reconcile cleanup stays fenced to legacy rows above.
+    let result = sqlx::query(REMOVE_EXACT_LINK_SQL)
+        .bind(&spec.kind)
+        .bind(a_id)
+        .bind(b_id)
+        .bind(&spec.a.iface)
+        .bind(spec.a.ip.to_string())
+        .bind(&spec.b.iface)
+        .bind(spec.b.ip.to_string())
+        .execute(&mut *tx)
+        .await?;
     let count = result.rows_affected();
     if apply {
         tx.commit().await?;
@@ -830,6 +847,10 @@ mod ring_tests {
 
     use super::*;
 
+    fn compact_sql(sql: &str) -> String {
+        sql.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     fn link(a: &str, ai: &str, aip: &str, b: &str, bi: &str, bip: &str) -> FabricLinkSpec {
         FabricLinkSpec::new(a, ai, aip, b, bi, bip, "cx7-200g").unwrap()
     }
@@ -886,5 +907,42 @@ mod ring_tests {
         assert!(network.validate_link_subnet().is_err());
         let broadcast = link("a", "cx0", "10.91.0.2", "b", "cx0", "10.91.0.3");
         assert!(broadcast.validate_link_subnet().is_err());
+    }
+
+    #[test]
+    fn reconcile_ignores_legacy_hints_but_fails_on_identity_collisions() {
+        let sql = compact_sql(RECONCILE_CONFLICT_SQL);
+        assert!(sql.contains("WHERE (pair_name = $1 AND NOT"));
+        assert!(sql.contains("OR (endpoints_explicit AND pair_name <> $1 AND"));
+        assert!(sql.contains(
+            "(computer_a_id = $2 AND computer_b_id = $4) OR (computer_a_id = $4 AND computer_b_id = $2)"
+        ));
+        assert!(sql.contains("OR cidr = $8"));
+    }
+
+    #[test]
+    fn reconcile_legacy_cleanup_is_same_pair_and_non_explicit_only() {
+        let sql = compact_sql(RECONCILE_LEGACY_CLEANUP_SQL);
+        assert!(sql.contains("WHERE NOT endpoints_explicit AND pair_name <> $1"));
+        assert!(sql.contains(
+            "(computer_a_id = $2 AND computer_b_id = $3) OR (computer_a_id = $3 AND computer_b_id = $2)"
+        ));
+        assert!(!sql.contains("a_iface"));
+        assert!(!sql.contains("a_ip"));
+        assert!(!sql.contains("cidr"));
+        assert!(!sql.contains("$4"));
+    }
+
+    #[test]
+    fn remove_requires_exact_endpoint_tuples_in_either_orientation() {
+        let sql = compact_sql(REMOVE_EXACT_LINK_SQL);
+        assert!(!sql.contains("pair_name"));
+        assert!(!sql.contains("endpoints_explicit"));
+        assert!(sql.contains(
+            "computer_a_id=$2 AND computer_b_id=$3 AND a_iface=$4 AND a_ip=$5 AND b_iface=$6 AND b_ip=$7"
+        ));
+        assert!(sql.contains(
+            "computer_a_id=$3 AND computer_b_id=$2 AND a_iface=$6 AND a_ip=$7 AND b_iface=$4 AND b_ip=$5"
+        ));
     }
 }
