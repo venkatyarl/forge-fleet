@@ -3219,7 +3219,7 @@ async fn handle_model_distribute(
 
 /// `ff model upgrade-available` — list catalog rows where upstream HF revision
 /// has moved past what's on disk. Driven by the daily `ModelUpstreamChecker`
-/// tick which writes `model_catalog.upstream_latest_rev` and flips
+/// tick which writes revision metadata into `fleet_model_catalog.variants` and flips
 /// `computer_models.status = 'revision_available'` for stale rows.
 async fn handle_model_upgrade_available(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     use crate::CYAN;
@@ -3234,22 +3234,36 @@ async fn handle_model_upgrade_available(pool: &sqlx::PgPool) -> anyhow::Result<(
         Option<chrono::DateTime<chrono::Utc>>,
     )> = sqlx::query_as(
         r#"
-            SELECT mc.id, mc.upstream_id,
-                   mc.upstream_latest_rev,
+            WITH upstreams AS (
+                SELECT DISTINCT
+                       mc.id,
+                       variant.value->>'hf_repo' AS upstream_id,
+                       variant.value->>'upstream_latest_rev' AS revision,
+                       NULLIF(variant.value->>'upstream_checked_at', '')::timestamptz
+                           AS checked_at
+                  FROM fleet_model_catalog mc
+                  CROSS JOIN LATERAL jsonb_array_elements(
+                      CASE WHEN jsonb_typeof(mc.variants) = 'array'
+                           THEN mc.variants ELSE '[]'::jsonb END
+                  ) AS variant(value)
+                 WHERE COALESCE(mc.lifecycle, 'active') <> 'retired'
+                   AND NULLIF(BTRIM(variant.value->>'hf_repo'), '') IS NOT NULL
+                   AND NULLIF(BTRIM(variant.value->>'upstream_latest_rev'), '') IS NOT NULL
+            )
+            SELECT u.id, u.upstream_id, u.revision,
                    string_agg(DISTINCT cm.status, ',') AS install_statuses,
-                   max(mc.upstream_checked_at)         AS last_checked
-              FROM model_catalog mc
+                   max(u.checked_at) AS last_checked
+              FROM upstreams u
               LEFT JOIN computer_models cm
-                ON cm.model_id = mc.id AND cm.present = true
-             WHERE mc.upstream_id IS NOT NULL
-               AND mc.upstream_latest_rev IS NOT NULL
-               AND EXISTS (
+                ON cm.model_id = u.id AND cm.present = true
+             WHERE EXISTS (
                  SELECT 1 FROM computer_models cm2
-                  WHERE cm2.model_id = mc.id
+                  WHERE cm2.model_id = u.id
+                    AND cm2.present = true
                     AND cm2.status = 'revision_available'
                )
-             GROUP BY mc.id, mc.upstream_id, mc.upstream_latest_rev
-             ORDER BY last_checked DESC NULLS LAST
+             GROUP BY u.id, u.upstream_id, u.revision
+             ORDER BY last_checked DESC NULLS LAST, u.id, u.upstream_id
             "#,
     )
     .fetch_all(pool)
