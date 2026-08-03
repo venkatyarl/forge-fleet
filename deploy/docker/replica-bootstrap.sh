@@ -15,7 +15,7 @@ set -e
 : "${POSTGRES_PRIMARY_HOST:?set POSTGRES_PRIMARY_HOST}"
 : "${POSTGRES_PRIMARY_PORT:?set POSTGRES_PRIMARY_PORT}"
 : "${POSTGRES_REPLICATION_USER:?set POSTGRES_REPLICATION_USER}"
-: "${POSTGRES_REPLICATION_PASSWORD:?set POSTGRES_REPLICATION_PASSWORD}"
+: "${POSTGRES_REPLICATION_PGPASS_FILE:?set POSTGRES_REPLICATION_PGPASS_FILE}"
 : "${POSTGRES_REPLICATION_SLOT:?set POSTGRES_REPLICATION_SLOT}"
 : "${FORGEFLEET_REPLICA_BACKUP_ID:?set FORGEFLEET_REPLICA_BACKUP_ID}"
 
@@ -25,7 +25,7 @@ set -e
 : "${PGDATA:=/var/lib/postgresql/data/pgdata}"
 export PGDATA
 BOOTSTRAP_MARKER="$(dirname "$PGDATA")/.forgefleet-replica-bootstrap"
-BOOTSTRAP_EVIDENCE="${FORGEFLEET_REPLICA_BACKUP_ID}|${POSTGRES_PRIMARY_HOST}|${POSTGRES_REPLICATION_SLOT}"
+BOOTSTRAP_EVIDENCE="${FORGEFLEET_REPLICA_BACKUP_ID}|${POSTGRES_PRIMARY_HOST}|${POSTGRES_PRIMARY_PORT}|${POSTGRES_REPLICATION_SLOT}"
 
 # If we're running as root, create the dir, chown to postgres, and
 # re-exec ourselves as postgres. This mirrors what docker-entrypoint.sh
@@ -42,6 +42,26 @@ if [ -s "$PGDATA/PG_VERSION" ]; then
     echo "Replica bootstrap: refusing existing non-standby PGDATA; reseed requires an explicit operator workflow." >&2
     exit 1
   fi
+  CURRENT_PRIMARY_CONNINFO="$(postgres -D "$PGDATA" -C primary_conninfo 2>/dev/null || true)"
+  CURRENT_PRIMARY_SLOT="$(postgres -D "$PGDATA" -C primary_slot_name 2>/dev/null || true)"
+  case " $CURRENT_PRIMARY_CONNINFO " in
+    *" host=${POSTGRES_PRIMARY_HOST} "*) ;;
+    *)
+      echo "Replica bootstrap: existing standby belongs to a different primary host; refusing implicit retarget/reseed." >&2
+      exit 1
+      ;;
+  esac
+  case " $CURRENT_PRIMARY_CONNINFO " in
+    *" port=${POSTGRES_PRIMARY_PORT} "*) ;;
+    *)
+      echo "Replica bootstrap: existing standby uses a different primary port; refusing implicit retarget/reseed." >&2
+      exit 1
+      ;;
+  esac
+  if [ "$CURRENT_PRIMARY_SLOT" != "$POSTGRES_REPLICATION_SLOT" ]; then
+    echo "Replica bootstrap: existing standby uses a different replication slot; refusing implicit retarget/reseed." >&2
+    exit 1
+  fi
   echo "Replica bootstrap: healthy standby PGDATA already present — skipping pg_basebackup."
 elif [ -n "$(find "$PGDATA" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
   if [ ! -f "$BOOTSTRAP_MARKER" ] || [ "$(cat "$BOOTSTRAP_MARKER")" != "$BOOTSTRAP_EVIDENCE" ]; then
@@ -56,8 +76,15 @@ else
   printf '%s' "$BOOTSTRAP_EVIDENCE" > "$BOOTSTRAP_MARKER"
 fi
 
+# Docker metadata contains only the mounted secret path. Copy the pgpass
+# material into PGDATA with libpq-required permissions, and keep the path in
+# the inherited environment for both pg_basebackup and the WAL receiver.
+PGPASSFILE="$PGDATA/.pgpass"
+export PGPASSFILE
+install -m 0600 "$POSTGRES_REPLICATION_PGPASS_FILE" "$PGPASSFILE"
+
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
-  PGPASSWORD="${POSTGRES_REPLICATION_PASSWORD}" pg_basebackup \
+  pg_basebackup \
     -h "${POSTGRES_PRIMARY_HOST}" \
     -p "${POSTGRES_PRIMARY_PORT}" \
     -U "${POSTGRES_REPLICATION_USER}" \

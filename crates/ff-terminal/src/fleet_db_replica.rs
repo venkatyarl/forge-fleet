@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use std::io::Write;
 use uuid::Uuid;
 
 use crate::{CYAN, FleetDbReplicaCommand, GREEN, RESET, YELLOW, shell_escape_single, whoami_tag};
@@ -28,14 +29,15 @@ struct Plan {
 impl Plan {
     fn id(&self) -> String {
         let canonical = format!(
-            "v1\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            "v1\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             self.target_id,
             self.target_name,
             self.target_ip,
             self.primary_name,
             self.primary_ip,
             self.slot,
-            self.backup_id
+            self.backup_id,
+            self.pg_major
         );
         Sha256::digest(canonical.as_bytes())
             .iter()
@@ -46,6 +48,70 @@ impl Plan {
 
 fn physical_slot(id: Uuid) -> String {
     format!("ff_{}", id.simple())
+}
+
+fn connected_primary_matches(
+    connected_ip: Option<&str>,
+    named_primary_ip: &str,
+    local_worker_matches: bool,
+) -> bool {
+    match connected_ip {
+        Some(ip) if ip == named_primary_ip => true,
+        Some("127.0.0.1" | "::1") | None => local_worker_matches,
+        Some(_) => false,
+    }
+}
+
+fn pgpass_field(value: &str) -> Result<String> {
+    if value.contains(['\n', '\r', '\0']) {
+        bail!("replication credential contains an invalid control character");
+    }
+    Ok(value.replace('\\', "\\\\").replace(':', "\\:"))
+}
+
+fn write_replication_passfile(plan: &Plan, password: &str) -> Result<std::path::PathBuf> {
+    let secret_dir = dirs::home_dir()
+        .context("HOME not set")?
+        .join(".forgefleet")
+        .join("secrets");
+    std::fs::create_dir_all(&secret_dir)
+        .with_context(|| format!("create {}", secret_dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        std::fs::set_permissions(&secret_dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod {}", secret_dir.display()))?;
+
+        let path = secret_dir.join(format!(
+            "postgres-replication-{}.pgpass",
+            plan.target_id.simple()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        let line = format!(
+            "{}:{}:*:replicator:{}\n",
+            pgpass_field(&plan.primary_ip)?,
+            PORT,
+            pgpass_field(password)?
+        );
+        file.write_all(line.as_bytes())
+            .with_context(|| format!("write {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", path.display()))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod {}", path.display()))?;
+        Ok(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (plan, password);
+        bail!("PostgreSQL replica bootstrap currently requires a Unix target")
+    }
 }
 
 async fn build_plan(pool: &sqlx::PgPool, to: &str, primary: &str) -> Result<Plan> {
@@ -72,17 +138,24 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary: &str) -> Result<Plan
     if primary_count > 1 {
         bail!("multiple PostgreSQL primary authority rows exist; reconcile before planning");
     }
-    let connected_ip: String = sqlx::query_scalar("SELECT host(inet_server_addr())")
+    let connected_ip: Option<String> = sqlx::query_scalar("SELECT host(inet_server_addr())")
         .fetch_one(pool)
         .await?;
-    let named_primary_ip: String = primary_row.get("primary_ip");
-    let local_socket_matches = (connected_ip == "127.0.0.1" || connected_ip == "::1")
-        && ff_agent::fleet_info::resolve_this_worker_name()
-            .await
-            .eq_ignore_ascii_case(primary);
-    if connected_ip != named_primary_ip && !local_socket_matches {
+    let named_primary_ip: String = primary_row
+        .try_get::<Option<String>, _>("primary_ip")?
+        .filter(|ip| !ip.trim().is_empty())
+        .context("primary has no usable LAN IP")?;
+    let local_worker_matches = ff_agent::fleet_info::resolve_this_worker_name()
+        .await
+        .eq_ignore_ascii_case(primary);
+    if !connected_primary_matches(
+        connected_ip.as_deref(),
+        &named_primary_ip,
+        local_worker_matches,
+    ) {
+        let connected_authority = connected_ip.as_deref().unwrap_or("local Unix socket");
         bail!(
-            "named primary '{primary}' ({named_primary_ip}) is not the connected PostgreSQL authority ({connected_ip})"
+            "named primary '{primary}' ({named_primary_ip}) is not the connected PostgreSQL authority ({connected_authority})"
         );
     }
     if primary_count == 1 {
@@ -95,19 +168,37 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary: &str) -> Result<Plan
     }
     // A bootstrap is only authorized when there is recent, checksummed,
     // restore-verified evidence. Planning remains read-only.
+    let primary_id: Uuid = primary_row.get("id");
     let backup_id: Uuid = sqlx::query_scalar(
-        "SELECT id FROM backups WHERE database_kind='postgres' AND checksum_sha256 IS NOT NULL AND verified_restorable_at IS NOT NULL AND verified_restorable_at > NOW() - make_interval(hours => $1) ORDER BY verified_restorable_at DESC LIMIT 1"
-    ).bind(MAX_BACKUP_AGE_HOURS).fetch_optional(pool).await?
-        .context("no restore-verified PostgreSQL backup from the last 24 hours; refusing bootstrap")?;
+        "SELECT id FROM backups
+          WHERE database_kind='postgres' AND source_computer_id=$2
+            AND size_bytes > 0
+            AND checksum_sha256 ~ '^[0-9a-fA-F]{64}$'
+            AND created_at BETWEEN NOW() - make_interval(hours => $1) AND NOW()
+            AND verified_restorable_at BETWEEN NOW() - make_interval(hours => $1) AND NOW()
+          ORDER BY verified_restorable_at DESC LIMIT 1",
+    )
+    .bind(MAX_BACKUP_AGE_HOURS)
+    .bind(primary_id)
+    .fetch_optional(pool)
+    .await?
+    .context("no restore-verified PostgreSQL backup from the last 24 hours; refusing bootstrap")?;
     let pg_major: i32 =
         sqlx::query_scalar("SELECT current_setting('server_version_num')::int / 10000")
             .fetch_one(pool)
             .await?;
     let target_id: Uuid = target.get("id");
+    let target_ip = target
+        .try_get::<Option<String>, _>("primary_ip")?
+        .filter(|ip| !ip.trim().is_empty())
+        .context("target has no usable LAN IP")?;
+    if target_ip == named_primary_ip {
+        bail!("replica target and primary resolve to the same LAN IP");
+    }
     Ok(Plan {
         target_id,
         target_name: target.get("name"),
-        target_ip: target.get("primary_ip"),
+        target_ip,
         primary_name: primary_row.get("name"),
         primary_ip: named_primary_ip,
         slot: physical_slot(target_id),
@@ -118,7 +209,7 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary: &str) -> Result<Plan
 
 fn local_apply_command(plan: &Plan) -> String {
     format!(
-        "\"$HOME/.local/bin/ff\" fleet db replica local-apply --to {} --primary {} --plan-id {}",
+        "cd \"$HOME/projects/forge-fleet\" && \"$HOME/.local/bin/ff\" fleet db replica local-apply --to {} --primary {} --plan-id {}",
         shell_escape_single(&plan.target_name),
         shell_escape_single(&plan.primary_name),
         shell_escape_single(&plan.id())
@@ -159,12 +250,14 @@ async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
             "run from a ForgeFleet checkout containing the follower compose and bootstrap script"
         );
     }
-    let replication_password = std::env::var("POSTGRES_REPLICATION_PASSWORD")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .context(
-            "POSTGRES_REPLICATION_PASSWORD must be present in the target worker environment",
-        )?;
+    let replication_password = ff_db::pg_get_secret(
+        pool,
+        ff_agent::ha::backup::POSTGRES_REPLICATION_PASSWORD_SECRET,
+    )
+    .await?
+    .filter(|value| !value.is_empty())
+    .context("missing PostgreSQL replication password in fleet secrets")?;
+    let replication_passfile = write_replication_passfile(plan, &replication_password)?;
     let docker_ok = tokio::process::Command::new("docker")
         .args(["compose", "version"])
         .status()
@@ -197,8 +290,22 @@ async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
     let required_bytes: i64 = sqlx::query_scalar("SELECT pg_database_size(current_database()) * 2")
         .fetch_one(pool)
         .await?;
+    let docker_info = tokio::process::Command::new("docker")
+        .args(["info", "--format", "{{.DockerRootDir}}"])
+        .output()
+        .await
+        .context("locate Docker storage")?;
+    if !docker_info.status.success() {
+        bail!("could not locate Docker storage for disk preflight");
+    }
+    let docker_root = String::from_utf8_lossy(&docker_info.stdout)
+        .trim()
+        .to_string();
+    if docker_root.is_empty() {
+        bail!("Docker reported an empty storage root");
+    }
     let disk = tokio::process::Command::new("df")
-        .args(["-Pk", "deploy"])
+        .args(["-Pk", &docker_root])
         .output()
         .await
         .context("target disk preflight")?;
@@ -224,8 +331,8 @@ async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
         );
     }
     // Prove the supplied credential can open the replication protocol before
-    // creating a slot or touching the follower volume. The password is passed
-    // only through the child environment and is never included in argv/logs.
+    // creating a slot or touching the follower volume. Only the protected
+    // passfile path is visible in argv/container metadata, never the password.
     let replication_dsn = format!(
         "host={} port={} user=replicator dbname=replication replication=true",
         plan.primary_ip, PORT
@@ -238,8 +345,13 @@ async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
                 "--rm",
                 "--network",
                 "host",
+                "--mount",
+                &format!(
+                    "type=bind,src={},dst=/run/secrets/postgres_replication_pgpass,readonly",
+                    replication_passfile.display()
+                ),
                 "-e",
-                "PGPASSWORD",
+                "PGPASSFILE=/run/secrets/postgres_replication_pgpass",
                 "pgvector/pgvector:pg16",
                 "psql",
                 "-XAt",
@@ -248,7 +360,7 @@ async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
                 "-c",
                 "IDENTIFY_SYSTEM",
             ])
-            .env("PGPASSWORD", replication_password)
+            .kill_on_drop(true)
             .output(),
     )
     .await
@@ -277,8 +389,10 @@ async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
             ])
             .env("POSTGRES_PRIMARY_HOST", &plan.primary_ip)
             .env("POSTGRES_PRIMARY_PORT", PORT.to_string())
+            .env("POSTGRES_REPLICATION_PGPASS_FILE", &replication_passfile)
             .env("POSTGRES_REPLICATION_SLOT", &plan.slot)
             .env("FORGEFLEET_REPLICA_BACKUP_ID", plan.backup_id.to_string())
+            .kill_on_drop(true)
             .status(),
     )
     .await
@@ -310,8 +424,17 @@ async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
     if !slot_active {
         bail!("primary slot '{}' is not active", plan.slot);
     }
-    let lag_bytes: i64 = sqlx::query_scalar("SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint, 0) FROM pg_replication_slots WHERE slot_name=$1")
-        .bind(&plan.slot).fetch_one(pool).await?;
+    let lag_bytes: i64 = sqlx::query_scalar(
+        "SELECT GREATEST(0, pg_wal_lsn_diff(pg_current_wal_lsn(), r.replay_lsn)::bigint)
+           FROM pg_replication_slots s
+           JOIN pg_stat_replication r ON r.pid = s.active_pid
+          WHERE s.slot_name=$1 AND s.slot_type='physical'
+            AND r.state='streaming' AND r.replay_lsn IS NOT NULL",
+    )
+    .bind(&plan.slot)
+    .fetch_optional(pool)
+    .await?
+    .context("active slot has no streaming standby replay position")?;
     if lag_bytes > MAX_POSTCHECK_LAG_BYTES {
         bail!("replica lag {lag_bytes} bytes exceeds postcheck limit {MAX_POSTCHECK_LAG_BYTES}");
     }
@@ -390,6 +513,26 @@ mod tests {
         assert!(s.len() <= 63);
     }
     #[test]
+    fn connected_primary_authority_is_fail_closed() {
+        assert!(connected_primary_matches(
+            Some("192.168.5.104"),
+            "192.168.5.104",
+            false
+        ));
+        assert!(connected_primary_matches(
+            Some("127.0.0.1"),
+            "192.168.5.104",
+            true
+        ));
+        assert!(connected_primary_matches(None, "192.168.5.104", true));
+        assert!(!connected_primary_matches(None, "192.168.5.104", false));
+        assert!(!connected_primary_matches(
+            Some("192.168.5.100"),
+            "192.168.5.104",
+            true
+        ));
+    }
+    #[test]
     fn deferred_command_has_no_credentials() {
         let p = Plan {
             target_id: Uuid::nil(),
@@ -404,6 +547,7 @@ mod tests {
         let c = local_apply_command(&p);
         assert!(!c.to_lowercase().contains("password"));
         assert!(c.contains("local-apply"));
+        assert!(c.starts_with("cd \"$HOME/projects/forge-fleet\""));
     }
     #[test]
     fn plan_id_is_stable_and_sensitive() {
@@ -421,6 +565,16 @@ mod tests {
         assert_eq!(a, p.id());
         p.primary_ip = "3".into();
         assert_ne!(a, p.id());
+        let b = p.id();
+        p.pg_major = 17;
+        assert_ne!(b, p.id());
+    }
+    #[test]
+    fn pgpass_fields_escape_delimiters_and_reject_lines() {
+        assert_eq!(pgpass_field(r"a:b\c").unwrap(), r"a\:b\\c");
+        assert!(pgpass_field("secret\nsecond-line").is_err());
+        assert!(pgpass_field("secret\rsecond-line").is_err());
+        assert!(pgpass_field("secret\0tail").is_err());
     }
     #[test]
     fn bootstrap_script_is_non_destructive_and_slot_bound() {
@@ -431,5 +585,12 @@ mod tests {
         assert!(script.contains("refusing partial/non-empty PGDATA"));
         assert!(script.contains("FORGEFLEET_REPLICA_BACKUP_ID"));
         assert!(script.contains("BOOTSTRAP_EVIDENCE"));
+        assert!(script.contains("CURRENT_PRIMARY_SLOT"));
+        assert!(script.contains("different primary host"));
+        let compose = include_str!("../../../deploy/docker-compose.follower.yml");
+        assert!(!compose.contains("192.168.5.100"));
+        assert!(!compose.contains("POSTGRES_PASSWORD: forgefleet"));
+        assert!(!compose.contains("POSTGRES_REPLICATION_PASSWORD:"));
+        assert!(compose.contains("POSTGRES_REPLICATION_PGPASS_FILE"));
     }
 }

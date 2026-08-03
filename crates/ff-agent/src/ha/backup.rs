@@ -1,4 +1,5 @@
-//! Backup orchestrator — snapshots Postgres + Redis (on the leader) and
+//! Backup orchestrator — snapshots Postgres + Redis on their configured
+//! source (the database authority by default) and
 //! FalkorDB (on its pinned source host) on a cadence, and distributes each
 //! snapshot to offsite peers via the deferred-task queue (rsync fan-out).
 //!
@@ -33,11 +34,10 @@
 //!   4. Run retention compaction: keep at most 2 `recent`, promote
 //!      oldest to `daily`, collapse `daily` → `weekly`.
 //!
-//! ## Leader gating
-//! `run_once` checks `pg_get_current_leader()` and short-circuits with
-//! `BackupOutcome::NotLeader` when we're not the current leader. That
-//! lets the spawn loop run on every daemon without coordination — only
-//! the leader actually shells out to `pg_basebackup`.
+//! ## Source gating
+//! `run_once` resolves each kind's configured source, falling back to the
+//! database authority. Every daemon may tick, but only that source produces
+//! an artifact. Fleet leadership is used only for fleet-wide peer cleanup.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -70,6 +70,9 @@ pub const BACKUP_ENC_PRIVKEY: &str = "backup_encryption_privkey";
 /// very Postgres DB the backups protect — the circular dependency this
 /// breaks). Malformed entries are skipped with a warning, never fatal.
 pub const BACKUP_ENC_EXTRA_RECIPIENTS: &str = "backup_encryption_extra_recipients";
+/// Fleet/1Password-synchronized secret used by every replication client and
+/// by the primary's `replicator` role. It is never written into a task payload.
+pub const POSTGRES_REPLICATION_PASSWORD_SECRET: &str = "postgres.replication_password";
 /// File name (under the backups dir root) of the key-escrow artifact: the
 /// fleet age identity, armor-encrypted to the extra recipients. Lets an
 /// operator recover even PRE-multi-recipient backups after total DB loss:
@@ -281,12 +284,17 @@ async fn resolve_backup_source_host_for_config(
     cfg: &BackupKindConfig,
 ) -> Result<Option<String>, BackupError> {
     if let Some(host) = cfg.source_host.as_deref().filter(|h| !h.trim().is_empty()) {
-        return Ok(Some(host.to_string()));
+        return sqlx::query_scalar("SELECT name FROM computers WHERE lower(name)=lower($1)")
+            .bind(host.trim())
+            .fetch_optional(pool)
+            .await
+            .map_err(BackupError::from);
     }
     sqlx::query_scalar(
         "SELECT COALESCE(
-             (SELECT NULLIF(primary_member, '') FROM dsn_of_record
-               WHERE singleton_key='current'),
+             (SELECT c.name FROM dsn_of_record d JOIN computers c
+                ON lower(c.name)=lower(NULLIF(d.primary_member, ''))
+               WHERE d.singleton_key='current'),
              (SELECT c.name FROM computers c
                WHERE c.primary_ip=host(inet_server_addr()) LIMIT 1),
              (SELECT c.name FROM database_replicas d JOIN computers c ON c.id=d.computer_id
@@ -389,11 +397,12 @@ impl BackupOrchestrator {
     /// Run a single backup cycle for the given kind (`"postgres"`,
     /// `"redis"`, `"falkordb"`, or `"all"`). Each kind is gated on its
     /// `fleet_backup_config.source_host`, or the current DB authority when it
-    /// is NULL. `force` affects cadence only and never bypasses authority.
+    /// is NULL. The boolean is retained for API compatibility; one `run_once`
+    /// call is immediate, but it never bypasses source authority.
     pub async fn run_once(
         &self,
         kind: &str,
-        _force: bool,
+        _run_now: bool,
     ) -> Result<Vec<BackupReport>, BackupError> {
         let kinds: Vec<&str> = match kind {
             "all" => vec!["postgres", "redis", "falkordb"],
@@ -611,7 +620,8 @@ impl BackupOrchestrator {
         // wipe). Self-heal it here, mirroring ensure_backup_keypair, so the HA
         // backup never depends on an operator hand-running
         // deploy/sql/setup-replication.sql.
-        ensure_replication_role(&self.pg).await?;
+        let replication_password = replication_password(&self.pg).await?;
+        ensure_replication_role(&self.pg, &replication_password).await?;
 
         let ts = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
         let file_name = format!("pg-{ts}.tar.gz{}", age_ext(cfg.encrypt));
@@ -626,16 +636,15 @@ impl BackupOrchestrator {
         // Using /bin/sh -c so the pipeline is handled by the shell and
         // we don't need to wire three tokio Commands together.
         let shell_cmd = format!(
-            "docker exec -e PGPASSWORD={pw} forgefleet-postgres \
+            "docker exec -e PGPASSWORD forgefleet-postgres \
                  pg_basebackup -h 127.0.0.1 -U replicator -D - -Ft -z -X fetch\
                  {age} > {out}",
-            pw = REPLICATOR_DEFAULT_PASSWORD,
             age = age_stage(&recipients),
             out = shell_quote(&path.to_string_lossy()),
         );
 
         info!(path = %path.display(), "running pg_basebackup | age");
-        let status = run_pipeline(&shell_cmd).await?;
+        let status = run_pipeline_with_env(&shell_cmd, "PGPASSWORD", &replication_password).await?;
         if !status.success() {
             return Err(BackupError::Cmd(format!(
                 "pg_basebackup|age pipeline exited with status {status}; \
@@ -2351,6 +2360,21 @@ async fn run_pipeline(cmd: &str) -> std::io::Result<std::process::ExitStatus> {
         .await
 }
 
+/// Variant for a pipeline that needs one secret in its environment. The value
+/// never enters the shell command/argv and is inherited by `docker exec -e KEY`.
+async fn run_pipeline_with_env(
+    cmd: &str,
+    key: &str,
+    value: &str,
+) -> std::io::Result<std::process::ExitStatus> {
+    Command::new("bash")
+        .arg("-c")
+        .arg(format!("set -o pipefail\n{cmd}"))
+        .env(key, value)
+        .status()
+        .await
+}
+
 /// Smallest plausible size (bytes) of a real encrypted backup artifact, by
 /// kind. Belt-and-suspenders alongside [`run_pipeline`]'s `pipefail`: even if a
 /// source command exits 0 but writes a truncated stream, the artifact is far
@@ -2532,12 +2556,17 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
-/// Password the HA backup uses for the `replicator` role. Must match the
-/// `PGPASSWORD=replicator-default` literal in [`BackupOrchestrator::run_postgres`]
-/// and `deploy/sql/setup-replication.sql` — this is a node-local replication
-/// credential reachable only over the container's loopback (pg_hba scopes it),
-/// not a fleet-wide secret.
-const REPLICATOR_DEFAULT_PASSWORD: &str = "replicator-default";
+async fn replication_password(pool: &PgPool) -> Result<String, BackupError> {
+    pg_get_secret(pool, POSTGRES_REPLICATION_PASSWORD_SECRET)
+        .await
+        .map_err(|e| BackupError::Cmd(format!("replication secret lookup: {e}")))?
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            BackupError::Cmd(format!(
+                "missing fleet secret {POSTGRES_REPLICATION_PASSWORD_SECRET}"
+            ))
+        })
+}
 
 /// Ensure the `replicator` Postgres role exists so `pg_basebackup -U replicator`
 /// can run.
@@ -2546,24 +2575,25 @@ const REPLICATOR_DEFAULT_PASSWORD: &str = "replicator-default";
 /// role is absent and every postgres backup tick fails with
 /// `role "replicator" does not exist`. This idempotently provisions it (the
 /// daemon connects as the DB owner/superuser, so it can `CREATE ROLE`), mirroring
-/// the self-provisioning of [`ensure_backup_keypair`]. No-op when the role
-/// already exists, so it's safe to call on every tick. The matching pg_hba
+/// the self-provisioning of [`ensure_backup_keypair`]. Existing roles are reset
+/// to the fleet/1Password-synchronized credential on every tick. The matching pg_hba
 /// `host replication` rule ships with the Postgres container image / deploy
 /// compose files, so only the role itself needs healing here.
-async fn ensure_replication_role(pool: &PgPool) -> Result<(), BackupError> {
+async fn ensure_replication_role(pool: &PgPool, password: &str) -> Result<(), BackupError> {
     let exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = 'replicator')")
             .fetch_one(pool)
             .await?;
-    if exists {
-        return Ok(());
+    let quoted_password: String = sqlx::query_scalar("SELECT quote_literal($1)")
+        .bind(password)
+        .fetch_one(pool)
+        .await?;
+    let action = if exists { "ALTER" } else { "CREATE" };
+    if !exists {
+        info!("provisioning Postgres `replicator` role for HA base-backup (first-run)");
     }
-
-    info!("provisioning Postgres `replicator` role for HA base-backup (first-run)");
-    // Password is a fixed literal (not user input) so the inline interpolation
-    // is injection-safe; quoted as a SQL string literal.
     sqlx::query(&format!(
-        "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '{REPLICATOR_DEFAULT_PASSWORD}'"
+        "{action} ROLE replicator WITH REPLICATION LOGIN PASSWORD {quoted_password}"
     ))
     .execute(pool)
     .await?;

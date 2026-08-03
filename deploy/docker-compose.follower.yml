@@ -1,11 +1,13 @@
 # ForgeFleet Postgres follower template.
-# Run on Marcus (and any other computer designated as follower).
-# Requires env var POSTGRES_PRIMARY_HOST to point at current primary (e.g. 192.168.5.100).
+# Run on any enrolled computer designated as a follower.
+# Requires POSTGRES_PRIMARY_HOST to name the current primary's LAN address.
 #
 # Usage on a follower node:
 #   cd deploy/
-#   POSTGRES_PRIMARY_HOST=192.168.5.100 \
-#     POSTGRES_REPLICATION_PASSWORD=<same as primary> \
+#   POSTGRES_PRIMARY_HOST=<primary-ip> \
+#     POSTGRES_REPLICATION_PGPASS_FILE=<protected-pgpass-path> \
+#     POSTGRES_REPLICATION_SLOT=<planned-slot> \
+#     FORGEFLEET_REPLICA_BACKUP_ID=<verified-backup-id> \
 #     docker compose -f docker-compose.follower.yml up -d
 #
 # On first start, the volume is empty so replica-bootstrap.sh runs
@@ -31,19 +33,15 @@ services:
       # Override default listen port so we don't collide with any
       # future local postgres on 5432; we keep the 55432 convention.
       PGPORT: 55432
-      # Credentials MUST match the primary (basebackup copies everything,
-      # including pg_authid). These are kept for clarity and for any
-      # future failover where this node becomes primary.
-      POSTGRES_USER: forgefleet
-      POSTGRES_PASSWORD: forgefleet
-      POSTGRES_DB: forgefleet
-      POSTGRES_PRIMARY_HOST: ${POSTGRES_PRIMARY_HOST:-192.168.5.100}
+      POSTGRES_PRIMARY_HOST: ${POSTGRES_PRIMARY_HOST:?set POSTGRES_PRIMARY_HOST}
       POSTGRES_PRIMARY_PORT: ${POSTGRES_PRIMARY_PORT:-55432}
       POSTGRES_REPLICATION_USER: replicator
-      POSTGRES_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD:?set POSTGRES_REPLICATION_PASSWORD}
+      POSTGRES_REPLICATION_PGPASS_FILE: /run/secrets/postgres_replication_pgpass
       POSTGRES_REPLICATION_SLOT: ${POSTGRES_REPLICATION_SLOT:?set POSTGRES_REPLICATION_SLOT}
       FORGEFLEET_REPLICA_BACKUP_ID: ${FORGEFLEET_REPLICA_BACKUP_ID:?set FORGEFLEET_REPLICA_BACKUP_ID}
       PGDATA: /var/lib/postgresql/data/pgdata
+    secrets:
+      - postgres_replication_pgpass
     volumes:
       - postgres_replica_data:/var/lib/postgresql/data
       - ./docker/replica-bootstrap.sh:/usr/local/bin/replica-bootstrap.sh:ro
@@ -56,3 +54,7 @@ services:
 volumes:
   postgres_replica_data:
     name: forgefleet-postgres-replica-data
+
+secrets:
+  postgres_replication_pgpass:
+    file: ${POSTGRES_REPLICATION_PGPASS_FILE:?set POSTGRES_REPLICATION_PGPASS_FILE}

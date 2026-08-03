@@ -10,9 +10,12 @@ Prerequisites:
 - the explicitly named primary agrees with any registered DB authority;
 - a checksummed, restore-verified PostgreSQL backup is less than 24 hours old;
 - Docker Compose and this checkout's `deploy/` directory exist on the target;
-- `POSTGRES_REPLICATION_PASSWORD` is in the target daemon environment;
+- `postgres.replication_password` exists in fleet secrets and is escrowed in
+  1Password; `ff` materializes it as a node-local mode-0600 pgpass file and
+  exposes only that file path to Docker;
 - primary TCP port 55432 accepts the `replicator` role from the target;
-- target free space is at least twice the current database size.
+- the target Docker storage filesystem has at least twice the current database
+  size free.
 
 ```sh
 ff fleet db replica plan --to <target> --primary <primary>

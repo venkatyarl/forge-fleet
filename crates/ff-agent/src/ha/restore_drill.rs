@@ -447,31 +447,50 @@ impl RestoreDrillTick {
         }
     }
 
-    /// Persist a drill outcome to `backup_drills`.
+    /// Persist a drill outcome to `backup_drills`. A successful drill also
+    /// promotes that exact backup to restore-verified evidence atomically.
     pub async fn record_drill(&self, o: &DrillOutcome) {
-        if let Err(e) = sqlx::query(
-            r#"
+        let result: Result<(), sqlx::Error> = async {
+            let mut tx = self.pg.begin().await?;
+            sqlx::query(
+                r#"
             INSERT INTO backup_drills
                 (backup_id, backup_file, database_kind, success, stage, detail,
                  extracted_bytes, file_count, pg_version, verifybackup,
                  duration_ms, drill_node, finished_at)
             VALUES ($1, $2, 'postgres', $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
             "#,
-        )
-        .bind(o.backup_id)
-        .bind(&o.backup_file)
-        .bind(o.success)
-        .bind(&o.stage)
-        .bind(&o.detail)
-        .bind(o.extracted_bytes)
-        .bind(o.file_count)
-        .bind(&o.pg_version)
-        .bind(o.verifybackup)
-        .bind(o.duration_ms)
-        .bind(&self.my_name)
-        .execute(&self.pg)
-        .await
-        {
+            )
+            .bind(o.backup_id)
+            .bind(&o.backup_file)
+            .bind(o.success)
+            .bind(&o.stage)
+            .bind(&o.detail)
+            .bind(o.extracted_bytes)
+            .bind(o.file_count)
+            .bind(&o.pg_version)
+            .bind(o.verifybackup)
+            .bind(o.duration_ms)
+            .bind(&self.my_name)
+            .execute(&mut *tx)
+            .await?;
+
+            if o.success
+                && let Some(backup_id) = o.backup_id
+            {
+                sqlx::query_scalar::<_, uuid::Uuid>(
+                    "UPDATE backups SET verified_restorable_at=NOW()
+                      WHERE id=$1 AND database_kind='postgres' RETURNING id",
+                )
+                .bind(backup_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
             tracing::error!(error = %e, "restore-drill: failed to record backup_drills row");
         }
     }

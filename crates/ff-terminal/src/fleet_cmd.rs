@@ -791,7 +791,7 @@ pub async fn handle_fleet_db_backup_now(
     } else {
         &[kind.as_str()]
     };
-    let mut dispatched = 0usize;
+    let mut local_kinds = Vec::new();
     for backup_kind in requested {
         let source = ff_agent::ha::backup::resolve_backup_source_host(pool, backup_kind)
             .await
@@ -819,10 +819,11 @@ pub async fn handle_fleet_db_backup_now(
             println!(
                 "{GREEN}✓{RESET} dispatched {backup_kind} backup to source '{source}' as task {id}"
             );
-            dispatched += 1;
+        } else {
+            local_kinds.push(*backup_kind);
         }
     }
-    if dispatched == requested.len() {
+    if local_kinds.is_empty() {
         return Ok(());
     }
     let computer_id: Option<uuid::Uuid> =
@@ -838,17 +839,25 @@ pub async fn handle_fleet_db_backup_now(
         );
     };
 
-    println!("{CYAN}▶ Running {kind} backup on source '{my_name}' (now={force})...{RESET}");
+    println!(
+        "{CYAN}▶ Running {} backup kind(s) on source '{my_name}' (now={force})...{RESET}",
+        local_kinds.len()
+    );
     let orchestrator = ff_agent::ha::backup::BackupOrchestrator::new(
         pool.clone(),
         computer_id,
         my_name.clone(),
         None,
     );
-    let reports = orchestrator
-        .run_once(&kind, force)
-        .await
-        .map_err(|e| anyhow::anyhow!("backup run_once: {e}"))?;
+    let mut reports = Vec::new();
+    for backup_kind in local_kinds {
+        reports.extend(
+            orchestrator
+                .run_once(backup_kind, force)
+                .await
+                .map_err(|e| anyhow::anyhow!("{backup_kind} backup run_once: {e}"))?,
+        );
+    }
 
     let mut any_skipped = false;
     for r in &reports {
@@ -871,7 +880,7 @@ pub async fn handle_fleet_db_backup_now(
         }
     }
     if any_skipped {
-        std::process::exit(2);
+        anyhow::bail!("one or more local backup kinds lost source authority during dispatch");
     }
     println!(
         "{GREEN}✓{RESET} backup cycle complete; HA distribution enqueued (watch `ff defer list`)."
@@ -2174,10 +2183,11 @@ pub async fn handle_fleet_disband(
     )
     .fetch_all(pool)
     .await?;
-    let computer_names: Vec<String> =
-        sqlx::query_scalar("SELECT name FROM computers WHERE LOWER(name) <> 'vinny' ORDER BY name")
-            .fetch_all(pool)
-            .await?;
+    let computer_names: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM computers WHERE LOWER(name) <> 'vinny' ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?;
 
     let mut targets: Vec<String> = fleet_names.clone();
     for n in &computer_names {
