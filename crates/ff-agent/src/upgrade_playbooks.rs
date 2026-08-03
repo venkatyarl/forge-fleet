@@ -97,6 +97,19 @@ pub(crate) fn base_family(os_family: &str) -> Option<&'static str> {
 const GIT_SYNC_FORGE_FLEET: &str = "cd ~/projects/forge-fleet && git fetch origin --prune && \
      git reset --hard origin/main && git clean -fdx graphify-out node-compile-cache";
 
+/// Build the web console (web-forge-fleet) static export before cargo.
+/// ff-gateway rust-embeds `web-forge-fleet/out` at compile time, and `out/`
+/// is git-ignored, so a fresh `git reset --hard` checkout does NOT contain
+/// it (the old `dashboard/dist` was committed, which is why this step was
+/// never needed before the 2026-08-03 web consolidation). Operator
+/// directive: never serve the placeholder — fail the upgrade if npm exists
+/// but the web build fails; only warn when npm is genuinely absent.
+/// Runs from the forge-fleet checkout root (GIT_SYNC_FORGE_FLEET cd's there).
+const WEB_BUILD_STEP: &str = "( if command -v npm >/dev/null 2>&1; then \
+     cd web-forge-fleet && npm ci --no-audit --no-fund --silent && npm run build --silent \
+       || { echo \"WEB_BUILD_FAILED: refusing to deploy a placeholder web console\" >&2; exit 11; }; \
+   else echo \"WARN: npm not found — web-forge-fleet/out may be stale/placeholder\" >&2; fi )";
+
 fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
     match (tool, os_family) {
         ("gh", "linux") => {
@@ -179,6 +192,7 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
         ("forgefleetd_git" | "forgefleetd", "macos") => Some(format!(
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
              {sync} && \
+             {web_build} && \
              cargo build --bin forgefleetd --release && {install} && \
              USER_ID=$(stat -f %u \"$HOME\" 2>/dev/null || id -u); \
              launchctl kickstart -k \"gui/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
@@ -187,11 +201,13 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
                    nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
                    </dev/null >/tmp/forgefleetd.log 2>&1 & disown)",
             sync = GIT_SYNC_FORGE_FLEET,
+            web_build = WEB_BUILD_STEP,
             install = atomic_install_cmd("forgefleetd", "$HOME/.local/bin/forgefleetd", true),
         )),
         ("forgefleetd_git" | "forgefleetd", "linux") => Some(format!(
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
              {sync} && \
+             {web_build} && \
              cargo build --bin forgefleetd --release && {install} && \
              export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
              setsid bash -c 'sleep 2; \
@@ -204,6 +220,7 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
              disown; \
              echo \"build+install OK; restart dispatched detached (setsid + --no-block; survives worker self-kill)\"",
             sync = GIT_SYNC_FORGE_FLEET,
+            web_build = WEB_BUILD_STEP,
             install = atomic_install_cmd("forgefleetd", "$HOME/.local/bin/forgefleetd", false),
         )),
         // DGX Sparks: aarch64 + 4 cores. Default cargo parallelism uses all
@@ -214,6 +231,7 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
         ("forgefleetd_git" | "forgefleetd", "linux-dgx") => Some(format!(
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
              {sync} && \
+             {web_build} && \
              cargo build --bin forgefleetd --release -j 2 && {install} && \
              export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
              setsid bash -c 'sleep 2; \
@@ -226,6 +244,7 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
              disown; \
              echo \"build+install OK; restart dispatched detached (setsid + --no-block; survives worker self-kill)\"",
             sync = GIT_SYNC_FORGE_FLEET,
+            web_build = WEB_BUILD_STEP,
             install = atomic_install_cmd("forgefleetd", "$HOME/.local/bin/forgefleetd", false),
         )),
         ("os", "linux") => Some("sudo apt-get update && sudo apt-get -y upgrade".into()),

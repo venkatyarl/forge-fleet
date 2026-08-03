@@ -5134,6 +5134,18 @@ fn deploy_install_restart_playbook(os_family: &str) -> String {
     }
 }
 
+/// Build the web console (web-forge-fleet) static export before cargo.
+/// ff-gateway rust-embeds `web-forge-fleet/out` at compile time, and `out/`
+/// is git-ignored, so a fresh `git reset --hard` checkout does NOT contain
+/// it (the old `dashboard/dist` was committed, which is why this step was
+/// never needed before the 2026-08-03 web consolidation). Operator
+/// directive: never serve the placeholder — fail the deploy if npm exists
+/// but the web build fails; only warn when npm is genuinely absent.
+const WEB_BUILD_STEP: &str = "( if command -v npm >/dev/null 2>&1; then \
+     cd web-forge-fleet && npm ci --no-audit --no-fund --silent && npm run build --silent \
+       || { echo \"WEB_BUILD_FAILED: refusing to deploy a placeholder web console\" >&2; exit 11; }; \
+   else echo \"WARN: npm not found — web-forge-fleet/out may be stale/placeholder\" >&2; fi )";
+
 fn deploy_playbook(
     os_family: &str,
     source_tree_path: &str,
@@ -5186,8 +5198,10 @@ fn deploy_playbook(
         ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
          cd \"{src}\" && \
          {git_sync} && \
+         {web_build} && \
          {cargo_build} && \
-         {install_restart}"
+         {install_restart}",
+        web_build = WEB_BUILD_STEP,
     )
 }
 
