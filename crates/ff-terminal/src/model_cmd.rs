@@ -1079,9 +1079,10 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 }
             } else {
                 let rows = sqlx::query(
-                    "SELECT id, display_name, family, license
-                     FROM model_catalog
-                     WHERE lifecycle_status = 'candidate' AND added_by = 'scout'
+                    "SELECT id, COALESCE(display_name, name) AS display_name, family, license
+                     FROM fleet_model_catalog
+                     WHERE lifecycle = 'candidate'
+                       AND description LIKE 'Discovered by model scout from Hugging Face%'
                      ORDER BY id
                      LIMIT 100",
                 )
@@ -1122,10 +1123,11 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
         }
         crate::ModelCommand::ReviewCandidates { json } => {
             let rows = sqlx::query(
-                "SELECT id, display_name, family, license, added_by, tasks
-                 FROM model_catalog
-                 WHERE lifecycle_status = 'candidate'
-                 ORDER BY added_by, id",
+                "SELECT id, COALESCE(display_name, name) AS display_name, family, license,
+                        COALESCE(tasks, '[]'::jsonb) AS tasks
+                 FROM fleet_model_catalog
+                 WHERE lifecycle = 'candidate'
+                 ORDER BY id",
             )
             .fetch_all(&pool)
             .await?;
@@ -1138,7 +1140,6 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                             "display_name": sqlx::Row::get::<String, _>(r, "display_name"),
                             "family": sqlx::Row::get::<String, _>(r, "family"),
                             "license": sqlx::Row::get::<Option<String>, _>(r, "license"),
-                            "added_by": sqlx::Row::get::<Option<String>, _>(r, "added_by"),
                             "tasks": sqlx::Row::get::<serde_json::Value, _>(r, "tasks"),
                         })
                     })
@@ -1147,15 +1148,11 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             } else if rows.is_empty() {
                 println!("(no candidates awaiting review)");
             } else {
-                println!(
-                    "{:<40} {:<10} {:<16} {:<20} TASKS",
-                    "ID", "ADDED_BY", "FAMILY", "LICENSE"
-                );
+                println!("{:<40} {:<16} {:<20} TASKS", "ID", "FAMILY", "LICENSE");
                 for r in &rows {
                     let id: String = sqlx::Row::get(r, "id");
                     let fam: String = sqlx::Row::get(r, "family");
                     let lic: Option<String> = sqlx::Row::get(r, "license");
-                    let added: Option<String> = sqlx::Row::get(r, "added_by");
                     let tasks: serde_json::Value = sqlx::Row::get(r, "tasks");
                     let tasks_str = tasks
                         .as_array()
@@ -1167,9 +1164,8 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                         })
                         .unwrap_or_default();
                     println!(
-                        "{:<40} {:<10} {:<16} {:<20} {}",
+                        "{:<40} {:<16} {:<20} {}",
                         id,
-                        added.unwrap_or_else(|| "-".into()),
                         fam,
                         lic.unwrap_or_else(|| "-".into()),
                         tasks_str,
