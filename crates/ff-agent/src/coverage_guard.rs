@@ -212,7 +212,7 @@ impl CoverageGuard {
             let mut enqueued = None;
             if remediate {
                 for cand in &candidates {
-                    match self.pick_host_for(&cand.id, cand.min_vram_gb).await? {
+                    match self.pick_host_for(&cand.id).await? {
                         Some(host) => {
                             let defer_id = self.enqueue_load(&cand.id, &host).await?;
                             info!(
@@ -298,21 +298,29 @@ impl CoverageGuard {
         ),
         sqlx::Error,
     > {
-        let dep_rows =
-            sqlx::query("SELECT model_id FROM computer_model_deployments WHERE status = 'active'")
-                .fetch_all(&self.pg)
-                .await?;
+        let dep_rows = sqlx::query(
+            "SELECT d.catalog_id
+             FROM fleet_model_deployments d
+             JOIN computers c ON c.name = d.worker_name
+             WHERE d.desired_state = 'active'
+               AND d.health_status = 'healthy'
+               AND c.status = 'online'",
+        )
+        .fetch_all(&self.pg)
+        .await?;
 
-        // Only `active` catalog rows count toward coverage. `candidate` rows
-        // are unreviewed model-scout discoveries whose `tasks` come straight
-        // from the HF `pipeline_tag` and are frequently mislabeled (e.g. the
-        // text/code MoE `qwen3-6-35b-a3b` was scouted as `image-text-to-text`),
-        // so crediting them produces false coverage. `deprecated` rows are on
-        // the way out. Operator-blessed `active` rows are the source of truth.
-        let cat_rows =
-            sqlx::query("SELECT id, tasks FROM model_catalog WHERE lifecycle_status = 'active'")
-                .fetch_all(&self.pg)
-                .await?;
+        // Catalog lifecycle does not gate already-serving coverage. Some
+        // canonical GLM/Devstral rows have a null lifecycle while healthy
+        // deployments serve their preferred workloads today.
+        let cat_rows = sqlx::query(
+            "SELECT id,
+                    COALESCE(CASE WHEN tasks IS NULL OR tasks = '[]'::jsonb
+                                  THEN preferred_workloads ELSE tasks END,
+                             '[]'::jsonb) AS coverage_tasks
+             FROM fleet_model_catalog",
+        )
+        .fetch_all(&self.pg)
+        .await?;
 
         let pref_rows = sqlx::query("SELECT task, preferred_model_ids FROM fleet_task_coverage")
             .fetch_all(&self.pg)
@@ -320,15 +328,18 @@ impl CoverageGuard {
 
         let deploy_norm: Vec<String> = dep_rows
             .iter()
-            .map(|r| normalize_model_id(&r.get::<String, _>("model_id")))
+            .map(|r| normalize_model_id(&r.get::<String, _>("catalog_id")))
             .collect();
 
-        // (normalized catalog id, tasks) for each active catalog row.
+        // (normalized catalog id, effective tasks) for each catalog row.
         let catalog: Vec<(String, Vec<String>)> = cat_rows
             .iter()
             .map(|r| {
                 let id: String = r.get("id");
-                (normalize_model_id(&id), json_str_array(r.get("tasks")))
+                (
+                    normalize_model_id(&id),
+                    json_str_array(r.get("coverage_tasks")),
+                )
             })
             .collect();
 
@@ -467,12 +478,16 @@ impl CoverageGuard {
         preferred: &[String],
     ) -> Result<Vec<Candidate>, sqlx::Error> {
         let rows = sqlx::query(
-            "SELECT id, quality_tier, quantization, file_size_gb, min_vram_gb
-             FROM model_catalog
-             WHERE tasks @> to_jsonb(ARRAY[$1]::text[])
-               AND lifecycle_status = 'active'",
+            "SELECT id, tier, variants
+             FROM fleet_model_catalog
+             WHERE lifecycle IN ('active', 'production')
+               AND (id = ANY($2)
+                    OR COALESCE(tasks, '[]'::jsonb) ? $1
+                    OR (tasks IS NULL OR tasks = '[]'::jsonb)
+                       AND COALESCE(preferred_workloads, '[]'::jsonb) ? $1)",
         )
         .bind(task)
+        .bind(preferred)
         .fetch_all(&self.pg)
         .await?;
 
@@ -483,10 +498,10 @@ impl CoverageGuard {
                 Candidate {
                     preferred: preferred.iter().any(|p| p == &id),
                     id,
-                    quality_tier: r.get("quality_tier"),
-                    quantization: r.get("quantization"),
-                    file_size_gb: r.get("file_size_gb"),
-                    min_vram_gb: r.get("min_vram_gb"),
+                    tier: r.get("tier"),
+                    variants: r
+                        .get::<Option<serde_json::Value>, _>("variants")
+                        .unwrap_or(serde_json::Value::Null),
                 }
             })
             .collect();
@@ -495,22 +510,10 @@ impl CoverageGuard {
             let a_pref = if a.preferred { 0 } else { 1 };
             let b_pref = if b.preferred { 0 } else { 1 };
 
-            let a_tier = tier_rank(a.quality_tier.as_deref());
-            let b_tier = tier_rank(b.quality_tier.as_deref());
-
-            let a_q4 = if is_q4(a.quantization.as_deref()) {
-                0
-            } else {
-                1
-            };
-            let b_q4 = if is_q4(b.quantization.as_deref()) {
-                0
-            } else {
-                1
-            };
-
-            let a_size = a.file_size_gb.unwrap_or(f64::MAX);
-            let b_size = b.file_size_gb.unwrap_or(f64::MAX);
+            let a_tier = a.tier.unwrap_or(i32::MAX);
+            let b_tier = b.tier.unwrap_or(i32::MAX);
+            let (a_q4, a_size) = variant_rank(&a.variants);
+            let (b_q4, b_size) = variant_rank(&b.variants);
 
             a_pref
                 .cmp(&b_pref)
@@ -529,46 +532,54 @@ impl CoverageGuard {
     /// Pick a computer that can host `model_id`:
     /// - online (`computers.status = 'online'`),
     /// - no active deployment of this model already,
-    /// - enough RAM (`total_ram_gb >= min_vram_gb`, or `has_gpu` with sufficient VRAM).
-    async fn pick_host_for(
-        &self,
-        model_id: &str,
-        min_vram_gb: Option<f64>,
-    ) -> Result<Option<String>, sqlx::Error> {
-        let required = min_vram_gb.unwrap_or(0.0);
-
+    /// - a nonzero library size matching a nonzero canonical variant size,
+    /// - runtime-compatible RAM/VRAM and GPU/Metal capabilities.
+    async fn pick_host_for(&self, model_id: &str) -> Result<Option<String>, sqlx::Error> {
         // Only consider hosts that ALREADY have the model file in their
         // library — otherwise `ff model load <id>` fails on the chosen host
         // with `no library entry with id '<id>'`. Auto-download is a
         // separate concern (handled by hf_download / model_library_scanner).
-        let row = sqlx::query(
-            "SELECT c.name AS name
+        let rows = sqlx::query(
+            "SELECT c.name, c.os_family, c.has_gpu, c.gpu_total_vram_gb,
+                    c.total_ram_gb, c.metal_version, lib.runtime, lib.quant,
+                    lib.size_bytes, mc.variants
              FROM computers c
+             JOIN fleet_model_library lib ON lib.worker_name = c.name
+                                          AND lib.catalog_id = $1
+             JOIN fleet_model_catalog mc ON mc.id = lib.catalog_id
              WHERE c.status = 'online'
-               AND EXISTS (
-                   SELECT 1 FROM fleet_model_library lib
-                    WHERE lib.worker_name = c.name
-                      AND lib.catalog_id = $1
-               )
                AND NOT EXISTS (
-                   SELECT 1 FROM computer_model_deployments d
-                    WHERE d.computer_id = c.id
-                      AND d.model_id = $1
-                      AND d.status IN ('active', 'loading')
+                   SELECT 1 FROM fleet_model_deployments d
+                    WHERE d.worker_name = c.name
+                      AND d.catalog_id = $1
+                      AND d.desired_state = 'active'
                )
-               AND (
-                   (c.has_gpu AND COALESCE(c.gpu_total_vram_gb, 0) >= $2)
-                   OR COALESCE(c.total_ram_gb, 0) >= $2
-               )
-             ORDER BY COALESCE(c.gpu_total_vram_gb, c.total_ram_gb::float, 0) DESC
-             LIMIT 1",
+             ORDER BY COALESCE(c.gpu_total_vram_gb, c.total_ram_gb::float, 0) DESC",
         )
         .bind(model_id)
-        .bind(required)
-        .fetch_optional(&self.pg)
+        .fetch_all(&self.pg)
         .await?;
-
-        Ok(row.map(|r| r.get("name")))
+        Ok(rows.into_iter().find_map(|r| {
+            let host = HostFit {
+                os_family: r.get("os_family"),
+                has_gpu: r.get("has_gpu"),
+                gpu_vram_gb: r.get("gpu_total_vram_gb"),
+                ram_gb: r.get::<Option<i32>, _>("total_ram_gb").map(f64::from),
+                has_metal: r.get::<Option<String>, _>("metal_version").is_some(),
+            };
+            let runtime: Option<String> = r.get("runtime");
+            let quant: Option<String> = r.get("quant");
+            let size_bytes: Option<i64> = r.get("size_bytes");
+            let variants = r
+                .get::<Option<serde_json::Value>, _>("variants")
+                .unwrap_or(serde_json::Value::Null);
+            let (Some(runtime), Some(quant)) = (runtime, quant) else {
+                return None;
+            };
+            library_variant_size_gb(&runtime, &quant, size_bytes, &variants)
+                .filter(|size| runtime_host_compatible(&runtime, *size, &host))
+                .map(|_| r.get("name"))
+        }))
     }
 
     /// Enqueue a deferred shell task that invokes `ff model load <id>` on
@@ -600,10 +611,72 @@ impl CoverageGuard {
 struct Candidate {
     id: String,
     preferred: bool,
-    quality_tier: Option<String>,
-    quantization: Option<String>,
-    file_size_gb: Option<f64>,
-    min_vram_gb: Option<f64>,
+    tier: Option<i32>,
+    variants: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct HostFit {
+    os_family: Option<String>,
+    has_gpu: bool,
+    gpu_vram_gb: Option<f64>,
+    ram_gb: Option<f64>,
+    has_metal: bool,
+}
+
+fn variant_size_gb(variants: &serde_json::Value, runtime: &str, quant: &str) -> Option<f64> {
+    variants.as_array()?.iter().find_map(|v| {
+        if v.get("runtime")?.as_str()? != runtime || v.get("quant")?.as_str()? != quant {
+            return None;
+        }
+        v.get("size_gb")?.as_f64().filter(|size| *size > 0.0)
+    })
+}
+
+fn library_variant_size_gb(
+    runtime: &str,
+    quant: &str,
+    size_bytes: Option<i64>,
+    variants: &serde_json::Value,
+) -> Option<f64> {
+    let library_gb = size_bytes.filter(|size| *size > 0)? as f64 / 1_000_000_000.0;
+    let variant_gb = variant_size_gb(variants, runtime, quant)?;
+    (library_gb >= variant_gb * 0.9).then_some(library_gb.max(variant_gb))
+}
+
+fn runtime_host_compatible(runtime: &str, size_gb: f64, host: &HostFit) -> bool {
+    if size_gb <= 0.0 {
+        return false;
+    }
+    let gpu_fits = host.has_gpu && host.gpu_vram_gb.unwrap_or(0.0) >= size_gb;
+    let ram_fits = host.ram_gb.unwrap_or(0.0) >= size_gb;
+    match runtime.to_ascii_lowercase().as_str() {
+        "vllm" => gpu_fits,
+        "mlx" => {
+            host.has_metal
+                && host
+                    .os_family
+                    .as_deref()
+                    .is_some_and(|os| os.eq_ignore_ascii_case("macos"))
+                && ram_fits
+        }
+        "llama.cpp" => gpu_fits || ram_fits,
+        _ => false,
+    }
+}
+
+fn variant_rank(variants: &serde_json::Value) -> (u8, f64) {
+    variants
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| {
+            let quant = v.get("quant")?.as_str()?;
+            let size = v.get("size_gb")?.as_f64().filter(|s| *s > 0.0)?;
+            Some((if is_q4(Some(quant)) { 0 } else { 1 }, size))
+        })
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or((1, f64::MAX))
 }
 
 /// Count gaps that have at least one catalog candidate — i.e. gaps that
@@ -1055,5 +1128,131 @@ mod tests {
         assert!(is_q4(Some("4bit")));
         assert!(!is_q4(Some("Q8_0")));
         assert!(!is_q4(None));
+    }
+
+    fn host(os: &str, gpu: bool, vram: f64, ram: f64, metal: bool) -> HostFit {
+        HostFit {
+            os_family: Some(os.into()),
+            has_gpu: gpu,
+            gpu_vram_gb: Some(vram),
+            ram_gb: Some(ram),
+            has_metal: metal,
+        }
+    }
+
+    #[test]
+    fn runtime_compatibility_is_runtime_specific_and_fail_closed() {
+        let linux_gpu = host("linux", true, 48.0, 64.0, false);
+        let linux_cpu = host("linux", false, 0.0, 64.0, false);
+        let mac = host("macos", true, 32.0, 64.0, true);
+        assert!(runtime_host_compatible("vllm", 40.0, &linux_gpu));
+        assert!(!runtime_host_compatible("vllm", 40.0, &linux_cpu));
+        assert!(runtime_host_compatible("mlx", 40.0, &mac));
+        assert!(!runtime_host_compatible("mlx", 40.0, &linux_gpu));
+        assert!(runtime_host_compatible("llama.cpp", 40.0, &linux_cpu));
+        assert!(!runtime_host_compatible("mystery", 1.0, &linux_gpu));
+        assert!(!runtime_host_compatible("llama.cpp", 0.0, &linux_gpu));
+    }
+
+    #[test]
+    fn library_variant_fit_rejects_missing_or_wrong_sizes() {
+        let variants = serde_json::json!([
+            {"runtime":"llama.cpp", "quant":"Q4_K_M", "size_gb":20.0}
+        ]);
+        assert_eq!(
+            library_variant_size_gb("llama.cpp", "Q4_K_M", None, &variants),
+            None
+        );
+        assert_eq!(
+            library_variant_size_gb("llama.cpp", "Q4_K_M", Some(0), &variants),
+            None
+        );
+        assert_eq!(
+            library_variant_size_gb("llama.cpp", "Q8_0", Some(20_000_000_000), &variants),
+            None
+        );
+        assert_eq!(
+            library_variant_size_gb("llama.cpp", "Q4_K_M", Some(10_000_000_000), &variants),
+            None
+        );
+        assert_eq!(
+            library_variant_size_gb("llama.cpp", "Q4_K_M", Some(20_000_000_000), &variants),
+            Some(20.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn live_schema_and_canonical_coverage_authority() {
+        let url = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"));
+        let Ok(url) = url else { return };
+        let pool = PgPool::connect(&url).await.expect("connect test database");
+
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'fleet_model_catalog'
+             ORDER BY ordinal_position",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read fleet_model_catalog shape");
+        assert_eq!(
+            columns,
+            [
+                "id",
+                "name",
+                "family",
+                "parameters",
+                "tier",
+                "description",
+                "gated",
+                "preferred_workloads",
+                "variants",
+                "updated_at",
+                "tool_calling",
+                "display_name",
+                "tasks",
+                "modalities",
+                "benchmarks",
+                "license",
+                "lifecycle"
+            ]
+        );
+
+        let guard = CoverageGuard::new_dbonly(pool.clone());
+        guard
+            .load_coverage_inputs()
+            .await
+            .expect("canonical coverage query");
+        guard
+            .rank_candidates("code", &[])
+            .await
+            .expect("candidate query uses the live catalog shape");
+
+        let null_lifecycle_serving: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM fleet_model_deployments d
+             JOIN computers c ON c.name=d.worker_name
+             JOIN fleet_model_catalog mc ON mc.id=d.catalog_id
+             WHERE d.catalog_id IN ('glm-4.5-air','devstral-small-2-24b')
+               AND d.desired_state='active' AND d.health_status='healthy'
+               AND c.status='online' AND mc.lifecycle IS NULL
+               AND jsonb_array_length(COALESCE(mc.preferred_workloads, '[]'::jsonb)) > 0",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("verify nullable-lifecycle serving rows");
+        assert!(null_lifecycle_serving > 0);
+
+        let incorrectly_countable: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM fleet_model_deployments d
+             JOIN computers c ON c.name=d.worker_name
+             WHERE d.desired_state='active'
+               AND (d.health_status <> 'healthy' OR c.status <> 'online')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("verify stale/offline fixture exists");
+        assert!(incorrectly_countable > 0);
     }
 }
