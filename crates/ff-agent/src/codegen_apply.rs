@@ -477,15 +477,6 @@ fn build_prompt(
     // file's #[cfg(test)] module (2026-07-29 hallucination root cause).
     let wants_test = task.to_ascii_lowercase().contains("test");
 
-    // Repo structure anchor: without a listing of what files ACTUALLY exist, the model invents
-    // plausible-but-wrong paths (e.g. a Python `src/work_item/relations.py` in a Rust repo) and
-    // every edit fails to apply. Inject the real crate layout + task-relevant tracked files so
-    // SEARCH/REPLACE edits target files that exist. (build_prompt runs inside spawn_blocking.)
-    if let Some(tree) = repo_structure_context(repo_path, &identifiers) {
-        prompt.push_str("\n\nThis repository's actual structure (edit ONLY files that exist here; do not invent paths):\n");
-        prompt.push_str(&tree);
-    }
-
     for path in task_context_paths(repo_path, task)? {
         let abs = repo_path.join(&path);
         let content =
@@ -505,6 +496,15 @@ fn build_prompt(
                 &extract_relevant_regions(&content, &identifiers, wants_test),
             ));
         }
+    }
+
+    // Repo structure anchor: without a listing of what files ACTUALLY exist, the model invents
+    // plausible-but-wrong paths (e.g. a Python `src/work_item/relations.py` in a Rust repo) and
+    // every edit fails to apply. Keep grounded source regions first, then add lower-value
+    // repository listings as path guardrails. (build_prompt runs inside spawn_blocking.)
+    if let Some(tree) = repo_structure_context(repo_path, &identifiers) {
+        prompt.push_str("\n\nThis repository's actual structure (edit ONLY files that exist here; do not invent paths):\n");
+        prompt.push_str(&tree);
     }
 
     if let Some(edits) = previous_edits {
@@ -599,6 +599,11 @@ fn task_identifiers(task: &str) -> Vec<String> {
         "existing",
         "large",
         "small",
+        "test",
+        "tests",
+        "testing",
+        "unit",
+        "integration",
     ]
     .into_iter()
     .collect();
@@ -674,7 +679,9 @@ fn extract_relevant_regions(content: &str, identifiers: &[String], wants_test: b
         return "No content.\n".to_string();
     }
 
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let test_spans = cfg_test_line_spans(&lines);
+    let mut implementation_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut test_ranges: Vec<(usize, usize)> = Vec::new();
     if !identifiers.is_empty() {
         for (idx, line) in lines.iter().enumerate() {
             let lower = line.to_ascii_lowercase();
@@ -684,38 +691,36 @@ fn extract_relevant_regions(content: &str, identifiers: &[String], wants_test: b
             {
                 let start = idx.saturating_sub(REGION_CONTEXT_LINES);
                 let end = (idx + REGION_CONTEXT_LINES).min(lines.len() - 1);
-                if let Some((_, last_end)) = ranges.last_mut()
-                    && start <= *last_end + 1
-                {
-                    *last_end = (*last_end).max(end);
-                    continue;
+                if line_in_spans(idx, &test_spans) {
+                    push_merged_range(&mut test_ranges, (start, end));
+                } else {
+                    push_merged_range(&mut implementation_ranges, (start, end));
                 }
-                ranges.push((start, end));
             }
         }
     }
 
-    // Test tasks ground on the test module: when the task mentions tests,
-    // the `#[cfg(test)]` module is the FIRST region so the char cap can never
-    // truncate it away (2026-07-29: the cap silently dropped the tests module
-    // and the model invented a `test_utils` helper that doesn't exist).
-    if wants_test && let Some(idx) = lines.iter().position(|l| l.contains("#[cfg(test)]")) {
-        let tr = (idx, lines.len() - 1);
-        // Keep/clamp identifier ranges that start before the test module;
-        // drop ones fully inside it (it is shown in full anyway).
-        ranges = ranges
-            .into_iter()
-            .filter_map(|(s, e)| {
-                if e < tr.0 {
-                    Some((s, e))
-                } else if s < tr.0 {
-                    Some((s, tr.0 - 1))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        ranges.insert(0, tr);
+    let mut ranked_ranges: Vec<(u8, usize, usize)> = implementation_ranges
+        .into_iter()
+        .map(|(start, end)| (0, start, end))
+        .collect();
+    ranked_ranges.extend(test_ranges.into_iter().map(|(start, end)| (1, start, end)));
+
+    // Test intent still benefits from cfg(test) grounding, but every module is
+    // bounded independently. Never treat "first #[cfg(test)] through EOF" as
+    // tests: large Rust files commonly interleave helpers, nested modules, and
+    // multiple unrelated test modules.
+    if wants_test {
+        for &(start, end) in &test_spans {
+            let bounded_end = end.min(start + REGION_CONTEXT_LINES);
+            ranked_ranges.push((2, start, bounded_end));
+        }
+    }
+
+    ranked_ranges.sort_by_key(|(rank, start, end)| (*rank, *start, *end));
+    let mut ranges = Vec::new();
+    for (_, start, end) in ranked_ranges {
+        push_non_overlapping_range(&mut ranges, (start, end));
     }
 
     if ranges.is_empty() {
@@ -723,6 +728,88 @@ fn extract_relevant_regions(content: &str, identifiers: &[String], wants_test: b
     }
 
     render_ranges(&lines, &ranges)
+}
+
+fn line_in_spans(line: usize, spans: &[(usize, usize)]) -> bool {
+    spans
+        .iter()
+        .any(|(start, end)| *start <= line && line <= *end)
+}
+
+fn push_merged_range(ranges: &mut Vec<(usize, usize)>, range: (usize, usize)) {
+    if let Some((_, last_end)) = ranges.last_mut()
+        && range.0 <= *last_end + 1
+    {
+        *last_end = (*last_end).max(range.1);
+        return;
+    }
+    ranges.push(range);
+}
+
+fn push_non_overlapping_range(ranges: &mut Vec<(usize, usize)>, range: (usize, usize)) {
+    let mut pending = vec![range];
+    for &(existing_start, existing_end) in ranges.iter() {
+        let mut next = Vec::new();
+        for (start, end) in pending {
+            if end < existing_start || existing_end < start {
+                next.push((start, end));
+                continue;
+            }
+            if start < existing_start {
+                next.push((start, existing_start - 1));
+            }
+            if existing_end < end {
+                next.push((existing_end + 1, end));
+            }
+        }
+        pending = next;
+        if pending.is_empty() {
+            return;
+        }
+    }
+    ranges.extend(pending);
+}
+
+fn cfg_test_line_spans(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut idx = 0usize;
+
+    while idx < lines.len() {
+        if !lines[idx].trim_start().starts_with("#[cfg(test)]") {
+            idx += 1;
+            continue;
+        }
+
+        let start = idx;
+        let mut end = start;
+        let mut depth = 0isize;
+        let mut opened = false;
+
+        while end < lines.len() {
+            for ch in lines[end].chars() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        opened = true;
+                    }
+                    '}' if opened => depth -= 1,
+                    _ => {}
+                }
+            }
+            if opened && depth <= 0 {
+                break;
+            }
+            end += 1;
+        }
+
+        if end >= lines.len() {
+            end = (start + REGION_CONTEXT_LINES).min(lines.len() - 1);
+        }
+        spans.push((start, end));
+        idx = end + 1;
+    }
+
+    spans
 }
 
 fn fallback_head_tail_regions(lines: &[&str]) -> String {
@@ -745,7 +832,6 @@ fn fallback_head_tail_regions(lines: &[&str]) -> String {
 
 fn render_ranges(lines: &[&str], ranges: &[(usize, usize)]) -> String {
     let mut out = String::new();
-    let mut omitted = 0usize;
 
     for (idx, (start, end)) in ranges.iter().enumerate() {
         let mut block = String::new();
@@ -760,25 +846,65 @@ fn render_ranges(lines: &[&str], ranges: &[(usize, usize)]) -> String {
             block.push('\n');
         }
 
-        if out.len() + block.len() > LARGE_CONTEXT_FILE_CHARS {
-            omitted = ranges.len() - idx;
-            // Name what the model CANNOT see: unnamed truncation invites the
-            // model to invent the missing content (2026-07-29 hallucination).
-            let spans: Vec<String> = ranges[idx..]
-                .iter()
-                .map(|(s, e)| format!("lines {}-{}", s + 1, e + 1))
-                .collect();
-            out.push_str(&format!(
-                "\n... omitted {omitted} later region(s) ({}) after ~{LARGE_CONTEXT_FILE_CHARS} chars. \
-                 Those lines are INVISIBLE to you — do NOT invent their content; SEARCH only from lines shown above.\n",
-                spans.join(", ")
-            ));
+        if char_count(&out) + char_count(&block) > LARGE_CONTEXT_FILE_CHARS {
+            render_truncated_range(lines, ranges, idx, *start, *end, &mut out);
             break;
         }
         out.push_str(&block);
     }
 
     out
+}
+
+fn render_truncated_range(
+    lines: &[&str],
+    ranges: &[(usize, usize)],
+    idx: usize,
+    start: usize,
+    end: usize,
+    out: &mut String,
+) {
+    let omitted = ranges.len() - idx;
+    let notice = format!(
+        "\n... omitted {omitted} later/truncated region(s) after ~{LARGE_CONTEXT_FILE_CHARS} chars. \
+         Those lines are INVISIBLE to you — do NOT invent their content; SEARCH only from lines shown above.\n"
+    );
+    let reserve = char_count(&notice);
+    if char_count(out) + reserve >= LARGE_CONTEXT_FILE_CHARS {
+        return;
+    }
+
+    if idx > 0 {
+        push_str_capped(out, "\n", LARGE_CONTEXT_FILE_CHARS - reserve);
+    }
+    push_str_capped(
+        out,
+        &format!("Region (lines {}-{}):\n", start + 1, end + 1),
+        LARGE_CONTEXT_FILE_CHARS - reserve,
+    );
+    for line in &lines[start..=end] {
+        if char_count(out) + char_count(line) + reserve <= LARGE_CONTEXT_FILE_CHARS {
+            out.push_str(line);
+        } else {
+            push_str_capped(out, line, LARGE_CONTEXT_FILE_CHARS - reserve);
+            break;
+        }
+    }
+    if char_count(out) + reserve <= LARGE_CONTEXT_FILE_CHARS {
+        out.push_str(&notice);
+    }
+}
+
+fn char_count(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn push_str_capped(out: &mut String, text: &str, cap: usize) {
+    let remaining = cap.saturating_sub(char_count(out));
+    if remaining == 0 {
+        return;
+    }
+    out.extend(text.chars().take(remaining));
 }
 
 fn task_context_paths(repo_path: &Path, task: &str) -> Result<Vec<PathBuf>> {
@@ -1424,9 +1550,10 @@ mod tests {
         assert!(!regions.contains("No task identifiers matched"));
     }
     #[test]
-    fn codegen_regions_test_module_first_when_task_wants_test() {
-        // Large file: identifier hit early, tests module at the end. With
-        // wants_test the cfg(test) module must lead (cap can't drop it).
+    fn codegen_regions_keep_implementation_before_bounded_tests() {
+        // Large file: identifier hit early, tests module at the end. Test
+        // grounding must not bury the exact implementation region behind a
+        // lower-value cfg(test) module.
         let mut content = String::new();
         for i in 1..40 {
             content.push_str(&format!("fn filler_{i}() {{}}\n"));
@@ -1440,10 +1567,94 @@ mod tests {
             .find("fn special_handler")
             .expect("identifier shown");
         assert!(
-            tests_pos < handler_pos,
-            "tests module must be the first region"
+            handler_pos < tests_pos,
+            "implementation region must precede bounded test grounding"
         );
         assert!(regions.contains("fn real_helper()"));
+    }
+
+    #[test]
+    fn codegen_extract_regions_preserves_exact_impl_and_named_test_under_cap() {
+        let mut content = String::new();
+        content.push_str("pub fn unrelated_head() {}\n");
+        content.push_str("#[cfg(test)]\nmod early_tests {\n");
+        for i in 0..120 {
+            content.push_str(&format!("    fn early_unrelated_{i}() {{}}\n"));
+        }
+        content.push_str("}\n");
+        for i in 0..260 {
+            content.push_str(&format!("fn filler_impl_{i}() {{}}\n"));
+        }
+        content.push_str(
+            "pub fn offload_workload_for_kind(kind: &str) -> Option<&'static str> {\n    match kind {\n        \"code\" => Some(\"code\"),\n        _ => None,\n    }\n}\n",
+        );
+        for i in 0..260 {
+            content.push_str(&format!("fn filler_between_{i}() {{}}\n"));
+        }
+        content.push_str("#[cfg(test)]\nmod routed_tests {\n    use super::*;\n\n");
+        content.push_str(
+            "    fn test_offload_workload_for_kind() {\n        assert_eq!(offload_workload_for_kind(\"code\"), Some(\"code\"));\n    }\n",
+        );
+        content.push_str("}\n");
+        content.push_str("#[cfg(test)]\nmod unrelated_tail_tests {\n");
+        for i in 0..900 {
+            content.push_str(&format!("    fn unrelated_tail_{i}() {{}}\n"));
+        }
+        content.push_str("}\n");
+
+        let identifiers = task_identifiers(
+            "add tests for offload_workload_for_kind and test_offload_workload_for_kind",
+        );
+        let regions = extract_relevant_regions(&content, &identifiers, true);
+
+        let impl_pos = regions
+            .find("pub fn offload_workload_for_kind")
+            .expect("exact implementation signature shown");
+        let test_pos = regions
+            .find("fn test_offload_workload_for_kind")
+            .expect("exact test signature shown");
+        assert!(
+            impl_pos < test_pos,
+            "implementation should be grounded before named test/helper"
+        );
+        assert!(
+            !regions.contains("fn unrelated_tail_899"),
+            "unbounded unrelated cfg(test) tail must be omitted"
+        );
+        assert!(
+            char_count(&regions) <= LARGE_CONTEXT_FILE_CHARS,
+            "regions exceeded declared cap: {}",
+            char_count(&regions)
+        );
+    }
+
+    #[test]
+    fn codegen_task_identifiers_drop_generic_test_words_not_exact_symbols() {
+        let identifiers =
+            task_identifiers("unit testing for tests test_offload_workload_for_kind integration");
+
+        assert!(!identifiers.iter().any(|id| id == "unit"));
+        assert!(!identifiers.iter().any(|id| id == "testing"));
+        assert!(!identifiers.iter().any(|id| id == "tests"));
+        assert!(!identifiers.iter().any(|id| id == "integration"));
+        assert!(
+            identifiers
+                .iter()
+                .any(|id| id == "test_offload_workload_for_kind")
+        );
+    }
+
+    #[test]
+    fn codegen_render_ranges_keeps_source_for_oversized_first_region() {
+        let huge_line = format!("fn target() {{ /* {} */ }}\n", "x".repeat(40_000));
+        let lines = vec![huge_line.as_str()];
+
+        let regions = render_ranges(&lines, &[(0, 0)]);
+
+        assert!(regions.contains("Region (lines 1-1):"));
+        assert!(regions.contains("fn target()"));
+        assert!(regions.contains("omitted"));
+        assert!(char_count(&regions) <= LARGE_CONTEXT_FILE_CHARS);
     }
 
     #[test]
