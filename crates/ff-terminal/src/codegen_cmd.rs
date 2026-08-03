@@ -13,6 +13,7 @@ pub async fn handle_codegen(
     model: Option<String>,
     rounds: u32,
     no_backstop: bool,
+    explicit_target: Option<ff_agent::fleet_oneshot::ResolvedFleetTarget>,
 ) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
@@ -22,19 +23,30 @@ pub async fn handle_codegen(
         None => std::env::current_dir().context("resolve current dir")?,
     };
 
-    let outcome = ff_agent::codegen_apply::codegen_apply(
+    let outcome = ff_agent::codegen_apply::codegen_apply_with_target(
         &pool,
         &repo_path,
         &task,
         model.as_deref(),
         rounds,
         None,
+        explicit_target.as_ref(),
     )
     .await?;
 
     if outcome.applied {
         print_outcome(&outcome);
         return Ok(());
+    }
+
+    if let Some(target) = explicit_target.as_ref() {
+        print_outcome(&outcome);
+        anyhow::bail!(
+            "explicit local target {} (catalog {}, deployment {}) failed; refusing cloud or fleet fallback",
+            target.endpoint,
+            target.catalog_id,
+            target.deployment_id
+        );
     }
 
     if no_backstop {

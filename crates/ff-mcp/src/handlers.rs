@@ -1066,8 +1066,8 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
 
     // ── Step 1: pick the best WARM endpoint, capability+kind-aware (same shared
     // selector `ff offload` uses → no drift between the CLI and MCP paths).
-    // Prefers a model whose workload matches `kind` (coder for code), falls back
-    // to any tool-capable model, then breaks ties by least-loaded host.
+    // Code-shaped kinds require a coder; general kinds use any tool-capable
+    // model. The shared selector breaks ties by least-loaded host.
     let candidate = ff_db::pg_pick_offload_endpoint(&pool, min_ctx, kind, &[])
         .await
         .map_err(|e| format!("fleet_offload router query failed: {e}"))?;
@@ -1122,21 +1122,49 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
         warn!(error = %e, "demand signal write failed (mcp_offload)");
     }
 
-    // ── Step 2: dispatch to the warm local endpoint over the OpenAI-compatible
-    // API — same request shape + parser `fleet_run` uses.
-    let routed_model = candidate
-        .catalog_id
-        .clone()
-        .unwrap_or_else(|| candidate.catalog_name.clone().unwrap_or_default());
-    let url = ff_core::url::normalize_chat_completions_url(&candidate.endpoint);
-
+    // ── Step 2: resolve and attest the canonical endpoint identity before chat.
+    // This is the same target/attestation boundary used by `ff run`; reachable
+    // identity errors fail closed and only /v1/models timeout is allowed through
+    // as explicitly unverified.
     let client = &*SHARED_HTTP;
-    // mlx_lm.server validates the OpenAI `model` field as an HF repo id, so the
-    // catalog id 401s "Repository Not Found" — it serves the model under its
-    // on-disk path. Probe /v1/models once and resolve to a served id (no-op for
-    // llama.cpp/vLLM). Resolves the mlx 401 that made fleet_offload unusable on
-    // every Mac mlx endpoint.
-    let model = ff_brain::resolve_served_model_id(client, &candidate.endpoint, &routed_model).await;
+    let unresolved_target = ff_agent::fleet_oneshot::resolve_candidate_target(
+        &pool,
+        &candidate,
+        ff_agent::fleet_oneshot::ResolvedTargetProvenance::Auto,
+        false,
+    )
+    .await
+    .map_err(|error| format!("fleet_offload target resolution failed: {error}"))?;
+    let target = match ff_agent::fleet_oneshot::attest_resolved_target(
+        client,
+        unresolved_target.clone(),
+        Duration::from_secs(5),
+    )
+    .await
+    {
+        Ok(target) => target,
+        Err(error) => {
+            let error_text = format!("fleet_offload target attestation failed: {error}");
+            record_mcp_offload_turn(
+                &pool,
+                task,
+                kind,
+                min_ctx,
+                max_tokens,
+                &unresolved_target,
+                "",
+                0,
+                0,
+                None,
+                "error",
+                Some(&error_text),
+            )
+            .await;
+            return Err(error_text);
+        }
+    };
+    let model = target.inference_model().to_string();
+    let url = ff_core::url::normalize_chat_completions_url(&target.endpoint);
 
     let request = ChatCompletionRequest {
         model: model.clone(),
@@ -1165,18 +1193,37 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
     };
 
     let started = Instant::now();
-    let response = client
+    let response = match client
         .post(&url)
         .timeout(Duration::from_secs(OFFLOAD_TIMEOUT_SECS))
         .json(&request)
         .send()
         .await
-        .map_err(|e| {
-            format!(
-                "fleet_offload dispatch to {} failed: {e}",
-                candidate.endpoint
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let error_text = format!(
+                "fleet_offload dispatch to {} failed: {error}",
+                target.endpoint
+            );
+            record_mcp_offload_turn(
+                &pool,
+                task,
+                kind,
+                min_ctx,
+                max_tokens,
+                &target,
+                "",
+                0,
+                0,
+                Some(started.elapsed()),
+                "error",
+                Some(&error_text),
             )
-        })?;
+            .await;
+            return Err(error_text);
+        }
+    };
 
     let latency = started.elapsed();
     let status = response.status();
@@ -1185,24 +1232,82 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
             .text()
             .await
             .unwrap_or_else(|_| "<failed reading error body>".to_string());
-        return Err(format!(
+        let error_text = format!(
             "fleet_offload endpoint {} (model {}) returned HTTP {status}: {body}",
-            candidate.endpoint, model
-        ));
+            target.endpoint, model
+        );
+        record_mcp_offload_turn(
+            &pool,
+            task,
+            kind,
+            min_ctx,
+            max_tokens,
+            &target,
+            &body,
+            0,
+            0,
+            Some(latency),
+            "error",
+            Some(&error_text),
+        )
+        .await;
+        return Err(error_text);
     }
 
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("fleet_offload: failed parsing endpoint JSON: {e}"))?;
+    let payload: Value = match response.json().await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let error_text = format!("fleet_offload: failed parsing endpoint JSON: {error}");
+            record_mcp_offload_turn(
+                &pool,
+                task,
+                kind,
+                min_ctx,
+                max_tokens,
+                &target,
+                "",
+                0,
+                0,
+                Some(latency),
+                "error",
+                Some(&error_text),
+            )
+            .await;
+            return Err(error_text);
+        }
+    };
     let result = strip_think_block(&extract_completion_text(&payload).unwrap_or_default());
+    let usage = payload.get("usage");
+    let usage_tok = |key: &str| -> i32 {
+        usage
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(0)
+    };
+    record_mcp_offload_turn(
+        &pool,
+        task,
+        kind,
+        min_ctx,
+        max_tokens,
+        &target,
+        &result,
+        usage_tok("prompt_tokens"),
+        usage_tok("completion_tokens"),
+        Some(latency),
+        "success",
+        None,
+    )
+    .await;
 
     Ok(json!({
         "offloaded": true,
         "decision": "offloaded",
-        "endpoint": candidate.endpoint,
-        "worker_name": candidate.worker_name,
+        "endpoint": target.endpoint,
+        "worker_name": target.worker_name,
         "model": model,
+        "route_decision": target.route_decision(),
         "tier": candidate.tier,
         "usable_agent_ctx": candidate.usable_agent_ctx,
         "kind": kind,
@@ -1212,6 +1317,53 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
         "review_hint": "Review this output before using it. If it's wrong or \
                         the task needed architectural judgment, redo it yourself."
     }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_mcp_offload_turn(
+    pool: &sqlx::PgPool,
+    task: &str,
+    kind: Option<&str>,
+    min_ctx: i32,
+    max_tokens: u32,
+    target: &ff_agent::fleet_oneshot::ResolvedFleetTarget,
+    response_text: &str,
+    tokens_in: i32,
+    tokens_out: i32,
+    latency: Option<Duration>,
+    outcome: &str,
+    error_text: Option<&str>,
+) {
+    let record = ff_db::InteractionRecord {
+        channel: "mcp".to_string(),
+        purpose: Some("build".to_string()),
+        request_text: task.chars().take(16000).collect(),
+        request_meta: json!({
+            "tool": "fleet_offload",
+            "kind": kind,
+            "min_ctx": min_ctx,
+            "max_tokens": max_tokens,
+        }),
+        route_decision: target.route_decision(),
+        model_versions: json!({
+            "catalog_id": target.catalog_id,
+            "served_model_id": target.served_model_id,
+            "served_model_ids": target.served_model_ids,
+        }),
+        engine: Some(target.engine_label()),
+        response_text: response_text.chars().take(16000).collect(),
+        tokens_in,
+        tokens_out,
+        latency_ms: latency.and_then(|value| i32::try_from(value.as_millis()).ok()),
+        outcome: outcome.to_string(),
+        error_text: error_text.map(str::to_string),
+        worker_name: Some(target.worker_name.clone()),
+        endpoint: Some(target.endpoint.clone()),
+        ..Default::default()
+    };
+    if let Err(error) = ff_db::pg_record_interaction(pool, &record).await {
+        tracing::warn!(error = %error, "fleet_offload: interaction capture failed");
+    }
 }
 
 /// Strip any `<think>…</think>` reasoning a model emitted, returning the trimmed

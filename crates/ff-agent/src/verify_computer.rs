@@ -41,16 +41,10 @@ pub async fn verify_computer(pool: &PgPool, worker_name: &str) -> Result<VerifyR
     };
     details.push(check_ssh_cmd(&ssh_dest, "db_reachable_from_node", db_cmd).await);
     // 3. redis_reachable_from_node
-    // Canonical fleet Redis is host-port 56379 (5-digit convention; container
-    // 6379 → host 56379). The old 6380 was remapped 2026-05-18 — probing it
-    // here made every node fail this check forever (surfaced by the
-    // fleet-integrity sweep, #388). Keep in sync with
-    // `ff_core::config::default_redis_url`.
-    let redis_cmd = if is_windows {
-        r#"powershell -NoProfile -Command "Test-NetConnection -ComputerName 192.168.5.100 -Port 56379 -InformationLevel Quiet | Out-String | Select-String True | ForEach-Object { exit 0 }; exit 1""#
-    } else {
-        "nc -z -w 3 192.168.5.100 56379"
-    };
+    // Ask the installed FF client to exercise its own configured Redis path.
+    // This keeps verification on the same authority as the runtime instead of
+    // baking a host, port, or auxiliary redis-cli/nc dependency into the check.
+    let redis_cmd = redis_check_command(is_windows);
     details.push(check_ssh_cmd(&ssh_dest, "redis_reachable_from_node", redis_cmd).await);
     // 4. sub_agent_dirs_exist
     let want = node.sub_agent_count;
@@ -89,11 +83,7 @@ pub async fn verify_computer(pool: &PgPool, worker_name: &str) -> Result<VerifyR
         },
     });
     // 5. tooling_installed
-    let tool_cmd = if is_windows {
-        r#"powershell -NoProfile -Command "$c = 0; foreach ($t in 'gh','git','codex','claude') { if (Get-Command $t -ErrorAction SilentlyContinue) { $c++ } }; if ($c -ge 3) { exit 0 } else { exit 1 }""#
-    } else {
-        "[ $(which gh op codex claude 2>/dev/null | wc -l) -ge 3 ]"
-    };
+    let tool_cmd = tooling_check_command(is_windows);
     details.push(check_ssh_cmd(&ssh_dest, "tooling_installed", tool_cmd).await);
     // 6. tool_versions_reported
     details.push(if node.tooling.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
@@ -142,7 +132,7 @@ pub async fn verify_computer(pool: &PgPool, worker_name: &str) -> Result<VerifyR
         check_ssh_cmd(&ssh_dest, "sudo_passwordless", "sudo -n true").await
     });
     // 10. mesh_ssh_complete
-    let mesh = ff_db::pg_list_mesh_status(pool, Some(worker_name))
+    let mesh = ff_db::queries::pg_list_active_mesh_status(pool, Some(worker_name))
         .await
         .unwrap_or_default();
     details.push(if mesh.is_empty() {
@@ -361,4 +351,54 @@ async fn ssh_capture(dest: &str, cmd: &str) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn redis_check_command(is_windows: bool) -> &'static str {
+    if is_windows {
+        r#"powershell -NoProfile -Command "$out = & \"$env:USERPROFILE\.local\bin\ff.exe\" status --no-color 2>&1 | Out-String; if ($out -match 'Redis.*PONG') { exit 0 } else { exit 1 }""#
+    } else {
+        "PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\" && ff status --no-color 2>&1 | grep -q 'Redis.*PONG'"
+    }
+}
+
+fn tooling_check_command(is_windows: bool) -> &'static str {
+    if is_windows {
+        r#"powershell -NoProfile -Command "$c = 0; foreach ($t in 'gh','git','codex','claude') { if (Get-Command $t -ErrorAction SilentlyContinue) { $c++ } }; if ($c -ge 3) { exit 0 } else { exit 1 }""#
+    } else {
+        "PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\" && [ $(command -v gh op codex claude 2>/dev/null | wc -l) -ge 3 ]"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_redis_command_uses_ff_configured_status() {
+        let cmd = redis_check_command(false);
+        assert!(!cmd.contains("192.168.5.100"));
+        assert!(!cmd.contains("nc"));
+        assert!(cmd.contains("ff status"));
+        assert!(cmd.contains("Redis.*PONG"));
+        assert!(cmd.contains("$HOME/.local/bin"));
+        assert!(cmd.contains("$HOME/.cargo/bin"));
+    }
+
+    #[test]
+    fn windows_redis_command_uses_ff_configured_status() {
+        let cmd = redis_check_command(true);
+        assert!(!cmd.contains("192.168.5.100"));
+        assert!(!cmd.contains("nc"));
+        assert!(cmd.contains("ff.exe"));
+        assert!(cmd.contains("Redis.*PONG"));
+    }
+
+    #[test]
+    fn unix_tooling_command_normalizes_non_login_path() {
+        let cmd = tooling_check_command(false);
+        assert!(cmd.contains("$HOME/.local/bin"));
+        assert!(cmd.contains("$HOME/.cargo/bin"));
+        assert!(cmd.contains("command -v"));
+        assert!(!cmd.contains("which"));
+    }
 }

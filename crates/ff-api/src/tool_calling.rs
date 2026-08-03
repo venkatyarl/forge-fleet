@@ -62,6 +62,11 @@ pub struct ToolChatMessage {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<Value>,
+    /// Some OpenAI-compatible reasoning models return their answer here while
+    /// leaving `content` null. This is response-only so internal reasoning is
+    /// not sent back as a non-standard request field on later turns.
+    #[serde(default, skip_serializing)]
+    pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,6 +138,18 @@ impl ToolChatMessage {
     /// Extract text content from this message, if present.
     pub fn text_content(&self) -> Option<&str> {
         self.content.as_ref().and_then(Value::as_str)
+    }
+
+    /// Extract the model's effective answer text, falling back to the
+    /// response-only `reasoning_content` used by some local reasoning models.
+    pub fn answer_content(&self) -> Option<&str> {
+        self.text_content()
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| {
+                self.reasoning_content
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+            })
     }
 
     /// Returns true if this message contains tool calls.
@@ -243,6 +260,35 @@ mod tests {
         assert!(msg.has_tool_calls());
         let calls = msg.tool_calls.as_ref().unwrap();
         assert_eq!(calls[0].function.name, "Bash");
+    }
+
+    #[test]
+    fn deserializes_content_answer() {
+        let msg: ToolChatMessage = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": "final answer"
+        }))
+        .unwrap();
+
+        assert_eq!(msg.answer_content(), Some("final answer"));
+    }
+
+    #[test]
+    fn falls_back_to_reasoning_only_answer_without_serializing_it() {
+        let msg: ToolChatMessage = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "reasoning-only answer"
+        }))
+        .unwrap();
+
+        assert_eq!(msg.answer_content(), Some("reasoning-only answer"));
+        assert!(
+            serde_json::to_value(&msg)
+                .unwrap()
+                .get("reasoning_content")
+                .is_none()
+        );
     }
 
     #[test]

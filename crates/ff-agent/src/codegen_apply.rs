@@ -1,7 +1,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -12,6 +13,62 @@ const SMALL_CONTEXT_FILE_BYTES: usize = 12_000;
 const LARGE_CONTEXT_FILE_CHARS: usize = 16_000;
 const REGION_CONTEXT_LINES: usize = 25;
 const FALLBACK_LINES: usize = 60;
+const CODEGEN_RUN_BUDGET: Duration = Duration::from_secs(420);
+const CODEGEN_FINALIZE_RESERVE: Duration = Duration::from_secs(60);
+const CODEGEN_CORRECTION_RESERVE: Duration = Duration::from_secs(45);
+const CODEGEN_ROLLBACK_RESERVE: Duration = Duration::from_secs(5);
+const CODEGEN_MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(210);
+const CODEGEN_REQUEST_STARTUP: Duration = Duration::from_secs(15);
+const CODEGEN_TELEMETRY_TIMEOUT: Duration = Duration::from_secs(2);
+const CODEGEN_OUTPUT_TOKENS_PER_SEC: u64 = 8;
+const CODEGEN_MIN_OUTPUT_TOKENS: u32 = 512;
+const CODEGEN_MAX_OUTPUT_TOKENS: u32 = 2048;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoundPlan {
+    request_timeout: Duration,
+    max_tokens: u32,
+}
+
+/// Admit a model round only when its request can fit before the absolute run
+/// deadline while preserving time to parse/apply/verify and, when applicable,
+/// one correction round. Token capacity is checked before clamping: otherwise
+/// a 30-second generation window would be inflated to the 512-token minimum
+/// even though the model cannot physically produce it at the conservative
+/// throughput floor.
+fn plan_round(remaining: Duration, rounds_after_current: u32) -> Option<RoundPlan> {
+    let correction_reserve = if rounds_after_current > 0 {
+        CODEGEN_CORRECTION_RESERVE
+    } else {
+        Duration::ZERO
+    };
+    let reserved = CODEGEN_FINALIZE_RESERVE.checked_add(correction_reserve)?;
+    let available = remaining.checked_sub(reserved)?;
+    let request_timeout = available.min(CODEGEN_MAX_REQUEST_TIMEOUT);
+    let generation_window = request_timeout.checked_sub(CODEGEN_REQUEST_STARTUP)?;
+    let achievable = generation_window
+        .as_secs()
+        .saturating_mul(CODEGEN_OUTPUT_TOKENS_PER_SEC);
+    if achievable < u64::from(CODEGEN_MIN_OUTPUT_TOKENS) {
+        return None;
+    }
+
+    Some(RoundPlan {
+        request_timeout,
+        max_tokens: achievable.min(u64::from(CODEGEN_MAX_OUTPUT_TOKENS)) as u32,
+    })
+}
+
+async fn bounded_best_effort<F>(timeout: Duration, future: F) -> Option<F::Output>
+where
+    F: Future,
+{
+    tokio::time::timeout(timeout, future).await.ok()
+}
+
+fn round_diagnostic(round: u32, stage: &str, detail: impl std::fmt::Display) -> String {
+    format!("round {round} {stage}: {detail}")
+}
 
 #[derive(Debug, Clone)]
 pub struct CodegenOutcome {
@@ -87,7 +144,19 @@ fn round_interaction(
     ff_db::InteractionRecord {
         channel: "codegen_apply".to_string(),
         request_text: prompt.chars().take(16000).collect(),
-        request_meta: serde_json::json!({ "round": round, "tokens_estimated": tokens_estimated }),
+        request_meta: serde_json::json!({
+            "round": round,
+            "tokens_estimated": tokens_estimated,
+            "route_provenance": resp.provenance.as_str(),
+        }),
+        route_decision: serde_json::json!({
+            "deployment_id": resp.deployment_id,
+            "endpoint": resp.endpoint,
+            "worker_name": resp.worker_name,
+            "catalog_id": resp.catalog_id,
+            "model": resp.model,
+            "provenance": resp.provenance.as_str(),
+        }),
         engine: Some(engine),
         response_text: resp.text.chars().take(16000).collect(),
         tokens_in,
@@ -131,59 +200,152 @@ pub async fn codegen_apply(
     max_rounds: u32,
     work_item_id: Option<uuid::Uuid>,
 ) -> Result<CodegenOutcome> {
+    codegen_apply_with_target(
+        pool,
+        repo_path,
+        task,
+        model_hint,
+        max_rounds,
+        work_item_id,
+        None,
+    )
+    .await
+}
+
+/// Run codegen with an optional explicit fleet target. The legacy entry point
+/// above is deliberately just the unpinned wrapper so routing logic cannot
+/// diverge between callers.
+#[allow(clippy::too_many_arguments)]
+pub async fn codegen_apply_with_target(
+    pool: &PgPool,
+    repo_path: &Path,
+    task: &str,
+    model_hint: Option<&str>,
+    max_rounds: u32,
+    work_item_id: Option<uuid::Uuid>,
+    explicit_target: Option<&crate::fleet_oneshot::ResolvedFleetTarget>,
+) -> Result<CodegenOutcome> {
+    let run_deadline = tokio::time::Instant::now() + CODEGEN_RUN_BUDGET;
     let mut last_edits: Option<String> = None;
     let mut last_error: Option<String> = None;
+    let mut diagnostics = Vec::new();
     let mut rounds = 0;
 
     for round in 1..=max_rounds {
-        rounds = round;
         let rp = repo_path.to_path_buf();
         let task = task.to_string();
         let previous_edits = last_edits.clone();
         let previous_error = last_error.clone();
-        let prompt = tokio::task::spawn_blocking(move || {
+        let prompt_task = tokio::task::spawn_blocking(move || {
             build_prompt(
                 &rp,
                 &task,
                 previous_edits.as_deref(),
                 previous_error.as_deref(),
             )
-        })
-        .await
-        .map_err(|e| anyhow!("build prompt task panicked: {e}"))??;
+        });
+        let prompt = match tokio::time::timeout_at(run_deadline, prompt_task).await {
+            Ok(Ok(result)) => result?,
+            Ok(Err(error)) => return Err(anyhow!("build prompt task panicked: {error}")),
+            Err(_) => {
+                let diagnostic = round_diagnostic(
+                    round,
+                    "not started",
+                    "building the grounded prompt exhausted the absolute run deadline",
+                );
+                warn!(round, error = %diagnostic, "codegen prompt build timed out");
+                diagnostics.push(diagnostic.clone());
+                last_error = Some(diagnostic);
+                break;
+            }
+        };
+
+        let remaining = run_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(plan) = plan_round(remaining, max_rounds.saturating_sub(round)) else {
+            let diagnostic = round_diagnostic(
+                round,
+                "not started",
+                format!(
+                    "remaining budget {remaining:?} cannot preserve finalization and a viable model request"
+                ),
+            );
+            warn!(round, error = %diagnostic, "codegen round rejected by budget admission");
+            diagnostics.push(diagnostic.clone());
+            last_error = Some(diagnostic);
+            break;
+        };
+        rounds = round;
         info!(
             round,
-            max_rounds, "requesting codegen edits from fleet model"
+            max_rounds,
+            request_timeout_ms = plan.request_timeout.as_millis(),
+            max_tokens = plan.max_tokens,
+            "requesting codegen edits from fleet model"
         );
 
         // Constrain to code-capable deployments: a build must never route to a
         // non-coder model (Lucy-1.7B / SmolVLM2-video), which return prose and no
         // valid diff → "no diff to check" failures. Capability-based via the
-        // router, not a model list; fails open if no coder is momentarily healthy.
+        // router, not a model list; fails closed if no coder is healthy.
         //
         // Ctx floor (2026-07-29, canary-2 root cause): glm-4.5-air is a REASONING
         // model — its slot must hold prompt + think + max_tokens or the reply
         // truncates into prose. Estimate prompt tokens (chars/4) and require the
         // slot to fit it plus the output plus a think reserve, so fat
         // repo-context prompts route to the 32K slots instead of thalia's 12K.
-        let est_prompt_tokens = (prompt.len() / 4) as i32;
-        let min_ctx = Some((est_prompt_tokens + 8192 + 2048).min(49152));
+        let est_prompt_tokens = i32::try_from(prompt.len() / 4).unwrap_or(i32::MAX);
+        let max_tokens = i32::try_from(plan.max_tokens).unwrap_or(i32::MAX);
+        let min_ctx = Some(
+            est_prompt_tokens
+                .saturating_add(max_tokens)
+                .saturating_add(2048)
+                .min(49152),
+        );
         // Canary-3 root cause: with the format contract mid-user-message, the
         // reasoning model thinks out loud in `content` and burns the completion
         // budget before any edit block. Strict SYSTEM contract (lab-proven on
-        // thalia) + 8192 completion budget for multi-block edits.
-        let response = crate::fleet_oneshot::fleet_oneshot_for_ctx(
+        // thalia) plus the admitted completion budget keeps the reply usable.
+        let request = crate::fleet_oneshot::fleet_oneshot_for_ctx_with_target(
             pool,
             &prompt,
             model_hint,
-            Some(Duration::from_secs(300)),
+            Some(plan.request_timeout),
             Some("code"),
             min_ctx,
             Some(CODEGEN_SYSTEM_CONTRACT),
-            8192,
-        )
-        .await
-        .with_context(|| format!("fleet_oneshot round {round}"))?;
+            plan.max_tokens,
+            explicit_target,
+        );
+        let response = match tokio::time::timeout(plan.request_timeout, request).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                let diagnostic =
+                    round_diagnostic(round, "model request failed", format!("{error:#}"));
+                warn!(round, error = %diagnostic, "codegen model request failed");
+                diagnostics.push(diagnostic.clone());
+                last_edits = None;
+                last_error = Some(diagnostic);
+                if explicit_target.is_some() {
+                    break;
+                }
+                continue;
+            }
+            Err(_) => {
+                let diagnostic = round_diagnostic(
+                    round,
+                    "model request timed out",
+                    format!("after {:?}", plan.request_timeout),
+                );
+                warn!(round, error = %diagnostic, "codegen model request timed out");
+                diagnostics.push(diagnostic.clone());
+                last_edits = None;
+                last_error = Some(diagnostic);
+                if explicit_target.is_some() {
+                    break;
+                }
+                continue;
+            }
+        };
 
         // Per-round episode capture (V250 episodic tagging): `fleet_oneshot`
         // never inserts into `ff_interactions` itself — it returns the
@@ -191,8 +353,24 @@ pub async fn codegen_apply(
         // turns only exist as the dispatch-level summary row, which can't
         // attribute individual rounds. Best-effort — never fails codegen.
         let rec = round_interaction(work_item_id, round, &prompt, &response);
-        if let Err(e) = ff_db::pg_record_interaction(pool, &rec).await {
-            warn!(round, error = %e, "codegen: interaction capture failed (non-fatal)");
+        let telemetry_timeout = CODEGEN_TELEMETRY_TIMEOUT
+            .min(run_deadline.saturating_duration_since(tokio::time::Instant::now()));
+        if !telemetry_timeout.is_zero() {
+            match bounded_best_effort(telemetry_timeout, ff_db::pg_record_interaction(pool, &rec))
+                .await
+            {
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    warn!(round, error = %error, "codegen: interaction capture failed (non-fatal)");
+                }
+                None => {
+                    warn!(
+                        round,
+                        timeout_ms = telemetry_timeout.as_millis(),
+                        "codegen: interaction capture timed out (non-fatal)"
+                    );
+                }
+            }
         }
 
         let edits = match parse_edit_blocks(&response.text) {
@@ -215,41 +393,42 @@ pub async fn codegen_apply(
                         already_done: true,
                     });
                 }
-                let err = "model response contained NO edit blocks — it was prose. \
-                           Reply with ONLY edit blocks starting with '*** FILE:' — \
-                           no explanation, no reasoning, no markdown fences around the whole reply"
-                    .to_string();
-                warn!(round, error = %err, "codegen response rejected");
+                let diagnostic = round_diagnostic(
+                    round,
+                    "response rejected",
+                    "model response contained NO edit blocks — it was prose. Reply with ONLY edit blocks starting with '*** FILE:' — no explanation, no reasoning, no markdown fences around the whole reply",
+                );
+                warn!(round, error = %diagnostic, "codegen response rejected");
+                diagnostics.push(diagnostic.clone());
                 last_edits = None;
-                last_error = Some(err);
+                last_error = Some(diagnostic);
                 continue;
             }
             Err(e) => {
-                let err = e.to_string();
-                warn!(round, error = %err, "codegen response rejected");
+                let diagnostic = round_diagnostic(round, "response rejected", e);
+                warn!(round, error = %diagnostic, "codegen response rejected");
+                diagnostics.push(diagnostic.clone());
                 last_edits = Some(response.text);
-                last_error = Some(err);
+                last_error = Some(diagnostic);
                 continue;
             }
         };
         let edit_summary = format_edit_summary(&edits);
 
-        let rp = repo_path.to_path_buf();
-        let edits_to_apply = edits.clone();
-        let snapshots = match tokio::task::spawn_blocking(move || apply_edits(&rp, &edits_to_apply))
-            .await
-            .map_err(|e| anyhow!("apply edits task panicked: {e}"))?
-        {
-            Ok(snapshots) => snapshots,
+        // File mutation is deliberately synchronous and bounded to the model's
+        // touched paths. Tokio task cancellation is cooperative, so no future
+        // can be dropped between the first write and construction of the
+        // rollback guard. Running this in a detached spawn_blocking task would
+        // let the caller observe/commit transient edits before that task later
+        // returned its guard and rolled them back.
+        let transaction = match apply_edits(repo_path, &edits).map(EditTransaction::new) {
+            Ok(transaction) => transaction,
             Err(e) => {
-                let err = e.to_string();
-                warn!(round, error = %err, "codegen edits failed to apply");
-                let rp = repo_path.to_path_buf();
-                tokio::task::spawn_blocking(move || clean_worktree(&rp))
-                    .await
-                    .map_err(|e| anyhow!("clean worktree task panicked: {e}"))??;
+                let diagnostic = round_diagnostic(round, "edits rejected", e);
+                warn!(round, error = %diagnostic, "codegen edits failed to apply");
+                diagnostics.push(diagnostic.clone());
                 last_edits = Some(edit_summary);
-                last_error = Some(err);
+                last_error = Some(diagnostic);
                 continue;
             }
         };
@@ -257,68 +436,89 @@ pub async fn codegen_apply(
         // Guard against no-op edits: a SEARCH/REPLACE where REPLACE == the matched
         // text (or edits that otherwise change nothing) would pass apply + cargo
         // check and be reported applied:true while the working tree is UNCHANGED
-        // (live-observed false-success on a 183K file). Require a real diff.
-        let rp = repo_path.to_path_buf();
-        let unchanged = tokio::task::spawn_blocking(move || {
-            Command::new("git")
-                .arg("-C")
-                .arg(rp)
-                .args(["status", "--porcelain"])
-                .output()
-                .map(|o| o.stdout.is_empty())
-                .unwrap_or(false)
-        })
-        .await
-        .map_err(|e| anyhow!("git status task panicked: {e}"))?;
-        if unchanged {
-            let err = "edits applied but produced NO change (no-op SEARCH/REPLACE)".to_string();
-            warn!(round, "{}", err);
+        // (live-observed false-success on a 183K file). Compare only the touched
+        // paths so unrelated pre-existing dirt cannot create a false success.
+        let transaction = match transaction.has_changes() {
+            Ok(true) => transaction,
+            Ok(false) => {
+                let diagnostic = round_diagnostic(
+                    round,
+                    "edits rejected",
+                    "applied edits produced NO touched-file change (no-op SEARCH/REPLACE)",
+                );
+                warn!(round, error = %diagnostic, "codegen edits were a no-op");
+                diagnostics.push(diagnostic.clone());
+                last_edits = Some(edit_summary);
+                last_error = Some(diagnostic);
+                continue;
+            }
+            Err(error) => {
+                let diagnostic = round_diagnostic(round, "edit inspection failed", error);
+                warn!(round, error = %diagnostic, "codegen could not inspect touched files");
+                diagnostics.push(diagnostic.clone());
+                last_edits = Some(edit_summary);
+                last_error = Some(diagnostic);
+                continue;
+            }
+        };
+
+        if tokio::time::Instant::now() >= run_deadline {
+            let diagnostic = round_diagnostic(
+                round,
+                "edits rejected",
+                "parsing and applying edits exhausted the absolute run deadline",
+            );
+            warn!(round, error = %diagnostic, "codegen apply exceeded deadline");
+            diagnostics.push(diagnostic.clone());
             last_edits = Some(edit_summary);
-            last_error = Some(err);
+            last_error = Some(diagnostic);
             continue;
         }
 
-        let rp = repo_path.to_path_buf();
-        let edits_for_verify = edits.clone();
-        let verify = tokio::task::spawn_blocking(move || {
-            let changed_packages = changed_crate_packages(&rp, &edits_for_verify)
-                .into_iter()
-                .collect::<Vec<_>>();
-            verify_command(&rp, &changed_packages)
-        })
-        .await
-        .map_err(|e| anyhow!("select verify command task panicked: {e}"))?;
+        let changed_packages = changed_crate_packages(repo_path, &edits)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let verify = verify_command(repo_path, &changed_packages);
         if let Some((program, args)) = verify {
             let check_name = format_command(&program, &args);
-            // Run the verify subprocess OFF the async runtime. It can take MINUTES
-            // (cargo check/build on the changed crates); a blocking
-            // Command::output() here runs on the tokio worker thread and starves
-            // the dispatch HeartbeatGuard task (same runtime), freezing the lease
-            // heartbeat. The scheduler's stale-heartbeat reaper (180s) then
-            // reclaims the ACTIVE build as "stalled", burning all 3 attempts on
-            // mechanical tasks that never reach a clean cloud lane — the root
-            // cause of #62 (observed on 00adb7e7 + 767afcc6, each reaped ~190s).
-            let rp = repo_path.to_path_buf();
-            let check = tokio::task::spawn_blocking(move || {
-                Command::new(&program).args(&args).current_dir(&rp).output()
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("verify subprocess task panicked: {e}"))?
-            .with_context(|| format!("run {check_name} in {}", repo_path.display()))?;
-
-            if !check.status.success() {
-                let err = command_error(&check_name, &check);
-                warn!(round, error = %err, "codegen edits failed verification");
-                tokio::task::spawn_blocking(move || restore_snapshots(&snapshots))
-                    .await
-                    .map_err(|e| anyhow!("restore snapshots task panicked: {e}"))??;
-                let rp = repo_path.to_path_buf();
-                tokio::task::spawn_blocking(move || clean_worktree(&rp))
-                    .await
-                    .map_err(|e| anyhow!("clean worktree task panicked: {e}"))??;
+            let remaining = run_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let Some(verify_timeout) = remaining.checked_sub(CODEGEN_ROLLBACK_RESERVE) else {
+                let diagnostic = round_diagnostic(
+                    round,
+                    "verification not started",
+                    format!(
+                        "remaining budget {remaining:?} does not preserve rollback reserve {CODEGEN_ROLLBACK_RESERVE:?}"
+                    ),
+                );
+                warn!(round, error = %diagnostic, "codegen verification rejected by budget");
+                diagnostics.push(diagnostic.clone());
                 last_edits = Some(edit_summary);
-                last_error = Some(err);
+                last_error = Some(diagnostic);
                 continue;
+            };
+
+            match run_verify_command(repo_path, &program, &args, verify_timeout).await {
+                Ok(check) if check.status.success() => {}
+                Ok(check) => {
+                    let diagnostic = round_diagnostic(
+                        round,
+                        "verification failed",
+                        command_error(&check_name, &check),
+                    );
+                    warn!(round, error = %diagnostic, "codegen edits failed verification");
+                    diagnostics.push(diagnostic.clone());
+                    last_edits = Some(edit_summary);
+                    last_error = Some(diagnostic);
+                    continue;
+                }
+                Err(error) => {
+                    let diagnostic = round_diagnostic(round, "verification failed", error);
+                    warn!(round, error = %diagnostic, "codegen verification could not complete");
+                    diagnostics.push(diagnostic.clone());
+                    last_edits = Some(edit_summary);
+                    last_error = Some(diagnostic);
+                    continue;
+                }
             }
         } else {
             info!(
@@ -328,6 +528,7 @@ pub async fn codegen_apply(
             );
         }
 
+        transaction.commit();
         return Ok(CodegenOutcome {
             applied: true,
             rounds,
@@ -342,7 +543,11 @@ pub async fn codegen_apply(
         applied: false,
         rounds,
         final_diff: None,
-        error: last_error,
+        error: if diagnostics.is_empty() {
+            last_error
+        } else {
+            Some(diagnostics.join("\n"))
+        },
         builder_catalog_id: None,
         already_done: false,
     })
@@ -359,6 +564,60 @@ struct Edit {
 struct FileSnapshot {
     path: PathBuf,
     previous: Option<String>,
+}
+
+/// Owns the exact pre-edit contents of every touched file. Unless committed,
+/// dropping the transaction restores those contents and removes files created
+/// by the model. Keeping this guard alive across verification makes timeout,
+/// task cancellation, and ordinary retry paths preserve both unrelated files
+/// and pre-existing dirty content in touched files.
+#[derive(Debug)]
+struct EditTransaction {
+    snapshots: Option<Vec<FileSnapshot>>,
+}
+
+impl EditTransaction {
+    fn new(snapshots: Vec<FileSnapshot>) -> Self {
+        Self {
+            snapshots: Some(snapshots),
+        }
+    }
+
+    fn has_changes(&self) -> Result<bool> {
+        let Some(snapshots) = self.snapshots.as_deref() else {
+            return Ok(false);
+        };
+        for snapshot in snapshots {
+            match &snapshot.previous {
+                Some(previous) => {
+                    let current = fs::read_to_string(&snapshot.path).with_context(|| {
+                        format!("read touched file {}", snapshot.path.display())
+                    })?;
+                    if &current != previous {
+                        return Ok(true);
+                    }
+                }
+                None if snapshot.path.exists() => return Ok(true),
+                None => {}
+            }
+        }
+        Ok(false)
+    }
+
+    fn commit(mut self) {
+        self.snapshots = None;
+    }
+}
+
+impl Drop for EditTransaction {
+    fn drop(&mut self) {
+        let Some(snapshots) = self.snapshots.take() else {
+            return;
+        };
+        if let Err(error) = restore_snapshots(&snapshots) {
+            warn!(error = %error, "failed to roll back codegen edit transaction");
+        }
+    }
 }
 
 /// Build a bounded repo-structure anchor for the codegen prompt: the crate/top-level layout
@@ -477,15 +736,6 @@ fn build_prompt(
     // file's #[cfg(test)] module (2026-07-29 hallucination root cause).
     let wants_test = task.to_ascii_lowercase().contains("test");
 
-    // Repo structure anchor: without a listing of what files ACTUALLY exist, the model invents
-    // plausible-but-wrong paths (e.g. a Python `src/work_item/relations.py` in a Rust repo) and
-    // every edit fails to apply. Inject the real crate layout + task-relevant tracked files so
-    // SEARCH/REPLACE edits target files that exist. (build_prompt runs inside spawn_blocking.)
-    if let Some(tree) = repo_structure_context(repo_path, &identifiers) {
-        prompt.push_str("\n\nThis repository's actual structure (edit ONLY files that exist here; do not invent paths):\n");
-        prompt.push_str(&tree);
-    }
-
     for path in task_context_paths(repo_path, task)? {
         let abs = repo_path.join(&path);
         let content =
@@ -505,6 +755,15 @@ fn build_prompt(
                 &extract_relevant_regions(&content, &identifiers, wants_test),
             ));
         }
+    }
+
+    // Repo structure anchor: without a listing of what files ACTUALLY exist, the model invents
+    // plausible-but-wrong paths (e.g. a Python `src/work_item/relations.py` in a Rust repo) and
+    // every edit fails to apply. Keep grounded source regions first, then add lower-value
+    // repository listings as path guardrails. (build_prompt runs inside spawn_blocking.)
+    if let Some(tree) = repo_structure_context(repo_path, &identifiers) {
+        prompt.push_str("\n\nThis repository's actual structure (edit ONLY files that exist here; do not invent paths):\n");
+        prompt.push_str(&tree);
     }
 
     if let Some(edits) = previous_edits {
@@ -599,6 +858,11 @@ fn task_identifiers(task: &str) -> Vec<String> {
         "existing",
         "large",
         "small",
+        "test",
+        "tests",
+        "testing",
+        "unit",
+        "integration",
     ]
     .into_iter()
     .collect();
@@ -674,7 +938,9 @@ fn extract_relevant_regions(content: &str, identifiers: &[String], wants_test: b
         return "No content.\n".to_string();
     }
 
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let test_spans = cfg_test_line_spans(&lines);
+    let mut implementation_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut test_ranges: Vec<(usize, usize)> = Vec::new();
     if !identifiers.is_empty() {
         for (idx, line) in lines.iter().enumerate() {
             let lower = line.to_ascii_lowercase();
@@ -684,45 +950,404 @@ fn extract_relevant_regions(content: &str, identifiers: &[String], wants_test: b
             {
                 let start = idx.saturating_sub(REGION_CONTEXT_LINES);
                 let end = (idx + REGION_CONTEXT_LINES).min(lines.len() - 1);
-                if let Some((_, last_end)) = ranges.last_mut()
-                    && start <= *last_end + 1
-                {
-                    *last_end = (*last_end).max(end);
-                    continue;
+                if line_in_spans(idx, &test_spans) {
+                    push_merged_range(&mut test_ranges, (start, end));
+                } else {
+                    push_merged_range(&mut implementation_ranges, (start, end));
                 }
-                ranges.push((start, end));
             }
         }
     }
 
-    // Test tasks ground on the test module: when the task mentions tests,
-    // the `#[cfg(test)]` module is the FIRST region so the char cap can never
-    // truncate it away (2026-07-29: the cap silently dropped the tests module
-    // and the model invented a `test_utils` helper that doesn't exist).
-    if wants_test && let Some(idx) = lines.iter().position(|l| l.contains("#[cfg(test)]")) {
-        let tr = (idx, lines.len() - 1);
-        // Keep/clamp identifier ranges that start before the test module;
-        // drop ones fully inside it (it is shown in full anyway).
-        ranges = ranges
-            .into_iter()
-            .filter_map(|(s, e)| {
-                if e < tr.0 {
-                    Some((s, e))
-                } else if s < tr.0 {
-                    Some((s, tr.0 - 1))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        ranges.insert(0, tr);
+    // Test intent still benefits from cfg(test) grounding, but every module is
+    // bounded independently. Never treat "first #[cfg(test)] through EOF" as
+    // tests: large Rust files commonly interleave helpers, nested modules, and
+    // multiple unrelated test modules.
+    if wants_test {
+        for &(start, end) in &test_spans {
+            let bounded_end = end.min(start + REGION_CONTEXT_LINES);
+            push_merged_range(&mut test_ranges, (start, bounded_end));
+        }
     }
 
-    if ranges.is_empty() {
+    // An exact named implementation and an exact named test/helper are the
+    // two highest-value regions for an edit model. Put those ranges first in
+    // their respective partitions so earlier incidental substring matches
+    // cannot evict either one from a fixed context budget.
+    if let Some(range) = named_function_range(&lines, &test_spans, identifiers, false) {
+        implementation_ranges.insert(0, range);
+    }
+    if let Some(range) = named_function_range(&lines, &test_spans, identifiers, true) {
+        test_ranges.insert(0, range);
+    }
+    prioritize_named_function_range(&mut implementation_ranges, &lines, identifiers, false);
+    prioritize_named_function_range(&mut test_ranges, &lines, identifiers, true);
+
+    let mut implementation = Vec::new();
+    for range in implementation_ranges {
+        push_non_overlapping_range(&mut implementation, range);
+    }
+    let mut tests = Vec::new();
+    for range in test_ranges {
+        push_non_overlapping_range(&mut tests, range);
+    }
+
+    if implementation.is_empty() && tests.is_empty() {
         return fallback_head_tail_regions(&lines);
     }
 
-    render_ranges(&lines, &ranges)
+    if wants_test && !implementation.is_empty() && !tests.is_empty() {
+        return render_partitioned_ranges(&lines, &implementation, &tests);
+    }
+
+    implementation.extend(tests);
+    render_ranges(&lines, &implementation)
+}
+
+fn named_function_range(
+    lines: &[&str],
+    test_spans: &[(usize, usize)],
+    identifiers: &[String],
+    test_function: bool,
+) -> Option<(usize, usize)> {
+    lines.iter().enumerate().find_map(|(idx, line)| {
+        if line_in_spans(idx, test_spans) != test_function {
+            return None;
+        }
+        let matched = identifiers.iter().any(|identifier| {
+            identifier.starts_with("test_") == test_function
+                && line_contains_named_function(line, identifier)
+        });
+        matched.then(|| {
+            (
+                idx.saturating_sub(REGION_CONTEXT_LINES),
+                (idx + REGION_CONTEXT_LINES).min(lines.len() - 1),
+            )
+        })
+    })
+}
+
+fn prioritize_named_function_range(
+    ranges: &mut Vec<(usize, usize)>,
+    lines: &[&str],
+    identifiers: &[String],
+    test_function: bool,
+) {
+    let Some(priority_idx) = ranges.iter().position(|(start, end)| {
+        lines[*start..=*end].iter().any(|line| {
+            identifiers.iter().any(|identifier| {
+                identifier.starts_with("test_") == test_function
+                    && line_contains_named_function(line, identifier)
+            })
+        })
+    }) else {
+        return;
+    };
+
+    ranges.swap(0, priority_idx);
+}
+
+fn line_contains_named_function(line: &str, identifier: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let needle = format!("fn {identifier}");
+    lower.match_indices(&needle).any(|(start, _)| {
+        lower
+            .as_bytes()
+            .get(start + needle.len())
+            .is_some_and(|next| matches!(next, b'(' | b'<' | b' ' | b'\t'))
+    })
+}
+
+fn line_in_spans(line: usize, spans: &[(usize, usize)]) -> bool {
+    spans
+        .iter()
+        .any(|(start, end)| *start <= line && line <= *end)
+}
+
+fn push_merged_range(ranges: &mut Vec<(usize, usize)>, range: (usize, usize)) {
+    if let Some((_, last_end)) = ranges.last_mut()
+        && range.0 <= *last_end + 1
+    {
+        *last_end = (*last_end).max(range.1);
+        return;
+    }
+    ranges.push(range);
+}
+
+fn push_non_overlapping_range(ranges: &mut Vec<(usize, usize)>, range: (usize, usize)) {
+    let mut pending = vec![range];
+    for &(existing_start, existing_end) in ranges.iter() {
+        let mut next = Vec::new();
+        for (start, end) in pending {
+            if end < existing_start || existing_end < start {
+                next.push((start, end));
+                continue;
+            }
+            if start < existing_start {
+                next.push((start, existing_start - 1));
+            }
+            if existing_end < end {
+                next.push((existing_end + 1, end));
+            }
+        }
+        pending = next;
+        if pending.is_empty() {
+            return;
+        }
+    }
+    ranges.extend(pending);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustLexMode {
+    Code,
+    BlockComment(usize),
+    String,
+    RawString(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RustBraceScanner {
+    mode: RustLexMode,
+}
+
+impl Default for RustBraceScanner {
+    fn default() -> Self {
+        Self {
+            mode: RustLexMode::Code,
+        }
+    }
+}
+
+impl RustBraceScanner {
+    fn is_code(self) -> bool {
+        self.mode == RustLexMode::Code
+    }
+
+    fn scan_line(&mut self, line: &str, mut on_brace: impl FnMut(u8)) {
+        let bytes = line.as_bytes();
+        let mut idx = 0usize;
+
+        while idx < bytes.len() {
+            match self.mode {
+                RustLexMode::Code => {
+                    if bytes[idx..].starts_with(b"//") {
+                        return;
+                    }
+                    if bytes[idx..].starts_with(b"/*") {
+                        self.mode = RustLexMode::BlockComment(1);
+                        idx += 2;
+                        continue;
+                    }
+                    if let Some((hashes, content_start)) = raw_string_open(bytes, idx) {
+                        self.mode = RustLexMode::RawString(hashes);
+                        idx = content_start;
+                        continue;
+                    }
+                    if literal_prefix_boundary(bytes, idx) && bytes[idx..].starts_with(b"b\"") {
+                        self.mode = RustLexMode::String;
+                        idx += 2;
+                        continue;
+                    }
+                    if bytes[idx] == b'"' {
+                        self.mode = RustLexMode::String;
+                        idx += 1;
+                        continue;
+                    }
+                    if literal_prefix_boundary(bytes, idx)
+                        && bytes[idx..].starts_with(b"b'")
+                        && let Some(end) = char_literal_end(line, idx + 1)
+                    {
+                        idx = end;
+                        continue;
+                    }
+                    if bytes[idx] == b'\''
+                        && let Some(end) = char_literal_end(line, idx)
+                    {
+                        idx = end;
+                        continue;
+                    }
+                    if matches!(bytes[idx], b'{' | b'}') {
+                        on_brace(bytes[idx]);
+                    }
+                    idx += 1;
+                }
+                RustLexMode::BlockComment(mut depth) => {
+                    if bytes[idx..].starts_with(b"/*") {
+                        depth += 1;
+                        self.mode = RustLexMode::BlockComment(depth);
+                        idx += 2;
+                    } else if bytes[idx..].starts_with(b"*/") {
+                        depth -= 1;
+                        self.mode = if depth == 0 {
+                            RustLexMode::Code
+                        } else {
+                            RustLexMode::BlockComment(depth)
+                        };
+                        idx += 2;
+                    } else {
+                        idx += 1;
+                    }
+                }
+                RustLexMode::String => match bytes[idx] {
+                    b'\\' => idx = (idx + 2).min(bytes.len()),
+                    b'"' => {
+                        self.mode = RustLexMode::Code;
+                        idx += 1;
+                    }
+                    _ => idx += 1,
+                },
+                RustLexMode::RawString(hashes) => {
+                    if bytes[idx] == b'"'
+                        && bytes
+                            .get(idx + 1..idx + 1 + hashes)
+                            .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#'))
+                    {
+                        self.mode = RustLexMode::Code;
+                        idx += 1 + hashes;
+                    } else {
+                        idx += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn literal_prefix_boundary(bytes: &[u8], idx: usize) -> bool {
+    idx == 0
+        || !matches!(bytes[idx - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+            && bytes[idx - 1].is_ascii()
+}
+
+/// Return `(hash_count, content_start)` for a Rust `r#"..."#` or
+/// `br#"..."#` opener beginning at `idx`.
+fn raw_string_open(bytes: &[u8], idx: usize) -> Option<(usize, usize)> {
+    if !literal_prefix_boundary(bytes, idx) {
+        return None;
+    }
+
+    let mut cursor = if bytes[idx..].starts_with(b"br") {
+        idx + 2
+    } else if bytes[idx] == b'r' {
+        idx + 1
+    } else {
+        return None;
+    };
+    let hash_start = cursor;
+    while bytes.get(cursor) == Some(&b'#') {
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b'"') {
+        return None;
+    }
+    Some((cursor - hash_start, cursor + 1))
+}
+
+/// Confirm a complete Rust character literal rather than treating every
+/// apostrophe (including lifetimes and labels) as a character delimiter.
+fn char_literal_end(line: &str, quote: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let content = quote.checked_add(1)?;
+    let first = *bytes.get(content)?;
+
+    let close = if first == b'\\' {
+        match *bytes.get(content + 1)? {
+            b'x' => {
+                let digits = bytes.get(content + 2..content + 4)?;
+                if !digits.iter().all(u8::is_ascii_hexdigit) {
+                    return None;
+                }
+                let value =
+                    (digits[0] as char).to_digit(16)? * 16 + (digits[1] as char).to_digit(16)?;
+                if value > 0x7f {
+                    return None;
+                }
+                content + 4
+            }
+            b'u' if bytes.get(content + 2) == Some(&b'{') => {
+                let mut cursor = content + 3;
+                let mut digits = 0usize;
+                let mut value = 0u32;
+                while let Some(byte) = bytes.get(cursor) {
+                    match byte {
+                        b'}' if digits > 0 && char::from_u32(value).is_some() => break,
+                        b'_' => {}
+                        byte if byte.is_ascii_hexdigit() && digits < 6 => {
+                            value = value.checked_mul(16)? + (*byte as char).to_digit(16)?;
+                            digits += 1;
+                        }
+                        _ => return None,
+                    }
+                    cursor += 1;
+                }
+                if bytes.get(cursor) != Some(&b'}') {
+                    return None;
+                }
+                cursor + 1
+            }
+            b'n' | b'r' | b't' | b'0' | b'\\' | b'\'' | b'"' => content + 2,
+            _ => return None,
+        }
+    } else {
+        let character = line.get(content..)?.chars().next()?;
+        if matches!(character, '\'' | '\n' | '\r') {
+            return None;
+        }
+        content + character.len_utf8()
+    };
+
+    (bytes.get(close) == Some(&b'\'')).then_some(close + 1)
+}
+
+fn cfg_test_attribute_lines(lines: &[&str]) -> Vec<usize> {
+    let mut scanner = RustBraceScanner::default();
+    let mut attributes = Vec::new();
+
+    for (idx, line) in lines.iter().enumerate() {
+        if scanner.is_code() && line.trim_start().starts_with("#[cfg(test)]") {
+            attributes.push(idx);
+        }
+        scanner.scan_line(line, |_| {});
+    }
+    attributes
+}
+
+fn cfg_test_line_spans(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+
+    for start in cfg_test_attribute_lines(lines) {
+        if spans.last().is_some_and(|(_, end)| start <= *end) {
+            continue;
+        }
+
+        let mut scanner = RustBraceScanner::default();
+        let mut end = start;
+        let mut depth = 0isize;
+        let mut opened = false;
+
+        while end < lines.len() {
+            scanner.scan_line(lines[end], |brace| match brace {
+                b'{' => {
+                    depth += 1;
+                    opened = true;
+                }
+                b'}' if opened => depth -= 1,
+                _ => {}
+            });
+            if opened && depth <= 0 {
+                break;
+            }
+            end += 1;
+        }
+
+        if end >= lines.len() {
+            end = (start + REGION_CONTEXT_LINES).min(lines.len() - 1);
+        }
+        spans.push((start, end));
+    }
+
+    spans
 }
 
 fn fallback_head_tail_regions(lines: &[&str]) -> String {
@@ -744,8 +1369,27 @@ fn fallback_head_tail_regions(lines: &[&str]) -> String {
 }
 
 fn render_ranges(lines: &[&str], ranges: &[(usize, usize)]) -> String {
+    render_ranges_capped(lines, ranges, LARGE_CONTEXT_FILE_CHARS)
+}
+
+fn render_partitioned_ranges(
+    lines: &[&str],
+    implementation: &[(usize, usize)],
+    tests: &[(usize, usize)],
+) -> String {
+    let implementation_budget = LARGE_CONTEXT_FILE_CHARS / 2;
+    let mut out = render_ranges_capped(lines, implementation, implementation_budget);
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    let test_budget = LARGE_CONTEXT_FILE_CHARS.saturating_sub(char_count(&out));
+    let rendered_tests = render_ranges_capped(lines, tests, test_budget);
+    push_str_capped(&mut out, &rendered_tests, LARGE_CONTEXT_FILE_CHARS);
+    out
+}
+
+fn render_ranges_capped(lines: &[&str], ranges: &[(usize, usize)], cap: usize) -> String {
     let mut out = String::new();
-    let mut omitted = 0usize;
 
     for (idx, (start, end)) in ranges.iter().enumerate() {
         let mut block = String::new();
@@ -760,25 +1404,69 @@ fn render_ranges(lines: &[&str], ranges: &[(usize, usize)]) -> String {
             block.push('\n');
         }
 
-        if out.len() + block.len() > LARGE_CONTEXT_FILE_CHARS {
-            omitted = ranges.len() - idx;
-            // Name what the model CANNOT see: unnamed truncation invites the
-            // model to invent the missing content (2026-07-29 hallucination).
-            let spans: Vec<String> = ranges[idx..]
-                .iter()
-                .map(|(s, e)| format!("lines {}-{}", s + 1, e + 1))
-                .collect();
-            out.push_str(&format!(
-                "\n... omitted {omitted} later region(s) ({}) after ~{LARGE_CONTEXT_FILE_CHARS} chars. \
-                 Those lines are INVISIBLE to you — do NOT invent their content; SEARCH only from lines shown above.\n",
-                spans.join(", ")
-            ));
+        if char_count(&out) + char_count(&block) > cap {
+            render_truncated_range(lines, ranges, idx, *start, *end, cap, &mut out);
             break;
         }
         out.push_str(&block);
     }
 
     out
+}
+
+fn render_truncated_range(
+    lines: &[&str],
+    ranges: &[(usize, usize)],
+    idx: usize,
+    start: usize,
+    end: usize,
+    cap: usize,
+    out: &mut String,
+) {
+    let omitted = ranges.len() - idx;
+    let notice = format!(
+        "\n... omitted {omitted} later/truncated region(s) after ~{cap} chars. \
+         Those lines are INVISIBLE to you — do NOT invent their content; SEARCH only from lines shown above.\n"
+    );
+    let reserve = char_count(&notice);
+    if char_count(out) + reserve >= cap {
+        return;
+    }
+
+    if idx > 0 {
+        push_str_capped(out, "\n", cap - reserve);
+    }
+    push_str_capped(
+        out,
+        &format!("Region (lines {}-{}):\n", start + 1, end + 1),
+        cap - reserve,
+    );
+    for line in &lines[start..=end] {
+        if char_count(out) + char_count(line) + reserve <= cap {
+            out.push_str(line);
+        } else {
+            push_str_capped(out, line, cap - reserve);
+            break;
+        }
+    }
+    if !out.ends_with('\n') && char_count(out) + reserve < cap {
+        out.push('\n');
+    }
+    if char_count(out) + reserve <= cap {
+        out.push_str(&notice);
+    }
+}
+
+fn char_count(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn push_str_capped(out: &mut String, text: &str, cap: usize) {
+    let remaining = cap.saturating_sub(char_count(out));
+    if remaining == 0 {
+        return;
+    }
+    out.extend(text.chars().take(remaining));
 }
 
 fn task_context_paths(repo_path: &Path, task: &str) -> Result<Vec<PathBuf>> {
@@ -832,7 +1520,14 @@ fn task_context_paths(repo_path: &Path, task: &str) -> Result<Vec<PathBuf>> {
 
 fn parse_edit_blocks(response: &str) -> Result<Vec<Edit>> {
     let mut edits = Vec::new();
-    for raw_block in response.split("*** FILE:").skip(1) {
+    let mut blocks = response.split("*** FILE:");
+    let prefix = blocks.next().unwrap_or_default();
+    if !prefix.trim().is_empty() {
+        return Err(anyhow!(
+            "model response has leading text before the first *** FILE: marker"
+        ));
+    }
+    for raw_block in blocks {
         let (path, body) = raw_block
             .split_once('\n')
             .ok_or_else(|| anyhow!("edit block missing body after FILE line"))?;
@@ -1041,22 +1736,28 @@ fn snapshot_file(
 }
 
 fn restore_snapshots(snapshots: &[FileSnapshot]) -> Result<()> {
+    let mut first_error: Option<anyhow::Error> = None;
     for snapshot in snapshots.iter().rev() {
-        match &snapshot.previous {
-            Some(content) => {
-                fs::write(&snapshot.path, content)
-                    .with_context(|| format!("restore {}", snapshot.path.display()))?;
-            }
+        let result = match &snapshot.previous {
+            Some(content) => fs::write(&snapshot.path, content)
+                .with_context(|| format!("restore {}", snapshot.path.display())),
             None => match fs::remove_file(&snapshot.path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(e).with_context(|| format!("remove {}", snapshot.path.display()));
-                }
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e).with_context(|| format!("remove {}", snapshot.path.display())),
             },
+        };
+        if let Err(error) = result {
+            warn!(path = %snapshot.path.display(), error = %error, "codegen snapshot restore failed; continuing with remaining paths");
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
         }
     }
-    Ok(())
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn resolve_repo_path(repo_path: &Path, path: &str) -> Result<PathBuf> {
@@ -1144,6 +1845,63 @@ fn verify_command(repo_path: &Path, changed_crates: &[String]) -> Option<(String
     None
 }
 
+async fn run_verify_command(
+    repo_path: &Path,
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    let check_name = format_command(program, args);
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .current_dir(repo_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let child = command
+        .spawn()
+        .with_context(|| format!("spawn {check_name} in {}", repo_path.display()))?;
+    let mut process_group = VerifyProcessGroup::new(child.id());
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| anyhow!("{check_name} timed out after {timeout:?}; process group killed"))?
+        .with_context(|| format!("wait for {check_name} in {}", repo_path.display()))?;
+    process_group.disarm();
+    Ok(output)
+}
+
+/// Cancellation guard for verification commands. `kill_on_drop` covers only
+/// the immediate child; Cargo/npm can leave descendants holding output pipes
+/// and CPU after their leader dies. The child is its own process-group leader,
+/// so dropping this guard on timeout or task cancellation kills the full tree.
+#[derive(Debug)]
+struct VerifyProcessGroup {
+    pid: Option<u32>,
+}
+
+impl VerifyProcessGroup {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid }
+    }
+
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for VerifyProcessGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            crate::task_runner::kill_process_group(pid);
+        }
+    }
+}
+
 fn package_json_has_script(package_json: &Path, script: &str) -> bool {
     let Ok(content) = fs::read_to_string(package_json) else {
         return false;
@@ -1227,21 +1985,6 @@ fn marker_section(text: &str) -> String {
     }
 }
 
-fn clean_worktree(repo_path: &Path) -> Result<()> {
-    let revert = Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .arg("checkout")
-        .arg("--")
-        .arg(".")
-        .output()
-        .with_context(|| format!("revert failed codegen edits in {}", repo_path.display()))?;
-    if !revert.status.success() {
-        return Err(anyhow!("{}", command_error("git checkout -- .", &revert)));
-    }
-    Ok(())
-}
-
 fn command_error(name: &str, output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1277,10 +2020,12 @@ mod tests {
         let work_item_id = uuid::Uuid::new_v4();
         let resp = crate::fleet_oneshot::FleetOneshot {
             text: "*** FILE: src/lib.rs".to_string(),
+            deployment_id: uuid::Uuid::new_v4(),
             endpoint: "http://192.168.5.103:55000".to_string(),
             worker_name: "worker-a".to_string(),
             catalog_id: Some("glm-4.5-air".to_string()),
             model: "qwen3-coder-30b".to_string(),
+            provenance: crate::fleet_oneshot::ResolvedTargetProvenance::ExplicitCatalog,
             latency_ms: 1234,
             tokens_in: 100,
             tokens_out: 50,
@@ -1292,6 +2037,12 @@ mod tests {
         assert_eq!(rec.work_item_id, Some(work_item_id));
         assert_eq!(rec.purpose.as_deref(), Some("build"));
         assert_eq!(rec.request_meta["round"], 2);
+        assert_eq!(rec.request_meta["route_provenance"], "explicit_catalog");
+        assert_eq!(
+            rec.route_decision["deployment_id"],
+            resp.deployment_id.to_string()
+        );
+        assert_eq!(rec.route_decision["provenance"], "explicit_catalog");
         assert_eq!(rec.worker_name.as_deref(), Some("worker-a"));
         assert_eq!(rec.endpoint.as_deref(), Some("http://192.168.5.103:55000"));
         assert_eq!(rec.engine.as_deref(), Some("local:glm-4.5-air"));
@@ -1424,9 +2175,10 @@ mod tests {
         assert!(!regions.contains("No task identifiers matched"));
     }
     #[test]
-    fn codegen_regions_test_module_first_when_task_wants_test() {
-        // Large file: identifier hit early, tests module at the end. With
-        // wants_test the cfg(test) module must lead (cap can't drop it).
+    fn codegen_regions_keep_implementation_before_bounded_tests() {
+        // Large file: identifier hit early, tests module at the end. Test
+        // grounding must not bury the exact implementation region behind a
+        // lower-value cfg(test) module.
         let mut content = String::new();
         for i in 1..40 {
             content.push_str(&format!("fn filler_{i}() {{}}\n"));
@@ -1440,10 +2192,188 @@ mod tests {
             .find("fn special_handler")
             .expect("identifier shown");
         assert!(
-            tests_pos < handler_pos,
-            "tests module must be the first region"
+            handler_pos < tests_pos,
+            "implementation region must precede bounded test grounding"
         );
         assert!(regions.contains("fn real_helper()"));
+    }
+
+    #[test]
+    fn codegen_extract_regions_preserves_exact_impl_and_named_test_under_cap() {
+        let content = include_str!("../../ff-db/src/queries.rs");
+        let identifiers = task_identifiers(
+            "add tests for offload_workload_for_kind and test_offload_workload_for_kind",
+        );
+        let regions = extract_relevant_regions(content, &identifiers, true);
+
+        let impl_pos = regions
+            .find("fn offload_workload_for_kind(kind: Option<&str>) -> Option<&'static str>")
+            .expect("byte-exact real implementation signature shown");
+        let test_pos = regions
+            .find("fn test_offload_workload_for_kind")
+            .expect("byte-exact real test signature shown");
+        assert!(
+            impl_pos < test_pos,
+            "implementation should be grounded before named test/helper"
+        );
+        assert!(
+            !regions.contains("fn deployment_health_fresh"),
+            "the first unrelated cfg(test) item must not become an unbounded test tail"
+        );
+        assert!(
+            char_count(&regions) <= LARGE_CONTEXT_FILE_CHARS,
+            "regions exceeded declared cap: {}",
+            char_count(&regions)
+        );
+    }
+
+    #[test]
+    fn codegen_exact_impl_and_test_have_reserved_budget_after_many_earlier_hits() {
+        let mut content = String::new();
+        for idx in 0..900 {
+            content.push_str(&format!(
+                "const OFFLOAD_WORKLOAD_FOR_KIND_REFERENCE_{idx}: &str = \"noise\";\n"
+            ));
+        }
+        content.push_str(
+            "fn offload_workload_for_kind(kind: Option<&str>) -> Option<&'static str> {\n    kind.map(|_| \"code-gen\")\n}\n",
+        );
+        content.push_str("#[cfg(test)]\nmod noisy_tests {\n");
+        for idx in 0..900 {
+            content.push_str(&format!(
+                "    fn offload_workload_for_kind_noise_{idx}() {{}}\n"
+            ));
+        }
+        content.push_str("}\n#[cfg(test)]\nmod exact_tests {\n");
+        content.push_str("    fn test_offload_workload_for_kind() {}\n}\n");
+
+        let identifiers =
+            task_identifiers("repair offload_workload_for_kind and test_offload_workload_for_kind");
+        let regions = extract_relevant_regions(&content, &identifiers, true);
+
+        let impl_pos = regions
+            .find("fn offload_workload_for_kind(kind: Option<&str>)")
+            .expect("reserved implementation region");
+        let test_pos = regions
+            .find("fn test_offload_workload_for_kind()")
+            .expect("reserved exact test region");
+        assert!(impl_pos < test_pos);
+        assert!(char_count(&regions) <= LARGE_CONTEXT_FILE_CHARS);
+    }
+
+    #[test]
+    fn codegen_task_identifiers_drop_generic_test_words_not_exact_symbols() {
+        let identifiers =
+            task_identifiers("unit testing for tests test_offload_workload_for_kind integration");
+
+        assert!(!identifiers.iter().any(|id| id == "unit"));
+        assert!(!identifiers.iter().any(|id| id == "testing"));
+        assert!(!identifiers.iter().any(|id| id == "tests"));
+        assert!(!identifiers.iter().any(|id| id == "integration"));
+        assert!(
+            identifiers
+                .iter()
+                .any(|id| id == "test_offload_workload_for_kind")
+        );
+    }
+
+    #[test]
+    fn codegen_named_function_anchor_requires_identifier_boundary() {
+        assert!(line_contains_named_function(
+            "pub async fn target_name<T>() {}",
+            "target_name"
+        ));
+        assert!(!line_contains_named_function(
+            "fn target_name_suffix() {}",
+            "target_name"
+        ));
+    }
+
+    #[test]
+    fn codegen_char_literal_recognizer_validates_unicode_and_ignores_lifetimes() {
+        assert_eq!(char_literal_end(r#"'\u{1f600}'"#, 0), Some(11));
+        assert_eq!(char_literal_end("'😀'", 0), Some(6));
+        assert_eq!(char_literal_end(r#"'\u{d800}'"#, 0), None);
+        assert_eq!(char_literal_end("'static", 0), None);
+        assert_eq!(char_literal_end("'outer:", 0), None);
+    }
+
+    #[test]
+    fn codegen_render_ranges_keeps_source_for_oversized_first_region() {
+        let huge_line = format!("fn target() {{ /* {} */ }}\n", "x".repeat(40_000));
+        let lines = vec![huge_line.as_str()];
+
+        let regions = render_ranges(&lines, &[(0, 0)]);
+
+        assert!(regions.contains("Region (lines 1-1):"));
+        assert!(regions.contains("fn target()"));
+        assert!(regions.contains("omitted"));
+        assert!(char_count(&regions) <= LARGE_CONTEXT_FILE_CHARS);
+    }
+
+    #[test]
+    fn codegen_render_ranges_preserves_multiline_boundaries_before_notice() {
+        let owned = (0..400)
+            .map(|idx| format!("let value_{idx} = \"{}\";\n", "x".repeat(80)))
+            .collect::<Vec<_>>();
+        let lines = owned.iter().map(String::as_str).collect::<Vec<_>>();
+
+        let regions = render_ranges(&lines, &[(0, lines.len() - 1)]);
+
+        assert!(regions.contains(&format!(
+            "let value_0 = \"{}\";\nlet value_1 =",
+            "x".repeat(80)
+        )));
+        assert!(regions.contains("\n... omitted"));
+        assert!(char_count(&regions) <= LARGE_CONTEXT_FILE_CHARS);
+    }
+
+    #[test]
+    fn codegen_cfg_test_spans_ignore_comments_strings_chars_and_lifetimes() {
+        let lines = [
+            "const IGNORED: &str = r##\"",
+            "#[cfg(test)]",
+            "mod fake { }",
+            "\"##;",
+            "/* outer {",
+            "   /* nested } */",
+            "#[cfg(test)]",
+            "*/",
+            "#[cfg(test)]",
+            "mod real_tests {",
+            "    let normal = \"{ }\\\"still string\";",
+            "    let bytes = b\"{ }\";",
+            "    let raw = r###\"{ }\"###;",
+            "    let byte_raw = br##\"{ }\"##;",
+            "    let open = '{';",
+            "    let quote = '\\'';",
+            "    let value: &'static str = \"}\";",
+            "    'outer: loop { break 'outer; }",
+            "    // } ignored",
+            "    /* nested comment {",
+            "       /* } */",
+            "       } still comment */",
+            "}",
+        ];
+
+        assert_eq!(cfg_test_line_spans(&lines), vec![(8, 22)]);
+    }
+
+    #[test]
+    fn codegen_cfg_test_spans_handle_multiple_items_and_unclosed_fallback() {
+        let lines = [
+            "#[cfg(test)]",
+            "mod one {",
+            "    let unicode = '😀';",
+            "}",
+            "#[cfg(test)]",
+            "fn two() { let escaped = '\\u{1f600}'; }",
+            "#[cfg(test)]",
+            "mod unclosed {",
+            "    let raw = r#\"} never closes;",
+        ];
+
+        assert_eq!(cfg_test_line_spans(&lines), vec![(0, 3), (4, 5), (6, 8)]);
     }
 
     #[test]
@@ -1511,5 +2441,232 @@ mod tests {
 
         assert!(err.to_string().contains("src/missing.rs"));
         assert!(!dir.path().join("src/new.rs").exists());
+    }
+
+    #[test]
+    fn codegen_round_plan_preserves_finalize_and_correction_reserves() {
+        assert_eq!(
+            plan_round(Duration::from_secs(420), 2),
+            Some(RoundPlan {
+                request_timeout: Duration::from_secs(210),
+                max_tokens: 1560,
+            })
+        );
+        assert_eq!(
+            plan_round(Duration::from_secs(165), 0),
+            Some(RoundPlan {
+                request_timeout: Duration::from_secs(105),
+                max_tokens: 720,
+            })
+        );
+        assert_eq!(plan_round(Duration::from_secs(105), 0), None);
+        assert_eq!(plan_round(Duration::from_secs(104), 0), None);
+    }
+
+    #[test]
+    fn codegen_two_slow_rounds_do_not_admit_a_third() {
+        let mut remaining = CODEGEN_RUN_BUDGET;
+        let first = plan_round(remaining, 2).expect("first round admitted");
+        remaining = remaining.saturating_sub(first.request_timeout);
+        let second = plan_round(remaining, 1).expect("correction round admitted");
+        remaining = remaining.saturating_sub(second.request_timeout);
+
+        assert_eq!(first.request_timeout, Duration::from_secs(210));
+        assert_eq!(second.request_timeout, Duration::from_secs(105));
+        assert_eq!(plan_round(remaining, 0), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codegen_pending_telemetry_is_bounded() {
+        let result =
+            bounded_best_effort(CODEGEN_TELEMETRY_TIMEOUT, std::future::pending::<()>()).await;
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn codegen_literal_nit_tail_is_explicitly_rejected_without_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("src/lib.rs");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "old\n").unwrap();
+        let response = "*** FILE: src/lib.rs\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n<nit: 1 line(s) skipped...>";
+
+        let error = parse_edit_blocks(response).unwrap_err();
+        let diagnostic = round_diagnostic(1, "response rejected", error);
+
+        assert!(diagnostic.contains("round 1 response rejected"));
+        assert!(diagnostic.contains("trailing text after REPLACE marker"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "old\n");
+    }
+
+    #[test]
+    fn codegen_leading_prose_or_fence_is_explicitly_rejected_without_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("src/lib.rs");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "old\n").unwrap();
+        let valid = "*** FILE: src/lib.rs\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE";
+
+        for response in [
+            format!("I will make the change.\n{valid}"),
+            format!("```rust\n{valid}"),
+        ] {
+            let error = parse_edit_blocks(&response).unwrap_err();
+            assert!(
+                error.to_string().contains("leading text before the first"),
+                "unexpected rejection: {error}"
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
+        }
+    }
+
+    #[test]
+    fn codegen_valid_edit_transaction_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("src/lib.rs");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "old\n").unwrap();
+        let edits = parse_edit_blocks(
+            "*** FILE: src/lib.rs\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE",
+        )
+        .unwrap();
+
+        let transaction = EditTransaction::new(apply_edits(dir.path(), &edits).unwrap());
+        assert!(transaction.has_changes().unwrap());
+        transaction.commit();
+
+        assert_eq!(fs::read_to_string(path).unwrap(), "new\n");
+    }
+
+    #[tokio::test]
+    async fn codegen_cancellation_restores_only_touched_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let touched = dir.path().join("src/lib.rs");
+        let created = dir.path().join("src/generated.rs");
+        let unrelated = dir.path().join("notes.txt");
+        fs::create_dir_all(touched.parent().unwrap()).unwrap();
+        fs::write(&touched, "pre-existing dirty content\n").unwrap();
+        fs::write(&unrelated, "unrelated dirty content\n").unwrap();
+        let edits = vec![
+            Edit {
+                path: "src/lib.rs".to_string(),
+                search: "pre-existing dirty content\n".to_string(),
+                replace: "model content\n".to_string(),
+            },
+            Edit {
+                path: "src/generated.rs".to_string(),
+                search: String::new(),
+                replace: "generated\n".to_string(),
+            },
+        ];
+        let transaction = EditTransaction::new(apply_edits(dir.path(), &edits).unwrap());
+        let task = tokio::spawn(async move {
+            let _transaction = transaction;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        assert_eq!(
+            fs::read_to_string(touched).unwrap(),
+            "pre-existing dirty content\n"
+        );
+        assert!(!created.exists());
+        assert_eq!(
+            fs::read_to_string(unrelated).unwrap(),
+            "unrelated dirty content\n"
+        );
+    }
+
+    #[test]
+    fn codegen_restore_continues_after_one_path_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let restorable = dir.path().join("restorable.txt");
+        let invalid_target = dir.path().join("is-a-directory");
+        fs::write(&restorable, "model content\n").unwrap();
+        fs::create_dir(&invalid_target).unwrap();
+        let snapshots = vec![
+            FileSnapshot {
+                path: restorable.clone(),
+                previous: Some("original content\n".to_string()),
+            },
+            FileSnapshot {
+                path: invalid_target,
+                previous: Some("cannot write a directory\n".to_string()),
+            },
+        ];
+
+        let error = restore_snapshots(&snapshots).unwrap_err();
+
+        assert!(error.to_string().contains("restore"));
+        assert_eq!(
+            fs::read_to_string(restorable).unwrap(),
+            "original content\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codegen_verification_cancellation_restores_touched_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let touched = dir.path().join("src/lib.rs");
+        let started = dir.path().join("verification-started");
+        fs::create_dir_all(touched.parent().unwrap()).unwrap();
+        fs::write(&touched, "original\n").unwrap();
+        let transaction = EditTransaction::new(
+            apply_edits(
+                dir.path(),
+                &[Edit {
+                    path: "src/lib.rs".to_string(),
+                    search: "original\n".to_string(),
+                    replace: "model change\n".to_string(),
+                }],
+            )
+            .unwrap(),
+        );
+        let repo_path = dir.path().to_path_buf();
+        let script = format!("touch {}; sleep 30", started.display());
+        let task = tokio::spawn(async move {
+            let _transaction = transaction;
+            let _ = run_verify_command(
+                &repo_path,
+                "sh",
+                &["-c".to_string(), script],
+                Duration::from_secs(60),
+            )
+            .await;
+        });
+        for _ in 0..100 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started.exists(), "verification process did not start");
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(fs::read_to_string(touched).unwrap(), "original\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codegen_verification_timeout_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+
+        let error = run_verify_command(
+            dir.path(),
+            "sh",
+            &["-c".to_string(), "sleep 30".to_string()],
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("process group killed"));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

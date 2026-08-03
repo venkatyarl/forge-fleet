@@ -169,6 +169,24 @@ pub enum BackupError {
     UnknownKind(String),
 }
 
+/// Stable, host-observed proof for one backup artifact.
+///
+/// This intentionally contains no database state: the computer that owns the
+/// bytes produces the evidence, and a coordinator may persist it later.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct BackupArtifactEvidence {
+    pub kind: String,
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub expected_sha256: String,
+    pub observed_sha256: String,
+    pub checksum_match: bool,
+    pub age_encrypted: bool,
+    /// `None` for plaintext artifacts, `Some(true)` only after an age reader
+    /// unwraps the file key and reads a bounded plaintext probe.
+    pub decrypt_probe_ok: Option<bool>,
+}
+
 /// Per-kind backup policy from the `fleet_backup_config` table (schema V163).
 /// Everything an operator can tune — who produces a kind, where the offsite
 /// copies go, cadence, retention, encryption — lives in the DB, not in code.
@@ -1936,6 +1954,283 @@ fn check_age_decryptable(path: &Path, identity: &age::x25519::Identity) -> Resul
     Ok(())
 }
 
+const BACKUP_VERIFY_BUFFER_BYTES: usize = 64 * 1024;
+const BACKUP_AGE_CIPHERTEXT_PROBE_BYTES: u64 = 512 * 1024;
+const BACKUP_COMPONENT_MAX_BYTES: usize = 255;
+const AGE_BINARY_PREFIX: &[u8] = b"age-encryption.org/v1";
+const AGE_ARMOR_PREFIX: &[u8] = b"-----BEGIN AGE ENCRYPTED FILE-----";
+
+/// Verify an artifact from the host that owns it without trusting a joined
+/// pathname. The root, kind directory, and artifact are opened independently;
+/// symlinks are rejected at every opened component. Hashing and the optional
+/// age probe both consume the already-open artifact descriptor, so replacing
+/// the pathname after open cannot change the bytes being attested.
+pub fn verify_backup_artifact(
+    backup_root: &Path,
+    kind: &str,
+    file_name: &str,
+    expected_sha256: &str,
+    identity: Option<&age::x25519::Identity>,
+) -> Result<BackupArtifactEvidence, BackupError> {
+    #[cfg(unix)]
+    {
+        if !is_known_backup_kind(kind) {
+            return Err(BackupError::UnknownKind(kind.to_string()));
+        }
+        validate_backup_component("kind", kind_dir(kind))?;
+        validate_backup_component("file_name", file_name)?;
+        validate_expected_sha256(expected_sha256)?;
+
+        let file = open_backup_artifact(backup_root, kind_dir(kind), file_name)?;
+        verify_opened_backup_artifact(file, kind, file_name, expected_sha256, identity)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (backup_root, kind, file_name, expected_sha256, identity);
+        Err(BackupError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "descriptor-safe backup verification requires Unix",
+        )))
+    }
+}
+
+fn validate_expected_sha256(expected: &str) -> Result<(), BackupError> {
+    if expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(());
+    }
+    Err(BackupError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "expected_sha256 must be exactly 64 hexadecimal characters",
+    )))
+}
+
+fn validate_backup_component(label: &str, value: &str) -> Result<(), BackupError> {
+    let valid = !value.is_empty()
+        && value.len() <= BACKUP_COMPONENT_MAX_BYTES
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if valid {
+        return Ok(());
+    }
+    Err(BackupError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "{label} must be one non-empty ASCII path component of at most \
+             {BACKUP_COMPONENT_MAX_BYTES} bytes"
+        ),
+    )))
+}
+
+#[cfg(unix)]
+fn open_backup_artifact(
+    backup_root: &Path,
+    kind_dir_name: &str,
+    file_name: &str,
+) -> Result<std::fs::File, BackupError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    fn open_dir_at(parent: RawFd, component: &CString) -> std::io::Result<std::fs::File> {
+        let fd = unsafe {
+            libc::openat(
+                parent,
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+        }
+    }
+
+    let root_c = CString::new(backup_root.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "backup root contains a NUL byte",
+        )
+    })?;
+    let root_fd = unsafe {
+        libc::open(
+            root_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if root_fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let root = unsafe { std::fs::File::from_raw_fd(root_fd) };
+
+    let kind_c = CString::new(kind_dir_name).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "kind contains a NUL byte")
+    })?;
+    let kind = open_dir_at(root.as_raw_fd(), &kind_c)?;
+
+    let file_c = CString::new(file_name).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file_name contains a NUL byte",
+        )
+    })?;
+    let file_fd = unsafe {
+        libc::openat(
+            kind.as_raw_fd(),
+            file_c.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if file_fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(file_fd) };
+    if !file.metadata()?.file_type().is_file() {
+        return Err(BackupError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "backup artifact is not a regular file",
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn verify_opened_backup_artifact(
+    mut file: std::fs::File,
+    kind: &str,
+    file_name: &str,
+    expected_sha256: &str,
+    identity: Option<&age::x25519::Identity>,
+) -> Result<BackupArtifactEvidence, BackupError> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let state_before = opened_file_state(&file)?;
+    let size_bytes = state_before.2;
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; BACKUP_VERIFY_BUFFER_BYTES];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let observed_sha256 = format!("{:x}", hasher.finalize());
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut prefix = [0u8; 64];
+    let prefix_len = file.read(&mut prefix)?;
+    let prefix = &prefix[..prefix_len];
+    let age_prefix = prefix.starts_with(AGE_BINARY_PREFIX) || prefix.starts_with(AGE_ARMOR_PREFIX);
+    let age_encrypted = age_prefix && age_header_is_valid(&file);
+    if age_prefix && !age_encrypted {
+        return Err(BackupError::Cmd(
+            "artifact has an age prefix but its bounded header is malformed".to_string(),
+        ));
+    }
+    let decrypt_probe_ok = if age_encrypted {
+        Some(match identity {
+            Some(identity) => probe_age_descriptor(&file, identity),
+            None => false,
+        })
+    } else {
+        None
+    };
+    let state_after = opened_file_state(&file)?;
+    if state_after != state_before {
+        return Err(BackupError::Cmd(
+            "backup artifact changed while it was being verified".to_string(),
+        ));
+    }
+
+    Ok(BackupArtifactEvidence {
+        kind: kind.to_string(),
+        file_name: file_name.to_string(),
+        size_bytes,
+        expected_sha256: expected_sha256.to_ascii_lowercase(),
+        observed_sha256: observed_sha256.clone(),
+        checksum_match: observed_sha256.eq_ignore_ascii_case(expected_sha256),
+        age_encrypted,
+        decrypt_probe_ok,
+    })
+}
+
+#[cfg(unix)]
+fn opened_file_state(file: &std::fs::File) -> std::io::Result<(u64, u64, u64, i64, i64, i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok((
+        metadata.dev(),
+        metadata.ino(),
+        metadata.size(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    ))
+}
+
+#[cfg(unix)]
+fn duplicate_artifact(file: &std::fs::File) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let duplicate_fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate_fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // Ownership transfers immediately to File, so every subsequent return
+        // path closes the duplicated descriptor via RAII.
+        Ok(unsafe { std::fs::File::from_raw_fd(duplicate_fd) })
+    }
+}
+
+#[cfg(unix)]
+fn age_header_is_valid(file: &std::fs::File) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut duplicate = match duplicate_artifact(file) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    if duplicate.seek(SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    let bounded = duplicate.take(BACKUP_AGE_CIPHERTEXT_PROBE_BYTES);
+    age::Decryptor::new(age::armor::ArmoredReader::new(bounded)).is_ok()
+}
+
+#[cfg(unix)]
+fn probe_age_descriptor(file: &std::fs::File, identity: &age::x25519::Identity) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut duplicate = match duplicate_artifact(file) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    if duplicate.seek(SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+
+    let bounded = duplicate.take(BACKUP_AGE_CIPHERTEXT_PROBE_BYTES);
+    let armored_or_binary = age::armor::ArmoredReader::new(bounded);
+    let decryptor = match age::Decryptor::new(armored_or_binary) {
+        Ok(decryptor) => decryptor,
+        Err(_) => return false,
+    };
+    let mut plaintext = match decryptor.decrypt(std::iter::once(identity as &dyn age::Identity)) {
+        Ok(reader) => reader,
+        Err(_) => return false,
+    };
+    let mut probe = [0u8; BACKUP_VERIFY_BUFFER_BYTES];
+    plaintext.read(&mut probe).is_ok()
+}
+
 /// Decryptability gate run on every encrypted artifact BEFORE it reaches the
 /// catalog or the rsync fan-out. Failure unlinks the artifact (mirroring
 /// [`validate_backup_size`]) and errors the cycle loudly — an undecryptable
@@ -2339,6 +2634,244 @@ pub async fn decrypt_backup_file(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn write_verifier_fixture(
+        kind: &str,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> (tempfile::TempDir, String) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(kind_dir(kind));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file_name), bytes).unwrap();
+        let expected = format!("{:x}", Sha256::digest(bytes));
+        (root, expected)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_artifact_verifier_streams_large_checksum_and_reports_mismatch() {
+        let bytes: Vec<u8> = (0..(3 * 1024 * 1024 + 113))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let (root, expected) = write_verifier_fixture("postgres", "pg-large.tar.gz", &bytes);
+
+        let evidence =
+            verify_backup_artifact(root.path(), "postgres", "pg-large.tar.gz", &expected, None)
+                .unwrap();
+        assert_eq!(evidence.size_bytes, bytes.len() as u64);
+        assert_eq!(evidence.observed_sha256, expected);
+        assert!(evidence.checksum_match);
+        assert!(!evidence.age_encrypted);
+        assert_eq!(evidence.decrypt_probe_ok, None);
+
+        let wrong = "0".repeat(64);
+        let mismatch =
+            verify_backup_artifact(root.path(), "postgres", "pg-large.tar.gz", &wrong, None)
+                .unwrap();
+        assert!(!mismatch.checksum_match);
+        assert_eq!(mismatch.observed_sha256, expected);
+
+        let uppercase = expected.to_ascii_uppercase();
+        let case_insensitive =
+            verify_backup_artifact(root.path(), "postgres", "pg-large.tar.gz", &uppercase, None)
+                .unwrap();
+        assert!(case_insensitive.checksum_match);
+        assert_eq!(case_insensitive.expected_sha256, expected);
+
+        for malformed in ["", "abc", &"g".repeat(64), &"0".repeat(63)] {
+            assert!(verify_backup_artifact(
+                root.path(),
+                "postgres",
+                "pg-large.tar.gz",
+                malformed,
+                None,
+            )
+            .is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_artifact_verifier_probes_binary_age_with_matching_identity_only() {
+        let identity = age::x25519::Identity::generate();
+        let wrong_identity = age::x25519::Identity::generate();
+        let ciphertext = age_encrypt_binary(
+            &vec![0x5a; BACKUP_VERIFY_BUFFER_BYTES + 37],
+            &[identity.to_public()],
+        );
+        let (root, expected) =
+            write_verifier_fixture("redis", "redis-test.rdb.zst.age", &ciphertext);
+
+        let matching = verify_backup_artifact(
+            root.path(),
+            "redis",
+            "redis-test.rdb.zst.age",
+            &expected,
+            Some(&identity),
+        )
+        .unwrap();
+        assert!(matching.age_encrypted);
+        assert_eq!(matching.decrypt_probe_ok, Some(true));
+
+        let wrong = verify_backup_artifact(
+            root.path(),
+            "redis",
+            "redis-test.rdb.zst.age",
+            &expected,
+            Some(&wrong_identity),
+        )
+        .unwrap();
+        assert!(wrong.age_encrypted);
+        assert_eq!(wrong.decrypt_probe_ok, Some(false));
+
+        let missing = verify_backup_artifact(
+            root.path(),
+            "redis",
+            "redis-test.rdb.zst.age",
+            &expected,
+            None,
+        )
+        .unwrap();
+        assert_eq!(missing.decrypt_probe_ok, Some(false));
+
+        let armored = age_armor_binary(&ciphertext);
+        let (armor_root, armor_checksum) =
+            write_verifier_fixture("redis", "redis-armored.rdb.zst.age", &armored);
+        let armor_evidence = verify_backup_artifact(
+            armor_root.path(),
+            "redis",
+            "redis-armored.rdb.zst.age",
+            &armor_checksum,
+            Some(&identity),
+        )
+        .unwrap();
+        assert!(armor_evidence.age_encrypted);
+        assert_eq!(armor_evidence.decrypt_probe_ok, Some(true));
+
+        let malformed = b"age-encryption.org/v1\nnot a valid age header";
+        let (bad_root, bad_checksum) =
+            write_verifier_fixture("redis", "redis-malformed.rdb.age", malformed);
+        assert!(
+            verify_backup_artifact(
+                bad_root.path(),
+                "redis",
+                "redis-malformed.rdb.age",
+                &bad_checksum,
+                Some(&identity),
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_artifact_verifier_rejects_unsafe_components_and_file_types() {
+        use std::os::unix::fs::symlink;
+
+        let bytes = b"backup bytes";
+        let (root, expected) = write_verifier_fixture("postgres", "pg-safe.tar.gz", bytes);
+        for unsafe_name in [
+            "",
+            "../pg-safe.tar.gz",
+            "/tmp/pg-safe.tar.gz",
+            ".",
+            "..",
+            "a/b",
+            "bad\0name",
+            "bad name",
+            "bad!name",
+            "unicodé.tar.gz",
+        ] {
+            assert!(
+                verify_backup_artifact(root.path(), "postgres", unsafe_name, &expected, None)
+                    .is_err(),
+                "unsafe component unexpectedly accepted: {unsafe_name}"
+            );
+        }
+        assert!(
+            verify_backup_artifact(
+                root.path(),
+                "postgres",
+                &"a".repeat(BACKUP_COMPONENT_MAX_BYTES + 1),
+                &expected,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            verify_backup_artifact(root.path(), "unknown", "pg-safe.tar.gz", &expected, None,)
+                .is_err()
+        );
+
+        let postgres = root.path().join("postgres");
+        symlink(
+            postgres.join("pg-safe.tar.gz"),
+            postgres.join("pg-link.tar.gz"),
+        )
+        .unwrap();
+        assert!(
+            verify_backup_artifact(root.path(), "postgres", "pg-link.tar.gz", &expected, None,)
+                .is_err()
+        );
+        std::fs::create_dir(postgres.join("pg-directory.tar.gz")).unwrap();
+        assert!(
+            verify_backup_artifact(
+                root.path(),
+                "postgres",
+                "pg-directory.tar.gz",
+                &expected,
+                None,
+            )
+            .is_err()
+        );
+
+        let linked_kind_root = tempfile::tempdir().unwrap();
+        symlink(&postgres, linked_kind_root.path().join("postgres")).unwrap();
+        assert!(
+            verify_backup_artifact(
+                linked_kind_root.path(),
+                "postgres",
+                "pg-safe.tar.gz",
+                &expected,
+                None,
+            )
+            .is_err()
+        );
+
+        let root_parent = tempfile::tempdir().unwrap();
+        let root_link = root_parent.path().join("backups-link");
+        symlink(root.path(), &root_link).unwrap();
+        assert!(
+            verify_backup_artifact(&root_link, "postgres", "pg-safe.tar.gz", &expected, None,)
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_artifact_verifier_attests_opened_inode_after_path_replacement() {
+        let original = b"original backup inode";
+        let replacement = b"replacement pathname bytes";
+        let (root, expected) = write_verifier_fixture("postgres", "pg-race.tar.gz", original);
+        let opened =
+            open_backup_artifact(root.path(), kind_dir("postgres"), "pg-race.tar.gz").unwrap();
+
+        let path = root.path().join("postgres/pg-race.tar.gz");
+        std::fs::rename(&path, root.path().join("postgres/pg-race-old.tar.gz")).unwrap();
+        std::fs::write(&path, replacement).unwrap();
+
+        let evidence =
+            verify_opened_backup_artifact(opened, "postgres", "pg-race.tar.gz", &expected, None)
+                .unwrap();
+        assert!(evidence.checksum_match);
+        assert_eq!(evidence.observed_sha256, expected);
+        assert_ne!(
+            evidence.observed_sha256,
+            format!("{:x}", Sha256::digest(replacement))
+        );
+    }
+
     #[test]
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("foo"), "'foo'");
@@ -2675,6 +3208,18 @@ mod tests {
             .unwrap();
         w.write_all(payload).unwrap();
         w.finish().unwrap();
+        out
+    }
+
+    fn age_armor_binary(ciphertext: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut out = Vec::new();
+        let mut writer =
+            age::armor::ArmoredWriter::wrap_output(&mut out, age::armor::Format::AsciiArmor)
+                .unwrap();
+        writer.write_all(ciphertext).unwrap();
+        writer.finish().unwrap();
         out
     }
 

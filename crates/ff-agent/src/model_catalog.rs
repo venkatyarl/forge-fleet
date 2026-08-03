@@ -10,11 +10,12 @@
 //! The public API ([`sync_catalog`], [`load_catalog_file`],
 //! [`CatalogFile`], [`CatalogModel`], [`CatalogVariant`]) is kept only
 //! so any callers that predate the retirement keep compiling.
-//! `sync_catalog` is now a no-op that logs once and returns 0.
+//! `sync_catalog` performs one narrowly-scoped capability repair. It never
+//! replays TOML or treats an operator-provided file as catalog authority.
 
 use std::path::{Path, PathBuf};
 
-use ff_db::{ModelCatalogRow, pg_upsert_catalog};
+use ff_db::ModelCatalogRow;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
@@ -105,38 +106,214 @@ pub fn load_catalog_file(path: &Path) -> Result<Vec<ModelCatalogRow>, String> {
     Ok(rows)
 }
 
-/// Retired no-op catalog sync. The DB migration
-/// `SCHEMA_V39_RETIRE_MODEL_CATALOG_TOML` now owns the canonical seed for
-/// the V14 `model_catalog` table. This function is preserved for
-/// call-site compatibility and logs once + returns 0.
+/// Reconcile the one canonical capability currently missing from the live
+/// catalog. Catalog rows and metadata remain migration/database owned: this
+/// function deliberately does not read `FORGEFLEET_CATALOG` or replay TOML.
 ///
-/// If a TOML file still exists at the resolved path (local override via
-/// `$FORGEFLEET_CATALOG` or an operator-written file), rows from it are
-/// upserted into the legacy `fleet_model_catalog` table for development
-/// convenience. Otherwise the function is a silent no-op.
+/// The guarded update fails closed for malformed workload values and preserves
+/// every column other than `preferred_workloads`. A case-insensitive existing
+/// `code` element makes the operation idempotent.
 pub async fn sync_catalog(pool: &PgPool) -> Result<usize, String> {
     use std::sync::atomic::{AtomicBool, Ordering};
     static LOGGED: AtomicBool = AtomicBool::new(false);
 
-    let path = resolve_catalog_path();
-    let rows = load_catalog_file(&path)?;
-
-    if rows.is_empty() {
-        if !LOGGED.swap(true, Ordering::Relaxed) {
-            tracing::info!(
-                "model_catalog.sync_catalog: TOML retired; canonical V14 rows come from migration V39"
-            );
-        }
-        return Ok(0);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            "model_catalog.sync_catalog: TOML retired; reconciling constrained canonical capabilities"
+        );
     }
 
-    // Dev path: a TOML override exists — replay it into the legacy table.
-    let mut synced = 0usize;
-    for row in &rows {
-        pg_upsert_catalog(pool, row)
+    let result = sqlx::query(
+        r#"
+        UPDATE fleet_model_catalog
+           SET preferred_workloads = preferred_workloads || '["code"]'::jsonb
+         WHERE id = 'devstral-small-2-24b'
+           AND jsonb_typeof(preferred_workloads) = 'array'
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM jsonb_array_elements_text(
+                          CASE
+                            WHEN jsonb_typeof(preferred_workloads) = 'array'
+                            THEN preferred_workloads
+                            ELSE '[]'::jsonb
+                          END
+                      ) AS workload(value)
+                WHERE LOWER(workload.value) = 'code'
+           )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("reconcile devstral code capability: {e}"))?;
+
+    Ok(result.rows_affected() as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::{Row, postgres::PgPoolOptions};
+
+    fn temp_db_urls() -> Option<(String, String, String)> {
+        let base_url = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()?;
+        let (prefix, _) = base_url.rsplit_once('/')?;
+        let db_name = format!("ff_catalog_repair_{}", uuid::Uuid::new_v4().simple());
+        Some((
+            format!("{prefix}/postgres"),
+            format!("{prefix}/{db_name}"),
+            db_name,
+        ))
+    }
+
+    async fn drop_temp_db(admin: PgPool, pool: PgPool, db_name: &str) {
+        pool.close().await;
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid)
+               FROM pg_stat_activity
+              WHERE datname = $1 AND pid <> pg_backend_pid()",
+        )
+        .bind(db_name)
+        .execute(&admin)
+        .await
+        .expect("terminate temp-db connections");
+        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
+            .execute(&admin)
             .await
-            .map_err(|e| format!("upsert {}: {}", row.id, e))?;
-        synced += 1;
+            .expect("drop temp db");
     }
-    Ok(synced)
+
+    #[tokio::test]
+    async fn sync_catalog_repairs_only_devstral_workloads_and_is_idempotent() {
+        let Some((admin_url, db_url, db_name)) = temp_db_urls() else {
+            return;
+        };
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("connect admin db");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create temp db");
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&db_url)
+            .await
+            .expect("connect temp db");
+
+        sqlx::raw_sql(
+            "CREATE TABLE fleet_model_catalog (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 family TEXT NOT NULL,
+                 parameters TEXT NOT NULL,
+                 tier INT NOT NULL,
+                 description TEXT,
+                 gated BOOLEAN NOT NULL DEFAULT FALSE,
+                 preferred_workloads JSONB NOT NULL DEFAULT '[]'::jsonb,
+                 variants JSONB NOT NULL DEFAULT '[]'::jsonb,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 tool_calling BOOLEAN NOT NULL DEFAULT FALSE,
+                 display_name TEXT,
+                 tasks JSONB,
+                 modalities JSONB,
+                 benchmarks JSONB,
+                 license TEXT,
+                 lifecycle TEXT
+             );
+             INSERT INTO fleet_model_catalog
+                 (id, name, family, parameters, tier, description, gated,
+                  preferred_workloads, variants, updated_at, tool_calling,
+                  display_name, tasks, modalities, benchmarks, license, lifecycle)
+             VALUES
+                 ('devstral-small-2-24b', 'Devstral', 'mistral', '24B', 2,
+                  'sentinel description', TRUE, '[\"reasoning\",\"tool_calling\"]',
+                  '[{\"runtime\":\"llama.cpp\"}]', '2026-01-02T03:04:05Z', TRUE,
+                  'Devstral Display', '[\"text-generation\"]', '[\"text\"]',
+                  '{\"score\":99}', 'apache-2.0', 'active'),
+                 ('sentinel', 'Sentinel', 'test', '1B', 9, NULL, FALSE,
+                  '[\"reasoning\"]', '[]', '2025-01-01T00:00:00Z', FALSE,
+                  NULL, NULL, NULL, NULL, NULL, NULL);",
+        )
+        .execute(&pool)
+        .await
+        .expect("create exact live catalog mirror");
+
+        let before: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(cat) - 'preferred_workloads'
+               FROM fleet_model_catalog cat
+              WHERE id = 'devstral-small-2-24b'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot non-workload columns");
+        let sentinel_before: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(cat) FROM fleet_model_catalog cat WHERE id = 'sentinel'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot sentinel row");
+
+        assert_eq!(sync_catalog(&pool).await.expect("first repair"), 1);
+        let row = sqlx::query(
+            "SELECT preferred_workloads,
+                    to_jsonb(cat) - 'preferred_workloads' AS other_columns
+               FROM fleet_model_catalog cat
+              WHERE id = 'devstral-small-2-24b'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read repaired row");
+        assert_eq!(
+            row.get::<serde_json::Value, _>("preferred_workloads"),
+            serde_json::json!(["reasoning", "tool_calling", "code"])
+        );
+        assert_eq!(row.get::<serde_json::Value, _>("other_columns"), before);
+        assert_eq!(sync_catalog(&pool).await.expect("idempotent repair"), 0);
+        let sentinel_after: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(cat) FROM fleet_model_catalog cat WHERE id = 'sentinel'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read sentinel row");
+        assert_eq!(sentinel_after, sentinel_before);
+
+        for malformed_or_present in [
+            serde_json::json!(["CoDe"]),
+            serde_json::json!("code"),
+            serde_json::json!({"code": true}),
+            serde_json::Value::Null,
+        ] {
+            sqlx::query(
+                "UPDATE fleet_model_catalog SET preferred_workloads = $1
+                  WHERE id = 'devstral-small-2-24b'",
+            )
+            .bind(&malformed_or_present)
+            .execute(&pool)
+            .await
+            .expect("set workload fixture");
+            assert_eq!(sync_catalog(&pool).await.expect("guarded repair"), 0);
+            let after: serde_json::Value = sqlx::query_scalar(
+                "SELECT preferred_workloads FROM fleet_model_catalog
+                  WHERE id = 'devstral-small-2-24b'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read guarded fixture");
+            assert_eq!(after, malformed_or_present);
+        }
+
+        let arbitrary_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fleet_model_catalog WHERE id = 'operator-toml-row'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count arbitrary rows");
+        assert_eq!(arbitrary_rows, 0);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
 }
