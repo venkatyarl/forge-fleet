@@ -291,9 +291,11 @@ impl HeartbeatV2Publisher {
                 for ip in all_ips.iter_mut() {
                     crate::cx7_detect::enrich_ip(ip, &computer_name);
                 }
+                let mac_addresses = detect_lan_mac_addresses(&all_ips);
                 beat.network = NetworkInfo {
                     primary_ip: detect_primary_ip(),
                     all_ips,
+                    mac_addresses,
                 };
 
                 // ── OS classification (V87+) ─────────────────────────────────
@@ -1145,6 +1147,83 @@ fn detect_all_ips() -> Vec<Ip> {
     result
 }
 
+fn normalize_mac(raw: &str) -> Option<String> {
+    let octets = raw
+        .trim()
+        .split(':')
+        .map(|part| {
+            if part.len() == 2 {
+                u8::from_str_radix(part, 16).ok()
+            } else {
+                None
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if octets.len() != 6
+        || octets.iter().all(|octet| *octet == 0)
+        || octets.iter().all(|octet| *octet == 0xff)
+        || octets[0] & 1 != 0
+    {
+        return None;
+    }
+    Some(
+        octets
+            .iter()
+            .map(|octet| format!("{octet:02x}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
+}
+
+fn detect_lan_mac_addresses(all_ips: &[Ip]) -> Vec<String> {
+    collect_lan_mac_addresses(all_ips, detect_iface_mac)
+}
+
+fn collect_lan_mac_addresses(
+    all_ips: &[Ip],
+    probe: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut macs = all_ips
+        .iter()
+        .filter(|ip| ip.kind == "lan")
+        .filter_map(|ip| probe(&ip.iface).and_then(|mac| normalize_mac(&mac)))
+        .collect::<Vec<_>>();
+    macs.sort();
+    macs.dedup();
+    macs
+}
+
+fn detect_iface_mac(iface: &str) -> Option<String> {
+    if iface.is_empty()
+        || matches!(iface, "." | "..")
+        || !iface
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+    {
+        return None;
+    }
+    if std::env::consts::OS == "macos" {
+        let output = command_output_with_timeout(
+            std::process::Command::new("/sbin/ifconfig").arg(iface),
+            3,
+        )?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("ether ").map(str::to_string))
+    } else {
+        std::fs::read_to_string(
+            std::path::Path::new("/sys/class/net")
+                .join(iface)
+                .join("address"),
+        )
+        .ok()
+        .map(|raw| raw.trim().to_string())
+    }
+}
+
 /// Linux: read `/sys/class/net/<iface>/speed` (Mbps for ethernet) and
 /// detect wifi via `/sys/class/net/<iface>/wireless` directory presence.
 fn probe_iface_linux(iface: &str) -> (Option<String>, Option<u32>) {
@@ -1307,6 +1386,54 @@ fn classify_iface(iface: &str, ip: &str) -> String {
 mod tests {
     use super::*;
 
+    fn fixture_ip(iface: &str, kind: &str) -> Ip {
+        Ip {
+            iface: iface.to_string(),
+            ip: "192.168.1.10".to_string(),
+            kind: kind.to_string(),
+            paired_with: None,
+            link_speed_gbps: None,
+            medium: None,
+        }
+    }
+
+    #[test]
+    fn mac_validator_accepts_only_safe_unicast_six_octet_values() {
+        assert_eq!(
+            normalize_mac("02:AB:0c:00:10:fF").as_deref(),
+            Some("02:ab:0c:00:10:ff")
+        );
+        for invalid in [
+            "",
+            "00:00:00:00:00:00",
+            "ff:ff:ff:ff:ff:ff",
+            "01:00:5e:00:00:01",
+            "0:11:22:33:44:55",
+            "00:11:22:33:44",
+            "gg:11:22:33:44:55",
+        ] {
+            assert_eq!(normalize_mac(invalid), None, "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn lan_mac_fixtures_exclude_loopback_virtual_tailscale_and_cx7() {
+        let ips = [
+            fixture_ip("en0", "lan"),
+            fixture_ip("eth0", "lan"),
+            fixture_ip("lo", "loopback"),
+            fixture_ip("docker0", "v4"),
+            fixture_ip("tailscale0", "tailscale"),
+            fixture_ip("rocep1s0", "cx7-fabric"),
+        ];
+        let macs = collect_lan_mac_addresses(&ips, |iface| match iface {
+            "en0" => Some("02:AA:00:00:00:02".to_string()),
+            "eth0" => Some("02:aa:00:00:00:01".to_string()),
+            _ => Some("02:aa:00:00:00:ff".to_string()),
+        });
+        assert_eq!(macs, ["02:aa:00:00:00:01", "02:aa:00:00:00:02"]);
+    }
+
     #[test]
     fn source_tree_precedence_is_role_aware() {
         let home = std::path::Path::new("/home/x");
@@ -1375,6 +1502,13 @@ mod tests {
         let decoded: PulseBeatV2 = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.computer_name, "test-computer");
         assert_eq!(decoded.hardware.cpu_cores, beat.hardware.cpu_cores);
+        assert_eq!(decoded.network.mac_addresses, beat.network.mac_addresses);
+        assert!(
+            beat.network
+                .mac_addresses
+                .iter()
+                .all(|mac| normalize_mac(mac).as_deref() == Some(mac.as_str()))
+        );
     }
 
     #[tokio::test]
