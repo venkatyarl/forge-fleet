@@ -69,6 +69,8 @@ const DEFAULT_MAX_FILES: u64 = 5_000_000;
 const DEFAULT_EXPANSION_RATIO: u64 = 8;
 const DEFAULT_RESERVE_BYTES: u64 = 20 * GIB;
 const POSTGRES_PROOF_IMAGE: &str = "pgvector/pgvector:pg16";
+const POSTGRES_PROOF_USER: &str = "forgefleet";
+const POSTGRES_PROOF_DATABASE: &str = "forgefleet";
 const DOCKER_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const POSTGRES_READY_TIMEOUT: Duration = Duration::from_secs(180);
 const PG_VERIFYBACKUP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -1558,18 +1560,8 @@ impl PostgresProofRuntime for DockerPostgresProof {
         let deadline = tokio::time::Instant::now() + POSTGRES_READY_TIMEOUT;
         let mut last_error = String::new();
         while tokio::time::Instant::now() < deadline {
-            match docker_output(
-                &[
-                    "exec",
-                    &resources.container,
-                    "pg_isready",
-                    "-h",
-                    "/tmp",
-                    "-U",
-                    "postgres",
-                    "-d",
-                    "postgres",
-                ],
+            match docker_output_owned(
+                &postgres_ready_probe_args(&resources.container),
                 Duration::from_secs(5),
             )
             .await
@@ -1586,23 +1578,8 @@ impl PostgresProofRuntime for DockerPostgresProof {
     }
 
     async fn application_read(&self, resources: &RestoreResourceNames) -> Result<(), String> {
-        let output = docker_output(
-            &[
-                "exec",
-                &resources.container,
-                "psql",
-                "-h",
-                "/tmp",
-                "-U",
-                "postgres",
-                "-d",
-                "forgefleet",
-                "-XAt",
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-c",
-                "SELECT current_setting('server_version_num')::int / 10000 = 16 AND (SELECT count(*) >= 0 FROM public.fleet_nodes);",
-            ],
+        let output = docker_output_owned(
+            &postgres_application_read_args(&resources.container),
             DOCKER_COMMAND_TIMEOUT,
         )
         .await?;
@@ -1614,6 +1591,45 @@ impl PostgresProofRuntime for DockerPostgresProof {
         }
         Ok(())
     }
+}
+
+fn postgres_ready_probe_args(container: &str) -> Vec<String> {
+    [
+        "exec",
+        container,
+        "pg_isready",
+        "-h",
+        "/tmp",
+        "-U",
+        POSTGRES_PROOF_USER,
+        "-d",
+        POSTGRES_PROOF_DATABASE,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn postgres_application_read_args(container: &str) -> Vec<String> {
+    [
+        "exec",
+        container,
+        "psql",
+        "-h",
+        "/tmp",
+        "-U",
+        POSTGRES_PROOF_USER,
+        "-d",
+        POSTGRES_PROOF_DATABASE,
+        "-XAt",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-c",
+        "SELECT current_setting('server_version_num')::int / 10000 = 16 AND (SELECT count(*) >= 0 FROM public.fleet_nodes);",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 async fn prove_postgres_restore(pgdata: &Path, run_id: uuid::Uuid) -> Result<String, String> {
@@ -1944,6 +1960,20 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("mock start failure"));
         assert_eq!(runtime.calls.lock().unwrap().last(), Some(&"cleanup"));
+    }
+
+    #[test]
+    fn restored_cluster_probes_use_the_forgefleet_bootstrap_identity() {
+        for args in [
+            postgres_ready_probe_args("drill-container"),
+            postgres_application_read_args("drill-container"),
+        ] {
+            let user_index = args.iter().position(|arg| arg == "-U").unwrap();
+            let database_index = args.iter().position(|arg| arg == "-d").unwrap();
+            assert_eq!(args[user_index + 1], POSTGRES_PROOF_USER);
+            assert_eq!(args[database_index + 1], POSTGRES_PROOF_DATABASE);
+            assert!(!args.iter().any(|arg| arg == "postgres"));
+        }
     }
 
     #[test]
