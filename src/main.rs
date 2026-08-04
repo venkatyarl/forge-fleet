@@ -36,6 +36,35 @@ use tracing::{error, info, warn};
 const SUBSYSTEM_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const SUBSYSTEM_ABORT_GRACE: Duration = Duration::from_secs(2);
 const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const MODEL_AUTO_UPGRADE_CANDIDATES_SQL: &str = r#"
+    SELECT c.name AS host,
+           cm.model_id,
+           revision.upstream_latest_rev
+      FROM computer_models cm
+      JOIN computers c      ON c.id = cm.computer_id
+      JOIN model_catalog mc ON mc.id = cm.model_id
+      JOIN LATERAL (
+        SELECT NULLIF(BTRIM(variant.value->>'upstream_latest_rev'), '') AS upstream_latest_rev
+          FROM jsonb_array_elements(COALESCE(mc.variants, '[]'::jsonb))
+               WITH ORDINALITY AS variant(value, ordinal)
+         WHERE NULLIF(BTRIM(variant.value->>'upstream_latest_rev'), '') IS NOT NULL
+         ORDER BY variant.ordinal
+         LIMIT 1
+      ) revision ON TRUE
+     WHERE cm.status = 'revision_available'
+       AND NOT EXISTS (
+         SELECT 1
+           FROM fleet_model_deployments dep
+           JOIN fleet_model_library lib ON lib.id = dep.library_id
+          WHERE lib.catalog_id = cm.model_id
+            AND dep.desired_state = 'active'
+       )
+     LIMIT 3
+"#;
+
+fn model_auto_upgrade_gate_enabled<E>(result: &std::result::Result<bool, E>) -> bool {
+    matches!(result, Ok(true))
+}
 
 /// clap's `--version` output. Mirrors the `Command::Version` subcommand
 /// branch so the drift collector sees the same `YYYY.M.D_N (STATE sha)`
@@ -1723,23 +1752,16 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                             continue;
                         }
 
-                        let rows = sqlx::query(
-                            r#"
-                            SELECT c.name AS host, cm.model_id, mc.upstream_latest_rev
-                              FROM computer_models cm
-                              JOIN computers c      ON c.id = cm.computer_id
-                              JOIN model_catalog mc ON mc.id = cm.model_id
-                             WHERE cm.status = 'revision_available'
-                               AND NOT EXISTS (
-                                 SELECT 1
-                                   FROM fleet_model_deployments dep
-                                   JOIN fleet_model_library lib ON lib.id = dep.library_id
-                                  WHERE lib.catalog_id = cm.model_id
-                                    AND dep.desired_state = 'active'
-                               )
-                             LIMIT 3
-                            "#,
-                        )
+                        let auto_upgrade_gate =
+                            ff_agent::auto_upgrade::is_enabled_durable(&pg_pool).await;
+                        if !model_auto_upgrade_gate_enabled(&auto_upgrade_gate) {
+                            if let Err(error) = auto_upgrade_gate {
+                                warn!(%error, "model auto-upgrade gate read failed; treating as disabled");
+                            }
+                            continue;
+                        }
+
+                        let rows = sqlx::query(MODEL_AUTO_UPGRADE_CANDIDATES_SQL)
                         .fetch_all(&pg_pool)
                         .await;
 
@@ -4306,6 +4328,16 @@ mod tests {
         assert!(!embedded.autonomous_mode);
         assert_eq!(embedded.poll_interval_secs, 8);
         assert_eq!(embedded.worker_name, "vinny");
+    }
+
+    #[test]
+    fn model_auto_upgrade_is_fail_closed_and_uses_live_catalog_shape() {
+        assert!(model_auto_upgrade_gate_enabled(&Ok::<bool, ()>(true)));
+        assert!(!model_auto_upgrade_gate_enabled(&Ok::<bool, ()>(false)));
+        assert!(!model_auto_upgrade_gate_enabled(&Err::<bool, _>(())));
+        assert!(MODEL_AUTO_UPGRADE_CANDIDATES_SQL.contains("jsonb_array_elements"));
+        assert!(MODEL_AUTO_UPGRADE_CANDIDATES_SQL.contains("mc.variants"));
+        assert!(!MODEL_AUTO_UPGRADE_CANDIDATES_SQL.contains("mc.upstream_latest_rev"));
     }
 
     #[test]
