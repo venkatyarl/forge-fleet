@@ -85,15 +85,12 @@ else
   printf '%s' "$BOOTSTRAP_EVIDENCE" > "$BOOTSTRAP_MARKER"
 fi
 
-# Docker metadata contains only the mounted secret path. Copy the pgpass
-# material into PGDATA with libpq-required permissions, and keep the path in
-# the inherited environment for both pg_basebackup and the WAL receiver.
-PGPASSFILE="$PGDATA/.pgpass"
+# Docker metadata contains only the mounted secret path. The root branch above
+# stages it outside PGDATA with libpq-required permissions. Keeping it outside
+# PGDATA is important: pg_basebackup refuses any non-empty destination.
+PGPASSFILE="$POSTGRES_REPLICATION_PGPASS_FILE"
 export PGPASSFILE
-install -m 0600 "$POSTGRES_REPLICATION_PGPASS_FILE" "$PGPASSFILE"
-if [ "$POSTGRES_REPLICATION_PGPASS_FILE" = /tmp/forgefleet-replication-pgpass ]; then
-  rm -f "$POSTGRES_REPLICATION_PGPASS_FILE"
-fi
+test -r "$PGPASSFILE"
 
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
   pg_basebackup \
