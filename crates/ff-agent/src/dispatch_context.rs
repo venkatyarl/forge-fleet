@@ -16,9 +16,10 @@
 
 use sqlx::{PgPool, Row};
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Node types eligible for the "known decisions and gotchas" pack.
 const BRAIN_NODE_TYPES: &[&str] = &["decision", "distilled_fact", "gotcha"];
@@ -30,6 +31,10 @@ const BRAIN_PACK_MAX_BYTES: usize = 1200;
 
 /// Max nodes surfaced in the decisions/gotchas pack, regardless of byte budget.
 const BRAIN_PACK_MAX_NODES: usize = 5;
+
+/// Live Cortex lookups are best-effort and must not delay dispatch.
+const CORTEX_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
+const CORTEX_OUTPUT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Tokens too generic to be worth a graph lookup even if they look like idents.
 const STOPWORDS: &[&str] = &[
@@ -71,18 +76,66 @@ pub fn extract_task_identifiers(title: &str, description: &str) -> Vec<String> {
 
 /// One `ff cortex` invocation in `repo_path`, returning parsed JSON or None.
 fn cortex_json(repo_path: &Path, args: &[&str]) -> Option<serde_json::Value> {
-    let out = Command::new("ff")
+    let mut command = Command::new("ff");
+    command
         .arg("cortex")
         .args(args)
         .arg("--format")
         .arg("json")
-        .current_dir(repo_path)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+        .current_dir(repo_path);
+    let stdout = command_output_bounded(&mut command, CORTEX_LOOKUP_TIMEOUT)?;
+    serde_json::from_slice(&stdout).ok()
+}
+
+/// Capture stdout without allowing a wedged command (or one of its descendants)
+/// to outlive the deadline. The reader runs concurrently so large JSON responses
+/// cannot fill the pipe and deadlock the child before it exits.
+fn command_output_bounded(command: &mut Command, timeout: Duration) -> Option<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
     }
-    serde_json::from_slice(&out.stdout).ok()
+
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .by_ref()
+            .take(CORTEX_OUTPUT_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (bytes.len() as u64 <= CORTEX_OUTPUT_MAX_BYTES).then_some(bytes)
+    });
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = reader.join().ok().flatten()?;
+                return status.success().then_some(output);
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                #[cfg(unix)]
+                unsafe {
+                    libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+                }
+                #[cfg(not(unix))]
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return None;
+            }
+        }
+    }
 }
 
 /// Make a corpus file path node-independent: the graph stores the LEADER's
@@ -516,11 +569,25 @@ pub async fn context_pack_for_dispatch(
 mod tests {
     use super::{
         build_brain_decisions_pack, build_context_pack_from_store, choose_expected_corpus,
-        cortex_hit_belongs_to_corpus, extract_task_identifiers, relativize, slug_from_path,
+        command_output_bounded, cortex_hit_belongs_to_corpus, extract_task_identifiers, relativize,
+        slug_from_path,
     };
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::path::Path;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_capture_kills_overlong_process_group() {
+        let started = Instant::now();
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & wait"]);
+
+        assert!(command_output_bounded(&mut command, Duration::from_millis(50)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn extracts_camel_and_snake_idents_skips_plain_words() {
