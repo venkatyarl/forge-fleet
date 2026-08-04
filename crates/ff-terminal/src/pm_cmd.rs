@@ -17,6 +17,11 @@ struct LeafTask {
     acceptance_criteria: Vec<String>,
 }
 
+const LEAF_TASK_SCHEMA: &str = r#"[{"title":"string","description":"string","files":["string"],"complexity":"mechanical|moderate|complex","acceptance_criteria":["string"]}]"#;
+const REPAIR_ERROR_CHARS: usize = 512;
+const REPAIR_RESPONSE_CHARS: usize = 6_000;
+const REPAIR_MAX_TOKENS: u32 = 2_048;
+
 pub async fn handle_pm(cmd: crate::PmCommand, cwd: Option<PathBuf>) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
@@ -1712,9 +1717,35 @@ async fn handle_pm_decompose(
     .await
     .map_err(|e| anyhow::anyhow!("fleet_oneshot decompose: {e}"))?;
 
-    let tasks = parse_leaf_tasks(&resp.text)?;
+    let (tasks, parse_repaired) = match parse_leaf_tasks(&resp.text) {
+        Ok(tasks) => (tasks, false),
+        Err(parse_error) => {
+            let repair_prompt = leaf_task_repair_prompt(&parse_error, &resp.text, max);
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(180))
+                .build()
+                .map_err(|e| anyhow::anyhow!("build planner repair client: {e}"))?;
+            let repaired = ff_agent::research::openai_single_completion(
+                &resp.endpoint,
+                &resp.model,
+                &repair_prompt,
+                REPAIR_MAX_TOKENS,
+                &client,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("repair malformed planner response: {e}"))?;
+            let tasks = parse_leaf_tasks(&repaired)
+                .map_err(|e| anyhow::anyhow!("parse repaired decomposition: {e}"))?;
+            (tasks, true)
+        }
+    };
     let tasks = match quality_gate_decomposition(tasks, repo_context.as_ref()) {
         Ok(tasks) => tasks,
+        Err(error) if parse_repaired => {
+            return Err(anyhow::anyhow!(
+                "decomposition quality gate failed after parse repair: {error}"
+            ));
+        }
         Err(first_error) => {
             // Bad paths and false assumptions are planning errors, not work for a
             // builder to discover after taking a lease. Give the planner exactly
@@ -1803,16 +1834,91 @@ async fn handle_pm_decompose(
 
 fn parse_leaf_tasks(text: &str) -> Result<Vec<LeafTask>> {
     let text = text.trim();
-    let json_slice = match (text.find('['), text.rfind(']')) {
-        (Some(a), Some(b)) if b > a => &text[a..=b],
-        _ => return Err(anyhow::anyhow!("LLM did not return a JSON array")),
+    let tasks = match serde_json::from_str::<Vec<LeafTask>>(text) {
+        Ok(tasks) => tasks,
+        Err(direct_error) => {
+            let mut parsed = balanced_json_arrays(text)
+                .into_iter()
+                .filter_map(|candidate| serde_json::from_str::<Vec<LeafTask>>(candidate).ok());
+            let Some(tasks) = parsed.next() else {
+                return Err(anyhow::anyhow!(
+                    "parse decomposed tasks JSON: {direct_error}"
+                ));
+            };
+            if parsed.next().is_some() {
+                return Err(anyhow::anyhow!(
+                    "planner response contained multiple task arrays"
+                ));
+            }
+            tasks
+        }
     };
-    let tasks: Vec<LeafTask> = serde_json::from_str(json_slice)
-        .map_err(|e| anyhow::anyhow!("parse decomposed tasks JSON: {e}"))?;
     if tasks.is_empty() {
         return Err(anyhow::anyhow!("LLM returned zero tasks"));
     }
     Ok(tasks)
+}
+
+/// Return balanced JSON array slices without interpreting or repairing their
+/// contents. Delimiters inside strings are ignored, so fenced/prose-wrapped JSON
+/// is safe to extract while multiple valid task arrays remain ambiguous.
+fn balanced_json_arrays(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut arrays = Vec::new();
+    for start in bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == b'[').then_some(index))
+    {
+        let mut stack = Vec::new();
+        let mut in_string = false;
+        let mut escaped = false;
+        for (offset, byte) in bytes[start..].iter().copied().enumerate() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => in_string = true,
+                b'[' | b'{' => stack.push(byte),
+                b']' if stack.pop() == Some(b'[') => {
+                    if stack.is_empty() {
+                        arrays.push(&text[start..=start + offset]);
+                        break;
+                    }
+                }
+                b'}' if stack.pop() == Some(b'{') => {}
+                b']' | b'}' => break,
+                _ => {}
+            }
+        }
+    }
+    arrays
+}
+
+fn capped_chars(text: &str, limit: usize) -> String {
+    let mut capped = text.chars().take(limit).collect::<String>();
+    if text.chars().count() > limit {
+        capped.push('…');
+    }
+    capped
+}
+
+fn leaf_task_repair_prompt(error: &anyhow::Error, prior_response: &str, max: usize) -> String {
+    format!(
+        "Regenerate as JSON only. The prior response failed strict parsing.\nError: {}\n\
+         Prior response (capped):\n{}\n\
+         Expected schema (array of at most {max} objects; field types are exact):\n{LEAF_TASK_SCHEMA}\n\
+         Return only the complete JSON array. Do not quote, coerce, or wrap field values.",
+        capped_chars(&error.to_string(), REPAIR_ERROR_CHARS),
+        capped_chars(prior_response, REPAIR_RESPONSE_CHARS),
+    )
 }
 
 fn quality_gate_decomposition(
@@ -3846,6 +3952,38 @@ mod tests {
         assert_eq!(gated[0].files, ["src/lib.rs", "src/tests.rs"]);
         assert!(gated[0].description.contains("add parser test"));
         assert_eq!(gated[0].complexity.as_deref(), Some("moderate"));
+    }
+
+    #[test]
+    fn parse_leaf_tasks_rejects_malformed_and_wrong_field_types() {
+        assert!(parse_leaf_tasks("not JSON").is_err());
+        assert!(parse_leaf_tasks(r#"[{"title":{"nested":true},"description":"d"}]"#).is_err());
+        assert!(parse_leaf_tasks(r#"[{"title":"t","description":"d"}"#).is_err());
+    }
+
+    #[test]
+    fn parse_leaf_tasks_accepts_safe_fenced_and_wrapped_arrays() {
+        let task = r#"[{"title":"Fix [strict] parser","description":"keep } and ] in strings","files":["src/lib.rs"],"complexity":"mechanical","acceptance_criteria":["parses"]}]"#;
+        let fenced = format!("```json\n{task}\n```");
+        let wrapped = format!("Here is the requested output:\n{task}\nDone.");
+        assert_eq!(parse_leaf_tasks(&fenced).unwrap().len(), 1);
+        assert_eq!(parse_leaf_tasks(&wrapped).unwrap().len(), 1);
+
+        let ambiguous = format!("{task}\n{task}");
+        assert!(parse_leaf_tasks(&ambiguous).is_err());
+    }
+
+    #[test]
+    fn leaf_task_repair_prompt_is_bounded_and_states_exact_schema() {
+        let error = anyhow::anyhow!("{}TAIL_ERROR", "e".repeat(REPAIR_ERROR_CHARS + 20));
+        let prior = format!("{}TAIL_RESPONSE", "x".repeat(REPAIR_RESPONSE_CHARS + 20));
+        let prompt = leaf_task_repair_prompt(&error, &prior, 7);
+
+        assert!(prompt.contains(LEAF_TASK_SCHEMA));
+        assert!(prompt.contains("array of at most 7 objects"));
+        assert!(!prompt.contains("TAIL_ERROR"));
+        assert!(!prompt.contains("TAIL_RESPONSE"));
+        assert!(prompt.chars().count() < REPAIR_ERROR_CHARS + REPAIR_RESPONSE_CHARS + 700);
     }
 
     #[test]
