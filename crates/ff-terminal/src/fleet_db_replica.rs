@@ -18,6 +18,8 @@ const COMPOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 *
 const REPLICA_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 const FIND_EXISTING_REPLICA_TASK_SQL: &str = "SELECT id FROM fleet_tasks WHERE task_class='deferred' AND summary=$1 AND status IN ('pending','dispatchable','running','completed') AND payload->'deferred_payload'->>'command' LIKE $2 ORDER BY created_at DESC LIMIT 1";
 const INSERT_REPLICA_TASK_SQL: &str = "INSERT INTO fleet_tasks (task_type,summary,payload,priority,requires_capability,status,created_at,task_class) VALUES ('shell',$1,$2,50,$3,'pending',NOW(),'deferred') RETURNING id";
+const UPSERT_PRIMARY_AUTHORITY_SQL: &str = "INSERT INTO database_replicas (computer_id,database_kind,role,status,lag_bytes,last_sync_at,notes) VALUES ($1,'postgres','primary','running',0,NOW(),$2) ON CONFLICT (computer_id,database_kind) DO UPDATE SET role='primary',status='running',lag_bytes=0,last_sync_at=NOW(),notes=$2";
+const UPSERT_REPLICA_SQL: &str = "INSERT INTO database_replicas (computer_id,database_kind,role,status,lag_bytes,last_sync_at,bootstrapped_from_backup_id,notes) VALUES ($1,'postgres','replica','running',$4,NOW(),$2,$3) ON CONFLICT (computer_id,database_kind) DO UPDATE SET role='replica',status='running',lag_bytes=$4,last_sync_at=NOW(),bootstrapped_from_backup_id=$2,notes=$3";
 
 fn postgres_major_from_version_output(output: &[u8]) -> Option<i32> {
     String::from_utf8_lossy(output)
@@ -36,6 +38,7 @@ struct Plan {
     target_id: Uuid,
     target_name: String,
     target_ip: String,
+    primary_id: Uuid,
     primary_name: String,
     primary_ip: String,
     slot: String,
@@ -46,10 +49,11 @@ struct Plan {
 impl Plan {
     fn id(&self) -> String {
         let canonical = format!(
-            "v1\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            "v2\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             self.target_id,
             self.target_name,
             self.target_ip,
+            self.primary_id,
             self.primary_name,
             self.primary_ip,
             self.slot,
@@ -245,6 +249,7 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary: &str) -> Result<Plan
         target_id,
         target_name: target.get("name"),
         target_ip,
+        primary_id,
         primary_name: primary_row.get("name"),
         primary_ip: named_primary_ip,
         slot: physical_slot(target_id),
@@ -301,6 +306,48 @@ async fn enqueue_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<String> {
     };
     tx.commit().await?;
     Ok(id.to_string())
+}
+
+async fn register_replica_topology(pool: &sqlx::PgPool, plan: &Plan, lag_bytes: i64) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let server_is_still_primary: bool = sqlx::query_scalar("SELECT NOT pg_is_in_recovery()")
+        .fetch_one(&mut *tx)
+        .await?;
+    if !server_is_still_primary {
+        bail!("connected PostgreSQL authority became a standby during replica bootstrap");
+    }
+    let registered_primary: Option<Uuid> = sqlx::query_scalar(
+        "SELECT computer_id FROM database_replicas WHERE database_kind='postgres' AND role='primary' FOR UPDATE",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    if registered_primary.is_some_and(|id| id != plan.primary_id) {
+        bail!("PostgreSQL primary authority changed during replica bootstrap");
+    }
+    sqlx::query(UPSERT_PRIMARY_AUTHORITY_SQL)
+        .bind(plan.primary_id)
+        .bind(format!(
+            "authority=verified-by-replica-plan;plan={};pg_major={}",
+            plan.id(),
+            plan.pg_major
+        ))
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(UPSERT_REPLICA_SQL)
+        .bind(plan.target_id)
+        .bind(plan.backup_id)
+        .bind(format!(
+            "primary={};slot={};plan={};pg_major={}",
+            plan.primary_name,
+            plan.slot,
+            plan.id(),
+            plan.pg_major
+        ))
+        .bind(lag_bytes)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
@@ -506,8 +553,7 @@ async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
     if lag_bytes > MAX_POSTCHECK_LAG_BYTES {
         bail!("replica lag {lag_bytes} bytes exceeds postcheck limit {MAX_POSTCHECK_LAG_BYTES}");
     }
-    sqlx::query("INSERT INTO database_replicas (computer_id,database_kind,role,status,lag_bytes,last_sync_at,bootstrapped_from_backup_id,notes) VALUES ($1,'postgres','replica','running',$4,NOW(),$2,$3) ON CONFLICT (computer_id,database_kind) DO UPDATE SET role='replica',status='running',lag_bytes=$4,last_sync_at=NOW(),bootstrapped_from_backup_id=$2,notes=$3")
-        .bind(plan.target_id).bind(plan.backup_id).bind(format!("primary={};slot={};plan={};pg_major={}", plan.primary_name, plan.slot, plan.id(), plan.pg_major)).bind(lag_bytes).execute(pool).await?;
+    register_replica_topology(pool, plan, lag_bytes).await?;
     Ok(())
 }
 
@@ -677,6 +723,7 @@ mod tests {
             target_id: Uuid::nil(),
             target_name: "node one".into(),
             target_ip: "10.0.0.2".into(),
+            primary_id: Uuid::from_u128(1),
             primary_name: "primary".into(),
             primary_ip: "10.0.0.1".into(),
             slot: physical_slot(Uuid::nil()),
@@ -704,6 +751,7 @@ mod tests {
             target_id: Uuid::nil(),
             target_name: "n".into(),
             target_ip: "1".into(),
+            primary_id: Uuid::from_u128(1),
             primary_name: "p".into(),
             primary_ip: "2".into(),
             slot: physical_slot(Uuid::nil()),
@@ -712,11 +760,21 @@ mod tests {
         };
         let a = p.id();
         assert_eq!(a, p.id());
+        p.primary_id = Uuid::from_u128(2);
+        assert_ne!(a, p.id());
+        p.primary_id = Uuid::from_u128(1);
         p.primary_ip = "3".into();
         assert_ne!(a, p.id());
         let b = p.id();
         p.pg_major = 17;
         assert_ne!(b, p.id());
+    }
+    #[test]
+    fn topology_registration_declares_primary_and_replica_rows() {
+        assert!(UPSERT_PRIMARY_AUTHORITY_SQL.contains("role,status"));
+        assert!(UPSERT_PRIMARY_AUTHORITY_SQL.contains("'primary','running'"));
+        assert!(UPSERT_REPLICA_SQL.contains("'replica','running'"));
+        assert!(UPSERT_REPLICA_SQL.contains("bootstrapped_from_backup_id"));
     }
     #[test]
     fn pgpass_fields_escape_delimiters_and_reject_lines() {
