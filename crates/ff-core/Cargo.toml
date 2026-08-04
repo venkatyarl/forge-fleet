@@ -19,6 +19,7 @@ chrono.workspace = true
 uuid.workspace = true
 sqlx.workspace = true
 sha2.workspace = true
+subtle.workspace = true
 dashmap.workspace = true
 reqwest.workspace = true
 dirs.workspace = true
@@ -26,6 +27,7 @@ notify = "7"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

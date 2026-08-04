@@ -85,6 +85,7 @@ bytes = "1"
 sha2 = { version = "0.10", features = [] }
 hmac = "0.12"
 subtle = "2"
+rustix = { version = "1", features = ["fs"] }
 hex = "0.4"
 
 # ─── Root binary (ForgeFleet daemon) ─────────────────────────────────────────

@@ -14,6 +14,7 @@ pub mod dsn_of_record;
 pub mod leader_state;
 pub mod metrics_partitions;
 pub mod migrations;
+pub mod model_integrity;
 pub mod models;
 pub mod operational_store;
 pub mod pm;
@@ -27,6 +28,10 @@ pub use leader_state::*;
 
 pub use metrics_partitions::{pg_drop_expired_metrics_partitions, pg_ensure_metrics_partitions};
 pub use migrations::run_postgres_migrations;
+pub use model_integrity::{
+    HashWriteDecision, ModelLibraryHashAssertion, ModelLibraryHashCasOutcome,
+    pg_compare_or_cas_model_library_sha256,
+};
 pub use models::WorkItem;
 pub use operational_store::OperationalStore;
 pub use queries::{

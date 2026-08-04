@@ -33,6 +33,7 @@ pub mod leader;
 pub mod llm_completion_policy;
 pub mod maintenance;
 pub mod model_id;
+pub mod model_integrity;
 pub mod monitor;
 pub mod notifications;
 pub mod obsidian_export;
