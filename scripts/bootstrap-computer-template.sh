@@ -38,14 +38,18 @@ IS_VINNY="{{IS_VINNY}}"
 # ─── Helpers ──────────────────────────────────────────────────────────────
 
 say() { printf '▶ %s\n' "$*"; }
+# JSON-escape a detail string WITHOUT python3 (the bootstrap's report/die/trap
+# paths must never depend on a binary that can hang: vinny 2026-08-04).
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n' ' '
+}
 report() {
   # POST progress event to the leader so the dashboard can show live status.
   local step="$1" status="${2:-running}" detail="${3:-}"
   curl -fsS -m 5 -X POST \
     -H "Content-Type: application/json" \
-    --data "$(printf '{"name":"%s","step":"%s","status":"%s","detail":%s}' \
-      "$NAME" "$step" "$status" \
-      "$(printf '%s' "$detail" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo '""')")" \
+    --data "$(printf '{"name":"%s","step":"%s","status":"%s","detail":"%s"}' \
+      "$NAME" "$step" "$status" "$(json_escape "$detail")")" \
     "$LEADER/api/fleet/enrollment-progress" >/dev/null 2>&1 || true
 }
 
@@ -726,35 +730,27 @@ except PermissionError:
     pass
 print(f"imported: +{added_user} authorized_keys, +{added_host} known_hosts")
 PY
-python3 "$MESH_PY" > "$MESH_LOG" 2>&1 &
-mesh_pid=$!
-mesh_wait=0
-# Watchdog poll. A finished-but-unreaped child is a ZOMBIE and `kill -0`
-# still succeeds on zombies (the 2026-08-04 vinny run spun here forever) —
-# so reap-detect via ps state, not just existence.
-while :; do
-  if ! kill -0 "$mesh_pid" 2>/dev/null; then break; fi
-  mesh_state="$(ps -o stat= -p "$mesh_pid" 2>/dev/null | tr -d '[:space:]')"
-  case "$mesh_state" in Z* | "") break ;; esac
-  sleep 3
-  mesh_wait=$((mesh_wait + 3))
-  if [ "$mesh_wait" -ge 90 ]; then
-    kill -9 "$mesh_pid" 2>/dev/null
-    wait "$mesh_pid" 2>/dev/null
-    cat "$MESH_LOG" >&2 || true
-    rm -f "$MESH_PY" "$MESH_LOG"
-    die "mesh_import timed out after 90s (partial output above) — re-run to retry"
-  fi
-done
-wait "$mesh_pid" || { cat "$MESH_LOG" >&2; rm -f "$MESH_PY" "$MESH_LOG"; die "failed to import peer SSH identities"; }
+# Hard, un-hangable cap: perl's alarm survives exec and always fires — no
+# polling loop, no zombie semantics, no ps portability roulette (the 2026-08-04
+# vinny runs proved every shell-watchdog variant can itself wedge). Peer keys
+# are best-effort: a failure here must NEVER block enrollment.
+perl -e 'alarm 60; exec @ARGV' python3 "$MESH_PY" > "$MESH_LOG" 2>&1
+mesh_rc=$?
 cat "$MESH_LOG"
+if [ "$mesh_rc" -ne 0 ]; then
+  report "mesh_import" failed "peer key import failed/timeout (rc=$mesh_rc) — continuing without it"
+else
+  report "mesh_import" ok
+fi
 rm -f "$MESH_PY" "$MESH_LOG"
-report "mesh_import" ok
 
-# ─── 10b. fleet.toml — Postgres + Redis URL pointing at the leader ──────
+# ─── 10b. fleet.toml — Postgres + Redis URL pointing at the DB host ──────
 # The daemon refuses to start without this file. Self-heal gap surfaced on
 # Sia's first enrollment (Apr 21 2026): daemon crashed-looped with
 # `connect Postgres: read fleet.toml: No such file or directory`.
+# DB host is rendered separately from the leader host: Postgres/Redis do NOT
+# necessarily live on the serving gateway (vinny 2026-08-04 — a fleet.toml
+# pointing at the leader's IP would crash-loop the fresh daemon).
 report "fleet_toml" running
 FLEET_TOML="$USER_HOME/.forgefleet/fleet.toml"
 run_as_user mkdir -p "$USER_HOME/.forgefleet"
@@ -763,15 +759,15 @@ if [ ! -f "$FLEET_TOML" ]; then
 [database]
 mode = \"postgres_full\"
 cutover_evidence = \"phase38-cutover-validated-2026-04-05\"
-host = \"{{LEADER_HOST}}\"
-port = 55432
+host = \"{{DB_HOST}}\"
+port = {{DB_PORT}}
 name = \"forgefleet\"
 user = \"forgefleet\"
 password = \"forgefleet\"
-url = \"postgresql://forgefleet:forgefleet@{{LEADER_HOST}}:55432/forgefleet\"
+url = \"postgresql://forgefleet:forgefleet@{{DB_HOST}}:{{DB_PORT}}/forgefleet\"
 
 [redis]
-url = \"redis://{{LEADER_HOST}}:56379\"
+url = \"redis://{{REDIS_HOST}}:{{REDIS_PORT}}\"
 prefix = \"pulse\"
 
 [loops.self_heal]
