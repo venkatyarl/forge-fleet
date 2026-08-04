@@ -25,6 +25,12 @@ const MIN_CLUSTER_SIZE: usize = 3;
 const MIN_SUCCESS_RATE: f64 = 0.80;
 /// Look-back window for session scanning (days).
 const LOOKBACK_DAYS: i64 = 7;
+const RECENT_SESSIONS_SQL: &str = r#"
+        SELECT id, goal, status
+        FROM agent_sessions
+        WHERE status IN ('succeeded', 'failed')
+          AND completed_at > $1
+        "#;
 
 /// A cluster of similar sessions.
 #[derive(Debug)]
@@ -42,17 +48,10 @@ pub async fn consolidate(pg: &PgPool) -> Result<usize> {
     let since = Utc::now() - Duration::days(LOOKBACK_DAYS);
 
     // 1. Fetch recent completed sessions.
-    let rows = sqlx::query(
-        r#"
-        SELECT id, goal, status
-        FROM agent_sessions
-        WHERE status IN ('succeeded', 'failed')
-          AND updated_at > $1
-        "#,
-    )
-    .bind(since)
-    .fetch_all(pg)
-    .await?;
+    let rows = sqlx::query(RECENT_SESSIONS_SQL)
+        .bind(since)
+        .fetch_all(pg)
+        .await?;
 
     #[derive(Debug)]
     struct SessionBrief {
@@ -315,6 +314,12 @@ mod tests {
         assert!(t.contains(&"rest".to_string()));
         assert!(t.contains(&"api".to_string()));
         assert!(!t.contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn recent_sessions_query_uses_live_completion_column() {
+        assert!(RECENT_SESSIONS_SQL.contains("completed_at > $1"));
+        assert!(!RECENT_SESSIONS_SQL.contains("updated_at"));
     }
 
     #[test]
