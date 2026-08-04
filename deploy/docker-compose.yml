@@ -90,7 +90,9 @@ services:
       - "-c"
       - "archive_timeout=300"
       - "-c"
-      - "archive_command=test -f /wal_archive/%f || cp %p /wal_archive/%f"
+      # The bind directory is setgid to the host backup user's group. Preserve
+      # group readability so the daemon's rsync fan-out can read each segment.
+      - "archive_command=test -f /wal_archive/%f || install -m 0640 %p /wal_archive/%f"
       - "-c"
       - "max_wal_senders=4"
       - "-c"
