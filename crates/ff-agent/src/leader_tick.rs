@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -62,9 +62,27 @@ const STALE_THRESHOLD_SECS: i64 = 45;
 /// even when Postgres heartbeat is fresh. Two back-to-back tick-pass
 /// observations (15 s + 15 s) cheaply filter transient Redis partitions.
 const MIN_PULSE_SILENT_SECS: u64 = 30;
+/// A daemon that was the last DB-confirmed leader may drive the failover
+/// manager through a brief primary outage. Without this retained authority the
+/// PostgreSQL-backed election tick fails before failover can run at all.
+const FAILOVER_LEADER_EVIDENCE_MAX_AGE_SECS: i64 = 300;
 const MIN_LEADER_RAM_GB: i32 = 48;
 const MIN_LEADERLESS_WAIT_SECS: u64 = 5 * 60;
 const LEADERLESS_JITTER_SECS: u64 = 5 * 60;
+
+fn has_retained_failover_authority(
+    my_computer_id: Uuid,
+    my_name: &str,
+    prior_leader: &LeaderInfo,
+    now: DateTime<Utc>,
+) -> bool {
+    let evidence_age = now
+        .signed_duration_since(prior_leader.observed_at)
+        .num_seconds();
+    prior_leader.computer_id == Some(my_computer_id)
+        && prior_leader.member_name.as_deref() == Some(my_name)
+        && (0..=FAILOVER_LEADER_EVIDENCE_MAX_AGE_SECS).contains(&evidence_age)
+}
 
 /// Errors returned by [`LeaderTick::tick`].
 #[derive(Debug, thiserror::Error)]
@@ -307,6 +325,44 @@ impl LeaderTick {
             .await;
     }
 
+    async fn run_pg_failover_check(&self) {
+        let Some(manager) = &self.pg_failover_manager else {
+            return;
+        };
+        match manager.check_and_failover(&self.pulse).await {
+            Ok(FailoverOutcome::Promoted {
+                target,
+                estimated_rpo_bytes,
+                estimated_rpo_seconds,
+            }) => {
+                tracing::info!(
+                    node = %self.my_name,
+                    %target,
+                    estimated_async_rpo_bytes = estimated_rpo_bytes,
+                    estimated_async_rpo_seconds = estimated_rpo_seconds,
+                    "pg_failover: promoted selected replica to primary"
+                );
+            }
+            Ok(FailoverOutcome::Blocked(why)) => {
+                tracing::warn!(
+                    node = %self.my_name,
+                    reason = %why,
+                    "pg_failover: blocked"
+                );
+            }
+            Ok(FailoverOutcome::NoOp) => {
+                tracing::debug!(node = %self.my_name, "pg_failover: no-op");
+            }
+            Err(error) => {
+                tracing::error!(
+                    node = %self.my_name,
+                    %error,
+                    "pg_failover: check_and_failover failed"
+                );
+            }
+        }
+    }
+
     /// Spawn the periodic loop. Runs `tick()` every `interval_secs` until
     /// `shutdown` flips to `true`.
     pub fn spawn(self, interval_secs: u64, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
@@ -434,52 +490,37 @@ impl LeaderTick {
                                     // runs on the currently-elected ForgeFleet
                                     // leader. Disabled via env var
                                     // FORGEFLEET_DISABLE_AUTO_PG_FAILOVER.
-                                    if let Some(manager) = &self.pg_failover_manager {
-                                        match manager.check_and_failover(&self.pulse).await {
-                                            Ok(FailoverOutcome::Promoted) => {
-                                                tracing::info!(
-                                                    node = %self.my_name,
-                                                    "pg_failover: promoted local replica to primary"
-                                                );
-                                            }
-                                            Ok(FailoverOutcome::PrimaryOdownPromotingMyReplica) => {
-                                                tracing::info!(
-                                                    node = %self.my_name,
-                                                    "pg_failover: promoting local replica"
-                                                );
-                                            }
-                                            Ok(FailoverOutcome::PrimaryOdownCantPromote) => {
-                                                tracing::warn!(
-                                                    node = %self.my_name,
-                                                    "pg_failover: primary odown but no local replica to promote"
-                                                );
-                                            }
-                                            Ok(FailoverOutcome::Blocked(why)) => {
-                                                tracing::warn!(
-                                                    node = %self.my_name,
-                                                    reason = %why,
-                                                    "pg_failover: blocked"
-                                                );
-                                            }
-                                            Ok(FailoverOutcome::NoOp) => {
-                                                tracing::debug!(
-                                                    node = %self.my_name,
-                                                    "pg_failover: no-op"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    node = %self.my_name,
-                                                    error = %e,
-                                                    "pg_failover: check_and_failover failed"
-                                                );
-                                            }
-                                        }
-                                    }
+                                    self.run_pg_failover_check().await;
                                 }
                             }
                             Err(err) => {
-                                self.update_leader_cache(false, LeaderInfo::default()).await;
+                                let prior_leader = LeaderCache::global().leader_info().await;
+                                let evidence_age = Utc::now()
+                                    .signed_duration_since(prior_leader.observed_at)
+                                    .num_seconds();
+                                let retained_failover_authority = has_retained_failover_authority(
+                                    self.my_computer_id,
+                                    &self.my_name,
+                                    &prior_leader,
+                                    Utc::now(),
+                                );
+                                if retained_failover_authority {
+                                    tracing::warn!(
+                                        node = %self.my_name,
+                                        evidence_age_secs = evidence_age,
+                                        "leader tick DB path failed; running failover from fresh last-confirmed leadership"
+                                    );
+                                    self.run_pg_failover_check().await;
+                                }
+                                self.update_leader_cache(
+                                    false,
+                                    if retained_failover_authority {
+                                        prior_leader
+                                    } else {
+                                        LeaderInfo::default()
+                                    },
+                                )
+                                .await;
                                 reconcile_mirror_service(
                                     self.mirror_fetch_config.as_ref(),
                                     false,
@@ -1593,6 +1634,37 @@ mod tests {
     use chrono::Duration as ChronoDuration;
     use sqlx::postgres::PgPoolOptions;
     use std::env;
+
+    #[test]
+    fn retained_failover_authority_requires_exact_recent_self_leader() {
+        let now = Utc::now();
+        let me = Uuid::new_v4();
+        let info = LeaderInfo {
+            computer_id: Some(me),
+            member_name: Some("adele".into()),
+            observed_at: now - ChronoDuration::seconds(30),
+            ..LeaderInfo::default()
+        };
+        assert!(has_retained_failover_authority(me, "adele", &info, now));
+        assert!(!has_retained_failover_authority(
+            Uuid::new_v4(),
+            "adele",
+            &info,
+            now
+        ));
+        assert!(!has_retained_failover_authority(me, "other", &info, now));
+
+        let stale = LeaderInfo {
+            observed_at: now - ChronoDuration::seconds(FAILOVER_LEADER_EVIDENCE_MAX_AGE_SECS + 1),
+            ..info.clone()
+        };
+        assert!(!has_retained_failover_authority(me, "adele", &stale, now));
+        let future = LeaderInfo {
+            observed_at: now + ChronoDuration::seconds(1),
+            ..info
+        };
+        assert!(!has_retained_failover_authority(me, "adele", &future, now));
+    }
 
     #[tokio::test]
     async fn mirror_service_starts_and_stops_with_leadership() {

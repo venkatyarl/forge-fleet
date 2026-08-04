@@ -1,10 +1,9 @@
 //! Leader-gated Postgres replica health monitor.
 //!
-//! Periodically probes every registered Postgres replica (rows in
-//! `database_replicas` with `database_kind='postgres' AND role='replica'`)
-//! via TCP connect to port 55432. When one or more replicas are unreachable,
-//! fires the `postgres_replica_dead` imperative alert. Resolves the alert when
-//! all replicas are reachable again.
+//! Periodically probes every registered Postgres replica through its host and
+//! verifies recovery, read-only, streaming and replay freshness. It measures
+//! replay lag against the live primary LSN and refreshes the authoritative
+//! `lag_bytes` / `last_sync_at` evidence consumed by automatic failover.
 //!
 //! Motivation: both replicas can die silently while the primary and hosts
 //! remain up; Pulse beats continue, so host-death alerts never fire and the
@@ -18,14 +17,12 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use super::pg_failover::{
+    ReplicaHost, lsn_lag_bytes, parse_pg_lsn, probe_replica_host, replica_probe_healthy,
+};
+
 /// The alert policy seeded by migration V179.
 const POLICY_NAME: &str = "postgres_replica_dead";
-
-/// Port the fleet's Postgres listens on (both primary and replica).
-const POSTGRES_PORT: u16 = 55432;
-
-/// How long to wait before giving up on a TCP connect to a replica.
-const PROBE_TIMEOUT_SECS: u64 = 5;
 
 /// How often the replica health check runs.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(60);
@@ -36,6 +33,7 @@ pub struct ReplicaRow {
     pub computer_id: Uuid,
     pub name: String,
     pub primary_ip: String,
+    pub ssh_user: String,
 }
 
 /// A replica that failed the TCP probe.
@@ -104,7 +102,8 @@ impl ReplicaMonitorTick {
         let rows = sqlx::query(
             "SELECT dr.computer_id,
                     c.name,
-                    c.primary_ip
+                    c.primary_ip,
+                    c.ssh_user
                FROM database_replicas dr
                JOIN computers c ON c.id = dr.computer_id
               WHERE dr.database_kind = 'postgres'
@@ -120,6 +119,7 @@ impl ReplicaMonitorTick {
                 computer_id: r.get("computer_id"),
                 name: r.get("name"),
                 primary_ip: r.get("primary_ip"),
+                ssh_user: r.get("ssh_user"),
             })
             .collect())
     }
@@ -136,15 +136,56 @@ impl ReplicaMonitorTick {
 
         let mut results = Vec::with_capacity(replicas.len());
         for r in &replicas {
-            let reachable =
-                probe_replica_tcp(&r.primary_ip, POSTGRES_PORT, PROBE_TIMEOUT_SECS).await;
+            let host = ReplicaHost {
+                name: r.name.clone(),
+                primary_ip: r.primary_ip.clone(),
+                ssh_user: r.ssh_user.clone(),
+            };
+            let probe = probe_replica_host(&host, r.name.eq_ignore_ascii_case(&self.my_name)).await;
+            // Read the primary LSN after the remote probe. Reading it before
+            // the probe creates a race where a healthy replica can legitimately
+            // report a later LSN and be misclassified as invalid.
+            let primary_lsn = sqlx::query_scalar::<_, String>("SELECT pg_current_wal_lsn()::text")
+                .fetch_one(&self.pg)
+                .await?;
+            let primary_lsn = parse_pg_lsn(primary_lsn.trim());
+            if primary_lsn.is_none() {
+                warn!(
+                    replica = %r.name,
+                    "replica_monitor: primary LSN is invalid; evidence fails closed"
+                );
+            }
+            let lag_bytes = primary_lsn
+                .zip(probe.as_ref().and_then(|value| value.replay_lsn))
+                .and_then(|(primary, replay)| lsn_lag_bytes(primary, replay));
+            let healthy = probe
+                .as_ref()
+                .is_some_and(|value| replica_probe_healthy(value, lag_bytes));
+            sqlx::query(
+                "UPDATE database_replicas
+                    SET status = CASE
+                            WHEN status='needs_repoint' THEN status
+                            WHEN $3 THEN 'running'
+                            ELSE 'degraded'
+                        END,
+                        lag_bytes = $2,
+                        last_sync_at = CASE WHEN $3 THEN NOW() ELSE last_sync_at END
+                  WHERE computer_id = $1 AND database_kind = 'postgres'
+                    AND role = 'replica'",
+            )
+            .bind(r.computer_id)
+            .bind(lag_bytes)
+            .bind(healthy)
+            .execute(&self.pg)
+            .await?;
             debug!(
                 replica = %r.name,
                 addr = %r.primary_ip,
-                reachable,
-                "replica_monitor: probed replica"
+                healthy,
+                lag_bytes,
+                "replica_monitor: deep-probed replica"
             );
-            results.push((r.clone(), reachable));
+            results.push((r.clone(), healthy));
         }
 
         let dead = dead_from_results(&results);
@@ -223,7 +264,7 @@ impl ReplicaMonitorTick {
             .map(|d| format!("{} ({})", d.name, d.primary_ip))
             .collect();
         let message = format!(
-            "Postgres replica death: {} replica(s) unreachable (detected by leader '{}'): {}",
+            "Postgres replica unhealthy: {} replica(s) failed recovery/streaming/freshness/lag evidence (detected by leader '{}'): {}",
             dead.len(),
             self.my_name,
             detail.join(", ")
@@ -313,27 +354,6 @@ impl ReplicaMonitorTick {
     }
 }
 
-/// Attempt a TCP connect with a timeout. Returns true on success.
-async fn probe_replica_tcp(host: &str, port: u16, timeout_secs: u64) -> bool {
-    let addr = format!("{host}:{port}");
-    match tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        tokio::net::TcpStream::connect(&addr),
-    )
-    .await
-    {
-        Ok(Ok(_stream)) => true,
-        Ok(Err(e)) => {
-            debug!(addr = %addr, error = %e, "replica_monitor: TCP connect failed");
-            false
-        }
-        Err(_) => {
-            debug!(addr = %addr, timeout = timeout_secs, "replica_monitor: TCP connect timed out");
-            false
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,11 +381,13 @@ mod tests {
             computer_id: Uuid::nil(),
             name: "r1".into(),
             primary_ip: "10.0.0.2".into(),
+            ssh_user: "r1".into(),
         };
         let r2 = ReplicaRow {
             computer_id: Uuid::nil(),
             name: "r2".into(),
             primary_ip: "10.0.0.3".into(),
+            ssh_user: "r2".into(),
         };
         let results = vec![(r1, true), (r2, false)];
         let dead = dead_from_results(&results);
@@ -380,11 +402,13 @@ mod tests {
             computer_id: Uuid::nil(),
             name: "r1".into(),
             primary_ip: "10.0.0.2".into(),
+            ssh_user: "r1".into(),
         };
         let r2 = ReplicaRow {
             computer_id: Uuid::nil(),
             name: "r2".into(),
             primary_ip: "10.0.0.3".into(),
+            ssh_user: "r2".into(),
         };
         let results = vec![(r1, true), (r2, true)];
         assert!(dead_from_results(&results).is_empty());
@@ -396,11 +420,13 @@ mod tests {
             computer_id: Uuid::nil(),
             name: "r1".into(),
             primary_ip: "10.0.0.2".into(),
+            ssh_user: "r1".into(),
         };
         let r2 = ReplicaRow {
             computer_id: Uuid::nil(),
             name: "r2".into(),
             primary_ip: "10.0.0.3".into(),
+            ssh_user: "r2".into(),
         };
         let results = vec![(r1, false), (r2, false)];
         let dead = dead_from_results(&results);
