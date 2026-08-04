@@ -4219,9 +4219,11 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                         "--from-here is a direct probe from this node; it can't be combined with --repair or --since"
                     );
                 }
-                println!(
-                    "{CYAN}▶ Probing ping + SSH from this node to every fleet worker...{RESET}"
-                );
+                if !json {
+                    println!(
+                        "{CYAN}▶ Probing ping + SSH from this node to every fleet worker...{RESET}"
+                    );
+                }
                 let probes = ff_agent::mesh_check::local_reach_check_scoped(&pool, &scope)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
@@ -4241,6 +4243,9 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                         })
                         .collect();
                     println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+                    ensure_mesh_json_success(
+                        probes.iter().filter(|probe| probe.status != "ok").count(),
+                    )?;
                     return Ok(());
                 }
                 println!(
@@ -4300,7 +4305,9 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                 println!("  refreshed {n} stale pair(s)");
                 return Ok(());
             }
-            println!("{CYAN}▶ Running pairwise SSH mesh check...{RESET}");
+            if !json {
+                println!("{CYAN}▶ Running pairwise SSH mesh check...{RESET}");
+            }
             let matrix = ff_agent::mesh_check::pairwise_ssh_check_scoped(&pool, &scope)
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
@@ -4317,6 +4324,13 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+                ensure_mesh_json_success(
+                    matrix
+                        .cells
+                        .iter()
+                        .filter(|cell| cell.status != "ok")
+                        .count(),
+                )?;
             } else {
                 let mut ok = 0;
                 let mut fail = 0;
@@ -4977,6 +4991,15 @@ fn route_candidate_json(r: &ff_db::RouteCandidate) -> serde_json::Value {
     })
 }
 
+/// Preserve machine-readable stdout, then turn a degraded JSON scan into a
+/// non-zero CLI result for automation.
+fn ensure_mesh_json_success(failed_edges: usize) -> Result<()> {
+    if failed_edges > 0 {
+        anyhow::bail!("SSH mesh check found {failed_edges} failed edge(s)");
+    }
+    Ok(())
+}
+
 /// Render a candidate's latest sampled load as `"<cpu>%/<reqs>"` (e.g.
 /// `"3.9%/0"`) for the `LOAD` column. An unsampled host (never written a
 /// `computer_metrics_history` row) shows `"-"` rather than a fake `0%/0`, so the
@@ -5033,6 +5056,13 @@ mod from_here_probe_row_tests {
     fn icmp_blocked_keeps_ssh_ok_but_flags_ping() {
         let row = fmt_from_here_probe_row(&probe(false, true, None));
         assert!(row.contains("down   ok"));
+    }
+
+    #[test]
+    fn json_mesh_exit_contract_fails_on_any_failed_edge() {
+        assert!(ensure_mesh_json_success(0).is_ok());
+        let error = ensure_mesh_json_success(32).expect_err("failed edges must return nonzero");
+        assert_eq!(error.to_string(), "SSH mesh check found 32 failed edge(s)");
     }
 }
 

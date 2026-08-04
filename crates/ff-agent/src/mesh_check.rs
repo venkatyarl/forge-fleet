@@ -1,7 +1,8 @@
 //! Fleet-wide SSH mesh verification + propagation.
 //! See plan: /Users/venkat/.claude/plans/gentle-questing-valley.md §3h.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::future::Future;
 use std::time::Duration;
 
 use sqlx::PgPool;
@@ -13,6 +14,13 @@ use uuid::Uuid;
 use crate::task_runner::{EnqueueOnceOutcome, pg_enqueue_shell_task_once};
 
 const SKIPPED_COMPUTER_STATUSES: [&str; 3] = ["offline", "reserved", "decommissioned"];
+
+/// Upper bound for useful fleet-wide pairwise concurrency. The scheduler below
+/// also reserves both endpoint names for every in-flight edge, so any one
+/// computer participates in at most one nested SSH probe at a time. With 15
+/// eligible computers this permits seven simultaneous probes while preventing
+/// a full N×(N-1) scan from flooding a small node's sshd.
+const PAIRWISE_MESH_MAX_IN_FLIGHT: usize = 8;
 
 /// Emergency kill switch for the autonomous leader SSH mesh-repair producer.
 ///
@@ -229,6 +237,16 @@ pub struct MeshMatrix {
     pub checked_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct MeshProbe {
+    src: String,
+    src_user: String,
+    src_ip: String,
+    dst: String,
+    dst_user: String,
+    dst_ip: String,
+}
+
 /// Canonical runtime-only mesh endpoints that an operator explicitly excluded.
 /// The set is never persisted; callers must pass it through the current run.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -374,19 +392,8 @@ pub async fn pairwise_ssh_check_scoped(
     Ok(matrix)
 }
 
-async fn pairwise_ssh_check_inner(
-    pool: &PgPool,
-    nodes: &[ff_db::FleetNodeRow],
-    scope: &MeshCheckScope,
-) -> Result<MeshMatrix, String> {
-    use futures::stream::{FuturesUnordered, StreamExt};
-
-    let by_name: std::collections::HashMap<String, (String, String)> = nodes
-        .iter()
-        .map(|n| (n.name.clone(), (n.ssh_user.clone(), n.ip.clone())))
-        .collect();
-
-    let mut pairs: Vec<(String, String, String, String, String)> = Vec::new();
+fn mesh_probe_plan(nodes: &[ff_db::FleetNodeRow], scope: &MeshCheckScope) -> Vec<MeshProbe> {
+    let mut probes = Vec::new();
     for src in nodes {
         for dst in nodes {
             if src.name == dst.name
@@ -396,47 +403,89 @@ async fn pairwise_ssh_check_inner(
             {
                 continue;
             }
-            pairs.push((
-                src.name.clone(),
-                src.ssh_user.clone(),
-                src.ip.clone(),
-                dst.name.clone(),
-                by_name
-                    .get(&dst.name)
-                    .map(|(u, _)| u.clone())
-                    .unwrap_or_default(),
-            ));
-            let _ = dst;
+            probes.push(MeshProbe {
+                src: src.name.clone(),
+                src_user: src.ssh_user.clone(),
+                src_ip: src.ip.clone(),
+                dst: dst.name.clone(),
+                dst_user: dst.ssh_user.clone(),
+                dst_ip: dst.ip.clone(),
+            });
         }
     }
-    let _ = by_name;
+    probes.sort_by(|a, b| (&a.src, &a.dst).cmp(&(&b.src, &b.dst)));
+    probes
+}
 
-    let mut futs = FuturesUnordered::new();
-    let mut cells = Vec::with_capacity(pairs.len());
-    for (src, src_user, src_ip, dst, dst_user) in pairs {
-        let dst_ip = nodes
-            .iter()
-            .find(|n| n.name == dst)
-            .map(|n| n.ip.clone())
-            .unwrap_or_default();
-        futs.push(probe_pair(src, src_user, src_ip, dst, dst_user, dst_ip));
-        if futs.len() >= 8
-            && let Some(cell) = futs.next().await
-        {
-            let _ = ff_db::pg_upsert_mesh_probe(
-                pool,
-                &cell.src,
-                &cell.dst,
-                &cell.status,
-                cell.last_error.as_deref(),
-                cell.ping_ok,
-                Some(cell.ssh_ok),
-            )
-            .await;
-            cells.push(cell);
+/// Execute directed mesh probes with both endpoints reserved for the lifetime
+/// of each probe. This is stricter than a destination-only cap: because the
+/// outer SSH hop also lands on `src`, a small computer is protected whether it
+/// appears as source or destination. Independent, node-disjoint edges still
+/// run concurrently up to `max_in_flight`.
+async fn run_bounded_mesh_probes<F, Fut>(
+    probes: Vec<MeshProbe>,
+    max_in_flight: usize,
+    run_probe: F,
+) -> Vec<MeshCell>
+where
+    F: Fn(MeshProbe) -> Fut,
+    Fut: Future<Output = MeshCell>,
+{
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    let mut pending: VecDeque<MeshProbe> = probes.into();
+    let mut active_nodes = BTreeSet::new();
+    let mut in_flight = FuturesUnordered::new();
+    let mut cells = Vec::with_capacity(pending.len());
+    let max_in_flight = max_in_flight.max(1);
+
+    while !pending.is_empty() || !in_flight.is_empty() {
+        while in_flight.len() < max_in_flight {
+            let Some(index) = pending.iter().position(|probe| {
+                !active_nodes.contains(&probe.src) && !active_nodes.contains(&probe.dst)
+            }) else {
+                break;
+            };
+            let probe = pending
+                .remove(index)
+                .expect("selected mesh probe index remains valid");
+            let src = probe.src.clone();
+            let dst = probe.dst.clone();
+            active_nodes.insert(src.clone());
+            active_nodes.insert(dst.clone());
+            let future = run_probe(probe);
+            in_flight.push(async move { (src, dst, future.await) });
         }
+
+        let Some((src, dst, cell)) = in_flight.next().await else {
+            debug_assert!(pending.is_empty());
+            break;
+        };
+        active_nodes.remove(&src);
+        active_nodes.remove(&dst);
+        cells.push(cell);
     }
-    while let Some(cell) = futs.next().await {
+
+    cells.sort_by(|a, b| (&a.src, &a.dst).cmp(&(&b.src, &b.dst)));
+    cells
+}
+
+async fn pairwise_ssh_check_inner(
+    pool: &PgPool,
+    nodes: &[ff_db::FleetNodeRow],
+    scope: &MeshCheckScope,
+) -> Result<MeshMatrix, String> {
+    let probes = mesh_probe_plan(nodes, scope);
+    let cells = run_bounded_mesh_probes(probes, PAIRWISE_MESH_MAX_IN_FLIGHT, |probe| async move {
+        let cell = probe_pair(
+            probe.src,
+            probe.src_user,
+            probe.src_ip,
+            probe.dst,
+            probe.dst_user,
+            probe.dst_ip,
+        )
+        .await;
         let _ = ff_db::pg_upsert_mesh_probe(
             pool,
             &cell.src,
@@ -447,8 +496,9 @@ async fn pairwise_ssh_check_inner(
             Some(cell.ssh_ok),
         )
         .await;
-        cells.push(cell);
-    }
+        cell
+    })
+    .await;
 
     Ok(MeshMatrix {
         cells,
@@ -1319,6 +1369,106 @@ mod tests {
             Some((false, true))
         );
         assert_eq!(parse_remote_probe_marker(b"no marker"), None);
+    }
+
+    #[tokio::test]
+    async fn pairwise_scheduler_serializes_each_endpoint_without_losing_parallelism() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let names = ["a", "b", "c", "d", "e", "f"];
+        let mut probes = Vec::new();
+        for src in names {
+            for dst in names {
+                if src == dst {
+                    continue;
+                }
+                probes.push(MeshProbe {
+                    src: src.into(),
+                    src_user: "user".into(),
+                    src_ip: "127.0.0.1".into(),
+                    dst: dst.into(),
+                    dst_user: "user".into(),
+                    dst_ip: "127.0.0.1".into(),
+                });
+            }
+        }
+        probes.sort_by(|a, b| (&a.src, &a.dst).cmp(&(&b.src, &b.dst)));
+
+        let active_by_node = Arc::new(Mutex::new(BTreeMap::<String, usize>::new()));
+        let active_total = Arc::new(AtomicUsize::new(0));
+        let max_total = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        // Six nodes permit a three-edge matching. Holding the first wave at a
+        // barrier proves independent edges overlap instead of accidentally
+        // degenerating to a fleet-wide serial scan.
+        let first_wave = Arc::new(tokio::sync::Barrier::new(3));
+
+        let run = run_bounded_mesh_probes(probes, PAIRWISE_MESH_MAX_IN_FLIGHT, |probe| {
+            let active_by_node = Arc::clone(&active_by_node);
+            let active_total = Arc::clone(&active_total);
+            let max_total = Arc::clone(&max_total);
+            let started = Arc::clone(&started);
+            let first_wave = Arc::clone(&first_wave);
+            async move {
+                {
+                    let mut active = active_by_node.lock().expect("endpoint counter lock");
+                    for endpoint in [&probe.src, &probe.dst] {
+                        let count = active.entry(endpoint.clone()).or_default();
+                        assert_eq!(
+                            *count, 0,
+                            "endpoint {endpoint} participated in concurrent mesh probes"
+                        );
+                        *count += 1;
+                    }
+                }
+                let current = active_total.fetch_add(1, Ordering::SeqCst) + 1;
+                max_total.fetch_max(current, Ordering::SeqCst);
+                if started.fetch_add(1, Ordering::SeqCst) < 3 {
+                    first_wave.wait().await;
+                }
+                tokio::task::yield_now().await;
+                active_total.fetch_sub(1, Ordering::SeqCst);
+                {
+                    let mut active = active_by_node.lock().expect("endpoint counter lock");
+                    for endpoint in [&probe.src, &probe.dst] {
+                        *active.get_mut(endpoint).expect("active endpoint") -= 1;
+                    }
+                }
+                MeshCell {
+                    src: probe.src,
+                    dst: probe.dst,
+                    status: "ok".into(),
+                    last_error: None,
+                    ping_ok: Some(true),
+                    ssh_ok: true,
+                }
+            }
+        });
+        let cells = timeout(Duration::from_secs(2), run)
+            .await
+            .expect("bounded scheduler deadlocked");
+
+        assert_eq!(cells.len(), names.len() * (names.len() - 1));
+        assert_eq!(
+            max_total.load(Ordering::SeqCst),
+            3,
+            "six endpoints should retain three useful concurrent probes"
+        );
+        assert!(
+            cells
+                .windows(2)
+                .all(|pair| { (&pair[0].src, &pair[0].dst) <= (&pair[1].src, &pair[1].dst) })
+        );
+        assert!(
+            active_by_node
+                .lock()
+                .expect("endpoint counter lock")
+                .values()
+                .all(|count| *count == 0)
+        );
     }
 
     #[test]
