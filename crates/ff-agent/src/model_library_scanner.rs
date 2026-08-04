@@ -242,8 +242,9 @@ fn classify_file(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disc
         stem.clone()
     };
 
-    let catalog_id = match_catalog(&base_name, catalog)
-        .unwrap_or_else(|| format!("unknown:{}", slugify(&base_name)));
+    let catalog_id =
+        match_catalog_for_artifact(&base_name, catalog, Some("llama.cpp"), quant.as_deref())
+            .unwrap_or_else(|| format!("unknown:{}", slugify(&base_name)));
 
     Some(Discovered {
         catalog_id,
@@ -314,8 +315,9 @@ fn classify_dir(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disco
             .iter()
             .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
             .sum();
-        let catalog_id = match_catalog(&dir_name, catalog)
-            .unwrap_or_else(|| format!("unknown:{}", slugify(&dir_name)));
+        let catalog_id =
+            match_catalog_for_artifact(&dir_name, catalog, Some(&runtime), quant.as_deref())
+                .unwrap_or_else(|| format!("unknown:{}", slugify(&dir_name)));
         return Some(Discovered {
             catalog_id,
             runtime,
@@ -339,9 +341,12 @@ fn classify_dir(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disco
             .unwrap_or_default();
         let stem = strip_ext(&first_name, ".gguf").unwrap_or_else(|| first_name.clone());
         let quant = extract_gguf_quant(&stem).or_else(|| extract_gguf_quant(&dir_name));
-        let catalog_id = match_catalog(&dir_name, catalog)
-            .or_else(|| match_catalog(&stem, catalog))
-            .unwrap_or_else(|| format!("unknown:{}", slugify(&dir_name)));
+        let catalog_id =
+            match_catalog_for_artifact(&dir_name, catalog, Some("llama.cpp"), quant.as_deref())
+                .or_else(|| {
+                    match_catalog_for_artifact(&stem, catalog, Some("llama.cpp"), quant.as_deref())
+                })
+                .unwrap_or_else(|| format!("unknown:{}", slugify(&dir_name)));
         return Some(Discovered {
             catalog_id,
             runtime: "llama.cpp".to_string(),
@@ -378,8 +383,9 @@ fn classify_dir(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disco
             .and_then(|n| n.to_str())
             .and_then(extract_gguf_quant)
             .or_else(|| extract_gguf_quant(&dir_name));
-        let catalog_id = match_catalog(&dir_name, catalog)
-            .unwrap_or_else(|| format!("unknown:{}", slugify(&dir_name)));
+        let catalog_id =
+            match_catalog_for_artifact(&dir_name, catalog, Some("llama.cpp"), quant.as_deref())
+                .unwrap_or_else(|| format!("unknown:{}", slugify(&dir_name)));
         return Some(Discovered {
             catalog_id,
             runtime: "llama.cpp".to_string(),
@@ -444,9 +450,24 @@ fn extract_hf_quant(lower: &str) -> Option<String> {
     }
 }
 
-/// Case-insensitive substring match against catalog `id` and `name`.
-/// Returns the best (longest match) catalog id.
+#[cfg(test)]
 fn match_catalog(needle: &str, catalog: &[ff_db::ModelCatalogRow]) -> Option<String> {
+    match_catalog_for_artifact(needle, catalog, None, None)
+}
+
+/// Case-insensitive identity match against catalog `id` and `name`.
+///
+/// Exact canonical identity wins before substring specificity. That ordering is
+/// important for format-specific scout rows: `qwen3-6-35b-a3b-nvfp4` is a
+/// longer substring match for a `qwen3.6-35b` directory, but it is not the
+/// identity of a Q4_K_M GGUF stored there. Artifact hints break ties between
+/// canonically-equivalent ids using the catalog's declared runtime/quant.
+fn match_catalog_for_artifact(
+    needle: &str,
+    catalog: &[ff_db::ModelCatalogRow],
+    runtime: Option<&str>,
+    quant: Option<&str>,
+) -> Option<String> {
     // Canonical form: lowercase + strip punctuation so "gemma-4" and "gemma4" match.
     let canon = |s: &str| -> String {
         s.chars()
@@ -465,21 +486,104 @@ fn match_catalog(needle: &str, catalog: &[ff_db::ModelCatalogRow]) -> Option<Str
     // match — `"".contains(...)`/`n.contains("")` would otherwise let a catalog
     // row with a punctuation-only id or name match every needle.
     let contains_either = |p: &str| -> bool { !p.is_empty() && (n.contains(p) || p.contains(&n)) };
-    let mut best: Option<(usize, String)> = None;
+    // (identity rank, artifact compatibility, substring specificity, id)
+    // Lexicographic tuple ordering keeps the result deterministic without
+    // allowing a longer format suffix to outrank an exact base-model identity.
+    let mut best: Option<((u8, u8, usize), String)> = None;
     for row in catalog {
         let id_c = canon(&row.id);
         let name_c = canon(&row.name);
         // Direct-contains match (either direction)
         let hit = contains_either(&id_c) || contains_either(&name_c);
-        if hit {
-            // Prefer longer catalog-id match — "qwen3-coder-30b" over "qwen3-14b" when both hit.
-            let score = id_c.len();
-            if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
-                best = Some((score, row.id.clone()));
-            }
+        if !hit || identity_declares_conflicting_quant(row, quant) {
+            continue;
+        }
+
+        let identity_rank = if id_c == n {
+            3
+        } else if name_c == n {
+            2
+        } else {
+            1
+        };
+        let compatibility = artifact_compatibility(row, runtime, quant);
+        let score = (identity_rank, compatibility, id_c.len());
+        if best
+            .as_ref()
+            .map(|(current, current_id)| {
+                score > *current || (score == *current && row.id < *current_id)
+            })
+            .unwrap_or(true)
+        {
+            best = Some((score, row.id.clone()));
         }
     }
     best.map(|(_, id)| id)
+}
+
+/// Reject a format-qualified catalog identity when the on-disk quant proves a
+/// different format. This is intentionally limited to suffixes embedded in the
+/// row identity; a catalog row may legitimately expose several variants with
+/// different quants, so variant metadata itself is used for ranking, not
+/// blanket rejection.
+fn identity_declares_conflicting_quant(
+    row: &ff_db::ModelCatalogRow,
+    artifact_quant: Option<&str>,
+) -> bool {
+    let Some(artifact_quant) = artifact_quant else {
+        return false;
+    };
+    let canonical_quant = artifact_quant
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let identity = format!("{} {}", row.id, row.name).to_ascii_lowercase();
+
+    ["nvfp4", "fp4", "fp8", "bf16", "fp16"]
+        .into_iter()
+        .find(|marker| identity.contains(marker))
+        .is_some_and(|declared| canonical_quant != declared)
+}
+
+/// Rank a catalog row by how specifically one of its declared variants matches
+/// the discovered artifact. Missing metadata is neutral; it never beats an
+/// explicit runtime+quant match.
+fn artifact_compatibility(
+    row: &ff_db::ModelCatalogRow,
+    runtime: Option<&str>,
+    quant: Option<&str>,
+) -> u8 {
+    let normalize = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let runtime = runtime.map(normalize);
+    let quant = quant.map(normalize);
+
+    row.variants
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|variant| {
+            let runtime_match = runtime.as_ref().is_some_and(|wanted| {
+                variant
+                    .get("runtime")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| normalize(value) == *wanted)
+            });
+            let quant_match = quant.as_ref().is_some_and(|wanted| {
+                variant
+                    .get("quant")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| normalize(value) == *wanted)
+            });
+            u8::from(runtime_match) + 2 * u8::from(quant_match)
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Lowercase, replace non-alphanumeric with `-`, collapse repeats.
@@ -553,6 +657,16 @@ mod tests {
         }
     }
 
+    fn row_with_variants(
+        id: &str,
+        name: &str,
+        variants: serde_json::Value,
+    ) -> ff_db::ModelCatalogRow {
+        let mut row = row(id, name);
+        row.variants = variants;
+        row
+    }
+
     #[test]
     fn match_catalog_prefers_longer_id() {
         let cat = vec![
@@ -565,6 +679,79 @@ mod tests {
             match_catalog("qwen3-coder-30b-instruct", &cat),
             Some("qwen3-coder-30b".to_string())
         );
+    }
+
+    #[test]
+    fn exact_identity_outranks_longer_format_suffix() {
+        let cat = vec![
+            row("qwen36-35b-a3b", "Qwen3.6-35B-A3B"),
+            row("qwen3-6-35b-a3b-nvfp4", "Qwen3.6-35B-A3B-NVFP4"),
+        ];
+        assert_eq!(
+            match_catalog("qwen3.6-35b-a3b", &cat),
+            Some("qwen36-35b-a3b".to_string())
+        );
+    }
+
+    #[test]
+    fn artifact_metadata_breaks_canonical_id_tie() {
+        let cat = vec![
+            row("qwen3-6-35b-a3b", "Qwen3.6-35B-A3B"),
+            row_with_variants(
+                "qwen36-35b-a3b",
+                "Qwen3.6-35B-A3B-Instruct",
+                serde_json::json!([{
+                    "runtime": "llama.cpp",
+                    "quant": "Q4_K_M",
+                    "hf_repo": "Qwen/Qwen3.6-35B-A3B-Instruct-GGUF"
+                }]),
+            ),
+        ];
+        assert_eq!(
+            match_catalog_for_artifact("qwen3.6-35b-a3b", &cat, Some("llama.cpp"), Some("Q4_K_M")),
+            Some("qwen36-35b-a3b".to_string())
+        );
+    }
+
+    #[test]
+    fn incompatible_format_qualified_identity_is_rejected() {
+        let cat = vec![row("qwen3-6-35b-a3b-nvfp4", "Qwen3.6-35B-A3B-NVFP4")];
+        assert_eq!(
+            match_catalog_for_artifact("qwen3.6-35b-a3b", &cat, Some("llama.cpp"), Some("Q4_K_M")),
+            None
+        );
+    }
+
+    #[test]
+    fn nested_precision_marker_does_not_conflict_with_itself() {
+        let nvfp4 = row("qwen3-6-35b-a3b-nvfp4", "Qwen3.6-35B-A3B-NVFP4");
+        assert!(!identity_declares_conflicting_quant(&nvfp4, Some("NVFP4")));
+    }
+
+    #[test]
+    fn qwen36_q4_directory_resolves_to_curated_runtime_variant() {
+        let temp = tempfile::tempdir().unwrap();
+        let model = temp.path().join("qwen3.6-35b");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(model.join("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"), b"gguf").unwrap();
+
+        let catalog = vec![
+            row("qwen3-6-35b-a3b", "Qwen3.6-35B-A3B"),
+            row_with_variants(
+                "qwen36-35b-a3b",
+                "Qwen3.6-35B-A3B-Instruct",
+                serde_json::json!([{
+                    "runtime": "llama.cpp",
+                    "quant": "Q4_K_M"
+                }]),
+            ),
+            row("qwen3-6-35b-a3b-nvfp4", "Qwen3.6-35B-A3B-NVFP4"),
+        ];
+
+        let discovered = classify_dir(&model, &catalog).expect("GGUF directory classified");
+        assert_eq!(discovered.catalog_id, "qwen36-35b-a3b");
+        assert_eq!(discovered.runtime, "llama.cpp");
+        assert_eq!(discovered.quant.as_deref(), Some("Q4_K_M"));
     }
 
     #[test]
