@@ -181,6 +181,13 @@ pub struct HardwareInfo {
     pub ram_gb: i32,
     pub disk_gb: i32,
     pub gpu: Option<String>,
+    /// ROCm/HIP platform version reported by AMD Linux hosts.
+    ///
+    /// Optional for rolling-upgrade compatibility and for transient probe
+    /// failures; materialization treats absence as "preserve the last known
+    /// good value", never as an instruction to clear it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rocm_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -489,6 +496,7 @@ impl PulseBeatV2 {
                 ram_gb: 0,
                 disk_gb: 0,
                 gpu: None,
+                rocm_version: None,
             },
             load: LoadInfo {
                 cpu_pct: 0.0,
@@ -729,12 +737,17 @@ mod tests {
         ] {
             obj.remove(later_field);
         }
+        obj.get_mut("hardware")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("hardware is an object")
+            .remove("rocm_version");
         let parsed: PulseBeatV2 =
             serde_json::from_value(json.clone()).expect("older-format beat must deserialize");
         assert_eq!(parsed.computer_name, "test-node-fake");
         assert!(parsed.encountered_bugs.is_empty());
         assert!(parsed.install_diff.is_empty());
         assert!(parsed.build_sha.is_none());
+        assert!(parsed.hardware.rocm_version.is_none());
 
         // Newer-generation sender: an unknown field must be ignored, not fatal.
         json.as_object_mut().unwrap().insert(

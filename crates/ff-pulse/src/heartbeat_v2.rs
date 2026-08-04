@@ -255,12 +255,14 @@ impl HeartbeatV2Publisher {
                 let (disk_total, disk_used) = aggregate_disks(&disks);
                 let disk_total_gb = (disk_total as f64 / 1_073_741_824.0) as i32;
                 let disk_free_gb = disk_total.saturating_sub(disk_used) as f64 / 1_073_741_824.0;
+                let gpu_kind = detect_gpu_kind();
 
                 beat.hardware = HardwareInfo {
                     cpu_cores,
                     ram_gb: ram_total_gb,
                     disk_gb: disk_total_gb,
-                    gpu: detect_gpu_model(),
+                    gpu: detect_gpu_model(&gpu_kind),
+                    rocm_version: detect_rocm_version(&gpu_kind),
                 };
 
                 beat.load = LoadInfo {
@@ -306,7 +308,6 @@ impl HeartbeatV2Publisher {
                 beat.source_tree_path = detect_source_tree_path(beat.role_claimed == "leader");
 
                 // ── Capabilities ─────────────────────────────────────────────
-                let gpu_kind = detect_gpu_kind();
                 let gpu_count = if gpu_kind == "none" { 0 } else { 1 };
                 let (gpu_vram_gb, gpu_total_vram_gb) =
                     detect_gpu_vram_gb(&gpu_kind, &beat.os.family);
@@ -1098,28 +1099,192 @@ fn local_total_ram_gb() -> Option<f64> {
     None
 }
 
-fn detect_gpu_model() -> Option<String> {
-    match std::env::consts::OS {
-        "macos" if std::env::consts::ARCH == "aarch64" => {
+fn clean_probe_value(value: &str) -> Option<String> {
+    let value = value.trim().trim_matches('"').trim();
+    if value.is_empty()
+        || matches!(
+            value.to_ascii_lowercase().as_str(),
+            "n/a" | "na" | "none" | "unknown" | "not available"
+        )
+    {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn value_after_label(line: &str, label: &str) -> Option<String> {
+    let offset = line.find(label)? + label.len();
+    clean_probe_value(&line[offset..])
+}
+
+/// Parse `rocm-smi --showproductname`, preferring its human-readable card
+/// series. Some releases also emit `Marketing Name`; `Card model` is retained
+/// only as a last resort when it is descriptive rather than a hexadecimal PCI
+/// identifier.
+fn parse_rocm_smi_gpu_model(output: &str) -> Option<String> {
+    let mut series = None;
+    let mut marketing = None;
+    let mut model = None;
+
+    for line in output.lines() {
+        series = series.or_else(|| value_after_label(line, "Card series:"));
+        marketing = marketing.or_else(|| value_after_label(line, "Marketing Name:"));
+        model = model.or_else(|| {
+            value_after_label(line, "Card model:").filter(|value| {
+                !value.to_ascii_lowercase().starts_with("0x")
+                    && value.chars().any(char::is_alphabetic)
+            })
+        });
+    }
+
+    series.or(marketing).or(model)
+}
+
+#[derive(Default)]
+struct RocmAgentIdentity {
+    is_gpu: bool,
+    marketing_name: Option<String>,
+    name: Option<String>,
+}
+
+fn record_rocm_gpu_identity(
+    agent: &RocmAgentIdentity,
+    marketing_name: &mut Option<String>,
+    name: &mut Option<String>,
+) {
+    if !agent.is_gpu {
+        return;
+    }
+    if marketing_name.is_none() {
+        *marketing_name = agent.marketing_name.clone();
+    }
+    if name.is_none() {
+        *name = agent
+            .name
+            .as_ref()
+            .filter(|value| value.to_ascii_lowercase().starts_with("gfx"))
+            .cloned();
+    }
+}
+
+/// Parse rocminfo by agent block so a CPU's AMD marketing name can never be
+/// mistaken for a GPU. Prefer a human marketing name across GPU agents, then
+/// fall back to the first `gfx*` architecture identifier.
+fn parse_rocminfo_gpu_model(output: &str) -> Option<String> {
+    let mut current = RocmAgentIdentity::default();
+    let mut marketing_name = None;
+    let mut name = None;
+
+    for line in output.lines() {
+        let line = line.trim();
+        if line.starts_with("Agent ") {
+            record_rocm_gpu_identity(&current, &mut marketing_name, &mut name);
+            current = RocmAgentIdentity::default();
+            continue;
+        }
+
+        let Some((field, value)) = line.split_once(':') else {
+            continue;
+        };
+        match field.trim() {
+            "Device Type" => current.is_gpu = value.trim() == "GPU",
+            "Marketing Name" => current.marketing_name = clean_probe_value(value),
+            "Name" => current.name = clean_probe_value(value),
+            _ => {}
+        }
+    }
+    record_rocm_gpu_identity(&current, &mut marketing_name, &mut name);
+
+    marketing_name.or(name)
+}
+
+fn parse_rocm_version(output: &str) -> Option<String> {
+    for line in output.lines() {
+        for label in ["HIP version:", "ROCm version:", "ROCm Version:"] {
+            if let Some(value) = value_after_label(line, label)
+                && let Some(version) = value.split_whitespace().next()
+            {
+                let version =
+                    version.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.');
+                if version.contains('.') && version.chars().any(|c| c.is_ascii_digit()) {
+                    return Some(version.to_string());
+                }
+            }
+        }
+    }
+
+    // `/opt/rocm/.info/version` is a single bare version token.
+    let mut non_blank = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let value = non_blank.next()?;
+    if non_blank.next().is_none()
+        && !value.contains(char::is_whitespace)
+        && value.contains('.')
+        && value.chars().any(|c| c.is_ascii_digit())
+    {
+        clean_probe_value(value)
+    } else {
+        None
+    }
+}
+
+fn rocm_program(name: &str) -> std::path::PathBuf {
+    let installed = std::path::Path::new("/opt/rocm/bin").join(name);
+    if installed.is_file() {
+        installed
+    } else {
+        name.into()
+    }
+}
+
+fn successful_command_stdout(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+) -> Option<String> {
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    command_output_with_timeout(&mut command, 3)
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn detect_gpu_model(gpu_kind: &str) -> Option<String> {
+    match (std::env::consts::OS, gpu_kind) {
+        ("macos", "apple_silicon") => {
             // Could parse `system_profiler SPDisplaysDataType` but that's slow.
-            // Return a generic label; precise model filled in by a later phase.
             Some("Apple Silicon GPU (Metal)".to_string())
         }
-        "linux" => command_output_with_timeout(
-            std::process::Command::new("nvidia-smi")
-                .args(["--query-gpu=name", "--format=csv,noheader"]),
-            3,
-        )
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .next()
-                .map(|s| s.trim().to_string())
-        })
-        .filter(|s| !s.is_empty()),
+        ("linux", "nvidia_cuda") => {
+            successful_command_stdout("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"])
+                .and_then(|output| output.lines().find_map(clean_probe_value))
+        }
+        ("linux", "amd_rocm") => {
+            let smi = successful_command_stdout(rocm_program("rocm-smi"), &["--showproductname"])
+                .and_then(|output| parse_rocm_smi_gpu_model(&output));
+            smi.or_else(|| {
+                successful_command_stdout(rocm_program("rocminfo"), &[])
+                    .and_then(|output| parse_rocminfo_gpu_model(&output))
+            })
+        }
         _ => None,
     }
+}
+
+fn detect_rocm_version(gpu_kind: &str) -> Option<String> {
+    if std::env::consts::OS != "linux" || gpu_kind != "amd_rocm" {
+        return None;
+    }
+
+    std::fs::read_to_string("/opt/rocm/.info/version")
+        .ok()
+        .and_then(|output| parse_rocm_version(&output))
+        .or_else(|| {
+            successful_command_stdout(rocm_program("hipconfig"), &["--version"])
+                .and_then(|output| parse_rocm_version(&output))
+        })
 }
 
 fn detect_primary_ip() -> String {
@@ -1781,6 +1946,75 @@ Agent 1
             classify_linux_gpu_probe_results(false, false, Some("Marketing Name: Radeon")),
             "none"
         );
+    }
+
+    #[test]
+    fn rocminfo_model_parser_ignores_cpu_and_prefers_gpu_marketing_name() {
+        let output = "\
+Agent 1
+  Name:                    cpu
+  Marketing Name:          AMD Ryzen AI MAX+ 395
+  Device Type:             CPU
+Agent 2
+  Name:                    gfx1151
+  Marketing Name:          Radeon 8060S Graphics
+  Device Type:             GPU
+";
+        assert_eq!(
+            parse_rocminfo_gpu_model(output).as_deref(),
+            Some("Radeon 8060S Graphics")
+        );
+        assert_eq!(
+            parse_rocminfo_gpu_model(
+                "Agent 1\n Name: cpu\n Marketing Name: AMD Ryzen\n Device Type: CPU\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rocminfo_model_parser_falls_back_to_gpu_gfx_name() {
+        let output = "\
+Agent 1
+  Name:                    gfx1151
+  Marketing Name:
+  Device Type:             GPU
+";
+        assert_eq!(parse_rocminfo_gpu_model(output).as_deref(), Some("gfx1151"));
+    }
+
+    #[test]
+    fn rocm_smi_model_parser_prefers_series_and_rejects_hex_only_model() {
+        let output = "\
+GPU[0]          : Card model:          0x15bf
+GPU[0]          : Card series:         AMD Radeon 8060S Graphics
+";
+        assert_eq!(
+            parse_rocm_smi_gpu_model(output).as_deref(),
+            Some("AMD Radeon 8060S Graphics")
+        );
+        assert_eq!(
+            parse_rocm_smi_gpu_model("GPU[0] : Card model: 0x15bf\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn rocm_version_parser_accepts_file_and_hipconfig_formats_only() {
+        assert_eq!(
+            parse_rocm_version("7.1.0-66\n").as_deref(),
+            Some("7.1.0-66")
+        );
+        assert_eq!(
+            parse_rocm_version("HIP version: 7.1.51831-1234\n").as_deref(),
+            Some("7.1.51831-1234")
+        );
+        assert_eq!(
+            parse_rocm_version("ROCm Version: 7.1.0 build 66\n").as_deref(),
+            Some("7.1.0")
+        );
+        assert_eq!(parse_rocm_version("\n\t\n"), None);
+        assert_eq!(parse_rocm_version("ROCm tools installed\n"), None);
     }
 
     #[test]

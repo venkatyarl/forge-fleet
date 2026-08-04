@@ -420,6 +420,7 @@ mod tests {
                 ram_gb: 32,
                 disk_gb: 500,
                 gpu: Some("Apple M3 Max".to_string()),
+                rocm_version: None,
             },
             load: LoadInfo {
                 cpu_pct: 10.0,

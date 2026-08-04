@@ -56,6 +56,22 @@ ON CONFLICT (id) DO UPDATE SET \
     gpu_total_vram_gb = EXCLUDED.gpu_total_vram_gb, \
     has_gpu = EXCLUDED.has_gpu";
 
+/// Stable accelerator identity is healed independently of the main computers
+/// upsert so it also runs on Redis's last-seen-only fast path. NULL/blank
+/// reports retain the existing value: a transient local probe failure is not
+/// evidence that the installed GPU or ROCm platform disappeared.
+const HEAL_GPU_METADATA_SQL: &str = "UPDATE computers SET \
+    gpu_model = COALESCE(NULLIF(BTRIM($1::text), ''), gpu_model), \
+    rocm_version = COALESCE(NULLIF(BTRIM($2::text), ''), rocm_version) \
+WHERE id = $3 AND (\
+    gpu_model IS DISTINCT FROM COALESCE(NULLIF(BTRIM($1::text), ''), gpu_model) \
+    OR rocm_version IS DISTINCT FROM COALESCE(NULLIF(BTRIM($2::text), ''), rocm_version)\
+)";
+
+fn non_blank_reported_value(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 // -----------------------------------------------------------------------------
 // Errors
 // -----------------------------------------------------------------------------
@@ -537,6 +553,21 @@ impl Materializer {
             .bind(computer_id)
             .execute(&self.pg)
             .await;
+        }
+
+        // Stable GPU identity/version self-heal. Keep this before the Redis
+        // fast path because these optional rolling-upgrade fields deliberately
+        // stay outside PersistedSnapshot. The SQL repeats the blank guard as
+        // defense in depth even though values are normalized here.
+        let gpu_model = non_blank_reported_value(beat.hardware.gpu.as_deref());
+        let rocm_version = non_blank_reported_value(beat.hardware.rocm_version.as_deref());
+        if gpu_model.is_some() || rocm_version.is_some() {
+            sqlx::query(HEAL_GPU_METADATA_SQL)
+                .bind(gpu_model)
+                .bind(rocm_version)
+                .bind(computer_id)
+                .execute(&self.pg)
+                .await?;
         }
 
         // Subsystem liveness is intentionally outside PersistedSnapshot: it
@@ -1857,6 +1888,7 @@ mod tests {
             ram_gb: 32,
             disk_gb: 500,
             gpu: None,
+            rocm_version: None,
         };
         b.capabilities = Capabilities {
             can_serve_ff_gateway: true,
@@ -2255,6 +2287,27 @@ mod tests {
                 "atomic computers upsert must set {col}"
             );
         }
+    }
+
+    #[test]
+    fn gpu_metadata_heal_preserves_known_good_values_on_blank_probe() {
+        assert_eq!(non_blank_reported_value(None), None);
+        assert_eq!(non_blank_reported_value(Some("")), None);
+        assert_eq!(non_blank_reported_value(Some("  \t\n")), None);
+        assert_eq!(
+            non_blank_reported_value(Some("  ROCm 7.1.0  ")),
+            Some("ROCm 7.1.0")
+        );
+
+        for (parameter, column) in [("$1::text", "gpu_model"), ("$2::text", "rocm_version")] {
+            let preserving_assignment =
+                format!("{column} = COALESCE(NULLIF(BTRIM({parameter}), ''), {column})");
+            assert!(
+                HEAL_GPU_METADATA_SQL.contains(&preserving_assignment),
+                "{column} must preserve its known-good value for NULL/blank input"
+            );
+        }
+        assert!(HEAL_GPU_METADATA_SQL.contains("IS DISTINCT FROM"));
     }
 
     #[test]
