@@ -31,9 +31,9 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::task_runner::pg_enqueue_shell_task;
+use crate::task_runner::{EnqueueOnceOutcome, pg_enqueue_shell_task_once};
 
 /// One row in the OAuth provider catalog. Drives the import + distribute
 /// + status logic — provider-agnostic from a single source of truth.
@@ -104,6 +104,71 @@ pub const REFRESH_POLL_SECS: u64 = 30;
 /// reading its credential file lets its native refresh-token flow run; ff then
 /// copies the resulting complete credential document to peers.
 const AUTO_REFRESH_PROVIDERS: &[&str] = &["claude", "codex", "kimi"];
+
+/// Emergency kill switch for every autonomous OAuth task producer.
+///
+/// Missing rows preserve the historical enabled behavior. A TTL-expired
+/// temporary disable restores to enabled. Any database/read error fails closed
+/// so an unavailable gate authority cannot create another queue flood.
+pub const OAUTH_DISTRIBUTION_ENABLED_KEY: &str = "oauth_distribution_enabled";
+const OAUTH_DISTRIBUTION_DEFAULT: bool = true;
+const OAUTH_DISTRIBUTION_RESTORE_ON_EXPIRY: bool = true;
+
+const OAUTH_BACKLOG_CANCEL_SQL: &str = "UPDATE fleet_tasks
+        SET status = 'cancelled',
+            completed_at = COALESCE(completed_at, NOW()),
+            progress_message = 'cancelled by ff oauth cancel-backlog'
+      WHERE task_type = 'shell'
+        AND status IN ('pending', 'dispatchable')
+        AND (
+            summary LIKE 'oauth-repush/%'
+            OR summary LIKE 'oauth-distribute/%'
+        )";
+const OAUTH_BACKLOG_COUNT_SQL: &str = "SELECT COUNT(*)::bigint
+       FROM fleet_tasks
+      WHERE task_type = 'shell'
+        AND status IN ('pending', 'dispatchable')
+        AND (
+            summary LIKE 'oauth-repush/%'
+            OR summary LIKE 'oauth-distribute/%'
+        )";
+
+fn resolve_oauth_distribution_gate<E>(result: std::result::Result<bool, E>) -> bool
+where
+    E: std::fmt::Display,
+{
+    match result {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            warn!(
+                key = OAUTH_DISTRIBUTION_ENABLED_KEY,
+                %error,
+                "OAuth distribution gate read failed; refusing new tasks"
+            );
+            false
+        }
+    }
+}
+
+pub async fn oauth_distribution_enabled(pool: &PgPool) -> bool {
+    resolve_oauth_distribution_gate(
+        ff_db::pg_read_safety_gate(
+            pool,
+            OAUTH_DISTRIBUTION_ENABLED_KEY,
+            OAUTH_DISTRIBUTION_DEFAULT,
+            OAUTH_DISTRIBUTION_RESTORE_ON_EXPIRY,
+        )
+        .await,
+    )
+}
+
+fn oauth_distribute_enqueue_key(provider: &str, target_id: uuid::Uuid) -> String {
+    format!("oauth-distribute:{provider}:{target_id}")
+}
+
+fn oauth_repush_enqueue_key(provider: &str, leader_id: uuid::Uuid) -> String {
+    format!("oauth-repush:{provider}:{leader_id}")
+}
 
 /// Read the password value of a macOS Keychain generic-password entry
 /// via `security find-generic-password -s <service> -a $USER -w`. Used
@@ -306,12 +371,21 @@ pub async fn import_token(pool: &PgPool, provider: &OauthProvider) -> Result<()>
 
 /// Push the full credential file to every fleet member's matching path.
 ///
-/// Uses base64 of the file contents and `pg_enqueue_shell_task` to fan
+/// Uses base64 of the file contents and `pg_enqueue_shell_task_once` to fan
 /// out via the existing wave dispatcher. Each per-target task writes the
 /// decoded payload to the target's `<cred_path>` (with `mode 0600`) so
 /// the local CLI sees the same login the leader did. Members without
 /// the directory get it created (`mkdir -p`) before write.
 pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result<usize> {
+    if !oauth_distribution_enabled(pool).await {
+        warn!(
+            provider = provider.name,
+            key = OAUTH_DISTRIBUTION_ENABLED_KEY,
+            "OAuth distribution disabled; no fleet tasks enqueued"
+        );
+        return Ok(0);
+    }
+
     // Keychain-first (macOS claude) / file source — same resolver as
     // `import_token`, so a macOS leader can fan out its Keychain-held claude
     // creds instead of failing on a nonexistent `~/.claude/.credentials.json`.
@@ -413,8 +487,10 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
             ssh_bypass = crate::ssh_opts::SSH_AGENT_BYPASS,
         );
 
-        pg_enqueue_shell_task(
+        let enqueue_once_key = oauth_distribute_enqueue_key(provider.name, id);
+        let outcome = pg_enqueue_shell_task_once(
             pool,
+            &enqueue_once_key,
             &format!(
                 "oauth-distribute/{}: {} → {}",
                 provider.name, provider.name, name
@@ -428,7 +504,16 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
         )
         .await
         .with_context(|| format!("enqueue distribute task for {name}"))?;
-        enqueued += 1;
+        if outcome.was_enqueued() {
+            enqueued += 1;
+        } else {
+            debug!(
+                provider = provider.name,
+                target = %name,
+                task_id = %outcome.task_id(),
+                "OAuth distribute task already active; duplicate suppressed"
+            );
+        }
     }
 
     info!(
@@ -436,6 +521,58 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
         enqueued, "OAuth distribute tasks enqueued"
     );
     Ok(enqueued)
+}
+
+/// Result of the narrowly-scoped OAuth queue cleanup verb.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct OauthBacklogCancellation {
+    /// Number of pending/dispatchable OAuth tasks matched by the operation.
+    pub eligible: u64,
+    /// Number actually moved to `cancelled` (`0` for a dry run).
+    pub cancelled: u64,
+    pub applied: bool,
+}
+
+/// Preview or cancel only the unstarted OAuth repush/distribute backlog.
+///
+/// Both paths use one transaction. Apply mode uses a single guarded `UPDATE`,
+/// so a row that races to `running` before its lock is acquired is re-checked
+/// and left untouched. Running, completed, failed, and already-cancelled rows
+/// are never eligible.
+pub async fn cancel_oauth_task_backlog(
+    pool: &PgPool,
+    apply: bool,
+) -> Result<OauthBacklogCancellation> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin OAuth backlog transaction")?;
+    if apply {
+        let result = sqlx::query(OAUTH_BACKLOG_CANCEL_SQL)
+            .execute(&mut *tx)
+            .await
+            .context("cancel pending OAuth task backlog")?;
+        let cancelled = result.rows_affected();
+        tx.commit()
+            .await
+            .context("commit OAuth backlog cancellation")?;
+        Ok(OauthBacklogCancellation {
+            eligible: cancelled,
+            cancelled,
+            applied: true,
+        })
+    } else {
+        let eligible: i64 = sqlx::query_scalar(OAUTH_BACKLOG_COUNT_SQL)
+            .fetch_one(&mut *tx)
+            .await
+            .context("count pending OAuth task backlog")?;
+        tx.commit().await.context("finish OAuth backlog dry run")?;
+        Ok(OauthBacklogCancellation {
+            eligible: u64::try_from(eligible).unwrap_or(0),
+            cancelled: 0,
+            applied: false,
+        })
+    }
 }
 
 /// Per-provider snapshot of the leader's local state + fleet_secrets entry.
@@ -508,6 +645,9 @@ pub async fn probe_all(pool: &PgPool) -> Vec<ProbeResult> {
 /// the complete refreshed credential. Import still runs after a failed probe:
 /// some CLIs rotate credentials before returning a non-zero diagnostic.
 pub async fn refresh_and_distribute(pool: &PgPool, provider: &OauthProvider) -> Result<usize> {
+    if !oauth_distribution_enabled(pool).await {
+        return Ok(0);
+    }
     let probe = probe_one(pool, provider).await;
     if probe.status != "ok" {
         warn!(provider = provider.name, status = %probe.status, detail = ?probe.message,
@@ -522,6 +662,9 @@ pub async fn refresh_and_distribute(pool: &PgPool, provider: &OauthProvider) -> 
 /// the leader-side task is naturally serialized by the fleet task runner.
 pub async fn validate_startup_and_request_repush(pool: &PgPool, worker_name: &str) {
     if crate::leader_cache::is_current_leader() {
+        return;
+    }
+    if !oauth_distribution_enabled(pool).await {
         return;
     }
     let leader = match ff_db::pg_get_current_leader(pool).await {
@@ -552,8 +695,10 @@ pub async fn validate_startup_and_request_repush(pool: &PgPool, worker_name: &st
         }
         let title = format!("oauth-repush/{} requested-by {worker_name}", provider.name);
         let command = format!("ff oauth refresh {}", provider.name);
-        if let Err(error) = pg_enqueue_shell_task(
+        let enqueue_once_key = oauth_repush_enqueue_key(provider.name, leader.computer_id);
+        let outcome = pg_enqueue_shell_task_once(
             pool,
+            &enqueue_once_key,
             &title,
             &command,
             &[],
@@ -562,12 +707,19 @@ pub async fn validate_startup_and_request_repush(pool: &PgPool, worker_name: &st
             90,
             None,
         )
-        .await
-        {
-            warn!(provider = provider.name, %error, "failed to request OAuth re-push from leader");
-        } else {
-            warn!(provider = provider.name, status = %probe.status,
-                "startup OAuth validation failed; requested leader re-push");
+        .await;
+        match outcome {
+            Err(error) => {
+                warn!(provider = provider.name, %error, "failed to request OAuth re-push from leader");
+            }
+            Ok(EnqueueOnceOutcome::Enqueued(task_id)) => {
+                warn!(provider = provider.name, status = %probe.status, %task_id,
+                    "startup OAuth validation failed; requested leader re-push");
+            }
+            Ok(EnqueueOnceOutcome::AlreadyActive(task_id)) => {
+                debug!(provider = provider.name, status = %probe.status, %task_id,
+                    "startup OAuth validation failed; leader re-push already active");
+            }
         }
     }
 }
@@ -588,6 +740,9 @@ pub fn spawn_oauth_probe_tick(
             tokio::select! {
                 _ = ticker.tick() => {
                     if !crate::leader_cache::is_current_leader() {
+                        continue;
+                    }
+                    if !oauth_distribution_enabled(&pg).await {
                         continue;
                     }
 
@@ -745,4 +900,78 @@ pub fn spawn_refresh_watch(pool: PgPool, mut shutdown: watch::Receiver<bool>) ->
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distribution_gate_defaults_and_ttl_restore_enabled_but_errors_fail_closed() {
+        assert!(OAUTH_DISTRIBUTION_DEFAULT);
+        assert!(OAUTH_DISTRIBUTION_RESTORE_ON_EXPIRY);
+        assert!(resolve_oauth_distribution_gate(Ok::<bool, anyhow::Error>(
+            true
+        )));
+        assert!(!resolve_oauth_distribution_gate(Ok::<bool, anyhow::Error>(
+            false
+        )));
+        assert!(!resolve_oauth_distribution_gate(Err(anyhow::anyhow!(
+            "gate database unavailable"
+        ))));
+    }
+
+    #[test]
+    fn enqueue_once_keys_scope_repush_and_distribution_independently() {
+        let leader = uuid::Uuid::nil();
+        let target = uuid::Uuid::from_u128(1);
+        assert_eq!(
+            oauth_repush_enqueue_key("codex", leader),
+            format!("oauth-repush:codex:{leader}")
+        );
+        assert_eq!(
+            oauth_distribute_enqueue_key("codex", target),
+            format!("oauth-distribute:codex:{target}")
+        );
+        assert_ne!(
+            oauth_distribute_enqueue_key("codex", target),
+            oauth_distribute_enqueue_key("kimi", target)
+        );
+    }
+
+    #[test]
+    fn backlog_cleanup_sql_is_narrow_and_never_names_running_or_terminal_statuses() {
+        for sql in [OAUTH_BACKLOG_COUNT_SQL, OAUTH_BACKLOG_CANCEL_SQL] {
+            assert!(sql.contains("task_type = 'shell'"));
+            assert!(sql.contains("status IN ('pending', 'dispatchable')"));
+            assert!(sql.contains("summary LIKE 'oauth-repush/%'"));
+            assert!(sql.contains("summary LIKE 'oauth-distribute/%'"));
+            assert!(!sql.contains("status IN ('running'"));
+            assert!(!sql.contains("status IN ('completed'"));
+        }
+    }
+
+    #[test]
+    fn both_autonomous_producers_check_the_gate_before_enqueuing() {
+        let source = include_str!("oauth_distributor.rs");
+        let startup = source
+            .split("pub async fn validate_startup_and_request_repush")
+            .nth(1)
+            .expect("startup producer")
+            .split("pub fn spawn_oauth_probe_tick")
+            .next()
+            .expect("startup body");
+        assert!(startup.contains("oauth_distribution_enabled(pool).await"));
+        assert!(startup.contains("pg_enqueue_shell_task_once"));
+
+        let periodic = source
+            .split("pub fn spawn_oauth_probe_tick")
+            .nth(1)
+            .expect("periodic producer")
+            .split("pub async fn probe_one")
+            .next()
+            .expect("periodic body");
+        assert!(periodic.contains("oauth_distribution_enabled(&pg).await"));
+        assert!(periodic.contains("refresh_and_distribute(&pg, provider).await"));
+    }
 }

@@ -12587,6 +12587,21 @@ ALTER TABLE fabric_pairs
     ADD COLUMN IF NOT EXISTS endpoints_explicit BOOLEAN NOT NULL DEFAULT FALSE;
 "#;
 
+/// v286: emergency kill switch for autonomous OAuth refresh/distribution task
+/// producers. Existing fleets keep the historical enabled posture, while
+/// `ff secrets disable-gate oauth_distribution_enabled ...` can fence every
+/// producer during credential recovery. Never overwrite an operator-set row.
+pub const SCHEMA_V286_OAUTH_DISTRIBUTION_GATE: &str = r#"
+INSERT INTO fleet_secrets (key, value, description, updated_by)
+VALUES (
+    'oauth_distribution_enabled',
+    'true',
+    'Allow autonomous OAuth repush/distribution fleet task creation',
+    'migration-v286'
+)
+ON CONFLICT (key) DO NOTHING;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

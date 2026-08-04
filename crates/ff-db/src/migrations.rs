@@ -1275,6 +1275,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "ring_safe_fabric",
         sql: schema::SCHEMA_V285_RING_SAFE_FABRIC,
     },
+    PgMigration {
+        version: 286,
+        name: "oauth_distribution_gate",
+        sql: schema::SCHEMA_V286_OAUTH_DISTRIBUTION_GATE,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -3073,5 +3078,17 @@ mod tests {
                 .sql
                 .contains("guard_project_digest_cursor_regression")
         );
+    }
+
+    #[test]
+    fn v286_seeds_oauth_distribution_gate_without_overwriting_operator_state() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 286)
+            .expect("V286 must be registered");
+        assert_eq!(migration.name, "oauth_distribution_gate");
+        assert!(migration.sql.contains("'oauth_distribution_enabled'"));
+        assert!(migration.sql.contains("'true'"));
+        assert!(migration.sql.contains("ON CONFLICT (key) DO NOTHING"));
     }
 }

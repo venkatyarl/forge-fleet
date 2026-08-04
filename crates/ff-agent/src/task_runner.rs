@@ -936,6 +936,124 @@ pub async fn pg_enqueue_shell_task(
     .await
 }
 
+/// Result of an enqueue-once request.
+///
+/// Callers always receive the authoritative task id. `Enqueued` means this
+/// invocation created a new row; `AlreadyActive` means another process already
+/// owns the same logical task and no duplicate row was written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnqueueOnceOutcome {
+    Enqueued(uuid::Uuid),
+    AlreadyActive(uuid::Uuid),
+}
+
+impl EnqueueOnceOutcome {
+    pub fn task_id(self) -> uuid::Uuid {
+        match self {
+            Self::Enqueued(id) | Self::AlreadyActive(id) => id,
+        }
+    }
+
+    pub fn was_enqueued(self) -> bool {
+        matches!(self, Self::Enqueued(_))
+    }
+}
+
+/// Enqueue one logical shell task at most once while a prior row is active.
+///
+/// `enqueue_once_key` is a stable, caller-namespaced identity such as
+/// `oauth-distribute:kimi:<computer-id>`. The existing unique
+/// `fleet_tasks.dedup_signature` index is the durable identity authority; a
+/// transaction-scoped advisory lock serializes the terminal-row rollover so
+/// concurrent daemon restarts cannot both clear/reuse the signature.
+///
+/// Unknown statuses are treated as active (fail closed). Only a task in a
+/// known terminal state (`completed`, `failed`, `cancelled`) releases the key
+/// for a new historical row. The prior row is preserved; only its signature is
+/// cleared before the replacement is inserted in the same transaction.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_enqueue_shell_task_once(
+    pg: &PgPool,
+    enqueue_once_key: &str,
+    summary: &str,
+    command: &str,
+    capabilities: &[String],
+    preferred_computer: Option<&str>,
+    parent_task_id: Option<uuid::Uuid>,
+    priority: i32,
+    created_by_computer_id: Option<uuid::Uuid>,
+) -> Result<EnqueueOnceOutcome, sqlx::Error> {
+    let mut tx = pg.begin().await?;
+
+    // hashtextextended gives the text key a stable 64-bit advisory-lock
+    // namespace. The unique index remains the collision-proof authority; a
+    // hash collision merely serializes two unrelated enqueues briefly.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0::bigint))")
+        .bind(enqueue_once_key)
+        .execute(&mut *tx)
+        .await?;
+
+    let existing: Option<(uuid::Uuid, String)> = sqlx::query_as(
+        "SELECT id, status
+           FROM fleet_tasks
+          WHERE dedup_signature = $1
+          FOR UPDATE",
+    )
+    .bind(enqueue_once_key)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some((id, status)) = existing {
+        if !is_terminal_enqueue_once_status(&status) {
+            tx.commit().await?;
+            return Ok(EnqueueOnceOutcome::AlreadyActive(id));
+        }
+
+        // Preserve the terminal row as history while releasing the unique key
+        // for this new occurrence. This and the insert commit atomically.
+        sqlx::query(
+            "UPDATE fleet_tasks
+                SET dedup_signature = NULL
+              WHERE id = $1 AND dedup_signature = $2",
+        )
+        .bind(id)
+        .bind(enqueue_once_key)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    let id = pg_enqueue_shell_task_full_tx(
+        &mut tx,
+        summary,
+        command,
+        capabilities,
+        preferred_computer,
+        parent_task_id,
+        priority,
+        created_by_computer_id,
+        false,
+        &[],
+        None,
+        None,
+    )
+    .await?;
+    sqlx::query("UPDATE fleet_tasks SET dedup_signature = $2 WHERE id = $1")
+        .bind(id)
+        .bind(enqueue_once_key)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    // Transactional helper deliberately publishes only after commit so a
+    // consumer can never observe a row that later rolls back.
+    crate::nats_jetstream::publish_task_inserted(id).await;
+    Ok(EnqueueOnceOutcome::Enqueued(id))
+}
+
+fn is_terminal_enqueue_once_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled")
+}
+
 /// Like [`pg_enqueue_shell_task`] but with `wait_for_siblings`. When set,
 /// the row is only claimable when no non-barrier sibling under the same
 /// `parent_task_id` is still pending or running. Used by the two-phase
@@ -2869,7 +2987,7 @@ mod watchdog_threshold_tests {
 
 #[cfg(test)]
 mod shell_task_capability_tests {
-    use super::shell_task_capabilities;
+    use super::{EnqueueOnceOutcome, is_terminal_enqueue_once_status, shell_task_capabilities};
 
     #[test]
     fn enqueue_pretags_ff_commands_and_normalizes_explicit_tags() {
@@ -2885,5 +3003,27 @@ mod shell_task_capability_tests {
             vec!["ff", "leader"]
         );
         assert!(shell_task_capabilities("git status", &[]).is_empty());
+    }
+
+    #[test]
+    fn enqueue_once_releases_only_known_terminal_statuses() {
+        for terminal in ["completed", "failed", "cancelled"] {
+            assert!(is_terminal_enqueue_once_status(terminal));
+        }
+        for active_or_unknown in [
+            "pending",
+            "dispatchable",
+            "claimed",
+            "running",
+            "paused",
+            "new",
+        ] {
+            assert!(!is_terminal_enqueue_once_status(active_or_unknown));
+        }
+
+        let id = uuid::Uuid::nil();
+        assert_eq!(EnqueueOnceOutcome::Enqueued(id).task_id(), id);
+        assert!(EnqueueOnceOutcome::Enqueued(id).was_enqueued());
+        assert!(!EnqueueOnceOutcome::AlreadyActive(id).was_enqueued());
     }
 }

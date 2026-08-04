@@ -1779,6 +1779,14 @@ enum OauthCommand {
         #[arg(default_value = "all")]
         provider: String,
     },
+    /// Preview or cancel the unstarted OAuth task flood. Only `shell` tasks
+    /// whose summary begins `oauth-repush/` or `oauth-distribute/` and whose
+    /// status is `pending`/`dispatchable` are eligible. Running and terminal
+    /// rows are never touched. Dry-run unless `--apply` is explicit.
+    CancelBacklog {
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+    },
 }
 
 /// `ff fleet leader <action>` — HA leadership management (Phase 1).
@@ -5668,12 +5676,17 @@ async fn main() -> Result<()> {
             let pool = ff_agent::fleet_info::get_fleet_pool()
                 .await
                 .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
-            ff_db::run_postgres_migrations(&pool)
-                .await
-                .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+            // Queue cleanup must be a narrowly scoped operation. In
+            // particular, its default dry-run must not apply unrelated schema
+            // migrations as a side effect.
+            if !matches!(&command, OauthCommand::CancelBacklog { .. }) {
+                ff_db::run_postgres_migrations(&pool)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+            }
             use ff_agent::oauth_distributor::{
-                OAUTH_PROVIDERS, distribute_token, import_token, provider_by_name,
-                spawn_refresh_watch, status,
+                OAUTH_PROVIDERS, cancel_oauth_task_backlog, distribute_token, import_token,
+                provider_by_name, spawn_refresh_watch, status,
             };
             // Resolve `all` to every catalog entry; otherwise look up the
             // single named provider.
@@ -5840,6 +5853,24 @@ async fn main() -> Result<()> {
                             "{:<10} {GREEN}✓{RESET} refreshed and enqueued {n} re-push task(s)",
                             p.name
                         );
+                    }
+                    Ok(())
+                }
+                OauthCommand::CancelBacklog { apply } => {
+                    let result = cancel_oauth_task_backlog(&pool, apply)
+                        .await
+                        .context("OAuth task backlog cleanup")?;
+                    if result.applied {
+                        println!(
+                            "{GREEN}✓{RESET} cancelled {} pending/dispatchable OAuth repush/distribute task(s); running and terminal rows were untouched",
+                            result.cancelled
+                        );
+                    } else {
+                        println!(
+                            "{YELLOW}dry-run{RESET}: {} pending/dispatchable OAuth repush/distribute task(s) would be cancelled; running and terminal rows would be untouched",
+                            result.eligible
+                        );
+                        println!("rerun with `ff oauth cancel-backlog --apply` to apply");
                     }
                     Ok(())
                 }
@@ -6462,6 +6493,42 @@ mod free_prompt_guard_tests {
         // the multi-arg form does. Quoting must not change the verdict.
         assert!(guard(&["summarize the fleet state"]).is_none());
         assert!(guard(&["what is running on the fleet"]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod oauth_cli_guard_tests {
+    use super::{Cli, Command, OauthCommand};
+    use clap::Parser;
+
+    fn parse_cancel_backlog(args: &[&str]) -> bool {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(owned))
+            .expect("spawn parser thread")
+            .join()
+            .expect("parser thread panicked")
+            .expect("valid oauth cancel-backlog command")
+            .command
+            .and_then(|command| match command {
+                Command::Oauth {
+                    command: OauthCommand::CancelBacklog { apply },
+                } => Some(apply),
+                _ => None,
+            })
+            .expect("parsed OAuth cancel-backlog")
+    }
+
+    #[test]
+    fn oauth_backlog_cleanup_is_dry_run_unless_apply_is_explicit() {
+        assert!(!parse_cancel_backlog(&["ff", "oauth", "cancel-backlog"]));
+        assert!(parse_cancel_backlog(&[
+            "ff",
+            "oauth",
+            "cancel-backlog",
+            "--apply",
+        ]));
     }
 }
 
