@@ -71,6 +71,7 @@ const DEFAULT_RESERVE_BYTES: u64 = 20 * GIB;
 const POSTGRES_PROOF_IMAGE: &str = "pgvector/pgvector:pg16";
 const POSTGRES_PROOF_USER: &str = "forgefleet";
 const POSTGRES_PROOF_DATABASE: &str = "forgefleet";
+const POSTGRES_PROOF_QUERY: &str = "SELECT current_setting('server_version_num')::int / 10000 = 16 AND (SELECT count(*) > 0 FROM public.computers);";
 const DOCKER_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const POSTGRES_READY_TIMEOUT: Duration = Duration::from_secs(180);
 const PG_VERIFYBACKUP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -1625,7 +1626,7 @@ fn postgres_application_read_args(container: &str) -> Vec<String> {
         "-v",
         "ON_ERROR_STOP=1",
         "-c",
-        "SELECT current_setting('server_version_num')::int / 10000 = 16 AND (SELECT count(*) >= 0 FROM public.fleet_nodes);",
+        POSTGRES_PROOF_QUERY,
     ]
     .into_iter()
     .map(str::to_string)
@@ -1973,6 +1974,11 @@ mod tests {
             assert_eq!(args[user_index + 1], POSTGRES_PROOF_USER);
             assert_eq!(args[database_index + 1], POSTGRES_PROOF_DATABASE);
             assert!(!args.iter().any(|arg| arg == "postgres"));
+            if let Some(query_index) = args.iter().position(|arg| arg == "-c") {
+                assert_eq!(args[query_index + 1], POSTGRES_PROOF_QUERY);
+                assert!(POSTGRES_PROOF_QUERY.contains("public.computers"));
+                assert!(!POSTGRES_PROOF_QUERY.contains("fleet_nodes"));
+            }
         }
     }
 
