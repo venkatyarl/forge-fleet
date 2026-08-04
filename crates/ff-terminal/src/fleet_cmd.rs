@@ -590,6 +590,9 @@ pub async fn handle_fleet_db(pool: &sqlx::PgPool, cmd: FleetDbCommand) -> Result
         FleetDbCommand::Replica { command } => {
             crate::fleet_db_replica::handle(pool, command).await?;
         }
+        FleetDbCommand::RedisReplica { command } => {
+            crate::fleet_db_redis_replica::handle(pool, command).await?;
+        }
         FleetDbCommand::Failover { to, force, yes } => {
             handle_fleet_db_failover(pool, &to, force, yes).await?;
         }

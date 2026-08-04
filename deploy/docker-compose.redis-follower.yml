@@ -1,0 +1,57 @@
+# ForgeFleet Redis 7 follower template.
+#
+# This service is deliberately NOT a failover system. It is bound to loopback,
+# remains replica-read-only, refuses stale reads, and has no Sentinel or
+# promotion command. `ff fleet db redis-replica` verifies the authoritative
+# primary and the exact image before starting it.
+
+name: forgefleet-redis-follower
+
+services:
+  redis-replica:
+    # Immutable multi-architecture image identity. Advance only after a
+    # controlled backup/restore and replication compatibility test.
+    image: redis@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    container_name: forgefleet-redis-replica
+    # Host networking lets Redis bind only the host loopback interface. A
+    # bridge port publish would reach the container via eth0 and defeat that
+    # binding. The replica is recovery inventory, not a fleet read endpoint.
+    network_mode: host
+    command:
+      - redis-server
+      - --port
+      - "56380"
+      - --bind
+      - 127.0.0.1
+      - --protected-mode
+      - "yes"
+      - --replicaof
+      - ${REDIS_PRIMARY_HOST:?set REDIS_PRIMARY_HOST}
+      - ${REDIS_PRIMARY_PORT:-56379}
+      - --replica-read-only
+      - "yes"
+      - --replica-serve-stale-data
+      - "no"
+      - --save
+      - "60"
+      - "1"
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --loglevel
+      - warning
+    volumes:
+      - redis_replica_data:/data
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "127.0.0.1", "-p", "56380", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  redis_replica_data:
+    name: forgefleet-redis-replica-data

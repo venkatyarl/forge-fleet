@@ -24,6 +24,7 @@ ff-deploy = { path = "../ff-deploy" }
 ff-pulse = { path = "../ff-pulse" }
 ff-voice = { path = "../ff-voice" }
 sqlx = { workspace = true }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 
 ratatui = { version = "0.29", features = ["crossterm"] }
 crossterm = "0.29"

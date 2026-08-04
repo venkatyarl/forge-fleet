@@ -59,6 +59,7 @@ mod events_cmd;
 mod ext_cmd;
 mod fabric_cmd;
 mod fleet_cmd;
+mod fleet_db_redis_replica;
 mod fleet_db_replica;
 mod github_cmd;
 mod health_cmd;
@@ -2363,6 +2364,12 @@ pub enum FleetDbCommand {
         #[command(subcommand)]
         command: FleetDbReplicaCommand,
     },
+    /// Plan or apply a loopback-only Redis streaming replica bootstrap.
+    /// Priya remains authoritative; this never promotes or fails over Redis.
+    RedisReplica {
+        #[command(subcommand)]
+        command: FleetDbRedisReplicaCommand,
+    },
     /// Register an off-site Postgres replica reachable via Tailscale (or
     /// another overlay network). Stores a row in `database_replicas` with
     /// role='wan_replica' and prints the compose command to run on the
@@ -2531,6 +2538,38 @@ pub enum FleetDbReplicaCommand {
         primary: String,
     },
     /// Enqueue the previously planned bootstrap on the named target node.
+    Apply {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        primary: String,
+        #[arg(long)]
+        plan_id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Target-side implementation used only by the deferred-task worker.
+    #[command(hide = true)]
+    LocalApply {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        primary: String,
+        #[arg(long)]
+        plan_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum FleetDbRedisReplicaCommand {
+    /// Read-only authority, backup, target, and Redis-primary preflight.
+    Plan {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        primary: String,
+    },
+    /// Enqueue the exact, previously planned bootstrap on the target node.
     Apply {
         #[arg(long)]
         to: String,
