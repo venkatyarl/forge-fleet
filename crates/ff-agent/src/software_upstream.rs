@@ -23,7 +23,7 @@
 //! (`ON CONFLICT DO UPDATE`), so duplicate writes from multiple nodes are
 //! last-writer-wins with no harm.
 
-use std::time::Duration;
+use std::{cmp::Ordering, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -77,6 +77,76 @@ pub struct CheckDetail {
     /// "updated" | "unchanged" | "skipped" | "error"
     pub status: String,
     pub message: Option<String>,
+    /// Concrete configured endpoint/ref used as evidence.
+    pub source: String,
+    /// RFC3339 time at which the evidence was observed.
+    pub observed_at: String,
+    /// True only for a successful observation made by this pass.
+    pub fresh: bool,
+}
+
+/// Compare release versions numerically after normalizing a leading `v` and
+/// harmless build metadata. Unknown/non-release formats are deliberately
+/// incomparable: guessing here can turn a stale registry response into a
+/// fleet-wide downgrade.
+pub fn compare_release_versions(a: &str, b: &str) -> Option<Ordering> {
+    fn parts(value: &str) -> Option<Vec<u64>> {
+        let value = strip_v_prefix(value).split('+').next()?;
+        if value.contains('-') {
+            return None;
+        }
+        let mut out = value
+            .split('.')
+            .map(|part| part.parse::<u64>().ok())
+            .collect::<Option<Vec<_>>>()?;
+        while out.last() == Some(&0) {
+            out.pop();
+        }
+        Some(out)
+    }
+    Some(parts(a)?.cmp(&parts(b)?))
+}
+
+fn evidence_source(method: &str, source: &JsonValue) -> String {
+    match method {
+        "github_release" => format!(
+            "github:{}#{}",
+            source.get("repo").and_then(|v| v.as_str()).unwrap_or("?"),
+            source
+                .get("ref_kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tagged")
+        ),
+        "brew" => format!(
+            "brew:{}",
+            source
+                .get("formula")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+        ),
+        "pip" => format!(
+            "pypi:{}",
+            source
+                .get("package")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+        ),
+        "npm_registry" => format!(
+            "npm:{}",
+            source
+                .get("package")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+        ),
+        "self_built" => format!(
+            "git:{}",
+            source
+                .get("git_ref")
+                .and_then(|v| v.as_str())
+                .unwrap_or("origin/main")
+        ),
+        other => other.to_string(),
+    }
 }
 
 /// Upstream version checker.
@@ -147,15 +217,47 @@ impl UpstreamChecker {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let source = evidence_source(&method, &version_source);
+            let observed_at = chrono::Utc::now().to_rfc3339();
 
             // `self_built` lives inline because it needs the pool (the leader
             // state lookup is a DB query, not an HTTP call). Every other
             // method goes through `query_upstream`.
-            let query_result = if method == "self_built" {
+            let mut query_result = if method == "self_built" {
                 query_self_built(&self.pg, &id).await
             } else {
                 query_upstream(http, &method, &version_source, github_token.as_deref()).await
             };
+            // Branch/commit versions are ordered by Git ancestry, never by SHA
+            // text. GitHub's compare API provides that evidence when the repo
+            // is not the leader's local self-built checkout.
+            let git_ref = version_source
+                .get("ref_kind")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v != "tagged" && v != "latest_tag");
+            if git_ref
+                && let (Some(old), UpstreamResult::Version(candidate), Some(repo)) = (
+                    old_version.as_deref(),
+                    &query_result,
+                    version_source.get("repo").and_then(|v| v.as_str()),
+                )
+                && old != candidate
+            {
+                query_result =
+                    match fetch_github_compare(http, repo, old, candidate, github_token.as_deref())
+                        .await
+                    {
+                        Ok(GitCompare::Ahead) => UpstreamResult::Version(candidate.clone()),
+                        Ok(GitCompare::Behind) => UpstreamResult::Skipped(format!(
+                            "git candidate {candidate} is behind accepted {old}"
+                        )),
+                        Ok(GitCompare::Identical) => UpstreamResult::Version(old.to_string()),
+                        Ok(GitCompare::Diverged) => UpstreamResult::Error(format!(
+                            "git candidate {candidate} diverges from accepted {old}"
+                        )),
+                        Err(err) => UpstreamResult::Error(err),
+                    };
+            }
 
             match query_result {
                 UpstreamResult::Version(new_version) => {
@@ -164,7 +266,32 @@ impl UpstreamChecker {
                         None => true,
                     };
 
-                    if changed {
+                    let is_git = method == "self_built"
+                        || version_source
+                            .get("ref_kind")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|v| v != "tagged" && v != "latest_tag");
+                    let regression = changed
+                        && !is_git
+                        && old_version.as_deref().is_some_and(|old| {
+                            compare_release_versions(&new_version, old) == Some(Ordering::Less)
+                        });
+                    let incomparable = changed
+                        && !is_git
+                        && old_version.as_deref().is_some_and(|old| {
+                            compare_release_versions(&new_version, old).is_none()
+                        });
+
+                    if regression || incomparable {
+                        report.unchanged += 1;
+                        report.details.push(CheckDetail {
+                            software_id: id.clone(), method, old_version,
+                            new_version: Some(new_version),
+                            status: if regression { "installed-newer" } else { "incomparable" }.to_string(),
+                            message: Some("candidate rejected: latest_version is monotonic without an explicit rollback policy".into()),
+                            source, observed_at, fresh: true,
+                        });
+                    } else if changed {
                         // Update the registry row first …
                         sqlx::query(
                             "UPDATE software_registry
@@ -207,8 +334,20 @@ impl UpstreamChecker {
                             new_version: Some(new_version),
                             status: "updated".to_string(),
                             message: None,
+                            source,
+                            observed_at,
+                            fresh: true,
                         });
                     } else {
+                        // Freshness describes the evidence observation, not only
+                        // a version change. A successful no-change probe must
+                        // renew it or safe reconciliation will reject it as stale.
+                        sqlx::query(
+                            "UPDATE software_registry SET latest_version_at = NOW() WHERE id = $1",
+                        )
+                        .bind(&id)
+                        .execute(&self.pg)
+                        .await?;
                         report.unchanged += 1;
                         report.details.push(CheckDetail {
                             software_id: id.clone(),
@@ -217,6 +356,9 @@ impl UpstreamChecker {
                             new_version: old_version,
                             status: "unchanged".to_string(),
                             message: None,
+                            source,
+                            observed_at,
+                            fresh: true,
                         });
                     }
                 }
@@ -229,6 +371,9 @@ impl UpstreamChecker {
                         new_version: None,
                         status: "skipped".to_string(),
                         message: Some(reason),
+                        source,
+                        observed_at,
+                        fresh: false,
                     });
                 }
                 UpstreamResult::Error(msg) => {
@@ -241,6 +386,9 @@ impl UpstreamChecker {
                         new_version: None,
                         status: "error".to_string(),
                         message: Some(msg),
+                        source,
+                        observed_at,
+                        fresh: false,
                     });
                 }
             }
@@ -412,6 +560,15 @@ async fn query_upstream(
                 Err(e) => UpstreamResult::Error(e),
             }
         }
+        "npm_registry" => {
+            let Some(package) = version_source.get("package").and_then(|v| v.as_str()) else {
+                return UpstreamResult::Error("npm_registry missing 'package'".to_string());
+            };
+            match fetch_npm_latest(http, package).await {
+                Ok(v) => UpstreamResult::Version(v),
+                Err(e) => UpstreamResult::Error(e),
+            }
+        }
         "sw_vers" => UpstreamResult::Skipped(
             "sw_vers is macOS-local; no reliable upstream catalog API".to_string(),
         ),
@@ -577,6 +734,32 @@ async fn fetch_github_branch_head(
     Ok(sha.chars().take(10).collect())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitCompare {
+    Ahead,
+    Behind,
+    Identical,
+    Diverged,
+}
+
+async fn fetch_github_compare(
+    http: &reqwest::Client,
+    repo: &str,
+    accepted: &str,
+    candidate: &str,
+    token: Option<&str>,
+) -> Result<GitCompare, String> {
+    let url = format!("https://api.github.com/repos/{repo}/compare/{accepted}...{candidate}");
+    let body = github_get_json(http, &url, token).await?;
+    match body.get("status").and_then(|v| v.as_str()) {
+        Some("ahead") => Ok(GitCompare::Ahead),
+        Some("behind") => Ok(GitCompare::Behind),
+        Some("identical") => Ok(GitCompare::Identical),
+        Some("diverged") => Ok(GitCompare::Diverged),
+        other => Err(format!("unknown git compare status {other:?} from {url}")),
+    }
+}
+
 /// Fetch the stable version of a Homebrew formula.
 async fn fetch_brew_latest(http: &reqwest::Client, formula: &str) -> Result<String, String> {
     let url = format!("https://formulae.brew.sh/api/formula/{formula}.json");
@@ -629,6 +812,29 @@ async fn fetch_pip_latest(http: &reqwest::Client, package: &str) -> Result<Strin
         .ok_or_else(|| format!("missing info.version in {url} response"))?;
 
     Ok(version.to_string())
+}
+
+/// Fetch npm's authoritative `latest` distribution tag. This is preferred to
+/// cached local npm/brew/apt metadata, whose refresh cadence differs per node.
+async fn fetch_npm_latest(http: &reqwest::Client, package: &str) -> Result<String, String> {
+    let encoded = package.replace('/', "%2f");
+    let url = format!("https://registry.npmjs.org/{encoded}/latest");
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GET {url}: HTTP {}", resp.status()));
+    }
+    let body: JsonValue = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse JSON from {url}: {e}"))?;
+    body.get("version")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("missing version in {url} response"))
 }
 
 /// Strip a single leading `v` (as in `v2.64.0`) if present.
@@ -702,5 +908,23 @@ mod tests {
         let tags = ["nightly", "edge", "v2.0-rc.1"];
         assert_eq!(select_latest_release_tag(&tags), None);
         assert_eq!(select_latest_release_tag(&[]), None);
+    }
+
+    #[test]
+    fn release_comparison_is_numeric_normalized_and_monotonic() {
+        assert_eq!(
+            compare_release_versions("0.146.0", "0.144.6"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_release_versions("v2.10.0", "2.9"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_release_versions("2.0.0+brew", "2"),
+            Some(Ordering::Equal)
+        );
+        // Stale/odd package-manager metadata is not guessed into an ordering.
+        assert_eq!(compare_release_versions("2.0-1ubuntu", "2.0"), None);
     }
 }

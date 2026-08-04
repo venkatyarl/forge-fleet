@@ -2607,6 +2607,13 @@ enum SoftwareCommand {
     /// Normally runs every 6h inside the daemon — use this to trigger
     /// an immediate check (e.g. after editing a `version_source`).
     CheckUpstream,
+    /// Classify fleet software drift without changing anything. Pass --apply
+    /// explicitly to reconcile statuses and make upgrade-needed rows eligible
+    /// for the normal gated rollout.
+    Reconcile {
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+    },
     /// Clear `status='upgrade_blocked'` and reset the failure counter for one row.
     ///
     /// After 3 consecutive auto-upgrade failures, the finalizer flips a

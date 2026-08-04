@@ -418,6 +418,9 @@ pub async fn handle_software(cmd: crate::SoftwareCommand) -> Result<()> {
             handle_auto_upgrade_run_once(&pool, force).await
         }
         crate::SoftwareCommand::CheckUpstream => handle_software_check_upstream(&pool).await,
+        crate::SoftwareCommand::Reconcile { apply } => {
+            handle_software_reconcile(&pool, apply).await
+        }
         crate::SoftwareCommand::Unblock {
             computer,
             software_id,
@@ -438,6 +441,14 @@ pub async fn handle_software_check_upstream(pool: &sqlx::PgPool) -> anyhow::Resu
     println!("unchanged: {}", report.unchanged);
     println!("skipped:   {}", report.skipped);
     println!("errors:    {}", report.errors.len());
+    println!();
+    println!("evidence:");
+    for detail in &report.details {
+        println!(
+            "  {:<24} {:<18} source={} observed={} fresh={}",
+            detail.software_id, detail.status, detail.source, detail.observed_at, detail.fresh
+        );
+    }
     if !report.errors.is_empty() {
         println!();
         println!("errors:");
@@ -446,4 +457,227 @@ pub async fn handle_software_check_upstream(pool: &sqlx::PgPool) -> anyhow::Resu
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileClass {
+    NoOp,
+    UpgradeNeeded,
+    InstalledNewer,
+    Unknown,
+}
+
+fn classify_release(installed: &str, latest: &str) -> ReconcileClass {
+    use std::cmp::Ordering;
+    match ff_agent::software_upstream::compare_release_versions(installed, latest) {
+        Some(Ordering::Equal) => ReconcileClass::NoOp,
+        Some(Ordering::Less) => ReconcileClass::UpgradeNeeded,
+        Some(Ordering::Greater) => ReconcileClass::InstalledNewer,
+        None => ReconcileClass::Unknown,
+    }
+}
+
+fn classify_git_ancestry(installed_is_ancestor: bool, latest_is_ancestor: bool) -> ReconcileClass {
+    match (installed_is_ancestor, latest_is_ancestor) {
+        (true, true) => ReconcileClass::NoOp,
+        (true, false) => ReconcileClass::UpgradeNeeded,
+        (false, true) => ReconcileClass::InstalledNewer,
+        (false, false) => ReconcileClass::Unknown,
+    }
+}
+
+fn git_is_ancestor(checkout: &str, older: &str, newer: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["-C", checkout, "merge-base", "--is-ancestor", older, newer])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn desired_status(class: ReconcileClass, evidence_stale: bool) -> &'static str {
+    match class {
+        ReconcileClass::NoOp => "ok",
+        ReconcileClass::UpgradeNeeded if !evidence_stale => "upgrade_available",
+        ReconcileClass::InstalledNewer => "installed_newer",
+        _ => "unknown",
+    }
+}
+
+fn may_reconcile_status(current: &str, interrupted: bool, active_task: bool) -> bool {
+    matches!(
+        current,
+        "ok" | "upgrade_available" | "installed_newer" | "unknown"
+    ) || (current == "upgrading" && interrupted && !active_task)
+}
+
+/// Plan-only by default. `--apply` changes only inventory status; actual
+/// execution remains behind the existing auto-upgrade gate/tick.
+async fn handle_software_reconcile(pool: &sqlx::PgPool, apply: bool) -> Result<()> {
+    use sqlx::Row;
+    let checkout: Option<String> = sqlx::query_scalar(
+        "SELECT c.source_tree_path FROM computers c
+          JOIN fleet_leader_state ls ON ls.computer_id = c.id
+         WHERE c.source_tree_path IS NOT NULL AND c.source_tree_path <> '' LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let checkout = checkout.map(|path| {
+        path.strip_prefix("~/")
+            .and_then(|rest| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|home| format!("{home}/{rest}"))
+            })
+            .unwrap_or(path)
+    });
+    let rows = sqlx::query(
+        "SELECT c.name computer, cs.software_id, cs.installed_version,
+                sr.latest_version, cs.status,
+                sr.version_source->>'method' method,
+                sr.version_source->>'ref_kind' ref_kind,
+                COALESCE(sr.latest_version_at < NOW() - INTERVAL '24 hours', true) stale,
+                COALESCE((cs.metadata->>'upgrade_started_at')::timestamptz
+                         < NOW() - INTERVAL '2 hours', false) interrupted,
+                EXISTS (
+                  SELECT 1 FROM deferred_tasks dt
+                   WHERE dt.payload#>>'{meta,auto_upgrade,computer}' = c.name
+                     AND dt.payload#>>'{meta,auto_upgrade,software_id}' = cs.software_id
+                     AND dt.status IN ('pending', 'dispatchable', 'running')
+                ) active_task
+           FROM computer_software cs
+           JOIN computers c ON c.id = cs.computer_id
+           JOIN software_registry sr ON sr.id = cs.software_id
+          ORDER BY c.name, cs.software_id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    println!(
+        "software reconcile {}",
+        if apply { "APPLY" } else { "PLAN (no changes)" }
+    );
+    let mut changed = 0u64;
+    for row in rows {
+        let computer: String = row.get("computer");
+        let software: String = row.get("software_id");
+        let installed: Option<String> = row.get("installed_version");
+        let latest: Option<String> = row.get("latest_version");
+        let current: String = row.get("status");
+        let method: Option<String> = row.get("method");
+        let ref_kind: Option<String> = row.get("ref_kind");
+        let stale: bool = row.get("stale");
+        let interrupted: bool = row.get("interrupted");
+        let active_task: bool = row.get("active_task");
+
+        let git_source = method.as_deref() == Some("self_built")
+            || (method.as_deref() == Some("github_release")
+                && ref_kind
+                    .as_deref()
+                    .is_some_and(|kind| kind != "tagged" && kind != "latest_tag"));
+
+        let class = match (installed.as_deref(), latest.as_deref()) {
+            (Some(a), Some(b)) if a == b => ReconcileClass::NoOp,
+            (Some(a), Some(b)) if !git_source => classify_release(a, b),
+            // Git versions are ordered only by repository ancestry.
+            (Some(a), Some(b))
+                if a.len() >= 7 && b.len() >= 7 && (a.starts_with(b) || b.starts_with(a)) =>
+            {
+                ReconcileClass::NoOp
+            }
+            (Some(a), Some(b)) if git_source && checkout.is_some() => {
+                let checkout = checkout.as_deref().unwrap_or_default();
+                classify_git_ancestry(
+                    git_is_ancestor(checkout, a, b),
+                    git_is_ancestor(checkout, b, a),
+                )
+            }
+            _ => ReconcileClass::Unknown,
+        };
+        let desired = desired_status(class, stale);
+        let action = match class {
+            ReconcileClass::NoOp => "no-op",
+            ReconcileClass::UpgradeNeeded if !stale => "upgrade",
+            ReconcileClass::InstalledNewer => "installed-newer",
+            _ if stale => "unknown(stale-upstream)",
+            _ => "unknown",
+        };
+        println!("  {computer:<14} {software:<24} {action:<24} {current} -> {desired}");
+
+        // Do not touch a genuinely in-flight upgrade. Only an explicitly
+        // timestamped, expired attempt may be recovered.
+        if apply && current != desired && may_reconcile_status(&current, interrupted, active_task) {
+            changed += sqlx::query(
+                "UPDATE computer_software cs SET status = $1
+                  FROM computers c
+                 WHERE cs.computer_id = c.id AND c.name = $2
+                   AND cs.software_id = $3 AND cs.status = $4",
+            )
+            .bind(desired)
+            .bind(&computer)
+            .bind(&software)
+            .bind(&current)
+            .execute(pool)
+            .await?
+            .rows_affected();
+        }
+    }
+    println!(
+        "{}",
+        if apply {
+            format!("applied {changed} status change(s)")
+        } else {
+            "re-run with --apply to reconcile statuses; rollout remains gated".into()
+        }
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+
+    #[test]
+    fn codex_installed_newer_is_not_downgraded() {
+        assert_eq!(
+            classify_release("0.146.0", "0.144.6"),
+            ReconcileClass::InstalledNewer
+        );
+        assert_eq!(
+            classify_release("0.144.6", "0.146.0"),
+            ReconcileClass::UpgradeNeeded
+        );
+    }
+
+    #[test]
+    fn git_descendant_is_installed_newer_than_cached_ancestor() {
+        assert_eq!(
+            classify_git_ancestry(false, true),
+            ReconcileClass::InstalledNewer
+        );
+        assert_eq!(
+            classify_git_ancestry(true, false),
+            ReconcileClass::UpgradeNeeded
+        );
+        assert_eq!(classify_git_ancestry(false, false), ReconcileClass::Unknown);
+    }
+
+    #[test]
+    fn stale_package_metadata_never_authorizes_upgrade() {
+        assert_eq!(
+            desired_status(ReconcileClass::UpgradeNeeded, true),
+            "unknown"
+        );
+        assert_eq!(
+            desired_status(ReconcileClass::UpgradeNeeded, false),
+            "upgrade_available"
+        );
+    }
+
+    #[test]
+    fn only_expired_interrupted_upgrade_is_reconciled() {
+        assert!(!may_reconcile_status("upgrading", false, false));
+        assert!(!may_reconcile_status("upgrading", true, true));
+        assert!(may_reconcile_status("upgrading", true, false));
+        assert!(may_reconcile_status("ok", false, false));
+        assert!(!may_reconcile_status("failed", true, false));
+    }
 }
