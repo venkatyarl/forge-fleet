@@ -504,7 +504,9 @@ pub async fn enqueue_plans(
 
         let updated = sqlx::query(
             "UPDATE computer_software cs
-                SET status = 'upgrading'
+                SET status = 'upgrading',
+                    metadata = COALESCE(cs.metadata, '{}'::jsonb)
+                        || jsonb_build_object('upgrade_started_at', NOW())
                FROM computers c
               WHERE cs.computer_id = c.id
                 AND cs.software_id = $1
