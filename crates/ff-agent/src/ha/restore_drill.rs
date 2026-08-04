@@ -36,10 +36,12 @@
 //!   - **Self-cleaning.** Decrypt + extract happen under a unique temp dir that
 //!     is removed on every exit path, success or failure.
 
-use std::path::{Path, PathBuf};
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use sqlx::PgPool;
+use sysinfo::Disks;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -56,11 +58,96 @@ const LEADER_FRESH_SECS: i64 = 60;
 /// before escalating.
 const STALE_DRILL_DAYS: f64 = 2.0;
 
-/// Refuse to extract an archive larger than this (decrypted size is bounded by
-/// the encrypted size we check first). Fleet metadata is <100 MB; a multi-GB
-/// archive means something is very wrong and we must not fill the leader's disk
-/// during an unattended drill.
-const MAX_ENCRYPTED_BYTES: i64 = 5 * 1024 * 1024 * 1024;
+const GIB: u64 = 1024 * 1024 * 1024;
+const DEFAULT_MAX_ENCRYPTED_BYTES: u64 = 64 * GIB;
+const DEFAULT_MAX_EXTRACTED_BYTES: u64 = 256 * GIB;
+const DEFAULT_MAX_FILES: u64 = 5_000_000;
+const DEFAULT_EXPANSION_RATIO: u64 = 8;
+const DEFAULT_RESERVE_BYTES: u64 = 20 * GIB;
+
+#[derive(Debug, Clone, Copy)]
+struct DrillPolicy {
+    max_encrypted_bytes: u64,
+    max_extracted_bytes: u64,
+    max_files: u64,
+    expansion_ratio: u64,
+    reserve_bytes: u64,
+}
+
+impl DrillPolicy {
+    fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            max_encrypted_bytes: env_u64(
+                "FF_RESTORE_DRILL_MAX_ENCRYPTED_BYTES",
+                DEFAULT_MAX_ENCRYPTED_BYTES,
+            )?,
+            max_extracted_bytes: env_u64(
+                "FF_RESTORE_DRILL_MAX_EXTRACTED_BYTES",
+                DEFAULT_MAX_EXTRACTED_BYTES,
+            )?,
+            max_files: env_u64("FF_RESTORE_DRILL_MAX_FILES", DEFAULT_MAX_FILES)?,
+            expansion_ratio: env_u64(
+                "FF_RESTORE_DRILL_MAX_EXPANSION_RATIO",
+                DEFAULT_EXPANSION_RATIO,
+            )?,
+            reserve_bytes: env_u64("FF_RESTORE_DRILL_RESERVE_BYTES", DEFAULT_RESERVE_BYTES)?,
+        })
+    }
+
+    fn extracted_limit(&self, encrypted_bytes: u64) -> u64 {
+        self.max_extracted_bytes
+            .min(encrypted_bytes.saturating_mul(self.expansion_ratio))
+    }
+
+    fn preflight(&self, encrypted_bytes: u64, available_bytes: u64) -> Result<u64, String> {
+        if encrypted_bytes > self.max_encrypted_bytes {
+            return Err(format!(
+                "ciphertext {encrypted_bytes} bytes exceeds policy ceiling {} bytes",
+                self.max_encrypted_bytes
+            ));
+        }
+        let extracted = self.extracted_limit(encrypted_bytes);
+        let required = encrypted_bytes
+            .saturating_add(extracted)
+            .saturating_add(self.reserve_bytes);
+        if available_bytes < required {
+            return Err(format!(
+                "insufficient scratch space: required={required} available={available_bytes} bytes; policy encrypted_max={} extracted_max={} effective_extracted={} files_max={} expansion_ratio={} reserve={}",
+                self.max_encrypted_bytes,
+                self.max_extracted_bytes,
+                extracted,
+                self.max_files,
+                self.expansion_ratio,
+                self.reserve_bytes
+            ));
+        }
+        Ok(required)
+    }
+
+    fn summary(&self, encrypted_bytes: u64, required: u64, available: u64) -> String {
+        format!(
+            "capacity required={required} available={available} bytes; policy encrypted_max={} extracted_max={} effective_extracted={} files_max={} expansion_ratio={} reserve={}",
+            self.max_encrypted_bytes,
+            self.max_extracted_bytes,
+            self.extracted_limit(encrypted_bytes),
+            self.max_files,
+            self.expansion_ratio,
+            self.reserve_bytes
+        )
+    }
+}
+
+fn env_u64(name: &str, default: u64) -> Result<u64, String> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| format!("{name} must be a positive integer byte/count value")),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(format!("cannot read {name}: {error}")),
+    }
+}
 
 /// The alert policy name seeded by migration V130.
 const POLICY_NAME: &str = "backup_restore_drill_failed";
@@ -201,17 +288,11 @@ impl RestoreDrillTick {
         //    newest by an rsync cycle, so it drills the newest copy it actually
         //    holds rather than false-failing — rsync lag is not un-restorability.
         let newest_name = rows[0].1.clone();
-        let mut found: Option<(uuid::Uuid, String, String, std::path::PathBuf, i64)> = None;
+        let mut found: Option<(uuid::Uuid, String, String, std::path::PathBuf, u64)> = None;
         for (id, file_name, _recorded_bytes, checksum) in &rows {
             let path = self.backup_dir.join("postgres").join(file_name);
             if let Ok(m) = tokio::fs::metadata(&path).await {
-                found = Some((
-                    *id,
-                    file_name.clone(),
-                    checksum.clone(),
-                    path,
-                    m.len() as i64,
-                ));
+                found = Some((*id, file_name.clone(), checksum.clone(), path, m.len()));
                 break;
             }
         }
@@ -238,17 +319,25 @@ impl RestoreDrillTick {
                     .into(),
             );
         }
-        if disk_bytes > MAX_ENCRYPTED_BYTES {
-            return DrillOutcome::failed(
-                Some(id),
-                &file_name,
-                "locate",
-                format!(
-                    "backup file is {disk_bytes} bytes (> {MAX_ENCRYPTED_BYTES} cap) — \
-                     refusing to extract during an unattended drill"
-                ),
-            );
-        }
+        let policy = match DrillPolicy::from_env() {
+            Ok(policy) => policy,
+            Err(error) => {
+                return DrillOutcome::failed(Some(id), &file_name, "preflight", error);
+            }
+        };
+        let available_bytes = match available_space(std::env::temp_dir().as_path()) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return DrillOutcome::failed(Some(id), &file_name, "preflight", error);
+            }
+        };
+        let required_bytes = match policy.preflight(disk_bytes, available_bytes) {
+            Ok(required) => required,
+            Err(error) => {
+                return DrillOutcome::failed(Some(id), &file_name, "preflight", error);
+            }
+        };
+        let capacity = policy.summary(disk_bytes, required_bytes, available_bytes);
 
         // 3) checksum — guards against bit-rot / truncated rsync.
         match crate::ha::backup::file_metadata(&path).await {
@@ -273,21 +362,19 @@ impl RestoreDrillTick {
 
         // Everything below materializes plaintext / extracts the cluster, so do
         // it under a unique temp dir we always remove.
-        let work = std::env::temp_dir().join(format!("ff-drill-{}", id.simple()));
-        let _ = tokio::fs::remove_dir_all(&work).await; // stale from a killed run
-        if let Err(e) = tokio::fs::create_dir_all(&work).await {
-            return DrillOutcome::failed(
-                Some(id),
-                &file_name,
-                "decrypt",
-                format!("create work dir failed: {e}"),
-            );
-        }
-        let outcome = self
-            .drill_decrypt_extract(id, &file_name, &path, &work)
-            .await;
-        let _ = tokio::fs::remove_dir_all(&work).await;
-        outcome
+        let work = match tempfile::Builder::new().prefix("ff-drill-").tempdir() {
+            Ok(work) => work,
+            Err(error) => {
+                return DrillOutcome::failed(
+                    Some(id),
+                    &file_name,
+                    "decrypt",
+                    format!("create unique work dir failed: {error}"),
+                );
+            }
+        };
+        self.drill_decrypt_extract(id, &file_name, &path, work.path(), policy, &capacity)
+            .await
     }
 
     /// Stages 4–6 (decrypt → extract → validate), all under `work`.
@@ -297,6 +384,8 @@ impl RestoreDrillTick {
         file_name: &str,
         enc_path: &Path,
         work: &Path,
+        policy: DrillPolicy,
+        capacity: &str,
     ) -> DrillOutcome {
         // 4) decrypt → `<work>/<file without .age>`.
         let plain_name = file_name.strip_suffix(".age").unwrap_or(file_name);
@@ -312,7 +401,7 @@ impl RestoreDrillTick {
             );
         }
 
-        // 5) extract — `tar -xzf` into `<work>/pgdata`.
+        // 5) extract with entry-by-entry type, path, byte, and file bounds.
         let pgdata = work.join("pgdata");
         if let Err(e) = tokio::fs::create_dir_all(&pgdata).await {
             return DrillOutcome::failed(
@@ -322,36 +411,26 @@ impl RestoreDrillTick {
                 format!("create pgdata dir failed: {e}"),
             );
         }
-        let tar_out = tokio::process::Command::new("tar")
-            .arg("-xzf")
-            .arg(&plain_path)
-            .arg("-C")
-            .arg(&pgdata)
-            .output()
-            .await;
-        match tar_out {
-            Ok(o) if o.status.success() => {}
-            Ok(o) => {
+        let extract_path = plain_path.clone();
+        let extract_root = pgdata.clone();
+        let extraction = tokio::task::spawn_blocking(move || {
+            extract_archive_bounded(&extract_path, &extract_root, policy)
+        })
+        .await;
+        let (file_count, extracted_bytes) = match extraction {
+            Ok(Ok(metrics)) => metrics,
+            Ok(Err(error)) => {
+                return DrillOutcome::failed(Some(id), file_name, "extract", error);
+            }
+            Err(error) => {
                 return DrillOutcome::failed(
                     Some(id),
                     file_name,
                     "extract",
-                    format!(
-                        "tar -xzf failed ({}): {}",
-                        o.status,
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    ),
+                    format!("extract worker failed: {error}"),
                 );
             }
-            Err(e) => {
-                return DrillOutcome::failed(
-                    Some(id),
-                    file_name,
-                    "extract",
-                    format!("tar spawn failed: {e}"),
-                );
-            }
-        }
+        };
 
         // 6) validate — structurally complete PGDATA?
         let pg_version_path = pgdata.join("PG_VERSION");
@@ -378,14 +457,12 @@ impl RestoreDrillTick {
             .ok()
             .map(|s| s.trim().to_string());
 
-        let (file_count, extracted_bytes) = dir_size_and_count(&pgdata).await;
-
         // Bonus: cryptographic per-file validation if both the manifest and the
         // tool are available. Absence is NOT a failure.
         let verifybackup = self.maybe_pg_verifybackup(&pgdata).await;
 
         let detail = match verifybackup {
-            Some(true) => "restore drill passed; pg_verifybackup OK".to_string(),
+            Some(true) => format!("restore drill passed; pg_verifybackup OK; {capacity}"),
             Some(false) => {
                 // verifybackup running but failing is a real integrity problem.
                 return DrillOutcome {
@@ -401,9 +478,9 @@ impl RestoreDrillTick {
                     duration_ms: 0,
                 };
             }
-            None => "restore drill passed (structural PGDATA validation; \
-                     pg_verifybackup not run)"
-                .to_string(),
+            None => format!(
+                "restore drill passed (structural PGDATA validation; pg_verifybackup not run); {capacity}"
+            ),
         };
 
         DrillOutcome {
@@ -618,36 +695,123 @@ impl RestoreDrillTick {
     }
 }
 
-/// Recursively sum file count + bytes under `root`. Best-effort; unreadable
-/// entries are skipped (a drill metric, not a correctness gate).
-async fn dir_size_and_count(root: &Path) -> (i64, i64) {
-    let mut count: i64 = 0;
-    let mut bytes: i64 = 0;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let mut rd = match tokio::fs::read_dir(&dir).await {
-            Ok(rd) => rd,
-            Err(_) => continue,
-        };
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            match entry.file_type().await {
-                Ok(ft) if ft.is_dir() => stack.push(entry.path()),
-                Ok(ft) if ft.is_file() => {
-                    count += 1;
-                    if let Ok(m) = entry.metadata().await {
-                        bytes += m.len() as i64;
-                    }
-                }
-                _ => {}
-            }
+fn available_space(path: &Path) -> Result<u64, String> {
+    let path = path.canonicalize().map_err(|error| {
+        format!(
+            "cannot resolve scratch directory '{}': {error}",
+            path.display()
+        )
+    })?;
+    let disks = Disks::new_with_refreshed_list();
+    disks
+        .iter()
+        .filter(|disk| path.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().components().count())
+        .map(|disk| disk.available_space())
+        .ok_or_else(|| {
+            format!(
+                "cannot determine available space for '{}'; failing closed",
+                path.display()
+            )
+        })
+}
+
+fn extract_archive_bounded(
+    archive_path: &Path,
+    root: &Path,
+    policy: DrillPolicy,
+) -> Result<(i64, i64), String> {
+    let file = std::fs::File::open(archive_path)
+        .map_err(|error| format!("open decrypted archive failed: {error}"))?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let mut paths = HashSet::new();
+    let mut files = 0_u64;
+    let mut bytes = 0_u64;
+    let byte_limit = policy.extracted_limit(
+        std::fs::metadata(archive_path)
+            .map_err(|error| format!("stat decrypted archive failed: {error}"))?
+            .len(),
+    );
+
+    let entries = archive
+        .entries()
+        .map_err(|error| format!("read tar archive failed: {error}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|error| format!("read tar entry failed: {error}"))?;
+        let path = entry
+            .path()
+            .map_err(|error| format!("invalid tar path: {error}"))?
+            .into_owned();
+        if !safe_archive_path(&path) {
+            return Err(format!("unsafe tar path rejected: '{}'", path.display()));
         }
+        if !paths.insert(path.clone()) {
+            return Err(format!("duplicate tar path rejected: '{}'", path.display()));
+        }
+
+        files = files.saturating_add(1);
+        if files > policy.max_files {
+            return Err(format!(
+                "file-count limit exceeded: {files} > {}",
+                policy.max_files
+            ));
+        }
+        let kind = entry.header().entry_type();
+        if kind.is_file() {
+            bytes = bytes.saturating_add(
+                entry
+                    .header()
+                    .size()
+                    .map_err(|error| format!("invalid size for '{}': {error}", path.display()))?,
+            );
+            if bytes > byte_limit {
+                return Err(format!(
+                    "extracted-byte limit exceeded: {bytes} > {byte_limit}"
+                ));
+            }
+        } else if !kind.is_dir() {
+            return Err(format!(
+                "unsafe tar entry type rejected for '{}' (links, sparse files, and devices are forbidden)",
+                path.display()
+            ));
+        }
+
+        entry
+            .unpack_in(root)
+            .map_err(|error| format!("extract '{}' failed: {error}", path.display()))?
+            .then_some(())
+            .ok_or_else(|| format!("tar entry escaped extraction root: '{}'", path.display()))?;
     }
-    (count, bytes)
+
+    let files =
+        i64::try_from(files).map_err(|_| "file count exceeds database metric range".to_string())?;
+    let bytes = i64::try_from(bytes)
+        .map_err(|_| "extracted bytes exceed database metric range".to_string())?;
+    Ok((files, bytes))
+}
+
+fn safe_archive_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_policy() -> DrillPolicy {
+        DrillPolicy {
+            max_encrypted_bytes: 64 * GIB,
+            max_extracted_bytes: 256 * GIB,
+            max_files: 5_000_000,
+            expansion_ratio: 8,
+            reserve_bytes: 20 * GIB,
+        }
+    }
 
     #[test]
     fn alerts_when_drill_failed_regardless_of_history() {
@@ -678,5 +842,153 @@ mod tests {
         assert_eq!(o.stage, "decrypt");
         assert!(o.extracted_bytes.is_none());
         assert!(o.verifybackup.is_none());
+    }
+
+    #[test]
+    fn live_sized_backup_fits_large_peer() {
+        let encrypted = 6_236_903_728;
+        let available = 577 * GIB;
+        let required = test_policy().preflight(encrypted, available).unwrap();
+        assert!(required < available);
+        assert!(required > encrypted);
+    }
+
+    #[test]
+    fn live_sized_backup_refuses_low_space_peer() {
+        let encrypted = 6_236_903_728;
+        let error = test_policy().preflight(encrypted, 30 * GIB).unwrap_err();
+        assert!(error.contains("required="));
+        assert!(error.contains("available="));
+    }
+
+    #[test]
+    fn corrupt_archive_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("corrupt.tar.gz");
+        std::fs::write(&archive, b"not a gzip archive").unwrap();
+        let error = extract_archive_bounded(&archive, dir.path(), test_policy()).unwrap_err();
+        assert!(error.contains("tar") || error.contains("archive"));
+    }
+
+    #[test]
+    fn excessive_expansion_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("large.tar.gz");
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(archive_file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let data = vec![0_u8; 4096];
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o600);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "large", data.as_slice())
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let mut policy = test_policy();
+        policy.max_extracted_bytes = 1024;
+        let error = extract_archive_bounded(&archive_path, dir.path(), policy).unwrap_err();
+        assert!(error.contains("extracted-byte limit exceeded"));
+    }
+
+    #[test]
+    fn pg_basebackup_shape_extracts_with_bounded_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("pg.tar.gz");
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(archive_file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+
+        for (path, data) in [
+            ("PG_VERSION", b"16\n".as_slice()),
+            ("global/pg_control", b"control".as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o600);
+            header.set_cksum();
+            builder.append_data(&mut header, path, data).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let extraction = dir.path().join("extracted");
+        std::fs::create_dir(&extraction).unwrap();
+        let (files, bytes) =
+            extract_archive_bounded(&archive_path, &extraction, test_policy()).unwrap();
+        assert_eq!(files, 2);
+        assert_eq!(bytes, 10);
+        assert_eq!(
+            std::fs::read_to_string(extraction.join("PG_VERSION")).unwrap(),
+            "16\n"
+        );
+        assert_eq!(
+            std::fs::read(extraction.join("global/pg_control")).unwrap(),
+            b"control"
+        );
+    }
+
+    #[test]
+    fn duplicate_paths_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("duplicate.tar.gz");
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(archive_file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        for data in [b"first".as_slice(), b"second".as_slice()] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o600);
+            header.set_cksum();
+            builder.append_data(&mut header, "same", data).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let error = extract_archive_bounded(&archive_path, dir.path(), test_policy()).unwrap_err();
+        assert!(error.contains("duplicate tar path rejected"));
+    }
+
+    #[test]
+    fn link_entries_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("link.tar.gz");
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(archive_file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_link_name("../escape").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "unsafe-link", std::io::empty())
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let error = extract_archive_bounded(&archive_path, dir.path(), test_policy()).unwrap_err();
+        assert!(error.contains("unsafe tar entry type rejected"));
+    }
+
+    #[test]
+    fn traversal_paths_are_rejected() {
+        assert!(!safe_archive_path(Path::new("../escape")));
+        assert!(!safe_archive_path(Path::new("/absolute")));
+        assert!(safe_archive_path(Path::new("global/pg_control")));
+    }
+
+    #[test]
+    fn unique_work_directory_cleans_up_on_error_path() {
+        let path = {
+            let work = tempfile::Builder::new()
+                .prefix("ff-drill-test-")
+                .tempdir()
+                .unwrap();
+            let path = work.path().to_path_buf();
+            std::fs::write(path.join("plaintext"), b"sensitive").unwrap();
+            path
+        };
+        assert!(!path.exists());
     }
 }
