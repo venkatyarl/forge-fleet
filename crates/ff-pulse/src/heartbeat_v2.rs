@@ -9,6 +9,7 @@
 //! stable config changes (IPs, installed software, deployment topology)
 //! result in DB writes. See materializer.rs.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -251,9 +252,7 @@ impl HeartbeatV2Publisher {
                         );
                         Disks::new()
                     });
-                let (disk_total, disk_used) = aggregate_disk_bytes(
-                    disks.iter().map(|d| (d.total_space(), d.available_space())),
-                );
+                let (disk_total, disk_used) = aggregate_disks(&disks);
                 let disk_total_gb = (disk_total as f64 / 1_073_741_824.0) as i32;
                 let disk_free_gb = disk_total.saturating_sub(disk_used) as f64 / 1_073_741_824.0;
 
@@ -598,21 +597,148 @@ async fn publish_beat(
     Ok(())
 }
 
-/// Sum `(total, used)` bytes across disks, guarding against pseudo-filesystems
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiskObservation {
+    total: u64,
+    available: u64,
+    /// Filesystems that share one physical allocation pool use the same key.
+    /// This is currently populated only for APFS containers on macOS.
+    shared_container: Option<String>,
+}
+
+pub(crate) fn aggregate_disks(disks: &Disks) -> (u64, u64) {
+    aggregate_disk_observations(disks.iter().map(|disk| DiskObservation {
+        total: disk.total_space(),
+        available: disk.available_space(),
+        shared_container: shared_container_key(disk),
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn shared_container_key(disk: &sysinfo::Disk) -> Option<String> {
+    if !disk
+        .file_system()
+        .to_string_lossy()
+        .eq_ignore_ascii_case("apfs")
+    {
+        return None;
+    }
+
+    macos_mount_device(disk.mount_point())
+        .and_then(|device| parse_apfs_container_device(&device).map(str::to_owned))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn shared_container_key(_disk: &sysinfo::Disk) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mount_device(mount_point: &std::path::Path) -> Option<String> {
+    use std::ffi::{CStr, CString};
+    use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mount = CString::new(mount_point.as_os_str().as_bytes()).ok()?;
+    let mut stat = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `mount` is NUL-terminated and valid for the duration of the call;
+    // `statfs` initializes the output structure when it returns zero.
+    if unsafe { libc::statfs(mount.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: guarded by the successful `statfs` result above.
+    let stat = unsafe { stat.assume_init() };
+    // SAFETY: macOS guarantees `f_mntfromname` is a NUL-terminated C string.
+    let device = unsafe { CStr::from_ptr(stat.f_mntfromname.as_ptr()) };
+    device.to_str().ok().map(str::to_owned)
+}
+
+/// Normalize an APFS volume device to its synthetic container device.
+///
+/// `/dev/disk3s1s1` (sealed System snapshot) and `/dev/disk3s5` (Data) both
+/// become `/dev/disk3`. The parser is intentionally strict: an unexpected
+/// device string returns `None`, which preserves the old independent-volume
+/// behavior instead of accidentally coalescing unrelated storage.
+#[cfg(any(target_os = "macos", test))]
+fn parse_apfs_container_device(device: &str) -> Option<&str> {
+    const PREFIX: &str = "/dev/disk";
+    let rest = device.strip_prefix(PREFIX)?;
+    let disk_digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if disk_digits == 0 {
+        return None;
+    }
+    rest[..disk_digits].parse::<u32>().ok()?;
+
+    let mut suffix = &rest[disk_digits..];
+    while !suffix.is_empty() {
+        suffix = suffix.strip_prefix('s')?;
+        let digits = suffix.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        suffix[..digits].parse::<u32>().ok()?;
+        suffix = &suffix[digits..];
+    }
+
+    Some(&device[..PREFIX.len() + disk_digits])
+}
+
+/// Sum `(total, used)` bytes across disk observations, guarding against
+/// shared allocation pools and pseudo-filesystems.
+///
+/// macOS exposes each browsable APFS volume separately even though System,
+/// Data, and related volumes draw from one container. Observations with the
+/// same `shared_container` are therefore reduced to one deterministic sample:
+/// the largest reported container total and largest reported availability
+/// (clamped to that total). Unkeyed observations — including every Linux disk
+/// — retain the historical additive behavior.
+pub(crate) fn aggregate_disk_observations(
+    disks: impl IntoIterator<Item = DiskObservation>,
+) -> (u64, u64) {
+    let mut totals = (0u64, 0u64);
+    let mut shared: HashMap<String, (u64, u64)> = HashMap::new();
+
+    for disk in disks {
+        if let Some(key) = disk.shared_container {
+            shared
+                .entry(key)
+                .and_modify(|sample| {
+                    sample.0 = sample.0.max(disk.total);
+                    sample.1 = sample.1.max(disk.available);
+                })
+                .or_insert((disk.total, disk.available));
+        } else {
+            totals = add_disk_bytes(totals, disk.total, disk.available);
+        }
+    }
+
+    shared
+        .into_values()
+        .fold(totals, |acc, (total, available)| {
+            add_disk_bytes(acc, total, available.min(total))
+        })
+}
+
+fn add_disk_bytes((total_acc, used_acc): (u64, u64), total: u64, available: u64) -> (u64, u64) {
+    (
+        total_acc.saturating_add(total),
+        used_acc.saturating_add(total.saturating_sub(available)),
+    )
+}
+
+/// Sum `(total, used)` bytes across independent disks, guarding against pseudo-filesystems
 /// that report `available_space > total_space` (overlay/tmpfs/FUSE mounts, or
 /// mounts reporting `total = 0` with `available > 0`). A plain
 /// `total - available` underflows there — panicking in debug, and in release
 /// (how `forgefleetd` ships) silently wrapping to a garbage huge `u64` that
 /// corrupts the disk metrics reported in the beat.
+#[cfg(test)]
 pub(crate) fn aggregate_disk_bytes(disks: impl IntoIterator<Item = (u64, u64)>) -> (u64, u64) {
-    disks
-        .into_iter()
-        .fold((0u64, 0u64), |(total_acc, used_acc), (total, available)| {
-            (
-                total_acc.saturating_add(total),
-                used_acc.saturating_add(total.saturating_sub(available)),
-            )
-        })
+    aggregate_disk_observations(disks.into_iter().map(|(total, available)| DiskObservation {
+        total,
+        available,
+        shared_container: None,
+    }))
 }
 
 // ─── GPU / network / OS detection helpers ───────────────────────────────
@@ -1358,6 +1484,93 @@ mod tests {
     #[test]
     fn aggregate_disk_bytes_empty_is_zero() {
         assert_eq!(aggregate_disk_bytes(std::iter::empty()), (0, 0));
+    }
+
+    fn observed_disk(total: u64, available: u64, container: Option<&str>) -> DiskObservation {
+        DiskObservation {
+            total,
+            available,
+            shared_container: container.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn aggregate_disk_observations_counts_ace_apfs_container_once() {
+        // Ace's sealed System and writable Data volumes both draw from disk3.
+        // The old mount sum reported roughly 456 GiB for one 245.1 GB container.
+        let total = 245_107_195_904u64;
+        let available = 8_110_985_216u64;
+        let (actual_total, actual_used) = aggregate_disk_observations([
+            observed_disk(total, available, Some("/dev/disk3")),
+            observed_disk(total, available, Some("/dev/disk3")),
+        ]);
+
+        assert_eq!(actual_total, total);
+        assert_eq!(actual_used, total - available);
+    }
+
+    #[test]
+    fn aggregate_disk_observations_is_order_independent_with_shared_free_space() {
+        let first = observed_disk(1_000, 100, Some("/dev/disk3"));
+        let second = observed_disk(1_000, 150, Some("/dev/disk3"));
+
+        let forward = aggregate_disk_observations([first.clone(), second.clone()]);
+        let reverse = aggregate_disk_observations([second, first]);
+
+        assert_eq!(forward, (1_000, 850));
+        assert_eq!(reverse, forward);
+    }
+
+    #[test]
+    fn aggregate_disk_observations_keeps_distinct_apfs_containers() {
+        let (total, used) = aggregate_disk_observations([
+            observed_disk(1_000, 400, Some("/dev/disk3")),
+            observed_disk(2_000, 500, Some("/dev/disk4")),
+        ]);
+
+        assert_eq!((total, used), (3_000, 2_100));
+    }
+
+    #[test]
+    fn aggregate_disk_observations_preserves_unkeyed_linux_mount_sum() {
+        // Equal numeric samples must still add when they have no shared-pool
+        // identity. Linux observations intentionally remain unkeyed.
+        let (total, used) = aggregate_disk_observations([
+            observed_disk(1_000, 400, None),
+            observed_disk(1_000, 400, None),
+        ]);
+
+        assert_eq!((total, used), (2_000, 1_200));
+    }
+
+    #[test]
+    fn apfs_device_parser_normalizes_volume_and_snapshot_devices() {
+        assert_eq!(
+            parse_apfs_container_device("/dev/disk3s1s1"),
+            Some("/dev/disk3")
+        );
+        assert_eq!(
+            parse_apfs_container_device("/dev/disk3s5"),
+            Some("/dev/disk3")
+        );
+        assert_eq!(
+            parse_apfs_container_device("/dev/disk12"),
+            Some("/dev/disk12")
+        );
+    }
+
+    #[test]
+    fn apfs_device_parser_rejects_unknown_or_overflowing_devices() {
+        for invalid in [
+            "disk3s5",
+            "/dev/disk",
+            "/dev/diskx",
+            "/dev/disk3foo",
+            "/dev/disk4294967296s1",
+            "/dev/disk3s4294967296",
+        ] {
+            assert_eq!(parse_apfs_container_device(invalid), None, "{invalid}");
+        }
     }
 
     #[tokio::test]
