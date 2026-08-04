@@ -49,12 +49,7 @@ pub async fn handle_software_unblock(
 /// them on their next poll.
 pub async fn handle_auto_upgrade_run_once(pool: &sqlx::PgPool, force: bool) -> Result<()> {
     // Mirror the gate check the hourly tick uses so --force is meaningful.
-    let enabled = ff_db::pg_get_secret(pool, "auto_upgrade_enabled")
-        .await
-        .ok()
-        .flatten()
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
-        .unwrap_or(false);
+    let enabled = ff_agent::auto_upgrade::is_enabled_durable(pool).await?;
     if !enabled && !force {
         println!("{YELLOW}auto_upgrade_enabled is not set — pass --force to run anyway.{RESET}");
         println!("  (To enable persistently: ff secrets set auto_upgrade_enabled true)");
@@ -80,8 +75,12 @@ pub async fn handle_auto_upgrade_run_once(pool: &sqlx::PgPool, force: bool) -> R
         .await
         .map_err(|e| anyhow::anyhow!("auto_upgrade run_once: {e}"))?;
     println!(
-        "{GREEN}✓ refreshed {} self-built version row(s); dispatched {} upgrade task(s){RESET}",
-        outcome.refreshed_self_built, outcome.enqueued
+        "{GREEN}✓ refreshed {} self-built version row(s); dispatched {} upgrade task(s); started {} rollout(s); skipped {} target(s); leader self-upgrade launched={}{RESET}",
+        outcome.refreshed_self_built,
+        outcome.enqueued,
+        outcome.rollouts_started,
+        outcome.skipped,
+        outcome.leader_self_upgrade_launched,
     );
     Ok(())
 }

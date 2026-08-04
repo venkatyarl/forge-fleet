@@ -694,6 +694,7 @@ mod tests {
         let plan = ff_agent::task_runner::ComposePlan {
             parent: None,
             parent_summary: "marcus: bring online".to_string(),
+            created_tasks: 0,
             tasks: vec![
                 ff_agent::task_runner::PlannedTask {
                     summary: "marcus/1: ssh-probe".to_string(),
@@ -737,6 +738,7 @@ mod tests {
             parent: Some(parent),
             parent_summary: "ignored in real path".to_string(),
             tasks: vec![],
+            created_tasks: 5,
         };
         let out = format_compose_plan(&plan, false);
         assert!(out.contains(&format!("composed parent task: {parent}")));
