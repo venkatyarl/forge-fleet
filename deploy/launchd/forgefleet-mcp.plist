@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.forgefleet.forgefleet-mcp</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__USER_HOME__/.local/bin/forgefleetd</string>
+        <string>mcp</string>
+        <string>--listen</string>
+        <string>127.0.0.1:50001</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__USER_HOME__/.cargo/bin:__USER_HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__USER_HOME__</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__USER_HOME__/.forgefleet/logs/forgefleet-mcp.log</string>
+    <key>StandardErrorPath</key>
+    <string>__USER_HOME__/.forgefleet/logs/forgefleet-mcp.log</string>
+</dict>
+</plist>
