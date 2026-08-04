@@ -201,9 +201,56 @@ pub async fn bootstrap_script(
             .unwrap_or_else(|| "venkatyarl".to_string())
     };
 
+    // DB endpoint for the rendered fleet.toml: the serving gateway's own
+    // fleet config is authoritative (Postgres/Redis are fleet services that
+    // do NOT necessarily live on the gateway/leader host).
+    let (db_host, db_port, redis_host, redis_port) = {
+        let mut db_h = "192.168.5.104".to_string();
+        let mut db_p = "55432".to_string();
+        let mut rd_h = db_h.clone();
+        let mut rd_p = "56379".to_string();
+        if let Some(cfg_lock) = state.fleet_config.as_ref() {
+            let cfg = cfg_lock.read().await;
+            if let Some(h) = cfg.database.host.as_ref().filter(|h| !h.trim().is_empty()) {
+                db_h = h.trim().to_string();
+            } else if let Some((h, _)) = cfg
+                .database
+                .url
+                .split('@')
+                .next_back()
+                .and_then(|s| s.split('/').next())
+                .and_then(|s| s.rsplit_once(':'))
+            {
+                db_h = h.to_string();
+            }
+            if let Some(p) = cfg.database.port {
+                db_p = p.to_string();
+            }
+            // redis://host:port[/db]
+            let redis_rest = cfg
+                .redis
+                .url
+                .strip_prefix("redis://")
+                .unwrap_or(&cfg.redis.url);
+            if let Some((h, p)) = redis_rest.split('/').next().and_then(|s| s.rsplit_once(':')) {
+                if !h.is_empty() {
+                    rd_h = h.to_string();
+                }
+                if let Ok(port) = p.parse::<u16>() {
+                    rd_p = port.to_string();
+                }
+            }
+        }
+        (db_h, db_p, rd_h, rd_p)
+    };
+
     let script = BOOTSTRAP_TEMPLATE
         .replace("{{LEADER_HOST}}", &leader_host)
         .replace("{{LEADER_PORT}}", &leader_port)
+        .replace("{{DB_HOST}}", &db_host)
+        .replace("{{DB_PORT}}", &db_port)
+        .replace("{{REDIS_HOST}}", &redis_host)
+        .replace("{{REDIS_PORT}}", &redis_port)
         .replace("{{TOKEN}}", &token)
         .replace("{{COMPUTER_NAME}}", &name)
         .replace("{{COMPUTER_IP}}", &ip)
@@ -1134,7 +1181,7 @@ mod bootstrap_lifecycle_tests {
 
     #[test]
     fn linux_bootstrap_uses_canonical_redis_port() {
-        assert!(BOOTSTRAP_TEMPLATE.contains("redis://{{LEADER_HOST}}:56379"));
+        assert!(BOOTSTRAP_TEMPLATE.contains("redis://{{REDIS_HOST}}:{{REDIS_PORT}}"));
         assert!(!BOOTSTRAP_TEMPLATE.contains("redis://{{LEADER_HOST}}:6380"));
     }
 
