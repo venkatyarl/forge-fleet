@@ -15,6 +15,8 @@ const MAX_BACKUP_AGE_HOURS: i64 = 24;
 const MAX_POSTCHECK_LAG_BYTES: i64 = 1 << 30;
 const PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const COMPOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const FIND_EXISTING_REPLICA_TASK_SQL: &str = "SELECT id FROM fleet_tasks WHERE task_class='deferred' AND summary=$1 AND status IN ('pending','dispatchable','running','completed') AND payload->'deferred_payload'->>'command' LIKE $2 ORDER BY created_at DESC LIMIT 1";
+const INSERT_REPLICA_TASK_SQL: &str = "INSERT INTO fleet_tasks (task_type,summary,payload,priority,requires_capability,status,created_at,task_class) VALUES ('shell',$1,$2,50,$3,'pending',NOW(),'deferred') RETURNING id";
 
 #[derive(Debug, Clone)]
 struct Plan {
@@ -251,16 +253,38 @@ async fn enqueue_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<String> {
     let title = format!("bootstrap PostgreSQL replica on {}", plan.target_name);
     let payload = serde_json::json!({"command": local_apply_command(plan), "summary": "PostgreSQL replica bootstrap"});
     let trigger = serde_json::json!({"node": plan.target_name});
+    let required_caps = serde_json::json!([]);
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
         .bind(plan.id())
         .execute(&mut *tx)
         .await?;
     let like = format!("%--plan-id {}%", plan.id());
-    let id = if let Some(id) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM deferred_tasks WHERE title=$1 AND status IN ('pending','dispatchable','running','completed') AND payload->>'command' LIKE $2 ORDER BY created_at DESC LIMIT 1")
-        .bind(&title).bind(&like).fetch_optional(&mut *tx).await? { id } else {
-        sqlx::query_scalar("INSERT INTO deferred_tasks (created_by,title,kind,payload,trigger_type,trigger_spec,preferred_node,required_caps,max_attempts) VALUES ($1,$2,'shell',$3,'node_online',$4,$5,'[]'::jsonb,1) RETURNING id")
-            .bind(whoami_tag()).bind(&title).bind(&payload).bind(&trigger).bind(&plan.target_name).fetch_one(&mut *tx).await?
+    let id = if let Some(id) = sqlx::query_scalar::<_, Uuid>(FIND_EXISTING_REPLICA_TASK_SQL)
+        .bind(&title)
+        .bind(&like)
+        .fetch_optional(&mut *tx)
+        .await?
+    {
+        id
+    } else {
+        let canonical_payload = serde_json::json!({
+            "deferred_payload": payload,
+            "created_by": whoami_tag(),
+            "kind": "shell",
+            "trigger_type": "node_online",
+            "trigger_spec": trigger,
+            "preferred_node": plan.target_name,
+            "required_caps": required_caps,
+            "attempts": 0,
+            "max_attempts": 1,
+        });
+        sqlx::query_scalar(INSERT_REPLICA_TASK_SQL)
+            .bind(&title)
+            .bind(&canonical_payload)
+            .bind(&required_caps)
+            .fetch_one(&mut *tx)
+            .await?
     };
     tx.commit().await?;
     Ok(id.to_string())
@@ -627,6 +651,16 @@ mod tests {
         assert!(c.contains("local-apply"));
         assert!(c.starts_with("cd \"$HOME/projects/forge-fleet\""));
     }
+
+    #[test]
+    fn deferred_enqueue_uses_canonical_fleet_tasks_schema() {
+        assert!(FIND_EXISTING_REPLICA_TASK_SQL.contains("FROM fleet_tasks"));
+        assert!(FIND_EXISTING_REPLICA_TASK_SQL.contains("task_class='deferred'"));
+        assert!(FIND_EXISTING_REPLICA_TASK_SQL.contains("payload->'deferred_payload'->>'command'"));
+        assert!(INSERT_REPLICA_TASK_SQL.contains("INSERT INTO fleet_tasks"));
+        assert!(!INSERT_REPLICA_TASK_SQL.contains("deferred_tasks"));
+    }
+
     #[test]
     fn plan_id_is_stable_and_sensitive() {
         let mut p = Plan {
