@@ -1,7 +1,7 @@
 //! Fleet-wide SSH mesh verification + propagation.
 //! See plan: /Users/venkat/.claude/plans/gentle-questing-valley.md §3h.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
 use sqlx::PgPool;
@@ -81,6 +81,29 @@ pub async fn enqueue_ssh_mesh_auto_repair(
     src: &str,
     dst: &str,
 ) -> Result<EnqueueOnceOutcome, sqlx::Error> {
+    let outcome = enqueue_ssh_mesh_auto_repair_scoped(
+        pool,
+        leader_name,
+        src,
+        dst,
+        &MeshExclusions::default(),
+    )
+    .await?;
+    Ok(outcome.expect("an empty exclusion set always permits the edge"))
+}
+
+/// Scoped variant used by operator-driven runs. Excluded edges return `None`
+/// before a task key, command, or database row is produced.
+pub async fn enqueue_ssh_mesh_auto_repair_scoped(
+    pool: &PgPool,
+    leader_name: &str,
+    src: &str,
+    dst: &str,
+    exclusions: &MeshExclusions,
+) -> Result<Option<EnqueueOnceOutcome>, sqlx::Error> {
+    if !exclusions.allows_edge(src, dst) {
+        return Ok(None);
+    }
     let summary = format!("auto-mesh-repair: {src} -> {dst}");
     let command = format!("ff fleet ssh-mesh-check --node {dst} --repair --yes 2>&1 | tail -10");
     pg_enqueue_shell_task_once(
@@ -95,6 +118,7 @@ pub async fn enqueue_ssh_mesh_auto_repair(
         None,
     )
     .await
+    .map(Some)
 }
 
 /// Result of the narrowly-scoped autonomous mesh-repair queue cleanup verb.
@@ -163,22 +187,26 @@ fn retry_cap_reached(
 async fn mark_ineligible_pairs_skipped(
     pool: &PgPool,
     nodes: &[ff_db::FleetNodeRow],
+    exclusions: &MeshExclusions,
 ) -> Result<(), String> {
     let names: Vec<&str> = nodes
         .iter()
-        .filter(|node| !mesh_eligible(node))
+        .filter(|node| !mesh_eligible(node) && !exclusions.contains(&node.name))
         .map(|node| node.name.as_str())
         .collect();
     if names.is_empty() {
         return Ok(());
     }
+    let excluded_names: Vec<&str> = exclusions.iter().map(String::as_str).collect();
     sqlx::query(
         "UPDATE fleet_mesh_status
             SET status = 'skipped', last_checked = NOW(),
                 last_error = 'endpoint computer is offline, reserved, or decommissioned'
-          WHERE src_node = ANY($1) OR dst_node = ANY($1)",
+          WHERE (src_node = ANY($1) OR dst_node = ANY($1))
+            AND NOT (src_node = ANY($2) OR dst_node = ANY($2))",
     )
     .bind(&names)
+    .bind(&excluded_names)
     .execute(pool)
     .await
     .map_err(|e| format!("mark skipped mesh rows: {e}"))?;
@@ -201,30 +229,155 @@ pub struct MeshMatrix {
     pub checked_at: chrono::DateTime<chrono::Utc>,
 }
 
-pub async fn pairwise_ssh_check(pool: &PgPool) -> Result<MeshMatrix, String> {
+/// Canonical runtime-only mesh endpoints that an operator explicitly excluded.
+/// The set is never persisted; callers must pass it through the current run.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct MeshExclusions {
+    names: BTreeSet<String>,
+}
+
+impl MeshExclusions {
+    #[cfg(test)]
+    pub(crate) fn from_canonical_names(names: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            names: names.into_iter().collect(),
+        }
+    }
+
+    pub fn contains(&self, node: &str) -> bool {
+        self.names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(node))
+    }
+
+    pub fn allows_edge(&self, src: &str, dst: &str) -> bool {
+        !self.contains(src) && !self.contains(dst)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &String> {
+        self.names.iter()
+    }
+}
+
+/// Canonical selected-node and endpoint-exclusion scope for one mesh command.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct MeshCheckScope {
+    only_node: Option<String>,
+    exclusions: MeshExclusions,
+}
+
+impl MeshCheckScope {
+    pub fn only_node(&self) -> Option<&str> {
+        self.only_node.as_deref()
+    }
+
+    pub fn exclusions(&self) -> &MeshExclusions {
+        &self.exclusions
+    }
+
+    pub fn edge_in_scope(&self, src: &str, dst: &str) -> bool {
+        self.exclusions.allows_edge(src, dst)
+            && self
+                .only_node
+                .as_deref()
+                .is_none_or(|node| src.eq_ignore_ascii_case(node) || dst.eq_ignore_ascii_case(node))
+    }
+
+    fn destination_in_scope(&self, src: &str, dst: &str) -> bool {
+        self.exclusions.allows_edge(src, dst)
+            && self
+                .only_node
+                .as_deref()
+                .is_none_or(|node| dst.eq_ignore_ascii_case(node))
+    }
+}
+
+fn resolve_mesh_check_scope_from_names(
+    available_names: impl IntoIterator<Item = String>,
+    only_node: Option<&str>,
+    requested_exclusions: &[String],
+) -> Result<MeshCheckScope, String> {
+    let available: Vec<String> = available_names.into_iter().collect();
+    let resolve = |requested: &str| {
+        let requested = requested.trim();
+        available
+            .iter()
+            .find(|name| name.eq_ignore_ascii_case(requested))
+            .cloned()
+    };
+
+    let only_node = only_node
+        .map(|requested| {
+            resolve(requested).ok_or_else(|| format!("unknown selected node '{requested}'"))
+        })
+        .transpose()?;
+
+    let mut names = BTreeSet::new();
+    for requested in requested_exclusions {
+        let canonical = resolve(requested)
+            .ok_or_else(|| format!("unknown excluded node '{}'", requested.trim()))?;
+        names.insert(canonical);
+    }
+    if let Some(selected) = &only_node
+        && names.contains(selected)
+    {
+        return Err(format!(
+            "selected node '{selected}' cannot also be excluded"
+        ));
+    }
+
+    Ok(MeshCheckScope {
+        only_node,
+        exclusions: MeshExclusions { names },
+    })
+}
+
+/// Resolve operator-supplied names against the authoritative fleet registry.
+pub async fn resolve_mesh_check_scope(
+    pool: &PgPool,
+    only_node: Option<&str>,
+    requested_exclusions: &[String],
+) -> Result<MeshCheckScope, String> {
     let nodes = ff_db::pg_list_nodes(pool)
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
-    mark_ineligible_pairs_skipped(pool, &nodes).await?;
-    let matrix = pairwise_ssh_check_inner(pool, &nodes, None).await?;
-    let _ = fire_mesh_alert(pool).await;
-    Ok(matrix)
+    resolve_mesh_check_scope_from_names(
+        nodes.into_iter().map(|node| node.name),
+        only_node,
+        requested_exclusions,
+    )
+}
+
+pub async fn pairwise_ssh_check(pool: &PgPool) -> Result<MeshMatrix, String> {
+    pairwise_ssh_check_scoped(pool, &MeshCheckScope::default()).await
 }
 
 pub async fn pairwise_ssh_check_node(pool: &PgPool, node: &str) -> Result<MeshMatrix, String> {
+    let scope = resolve_mesh_check_scope(pool, Some(node), &[]).await?;
+    pairwise_ssh_check_scoped(pool, &scope).await
+}
+
+pub async fn pairwise_ssh_check_scoped(
+    pool: &PgPool,
+    scope: &MeshCheckScope,
+) -> Result<MeshMatrix, String> {
     let nodes = ff_db::pg_list_nodes(pool)
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
-    mark_ineligible_pairs_skipped(pool, &nodes).await?;
-    let matrix = pairwise_ssh_check_inner(pool, &nodes, Some(node)).await?;
-    let _ = fire_mesh_alert(pool).await;
+    mark_ineligible_pairs_skipped(pool, &nodes, scope.exclusions()).await?;
+    let matrix = pairwise_ssh_check_inner(pool, &nodes, scope).await?;
+    let _ = fire_mesh_alert_scoped(pool, scope.exclusions()).await;
     Ok(matrix)
 }
 
 async fn pairwise_ssh_check_inner(
     pool: &PgPool,
     nodes: &[ff_db::FleetNodeRow],
-    only_node: Option<&str>,
+    scope: &MeshCheckScope,
 ) -> Result<MeshMatrix, String> {
     use futures::stream::{FuturesUnordered, StreamExt};
 
@@ -236,12 +389,10 @@ async fn pairwise_ssh_check_inner(
     let mut pairs: Vec<(String, String, String, String, String)> = Vec::new();
     for src in nodes {
         for dst in nodes {
-            if src.name == dst.name || !mesh_eligible(src) || !mesh_eligible(dst) {
-                continue;
-            }
-            if let Some(n) = only_node
-                && src.name != n
-                && dst.name != n
+            if src.name == dst.name
+                || !mesh_eligible(src)
+                || !mesh_eligible(dst)
+                || !scope.edge_in_scope(&src.name, &dst.name)
             {
                 continue;
             }
@@ -416,20 +567,26 @@ pub async fn local_reach_check(
     pool: &PgPool,
     only_node: Option<&str>,
 ) -> Result<Vec<LocalProbe>, String> {
+    let scope = resolve_mesh_check_scope(pool, only_node, &[]).await?;
+    local_reach_check_scoped(pool, &scope).await
+}
+
+pub async fn local_reach_check_scoped(
+    pool: &PgPool,
+    scope: &MeshCheckScope,
+) -> Result<Vec<LocalProbe>, String> {
     use futures::stream::{FuturesUnordered, StreamExt};
 
     let me = crate::fleet_info::resolve_this_worker_name().await;
     let nodes = ff_db::pg_list_nodes(pool)
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
-    mark_ineligible_pairs_skipped(pool, &nodes).await?;
+    mark_ineligible_pairs_skipped(pool, &nodes, scope.exclusions()).await?;
 
     let mut futs = FuturesUnordered::new();
     let mut probes = Vec::new();
     for n in nodes.iter().filter(|n| n.name != me && mesh_eligible(n)) {
-        if let Some(o) = only_node
-            && n.name != o
-        {
+        if !scope.destination_in_scope(&me, &n.name) {
             continue;
         }
         futs.push(probe_direct(
@@ -467,7 +624,7 @@ pub async fn local_reach_check(
         .await;
         probes.push(p);
     }
-    let _ = fire_mesh_alert(pool).await;
+    let _ = fire_mesh_alert_scoped(pool, scope.exclusions()).await;
     probes.sort_by(|a, b| a.dst.cmp(&b.dst));
     Ok(probes)
 }
@@ -562,15 +719,20 @@ struct MeshAlertSnapshot {
     asymmetric: Vec<(String, String, String, String)>,
 }
 
-async fn load_mesh_alert_snapshot(pg: &PgPool) -> Result<MeshAlertSnapshot, String> {
+type MeshAlertRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
+async fn load_mesh_alert_snapshot(
+    pg: &PgPool,
+    exclusions: &MeshExclusions,
+) -> Result<MeshAlertSnapshot, String> {
     let cutoff = chrono::Utc::now() - chrono::Duration::hours(MESH_ALERT_RECENCY_HOURS);
-    let rows: Vec<(
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<chrono::DateTime<chrono::Utc>>,
-    )> = sqlx::query_as(
+    let rows: Vec<MeshAlertRow> = sqlx::query_as(
         "SELECT src_node, dst_node, status, last_error, last_checked
          FROM fleet_mesh_status
          ORDER BY src_node, dst_node",
@@ -579,9 +741,17 @@ async fn load_mesh_alert_snapshot(pg: &PgPool) -> Result<MeshAlertSnapshot, Stri
     .await
     .map_err(|e| format!("load mesh status: {e}"))?;
 
+    Ok(mesh_alert_snapshot_from_rows(rows, cutoff, exclusions))
+}
+
+fn mesh_alert_snapshot_from_rows(
+    rows: impl IntoIterator<Item = MeshAlertRow>,
+    cutoff: chrono::DateTime<chrono::Utc>,
+    exclusions: &MeshExclusions,
+) -> MeshAlertSnapshot {
     let mut directed: BTreeMap<(String, String), (String, Option<String>)> = BTreeMap::new();
     for (src, dst, status, last_error, last_checked) in rows {
-        if last_checked.map(|t| t < cutoff).unwrap_or(true) {
+        if !exclusions.allows_edge(&src, &dst) || last_checked.map(|t| t < cutoff).unwrap_or(true) {
             continue;
         }
         directed.insert((src, dst), (status, last_error));
@@ -620,7 +790,7 @@ async fn load_mesh_alert_snapshot(pg: &PgPool) -> Result<MeshAlertSnapshot, Stri
         }
     }
 
-    Ok(snapshot)
+    snapshot
 }
 
 /// Fire the `ssh_mesh_degraded` imperative alert if the recent mesh snapshot
@@ -628,6 +798,13 @@ async fn load_mesh_alert_snapshot(pg: &PgPool) -> Result<MeshAlertSnapshot, Stri
 /// after full pairwise checks and local reachability checks so both scheduled
 /// ticks and on-demand `ff fleet ssh-mesh-check` alert on problems.
 pub async fn fire_mesh_alert(pg: &PgPool) -> Result<(), String> {
+    fire_mesh_alert_scoped(pg, &MeshExclusions::default()).await
+}
+
+pub async fn fire_mesh_alert_scoped(
+    pg: &PgPool,
+    exclusions: &MeshExclusions,
+) -> Result<(), String> {
     let policy: Option<(Uuid, String, String)> = sqlx::query_as(
         "SELECT id, severity, channel FROM alert_policies WHERE name = $1 AND enabled = true",
     )
@@ -644,7 +821,7 @@ pub async fn fire_mesh_alert(pg: &PgPool) -> Result<(), String> {
         return Ok(());
     };
 
-    let snapshot = load_mesh_alert_snapshot(pg).await?;
+    let snapshot = load_mesh_alert_snapshot(pg, exclusions).await?;
     let total = snapshot.failed_edges.len() + snapshot.asymmetric.len();
     if total == 0 {
         return Ok(());
@@ -762,7 +939,7 @@ pub async fn mesh_propagate(
     let nodes = ff_db::pg_list_nodes(pool)
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
-    mark_ineligible_pairs_skipped(pool, &nodes).await?;
+    mark_ineligible_pairs_skipped(pool, &nodes, &MeshExclusions::default()).await?;
     if nodes
         .iter()
         .find(|node| node.name == new_node)
@@ -881,7 +1058,7 @@ pub async fn probe_single_pair(pool: &PgPool, src: &str, dst: &str) -> Result<Me
     let nodes = ff_db::pg_list_nodes(pool)
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
-    mark_ineligible_pairs_skipped(pool, &nodes).await?;
+    mark_ineligible_pairs_skipped(pool, &nodes, &MeshExclusions::default()).await?;
     let s = nodes
         .iter()
         .find(|n| n.name == src)
@@ -927,12 +1104,19 @@ pub async fn probe_single_pair(pool: &PgPool, src: &str, dst: &str) -> Result<Me
 /// against any active retry for the same (src,dst) pair. Capped at 5 attempts
 /// per 24h across task IDs so a completed task cannot reset the retry budget.
 pub async fn enqueue_retries(pool: &PgPool) -> Result<usize, String> {
+    enqueue_retries_scoped(pool, &MeshCheckScope::default()).await
+}
+
+pub async fn enqueue_retries_scoped(
+    pool: &PgPool,
+    scope: &MeshCheckScope,
+) -> Result<usize, String> {
     let cutoff = chrono::Utc::now() - chrono::Duration::minutes(10);
     let retry_window = chrono::Utc::now() - chrono::Duration::hours(24);
     let nodes = ff_db::pg_list_nodes(pool)
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
-    mark_ineligible_pairs_skipped(pool, &nodes).await?;
+    mark_ineligible_pairs_skipped(pool, &nodes, scope.exclusions()).await?;
     let eligible: HashSet<&str> = nodes
         .iter()
         .filter(|node| mesh_eligible(node))
@@ -947,6 +1131,7 @@ pub async fn enqueue_retries(pool: &PgPool) -> Result<usize, String> {
             r.status == "failed"
                 && eligible.contains(r.src_node.as_str())
                 && eligible.contains(r.dst_node.as_str())
+                && scope.edge_in_scope(&r.src_node, &r.dst_node)
                 && r.last_checked.map(|t| t < cutoff).unwrap_or(true)
         })
         .map(|r| (r.src_node.clone(), r.dst_node.clone()))
@@ -1006,19 +1191,30 @@ pub async fn enqueue_retries(pool: &PgPool) -> Result<usize, String> {
 }
 
 pub async fn refresh_stale(pool: &PgPool, max_age: chrono::Duration) -> Result<usize, String> {
+    refresh_stale_scoped(pool, max_age, &MeshCheckScope::default()).await
+}
+
+pub async fn refresh_stale_scoped(
+    pool: &PgPool,
+    max_age: chrono::Duration,
+    scope: &MeshCheckScope,
+) -> Result<usize, String> {
     let cutoff = chrono::Utc::now() - max_age;
     let all = ff_db::pg_list_mesh_status(pool, None)
         .await
         .map_err(|e| format!("pg_list_mesh_status: {e}"))?;
     let stale: HashSet<(String, String)> = all
         .iter()
-        .filter(|r| r.last_checked.map(|t| t < cutoff).unwrap_or(true))
+        .filter(|r| {
+            scope.edge_in_scope(&r.src_node, &r.dst_node)
+                && r.last_checked.map(|t| t < cutoff).unwrap_or(true)
+        })
         .map(|r| (r.src_node.clone(), r.dst_node.clone()))
         .collect();
     if stale.is_empty() {
         return Ok(0);
     }
-    let _ = pairwise_ssh_check(pool).await?;
+    let _ = pairwise_ssh_check_scoped(pool, scope).await?;
     Ok(stale.len())
 }
 
@@ -1169,5 +1365,143 @@ mod tests {
             [(now, 4), (now - chrono::Duration::hours(25), 20),].into_iter(),
             recent
         ));
+    }
+
+    #[test]
+    fn mesh_scope_canonicalizes_deduplicates_and_rejects_invalid_names() {
+        let available = || {
+            ["Logan", "Vinny", "Sia", "Beyonce"]
+                .into_iter()
+                .map(str::to_string)
+        };
+        let scope = resolve_mesh_check_scope_from_names(
+            available(),
+            Some("logan"),
+            &[" VINNY ".into(), "vinny".into()],
+        )
+        .expect("valid scope");
+
+        assert_eq!(scope.only_node(), Some("Logan"));
+        assert_eq!(scope.exclusions.iter().collect::<Vec<_>>(), [&"Vinny"]);
+        assert!(scope.exclusions.contains("VINNY"));
+        assert!(!scope.edge_in_scope("logan", "VINNY"));
+        assert!(scope.edge_in_scope("LOGAN", "SIA"));
+        assert_eq!(
+            resolve_mesh_check_scope_from_names(available(), None, &["unknown".into()])
+                .unwrap_err(),
+            "unknown excluded node 'unknown'"
+        );
+        assert_eq!(
+            resolve_mesh_check_scope_from_names(available(), Some("Vinny"), &["vinny".into()])
+                .unwrap_err(),
+            "selected node 'Vinny' cannot also be excluded"
+        );
+    }
+
+    #[test]
+    fn exclusions_remove_both_edge_directions_without_changing_legacy_scope() {
+        let names = ["Logan", "Vinny", "Sia", "Beyonce"];
+        let selected = resolve_mesh_check_scope_from_names(
+            names.into_iter().map(str::to_string),
+            Some("Logan"),
+            &["Vinny".into()],
+        )
+        .expect("valid scope");
+        let legacy = resolve_mesh_check_scope_from_names(
+            names.into_iter().map(str::to_string),
+            Some("Logan"),
+            &[],
+        )
+        .expect("legacy scope");
+
+        for src in names {
+            for dst in names {
+                if src == dst {
+                    continue;
+                }
+                assert_eq!(
+                    legacy.edge_in_scope(src, dst),
+                    src == "Logan" || dst == "Logan",
+                    "empty exclusions must preserve the selected-node predicate for {src}->{dst}"
+                );
+                assert_eq!(
+                    selected.edge_in_scope(src, dst),
+                    (src == "Logan" || dst == "Logan") && src != "Vinny" && dst != "Vinny",
+                    "excluded endpoint leaked into {src}->{dst}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exclusions_guard_retry_repair_and_direct_probe_predicates() {
+        let scope = resolve_mesh_check_scope_from_names(
+            ["Logan", "Vinny", "Sia"].into_iter().map(str::to_string),
+            None,
+            &["Vinny".into()],
+        )
+        .expect("valid scope");
+
+        assert!(!scope.edge_in_scope("Logan", "Vinny"));
+        assert!(!scope.edge_in_scope("Vinny", "Logan"));
+        assert!(!scope.destination_in_scope("Logan", "Vinny"));
+        assert!(!scope.destination_in_scope("Vinny", "Logan"));
+        assert!(scope.edge_in_scope("Logan", "Sia"));
+        assert!(scope.destination_in_scope("Logan", "Sia"));
+    }
+
+    #[tokio::test]
+    async fn excluded_auto_repair_returns_without_opening_a_database_connection() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://invalid:invalid@127.0.0.1:1/invalid")
+            .expect("lazy pool");
+        let exclusions = MeshExclusions::from_canonical_names(["Vinny".into()]);
+
+        let result =
+            enqueue_ssh_mesh_auto_repair_scoped(&pool, "Logan", "Logan", "Vinny", &exclusions)
+                .await
+                .expect("excluded repair should be a no-op");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn alert_snapshot_ignores_excluded_failures_and_asymmetry_only_when_explicit() {
+        let now = chrono::Utc::now();
+        let cutoff = now - chrono::Duration::hours(24);
+        let rows = vec![
+            (
+                "Logan".into(),
+                "Vinny".into(),
+                "failed".into(),
+                Some("down".into()),
+                Some(now),
+            ),
+            ("Vinny".into(), "Logan".into(), "ok".into(), None, Some(now)),
+            ("Logan".into(), "Sia".into(), "ok".into(), None, Some(now)),
+            ("Sia".into(), "Logan".into(), "ok".into(), None, Some(now)),
+        ];
+
+        let legacy =
+            mesh_alert_snapshot_from_rows(rows.clone(), cutoff, &MeshExclusions::default());
+        assert_eq!(legacy.failed_edges.len(), 1);
+        assert_eq!(legacy.asymmetric.len(), 1);
+
+        let excluding_vinny = MeshExclusions::from_canonical_names(["Vinny".into()]);
+        let scoped = mesh_alert_snapshot_from_rows(rows, cutoff, &excluding_vinny);
+        assert!(scoped.failed_edges.is_empty());
+        assert!(scoped.asymmetric.is_empty());
+
+        let still_failed = mesh_alert_snapshot_from_rows(
+            vec![(
+                "Logan".into(),
+                "Beyonce".into(),
+                "failed".into(),
+                Some("refused".into()),
+                Some(now),
+            )],
+            cutoff,
+            &excluding_vinny,
+        );
+        assert_eq!(still_failed.failed_edges.len(), 1);
     }
 }

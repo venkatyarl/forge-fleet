@@ -1829,6 +1829,9 @@ enum FleetCommand {
     SshMeshCheck {
         #[arg(long)]
         node: Option<String>,
+        /// Runtime-only endpoint exclusions. Repeat for multiple nodes.
+        #[arg(long = "exclude-node", value_name = "NAME", action = clap::ArgAction::Append)]
+        exclude_node: Vec<String>,
         #[arg(long)]
         json: bool,
         /// Probe directly FROM this node (ICMP ping + single-hop SSH,
@@ -1860,6 +1863,9 @@ enum FleetCommand {
     /// Full 12-check verify battery for one node.
     VerifyNode {
         name: String,
+        /// Ignore persisted mesh rows involving these runtime-only exclusions.
+        #[arg(long = "exclude-node", value_name = "NAME", action = clap::ArgAction::Append)]
+        exclude_node: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -9111,6 +9117,72 @@ mod backup_policy_cli_tests {
             .join()
             .expect("backup-policy missing-kind parser test panicked");
         assert!(rejected);
+    }
+}
+
+#[cfg(test)]
+mod mesh_exclusion_cli_tests {
+    use super::{Cli, Command, FleetCommand};
+    use clap::Parser;
+
+    fn parse_fleet(args: &[&str]) -> FleetCommand {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(owned))
+            .expect("spawn mesh exclusion parser test")
+            .join()
+            .expect("mesh exclusion parser test panicked")
+            .expect("valid fleet command")
+            .command
+            .and_then(|command| match command {
+                Command::Fleet { command } => Some(command),
+                _ => None,
+            })
+            .expect("parsed fleet command")
+    }
+
+    #[test]
+    fn ssh_mesh_check_accepts_repeatable_runtime_exclusions() {
+        match parse_fleet(&[
+            "ff",
+            "fleet",
+            "ssh-mesh-check",
+            "--node",
+            "Logan",
+            "--exclude-node",
+            "Vinny",
+            "--exclude-node",
+            "Sia",
+        ]) {
+            FleetCommand::SshMeshCheck {
+                node, exclude_node, ..
+            } => {
+                assert_eq!(node.as_deref(), Some("Logan"));
+                assert_eq!(exclude_node, ["Vinny", "Sia"]);
+            }
+            other => panic!("expected ssh-mesh-check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_node_accepts_the_same_runtime_exclusion_scope() {
+        match parse_fleet(&[
+            "ff",
+            "fleet",
+            "verify-node",
+            "Logan",
+            "--exclude-node",
+            "Vinny",
+        ]) {
+            FleetCommand::VerifyNode {
+                name, exclude_node, ..
+            } => {
+                assert_eq!(name, "Logan");
+                assert_eq!(exclude_node, ["Vinny"]);
+            }
+            other => panic!("expected verify-node, got {other:?}"),
+        }
     }
 }
 

@@ -4199,12 +4199,20 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
     match cmd {
         FleetCommand::SshMeshCheck {
             node,
+            exclude_node,
             json,
             from_here,
             since,
             repair,
             yes,
         } => {
+            let scope = ff_agent::mesh_check::resolve_mesh_check_scope(
+                &pool,
+                node.as_deref(),
+                &exclude_node,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
             if from_here {
                 if repair || since.is_some() {
                     anyhow::bail!(
@@ -4214,7 +4222,7 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                 println!(
                     "{CYAN}▶ Probing ping + SSH from this node to every fleet worker...{RESET}"
                 );
-                let probes = ff_agent::mesh_check::local_reach_check(&pool, node.as_deref())
+                let probes = ff_agent::mesh_check::local_reach_check_scoped(&pool, &scope)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
                 if probes.is_empty() {
@@ -4268,13 +4276,15 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                     .await
                     .map_err(|e| anyhow::anyhow!("pg_list_mesh_status: {e}"))?
                     .into_iter()
-                    .filter(|r| r.status == "failed")
+                    .filter(|r| {
+                        r.status == "failed" && scope.edge_in_scope(&r.src_node, &r.dst_node)
+                    })
                     .collect::<Vec<_>>();
                 println!(
                     "  found {} failed pair(s) — re-enqueuing as mesh_retry tasks",
                     failed.len()
                 );
-                let created = ff_agent::mesh_check::enqueue_retries(&pool)
+                let created = ff_agent::mesh_check::enqueue_retries_scoped(&pool, &scope)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
                 println!("  enqueued {created} mesh_retry task(s)");
@@ -4284,18 +4294,16 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                     anyhow::anyhow!("unrecognized --since value '{spec}' (try 1h, 30m, 2d)")
                 })?;
                 println!("{CYAN}▶ Refreshing pairs older than {spec}...{RESET}");
-                let n = ff_agent::mesh_check::refresh_stale(&pool, age)
+                let n = ff_agent::mesh_check::refresh_stale_scoped(&pool, age, &scope)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
                 println!("  refreshed {n} stale pair(s)");
                 return Ok(());
             }
             println!("{CYAN}▶ Running pairwise SSH mesh check...{RESET}");
-            let matrix = match &node {
-                Some(n) => ff_agent::mesh_check::pairwise_ssh_check_node(&pool, n).await,
-                None => ff_agent::mesh_check::pairwise_ssh_check(&pool).await,
-            }
-            .map_err(|e| anyhow::anyhow!(e))?;
+            let matrix = ff_agent::mesh_check::pairwise_ssh_check_scoped(&pool, &scope)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
             if json {
                 let arr: Vec<_> = matrix
                     .cells
@@ -4350,11 +4358,26 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                 println!("rerun with `ff fleet cleanup-mesh-repair-backlog --apply` to apply");
             }
         }
-        FleetCommand::VerifyNode { name, json } => {
-            println!("{CYAN}▶ Running verify-node battery for {name}...{RESET}");
-            let report = ff_agent::verify_computer::verify_computer(&pool, &name)
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
+        FleetCommand::VerifyNode {
+            name,
+            exclude_node,
+            json,
+        } => {
+            let scope =
+                ff_agent::mesh_check::resolve_mesh_check_scope(&pool, Some(&name), &exclude_node)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+            let canonical_name = scope
+                .only_node()
+                .expect("verify-node always resolves a selected node");
+            println!("{CYAN}▶ Running verify-node battery for {canonical_name}...{RESET}");
+            let report = ff_agent::verify_computer::verify_computer_with_exclusions(
+                &pool,
+                canonical_name,
+                scope.exclusions(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
             if json {
                 println!(
                     "{}",

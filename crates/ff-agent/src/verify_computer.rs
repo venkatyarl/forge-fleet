@@ -23,6 +23,15 @@ pub struct VerifyReport {
 }
 
 pub async fn verify_computer(pool: &PgPool, worker_name: &str) -> Result<VerifyReport, String> {
+    let exclusions = crate::mesh_check::MeshExclusions::default();
+    verify_computer_with_exclusions(pool, worker_name, &exclusions).await
+}
+
+pub async fn verify_computer_with_exclusions(
+    pool: &PgPool,
+    worker_name: &str,
+    exclusions: &crate::mesh_check::MeshExclusions,
+) -> Result<VerifyReport, String> {
     let node = ff_db::pg_get_node(pool, worker_name)
         .await
         .map_err(|e| format!("pg_get_node: {e}"))?
@@ -135,37 +144,7 @@ pub async fn verify_computer(pool: &PgPool, worker_name: &str) -> Result<VerifyR
     let mesh = ff_db::queries::pg_list_active_mesh_status(pool, Some(worker_name))
         .await
         .unwrap_or_default();
-    details.push(if mesh.is_empty() {
-        CheckResult {
-            check: "mesh_ssh_complete".into(),
-            status: "skip".into(),
-            message: Some("no mesh checks yet; run `ff fleet ssh-mesh-check`".into()),
-            retry_task_id: None,
-        }
-    } else if mesh.iter().all(|r| r.status == "ok") {
-        CheckResult {
-            check: "mesh_ssh_complete".into(),
-            status: "pass".into(),
-            message: Some(format!("{} pairs all ok", mesh.len())),
-            retry_task_id: None,
-        }
-    } else {
-        let fails: Vec<String> = mesh
-            .iter()
-            .filter(|r| r.status != "ok")
-            .map(|r| format!("{}→{}", r.src_node, r.dst_node))
-            .collect();
-        CheckResult {
-            check: "mesh_ssh_complete".into(),
-            status: "fail".into(),
-            message: Some(format!(
-                "{} pair(s) failed: {}",
-                fails.len(),
-                fails.join(", ")
-            )),
-            retry_task_id: None,
-        }
-    });
+    details.push(mesh_ssh_complete_result(&mesh, exclusions));
     // 11. defer_end_to_end
     // Skip on nodes whose ff binary predates the defer-worker subcommand
     // (added 2026-05-04). Without defer-worker the task enqueues but is
@@ -273,6 +252,60 @@ pub async fn verify_computer(pool: &PgPool, worker_name: &str) -> Result<VerifyR
     })
 }
 
+fn mesh_ssh_complete_result(
+    rows: &[ff_db::MeshStatusRow],
+    exclusions: &crate::mesh_check::MeshExclusions,
+) -> CheckResult {
+    let scoped: Vec<&ff_db::MeshStatusRow> = rows
+        .iter()
+        .filter(|row| exclusions.allows_edge(&row.src_node, &row.dst_node))
+        .collect();
+    if scoped.is_empty() {
+        return CheckResult {
+            check: "mesh_ssh_complete".into(),
+            status: "skip".into(),
+            message: Some(if exclusions.is_empty() {
+                "no mesh checks yet; run `ff fleet ssh-mesh-check`".into()
+            } else {
+                "no in-scope mesh checks; run `ff fleet ssh-mesh-check`".into()
+            }),
+            retry_task_id: None,
+        };
+    }
+    if scoped.iter().all(|row| row.status == "ok") {
+        return CheckResult {
+            check: "mesh_ssh_complete".into(),
+            status: "pass".into(),
+            message: Some(if exclusions.is_empty() {
+                format!("{} pairs all ok", scoped.len())
+            } else {
+                format!("{} in-scope pairs all ok", scoped.len())
+            }),
+            retry_task_id: None,
+        };
+    }
+
+    let failures: Vec<String> = scoped
+        .into_iter()
+        .filter(|row| row.status != "ok")
+        .map(|row| format!("{}→{}", row.src_node, row.dst_node))
+        .collect();
+    CheckResult {
+        check: "mesh_ssh_complete".into(),
+        status: "fail".into(),
+        message: Some(if exclusions.is_empty() {
+            format!("{} pair(s) failed: {}", failures.len(), failures.join(", "))
+        } else {
+            format!(
+                "{} in-scope pair(s) failed: {}",
+                failures.len(),
+                failures.join(", ")
+            )
+        }),
+        retry_task_id: None,
+    }
+}
+
 async fn check_daemon_healthy(node: &ff_db::FleetNodeRow) -> CheckResult {
     if node.status == "offline" {
         return CheckResult {
@@ -363,9 +396,9 @@ fn redis_check_command(is_windows: bool) -> &'static str {
 
 fn tooling_check_command(is_windows: bool) -> &'static str {
     if is_windows {
-        r#"powershell -NoProfile -Command "$c = 0; foreach ($t in 'gh','git','codex','claude') { if (Get-Command $t -ErrorAction SilentlyContinue) { $c++ } }; if ($c -ge 3) { exit 0 } else { exit 1 }""#
+        r#"powershell -NoProfile -Command "$missing = @(); foreach ($t in 'gh','git','codex','claude') { if (-not (Get-Command $t -ErrorAction SilentlyContinue)) { $missing += $t } }; if ($missing.Count -eq 0) { exit 0 } else { [Console]::Error.WriteLine(('missing required tools: ' + ($missing -join ', '))); exit 1 }""#
     } else {
-        "PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\" && [ $(command -v gh op codex claude 2>/dev/null | wc -l) -ge 3 ]"
+        "PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"; missing=\"\"; for t in gh op codex claude; do if ! command -v \"$t\" >/dev/null 2>&1; then missing=\"$missing $t\"; fi; done; if [ -n \"$missing\" ]; then printf 'missing required tools:%s\\n' \"$missing\" >&2; exit 1; fi"
     }
 }
 
@@ -402,5 +435,103 @@ mod tests {
         assert!(cmd.contains("$HOME/.cargo/bin"));
         assert!(cmd.contains("command -v"));
         assert!(!cmd.contains("which"));
+    }
+
+    #[test]
+    fn unix_tooling_command_requires_and_reports_every_tool() {
+        let cmd = tooling_check_command(false);
+        assert!(cmd.contains("for t in gh op codex claude"));
+        assert!(cmd.contains("missing required tools:"));
+        assert!(cmd.contains("[ -n \"$missing\" ]"));
+        assert!(!cmd.contains("-ge 3"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_tooling_command_fails_three_of_four_then_passes_four_of_four() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().expect("temp home");
+        let bin = home.path().join(".local/bin");
+        let empty_path = home.path().join("empty-path");
+        std::fs::create_dir_all(&bin).expect("create fake bin");
+        std::fs::create_dir_all(&empty_path).expect("create empty PATH");
+
+        let install_tool = |name: &str| {
+            let path = bin.join(name);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write fake tool");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("make fake tool executable");
+        };
+        for tool in ["gh", "op", "codex"] {
+            install_tool(tool);
+        }
+
+        let run_check = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", tooling_check_command(false)])
+                .env("HOME", home.path())
+                .env("PATH", &empty_path)
+                .output()
+                .expect("run tooling check")
+        };
+
+        let missing_one = run_check();
+        assert!(!missing_one.status.success());
+        assert!(String::from_utf8_lossy(&missing_one.stderr).contains("claude"));
+
+        install_tool("claude");
+        let complete = run_check();
+        assert!(complete.status.success());
+        assert!(complete.stderr.is_empty());
+    }
+
+    #[test]
+    fn windows_tooling_command_requires_and_reports_every_tool() {
+        let cmd = tooling_check_command(true);
+        assert!(cmd.contains("'gh','git','codex','claude'"));
+        assert!(cmd.contains("missing required tools:"));
+        assert!(cmd.contains("$missing.Count -eq 0"));
+        assert!(!cmd.contains("$c -ge 3"));
+    }
+
+    fn mesh_row(src: &str, dst: &str, status: &str) -> ff_db::MeshStatusRow {
+        ff_db::MeshStatusRow {
+            src_node: src.into(),
+            dst_node: dst.into(),
+            status: status.into(),
+            last_checked: Some(chrono::Utc::now()),
+            last_error: (status != "ok").then(|| "unreachable".into()),
+            attempts: 1,
+        }
+    }
+
+    #[test]
+    fn mesh_verification_ignores_excluded_rows_only_when_explicit() {
+        let rows = vec![
+            mesh_row("Logan", "Vinny", "failed"),
+            mesh_row("Vinny", "Logan", "failed"),
+            mesh_row("Logan", "Sia", "ok"),
+        ];
+
+        let legacy = mesh_ssh_complete_result(&rows, &crate::mesh_check::MeshExclusions::default());
+        assert_eq!(legacy.status, "fail");
+        let legacy_message = legacy.message.expect("legacy failure message");
+        assert!(legacy_message.contains("Logan→Vinny"));
+        assert!(legacy_message.contains("Vinny→Logan"));
+        assert!(!legacy_message.contains("in-scope"));
+
+        let exclusions = crate::mesh_check::MeshExclusions::from_canonical_names(["Vinny".into()]);
+        let scoped = mesh_ssh_complete_result(&rows, &exclusions);
+        assert_eq!(scoped.status, "pass");
+        assert_eq!(scoped.message.as_deref(), Some("1 in-scope pairs all ok"));
+
+        let mut other_failure = rows;
+        other_failure.push(mesh_row("Logan", "Beyonce", "failed"));
+        let scoped = mesh_ssh_complete_result(&other_failure, &exclusions);
+        assert_eq!(scoped.status, "fail");
+        let scoped_message = scoped.message.expect("scoped failure message");
+        assert!(scoped_message.contains("Logan→Beyonce"));
+        assert!(!scoped_message.contains("Vinny"));
     }
 }
