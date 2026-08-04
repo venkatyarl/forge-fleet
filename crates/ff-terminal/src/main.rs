@@ -3002,6 +3002,17 @@ pub enum MemoryCommand {
         #[arg(long, default_value = "")]
         scope_key: String,
     },
+    /// Preview or compact one exact legacy/lowered-cap Scratchpad scope.
+    /// Read-only unless --apply is explicitly supplied.
+    Compact {
+        #[arg(long, default_value = "session")]
+        scope_type: String,
+        #[arg(long, default_value = "default")]
+        scope_key: String,
+        /// Run archive-before-summary/hard-trim compaction.
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -6611,6 +6622,79 @@ mod oauth_cli_guard_tests {
             "cleanup-mesh-repair-backlog",
             "--apply",
         ]));
+    }
+}
+
+#[cfg(test)]
+mod memory_cli_guard_tests {
+    use super::{Cli, Command, MemoryCommand};
+    use clap::Parser;
+
+    fn parse_compact(args: &[&str]) -> (String, String, bool) {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(owned))
+            .expect("spawn parser thread")
+            .join()
+            .expect("parser thread panicked")
+            .expect("valid memory compact command")
+            .command
+            .and_then(|command| match command {
+                Command::Memory {
+                    command:
+                        MemoryCommand::Compact {
+                            scope_type,
+                            scope_key,
+                            apply,
+                        },
+                } => Some((scope_type, scope_key, apply)),
+                _ => None,
+            })
+            .expect("parsed memory compact")
+    }
+
+    #[test]
+    fn memory_compact_defaults_to_exact_auto_scope_preview() {
+        assert_eq!(
+            parse_compact(&["ff", "memory", "compact"]),
+            ("session".to_string(), "default".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn memory_compact_apply_and_explicit_scope_parse() {
+        assert_eq!(
+            parse_compact(&[
+                "ff",
+                "memory",
+                "compact",
+                "--scope-type",
+                "project",
+                "--scope-key",
+                "forge-fleet",
+                "--apply",
+            ]),
+            ("project".to_string(), "forge-fleet".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn memory_compact_preserves_arbitrary_explicit_scope_keys() {
+        for scope_key in ["default", "github.com/venkatyarl/forge-fleet"] {
+            assert_eq!(
+                parse_compact(&[
+                    "ff",
+                    "memory",
+                    "compact",
+                    "--scope-type",
+                    "project",
+                    "--scope-key",
+                    scope_key,
+                ]),
+                ("project".to_string(), scope_key.to_string(), false)
+            );
+        }
     }
 }
 

@@ -9426,6 +9426,45 @@ pub struct MemoryBlock {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One coherent, scope-locked Scratchpad view used by compaction.
+#[derive(Debug, Clone)]
+pub struct MemoryScopeSnapshot {
+    pub blocks: Vec<MemoryBlock>,
+    pub cap_bytes: i32,
+    /// SHA-256 over the complete ordered block/content/byte state.
+    pub scope_hash: String,
+}
+
+/// A compaction preview/result snapshot plus durable preservation evidence.
+#[derive(Debug, Clone)]
+pub struct MemoryCompactSnapshot {
+    pub scope: MemoryScopeSnapshot,
+    pub evidence: MemoryPreservationEvidence,
+}
+
+const MEMORY_SCOPE_HASH_SQL: &str = "SELECT encode(
+         digest(
+             COALESCE(
+                 jsonb_agg(jsonb_build_array(block, content, bytes) ORDER BY block)::TEXT,
+                 '[]'
+             ),
+             'sha256'
+         ),
+         'hex'
+     ) AS scope_hash
+       FROM agent_memory
+      WHERE scope_type = $1 AND scope_key = $2";
+
+const MEMORY_PRESERVATION_EVIDENCE_SQL: &str = "SELECT COUNT(DISTINCT e.id)::BIGINT AS evictions,
+            COUNT(DISTINCT CASE
+                WHEN b.body IS NOT NULL
+                 AND encode(digest(b.body, 'sha256'), 'hex') = e.prev_hash
+                THEN b.id
+            END)::BIGINT AS brain_candidates
+       FROM agent_memory_evictions e
+       LEFT JOIN brain_knowledge_candidates b ON b.id::TEXT = e.brain_ref
+      WHERE e.scope_type = $1 AND e.scope_key = $2";
+
 /// Resolve the byte cap for a scope: a `(scope_type, scope_key)` override,
 /// else the `(scope_type, '')` default, else [`MEMORY_DEFAULT_CAP_BYTES`].
 pub async fn pg_memory_cap(pool: &PgPool, scope_type: &str, scope_key: &str) -> Result<i32> {
@@ -9492,6 +9531,124 @@ pub async fn pg_memory_get_all(
             updated_at: r.get("updated_at"),
         })
         .collect())
+}
+
+async fn memory_scope_snapshot_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope_type: &str,
+    scope_key: &str,
+) -> Result<MemoryScopeSnapshot> {
+    let rows = sqlx::query(
+        "SELECT scope_type, scope_key, block, content, bytes, updated_at
+           FROM agent_memory
+          WHERE scope_type = $1 AND scope_key = $2
+          ORDER BY array_position(ARRAY['task','decisions','findings','state','scratch'], block)",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .fetch_all(&mut **tx)
+    .await?;
+    let blocks = rows
+        .iter()
+        .map(|row| MemoryBlock {
+            scope_type: row.get("scope_type"),
+            scope_key: row.get("scope_key"),
+            block: row.get("block"),
+            content: row.get("content"),
+            bytes: row.get("bytes"),
+            updated_at: row.get("updated_at"),
+        })
+        .collect();
+    let cap_bytes: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(
+             (SELECT cap_bytes FROM agent_memory_caps
+               WHERE scope_type = $1 AND scope_key IN ($2, '')
+               ORDER BY (scope_key = $2) DESC
+               LIMIT 1),
+             $3
+         )",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .bind(MEMORY_DEFAULT_CAP_BYTES)
+    .fetch_one(&mut **tx)
+    .await?;
+    let scope_hash: String = sqlx::query_scalar(MEMORY_SCOPE_HASH_SQL)
+        .bind(scope_type)
+        .bind(scope_key)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(MemoryScopeSnapshot {
+        blocks,
+        cap_bytes,
+        scope_hash,
+    })
+}
+
+async fn memory_preservation_evidence_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope_type: &str,
+    scope_key: &str,
+) -> Result<MemoryPreservationEvidence> {
+    let row = sqlx::query(MEMORY_PRESERVATION_EVIDENCE_SQL)
+        .bind(scope_type)
+        .bind(scope_key)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(MemoryPreservationEvidence {
+        evictions: row.get("evictions"),
+        brain_candidates: row.get("brain_candidates"),
+    })
+}
+
+async fn begin_locked_memory_snapshot<'a>(
+    pool: &'a PgPool,
+    scope_type: &str,
+    scope_key: &str,
+) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let lock_name = format!("agent-memory:{scope_type}:{scope_key}");
+    let locked: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(lock_name)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !locked {
+        tx.rollback().await?;
+        return Err(sqlx::Error::Protocol(
+            "Scratchpad scope is being updated concurrently; retry compaction".into(),
+        )
+        .into());
+    }
+    Ok(tx)
+}
+
+/// Read an exact Scratchpad scope/cap revision while holding its writer lock.
+pub async fn pg_memory_scope_snapshot(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_key: &str,
+) -> Result<MemoryScopeSnapshot> {
+    let mut tx = begin_locked_memory_snapshot(pool, scope_type, scope_key).await?;
+    let snapshot = memory_scope_snapshot_in(&mut tx, scope_type, scope_key).await?;
+    tx.commit().await?;
+    Ok(snapshot)
+}
+
+/// Read an exact compaction preview/result, including preservation evidence.
+pub async fn pg_memory_compact_snapshot(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_key: &str,
+) -> Result<MemoryCompactSnapshot> {
+    let mut tx = begin_locked_memory_snapshot(pool, scope_type, scope_key).await?;
+    let scope = memory_scope_snapshot_in(&mut tx, scope_type, scope_key).await?;
+    let evidence = memory_preservation_evidence_in(&mut tx, scope_type, scope_key).await?;
+    tx.commit().await?;
+    Ok(MemoryCompactSnapshot { scope, evidence })
 }
 
 /// Read a single block's content (empty string if the block does not exist).
@@ -9566,12 +9723,30 @@ pub enum MemoryBlockWriteStatus {
     OverCap,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MemoryBlockWriteResult {
     pub status: MemoryBlockWriteStatus,
     pub bytes_used: i64,
     pub cap_bytes: i32,
     pub over_cap: bool,
+    /// Present only when an archive and replacement committed atomically.
+    pub eviction_id: Option<uuid::Uuid>,
+    /// Exact complete scope state after an applied write.
+    pub scope_hash: Option<String>,
+}
+
+/// Full-content preservation metadata for an atomic compaction write.
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryEvictionArchive<'a> {
+    /// Full scope revision captured with the block list used to choose this target.
+    pub expected_scope_hash: &'a str,
+    /// Effective cap captured by the compactor. A changed cap invalidates the write.
+    pub expected_cap_bytes: i32,
+    pub prev_bytes: i32,
+    /// Summary/trim result. The DB primitive appends the full expected content.
+    pub result_summary: &'a str,
+    pub summarizer: &'a str,
+    pub brain_ref: Option<&'a str>,
 }
 
 fn memory_write_allowed(
@@ -9594,7 +9769,10 @@ fn memory_write_allowed(
 /// the expected block content is checked after the lock is acquired, and a
 /// normal write is committed only if the resulting scope is within its cap.
 /// Compaction may set `allow_over_cap_repair` to make monotonic progress on a
-/// scope that was already oversized; it can never make that scope larger.
+/// scope that was already oversized; it can never make that scope larger. If
+/// `eviction_archive` is present, the scope revision and cap are also compared
+/// and the full-content archive is inserted in this same transaction before
+/// the block replacement.
 pub async fn pg_memory_try_set_block(
     pool: &PgPool,
     scope_type: &str,
@@ -9603,8 +9781,12 @@ pub async fn pg_memory_try_set_block(
     expected_content: &str,
     new_content: &str,
     allow_over_cap_repair: bool,
+    eviction_archive: Option<MemoryEvictionArchive<'_>>,
 ) -> Result<MemoryBlockWriteResult> {
     let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .execute(&mut *tx)
+        .await?;
     let lock_name = format!("agent-memory:{scope_type}:{scope_key}");
     let locked: bool =
         sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
@@ -9618,6 +9800,8 @@ pub async fn pg_memory_try_set_block(
             bytes_used: 0,
             cap_bytes: 0,
             over_cap: false,
+            eviction_id: None,
+            scope_hash: None,
         });
     }
 
@@ -9661,6 +9845,11 @@ pub async fn pg_memory_try_set_block(
     .bind(scope_key)
     .fetch_one(&mut *tx)
     .await?;
+    let current_scope_hash: String = sqlx::query_scalar(MEMORY_SCOPE_HASH_SQL)
+        .bind(scope_type)
+        .bind(scope_key)
+        .fetch_one(&mut *tx)
+        .await?;
 
     if current_content != expected_content {
         tx.rollback().await?;
@@ -9669,6 +9858,23 @@ pub async fn pg_memory_try_set_block(
             bytes_used: current_total,
             cap_bytes,
             over_cap: current_total > i64::from(cap_bytes),
+            eviction_id: None,
+            scope_hash: Some(current_scope_hash.clone()),
+        });
+    }
+    if let Some(archive) = eviction_archive
+        && (current_scope_hash != archive.expected_scope_hash
+            || cap_bytes != archive.expected_cap_bytes
+            || current_block_bytes != i64::from(archive.prev_bytes))
+    {
+        tx.rollback().await?;
+        return Ok(MemoryBlockWriteResult {
+            status: MemoryBlockWriteStatus::Stale,
+            bytes_used: current_total,
+            cap_bytes,
+            over_cap: current_total > i64::from(cap_bytes),
+            eviction_id: None,
+            scope_hash: Some(current_scope_hash.clone()),
         });
     }
 
@@ -9688,8 +9894,41 @@ pub async fn pg_memory_try_set_block(
             bytes_used: prospective,
             cap_bytes,
             over_cap: true,
+            eviction_id: None,
+            scope_hash: Some(current_scope_hash),
         });
     }
+
+    // Archive and compare-and-set commit together. If the audit insert or the
+    // later block update fails, PostgreSQL rolls both back, so content can
+    // never be mutated without its complete pre-mutation value being durable.
+    let eviction_id = if let Some(archive) = eviction_archive {
+        let durable_summary = durable_memory_archive(archive.result_summary, expected_content);
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_memory_evictions
+                (scope_type, scope_key, block, prev_hash, prev_bytes,
+                 summary, summarizer, brain_ref)
+             VALUES ($1, $2, $3, encode(digest($4, 'sha256'), 'hex'), $5, $6, $7, $8)
+             RETURNING id",
+        )
+        .bind(scope_type)
+        .bind(scope_key)
+        .bind(block)
+        .bind(expected_content)
+        .bind(archive.prev_bytes)
+        .bind(durable_summary)
+        .bind(archive.summarizer)
+        .bind(
+            archive
+                .brain_ref
+                .filter(|reference| !reference.trim().is_empty()),
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        Some(id)
+    } else {
+        None
+    };
 
     if new_content.is_empty() {
         sqlx::query(
@@ -9717,6 +9956,11 @@ pub async fn pg_memory_try_set_block(
         .execute(&mut *tx)
         .await?;
     }
+    let scope_hash: String = sqlx::query_scalar(MEMORY_SCOPE_HASH_SQL)
+        .bind(scope_type)
+        .bind(scope_key)
+        .fetch_one(&mut *tx)
+        .await?;
     tx.commit().await?;
 
     Ok(MemoryBlockWriteResult {
@@ -9724,12 +9968,20 @@ pub async fn pg_memory_try_set_block(
         bytes_used: prospective,
         cap_bytes,
         over_cap: prospective > i64::from(cap_bytes),
+        eviction_id,
+        scope_hash: Some(scope_hash),
     })
+}
+
+fn durable_memory_archive(result_summary: &str, full_content: &str) -> String {
+    format!(
+        "(archive-before-mutation; full pre-mutation content preserved below)\n\nRESULT:\n{result_summary}\n\nFULL PRE-MUTATION:\n{full_content}"
+    )
 }
 
 #[cfg(test)]
 mod scratchpad_write_tests {
-    use super::memory_write_allowed;
+    use super::{durable_memory_archive, memory_write_allowed};
 
     #[test]
     fn normal_write_fails_closed_above_cap() {
@@ -9753,6 +10005,13 @@ mod scratchpad_write_tests {
             memory_write_allowed(100_000, 90_000, 95_000, 6_144, true),
             (false, 105_000)
         );
+    }
+
+    #[test]
+    fn atomic_eviction_archive_contains_complete_previous_content() {
+        let archive = durable_memory_archive("short summary", "complete previous content");
+        assert!(archive.contains("RESULT:\nshort summary"));
+        assert!(archive.contains("FULL PRE-MUTATION:\ncomplete previous content"));
     }
 }
 
@@ -9803,6 +10062,34 @@ pub async fn pg_memory_record_eviction(
     .fetch_one(pool)
     .await?;
     Ok(row.get("id"))
+}
+
+/// Durable preservation evidence for one Scratchpad scope.
+///
+/// `evictions` counts archive-before-mutation audit rows. `brain_candidates`
+/// counts only references that still resolve to a Brain candidate whose body
+/// hashes to the eviction's `prev_hash`, rather than trusting a text reference
+/// or row existence by itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct MemoryPreservationEvidence {
+    pub evictions: i64,
+    pub brain_candidates: i64,
+}
+
+pub async fn pg_memory_preservation_evidence(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_key: &str,
+) -> Result<MemoryPreservationEvidence> {
+    let row = sqlx::query(MEMORY_PRESERVATION_EVIDENCE_SQL)
+        .bind(scope_type)
+        .bind(scope_key)
+        .fetch_one(pool)
+        .await?;
+    Ok(MemoryPreservationEvidence {
+        evictions: row.get("evictions"),
+        brain_candidates: row.get("brain_candidates"),
+    })
 }
 
 // ── Pillar 4: distributed-dev work_item scheduler ────────────────────────
