@@ -18,6 +18,18 @@ const COMPOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 *
 const FIND_EXISTING_REPLICA_TASK_SQL: &str = "SELECT id FROM fleet_tasks WHERE task_class='deferred' AND summary=$1 AND status IN ('pending','dispatchable','running','completed') AND payload->'deferred_payload'->>'command' LIKE $2 ORDER BY created_at DESC LIMIT 1";
 const INSERT_REPLICA_TASK_SQL: &str = "INSERT INTO fleet_tasks (task_type,summary,payload,priority,requires_capability,status,created_at,task_class) VALUES ('shell',$1,$2,50,$3,'pending',NOW(),'deferred') RETURNING id";
 
+fn postgres_major_from_version_output(output: &[u8]) -> Option<i32> {
+    String::from_utf8_lossy(output)
+        .split_whitespace()
+        .find_map(|token| {
+            let version = token.trim_matches(|character: char| !character.is_ascii_digit());
+            version
+                .contains('.')
+                .then(|| version.split('.').next()?.parse().ok())
+                .flatten()
+        })
+}
+
 #[derive(Debug, Clone)]
 struct Plan {
     target_id: Uuid,
@@ -333,13 +345,13 @@ async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
         .output()
         .await
         .context("PostgreSQL image version preflight")?;
-    if !version.status.success()
-        || !String::from_utf8_lossy(&version.stdout)
-            .contains(&format!("PostgreSQL {}.", plan.pg_major))
-    {
+    let image_major = postgres_major_from_version_output(&version.stdout)
+        .or_else(|| postgres_major_from_version_output(&version.stderr));
+    if !version.status.success() || image_major != Some(plan.pg_major) {
         bail!(
-            "target PostgreSQL image major does not match primary major {}",
-            plan.pg_major
+            "target PostgreSQL image major {:?} does not match primary major {}",
+            image_major,
+            plan.pg_major,
         );
     }
     let required_bytes: i64 = sqlx::query_scalar("SELECT pg_database_size(current_database()) * 2")
@@ -566,6 +578,21 @@ mod tests {
         let s = physical_slot(id);
         assert_eq!(s, "ff_00000000000000000000000000000000");
         assert!(s.len() <= 63);
+    }
+
+    #[test]
+    fn parses_postgres_image_major_from_real_version_output() {
+        assert_eq!(
+            postgres_major_from_version_output(
+                b"postgres (PostgreSQL) 16.14 (Debian 16.14-1.pgdg12+1)\n"
+            ),
+            Some(16)
+        );
+        assert_eq!(
+            postgres_major_from_version_output(b"PostgreSQL 17.2\n"),
+            Some(17)
+        );
+        assert_eq!(postgres_major_from_version_output(b"not a version\n"), None);
     }
     #[test]
     fn connected_primary_authority_is_fail_closed() {
