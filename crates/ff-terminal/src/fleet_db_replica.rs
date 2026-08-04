@@ -15,6 +15,7 @@ const MAX_BACKUP_AGE_HOURS: i64 = 24;
 const MAX_POSTCHECK_LAG_BYTES: i64 = 1 << 30;
 const PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const COMPOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const REPLICA_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 const FIND_EXISTING_REPLICA_TASK_SQL: &str = "SELECT id FROM fleet_tasks WHERE task_class='deferred' AND summary=$1 AND status IN ('pending','dispatchable','running','completed') AND payload->'deferred_payload'->>'command' LIKE $2 ORDER BY created_at DESC LIMIT 1";
 const INSERT_REPLICA_TASK_SQL: &str = "INSERT INTO fleet_tasks (task_type,summary,payload,priority,requires_capability,status,created_at,task_class) VALUES ('shell',$1,$2,50,$3,'pending',NOW(),'deferred') RETURNING id";
 
@@ -468,7 +469,7 @@ async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
     if !status.success() {
         bail!("follower compose failed; PGDATA and slot were preserved for retry");
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    let deadline = std::time::Instant::now() + REPLICA_READY_TIMEOUT;
     loop {
         let output = tokio::time::timeout(PREFLIGHT_TIMEOUT, tokio::process::Command::new("docker").args(["exec", "forgefleet-postgres-replica", "psql", "-U", "forgefleet", "-d", "forgefleet", "-Atc", "SELECT pg_is_in_recovery() AND current_setting('transaction_read_only')::bool AND EXISTS (SELECT 1 FROM pg_stat_wal_receiver WHERE status='streaming') AND pg_last_wal_replay_lsn() IS NOT NULL"]).output())
             .await.context("replica postcheck timed out")?.context("replica postcheck")?;
@@ -477,7 +478,7 @@ async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
         }
         if std::time::Instant::now() >= deadline {
             bail!(
-                "replica did not become recovery/read-only/streaming within 10 minutes; PGDATA and slot preserved"
+                "replica did not become recovery/read-only/streaming within 30 minutes; PGDATA and slot preserved"
             );
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -593,6 +594,15 @@ mod tests {
             Some(17)
         );
         assert_eq!(postgres_major_from_version_output(b"not a version\n"), None);
+    }
+
+    #[test]
+    fn replica_ready_timeout_covers_checkpoint_and_large_basebackup() {
+        assert_eq!(
+            REPLICA_READY_TIMEOUT,
+            std::time::Duration::from_secs(30 * 60)
+        );
+        assert!(REPLICA_READY_TIMEOUT > COMPOSE_TIMEOUT);
     }
     #[test]
     fn connected_primary_authority_is_fail_closed() {
