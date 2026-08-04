@@ -740,7 +740,7 @@ pub async fn enrollment_progress(
     // for failures — a fatal without its reason is undebuggable (vinny
     // 2026-08-04: mesh_import fatal with no visible cause).
     if payload.status == "failed" {
-        tracing::warn!(target: "ff-gateway::onboard", node=%payload.name, step=%payload.step, detail=%payload.detail, "enrollment step FAILED");
+        tracing::warn!(target: "ff-gateway::onboard", node=%payload.name, step=%payload.step, detail=payload.detail.as_deref().unwrap_or(""), "enrollment step FAILED");
     } else {
         tracing::info!(target: "ff-gateway::onboard", node=%payload.name, step=%payload.step, status=%payload.status, "enrollment progress");
     }
