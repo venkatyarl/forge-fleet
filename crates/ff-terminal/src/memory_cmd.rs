@@ -95,14 +95,17 @@ pub async fn handle_memory(cmd: crate::MemoryCommand) -> Result<()> {
 }
 
 fn print_write(r: &scratchpad::WriteResult) {
-    let flag = if r.consolidated {
-        " (consolidated — over cap, summarized)"
-    } else {
-        ""
+    let flag = match (r.over_cap, r.data_loss, r.consolidated) {
+        (true, true, _) => " (over cap; destructive trim occurred)",
+        (true, false, true) => " (still over cap after consolidation)",
+        (true, false, false) => " (over cap)",
+        (false, true, _) => " (destructive trim occurred)",
+        (false, false, true) => " (consolidated)",
+        (false, false, false) => "",
     };
     println!(
-        "{CYAN}✓ {}:{} / {} — {}/{} bytes{}{RESET}",
-        r.scope_type, r.scope_key, r.block, r.bytes_used, r.cap_bytes, flag
+        "{CYAN}✓ {}:{} / {} — {}/{} bytes — {}{}{RESET}",
+        r.scope_type, r.scope_key, r.block, r.bytes_used, r.cap_bytes, r.status, flag
     );
 }
 

@@ -1,12 +1,12 @@
 //! The memory **dreamer** — ForgeFleet's sleep-time consolidation loop.
 //!
-//! Background counterpart to the event-driven scratchpad consolidation in
-//! [`crate::scratchpad`]: that path only fires when a *write* pushes a scope
-//! over its byte cap (the MemGPT "flush at 100%" analog), so memory that stops
-//! being written — above all **session scopes whose session has ended** — is
-//! never consolidated and lingers forever. The dreamer is the Letta/MemGPT
-//! "sleep-time agent" analog: a recurring background pass that curates memory
-//! while no agent is actively using it.
+//! Background counterpart to the fail-closed Scratchpad write path in
+//! [`crate::scratchpad`]. Foreground writes never create new over-cap scopes;
+//! the dreamer repairs scopes inherited from older software or a lowered cap,
+//! and archives memory that stops being written — above all **session scopes
+//! whose session has ended**. It is the Letta/MemGPT "sleep-time agent"
+//! analog: a recurring background pass that curates memory while no agent is
+//! actively using it.
 //!
 //! ## What one pass does
 //! 1. **Archive dead session scopes** (Letta sleep-time + MemGPT eviction):
@@ -16,8 +16,8 @@
 //!    deleted. Episodic working memory graduates to long-term storage instead
 //!    of rotting in place — the Graphiti episodic→semantic promotion pattern.
 //! 2. **Re-enforce byte caps** on the durable `agent`/`project` scopes:
-//!    normally a no-op (the write path already enforces caps), but catches
-//!    scopes left over-cap by a lowered cap or a crashed consolidation.
+//!    normally a no-op (the write path enforces caps), but catches scopes left
+//!    over-cap by older software, a lowered cap, or a crashed consolidation.
 //!
 //! ## Cadence — a self-rescheduling chain on `deferred_tasks`
 //! Each pass runs as ONE deferred task (`kind='internal'`,
@@ -198,6 +198,7 @@ pub async fn run_dreamer_pass(pool: &PgPool) -> Result<serde_json::Value> {
     .context("list durable memory scopes")?;
 
     let mut scopes_consolidated = 0usize;
+    let mut scopes_still_over_cap = 0usize;
     for (scope_type, scope_key) in &durable {
         let cap = ff_db::queries::pg_memory_cap(pool, scope_type, scope_key).await?;
         let total = ff_db::queries::pg_memory_total_bytes(pool, scope_type, scope_key).await?;
@@ -205,8 +206,14 @@ pub async fn run_dreamer_pass(pool: &PgPool) -> Result<serde_json::Value> {
             continue;
         }
         match crate::scratchpad::consolidate_and_forget(pool, scope_type, scope_key, cap).await {
-            Ok(true) => scopes_consolidated += 1,
-            Ok(false) => {}
+            Ok(result) => {
+                if result.changed {
+                    scopes_consolidated += 1;
+                }
+                if result.over_cap {
+                    scopes_still_over_cap += 1;
+                }
+            }
             Err(e) => {
                 warn!(scope_type, scope_key, error = %e, "dreamer: cap re-enforcement failed")
             }
@@ -223,6 +230,7 @@ pub async fn run_dreamer_pass(pool: &PgPool) -> Result<serde_json::Value> {
         "sessions_archived": sessions_archived,
         "blocks_archived": blocks_archived,
         "over_cap_scopes_consolidated": scopes_consolidated,
+        "scopes_still_over_cap": scopes_still_over_cap,
     }))
 }
 

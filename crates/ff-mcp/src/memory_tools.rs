@@ -33,9 +33,12 @@ fn str_param<'a>(p: &'a Value, key: &str) -> Result<&'a str, String> {
 fn scope_of(p: &Value) -> (String, String) {
     let st = p.get("scope_type").and_then(|v| v.as_str());
     let sk = p.get("scope_key").and_then(|v| v.as_str());
-    // An explicit scope (caller passed scope_type and/or a non-default key) wins.
-    let explicit = st.is_some_and(|s| s != "session") || sk.is_some_and(|s| s != "default");
-    if !explicit
+    // A non-default key always wins. `scope_type=project` with no real key is
+    // still eligible for cwd derivation; otherwise callers that explicitly ask
+    // for durable memory accidentally converge on the global `project:default`.
+    let derive_project =
+        !sk.is_some_and(|s| s != "default") && matches!(st, None | Some("project"));
+    if derive_project
         && let Some(cwd) = p
             .get("cwd")
             .and_then(|v| v.as_str())
@@ -50,6 +53,37 @@ fn scope_of(p: &Value) -> (String, String) {
     )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::scope_of;
+    use serde_json::json;
+
+    #[test]
+    fn explicit_project_without_key_does_not_force_global_default() {
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let (scope_type, scope_key) = scope_of(&json!({
+            "scope_type": "project",
+            "scope_key": "default",
+            "cwd": cwd,
+        }));
+        assert_eq!(scope_type, "project");
+        assert_ne!(scope_key, "default");
+    }
+
+    #[test]
+    fn explicit_session_and_named_project_keys_keep_precedence() {
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        assert_eq!(
+            scope_of(&json!({"scope_type": "session", "cwd": cwd})),
+            ("session".to_string(), "default".to_string())
+        );
+        assert_eq!(
+            scope_of(&json!({"scope_type": "project", "scope_key": "chosen", "cwd": cwd})),
+            ("project".to_string(), "chosen".to_string())
+        );
+    }
+}
+
 fn write_json(r: scratchpad::WriteResult) -> Value {
     json!({
         "scope_type": r.scope_type,
@@ -58,6 +92,9 @@ fn write_json(r: scratchpad::WriteResult) -> Value {
         "bytes_used": r.bytes_used,
         "cap_bytes": r.cap_bytes,
         "consolidated": r.consolidated,
+        "over_cap": r.over_cap,
+        "data_loss": r.data_loss,
+        "status": r.status,
     })
 }
 

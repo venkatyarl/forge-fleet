@@ -1926,7 +1926,7 @@ impl ToolRegistry {
     fn memory_add() -> ToolDefinition {
         ToolDefinition {
             name: "memory_add".to_string(),
-            description: "Append a line to a working-memory block. Use to record a decision, a finding, current task state. When the scope exceeds its byte cap, the lowest-priority block is auto-summarized (consolidate-and-forget) and the full text is preserved in Brain.".to_string(),
+            description: "Append a line to a working-memory block. Use to record a decision, a finding, or current task state. The write fails closed if it would exceed the scope's byte cap; replace/remove stale content first. Background consolidation preserves evicted full text in Brain.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

@@ -1,10 +1,11 @@
 //! Agent working memory — the "Scratchpad".
 //!
 //! A small, byte-capped, agent-self-editable text surface with fixed blocks
-//! and layered scope. When a write pushes a scope over its byte cap, the
-//! lowest-priority block is summarized (consolidate-and-forget) and its full
-//! pre-summary content is pushed down into Brain as a candidate so nothing is
-//! truly lost. Sits *beside* `session_brain`, *above* Brain/Cortex/Vault.
+//! and layered scope. Foreground writes fail closed when they would exceed the
+//! cap. The dreamer repairs legacy/lowered-cap scopes by summarizing the
+//! lowest-priority block and pushing full pre-summary content into Brain, so
+//! nothing is truly lost. Sits *beside* `session_brain`, *above*
+//! Brain/Cortex/Vault.
 //!
 //! ff-db owns the transactional SQL primitives (`pg_memory_*`); this module
 //! owns the string-edit ops (`add`/`replace`/`remove`) and the
@@ -13,7 +14,7 @@
 //! Design: `plans/agent-working-memory.md` (LLM council 2026-06-19).
 
 use anyhow::{Context, Result, bail};
-use ff_db::queries::{MEMORY_BLOCKS, MemoryBlock};
+use ff_db::queries::{MEMORY_BLOCKS, MemoryBlock, MemoryBlockWriteStatus};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::{info, warn};
@@ -23,8 +24,16 @@ const DEFAULT_USER: &str = "venkat";
 /// Eviction priority: `scratch` first, `decisions` last (only ever summarized).
 const EVICTION_ORDER: [&str; 5] = ["scratch", "findings", "state", "task", "decisions"];
 
+/// Decisions are never hard-trimmed; all other blocks may be deterministically
+/// reduced after their complete previous value is durably archived.
+const HARD_TRIM_ORDER: [&str; 4] = ["scratch", "findings", "state", "task"];
+
 /// Max consolidate-and-forget passes before falling back to a hard trim.
 const MAX_CONSOLIDATE_PASSES: usize = 5;
+
+/// Four 32-bit byte-sized blocks need at most 31 halvings each. This bound is
+/// intentionally generous while remaining deterministic under corrupt data.
+const MAX_HARD_TRIM_PASSES: usize = 128;
 
 /// Result of a memory write, mirrored back to the caller / tool response.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -35,6 +44,22 @@ pub struct WriteResult {
     pub bytes_used: i64,
     pub cap_bytes: i32,
     pub consolidated: bool,
+    pub over_cap: bool,
+    pub data_loss: bool,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ConsolidationResult {
+    pub changed: bool,
+    pub data_loss: bool,
+    pub over_cap: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TrimResult {
+    changed: bool,
+    data_loss: bool,
 }
 
 fn valid_scope_type(scope_type: &str) -> bool {
@@ -92,7 +117,7 @@ pub async fn memory_add(
     } else {
         format!("{cur}\n{text}")
     };
-    write_block(pool, scope_type, scope_key, block, &next).await
+    write_block(pool, scope_type, scope_key, block, &cur, &next).await
 }
 
 /// Replace the single occurrence of `old` with `new` in a block.
@@ -118,7 +143,7 @@ pub async fn memory_replace(
         bail!("memory_replace: 'old' matches {matches}× in block '{block}' (must be unique)");
     }
     let next = cur.replacen(old, new, 1);
-    write_block(pool, scope_type, scope_key, block, &next).await
+    write_block(pool, scope_type, scope_key, block, &cur, &next).await
 }
 
 /// Remove one occurrence of `text` from a block, or clear the block entirely
@@ -131,11 +156,10 @@ pub async fn memory_remove(
     text: Option<&str>,
 ) -> Result<WriteResult> {
     validate(scope_type, block)?;
+    let cur = ff_db::queries::pg_memory_get_block(pool, scope_type, scope_key, block).await?;
     let next = match text {
         None => String::new(),
         Some(t) => {
-            let cur =
-                ff_db::queries::pg_memory_get_block(pool, scope_type, scope_key, block).await?;
             match cur.find(t) {
                 Some(idx) => {
                     let mut s = cur.clone();
@@ -147,7 +171,7 @@ pub async fn memory_remove(
             }
         }
     };
-    write_block(pool, scope_type, scope_key, block, &next).await
+    write_block(pool, scope_type, scope_key, block, &cur, &next).await
 }
 
 /// Set the per-scope byte cap (`scope_key == ""` sets the scope_type default).
@@ -165,35 +189,53 @@ pub async fn memory_set_cap(
         .context("set memory cap")
 }
 
-/// Write a block's full new content, then enforce the scope's byte cap by
-/// consolidating if needed. Shared tail of every edit op.
+/// Compare-and-set a block's full new content without ever growing the scope
+/// above its cap. Background consolidation repairs legacy over-cap scopes;
+/// foreground callers fail closed instead of committing an oversized write.
 async fn write_block(
     pool: &PgPool,
     scope_type: &str,
     scope_key: &str,
     block: &str,
+    expected_content: &str,
     content: &str,
 ) -> Result<WriteResult> {
-    ff_db::queries::pg_memory_set_block(pool, scope_type, scope_key, block, content)
-        .await
-        .context("write memory block")?;
-
-    let cap = ff_db::queries::pg_memory_cap(pool, scope_type, scope_key).await?;
-    let mut total = ff_db::queries::pg_memory_total_bytes(pool, scope_type, scope_key).await?;
-    let mut consolidated = false;
-
-    if total > cap as i64 {
-        consolidated = consolidate_and_forget(pool, scope_type, scope_key, cap).await?;
-        total = ff_db::queries::pg_memory_total_bytes(pool, scope_type, scope_key).await?;
+    let write = ff_db::queries::pg_memory_try_set_block(
+        pool,
+        scope_type,
+        scope_key,
+        block,
+        expected_content,
+        content,
+        false,
+    )
+    .await
+    .context("write bounded memory block")?;
+    match write.status {
+        MemoryBlockWriteStatus::Applied => {}
+        MemoryBlockWriteStatus::Busy => {
+            bail!("Scratchpad scope is being updated concurrently; retry the write")
+        }
+        MemoryBlockWriteStatus::Stale => {
+            bail!("Scratchpad block changed concurrently; read it again before retrying")
+        }
+        MemoryBlockWriteStatus::OverCap => bail!(
+            "Scratchpad write rejected: resulting scope would use {}/{} bytes; remove or replace existing content first",
+            write.bytes_used,
+            write.cap_bytes
+        ),
     }
 
     Ok(WriteResult {
         scope_type: scope_type.to_string(),
         scope_key: scope_key.to_string(),
         block: block.to_string(),
-        bytes_used: total,
-        cap_bytes: cap,
-        consolidated,
+        bytes_used: write.bytes_used,
+        cap_bytes: write.cap_bytes,
+        consolidated: false,
+        over_cap: write.over_cap,
+        data_loss: false,
+        status: write_status(write.over_cap, false, false),
     })
 }
 
@@ -208,22 +250,20 @@ pub(crate) async fn consolidate_and_forget(
     scope_type: &str,
     scope_key: &str,
     cap: i32,
-) -> Result<bool> {
-    let mut did_anything = false;
+) -> Result<ConsolidationResult> {
+    let mut result = ConsolidationResult::default();
+    let mut skipped_blocks: Vec<String> = Vec::new();
 
     for _ in 0..MAX_CONSOLIDATE_PASSES {
         let blocks = ff_db::queries::pg_memory_get_all(pool, scope_type, scope_key).await?;
         let total: i64 = blocks.iter().map(|b| b.bytes as i64).sum();
         if total <= cap as i64 {
-            return Ok(did_anything);
+            return Ok(result);
         }
 
-        // Pick the highest-priority-to-evict block that actually has content.
-        let target = EVICTION_ORDER.iter().find_map(|name| {
-            blocks
-                .iter()
-                .find(|b| &b.block == name && !b.content.is_empty())
-        });
+        // Pick the next eligible block. A non-shrinking pass is skipped until a
+        // later pass makes progress, so one stubborn block cannot spin forever.
+        let target = next_eligible_block(&blocks, &skipped_blocks);
         let Some(target) = target else {
             break; // nothing left to evict
         };
@@ -232,11 +272,34 @@ pub(crate) async fn consolidate_and_forget(
             Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
             Ok(_) | Err(_) => {
                 // Summarizer unavailable/empty → hard-trim backstop this pass.
-                hard_trim(pool, scope_type, scope_key, target).await?;
-                did_anything = true;
+                let trim = hard_trim(pool, scope_type, scope_key, target).await?;
+                result.changed |= trim.changed;
+                result.data_loss |= trim.data_loss;
+                let after =
+                    ff_db::queries::pg_memory_total_bytes(pool, scope_type, scope_key).await?;
+                if after < total {
+                    skipped_blocks.clear();
+                } else {
+                    skipped_blocks.push(target.block.clone());
+                }
                 continue;
             }
         };
+
+        // Model output is untrusted. Never replace a block with a summary that
+        // does not strictly reduce its UTF-8 byte length.
+        if !summary_makes_progress(&target.content, &summary) {
+            let trim = hard_trim(pool, scope_type, scope_key, target).await?;
+            result.changed |= trim.changed;
+            result.data_loss |= trim.data_loss;
+            let after = ff_db::queries::pg_memory_total_bytes(pool, scope_type, scope_key).await?;
+            if after < total {
+                skipped_blocks.clear();
+            } else {
+                skipped_blocks.push(target.block.clone());
+            }
+            continue;
+        }
 
         // Push full pre-summary content down to Brain (best-effort).
         let prev_hash = hex_sha256(&target.content);
@@ -257,10 +320,36 @@ pub(crate) async fn consolidate_and_forget(
         .await
         .context("record memory eviction")?;
 
-        ff_db::queries::pg_memory_set_block(pool, scope_type, scope_key, &target.block, &summary)
-            .await
-            .context("replace block with summary")?;
-        did_anything = true;
+        let replacement = ff_db::queries::pg_memory_try_set_block(
+            pool,
+            scope_type,
+            scope_key,
+            &target.block,
+            &target.content,
+            &summary,
+            true,
+        )
+        .await
+        .context("replace block with bounded summary")?;
+        match replacement.status {
+            MemoryBlockWriteStatus::Applied => result.changed = true,
+            MemoryBlockWriteStatus::Stale => {
+                skipped_blocks.push(target.block.clone());
+                continue;
+            }
+            MemoryBlockWriteStatus::Busy => {
+                bail!("Scratchpad scope is being updated concurrently; retry consolidation")
+            }
+            MemoryBlockWriteStatus::OverCap => {
+                bail!("Scratchpad rejected a non-reducing consolidation")
+            }
+        }
+        let after = ff_db::queries::pg_memory_total_bytes(pool, scope_type, scope_key).await?;
+        if after < total {
+            skipped_blocks.clear();
+        } else {
+            skipped_blocks.push(target.block.clone());
+        }
         info!(
             scope_type, scope_key, block = %target.block,
             prev_bytes = target.bytes, brain = brain_ref.is_some(),
@@ -268,21 +357,41 @@ pub(crate) async fn consolidate_and_forget(
         );
     }
 
-    // Final backstop: if still over cap, hard-trim scratch then findings.
-    let blocks = ff_db::queries::pg_memory_get_all(pool, scope_type, scope_key).await?;
-    let total: i64 = blocks.iter().map(|b| b.bytes as i64).sum();
-    if total > cap as i64 {
-        for name in ["scratch", "findings"] {
-            if let Some(b) = blocks
-                .iter()
-                .find(|b| b.block == name && !b.content.is_empty())
-            {
-                hard_trim(pool, scope_type, scope_key, b).await?;
-                did_anything = true;
-            }
+    // Deterministic backstop: repeatedly halve every hard-trimmable block in
+    // eviction order until the scope fits. Full pre-trim content is archived
+    // before each compare-and-set replacement.
+    let mut skipped_blocks = Vec::new();
+    for _ in 0..MAX_HARD_TRIM_PASSES {
+        let blocks = ff_db::queries::pg_memory_get_all(pool, scope_type, scope_key).await?;
+        let total: i64 = blocks.iter().map(|b| i64::from(b.bytes)).sum();
+        if total <= i64::from(cap) {
+            return Ok(result);
+        }
+        let Some(target) = next_hard_trim_block(&blocks, &skipped_blocks) else {
+            break;
+        };
+        let trim = hard_trim(pool, scope_type, scope_key, target).await?;
+        result.changed |= trim.changed;
+        result.data_loss |= trim.data_loss;
+        if trim.changed {
+            skipped_blocks.clear();
+        } else {
+            skipped_blocks.push(target.block.clone());
         }
     }
-    Ok(did_anything)
+
+    let total = ff_db::queries::pg_memory_total_bytes(pool, scope_type, scope_key).await?;
+    result.over_cap = total > i64::from(cap);
+    if result.over_cap {
+        warn!(
+            scope_type,
+            scope_key,
+            bytes_used = total,
+            cap_bytes = cap,
+            "scratchpad: fail-closed consolidation could not reach cap"
+        );
+    }
+    Ok(result)
 }
 
 /// Archive a dead `session`-scope scratchpad: push every non-empty block's
@@ -332,17 +441,189 @@ async fn hard_trim(
     scope_type: &str,
     scope_key: &str,
     block: &MemoryBlock,
-) -> Result<()> {
-    let lines: Vec<&str> = block.content.lines().collect();
-    let keep_from = lines.len() / 2;
-    let trimmed: String = lines[keep_from..].join("\n");
+) -> Result<TrimResult> {
+    let trimmed = newest_half(&block.content);
+    if trimmed == block.content {
+        return Ok(TrimResult {
+            changed: false,
+            data_loss: false,
+        });
+    }
+    let brain_ref = push_to_brain(pool, scope_type, scope_key, &block.block, &block.content).await;
+    let audit_summary = format!(
+        "(hard-trimmed to newest half; full pre-trim content preserved below)\n\n{}",
+        block.content
+    );
+    ff_db::queries::pg_memory_record_eviction(
+        pool,
+        scope_type,
+        scope_key,
+        &block.block,
+        &hex_sha256(&block.content),
+        block.bytes,
+        &audit_summary,
+        "hard-trim",
+        brain_ref.as_deref(),
+    )
+    .await
+    .context("record hard-trim eviction")?;
     warn!(
         scope_type, scope_key, block = %block.block,
         "scratchpad: summarizer unavailable — hard-trimmed block to newest half"
     );
-    ff_db::queries::pg_memory_set_block(pool, scope_type, scope_key, &block.block, &trimmed)
-        .await
-        .context("hard-trim block")
+    let replacement = ff_db::queries::pg_memory_try_set_block(
+        pool,
+        scope_type,
+        scope_key,
+        &block.block,
+        &block.content,
+        &trimmed,
+        true,
+    )
+    .await
+    .context("hard-trim block")?;
+    match replacement.status {
+        MemoryBlockWriteStatus::Applied => Ok(TrimResult {
+            changed: true,
+            data_loss: true,
+        }),
+        MemoryBlockWriteStatus::Stale => Ok(TrimResult::default()),
+        MemoryBlockWriteStatus::Busy => {
+            bail!("Scratchpad scope is being updated concurrently; retry hard trim")
+        }
+        MemoryBlockWriteStatus::OverCap => {
+            bail!("Scratchpad rejected a non-reducing hard trim")
+        }
+    }
+}
+
+fn newest_half(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() > 1 {
+        return lines[lines.len() / 2..].join("\n");
+    }
+    let chars: Vec<char> = content.chars().collect();
+    chars[chars.len() / 2..].iter().collect()
+}
+
+fn summary_makes_progress(content: &str, summary: &str) -> bool {
+    summary.len() < content.len()
+}
+
+fn next_eligible_block<'a>(
+    blocks: &'a [MemoryBlock],
+    skipped_blocks: &[String],
+) -> Option<&'a MemoryBlock> {
+    EVICTION_ORDER.iter().find_map(|name| {
+        if skipped_blocks.iter().any(|skipped| skipped == name) {
+            return None;
+        }
+        blocks
+            .iter()
+            .find(|b| &b.block == name && !b.content.is_empty())
+    })
+}
+
+fn next_hard_trim_block<'a>(
+    blocks: &'a [MemoryBlock],
+    skipped_blocks: &[String],
+) -> Option<&'a MemoryBlock> {
+    HARD_TRIM_ORDER.iter().find_map(|name| {
+        if skipped_blocks.iter().any(|skipped| skipped == name) {
+            return None;
+        }
+        blocks
+            .iter()
+            .find(|b| &b.block == name && !b.content.is_empty())
+    })
+}
+
+fn write_status(over_cap: bool, consolidated: bool, data_loss: bool) -> String {
+    match (over_cap, consolidated, data_loss) {
+        (true, _, true) => "over_cap_data_loss",
+        (true, true, false) => "over_cap_after_consolidation",
+        (true, false, false) => "over_cap",
+        (false, _, true) => "ok_data_loss",
+        (false, true, false) => "ok_consolidated",
+        (false, false, false) => "ok",
+    }
+    .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(name: &str, content: &str) -> MemoryBlock {
+        MemoryBlock {
+            scope_type: "project".to_string(),
+            scope_key: "test".to_string(),
+            block: name.to_string(),
+            content: content.to_string(),
+            bytes: content.len() as i32,
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn scratchpad_selection_advances_past_non_progressing_block() {
+        let blocks = vec![
+            block("task", "task"),
+            block("findings", "findings"),
+            block("scratch", "scratch"),
+        ];
+
+        let first = next_eligible_block(&blocks, &[]).expect("first eligible");
+        assert_eq!(first.block, "scratch");
+
+        let skipped = vec!["scratch".to_string()];
+        let next = next_eligible_block(&blocks, &skipped).expect("next eligible");
+        assert_eq!(next.block, "findings");
+    }
+
+    #[test]
+    fn scratchpad_newest_half_shrinks_single_line_content() {
+        assert_eq!(newest_half("abcdef"), "def");
+        assert_eq!(newest_half("a\nb\nc\nd"), "c\nd");
+        assert_eq!(newest_half("é🙂漢字"), "漢字");
+    }
+
+    #[test]
+    fn scratchpad_rejects_non_shrinking_model_output() {
+        assert!(!summary_makes_progress("short", "longer"));
+        assert!(!summary_makes_progress("same", "size"));
+        assert!(summary_makes_progress("longer", "short"));
+    }
+
+    #[test]
+    fn scratchpad_hard_trim_advances_through_every_mutable_block() {
+        let blocks = vec![
+            block("decisions", "preserve"),
+            block("task", "task"),
+            block("state", "state"),
+        ];
+        assert_eq!(
+            next_hard_trim_block(&blocks, &[])
+                .expect("state is hard-trimmable")
+                .block,
+            "state"
+        );
+        let skipped = vec!["state".to_string(), "task".to_string()];
+        assert!(next_hard_trim_block(&blocks, &skipped).is_none());
+    }
+
+    #[test]
+    fn scratchpad_write_status_reports_over_cap_and_data_loss() {
+        assert_eq!(
+            write_status(true, true, true),
+            "over_cap_data_loss".to_string()
+        );
+        assert_eq!(
+            write_status(true, true, false),
+            "over_cap_after_consolidation".to_string()
+        );
+        assert_eq!(write_status(false, false, false), "ok".to_string());
+    }
 }
 
 /// Summarize a block via a cheap fleet model, preserving the durable facts.

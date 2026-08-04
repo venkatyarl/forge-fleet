@@ -9553,6 +9553,209 @@ pub async fn pg_memory_set_block(
     Ok(())
 }
 
+/// Outcome from a serialized Scratchpad block write.
+///
+/// `Applied` may still report `over_cap = true` only for an explicitly allowed
+/// repair that strictly reduced a scope which was already over its cap. Normal
+/// writes are accepted only when their resulting scope fits the cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryBlockWriteStatus {
+    Applied,
+    Busy,
+    Stale,
+    OverCap,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryBlockWriteResult {
+    pub status: MemoryBlockWriteStatus,
+    pub bytes_used: i64,
+    pub cap_bytes: i32,
+    pub over_cap: bool,
+}
+
+fn memory_write_allowed(
+    current_total: i64,
+    current_block_bytes: i64,
+    new_block_bytes: i64,
+    cap_bytes: i32,
+    allow_over_cap_repair: bool,
+) -> (bool, i64) {
+    let prospective = current_total - current_block_bytes + new_block_bytes;
+    let fits = prospective <= i64::from(cap_bytes);
+    let repairs = allow_over_cap_repair && prospective < current_total;
+    (fits || repairs, prospective)
+}
+
+/// Compare-and-set one Scratchpad block while serializing writers for the
+/// whole scope with a transaction-scoped advisory lock.
+///
+/// This is the fail-closed write primitive for shared cross-session memory:
+/// the expected block content is checked after the lock is acquired, and a
+/// normal write is committed only if the resulting scope is within its cap.
+/// Compaction may set `allow_over_cap_repair` to make monotonic progress on a
+/// scope that was already oversized; it can never make that scope larger.
+pub async fn pg_memory_try_set_block(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_key: &str,
+    block: &str,
+    expected_content: &str,
+    new_content: &str,
+    allow_over_cap_repair: bool,
+) -> Result<MemoryBlockWriteResult> {
+    let mut tx = pool.begin().await?;
+    let lock_name = format!("agent-memory:{scope_type}:{scope_key}");
+    let locked: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(lock_name)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !locked {
+        tx.rollback().await?;
+        return Ok(MemoryBlockWriteResult {
+            status: MemoryBlockWriteStatus::Busy,
+            bytes_used: 0,
+            cap_bytes: 0,
+            over_cap: false,
+        });
+    }
+
+    let current = sqlx::query(
+        "SELECT content, bytes FROM agent_memory
+          WHERE scope_type = $1 AND scope_key = $2 AND block = $3",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .bind(block)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let current_content = current
+        .as_ref()
+        .map(|row| row.get::<String, _>("content"))
+        .unwrap_or_default();
+    let current_block_bytes = current
+        .as_ref()
+        .map(|row| i64::from(row.get::<i32, _>("bytes")))
+        .unwrap_or(0);
+
+    let cap_bytes: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(
+             (SELECT cap_bytes FROM agent_memory_caps
+               WHERE scope_type = $1 AND scope_key IN ($2, '')
+               ORDER BY (scope_key = $2) DESC
+               LIMIT 1),
+             $3
+         )",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .bind(MEMORY_DEFAULT_CAP_BYTES)
+    .fetch_one(&mut *tx)
+    .await?;
+    let current_total: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(bytes), 0)::BIGINT
+           FROM agent_memory WHERE scope_type = $1 AND scope_key = $2",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if current_content != expected_content {
+        tx.rollback().await?;
+        return Ok(MemoryBlockWriteResult {
+            status: MemoryBlockWriteStatus::Stale,
+            bytes_used: current_total,
+            cap_bytes,
+            over_cap: current_total > i64::from(cap_bytes),
+        });
+    }
+
+    let new_block_bytes = i64::try_from(new_content.len())
+        .map_err(|_| sqlx::Error::Protocol("Scratchpad block is too large".into()))?;
+    let (allowed, prospective) = memory_write_allowed(
+        current_total,
+        current_block_bytes,
+        new_block_bytes,
+        cap_bytes,
+        allow_over_cap_repair,
+    );
+    if !allowed {
+        tx.rollback().await?;
+        return Ok(MemoryBlockWriteResult {
+            status: MemoryBlockWriteStatus::OverCap,
+            bytes_used: prospective,
+            cap_bytes,
+            over_cap: true,
+        });
+    }
+
+    if new_content.is_empty() {
+        sqlx::query(
+            "DELETE FROM agent_memory
+              WHERE scope_type = $1 AND scope_key = $2 AND block = $3",
+        )
+        .bind(scope_type)
+        .bind(scope_key)
+        .bind(block)
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        sqlx::query(
+            "INSERT INTO agent_memory (scope_type, scope_key, block, content, bytes, updated_at)
+             VALUES ($1, $2, $3, $4, octet_length($4), NOW())
+             ON CONFLICT (scope_type, scope_key, block)
+             DO UPDATE SET content = EXCLUDED.content,
+                           bytes = EXCLUDED.bytes,
+                           updated_at = NOW()",
+        )
+        .bind(scope_type)
+        .bind(scope_key)
+        .bind(block)
+        .bind(new_content)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+
+    Ok(MemoryBlockWriteResult {
+        status: MemoryBlockWriteStatus::Applied,
+        bytes_used: prospective,
+        cap_bytes,
+        over_cap: prospective > i64::from(cap_bytes),
+    })
+}
+
+#[cfg(test)]
+mod scratchpad_write_tests {
+    use super::memory_write_allowed;
+
+    #[test]
+    fn normal_write_fails_closed_above_cap() {
+        assert_eq!(
+            memory_write_allowed(6_000, 100, 400, 6_144, false),
+            (false, 6_300)
+        );
+        assert_eq!(
+            memory_write_allowed(6_000, 100, 200, 6_144, false),
+            (true, 6_100)
+        );
+    }
+
+    #[test]
+    fn repair_may_only_reduce_an_existing_overage() {
+        assert_eq!(
+            memory_write_allowed(100_000, 90_000, 45_000, 6_144, true),
+            (true, 55_000)
+        );
+        assert_eq!(
+            memory_write_allowed(100_000, 90_000, 95_000, 6_144, true),
+            (false, 105_000)
+        );
+    }
+}
+
 /// Total bytes used across all blocks in a scope.
 pub async fn pg_memory_total_bytes(
     pool: &PgPool,
