@@ -473,23 +473,15 @@ fn upsert_codex_mcp(
         "http://localhost:50001/mcp" | "http://127.0.0.1:50001/mcp"
     ) {
         // Remote Codex configs retain the native HTTP transport. The local
-        // default is the resilient DB-independent stdio bootstrap below.
+        // default now uses the same native transport via the independently
+        // supervised loopback MCP service below.
         let block =
             format!("\n[mcp_servers.{server_name}]\ntype = \"http\"\nurl = \"{server_url}\"\n");
         return replace_codex_section(path, &existing, server_name, &block, dry_run);
     }
     let block = format!(
-        "\n[mcp_servers.{server_name}]\ncommand = \"forgefleetd\"\nargs = [\"mcp\", \"--stdio\"]\nstartup_timeout_sec = 30\ntool_timeout_sec = 120\n"
+        "\n[mcp_servers.{server_name}]\nurl = \"{server_url}\"\nstartup_timeout_sec = 30\ntool_timeout_sec = 120\n"
     );
-
-    // If the marker is already present and points at the same URL, skip.
-    let marker = format!("[mcp_servers.{server_name}]");
-    if existing.contains(&marker)
-        && existing.contains("command = \"forgefleetd\"")
-        && existing.contains("args = [\"mcp\", \"--stdio\"]")
-    {
-        return Ok(());
-    }
 
     replace_codex_section(path, &existing, server_name, &block, dry_run)
 }
@@ -847,6 +839,61 @@ mod tests {
         std::fs::write(&legacy, r#"{"mcpServers":{"forgefleet":{}}}"#).unwrap();
         let text_output = render_status(temp.path(), false);
         assert!(text_output.contains("kimi-legacy  ✓ forgefleet installed"));
+    }
+
+    #[test]
+    fn codex_localhost_replaces_legacy_stdio_with_native_http() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join(".codex").join("config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            "model = \"gpt-5\"\n\n[mcp_servers.forgefleet]\ncommand = \"forgefleetd\"\nargs = [\"mcp\", \"--stdio\"]\nstartup_timeout_sec = 30\ntool_timeout_sec = 120\n",
+        )
+        .unwrap();
+
+        upsert_codex_mcp(&config, "forgefleet", "http://127.0.0.1:50001/mcp", false).unwrap();
+
+        let updated = std::fs::read_to_string(config).unwrap();
+        assert!(updated.contains("model = \"gpt-5\""));
+        assert!(updated.contains("url = \"http://127.0.0.1:50001/mcp\""));
+        assert!(!updated.contains("command = \"forgefleetd\""));
+        assert!(!updated.contains("--stdio"));
+    }
+
+    #[test]
+    fn codex_local_http_install_is_byte_idempotent_and_preserves_other_sections() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join(".codex").join("config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            "model = \"gpt-5\"\n\n[mcp_servers.other]\nurl = \"https://other.example/mcp\"\n",
+        )
+        .unwrap();
+
+        upsert_codex_mcp(&config, "forgefleet", "http://localhost:50001/mcp", false).unwrap();
+        let first = std::fs::read_to_string(&config).unwrap();
+        upsert_codex_mcp(&config, "forgefleet", "http://localhost:50001/mcp", false).unwrap();
+        let second = std::fs::read_to_string(config).unwrap();
+
+        assert_eq!(second, first);
+        assert!(second.contains("[mcp_servers.other]"));
+        assert!(second.contains("url = \"https://other.example/mcp\""));
+        assert_eq!(second.matches("[mcp_servers.forgefleet]").count(), 1);
+    }
+
+    #[test]
+    fn codex_explicit_remote_url_keeps_native_http_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join(".codex").join("config.toml");
+
+        upsert_codex_mcp(&config, "forgefleet", "https://fleet.example/mcp", false).unwrap();
+
+        let updated = std::fs::read_to_string(config).unwrap();
+        assert!(updated.contains("type = \"http\""));
+        assert!(updated.contains("url = \"https://fleet.example/mcp\""));
+        assert!(!updated.contains("command ="));
     }
 
     #[test]
