@@ -7672,9 +7672,44 @@ const DAEMON_GATES: &[GateSpec] = &[
         controls: "disk-reconcile policy actuation",
     },
     GateSpec {
+        key: "deployment_autorestart_mode",
+        default: "off",
+        controls: "automatic restart of unhealthy model deployments",
+    },
+    GateSpec {
+        key: "dreamer_mode",
+        default: "on",
+        controls: "scheduled memory consolidation and dreamer chain",
+    },
+    GateSpec {
         key: "fleet_integrity_mode",
         default: "off",
         controls: "fleet-integrity verify sweep",
+    },
+    GateSpec {
+        key: "ha_handoff_mode",
+        default: "disabled",
+        controls: "automatic leader and database handoff",
+    },
+    GateSpec {
+        key: "metrics_partition_mode",
+        default: "on",
+        controls: "metrics partition creation and retention",
+    },
+    GateSpec {
+        key: "oauth_distribution_enabled",
+        default: "true",
+        controls: "autonomous OAuth credential distribution task producers",
+    },
+    GateSpec {
+        key: "rolling_deploy_mode",
+        default: "off",
+        controls: "automatic origin/main convergence deploys",
+    },
+    GateSpec {
+        key: "rollout_mode",
+        default: "manual",
+        controls: "continuous staged rollout advancement",
     },
     GateSpec {
         key: "ssh_mesh_auto_repair_enabled",
@@ -7692,9 +7727,34 @@ const DAEMON_GATES: &[GateSpec] = &[
         controls: "Pillar-4 merge-queue auto-merge",
     },
     GateSpec {
+        key: "work_item_execution_enabled",
+        default: "true",
+        controls: "Pillar-4 assignment, child dispatch, and self-heal writers",
+    },
+    GateSpec {
+        key: "work_item_lane15_mode",
+        default: "on",
+        controls: "lane-15 480B work-item routing",
+    },
+    GateSpec {
         key: "auto_feeder_mode",
         default: "off",
         controls: "idea backlog decomposition and promotion",
+    },
+    GateSpec {
+        key: "review_ladder_mode",
+        default: "cost_optimal",
+        controls: "local-to-cloud work-item review escalation",
+    },
+    GateSpec {
+        key: "target_cleanup_mode",
+        default: "on",
+        controls: "stale per-host Rust incremental-cache cleanup",
+    },
+    GateSpec {
+        key: "task_retention_mode",
+        default: "on",
+        controls: "leader terminal task-history retention",
     },
     GateSpec {
         key: "cortex_index_mode",
@@ -7802,6 +7862,8 @@ mod gates_tests {
     fn defaults_when_unset() {
         let rows = build_gate_rows(&HashMap::new());
         assert_eq!(rows.len(), DAEMON_GATES.len());
+        let unique: std::collections::HashSet<_> = rows.iter().map(|row| &row.key).collect();
+        assert_eq!(unique.len(), rows.len(), "daemon gate keys must be unique");
         // Every row falls back to its default + is marked "default".
         assert!(rows.iter().all(|r| r.source == "default"));
         let auto = rows
@@ -7811,6 +7873,17 @@ mod gates_tests {
         assert_eq!(auto.value, "false");
         let idx = rows.iter().find(|r| r.key == "cortex_index_mode").unwrap();
         assert_eq!(idx.value, "on");
+        for recovery_gate in [
+            "oauth_distribution_enabled",
+            "rolling_deploy_mode",
+            "ssh_mesh_auto_repair_enabled",
+            "work_item_execution_enabled",
+        ] {
+            assert!(
+                rows.iter().any(|row| row.key == recovery_gate),
+                "recovery-critical gate {recovery_gate} must be visible"
+            );
+        }
     }
 
     #[test]
