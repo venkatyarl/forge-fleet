@@ -65,6 +65,43 @@ const MAX_BUILD_ATTEMPTS: i32 = 5;
 const DISPATCH_TICK_STALE_SECS: i64 = 60;
 const FAILED_RETRY_COOLDOWN_MINUTES: i64 = 20;
 const MAX_FAILED_RETRIES: i32 = 3;
+pub(crate) const WORK_ITEM_EXECUTION_ENABLED_KEY: &str = "work_item_execution_enabled";
+const WORK_ITEM_EXECUTION_DEFAULT: bool = true;
+const WORK_ITEM_EXECUTION_RESTORE_ON_EXPIRY: bool = true;
+
+fn resolve_work_item_execution_gate<E>(result: std::result::Result<bool, E>) -> bool
+where
+    E: std::fmt::Display,
+{
+    match result {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            warn!(
+                key = WORK_ITEM_EXECUTION_ENABLED_KEY,
+                %error,
+                "work-item execution gate read failed; refusing new execution"
+            );
+            false
+        }
+    }
+}
+
+/// Whether the autonomous Pillar-4 pipeline may assign or start new work.
+///
+/// Missing rows preserve the historical enabled behavior. Temporary disables
+/// restore to enabled when their TTL expires. A read failure is fail-closed so
+/// recovery work cannot accidentally resume while gate authority is unknown.
+pub(crate) async fn work_item_execution_enabled(pg: &PgPool) -> bool {
+    resolve_work_item_execution_gate(
+        ff_db::pg_read_safety_gate(
+            pg,
+            WORK_ITEM_EXECUTION_ENABLED_KEY,
+            WORK_ITEM_EXECUTION_DEFAULT,
+            WORK_ITEM_EXECUTION_RESTORE_ON_EXPIRY,
+        )
+        .await,
+    )
+}
 
 const LEASE_STALE_SAMPLE_SQL: &str = r#"
 SELECT COUNT(*) FILTER (
@@ -557,6 +594,16 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         );
     }
 
+    // Keep reconciliation and stale-lease cleanup alive during a recovery
+    // freeze, but stop before fetching capacity or creating any new leases.
+    if !work_item_execution_enabled(pg).await {
+        tracing::debug!(
+            key = WORK_ITEM_EXECUTION_ENABLED_KEY,
+            "work_item_scheduler: new assignments paused by execution gate"
+        );
+        return Ok(0);
+    }
+
     let ready = ff_db::pg_ready_work_items(pg, MAX_ASSIGN_PER_TICK).await?;
     if ready.is_empty() {
         return Ok(0);
@@ -965,6 +1012,52 @@ pub fn spawn_work_item_scheduler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_gate_defaults_and_ttl_restore_are_enabled_but_errors_fail_closed() {
+        assert!(WORK_ITEM_EXECUTION_DEFAULT);
+        assert!(WORK_ITEM_EXECUTION_RESTORE_ON_EXPIRY);
+        assert!(resolve_work_item_execution_gate(Ok::<bool, anyhow::Error>(
+            true
+        )));
+        assert!(!resolve_work_item_execution_gate(
+            Ok::<bool, anyhow::Error>(false)
+        ));
+        assert!(!resolve_work_item_execution_gate(Err(anyhow::anyhow!(
+            "gate authority unavailable"
+        ))));
+    }
+
+    #[test]
+    fn execution_gate_runs_after_housekeeping_and_before_assignment() {
+        let source = include_str!("work_item_scheduler.rs");
+        let body = source
+            .split("pub async fn evaluate_work_items")
+            .nth(1)
+            .expect("scheduler evaluator exists");
+        let housekeeping = body
+            .find("pg_complete_parent_work_items")
+            .expect("final housekeeping step exists");
+        let gate = body
+            .find("if !work_item_execution_enabled(pg).await")
+            .expect("execution gate exists");
+        let assignment = body
+            .find("pg_ready_work_items")
+            .expect("assignment fetch exists");
+
+        assert!(
+            housekeeping < gate,
+            "gate must preserve scheduler housekeeping"
+        );
+        assert!(
+            gate < assignment,
+            "gate must stop before new assignment work"
+        );
+        assert!(
+            body[gate..assignment].contains("return Ok(0)"),
+            "disabled gate must return without assigning"
+        );
+    }
 
     #[test]
     fn failed_retry_query_is_bounded_atomic_and_excludes_terminal_markers() {

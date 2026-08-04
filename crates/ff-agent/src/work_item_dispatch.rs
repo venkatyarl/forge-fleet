@@ -234,6 +234,19 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
     // process keeps heartbeating.
     bump_dispatch_tick_at(pg, worker_name).await;
 
+    // The recovery gate stops only NEW child launches. Canonical-slot
+    // reconciliation and the host dispatch clock above must keep advancing so
+    // fleet health still distinguishes an intentional pause from a wedged loop;
+    // already-running dispatch tasks own their own heartbeat/finalization.
+    if !crate::work_item_scheduler::work_item_execution_enabled(pg).await {
+        tracing::debug!(
+            key = crate::work_item_scheduler::WORK_ITEM_EXECUTION_ENABLED_KEY,
+            worker = worker_name,
+            "work_item_dispatch: new child launches paused by execution gate"
+        );
+        return Ok(0);
+    }
+
     // Capacity-aware budget: dispatch up to this host's free-slot count, capped
     // at MAX_DISPATCH_PER_TICK, throttled to 1 under recent-failure backpressure.
     // Replaces the old hard 1/tick that left the fleet mostly idle.
@@ -7416,6 +7429,44 @@ mod tests {
             work: Vec::new(),
             post_work: Vec::new(),
         }
+    }
+
+    #[test]
+    fn execution_gate_preserves_dispatch_liveness_but_precedes_child_selection() {
+        let source = include_str!("work_item_dispatch.rs");
+        let body = source
+            .split("pub async fn evaluate_work_item_dispatch")
+            .nth(1)
+            .expect("dispatch evaluator exists");
+        let canonical_slot = body
+            .find("ensure_canonical_sub_agent_row")
+            .expect("canonical-slot reconciliation exists");
+        let dispatch_heartbeat = body
+            .find("bump_dispatch_tick_at")
+            .expect("dispatch heartbeat exists");
+        let gate = body
+            .find("work_item_execution_enabled(pg).await")
+            .expect("execution gate exists");
+        let child_selection = body
+            .find("assigned_work_items")
+            .expect("assigned-work selection exists");
+
+        assert!(
+            canonical_slot < gate,
+            "gate must preserve canonical-slot state"
+        );
+        assert!(
+            dispatch_heartbeat < gate,
+            "gate must preserve dispatch heartbeat"
+        );
+        assert!(
+            gate < child_selection,
+            "gate must stop before selecting new children"
+        );
+        assert!(
+            body[gate..child_selection].contains("return Ok(0)"),
+            "disabled gate must return without spawning a child"
+        );
     }
 
     #[test]
