@@ -1,5 +1,5 @@
 //! Periodic DB integrity guard — runs PostgreSQL `amcheck` over every valid
-//! btree UNIQUE index and raises a fleet alert on corruption.
+//! physical btree UNIQUE index and raises a fleet alert on corruption.
 //!
 //! Motivation: on 2026-05-30 a glibc/ICU collation upgrade silently corrupted
 //! several btree UNIQUE indexes (their on-disk ordering no longer matched the
@@ -30,6 +30,25 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// The alert policy name seeded by migration V110.
 const POLICY_NAME: &str = "db_index_corruption";
+
+/// Physical unique btree indexes supported by `amcheck`.
+///
+/// PostgreSQL partitioned index parents have `pg_class.relkind = 'I'` and no
+/// physical index storage; `bt_index_check` rejects them with SQLSTATE 0A000.
+/// Their independently checkable child indexes have `relkind = 'i'`, so this
+/// predicate skips only the unsupported parents without reducing coverage.
+const UNIQUE_BTREE_INDEXES_SQL: &str = r#"
+    SELECT c.oid::int8 AS oid, c.relname AS relname
+    FROM pg_index i
+    JOIN pg_class c  ON c.oid = i.indexrelid
+    JOIN pg_am    am ON am.oid = c.relam
+    WHERE i.indisunique
+      AND i.indisvalid
+      AND am.amname = 'btree'
+      AND c.relkind = 'i'
+      AND c.relnamespace = 'public'::regnamespace
+    ORDER BY c.relname
+"#;
 
 /// One corrupt index found during a check pass.
 #[derive(Debug, Clone)]
@@ -66,25 +85,15 @@ impl AmcheckTick {
         crate::leader_cache::is_current_leader()
     }
 
-    /// List every valid btree UNIQUE index in the `public` schema, as
-    /// `(oid, relname)`. The oid is returned as `int8` so it binds cleanly as
-    /// an `i64` and is cast back to `oid`/`regclass` in the check query.
+    /// List every valid physical btree UNIQUE index in the `public` schema,
+    /// as `(oid, relname)`. Partitioned parent indexes are catalog-only and
+    /// unsupported by `amcheck`; their physical child indexes remain included.
+    /// The oid is returned as `int8` so it binds cleanly as an `i64` and is
+    /// cast back to `oid`/`regclass` in the check query.
     async fn list_unique_btree_indexes(&self) -> Result<Vec<(i64, String)>, sqlx::Error> {
-        let rows = sqlx::query(
-            r#"
-            SELECT c.oid::int8 AS oid, c.relname AS relname
-            FROM pg_index i
-            JOIN pg_class c  ON c.oid = i.indexrelid
-            JOIN pg_am    am ON am.oid = c.relam
-            WHERE i.indisunique
-              AND i.indisvalid
-              AND am.amname = 'btree'
-              AND c.relnamespace = 'public'::regnamespace
-            ORDER BY c.relname
-            "#,
-        )
-        .fetch_all(&self.pg)
-        .await?;
+        let rows = sqlx::query(UNIQUE_BTREE_INDEXES_SQL)
+            .fetch_all(&self.pg)
+            .await?;
 
         Ok(rows
             .into_iter()
@@ -254,5 +263,18 @@ impl AmcheckTick {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UNIQUE_BTREE_INDEXES_SQL;
+
+    #[test]
+    fn amcheck_query_selects_only_physical_btree_indexes() {
+        assert!(UNIQUE_BTREE_INDEXES_SQL.contains("c.relkind = 'i'"));
+        assert!(UNIQUE_BTREE_INDEXES_SQL.contains("am.amname = 'btree'"));
+        assert!(UNIQUE_BTREE_INDEXES_SQL.contains("i.indisunique"));
+        assert!(UNIQUE_BTREE_INDEXES_SQL.contains("i.indisvalid"));
     }
 }
