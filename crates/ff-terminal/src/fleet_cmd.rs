@@ -3932,9 +3932,13 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
         .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
-    ff_db::run_postgres_migrations(&pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+    // Queue cleanup must remain narrowly scoped. In particular, the default
+    // dry-run must not apply unrelated schema migrations as a side effect.
+    if !matches!(&cmd, FleetCommand::CleanupMeshRepairBacklog { .. }) {
+        ff_db::run_postgres_migrations(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+    }
 
     match cmd {
         FleetCommand::SshMeshCheck {
@@ -4071,6 +4075,23 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                     "\n{ok} ok, {fail} failed — checked {} pairs",
                     matrix.cells.len()
                 );
+            }
+        }
+        FleetCommand::CleanupMeshRepairBacklog { apply } => {
+            let result = ff_agent::mesh_check::cancel_mesh_auto_repair_backlog(&pool, apply)
+                .await
+                .map_err(|e| anyhow::anyhow!("SSH mesh auto-repair backlog cleanup: {e}"))?;
+            if result.applied {
+                println!(
+                    "{GREEN}✓{RESET} cancelled {} pending/dispatchable auto-mesh-repair shell task(s); running and terminal rows were untouched",
+                    result.cancelled
+                );
+            } else {
+                println!(
+                    "{YELLOW}dry-run{RESET}: {} pending/dispatchable auto-mesh-repair shell task(s) would be cancelled; running and terminal rows would be untouched",
+                    result.eligible
+                );
+                println!("rerun with `ff fleet cleanup-mesh-repair-backlog --apply` to apply");
             }
         }
         FleetCommand::VerifyNode { name, json } => {
@@ -7645,6 +7666,11 @@ const DAEMON_GATES: &[GateSpec] = &[
         key: "fleet_integrity_mode",
         default: "off",
         controls: "fleet-integrity verify sweep",
+    },
+    GateSpec {
+        key: "ssh_mesh_auto_repair_enabled",
+        default: "true",
+        controls: "leader SSH mesh auto-repair task producer",
     },
     GateSpec {
         key: "staged_rollout_mode",

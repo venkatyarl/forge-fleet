@@ -12602,6 +12602,21 @@ VALUES (
 ON CONFLICT (key) DO NOTHING;
 "#;
 
+/// v287: emergency kill switch for the autonomous leader SSH mesh-repair task
+/// producer. Existing fleets keep the historical enabled posture, while
+/// `ff secrets disable-gate ssh_mesh_auto_repair_enabled ...` can fence the
+/// producer during recovery. Never overwrite an operator-set row.
+pub const SCHEMA_V287_SSH_MESH_AUTO_REPAIR_GATE: &str = r#"
+INSERT INTO fleet_secrets (key, value, description, updated_by)
+VALUES (
+    'ssh_mesh_auto_repair_enabled',
+    'true',
+    'Allow autonomous leader SSH mesh auto-repair fleet task creation',
+    'migration-v287'
+)
+ON CONFLICT (key) DO NOTHING;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

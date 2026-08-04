@@ -1280,6 +1280,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "oauth_distribution_gate",
         sql: schema::SCHEMA_V286_OAUTH_DISTRIBUTION_GATE,
     },
+    PgMigration {
+        version: 287,
+        name: "ssh_mesh_auto_repair_gate",
+        sql: schema::SCHEMA_V287_SSH_MESH_AUTO_REPAIR_GATE,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -3088,6 +3093,18 @@ mod tests {
             .expect("V286 must be registered");
         assert_eq!(migration.name, "oauth_distribution_gate");
         assert!(migration.sql.contains("'oauth_distribution_enabled'"));
+        assert!(migration.sql.contains("'true'"));
+        assert!(migration.sql.contains("ON CONFLICT (key) DO NOTHING"));
+    }
+
+    #[test]
+    fn v287_seeds_ssh_mesh_auto_repair_gate_without_overwriting_operator_state() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 287)
+            .expect("V287 must be registered");
+        assert_eq!(migration.name, "ssh_mesh_auto_repair_gate");
+        assert!(migration.sql.contains("'ssh_mesh_auto_repair_enabled'"));
         assert!(migration.sql.contains("'true'"));
         assert!(migration.sql.contains("ON CONFLICT (key) DO NOTHING"));
     }

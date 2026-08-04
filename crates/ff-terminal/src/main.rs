@@ -1848,6 +1848,14 @@ enum FleetCommand {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
+    /// Preview or cancel only pending/dispatchable `auto-mesh-repair:` shell
+    /// tasks. Defaults to a read-only count; running and terminal rows are
+    /// always left untouched.
+    CleanupMeshRepairBacklog {
+        /// Apply the cancellation. Without this flag the command is read-only.
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+    },
     /// Full 12-check verify battery for one node.
     VerifyNode {
         name: String,
@@ -6498,7 +6506,7 @@ mod free_prompt_guard_tests {
 
 #[cfg(test)]
 mod oauth_cli_guard_tests {
-    use super::{Cli, Command, OauthCommand};
+    use super::{Cli, Command, FleetCommand, OauthCommand};
     use clap::Parser;
 
     fn parse_cancel_backlog(args: &[&str]) -> bool {
@@ -6527,6 +6535,40 @@ mod oauth_cli_guard_tests {
             "ff",
             "oauth",
             "cancel-backlog",
+            "--apply",
+        ]));
+    }
+
+    fn parse_mesh_repair_cleanup(args: &[&str]) -> bool {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(owned))
+            .expect("spawn parser thread")
+            .join()
+            .expect("parser thread panicked")
+            .expect("valid mesh repair cleanup command")
+            .command
+            .and_then(|command| match command {
+                Command::Fleet {
+                    command: FleetCommand::CleanupMeshRepairBacklog { apply },
+                } => Some(apply),
+                _ => None,
+            })
+            .expect("parsed fleet cleanup-mesh-repair-backlog")
+    }
+
+    #[test]
+    fn mesh_repair_backlog_cleanup_is_dry_run_unless_apply_is_explicit() {
+        assert!(!parse_mesh_repair_cleanup(&[
+            "ff",
+            "fleet",
+            "cleanup-mesh-repair-backlog",
+        ]));
+        assert!(parse_mesh_repair_cleanup(&[
+            "ff",
+            "fleet",
+            "cleanup-mesh-repair-backlog",
             "--apply",
         ]));
     }

@@ -10,7 +10,136 @@ use tokio::time::timeout;
 use tracing::{error, warn};
 use uuid::Uuid;
 
+use crate::task_runner::{EnqueueOnceOutcome, pg_enqueue_shell_task_once};
+
 const SKIPPED_COMPUTER_STATUSES: [&str; 3] = ["offline", "reserved", "decommissioned"];
+
+/// Emergency kill switch for the autonomous leader SSH mesh-repair producer.
+///
+/// A missing row preserves the historical enabled behavior, and an expired
+/// temporary disable restores to enabled. Any database/read error fails closed:
+/// an unavailable gate authority must never create another repair queue flood.
+pub const SSH_MESH_AUTO_REPAIR_ENABLED_KEY: &str = "ssh_mesh_auto_repair_enabled";
+const SSH_MESH_AUTO_REPAIR_DEFAULT: bool = true;
+const SSH_MESH_AUTO_REPAIR_RESTORE_ON_EXPIRY: bool = true;
+
+const MESH_REPAIR_BACKLOG_CANCEL_SQL: &str = "UPDATE fleet_tasks
+        SET status = 'cancelled',
+            completed_at = COALESCE(completed_at, NOW()),
+            progress_message = 'cancelled by ff fleet cleanup-mesh-repair-backlog'
+      WHERE task_type = 'shell'
+        AND status IN ('pending', 'dispatchable')
+        AND summary LIKE 'auto-mesh-repair:%'";
+const MESH_REPAIR_BACKLOG_COUNT_SQL: &str = "SELECT COUNT(*)::bigint
+       FROM fleet_tasks
+      WHERE task_type = 'shell'
+        AND status IN ('pending', 'dispatchable')
+        AND summary LIKE 'auto-mesh-repair:%'";
+
+fn resolve_ssh_mesh_auto_repair_gate<E>(result: Result<bool, E>) -> bool
+where
+    E: std::fmt::Display,
+{
+    match result {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            warn!(
+                key = SSH_MESH_AUTO_REPAIR_ENABLED_KEY,
+                %error,
+                "SSH mesh auto-repair gate read failed; refusing new tasks"
+            );
+            false
+        }
+    }
+}
+
+/// Read the authoritative autonomous mesh-repair gate.
+pub async fn ssh_mesh_auto_repair_enabled(pool: &PgPool) -> bool {
+    resolve_ssh_mesh_auto_repair_gate(
+        ff_db::pg_read_safety_gate(
+            pool,
+            SSH_MESH_AUTO_REPAIR_ENABLED_KEY,
+            SSH_MESH_AUTO_REPAIR_DEFAULT,
+            SSH_MESH_AUTO_REPAIR_RESTORE_ON_EXPIRY,
+        )
+        .await,
+    )
+}
+
+fn mesh_auto_repair_enqueue_key(src: &str, dst: &str) -> String {
+    format!("ssh-mesh-auto-repair:{src}:{dst}")
+}
+
+/// Enqueue at most one active autonomous repair for a directed mesh edge.
+///
+/// The stable per-edge key is protected by the fleet task unique index and a
+/// transaction-scoped advisory lock in `pg_enqueue_shell_task_once`, so daemon
+/// restarts and leadership races cannot create duplicate active rows.
+pub async fn enqueue_ssh_mesh_auto_repair(
+    pool: &PgPool,
+    leader_name: &str,
+    src: &str,
+    dst: &str,
+) -> Result<EnqueueOnceOutcome, sqlx::Error> {
+    let summary = format!("auto-mesh-repair: {src} -> {dst}");
+    let command = format!("ff fleet ssh-mesh-check --node {dst} --repair --yes 2>&1 | tail -10");
+    pg_enqueue_shell_task_once(
+        pool,
+        &mesh_auto_repair_enqueue_key(src, dst),
+        &summary,
+        &command,
+        &["ff".to_string()],
+        Some(leader_name),
+        None,
+        50,
+        None,
+    )
+    .await
+}
+
+/// Result of the narrowly-scoped autonomous mesh-repair queue cleanup verb.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct MeshRepairBacklogCancellation {
+    /// Number of pending/dispatchable auto-repair tasks matched by the operation.
+    pub eligible: u64,
+    /// Number actually moved to `cancelled` (`0` for a dry run).
+    pub cancelled: u64,
+    pub applied: bool,
+}
+
+/// Preview or cancel only unstarted `auto-mesh-repair:` shell tasks.
+///
+/// Apply is a single guarded update. A row that races to `running` before the
+/// update locks it is re-checked and left untouched; running and terminal rows
+/// are never eligible.
+pub async fn cancel_mesh_auto_repair_backlog(
+    pool: &PgPool,
+    apply: bool,
+) -> Result<MeshRepairBacklogCancellation, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if apply {
+        let cancelled = sqlx::query(MESH_REPAIR_BACKLOG_CANCEL_SQL)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(MeshRepairBacklogCancellation {
+            eligible: cancelled,
+            cancelled,
+            applied: true,
+        })
+    } else {
+        let eligible: i64 = sqlx::query_scalar(MESH_REPAIR_BACKLOG_COUNT_SQL)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(MeshRepairBacklogCancellation {
+            eligible: u64::try_from(eligible).unwrap_or(0),
+            cancelled: 0,
+            applied: false,
+        })
+    }
+}
 
 fn mesh_eligible(node: &ff_db::FleetNodeRow) -> bool {
     computer_status_eligible(node.computer_status.as_deref())
@@ -941,6 +1070,47 @@ pub fn spawn_mesh_refresh_tick(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_repair_gate_defaults_and_ttl_restore_enabled_but_errors_fail_closed() {
+        assert!(SSH_MESH_AUTO_REPAIR_DEFAULT);
+        assert!(SSH_MESH_AUTO_REPAIR_RESTORE_ON_EXPIRY);
+        assert!(resolve_ssh_mesh_auto_repair_gate(
+            Ok::<bool, anyhow::Error>(true)
+        ));
+        assert!(!resolve_ssh_mesh_auto_repair_gate(
+            Ok::<bool, anyhow::Error>(false)
+        ));
+        assert!(!resolve_ssh_mesh_auto_repair_gate(Err(anyhow::anyhow!(
+            "gate database unavailable"
+        ))));
+    }
+
+    #[test]
+    fn enqueue_once_key_is_stable_and_scoped_to_the_directed_edge() {
+        assert_eq!(
+            mesh_auto_repair_enqueue_key("shakira", "beyonce"),
+            "ssh-mesh-auto-repair:shakira:beyonce"
+        );
+        assert_ne!(
+            mesh_auto_repair_enqueue_key("shakira", "beyonce"),
+            mesh_auto_repair_enqueue_key("beyonce", "shakira")
+        );
+    }
+
+    #[test]
+    fn backlog_cleanup_sql_is_narrow_and_never_names_running_or_terminal_statuses() {
+        for sql in [
+            MESH_REPAIR_BACKLOG_COUNT_SQL,
+            MESH_REPAIR_BACKLOG_CANCEL_SQL,
+        ] {
+            assert!(sql.contains("task_type = 'shell'"));
+            assert!(sql.contains("status IN ('pending', 'dispatchable')"));
+            assert!(sql.contains("summary LIKE 'auto-mesh-repair:%'"));
+            assert!(!sql.contains("status IN ('running'"));
+            assert!(!sql.contains("status IN ('completed'"));
+        }
+    }
 
     #[test]
     fn parses_remote_ping_and_ssh_verdicts() {

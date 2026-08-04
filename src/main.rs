@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Duration, timeout};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Maximum time allowed for cooperative subsystem shutdown. A separate,
 /// shorter abort phase follows, then the Tokio runtime itself gets a bounded
@@ -1576,6 +1576,9 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                         if !is_leader {
                             continue;
                         }
+                        if !ff_agent::mesh_check::ssh_mesh_auto_repair_enabled(&pg_pool).await {
+                            continue;
+                        }
 
                         // Edge selection with EXPONENTIAL BACKOFF + give-up gate.
                         // The original form (`attempts >= 3 ORDER BY attempts DESC`,
@@ -1614,48 +1617,53 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
 
                         match bad {
                             Ok(Some((src, dst, attempts))) => {
-                                info!(
-                                    src = %src,
-                                    dst = %dst,
-                                    attempts,
-                                    "dispatching ssh mesh auto-repair"
-                                );
-                                let command = format!(
-                                    "ff fleet ssh-mesh-check --node {dst} --repair --yes 2>&1 | tail -10"
-                                );
-                                if let Err(e) = ff_agent::task_runner::pg_enqueue_shell_task(
+                                match ff_agent::mesh_check::enqueue_ssh_mesh_auto_repair(
                                     &pg_pool,
-                                    &format!("auto-mesh-repair: {src} -> {dst}"),
-                                    &command,
-                                    &["ff".to_string()],
-                                    Some(&name),
-                                    None,
-                                    50,
-                                    None,
+                                    &name,
+                                    &src,
+                                    &dst,
                                 )
                                 .await
                                 {
-                                    warn!(
+                                    Ok(ff_agent::task_runner::EnqueueOnceOutcome::Enqueued(task_id)) => {
+                                        info!(
+                                            src = %src,
+                                            dst = %dst,
+                                            attempts,
+                                            %task_id,
+                                            "dispatched ssh mesh auto-repair"
+                                        );
+                                        // Notify on the FIRST auto-repair of an edge only
+                                        // (attempts==3, the dispatch threshold). Repeats run
+                                        // silently under backoff — a repair loop is plumbing,
+                                        // not operator news; 150 identical pings taught the
+                                        // operator to ignore the channel.
+                                        if attempts == 3 {
+                                            let _ = ff_agent::telegram::send_telegram_from_secrets(
+                                                &pg_pool,
+                                                "SSH mesh auto-repair",
+                                                &format!(
+                                                    "Repair dispatched: {src} -> {dst} (attempts={attempts}); further retries run silently with backoff"
+                                                ),
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    Ok(ff_agent::task_runner::EnqueueOnceOutcome::AlreadyActive(task_id)) => {
+                                        debug!(
+                                            src = %src,
+                                            dst = %dst,
+                                            attempts,
+                                            %task_id,
+                                            "ssh mesh auto-repair already active; duplicate suppressed"
+                                        );
+                                    }
+                                    Err(e) => warn!(
                                         src = %src,
                                         dst = %dst,
                                         error = %e,
                                         "failed to enqueue ssh mesh auto-repair task"
-                                    );
-                                }
-                                // Notify on the FIRST auto-repair of an edge only
-                                // (attempts==3, the dispatch threshold). Repeats run
-                                // silently under backoff — a repair loop is plumbing,
-                                // not operator news; 150 identical pings taught the
-                                // operator to ignore the channel.
-                                if attempts == 3 {
-                                    let _ = ff_agent::telegram::send_telegram_from_secrets(
-                                        &pg_pool,
-                                        "SSH mesh auto-repair",
-                                        &format!(
-                                            "Repair dispatched: {src} -> {dst} (attempts={attempts}); further retries run silently with backoff"
-                                        ),
-                                    )
-                                    .await;
+                                    ),
                                 }
                             }
                             Ok(None) => {}
@@ -4236,6 +4244,26 @@ async fn wait_for_shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_auto_repair_producer_gates_before_atomic_enqueue() {
+        let source = include_str!("main.rs");
+        let producer = source
+            .split("// 20b3) SSH mesh auto-repair tick")
+            .nth(1)
+            .expect("mesh auto-repair producer")
+            .split("// 20c)")
+            .next()
+            .expect("mesh auto-repair producer body");
+        let gate = producer
+            .find("ssh_mesh_auto_repair_enabled(&pg_pool).await")
+            .expect("producer reads gate");
+        let enqueue = producer
+            .find("enqueue_ssh_mesh_auto_repair")
+            .expect("producer uses atomic enqueue-once helper");
+        assert!(gate < enqueue, "gate must be checked before enqueue");
+        assert!(producer.contains("EnqueueOnceOutcome::AlreadyActive"));
+    }
 
     #[tokio::test]
     async fn subsystem_shutdown_uses_one_deadline_and_aborts_stragglers() {
