@@ -1081,6 +1081,78 @@ pub async fn pg_enqueue_shell_task_full(
     Ok(id)
 }
 
+/// Transaction-scoped counterpart used by graph composers that must publish
+/// either the whole task DAG or none of it.  NATS publication is deliberately
+/// deferred until after the caller commits, so consumers can never observe an
+/// id whose database row later rolls back.
+#[allow(clippy::too_many_arguments)]
+async fn pg_enqueue_shell_task_full_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    summary: &str,
+    command: &str,
+    capabilities: &[String],
+    preferred_computer: Option<&str>,
+    parent_task_id: Option<uuid::Uuid>,
+    priority: i32,
+    created_by_computer_id: Option<uuid::Uuid>,
+    wait_for_siblings: bool,
+    excludes_computer_ids: &[uuid::Uuid],
+    max_duration_secs: Option<u64>,
+    depends_on_task_id: Option<uuid::Uuid>,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    let preferred_id: Option<uuid::Uuid> = if let Some(name) = preferred_computer {
+        sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
+            .bind(name)
+            .fetch_optional(&mut **tx)
+            .await?
+    } else {
+        None
+    };
+
+    let payload = match max_duration_secs {
+        Some(secs) => json!({ "command": command, "max_duration_secs": secs }),
+        None => json!({ "command": command }),
+    };
+    let capabilities = shell_task_capabilities(command, capabilities);
+    let caps = serde_json::Value::Array(
+        capabilities
+            .iter()
+            .map(|capability| Value::String(capability.clone()))
+            .collect(),
+    );
+    let excludes_json = serde_json::Value::Array(
+        excludes_computer_ids
+            .iter()
+            .map(|id| Value::String(id.to_string()))
+            .collect(),
+    );
+
+    sqlx::query_scalar(
+        r#"
+        INSERT INTO fleet_tasks (
+            parent_task_id, task_type, summary, payload,
+            priority, requires_capability, preferred_computer_id,
+            created_by_computer_id, wait_for_siblings,
+            excludes_computer_ids, depends_on_task_id
+        )
+        VALUES ($1, 'shell', $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        RETURNING id
+        "#,
+    )
+    .bind(parent_task_id)
+    .bind(summary)
+    .bind(&payload)
+    .bind(priority)
+    .bind(&caps)
+    .bind(preferred_id)
+    .bind(created_by_computer_id)
+    .bind(wait_for_siblings)
+    .bind(&excludes_json)
+    .bind(depends_on_task_id)
+    .fetch_one(&mut **tx)
+    .await
+}
+
 /// Like [`pg_enqueue_shell_task_with_options`] but with explicit routing mode.
 /// Use this when you need `fleet_first`, `local_only`, or `balanced` instead
 /// of the default `fleet_first`.
@@ -1465,6 +1537,9 @@ pub struct ComposePlan {
     pub parent: Option<uuid::Uuid>,
     pub parent_summary: String,
     pub tasks: Vec<PlannedTask>,
+    /// Exact number of committed `fleet_tasks` rows, including the parent.
+    /// Zero for dry-runs.
+    pub created_tasks: usize,
 }
 
 /// One parent (compound, no shell) plus N children, one per
@@ -1551,7 +1626,6 @@ pub async fn compose_node_bootstrap(
         .fetch_one(pg)
         .await?
     };
-
     let port_arg = if target_ssh_port == 22 {
         String::new()
     } else {
@@ -1712,6 +1786,7 @@ pub async fn compose_node_bootstrap(
         parent: if dry_run { None } else { Some(parent) },
         parent_summary,
         tasks: planned,
+        created_tasks: if dry_run { 0 } else { 5 },
     })
 }
 
@@ -1842,6 +1917,22 @@ pub async fn compose_fleet_upgrade_wave_filtered(
     // software, the singleton spans the WHOLE family — refuse if any
     // ff_git / forgefleetd_git / forgefleet wave is in flight, not just
     // this exact software_id. The two waves now serialize across ticks.
+    // Serialize the singleton check and the complete parent/build/restart DAG
+    // creation.  Without a transaction, a mid-compose error left orphaned
+    // parents or partial waves and an operator retry could create a second
+    // graph.  The advisory xact lock also closes the race where two composers
+    // both observe no in-flight wave before either inserts its parent.
+    let mut tx = pg.begin().await?;
+    let lock_scope = if crate::auto_upgrade::is_daemon_self_software(software_id) {
+        "fleet-upgrade-wave:daemon-self".to_string()
+    } else {
+        format!("fleet-upgrade-wave:{software_id}")
+    };
+    let _: i64 = sqlx::query_scalar("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&lock_scope)
+        .fetch_one(&mut *tx)
+        .await?;
+
     let wave_inflight: bool = if crate::auto_upgrade::is_daemon_self_software(software_id) {
         let family = crate::auto_upgrade::DAEMON_SELF_SOFTWARE;
         let patterns: Vec<String> = family
@@ -1858,7 +1949,7 @@ pub async fn compose_fleet_upgrade_wave_filtered(
             "#,
         )
         .bind(&patterns)
-        .fetch_one(pg)
+        .fetch_one(&mut *tx)
         .await?
     } else {
         sqlx::query_scalar(
@@ -1871,7 +1962,7 @@ pub async fn compose_fleet_upgrade_wave_filtered(
             "#,
         )
         .bind(format!("fleet-upgrade-wave/%: {software_id} on %"))
-        .fetch_one(pg)
+        .fetch_one(&mut *tx)
         .await?
     };
     if wave_inflight {
@@ -1892,12 +1983,24 @@ pub async fn compose_fleet_upgrade_wave_filtered(
     // maintenance lease is active. Restarting daemons mid-handoff is the wave
     // self-kill race the V62 singleton guards against, now spanning a leader
     // change — defer until the lease ends (it auto-fails-back), then re-compose.
-    if crate::auto_upgrade::is_daemon_self_software(software_id)
-        && ff_db::pg_get_active_maintenance_lease(pg)
-            .await
-            .unwrap_or(None)
-            .is_some()
-    {
+    let maintenance_lease: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM fleet_secrets WHERE key = 'leader_maintenance_lease'",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let maintenance_active = maintenance_lease.as_deref().is_some_and(|raw| {
+        raw.split_once('|')
+            .and_then(|(standby, until)| {
+                if standby.trim().is_empty() {
+                    return None;
+                }
+                chrono::DateTime::parse_from_rfc3339(until.trim())
+                    .ok()
+                    .map(|deadline| deadline.with_timezone(&chrono::Utc))
+            })
+            .is_some_and(|deadline| deadline > chrono::Utc::now())
+    });
+    if crate::auto_upgrade::is_daemon_self_software(software_id) && maintenance_active {
         tracing::info!(
             software_id = %software_id,
             "fleet-upgrade-wave: refusing dispatch — leadership maintenance lease active (HA Phase 2 drain)"
@@ -1925,7 +2028,7 @@ pub async fn compose_fleet_upgrade_wave_filtered(
                FROM computers WHERE name = $1",
         )
         .bind(&plan.computer_name)
-        .fetch_optional(pg)
+        .fetch_optional(&mut *tx)
         .await?;
         let Some((target_id, ssh_user, primary_ip, ssh_port, os_family)) = row else {
             tracing::warn!(
@@ -1978,9 +2081,13 @@ pub async fn compose_fleet_upgrade_wave_filtered(
             "target_count": wave_targets.len(),
         }))
         .bind(leader_computer_id)
-        .fetch_one(pg)
+        .fetch_one(&mut *tx)
         .await?
     };
+    let mut created_task_ids = Vec::with_capacity(1 + wave_targets.len() * 2);
+    if !dry_run {
+        created_task_ids.push(parent);
+    }
 
     // 4. Phase 1 — chunk targets into waves; one build/install shell task
     //    per (wave, target). Empty capability set = any worker may claim,
@@ -2074,8 +2181,8 @@ pub async fn compose_fleet_upgrade_wave_filtered(
                 });
                 continue;
             }
-            let build_id = pg_enqueue_shell_task_full(
-                pg,
+            let build_id = pg_enqueue_shell_task_full_tx(
+                &mut tx,
                 &build_summary,
                 &command,
                 &[],
@@ -2090,6 +2197,7 @@ pub async fn compose_fleet_upgrade_wave_filtered(
             )
             .await?;
             build_ids_by_target.insert(t.target_id, build_id);
+            created_task_ids.push(build_id);
         }
     }
 
@@ -2222,8 +2330,8 @@ pub async fn compose_fleet_upgrade_wave_filtered(
             continue;
         }
         let build_dep = build_ids_by_target.get(&t.target_id).copied();
-        pg_enqueue_shell_task_full(
-            pg,
+        let restart_id = pg_enqueue_shell_task_full_tx(
+            &mut tx,
             &restart_summary,
             &restart_command,
             &[],
@@ -2237,12 +2345,19 @@ pub async fn compose_fleet_upgrade_wave_filtered(
             build_dep,
         )
         .await?;
+        created_task_ids.push(restart_id);
+    }
+
+    tx.commit().await?;
+    for task_id in &created_task_ids {
+        crate::nats_jetstream::publish_task_inserted(*task_id).await;
     }
 
     Ok(ComposePlan {
         parent: if dry_run { None } else { Some(parent) },
         parent_summary,
         tasks: planned,
+        created_tasks: created_task_ids.len(),
     })
 }
 

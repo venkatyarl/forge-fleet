@@ -389,7 +389,7 @@ pub async fn handle_fleet_upgrade(
     // Dirty-build gate for `ff_git` / `forgefleetd_git` — refuses propagation
     // of a leader with an uncommitted working tree unless `--force-dirty`.
     use ff_agent::auto_upgrade::GitStateGate;
-    let gate = ff_agent::auto_upgrade::gate_git_state(pool, software_id, force_dirty).await;
+    let gate = ff_agent::auto_upgrade::gate_git_state(pool, software_id, force_dirty).await?;
     let leader_sha = plans
         .first()
         .and_then(|p| p.installed_version.clone())

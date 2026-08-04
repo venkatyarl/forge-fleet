@@ -638,6 +638,88 @@ fn text_mark(state: &str) -> &'static str {
     }
 }
 
+fn status_candidates(home: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
+    let mut candidates = vec![
+        ("claude-code", home.join(".claude").join("settings.json")),
+        ("claude-desktop", claude_desktop_config_path(home)),
+        ("codex", home.join(".codex").join("config.toml")),
+        ("gemini", home.join(".gemini").join("settings.json")),
+        ("kimi", home.join(".kimi-code").join("mcp.json")),
+        ("kimi-desktop", kimi_desktop_config_path(home)),
+        ("cursor", home.join(".cursor").join("mcp.json")),
+        (
+            "windsurf",
+            home.join(".codeium")
+                .join("windsurf")
+                .join("mcp_config.json"),
+        ),
+        (
+            "goose",
+            home.join(".config").join("goose").join("config.yaml"),
+        ),
+        ("grok", home.join(".grok").join("mcp-config.json")),
+    ];
+    let legacy_kimi = home.join(".kimi").join("config.json");
+    if legacy_kimi.exists() {
+        candidates.insert(5, ("kimi-legacy", legacy_kimi));
+    }
+    candidates
+}
+
+fn config_has_forgefleet(path: &std::path::Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "json")
+    {
+        return serde_json::from_str::<Value>(&contents)
+            .ok()
+            .and_then(|doc| {
+                doc.get("mcpServers")?
+                    .as_object()?
+                    .get("forgefleet")
+                    .cloned()
+            })
+            .is_some_and(|server| server.is_object());
+    }
+    contents.contains("forgefleet")
+}
+
+fn status_rows(home: &std::path::Path) -> Vec<Value> {
+    status_candidates(home)
+        .into_iter()
+        .map(|(name, path)| {
+            let exists = path.exists();
+            let has_ff = exists && config_has_forgefleet(&path);
+            json!({
+                "client": name,
+                "config_path": path.display().to_string(),
+                "exists": exists,
+                "forgefleet_installed": has_ff,
+                "state": classify_state(exists, has_ff),
+            })
+        })
+        .collect()
+}
+
+fn render_status(home: &std::path::Path, as_json: bool) -> String {
+    let rows = status_rows(home);
+    if as_json {
+        return serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string());
+    }
+
+    let mut output = String::from("MCP client configs on this computer:\n");
+    for row in rows {
+        let name = row["client"].as_str().unwrap_or_default();
+        let state = row["state"].as_str().unwrap_or_default();
+        let path = row["config_path"].as_str().unwrap_or_default();
+        output.push_str(&format!("  {name:<12} {} {path}\n", text_mark(state)));
+    }
+    output
+}
+
 fn print_status(as_json: bool) {
     let home = match dirs::home_dir() {
         Some(h) => h,
@@ -646,73 +728,7 @@ fn print_status(as_json: bool) {
             return;
         }
     };
-    let candidates: &[(&str, Vec<PathBuf>)] = &[
-        (
-            "claude-code",
-            vec![home.join(".claude").join("settings.json")],
-        ),
-        ("claude-desktop", vec![claude_desktop_config_path(&home)]),
-        ("codex", vec![home.join(".codex").join("config.toml")]),
-        ("gemini", vec![home.join(".gemini").join("settings.json")]),
-        (
-            "kimi",
-            vec![
-                home.join(".kimi-code").join("config.toml"),
-                home.join(".kimi").join("config.json"),
-            ],
-        ),
-        ("kimi-desktop", vec![kimi_desktop_config_path(&home)]),
-        ("cursor", vec![home.join(".cursor").join("mcp.json")]),
-        (
-            "windsurf",
-            vec![
-                home.join(".codeium")
-                    .join("windsurf")
-                    .join("mcp_config.json"),
-            ],
-        ),
-        (
-            "goose",
-            vec![home.join(".config").join("goose").join("config.yaml")],
-        ),
-        ("grok", vec![home.join(".grok").join("mcp-config.json")]),
-    ];
-
-    let mut rows: Vec<Value> = Vec::new();
-    if !as_json {
-        println!("MCP client configs on this computer:");
-    }
-    for (name, paths) in candidates {
-        for path in paths {
-            let exists = path.exists();
-            let has_ff = if exists {
-                std::fs::read_to_string(path)
-                    .ok()
-                    .map(|s| s.contains("forgefleet"))
-                    .unwrap_or(false)
-            } else {
-                false
-            };
-            let state = classify_state(exists, has_ff);
-            if as_json {
-                rows.push(json!({
-                    "client": name,
-                    "config_path": path.display().to_string(),
-                    "exists": exists,
-                    "forgefleet_installed": has_ff,
-                    "state": state,
-                }));
-            } else {
-                println!("  {:<12} {} {}", name, text_mark(state), path.display());
-            }
-        }
-    }
-    if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string())
-        );
-    }
+    println!("{}", render_status(&home, as_json).trim_end());
 }
 
 #[cfg(test)]
@@ -736,6 +752,101 @@ mod tests {
         assert_eq!(text_mark("absent"), "—");
         assert_eq!(text_mark("installed"), "✓ forgefleet installed");
         assert_eq!(text_mark("not_installed"), "× forgefleet missing");
+    }
+
+    #[test]
+    fn kimi_status_uses_authoritative_json_and_reports_installed() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join(".kimi-code").join("mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            r#"{"mcpServers":{"forgefleet":{"command":"forgefleetd"}}}"#,
+        )
+        .unwrap();
+
+        let row = status_rows(temp.path())
+            .into_iter()
+            .find(|row| row["client"] == "kimi")
+            .unwrap();
+        assert_eq!(row["config_path"], config.display().to_string());
+        assert_eq!(row["exists"], true);
+        assert_eq!(row["forgefleet_installed"], true);
+        assert_eq!(row["state"], "installed");
+    }
+
+    #[test]
+    fn kimi_status_reports_missing_and_malformed_json_truthfully() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = status_rows(temp.path())
+            .into_iter()
+            .find(|row| row["client"] == "kimi")
+            .unwrap();
+        assert_eq!(missing["exists"], false);
+        assert_eq!(missing["forgefleet_installed"], false);
+        assert_eq!(missing["state"], "absent");
+
+        let config = temp.path().join(".kimi-code").join("mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, r#"{"mcpServers":{"forgefleet": broken}"#).unwrap();
+        let malformed = status_rows(temp.path())
+            .into_iter()
+            .find(|row| row["client"] == "kimi")
+            .unwrap();
+        assert_eq!(malformed["exists"], true);
+        assert_eq!(malformed["forgefleet_installed"], false);
+        assert_eq!(malformed["state"], "not_installed");
+    }
+
+    #[test]
+    fn kimi_status_requires_forgefleet_server_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join(".kimi-code").join("mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+
+        for (value, expected_state) in [
+            (serde_json::json!(null), "not_installed"),
+            (serde_json::json!("forgefleet"), "not_installed"),
+            (serde_json::json!([]), "not_installed"),
+            (serde_json::json!({}), "installed"),
+        ] {
+            std::fs::write(
+                &config,
+                serde_json::json!({"mcpServers": {"forgefleet": value}}).to_string(),
+            )
+            .unwrap();
+            let row = status_rows(temp.path())
+                .into_iter()
+                .find(|row| row["client"] == "kimi")
+                .unwrap();
+            assert_eq!(row["state"], expected_state, "server value: {value}");
+        }
+    }
+
+    #[test]
+    fn kimi_json_and_text_status_share_truth_and_legacy_is_conditional() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join(".kimi-code").join("mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, r#"{"mcpServers":{"other":{}}}"#).unwrap();
+
+        let json_output: Value = serde_json::from_str(&render_status(temp.path(), true)).unwrap();
+        let kimi = json_output
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["client"] == "kimi")
+            .unwrap();
+        assert_eq!(kimi["state"], "not_installed");
+        let text_output = render_status(temp.path(), false);
+        assert!(text_output.contains("kimi         × forgefleet missing"));
+        assert!(!text_output.contains("kimi-legacy"));
+
+        let legacy = temp.path().join(".kimi").join("config.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, r#"{"mcpServers":{"forgefleet":{}}}"#).unwrap();
+        let text_output = render_status(temp.path(), false);
+        assert!(text_output.contains("kimi-legacy  ✓ forgefleet installed"));
     }
 
     #[test]

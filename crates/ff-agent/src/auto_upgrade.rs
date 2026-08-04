@@ -330,9 +330,13 @@ pub enum GitStateGate {
 /// non-`ff_git` / `forgefleetd_git` software (the gate is a no-op for
 /// package-manager-managed upgrades). `force_dirty` converts `BlockDirty`
 /// to `AllowWithWarning` so the operator can override after inspection.
-pub async fn gate_git_state(pool: &PgPool, software_id: &str, force_dirty: bool) -> GitStateGate {
+pub async fn gate_git_state(
+    pool: &PgPool,
+    software_id: &str,
+    force_dirty: bool,
+) -> Result<GitStateGate> {
     if !matches!(software_id, "ff_git" | "forgefleetd_git") {
-        return GitStateGate::Allow;
+        return Ok(GitStateGate::Allow);
     }
     // Leader = the computer currently named in `fleet_leader_state`.
     let state = sqlx::query_scalar::<_, Option<String>>(
@@ -346,11 +350,10 @@ pub async fn gate_git_state(pool: &PgPool, software_id: &str, force_dirty: bool)
     .bind(software_id)
     .fetch_optional(pool)
     .await
-    .ok()
-    .flatten()
+    .context("read leader git-state safety gate")?
     .flatten();
 
-    match state.as_deref() {
+    Ok(match state.as_deref() {
         Some("pushed") => GitStateGate::Allow,
         Some("unpushed") => GitStateGate::AllowWithWarning,
         Some("dirty") => {
@@ -361,7 +364,7 @@ pub async fn gate_git_state(pool: &PgPool, software_id: &str, force_dirty: bool)
             }
         }
         _ => GitStateGate::Allow, // unknown / missing — dev fleet, proceed with weaker guarantees
-    }
+    })
 }
 
 /// Mark every target row for `software_id` as `upgrade_blocked_dirty` so
@@ -388,8 +391,58 @@ pub async fn enqueue_plans(
     plans: &[UpgradePlan],
     who: &str,
 ) -> Result<Vec<EnqueuedPlan>> {
+    // Keep the task insert and the status transition in one transaction.  The
+    // previous two-step implementation could commit the task, fail the
+    // best-effort status UPDATE, and enqueue a duplicate on the next tick.
+    // Lock in a deterministic order so concurrent manual/automatic runs wait
+    // for one another without deadlocking; the loser observes `upgrading` and
+    // skips the already-dispatched target.
+    let mut ordered: Vec<&UpgradePlan> = plans.iter().collect();
+    ordered.sort_by(|a, b| {
+        (&a.software_id, a.computer_name.to_ascii_lowercase())
+            .cmp(&(&b.software_id, b.computer_name.to_ascii_lowercase()))
+    });
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin atomic auto-upgrade enqueue")?;
     let mut out = Vec::with_capacity(plans.len());
-    for p in plans {
+    for p in ordered {
+        let current_status: Option<String> = sqlx::query_scalar(
+            "SELECT cs.status
+               FROM computer_software cs
+               JOIN computers c ON c.id = cs.computer_id
+              WHERE cs.software_id = $1
+                AND LOWER(c.name) = LOWER($2)
+              FOR UPDATE OF cs",
+        )
+        .bind(&p.software_id)
+        .bind(&p.computer_name)
+        .fetch_optional(&mut *tx)
+        .await
+        .with_context(|| {
+            format!(
+                "lock computer_software for {} on {}",
+                p.software_id, p.computer_name
+            )
+        })?;
+        let Some(current_status) = current_status else {
+            anyhow::bail!(
+                "computer_software row disappeared for {} on {}",
+                p.software_id,
+                p.computer_name
+            );
+        };
+        if current_status == "upgrading" {
+            tracing::info!(
+                software_id = %p.software_id,
+                computer = %p.computer_name,
+                "auto-upgrade target already upgrading; reusing the committed state fence"
+            );
+            continue;
+        }
+
         let payload = json!({
             "command": p.command,
             "meta": {
@@ -406,23 +459,50 @@ pub async fn enqueue_plans(
         });
         let trigger_spec = json!({ "node": p.computer_name });
         let title = format!("Upgrade {} on {}", p.software_id, p.computer_name);
-        let id = ff_db::pg_enqueue_deferred(
-            pool,
-            &title,
-            "shell",
-            &payload,
-            "node_online",
-            &trigger_spec,
-            Some(&p.computer_name),
-            &json!([]),
-            Some(who),
-            Some(3),
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO fleet_tasks
+                (task_type, summary, payload, priority, requires_capability, status,
+                 created_at, task_class, not_before)
+             VALUES (
+                 'shell',
+                 $1,
+                 jsonb_strip_nulls(
+                     jsonb_build_object(
+                         'deferred_payload', $2,
+                         'created_by', $3,
+                         'kind', 'shell',
+                         'trigger_type', 'node_online',
+                         'trigger_spec', $4,
+                         'preferred_node', $5,
+                         'required_caps', '[]'::jsonb,
+                         'attempts', 0,
+                         'max_attempts', 3
+                     )
+                 ),
+                 50,
+                 '[]'::jsonb,
+                 'pending',
+                 NOW(),
+                 'deferred',
+                 NULL
+             )
+             RETURNING id",
         )
+        .bind(&title)
+        .bind(&payload)
+        .bind(who)
+        .bind(&trigger_spec)
+        .bind(&p.computer_name)
+        .fetch_one(&mut *tx)
         .await
-        .context("enqueue deferred task")?;
+        .with_context(|| {
+            format!(
+                "enqueue deferred upgrade for {} on {}",
+                p.software_id, p.computer_name
+            )
+        })?;
 
-        // Flip status so repeat ticks don't double-dispatch.
-        let _ = sqlx::query(
+        let updated = sqlx::query(
             "UPDATE computer_software cs
                 SET status = 'upgrading'
                FROM computers c
@@ -432,15 +512,31 @@ pub async fn enqueue_plans(
         )
         .bind(&p.software_id)
         .bind(&p.computer_name)
-        .execute(pool)
-        .await;
+        .execute(&mut *tx)
+        .await
+        .with_context(|| {
+            format!(
+                "fence deferred upgrade for {} on {}",
+                p.software_id, p.computer_name
+            )
+        })?
+        .rows_affected();
+        anyhow::ensure!(
+            updated == 1,
+            "expected one computer_software fence for {} on {}, updated {updated}",
+            p.software_id,
+            p.computer_name
+        );
 
         out.push(EnqueuedPlan {
             computer_name: p.computer_name.clone(),
-            defer_id: id,
+            defer_id: id.to_string(),
             software_id: p.software_id.clone(),
         });
     }
+    tx.commit()
+        .await
+        .context("commit atomic auto-upgrade enqueue")?;
     Ok(out)
 }
 
@@ -502,6 +598,23 @@ pub(crate) async fn is_leader(_pool: &PgPool, _my_name: &str) -> bool {
     crate::leader_cache::is_current_leader()
 }
 
+/// Read leadership from the durable singleton instead of the daemon's hot-path
+/// cache. Short-lived operator processes never initialize `LeaderCache`, so
+/// explicit/run-once entry points must use this authority and fail closed when
+/// it cannot be read.
+pub async fn is_durable_leader(pool: &PgPool, my_name: &str) -> Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM fleet_leader_state \
+         WHERE singleton_key = 'current' \
+           AND LOWER(member_name) = LOWER($1) \
+           AND heartbeat_at > NOW() - INTERVAL '60 seconds')",
+    )
+    .bind(my_name)
+    .fetch_one(pool)
+    .await
+    .context("read durable fleet leader authority")
+}
+
 /// Is the auto-upgrade feature turned on via `fleet_secrets`?
 ///
 /// Treated as a self-expiring safety gate (V58): if an operator flipped
@@ -510,13 +623,23 @@ pub(crate) async fn is_leader(_pool: &PgPool, _my_name: &str) -> bool {
 /// expected posture is auto-upgrades flowing). Permanent-off rows
 /// (no `expires_at`) still suppress the tick, so existing operators
 /// who explicitly disable via `ff secrets set` are unaffected.
-pub(crate) async fn is_enabled(pool: &PgPool) -> bool {
+pub async fn is_enabled_durable(pool: &PgPool) -> Result<bool> {
     // default_when_missing = false   (preserve pre-V58 "off if no row")
     // restore_when_expired = true    (TTL'd disable auto-restores to ON,
     //                                 fleet's expected posture)
     ff_db::pg_read_safety_gate(pool, AUTO_UPGRADE_ENABLED_KEY, false, true)
         .await
-        .unwrap_or(false)
+        .context("read auto_upgrade_enabled safety gate")
+}
+
+pub(crate) async fn is_enabled(pool: &PgPool) -> bool {
+    match is_enabled_durable(pool).await {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            tracing::warn!(%error, "auto-upgrade gate read failed; treating as disabled");
+            false
+        }
+    }
 }
 
 /// Closes the leader-self-upgrade gap. The wave dispatcher excludes the leader
@@ -532,17 +655,21 @@ pub(crate) async fn is_enabled(pool: &PgPool) -> bool {
 /// time-bounded per-target marker stops it re-firing while a build is running.
 /// Gated OFF by default. Returns true if a self-upgrade was launched.
 /// Live-verified 2026-06-01: leader self-heals on drift via this path.
-async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str, running_sha: &str) -> bool {
+async fn maybe_self_upgrade_leader(
+    pool: &PgPool,
+    my_name: &str,
+    running_sha: &str,
+) -> Result<bool> {
     // Gate: permanent-default OFF (no TTL auto-restore — self-restart is risky,
     // so it stays off unless explicitly enabled).
     if !ff_db::pg_read_safety_gate(pool, LEADER_SELF_UPGRADE_KEY, false, false)
         .await
-        .unwrap_or(false)
+        .context("read leader_self_upgrade safety gate")?
     {
-        return false;
+        return Ok(false);
     }
-    if !is_leader(pool, my_name).await {
-        return false;
+    if !is_durable_leader(pool, my_name).await? {
+        return Ok(false);
     }
 
     // Is the leader in drift on its own daemon binary? Compare the RUNNING
@@ -563,10 +690,10 @@ async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str, running_sha: &s
     )
     .fetch_optional(pool)
     .await
-    .ok()
+    .context("read leader self-upgrade target SHA")?
     .flatten();
     let Some(latest_sha) = latest_sha else {
-        return false; // no known target
+        return Ok(false); // no known target
     };
     // SHAs may differ in length (running is 10-char from --short=10; registry
     // may be 10 or full). Prefix-compare so the shorter is a prefix of the
@@ -575,7 +702,7 @@ async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str, running_sha: &s
     let running = running_sha.trim();
     let latest = latest_sha.trim();
     if running.is_empty() || running.starts_with(latest) || latest.starts_with(running) {
-        return false; // running binary already at latest (or build unknown)
+        return Ok(false); // running binary already at latest (or build unknown)
     }
     let target_sha = latest_sha;
 
@@ -591,11 +718,10 @@ async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str, running_sha: &s
     )
     .fetch_optional(pool)
     .await
-    .ok()
+    .context("read leader source_tree_path")?
     .flatten();
     let Some(source_tree) = source_tree else {
-        tracing::warn!("leader self-upgrade: no source_tree_path on leader; skipping");
-        return false;
+        anyhow::bail!("leader self-upgrade: no source_tree_path on leader");
     };
     let source_tree = expand_tilde(&source_tree);
     let home = std::env::var("HOME").unwrap_or_default();
@@ -606,29 +732,34 @@ async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str, running_sha: &s
     )
     .fetch_optional(pool)
     .await
-    .ok()
-    .flatten()
+    .context("read leader self-upgrade git ref")?
     .and_then(|vs| vs.get("git_ref").and_then(|v| v.as_str()).map(String::from))
     .unwrap_or_else(|| "origin/main".to_string());
 
     // Time-bounded marker: skip if a build for THIS target launched < 45min ago
     // (so a failed/hung build retries later instead of wedging forever).
     let marker = format!("{home}/.forgefleet/leader-self-upgrade.target");
-    if let Ok(meta) = std::fs::metadata(&marker) {
-        let recent = meta
-            .modified()
-            .ok()
-            .and_then(|m| m.elapsed().ok())
-            .map(|e| e.as_secs() < 2700)
-            .unwrap_or(false);
-        if recent
-            && std::fs::read_to_string(&marker)
-                .map(|s| s.trim() == target_sha)
-                .unwrap_or(false)
-        {
-            tracing::debug!(sha = %target_sha, "leader self-upgrade already in flight; skipping");
-            return false;
+    match std::fs::metadata(&marker) {
+        Ok(meta) => {
+            let recent = meta
+                .modified()
+                .context("read leader self-upgrade marker mtime")?
+                .elapsed()
+                .context("measure leader self-upgrade marker age")?
+                .as_secs()
+                < 2700;
+            if recent
+                && std::fs::read_to_string(&marker)
+                    .context("read leader self-upgrade marker")?
+                    .trim()
+                    == target_sha
+            {
+                tracing::debug!(sha = %target_sha, "leader self-upgrade already in flight; skipping");
+                return Ok(false);
+            }
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("stat leader self-upgrade marker"),
     }
 
     // OS-specific graceful restart (NOT pkill). Code-signing is folded into the
@@ -675,26 +806,24 @@ async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str, running_sha: &s
          {restart}\n"
     );
     let script_path = format!("{home}/.forgefleet/leader-self-upgrade.sh");
-    if let Err(e) = std::fs::write(&script_path, &script) {
-        tracing::warn!(error = %e, "leader self-upgrade: failed to write helper script");
-        return false;
-    }
-    let _ = std::fs::write(&marker, &target_sha);
+    std::fs::write(&script_path, &script).context("write leader self-upgrade helper script")?;
+    std::fs::write(&marker, &target_sha).context("write leader self-upgrade target marker")?;
 
     // Ask the election loop to hand leadership to a follower before the
     // detached helper restarts this node. The request expires automatically.
     let handoff_until = chrono::Utc::now() + chrono::Duration::minutes(10);
-    if let Err(e) = ff_db::pg_set_secret(
+    let handoff_value = format!("{my_name}|{}", handoff_until.to_rfc3339());
+    if let Err(error) = ff_db::pg_set_secret(
         pool,
         "leader_yield_request",
-        &format!("{my_name}|{}", handoff_until.to_rfc3339()),
+        &handoff_value,
         Some("continuous rollout leader-last restart"),
         Some("auto-upgrade"),
     )
     .await
     {
-        tracing::warn!(error = %e, "leader self-upgrade: handoff request failed");
-        return false;
+        let _ = std::fs::remove_file(&marker);
+        return Err(error).context("persist leader self-upgrade handoff request");
     }
 
     // Spawn DETACHED in a new session so the daemon restart (which kills
@@ -723,11 +852,22 @@ async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str, running_sha: &s
                 pid = child.id(),
                 "LEADER SELF-UPGRADE launched (detached): rebuilding + restarting forgefleetd"
             );
-            true
+            Ok(true)
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "leader self-upgrade: spawn failed");
-            false
+        Err(error) => {
+            let clear_result = sqlx::query(
+                "DELETE FROM fleet_secrets
+                  WHERE key = 'leader_yield_request' AND value = $1",
+            )
+            .bind(&handoff_value)
+            .execute(pool)
+            .await;
+            let marker_result = std::fs::remove_file(&marker);
+            anyhow::bail!(
+                "leader self-upgrade spawn failed: {error}; cleanup handoff={:?}, marker={:?}",
+                clear_result.map(|result| result.rows_affected()),
+                marker_result
+            )
         }
     }
 }
@@ -763,6 +903,61 @@ pub struct AutoUpgradeTick {
     running_sha: String,
 }
 
+/// Observable result for an operator-triggered tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoUpgradeRunOnceOutcome {
+    pub refreshed_self_built: u64,
+    pub enqueued: usize,
+    pub rollouts_started: usize,
+    pub skipped: usize,
+    pub leader_self_upgrade_launched: bool,
+}
+
+fn record_operation_failure(
+    failures: &mut Vec<String>,
+    surface_failures: bool,
+    software_id: &str,
+    operation: &str,
+    error: impl std::fmt::Display,
+) {
+    tracing::warn!(
+        software_id = %software_id,
+        operation = %operation,
+        error = %error,
+        "auto-upgrade operation failed"
+    );
+    if surface_failures {
+        failures.push(format!("{software_id}: {operation}: {error}"));
+    }
+}
+
+fn finish_run_once(
+    refreshed_self_built: u64,
+    enqueued: usize,
+    rollouts_started: usize,
+    skipped: usize,
+    leader_self_upgrade_launched: bool,
+    failures: Vec<String>,
+) -> Result<AutoUpgradeRunOnceOutcome> {
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "auto-upgrade dispatch incomplete after refreshing {refreshed_self_built} self-built \
+             version row(s), dispatching {enqueued} upgrade task(s), skipping {skipped} target(s), \
+             starting {rollouts_started} rollout(s), and \
+             leader_self_upgrade_launched={leader_self_upgrade_launched}: {} failure(s): {}",
+            failures.len(),
+            failures.join("; ")
+        );
+    }
+    Ok(AutoUpgradeRunOnceOutcome {
+        refreshed_self_built,
+        enqueued,
+        rollouts_started,
+        skipped,
+        leader_self_upgrade_launched,
+    })
+}
+
 impl AutoUpgradeTick {
     pub fn new(pool: PgPool, my_name: String, running_sha: String) -> Self {
         let client = reqwest::Client::builder()
@@ -786,11 +981,43 @@ impl AutoUpgradeTick {
         if !is_leader(&self.pool, &self.my_name).await {
             return Ok(0);
         }
-        if !force && !is_enabled(&self.pool).await {
+        Ok(self.run_once_authorized(force, false).await?.enqueued)
+    }
+
+    /// Operator/CLI run-once path. Unlike the daemon hot path, leadership is
+    /// read directly from `fleet_leader_state` and self-built refresh failures
+    /// are returned to the caller instead of becoming a false zero-success.
+    pub async fn run_once_durable(&self, force: bool) -> Result<AutoUpgradeRunOnceOutcome> {
+        if !is_durable_leader(&self.pool, &self.my_name).await? {
+            anyhow::bail!(
+                "worker '{}' is not the fresh current leader in fleet_leader_state",
+                self.my_name
+            );
+        }
+        self.run_once_authorized(force, true).await
+    }
+
+    async fn run_once_authorized(
+        &self,
+        force: bool,
+        surface_failures: bool,
+    ) -> Result<AutoUpgradeRunOnceOutcome> {
+        let enabled = if surface_failures {
+            is_enabled_durable(&self.pool).await?
+        } else {
+            is_enabled(&self.pool).await
+        };
+        if !force && !enabled {
             tracing::debug!(
                 "auto-upgrade disabled (fleet_secrets.auto_upgrade_enabled not truthy)"
             );
-            return Ok(0);
+            return Ok(AutoUpgradeRunOnceOutcome {
+                refreshed_self_built: 0,
+                enqueued: 0,
+                rollouts_started: 0,
+                skipped: 0,
+                leader_self_upgrade_launched: false,
+            });
         }
 
         // Self-built tools (ff_git, forgefleetd_git, etc.) use method=self_built
@@ -799,18 +1026,55 @@ impl AutoUpgradeTick {
         // but that's too slow for active dev. Do an inline refresh here on every
         // auto-upgrade tick — one SQL UPDATE per row. If leader's row just flipped,
         // the next line (drift check) will see upgrade_available immediately.
-        let _ = refresh_self_built_latest_versions(&self.pool).await;
+        let mut failures = Vec::new();
+        let refreshed_self_built = if surface_failures {
+            refresh_self_built_latest_versions(&self.pool).await?
+        } else {
+            refresh_self_built_latest_versions(&self.pool)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "auto-upgrade: self-built refresh failed");
+                    0
+                })
+        };
         // npm-distributed tools (codex, context-mode, …): query
         // registry.npmjs.org/<pkg>/latest. Same-tick refresh for parity with
         // self_built — without this, npm releases sit unnoticed indefinitely.
-        let _ = refresh_npm_registry_latest_versions(&self.client, &self.pool).await;
+        for (operation, result) in [
+            (
+                "refresh npm registry versions",
+                refresh_npm_registry_latest_versions(&self.client, &self.pool).await,
+            ),
+            (
+                "refresh PyPI versions",
+                refresh_pypi_latest_versions(&self.client, &self.pool).await,
+            ),
+            (
+                "refresh GitHub release versions",
+                refresh_github_release_latest_versions(&self.client, &self.pool).await,
+            ),
+            (
+                "refresh git-head versions",
+                refresh_git_head_latest_versions(&self.client, &self.pool).await,
+            ),
+            (
+                "seed auto-install rows",
+                seed_auto_install_rows(&self.pool).await,
+            ),
+            ("flip drift status", flip_drift_status(&self.pool).await),
+        ] {
+            if let Err(error) = result {
+                record_operation_failure(
+                    &mut failures,
+                    surface_failures,
+                    "registry",
+                    operation,
+                    error,
+                );
+            }
+        }
         // PyPI-distributed (vllm, mlx_lm, …) and GitHub-released (gh, etc.)
         // follow the same shape, different upstream URL.
-        let _ = refresh_pypi_latest_versions(&self.client, &self.pool).await;
-        let _ = refresh_github_release_latest_versions(&self.client, &self.pool).await;
-        // Git-head: tools we install by git-clone that don't ship versioned
-        // releases yet (open-design, etc.). Returns 10-char SHA of named ref.
-        let _ = refresh_git_head_latest_versions(&self.client, &self.pool).await;
         // V67 install bootstrap: for `software_registry.auto_install = true`
         // rows, seed a `computer_software` row (status='upgrade_available')
         // for every member that doesn't already have one. Without this,
@@ -818,11 +1082,12 @@ impl AutoUpgradeTick {
         // dispatch — flip_drift_status only operates on existing rows,
         // and the materializer only creates rows when a beat reports the
         // software detected. Closes the install-bootstrap loop.
-        let _ = seed_auto_install_rows(&self.pool).await;
         // Then: flip computer_software.status = 'upgrade_available' for any row
         // where installed_version != latest_version and status is currently 'ok'.
         // Generic across all methods.
-        let _ = flip_drift_status(&self.pool).await;
+        if surface_failures && !failures.is_empty() {
+            return finish_run_once(refreshed_self_built, 0, 0, 0, false, failures);
+        }
 
         // Leader self-upgrade (closes the leader gap). Runs BEFORE the
         // ids.is_empty() early return below so the leader self-heals on its OWN
@@ -832,16 +1097,41 @@ impl AutoUpgradeTick {
         // Continuous rollouts converge followers first. The leader's detached
         // self-upgrade is considered only after no automatic follower rollout
         // remains in progress (leader-last invariant).
-        let auto_mode = crate::upgrade_rollout::continuous_mode_is_auto(&self.pool).await;
-        let auto_rollout_inflight: bool = sqlx::query_scalar(
+        let auto_mode =
+            match crate::upgrade_rollout::continuous_mode_is_auto_durable(&self.pool).await {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    record_operation_failure(
+                        &mut failures,
+                        surface_failures,
+                        "rollout",
+                        "read continuous rollout mode",
+                        error,
+                    );
+                    None
+                }
+            };
+        let auto_rollout_inflight_result: Result<bool, sqlx::Error> = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM upgrade_rollouts \
              WHERE automatic = TRUE AND status = 'in_progress')",
         )
         .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
-        let followers_converged: bool = if auto_mode {
-            sqlx::query_scalar(
+        .await;
+        let auto_rollout_inflight = match auto_rollout_inflight_result {
+            Ok(value) => Some(value),
+            Err(error) => {
+                record_operation_failure(
+                    &mut failures,
+                    surface_failures,
+                    "rollout",
+                    "read active automatic rollout",
+                    error,
+                );
+                None
+            }
+        };
+        let followers_converged: Option<bool> = match auto_mode {
+            Some(true) => match sqlx::query_scalar(
                 "SELECT EXISTS (SELECT 1 FROM upgrade_rollouts ur \
                  JOIN software_registry sr ON sr.id = ur.software_id \
                  WHERE ur.automatic = TRUE AND ur.status = 'completed' \
@@ -849,30 +1139,95 @@ impl AutoUpgradeTick {
             )
             .fetch_one(&self.pool)
             .await
-            .unwrap_or(false)
-        } else {
-            true
+            {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    record_operation_failure(
+                        &mut failures,
+                        surface_failures,
+                        "rollout",
+                        "read follower convergence",
+                        error,
+                    );
+                    None
+                }
+            },
+            Some(false) => Some(true),
+            None => None,
         };
-        if !auto_rollout_inflight && followers_converged {
-            let _ = maybe_self_upgrade_leader(&self.pool, &self.my_name, &self.running_sha).await;
+        if surface_failures && !failures.is_empty() {
+            return finish_run_once(refreshed_self_built, 0, 0, 0, false, failures);
+        }
+        let mut daemon_self_dispatch_allowed =
+            auto_mode.is_some() && auto_rollout_inflight.is_some() && followers_converged.is_some();
+        let mut leader_self_upgrade_launched = false;
+        if daemon_self_dispatch_allowed
+            && !auto_rollout_inflight.unwrap_or(true)
+            && followers_converged.unwrap_or(false)
+        {
+            match maybe_self_upgrade_leader(&self.pool, &self.my_name, &self.running_sha).await {
+                Ok(launched) => {
+                    leader_self_upgrade_launched = launched;
+                    if launched {
+                        // A detached leader restart is a complete, observable
+                        // side effect.  Do not dispatch anything else from an
+                        // operator run that is about to lose its leader.
+                        daemon_self_dispatch_allowed = false;
+                        if surface_failures {
+                            return finish_run_once(refreshed_self_built, 0, 0, 0, true, failures);
+                        }
+                    }
+                }
+                Err(error) => {
+                    record_operation_failure(
+                        &mut failures,
+                        surface_failures,
+                        "leader",
+                        "launch self-upgrade",
+                        error,
+                    );
+                    daemon_self_dispatch_allowed = false;
+                }
+            }
+        }
+        if surface_failures && !failures.is_empty() {
+            return finish_run_once(
+                refreshed_self_built,
+                0,
+                0,
+                0,
+                leader_self_upgrade_launched,
+                failures,
+            );
         }
 
         let ids = software_ids_with_drift(&self.pool).await?;
         if ids.is_empty() {
-            return Ok(0);
+            return finish_run_once(
+                refreshed_self_built,
+                0,
+                0,
+                0,
+                leader_self_upgrade_launched,
+                failures,
+            );
         }
 
         let who = format!("auto-upgrade@{}", self.my_name);
         let mut total = 0usize;
+        let mut rollouts_started = 0usize;
+        let mut skipped_total = 0usize;
         for software_id in &ids {
             let (plans, skipped) =
                 match resolve_upgrade_plans(&self.pool, software_id, None, true).await {
                     Ok(x) => x,
                     Err(e) => {
-                        tracing::warn!(
-                            software_id = %software_id,
-                            error = %e,
-                            "resolve_upgrade_plans failed"
+                        record_operation_failure(
+                            &mut failures,
+                            surface_failures,
+                            software_id,
+                            "resolve upgrade plans",
+                            e,
                         );
                         continue;
                     }
@@ -885,6 +1240,7 @@ impl AutoUpgradeTick {
                     "auto-upgrade skipped computer"
                 );
             }
+            skipped_total += skipped.len();
             if plans.is_empty() {
                 continue;
             }
@@ -895,7 +1251,19 @@ impl AutoUpgradeTick {
                 .first()
                 .and_then(|p| p.installed_version.clone())
                 .unwrap_or_else(|| "(unknown)".into());
-            let gate = gate_git_state(&self.pool, software_id, false).await;
+            let gate = match gate_git_state(&self.pool, software_id, false).await {
+                Ok(gate) => gate,
+                Err(error) => {
+                    record_operation_failure(
+                        &mut failures,
+                        surface_failures,
+                        software_id,
+                        "read leader git-state safety gate",
+                        error,
+                    );
+                    continue;
+                }
+            };
             match gate {
                 GitStateGate::BlockDirty => {
                     tracing::warn!(
@@ -904,6 +1272,11 @@ impl AutoUpgradeTick {
                         "refusing to propagate dirty build {leader_sha} — commit or pass --force-dirty"
                     );
                     mark_targets_blocked_dirty(&self.pool, software_id).await;
+                    if surface_failures {
+                        failures.push(format!(
+                            "{software_id}: dispatch blocked because leader build {leader_sha} is dirty"
+                        ));
+                    }
                     continue;
                 }
                 GitStateGate::AllowWithWarning => {
@@ -964,7 +1337,15 @@ impl AutoUpgradeTick {
             // would otherwise be filtered to empty), the wave still
             // sees and processes every non-leader target.
             if is_daemon_self_software(software_id) {
-                if crate::upgrade_rollout::continuous_mode_is_auto(&self.pool).await {
+                if !daemon_self_dispatch_allowed {
+                    skipped_total += plans.len();
+                    tracing::warn!(
+                        software_id = %software_id,
+                        "auto-upgrade: daemon-self dispatch skipped because rollout authority is unavailable or a leader self-upgrade launched"
+                    );
+                    continue;
+                }
+                if auto_mode == Some(true) {
                     let target_sha = plans
                         .iter()
                         .find_map(|p| p.latest_version.as_deref())
@@ -978,25 +1359,46 @@ impl AutoUpgradeTick {
                     )
                     .await
                     {
-                        Ok(true) => total += plans.len().max(1),
+                        Ok(true) => rollouts_started += 1,
                         Ok(false) => {}
-                        Err(e) => tracing::warn!(software_id = %software_id, error = %e,
-                            "continuous-rollout: auto start failed"),
+                        Err(e) => record_operation_failure(
+                            &mut failures,
+                            surface_failures,
+                            software_id,
+                            "start continuous rollout",
+                            e,
+                        ),
                     }
                     continue;
                 }
-                let leader_id: Option<uuid::Uuid> =
-                    sqlx::query_scalar("SELECT computer_id FROM fleet_leader_state LIMIT 1")
-                        .fetch_optional(&self.pool)
-                        .await
-                        .ok()
-                        .flatten();
-                let Some(leader_id) = leader_id else {
-                    tracing::warn!(
-                        software_id = %software_id,
-                        "auto-upgrade: no leader_computer_id available; skipping wave dispatch"
-                    );
-                    continue;
+                let leader_id: uuid::Uuid = match sqlx::query_scalar(
+                    "SELECT computer_id FROM fleet_leader_state \
+                     WHERE singleton_key = 'current' LIMIT 1",
+                )
+                .fetch_optional(&self.pool)
+                .await
+                {
+                    Ok(Some(leader_id)) => leader_id,
+                    Ok(None) => {
+                        record_operation_failure(
+                            &mut failures,
+                            surface_failures,
+                            software_id,
+                            "read wave leader",
+                            "no current leader row",
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        record_operation_failure(
+                            &mut failures,
+                            surface_failures,
+                            software_id,
+                            "read wave leader",
+                            error,
+                        );
+                        continue;
+                    }
                 };
                 match crate::task_runner::compose_fleet_upgrade_wave(
                     &self.pool,
@@ -1011,14 +1413,17 @@ impl AutoUpgradeTick {
                         tracing::info!(
                             software_id = %software_id,
                             parent_task_id = ?plan.parent,
+                            created_tasks = plan.created_tasks,
                             "auto-upgrade dispatched via two-phase wave"
                         );
-                        total += plans.len().max(1);
+                        total += plan.created_tasks;
                     }
-                    Err(e) => tracing::warn!(
-                        software_id = %software_id,
-                        error = %e,
-                        "auto-upgrade: compose_fleet_upgrade_wave failed"
+                    Err(e) => record_operation_failure(
+                        &mut failures,
+                        surface_failures,
+                        software_id,
+                        "compose fleet upgrade wave",
+                        e,
                     ),
                 }
                 continue;
@@ -1047,7 +1452,12 @@ impl AutoUpgradeTick {
                         "auto-upgrade dispatched"
                     );
                     // Publish a start event — finalizer publishes completion.
-                    for plan in &plans {
+                    for plan in plans.iter().filter(|plan| {
+                        enqueued.iter().any(|item| {
+                            item.software_id == plan.software_id
+                                && item.computer_name.eq_ignore_ascii_case(&plan.computer_name)
+                        })
+                    }) {
                         let payload = json!({
                             "software_id": plan.software_id,
                             "display_name": plan.display_name,
@@ -1066,19 +1476,29 @@ impl AutoUpgradeTick {
                         )
                         .await;
                     }
+                    skipped_total += plans.len().saturating_sub(enqueued.len());
                     total += enqueued.len();
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        software_id = %software_id,
-                        error = %e,
-                        "enqueue_plans failed"
+                    record_operation_failure(
+                        &mut failures,
+                        surface_failures,
+                        software_id,
+                        "enqueue upgrade plans",
+                        e,
                     );
                 }
             }
         }
 
-        Ok(total)
+        finish_run_once(
+            refreshed_self_built,
+            total,
+            rollouts_started,
+            skipped_total,
+            leader_self_upgrade_launched,
+            failures,
+        )
     }
 
     /// Spawn the hourly tick. First tick fires ~90s after spawn so the
@@ -1307,18 +1727,16 @@ pub async fn refresh_self_built_latest_versions(pool: &PgPool) -> Result<u64> {
 
     let repo = expand_tilde(&source_tree);
     let fetch_repo = repo.clone();
-    let candidate = match tokio::task::spawn_blocking(move || {
-        fetch_canonical_origin_main(&fetch_repo)
-    })
-    .await
-    .context("join canonical origin/main fetch")?
-    {
-        Ok(candidate) => candidate,
-        Err(reason) => {
-            tracing::warn!(%reason, "refresh_self_built: canonical fetch unavailable; holding authority");
-            return Ok(0);
-        }
-    };
+    let candidate =
+        match tokio::task::spawn_blocking(move || fetch_canonical_origin_main(&fetch_repo))
+            .await
+            .context("join canonical origin/main fetch")?
+        {
+            Ok(candidate) => candidate,
+            Err(reason) => anyhow::bail!(
+                "refresh_self_built: canonical origin/main fetch unavailable: {reason}"
+            ),
+        };
 
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
         "SELECT id, latest_version FROM software_registry \
@@ -1344,11 +1762,9 @@ pub async fn refresh_self_built_latest_versions(pool: &PgPool) -> Result<u64> {
     .context("join self-built ancestry plan")?
     {
         Ok(plan) => plan,
-        Err(reason) => {
-            tracing::warn!(%reason, candidate = %candidate,
-                "refresh_self_built: monotonic proof failed; holding every self-built row");
-            return Ok(0);
-        }
+        Err(reason) => anyhow::bail!(
+            "refresh_self_built: candidate {candidate} failed monotonic proof: {reason}"
+        ),
     };
 
     if !plan.iter().any(|row| row.change) {
@@ -1799,6 +2215,59 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn daemon_operation_failures_remain_soft() {
+        let mut failures = Vec::new();
+        record_operation_failure(
+            &mut failures,
+            false,
+            "ff_git",
+            "compose fleet upgrade wave",
+            "synthetic failure",
+        );
+        assert!(failures.is_empty());
+        assert_eq!(
+            finish_run_once(2, 3, 1, 4, true, failures).unwrap(),
+            AutoUpgradeRunOnceOutcome {
+                refreshed_self_built: 2,
+                enqueued: 3,
+                rollouts_started: 1,
+                skipped: 4,
+                leader_self_upgrade_launched: true,
+            }
+        );
+    }
+
+    #[test]
+    fn durable_operation_failures_report_partial_dispatch() {
+        let mut failures = Vec::new();
+        record_operation_failure(
+            &mut failures,
+            true,
+            "ff_git",
+            "compose fleet upgrade wave",
+            "wave unavailable",
+        );
+        record_operation_failure(
+            &mut failures,
+            true,
+            "codex",
+            "enqueue upgrade plans",
+            "queue unavailable",
+        );
+        let error = finish_run_once(2, 3, 1, 4, true, failures)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refreshing 2 self-built"));
+        assert!(error.contains("dispatching 3 upgrade task"));
+        assert!(error.contains("starting 1 rollout"));
+        assert!(error.contains("skipping 4 target"));
+        assert!(error.contains("leader_self_upgrade_launched=true"));
+        assert!(error.contains("2 failure(s)"));
+        assert!(error.contains("ff_git: compose fleet upgrade wave: wave unavailable"));
+        assert!(error.contains("codex: enqueue upgrade plans: queue unavailable"));
+    }
+
     // The same-commit / prefix-length regression guard moved to
     // ff_core::build_version::tests (same_commit_is_hex_guarded_and_prefix_agnostic
     // + is_same_version_covers_every_path) when the predicate was consolidated.
@@ -1949,6 +2418,71 @@ mod tests {
     fn self_built_fetch_unavailable_never_invents_a_candidate() {
         let (dir, _, _) = temp_git_repo();
         assert!(fetch_canonical_origin_main(dir.path().to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn canonical_remote_main_fetch_advances_a_stale_checkout() {
+        fn git(repo: &std::path::Path, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("remote.git");
+        let source = root.path().join("source");
+        let checkout = root.path().join("checkout");
+        std::fs::create_dir(&remote).unwrap();
+        git(&remote, &["init", "--bare", "-q"]);
+        std::fs::create_dir(&source).unwrap();
+        git(&source, &["init", "-q", "-b", "main"]);
+        git(&source, &["config", "user.email", "tests@forgefleet.local"]);
+        git(&source, &["config", "user.name", "ForgeFleet Tests"]);
+        std::fs::write(source.join("authority.txt"), "one\n").unwrap();
+        git(&source, &["add", "authority.txt"]);
+        git(&source, &["commit", "-qm", "first"]);
+        git(
+            &source,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&source, &["push", "-qu", "origin", "main"]);
+        git(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                "--branch",
+                "main",
+                remote.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+
+        std::fs::write(source.join("authority.txt"), "two\n").unwrap();
+        git(&source, &["commit", "-qam", "second"]);
+        let second = git(&source, &["rev-parse", "HEAD"]);
+        git(&source, &["push", "-q", "origin", "main"]);
+
+        let fetched = fetch_canonical_origin_main(checkout.to_str().unwrap()).unwrap();
+        assert_eq!(
+            fetched, second,
+            "authority must be fetched from remote main"
+        );
+        assert_ne!(
+            git(&checkout, &["rev-parse", "HEAD"]),
+            fetched,
+            "the stale working-tree HEAD must not be mistaken for authority"
+        );
     }
 
     #[test]
