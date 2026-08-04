@@ -61,10 +61,35 @@ const BOOTSTRAP_TEMPLATE: &str = include_str!("../../../scripts/bootstrap-comput
 const BOOTSTRAP_TEMPLATE_PS1: &str =
     include_str!("../../../scripts/bootstrap-computer-template.ps1");
 
+/// New-node enrollment currently has no server-owned TLS listener or trusted
+/// transport extension. Keep every credential-bearing onboarding handler
+/// quarantined until the TLS lane can supply connection-level evidence. Do not
+/// replace this with an environment flag or forwarding header: either would
+/// let a plaintext LAN caller self-assert that its request was secure.
+fn secure_onboarding_transport_available() -> bool {
+    false
+}
+
+const ONBOARDING_TRANSPORT_QUARANTINE: &str =
+    "new-node onboarding is quarantined until the gateway has server-verified TLS transport";
+
+/// Bootstrap script authorization belongs in a request header, never in a URL
+/// query that is routinely retained by browser history, access logs, proxies,
+/// and shell history.  This remains dormant behind the transport quarantine,
+/// but makes the eventual TLS-only path fail closed when the header is absent.
+fn bootstrap_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+}
+
 /// Query params accepted by GET /onboard/bootstrap.sh
 #[derive(Debug, Deserialize)]
 pub struct BootstrapQuery {
-    pub token: Option<String>,
     pub name: Option<String>,
     pub ip: Option<String>,
     pub ssh_user: Option<String>,
@@ -81,17 +106,32 @@ pub async fn bootstrap_script(
     headers: HeaderMap,
     Query(q): Query<BootstrapQuery>,
 ) -> axum::response::Response {
+    if !secure_onboarding_transport_available() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ONBOARDING_TRANSPORT_QUARANTINE,
+        )
+            .into_response();
+    }
     // Resolve enrollment policy (config/env, with fleet-vault fallback).
     let policy = resolve_enrollment_policy(&state).await;
-    let expected_token = match &policy {
+    match &policy {
         ff_core::config::EnrollmentEnforcement::Disabled => {
             tracing::warn!(
                 endpoint = "/onboard/bootstrap.sh",
                 "enrollment token check DISABLED (require_shared_secret=false) — serving script without auth"
             );
-            String::new()
         }
-        ff_core::config::EnrollmentEnforcement::Required(tok) => tok.clone(),
+        ff_core::config::EnrollmentEnforcement::Required(expected)
+            if bootstrap_bearer_token(&headers) != Some(expected.as_str()) =>
+        {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "enrollment bearer token missing or invalid\n",
+            )
+                .into_response();
+        }
+        ff_core::config::EnrollmentEnforcement::Required(_) => {}
         ff_core::config::EnrollmentEnforcement::MisconfiguredRequired => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -99,17 +139,6 @@ pub async fn bootstrap_script(
             )
                 .into_response();
         }
-    };
-
-    let token = q.token.clone().unwrap_or_else(|| expected_token.clone());
-    if matches!(policy, ff_core::config::EnrollmentEnforcement::Required(_))
-        && (token.is_empty() || token != expected_token)
-    {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "enrollment token missing or invalid\n",
-        )
-            .into_response();
     }
 
     // Leader host: derive from the operator's browser connection if possible;
@@ -232,7 +261,11 @@ pub async fn bootstrap_script(
                 .url
                 .strip_prefix("redis://")
                 .unwrap_or(&cfg.redis.url);
-            if let Some((h, p)) = redis_rest.split('/').next().and_then(|s| s.rsplit_once(':')) {
+            if let Some((h, p)) = redis_rest
+                .split('/')
+                .next()
+                .and_then(|s| s.rsplit_once(':'))
+            {
                 if !h.is_empty() {
                     rd_h = h.to_string();
                 }
@@ -251,14 +284,12 @@ pub async fn bootstrap_script(
         .replace("{{DB_PORT}}", &db_port)
         .replace("{{REDIS_HOST}}", &redis_host)
         .replace("{{REDIS_PORT}}", &redis_port)
-        .replace("{{TOKEN}}", &token)
         .replace("{{COMPUTER_NAME}}", &name)
         .replace("{{COMPUTER_IP}}", &ip)
         .replace("{{SSH_USER}}", &ssh_user)
         .replace("{{ROLE}}", &role)
         .replace("{{RUNTIME}}", &runtime)
         .replace("{{GITHUB_OWNER}}", &github_owner)
-        .replace("{{GITHUB_PAT_SECRET_KEY}}", "github.venkat_pat")
         .replace("{{IS_VINNY}}", is_vinny);
 
     (
@@ -279,19 +310,34 @@ pub async fn bootstrap_script_ps1(
     headers: HeaderMap,
     Query(q): Query<BootstrapQuery>,
 ) -> axum::response::Response {
+    if !secure_onboarding_transport_available() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ONBOARDING_TRANSPORT_QUARANTINE,
+        )
+            .into_response();
+    }
     let policy = match state.fleet_config.as_ref() {
         Some(cfg_lock) => cfg_lock.read().await.enrollment.enforcement_policy(),
         None => ff_core::config::EnrollmentEnforcement::MisconfiguredRequired,
     };
-    let expected_token = match &policy {
+    match &policy {
         ff_core::config::EnrollmentEnforcement::Disabled => {
             tracing::warn!(
                 endpoint = "/onboard/bootstrap.ps1",
                 "enrollment token check DISABLED (require_shared_secret=false) — serving script without auth"
             );
-            String::new()
         }
-        ff_core::config::EnrollmentEnforcement::Required(tok) => tok.clone(),
+        ff_core::config::EnrollmentEnforcement::Required(expected)
+            if bootstrap_bearer_token(&headers) != Some(expected.as_str()) =>
+        {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "# enrollment bearer token missing or invalid\n",
+            )
+                .into_response();
+        }
+        ff_core::config::EnrollmentEnforcement::Required(_) => {}
         ff_core::config::EnrollmentEnforcement::MisconfiguredRequired => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -299,16 +345,6 @@ pub async fn bootstrap_script_ps1(
             )
                 .into_response();
         }
-    };
-    let token = q.token.clone().unwrap_or_else(|| expected_token.clone());
-    if matches!(policy, ff_core::config::EnrollmentEnforcement::Required(_))
-        && (token.is_empty() || token != expected_token)
-    {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "# enrollment token missing or invalid\n",
-        )
-            .into_response();
     }
 
     let leader_host =
@@ -387,7 +423,9 @@ pub async fn bootstrap_script_ps1(
     let script = BOOTSTRAP_TEMPLATE_PS1
         .replace("{{LEADER_HOST}}", &leader_host)
         .replace("{{LEADER_PORT}}", &leader_port)
-        .replace("{{TOKEN}}", &token)
+        // PowerShell onboarding remains quarantined and must not receive a
+        // server-side enrollment secret through rendered script content.
+        .replace("{{TOKEN}}", "")
         .replace("{{COMPUTER_NAME}}", &name)
         .replace("{{COMPUTER_IP}}", &ip)
         .replace("{{SSH_USER}}", &ssh_user)
@@ -499,6 +537,12 @@ pub async fn self_enroll(
     State(state): State<Arc<GatewayState>>,
     Json(payload): Json<SelfEnrollPayload>,
 ) -> Result<Json<SelfEnrollResponse>, (StatusCode, Json<Value>)> {
+    if !secure_onboarding_transport_available() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": ONBOARDING_TRANSPORT_QUARANTINE})),
+        ));
+    }
     let pool = state
         .operational_store
         .as_ref()
@@ -903,74 +947,19 @@ pub async fn check_tcp(Query(q): Query<CheckTcpQuery>) -> Json<Value> {
     Json(json!({"ip": q.ip, "port": q.port, "reachable": reachable}))
 }
 
-// ─── Secret peek (one-shot bootstrap lookup gated by enrollment token) ──
+// ─── Secret peek quarantine ──────────────────────────────────────────────
 //
-// Used by scripts/bootstrap-computer-template.sh §5b to fetch the GitHub PAT
-// before `ff` is installed. The enrollment token doubles as auth — it's
-// the same gate as self-enroll, so no weaker surface is exposed.
-
-#[derive(Debug, Deserialize)]
-pub struct SecretPeekQuery {
-    pub token: String,
-    pub key: String,
-}
-
-pub async fn secret_peek(
-    State(state): State<Arc<GatewayState>>,
-    Query(q): Query<SecretPeekQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Secret peek always requires a valid token — even when
-    // require_shared_secret=false. Exposing secrets without auth would be a
-    // fleet-wide leak, so this endpoint stays locked regardless of the flag.
-    let expected = match state.fleet_config.as_ref() {
-        Some(cfg_lock) => cfg_lock
-            .read()
-            .await
-            .enrollment
-            .resolve_shared_secret()
-            .unwrap_or_default(),
-        None => String::new(),
-    };
-    if expected.is_empty() || q.token != expected {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "invalid enrollment token"})),
-        ));
-    }
-    // Whitelist which keys are allowed — never expose arbitrary secrets.
-    let allowed = [
-        "github.venkat_pat",
-        "github.default_owner",
-        "github_ssh_id_venkat_priv",
-        "github_ssh_id_venkat_pub",
-        "anthropic.oauth_token",
-        "openai.oauth_token",
-        "moonshot.oauth_token",
-        "anthropic.oauth_token.credentials",
-        "openai.oauth_token.credentials",
-        "moonshot.oauth_token.credentials",
-    ];
-    if !allowed.contains(&q.key.as_str()) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({"error": "key not allowed for bootstrap peek"})),
-        ));
-    }
-    let pool = state
-        .operational_store
-        .as_ref()
-        .and_then(|os| os.pg_pool())
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error":"postgres pool not available"})),
-            )
-        })?;
-    let value = ff_db::pg_get_secret(pool, &q.key)
-        .await
-        .map_err(|e| db_err("pg_get_secret", e))?
-        .unwrap_or_default();
-    Ok(Json(json!({"key": q.key, "value": value})))
+// Retain the legacy route temporarily so old bootstrap clients receive an
+// explicit terminal response, but never consult enrollment policy, Postgres,
+// or another secret authority. Unix onboarding reads directly from 1Password;
+// the insecure Windows flow is quarantined until it can do the same.
+pub async fn secret_peek() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::GONE,
+        Json(json!({
+            "error": "bootstrap secret retrieval is disabled; use direct 1Password authority"
+        })),
+    )
 }
 
 // ─── Fleet tooling matrix (for /versions dashboard page) ────────────────
@@ -1175,9 +1164,19 @@ fn parse_redis_hostport(url: &str) -> Option<(String, u16)> {
 
 #[cfg(test)]
 mod bootstrap_lifecycle_tests {
-    use super::BOOTSTRAP_TEMPLATE;
+    use super::{
+        BOOTSTRAP_TEMPLATE, ONBOARDING_TRANSPORT_QUARANTINE, bootstrap_bearer_token, secret_peek,
+        secure_onboarding_transport_available,
+    };
+    use axum::{
+        Json,
+        http::{HeaderMap, HeaderValue, StatusCode, header::AUTHORIZATION},
+    };
+    use serde_json::json;
+    use std::{fs, process::Command, time::SystemTime};
 
     const SYSTEMD_UNIT: &str = include_str!("../../../deploy/systemd/forgefleetd.service");
+    const MCP_SYSTEMD_UNIT: &str = include_str!("../../../deploy/systemd/forgefleet-mcp.service");
 
     #[test]
     fn linux_bootstrap_uses_canonical_redis_port() {
@@ -1195,6 +1194,10 @@ mod bootstrap_lifecycle_tests {
             "user_systemctl restart forgefleetd.service",
             "user_systemctl is-enabled forgefleetd.service",
             "user_systemctl is-active forgefleetd.service",
+            "user_systemctl enable forgefleetd.service forgefleet-mcp.service",
+            "user_systemctl restart forgefleet-mcp.service",
+            "user_systemctl is-enabled forgefleet-mcp.service",
+            "user_systemctl is-active forgefleet-mcp.service",
         ] {
             assert!(
                 BOOTSTRAP_TEMPLATE.contains(required),
@@ -1216,5 +1219,438 @@ mod bootstrap_lifecycle_tests {
         assert!(SYSTEMD_UNIT.contains("Restart=on-failure"));
         assert!(SYSTEMD_UNIT.contains("[Install]\nWantedBy=default.target"));
         assert!(SYSTEMD_UNIT.contains("ExecStart=%h/.local/bin/forgefleetd start"));
+        assert!(MCP_SYSTEMD_UNIT.contains("Restart=always"));
+        assert!(MCP_SYSTEMD_UNIT.contains("[Install]\nWantedBy=default.target"));
+        assert!(
+            MCP_SYSTEMD_UNIT
+                .contains("ExecStart=%h/.local/bin/forgefleetd mcp --listen 0.0.0.0:50001")
+        );
+    }
+
+    #[test]
+    fn mac_bootstrap_installs_and_loads_a_separate_mcp_launch_agent() {
+        for required in [
+            "com.forgefleet.forgefleet-mcp.plist",
+            "<string>com.forgefleet.forgefleet-mcp</string>",
+            "<string>mcp</string>",
+            "<string>--listen</string>",
+            "<string>0.0.0.0:50001</string>",
+            "launchctl bootstrap \"gui/$USER_UID\" \"$MCP_PLIST_TARGET\"",
+            "launchctl enable \"$MCP_GUI_DOMAIN\"",
+            "launchctl kickstart -k \"$MCP_GUI_DOMAIN\"",
+            "launchctl print \"$MCP_GUI_DOMAIN\"",
+            "die \"launchd did not register the separate ForgeFleet MCP agent\"",
+        ] {
+            assert!(
+                BOOTSTRAP_TEMPLATE.contains(required),
+                "bootstrap is missing separate macOS MCP service step: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn mac_mcp_launch_agent_is_linted_and_atomically_published_before_restart() {
+        let stage = BOOTSTRAP_TEMPLATE
+            .find("MCP_PLIST_TMP=\"")
+            .expect("same-directory MCP plist staging");
+        let mcp = &BOOTSTRAP_TEMPLATE[stage..];
+        let lint = mcp
+            .find("plutil -lint \"$MCP_PLIST_TMP\"")
+            .expect("plutil lint");
+        let publish = mcp
+            .find("mv -f \"$MCP_PLIST_TMP\" \"$MCP_PLIST_TARGET\"")
+            .expect("atomic plist publish");
+        let bootout = mcp
+            .find("launchctl bootout \"gui/$USER_UID\" \"$MCP_PLIST_TARGET\"")
+            .expect("launchd bootout");
+        let bootstrap = mcp
+            .find("launchctl bootstrap \"gui/$USER_UID\" \"$MCP_PLIST_TARGET\"")
+            .expect("launchd bootstrap");
+        assert!(lint < publish && publish < bootout && bootout < bootstrap);
+        assert!(mcp.contains("mktemp \"$PLIST_TARGET_DIR/.com.forgefleet.forgefleet-mcp.XXXXXX\""));
+        assert!(!mcp.contains("cat > '$MCP_PLIST_TARGET'"));
+    }
+
+    #[test]
+    fn bootstrap_verifies_mcp_listener_and_tools_before_client_install() {
+        let health = BOOTSTRAP_TEMPLATE
+            .find("http://127.0.0.1:50001/mcp/health")
+            .expect("MCP health probe");
+        let tools = BOOTSTRAP_TEMPLATE
+            .find("\\\"method\\\":\\\"tools/list\\\"")
+            .expect("MCP tools/list probe");
+        let install = BOOTSTRAP_TEMPLATE
+            .find("mcp install --for all --no-instructions")
+            .expect("MCP client install");
+        assert!(health < tools && tools < install);
+        assert!(BOOTSTRAP_TEMPLATE.contains("die \"separate ForgeFleet MCP returned no tools\""));
+    }
+
+    #[test]
+    fn linux_bootstrap_restricts_fleet_toml_for_new_and_existing_files() {
+        assert!(BOOTSTRAP_TEMPLATE.contains("umask 077\ncat > '$FLEET_TOML'"));
+        assert!(BOOTSTRAP_TEMPLATE.contains("run_as_user chmod 600 \"$FLEET_TOML\""));
+        assert!(BOOTSTRAP_TEMPLATE.contains("failed to restrict $FLEET_TOML to mode 0600"));
+        assert!(BOOTSTRAP_TEMPLATE.contains("$FLEET_TOML_RESULT; mode=0600"));
+    }
+
+    #[test]
+    fn linux_bootstrap_delegates_mcp_config_to_typed_installer() {
+        assert!(BOOTSTRAP_TEMPLATE.contains(
+            "run_as_user \"$USER_HOME/.local/bin/ff\" mcp install --for all --no-instructions"
+        ));
+        assert!(BOOTSTRAP_TEMPLATE.contains("grep -Fq '✗'"));
+        assert!(
+            BOOTSTRAP_TEMPLATE
+                .contains("report \"mcp-config\" failed \"canonical installer reported")
+        );
+        assert!(
+            BOOTSTRAP_TEMPLATE.contains(
+                "die \"ff mcp install reported one or more client configuration failures\""
+            )
+        );
+        assert!(BOOTSTRAP_TEMPLATE.contains("die \"ff mcp install failed\""));
+        for stale_writer in [
+            "CLAUDE_MCP_FILE",
+            "CODEX_CONFIG_FILE",
+            "GEMINI_FILE",
+            "claude mcp add forgefleet",
+        ] {
+            assert!(
+                !BOOTSTRAP_TEMPLATE.contains(stale_writer),
+                "bootstrap still contains bespoke MCP writer: {stale_writer}"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_bootstrap_installs_official_1password_cli_for_host_architecture() {
+        for required in [
+            "https://downloads.1password.com/linux/keys/1password.asc",
+            "OP_DEB_ARCH=\"$(dpkg --print-architecture)\"",
+            "https://downloads.1password.com/linux/debian/%s stable main",
+            "apt-get install -y 1password-cli",
+            "OP_BIN=\"$(run_as_user bash -lc 'command -v op'",
+        ] {
+            assert!(
+                BOOTSTRAP_TEMPLATE.contains(required),
+                "bootstrap is missing 1Password prerequisite: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_reads_credentials_directly_from_1password_without_http_peek() {
+        for forbidden in [
+            "peek_secret",
+            "/api/fleet/secret-peek",
+            "secret-peek?token=",
+            "fleet_secrets",
+            "ff github sync",
+            "github_ssh_id_venkat_priv",
+            "github_ssh_id_venkat_pub",
+            "anthropic.oauth_token.credentials",
+            "openai.oauth_token.credentials",
+            "moonshot.oauth_token.credentials",
+        ] {
+            assert!(
+                !BOOTSTRAP_TEMPLATE.contains(forbidden),
+                "bootstrap still contains quarantined credential path: {forbidden}"
+            );
+        }
+        for required in [
+            "OP_VAULT_REF=\"${FORGEFLEET_OP_VAULT_REF:-mtfbfuettwrsog55of33tbribq}\"",
+            "OP_GITHUB_SSH_ITEM_REF=\"${FORGEFLEET_OP_GITHUB_SSH_ITEM_REF:-ww3gtuioogq3sdfpyfdlqaryhi}\"",
+            "OP_CLAUDE_CREDENTIAL_DOCUMENT_REF=\"${FORGEFLEET_OP_CLAUDE_CREDENTIAL_DOCUMENT_REF:-z4zjqnfchtpv5ynody4mesmysa}\"",
+            "OP_CODEX_CREDENTIAL_DOCUMENT_REF=\"${FORGEFLEET_OP_CODEX_CREDENTIAL_DOCUMENT_REF:-u432zsofisggkhraw6c2he7yei}\"",
+            "OP_KIMI_CREDENTIAL_DOCUMENT_REF=\"${FORGEFLEET_OP_KIMI_CREDENTIAL_DOCUMENT_REF:-wls3pwdwilxbgmuh6qxwc676ga}\"",
+            "\"$OP_BIN\" read \"op://${OP_VAULT_REF}/${OP_GITHUB_SSH_ITEM_REF}/private_key\"",
+            "\"$OP_BIN\" read \"op://${OP_VAULT_REF}/${OP_GITHUB_SSH_ITEM_REF}/public_key\"",
+            "\"$OP_BIN\" document get \"$OP_CLAUDE_CREDENTIAL_DOCUMENT_REF\" --vault \"$OP_VAULT_REF\"",
+            "\"$OP_BIN\" document get \"$OP_CODEX_CREDENTIAL_DOCUMENT_REF\" --vault \"$OP_VAULT_REF\"",
+            "\"$OP_BIN\" document get \"$OP_KIMI_CREDENTIAL_DOCUMENT_REF\" --vault \"$OP_VAULT_REF\"",
+            "unset OP_SERVICE_ACCOUNT_TOKEN",
+        ] {
+            assert!(
+                BOOTSTRAP_TEMPLATE.contains(required),
+                "bootstrap is missing direct 1Password authority step: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_validates_and_atomically_installs_cloud_credentials() {
+        for required in [
+            "atomic_install_json_credential()",
+            "mktemp \"$final_dir/.forgefleet-credential.XXXXXX\"",
+            "run_as_user chmod 600 \"$temp_path\"",
+            "python3 -m json.tool > \"$1\"",
+            "run_as_user mv -f \"$temp_path\" \"$final_path\"",
+            "atomic_install_json_credential \"$USER_HOME/.claude/.credentials.json\"",
+            "atomic_install_json_credential \"$USER_HOME/.codex/auth.json\"",
+            "atomic_install_json_credential \"$USER_HOME/.kimi/credentials/kimi-code.json\"",
+            "existing credentials were preserved",
+        ] {
+            assert!(
+                BOOTSTRAP_TEMPLATE.contains(required),
+                "bootstrap is missing atomic credential contract: {required}"
+            );
+        }
+        for unsafe_write in [
+            "tee \"$USER_HOME/.claude/.credentials.json\"",
+            "tee \"$USER_HOME/.codex/auth.json\"",
+            "tee \"$USER_HOME/.kimi/credentials/kimi-code.json\"",
+        ] {
+            assert!(
+                !BOOTSTRAP_TEMPLATE.contains(unsafe_write),
+                "bootstrap still overwrites a credential before validation: {unsafe_write}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_validates_github_key_pair_and_uses_only_pinned_host_trust() {
+        for required in [
+            "ssh-keygen -y -f \"$VENKAT_PRIV_TMP\"",
+            "DERIVED_VENKAT_MATERIAL",
+            "STORED_VENKAT_PUB",
+            "private/public key pair does not match",
+            "publish_github_key_pair()",
+            "restore_github_key_pair()",
+            "mktemp -d \"$final_dir/.forgefleet-key-pair-backup.XXXXXX\"",
+            "the prior canonical pair was restored",
+            "mv -f \"$staged_private\" \"$final_private\"",
+            "mv -f \"$staged_public\" \"$final_public\"",
+            "UserKnownHostsFile ~/.ssh/known_hosts.github",
+            "GlobalKnownHostsFile /dev/null",
+            "StrictHostKeyChecking yes",
+            "SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s",
+            "SHA256:p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM",
+            "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU",
+        ] {
+            assert!(
+                BOOTSTRAP_TEMPLATE.contains(required),
+                "bootstrap is missing GitHub SSH verification contract: {required}"
+            );
+        }
+        assert!(!BOOTSTRAP_TEMPLATE.contains("ssh-keyscan"));
+    }
+
+    #[test]
+    fn github_key_pair_publication_rolls_back_each_rename_failure_and_absence() {
+        let helper_start = BOOTSTRAP_TEMPLATE
+            .find("# BEGIN github-key-pair-publication-helper")
+            .expect("key-pair publication helper start");
+        let helper_end = BOOTSTRAP_TEMPLATE
+            .find("# END github-key-pair-publication-helper")
+            .expect("key-pair publication helper end");
+        let helper = &BOOTSTRAP_TEMPLATE[helper_start..helper_end];
+        let script = [
+            r#"
+set -eu
+
+# Inject a failure *after* the selected rename has executed. This models the
+# most dangerous failure report: a canonical path changed before the caller
+# learned the publication step failed.
+run_as_user() {
+  if [ "${1:-}" = "mv" ] && [ "${3:-}" = "${FAIL_SOURCE:-}" ] && [ "${INJECTED:-}" != "yes" ]; then
+    command "$@"
+    INJECTED=yes
+    return 1
+  fi
+  command "$@"
+}
+"#,
+            helper,
+            r#"
+
+exercise_case() {
+  local label="$1" initial_state="$2" fail_half="$3"
+  local case_dir="$PAIR_TEST_DIR/$label"
+  local final_private="$case_dir/id_venkat" final_public="$case_dir/id_venkat.pub"
+  local staged_private="$case_dir/.private.new" staged_public="$case_dir/.public.new"
+  mkdir -p "$case_dir"
+  if [ "$initial_state" = "present" ]; then
+    printf '%s\n' 'old-private' > "$final_private"
+    printf '%s\n' 'ssh-ed25519 old-public old-comment' > "$final_public"
+    chmod 600 "$final_private"
+    chmod 644 "$final_public"
+  fi
+  printf '%s\n' 'new-private' > "$staged_private"
+  printf '%s\n' 'ssh-ed25519 new-public new-comment' > "$staged_public"
+  chmod 600 "$staged_private"
+  chmod 644 "$staged_public"
+
+  INJECTED=""
+  if [ "$fail_half" = "private" ]; then
+    FAIL_SOURCE="$staged_private"
+  else
+    FAIL_SOURCE="$staged_public"
+  fi
+  if publish_github_key_pair \
+    "$staged_private" "$staged_public" "$final_private" "$final_public"; then
+    echo "publication unexpectedly succeeded: $label" >&2
+    return 20
+  else
+    local rc=$?
+    [ "$rc" -eq 1 ] || {
+      echo "rollback was not reported successful: $label rc=$rc" >&2
+      return 21
+    }
+  fi
+
+  if [ "$initial_state" = "present" ]; then
+    [ "$(cat "$final_private")" = "old-private" ]
+    [ "$(cat "$final_public")" = "ssh-ed25519 old-public old-comment" ]
+    [ "$(stat -c %a "$final_private")" = "600" ]
+    [ "$(stat -c %a "$final_public")" = "644" ]
+  else
+    [ ! -e "$final_private" ]
+    [ ! -e "$final_public" ]
+  fi
+}
+
+exercise_case present_public_failure present public
+exercise_case present_private_failure present private
+exercise_case absent_public_failure absent public
+exercise_case absent_private_failure absent private
+"#,
+        ]
+        .concat();
+
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let test_dir = std::env::temp_dir().join(format!(
+            "forgefleet-key-pair-rollback-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&test_dir).expect("create key-pair rollback test directory");
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env("PAIR_TEST_DIR", &test_dir)
+            .output()
+            .expect("execute key-pair rollback fault-injection test");
+        fs::remove_dir_all(&test_dir).expect("remove key-pair rollback test directory");
+        assert!(
+            output.status.success(),
+            "key-pair rollback fault-injection failed: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn bootstrap_script_auth_is_header_only_and_missing_tokens_fail_closed() {
+        let headers = HeaderMap::new();
+        assert_eq!(bootstrap_bearer_token(&headers), None);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer"));
+        assert_eq!(bootstrap_bearer_token(&headers), None);
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic abc"));
+        assert_eq!(bootstrap_bearer_token(&headers), None);
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer expected-token"),
+        );
+        assert_eq!(bootstrap_bearer_token(&headers), Some("expected-token"));
+
+        let source = include_str!("onboard.rs");
+        for forbidden_parts in [
+            ["pub token:", " Option<String>"],
+            ["unwrap_or_else(|| ", "expected_token.clone())"],
+            [".replace(\"{{TOKEN}}\", ", "&token)"],
+        ] {
+            let forbidden = forbidden_parts.concat();
+            assert!(
+                !source.contains(&forbidden),
+                "onboarding source contains query-token fallback/rendering: {forbidden}"
+            );
+        }
+        assert!(source.contains(&[".replace(\"{{TOKEN}}\", ", "\"\")"].concat()));
+    }
+
+    #[tokio::test]
+    async fn legacy_secret_peek_route_is_permanently_fail_closed() {
+        let (status, Json(body)) = secret_peek().await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(
+            body,
+            json!({
+                "error": "bootstrap secret retrieval is disabled; use direct 1Password authority"
+            })
+        );
+        assert!(body.get("value").is_none());
+        assert!(body.get("key").is_none());
+    }
+
+    #[test]
+    fn credential_bearing_onboarding_stays_quarantined_without_server_tls_evidence() {
+        assert!(!secure_onboarding_transport_available());
+        assert!(ONBOARDING_TRANSPORT_QUARANTINE.contains("server-verified TLS"));
+        assert!(!ONBOARDING_TRANSPORT_QUARANTINE.is_empty());
+    }
+
+    #[test]
+    fn unix_bootstrap_does_not_embed_the_enrollment_secret() {
+        assert!(!BOOTSTRAP_TEMPLATE.contains("{{TOKEN}}"));
+        assert!(BOOTSTRAP_TEMPLATE.contains("TOKEN=\"${FORGEFLEET_ENROLLMENT_TOKEN:-}\""));
+        assert!(
+            BOOTSTRAP_TEMPLATE.contains(
+                "FORGEFLEET_ENROLLMENT_TOKEN is required out-of-band for self-enrollment"
+            )
+        );
+        assert!(BOOTSTRAP_TEMPLATE.contains("--data-binary @-"));
+        assert!(
+            BOOTSTRAP_TEMPLATE.contains("unset ENROLL_PAYLOAD TOKEN FORGEFLEET_ENROLLMENT_TOKEN")
+        );
+        assert!(!BOOTSTRAP_TEMPLATE.contains("--data \"$ENROLL_PAYLOAD\""));
+    }
+
+    #[test]
+    fn service_account_token_is_fail_closed_and_never_forwarded_in_argv_or_reports() {
+        assert!(BOOTSTRAP_TEMPLATE.contains("[ -n \"${OP_SERVICE_ACCOUNT_TOKEN:-}\" ]"));
+        assert!(BOOTSTRAP_TEMPLATE.contains("\"$OP_BIN\" whoami >/dev/null 2>&1"));
+        assert!(
+            BOOTSTRAP_TEMPLATE
+                .contains("export -n FORGEFLEET_ENROLLMENT_TOKEN OP_SERVICE_ACCOUNT_TOKEN")
+        );
+        assert!(
+            BOOTSTRAP_TEMPLATE.contains("OP_SERVICE_ACCOUNT_TOKEN=\"$OP_SERVICE_ACCOUNT_TOKEN\"")
+        );
+        for forbidden in [
+            "env OP_SERVICE_ACCOUNT_TOKEN=",
+            "--token $OP_SERVICE_ACCOUNT_TOKEN",
+            "--token \"$OP_SERVICE_ACCOUNT_TOKEN\"",
+            "report \"OP_SERVICE_ACCOUNT_TOKEN",
+            "report \"1password\" ok \"$OP_SERVICE_ACCOUNT_TOKEN",
+        ] {
+            assert!(
+                !BOOTSTRAP_TEMPLATE.contains(forbidden),
+                "service-account token could enter argv/report via: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_bootstrap_never_fetches_or_persists_github_pat() {
+        assert!(
+            BOOTSTRAP_TEMPLATE
+                .contains("API token is injected on demand from fleet/1Password authority")
+        );
+        for forbidden in [
+            "GITHUB_PAT_SECRET_KEY",
+            "PAT_VALUE",
+            "gh auth login --with-token",
+        ] {
+            assert!(
+                !BOOTSTRAP_TEMPLATE.contains(forbidden),
+                "bootstrap still contains plaintext PAT path: {forbidden}"
+            );
+        }
     }
 }

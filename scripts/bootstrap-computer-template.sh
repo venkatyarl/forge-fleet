@@ -4,18 +4,21 @@
 # Placeholders substituted by crates/ff-gateway/src/onboard.rs::render_bootstrap:
 #   {{LEADER_HOST}}            — e.g. "192.168.5.100"
 #   {{LEADER_PORT}}            — e.g. "51002"
-#   {{TOKEN}}                  — one-use-ish enrollment token
 #   {{COMPUTER_NAME}}              — desired fleet_workers.name (from form)
 #   {{COMPUTER_IP}}                — computer's LAN IP (from form / server remote_addr)
 #   {{SSH_USER}}               — ssh_user for this computer
 #   {{ROLE}}                   — "builder" | "gateway" | "testbed"
 #   {{RUNTIME}}                — "auto" | "llama.cpp" | "mlx" | "vllm"
 #   {{GITHUB_OWNER}}           — e.g. "venkatyarl"
-#   {{GITHUB_PAT_SECRET_KEY}}  — "github.venkat_pat"
 #   {{IS_VINNY}}              — "true" or "false" (controls passwordless sudo)
 #
 # This script expects to be run with sudo on the new machine:
-#   curl -fsSL 'http://...' | sudo bash
+#   read -rsp 'Enrollment token: ' FORGEFLEET_ENROLLMENT_TOKEN; echo
+#   read -rsp '1Password service-account token: ' OP_SERVICE_ACCOUNT_TOKEN; echo
+#   export FORGEFLEET_ENROLLMENT_TOKEN OP_SERVICE_ACCOUNT_TOKEN
+#   curl -fsSL 'http://...' | sudo --preserve-env=FORGEFLEET_ENROLLMENT_TOKEN,OP_SERVICE_ACCOUNT_TOKEN bash
+# Both credentials are accepted only through the inherited environment; never
+# put them in this script's URL or command-line arguments.
 #
 # It is intentionally bash, self-contained, and idempotent: re-running it on
 # a computer that's already partially set up just advances to the next unfinished
@@ -25,15 +28,28 @@ set -eu
 set -o pipefail
 
 LEADER="http://{{LEADER_HOST}}:{{LEADER_PORT}}"
-TOKEN="{{TOKEN}}"
+TOKEN="${FORGEFLEET_ENROLLMENT_TOKEN:-}"
 NAME="{{COMPUTER_NAME}}"
 IP="{{COMPUTER_IP}}"
 SSH_USER="{{SSH_USER}}"
 ROLE="{{ROLE}}"
 RUNTIME_HINT="{{RUNTIME}}"
 GITHUB_OWNER="{{GITHUB_OWNER}}"
-GITHUB_PAT_SECRET_KEY="{{GITHUB_PAT_SECRET_KEY}}"
 IS_VINNY="{{IS_VINNY}}"
+
+# Non-secret 1Password authority references. Operators may override these IDs
+# out-of-band without editing the rendered bootstrap. Secret values themselves
+# are never accepted through argv, files, enrollment APIs, or progress reports.
+OP_VAULT_REF="${FORGEFLEET_OP_VAULT_REF:-mtfbfuettwrsog55of33tbribq}"
+OP_GITHUB_SSH_ITEM_REF="${FORGEFLEET_OP_GITHUB_SSH_ITEM_REF:-ww3gtuioogq3sdfpyfdlqaryhi}"
+OP_CLAUDE_CREDENTIAL_DOCUMENT_REF="${FORGEFLEET_OP_CLAUDE_CREDENTIAL_DOCUMENT_REF:-z4zjqnfchtpv5ynody4mesmysa}"
+OP_CODEX_CREDENTIAL_DOCUMENT_REF="${FORGEFLEET_OP_CODEX_CREDENTIAL_DOCUMENT_REF:-u432zsofisggkhraw6c2he7yei}"
+OP_KIMI_CREDENTIAL_DOCUMENT_REF="${FORGEFLEET_OP_KIMI_CREDENTIAL_DOCUMENT_REF:-wls3pwdwilxbgmuh6qxwc676ga}"
+
+# Retain both values as shell-local state, but stop exporting them to every
+# child process. Each direct `op` invocation below receives its token through
+# a command-local environment assignment; self-enroll receives TOKEN on stdin.
+export -n FORGEFLEET_ENROLLMENT_TOKEN OP_SERVICE_ACCOUNT_TOKEN 2>/dev/null || true
 
 # ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -61,15 +77,6 @@ die() {
   exit 1
 }
 
-# Fetch one explicitly allowlisted fleet secret through the enrollment-token
-# bootstrap endpoint. The endpoint never permits arbitrary secret names.
-peek_secret() {
-  local key="$1"
-  curl -fsS -m 10 \
-    "$LEADER/api/fleet/secret-peek?token=$TOKEN&key=$key" \
-    2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin).get("value",""))' 2>/dev/null || true
-}
-
 # Run as the target user (not as root). Used for cargo, git, etc. When
 # invoked by `sudo bash`, we drop to the real invoker; when invoked directly
 # as the user (the sudo-less path), we run commands straight through.
@@ -95,6 +102,121 @@ as_root() {
   fi
 }
 
+# Validate a JSON document into a same-directory, mode-0600 temporary file and
+# only then atomically replace its canonical destination.  The caller supplies
+# the document on stdin so credential material never enters a process argv.
+# A validation/write failure removes only the temporary file; an existing
+# credential file remains byte-for-byte untouched.
+atomic_install_json_credential() {
+  local final_path="$1" final_dir temp_path
+  final_dir="${final_path%/*}"
+  run_as_user mkdir -p "$final_dir" || return 1
+  temp_path="$(run_as_user mktemp "$final_dir/.forgefleet-credential.XXXXXX")" \
+    || return 1
+  if ! run_as_user chmod 600 "$temp_path"; then
+    run_as_user rm -f "$temp_path"
+    return 1
+  fi
+  if ! run_as_user sh -c 'umask 077; python3 -m json.tool > "$1"' \
+    forgefleet-json-install "$temp_path"; then
+    run_as_user rm -f "$temp_path"
+    return 1
+  fi
+  if ! run_as_user chmod 600 "$temp_path" \
+    || ! run_as_user mv -f "$temp_path" "$final_path"; then
+    run_as_user rm -f "$temp_path"
+    return 1
+  fi
+}
+
+# BEGIN github-key-pair-publication-helper
+# Restore both canonical key paths to the exact state captured before a
+# publication attempt.  Existing files are restored from same-filesystem
+# backups; paths that were absent are removed.  Always attempt both restores so
+# one error cannot prevent recovery of the other half of the pair.
+restore_github_key_pair() {
+  local final_private="$1" final_public="$2" backup_dir="$3"
+  local private_existed="$4" public_existed="$5" restore_failed=""
+
+  if [ "$private_existed" = "yes" ]; then
+    run_as_user mv -f "$backup_dir/private" "$final_private" || restore_failed=1
+  else
+    run_as_user rm -f "$final_private" || restore_failed=1
+  fi
+  if [ "$public_existed" = "yes" ]; then
+    run_as_user mv -f "$backup_dir/public" "$final_public" || restore_failed=1
+  else
+    run_as_user rm -f "$final_public" || restore_failed=1
+  fi
+
+  [ -z "$restore_failed" ]
+}
+
+# Publish a pre-validated staged private/public pair while retaining enough
+# same-directory state to roll back *both* canonical paths if either rename
+# reports failure. Return 2 when publication failed and rollback itself was not
+# complete; callers must treat both non-zero results as fatal.
+publish_github_key_pair() {
+  local staged_private="$1" staged_public="$2" final_private="$3" final_public="$4"
+  local final_dir backup_dir private_existed="no" public_existed="no"
+  final_dir="${final_private%/*}"
+
+  [ "${final_public%/*}" = "$final_dir" ] || return 2
+  [ -f "$staged_private" ] && [ -f "$staged_public" ] || return 2
+  if { [ -e "$final_private" ] && [ ! -f "$final_private" ]; } \
+    || { [ -e "$final_public" ] && [ ! -f "$final_public" ]; }; then
+    return 2
+  fi
+
+  backup_dir="$(run_as_user mktemp -d "$final_dir/.forgefleet-key-pair-backup.XXXXXX")" \
+    || return 2
+  if [ -e "$final_private" ]; then
+    private_existed="yes"
+    if ! run_as_user cp -p "$final_private" "$backup_dir/private"; then
+      run_as_user rmdir "$backup_dir" 2>/dev/null || true
+      return 2
+    fi
+  fi
+  if [ -e "$final_public" ]; then
+    public_existed="yes"
+    if ! run_as_user cp -p "$final_public" "$backup_dir/public"; then
+      run_as_user rm -f "$backup_dir/private"
+      run_as_user rmdir "$backup_dir" 2>/dev/null || true
+      return 2
+    fi
+  fi
+
+  # Publish the public half first.  If this rename, or the private rename that
+  # follows, returns failure, restore the prior contents/absence of both paths.
+  if ! run_as_user mv -f "$staged_public" "$final_public" \
+    || ! run_as_user mv -f "$staged_private" "$final_private"; then
+    local rollback_ok="yes"
+    restore_github_key_pair \
+      "$final_private" "$final_public" "$backup_dir" \
+      "$private_existed" "$public_existed" \
+      || rollback_ok="no"
+    run_as_user rm -f "$staged_private" "$staged_public"
+    if [ "$rollback_ok" = "yes" ]; then
+      run_as_user rm -f "$backup_dir/private" "$backup_dir/public"
+      run_as_user rmdir "$backup_dir" 2>/dev/null || true
+      return 1
+    fi
+    # Retain any not-yet-restored backup instead of deleting the last recovery
+    # copy.  The caller reports a terminal error and the recovery directory.
+    GITHUB_KEY_PAIR_RECOVERY_DIR="$backup_dir"
+    return 2
+  fi
+
+  if ! run_as_user rm -f "$backup_dir/private" "$backup_dir/public"; then
+    GITHUB_KEY_PAIR_RECOVERY_DIR="$backup_dir"
+    return 2
+  fi
+  run_as_user rmdir "$backup_dir" 2>/dev/null || true
+  unset GITHUB_KEY_PAIR_RECOVERY_DIR
+  return 0
+}
+# END github-key-pair-publication-helper
+
 # Report unexpected early exits — previously a truncated/aborted run died
 # silently and the operator stared at a stuck "running" step forever.
 FF_COMPLETED=""
@@ -117,6 +239,9 @@ USER_HOME="$(eval echo ~${SUDO_INVOKER})"
 run_as_user mkdir -p "$USER_HOME/.local/bin" "$USER_HOME/.forgefleet/logs"
 
 say "ForgeFleet onboarding for $NAME ($IP) — runtime hint: $RUNTIME_HINT"
+
+[ -n "$TOKEN" ] \
+  || die "FORGEFLEET_ENROLLMENT_TOKEN is required out-of-band for self-enrollment"
 
 # ─── Preflight: the leader must be reachable BEFORE doing any work ────────
 # A wrong subnet/VLAN (e.g. Wi-Fi on 192.168.4.x vs fleet LAN 192.168.5.x)
@@ -284,17 +409,73 @@ report "prereqs" running
 case "$OS_ID" in
   macos)
     # Homebrew presumed installed manually (mac setup is interactive).
+    if ! run_as_user bash -lc 'command -v op >/dev/null 2>&1'; then
+      run_as_user bash -lc 'command -v brew >/dev/null && brew install --cask 1password-cli' \
+        || die "1Password CLI install failed"
+    fi
     ;;
   *)
     # Ubuntu/DGX OS/Debian — install build toolchain.
     export DEBIAN_FRONTEND=noninteractive
     as_root apt-get update -y >/dev/null 2>&1 || die "apt-get update failed"
     as_root apt-get install -y --no-install-recommends \
-      build-essential pkg-config libssl-dev git curl ca-certificates openssh-client openssh-server \
+      build-essential pkg-config libssl-dev git curl ca-certificates gnupg openssh-client openssh-server \
       >/dev/null 2>&1 || die "apt-get install (prereqs) failed"
+
+    # Install the signed 1Password CLI package from its official APT
+    # repository. `op` is a required onboarding tool, not an upgrade-only
+    # optional: a fresh node must be able to use the fleet's service-account
+    # authority without persisting secrets locally.
+    if ! command -v op >/dev/null 2>&1; then
+      as_root install -d -m 0755 \
+        /usr/share/keyrings \
+        /etc/apt/sources.list.d \
+        /etc/debsig/policies/AC2D62742012EA22 \
+        /usr/share/debsig/keyrings/AC2D62742012EA22
+      curl -fsSL https://downloads.1password.com/linux/keys/1password.asc \
+        | as_root gpg --dearmor --yes --output /usr/share/keyrings/1password-archive-keyring.gpg \
+        || die "1Password signing-key install failed"
+      OP_DEB_ARCH="$(dpkg --print-architecture)"
+      printf 'deb [arch=%s signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/%s stable main\n' \
+        "$OP_DEB_ARCH" "$OP_DEB_ARCH" \
+        | as_root tee /etc/apt/sources.list.d/1password.list >/dev/null
+      curl -fsSL https://downloads.1password.com/linux/debian/debsig/1password.pol \
+        | as_root tee /etc/debsig/policies/AC2D62742012EA22/1password.pol >/dev/null \
+        || die "1Password debsig policy install failed"
+      curl -fsSL https://downloads.1password.com/linux/keys/1password.asc \
+        | as_root gpg --dearmor --yes --output /usr/share/debsig/keyrings/AC2D62742012EA22/debsig.gpg \
+        || die "1Password debsig key install failed"
+      as_root apt-get update -y >/dev/null 2>&1 || die "1Password apt update failed"
+      as_root apt-get install -y 1password-cli >/dev/null 2>&1 \
+        || die "1Password CLI install failed"
+    fi
     systemctl enable --now ssh >/dev/null 2>&1 || true
     ;;
 esac
+OP_BIN="$(run_as_user bash -lc 'command -v op' 2>/dev/null || true)"
+[ -n "$OP_BIN" ] && [ -x "$OP_BIN" ] \
+  || die "1Password CLI is missing from the target user's login PATH after prerequisites"
+
+# Fail closed before the first secret read. `op` inherits the service-account
+# token from this process; the value is never copied into argv, a file, an
+# enrollment report, or ForgeFleet storage. The explicit item/document refs
+# above are non-secret IDs and may be overridden through environment variables.
+[ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ] \
+  || die "OP_SERVICE_ACCOUNT_TOKEN is required out-of-band before 1Password retrieval"
+for op_ref_name in \
+  OP_VAULT_REF \
+  OP_GITHUB_SSH_ITEM_REF \
+  OP_CLAUDE_CREDENTIAL_DOCUMENT_REF \
+  OP_CODEX_CREDENTIAL_DOCUMENT_REF \
+  OP_KIMI_CREDENTIAL_DOCUMENT_REF; do
+  op_ref_value="${!op_ref_name}"
+  [ -n "$op_ref_value" ] || die "required non-secret 1Password reference is unset: $op_ref_name"
+done
+unset op_ref_name op_ref_value
+if ! OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN" \
+  "$OP_BIN" whoami >/dev/null 2>&1; then
+  die "1Password service-account authentication failed; verify the out-of-band token and vault access"
+fi
 report "prereqs" ok
 
 # ─── 3. Rust toolchain (as the invoking user) ─────────────────────────────
@@ -341,29 +522,13 @@ case "$OS_ID" in
 esac
 report "gh" ok
 
-# ─── 5b. gh auth login via PAT stored in fleet_secrets ───────────────────
-# Prereq: operator ran `ff secrets set github.venkat_pat ghp_xxx` on vinny.
-# If the secret isn't set we skip — `git clone` will still work for PUBLIC
-# repos, and `gh auth status` will fail at verify-time so the operator knows.
+# ─── 5b. GitHub API credential policy ────────────────────────────────────
+# Do not fetch, interpolate, or persist a GitHub PAT during enrollment.
+# Repository clone/push authority is the fleet-owned SSH identity installed
+# below. Commands that require the GitHub API receive GH_TOKEN on demand from
+# the fleet/1Password authority after ff is installed.
 report "gh_auth" running
-# We don't have ff installed yet on this new box, so fetch the secret via HTTP.
-# The enrollment token doubles as auth for this one-time lookup.
-PAT_VALUE="$(peek_secret "$GITHUB_PAT_SECRET_KEY")"
-
-if [ -n "$PAT_VALUE" ]; then
-  if run_as_user bash -lc "echo \"$PAT_VALUE\" | gh auth login --with-token >/dev/null 2>&1"; then
-    if run_as_user bash -lc 'gh auth status --hostname github.com >/dev/null 2>&1'; then
-      GH_USER="$(run_as_user bash -lc 'gh api user -q .login 2>/dev/null' || echo unknown)"
-      report "gh_auth" ok "logged in as $GH_USER"
-    else
-      report "gh_auth" failed "login accepted but auth status verification failed"
-    fi
-  else
-    report "gh_auth" failed "gh auth login --with-token rejected PAT"
-  fi
-else
-  report "gh_auth" ok "no PAT on fleet (public repo clone will still work)"
-fi
+report "gh_auth" ok "deferred: API token is injected on demand from fleet/1Password authority"
 
 # ─── 5c. Git identity ────────────────────────────────────────────────────
 # Commits made on this computer (sub-agent worktrees, dispatched builds) need
@@ -377,35 +542,170 @@ report "git_identity" ok
 # Materialize the fleet's canonical GitHub identity before cloning. This
 # avoids an HTTPS staging clone that is rewritten only after ff is built.
 report "github_deploy_key" running
-VENKAT_PRIV="$(peek_secret github_ssh_id_venkat_priv)"
-VENKAT_PUB="$(peek_secret github_ssh_id_venkat_pub)"
-if [ -n "$VENKAT_PRIV" ] && [ -n "$VENKAT_PUB" ]; then
-  run_as_user mkdir -p "$USER_HOME/.ssh"
-  run_as_user chmod 700 "$USER_HOME/.ssh"
-  printf '%s\n' "$VENKAT_PRIV" | run_as_user tee "$USER_HOME/.ssh/id_venkat" >/dev/null
-  printf '%s\n' "$VENKAT_PUB" | run_as_user tee "$USER_HOME/.ssh/id_venkat.pub" >/dev/null
-  run_as_user chmod 600 "$USER_HOME/.ssh/id_venkat"
-  run_as_user chmod 644 "$USER_HOME/.ssh/id_venkat.pub"
-  run_as_user touch "$USER_HOME/.ssh/known_hosts" "$USER_HOME/.ssh/config"
-  if ! run_as_user ssh-keygen -F github.com -f "$USER_HOME/.ssh/known_hosts" >/dev/null 2>&1; then
-    run_as_user bash -c "ssh-keyscan github.com >> '$USER_HOME/.ssh/known_hosts'" 2>/dev/null \
-      || die "failed to record github.com host key"
-  fi
-  if ! run_as_user grep -qFx 'Host github.com-venkat' "$USER_HOME/.ssh/config"; then
-    run_as_user bash -c "cat >> '$USER_HOME/.ssh/config' <<'EOF'
+if ! VENKAT_PRIV="$(OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN" \
+  "$OP_BIN" read "op://${OP_VAULT_REF}/${OP_GITHUB_SSH_ITEM_REF}/private_key" 2>/dev/null)" \
+  || [ -z "$VENKAT_PRIV" ]; then
+  die "1Password GitHub SSH private-key retrieval failed; verify the configured item reference and service-account access"
+fi
+if ! VENKAT_PUB="$(OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN" \
+  "$OP_BIN" read "op://${OP_VAULT_REF}/${OP_GITHUB_SSH_ITEM_REF}/public_key" 2>/dev/null)" \
+  || [ -z "$VENKAT_PUB" ]; then
+  die "1Password GitHub SSH public-key retrieval failed; verify the configured item reference and service-account access"
+fi
+run_as_user mkdir -p "$USER_HOME/.ssh"
+run_as_user chmod 700 "$USER_HOME/.ssh"
 
+# Stage both key files in their final directory.  Validate the public material
+# supplied by 1Password against `ssh-keygen -y` output from the private key,
+# comparing the algorithm and base64 fields while deliberately ignoring any
+# comment.  No canonical key is replaced until all validation has succeeded.
+VENKAT_PRIV_TMP="$(run_as_user mktemp "$USER_HOME/.ssh/.id_venkat.private.XXXXXX")" \
+  || die "failed to stage the GitHub SSH private key"
+VENKAT_PUB_TMP="$(run_as_user mktemp "$USER_HOME/.ssh/.id_venkat.public.XXXXXX")" \
+  || {
+    run_as_user rm -f "$VENKAT_PRIV_TMP"
+    die "failed to stage the GitHub SSH public key"
+  }
+if ! printf '%s\n' "$VENKAT_PRIV" \
+  | run_as_user sh -c 'umask 077; cat > "$1"' forgefleet-key-install "$VENKAT_PRIV_TMP" \
+  || ! printf '%s\n' "$VENKAT_PUB" \
+  | run_as_user sh -c 'umask 077; cat > "$1"' forgefleet-key-install "$VENKAT_PUB_TMP"; then
+  unset VENKAT_PRIV VENKAT_PUB
+  run_as_user rm -f "$VENKAT_PRIV_TMP" "$VENKAT_PUB_TMP"
+  die "failed to stage the GitHub SSH key pair"
+fi
+unset VENKAT_PRIV VENKAT_PUB
+run_as_user chmod 600 "$VENKAT_PRIV_TMP" \
+  || {
+    run_as_user rm -f "$VENKAT_PRIV_TMP" "$VENKAT_PUB_TMP"
+    die "failed to restrict the staged GitHub SSH private key"
+  }
+run_as_user chmod 644 "$VENKAT_PUB_TMP" \
+  || {
+    run_as_user rm -f "$VENKAT_PRIV_TMP" "$VENKAT_PUB_TMP"
+    die "failed to set the staged GitHub SSH public-key mode"
+  }
+if ! DERIVED_VENKAT_PUB="$(run_as_user ssh-keygen -y -f "$VENKAT_PRIV_TMP" 2>/dev/null)" \
+  || ! STORED_VENKAT_PUB="$(run_as_user awk 'NF >= 2 { print $1 " " $2; found=1; exit } END { if (!found) exit 1 }' "$VENKAT_PUB_TMP")" \
+  || ! run_as_user ssh-keygen -l -f "$VENKAT_PUB_TMP" >/dev/null 2>&1; then
+  unset DERIVED_VENKAT_PUB STORED_VENKAT_PUB
+  run_as_user rm -f "$VENKAT_PRIV_TMP" "$VENKAT_PUB_TMP"
+  die "1Password GitHub SSH key pair is malformed"
+fi
+DERIVED_VENKAT_MATERIAL="$(printf '%s\n' "$DERIVED_VENKAT_PUB" \
+  | awk 'NF >= 2 { print $1 " " $2; found=1; exit } END { if (!found) exit 1 }')" \
+  || {
+    unset DERIVED_VENKAT_PUB STORED_VENKAT_PUB
+    run_as_user rm -f "$VENKAT_PRIV_TMP" "$VENKAT_PUB_TMP"
+    die "failed to derive GitHub SSH public-key material"
+  }
+if [ "$DERIVED_VENKAT_MATERIAL" != "$STORED_VENKAT_PUB" ]; then
+  unset DERIVED_VENKAT_PUB DERIVED_VENKAT_MATERIAL STORED_VENKAT_PUB
+  run_as_user rm -f "$VENKAT_PRIV_TMP" "$VENKAT_PUB_TMP"
+  die "1Password GitHub SSH private/public key pair does not match"
+fi
+unset DERIVED_VENKAT_PUB DERIVED_VENKAT_MATERIAL STORED_VENKAT_PUB
+if publish_github_key_pair \
+  "$VENKAT_PRIV_TMP" \
+  "$VENKAT_PUB_TMP" \
+  "$USER_HOME/.ssh/id_venkat" \
+  "$USER_HOME/.ssh/id_venkat.pub"; then
+  :
+else
+  KEY_PAIR_PUBLISH_RC=$?
+  run_as_user rm -f "$VENKAT_PRIV_TMP" "$VENKAT_PUB_TMP"
+  if [ "$KEY_PAIR_PUBLISH_RC" -eq 1 ]; then
+    die "failed to publish the GitHub SSH key pair; the prior canonical pair was restored"
+  fi
+  die "failed to publish the GitHub SSH key pair and fully restore its prior state; do not use the canonical key paths; recovery snapshot: ${GITHUB_KEY_PAIR_RECOVERY_DIR:-unavailable}"
+fi
+
+# Pin GitHub's published host keys in a dedicated trust file.  These values and
+# fingerprints come from https://docs.github.com/en/authentication/
+# keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints.  Never
+# turn an unauthenticated network scan directly into trust.
+GITHUB_KNOWN_HOSTS="$USER_HOME/.ssh/known_hosts.github"
+GITHUB_KNOWN_HOSTS_TMP="$(run_as_user mktemp "$USER_HOME/.ssh/.known_hosts.github.XXXXXX")" \
+  || die "failed to stage pinned GitHub SSH host keys"
+if ! run_as_user sh -c 'umask 077; cat > "$1"' \
+  forgefleet-github-hosts "$GITHUB_KNOWN_HOSTS_TMP" <<'EOF'
+github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+EOF
+then
+  run_as_user rm -f "$GITHUB_KNOWN_HOSTS_TMP"
+  die "failed to write pinned GitHub SSH host keys"
+fi
+GITHUB_HOST_FINGERPRINTS="$(run_as_user ssh-keygen -lf "$GITHUB_KNOWN_HOSTS_TMP" -E sha256 2>/dev/null)" \
+  || {
+    run_as_user rm -f "$GITHUB_KNOWN_HOSTS_TMP"
+    die "pinned GitHub SSH host keys are malformed"
+  }
+for github_fp in \
+  'SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s' \
+  'SHA256:p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM' \
+  'SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU'; do
+  if ! printf '%s\n' "$GITHUB_HOST_FINGERPRINTS" | grep -Fq "$github_fp"; then
+    unset GITHUB_HOST_FINGERPRINTS github_fp
+    run_as_user rm -f "$GITHUB_KNOWN_HOSTS_TMP"
+    die "pinned GitHub SSH host-key fingerprint validation failed"
+  fi
+done
+unset GITHUB_HOST_FINGERPRINTS github_fp
+run_as_user chmod 644 "$GITHUB_KNOWN_HOSTS_TMP" \
+  && run_as_user mv -f "$GITHUB_KNOWN_HOSTS_TMP" "$GITHUB_KNOWN_HOSTS" \
+  || {
+    run_as_user rm -f "$GITHUB_KNOWN_HOSTS_TMP"
+    die "failed to atomically install pinned GitHub SSH host keys"
+  }
+
+# Put the managed alias in a dedicated include that is evaluated before any
+# legacy Host block, so older bootstrap output cannot weaken pinned trust.
+SSH_CONFIG_D="$USER_HOME/.ssh/config.d"
+SSH_GITHUB_CONFIG="$SSH_CONFIG_D/forgefleet-github.conf"
+run_as_user mkdir -p "$SSH_CONFIG_D"
+SSH_GITHUB_CONFIG_TMP="$(run_as_user mktemp "$SSH_CONFIG_D/.forgefleet-github.XXXXXX")" \
+  || die "failed to stage the GitHub SSH configuration"
+if ! run_as_user sh -c 'umask 077; cat > "$1"' \
+  forgefleet-github-config "$SSH_GITHUB_CONFIG_TMP" <<'EOF'
 Host github.com-venkat
   HostName github.com
   User git
   IdentityFile ~/.ssh/id_venkat
   IdentitiesOnly yes
-EOF"
-  fi
-  run_as_user chmod 600 "$USER_HOME/.ssh/config"
-  report "github_deploy_key" ok "installed id_venkat"
-else
-  report "github_deploy_key" warn "id_venkat is not available in fleet_secrets"
+  StrictHostKeyChecking yes
+  UserKnownHostsFile ~/.ssh/known_hosts.github
+  GlobalKnownHostsFile /dev/null
+EOF
+then
+  run_as_user rm -f "$SSH_GITHUB_CONFIG_TMP"
+  die "failed to write the GitHub SSH configuration"
 fi
+run_as_user chmod 600 "$SSH_GITHUB_CONFIG_TMP" \
+  && run_as_user mv -f "$SSH_GITHUB_CONFIG_TMP" "$SSH_GITHUB_CONFIG" \
+  || {
+    run_as_user rm -f "$SSH_GITHUB_CONFIG_TMP"
+    die "failed to atomically install the GitHub SSH configuration"
+  }
+SSH_CONFIG="$USER_HOME/.ssh/config"
+if ! run_as_user grep -qFx 'Include ~/.ssh/config.d/forgefleet-github.conf' "$SSH_CONFIG" 2>/dev/null; then
+  SSH_CONFIG_TMP="$(run_as_user mktemp "$USER_HOME/.ssh/.config.XXXXXX")" \
+    || die "failed to stage the SSH configuration include"
+  if ! run_as_user sh -c 'umask 077; { printf "%s\n" "Include ~/.ssh/config.d/forgefleet-github.conf"; cat "$2" 2>/dev/null || true; } > "$1"' \
+    forgefleet-ssh-config "$SSH_CONFIG_TMP" "$SSH_CONFIG"; then
+    run_as_user rm -f "$SSH_CONFIG_TMP"
+    die "failed to stage the SSH configuration include"
+  fi
+  run_as_user chmod 600 "$SSH_CONFIG_TMP" \
+    && run_as_user mv -f "$SSH_CONFIG_TMP" "$SSH_CONFIG" \
+    || {
+      run_as_user rm -f "$SSH_CONFIG_TMP"
+      die "failed to atomically install the SSH configuration include"
+    }
+fi
+run_as_user chmod 600 "$SSH_CONFIG"
+report "github_deploy_key" ok "validated and atomically installed id_venkat with pinned GitHub host trust"
 
 # ─── 6. Clone forge-fleet + build ff ─────────────────────────────────────
 #
@@ -502,28 +802,41 @@ if ! run_as_user bash -lc 'command -v kimi >/dev/null 2>&1'; then
   run_as_user bash -lc 'uv tool install kimi-cli' || die "Kimi CLI install failed"
 fi
 
-CLAUDE_CREDENTIALS="$(peek_secret anthropic.oauth_token.credentials)"
-CODEX_CREDENTIALS="$(peek_secret openai.oauth_token.credentials)"
-KIMI_CREDENTIALS="$(peek_secret moonshot.oauth_token.credentials)"
+if ! CLAUDE_CREDENTIALS="$(OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN" \
+  "$OP_BIN" document get "$OP_CLAUDE_CREDENTIAL_DOCUMENT_REF" --vault "$OP_VAULT_REF" 2>/dev/null)" \
+  || [ -z "$CLAUDE_CREDENTIALS" ]; then
+  die "1Password Claude credential-document retrieval failed; verify its configured reference and service-account access"
+fi
+if ! CODEX_CREDENTIALS="$(OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN" \
+  "$OP_BIN" document get "$OP_CODEX_CREDENTIAL_DOCUMENT_REF" --vault "$OP_VAULT_REF" 2>/dev/null)" \
+  || [ -z "$CODEX_CREDENTIALS" ]; then
+  die "1Password Codex credential-document retrieval failed; verify its configured reference and service-account access"
+fi
+if ! KIMI_CREDENTIALS="$(OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN" \
+  "$OP_BIN" document get "$OP_KIMI_CREDENTIAL_DOCUMENT_REF" --vault "$OP_VAULT_REF" 2>/dev/null)" \
+  || [ -z "$KIMI_CREDENTIALS" ]; then
+  die "1Password Kimi credential-document retrieval failed; verify its configured reference and service-account access"
+fi
+# No more secret retrieval occurs after this point. Drop the service-account
+# credential from the bootstrap environment before parsing or writing documents.
+unset OP_SERVICE_ACCOUNT_TOKEN
 run_as_user mkdir -p "$USER_HOME/.claude" "$USER_HOME/.codex" "$USER_HOME/.kimi/credentials"
-if [ -n "$CLAUDE_CREDENTIALS" ]; then
-  printf '%s' "$CLAUDE_CREDENTIALS" | python3 -m json.tool \
-    | run_as_user tee "$USER_HOME/.claude/.credentials.json" >/dev/null \
-    || die "invalid Claude credentials from fleet_secrets"
-  run_as_user chmod 600 "$USER_HOME/.claude/.credentials.json"
+if ! printf '%s' "$CLAUDE_CREDENTIALS" \
+  | atomic_install_json_credential "$USER_HOME/.claude/.credentials.json"; then
+  unset CLAUDE_CREDENTIALS CODEX_CREDENTIALS KIMI_CREDENTIALS
+  die "invalid Claude credential document from 1Password; existing credentials were preserved"
 fi
-if [ -n "$CODEX_CREDENTIALS" ]; then
-  printf '%s' "$CODEX_CREDENTIALS" | python3 -m json.tool \
-    | run_as_user tee "$USER_HOME/.codex/auth.json" >/dev/null \
-    || die "invalid Codex credentials from fleet_secrets"
-  run_as_user chmod 600 "$USER_HOME/.codex/auth.json"
+if ! printf '%s' "$CODEX_CREDENTIALS" \
+  | atomic_install_json_credential "$USER_HOME/.codex/auth.json"; then
+  unset CLAUDE_CREDENTIALS CODEX_CREDENTIALS KIMI_CREDENTIALS
+  die "invalid Codex credential document from 1Password; existing credentials were preserved"
 fi
-if [ -n "$KIMI_CREDENTIALS" ]; then
-  printf '%s' "$KIMI_CREDENTIALS" | python3 -m json.tool \
-    | run_as_user tee "$USER_HOME/.kimi/credentials/kimi-code.json" >/dev/null \
-    || die "invalid Kimi credentials from fleet_secrets"
-  run_as_user chmod 600 "$USER_HOME/.kimi/credentials/kimi-code.json"
+if ! printf '%s' "$KIMI_CREDENTIALS" \
+  | atomic_install_json_credential "$USER_HOME/.kimi/credentials/kimi-code.json"; then
+  unset CLAUDE_CREDENTIALS CODEX_CREDENTIALS KIMI_CREDENTIALS
+  die "invalid Kimi credential document from 1Password; existing credentials were preserved"
 fi
+unset CLAUDE_CREDENTIALS CODEX_CREDENTIALS KIMI_CREDENTIALS
 report "cloud_clis" ok "claude, codex, kimi"
 
 report "web_build" running
@@ -563,8 +876,6 @@ KEY_PATH="$USER_HOME/.ssh/id_ed25519"
 if [ ! -f "$KEY_PATH" ]; then
   run_as_user mkdir -p "$USER_HOME/.ssh"
   run_as_user chmod 700 "$USER_HOME/.ssh"
-  # Populate known_hosts for github.com so git over SSH works without prompts.
-  run_as_user bash -lc "ssh-keyscan github.com >> '$USER_HOME/.ssh/known_hosts'" 2>/dev/null || true
   run_as_user ssh-keygen -t ed25519 -N "" -f "$KEY_PATH" -C "${SUDO_INVOKER}@${NAME}" >/dev/null
 fi
 # Read the public key we just generated (or that already existed). Redirect
@@ -655,10 +966,11 @@ ENROLL_PAYLOAD="$(cat <<EOF
 EOF
 )"
 
-ENROLL_RESP="$(curl -fsS -m 30 -X POST \
+ENROLL_RESP="$(printf '%s' "$ENROLL_PAYLOAD" | curl -fsS -m 30 -X POST \
   -H "Content-Type: application/json" \
-  --data "$ENROLL_PAYLOAD" \
+  --data-binary @- \
   "$LEADER/api/fleet/self-enroll")" || die "self-enroll HTTP request failed"
+unset ENROLL_PAYLOAD TOKEN FORGEFLEET_ENROLLMENT_TOKEN
 
 say "Enrolled: $ENROLL_RESP"
 report "enroll" ok
@@ -755,7 +1067,10 @@ report "fleet_toml" running
 FLEET_TOML="$USER_HOME/.forgefleet/fleet.toml"
 run_as_user mkdir -p "$USER_HOME/.forgefleet"
 if [ ! -f "$FLEET_TOML" ]; then
-  run_as_user bash -c "cat > '$FLEET_TOML' <<EOF
+  # Create secret-bearing configuration under a restrictive umask so there is
+  # no permissive-mode window before the unconditional chmod below.
+  run_as_user bash -c "umask 077
+cat > '$FLEET_TOML' <<EOF
 [database]
 mode = \"postgres_full\"
 cutover_evidence = \"phase38-cutover-validated-2026-04-05\"
@@ -778,10 +1093,13 @@ max_health_failures = 3
 stop_timeout_secs = 10
 health_probe_timeout_secs = 3
 EOF"
-  report "fleet_toml" ok
+  FLEET_TOML_RESULT="created"
 else
-  report "fleet_toml" ok "already exists"
+  FLEET_TOML_RESULT="already existed"
 fi
+run_as_user chmod 600 "$FLEET_TOML" \
+  || die "failed to restrict $FLEET_TOML to mode 0600"
+report "fleet_toml" ok "$FLEET_TOML_RESULT; mode=0600"
 
 # ─── 11. systemd unit ────────────────────────────────────────────────────
 
@@ -852,11 +1170,15 @@ if [ "$OS_ID" != "macos" ]; then
   sleep 2
   if ! user_systemctl is-enabled forgefleetd.service >/dev/null 2>&1; then
     die "systemctl --user reports forgefleetd.service disabled; run: systemctl --user enable forgefleetd.service"
-  elif user_systemctl is-active forgefleetd.service >/dev/null 2>&1; then
-    report "service" ok
-  else
+  elif ! user_systemctl is-active forgefleetd.service >/dev/null 2>&1; then
     die "systemctl --user reports forgefleetd.service inactive; inspect: systemctl --user status forgefleetd.service"
   fi
+  if ! user_systemctl is-enabled forgefleet-mcp.service >/dev/null 2>&1; then
+    die "systemctl --user reports forgefleet-mcp.service disabled; run: systemctl --user enable forgefleet-mcp.service"
+  elif ! user_systemctl is-active forgefleet-mcp.service >/dev/null 2>&1; then
+    die "systemctl --user reports forgefleet-mcp.service inactive; inspect: systemctl --user status forgefleet-mcp.service"
+  fi
+  report "service" ok "forgefleetd and separate MCP user units active"
 else
   # macOS: install LaunchAgent plist so `launchctl kickstart -k` works
   # for the wave dispatcher's Phase-2 restart. Skipping this step left
@@ -868,9 +1190,11 @@ else
   PLIST_TEMPLATE="$REPO_DIR/deploy/launchd/com.forgefleet.forgefleetd.template.plist"
   PLIST_TARGET_DIR="$USER_HOME/Library/LaunchAgents"
   PLIST_TARGET="$PLIST_TARGET_DIR/com.forgefleet.forgefleetd.plist"
+  MCP_PLIST_TARGET="$PLIST_TARGET_DIR/com.forgefleet.forgefleet-mcp.plist"
   if [ -f "$PLIST_TEMPLATE" ]; then
     USER_UID="$(run_as_user id -u)"
     GUI_DOMAIN="gui/$USER_UID/com.forgefleet.forgefleetd"
+    MCP_GUI_DOMAIN="gui/$USER_UID/com.forgefleet.forgefleet-mcp"
     run_as_user mkdir -p "$PLIST_TARGET_DIR" "$USER_HOME/.forgefleet/logs"
     TG_TOKEN="${TELEGRAM_BOT_TOKEN:-${FORGEFLEET_TELEGRAM_BOT_TOKEN:-}}"
     run_as_user bash -c "sed -e 's|__USER_HOME__|$USER_HOME|g' -e 's|__COMPUTER_NAME__|$NAME|g' -e 's|__TELEGRAM_BOT_TOKEN__|$TG_TOKEN|g' '$PLIST_TEMPLATE' > '$PLIST_TARGET'"
@@ -884,103 +1208,159 @@ else
     else
       report "service" warn "launchd plist installed but not yet registered (may need user re-login)"
     fi
+
+    # MCP is a separate, restartable process just like the Linux
+    # forgefleet-mcp.service. Keeping it out of the main daemon means client
+    # transports survive a forgefleetd rollout and reconnect to a stable port.
+    # Stage in the LaunchAgents directory, validate the XML with plutil, and
+    # atomically publish it before touching the currently running agent.  A
+    # malformed generated plist therefore leaves both the existing file and
+    # existing launchd job intact.
+    MCP_PLIST_TMP="$(run_as_user mktemp "$PLIST_TARGET_DIR/.com.forgefleet.forgefleet-mcp.XXXXXX")" \
+      || die "failed to stage the separate ForgeFleet MCP LaunchAgent"
+    if ! run_as_user bash -c "umask 077; cat > '$MCP_PLIST_TMP' <<EOF
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+  <key>Label</key>
+  <string>com.forgefleet.forgefleet-mcp</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$USER_HOME/.local/bin/forgefleetd</string>
+    <string>mcp</string>
+    <string>--listen</string>
+    <string>0.0.0.0:50001</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>$USER_HOME</string>
+    <key>PATH</key>
+    <string>$USER_HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>$USER_HOME</string>
+  <key>StandardOutPath</key>
+  <string>$USER_HOME/.forgefleet/logs/forgefleet-mcp.log</string>
+  <key>StandardErrorPath</key>
+  <string>$USER_HOME/.forgefleet/logs/forgefleet-mcp.log</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>2</integer>
+</dict>
+</plist>
+EOF"; then
+      run_as_user rm -f "$MCP_PLIST_TMP"
+      die "failed to write the staged ForgeFleet MCP LaunchAgent"
+    fi
+    if ! run_as_user plutil -lint "$MCP_PLIST_TMP" >/dev/null 2>&1; then
+      run_as_user rm -f "$MCP_PLIST_TMP"
+      die "generated ForgeFleet MCP LaunchAgent failed plutil validation"
+    fi
+    run_as_user chmod 600 "$MCP_PLIST_TMP" \
+      && run_as_user mv -f "$MCP_PLIST_TMP" "$MCP_PLIST_TARGET" \
+      || {
+        run_as_user rm -f "$MCP_PLIST_TMP"
+        die "failed to atomically install the ForgeFleet MCP LaunchAgent"
+      }
+    run_as_user launchctl bootout "gui/$USER_UID" "$MCP_PLIST_TARGET" 2>/dev/null || true
+    run_as_user launchctl bootstrap "gui/$USER_UID" "$MCP_PLIST_TARGET" \
+      || die "failed to bootstrap the separate ForgeFleet MCP LaunchAgent"
+    run_as_user launchctl enable "$MCP_GUI_DOMAIN" \
+      || die "failed to enable the separate ForgeFleet MCP LaunchAgent"
+    run_as_user launchctl kickstart -k "$MCP_GUI_DOMAIN" \
+      || die "failed to start the separate ForgeFleet MCP LaunchAgent"
+    sleep 2
+    run_as_user launchctl print "$MCP_GUI_DOMAIN" >/dev/null 2>&1 \
+      || die "launchd did not register the separate ForgeFleet MCP agent"
+    report "mcp-service" ok "separate launchd MCP agent registered"
   else
-    report "service" failed "missing $PLIST_TEMPLATE"
+    die "missing canonical launchd template: $PLIST_TEMPLATE"
   fi
 fi
+
+# Do not install any client configuration until the independently supervised
+# MCP listener both answers health and exposes a non-empty tools catalog.
+report "mcp-ready" running
+MCP_HEALTHY=""
+MCP_ATTEMPT=0
+while [ "$MCP_ATTEMPT" -lt 20 ]; do
+  if curl -fsS -m 2 http://127.0.0.1:50001/mcp/health 2>/dev/null | grep -q '^ok$'; then
+    MCP_HEALTHY=1
+    break
+  fi
+  MCP_ATTEMPT=$((MCP_ATTEMPT + 1))
+  sleep 1
+done
+[ -n "$MCP_HEALTHY" ] \
+  || die "separate ForgeFleet MCP listener did not become healthy on 127.0.0.1:50001"
+if ! MCP_TOOLS_RESPONSE="$(curl -fsS -m 10 \
+  -H 'Content-Type: application/json' \
+  --data '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}' \
+  http://127.0.0.1:50001/mcp 2>/dev/null)"; then
+  die "separate ForgeFleet MCP tools/list request failed"
+fi
+if ! printf '%s' "$MCP_TOOLS_RESPONSE" | python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+tools = payload.get("result", {}).get("tools", [])
+raise SystemExit(0 if isinstance(tools, list) and tools else 1)
+'; then
+  die "separate ForgeFleet MCP returned no tools"
+fi
+unset MCP_TOOLS_RESPONSE MCP_HEALTHY MCP_ATTEMPT
+report "mcp-ready" ok "listener healthy with tools available"
 
 # ─── 12. CLI MCP auto-config ─────────────────────────────────────────────
 #
-# Wire each vendor CLI (Claude Code, Codex, Gemini) to the local ff-mcp
-# server at port 50001 so the agent loops in those CLIs see ff's brain
-# tools (brain_search, brain_write_to_inbox, etc.) and the standard 36
-# fleet MCP tools. Per the multi-LLM roadmap (PR-A4), this closes the
-# manual `claude mcp add ...` gap.
-#
-# Each CLI has its own config-file convention; we write only when the
-# CLI binary itself is installed (gated by `command -v <cli>`). Idempotent
-# via merge-or-create logic.
+# Delegate every client-specific config shape and transport choice to ff's
+# typed, idempotent installer. This is the single authority for current Claude
+# Code/Desktop, Codex, Gemini, Kimi Code/Desktop, and the other supported
+# clients. In particular, do not call `claude mcp add <name> <url>` here: that
+# CLI form can interpret the URL as a stdio command instead of a native HTTP
+# endpoint. --no-instructions limits bootstrap to MCP config; the shared
+# project/user instructions are managed separately.
 report "mcp-config" running
 
-MCP_URL="http://127.0.0.1:50001/mcp"
-
-# Claude Code: ~/.claude/.mcp-servers.json (JSON array of server objs)
-if run_as_user bash -lc 'command -v claude >/dev/null 2>&1'; then
-  CLAUDE_MCP_DIR="$USER_HOME/.claude"
-  CLAUDE_MCP_FILE="$CLAUDE_MCP_DIR/.mcp-servers.json"
-  run_as_user mkdir -p "$CLAUDE_MCP_DIR"
-  if [ ! -f "$CLAUDE_MCP_FILE" ]; then
-    run_as_user bash -c "cat > '$CLAUDE_MCP_FILE' <<EOF
-{\"mcpServers\":{\"forgefleet\":{\"url\":\"$MCP_URL\"}}}
-EOF"
-    report "mcp-config" ok "wrote claude mcp config"
+if MCP_CONFIG_OUTPUT="$(run_as_user "$USER_HOME/.local/bin/ff" mcp install --for all --no-instructions 2>&1)"; then
+  printf '%s\n' "$MCP_CONFIG_OUTPUT"
+  # `ff mcp install` continues across per-client errors and reports each one
+  # with a cross marker. Surface partial failure in the bootstrap workstream
+  # even though the aggregate CLI invocation intentionally exits successfully.
+  if grep -Fq '✗' <<<"$MCP_CONFIG_OUTPUT"; then
+    MCP_CONFIG_FAILURES="$(grep -Fc '✗' <<<"$MCP_CONFIG_OUTPUT")"
+    report "mcp-config" failed "canonical installer reported $MCP_CONFIG_FAILURES client failure(s); inspect bootstrap output"
+    die "ff mcp install reported one or more client configuration failures"
   else
-    # File exists — try `claude mcp add` if available, else leave alone.
-    run_as_user bash -lc "claude mcp add forgefleet $MCP_URL 2>/dev/null" || true
-  fi
-fi
-
-# Codex: ~/.codex/config.toml (TOML; append [mcp_servers.forgefleet] block)
-if run_as_user bash -lc 'command -v codex >/dev/null 2>&1'; then
-  CODEX_CONFIG_DIR="$USER_HOME/.codex"
-  CODEX_CONFIG_FILE="$CODEX_CONFIG_DIR/config.toml"
-  run_as_user mkdir -p "$CODEX_CONFIG_DIR"
-  if ! run_as_user bash -lc "grep -q 'mcp_servers.forgefleet' '$CODEX_CONFIG_FILE' 2>/dev/null"; then
-    run_as_user bash -c "cat >> '$CODEX_CONFIG_FILE' <<EOF
-
-[mcp_servers.forgefleet]
-url = \"$MCP_URL\"
-EOF"
-    report "mcp-config" ok "appended codex mcp config"
-  fi
-fi
-
-# Gemini CLI: ~/.gemini/settings.json (JSON; mcpServers map, similar shape)
-if run_as_user bash -lc 'command -v gemini >/dev/null 2>&1'; then
-  GEMINI_DIR="$USER_HOME/.gemini"
-  GEMINI_FILE="$GEMINI_DIR/settings.json"
-  run_as_user mkdir -p "$GEMINI_DIR"
-  if [ ! -f "$GEMINI_FILE" ]; then
-    run_as_user bash -c "cat > '$GEMINI_FILE' <<EOF
-{\"mcpServers\":{\"forgefleet\":{\"url\":\"$MCP_URL\"}}}
-EOF"
-    report "mcp-config" ok "wrote gemini mcp config"
-  fi
-fi
-
-report "mcp-config" ok
-
-# ─── GitHub SSH identity (V89) ───────────────────────────────────────────
-# Pull the canonical github.com SSH aliases + keypairs from Postgres so
-# this new computer can `git push` to GitHub from day one. The DB owns the
-# config; `ff github sync` materializes ~/.ssh/id_* (chmod 600/644) and
-# appends any missing `Host github.com-*` blocks to ~/.ssh/config.
-# Idempotent: re-running on an already-bootstrapped computer is a no-op.
-report "github-identity" running
-if run_as_user bash -lc 'command -v ff >/dev/null 2>&1'; then
-  if run_as_user bash -lc 'ff github sync 2>&1'; then
-    report "github-identity" ok "synced from fleet_secrets"
-    # Flip the forge-fleet remote from HTTPS (clone path) to the SSH
-    # alias now that the keys are in place. Without this the computer
-    # has working SSH auth but `git push` still hits HTTPS and fails.
-    # The flip is idempotent — re-running on a computer that's already
-    # on SSH is a no-op.
-    run_as_user bash -lc "cd '$REPO_DIR' && \
-      old=\$(git remote get-url origin 2>/dev/null); \
-      if [[ \"\$old\" =~ ^https://github.com/(.+)\$ ]]; then \
-        path=\${BASH_REMATCH[1]%.git}.git; \
-        git remote set-url origin git@github.com-venkat:\$path; \
-        echo 'flipped origin to SSH (github.com-venkat alias)'; \
-      fi" || true
-  else
-    # Don't fail the whole bootstrap — operator can run `ff github sync`
-    # manually once they fix whatever blocked it (usually first-time DB
-    # connectivity or empty fleet_secrets).
-    report "github-identity" warn "ff github sync failed — run manually after bootstrap"
+    report "mcp-config" ok "canonical ff mcp install --for all completed"
   fi
 else
-  report "github-identity" warn "ff not on PATH — skipping github sync"
+  MCP_CONFIG_RC=$?
+  printf '%s\n' "$MCP_CONFIG_OUTPUT" >&2
+  report "mcp-config" failed "ff mcp install exited $MCP_CONFIG_RC; inspect bootstrap output"
+  die "ff mcp install failed"
 fi
+
+# ─── GitHub SSH identity verification ────────────────────────────────────
+# The keypair was read directly from 1Password before clone. Do not replace
+# it here from a database-backed sync path: 1Password is the sole credential
+# authority for onboarding.
+report "github-identity" running
+[ -s "$USER_HOME/.ssh/id_venkat" ] && [ -s "$USER_HOME/.ssh/id_venkat.pub" ] \
+  || die "1Password-backed GitHub SSH identity is missing after installation"
+# Flip the forge-fleet remote from HTTPS to the SSH alias. The flip is
+# idempotent and leaves an already-canonical SSH remote unchanged.
+run_as_user bash -lc "cd '$REPO_DIR' && \
+  old=\$(git remote get-url origin 2>/dev/null); \
+  if [[ \"\$old\" =~ ^https://github.com/(.+)\$ ]]; then \
+    path=\${BASH_REMATCH[1]%.git}.git; \
+    git remote set-url origin git@github.com-venkat:\$path; \
+  fi" || die "failed to enforce the 1Password-backed GitHub SSH remote"
+report "github-identity" ok "1Password-backed id_venkat installed"
 
 # ─── Skills catalog sync (V105) ──────────────────────────────────────────
 # Materialize the DB skills catalog onto disk under ~/.forgefleet/skills/

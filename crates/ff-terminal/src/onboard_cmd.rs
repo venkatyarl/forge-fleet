@@ -1,7 +1,19 @@
-use crate::{CYAN, RESET};
 use anyhow::Result;
 
+const ONBOARDING_TRANSPORT_QUARANTINE: &str = "new-node onboarding is quarantined until the gateway has server-verified TLS transport; no bootstrap command was generated";
+
+fn reject_onboarding_show() -> Result<()> {
+    anyhow::bail!(ONBOARDING_TRANSPORT_QUARANTINE)
+}
+
 pub async fn handle_onboard(cmd: crate::OnboardCommand) -> Result<()> {
+    // Fail before connecting to Postgres or resolving any secret. Until the
+    // dedicated TLS listener exists, Show must not synthesize a command that
+    // implies plaintext onboarding can work.
+    if matches!(&cmd, crate::OnboardCommand::Show { .. }) {
+        return reject_onboarding_show();
+    }
+
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
         .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
@@ -10,45 +22,8 @@ pub async fn handle_onboard(cmd: crate::OnboardCommand) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
 
     match cmd {
-        crate::OnboardCommand::Show {
-            name,
-            ip,
-            ssh_user,
-            role,
-            runtime,
-        } => {
-            let token = ff_agent::fleet_info::fetch_secret("enrollment.shared_secret")
-                .await
-                .or_else(|| std::env::var("FORGEFLEET_ENROLLMENT_TOKEN").ok())
-                .unwrap_or_else(|| "<SET-TOKEN-FIRST>".into());
-            // Leader host: env override → live DB (elected leader's roster IP)
-            // → legacy vinny fallback only if both fail. Keeps the printed
-            // curl correct across failovers instead of pinning dead .100.
-            let db_leader: Option<(String,)> = sqlx::query_as(
-                "SELECT w.ip FROM fleet_leader_state ls
-                 JOIN fleet_workers w ON w.name = ls.member_name
-                 LIMIT 1",
-            )
-            .fetch_optional(&pool)
-            .await
-            .ok()
-            .flatten();
-            let leader = std::env::var("FORGEFLEET_LEADER_HOST")
-                .ok()
-                .or(db_leader.map(|(ip,)| ip))
-                .unwrap_or_else(|| "192.168.5.100".into());
-            let ssh_user = ssh_user.unwrap_or_else(|| name.clone());
-            let ip_q = ip.unwrap_or_else(|| "auto".into());
-            println!("{CYAN}▶ On the new computer, paste:{RESET}\n");
-            // Download-first form: `curl | bash` streaming can truncate
-            // mid-script and abort silently (vinny 2026-08-03). The script
-            // elevates via sudo internally only where needed (macOS: never).
-            println!("curl -fsSL -o /tmp/ff-bootstrap.sh 'http://{leader}:51002/onboard/bootstrap.sh\\");
-            println!("    ?token={token}&name={name}&ip={ip_q}\\");
-            println!("    &ssh_user={ssh_user}&role={role}&runtime={runtime}' \\");
-            println!("  && bash -n /tmp/ff-bootstrap.sh && echo SYNTAX_OK \\");
-            println!("  && bash /tmp/ff-bootstrap.sh");
-            println!("\n  (Or open http://{leader}:51002/onboard in the browser.)");
+        crate::OnboardCommand::Show { .. } => {
+            unreachable!("Show is rejected before database access")
         }
         crate::OnboardCommand::List { limit } => {
             let nodes = ff_db::pg_list_nodes(&pool).await?;
@@ -92,4 +67,37 @@ pub async fn handle_onboard(cmd: crate::OnboardCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WEB_ONBOARDING_PAGE: &str =
+        include_str!("../../../web-forge-fleet/app/(console)/onboarding/page.tsx");
+
+    #[test]
+    fn show_is_fail_closed_without_emitting_a_bootstrap_command() {
+        let message = reject_onboarding_show()
+            .expect_err("Show must remain quarantined")
+            .to_string();
+        assert!(message.contains("server-verified TLS"));
+        assert!(message.contains("no bootstrap command was generated"));
+        assert!(!message.contains("curl"));
+        assert!(!message.contains(&["?", "token="].concat()));
+    }
+
+    #[test]
+    fn web_onboarding_emits_neither_token_query_nor_runnable_bootstrap() {
+        let token_query = ["?", "token="].concat();
+        let shell_bootstrap = ["curl", " -fsSL"].concat();
+        let powershell_bootstrap = ["iwr", " -useb"].concat();
+
+        assert!(WEB_ONBOARDING_PAGE.contains("server-verified TLS"));
+        assert!(WEB_ONBOARDING_PAGE.contains("No bootstrap command was generated"));
+        assert!(!WEB_ONBOARDING_PAGE.contains(&token_query));
+        assert!(!WEB_ONBOARDING_PAGE.contains(&shell_bootstrap));
+        assert!(!WEB_ONBOARDING_PAGE.contains(&powershell_bootstrap));
+        assert!(!WEB_ONBOARDING_PAGE.contains("enrollment.shared_secret"));
+    }
 }

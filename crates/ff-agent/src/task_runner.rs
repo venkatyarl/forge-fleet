@@ -1619,14 +1619,14 @@ pub(crate) fn kill_process_group(pid: u32) {
 #[cfg(not(unix))]
 pub(crate) fn kill_process_group(_pid: u32) {}
 
+const ONBOARDING_TRANSPORT_QUARANTINE: &str = "new-node onboarding is quarantined until the gateway has server-verified TLS transport; no bootstrap task graph was generated";
+
 /// Compose the multi-step "bring `<target>` online" task graph atomically.
 ///
-/// Every node-specific value (IPs, ssh user, role) and every fleet
-/// constant (gateway port) is read from the DB at compose time — no
-/// IPs, names, usernames, or port numbers in source. Ports come from
-/// `fleet_secrets` (seeded by V50: `port.gateway`, …)
-/// so an operator can change one row to change a port fleet-wide
-/// without a recompile.
+/// This producer is deliberately disabled until V289 supplies a dedicated
+/// authenticated TLS enrollment transport. Returning before any DB access is
+/// important: a non-dry-run caller must not enqueue even the parent/probe tasks
+/// for a graph whose bootstrap step cannot be transported securely.
 ///
 /// One task in a composed-but-not-yet-enqueued graph, returned by the
 /// `compose_*` functions when `dry_run` is set. Mirrors the arguments
@@ -1665,247 +1665,48 @@ pub struct ComposePlan {
 /// the leader picks them in order; for a true DAG with edges we'd add
 /// a `depends_on` column to V44.
 ///
-/// When `dry_run` is true NOTHING is written to the DB: the function
-/// reads the same fleet data, composes the identical task graph, and
-/// returns it in [`ComposePlan::tasks`] for preview (the parent is
-/// `None`). When false the real path is byte-for-byte unchanged —
-/// every task is enqueued and `tasks` is empty.
+/// Both dry-run and enqueue modes fail closed without producing a command.
 pub async fn compose_node_bootstrap(
-    pg: &PgPool,
-    target_name: &str,
-    leader_computer_id: uuid::Uuid,
-    dry_run: bool,
+    _pg: &PgPool,
+    _target_name: &str,
+    _leader_computer_id: uuid::Uuid,
+    _dry_run: bool,
 ) -> Result<ComposePlan, sqlx::Error> {
-    let mut planned: Vec<PlannedTask> = Vec::new();
-    // These onboarding steps run on the leader, which after an HA failover can
-    // be a headless Linux follower whose inherited ssh-agent may be wedged —
-    // bypass it the same way the wave SSH does (see `crate::ssh_opts`).
-    let ssh_bypass = SSH_AGENT_BYPASS;
-    // ── 1. Pull everything we need from the DB. ──────────────────────────
-    let target_row = sqlx::query(
-        "SELECT name, primary_ip, all_ips, ssh_user, ssh_port, os_family
-           FROM computers WHERE name = $1",
-    )
-    .bind(target_name)
-    .fetch_optional(pg)
-    .await?
-    .ok_or_else(|| {
-        sqlx::Error::RowNotFound // mapped by caller
-    })?;
+    Err(sqlx::Error::Protocol(
+        ONBOARDING_TRANSPORT_QUARANTINE.to_string(),
+    ))
+}
 
-    let target_name: String = target_row.get("name");
-    let target_primary_ip: String = target_row.get("primary_ip");
-    let target_all_ips_json: serde_json::Value = target_row.get("all_ips");
-    let target_ssh_user: String = target_row.get("ssh_user");
-    let target_ssh_port: i32 = target_row.get("ssh_port");
-    let target_os_family: String = target_row.get("os_family");
+#[cfg(test)]
+mod onboarding_quarantine_tests {
+    use super::*;
 
-    // Flatten all_ips JSONB → Vec<String>. The column may be a list of
-    // strings or a list of {ip,iface,kind,…} objects depending on the
-    // writer's vintage; tolerate both.
-    let target_ips: Vec<String> = match &target_all_ips_json {
-        serde_json::Value::Array(arr) if !arr.is_empty() => arr
-            .iter()
-            .filter_map(|v| match v {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Object(o) => {
-                    o.get("ip").and_then(|x| x.as_str()).map(String::from)
-                }
-                _ => None,
-            })
-            .collect(),
-        _ => vec![target_primary_ip.clone()],
-    };
+    #[tokio::test]
+    async fn composer_fails_before_db_access_or_command_generation() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:9/unused")
+            .expect("lazy pool");
 
-    let leader_ip: String = sqlx::query_scalar("SELECT primary_ip FROM computers WHERE id = $1")
-        .bind(leader_computer_id)
-        .fetch_one(pg)
-        .await?;
-    // Single source of truth: fleet_secrets['port.gateway'] (V50).
-    let gateway_port = read_port_secret(pg, "port.gateway").await?;
-    let gateway_url = format!("http://{leader_ip}:{gateway_port}");
+        let error = compose_node_bootstrap(&pool, "new-node", uuid::Uuid::nil(), true)
+            .await
+            .expect_err("onboarding composer must remain quarantined");
+        let message = error.to_string();
 
-    // ── 2. Parent task. ──────────────────────────────────────────────────
-    let parent_summary = format!("{target_name}: bring online via fleet cooperation");
-    let parent: uuid::Uuid = if dry_run {
-        uuid::Uuid::nil()
-    } else {
-        sqlx::query_scalar(
-            r#"
-        INSERT INTO fleet_tasks (
-            task_type, summary, payload, priority, created_by_computer_id
-        )
-        VALUES ('compound', $1, '{}'::jsonb, 80, $2)
-        RETURNING id
-        "#,
-        )
-        .bind(&parent_summary)
-        .bind(leader_computer_id)
-        .fetch_one(pg)
-        .await?
-    };
-    let port_arg = if target_ssh_port == 22 {
-        String::new()
-    } else {
-        format!(" -p {target_ssh_port}")
-    };
-    let ssh_target_for_iter = format!("{target_ssh_user}@$ip");
-    let ssh_target_primary = format!("{target_ssh_user}@{target_primary_ip}");
-
-    // ── Step 1: probe every known IP. ────────────────────────────────────
-    let ip_list = target_ips.join(" ");
-    let step1 = format!(
-        // ssh -o ConnectTimeout, NOT `timeout 5 ssh`: this step runs on the
-        // LEADER (capability=["leader"]), which is often macOS (vinny/ace)
-        // where `timeout` is not a default command (it's `gtimeout` via
-        // coreutils) — so `timeout 5 ssh` silently breaks the probe on macOS.
-        // ssh's built-in ConnectTimeout is portable and covers the hang case.
-        "set -e; for ip in {ip_list}; do \
-           echo \"== $ip ==\"; \
-           ssh{port_arg} -o ConnectTimeout=5 {ssh_bypass} -o StrictHostKeyChecking=accept-new \
-             {ssh_target_for_iter} 'echo ok && uname -srvmo' || echo 'unreachable'; \
-         done"
-    );
-    let summary1 = format!("{target_name}/1: ssh-probe all known IPs");
-    if dry_run {
-        planned.push(PlannedTask {
-            summary: summary1,
-            command: step1,
-            capabilities: vec!["leader".to_string()],
-            priority: 90,
-            timeout_secs: None,
-            depends_on: None,
-        });
-    } else {
-        pg_enqueue_shell_task(
-            pg,
-            &summary1,
-            &step1,
-            &["leader".to_string()],
-            None,
-            Some(parent),
-            90,
-            Some(leader_computer_id),
-        )
-        .await?;
+        assert!(message.contains("server-verified TLS"));
+        assert!(message.contains("no bootstrap task graph was generated"));
+        assert!(!message.contains("curl"));
+        assert!(!message.contains(&["?", "token="].concat()));
     }
 
-    // ── Step 2: leader runs the bootstrap script. ────────────────────────
-    let step2 = format!(
-        "ssh{port_arg} {ssh_bypass} {ssh_target_primary} \
-         \"curl -fsSL '{gateway_url}/onboard/bootstrap.sh\
-?name={target_name}&ip={target_primary_ip}&ssh_user={target_ssh_user}&role=builder&runtime=auto' \
-         | sudo bash\""
-    );
-    let summary2 = format!("{target_name}/2: install forgefleetd via gateway bootstrap");
-    if dry_run {
-        planned.push(PlannedTask {
-            summary: summary2,
-            command: step2,
-            capabilities: vec!["leader".to_string()],
-            priority: 85,
-            timeout_secs: None,
-            depends_on: None,
-        });
-    } else {
-        pg_enqueue_shell_task(
-            pg,
-            &summary2,
-            &step2,
-            &["leader".to_string()],
-            None,
-            Some(parent),
-            85,
-            Some(leader_computer_id),
-        )
-        .await?;
-    }
+    #[test]
+    fn source_contains_no_dormant_bootstrap_command_or_token_query() {
+        let source = include_str!("task_runner.rs");
+        let bootstrap_script = ["bootstrap", ".sh"].concat();
+        let token_query = ["?", "token="].concat();
 
-    // ── Step 3: verify forgefleetd active. ───────────────────────────────
-    // Unit names are project-fixed deploy artifacts (see deploy/linux/
-    // forgefleet.service and revive.rs fallback chain) — keeping them
-    // here is consistent with treating them as constants. `grep -qx`
-    // (exact line match) avoids the bug where 'inactive' matches.
-    // macOS uses launchctl rather than systemctl; gate the check.
-    let step3 = if target_os_family == "macos" {
-        format!(
-            "ssh{port_arg} {ssh_bypass} {ssh_target_primary} \
-             'launchctl list | grep -E \"com\\.forgefleet\\.(forgefleetd|daemon)\" >/dev/null'"
-        )
-    } else {
-        format!(
-            "ssh{port_arg} {ssh_bypass} {ssh_target_primary} \
-             'systemctl --user is-active forgefleetd.service \
-                || systemctl --user is-active forgefleet-node.service \
-                || systemctl --user is-active forgefleet-daemon.service \
-                || systemctl --user is-active forgefleet-agent.service' \
-             | grep -qx active"
-        )
-    };
-    let summary3 = format!("{target_name}/3: verify forgefleetd running on {target_name}");
-    if dry_run {
-        planned.push(PlannedTask {
-            summary: summary3,
-            command: step3,
-            capabilities: vec!["leader".to_string()],
-            priority: 80,
-            timeout_secs: None,
-            depends_on: None,
-        });
-    } else {
-        pg_enqueue_shell_task(
-            pg,
-            &summary3,
-            &step3,
-            &["leader".to_string()],
-            None,
-            Some(parent),
-            80,
-            Some(leader_computer_id),
-        )
-        .await?;
+        assert!(!source.contains(&bootstrap_script));
+        assert!(!source.contains(&token_query));
     }
-
-    // ── Step 4: confirm online via ff (any peer with ff). ────────────────
-    let step4 = format!(
-        "for i in $(seq 1 30); do \
-           if ff fleet health 2>/dev/null | awk '$1 == \"{target_name}\" {{print $3}}' \
-              | grep -qx online; then \
-             echo '{target_name} online in fleet health'; exit 0; \
-           fi; sleep 2; \
-         done; echo 'timeout: {target_name} still not online after 60s'; exit 1"
-    );
-    let summary4 =
-        format!("{target_name}/4: confirm {target_name} shows online in ff fleet health");
-    if dry_run {
-        planned.push(PlannedTask {
-            summary: summary4,
-            command: step4,
-            capabilities: vec!["ff".to_string()],
-            priority: 75,
-            timeout_secs: None,
-            depends_on: None,
-        });
-    } else {
-        pg_enqueue_shell_task(
-            pg,
-            &summary4,
-            &step4,
-            &["ff".to_string()],
-            None,
-            Some(parent),
-            75,
-            Some(leader_computer_id),
-        )
-        .await?;
-    }
-
-    Ok(ComposePlan {
-        parent: if dry_run { None } else { Some(parent) },
-        parent_summary,
-        tasks: planned,
-        created_tasks: if dry_run { 0 } else { 5 },
-    })
 }
 
 /// Compose a wave-based fleet-upgrade graph for `software_id`.
