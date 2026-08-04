@@ -5459,23 +5459,27 @@ mod tests {
             supply.general_endpoints[0].catalog_id.as_deref(),
             Some("near")
         );
-        assert!(supply
-            .code_endpoints
-            .iter()
-            .chain(&supply.general_endpoints)
-            .all(|row| !matches!(
-                row.catalog_id.as_deref(),
-                Some("retired-code" | "retired-general" | "inactive-code")
-            )));
+        assert!(
+            supply
+                .code_endpoints
+                .iter()
+                .chain(&supply.general_endpoints)
+                .all(|row| !matches!(
+                    row.catalog_id.as_deref(),
+                    Some("retired-code" | "retired-general" | "inactive-code")
+                ))
+        );
 
         let readiness = pg_agent_readiness(&pool, None)
             .await
             .expect("read readiness");
         assert_eq!(readiness.len(), 2);
         assert_eq!(readiness.iter().filter(|row| row.is_code).count(), 1);
-        assert!(readiness
-            .iter()
-            .any(|row| row.catalog_id.as_deref() == Some("mixed") && row.is_code));
+        assert!(
+            readiness
+                .iter()
+                .any(|row| row.catalog_id.as_deref() == Some("mixed") && row.is_code)
+        );
         assert!(readiness.iter().all(|row| !matches!(
             row.catalog_id.as_deref(),
             Some("retired-code" | "retired-general" | "inactive-code")
@@ -5486,9 +5490,11 @@ mod tests {
             .expect("read reprofile candidates");
         assert_eq!(reprofile.len(), 2);
         assert_eq!(reprofile.iter().filter(|row| row.is_code).count(), 1);
-        assert!(reprofile
-            .iter()
-            .any(|row| row.catalog_id.as_deref() == Some("near") && !row.is_code));
+        assert!(
+            reprofile
+                .iter()
+                .any(|row| row.catalog_id.as_deref() == Some("near") && !row.is_code)
+        );
         assert!(reprofile.iter().all(|row| !matches!(
             row.catalog_id.as_deref(),
             Some("retired-code" | "retired-general" | "inactive-code")

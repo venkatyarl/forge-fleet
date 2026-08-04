@@ -43,7 +43,9 @@ pub async fn handle_onboard(cmd: crate::OnboardCommand) -> Result<()> {
             // Download-first form: `curl | bash` streaming can truncate
             // mid-script and abort silently (vinny 2026-08-03). The script
             // elevates via sudo internally only where needed (macOS: never).
-            println!("curl -fsSL -o /tmp/ff-bootstrap.sh 'http://{leader}:51002/onboard/bootstrap.sh\\");
+            println!(
+                "curl -fsSL -o /tmp/ff-bootstrap.sh 'http://{leader}:51002/onboard/bootstrap.sh\\"
+            );
             println!("    ?token={token}&name={name}&ip={ip_q}\\");
             println!("    &ssh_user={ssh_user}&role={role}&runtime={runtime}' \\");
             println!("  && bash -n /tmp/ff-bootstrap.sh && echo SYNTAX_OK \\");
