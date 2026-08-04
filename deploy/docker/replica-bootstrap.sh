@@ -34,6 +34,15 @@ if [ "$(id -u)" = "0" ]; then
   mkdir -p "$PGDATA"
   chown -R postgres:postgres "$(dirname "$PGDATA")"
   chmod 0700 "$PGDATA" || true
+  # Compose implements local secrets as read-only bind mounts. Their host UID
+  # is preserved, so the postgres UID cannot necessarily read the mount after
+  # gosu. Stage a container-local copy while still root, then pass only that
+  # protected path across the privilege drop.
+  STAGED_PGPASS_FILE=/tmp/forgefleet-replication-pgpass
+  install -o postgres -g postgres -m 0600 \
+    "$POSTGRES_REPLICATION_PGPASS_FILE" "$STAGED_PGPASS_FILE"
+  POSTGRES_REPLICATION_PGPASS_FILE="$STAGED_PGPASS_FILE"
+  export POSTGRES_REPLICATION_PGPASS_FILE
   exec gosu postgres "$0" "$@"
 fi
 
@@ -82,6 +91,9 @@ fi
 PGPASSFILE="$PGDATA/.pgpass"
 export PGPASSFILE
 install -m 0600 "$POSTGRES_REPLICATION_PGPASS_FILE" "$PGPASSFILE"
+if [ "$POSTGRES_REPLICATION_PGPASS_FILE" = /tmp/forgefleet-replication-pgpass ]; then
+  rm -f "$POSTGRES_REPLICATION_PGPASS_FILE"
+fi
 
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
   pg_basebackup \

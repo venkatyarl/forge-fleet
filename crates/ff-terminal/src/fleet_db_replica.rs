@@ -726,6 +726,9 @@ mod tests {
         assert!(script.contains("BOOTSTRAP_EVIDENCE"));
         assert!(script.contains("CURRENT_PRIMARY_SLOT"));
         assert!(script.contains("different primary host"));
+        assert!(script.contains("STAGED_PGPASS_FILE=/tmp/forgefleet-replication-pgpass"));
+        assert!(script.contains("install -o postgres -g postgres -m 0600"));
+        assert!(script.contains("rm -f \"$POSTGRES_REPLICATION_PGPASS_FILE\""));
         let compose = include_str!("../../../deploy/docker-compose.follower.yml");
         assert!(!compose.contains("192.168.5.100"));
         assert!(!compose.contains("POSTGRES_PASSWORD: forgefleet"));
