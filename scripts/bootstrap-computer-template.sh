@@ -727,11 +727,18 @@ PY
 python3 "$MESH_PY" > "$MESH_LOG" 2>&1 &
 mesh_pid=$!
 mesh_wait=0
-while kill -0 "$mesh_pid" 2>/dev/null; do
+# Watchdog poll. A finished-but-unreaped child is a ZOMBIE and `kill -0`
+# still succeeds on zombies (the 2026-08-04 vinny run spun here forever) —
+# so reap-detect via ps state, not just existence.
+while :; do
+  if ! kill -0 "$mesh_pid" 2>/dev/null; then break; fi
+  mesh_state="$(ps -o stat= -p "$mesh_pid" 2>/dev/null | tr -d '[:space:]')"
+  case "$mesh_state" in Z* | "") break ;; esac
   sleep 3
   mesh_wait=$((mesh_wait + 3))
   if [ "$mesh_wait" -ge 90 ]; then
     kill -9 "$mesh_pid" 2>/dev/null
+    wait "$mesh_pid" 2>/dev/null
     cat "$MESH_LOG" >&2 || true
     rm -f "$MESH_PY" "$MESH_LOG"
     die "mesh_import timed out after 90s (partial output above) — re-run to retry"
