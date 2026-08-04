@@ -1712,7 +1712,16 @@ async fn handle_pm_decompose(
     .await
     .map_err(|e| anyhow::anyhow!("fleet_oneshot decompose: {e}"))?;
 
-    let tasks = parse_leaf_tasks(&resp.text)?;
+    let tasks = match parse_leaf_tasks(&resp.text, max) {
+        Ok(tasks) => tasks,
+        Err(first_error) => {
+            let repair_prompt = bounded_decomposition_repair_prompt(&resp.text, max, &first_error);
+            let repaired = repair_decomposition_at_same_endpoint(&resp, &repair_prompt).await?;
+            parse_leaf_tasks(&repaired, max).map_err(|e| {
+                anyhow::anyhow!("parse repaired decomposition from same planner: {e}")
+            })?
+        }
+    };
     let tasks = match quality_gate_decomposition(tasks, repo_context.as_ref()) {
         Ok(tasks) => tasks,
         Err(first_error) => {
@@ -1733,7 +1742,7 @@ async fn handle_pm_decompose(
             )
             .await
             .map_err(|e| anyhow::anyhow!("fleet_oneshot decompose regeneration: {e}"))?;
-            let retry_tasks = parse_leaf_tasks(&retry.text)?;
+            let retry_tasks = parse_leaf_tasks(&retry.text, max)?;
             quality_gate_decomposition(retry_tasks, repo_context.as_ref()).map_err(|e| {
                 anyhow::anyhow!("decomposition quality gate failed after regeneration: {e}")
             })?
@@ -1801,16 +1810,119 @@ async fn handle_pm_decompose(
     Ok(())
 }
 
-fn parse_leaf_tasks(text: &str) -> Result<Vec<LeafTask>> {
+const MAX_REPAIR_RESPONSE_CHARS: usize = 16_384;
+
+fn bounded_decomposition_repair_prompt(text: &str, max: usize, error: &anyhow::Error) -> String {
+    let response = text
+        .chars()
+        .take(MAX_REPAIR_RESPONSE_CHARS)
+        .collect::<String>();
+    format!(
+        "Repair the planner response below. Output ONLY one strict JSON array of at most {max} task objects; no prose, markdown, coercion, or omitted required fields. Parse error: {error}\n\n{response}"
+    )
+}
+
+async fn repair_decomposition_at_same_endpoint(
+    original: &ff_agent::fleet_oneshot::FleetOneshot,
+    prompt: &str,
+) -> Result<String> {
+    let url = ff_core::url::normalize_chat_completions_url(&original.endpoint);
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()?
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": original.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": false,
+            "max_tokens": 4096,
+            "temperature": 0.0,
+        }))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("repair POST {url}: {e}"))?;
+    let status = response.status();
+    let payload: serde_json::Value = response.json().await?;
+    if !status.is_success() {
+        return Err(anyhow::anyhow!(
+            "same-endpoint planner repair returned HTTP {status}: {}",
+            payload.to_string().chars().take(400).collect::<String>()
+        ));
+    }
+    payload["choices"][0]["message"]["content"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("same-endpoint planner repair returned no text"))
+}
+
+fn parse_leaf_tasks(text: &str, max: usize) -> Result<Vec<LeafTask>> {
     let text = text.trim();
-    let json_slice = match (text.find('['), text.rfind(']')) {
-        (Some(a), Some(b)) if b > a => &text[a..=b],
-        _ => return Err(anyhow::anyhow!("LLM did not return a JSON array")),
-    };
-    let tasks: Vec<LeafTask> = serde_json::from_str(json_slice)
-        .map_err(|e| anyhow::anyhow!("parse decomposed tasks JSON: {e}"))?;
+    if let Ok(tasks) = serde_json::from_str::<Vec<LeafTask>>(text) {
+        return validate_leaf_task_count(tasks, max);
+    }
+
+    let bytes = text.as_bytes();
+    let mut valid: Option<Vec<LeafTask>> = None;
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, &byte) in bytes.iter().enumerate() {
+        if let Some(array_start) = start {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => in_string = true,
+                b'[' | b'{' => depth += 1,
+                b']' | b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        if let Ok(tasks) =
+                            serde_json::from_str::<Vec<LeafTask>>(&text[array_start..=index])
+                        {
+                            if valid.is_some() {
+                                return Err(anyhow::anyhow!(
+                                    "LLM returned more than one valid JSON task array"
+                                ));
+                            }
+                            valid = Some(tasks);
+                        }
+                        start = None;
+                    }
+                }
+                _ => {}
+            }
+        } else if byte == b'[' {
+            start = Some(index);
+            depth = 1;
+            in_string = false;
+            escaped = false;
+        }
+    }
+
+    let tasks =
+        valid.ok_or_else(|| anyhow::anyhow!("LLM did not return a valid JSON task array"))?;
+    validate_leaf_task_count(tasks, max)
+}
+
+fn validate_leaf_task_count(tasks: Vec<LeafTask>, max: usize) -> Result<Vec<LeafTask>> {
     if tasks.is_empty() {
         return Err(anyhow::anyhow!("LLM returned zero tasks"));
+    }
+    if tasks.len() > max {
+        return Err(anyhow::anyhow!(
+            "LLM returned {} tasks, exceeding maximum {max}",
+            tasks.len()
+        ));
     }
     Ok(tasks)
 }
@@ -3202,6 +3314,49 @@ mod tests {
             .await
             .unwrap();
         admin.close().await;
+    }
+
+    const LEAF_JSON: &str = r#"[{"title":"edit parser","description":"make it strict","files":["src/lib.rs"],"complexity":"mechanical","acceptance_criteria":["compiles"]}]"#;
+
+    #[test]
+    fn parse_leaf_tasks_accepts_wrapped_and_fenced_array() {
+        let tasks = parse_leaf_tasks(&format!("result:\n```json\n{LEAF_JSON}\n```"), 4).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "edit parser");
+    }
+
+    #[test]
+    fn parse_leaf_tasks_rejects_ambiguous_arrays() {
+        let error = parse_leaf_tasks(&format!("{LEAF_JSON}\n{LEAF_JSON}"), 4).unwrap_err();
+        assert!(error.to_string().contains("more than one"));
+    }
+
+    #[test]
+    fn parse_leaf_tasks_bounds_bracket_soup() {
+        let soup = "[".repeat(100_000);
+        assert!(parse_leaf_tasks(&soup, 4).is_err());
+    }
+
+    #[test]
+    fn parse_leaf_tasks_handles_strings_escapes_and_nesting() {
+        let json = r#"[{"title":"brackets [ ] and quote \"","description":"nested escapes \\\\ [ok]","files":["src/[parser].rs"],"acceptance_criteria":["object { nested }"]}]"#;
+        let tasks = parse_leaf_tasks(&format!("before {json} after"), 2).unwrap();
+        assert_eq!(tasks[0].title, "brackets [ ] and quote \"");
+        assert_eq!(tasks[0].files, ["src/[parser].rs"]);
+    }
+
+    #[test]
+    fn parse_leaf_tasks_handles_utf8_wrappers_and_values() {
+        let json = r#"[{"title":"修复解析器 🚀","description":"préserve UTF-8","files":[]}]"#;
+        let tasks = parse_leaf_tasks(&format!("前置说明\n{json}\nfin"), 2).unwrap();
+        assert_eq!(tasks[0].title, "修复解析器 🚀");
+    }
+
+    #[test]
+    fn parse_leaf_tasks_enforces_maximum() {
+        let two = format!("[{0},{0}]", &LEAF_JSON[1..LEAF_JSON.len() - 1]);
+        let error = parse_leaf_tasks(&two, 1).unwrap_err();
+        assert!(error.to_string().contains("exceeding maximum 1"));
     }
 
     async fn seed_bind_repo(pool: &sqlx::PgPool) -> (uuid::Uuid, uuid::Uuid) {
