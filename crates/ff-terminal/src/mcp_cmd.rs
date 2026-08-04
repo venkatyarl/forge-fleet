@@ -676,8 +676,13 @@ fn config_has_forgefleet(path: &std::path::Path) -> bool {
     {
         return serde_json::from_str::<Value>(&contents)
             .ok()
-            .and_then(|doc| doc.get("mcpServers")?.get("forgefleet").cloned())
-            .is_some();
+            .and_then(|doc| {
+                doc.get("mcpServers")?
+                    .as_object()?
+                    .get("forgefleet")
+                    .cloned()
+            })
+            .is_some_and(|server| server.is_object());
     }
     contents.contains("forgefleet")
 }
@@ -791,6 +796,31 @@ mod tests {
         assert_eq!(malformed["exists"], true);
         assert_eq!(malformed["forgefleet_installed"], false);
         assert_eq!(malformed["state"], "not_installed");
+    }
+
+    #[test]
+    fn kimi_status_requires_forgefleet_server_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join(".kimi-code").join("mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+
+        for (value, expected_state) in [
+            (serde_json::json!(null), "not_installed"),
+            (serde_json::json!("forgefleet"), "not_installed"),
+            (serde_json::json!([]), "not_installed"),
+            (serde_json::json!({}), "installed"),
+        ] {
+            std::fs::write(
+                &config,
+                serde_json::json!({"mcpServers": {"forgefleet": value}}).to_string(),
+            )
+            .unwrap();
+            let row = status_rows(temp.path())
+                .into_iter()
+                .find(|row| row["client"] == "kimi")
+                .unwrap();
+            assert_eq!(row["state"], expected_state, "server value: {value}");
+        }
     }
 
     #[test]
