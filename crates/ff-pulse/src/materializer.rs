@@ -589,6 +589,47 @@ impl Materializer {
                 .execute(&self.pg)
                 .await?;
 
+            // The Redis snapshot captures the reported installed version, but
+            // not software_registry.latest_version. Re-project stable status
+            // before returning so a registry-only release change cannot leave
+            // an unchanged beat permanently stuck at the old status.
+            if let Err(e) = self.recompute_stable_software_statuses(computer_id).await {
+                tracing::warn!(
+                    computer = %beat.computer_name,
+                    error = %e,
+                    "materializer: stable software status projection failed"
+                );
+            }
+
+            // A new data-driven OS rule can arrive after Redis already cached
+            // the beat. Ensure the singular current Ubuntu projection exists
+            // even on this fast path, then retire mutually-exclusive older
+            // projections only after that upsert succeeds.
+            if let Some(current_ubuntu) = current_ubuntu_projection(&beat.installed_software) {
+                match self.upsert_software(computer_id, current_ubuntu).await {
+                    Ok(_) => {
+                        report.software_upserts += 1;
+                        if let Err(e) = self
+                            .retire_other_ubuntu_projections(computer_id, &current_ubuntu.id)
+                            .await
+                        {
+                            tracing::warn!(
+                                computer = %beat.computer_name,
+                                current_ubuntu = %current_ubuntu.id,
+                                error = %e,
+                                "materializer: failed to retire stale Ubuntu projections"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        computer = %beat.computer_name,
+                        software_id = %current_ubuntu.id,
+                        error = %e,
+                        "materializer: current Ubuntu projection upsert failed; preserving older projections"
+                    ),
+                }
+            }
+
             // Refresh the TTL on the snapshot so it doesn't expire mid-stream.
             let _: Result<(), _> = redis_conn
                 .set_ex(
@@ -888,10 +929,14 @@ impl Materializer {
         // V64 adds the missing registry rows. This change makes the loop
         // resilient even if the schemas drift again: log + skip unknown
         // software_ids, keep processing the rest of the beat.
+        let current_ubuntu_id = current_ubuntu_projection(&beat.installed_software)
+            .map(|software| software.id.as_str());
+        let mut current_ubuntu_persisted = false;
         for sw in &beat.installed_software {
             match self.upsert_software(computer_id, sw).await {
                 Ok(_) => {
                     report.software_upserts += 1;
+                    current_ubuntu_persisted |= current_ubuntu_id == Some(sw.id.as_str());
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -902,6 +947,19 @@ impl Materializer {
                     );
                 }
             }
+        }
+        if current_ubuntu_persisted
+            && let Some(current_ubuntu_id) = current_ubuntu_id
+            && let Err(e) = self
+                .retire_other_ubuntu_projections(computer_id, current_ubuntu_id)
+                .await
+        {
+            tracing::warn!(
+                computer = %beat.computer_name,
+                current_ubuntu = current_ubuntu_id,
+                error = %e,
+                "materializer: failed to retire stale Ubuntu projections"
+            );
         }
 
         // Model presence upserts (Q10).
@@ -1029,16 +1087,13 @@ impl Materializer {
                 .flatten()
         });
 
-        let new_status: &str = match latest_version.as_deref() {
-            Some(lv) if !lv.is_empty() && lv != sw.version => "upgrade_available",
-            _ => "ok",
-        };
+        let new_status = projected_software_status(&sw.version, latest_version.as_deref());
 
         // Q8: UPSERT.
         //
-        // Only bump `status` when installed_version itself changed: we
-        // compare the pre-existing row's installed_version to the incoming
-        // one in the ON CONFLICT clause using a WHERE on the excluded row.
+        // Recompute stable status even when installed_version is unchanged:
+        // software_registry.latest_version may have advanced independently.
+        // Preserve in-flight/terminal states written by upgrade machinery.
         //
         // `metadata` is merged into the existing row (jsonb concat) so
         // keys like `git_state` are preserved across beats that don't
@@ -1058,6 +1113,8 @@ impl Materializer {
                 status = CASE \
                     WHEN computer_software.installed_version IS DISTINCT FROM EXCLUDED.installed_version \
                         THEN EXCLUDED.status \
+                    WHEN computer_software.status IN ('ok', 'upgrade_available', 'absent') \
+                        THEN EXCLUDED.status \
                     ELSE computer_software.status \
                 END",
         )
@@ -1072,6 +1129,73 @@ impl Materializer {
         .await?;
 
         Ok(())
+    }
+
+    /// Recompute only passive status projections. Upgrade-owned states such
+    /// as `upgrading`, `failed`, and `upgrade_blocked_dirty` are deliberately
+    /// excluded so a pulse cannot erase workflow state.
+    async fn recompute_stable_software_statuses(
+        &self,
+        computer_id: Uuid,
+    ) -> Result<u64, MaterializerError> {
+        let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT cs.software_id,
+                    COALESCE(cs.installed_version, ''),
+                    cs.status,
+                    sr.latest_version
+               FROM computer_software cs
+               JOIN software_registry sr ON sr.id = cs.software_id
+              WHERE cs.computer_id = $1
+                AND cs.status IN ('ok', 'upgrade_available')",
+        )
+        .bind(computer_id)
+        .fetch_all(&self.pg)
+        .await?;
+
+        let mut updated = 0;
+        for (software_id, installed_version, old_status, latest_version) in rows {
+            let projected =
+                projected_software_status(&installed_version, latest_version.as_deref());
+            if projected == old_status {
+                continue;
+            }
+            updated += sqlx::query(
+                "UPDATE computer_software
+                    SET status = $3
+                  WHERE computer_id = $1
+                    AND software_id = $2
+                    AND status = $4
+                    AND status IN ('ok', 'upgrade_available')",
+            )
+            .bind(computer_id)
+            .bind(&software_id)
+            .bind(projected)
+            .bind(&old_status)
+            .execute(&self.pg)
+            .await?
+            .rows_affected();
+        }
+        Ok(updated)
+    }
+
+    async fn retire_other_ubuntu_projections(
+        &self,
+        computer_id: Uuid,
+        current_software_id: &str,
+    ) -> Result<u64, MaterializerError> {
+        Ok(sqlx::query(
+            "UPDATE computer_software
+                SET status = 'absent', last_checked_at = NOW()
+              WHERE computer_id = $1
+                AND software_id LIKE 'os-ubuntu-%'
+                AND software_id <> $2
+                AND status IS DISTINCT FROM 'absent'",
+        )
+        .bind(computer_id)
+        .bind(current_software_id)
+        .execute(&self.pg)
+        .await?
+        .rows_affected())
     }
 
     async fn upsert_model_presence(
@@ -1609,6 +1733,34 @@ fn can_use_last_seen_fast_path(
     snapshots_match && !status_changed && !persistent_row_differ
 }
 
+/// Project passive inventory status from the two authoritative versions.
+/// Uses the shared ForgeFleet comparison so full/prefix SHAs and vendor
+/// semver wrappers do not create phantom drift.
+fn projected_software_status(
+    installed_version: &str,
+    latest_version: Option<&str>,
+) -> &'static str {
+    match latest_version {
+        Some(latest)
+            if !latest.trim().is_empty()
+                && !ff_core::build_version::is_same_version(installed_version, latest) =>
+        {
+            "upgrade_available"
+        }
+        _ => "ok",
+    }
+}
+
+/// Return a current Ubuntu projection only when the beat reports exactly one.
+/// Ambiguous beats must never retire every competing OS row.
+fn current_ubuntu_projection(software: &[InstalledSoftware]) -> Option<&InstalledSoftware> {
+    let mut ubuntu = software
+        .iter()
+        .filter(|entry| entry.id.starts_with("os-ubuntu-"));
+    let current = ubuntu.next()?;
+    ubuntu.next().is_none().then_some(current)
+}
+
 fn computer_row_has_empty_node_attributes(primary_ip: Option<&str>, ram_gb: Option<i32>) -> bool {
     primary_ip.is_none_or(str::is_empty) || ram_gb.is_none_or(|ram| ram <= 0)
 }
@@ -1783,6 +1935,50 @@ mod tests {
         let sa = PersistedSnapshot::from_beat(&a);
         let sb = PersistedSnapshot::from_beat(&b);
         assert_ne!(sa, sb, "version bump must invalidate snapshot");
+    }
+
+    #[test]
+    fn registry_latest_change_reprojects_unchanged_installed_version() {
+        assert_eq!(projected_software_status("1.131.0", Some("1.131.0")), "ok");
+        assert_eq!(
+            projected_software_status("1.131.0", Some("1.132.0")),
+            "upgrade_available"
+        );
+        assert_eq!(
+            projected_software_status("1.132.0", Some("1.132.0")),
+            "ok",
+            "a registry correction back to the installed version clears passive drift"
+        );
+        assert_eq!(
+            projected_software_status("7dc2a6b37d", Some("7dc2a6b37dfd")),
+            "ok",
+            "prefix-equivalent commit SHAs are the same installed build"
+        );
+    }
+
+    #[test]
+    fn ubuntu_projection_requires_one_unambiguous_current_release() {
+        let ubuntu_2604 = InstalledSoftware {
+            id: "os-ubuntu-26.04".to_string(),
+            version: "26.04".to_string(),
+            install_source: Some("system".to_string()),
+            install_path: None,
+            metadata: None,
+        };
+        assert_eq!(
+            current_ubuntu_projection(std::slice::from_ref(&ubuntu_2604)).map(|sw| sw.id.as_str()),
+            Some("os-ubuntu-26.04")
+        );
+
+        let ubuntu_2404 = InstalledSoftware {
+            id: "os-ubuntu-24.04".to_string(),
+            version: "24.04".to_string(),
+            ..ubuntu_2604.clone()
+        };
+        assert!(
+            current_ubuntu_projection(&[ubuntu_2404, ubuntu_2604]).is_none(),
+            "ambiguous OS evidence must not retire any projection"
+        );
     }
 
     #[test]

@@ -92,6 +92,21 @@ fn restart_spec(library_id: Option<String>, port: i32) -> Option<(String, u16)> 
     Some((library_id?, port))
 }
 
+/// Return the linked library that may be projected `hot` after a reconcile.
+/// Health is deliberately insufficient: the caller must also prove that the
+/// listener is the deployment's recorded process incarnation or the MainPID
+/// of its ForgeFleet-written systemd unit.
+fn authenticated_hot_library<'a>(
+    healthy: bool,
+    desired_state: &str,
+    identity_authenticated: bool,
+    library_id: Option<&'a str>,
+) -> Option<&'a str> {
+    (healthy && desired_state == "active" && identity_authenticated)
+        .then_some(library_id)
+        .flatten()
+}
+
 pub async fn restart_hung_local_deployments(pool: &sqlx::PgPool) -> u64 {
     let gate = ff_db::pg_read_gate_value(pool, "deployment_autorestart_mode", "off", "off").await;
     let enabled = autorestart_enabled(gate.as_deref().ok());
@@ -240,7 +255,10 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
                 .as_deref()
                 .and_then(|library_id| libs.iter().find(|lib| lib.id == library_id))
                 .map(|lib| lib.file_path.clone());
-            let model_matches_row = match (existing_lib_path.as_deref(), proc_info.model_path.as_deref()) {
+            let model_matches_row = match (
+                existing_lib_path.as_deref(),
+                proc_info.model_path.as_deref(),
+            ) {
                 (Some(expected), Some(actual)) => {
                     crate::model_runtime::model_paths_match(expected, actual)
                 }
@@ -310,7 +328,7 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
             // Guard on the identity we authenticated against (the previously
             // recorded pid/marker), and persist the live incarnation — for a
             // re-adopted supervised restart that rewrites pid + start marker.
-            if let Err(e) = sqlx::query(
+            let refresh_result = sqlx::query(
                 "UPDATE fleet_model_deployments
                     SET health_status = $1,
                         last_health_at = NOW(),
@@ -336,17 +354,73 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
             .bind(existing.pid)
             .bind(existing.process_start_marker.as_deref())
             .execute(pool)
-            .await
-            {
-                tracing::warn!("failed to refresh deployment {}: {e}", existing.id);
-            } else {
-                summary.refreshed += 1;
-                if usable.is_some() {
-                    tracing::info!(
-                        port,
-                        usable_agent_ctx = usable,
-                        "backfilled agent ctx for adopted deployment"
+            .await;
+            match refresh_result {
+                Err(e) => tracing::warn!("failed to refresh deployment {}: {e}", existing.id),
+                Ok(result) if result.rows_affected() != 1 => {
+                    tracing::warn!(
+                        deployment = %existing.id,
+                        rows_affected = result.rows_affected(),
+                        "authenticated deployment refresh lost its identity race; refusing library projection"
                     );
+                }
+                Ok(_) => {
+                    summary.refreshed += 1;
+                    if usable.is_some() {
+                        tracing::info!(
+                            port,
+                            usable_agent_ctx = usable,
+                            "backfilled agent ctx for adopted deployment"
+                        );
+                    }
+
+                    // A supervised server can come back with a new PID after a
+                    // reboot while its library row remains `cold`. Restore that
+                    // derived projection only after both the live identity proof
+                    // above and the compare-and-swap deployment refresh succeed.
+                    // The EXISTS clause re-checks active/healthy identity in the
+                    // database, so an unauthenticated health endpoint can never
+                    // heat a library by itself.
+                    let identity_authenticated =
+                        recorded_identity_matches || supervised_restart_matches;
+                    if let Some(library_id) = authenticated_hot_library(
+                        healthy,
+                        &existing.desired_state,
+                        identity_authenticated,
+                        existing.library_id.as_deref(),
+                    ) {
+                        if let Err(e) = sqlx::query(
+                            "UPDATE fleet_model_library lib
+                            SET state = 'hot', last_used_at = NOW()
+                          WHERE lib.id = $1::uuid
+                            AND lib.state IS DISTINCT FROM 'hot'
+                            AND EXISTS (
+                                SELECT 1
+                                  FROM fleet_model_deployments deployment
+                                 WHERE deployment.id = $2::uuid
+                                   AND deployment.library_id = lib.id
+                                   AND deployment.desired_state = 'active'
+                                   AND deployment.health_status = 'healthy'
+                                   AND deployment.pid = $3
+                                   AND deployment.process_start_marker
+                                       IS NOT DISTINCT FROM $4
+                            )",
+                        )
+                        .bind(library_id)
+                        .bind(&existing.id)
+                        .bind(proc_info.pid as i32)
+                        .bind(live_marker.as_deref())
+                        .execute(pool)
+                        .await
+                        {
+                            tracing::warn!(
+                                deployment = %existing.id,
+                                library_id,
+                                error = %e,
+                                "failed to project authenticated healthy deployment library hot"
+                            );
+                        }
+                    }
                 }
             }
         } else {
@@ -781,6 +855,28 @@ mod tests {
             restart_spec(Some("library-id".to_string()), i32::from(u16::MAX) + 1),
             None
         );
+    }
+
+    #[test]
+    fn hot_projection_requires_healthy_active_authenticated_link() {
+        assert_eq!(
+            authenticated_hot_library(true, "active", true, Some("library-id")),
+            Some("library-id")
+        );
+        assert_eq!(
+            authenticated_hot_library(true, "active", false, Some("library-id")),
+            None,
+            "a healthy unauthenticated endpoint is not placement authority"
+        );
+        assert_eq!(
+            authenticated_hot_library(false, "active", true, Some("library-id")),
+            None
+        );
+        assert_eq!(
+            authenticated_hot_library(true, "retired", true, Some("library-id")),
+            None
+        );
+        assert_eq!(authenticated_hot_library(true, "active", true, None), None);
     }
 
     fn lib(id: &str, catalog_id: &str) -> ff_db::ModelLibraryRow {

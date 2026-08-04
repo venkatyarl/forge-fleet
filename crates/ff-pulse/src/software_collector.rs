@@ -226,7 +226,6 @@ fn detect_python_module(rule: &DetectionRule) -> Option<InstalledSoftware> {
 fn detect_os_release(rule: &DetectionRule) -> Option<InstalledSoftware> {
     let det = &rule.detection;
     let expected_id = det.get("expected_id").and_then(|v| v.as_str());
-    let expected_version_prefix = det.get("expected_version_prefix").and_then(|v| v.as_str());
     let expected_kernel_contains = det.get("expected_kernel_contains").and_then(|v| v.as_str());
 
     match std::env::consts::OS {
@@ -264,28 +263,7 @@ fn detect_os_release(rule: &DetectionRule) -> Option<InstalledSoftware> {
             }
             // /etc/os-release ID + VERSION_ID match.
             let osr = std::fs::read_to_string("/etc/os-release").ok()?;
-            let id = regex_capture(&osr, r#"^ID\s*=\s*"?([^"\n]+)"?"#)
-                .or_else(|| regex_capture(&osr, r#"\nID\s*=\s*"?([^"\n]+)"?"#))
-                .unwrap_or_default();
-            if let Some(want) = expected_id
-                && id != want
-            {
-                return None;
-            }
-            let version_id =
-                regex_capture(&osr, r#"VERSION_ID\s*=\s*"([^"]+)""#).unwrap_or_default();
-            if let Some(prefix) = expected_version_prefix
-                && !version_id.starts_with(prefix)
-            {
-                return None;
-            }
-            Some(InstalledSoftware {
-                id: rule.software_id.clone(),
-                version: version_id,
-                install_source: Some("system".into()),
-                install_path: None,
-                metadata: None,
-            })
+            detect_linux_os_release(rule, &osr)
         }
         "windows" => {
             if expected_id != Some("windows") {
@@ -309,6 +287,38 @@ fn detect_os_release(rule: &DetectionRule) -> Option<InstalledSoftware> {
         }
         _ => None,
     }
+}
+
+/// Pure `/etc/os-release` matcher used by the Linux probe and fixture tests.
+/// Keeping the version-prefix comparison here makes a newly registered Ubuntu
+/// release immediately recognizable without adding another hard-coded branch.
+fn detect_linux_os_release(rule: &DetectionRule, os_release: &str) -> Option<InstalledSoftware> {
+    let expected_id = rule
+        .detection
+        .get("expected_id")
+        .and_then(|value| value.as_str());
+    let expected_version_prefix = rule
+        .detection
+        .get("expected_version_prefix")
+        .and_then(|value| value.as_str());
+    let id = regex_capture(os_release, r#"^ID\s*=\s*"?([^"\n]+)"?"#)
+        .or_else(|| regex_capture(os_release, r#"\nID\s*=\s*"?([^"\n]+)"?"#))
+        .unwrap_or_default();
+    if expected_id.is_some_and(|want| id != want) {
+        return None;
+    }
+    let version_id =
+        regex_capture(os_release, r#"VERSION_ID\s*=\s*"?([^"\n]+)"?"#).unwrap_or_default();
+    if expected_version_prefix.is_some_and(|prefix| !version_id.starts_with(prefix)) {
+        return None;
+    }
+    Some(InstalledSoftware {
+        id: rule.software_id.clone(),
+        version: version_id,
+        install_source: Some("system".into()),
+        install_path: None,
+        metadata: None,
+    })
 }
 
 /// Expand `$HOME` (and bare `~`) in path templates loaded from JSONB.
@@ -588,6 +598,18 @@ fn classify_pkg_source_for(path: &str, os: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn ubuntu_rule(software_id: &str, version: &str) -> DetectionRule {
+        DetectionRule {
+            software_id: software_id.to_string(),
+            display_name: software_id.to_string(),
+            detection: serde_json::json!({
+                "method": "os_release",
+                "expected_id": "ubuntu",
+                "expected_version_prefix": version,
+            }),
+        }
+    }
+
     #[test]
     fn new_with_empty_registry_returns_empty_inventory() {
         // V66+: collector reads from the global detection_registry cache,
@@ -606,6 +628,22 @@ mod tests {
         // With an empty registry cache, known_ids() is also empty.
         let c = SoftwareCollector::new();
         assert!(c.known_ids().is_empty());
+    }
+
+    #[test]
+    fn ubuntu_2604_rule_matches_only_2604_os_release() {
+        let ubuntu_2604 = "NAME=Ubuntu\nID=ubuntu\nVERSION_ID=\"26.04\"\n";
+        let detected =
+            detect_linux_os_release(&ubuntu_rule("os-ubuntu-26.04", "26.04"), ubuntu_2604)
+                .expect("Ubuntu 26.04 registry rule should match Ubuntu 26.04");
+        assert_eq!(detected.id, "os-ubuntu-26.04");
+        assert_eq!(detected.version, "26.04");
+
+        assert!(
+            detect_linux_os_release(&ubuntu_rule("os-ubuntu-24.04", "24.04"), ubuntu_2604,)
+                .is_none(),
+            "mutually exclusive older Ubuntu projections must not match 26.04"
+        );
     }
 
     #[test]

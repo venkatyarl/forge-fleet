@@ -12617,6 +12617,40 @@ VALUES (
 ON CONFLICT (key) DO NOTHING;
 "#;
 
+/// v288: register Ubuntu 26.04 as a data-driven software projection. The
+/// collector reads these rules from Postgres; without this FK-owned registry
+/// row a correct 26.04 beat cannot be materialized at all.
+pub const SCHEMA_V288_UBUNTU_2604_SOFTWARE_PROJECTION: &str = r#"
+INSERT INTO software_registry (
+    id,
+    display_name,
+    kind,
+    applies_to_os_family,
+    version_source,
+    upgrade_playbook,
+    requires_restart,
+    requires_reboot,
+    detection
+)
+VALUES (
+    'os-ubuntu-26.04',
+    'Ubuntu 26.04 LTS',
+    'os',
+    'linux-ubuntu',
+    '{"method":"apt_dist"}'::jsonb,
+    '{"linux-ubuntu":"sudo apt-get update && sudo apt-get -y dist-upgrade"}'::jsonb,
+    TRUE,
+    TRUE,
+    '{"method":"os_release","expected_id":"ubuntu","expected_version_prefix":"26.04"}'::jsonb
+)
+ON CONFLICT (id) DO UPDATE SET
+    detection = COALESCE(software_registry.detection, EXCLUDED.detection),
+    applies_to_os_family = COALESCE(
+        software_registry.applies_to_os_family,
+        EXCLUDED.applies_to_os_family
+    );
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

@@ -1285,6 +1285,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "ssh_mesh_auto_repair_gate",
         sql: schema::SCHEMA_V287_SSH_MESH_AUTO_REPAIR_GATE,
     },
+    PgMigration {
+        version: 288,
+        name: "ubuntu_2604_software_projection",
+        sql: schema::SCHEMA_V288_UBUNTU_2604_SOFTWARE_PROJECTION,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -3107,5 +3112,28 @@ mod tests {
         assert!(migration.sql.contains("'ssh_mesh_auto_repair_enabled'"));
         assert!(migration.sql.contains("'true'"));
         assert!(migration.sql.contains("ON CONFLICT (key) DO NOTHING"));
+    }
+
+    #[test]
+    fn v288_registers_ubuntu_2604_detection_idempotently() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 288)
+            .expect("V288 must be registered");
+        assert_eq!(migration.name, "ubuntu_2604_software_projection");
+        assert!(migration.sql.contains("'os-ubuntu-26.04'"));
+        assert!(migration.sql.contains("'Ubuntu 26.04 LTS'"));
+        assert!(migration.sql.contains("\"method\":\"os_release\""));
+        assert!(
+            migration
+                .sql
+                .contains("\"expected_version_prefix\":\"26.04\"")
+        );
+        assert!(migration.sql.contains("ON CONFLICT (id) DO UPDATE SET"));
+        assert!(
+            migration
+                .sql
+                .contains("COALESCE(software_registry.detection")
+        );
     }
 }
