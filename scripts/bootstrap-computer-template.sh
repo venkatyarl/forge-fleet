@@ -667,8 +667,10 @@ report "mesh_import" running
 # heredoc) under a 90s watchdog with captured output: the 2026-08-03 vinny
 # onboard hung silently INSIDE this step with zero diagnostics — a hang the
 # EXIT trap cannot see — so now it logs visibly and times out loudly.
-MESH_PY="$(mktemp /tmp/forgefleet-mesh-import.XXXXXX.py)"
-MESH_LOG="$(mktemp /tmp/forgefleet-mesh-import.XXXXXX.log)"
+# Suffix-free mktemp templates — GNU mktemp accepts `XXXXXX.py` suffixes but
+# stock macOS (BSD) mktemp rejects them, killing the step instantly.
+MESH_PY="$(mktemp /tmp/forgefleet-mesh-import-py.XXXXXX)"
+MESH_LOG="$(mktemp /tmp/forgefleet-mesh-import-log.XXXXXX)"
 cat > "$MESH_PY" <<PY
 import json, os, sys, pathlib
 data = json.loads('''$ENROLL_RESP''')
