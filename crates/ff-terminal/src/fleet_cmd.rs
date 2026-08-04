@@ -620,33 +620,51 @@ pub async fn handle_fleet_db(pool: &sqlx::PgPool, cmd: FleetDbCommand) -> Result
         FleetDbCommand::Backup { kind, now } => {
             handle_fleet_db_backup_now(pool, &kind, now).await?;
         }
-        FleetDbCommand::Drill { on } => {
-            handle_fleet_db_drill(pool, on.as_deref()).await?;
+        FleetDbCommand::Drill {
+            backup_id,
+            run_id,
+            on,
+        } => {
+            handle_fleet_db_drill(pool, &backup_id, run_id.as_deref(), on.as_deref()).await?;
         }
     }
     Ok(())
 }
 
-/// `ff fleet db drill` — run the backup restore-drill on demand. Shares the
-/// exact path (`RestoreDrillTick::run_record_and_alert`) the daily leader tick
-/// uses: decrypt → extract → validate the newest Postgres backup, record to
-/// `backup_drills`, alert on failure. Exits non-zero on a failed drill.
-pub async fn handle_fleet_db_drill(pool: &sqlx::PgPool, on: Option<&str>) -> Result<()> {
+/// `ff fleet db drill --backup-id <uuid>` — run one identity-fenced backup
+/// restore-drill. No caller path is allowed to substitute newest/local data.
+pub async fn handle_fleet_db_drill(
+    pool: &sqlx::PgPool,
+    backup_id: &str,
+    run_id: Option<&str>,
+    on: Option<&str>,
+) -> Result<()> {
+    let backup_id = uuid::Uuid::parse_str(backup_id)
+        .map_err(|error| anyhow::anyhow!("invalid --backup-id UUID: {error}"))?;
+    let run_id = match run_id {
+        Some(run_id) => uuid::Uuid::parse_str(run_id)
+            .map_err(|error| anyhow::anyhow!("invalid --run-id UUID: {error}"))?,
+        None => uuid::Uuid::new_v4(),
+    };
     let my_name = ff_agent::fleet_info::resolve_this_worker_name().await;
     // Cross-node: dispatch the drill to a remote computer via the deferred-task
     // queue and report back its result. Proves DR-readiness on the node that
     // would actually take over (the backup fanned out there AND restores).
     if let Some(node) = on {
         if !node.eq_ignore_ascii_case(&my_name) {
-            return enqueue_remote_drill(pool, node, &my_name).await;
+            return enqueue_remote_drill(pool, node, &my_name, backup_id, run_id).await;
         }
     }
-    println!("{CYAN}▶ ff fleet db drill{RESET}  (node={my_name})");
+    println!(
+        "{CYAN}▶ ff fleet db drill{RESET}  (node={my_name}, backup={backup_id}, run={run_id})"
+    );
     let tick = ff_agent::ha::restore_drill::RestoreDrillTick::new(pool.clone(), my_name);
-    let o = tick.run_record_and_alert().await;
+    let o = tick.run_record_and_alert_exact(backup_id, run_id).await;
     if o.success {
         println!(
-            "{GREEN}✓ restore drill PASSED{RESET}  backup={} files={} bytes={} pg_version={} verifybackup={:?} ({}ms)",
+            "{GREEN}✓ restore drill PASSED{RESET}  run={} backup_id={} file={} files={} bytes={} pg_version={} verifybackup={:?} ({}ms)",
+            o.run_id,
+            o.backup_id.unwrap_or(backup_id),
             o.backup_file,
             o.file_count.unwrap_or(0),
             o.extracted_bytes.unwrap_or(0),
@@ -657,10 +675,121 @@ pub async fn handle_fleet_db_drill(pool: &sqlx::PgPool, on: Option<&str>) -> Res
         println!("    {}", o.detail);
     } else {
         eprintln!(
-            "{RED}✗ restore drill FAILED{RESET}  backup={} stage={}\n    {}",
-            o.backup_file, o.stage, o.detail
+            "{RED}✗ restore drill FAILED{RESET}  run={} backup_id={} file={} stage={}\n    {}",
+            o.run_id, backup_id, o.backup_file, o.stage, o.detail
         );
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn remote_drill_payload(
+    node: &str,
+    backup_id: uuid::Uuid,
+    run_id: uuid::Uuid,
+) -> serde_json::Value {
+    serde_json::json!({
+        "command": format!(
+            "\"$HOME/.local/bin/ff\" fleet db drill --backup-id {backup_id} --run-id {run_id}"
+        ),
+        "summary": format!("exact backup restore-drill on {node}"),
+        "operation": "exact_backup_restore_drill",
+        "backup_id": backup_id,
+        "run_id": run_id,
+        "expected_computer": node,
+        "evidence_tier": "restore",
+        "metadata": {
+            "database_kind": "postgres",
+            "identity_fence": "backup_id+run_id+node",
+        },
+    })
+}
+
+/// Require host-local checksum+decrypt evidence for the exact catalog
+/// checksum before dispatching a remote restore. Legacy `rsync completed`
+/// arrays and evidence for a different host/checksum fail closed.
+fn validate_remote_backup_receipt(
+    distribution_status: &serde_json::Value,
+    node: &str,
+    expected_checksum: &str,
+    backup_created_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> std::result::Result<(), String> {
+    let hosts = distribution_status
+        .get("hosts")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "distribution_status.hosts receipt map is missing".to_string())?;
+    let mut matches = hosts
+        .iter()
+        .filter(|(host, _)| host.eq_ignore_ascii_case(node));
+    let (_, receipt) = matches
+        .next()
+        .ok_or_else(|| format!("no verified distribution receipt for exact host {node}"))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "ambiguous case-insensitive distribution receipts for host {node}"
+        ));
+    }
+    let receipt = receipt
+        .as_object()
+        .ok_or_else(|| format!("distribution receipt for {node} is not an object"))?;
+    let string = |field: &str| {
+        receipt
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("receipt field {field} is missing or not a string"))
+    };
+
+    let tier = string("evidence_tier")?;
+    if !matches!(tier, "checksum_decrypt" | "restore") {
+        return Err(format!("receipt evidence_tier {tier:?} is insufficient"));
+    }
+    if string("checksum")? != "ok" {
+        return Err("receipt checksum status is not ok".into());
+    }
+    if string("decrypt")? != "ok" {
+        return Err("receipt decrypt status is not ok".into());
+    }
+    if receipt
+        .get("age_format")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err("receipt age_format is not true".into());
+    }
+    let observed_checksum = string("observed_checksum")?;
+    if !observed_checksum.eq_ignore_ascii_case(expected_checksum) {
+        return Err(format!(
+            "receipt checksum {observed_checksum} does not match exact catalog checksum {expected_checksum}"
+        ));
+    }
+    if let Some(receipt_expected) = receipt
+        .get("expected_checksum")
+        .and_then(serde_json::Value::as_str)
+    {
+        if !receipt_expected.eq_ignore_ascii_case(expected_checksum) {
+            return Err("receipt expected_checksum is bound to another catalog version".into());
+        }
+    }
+    uuid::Uuid::parse_str(string("run_id")?)
+        .map_err(|_| "receipt run_id is not a UUID".to_string())?;
+
+    let parse_time = |field: &str| {
+        chrono::DateTime::parse_from_rfc3339(string(field)?)
+            .map(|value| value.with_timezone(&chrono::Utc))
+            .map_err(|_| format!("receipt {field} is not RFC3339"))
+    };
+    let observed_at = parse_time("observed_at")?;
+    let last_ok = parse_time("last_ok")?;
+    if observed_at < backup_created_at || last_ok < backup_created_at {
+        return Err("receipt predates the exact backup catalog row".into());
+    }
+    if last_ok < observed_at {
+        return Err("receipt last_ok predates its observed_at proof".into());
+    }
+    let future_skew = chrono::Duration::minutes(5);
+    if observed_at > now + future_skew || last_ok > now + future_skew {
+        return Err("receipt timestamp is implausibly in the future".into());
     }
     Ok(())
 }
@@ -670,18 +799,41 @@ pub async fn handle_fleet_db_drill(pool: &sqlx::PgPool, on: Option<&str>) -> Res
 /// `ff fleet db drill --on <node>`: proves the backup fanned out to `<node>`
 /// AND is restorable there — the leader-loss recovery story, on the node that
 /// would actually take over.
-async fn enqueue_remote_drill(pool: &sqlx::PgPool, node: &str, me: &str) -> Result<()> {
+async fn enqueue_remote_drill(
+    pool: &sqlx::PgPool,
+    node: &str,
+    me: &str,
+    backup_id: uuid::Uuid,
+    run_id: uuid::Uuid,
+) -> Result<()> {
     println!(
-        "{CYAN}▶ ff fleet db drill --on {node}{RESET}  (dispatched from {me} via the defer queue)"
+        "{CYAN}▶ ff fleet db drill --on {node}{RESET}  (from={me}, backup={backup_id}, run={run_id})"
     );
-    let baseline = chrono::Utc::now();
-    // The remote defer-worker runs this shell command; `ff` lives at the
-    // canonical install path. The drill records into the shared `backup_drills`
-    // table with `drill_node=<node>`, which is how we recover its result.
-    let payload = serde_json::json!({
-        "command": "\"$HOME/.local/bin/ff\" fleet db drill",
-        "summary": format!("backup restore-drill on {node}"),
-    });
+    let (checksum, created_at, distribution_status): (
+        String,
+        chrono::DateTime<chrono::Utc>,
+        serde_json::Value,
+    ) = sqlx::query_as(
+        "SELECT checksum_sha256, created_at, distribution_status
+           FROM backups WHERE id=$1 AND database_kind='postgres'",
+    )
+    .bind(backup_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| {
+        anyhow::anyhow!("no postgres backup row with id {backup_id}; remote drill refuses fallback")
+    })?;
+    validate_remote_backup_receipt(
+        &distribution_status,
+        node,
+        &checksum,
+        created_at,
+        chrono::Utc::now(),
+    )
+    .map_err(|error| anyhow::anyhow!("remote backup receipt gate rejected {node}: {error}"))?;
+
+    ff_agent::ha::restore_drill::reserve_drill_run(pool, run_id, backup_id, node).await?;
+    let payload = remote_drill_payload(node, backup_id, run_id);
     let trigger_spec = serde_json::json!({ "node": node });
     let id = ff_db::pg_enqueue_deferred(
         pool,
@@ -692,7 +844,7 @@ async fn enqueue_remote_drill(pool: &sqlx::PgPool, node: &str, me: &str) -> Resu
         &trigger_spec,
         Some(node),
         &serde_json::json!([]),
-        Some("ff fleet db drill --on"),
+        Some("ff fleet db drill --backup-id/--run-id --on"),
         Some(3),
     )
     .await?;
@@ -700,10 +852,10 @@ async fn enqueue_remote_drill(pool: &sqlx::PgPool, node: &str, me: &str) -> Resu
         "{GREEN}✓{RESET} enqueued drill task {id} (preferred_node={node}, trigger=node_online)"
     );
     println!(
-        "  waiting up to 200s for {node} to run it (the defer-worker claims pending tasks ~every 15s)…"
+        "  waiting up to 30m for exact run {run_id} (the worker claims pending tasks ~every 15s)…"
     );
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(200);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30 * 60);
     loop {
         #[allow(clippy::type_complexity)]
         let row: Option<(
@@ -720,11 +872,13 @@ async fn enqueue_remote_drill(pool: &sqlx::PgPool, node: &str, me: &str) -> Resu
             "SELECT success, stage, detail, file_count, extracted_bytes, pg_version, \
                     verifybackup, backup_file, duration_ms \
                FROM backup_drills \
-              WHERE drill_node = $1 AND started_at > $2 \
-              ORDER BY started_at DESC LIMIT 1",
+              WHERE id = $1 AND backup_id = $2
+                AND LOWER(drill_node) = LOWER($3)
+                AND finished_at IS NOT NULL",
         )
+        .bind(run_id)
+        .bind(backup_id)
         .bind(node)
-        .bind(baseline)
         .fetch_optional(pool)
         .await?;
 
@@ -743,7 +897,7 @@ async fn enqueue_remote_drill(pool: &sqlx::PgPool, node: &str, me: &str) -> Resu
             let detail = detail.unwrap_or_default();
             if success {
                 println!(
-                    "{GREEN}✓ remote restore drill PASSED on {node}{RESET}  backup={} files={} bytes={} pg_version={} verifybackup={:?} ({}ms)",
+                    "{GREEN}✓ remote restore drill PASSED on {node}{RESET}  run={run_id} backup_id={backup_id} file={} files={} bytes={} pg_version={} verifybackup={:?} ({}ms)",
                     backup_file,
                     file_count.unwrap_or(0),
                     extracted_bytes.unwrap_or(0),
@@ -755,20 +909,107 @@ async fn enqueue_remote_drill(pool: &sqlx::PgPool, node: &str, me: &str) -> Resu
                 return Ok(());
             }
             eprintln!(
-                "{RED}✗ remote restore drill FAILED on {node}{RESET}  backup={backup_file} stage={stage}\n    {detail}"
+                "{RED}✗ remote restore drill FAILED on {node}{RESET}  run={run_id} backup_id={backup_id} file={backup_file} stage={stage}\n    {detail}"
             );
             std::process::exit(1);
         }
 
         if std::time::Instant::now() >= deadline {
             eprintln!(
-                "{YELLOW}⏱ no result from {node} within 200s.{RESET} The task may still be \
+                "{YELLOW}⏱ no exact result from {node} within 30m (run={run_id}, backup={backup_id}).{RESET} The task may still be \
                  queued/running — check `ff defer get {id}`. A worker that is offline or has \
                  no backup copy won't report."
             );
             std::process::exit(2);
         }
         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    }
+}
+
+#[cfg(test)]
+mod exact_restore_drill_tests {
+    use super::*;
+
+    fn receipt(
+        node: &str,
+        checksum: &str,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "hosts": {
+                node: {
+                    "observed_at": observed_at,
+                    "last_ok": observed_at,
+                    "run_id": uuid::Uuid::new_v4(),
+                    "evidence_tier": "checksum_decrypt",
+                    "checksum": "ok",
+                    "observed_checksum": checksum,
+                    "decrypt": "ok",
+                    "age_format": true,
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn verified_remote_receipt_is_bound_to_host_checksum_and_backup_time() {
+        let now = chrono::Utc::now();
+        let created = now - chrono::Duration::hours(1);
+        let status = receipt("priya", "ab12", now);
+        validate_remote_backup_receipt(&status, "PRIYA", "AB12", created, now).unwrap();
+
+        assert!(validate_remote_backup_receipt(&status, "vinny", "ab12", created, now).is_err());
+        assert!(
+            validate_remote_backup_receipt(&status, "priya", "different", created, now).is_err()
+        );
+        assert!(
+            validate_remote_backup_receipt(
+                &receipt("priya", "ab12", created - chrono::Duration::seconds(1)),
+                "priya",
+                "ab12",
+                created,
+                now,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_or_incomplete_distribution_evidence_fails_closed() {
+        let now = chrono::Utc::now();
+        let created = now - chrono::Duration::hours(1);
+        for status in [
+            serde_json::json!(["priya"]),
+            serde_json::json!({"hosts": {"priya": {"checksum": "ok"}}}),
+            serde_json::json!({"hosts": {"priya": {
+                "observed_at": now,
+                "last_ok": now,
+                "run_id": uuid::Uuid::new_v4(),
+                "evidence_tier": "checksum_decrypt",
+                "checksum": "ok",
+                "observed_checksum": "ab12",
+                "decrypt": "ok",
+                "age_format": false
+            }}}),
+        ] {
+            assert!(
+                validate_remote_backup_receipt(&status, "priya", "ab12", created, now).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn remote_payload_carries_exact_backup_and_run_ids() {
+        let backup_id = uuid::Uuid::new_v4();
+        let run_id = uuid::Uuid::new_v4();
+        let payload = remote_drill_payload("priya", backup_id, run_id);
+        assert_eq!(payload["backup_id"], serde_json::json!(backup_id));
+        assert_eq!(payload["run_id"], serde_json::json!(run_id));
+        assert_eq!(payload["expected_computer"], "priya");
+        let command = payload["command"].as_str().unwrap();
+        assert!(command.contains(&format!("--backup-id {backup_id}")));
+        assert!(command.contains(&format!("--run-id {run_id}")));
+        assert!(!command.contains(" --on "));
     }
 }
 

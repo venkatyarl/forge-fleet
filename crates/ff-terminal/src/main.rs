@@ -2477,9 +2477,9 @@ pub enum FleetDbCommand {
         #[arg(long = "now", default_value_t = true)]
         now: bool,
     },
-    /// Run the backup restore-drill RIGHT NOW against the newest Postgres
-    /// backup: decrypt → extract → validate it's a structurally complete
-    /// PGDATA, record the outcome in `backup_drills`, and alert on failure.
+    /// Run the backup restore-drill RIGHT NOW against one exact Postgres
+    /// backup: decrypt → extract → start isolated PostgreSQL 16 → execute an
+    /// application SELECT, record the exact run, and alert on failure.
     ///
     /// This is the exact path the daily leader tick runs — use it to verify
     /// restorability on demand (run it ON the leader, where the `.age` files
@@ -2488,10 +2488,17 @@ pub enum FleetDbCommand {
     /// `--on <node>` runs the drill on a REMOTE fleet computer via the
     /// deferred-task queue instead of locally: it proves the backup fanned out
     /// to `<node>` AND is restorable there (the leader-loss recovery story).
-    /// The remote node drills the newest copy it actually holds; the result
-    /// lands in `backup_drills` with `drill_node=<node>`. Exits non-zero if the
-    /// remote drill fails or doesn't report back in time.
+    /// The remote node must have fresh checksum+decrypt distribution evidence
+    /// for this backup. The same backup ID and run ID fence dispatch and result
+    /// polling; there is no newest/local fallback.
     Drill {
+        /// Exact Postgres backup UUID from `backups` (required; no fallback).
+        #[arg(long)]
+        backup_id: String,
+        /// Exact drill-run UUID. Generated when omitted; remote dispatch carries
+        /// this UUID and accepts only the matching result row.
+        #[arg(long)]
+        run_id: Option<String>,
         #[arg(long)]
         on: Option<String>,
     },
