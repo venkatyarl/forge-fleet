@@ -94,6 +94,11 @@ const FALKORDB_CONTAINER: &str = "forgefleet-falkordb";
 /// Offsite fan-out width when `fleet_backup_config.dest_hosts` is empty:
 /// a kind's backups go to this many OTHER computers (never the source).
 const OFFSITE_DEST_COUNT: i64 = 2;
+/// Automatic destinations need positive, current Pulse evidence. Five minutes
+/// is the fleet's conservative online window for health-sensitive placement:
+/// beats normally arrive every few seconds, so this tolerates transient misses
+/// without treating a host seen earlier in the day as a viable backup target.
+const AUTO_DESTINATION_FRESHNESS: &str = "5 minutes";
 /// Delay before the first tick after daemon startup (avoid racing
 /// Postgres/Redis containers still coming up).
 const STARTUP_DELAY_SECS: u64 = 300;
@@ -155,6 +160,45 @@ const DISTRIBUTION_WAVE_STAGGER_SECS: i64 = 45;
 /// `w * DISTRIBUTION_WAVE_STAGGER_SECS`. Pure so the wave schedule is unit-testable.
 fn distribution_stagger_secs(idx: usize) -> i64 {
     (idx / DISTRIBUTION_WAVE_SIZE) as i64 * DISTRIBUTION_WAVE_STAGGER_SECS
+}
+
+/// Which source an automatic backup-destination query must exclude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoDestinationSource {
+    ComputerId,
+    ComputerName,
+    FleetLeader,
+}
+
+/// Build the canonical automatic-destination query.
+///
+/// Explicit `dest_hosts` never use this path. Automatic selection fails closed
+/// to peers with positive recent Pulse evidence that are not reserved/drained.
+/// `connectivity_mode` is deliberately not a gate: roaming and Tailscale peers
+/// can be valid offsite holders, while that metadata does not prove rsync data-
+/// plane reachability. Ordering remains stable across backup, WAL, and local-
+/// freshness expectation paths.
+fn auto_destination_sql(source: AutoDestinationSource) -> String {
+    let (source_predicate, limit_parameter) = match source {
+        AutoDestinationSource::ComputerId => ("c.id <> $1", "$2"),
+        AutoDestinationSource::ComputerName => ("LOWER(c.name) <> LOWER($1)", "$2"),
+        AutoDestinationSource::FleetLeader => (
+            "c.id <> (SELECT computer_id FROM fleet_leader_state LIMIT 1)",
+            "$1",
+        ),
+    };
+
+    format!(
+        "SELECT c.name
+           FROM computers c
+          WHERE {source_predicate}
+            AND c.status = 'online'
+            AND c.last_seen_at IS NOT NULL
+            AND c.last_seen_at >= NOW() - INTERVAL '{AUTO_DESTINATION_FRESHNESS}'
+            AND c.reservation_state = 'available'
+          ORDER BY c.last_seen_at DESC, c.name ASC
+          LIMIT {limit_parameter}"
+    )
 }
 
 /// Errors emitted by [`BackupOrchestrator`].
@@ -948,19 +992,21 @@ impl BackupOrchestrator {
                 .cloned()
                 .collect()
         } else {
-            sqlx::query_scalar::<_, String>(
-                "SELECT c.name
-                   FROM computers c
-                  WHERE c.id <> $1
-                    AND (c.last_seen_at IS NULL OR c.last_seen_at > NOW() - INTERVAL '24 hours')
-                  ORDER BY c.last_seen_at DESC NULLS LAST, c.name
-                  LIMIT $2",
-            )
-            .bind(self.my_computer_id)
-            .bind(OFFSITE_DEST_COUNT)
-            .fetch_all(&self.pg)
-            .await?
+            let query = auto_destination_sql(AutoDestinationSource::ComputerId);
+            sqlx::query_scalar::<_, String>(&query)
+                .bind(self.my_computer_id)
+                .bind(OFFSITE_DEST_COUNT)
+                .fetch_all(&self.pg)
+                .await?
         };
+        if cfg.dest_hosts.is_empty() && names.len() < OFFSITE_DEST_COUNT as usize {
+            warn!(
+                kind,
+                eligible_destinations = names.len(),
+                required_destinations = OFFSITE_DEST_COUNT,
+                "backup auto fan-out is below target; refusing stale/offline fallback"
+            );
+        }
 
         let mut enqueued = Vec::new();
         let source_path = format!(
@@ -1082,19 +1128,21 @@ impl BackupOrchestrator {
                 .cloned()
                 .collect()
         } else {
-            sqlx::query_scalar::<_, String>(
-                "SELECT c.name
-                   FROM computers c
-                  WHERE c.id <> $1
-                    AND (c.last_seen_at IS NULL OR c.last_seen_at > NOW() - INTERVAL '24 hours')
-                  ORDER BY c.last_seen_at DESC NULLS LAST, c.name
-                  LIMIT $2",
-            )
-            .bind(self.my_computer_id)
-            .bind(OFFSITE_DEST_COUNT)
-            .fetch_all(&self.pg)
-            .await?
+            let query = auto_destination_sql(AutoDestinationSource::ComputerId);
+            sqlx::query_scalar::<_, String>(&query)
+                .bind(self.my_computer_id)
+                .bind(OFFSITE_DEST_COUNT)
+                .fetch_all(&self.pg)
+                .await?
         };
+        if cfg.dest_hosts.is_empty() && names.len() < OFFSITE_DEST_COUNT as usize {
+            warn!(
+                kind = "postgres_wal",
+                eligible_destinations = names.len(),
+                required_destinations = OFFSITE_DEST_COUNT,
+                "backup auto fan-out is below target; refusing stale/offline fallback"
+            );
+        }
 
         let source_path = format!(
             "{}@{}:{}/{}/",
@@ -1364,32 +1412,18 @@ impl BackupOrchestrator {
         }
 
         let expected: Vec<String> = if let Some(source_host) = cfg.source_host.as_deref() {
-            sqlx::query_scalar::<_, String>(
-                "SELECT c.name
-                   FROM computers c
-                  WHERE c.name <> $1
-                    AND (c.last_seen_at IS NULL OR c.last_seen_at > NOW() - INTERVAL '24 hours')
-                  ORDER BY c.last_seen_at DESC NULLS LAST, c.name
-                  LIMIT $2",
-            )
-            .bind(source_host)
-            .bind(OFFSITE_DEST_COUNT)
-            .fetch_all(&self.pg)
-            .await?
+            let query = auto_destination_sql(AutoDestinationSource::ComputerName);
+            sqlx::query_scalar::<_, String>(&query)
+                .bind(source_host)
+                .bind(OFFSITE_DEST_COUNT)
+                .fetch_all(&self.pg)
+                .await?
         } else {
-            sqlx::query_scalar::<_, String>(
-                "SELECT c.name
-                   FROM computers c
-                  WHERE c.id <> (
-                        SELECT computer_id FROM fleet_leader_state LIMIT 1
-                    )
-                    AND (c.last_seen_at IS NULL OR c.last_seen_at > NOW() - INTERVAL '24 hours')
-                  ORDER BY c.last_seen_at DESC NULLS LAST, c.name
-                  LIMIT $1",
-            )
-            .bind(OFFSITE_DEST_COUNT)
-            .fetch_all(&self.pg)
-            .await?
+            let query = auto_destination_sql(AutoDestinationSource::FleetLeader);
+            sqlx::query_scalar::<_, String>(&query)
+                .bind(OFFSITE_DEST_COUNT)
+                .fetch_all(&self.pg)
+                .await?
         };
 
         debug!(
@@ -3031,6 +3065,53 @@ mod tests {
             );
             prev = d;
         }
+    }
+
+    #[test]
+    fn auto_destination_queries_share_fail_closed_eligibility() {
+        for source in [
+            AutoDestinationSource::ComputerId,
+            AutoDestinationSource::ComputerName,
+            AutoDestinationSource::FleetLeader,
+        ] {
+            let query = auto_destination_sql(source);
+            assert!(query.contains("c.status = 'online'"), "query: {query}");
+            assert!(
+                query.contains("c.last_seen_at IS NOT NULL"),
+                "query: {query}"
+            );
+            assert!(
+                query.contains("c.last_seen_at >= NOW() - INTERVAL '5 minutes'"),
+                "query: {query}"
+            );
+            assert!(
+                query.contains("c.reservation_state = 'available'"),
+                "query: {query}"
+            );
+            assert!(
+                query.contains("ORDER BY c.last_seen_at DESC, c.name ASC"),
+                "query: {query}"
+            );
+            assert!(!query.contains("24 hours"), "query: {query}");
+            assert!(!query.contains("last_seen_at IS NULL OR"), "query: {query}");
+            assert!(!query.contains("connectivity_mode"), "query: {query}");
+            assert!(
+                !query.to_ascii_lowercase().contains("vinny"),
+                "query: {query}"
+            );
+        }
+
+        let by_id = auto_destination_sql(AutoDestinationSource::ComputerId);
+        assert!(by_id.contains("c.id <> $1"));
+        assert!(by_id.contains("LIMIT $2"));
+
+        let by_name = auto_destination_sql(AutoDestinationSource::ComputerName);
+        assert!(by_name.contains("LOWER(c.name) <> LOWER($1)"));
+        assert!(by_name.contains("LIMIT $2"));
+
+        let by_leader = auto_destination_sql(AutoDestinationSource::FleetLeader);
+        assert!(by_leader.contains("fleet_leader_state"));
+        assert!(by_leader.contains("LIMIT $1"));
     }
 
     #[test]

@@ -8,6 +8,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use ff_core::llm_completion_policy::{
+    CompletionBudget, CompletionValidationError, LEGACY_DEFAULT_COMPLETION_TOKENS, WorkloadClass,
+    apply_completion_policy, validate_completion_response,
+};
 use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc};
@@ -92,7 +96,7 @@ impl ExecutorConfig {
 struct StepRuntime {
     rust_fn_registry: Option<Arc<RustFnRegistry>>,
     http_client: reqwest::Client,
-    llm_chat_completions_url: String,
+    llm_base_url: String,
     llm_api_key: Option<String>,
     llm_model: Option<String>,
 }
@@ -122,22 +126,60 @@ impl StepRuntime {
         Self {
             rust_fn_registry: config.rust_fn_registry.clone(),
             http_client: config.http_client.clone(),
-            llm_chat_completions_url: normalize_chat_completions_url(&llm_base_url),
+            llm_base_url,
             llm_api_key,
             llm_model,
         }
     }
 }
 
-fn normalize_chat_completions_url(base: &str) -> String {
-    let base = base.trim_end_matches('/');
-    if base.ends_with("/v1/chat/completions") {
-        base.to_string()
-    } else if base.ends_with("/v1") {
-        format!("{base}/chat/completions")
-    } else {
-        format!("{base}/v1/chat/completions")
+fn resolve_llm_chat_completions_url(
+    step_endpoint: Option<&str>,
+    global_endpoint: &str,
+) -> Result<String, PipelineError> {
+    // `Some` is an explicit authority choice. Even an empty or malformed value
+    // must fail closed instead of silently sending the prompt elsewhere.
+    normalize_llm_chat_completions_url(step_endpoint.unwrap_or(global_endpoint))
+}
+
+fn normalize_llm_chat_completions_url(endpoint: &str) -> Result<String, PipelineError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(PipelineError::LlmRequest(
+            "invalid LLM endpoint: endpoint is empty".to_string(),
+        ));
     }
+
+    let mut url = reqwest::Url::parse(endpoint).map_err(|_| {
+        PipelineError::LlmRequest("invalid LLM endpoint: expected an absolute URL".to_string())
+    })?;
+
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(PipelineError::LlmRequest(
+            "invalid LLM endpoint: only absolute http(s) URLs are allowed".to_string(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(PipelineError::LlmRequest(
+            "invalid LLM endpoint: credentials are not allowed in the URL".to_string(),
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(PipelineError::LlmRequest(
+            "invalid LLM endpoint: query strings and fragments are not allowed".to_string(),
+        ));
+    }
+
+    let path = url.path().trim_end_matches('/');
+    let normalized_path = if path.ends_with("/v1/chat/completions") {
+        path.to_string()
+    } else if path.ends_with("/v1") {
+        format!("{path}/chat/completions")
+    } else {
+        format!("{path}/v1/chat/completions")
+    };
+    url.set_path(&normalized_path);
+    Ok(url.to_string())
 }
 
 // ─── Progress Callback ──────────────────────────────────────────────────────
@@ -463,104 +505,103 @@ async fn execute_step_kind(
             prompt,
             model,
             max_tokens,
+            endpoint,
         } => {
             let selected_model = model
                 .clone()
                 .or_else(|| runtime.llm_model.clone())
                 .unwrap_or_else(|| "default".to_string());
 
+            let endpoint =
+                resolve_llm_chat_completions_url(endpoint.as_deref(), &runtime.llm_base_url)?;
+
+            let completion_budget =
+                CompletionBudget::new(max_tokens.unwrap_or(LEGACY_DEFAULT_COMPLETION_TOKENS))
+                    .map_err(|e| PipelineError::LlmRequest(e.to_string()))?;
+
             let mut payload = json!({
-                "model": selected_model,
+                "model": &selected_model,
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": false,
             });
 
-            if let Some(max_tokens) = max_tokens {
-                payload["max_tokens"] = json!(max_tokens);
-            }
+            apply_completion_policy(&mut payload, WorkloadClass::CodeOneShot, completion_budget)
+                .map_err(|e| PipelineError::LlmRequest(e.to_string()))?;
 
-            let mut request = runtime
-                .http_client
-                .post(&runtime.llm_chat_completions_url)
-                .json(&payload);
+            let mut request = runtime.http_client.post(&endpoint).json(&payload);
 
             if let Some(api_key) = &runtime.llm_api_key {
                 request = request.bearer_auth(api_key);
             }
 
-            let response = request
-                .send()
-                .await
-                .map_err(|e| PipelineError::LlmRequest(e.to_string()))?;
+            let response = request.send().await.map_err(|_| {
+                PipelineError::LlmRequest("LLM endpoint is unreachable".to_string())
+            })?;
             let status = response.status();
-            let body = response
-                .text()
-                .await
-                .map_err(|e| PipelineError::LlmRequest(e.to_string()))?;
 
             if !status.is_success() {
                 return Err(PipelineError::LlmRequest(format!(
-                    "status {}: {}",
-                    status.as_u16(),
-                    body
+                    "LLM endpoint returned HTTP {}",
+                    status.as_u16()
                 )));
             }
 
-            let json: Value = serde_json::from_str(&body).map_err(|e| {
-                PipelineError::LlmResponse(format!("invalid JSON response: {e}; body: {body}"))
+            let response: Value = response.json().await.map_err(|_| {
+                PipelineError::LlmResponse("LLM endpoint returned invalid JSON".to_string())
             })?;
 
-            extract_llm_text(&json).ok_or_else(|| {
-                PipelineError::LlmResponse(format!("missing assistant content in response: {body}"))
-            })
+            let reported_model = validate_reported_model(&response)?;
+            let model_mismatch = reported_model
+                .map(|reported| reported != selected_model)
+                .unwrap_or(false);
+            info!(
+                llm_endpoint = %endpoint,
+                requested_model = %selected_model,
+                reported_model = ?reported_model,
+                model_mismatch,
+                "pipeline LLM route receipt"
+            );
+            if model_mismatch && selected_model != "default" {
+                warn!(
+                    llm_endpoint = %endpoint,
+                    requested_model = %selected_model,
+                    reported_model = ?reported_model,
+                    "LLM endpoint reported a runtime model alias; preserving catalog request identity"
+                );
+            }
+
+            validate_completion_response(&response)
+                .map(|completion| completion.content)
+                .map_err(|error| PipelineError::LlmResponse(safe_completion_error(&error)))
         }
 
         StepKind::Noop => Ok("noop".to_string()),
     }
 }
 
-fn extract_llm_text(response: &Value) -> Option<String> {
-    if let Some(content) = response.pointer("/choices/0/message/content") {
-        return extract_content_value(content);
-    }
-
-    response
-        .pointer("/choices/0/text")
-        .and_then(Value::as_str)
-        .map(|s| s.to_string())
+fn validate_reported_model(response: &Value) -> Result<Option<&str>, PipelineError> {
+    let Some(value) = response.get("model") else {
+        return Ok(None);
+    };
+    let Some(model) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    else {
+        return Err(PipelineError::LlmResponse(
+            "LLM response model metadata is invalid".to_string(),
+        ));
+    };
+    Ok(Some(model))
 }
 
-fn extract_content_value(content: &Value) -> Option<String> {
-    if let Some(s) = content.as_str() {
-        return Some(s.to_string());
-    }
-
-    if let Some(text) = content.get("text").and_then(Value::as_str) {
-        return Some(text.to_string());
-    }
-
-    if let Some(items) = content.as_array() {
-        let mut joined = String::new();
-        for item in items {
-            if let Some(s) = item.as_str() {
-                joined.push_str(s);
-                continue;
-            }
-            if let Some(text) = item.get("text").and_then(Value::as_str) {
-                joined.push_str(text);
-                continue;
-            }
-            if let Some(text) = item.get("content").and_then(Value::as_str) {
-                joined.push_str(text);
-            }
+fn safe_completion_error(error: &CompletionValidationError) -> String {
+    match error {
+        CompletionValidationError::UnknownFinishReason { .. } => {
+            "completion has an unsupported finish_reason".to_string()
         }
-
-        if !joined.is_empty() {
-            return Some(joined);
-        }
+        _ => error.to_string(),
     }
-
-    None
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -618,6 +659,52 @@ mod tests {
         });
 
         (format!("http://{addr}"), rx)
+    }
+
+    fn successful_llm_response(model: &str, content: &str) -> String {
+        json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 1,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content
+                },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string()
+    }
+
+    fn llm_pipeline(
+        model: Option<&str>,
+        max_tokens: Option<u32>,
+        endpoint: Option<String>,
+    ) -> PipelineGraph {
+        let mut graph = PipelineGraph::new();
+        graph
+            .add_step(Step::new(
+                "llm",
+                "LLM Prompt",
+                StepKind::LlmPrompt {
+                    prompt: "Say hello".to_string(),
+                    model: model.map(str::to_string),
+                    max_tokens,
+                    endpoint,
+                },
+            ))
+            .unwrap();
+        graph
+    }
+
+    fn llm_failure(result: &PipelineRunResult) -> &str {
+        assert!(!result.success);
+        let step = &result.results[&StepId::new("llm")];
+        assert_eq!(step.status, StepStatus::Failed);
+        step.error.as_deref().expect("failed step has an error")
     }
 
     #[tokio::test]
@@ -828,38 +915,12 @@ mod tests {
 
     #[tokio::test]
     async fn execute_llm_prompt_step_openai_compatible() {
-        let llm_response = json!({
-            "id": "chatcmpl-test",
-            "object": "chat.completion",
-            "created": 1,
-            "model": "pipeline-model",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "hello from llm"
-                    },
-                    "finish_reason": "stop"
-                }
-            ]
-        })
-        .to_string();
+        let llm_response = successful_llm_response("pipeline-model", "hello from llm");
 
         let (base_url, request_rx) =
             spawn_single_request_server("200 OK", "application/json", llm_response).await;
 
-        let mut g = PipelineGraph::new();
-        g.add_step(Step::new(
-            "llm",
-            "LLM Prompt",
-            StepKind::LlmPrompt {
-                prompt: "Say hello".to_string(),
-                model: None,
-                max_tokens: Some(32),
-            },
-        ))
-        .unwrap();
+        let g = llm_pipeline(None, None, None);
 
         let config = ExecutorConfig::default()
             .with_llm_base_url(base_url)
@@ -874,5 +935,296 @@ mod tests {
         assert!(raw_request.contains("POST /v1/chat/completions HTTP/1.1"));
         assert!(raw_request.contains("\"model\":\"pipeline-model\""));
         assert!(raw_request.contains("\"Say hello\""));
+        assert!(raw_request.contains("\"max_tokens\":2048"));
+        assert!(raw_request.contains("\"enable_thinking\":false"));
+    }
+
+    #[test]
+    fn llm_endpoint_normalization_accepts_supported_shapes() {
+        let full = "https://models.example:55000/v1/chat/completions";
+        assert_eq!(
+            normalize_llm_chat_completions_url("https://models.example:55000").unwrap(),
+            full
+        );
+        assert_eq!(
+            normalize_llm_chat_completions_url("https://models.example:55000/v1/").unwrap(),
+            full
+        );
+        assert_eq!(
+            normalize_llm_chat_completions_url("https://models.example:55000/v1/chat/completions/")
+                .unwrap(),
+            full
+        );
+    }
+
+    #[test]
+    fn llm_endpoint_validation_rejects_non_http_and_ambiguous_urls() {
+        for invalid in [
+            "",
+            "models.example:55000",
+            "ftp://models.example/model",
+            "http://user:secret@models.example",
+            "https://models.example/v1?token=secret",
+        ] {
+            assert!(
+                normalize_llm_chat_completions_url(invalid).is_err(),
+                "endpoint should be rejected: {invalid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_step_endpoint_takes_precedence_over_global_endpoint() {
+        let (step_url, step_request_rx) = spawn_single_request_server(
+            "200 OK",
+            "application/json",
+            successful_llm_response("step-model", "from step endpoint"),
+        )
+        .await;
+        let (global_url, global_request_rx) = spawn_single_request_server(
+            "200 OK",
+            "application/json",
+            successful_llm_response("step-model", "from global endpoint"),
+        )
+        .await;
+
+        let graph = llm_pipeline(Some("step-model"), Some(64), Some(step_url));
+        let result = execute(
+            &graph,
+            ExecutorConfig::default().with_llm_base_url(global_url),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.success);
+        assert_eq!(
+            result.results[&StepId::new("llm")].output,
+            "from step endpoint"
+        );
+        assert!(step_request_rx.await.unwrap().contains("max_tokens\":64"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), global_request_rx)
+                .await
+                .is_err(),
+            "global endpoint must not receive a request when the step endpoint is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_explicit_llm_endpoint_does_not_fall_back() {
+        let (global_url, global_request_rx) = spawn_single_request_server(
+            "200 OK",
+            "application/json",
+            successful_llm_response("pipeline-model", "must not be used"),
+        )
+        .await;
+        let graph = llm_pipeline(
+            Some("pipeline-model"),
+            None,
+            Some("ftp://explicit.invalid".to_string()),
+        );
+
+        let result = execute(
+            &graph,
+            ExecutorConfig::default().with_llm_base_url(global_url),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(llm_failure(&result).contains("invalid LLM endpoint"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), global_request_rx)
+                .await
+                .is_err(),
+            "invalid explicit endpoint must not fall back to the global endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_explicit_llm_endpoint_does_not_fall_back() {
+        let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_url = format!("http://{}", unavailable.local_addr().unwrap());
+        drop(unavailable);
+
+        let (global_url, global_request_rx) = spawn_single_request_server(
+            "200 OK",
+            "application/json",
+            successful_llm_response("pipeline-model", "must not be used"),
+        )
+        .await;
+        let graph = llm_pipeline(Some("pipeline-model"), None, Some(unavailable_url));
+
+        let result = execute(
+            &graph,
+            ExecutorConfig::default().with_llm_base_url(global_url),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(llm_failure(&result).contains("unreachable"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), global_request_rx)
+                .await
+                .is_err(),
+            "unreachable explicit endpoint must not fall back to the global endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_response_model_alias_preserves_requested_identity() {
+        let (base_url, _) = spawn_single_request_server(
+            "200 OK",
+            "application/json",
+            successful_llm_response("Lucy-Q4_K_M.gguf", "alias accepted safely"),
+        )
+        .await;
+        let graph = llm_pipeline(Some("lucy-1-7b"), None, None);
+
+        let result = execute(
+            &graph,
+            ExecutorConfig::default().with_llm_base_url(base_url),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.success);
+        assert_eq!(
+            result.results[&StepId::new("llm")].output,
+            "alias accepted safely"
+        );
+    }
+
+    #[test]
+    fn reported_model_metadata_is_optional_but_must_be_a_nonblank_string() {
+        assert_eq!(validate_reported_model(&json!({})).unwrap(), None);
+        assert_eq!(
+            validate_reported_model(&json!({"model": " Lucy-Q4_K_M.gguf "})).unwrap(),
+            Some("Lucy-Q4_K_M.gguf")
+        );
+
+        for response in [
+            json!({"model": ""}),
+            json!({"model": "  "}),
+            json!({"model": 7}),
+        ] {
+            let error = validate_reported_model(&response).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                "llm response parse failed: LLM response model metadata is invalid"
+            );
+            assert!(!error.contains(&response.to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn default_model_allows_provider_to_report_resolved_model() {
+        let (base_url, _) = spawn_single_request_server(
+            "200 OK",
+            "application/json",
+            successful_llm_response("provider-resolved-model", "resolved safely"),
+        )
+        .await;
+        let graph = llm_pipeline(None, None, None);
+
+        let result = execute(
+            &graph,
+            ExecutorConfig::default().with_llm_base_url(base_url),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.success);
+        assert_eq!(
+            result.results[&StepId::new("llm")].output,
+            "resolved safely"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_truncation_fails_without_leaking_provider_body() {
+        const SECRET: &str = "private-provider-reasoning-4f172";
+        let response = json!({
+            "model": "pipeline-model",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": SECRET,
+                    "reasoning_content": SECRET
+                },
+                "finish_reason": "length"
+            }]
+        })
+        .to_string();
+        let (base_url, _) =
+            spawn_single_request_server("200 OK", "application/json", response).await;
+        let graph = llm_pipeline(Some("pipeline-model"), Some(32), None);
+
+        let result = execute(
+            &graph,
+            ExecutorConfig::default().with_llm_base_url(base_url),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let error = llm_failure(&result);
+        assert!(error.contains("truncated"));
+        assert!(!error.contains(SECRET));
+    }
+
+    #[tokio::test]
+    async fn llm_http_error_does_not_leak_provider_body() {
+        const SECRET: &str = "provider-error-secret-c81ba";
+        let (base_url, _) = spawn_single_request_server(
+            "500 Internal Server Error",
+            "application/json",
+            format!(r#"{{"error":"{SECRET}"}}"#),
+        )
+        .await;
+        let graph = llm_pipeline(None, None, None);
+
+        let result = execute(
+            &graph,
+            ExecutorConfig::default().with_llm_base_url(base_url),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let error = llm_failure(&result);
+        assert!(error.contains("HTTP 500"));
+        assert!(!error.contains(SECRET));
+    }
+
+    #[tokio::test]
+    async fn llm_completion_budget_is_bounded_before_dispatch() {
+        let (base_url, request_rx) = spawn_single_request_server(
+            "200 OK",
+            "application/json",
+            successful_llm_response("default", "must not be used"),
+        )
+        .await;
+        let graph = llm_pipeline(None, Some(32_769), None);
+
+        let result = execute(
+            &graph,
+            ExecutorConfig::default().with_llm_base_url(base_url),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(llm_failure(&result).contains("exceeds hard cap"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), request_rx)
+                .await
+                .is_err(),
+            "invalid budget must fail before dispatch"
+        );
     }
 }

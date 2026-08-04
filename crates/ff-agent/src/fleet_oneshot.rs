@@ -25,6 +25,9 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use ff_core::llm_completion_policy::{
+    apply_completion_policy, validate_completion_response, CompletionBudget, WorkloadClass,
+};
 use ff_db::queries::{RouteCandidate, RouteFilter, pg_route_deployments};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -631,6 +634,9 @@ pub async fn fleet_oneshot_for_ctx_with_target(
     max_tokens: u32,
     explicit_target: Option<&ResolvedFleetTarget>,
 ) -> Result<FleetOneshot> {
+    let completion_budget = CompletionBudget::new(max_tokens)
+        .map_err(|error| anyhow!("invalid fleet one-shot completion budget: {error}"))?;
+    let completion_workload = completion_workload_for_route(workload);
     let client = reqwest::Client::builder()
         .timeout(timeout.unwrap_or(Duration::from_secs(180)))
         .build()
@@ -639,8 +645,15 @@ pub async fn fleet_oneshot_for_ctx_with_target(
     if let Some(target) = explicit_target {
         revalidate_explicit_target(pool, target, workload, false, min_ctx).await?;
         let _guard = InFlightGuard::acquire(&target.endpoint);
-        return dispatch_to_resolved_target(target.clone(), &client, prompt, system, max_tokens)
-            .await;
+        return dispatch_to_resolved_target(
+            target.clone(),
+            &client,
+            prompt,
+            system,
+            completion_workload,
+            completion_budget,
+        )
+        .await;
     }
 
     let ordered = resolve_route_candidates(pool, model_hint, workload, min_ctx).await?;
@@ -655,8 +668,17 @@ pub async fn fleet_oneshot_for_ctx_with_target(
             continue;
         };
         attempted = true;
-        match dispatch_to_candidate(pool, cand, &client, prompt, model_hint, system, max_tokens)
-            .await
+        match dispatch_to_candidate(
+            pool,
+            cand,
+            &client,
+            prompt,
+            model_hint,
+            system,
+            completion_workload,
+            completion_budget,
+        )
+        .await
         {
             Ok(ok) => return Ok(ok),
             Err(e) => {
@@ -678,8 +700,17 @@ pub async fn fleet_oneshot_for_ctx_with_target(
         );
         for cand in &ordered {
             let _guard = InFlightGuard::acquire(&cand.endpoint);
-            match dispatch_to_candidate(pool, cand, &client, prompt, model_hint, system, max_tokens)
-                .await
+            match dispatch_to_candidate(
+                pool,
+                cand,
+                &client,
+                prompt,
+                model_hint,
+                system,
+                completion_workload,
+                completion_budget,
+            )
+            .await
             {
                 Ok(ok) => return Ok(ok),
                 Err(e) => {
@@ -1011,11 +1042,12 @@ async fn dispatch_to_candidate(
     prompt: &str,
     _model_hint: Option<&str>,
     system: Option<&str>,
-    max_tokens: u32,
+    workload: WorkloadClass,
+    budget: CompletionBudget,
 ) -> anyhow::Result<FleetOneshot> {
     let target =
         resolve_candidate_target(pool, cand, ResolvedTargetProvenance::Auto, false).await?;
-    dispatch_to_resolved_target(target, client, prompt, system, max_tokens).await
+    dispatch_to_resolved_target(target, client, prompt, system, workload, budget).await
 }
 
 async fn dispatch_to_resolved_target(
@@ -1023,7 +1055,8 @@ async fn dispatch_to_resolved_target(
     client: &reqwest::Client,
     prompt: &str,
     system: Option<&str>,
-    max_tokens: u32,
+    workload: WorkloadClass,
+    budget: CompletionBudget,
 ) -> anyhow::Result<FleetOneshot> {
     let target = attest_resolved_target(client, target, Duration::from_secs(5)).await?;
     enforce_dispatch_attestation(&target)?;
@@ -1044,21 +1077,7 @@ async fn dispatch_to_resolved_target(
         ]),
         None => json!([{"role": "user", "content": prompt}]),
     };
-    let body = json!({
-        "model": model,
-        "messages": messages,
-        "stream": false,
-        // EXPLICIT generous token budget (2026-07-27). Without max_tokens the
-        // server default cap truncated the response — fatal for a REASONING model
-        // (glm-4.5-air, Qwen/DeepSeek reasoners): it spends hundreds of tokens
-        // "thinking" in reasoning_content BEFORE emitting the answer/edit block in
-        // content, so a low cap cut it off mid-think → empty content → codegen saw
-        // no edit block → 0 completions (proven root cause). 4096 leaves ample
-        // room for the think + a multi-block SEARCH/REPLACE answer within the 32K
-        // ctx. temperature low for deterministic, format-faithful edits.
-        "max_tokens": max_tokens,
-        "temperature": 0.2,
-    });
+    let body = completion_request_body(&model, messages, workload, budget)?;
     let start = std::time::Instant::now();
 
     let resp = client
@@ -1068,20 +1087,18 @@ async fn dispatch_to_resolved_target(
         .await
         .map_err(|e| anyhow!("POST {url}: {e}"))?;
     let status = resp.status();
+    if !status.is_success() {
+        // Provider bodies can echo prompts or private reasoning. Keep only
+        // endpoint identity and status in errors/logs.
+        return Err(anyhow!("{worker_name} ({model}) returned HTTP {status}"));
+    }
     let payload: Value = resp
         .json()
         .await
         .map_err(|e| anyhow!("decode response from {worker_name}: {e}"))?;
-    if !status.is_success() {
-        return Err(anyhow!(
-            "{worker_name} ({model}) returned HTTP {status}: {}",
-            payload.to_string().chars().take(400).collect::<String>()
-        ));
-    }
-    let text = extract_completion_text(&payload)
-        .map(|t| strip_think_block(&t))
-        .filter(|t| !t.trim().is_empty())
-        .ok_or_else(|| anyhow!("{worker_name} ({model}) returned an empty completion"))?;
+    let text = validate_completion_response(&payload)
+        .map_err(|error| anyhow!("{worker_name} ({model}) returned unsafe completion: {error}"))?
+        .content;
     let (tokens_in, tokens_out) = usage_tokens_i32(&payload);
     Ok(FleetOneshot {
         text,
@@ -1266,52 +1283,34 @@ fn model_name_present(catalog_id: Option<&str>, catalog_name: Option<&str>) -> b
     present(catalog_id) || present(catalog_name)
 }
 
-/// Pull the assistant text out of an OpenAI-shape chat-completion payload,
-/// tolerating both `message.content` and the legacy `text` field.
-pub(crate) fn extract_completion_text(payload: &Value) -> Option<String> {
-    let choice = payload.get("choices")?.as_array()?.first()?;
-    if let Some(content) = choice
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        && !content.trim().is_empty()
-    {
-        return Some(content.to_string());
+fn completion_workload_for_route(workload: Option<&str>) -> WorkloadClass {
+    if workload.is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "code" | "codegen" | "coding" | "review" | "reviewer"
+        )
+    }) {
+        WorkloadClass::CodeOneShot
+    } else {
+        WorkloadClass::Reasoning
     }
-    // REASONING-MODEL FALLBACK (2026-07-27): a reasoning model (glm-4.5-air, and
-    // the Qwen/DeepSeek reasoners) splits its output — it "thinks" in
-    // `message.reasoning_content` and emits the ANSWER in `message.content`. But
-    // when the response is short OR the token budget runs out mid-think, `content`
-    // comes back EMPTY while the actual answer (including the code / edit block)
-    // sits in `reasoning_content`. Reading only `content` then loses it entirely
-    // — the root cause of glm completing 0 codegen builds (proven: a 400-token
-    // codegen call returned empty content, full answer in reasoning_content). Fall
-    // back to reasoning_content so the caller still gets the model's work; the
-    // codegen parser tolerates the surrounding think-prose.
-    if let Some(reasoning) = choice
-        .get("message")
-        .and_then(|m| m.get("reasoning_content"))
-        .and_then(|c| c.as_str())
-        && !reasoning.trim().is_empty()
-    {
-        return Some(reasoning.to_string());
-    }
-    choice
-        .get("text")
-        .and_then(|t| t.as_str())
-        .map(String::from)
 }
 
-/// Strip a leading `<think>…</think>` reasoning block some local models emit so
-/// the council sees only the answer.
-pub(crate) fn strip_think_block(s: &str) -> String {
-    let t = s.trim_start();
-    if let Some(rest) = t.strip_prefix("<think>")
-        && let Some(end) = rest.find("</think>")
-    {
-        return rest[end + "</think>".len()..].trim().to_string();
-    }
-    s.trim().to_string()
+fn completion_request_body(
+    model: &str,
+    messages: Value,
+    workload: WorkloadClass,
+    budget: CompletionBudget,
+) -> anyhow::Result<Value> {
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "stream": false,
+        "temperature": 0.2,
+    });
+    apply_completion_policy(&mut body, workload, budget)
+        .map_err(|error| anyhow!("completion request policy rejected request: {error}"))?;
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -1824,15 +1823,6 @@ mod tests {
         assert!(different_model.contains("not requested model devstral-small-2-24b"));
     }
 
-    #[test]
-    fn extracts_message_then_text() {
-        let p = json!({"choices":[{"message":{"content":"hello"}}]});
-        assert_eq!(extract_completion_text(&p).as_deref(), Some("hello"));
-        let p = json!({"choices":[{"text":"legacy"}]});
-        assert_eq!(extract_completion_text(&p).as_deref(), Some("legacy"));
-        assert_eq!(extract_completion_text(&json!({})), None);
-    }
-
     // Authored by a fleet model (qwen36 on lily) via `ff offload`, hand-verified,
     // then integrated — dogfooding the fleet for test-gen (grows ff_interactions).
     // Pins the usage→i32 clamp that feeds council token attribution.
@@ -1852,12 +1842,59 @@ mod tests {
     }
 
     #[test]
-    fn strips_think_block() {
-        assert_eq!(
-            strip_think_block("<think>reasoning</think>  answer"),
-            "answer"
-        );
-        assert_eq!(strip_think_block("plain"), "plain");
+    fn code_route_builds_non_thinking_request_with_exact_budget() {
+        for alias in ["code", "CODEGEN", "coding", "review", "reviewer"] {
+            assert_eq!(
+                completion_workload_for_route(Some(alias)),
+                WorkloadClass::CodeOneShot,
+                "{alias} must use the non-thinking one-shot policy"
+            );
+        }
+        let workload = completion_workload_for_route(Some("code"));
+        let body = completion_request_body(
+            "glm-4.5-air",
+            json!([{"role": "user", "content": "write code"}]),
+            workload,
+            CompletionBudget::new(777).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["max_tokens"], 777);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn council_route_preserves_reasoning_default_but_sets_budget() {
+        let workload = completion_workload_for_route(None);
+        assert_eq!(workload, WorkloadClass::Reasoning);
+        let body = completion_request_body(
+            "glm-4.5-air",
+            json!([{"role": "user", "content": "deliberate"}]),
+            workload,
+            CompletionBudget::new(4_096).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["max_tokens"], 4_096);
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn compatibility_extractor_rejects_reasoning_only_and_truncation() {
+        let secret = "private reasoning";
+        let reasoning_only = json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": null, "reasoning_content": secret}
+            }]
+        });
+        assert!(validate_completion_response(&reasoning_only).is_err());
+
+        let truncated = json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": "partial", "reasoning_content": secret}
+            }]
+        });
+        assert!(validate_completion_response(&truncated).is_err());
     }
 
     #[test]

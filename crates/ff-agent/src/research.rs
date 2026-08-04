@@ -31,6 +31,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use ff_core::llm_completion_policy::{
+    apply_completion_policy, validate_completion_response, CompletionBudget, WorkloadClass,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
@@ -2034,13 +2037,15 @@ pub async fn openai_single_completion_with_usage(
     max_tokens: u32,
     client: &reqwest::Client,
 ) -> Result<(String, u64, u64)> {
+    let budget = CompletionBudget::new(max_tokens).context("invalid completion token budget")?;
     let url = ff_core::url::normalize_chat_completions_url(gateway_url);
-    let body = json!({
+    let mut body = json!({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
         "temperature": 0.2,
     });
+    apply_completion_policy(&mut body, WorkloadClass::Reasoning, budget)
+        .context("apply research completion policy")?;
     let resp = client
         .post(&url)
         .json(&body)
@@ -2050,38 +2055,18 @@ pub async fn openai_single_completion_with_usage(
         .with_context(|| format!("POST {url}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let txt = resp.text().await.unwrap_or_default();
-        anyhow::bail!("{url}: HTTP {status}: {txt}");
+        // Provider error bodies can contain private reasoning or echoed prompts.
+        // Keep the failure actionable without copying any raw provider payload
+        // into logs, anyhow chains, or persisted research diagnostics.
+        anyhow::bail!("{url}: HTTP {status}");
     }
     let v: Value = resp
         .json()
         .await
         .with_context(|| format!("parse JSON from {url}"))?;
-    // Some local reasoning-model servers (mlx_lm.server / vLLM with Qwen3
-    // "thinking" builds) put the visible answer in `reasoning_content` (or
-    // `reasoning`) and leave `content` empty when the response is truncated
-    // by the token cap mid-thought. Try the OpenAI-standard `content` first,
-    // then fall back to the reasoning fields so the planner/synthesizer still
-    // gets usable text instead of erroring on empty content.
-    let msg = v
-        .pointer("/choices/0/message")
-        .ok_or_else(|| anyhow::anyhow!("missing choices[0].message in {v}"))?;
-    let pick = |key: &str| {
-        msg.get(key)
-            .and_then(|x| x.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    let content = pick("content")
-        .or_else(|| pick("reasoning_content"))
-        .or_else(|| pick("reasoning"))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "missing/empty choices[0].message.content, .reasoning_content, \
-                 and .reasoning in {v}"
-            )
-        })?;
+    let content = validate_completion_response(&v)
+        .with_context(|| format!("validate completion from {url}"))?
+        .content;
     let (tin, tout) = parse_completion_usage(&v);
     Ok((content, tin, tout))
 }
@@ -2156,8 +2141,39 @@ fn whoami_tag() -> String {
 
 #[cfg(test)]
 mod usage_tests {
-    use super::parse_completion_usage;
+    use super::{openai_single_completion_with_usage, parse_completion_usage};
+    use ff_core::llm_completion_policy::HARD_MAX_COMPLETION_TOKENS;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    async fn spawn_completion_server(
+        status: axum::http::StatusCode,
+        response: serde_json::Value,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let handler = move |axum::Json(request): axum::Json<serde_json::Value>| {
+            let captured = captured.clone();
+            let response = response.clone();
+            async move {
+                captured.lock().unwrap().push(request);
+                (status, axum::Json(response))
+            }
+        };
+        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(handler));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (endpoint, requests, server)
+    }
 
     #[test]
     fn parses_openai_usage_block() {
@@ -2177,5 +2193,137 @@ mod usage_tests {
             parse_completion_usage(&json!({"usage": {"prompt_tokens": 7}})),
             (7, 0)
         );
+    }
+
+    #[tokio::test]
+    async fn research_completion_applies_reasoning_policy_and_preserves_usage() {
+        let (endpoint, requests, server) = spawn_completion_server(
+            axum::http::StatusCode::OK,
+            json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"content": "<think>private</think> public answer"}
+                }],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 7}
+            }),
+        )
+        .await;
+
+        let result = openai_single_completion_with_usage(
+            &endpoint,
+            "reasoning-model",
+            "research this",
+            321,
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, ("public answer".to_string(), 12, 7));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["max_tokens"], 321);
+        assert!(requests[0].get("chat_template_kwargs").is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn research_completion_rejects_invalid_budget_before_http() {
+        let client = reqwest::Client::new();
+        for invalid in [0, HARD_MAX_COMPLETION_TOKENS + 1] {
+            let error = openai_single_completion_with_usage(
+                "http://127.0.0.1:9",
+                "reasoning-model",
+                "research this",
+                invalid,
+                &client,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("invalid completion token budget"));
+            assert!(!error.contains("POST"));
+        }
+    }
+
+    #[tokio::test]
+    async fn research_completion_rejects_length_without_reasoning_leak() {
+        let secret = "private chain from truncated generation";
+        let (endpoint, _requests, server) = spawn_completion_server(
+            axum::http::StatusCode::OK,
+            json!({
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": {"content": null, "reasoning_content": secret}
+                }]
+            }),
+        )
+        .await;
+
+        let error = openai_single_completion_with_usage(
+            &endpoint,
+            "reasoning-model",
+            "research this",
+            512,
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap_err();
+        let display = format!("{error:#}");
+        assert!(display.contains("truncated at its token limit"));
+        assert!(!display.contains(secret));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn research_completion_rejects_reasoning_only_stop() {
+        let secret = "private reasoning must not become the report";
+        let (endpoint, _requests, server) = spawn_completion_server(
+            axum::http::StatusCode::OK,
+            json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"content": null, "reasoning": secret}
+                }]
+            }),
+        )
+        .await;
+
+        let error = openai_single_completion_with_usage(
+            &endpoint,
+            "reasoning-model",
+            "research this",
+            512,
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!format!("{error:#}").contains(secret));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn research_completion_http_error_omits_provider_body() {
+        let secret = "provider-private-error-body";
+        let (endpoint, _requests, server) = spawn_completion_server(
+            axum::http::StatusCode::BAD_GATEWAY,
+            json!({"reasoning_content": secret, "error": "provider detail"}),
+        )
+        .await;
+
+        let error = openai_single_completion_with_usage(
+            &endpoint,
+            "reasoning-model",
+            "research this",
+            512,
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap_err();
+        let display = format!("{error:#}");
+        assert!(display.contains("502 Bad Gateway"));
+        assert!(!display.contains(secret));
+        assert!(!display.contains("provider detail"));
+        server.abort();
     }
 }

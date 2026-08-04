@@ -22,6 +22,9 @@
 
 use std::time::Duration;
 
+use ff_core::llm_completion_policy::{
+    apply_completion_policy, validate_completion_response, CompletionBudget, WorkloadClass,
+};
 use ff_orchestrator::cascade_strategy::LlmExec;
 use serde_json::json;
 
@@ -30,6 +33,8 @@ use serde_json::json;
 pub struct GatewayLlmExec {
     client: reqwest::Client,
     pool: Option<sqlx::PgPool>,
+    workload: WorkloadClass,
+    completion_ceiling: Option<CompletionBudget>,
 }
 
 impl GatewayLlmExec {
@@ -41,6 +46,8 @@ impl GatewayLlmExec {
                 .build()
                 .expect("reqwest client"),
             pool: None,
+            workload: WorkloadClass::CodeOneShot,
+            completion_ceiling: None,
         }
     }
 
@@ -49,6 +56,18 @@ impl GatewayLlmExec {
     /// hardcoded endpoint map.
     pub fn with_pool(mut self, pool: sqlx::PgPool) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    /// Apply the caller-selected completion policy to non-judge stages.
+    pub fn with_workload(mut self, workload: WorkloadClass) -> Self {
+        self.workload = workload;
+        self
+    }
+
+    /// Bound non-judge stage budgets without silently increasing them.
+    pub fn with_completion_ceiling(mut self, ceiling: Option<CompletionBudget>) -> Self {
+        self.completion_ceiling = ceiling;
         self
     }
 
@@ -272,16 +291,12 @@ impl GatewayLlmExec {
         endpoint: &str,
         model: &str,
         prompt: &str,
-        max_tokens: u32,
+        workload: WorkloadClass,
+        budget: CompletionBudget,
         timeout: Duration,
     ) -> Result<String, String> {
         let url = ff_core::url::normalize_chat_completions_url(endpoint);
-        let body = json!({
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "temperature": 0.3,
-        });
+        let body = Self::completion_request_body(model, prompt, workload, budget)?;
         let resp = self
             .client
             .post(&url)
@@ -291,29 +306,41 @@ impl GatewayLlmExec {
             .await
             .map_err(|e| format!("POST {url}: {e}"))?;
         let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| format!("read body from {url}: {e}"))?;
         if !status.is_success() {
-            return Err(format!("{url} returned {status}: {text}"));
+            return Err(format!("{url} returned HTTP {status}"));
         }
-        let payload: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            format!(
-                "parse {url} body: {e}; raw: {}",
-                &text[..text.len().min(200)]
-            )
-        })?;
-        let content = payload
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("{url}: no choices[0].message.content"))?
-            .to_string();
-        Ok(content)
+        let payload: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("decode completion response from {url}: {e}"))?;
+        validate_completion_response(&payload)
+            .map(|completion| completion.content)
+            .map_err(|error| format!("{url}: invalid completion: {error}"))
+    }
+
+    fn completion_request_body(
+        model: &str,
+        prompt: &str,
+        workload: WorkloadClass,
+        budget: CompletionBudget,
+    ) -> Result<serde_json::Value, String> {
+        let mut body = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+        });
+        apply_completion_policy(&mut body, workload, budget)
+            .map_err(|error| format!("completion request policy rejected request: {error}"))?;
+        Ok(body)
+    }
+
+    fn stage_budget(&self, requested: u32) -> Result<CompletionBudget, String> {
+        let effective = self
+            .completion_ceiling
+            .map(|ceiling| requested.min(ceiling.get()))
+            .unwrap_or(requested);
+        CompletionBudget::new(effective)
+            .map_err(|error| format!("invalid completion budget: {error}"))
     }
 }
 
@@ -333,14 +360,8 @@ impl LlmExec for GatewayLlmExec {
         timeout: Duration,
     ) -> Result<String, String> {
         let (endpoint, model) = self.endpoint_for_tier(tier).await;
-        // Qwen3 family always emits <think> blocks and silently truncates if
-        // max_tokens < 1024 (see llm_routing::QWEN3_MAX_TOKENS_FLOOR).
-        let effective_max = if model.to_lowercase().contains("qwen3") && max_tokens < 1024 {
-            1024
-        } else {
-            max_tokens
-        };
-        self.http_complete(&endpoint, &model, prompt, effective_max, timeout)
+        let budget = self.stage_budget(max_tokens)?;
+        self.http_complete(&endpoint, &model, prompt, self.workload, budget, timeout)
             .await
     }
 
@@ -351,8 +372,17 @@ impl LlmExec for GatewayLlmExec {
         timeout: Duration,
     ) -> Result<String, String> {
         let (endpoint, model) = self.judge_endpoint().await?;
-        self.http_complete(&endpoint, &model, prompt, max_tokens, timeout)
-            .await
+        let budget = CompletionBudget::new(max_tokens)
+            .map_err(|error| format!("invalid judge completion budget: {error}"))?;
+        self.http_complete(
+            &endpoint,
+            &model,
+            prompt,
+            WorkloadClass::Reasoning,
+            budget,
+            timeout,
+        )
+        .await
     }
 }
 
@@ -403,5 +433,39 @@ mod tests {
             assert!(endpoint.starts_with("http://"));
             assert!(!model.is_empty());
         }
+    }
+
+    #[test]
+    fn code_request_disables_thinking_and_preserves_exact_budget() {
+        let body = GatewayLlmExec::completion_request_body(
+            "glm-4.5-air",
+            "write code",
+            WorkloadClass::CodeOneShot,
+            CompletionBudget::new(777).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["max_tokens"], 777);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn reasoning_request_preserves_endpoint_thinking_default() {
+        let body = GatewayLlmExec::completion_request_body(
+            "glm-4.5-air",
+            "judge this",
+            WorkloadClass::Reasoning,
+            CompletionBudget::new(256).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["max_tokens"], 256);
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn caller_ceiling_never_increases_stage_budget() {
+        let exec = GatewayLlmExec::new()
+            .with_completion_ceiling(Some(CompletionBudget::new(512).unwrap()));
+        assert_eq!(exec.stage_budget(2_048).unwrap().get(), 512);
+        assert_eq!(exec.stage_budget(128).unwrap().get(), 128);
     }
 }

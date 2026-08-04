@@ -19,6 +19,10 @@ use ff_api::registry::{BackendEndpoint, BackendRegistry};
 use ff_api::router::{TierRouter, TierRouterConfig, TierTimeouts};
 use ff_api::types::{ChatCompletionRequest, ChatMessage};
 use ff_core::config::{self, FleetConfig};
+use ff_core::llm_completion_policy::{
+    apply_completion_policy, redacted_for_logging, validate_completion_response, CompletionBudget,
+    WorkloadClass, LEGACY_DEFAULT_COMPLETION_TOKENS,
+};
 use ff_db::{ModelDeploymentRow, OperationalStore};
 use ff_discovery::health::{HealthMonitor, HealthStatus, HealthTarget};
 use ff_discovery::ports::known_llm_ports;
@@ -82,7 +86,7 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
     let (config, config_path) = load_config_auto()?;
 
     // ─── Primary source: Postgres. Fallback: fleet.toml ─────────────────────
-    let (pg_nodes, pg_deployments) = match get_pg_pool(&config).await {
+    let (pg_nodes, pg_deployments, scan_port) = match get_pg_pool(&config).await {
         Ok(pool) => {
             let nodes = ff_db::pg_list_nodes(&pool).await.unwrap_or_default();
             // Models LOADED = what's actually RUNNING (fleet_model_deployments),
@@ -92,21 +96,33 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
             let deployments = ff_db::pg_list_deployments(&pool, None)
                 .await
                 .unwrap_or_default();
+            // `fleet.api_port` is the loopback-only agent API (:51000) on
+            // managed nodes. Cross-node health must probe the public gateway
+            // port, whose live authority is `fleet_secrets.port.gateway`.
+            let gateway_port = sqlx::query_scalar::<_, String>(
+                "SELECT value FROM fleet_secrets WHERE key = 'port.gateway'",
+            )
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(config.fleet.api_port);
             if nodes.is_empty() {
                 info!("fleet_status: Postgres fleet_workers empty, falling back to fleet.toml");
-                (None, None)
+                (None, None, config.fleet.api_port)
             } else {
                 info!(
                     nodes = nodes.len(),
                     deployments = deployments.len(),
                     "fleet_status: using Postgres as primary source"
                 );
-                (Some(nodes), Some(deployments))
+                (Some(nodes), Some(deployments), gateway_port)
             }
         }
         Err(e) => {
             warn!("fleet_status: Postgres unavailable ({e}), falling back to fleet.toml");
-            (None, None)
+            (None, None, config.fleet.api_port)
         }
     };
 
@@ -114,19 +130,18 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
 
     // Build scan targets from whichever source we're using
     let scan_targets = if let Some(ref db_nodes) = pg_nodes {
-        let default_port = config.fleet.api_port;
         let node_tuples: Vec<(String, String, Option<u16>, u32)> = db_nodes
             .iter()
             .map(|n| {
                 (
                     n.name.clone(),
                     n.ip.clone(),
-                    Some(default_port),
+                    Some(scan_port),
                     n.election_priority as u32,
                 )
             })
             .collect();
-        build_scan_targets(node_tuples, default_port)
+        build_scan_targets(node_tuples, scan_port)
     } else {
         build_known_scan_targets(&config)
     };
@@ -330,6 +345,7 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
     Ok(json!({
         "refresh": refresh,
         "config_path": config_path,
+        "scan_port": scan_port,
         "source": if using_postgres { "postgres" } else { "fleet.toml" },
         "nodes": nodes_json,
         "summary": {
@@ -554,6 +570,46 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
         .and_then(|v| v.as_str())
         .ok_or_else(|| "fleet_run requires 'prompt'".to_string())?;
 
+    let workload = match params.as_ref().and_then(|p| p.get("workload")) {
+        Some(Value::String(value)) if matches!(value.as_str(), "code_oneshot" | "code_one_shot") => {
+            WorkloadClass::CodeOneShot
+        }
+        Some(Value::String(value)) if value == "reasoning" => WorkloadClass::Reasoning,
+        Some(Value::String(other)) => {
+            return Err(format!(
+                "fleet_run workload must be code_oneshot or reasoning, got {other:?}"
+            ));
+        }
+        Some(_) => return Err("fleet_run workload must be a string".to_string()),
+        None => {
+            warn!(
+                "fleet_run request omitted workload; applying deprecated safe default code_oneshot"
+            );
+            WorkloadClass::CodeOneShot
+        }
+    };
+    let requested_max_tokens = match params.as_ref().and_then(|p| p.get("max_tokens")) {
+        Some(value) => Some(
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    "fleet_run max_tokens must be a positive integer no greater than 32768"
+                        .to_string()
+                })?,
+        ),
+        None => None,
+    };
+    let completion_budget =
+        CompletionBudget::new(requested_max_tokens.unwrap_or(LEGACY_DEFAULT_COMPLETION_TOKENS))
+            .map_err(|error| format!("fleet_run invalid max_tokens: {error}"))?;
+    if requested_max_tokens.is_none() {
+        warn!(
+            default_max_tokens = LEGACY_DEFAULT_COMPLETION_TOKENS,
+            "fleet_run request omitted max_tokens; legacy tier routing uses the 2048-token compatibility default while strategy routing preserves its bounded stage budgets"
+        );
+    }
+
     // strategy: "tier" (default — legacy TierRouter escalation, unchanged
     // behaviour) | "auto" (classifier picks the cascade shape) | "single"
     // | "cascade" | "judge_escalate". When != "tier", dispatch through the
@@ -654,7 +710,9 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                 );
                 crate::llm_exec::GatewayLlmExec::new()
             }
-        };
+        }
+        .with_workload(workload)
+        .with_completion_ceiling(requested_max_tokens.map(|_| completion_budget));
 
         let tier_hint = params
             .as_ref()
@@ -860,6 +918,10 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                 user: None,
                 extra: HashMap::new(),
             };
+            let mut request = serde_json::to_value(request)
+                .map_err(|error| format!("failed serializing fleet_run request: {error}"))?;
+            apply_completion_policy(&mut request, workload, completion_budget)
+                .map_err(|error| format!("fleet_run request policy failed: {error}"))?;
 
             let started = Instant::now();
             let endpoint = ff_core::url::normalize_chat_completions_url(&backend.base_url());
@@ -876,10 +938,6 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
 
                     if !response.status().is_success() {
                         let status = response.status();
-                        let body = response
-                            .text()
-                            .await
-                            .unwrap_or_else(|_| "<failed reading error body>".to_string());
 
                         tier_router.record_failure(&backend.id, latency);
                         quality_tracker.record(
@@ -888,17 +946,44 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                             &Outcome::failure(latency.as_millis() as f64),
                         );
 
-                        last_error = format!(
-                            "backend '{}' returned HTTP {}: {}",
-                            backend.id, status, body
-                        );
+                        // Provider bodies can echo prompts or private reasoning.
+                        // Preserve the actionable endpoint/status only.
+                        last_error = format!("backend '{}' returned HTTP {}", backend.id, status);
                         continue;
                     }
 
-                    let payload: Value = response
-                        .json()
-                        .await
-                        .map_err(|e| format!("failed parsing backend JSON response: {e}"))?;
+                    let payload: Value = match response.json().await {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            tier_router.record_failure(&backend.id, latency);
+                            quality_tracker.record(
+                                &backend.model,
+                                decision.profile.task_type,
+                                &Outcome::failure(latency.as_millis() as f64),
+                            );
+                            last_error = format!(
+                                "backend '{}' returned invalid completion JSON: {error}",
+                                backend.id
+                            );
+                            continue;
+                        }
+                    };
+                    let completion = match validate_completion_response(&payload) {
+                        Ok(completion) => completion,
+                        Err(error) => {
+                            tier_router.record_failure(&backend.id, latency);
+                            quality_tracker.record(
+                                &backend.model,
+                                decision.profile.task_type,
+                                &Outcome::failure(latency.as_millis() as f64),
+                            );
+                            last_error = format!(
+                                "backend '{}' returned an unsafe completion: {error}",
+                                backend.id
+                            );
+                            continue;
+                        }
+                    };
 
                     tier_router.record_success(&backend.id, latency);
                     quality_tracker.record(
@@ -909,14 +994,15 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
 
                     persist_quality_snapshot(&quality_tracker).await;
 
-                    let text = extract_completion_text(&payload);
+                    let text = completion.content;
+                    let redacted_payload = redacted_for_logging(&payload);
 
                     // Fire-and-forget interaction capture (Track A). Never
                     // blocks the response; skips silently if no pool is
                     // available. channel="mcp".
                     {
                         let prompt_owned = prompt.to_string();
-                        let response_owned = text.clone().unwrap_or_default();
+                        let response_owned = text.clone();
                         // `backend.model` is a local deployment's model name /
                         // gguf filename — record the canonical local engine.
                         let engine_owned = ff_agent::llm_attribution::engine_label(&backend.model);
@@ -973,7 +1059,8 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                         },
                         "latency_ms": latency.as_millis(),
                         "response": text,
-                        "raw_response": payload,
+                        "raw_response": redacted_payload,
+                        "raw_response_redacted": true,
                         "project_policy": applied_policy
                     }));
                 }
@@ -1014,9 +1101,9 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
 //      hosts in v1. This is the SAME scored selector `fleet_route` and the
 //      agent router use — no parallel router.
 //   2. Found → dispatch the task to it over the OpenAI-compatible API, reusing
-//      the same SHARED_HTTP client + `/v1/chat/completions` request shape +
-//      `extract_completion_text` helper that `fleet_run` uses (no parallel LLM
-//      client). Return {offloaded:true, endpoint, model, result, ...}.
+//      the same SHARED_HTTP client + shared fail-closed completion policy that
+//      `fleet_run` uses (no parallel LLM client). Return
+//      {offloaded:true, endpoint, model, result, ...}.
 //   3. None warm → record the UNMET demand (so the P3 autoscaler warms a
 //      matching endpoint for next time) and return {offloaded:false,
 //      decision:"do_in_cloud", autoscaler_signaled, reason:...} so the caller
@@ -1179,18 +1266,18 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
         n: None,
         stream: Some(false),
         stop: None,
-        max_tokens: Some(max_tokens),
+        max_tokens: None,
         presence_penalty: None,
         frequency_penalty: None,
         user: None,
-        // Disable Qwen3-style "thinking" so offload returns the answer, not
-        // chain-of-thought that eats the token budget (can return empty content
-        // under a tight cap). Harmless on servers that don't recognize it.
-        extra: HashMap::from([(
-            "chat_template_kwargs".to_string(),
-            json!({"enable_thinking": false}),
-        )]),
+        extra: HashMap::new(),
     };
+    let mut request = serde_json::to_value(request)
+        .map_err(|error| format!("fleet_offload failed serializing request: {error}"))?;
+    let offload_budget = CompletionBudget::new(max_tokens)
+        .map_err(|error| format!("fleet_offload invalid max_tokens: {error}"))?;
+    apply_completion_policy(&mut request, WorkloadClass::CodeOneShot, offload_budget)
+        .map_err(|error| format!("fleet_offload request policy failed: {error}"))?;
 
     let started = Instant::now();
     let response = match client
@@ -1228,12 +1315,8 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
     let latency = started.elapsed();
     let status = response.status();
     if !status.is_success() {
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed reading error body>".to_string());
         let error_text = format!(
-            "fleet_offload endpoint {} (model {}) returned HTTP {status}: {body}",
+            "fleet_offload endpoint {} (model {}) returned HTTP {status}",
             target.endpoint, model
         );
         record_mcp_offload_turn(
@@ -1243,7 +1326,7 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
             min_ctx,
             max_tokens,
             &target,
-            &body,
+            "",
             0,
             0,
             Some(latency),
@@ -1276,7 +1359,28 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
             return Err(error_text);
         }
     };
-    let result = strip_think_block(&extract_completion_text(&payload).unwrap_or_default());
+    let result = match validate_completion_response(&payload) {
+        Ok(completion) => completion.content,
+        Err(error) => {
+            let error_text = format!("fleet_offload returned an unsafe completion: {error}");
+            record_mcp_offload_turn(
+                &pool,
+                task,
+                kind,
+                min_ctx,
+                max_tokens,
+                &target,
+                "",
+                0,
+                0,
+                Some(latency),
+                "error",
+                Some(&error_text),
+            )
+            .await;
+            return Err(error_text);
+        }
+    };
     let usage = payload.get("usage");
     let usage_tok = |key: &str| -> i32 {
         usage
@@ -1313,7 +1417,8 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
         "kind": kind,
         "latency_ms": latency.as_millis(),
         "result": result,
-        "raw_response": payload,
+        "raw_response": redacted_for_logging(&payload),
+        "raw_response_redacted": true,
         "review_hint": "Review this output before using it. If it's wrong or \
                         the task needed architectural judgment, redo it yourself."
     }))
@@ -1364,37 +1469,6 @@ async fn record_mcp_offload_turn(
     if let Err(error) = ff_db::pg_record_interaction(pool, &record).await {
         tracing::warn!(error = %error, "fleet_offload: interaction capture failed");
     }
-}
-
-/// Strip any `<think>…</think>` reasoning a model emitted, returning the trimmed
-/// remainder. Belt-and-suspenders with chat_template_kwargs.enable_thinking=false.
-/// NOTE: keep in sync with `strip_think` in ff-terminal/src/offload_cmd.rs.
-fn strip_think_block(s: &str) -> String {
-    let mut out = s.to_string();
-    // 1) Remove well-formed <think>…</think> pairs, left-to-right.
-    loop {
-        let Some(open) = out.find("<think>") else {
-            break;
-        };
-        match out[open..].find("</think>") {
-            Some(rel) => {
-                let close = open + rel + "</think>".len();
-                out.replace_range(open..close, "");
-            }
-            // 2) Unclosed opener — a thinking model cut off mid-reasoning under a
-            //    token cap. Everything from <think> on is reasoning; drop it.
-            None => {
-                out.truncate(open);
-                break;
-            }
-        }
-    }
-    // 3) A lone trailing </think> with no opener (the open tag was consumed by
-    //    the chat template): the answer is whatever follows the last </think>.
-    if let Some(i) = out.rfind("</think>") {
-        out = out[i + "</think>".len()..].to_string();
-    }
-    out.trim().to_string()
 }
 
 // ─── Fleet Cascade ───────────────────────────────────────────────────────────
@@ -1898,7 +1972,7 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
     // Build the crew from the V112 `fleet_agents` catalog, routing each agent
     // through the agent-swarm capability router. Falls back to the hardcoded
     // TeamTemplates when the catalog / DB is unavailable (back-compat).
-    let (team, crew_routing) = build_crew_team(applied_policy.as_ref()).await;
+    let (team, crew_routing) = build_crew_team(applied_policy.as_ref()).await?;
     let policy_notes = applied_policy
         .as_ref()
         .map(policy_notes_for_crew)
@@ -1945,6 +2019,7 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
                 prompt,
                 model: model_hint,
                 max_tokens: Some(1200),
+                endpoint: assignment.endpoint.clone(),
             },
         )
         .with_timeout(Duration::from_secs(timeout_secs))
@@ -3206,19 +3281,21 @@ impl CrewRouting {
 ///
 /// Returns the team alongside a [`CrewRouting`] summary so the caller can
 /// surface (and this fn logs) any silent routing degradation.
-async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> (TeamConfig, CrewRouting) {
+async fn build_crew_team(
+    policy: Option<&AppliedProjectPolicy>,
+) -> Result<(TeamConfig, CrewRouting), String> {
     let fallback = |reason: &str| {
         warn!(
             reason,
             "fleet_crew: agent catalog unavailable; using hardcoded TeamTemplates — agents run on the executor's default endpoint, not a routed fleet model"
         );
-        (
+        Ok((
             choose_team_for_policy(policy),
             CrewRouting {
                 used_template_fallback: true,
                 ..Default::default()
             },
-        )
+        ))
     };
 
     let Ok((config, _)) = load_config_auto() else {
@@ -3267,7 +3344,23 @@ async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> (TeamConfig, 
         if used_leader {
             routing.leader_fallbacks.push(row.name.clone());
         }
-        let endpoint = candidate.map(|c| c.endpoint);
+        let (endpoint, routed_model) = match candidate {
+            Some(candidate) => {
+                let (endpoint, model) = validate_crew_route_identity(
+                    &candidate.endpoint,
+                    candidate.catalog_id.as_deref(),
+                    candidate.catalog_name.as_deref(),
+                )
+                .map_err(|error| {
+                        format!(
+                            "fleet_crew routed agent {:?} without a usable endpoint/model identity: {error}",
+                            row.name,
+                        )
+                    })?;
+                (Some(endpoint), Some(model))
+            }
+            None => (None, None),
+        };
         match &endpoint {
             Some(_) => routing.routed += 1,
             None => {
@@ -3279,12 +3372,16 @@ async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> (TeamConfig, 
                 routing.unrouted_agents.push(row.name.clone());
             }
         }
-        team.add(AgentAssignment::from_catalog(
+        let mut assignment = AgentAssignment::from_catalog(
             row.name.clone(),
             role,
             row.system_prompt.clone(),
             endpoint,
-        ));
+        );
+        if let Some(model) = routed_model {
+            assignment.model_preference = ModelPreference::specific(model);
+        }
+        team.add(assignment);
         built_any = true;
     }
 
@@ -3302,10 +3399,48 @@ async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> (TeamConfig, 
                 "fleet_crew: no non-leader agent-capable endpoint for some agents — routed them to the leader (preference overridden)"
             );
         }
-        (team, routing)
+        Ok((team, routing))
     } else {
         fallback("empty_catalog")
     }
+}
+
+fn validate_crew_endpoint(endpoint: &str) -> Result<String, String> {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    if endpoint.is_empty() {
+        return Err("endpoint is empty".to_string());
+    }
+    let parsed = reqwest::Url::parse(endpoint)
+        .map_err(|error| format!("endpoint is not an absolute URL: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "endpoint scheme {:?} is not http or https",
+            parsed.scheme()
+        ));
+    }
+    if parsed.host_str().is_none() {
+        return Err("endpoint has no host".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("endpoint must not contain credentials".to_string());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("endpoint must not contain a query or fragment".to_string());
+    }
+    Ok(endpoint.to_string())
+}
+
+fn validate_crew_route_identity(
+    endpoint: &str,
+    catalog_id: Option<&str>,
+    catalog_name: Option<&str>,
+) -> Result<(String, String), String> {
+    let endpoint = validate_crew_endpoint(endpoint)?;
+    let model = catalog_id
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| catalog_name.filter(|value| !value.trim().is_empty()))
+        .ok_or_else(|| "catalog model identity is empty".to_string())?;
+    Ok((endpoint, model.trim().to_string()))
 }
 
 fn choose_team_for_policy(policy: Option<&AppliedProjectPolicy>) -> TeamConfig {
@@ -4024,46 +4159,6 @@ fn infer_subnet(config: &FleetConfig) -> Option<String> {
     None
 }
 
-fn extract_completion_text(payload: &Value) -> Option<String> {
-    payload
-        .get("choices")
-        .and_then(|v| v.as_array())
-        .and_then(|choices| choices.first())
-        .and_then(|choice| {
-            choice
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(value_to_string)
-                .or_else(|| {
-                    choice
-                        .get("delta")
-                        .and_then(|m| m.get("content"))
-                        .and_then(value_to_string)
-                })
-                .or_else(|| choice.get("text").and_then(value_to_string))
-        })
-}
-
-fn value_to_string(value: &Value) -> Option<String> {
-    match value {
-        Value::String(s) => Some(s.clone()),
-        Value::Array(arr) => {
-            let mut text_parts = Vec::new();
-            for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    text_parts.push(text.to_string());
-                }
-            }
-            if text_parts.is_empty() {
-                None
-            } else {
-                Some(text_parts.join("\n"))
-            }
-        }
-        _ => None,
-    }
-}
-
 async fn persist_quality_snapshot(tracker: &Arc<QualityTracker>) {
     match tracker.export_json() {
         Ok(snapshot) => {
@@ -4289,6 +4384,52 @@ mod tests {
         assert!(!leader_only.degraded());
     }
 
+    #[test]
+    fn crew_route_identity_preserves_endpoint_and_catalog_model() {
+        assert_eq!(
+            validate_crew_route_identity(
+                "  http://192.168.5.110:55004/ ",
+                Some("lucy-1-7b"),
+                Some("fallback-name"),
+            )
+            .unwrap(),
+            (
+                "http://192.168.5.110:55004".to_string(),
+                "lucy-1-7b".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn crew_route_identity_rejects_unsafe_or_incomplete_routes() {
+        for endpoint in [
+            "",
+            "127.0.0.1:51002",
+            "file:///tmp/socket",
+            "http://user:secret@host:55000",
+            "http://host:55000?token=secret",
+        ] {
+            assert!(
+                validate_crew_route_identity(endpoint, Some("model"), None).is_err(),
+                "unsafe endpoint {endpoint:?} must fail closed"
+            );
+        }
+        assert!(validate_crew_route_identity("http://host:55000", Some("  "), None).is_err());
+    }
+
+    #[tokio::test]
+    async fn fleet_run_rejects_malformed_completion_policy_before_routing() {
+        let workload_error = fleet_run(Some(json!({"prompt": "x", "workload": 7})))
+            .await
+            .unwrap_err();
+        assert_eq!(workload_error, "fleet_run workload must be a string");
+
+        let token_error = fleet_run(Some(json!({"prompt": "x", "max_tokens": -1})))
+            .await
+            .unwrap_err();
+        assert!(token_error.contains("max_tokens must be a positive integer"));
+    }
+
     fn setup_test_db() -> (String, Option<String>) {
         let db_path = std::env::temp_dir().join(format!(
             "ff-mcp-fleet-crew-test-{}.db",
@@ -4319,6 +4460,49 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    fn setup_isolated_crew_test() -> (String, Option<String>, String, Option<String>) {
+        let (db_path, prev_db_path) = setup_test_db();
+        let config_path = std::env::temp_dir().join(format!(
+            "ff-mcp-fleet-crew-config-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&config_path, "this is intentionally invalid TOML =")
+            .expect("write invalid isolated crew config");
+
+        let prev_config_path = std::env::var("FORGEFLEET_CONFIG").ok();
+        // SAFETY: the crew tests serialize environment mutation with env_lock.
+        unsafe {
+            std::env::set_var("FORGEFLEET_CONFIG", &config_path);
+        }
+
+        (
+            db_path,
+            prev_db_path,
+            config_path.to_string_lossy().to_string(),
+            prev_config_path,
+        )
+    }
+
+    fn restore_isolated_crew_test(
+        db_path: &str,
+        prev_db_path: Option<String>,
+        config_path: &str,
+        prev_config_path: Option<String>,
+    ) {
+        match prev_config_path {
+            Some(value) => unsafe {
+                // SAFETY: the crew tests serialize environment mutation with env_lock.
+                std::env::set_var("FORGEFLEET_CONFIG", value);
+            },
+            None => unsafe {
+                // SAFETY: the crew tests serialize environment mutation with env_lock.
+                std::env::remove_var("FORGEFLEET_CONFIG");
+            },
+        }
+        let _ = std::fs::remove_file(config_path);
+        restore_test_db_env(db_path, prev_db_path);
+    }
+
     async fn spawn_mock_llm_server(always_fail: bool) -> (String, tokio::task::JoinHandle<()>) {
         let app = Router::new().route(
             "/v1/chat/completions",
@@ -4340,6 +4524,7 @@ mod tests {
                     Json(json!({
                         "choices": [
                             {
+                                "finish_reason": "stop",
                                 "message": {
                                     "content": format!("mock response: {}", prompt)
                                 }
@@ -4411,23 +4596,10 @@ mod tests {
         assert!(parse_host_port("bad-format").is_err());
     }
 
-    #[test]
-    fn extract_completion_text_prefers_message_content() {
-        let payload = json!({
-            "choices": [
-                {
-                    "message": { "content": "hello" },
-                    "text": "fallback"
-                }
-            ]
-        });
-        assert_eq!(extract_completion_text(&payload).as_deref(), Some("hello"));
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn fleet_crew_executes_pipeline_successfully() {
         let _guard = env_lock().lock().unwrap();
-        let (db_path, prev_db_path) = setup_test_db();
+        let (db_path, prev_db_path, config_path, prev_config_path) = setup_isolated_crew_test();
 
         let (base_url, server_handle) = spawn_mock_llm_server(false).await;
 
@@ -4444,7 +4616,10 @@ mod tests {
         .expect("fleet_crew should succeed");
 
         let status = response["status"].as_str().unwrap_or_default();
-        assert_eq!(status, "completed");
+        assert_eq!(
+            status, "completed",
+            "unexpected crew response: {response:#}"
+        );
         assert_eq!(response["execution"]["status"], "completed");
 
         let steps = response["execution"]["steps"].as_array().unwrap();
@@ -4456,13 +4631,13 @@ mod tests {
 
         server_handle.abort();
         let _ = std::fs::remove_dir_all(&repo_dir);
-        restore_test_db_env(&db_path, prev_db_path);
+        restore_isolated_crew_test(&db_path, prev_db_path, &config_path, prev_config_path);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn fleet_crew_reports_failures_when_steps_fail() {
         let _guard = env_lock().lock().unwrap();
-        let (db_path, prev_db_path) = setup_test_db();
+        let (db_path, prev_db_path, config_path, prev_config_path) = setup_isolated_crew_test();
 
         let (base_url, server_handle) = spawn_mock_llm_server(true).await;
 
@@ -4511,7 +4686,7 @@ mod tests {
 
         server_handle.abort();
         let _ = std::fs::remove_dir_all(&repo_dir);
-        restore_test_db_env(&db_path, prev_db_path);
+        restore_isolated_crew_test(&db_path, prev_db_path, &config_path, prev_config_path);
     }
 
     // Requires a live Postgres: project_profile_upsert/policy_resolve now route

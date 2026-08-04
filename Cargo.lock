@@ -1674,6 +1674,7 @@ name = "ff-pipeline"
 version = "2026.4.7"
 dependencies = [
  "chrono",
+ "ff-core",
  "ff-db",
  "reqwest",
  "serde",

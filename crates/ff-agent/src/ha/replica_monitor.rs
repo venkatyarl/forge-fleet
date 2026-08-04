@@ -237,17 +237,17 @@ impl ReplicaMonitorTick {
     /// True if an unresolved alert_event for this policy (fleet-wide, so
     /// computer_id IS NULL) already exists.
     async fn has_unresolved_event(&self, policy_id: Uuid) -> Result<bool, sqlx::Error> {
-        let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT 1 FROM alert_events
-              WHERE policy_id = $1
-                AND computer_id IS NULL
-                AND resolved_at IS NULL
-              LIMIT 1",
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1 FROM alert_events
+                 WHERE policy_id = $1
+                   AND computer_id IS NULL
+                   AND resolved_at IS NULL
+            )",
         )
         .bind(policy_id)
-        .fetch_optional(&self.pg)
-        .await?;
-        Ok(row.is_some())
+        .fetch_one(&self.pg)
+        .await
     }
 
     /// Fire the `postgres_replica_dead` alert through the seeded policy's

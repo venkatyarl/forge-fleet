@@ -434,6 +434,18 @@ impl ToolRegistry {
                         "enum": ["none", "json", "yaml"],
                         "default": "none",
                         "description": "(strategy=cascade only) Validator gate between cascade tiers. 'json' parses each tier's output."
+                    },
+                    "workload": {
+                        "type": "string",
+                        "enum": ["code_oneshot", "code_one_shot", "reasoning"],
+                        "default": "code_oneshot",
+                        "description": "Completion policy. Code one-shot disables private thinking; reasoning preserves the endpoint default but still requires a public final answer."
+                    },
+                    "max_tokens": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 32768,
+                        "description": "Optional bounded completion budget. Legacy tier calls default to 2048; Path-3 uses this as a ceiling over its stage budget."
                     }
                 },
                 "required": ["prompt"]
@@ -2092,5 +2104,18 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn fleet_run_schema_exposes_bounded_completion_policy_without_new_required_fields() {
+        let registry = ToolRegistry::new();
+        let schema = &registry.get("fleet_run").unwrap().input_schema;
+        assert_eq!(schema["required"], json!(["prompt"]));
+        assert_eq!(
+            schema["properties"]["workload"]["enum"],
+            json!(["code_oneshot", "code_one_shot", "reasoning"])
+        );
+        assert_eq!(schema["properties"]["max_tokens"]["minimum"], 1);
+        assert_eq!(schema["properties"]["max_tokens"]["maximum"], 32768);
     }
 }

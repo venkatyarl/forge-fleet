@@ -1015,6 +1015,7 @@ fn build_pipeline_graph(
                 ),
                 model: task.model.clone(),
                 max_tokens: task.max_tokens.or(Some(512)),
+                endpoint: None,
             },
         };
 

@@ -30,6 +30,7 @@ pub mod fleet_resolver;
 pub mod hardware;
 pub mod health;
 pub mod leader;
+pub mod llm_completion_policy;
 pub mod maintenance;
 pub mod model_id;
 pub mod monitor;

@@ -10,6 +10,7 @@
 //! - Session save/resume to disk
 //! - Cancellation support
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use ff_api::tool_calling::{OpenAiTool, ToolChatCompletionResponse, ToolChatMessage};
@@ -1060,16 +1061,10 @@ async fn run_agent_loop(
             }
         };
 
-        let finish_reason = choice
-            .finish_reason
-            .as_deref()
-            .unwrap_or("stop")
-            .to_string();
-
-        let assistant_msg = match response_message(choice) {
-            Ok(msg) => msg.clone(),
+        let (assistant_msg, validated_turn) = match validate_assistant_turn(choice) {
+            Ok(validated) => validated,
             Err(error) => {
-                let msg = error.to_string();
+                let msg = error;
                 emit(
                     &event_tx,
                     AgentEvent::Error {
@@ -1081,82 +1076,66 @@ async fn run_agent_loop(
             }
         };
 
-        // Append assistant message to history
-        session.messages.push(assistant_msg.clone());
+        let finish_reason = validated_turn.finish_reason().to_string();
 
-        // Check for tool calls — message itself is primary signal
-        let mut tool_calls = openai_bridge::extract_tool_calls(&assistant_msg);
+        let (tool_calls, tool_calls_from_text) = match validated_turn {
+            ValidatedAssistantTurn::Final(final_text) => {
+                // Persist only the sanitized public answer. Provider-private
+                // reasoning fields and leading thinking blocks must never be
+                // promoted into session history or emitted as the final text.
+                session
+                    .messages
+                    .push(ToolChatMessage::assistant(final_text.clone()));
 
-        // Text-mode fallback parsing: recover tool calls a (typically small,
-        // local) model emitted as plain text instead of the structured field.
-        let mut tool_calls_from_text = false;
-        if tool_calls.is_empty()
-            && let Some(text) = assistant_msg.text_content()
-        {
-            let text_calls = openai_bridge::parse_text_tool_calls(text);
-            if !text_calls.is_empty() {
-                // Recovery fired — the model emitted tool calls as free-form
-                // text instead of the structured field. Log at info with the
-                // model so the residual rate is visible after server-side
-                // prevention (--jinja for tool-capable chat models): a model
-                // that still shows up here is not honouring its chat template.
-                info!(
-                    model = %session.config.model,
-                    count = text_calls.len(),
-                    "recovered tool call(s) from malformed text output — model is not emitting structured tool_calls"
+                emit(
+                    &event_tx,
+                    AgentEvent::AssistantText {
+                        session_id: session_id.clone(),
+                        text: final_text.clone(),
+                    },
                 );
-                tool_calls = text_calls;
-                tool_calls_from_text = true;
+
+                emit(
+                    &event_tx,
+                    AgentEvent::TurnComplete {
+                        session_id: session_id.clone(),
+                        turn,
+                        finish_reason,
+                    },
+                );
+
+                emit(
+                    &event_tx,
+                    AgentEvent::Done {
+                        session_id: session_id.clone(),
+                        final_text: final_text.clone(),
+                    },
+                );
+
+                info!(session = %session_id, turn, "agent loop completed");
+                return AgentOutcome::EndTurn {
+                    final_message: final_text,
+                };
             }
-        }
-
-        if tool_calls.is_empty() {
-            // No tool calls — agent is done
-            let final_text = match final_answer(&assistant_msg) {
-                Ok(text) => text.to_string(),
-                Err(error) => {
-                    let msg = error.to_string();
-                    emit(
-                        &event_tx,
-                        AgentEvent::Error {
-                            session_id: session_id.clone(),
-                            message: msg.clone(),
-                        },
+            ValidatedAssistantTurn::ToolCalls { calls, from_text } => {
+                // Validation is complete: only now may the assistant message
+                // enter history or any tool execute.
+                session.messages.push(assistant_msg.clone());
+                if from_text {
+                    // Recovery fired — the model emitted tool calls as free-form
+                    // text instead of the structured field. Log at info with the
+                    // model so the residual rate is visible after server-side
+                    // prevention (--jinja for tool-capable chat models): a model
+                    // that still shows up here is not honouring its chat template.
+                    info!(
+                        model = %session.config.model,
+                        count = calls.len(),
+                        "recovered tool call(s) from malformed text output — model is not emitting structured tool_calls"
                     );
-                    return AgentOutcome::Error(msg);
                 }
-            };
-
-            emit(
-                &event_tx,
-                AgentEvent::AssistantText {
-                    session_id: session_id.clone(),
-                    text: final_text.clone(),
-                },
-            );
-
-            emit(
-                &event_tx,
-                AgentEvent::TurnComplete {
-                    session_id: session_id.clone(),
-                    turn,
-                    finish_reason,
-                },
-            );
-
-            emit(
-                &event_tx,
-                AgentEvent::Done {
-                    session_id: session_id.clone(),
-                    final_text: final_text.clone(),
-                },
-            );
-
-            info!(session = %session_id, turn, "agent loop completed");
-            return AgentOutcome::EndTurn {
-                final_message: final_text,
-            };
-        }
+                (calls, from_text)
+            }
+        };
 
         // --- Execute tool calls ---
         info!(
@@ -1697,19 +1676,15 @@ async fn send_request<T: serde::Serialize>(
 
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("LLM returned HTTP {status}: {body}");
+        // Provider error bodies may echo prompts or private reasoning.
+        anyhow::bail!("LLM returned HTTP {status}");
     }
 
     let body = resp.text().await?;
     debug!(body_len = body.len(), "received LLM response");
 
-    let parsed: ToolChatCompletionResponse = serde_json::from_str(&body).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to parse LLM response: {e}\nBody: {}",
-            truncate_for_error(&body)
-        )
-    })?;
+    let parsed: ToolChatCompletionResponse = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("Failed to parse LLM response: {e}"))?;
 
     Ok(parsed)
 }
@@ -1717,7 +1692,11 @@ async fn send_request<T: serde::Serialize>(
 fn first_response_choice(
     response: &ToolChatCompletionResponse,
 ) -> Result<&ff_api::tool_calling::ToolChatChoice, &'static str> {
-    response.choices.first().ok_or("LLM returned empty choices")
+    match response.choices.as_slice() {
+        [] => Err("LLM returned empty choices"),
+        [choice] => Ok(choice),
+        _ => Err("LLM returned multiple choices; exactly one is required"),
+    }
 }
 
 fn response_message(
@@ -1729,10 +1708,264 @@ fn response_message(
         .ok_or("LLM response missing message")
 }
 
-fn final_answer(message: &ToolChatMessage) -> Result<&str, &'static str> {
-    message
-        .answer_content()
-        .ok_or("LLM returned empty content without tool calls")
+#[derive(Debug)]
+enum ValidatedAssistantTurn {
+    Final(String),
+    ToolCalls {
+        calls: Vec<ff_api::tool_calling::ToolCall>,
+        from_text: bool,
+    },
+}
+
+impl ValidatedAssistantTurn {
+    fn finish_reason(&self) -> &'static str {
+        match self {
+            Self::Final(_)
+            | Self::ToolCalls {
+                from_text: true, ..
+            } => "stop",
+            Self::ToolCalls {
+                from_text: false, ..
+            } => "tool_calls",
+        }
+    }
+}
+
+/// Validate the finish reason together with its allowed payload shape.
+///
+/// This is intentionally fail-closed and runs before the response is appended
+/// to history, emitted as success, or allowed to execute tools. A normal stop
+/// must contain a real public answer, except for the legacy text-mode tool-call
+/// recovery. A `tool_calls` finish must contain structured tool calls.
+fn validate_assistant_turn(
+    choice: &ff_api::tool_calling::ToolChatChoice,
+) -> Result<(ToolChatMessage, ValidatedAssistantTurn), String> {
+    let finish_reason = choice
+        .finish_reason
+        .as_deref()
+        .ok_or_else(|| "LLM response missing or null finish_reason".to_string())?;
+
+    match finish_reason {
+        "length" => return Err("LLM response was truncated at its token limit".into()),
+        "content_filter" => return Err("LLM response was blocked by a content filter".into()),
+        "stop" | "tool_calls" => {}
+        other => {
+            return Err(format!(
+                "LLM response has unsupported finish_reason {other:?}"
+            ));
+        }
+    }
+
+    let message = response_message(choice).map_err(str::to_string)?;
+    if message.role != "assistant" {
+        return Err(format!(
+            "LLM response message role must be assistant, got {:?}",
+            message.role
+        ));
+    }
+    let structured_calls = openai_bridge::extract_tool_calls(message);
+
+    match finish_reason {
+        "tool_calls" => {
+            if structured_calls.is_empty() {
+                return Err(
+                    "LLM response used finish_reason tool_calls without structured tool calls"
+                        .into(),
+                );
+            }
+            validate_tool_call_batch(&structured_calls)?;
+            let normalized = normalized_tool_call_message(message, &structured_calls, true)?;
+            Ok((
+                normalized,
+                ValidatedAssistantTurn::ToolCalls {
+                    calls: structured_calls,
+                    from_text: false,
+                },
+            ))
+        }
+        "stop" => {
+            if !structured_calls.is_empty() {
+                return Err(
+                    "LLM response used finish_reason stop with structured tool calls".into(),
+                );
+            }
+
+            if let Some(text) = message.text_content() {
+                if let Some(text_calls) = strict_legacy_text_tool_calls(text)? {
+                    let normalized = ToolChatMessage::assistant_tool_calls(text_calls.clone());
+                    return Ok((
+                        normalized,
+                        ValidatedAssistantTurn::ToolCalls {
+                            calls: text_calls,
+                            from_text: true,
+                        },
+                    ));
+                }
+            }
+
+            final_answer(message)
+                .map(|answer| {
+                    (
+                        ToolChatMessage::assistant(answer.clone()),
+                        ValidatedAssistantTurn::Final(answer),
+                    )
+                })
+                .map_err(|error| error.to_string())
+        }
+        _ => unreachable!("finish reason validated above"),
+    }
+}
+
+fn normalized_tool_call_message(
+    source: &ToolChatMessage,
+    calls: &[ff_api::tool_calling::ToolCall],
+    preserve_public_preamble: bool,
+) -> Result<ToolChatMessage, String> {
+    use ff_core::llm_completion_policy::sanitize_public_content;
+
+    let mut normalized = ToolChatMessage::assistant_tool_calls(calls.to_vec());
+    if !preserve_public_preamble {
+        return Ok(normalized);
+    }
+    match source.content.as_ref() {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(content)) if content.trim().is_empty() => {}
+        Some(serde_json::Value::String(content)) => {
+            let public = sanitize_public_content(content)
+                .map_err(|error| format!("unsafe tool-call preamble: {error}"))?;
+            normalized.content = Some(serde_json::Value::String(public));
+        }
+        Some(_) => return Err("LLM tool-call message content must be a string or null".into()),
+    }
+    Ok(normalized)
+}
+
+fn validate_tool_call_batch(calls: &[ff_api::tool_calling::ToolCall]) -> Result<(), String> {
+    let mut ids = HashSet::with_capacity(calls.len());
+    for (index, call) in calls.iter().enumerate() {
+        if call.id.trim().is_empty() {
+            return Err(format!("tool call {index} has an empty id"));
+        }
+        if !ids.insert(call.id.as_str()) {
+            return Err(format!(
+                "tool-call batch contains duplicate id {:?}",
+                call.id
+            ));
+        }
+        if call.call_type != "function" {
+            return Err(format!(
+                "tool call {:?} has unsupported type {:?}",
+                call.id, call.call_type
+            ));
+        }
+        if call.function.name.trim().is_empty() {
+            return Err(format!(
+                "tool call {:?} has an empty function name",
+                call.id
+            ));
+        }
+        let arguments: serde_json::Value =
+            serde_json::from_str(&call.function.arguments).map_err(|error| {
+                format!(
+                    "tool call {:?} has invalid JSON arguments: {error}",
+                    call.id
+                )
+            })?;
+        if !arguments.is_object() {
+            return Err(format!(
+                "tool call {:?} arguments must be a JSON object",
+                call.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Recover only a complete, all-or-nothing legacy text tool-call payload.
+/// Embedded prose and partially parseable arrays are rejected instead of
+/// executing the valid subset of a malformed batch.
+fn strict_legacy_text_tool_calls(
+    text: &str,
+) -> Result<Option<Vec<ff_api::tool_calling::ToolCall>>, String> {
+    let calls = openai_bridge::parse_text_tool_calls(text);
+    if calls.is_empty() {
+        return Ok(None);
+    }
+
+    let trimmed = strip_whole_code_fence(text.trim()).unwrap_or_else(|| text.trim());
+    let expected = if let Some(rest) = trimmed.strip_prefix("[TOOL_CALLS]") {
+        strict_json_call_count(rest.trim())
+    } else if trimmed.starts_with("<tool_call>") && trimmed.ends_with("</tool_call>") {
+        strict_single_tag_count(trimmed, "<tool_call>", "</tool_call>")
+    } else if trimmed.starts_with("<function_call>") && trimmed.ends_with("</function_call>") {
+        strict_single_tag_count(trimmed, "<function_call>", "</function_call>")
+    } else {
+        strict_json_call_count(trimmed)
+    }
+    .ok_or_else(|| {
+        "legacy text tool-call recovery requires one complete JSON/tagged payload".to_string()
+    })?;
+
+    if expected != calls.len() {
+        return Err(format!(
+            "legacy text tool-call batch was only partially parseable: expected {expected}, recovered {}",
+            calls.len()
+        ));
+    }
+    validate_tool_call_batch(&calls)?;
+    Ok(Some(calls))
+}
+
+fn strict_single_tag_count(text: &str, opening: &str, closing: &str) -> Option<usize> {
+    if text.matches(opening).count() != 1 || text.matches(closing).count() != 1 {
+        return None;
+    }
+    let inner = text.strip_prefix(opening)?.strip_suffix(closing)?.trim();
+    let count = strict_json_call_count(inner)?;
+    (count == 1).then_some(1)
+}
+
+fn strict_json_call_count(text: &str) -> Option<usize> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    match value {
+        serde_json::Value::Array(items) => Some(items.len()),
+        serde_json::Value::Object(ref object) => {
+            for key in ["tool_calls", "calls"] {
+                if let Some(items) = object.get(key).and_then(serde_json::Value::as_array) {
+                    return Some(items.len());
+                }
+            }
+            Some(1)
+        }
+        _ => None,
+    }
+}
+
+fn strip_whole_code_fence(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("```")?;
+    let closing = rest.rfind("```")?;
+    if !rest[closing + 3..].trim().is_empty() {
+        return None;
+    }
+    let mut inner = rest[..closing].trim();
+    if let Some(newline) = inner.find('\n') {
+        let possible_language = &inner[..newline];
+        if !possible_language.contains(['{', '[', '<']) {
+            inner = inner[newline + 1..].trim();
+        }
+    }
+    Some(inner)
+}
+
+fn final_answer(
+    message: &ToolChatMessage,
+) -> Result<String, ff_core::llm_completion_policy::CompletionValidationError> {
+    use ff_core::llm_completion_policy::{sanitize_public_content, CompletionValidationError};
+
+    let content = message
+        .text_content()
+        .ok_or(CompletionValidationError::MissingContent)?;
+    sanitize_public_content(content)
 }
 
 /// Execute a single tool call (used by parallel executor).
@@ -1835,10 +2068,6 @@ async fn execute_single_tool(
         );
         (tool_id.to_string(), err, true, false)
     }
-}
-
-fn truncate_for_error(s: &str) -> String {
-    s.chars().take(500).collect()
 }
 
 /// Attempt to fix common JSON issues from LLMs.
@@ -2099,7 +2328,10 @@ mod commit_back_provenance_tests {
 
 #[cfg(test)]
 mod router_empty_tests {
-    use super::{final_answer, first_response_choice, response_message};
+    use super::{
+        final_answer, first_response_choice, response_message, strict_legacy_text_tool_calls,
+        validate_assistant_turn, ValidatedAssistantTurn,
+    };
     use ff_api::tool_calling::{
         FunctionCall, ToolCall, ToolChatChoice, ToolChatCompletionResponse, ToolChatMessage,
     };
@@ -2115,24 +2347,32 @@ mod router_empty_tests {
         }
     }
 
-    fn choice(message: Option<ToolChatMessage>) -> ToolChatChoice {
+    fn choice(message: Option<ToolChatMessage>, finish_reason: Option<&str>) -> ToolChatChoice {
         ToolChatChoice {
             index: 0,
             message,
-            finish_reason: Some("stop".into()),
+            finish_reason: finish_reason.map(str::to_string),
         }
     }
 
     #[test]
-    fn accepts_content_answer() {
+    fn accepts_sanitized_public_content_on_stop() {
         assert_eq!(
-            final_answer(&ToolChatMessage::assistant("answer")),
-            Ok("answer")
+            final_answer(&ToolChatMessage::assistant(
+                "<think>private reasoning</think> public answer"
+            )),
+            Ok("public answer".to_string())
         );
+
+        let choice = choice(Some(ToolChatMessage::assistant("answer")), Some("stop"));
+        assert!(matches!(
+            validate_assistant_turn(&choice),
+            Ok((_, ValidatedAssistantTurn::Final(answer))) if answer == "answer"
+        ));
     }
 
     #[test]
-    fn accepts_reasoning_only_answer() {
+    fn rejects_reasoning_only_answer() {
         let message: ToolChatMessage = serde_json::from_value(serde_json::json!({
             "role": "assistant",
             "content": null,
@@ -2140,15 +2380,14 @@ mod router_empty_tests {
         }))
         .unwrap();
 
-        assert_eq!(final_answer(&message), Ok("reasoning answer"));
+        assert!(final_answer(&message).is_err());
+        let choice = choice(Some(message), Some("stop"));
+        assert!(validate_assistant_turn(&choice).is_err());
     }
 
     #[test]
     fn rejects_whitespace_content_without_tools() {
-        assert_eq!(
-            final_answer(&ToolChatMessage::assistant(" \n\t ")),
-            Err("LLM returned empty content without tool calls")
-        );
+        assert!(final_answer(&ToolChatMessage::assistant(" \n\t ")).is_err());
     }
 
     #[test]
@@ -2159,10 +2398,7 @@ mod router_empty_tests {
         }))
         .unwrap();
 
-        assert_eq!(
-            final_answer(&message),
-            Err("LLM returned empty content without tool calls")
-        );
+        assert!(final_answer(&message).is_err());
     }
 
     #[test]
@@ -2174,16 +2410,46 @@ mod router_empty_tests {
     }
 
     #[test]
+    fn rejects_multiple_choices() {
+        let choices = vec![
+            choice(Some(ToolChatMessage::assistant("one")), Some("stop")),
+            choice(Some(ToolChatMessage::assistant("two")), Some("stop")),
+        ];
+        assert_eq!(
+            first_response_choice(&response(choices)).unwrap_err(),
+            "LLM returned multiple choices; exactly one is required"
+        );
+    }
+
+    #[test]
     fn rejects_missing_message() {
         assert_eq!(
-            response_message(first_response_choice(&response(vec![choice(None)])).unwrap())
-                .unwrap_err(),
+            response_message(
+                first_response_choice(&response(vec![choice(None, Some("stop"))])).unwrap()
+            )
+            .unwrap_err(),
             "LLM response missing message"
         );
     }
 
     #[test]
-    fn preserves_null_content_with_valid_tools() {
+    fn rejects_missing_and_length_finish_reasons() {
+        let missing = choice(Some(ToolChatMessage::assistant("answer")), None);
+        assert!(validate_assistant_turn(&missing)
+            .unwrap_err()
+            .contains("missing or null finish_reason"));
+
+        let length = choice(
+            Some(ToolChatMessage::assistant("partial answer")),
+            Some("length"),
+        );
+        assert!(validate_assistant_turn(&length)
+            .unwrap_err()
+            .contains("truncated"));
+    }
+
+    #[test]
+    fn accepts_tool_calls_finish_only_with_structured_calls() {
         let message = ToolChatMessage::assistant_tool_calls(vec![ToolCall {
             id: "call-1".into(),
             call_type: "function".into(),
@@ -2192,9 +2458,126 @@ mod router_empty_tests {
                 arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
             },
         }]);
+        let structured = choice(Some(message), Some("tool_calls"));
 
-        assert_eq!(message.text_content(), None);
-        assert!(message.has_tool_calls());
-        assert_eq!(crate::openai_bridge::extract_tool_calls(&message).len(), 1);
+        assert!(matches!(
+            validate_assistant_turn(&structured),
+            Ok((_, ValidatedAssistantTurn::ToolCalls { calls, from_text: false }))
+                if calls.len() == 1
+        ));
+
+        let absent = choice(
+            Some(ToolChatMessage::assistant("answer")),
+            Some("tool_calls"),
+        );
+        assert!(validate_assistant_turn(&absent)
+            .unwrap_err()
+            .contains("without structured tool calls"));
+    }
+
+    #[test]
+    fn tool_call_batch_is_validated_atomically_before_execution() {
+        let valid = ToolCall {
+            id: "call-1".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "Read".into(),
+                arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
+            },
+        };
+        let malformed = ToolCall {
+            id: "call-2".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "Write".into(),
+                arguments: "{not-json".into(),
+            },
+        };
+        let message = ToolChatMessage::assistant_tool_calls(vec![valid, malformed]);
+        let error =
+            validate_assistant_turn(&choice(Some(message), Some("tool_calls"))).unwrap_err();
+        assert!(error.contains("invalid JSON arguments"));
+
+        let duplicate = ToolChatMessage::assistant_tool_calls(vec![
+            ToolCall {
+                id: "same".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "Read".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            ToolCall {
+                id: "same".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "Write".into(),
+                    arguments: "{}".into(),
+                },
+            },
+        ]);
+        assert!(
+            validate_assistant_turn(&choice(Some(duplicate), Some("tool_calls")))
+                .unwrap_err()
+                .contains("duplicate id")
+        );
+    }
+
+    #[test]
+    fn structured_tool_preamble_is_sanitized_before_history() {
+        let mut message = ToolChatMessage::assistant_tool_calls(vec![ToolCall {
+            id: "call-1".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "Read".into(),
+                arguments: "{}".into(),
+            },
+        }]);
+        message.content = Some(serde_json::json!(
+            "<THINK>private</THINK> I will inspect the file."
+        ));
+        let (normalized, _) =
+            validate_assistant_turn(&choice(Some(message), Some("tool_calls"))).unwrap();
+        assert_eq!(normalized.text_content(), Some("I will inspect the file."));
+        assert!(normalized.reasoning_content.is_none());
+    }
+
+    #[test]
+    fn stop_rejects_structured_calls_but_keeps_text_mode_recovery() {
+        let structured_message = ToolChatMessage::assistant_tool_calls(vec![ToolCall {
+            id: "call-1".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "Read".into(),
+                arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
+            },
+        }]);
+        let structured_stop = choice(Some(structured_message), Some("stop"));
+        assert!(validate_assistant_turn(&structured_stop)
+            .unwrap_err()
+            .contains("stop with structured tool calls"));
+
+        let text_stop = choice(
+            Some(ToolChatMessage::assistant(
+                r#"<tool_call>{"name":"Read","arguments":{"file_path":"src/lib.rs"}}</tool_call>"#,
+            )),
+            Some("stop"),
+        );
+        assert!(matches!(
+            validate_assistant_turn(&text_stop),
+            Ok((normalized, ValidatedAssistantTurn::ToolCalls { calls, from_text: true }))
+                if calls.len() == 1 && normalized.tool_calls.as_ref().is_some_and(|value| value.len() == 1)
+                    && normalized.content.is_none()
+        ));
+    }
+
+    #[test]
+    fn legacy_text_recovery_rejects_partially_parseable_batches() {
+        let mixed = r#"[{"name":"Read","arguments":{}},{"arguments":{}}]"#;
+        let error = strict_legacy_text_tool_calls(mixed).unwrap_err();
+        assert!(error.contains("partially parseable"));
+
+        let embedded = r#"I might call {"name":"Read","arguments":{}} next"#;
+        assert!(strict_legacy_text_tool_calls(embedded).is_err());
     }
 }

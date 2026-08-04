@@ -23,6 +23,10 @@
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use ff_core::llm_completion_policy::{
+    apply_completion_policy, sanitize_public_content, validate_completion_response,
+    CompletionBudget, WorkloadClass,
+};
 use futures::StreamExt;
 use serde_json::{Value, json};
 
@@ -107,25 +111,20 @@ impl LocalLlmMember {
             .build()
             .map_err(|e| anyhow!("build http client: {e}"))?;
         let url = ff_core::url::normalize_chat_completions_url(&self.endpoint);
-        let body = json!({
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": self.stream,
-        });
+        let body = completion_request_body(&self.model, prompt, self.stream)?;
         let start = std::time::Instant::now();
         let (raw, tokens_in, tokens_out) = if self.stream {
             self.stream_completion(&client, &url, &body).await?
         } else {
             self.blocking_completion(&client, &url, &body).await?
         };
-        let text = crate::fleet_oneshot::strip_think_block(&raw);
-        if text.trim().is_empty() {
-            return Err(anyhow!(
-                "{} ({}) returned an empty completion",
+        let text = sanitize_public_content(&raw).map_err(|error| {
+            anyhow!(
+                "{} ({}): unsafe completion: {error}",
                 self.endpoint,
                 self.model
-            ));
-        }
+            )
+        })?;
         let parsed = parse_council_answer(&text);
         Ok(CouncilMemberResponse {
             answer: parsed.answer,
@@ -140,8 +139,8 @@ impl LocalLlmMember {
     }
 
     /// One non-streaming chat completion, mirroring `fleet_oneshot`'s
-    /// dispatch: decode the JSON payload, surface HTTP errors with a truncated
-    /// body, and read `usage` tokens.
+    /// dispatch: check HTTP status without retaining provider bodies, decode
+    /// the JSON payload, enforce strict completion semantics, and read usage.
     async fn blocking_completion(
         &self,
         client: &reqwest::Client,
@@ -155,25 +154,26 @@ impl LocalLlmMember {
             .await
             .map_err(|e| anyhow!("POST {url}: {e}"))?;
         let status = resp.status();
+        if !status.is_success() {
+            return Err(anyhow!(
+                "{} ({}) returned HTTP {status}",
+                self.endpoint,
+                self.model
+            ));
+        }
         let payload: Value = resp
             .json()
             .await
             .map_err(|e| anyhow!("decode response from {}: {e}", self.endpoint))?;
-        if !status.is_success() {
-            return Err(anyhow!(
-                "{} ({}) returned HTTP {status}: {}",
-                self.endpoint,
-                self.model,
-                payload.to_string().chars().take(400).collect::<String>()
-            ));
-        }
-        let text = crate::fleet_oneshot::extract_completion_text(&payload).ok_or_else(|| {
-            anyhow!(
-                "{} ({}) returned an empty completion",
-                self.endpoint,
-                self.model
-            )
-        })?;
+        let text = validate_completion_response(&payload)
+            .map_err(|error| {
+                anyhow!(
+                    "{} ({}): unsafe completion: {error}",
+                    self.endpoint,
+                    self.model
+                )
+            })?
+            .content;
         let (tokens_in, tokens_out) = crate::fleet_oneshot::usage_tokens_i32(&payload);
         Ok((text, tokens_in, tokens_out))
     }
@@ -195,12 +195,10 @@ impl LocalLlmMember {
             .map_err(|e| anyhow!("POST {url}: {e}"))?;
         let status = resp.status();
         if !status.is_success() {
-            let err_body = resp.text().await.unwrap_or_default();
             return Err(anyhow!(
-                "{} ({}) returned HTTP {status}: {}",
+                "{} ({}) returned HTTP {status}",
                 self.endpoint,
-                self.model,
-                err_body.chars().take(400).collect::<String>()
+                self.model
             ));
         }
         let mut parser = SseParser::default();
@@ -221,8 +219,24 @@ impl LocalLlmMember {
                 acc.consume(&payload);
             }
         }
-        Ok((acc.text, acc.tokens_in, acc.tokens_out))
+        acc.into_completion()
+            .map_err(|error| anyhow!("{} ({}): {error}", self.endpoint, self.model))
     }
+}
+
+fn completion_request_body(model: &str, prompt: &str, stream: bool) -> Result<Value> {
+    let mut body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": stream,
+    });
+    apply_completion_policy(
+        &mut body,
+        WorkloadClass::Reasoning,
+        CompletionBudget::default(),
+    )
+    .map_err(|error| anyhow!("apply local council completion policy: {error}"))?;
+    Ok(body)
 }
 
 #[async_trait::async_trait]
@@ -310,26 +324,102 @@ struct StreamAccumulator {
     tokens_in: i32,
     tokens_out: i32,
     done: bool,
+    finish_reason: Option<String>,
+    error: Option<String>,
 }
 
 impl StreamAccumulator {
     fn consume(&mut self, payload: &str) {
+        if self.error.is_some() {
+            return;
+        }
         let trimmed = payload.trim();
         if trimmed == "[DONE]" {
             self.done = true;
             return;
         }
         let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            self.error = Some("stream event is not valid JSON".to_string());
             return;
         };
-        if let Some(delta) = stream_delta_text(&value) {
-            self.text.push_str(delta);
-        }
         let (tokens_in, tokens_out) = crate::fleet_oneshot::usage_tokens_i32(&value);
         if tokens_in > 0 || tokens_out > 0 {
             self.tokens_in = tokens_in;
             self.tokens_out = tokens_out;
         }
+
+        let Some(choices) = value.get("choices") else {
+            if value.get("usage").is_none() {
+                self.error = Some("stream event is missing choices".to_string());
+            }
+            return;
+        };
+        let Some(choices) = choices.as_array() else {
+            self.error = Some("stream choices must be an array".to_string());
+            return;
+        };
+        if choices.is_empty() && value.get("usage").is_some() {
+            return;
+        }
+        if choices.len() != 1 {
+            self.error = Some(format!(
+                "stream event contains {} choices; exactly one is required",
+                choices.len()
+            ));
+            return;
+        }
+        let Some(choice) = choices[0].as_object() else {
+            self.error = Some("stream choice must be an object".to_string());
+            return;
+        };
+
+        match choice.get("finish_reason") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(reason)) if reason == "stop" => {
+                self.finish_reason = Some(reason.clone());
+            }
+            Some(Value::String(reason)) if reason == "length" => {
+                self.error = Some("streamed completion was truncated at its token limit".into());
+                return;
+            }
+            Some(Value::String(reason)) if reason == "content_filter" => {
+                self.error = Some("streamed completion was blocked by a content filter".into());
+                return;
+            }
+            Some(Value::String(reason)) => {
+                self.error = Some(format!(
+                    "streamed completion has unsupported finish_reason {reason:?}"
+                ));
+                return;
+            }
+            Some(_) => {
+                self.error = Some("stream finish_reason must be a string or null".into());
+                return;
+            }
+        }
+
+        if let Some(delta) = stream_delta_text(&value) {
+            self.text.push_str(delta);
+        } else if choice
+            .get("delta")
+            .and_then(|delta| delta.get("content"))
+            .is_some_and(|content| !content.is_null())
+            || choice.get("text").is_some_and(|text| !text.is_null())
+        {
+            self.error = Some("stream public content must be a string or null".into());
+        }
+    }
+
+    fn into_completion(self) -> std::result::Result<(String, i32, i32), String> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        if self.finish_reason.as_deref() != Some("stop") {
+            return Err("stream ended without finish_reason stop".to_string());
+        }
+        let public = sanitize_public_content(&self.text)
+            .map_err(|error| format!("unsafe streamed completion: {error}"))?;
+        Ok((public, self.tokens_in, self.tokens_out))
     }
 }
 
@@ -455,13 +545,15 @@ mod tests {
         let payloads = parser.push(
             b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n\
               data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
-              data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n\
+              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n\
               data: [DONE]\n\n",
         );
         let acc = consume_all(&payloads);
         assert!(acc.done);
         assert_eq!(acc.text, "hi");
         assert_eq!((acc.tokens_in, acc.tokens_out), (7, 3));
+        assert_eq!(acc.finish_reason.as_deref(), Some("stop"));
+        assert!(acc.error.is_none());
     }
 
     #[test]
@@ -498,5 +590,67 @@ mod tests {
         assert_eq!(CouncilMember::name(&member), "local:qwen3-coder-30b");
         assert!(member.stream);
         assert_eq!(member.timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn local_council_request_has_explicit_bounded_reasoning_budget() {
+        let body = completion_request_body("glm-4.5-air", "decide", true).unwrap();
+        assert_eq!(body["max_tokens"], 2_048);
+        assert_eq!(body["stream"], true);
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn stream_completion_requires_stop_and_public_content() {
+        let mut good = StreamAccumulator::default();
+        good.consume(r#"{"choices":[{"delta":{"content":"<think>private</think> public"}}]}"#);
+        good.consume(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#);
+        good.consume("[DONE]");
+        assert_eq!(good.into_completion().unwrap().0, "public");
+
+        let mut missing = StreamAccumulator::default();
+        missing.consume(r#"{"choices":[{"delta":{"content":"partial"}}]}"#);
+        missing.consume("[DONE]");
+        assert!(missing
+            .into_completion()
+            .unwrap_err()
+            .contains("without finish_reason stop"));
+
+        for reason in ["length", "content_filter", "tool_calls"] {
+            let mut rejected = StreamAccumulator::default();
+            rejected.consume(&format!(
+                r#"{{"choices":[{{"delta":{{"content":"partial"}},"finish_reason":"{reason}"}}]}}"#
+            ));
+            let error = rejected.into_completion().unwrap_err();
+            assert!(
+                error.contains("truncated")
+                    || error.contains("content filter")
+                    || error.contains("unsupported")
+            );
+        }
+    }
+
+    #[test]
+    fn usage_only_stream_event_is_allowed_after_terminal_choice() {
+        let mut acc = StreamAccumulator::default();
+        acc.consume(r#"{"choices":[{"delta":{"content":"answer"}}]}"#);
+        acc.consume(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#);
+        acc.consume(r#"{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":4}}"#);
+        assert_eq!(
+            acc.into_completion().unwrap(),
+            ("answer".to_string(), 11, 4)
+        );
+    }
+
+    #[test]
+    fn malformed_stream_event_fails_closed() {
+        let mut acc = StreamAccumulator::default();
+        acc.consume(r#"{"choices":[{"delta":{"content":"partial"}}]}"#);
+        acc.consume("{not-json");
+        acc.consume(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#);
+        assert_eq!(
+            acc.into_completion().unwrap_err(),
+            "stream event is not valid JSON"
+        );
     }
 }

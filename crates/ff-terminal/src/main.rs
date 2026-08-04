@@ -2500,6 +2500,13 @@ pub enum FleetDbCommand {
         #[arg(long = "now", default_value_t = true)]
         now: bool,
     },
+    /// Inspect or update the two explicit offsite destinations used by the
+    /// backup orchestrator. This is the typed control plane for
+    /// `fleet_backup_config.dest_hosts`; it never accepts raw SQL.
+    BackupPolicy {
+        #[command(subcommand)]
+        command: FleetDbBackupPolicyCommand,
+    },
     /// Run the backup restore-drill RIGHT NOW against one exact Postgres or
     /// FalkorDB backup: decrypt → extract → start an isolated digest-pinned
     /// database → execute a read-only application proof, record the exact run,
@@ -2525,6 +2532,21 @@ pub enum FleetDbCommand {
         run_id: Option<String>,
         #[arg(long)]
         on: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum FleetDbBackupPolicyCommand {
+    /// Show every backup kind and its configured source/destinations.
+    Show,
+    /// Pin one backup kind to exactly two distinct enrolled computers.
+    Set {
+        /// Existing kind from the live `fleet_backup_config` table.
+        #[arg(long)]
+        kind: String,
+        /// Destination computer. Pass exactly twice.
+        #[arg(long = "dest", required = true, action = clap::ArgAction::Append)]
+        destinations: Vec<String>,
     },
 }
 
@@ -9006,6 +9028,89 @@ mod fleet_deploy_cli_tests {
             "--all",
             "--graceful=false"
         ]));
+    }
+}
+
+#[cfg(test)]
+mod backup_policy_cli_tests {
+    use super::{Cli, Command, FleetCommand, FleetDbBackupPolicyCommand, FleetDbCommand};
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> FleetDbBackupPolicyCommand {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(owned))
+            .expect("spawn backup-policy parser test")
+            .join()
+            .expect("backup-policy parser test panicked")
+            .expect("valid backup-policy command")
+            .command
+            .and_then(|command| match command {
+                Command::Fleet {
+                    command:
+                        FleetCommand::Db {
+                            command: FleetDbCommand::BackupPolicy { command },
+                        },
+                } => Some(command),
+                _ => None,
+            })
+            .expect("parsed fleet db backup-policy command")
+    }
+
+    #[test]
+    fn backup_policy_show_parses() {
+        assert!(matches!(
+            parse(&["ff", "fleet", "db", "backup-policy", "show"]),
+            FleetDbBackupPolicyCommand::Show
+        ));
+    }
+
+    #[test]
+    fn backup_policy_set_preserves_repeated_destinations() {
+        match parse(&[
+            "ff",
+            "fleet",
+            "db",
+            "backup-policy",
+            "set",
+            "--kind",
+            "postgres",
+            "--dest",
+            "lily",
+            "--dest",
+            "rihanna",
+        ]) {
+            FleetDbBackupPolicyCommand::Set { kind, destinations } => {
+                assert_eq!(kind, "postgres");
+                assert_eq!(destinations, ["lily", "rihanna"]);
+            }
+            other => panic!("expected backup-policy set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backup_policy_set_requires_kind() {
+        let rejected = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                Cli::try_parse_from([
+                    "ff",
+                    "fleet",
+                    "db",
+                    "backup-policy",
+                    "set",
+                    "--dest",
+                    "lily",
+                    "--dest",
+                    "rihanna",
+                ])
+                .is_err()
+            })
+            .expect("spawn backup-policy missing-kind parser test")
+            .join()
+            .expect("backup-policy missing-kind parser test panicked");
+        assert!(rejected);
     }
 }
 

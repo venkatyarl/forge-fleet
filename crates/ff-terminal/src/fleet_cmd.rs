@@ -8,8 +8,8 @@ use ff_deploy::resolution::{
 };
 
 use crate::{
-    CYAN, FleetCommand, FleetDbCommand, GREEN, LeaderAction, RED, RESET, TaskCoverageCommand,
-    YELLOW, pulse_reader, shell_escape_single, whoami_tag,
+    CYAN, FleetCommand, FleetDbBackupPolicyCommand, FleetDbCommand, GREEN, LeaderAction, RED,
+    RESET, TaskCoverageCommand, YELLOW, pulse_reader, shell_escape_single, whoami_tag,
 };
 
 /// `ff fleet panic-stop` — emergency halt of every daemon.
@@ -623,6 +623,9 @@ pub async fn handle_fleet_db(pool: &sqlx::PgPool, cmd: FleetDbCommand) -> Result
         FleetDbCommand::Backup { kind, now } => {
             handle_fleet_db_backup_now(pool, &kind, now).await?;
         }
+        FleetDbCommand::BackupPolicy { command } => {
+            handle_fleet_db_backup_policy(pool, command).await?;
+        }
         FleetDbCommand::Drill {
             backup_id,
             run_id,
@@ -632,6 +635,250 @@ pub async fn handle_fleet_db(pool: &sqlx::PgPool, cmd: FleetDbCommand) -> Result
         }
     }
     Ok(())
+}
+
+type BackupPolicyRow = (
+    String,
+    Option<String>,
+    Vec<String>,
+    chrono::DateTime<chrono::Utc>,
+);
+
+fn validate_backup_policy_destinations(destinations: &[String]) -> Result<Vec<String>> {
+    if destinations.len() != 2 {
+        anyhow::bail!(
+            "backup policy requires exactly two --dest values (got {})",
+            destinations.len()
+        );
+    }
+
+    let normalized: Vec<String> = destinations
+        .iter()
+        .map(|destination| destination.trim().to_string())
+        .collect();
+    if normalized.iter().any(String::is_empty) {
+        anyhow::bail!("backup policy destinations cannot be empty");
+    }
+    if normalized[0].eq_ignore_ascii_case(&normalized[1]) {
+        anyhow::bail!("backup policy destinations must be distinct (case-insensitive)");
+    }
+    Ok(normalized)
+}
+
+fn ensure_backup_policy_excludes_source(
+    destinations: &[String],
+    source: Option<&str>,
+) -> Result<()> {
+    let Some(source) = source.map(str::trim).filter(|source| !source.is_empty()) else {
+        return Ok(());
+    };
+    if destinations
+        .iter()
+        .any(|destination| destination.eq_ignore_ascii_case(source))
+    {
+        anyhow::bail!("backup source '{source}' cannot also be a destination");
+    }
+    Ok(())
+}
+
+fn print_backup_policy_row(label: &str, row: &BackupPolicyRow, resolved_source: Option<&str>) {
+    let source = row
+        .1
+        .as_deref()
+        .filter(|source| !source.trim().is_empty())
+        .or(resolved_source)
+        .unwrap_or("unresolved");
+    let source_mode = if row
+        .1
+        .as_deref()
+        .is_some_and(|source| !source.trim().is_empty())
+    {
+        "pinned"
+    } else {
+        "authority"
+    };
+    let destinations = if row.2.is_empty() {
+        "auto".to_string()
+    } else {
+        row.2.join(",")
+    };
+    println!(
+        "{label:<7} kind={kind:<12} source={source} ({source_mode}) destinations={destinations} updated={updated}",
+        kind = row.0,
+        updated = row.3.to_rfc3339(),
+    );
+}
+
+async fn resolve_backup_policy_source_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    configured_source: Option<&str>,
+) -> Result<String> {
+    if let Some(source) = configured_source
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+    {
+        return sqlx::query_scalar(
+            "SELECT name FROM computers WHERE LOWER(name) = LOWER($1) FOR SHARE",
+        )
+        .bind(source)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| anyhow::anyhow!("resolve configured backup source '{source}': {error}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("configured backup source '{source}' is not an enrolled computer")
+        });
+    }
+
+    // Serialize this authority read with the failover CAS so a destination
+    // policy cannot be committed against a source that changes mid-command.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('forgefleet:postgres-primary-authority'))")
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| anyhow::anyhow!("lock current backup source authority: {error}"))?;
+
+    let source: Option<String> = sqlx::query_scalar(
+        "SELECT COALESCE(
+             (SELECT c.name FROM dsn_of_record d JOIN computers c
+                ON lower(c.name)=lower(NULLIF(d.primary_member, ''))
+               WHERE d.singleton_key='current'),
+             (SELECT c.name FROM computers c
+               WHERE c.primary_ip=host(inet_server_addr()) LIMIT 1),
+             (SELECT c.name FROM database_replicas d JOIN computers c ON c.id=d.computer_id
+               WHERE d.database_kind='postgres' AND d.role='primary'
+               ORDER BY d.promoted_at DESC NULLS LAST LIMIT 1))",
+    )
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| anyhow::anyhow!("resolve current backup source authority: {error}"))?;
+    source.ok_or_else(|| {
+        anyhow::anyhow!(
+            "current backup source authority is unresolved; refusing to change destinations"
+        )
+    })
+}
+
+async fn lock_backup_policy_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    kind: &str,
+) -> Result<BackupPolicyRow> {
+    let kind = kind.trim();
+    if kind.is_empty() {
+        anyhow::bail!("--kind cannot be empty");
+    }
+    sqlx::query_as::<_, BackupPolicyRow>(
+        "SELECT kind, source_host, dest_hosts, updated_at
+           FROM fleet_backup_config
+          WHERE LOWER(kind) = LOWER($1)
+          FOR UPDATE",
+    )
+    .bind(kind)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| anyhow::anyhow!("read backup policy for kind '{kind}': {error}"))?
+    .ok_or_else(|| anyhow::anyhow!("no backup policy kind '{kind}' exists in fleet_backup_config"))
+}
+
+async fn canonical_backup_destinations(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    destinations: &[String],
+) -> Result<Vec<String>> {
+    let mut canonical = Vec::with_capacity(destinations.len());
+    for destination in destinations {
+        let enrolled: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM computers WHERE LOWER(name) = LOWER($1) FOR SHARE",
+        )
+        .bind(destination)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| anyhow::anyhow!("look up backup destination '{destination}': {error}"))?;
+        canonical.push(enrolled.ok_or_else(|| {
+            anyhow::anyhow!("backup destination '{destination}' is not an enrolled computer")
+        })?);
+    }
+    Ok(canonical)
+}
+
+/// Typed control plane for `fleet_backup_config.dest_hosts`.
+async fn handle_fleet_db_backup_policy(
+    pool: &sqlx::PgPool,
+    command: FleetDbBackupPolicyCommand,
+) -> Result<()> {
+    match command {
+        FleetDbBackupPolicyCommand::Show => {
+            let rows = sqlx::query_as::<_, BackupPolicyRow>(
+                "SELECT kind, source_host, dest_hosts, updated_at
+                   FROM fleet_backup_config
+                  ORDER BY kind",
+            )
+            .fetch_all(pool)
+            .await
+            .map_err(|error| anyhow::anyhow!("read backup policies: {error}"))?;
+            for row in rows {
+                let source = ff_agent::ha::backup::resolve_backup_source_host(pool, &row.0)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("resolve {} backup source: {error}", row.0))?;
+                print_backup_policy_row("policy", &row, source.as_deref());
+            }
+        }
+        FleetDbBackupPolicyCommand::Set { kind, destinations } => {
+            let requested = validate_backup_policy_destinations(&destinations)?;
+            let mut tx = pool.begin().await?;
+            let before = lock_backup_policy_row(&mut tx, &kind).await?;
+            let canonical = canonical_backup_destinations(&mut tx, &requested).await?;
+            let source = resolve_backup_policy_source_in_tx(&mut tx, before.1.as_deref()).await?;
+            ensure_backup_policy_excludes_source(&canonical, Some(&source))?;
+
+            let after = sqlx::query_as::<_, BackupPolicyRow>(
+                "UPDATE fleet_backup_config
+                    SET dest_hosts = $2, updated_at = NOW()
+                  WHERE kind = $1
+              RETURNING kind, source_host, dest_hosts, updated_at",
+            )
+            .bind(&before.0)
+            .bind(&canonical)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| anyhow::anyhow!("update {} backup policy: {error}", before.0))?;
+            tx.commit().await?;
+
+            print_backup_policy_row("before", &before, Some(&source));
+            print_backup_policy_row("after", &after, Some(&source));
+            println!("{GREEN}✓{RESET} backup destinations updated atomically");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod backup_policy_tests {
+    use super::*;
+
+    #[test]
+    fn destinations_require_exactly_two_distinct_nonempty_values() {
+        for invalid in [
+            vec![],
+            vec!["lily".to_string()],
+            vec!["lily".to_string(), "rihanna".to_string(), "sia".to_string()],
+            vec!["lily".to_string(), "LILY".to_string()],
+            vec!["lily".to_string(), "   ".to_string()],
+        ] {
+            assert!(validate_backup_policy_destinations(&invalid).is_err());
+        }
+        assert_eq!(
+            validate_backup_policy_destinations(&[" Lily ".to_string(), "Rihanna".to_string(),])
+                .unwrap(),
+            vec!["Lily", "Rihanna"]
+        );
+    }
+
+    #[test]
+    fn configured_or_resolved_source_is_rejected_case_insensitively() {
+        let destinations = vec!["Lily".to_string(), "Rihanna".to_string()];
+        assert!(ensure_backup_policy_excludes_source(&destinations, Some("lily")).is_err());
+        assert!(ensure_backup_policy_excludes_source(&destinations, Some("RIHANNA")).is_err());
+        assert!(ensure_backup_policy_excludes_source(&destinations, Some("Priya")).is_ok());
+        assert!(ensure_backup_policy_excludes_source(&destinations, None).is_ok());
+    }
 }
 
 /// `ff fleet db drill --backup-id <uuid>` — run one identity-fenced backup
