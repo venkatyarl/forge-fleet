@@ -663,8 +663,13 @@ report "enroll" ok
 
 report "mesh_import" running
 # Parse peer_ssh_identities from the enrollment response and merge into
-# ~/.ssh/authorized_keys and ~/.ssh/known_hosts.
-python3 <<PY || die "failed to import peer SSH identities"
+# ~/.ssh/authorized_keys and ~/.ssh/known_hosts. Runs from a temp file (not a
+# heredoc) under a 90s watchdog with captured output: the 2026-08-03 vinny
+# onboard hung silently INSIDE this step with zero diagnostics — a hang the
+# EXIT trap cannot see — so now it logs visibly and times out loudly.
+MESH_PY="$(mktemp /tmp/forgefleet-mesh-import.XXXXXX.py)"
+MESH_LOG="$(mktemp /tmp/forgefleet-mesh-import.XXXXXX.log)"
+cat > "$MESH_PY" <<PY
 import json, os, sys, pathlib
 data = json.loads('''$ENROLL_RESP''')
 peers = data.get("peer_ssh_identities", [])
@@ -708,12 +713,33 @@ authz.chmod(0o600)
 known.write_text(existing_known)
 known.chmod(0o644)
 import pwd
-uid = pwd.getpwnam("$SUDO_INVOKER").pw_uid
-gid = pwd.getpwnam("$SUDO_INVOKER").pw_gid
-os.chown(str(authz), uid, gid)
-os.chown(str(known), uid, gid)
+try:
+    uid = pwd.getpwnam("$SUDO_INVOKER").pw_uid
+    gid = pwd.getpwnam("$SUDO_INVOKER").pw_gid
+    os.chown(str(authz), uid, gid)
+    os.chown(str(known), uid, gid)
+except PermissionError:
+    # Sudo-less runs already own these files; chown is only needed when the
+    # script runs as root (legacy sudo flow).
+    pass
 print(f"imported: +{added_user} authorized_keys, +{added_host} known_hosts")
 PY
+python3 "$MESH_PY" > "$MESH_LOG" 2>&1 &
+mesh_pid=$!
+mesh_wait=0
+while kill -0 "$mesh_pid" 2>/dev/null; do
+  sleep 3
+  mesh_wait=$((mesh_wait + 3))
+  if [ "$mesh_wait" -ge 90 ]; then
+    kill -9 "$mesh_pid" 2>/dev/null
+    cat "$MESH_LOG" >&2 || true
+    rm -f "$MESH_PY" "$MESH_LOG"
+    die "mesh_import timed out after 90s (partial output above) — re-run to retry"
+  fi
+done
+wait "$mesh_pid" || { cat "$MESH_LOG" >&2; rm -f "$MESH_PY" "$MESH_LOG"; die "failed to import peer SSH identities"; }
+cat "$MESH_LOG"
+rm -f "$MESH_PY" "$MESH_LOG"
 report "mesh_import" ok
 
 # ─── 10b. fleet.toml — Postgres + Redis URL pointing at the leader ──────
