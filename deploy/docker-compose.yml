@@ -177,7 +177,10 @@ services:
   # FalkorDB gives the code graph a native graph store with OpenCypher plus
   # vector indexes for the existing bge-m3 embeddings.
   falkordb:
-    image: falkordb/falkordb:latest
+    # Pin the exact image used by the encrypted restore drill.  Upgrades must
+    # advance this digest deliberately after backup + isolated restore proof;
+    # a mutable `latest` tag makes container rollback non-reproducible.
+    image: ${FALKORDB_IMAGE:-falkordb/falkordb@sha256:9042fdc4e53f5390ca5a3993aa71506523970efb40ffb9a98e6a4b1a9a4f8862}
     container_name: forgefleet-falkordb
     ports:
       # Host 63379 -> container 6379. Keep host ports 5-digit and outside the
@@ -186,7 +189,10 @@ services:
       # The combined FalkorDB image includes FalkorDB Browser on port 3000.
       - "63000:3000"
     volumes:
-      - falkordb_data:/data
+      # The image persists Redis/Falkor files here.  `/data` only contains a
+      # symlink into this directory, so mounting the volume at `/data` leaves
+      # the actual graph bytes in the disposable container overlay.
+      - falkordb_data:/var/lib/falkordb/data
     environment:
       REDIS_ARGS: "--save 60 1 --appendonly yes --appendfsync everysec"
       FALKORDB_ARGS: "THREAD_COUNT 4 CACHE_SIZE 256"
