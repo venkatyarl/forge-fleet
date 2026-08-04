@@ -50,6 +50,7 @@ secrecy = "0.10"
 rand = "0.8"
 sysinfo = "0.33"
 flate2 = "1"
+zstd = "0.13"
 tar = "0.4"
 tempfile = "3"
 

@@ -2493,9 +2493,10 @@ pub enum FleetDbCommand {
         #[arg(long = "now", default_value_t = true)]
         now: bool,
     },
-    /// Run the backup restore-drill RIGHT NOW against one exact Postgres
-    /// backup: decrypt → extract → start isolated PostgreSQL 16 → execute an
-    /// application SELECT, record the exact run, and alert on failure.
+    /// Run the backup restore-drill RIGHT NOW against one exact Postgres or
+    /// FalkorDB backup: decrypt → extract → start an isolated digest-pinned
+    /// database → execute a read-only application proof, record the exact run,
+    /// and alert on failure.
     ///
     /// This is the exact path the daily leader tick runs — use it to verify
     /// restorability on demand (run it ON the leader, where the `.age` files
@@ -2508,7 +2509,7 @@ pub enum FleetDbCommand {
     /// for this backup. The same backup ID and run ID fence dispatch and result
     /// polling; there is no newest/local fallback.
     Drill {
-        /// Exact Postgres backup UUID from `backups` (required; no fallback).
+        /// Exact Postgres or FalkorDB backup UUID from `backups` (required; no fallback).
         #[arg(long)]
         backup_id: String,
         /// Exact drill-run UUID. Generated when omitted; remote dispatch carries

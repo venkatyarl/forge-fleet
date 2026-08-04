@@ -687,6 +687,7 @@ fn remote_drill_payload(
     node: &str,
     backup_id: uuid::Uuid,
     run_id: uuid::Uuid,
+    database_kind: &str,
 ) -> serde_json::Value {
     serde_json::json!({
         "command": format!(
@@ -699,7 +700,7 @@ fn remote_drill_payload(
         "expected_computer": node,
         "evidence_tier": "restore",
         "metadata": {
-            "database_kind": "postgres",
+            "database_kind": database_kind,
             "identity_fence": "backup_id+run_id+node",
         },
     })
@@ -809,19 +810,23 @@ async fn enqueue_remote_drill(
     println!(
         "{CYAN}▶ ff fleet db drill --on {node}{RESET}  (from={me}, backup={backup_id}, run={run_id})"
     );
-    let (checksum, created_at, distribution_status): (
+    let (checksum, created_at, distribution_status, database_kind): (
         String,
         chrono::DateTime<chrono::Utc>,
         serde_json::Value,
+        String,
     ) = sqlx::query_as(
-        "SELECT checksum_sha256, created_at, distribution_status
-           FROM backups WHERE id=$1 AND database_kind='postgres'",
+        "SELECT checksum_sha256, created_at, distribution_status, database_kind
+           FROM backups
+          WHERE id=$1 AND database_kind IN ('postgres', 'falkordb')",
     )
     .bind(backup_id)
     .fetch_optional(pool)
     .await?
     .ok_or_else(|| {
-        anyhow::anyhow!("no postgres backup row with id {backup_id}; remote drill refuses fallback")
+        anyhow::anyhow!(
+            "no supported postgres/falkordb backup row with id {backup_id}; remote drill refuses fallback"
+        )
     })?;
     validate_remote_backup_receipt(
         &distribution_status,
@@ -833,7 +838,7 @@ async fn enqueue_remote_drill(
     .map_err(|error| anyhow::anyhow!("remote backup receipt gate rejected {node}: {error}"))?;
 
     ff_agent::ha::restore_drill::reserve_drill_run(pool, run_id, backup_id, node).await?;
-    let payload = remote_drill_payload(node, backup_id, run_id);
+    let payload = remote_drill_payload(node, backup_id, run_id, &database_kind);
     let trigger_spec = serde_json::json!({ "node": node });
     let id = ff_db::pg_enqueue_deferred(
         pool,
@@ -1002,10 +1007,11 @@ mod exact_restore_drill_tests {
     fn remote_payload_carries_exact_backup_and_run_ids() {
         let backup_id = uuid::Uuid::new_v4();
         let run_id = uuid::Uuid::new_v4();
-        let payload = remote_drill_payload("priya", backup_id, run_id);
+        let payload = remote_drill_payload("priya", backup_id, run_id, "falkordb");
         assert_eq!(payload["backup_id"], serde_json::json!(backup_id));
         assert_eq!(payload["run_id"], serde_json::json!(run_id));
         assert_eq!(payload["expected_computer"], "priya");
+        assert_eq!(payload["metadata"]["database_kind"], "falkordb");
         let command = payload["command"].as_str().unwrap();
         assert!(command.contains(&format!("--backup-id {backup_id}")));
         assert!(command.contains(&format!("--run-id {run_id}")));
