@@ -1105,6 +1105,19 @@ impl LeaderTick {
         }
 
         // ── 3. Dispatch writer tasks for detected rows ──────────────────────
+        // Self-heal writers eventually become code-writing work, so the
+        // operator recovery fence must cover this legacy deferred-task path
+        // as well as the work-item scheduler. Keep aggregation and stale
+        // claim recovery above active for observability, but fail closed
+        // before creating any new writer command.
+        if !crate::work_item_scheduler::work_item_execution_enabled(&self.pg).await {
+            tracing::warn!(
+                node = %self.my_name,
+                "self_heal: work-item execution gate disabled; skipping writer dispatch"
+            );
+            return Ok(());
+        }
+
         let detected = sqlx::query(
             "SELECT bug_signature, tier \
              FROM fleet_self_heal_queue \
@@ -1634,6 +1647,27 @@ mod tests {
     use chrono::Duration as ChronoDuration;
     use sqlx::postgres::PgPoolOptions;
     use std::env;
+
+    #[test]
+    fn self_heal_writer_dispatch_respects_work_item_execution_fence() {
+        let source = include_str!("leader_tick.rs");
+        let body = source
+            .split("pub async fn self_heal_scan")
+            .nth(1)
+            .expect("self-heal scan exists");
+        let gate = body
+            .find("work_item_execution_enabled(&self.pg).await")
+            .expect("self-heal dispatch gate exists");
+        let dispatch = body
+            .find("pg_enqueue_deferred")
+            .expect("self-heal deferred dispatch exists");
+
+        assert!(gate < dispatch, "gate must precede writer dispatch");
+        assert!(
+            body[gate..dispatch].contains("return Ok(())"),
+            "disabled gate must return without dispatching a writer"
+        );
+    }
 
     #[test]
     fn retained_failover_authority_requires_exact_recent_self_leader() {
