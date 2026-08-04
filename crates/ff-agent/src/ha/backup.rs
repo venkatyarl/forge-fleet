@@ -692,29 +692,11 @@ impl BackupOrchestrator {
         let file_name = format!("redis-{ts}.rdb.zst{}", age_ext(cfg.encrypt));
         let path = out_dir.join(&file_name);
 
-        // 1) Ask Redis to write an RDB snapshot. BGSAVE is async but
-        //    with appendonly yes the RDB may trail the AOF; that's fine
-        //    for our recovery model (AOF replays on restore anyway).
-        let bgsave = Command::new("docker")
-            .args(["exec", "forgefleet-redis", "redis-cli", "BGSAVE"])
-            .output()
-            .await?;
-        if !bgsave.status.success() {
-            return Err(BackupError::Cmd(format!(
-                "redis BGSAVE failed: {}",
-                String::from_utf8_lossy(&bgsave.stderr).trim()
-            )));
-        }
-
-        // 2) Wait for LASTSAVE to advance (short poll — 60s max).
-        let before_ts = container_lastsave("forgefleet-redis").await.unwrap_or(0);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if container_lastsave("forgefleet-redis").await.unwrap_or(0) > before_ts {
-                break;
-            }
-        }
+        // 1) Ask Redis to write an RDB snapshot and prove that this exact
+        //    request completed before exporting bytes. BGSAVE is async but
+        //    this Redis backup contains only the resulting RDB, so the
+        //    completion fence below is required before it can be trusted.
+        bgsave_and_wait("forgefleet-redis", "redis").await?;
 
         // 3) Stream the dump out of the container through zstd + age
         //    into the target file. `docker cp` would copy to a temp
@@ -793,7 +775,7 @@ impl BackupOrchestrator {
 
     /// FalkorDB is a Redis module, so the same BGSAVE/RDB/AOF machinery
     /// applies — but unlike redis we also capture the multi-part AOF dir
-    /// (`/data/appendonlydir`), tar both out of the container, compress,
+    /// (under the Redis-configured `dir`), tar both out of the container, compress,
     /// and encrypt per policy into
     /// `~/.forgefleet/backups/FalkorDB/falkordb-<ts>.tar.zst[.age]`.
     /// Runs only on the configured `source_host` (the node whose docker
@@ -804,35 +786,20 @@ impl BackupOrchestrator {
 
         let recipients = self.encryption_recipients(cfg).await?;
 
-        // 1) Ask FalkorDB to write an RDB snapshot.
-        let bgsave = Command::new("docker")
-            .args(["exec", FALKORDB_CONTAINER, "redis-cli", "BGSAVE"])
-            .output()
-            .await?;
-        if !bgsave.status.success() {
-            return Err(BackupError::Cmd(format!(
-                "falkordb BGSAVE failed (is the {FALKORDB_CONTAINER} container \
-                 running on this host?): {}",
-                String::from_utf8_lossy(&bgsave.stderr).trim()
-            )));
-        }
+        // 1) Produce and prove a new snapshot before reading the data directory.
+        bgsave_and_wait(FALKORDB_CONTAINER, "falkordb").await?;
 
-        // 2) Wait for LASTSAVE to advance (short poll — 60s max).
-        let before_ts = container_lastsave(FALKORDB_CONTAINER).await.unwrap_or(0);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if container_lastsave(FALKORDB_CONTAINER).await.unwrap_or(0) > before_ts {
-                break;
-            }
-        }
+        // FalkorDB images do not consistently use Redis' conventional /data.
+        // Ask the running service for the authoritative directory instead of
+        // archiving a compose mount that may not contain the live dataset.
+        let data_dir = container_redis_config(FALKORDB_CONTAINER, "dir").await?;
 
         let ts = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
         let file_name = format!("falkordb-{ts}.tar.zst{}", age_ext(cfg.encrypt));
         let path = out_dir.join(&file_name);
 
         // 3) tar dump.rdb + AOF dir out of the container, compress, encrypt.
-        let shell_cmd = falkordb_dump_cmd(&recipients, &path.to_string_lossy());
+        let shell_cmd = falkordb_dump_cmd(&recipients, &path.to_string_lossy(), &data_dir);
         info!(path = %path.display(), "running falkordb tar | zstd | age");
         let status = run_pipeline(&shell_cmd).await?;
         if !status.success() {
@@ -1735,16 +1702,89 @@ pub(crate) async fn file_metadata(path: &Path) -> Result<(i64, String), BackupEr
 
 /// `LASTSAVE` of a Redis-protocol container (redis proper or FalkorDB,
 /// which is a Redis module and answers the same command).
-async fn container_lastsave(container: &str) -> Option<u64> {
+async fn container_lastsave(container: &str) -> Result<u64, BackupError> {
     let out = Command::new("docker")
         .args(["exec", container, "redis-cli", "LASTSAVE"])
         .output()
-        .await
-        .ok()?;
+        .await?;
     if !out.status.success() {
-        return None;
+        return Err(BackupError::Cmd(format!(
+            "{container} LASTSAVE failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .map_err(|e| BackupError::Cmd(format!("{container} returned invalid LASTSAVE: {e}")))
+}
+
+/// Start a fresh RDB snapshot and wait until Redis proves it completed.
+///
+/// The baseline must be captured *before* BGSAVE. Capturing it afterwards can
+/// race a fast snapshot and then either wait the full timeout or export stale /
+/// in-flight bytes. A timeout is an error: an unproven artifact must never be
+/// catalogued or distributed as a backup.
+async fn bgsave_and_wait(container: &str, kind: &str) -> Result<(), BackupError> {
+    let before_ts = container_lastsave(container).await?;
+    let bgsave = Command::new("docker")
+        .args(["exec", container, "redis-cli", "BGSAVE"])
+        .output()
+        .await?;
+    if !bgsave.status.success() {
+        return Err(BackupError::Cmd(format!(
+            "{kind} BGSAVE failed: {}",
+            String::from_utf8_lossy(&bgsave.stderr).trim()
+        )));
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if container_lastsave(container).await? > before_ts {
+            return Ok(());
+        }
+    }
+
+    Err(BackupError::Cmd(format!(
+        "{kind} BGSAVE did not advance LASTSAVE within 60s; refusing to export an unproven snapshot"
+    )))
+}
+
+/// Read one Redis CONFIG value from a container and reject malformed paths.
+async fn container_redis_config(container: &str, key: &str) -> Result<String, BackupError> {
+    let out = Command::new("docker")
+        .args([
+            "exec",
+            container,
+            "redis-cli",
+            "--raw",
+            "CONFIG",
+            "GET",
+            key,
+        ])
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(BackupError::Cmd(format!(
+            "{container} CONFIG GET {key} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+
+    let value = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .next_back()
+        .unwrap_or_default()
+        .to_string();
+    if value.is_empty() || !Path::new(&value).is_absolute() {
+        return Err(BackupError::Cmd(format!(
+            "{container} CONFIG GET {key} returned an invalid absolute path"
+        )));
+    }
+    Ok(value)
 }
 
 /// Filename prefix the backup writer uses for a kind's artifacts
@@ -2317,14 +2357,16 @@ async fn verify_backup_decryptable(pool: &PgPool, path: &Path) -> Result<(), Bac
 
 /// Shell pipeline that streams `dump.rdb` plus the multi-part AOF dir (when
 /// present) out of the FalkorDB container as a tar, compresses with zstd, and
-/// optionally encrypts. The inner `sh -c` runs INSIDE the container; tar'ing
-/// only the two known paths means a stray file in /data is never captured.
+/// optionally encrypts. `data_dir` comes from Redis `CONFIG GET dir`; tar'ing
+/// only the two known paths means a stray file in that directory is never
+/// captured.
 /// Pure — no IO — so the command shape is unit-testable.
-fn falkordb_dump_cmd(recipients: &[String], out_path: &str) -> String {
+fn falkordb_dump_cmd(recipients: &[String], out_path: &str, data_dir: &str) -> String {
     format!(
-        "docker exec {FALKORDB_CONTAINER} sh -c \
-           'cd /data && tar cf - dump.rdb $(test -d appendonlydir && echo appendonlydir)' \
+        "docker exec --workdir {data_dir} {FALKORDB_CONTAINER} sh -c \
+           'tar cf - dump.rdb $(test -d appendonlydir && echo appendonlydir)' \
          | zstd -q{age} > {out}",
+        data_dir = shell_quote(data_dir),
         age = age_stage(recipients),
         out = shell_quote(out_path),
     )
@@ -3213,9 +3255,13 @@ mod tests {
 
     #[test]
     fn falkordb_dump_cmd_captures_rdb_and_aof() {
-        let cmd = falkordb_dump_cmd(&["age1abc".to_string()], "/tmp/falkordb-x.tar.zst.age");
+        let cmd = falkordb_dump_cmd(
+            &["age1abc".to_string()],
+            "/tmp/falkordb-x.tar.zst.age",
+            "/var/lib/falkordb/data",
+        );
         assert!(
-            cmd.contains("docker exec forgefleet-falkordb"),
+            cmd.contains("docker exec --workdir '/var/lib/falkordb/data' forgefleet-falkordb"),
             "cmd: {cmd}"
         );
         // Both the RDB snapshot and the multi-part AOF dir must be in the tar.
@@ -3229,7 +3275,8 @@ mod tests {
         );
 
         // encrypt=false policy → no age stage at all.
-        let plain = falkordb_dump_cmd(&[], "/tmp/falkordb-x.tar.zst");
+        let plain = falkordb_dump_cmd(&[], "/tmp/falkordb-x.tar.zst", "/data dir");
+        assert!(plain.contains("--workdir '/data dir'"), "cmd: {plain}");
         assert!(!plain.contains("age -r"), "cmd: {plain}");
         assert!(plain.contains("| zstd -q > "), "cmd: {plain}");
     }
