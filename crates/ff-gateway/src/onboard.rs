@@ -736,8 +736,14 @@ pub async fn enrollment_progress(
     })
     .to_string();
     let _ = publish_redis(&channel, &message).await;
-    // Also log so operators can tail daemon logs.
-    tracing::info!(target: "ff-gateway::onboard", node=%payload.name, step=%payload.step, status=%payload.status, "enrollment progress");
+    // Also log so operators can tail daemon logs. Include the detail payload
+    // for failures — a fatal without its reason is undebuggable (vinny
+    // 2026-08-04: mesh_import fatal with no visible cause).
+    if payload.status == "failed" {
+        tracing::warn!(target: "ff-gateway::onboard", node=%payload.name, step=%payload.step, detail=%payload.detail, "enrollment step FAILED");
+    } else {
+        tracing::info!(target: "ff-gateway::onboard", node=%payload.name, step=%payload.step, status=%payload.status, "enrollment progress");
+    }
     StatusCode::NO_CONTENT
 }
 
