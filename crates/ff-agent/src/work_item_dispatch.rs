@@ -2055,10 +2055,7 @@ async fn invalidate_nonlocal_worktree_mapping(pg: &PgPool, item: &AssignedWorkIt
 }
 
 async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Result<WorktreeRecord> {
-    let base_branch = match item.base_branch.as_deref() {
-        Some(branch) if !branch.trim().is_empty() => branch.trim().to_string(),
-        _ => default_branch(&item.repo_path).unwrap_or_else(|_| "main".to_string()),
-    };
+    let base_branch = resolve_worktree_base_branch(pg, item).await?;
     let task_branch = task_branch_name(&item.title, item.work_item_id);
 
     // Canonical slots reuse an existing project checkout (~/projects/{project});
@@ -2108,6 +2105,164 @@ async fn create_worktree_for_item(pg: &PgPool, item: &AssignedWorkItem) -> Resul
         base_branch,
         task_branch,
     })
+}
+
+fn normalized_repo_url(url: &str) -> String {
+    let normalized = url
+        .trim()
+        .trim_end_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or_else(|| url.trim().trim_end_matches('/'))
+        .replace(':', "/");
+    let parts: Vec<_> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    parts
+        .iter()
+        .rev()
+        .take(2)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+        .join("/")
+        .to_ascii_lowercase()
+}
+
+fn branch_exists(repo_path: &Path, branch: &str) -> bool {
+    let reference = format!("refs/remotes/origin/{branch}");
+    run_git(
+        repo_path,
+        ["rev-parse", "--verify", "--quiet", &reference],
+        Duration::from_secs(30),
+    )
+    .is_ok_and(|out| out.status.success())
+}
+
+fn base_branch_candidates(
+    configured: Option<&str>,
+    origin_head: Option<String>,
+    repo_default: Option<&str>,
+    project_default: &str,
+) -> Vec<(&'static str, String)> {
+    let mut candidates = Vec::new();
+    if let Some(branch) = configured
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+    {
+        candidates.push(("configured", branch.to_string()));
+    }
+    if let Some(branch) = origin_head.filter(|branch| !branch.trim().is_empty()) {
+        candidates.push(("origin_head", branch));
+    }
+    if let Some(branch) = repo_default
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+    {
+        candidates.push(("repo_default", branch.to_string()));
+    }
+    if !project_default.trim().is_empty() {
+        candidates.push(("project_default", project_default.trim().to_string()));
+    }
+    candidates.push(("conventional_default", "main".to_string()));
+    candidates.push(("conventional_default", "master".to_string()));
+    candidates
+}
+
+async fn resolve_worktree_base_branch(pg: &PgPool, item: &AssignedWorkItem) -> Result<String> {
+    let project: Option<(Option<String>, String)> =
+        sqlx::query_as("SELECT NULLIF(repo_url, ''), default_branch FROM projects WHERE id = $1")
+            .bind(&item.project_id)
+            .fetch_optional(pg)
+            .await?;
+    let (project_repo_url, project_default) = project.ok_or_else(|| {
+        anyhow!(
+            "worktree branch resolution: project {} does not exist",
+            item.project_id
+        )
+    })?;
+
+    let repo_config: Option<(String, String, String)> =
+        match item.repo_id {
+            Some(repo_id) => sqlx::query_as(
+                "SELECT project_id, github_url, default_branch FROM project_repos WHERE id = $1",
+            )
+            .bind(repo_id)
+            .fetch_optional(pg)
+            .await?,
+            None => None,
+        };
+    if let Some((repo_project_id, _, _)) = &repo_config
+        && repo_project_id != &item.project_id
+    {
+        bail!(
+            "worktree branch resolution: repo {} belongs to project {}, not work item project {}",
+            item.repo_id.expect("repo id exists when config exists"),
+            repo_project_id,
+            item.project_id
+        );
+    }
+    if item.repo_id.is_some() && repo_config.is_none() {
+        bail!(
+            "worktree branch resolution: repo {} is not registered",
+            item.repo_id.expect("checked as some")
+        );
+    }
+    if let (Some(item_url), Some((_, configured_url, _))) = (&item.repo_url, &repo_config)
+        && normalized_repo_url(item_url) != normalized_repo_url(configured_url)
+    {
+        bail!(
+            "worktree branch resolution: work item repo URL {item_url} conflicts with configured repo URL {configured_url}"
+        );
+    }
+    if repo_config.is_none()
+        && let (Some(item_url), Some(project_url)) = (&item.repo_url, &project_repo_url)
+        && normalized_repo_url(item_url) != normalized_repo_url(project_url)
+    {
+        bail!(
+            "worktree branch resolution: work item repo URL {item_url} conflicts with project repo URL {project_url}"
+        );
+    }
+
+    let candidates = base_branch_candidates(
+        item.base_branch.as_deref(),
+        default_branch(&item.repo_path).ok(),
+        repo_config.as_ref().map(|(_, _, branch)| branch.as_str()),
+        &project_default,
+    );
+
+    let mut checked = Vec::new();
+    for (tier, branch) in candidates {
+        if checked.contains(&branch) {
+            continue;
+        }
+        checked.push(branch.clone());
+        let exists = branch_exists(&item.repo_path, &branch);
+        info!(
+            work_item_id = %item.work_item_id,
+            project_id = %item.project_id,
+            repo_id = ?item.repo_id,
+            resolution_tier = tier,
+            candidate = %branch,
+            exists,
+            "work_item_dispatch: checked base branch resolution tier"
+        );
+        if exists {
+            info!(
+                work_item_id = %item.work_item_id,
+                resolution_tier = tier,
+                base_branch = %branch,
+                "work_item_dispatch: resolved base branch"
+            );
+            return Ok(branch);
+        }
+    }
+    bail!(
+        "worktree branch resolution: none of the candidate branches exist for project {} repo {:?}: {}",
+        item.project_id,
+        item.repo_id,
+        checked.join(", ")
+    )
 }
 
 async fn insert_worktree_creating(
@@ -7341,13 +7496,14 @@ mod tests {
     use super::{
         AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS, ReviewerStat,
         WorktreeRecord, affected_crate_manifests, agent_output_tail, backend_failed_without_output,
-        builder_excludes_480b, check_dispatch_prerequisites, classify_dispatch_outcome,
-        collect_leftover_tmp_output, command_display, complexity_at_least_moderate,
-        contains_file_line_citation, default_clone_path, dispatch_budget_for_host, dispatch_prompt,
-        expand_home, is_build_timeout, legacy_acceptance_sql, local_failure_diagnosis_for,
-        local_failure_diagnosis_for_attempt, mark_local_retest_failed, mark_local_retest_passed,
-        mark_ready_for_review, mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers,
-        parse_cli_tokens, parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
+        base_branch_candidates, branch_exists, builder_excludes_480b, check_dispatch_prerequisites,
+        classify_dispatch_outcome, collect_leftover_tmp_output, command_display,
+        complexity_at_least_moderate, contains_file_line_citation, default_clone_path,
+        dispatch_budget_for_host, dispatch_prompt, expand_home, is_build_timeout,
+        legacy_acceptance_sql, local_failure_diagnosis_for, local_failure_diagnosis_for_attempt,
+        mark_local_retest_failed, mark_local_retest_passed, mark_ready_for_review, mirror_repo_url,
+        normalized_cloud_backend, normalized_repo_url, order_cloud_reviewers, parse_cli_tokens,
+        parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
         quick_empty_success_is_provider_failure, record_cloud_rescue_local_failure_diagnosis,
         repo_cache_path, repo_slug, resolve_dispatch_repo_binding, retry_error_is_actionable,
         rewrite_github_host_alias, same_model_family, should_attempt_lane15,
@@ -7388,6 +7544,60 @@ mod tests {
             work: Vec::new(),
             post_work: Vec::new(),
         }
+    }
+
+    #[test]
+    fn base_branch_candidates_prioritize_configuration_then_head_then_defaults() {
+        assert_eq!(
+            base_branch_candidates(
+                Some(" release "),
+                Some("develop".to_string()),
+                Some("repo-main"),
+                "project-main",
+            ),
+            vec![
+                ("configured", "release".to_string()),
+                ("origin_head", "develop".to_string()),
+                ("repo_default", "repo-main".to_string()),
+                ("project_default", "project-main".to_string()),
+                ("conventional_default", "main".to_string()),
+                ("conventional_default", "master".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_existence_and_repo_url_normalization_are_explicit() {
+        let tmp = tempfile::tempdir().unwrap();
+        super::run_git(tmp.path(), ["init"], Duration::from_secs(10)).unwrap();
+        super::run_git(
+            tmp.path(),
+            [
+                "-c",
+                "user.name=ForgeFleet Test",
+                "-c",
+                "user.email=test@forgefleet.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            tmp.path(),
+            ["update-ref", "refs/remotes/origin/configured", "HEAD"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+
+        assert!(branch_exists(tmp.path(), "configured"));
+        assert!(!branch_exists(tmp.path(), "missing"));
+        assert_eq!(
+            normalized_repo_url("git@github.com-venkat:venkatyarl/forge-fleet.git"),
+            normalized_repo_url("https://github.com/venkatyarl/forge-fleet/")
+        );
     }
 
     #[test]
