@@ -889,6 +889,38 @@ fn detect_os_info() -> crate::beat_v2::OsInfo {
     }
 }
 
+/// Return true only when `rocminfo` reports an HSA agent whose device type is
+/// GPU.  A marketing-name match is not sufficient: CPU-only systems can have
+/// the ROCm runtime installed and their CPU agent also carries an AMD marketing
+/// name.
+fn rocminfo_reports_gpu(output: &str) -> bool {
+    output.lines().any(|line| {
+        line.trim()
+            .strip_prefix("Device Type:")
+            .is_some_and(|value| value.trim() == "GPU")
+    })
+}
+
+/// Pure precedence policy for Linux accelerator probes.  Keep NVIDIA first,
+/// preserve the existing rocm-smi behavior, then use rocminfo as the fallback
+/// for ROCm installations (notably ROCm 7.1/gfx1151) that no longer ship the
+/// rocm-smi compatibility command.
+fn classify_linux_gpu_probe_results(
+    nvidia_smi_ok: bool,
+    rocm_smi_ok: bool,
+    rocminfo_output: Option<&str>,
+) -> &'static str {
+    if nvidia_smi_ok {
+        "nvidia_cuda"
+    } else if rocm_smi_ok {
+        "amd_rocm"
+    } else if rocminfo_output.is_some_and(rocminfo_reports_gpu) {
+        "amd_rocm"
+    } else {
+        "none"
+    }
+}
+
 fn detect_gpu_kind() -> String {
     // macOS: aarch64 = Apple Silicon (Metal/MLX), x86_64 = Intel (no useful GPU).
     if std::env::consts::OS == "macos" {
@@ -899,9 +931,11 @@ fn detect_gpu_kind() -> String {
         };
     }
 
-    // Linux: probe for nvidia-smi, then rocm-smi.
+    // Linux: probe for nvidia-smi, then rocm-smi, then rocminfo.  Run the
+    // probes sequentially so the fallback adds no subprocess cost on hosts
+    // already identified by either established probe.
     if std::env::consts::OS == "linux" {
-        if command_output_with_timeout(
+        let nvidia_smi_ok = command_output_with_timeout(
             std::process::Command::new("nvidia-smi")
                 .arg("--version")
                 .stdout(std::process::Stdio::null())
@@ -909,11 +943,12 @@ fn detect_gpu_kind() -> String {
             3,
         )
         .map(|o| o.status.success())
-        .unwrap_or(false)
-        {
-            return "nvidia_cuda".to_string();
+        .unwrap_or(false);
+        if nvidia_smi_ok {
+            return classify_linux_gpu_probe_results(true, false, None).to_string();
         }
-        if command_output_with_timeout(
+
+        let rocm_smi_ok = command_output_with_timeout(
             std::process::Command::new("rocm-smi")
                 .arg("--version")
                 .stdout(std::process::Stdio::null())
@@ -921,10 +956,18 @@ fn detect_gpu_kind() -> String {
             3,
         )
         .map(|o| o.status.success())
-        .unwrap_or(false)
-        {
-            return "amd_rocm".to_string();
+        .unwrap_or(false);
+        if rocm_smi_ok {
+            return classify_linux_gpu_probe_results(false, true, None).to_string();
         }
+
+        let rocminfo = command_output_with_timeout(
+            std::process::Command::new("rocminfo").stderr(std::process::Stdio::null()),
+            3,
+        )
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        return classify_linux_gpu_probe_results(false, false, rocminfo.as_deref()).to_string();
     }
 
     "none".to_string()
@@ -1133,6 +1176,35 @@ fn run_with_timeout<T: Send + 'static>(
     }
 }
 
+const COMMAND_CAPTURE_LIMIT_BYTES: usize = 1024 * 1024;
+const COMMAND_CAPTURE_TRUNCATION_MARKER: &[u8] = b"\n[forgefleet: output truncated]\n";
+
+fn drain_command_pipe_bounded<R: std::io::Read>(mut reader: R) -> Vec<u8> {
+    let payload_limit =
+        COMMAND_CAPTURE_LIMIT_BYTES.saturating_sub(COMMAND_CAPTURE_TRUNCATION_MARKER.len());
+    let mut captured = Vec::with_capacity(payload_limit.min(64 * 1024));
+    let mut truncated = false;
+    let mut chunk = [0_u8; 16 * 1024];
+
+    loop {
+        let count = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let remaining = payload_limit.saturating_sub(captured.len());
+        let keep = remaining.min(count);
+        captured.extend_from_slice(&chunk[..keep]);
+        truncated |= keep < count;
+    }
+
+    if truncated {
+        captured.extend_from_slice(COMMAND_CAPTURE_TRUNCATION_MARKER);
+    }
+    captured
+}
+
 fn command_output_with_timeout(
     cmd: &mut std::process::Command,
     timeout_secs: u64,
@@ -1143,31 +1215,48 @@ fn command_output_with_timeout(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .ok()?;
+    let stdout = child.stdout.take()?;
+    let stderr = child.stderr.take()?;
+    // Drain both pipes while the process is running. Waiting for exit first can
+    // deadlock once either OS pipe buffer fills (rocminfo can be especially
+    // verbose on multi-GPU hosts). The readers keep draining after the bounded
+    // prefix is full, so capture is memory-safe without applying backpressure
+    // to the child. One MiB retains the complete output of realistic rocminfo
+    // probes by a wide margin; truncation is explicit for every other caller.
+    let stdout_reader = std::thread::spawn(move || drain_command_pipe_bounded(stdout));
+    let stderr_reader = std::thread::spawn(move || drain_command_pipe_bounded(stderr));
     let pid = child.id();
     let start = std::time::Instant::now();
     loop {
-        match child.try_wait().ok()? {
-            Some(status) => {
-                let mut out = std::process::Output {
-                    status,
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                };
-                // best-effort read stdout/stderr; ignore errors
-                let _ = child.stdout.take().map(|mut r| {
-                    use std::io::Read;
-                    let _ = r.read_to_end(&mut out.stdout);
-                });
-                let _ = child.stderr.take().map(|mut r| {
-                    use std::io::Read;
-                    let _ = r.read_to_end(&mut out.stderr);
-                });
-                return Some(out);
+        match child.try_wait() {
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                tracing::debug!(
+                    pid,
+                    ?cmd,
+                    %error,
+                    "command_output_with_timeout: failed to poll subprocess"
+                );
+                return None;
             }
-            None => {
+            Ok(Some(status)) => {
+                let stdout = stdout_reader.join().unwrap_or_default();
+                let stderr = stderr_reader.join().unwrap_or_default();
+                return Some(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
                 if start.elapsed() > Duration::from_secs(timeout_secs) {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
                     tracing::debug!(
                         pid,
                         ?cmd,
@@ -1612,6 +1701,104 @@ mod tests {
             ),
             "unexpected gpu_kind: {kind}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_capture_drains_full_pipes_and_marks_bounded_output() {
+        // Both streams exceed the common 64 KiB pipe capacity and the helper's
+        // memory cap. The GPU evidence is deliberately emitted first, matching
+        // rocminfo's agent-header ordering, and must survive truncation.
+        let kib_blocks = (COMMAND_CAPTURE_LIMIT_BYTES / 1024) + 128;
+        let script = format!(
+            "printf 'Device Type: GPU\\n'; \
+             dd if=/dev/zero bs=1024 count={kib_blocks} 2>/dev/null & \
+             dd if=/dev/zero bs=1024 count={kib_blocks} 1>&2 2>/dev/null & \
+             wait"
+        );
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", &script]);
+
+        let started = std::time::Instant::now();
+        let output = command_output_with_timeout(&mut command, 5)
+            .expect("concurrent drains must let a verbose child exit normally");
+
+        assert!(output.status.success());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(output.stdout.len(), COMMAND_CAPTURE_LIMIT_BYTES);
+        assert_eq!(output.stderr.len(), COMMAND_CAPTURE_LIMIT_BYTES);
+        assert!(output.stdout.ends_with(COMMAND_CAPTURE_TRUNCATION_MARKER));
+        assert!(output.stderr.ends_with(COMMAND_CAPTURE_TRUNCATION_MARKER));
+        assert!(rocminfo_reports_gpu(&String::from_utf8_lossy(
+            &output.stdout
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_timeout_kills_and_reaps_child_promptly() {
+        let mut command = std::process::Command::new("sh");
+        // `exec` ensures the PID owned by the helper is the sleeping process,
+        // so killing and reaping it also closes both capture pipes.
+        command.args(["-c", "exec sleep 30"]);
+
+        let started = std::time::Instant::now();
+        assert!(command_output_with_timeout(&mut command, 1).is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timed-out child was not killed and reaped promptly"
+        );
+    }
+
+    #[test]
+    fn rocminfo_fallback_requires_a_gpu_agent() {
+        let gpu = "\
+Agent 1
+  Device Type:             CPU
+  Marketing Name:          AMD Ryzen AI MAX+ 395
+Agent 2
+  Device Type:             GPU
+  Name:                    gfx1151
+  Marketing Name:          Radeon 8060S Graphics
+";
+        assert!(rocminfo_reports_gpu(gpu));
+        assert_eq!(
+            classify_linux_gpu_probe_results(false, false, Some(gpu)),
+            "amd_rocm"
+        );
+
+        let cpu_only = "\
+Agent 1
+  Device Type:             CPU
+  Marketing Name:          AMD Ryzen AI MAX+ 395
+";
+        assert!(!rocminfo_reports_gpu(cpu_only));
+        assert_eq!(
+            classify_linux_gpu_probe_results(false, false, Some(cpu_only)),
+            "none"
+        );
+        assert_eq!(
+            classify_linux_gpu_probe_results(false, false, Some("Marketing Name: Radeon")),
+            "none"
+        );
+    }
+
+    #[test]
+    fn linux_gpu_probe_precedence_preserves_existing_detectors() {
+        let rocminfo_gpu = "Device Type: GPU";
+        assert_eq!(
+            classify_linux_gpu_probe_results(true, true, Some(rocminfo_gpu)),
+            "nvidia_cuda"
+        );
+        assert_eq!(
+            classify_linux_gpu_probe_results(false, true, Some(rocminfo_gpu)),
+            "amd_rocm"
+        );
+        assert_eq!(
+            classify_linux_gpu_probe_results(false, true, None),
+            "amd_rocm"
+        );
+        assert_eq!(classify_linux_gpu_probe_results(false, false, None), "none");
     }
 
     #[test]
