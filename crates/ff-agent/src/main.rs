@@ -116,6 +116,25 @@ async fn main() -> anyhow::Result<()> {
         cancel.clone(),
     ));
 
+    // Every daemon attempts one idempotent seed. The scheduler's database
+    // advisory lock makes concurrent node startups converge on one active
+    // durable chain.
+    let dreamer_startup_handle = std::env::var("FORGEFLEET_POSTGRES_URL")
+        .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+        .ok()
+        .and_then(|database_url| {
+            sqlx::PgPool::connect_lazy(&database_url)
+                .map_err(|error| warn!(%error, "dreamer database URL is invalid"))
+                .ok()
+        })
+        .map(|pool| {
+            tokio::spawn(async move {
+                if let Err(error) = ff_agent::dreamer::ensure_dreamer_scheduled(&pool).await {
+                    warn!(%error, "failed to seed memory dreamer at startup");
+                }
+            })
+        });
+
     let fabric_handle = std::env::var("FORGEFLEET_POSTGRES_URL")
         .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
         .ok()
@@ -171,6 +190,9 @@ async fn main() -> anyhow::Result<()> {
     activity_handle.abort();
     poller_handle.abort();
     build_monitor_handle.abort();
+    if let Some(handle) = dreamer_startup_handle {
+        handle.abort();
+    }
     if let Some(handle) = fabric_handle {
         handle.abort();
     }

@@ -60,6 +60,9 @@ pub const SESSION_SCOPE_IDLE_SECS: i64 = 6 * 3600;
 /// Max session scopes archived per pass — bounds one pass's Brain-insert and
 /// delete work; the 30-min chain drains any backlog across passes.
 pub const MAX_SESSION_SWEEPS_PER_PASS: i64 = 16;
+/// Max durable scopes inspected per pass, preventing an unbounded startup or
+/// backlog scan from monopolizing the deferred worker.
+pub const MAX_DURABLE_SCOPES_PER_PASS: i64 = 32;
 
 /// fleet_secrets gate: `off`/`false`/`0`/`disabled`/`no` skips the pass body
 /// (the chain keeps ticking so flipping the gate back on needs no re-seed).
@@ -96,7 +99,10 @@ async fn read_secret(pool: &PgPool, key: &str) -> Option<String> {
 
 /// Does an active (pending / dispatchable / running) dreamer task other than
 /// `exclude_id` already exist? Guards against duplicate chains.
-async fn active_chain_exists(pool: &PgPool, exclude_id: Option<&str>) -> Result<bool> {
+async fn active_chain_exists(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
+    exclude_id: Option<&str>,
+) -> Result<bool> {
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (
             SELECT 1 FROM fleet_tasks
@@ -108,7 +114,7 @@ async fn active_chain_exists(pool: &PgPool, exclude_id: Option<&str>) -> Result<
     )
     .bind(DREAMER_TASK_TITLE)
     .bind(exclude_id)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
     .context("probe for an active dreamer task")?;
     Ok(exists)
@@ -121,7 +127,13 @@ async fn active_chain_exists(pool: &PgPool, exclude_id: Option<&str>) -> Result<
 /// `max_attempts = 1`: a failed pass must NOT retry-loop — the next link is
 /// already scheduled and re-covers the same work (every step is idempotent).
 pub async fn schedule_next_run(pool: &PgPool, current_task_id: Option<&str>) -> Result<bool> {
-    if active_chain_exists(pool, current_task_id).await? {
+    let mut tx = pool.begin().await.context("begin dreamer scheduling")?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('memory-dreamer-scheduler', 0))")
+        .execute(&mut *tx)
+        .await
+        .context("lock dreamer scheduling")?;
+    if active_chain_exists(&mut *tx, current_task_id).await? {
+        tx.commit().await?;
         return Ok(false);
     }
     let interval =
@@ -141,6 +153,7 @@ pub async fn schedule_next_run(pool: &PgPool, current_task_id: Option<&str>) -> 
     )
     .await
     .context("enqueue next dreamer link")?;
+    tx.commit().await.context("commit dreamer scheduling")?;
     Ok(true)
 }
 
@@ -190,9 +203,23 @@ pub async fn run_dreamer_pass(pool: &PgPool) -> Result<serde_json::Value> {
     // 2) Re-enforce caps on durable scopes (no-op unless a cap was lowered or
     //    a previous consolidation crashed mid-way).
     let durable: Vec<(String, String)> = sqlx::query_as(
-        "SELECT DISTINCT scope_type, scope_key FROM agent_memory
-          WHERE scope_type IN ('agent', 'project')",
+        "WITH scopes AS (
+             SELECT scope_type, scope_key, SUM(bytes)::bigint AS total
+               FROM agent_memory
+              WHERE scope_type IN ('agent', 'project')
+              GROUP BY scope_type, scope_key
+         )
+         SELECT s.scope_type, s.scope_key FROM scopes s
+          WHERE s.total > COALESCE((
+              SELECT cap_bytes FROM agent_memory_caps c
+               WHERE c.scope_type=s.scope_type AND c.scope_key IN (s.scope_key, '')
+               ORDER BY (c.scope_key=s.scope_key) DESC LIMIT 1
+          ), $2)
+          ORDER BY s.scope_type, s.scope_key
+          LIMIT $1",
     )
+    .bind(MAX_DURABLE_SCOPES_PER_PASS)
+    .bind(ff_db::queries::MEMORY_DEFAULT_CAP_BYTES)
     .fetch_all(pool)
     .await
     .context("list durable memory scopes")?;
@@ -260,5 +287,6 @@ mod tests {
         assert!(DREAMER_INTERVAL_SECS >= MIN_INTERVAL_SECS);
         assert!(SESSION_SCOPE_IDLE_SECS > DREAMER_INTERVAL_SECS);
         assert!(MAX_SESSION_SWEEPS_PER_PASS > 0);
+        assert!(MAX_DURABLE_SCOPES_PER_PASS > 0);
     }
 }
