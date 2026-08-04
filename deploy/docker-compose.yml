@@ -32,6 +32,10 @@ services:
     # was a no-op behind its `IF pg_extension` guard.
     image: pgvector/pgvector:pg16
     container_name: forgefleet-postgres
+    # PostgreSQL uses POSIX dynamic shared memory for parallel workers. Docker's
+    # 64 MiB default was already >70% full on Priya, leaving too little burst
+    # headroom for backup/index activity. This is a ceiling, not a reservation.
+    shm_size: 1g
     ports:
       - "55432:5432"
     environment:
@@ -50,7 +54,12 @@ services:
       - "-c"
       - "shared_buffers=256MB"
       - "-c"
-      - "work_mem=32MB"
+      - "work_mem=8MB"
+      - "-c"
+      # Abandoned open transactions retain locks and prevent vacuum cleanup.
+      # Ordinary pooled idle sessions remain unlimited; only idle transactions
+      # are terminated after this bounded safety window.
+      - "idle_in_transaction_session_timeout=5min"
       - "-c"
       - "maintenance_work_mem=128MB"
       - "-c"
@@ -90,12 +99,10 @@ services:
       - "hot_standby=on"
       - "-c"
       - "synchronous_commit=off"
-    # 4 GB ceiling on the 96 GB Mac Studio. The old 768m cap sat at ~88% even
-    # idle (shared_buffers=256MB + maintenance_work_mem=128MB + per-conn
-    # work_mem), so a full Cortex reindex (batch inserts + pgvector HNSW index
-    # builds across ~66k nodes) blew past it → Docker OOM-killed the container
-    # mid-query → "got 0 bytes at EOF". 4g leaves ample headroom for index builds.
-    mem_limit: 4g
+    # Priya exhausted the previous 4 GiB cgroup during backup/index activity,
+    # and the kernel OOM-killed PostgreSQL backends. 8 GiB leaves controlled
+    # headroom on the 32 GiB host while retaining a hard container ceiling.
+    mem_limit: 8g
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U forgefleet -d forgefleet"]
       interval: 10s
@@ -103,6 +110,9 @@ services:
       retries: 5
       start_period: 10s
     restart: unless-stopped
+    # Compose otherwise escalates SIGTERM to SIGKILL after only 10 seconds.
+    # Allow PostgreSQL time to checkpoint and shut down cleanly.
+    stop_grace_period: 60s
     networks:
       - forgefleet
 

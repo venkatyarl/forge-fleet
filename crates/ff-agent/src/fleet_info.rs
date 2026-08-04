@@ -137,14 +137,19 @@ pub async fn get_heartbeat_pool() -> Result<PgPool, String> {
 
 async fn build_heartbeat_pool() -> Result<PgPool, String> {
     let db_url = read_db_url()?;
+    heartbeat_pool_options()
+        .connect(&db_url)
+        .await
+        .map_err(|e| format!("connect Postgres (heartbeat pool): {e}"))
+}
+
+fn heartbeat_pool_options() -> PgPoolOptions {
     PgPoolOptions::new()
         .max_connections(2)
         .min_connections(1)
         .acquire_timeout(Duration::from_secs(3))
+        .idle_timeout(Some(Duration::from_secs(60)))
         .max_lifetime(Some(Duration::from_secs(30 * 60)))
-        .connect(&db_url)
-        .await
-        .map_err(|e| format!("connect Postgres (heartbeat pool): {e}"))
 }
 
 /// Fetch all fleet nodes from Postgres.
@@ -562,6 +567,20 @@ at startup to populate this section."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_pool_keeps_one_warm_connection_with_idle_reaping() {
+        let options = heartbeat_pool_options();
+
+        assert_eq!(options.get_max_connections(), 2);
+        assert_eq!(options.get_min_connections(), 1);
+        assert_eq!(options.get_acquire_timeout(), Duration::from_secs(3));
+        assert_eq!(options.get_idle_timeout(), Some(Duration::from_secs(60)));
+        assert_eq!(
+            options.get_max_lifetime(),
+            Some(Duration::from_secs(30 * 60))
+        );
+    }
 
     #[test]
     fn telegram_bot_token_env_key_matches_existing_convention() {
