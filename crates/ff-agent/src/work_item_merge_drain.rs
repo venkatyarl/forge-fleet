@@ -8,6 +8,8 @@
 //! Serialization (one in-flight merge per project) is enforced by
 //! [`ff_db::pg_next_merge_queue_item`], so merges land sequentially even though
 //! builds ran in parallel across the fleet.
+//! The leader remains the sole drain serializer. Durable HA claim tokens are a
+//! follow-up schema layer after V286; this selector does not introduce claims.
 //!
 //! Design: `.forgefleet/plans/DECISION-pillar4-canonical-home.md`.
 

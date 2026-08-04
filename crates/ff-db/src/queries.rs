@@ -10940,20 +10940,30 @@ pub async fn pg_next_merge_queue_item(pool: &PgPool) -> Result<Option<MergeQueue
     // carry a reject). Filtering on `= 'approve'` made such rows both
     // unselectable AND permanent head-blockers via the NOT EXISTS sibling
     // guard (2026-07-28: PR #1480 stalled the whole forge-fleet queue).
+    let automerge_enabled = matches!(
+        pg_read_gate_value(pool, "work_item_automerge_mode", "off", "off")
+            .await?
+            .as_str(),
+        "on" | "true" | "1"
+    );
+    // Rank before testing actionability: an approval-gated `mergeable` head is
+    // still its project's blocker, but must not starve another project's head.
     let row = sqlx::query(
-        "SELECT id, work_item_id, project_id, pr_url, branch_name
-           FROM work_item_merge_queue q
-          WHERE q.status IN ('queued', 'ci_running', 'mergeable')
-            AND COALESCE(q.review_verdict, '') <> 'reject'
-            AND NOT EXISTS (
-                SELECT 1 FROM work_item_merge_queue q2
-                 WHERE q2.project_id = q.project_id
-                   AND q2.status IN ('queued', 'ci_running', 'mergeable')
-                   AND COALESCE(q2.review_verdict, '') <> 'reject'
-                   AND q2.position < q.position)
-          ORDER BY q.position ASC
+        "WITH project_heads AS (
+             SELECT q.*,
+                    ROW_NUMBER() OVER (PARTITION BY q.project_id ORDER BY q.position) AS project_rank
+               FROM work_item_merge_queue q
+              WHERE q.status IN ('queued', 'ci_running', 'mergeable')
+                AND COALESCE(q.review_verdict, '') <> 'reject'
+         )
+         SELECT id, work_item_id, project_id, pr_url, branch_name
+           FROM project_heads
+          WHERE project_rank = 1
+            AND (status <> 'mergeable' OR $1)
+          ORDER BY position ASC
           LIMIT 1",
     )
+    .bind(automerge_enabled)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|r| MergeQueueItem {
@@ -10963,6 +10973,143 @@ pub async fn pg_next_merge_queue_item(pool: &PgPool) -> Result<Option<MergeQueue
         pr_url: r.try_get("pr_url").ok().flatten(),
         branch_name: r.get("branch_name"),
     }))
+}
+
+#[cfg(test)]
+mod merge_queue_selection_tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    async fn test_pool() -> Option<(PgPool, PgPool, String)> {
+        let url = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()?;
+        let (prefix, _) = url.rsplit_once('/')?;
+        let db_name = format!("ff_merge_fairness_{}", uuid::Uuid::new_v4().simple());
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("{prefix}/postgres"))
+            .await
+            .expect("connect to admin database");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create test database");
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&format!("{prefix}/{db_name}"))
+            .await
+            .expect("connect to test database");
+        sqlx::raw_sql(
+            "CREATE TABLE fleet_secrets (
+                 key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at TIMESTAMPTZ,
+                 previous_value TEXT, updated_at TIMESTAMPTZ DEFAULT NOW()
+             );
+             CREATE TABLE work_item_merge_queue (
+                 id UUID PRIMARY KEY, work_item_id UUID NOT NULL, project_id TEXT NOT NULL,
+                 position BIGINT NOT NULL, status TEXT NOT NULL, review_verdict TEXT,
+                 pr_url TEXT, branch_name TEXT NOT NULL
+             );",
+        )
+        .execute(&pool)
+        .await
+        .expect("create merge queue test schema");
+        Some((admin, pool, db_name))
+    }
+
+    async fn insert(
+        pool: &PgPool,
+        project: &str,
+        position: i64,
+        status: &str,
+        verdict: &str,
+    ) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO work_item_merge_queue
+                 (id, work_item_id, project_id, position, status, review_verdict, branch_name)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(id)
+        .bind(uuid::Uuid::new_v4())
+        .bind(project)
+        .bind(position)
+        .bind(status)
+        .bind(verdict)
+        .bind(format!("wi/{id}"))
+        .execute(pool)
+        .await
+        .expect("insert queue row");
+        id
+    }
+
+    async fn reset(pool: &PgPool, gate: &str) {
+        sqlx::raw_sql("TRUNCATE work_item_merge_queue; TRUNCATE fleet_secrets;")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO fleet_secrets (key, value) VALUES ('work_item_automerge_mode', $1)",
+        )
+        .bind(gate)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn drop_test_pool(admin: PgPool, pool: PgPool, db_name: &str) {
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("drop test database");
+    }
+
+    #[tokio::test]
+    async fn merge_queue_heads_are_fair_and_approval_safe() {
+        let Some((admin, pool, db_name)) = test_pool().await else {
+            return;
+        };
+
+        reset(&pool, "off").await;
+        let blocked = insert(&pool, "blocked", 1, "mergeable", "approve").await;
+        let blocked_second = insert(&pool, "blocked", 2, "queued", "approve").await;
+        let independent = insert(&pool, "independent", 3, "queued", "approve").await;
+        assert_eq!(
+            pg_next_merge_queue_item(&pool).await.unwrap().unwrap().id,
+            independent
+        );
+        assert_ne!(independent, blocked_second);
+
+        reset(&pool, "on").await;
+        let gated_head = insert(&pool, "blocked", 1, "mergeable", "approve").await;
+        insert(&pool, "independent", 2, "queued", "approve").await;
+        assert_eq!(
+            pg_next_merge_queue_item(&pool).await.unwrap().unwrap().id,
+            gated_head
+        );
+
+        reset(&pool, "off").await;
+        let later_global = insert(&pool, "alpha", 8, "queued", "approve").await;
+        let earlier_global = insert(&pool, "beta", 4, "ci_running", "approve").await;
+        assert_eq!(
+            pg_next_merge_queue_item(&pool).await.unwrap().unwrap().id,
+            earlier_global
+        );
+        assert_ne!(earlier_global, later_global);
+
+        reset(&pool, "on").await;
+        insert(&pool, "legacy", 1, "queued", "reject").await;
+        insert(&pool, "legacy", 2, "merged", "approve").await;
+        let active = insert(&pool, "legacy", 3, "queued", "").await;
+        assert_eq!(
+            pg_next_merge_queue_item(&pool).await.unwrap().unwrap().id,
+            active
+        );
+        assert_ne!(active, blocked);
+
+        drop_test_pool(admin, pool, &db_name).await;
+    }
 }
 
 /// Rotate a merge-queue entry to the BACK of its project's active queue by
