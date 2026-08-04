@@ -26,9 +26,16 @@ use ff_updater::verifier::VerifierConfig;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::task::JoinHandle;
-use tokio::time::Duration;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{Duration, timeout};
 use tracing::{error, info, warn};
+
+/// Maximum time allowed for cooperative subsystem shutdown. A separate,
+/// shorter abort phase follows, then the Tokio runtime itself gets a bounded
+/// teardown window. Together these stay below systemd's stop timeout.
+const SUBSYSTEM_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+const SUBSYSTEM_ABORT_GRACE: Duration = Duration::from_secs(2);
+const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// clap's `--version` output. Mirrors the `Command::Version` subcommand
 /// branch so the drift collector sees the same `YYYY.M.D_N (STATE sha)`
@@ -103,8 +110,27 @@ struct StartArgs {
     disable_pulse_v2: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // `#[tokio::main]` drops its runtime after the async main future returns.
+    // Runtime::drop waits indefinitely for `spawn_blocking` work, so one
+    // detached filesystem scan or command cleanup can keep systemd in
+    // stop-sigterm until TimeoutStopSec expires even after run_daemon logged
+    // "shutdown complete". Owning the runtime explicitly gives teardown a
+    // hard upper bound.
+    let runtime = build_runtime()?;
+    let result = runtime.block_on(async_main());
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    result
+}
+
+fn build_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build ForgeFleet Tokio runtime")
+}
+
+async fn async_main() -> Result<()> {
     let cli = Cli::parse();
     execute(cli).await
 }
@@ -292,7 +318,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
 
     // ─── Config hot-reload handle ────────────────────────────────────────────
     let (config_handle, config_tx) = ConfigHandle::new(config.clone(), config_path.clone());
-    let (_config_shutdown_tx, config_shutdown_rx) = tokio::sync::watch::channel(false);
+    let (config_shutdown_tx, config_shutdown_rx) = tokio::sync::watch::channel(false);
     let config_watcher = spawn_watcher(config_handle, config_tx, config_shutdown_rx);
 
     // ─── Control-plane bootstrap ─────────────────────────────────────────────
@@ -319,7 +345,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let mut subsystem_tasks: Vec<JoinHandle<()>> = Vec::new();
+    let mut subsystem_tasks: Vec<JoinHandle<()>> = vec![config_watcher];
 
     // ─── Pre-seed registry from fleet.toml + Postgres ─────────────────────────
     let registry = control_plane.handles.discovery.registry.clone();
@@ -406,7 +432,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     // 5) cron
     info!("starting subsystem: cron");
     let cron_engine = control_plane.handles.scheduler.engine.clone();
-    let cron_task = cron_engine.clone().start();
+    subsystem_tasks.push(cron_engine.clone().start());
 
     // 6) gateway — pass shared state
     info!("starting subsystem: gateway");
@@ -2113,22 +2139,107 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
 
     info!("shutdown signal received; draining subsystems");
     let _ = shutdown_tx.send(true);
+    let _ = config_shutdown_tx.send(true);
 
     cron_engine.shutdown();
-    if let Err(join_err) = cron_task.await {
-        warn!(error = %join_err, "cron task join failed during shutdown");
+    let drain = drain_subsystem_tasks(
+        subsystem_tasks,
+        SUBSYSTEM_SHUTDOWN_GRACE,
+        SUBSYSTEM_ABORT_GRACE,
+    )
+    .await;
+    if drain.forced > 0 || drain.remaining > 0 || drain.join_errors > 0 {
+        warn!(
+            total = drain.total,
+            graceful = drain.graceful,
+            forced = drain.forced,
+            remaining = drain.remaining,
+            join_errors = drain.join_errors,
+            "daemon subsystem shutdown required bounded cleanup"
+        );
+    } else {
+        info!(
+            total = drain.total,
+            graceful = drain.graceful,
+            "all daemon subsystems stopped cooperatively"
+        );
     }
-
-    for task in subsystem_tasks {
-        task.abort();
-        let _ = task.await;
-    }
-
-    config_watcher.abort();
-    let _ = config_watcher.await;
 
     info!("forgefleet shutdown complete");
     Ok(())
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ShutdownDrain {
+    total: usize,
+    graceful: usize,
+    forced: usize,
+    remaining: usize,
+    join_errors: usize,
+}
+
+/// Give every subsystem one shared cooperative deadline, then abort all
+/// stragglers together and join them under one shared abort deadline.
+///
+/// Wrapping the handles in a `JoinSet` is deliberate: awaiting N handles one
+/// by one with an N-second timeout creates an N×timeout shutdown path. The
+/// original abort handles are retained so aborting a wrapper cannot detach its
+/// underlying subsystem task.
+async fn drain_subsystem_tasks(
+    tasks: Vec<JoinHandle<()>>,
+    graceful_timeout: Duration,
+    abort_timeout: Duration,
+) -> ShutdownDrain {
+    let mut drain = ShutdownDrain {
+        total: tasks.len(),
+        ..ShutdownDrain::default()
+    };
+    let abort_handles: Vec<_> = tasks.iter().map(JoinHandle::abort_handle).collect();
+    let mut joins = JoinSet::new();
+    for task in tasks {
+        joins.spawn(async move { task.await });
+    }
+
+    let graceful_result = timeout(graceful_timeout, async {
+        while let Some(result) = joins.join_next().await {
+            record_shutdown_join(result, &mut drain);
+            drain.graceful += 1;
+        }
+    })
+    .await;
+
+    if graceful_result.is_ok() {
+        return drain;
+    }
+
+    drain.forced = joins.len();
+    for abort in &abort_handles {
+        abort.abort();
+    }
+
+    let _ = timeout(abort_timeout, async {
+        while let Some(result) = joins.join_next().await {
+            record_shutdown_join(result, &mut drain);
+        }
+    })
+    .await;
+
+    drain.remaining = joins.len();
+    if drain.remaining > 0 {
+        joins.abort_all();
+    }
+    drain
+}
+
+fn record_shutdown_join(
+    result: Result<Result<(), tokio::task::JoinError>, tokio::task::JoinError>,
+    drain: &mut ShutdownDrain,
+) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) | Err(err) if err.is_cancelled() => {}
+        Ok(Err(_)) | Err(_) => drain.join_errors += 1,
+    }
 }
 
 fn run_status(cli: &Cli) -> Result<()> {
@@ -4103,6 +4214,89 @@ async fn wait_for_shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn subsystem_shutdown_uses_one_deadline_and_aborts_stragglers() {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let cooperative = tokio::spawn(async move {
+            while shutdown_rx.changed().await.is_ok() {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+            }
+        });
+        let straggler = tokio::spawn(std::future::pending::<()>());
+
+        shutdown_tx.send(true).expect("signal shutdown");
+        let started = std::time::Instant::now();
+        let drain = drain_subsystem_tasks(
+            vec![cooperative, straggler],
+            Duration::from_millis(25),
+            Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(drain.total, 2);
+        assert_eq!(drain.graceful, 1);
+        assert_eq!(drain.forced, 1);
+        assert_eq!(drain.remaining, 0);
+        assert_eq!(drain.join_errors, 0);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn runtime_shutdown_timeout_does_not_wait_for_blocking_work() {
+        let runtime = build_runtime().expect("build runtime");
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        runtime.spawn_blocking(move || {
+            started_tx.send(()).expect("report blocking task start");
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocking task did not start");
+
+        let started = std::time::Instant::now();
+        runtime.shutdown_timeout(Duration::from_millis(20));
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "runtime teardown ignored its timeout"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn forced_shutdown_drops_and_reaps_owned_child() {
+        let (pid_tx, pid_rx) = tokio::sync::oneshot::channel();
+        let child_task = tokio::spawn(async move {
+            let mut command = tokio::process::Command::new("sleep");
+            command.arg("30").kill_on_drop(true);
+            let mut child = command.spawn().expect("spawn child");
+            pid_tx.send(child.id().expect("child pid")).ok();
+            let _ = child.wait().await;
+        });
+        let pid = pid_rx.await.expect("receive child pid");
+
+        let drain = drain_subsystem_tasks(
+            vec![child_task],
+            Duration::from_millis(25),
+            Duration::from_millis(250),
+        )
+        .await;
+        assert_eq!(drain.forced, 1);
+        assert_eq!(drain.remaining, 0);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::path::Path::new(&format!("/proc/{pid}")).exists()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "owned child {pid} survived forced task cleanup"
+        );
+    }
 
     #[test]
     fn embedded_agent_config_defaults_to_heartbeat_mode() {
