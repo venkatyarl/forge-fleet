@@ -40,10 +40,11 @@ const DEFAULT_LEASE_SECONDS: i32 = 120;
 const RUN_CANDIDATE_SCRIPT: &str = r#"set -eu
 tx=$1; expected_sha=$2; expected_size=$3; platform=$4; provided_candidate=$5; shift 5
 base="$HOME/.forgefleet/release-rollout/candidates/$tx"
-candidate="$base/ff"; lock="$base.lock"
+candidate="$base/ff"
 [ "$candidate" = "$provided_candidate" ]
-if ! mkdir "$lock" 2>/dev/null; then exit 75; fi
-trap 'rm -rf "$lock"' EXIT HUP INT TERM
+# Do not add a filesystem-presence lock here.  Each artifact subcommand holds
+# the release activation layer's kernel flock, which is released on process
+# death; a mkdir/trap lock can survive a severed SSH session and block resume.
 [ -f "$candidate" ] && [ ! -L "$candidate" ]
 actual_size=$(/usr/bin/wc -c < "$candidate" | /usr/bin/tr -d ' ')
 if command -v sha256sum >/dev/null 2>&1; then actual_sha=$(sha256sum "$candidate" | /usr/bin/awk '{print $1}'); else actual_sha=$(shasum -a 256 "$candidate" | /usr/bin/awk '{print $1}'); fi
@@ -1833,11 +1834,12 @@ fi
 umask 077
 tx=$1; expected_sha=$2; expected_size=$3; platform=$4
 base="$HOME/.forgefleet/release-rollout/candidates/$tx"
-lock="$base.lock"
 mkdir -p "$HOME/.forgefleet/release-rollout/candidates"
 chmod 700 "$HOME/.forgefleet" "$HOME/.forgefleet/release-rollout" "$HOME/.forgefleet/release-rollout/candidates" 2>/dev/null || true
-if ! mkdir "$lock" 2>/dev/null; then exit 75; fi
-trap 'rm -rf "$lock" "$base/.ff.incoming.$$"' EXIT HUP INT TERM
+# Concurrent lease handoff can only publish the same registered bytes.  The
+# PID-scoped temp plus verified atomic rename is crash-safe without a stale
+# directory lock, and RUN_CANDIDATE_SCRIPT verifies the final file again.
+trap 'rm -f "$base/.ff.incoming.$$"' EXIT HUP INT TERM
 mkdir -p "$base"; chmod 700 "$base"
 tmp="$base/.ff.incoming.$$"
 /bin/cat > "$tmp"; chmod 500 "$tmp"
@@ -3110,7 +3112,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn candidate_lock_is_removed_after_nonzero_command_exit() {
+    async fn candidate_execution_leaves_locking_to_the_artifact_layer() {
         let home = tempfile::tempdir().unwrap();
         let transaction_id = Uuid::new_v4();
         let base = home
@@ -3146,7 +3148,8 @@ mod tests {
         assert_eq!(output.status.code(), Some(7));
         assert!(
             !lock.exists(),
-            "candidate lock must be removed by EXIT trap"
+            "the rollout wrapper must not create a crash-stale directory lock"
         );
+        assert!(!RUN_CANDIDATE_SCRIPT.contains("mkdir \"$lock\""));
     }
 }
