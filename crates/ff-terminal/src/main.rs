@@ -6865,7 +6865,10 @@ mod oauth_cli_guard_tests {
 
 #[cfg(test)]
 mod artifact_cli_tests {
-    use super::{Cli, Command, artifact_cmd::ArtifactCommand};
+    use super::{
+        Cli, Command,
+        artifact_cmd::{ArtifactCommand, ArtifactRolloutCommand},
+    };
     use clap::Parser;
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
@@ -6951,6 +6954,87 @@ mod artifact_cli_tests {
 
         assert!(parse(&["ff", "artifact", "delete"]).is_err());
         assert!(parse(&["ff", "artifact", "unregister"]).is_err());
+    }
+
+    #[test]
+    fn artifact_rollout_exposes_only_exact_authority_and_transaction_ids() {
+        let source = "39b017341b7536df64b61f42672ab33fb62343f8";
+        let authority = "11111111-1111-4111-8111-111111111111";
+        let request = "22222222-2222-4222-8222-222222222222";
+        let parsed = parse(&[
+            "ff",
+            "artifact",
+            "rollout",
+            "start",
+            "--authority-id",
+            authority,
+            "--request-id",
+            request,
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Artifact {
+                command: ArtifactCommand::Rollout {
+                    command: ArtifactRolloutCommand::Start { json: true, .. }
+                }
+            })
+        ));
+        assert!(
+            parse(&[
+                "ff",
+                "artifact",
+                "rollout",
+                "plan",
+                "--source-commit",
+                source,
+                "--force"
+            ])
+            .is_err()
+        );
+        for forbidden in ["--host", "--path", "--command", "--force"] {
+            assert!(
+                parse(&[
+                    "ff",
+                    "artifact",
+                    "rollout",
+                    "resume",
+                    "--transaction-id",
+                    request,
+                    forbidden,
+                    "vinny",
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn local_rollback_accepts_only_transaction_identity_and_no_force() {
+        let transaction = "33333333-3333-4333-8333-333333333333";
+        assert!(
+            parse(&[
+                "ff",
+                "artifact",
+                "rollback",
+                "--transaction-id",
+                transaction,
+                "--json",
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse(&[
+                "ff",
+                "artifact",
+                "rollback",
+                "--transaction-id",
+                transaction,
+                "--force",
+            ])
+            .is_err()
+        );
     }
 }
 

@@ -60,7 +60,7 @@ pub struct RolloutAuthorityRegistration {
     pub outcome: RolloutAuthorityRegistrationOutcome,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReleaseRolloutTransactionRow {
     pub id: Uuid,
     pub request_id: Uuid,

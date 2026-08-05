@@ -42,6 +42,11 @@ const DAEMON_LABEL: &str = "com.forgefleet.forgefleetd";
 #[derive(Debug, Clone)]
 pub struct LocalReleaseActivationRequest {
     pub source_commit: String,
+    /// Optional coordinator-selected transaction identity. Fleet rollout uses
+    /// the sealed V295 transaction UUID so a lost SSH response can be adopted
+    /// from the same private local receipt after a crash. Interactive local
+    /// activation leaves this unset and receives a fresh UUID.
+    pub transaction_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +121,21 @@ pub struct ReleaseRollbackReceipt {
     pub rolled_back_at: DateTime<Utc>,
     pub artifacts: Vec<RestoredArtifactReceipt>,
     pub receipt_path: String,
+}
+
+/// Read-only evidence that a committed activation retains the exact local
+/// predecessor bytes required by explicit rollback.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseRollbackProof {
+    pub transaction_id: Uuid,
+    pub source_commit: String,
+    pub prior_release_identity: PriorReleaseIdentity,
+    pub computer_id: Uuid,
+    pub computer_name: String,
+    pub manifest_sha256: String,
+    pub activation_receipt_sha256: String,
+    pub verified_at: DateTime<Utc>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -239,6 +259,13 @@ struct PreparedExplicitRollback {
     _operation_lock: File,
 }
 
+#[derive(Debug)]
+struct InspectedCommittedActivation {
+    receipt: ReleaseActivationReceipt,
+    proof: ReleaseRollbackProof,
+    _operation_lock: File,
+}
+
 /// Activate the exact `ff` + `forgefleetd` V291 pair for this host.
 ///
 /// Missing local custody is acquired only from the single canonical matching
@@ -268,6 +295,29 @@ pub async fn activate_local_release_pair(
         ReleaseActivationError::Refused("effective-user home is unavailable".into())
     })?;
     let ports = resolve_service_ports(pool, &home).await?;
+    if let Some(transaction_id) = request.transaction_id {
+        let identity_for_worker = identity.clone();
+        let home_for_worker = home.clone();
+        let existing = tokio::task::spawn_blocking(move || {
+            inspect_committed_activation(
+                transaction_id,
+                identity_for_worker,
+                platform,
+                home_for_worker,
+                &SystemCommandRunner,
+            )
+        })
+        .await??;
+        if let Some(existing) = existing {
+            if existing.receipt.source_commit != request.source_commit {
+                return Err(ReleaseActivationError::Refused(
+                    "coordinator transaction receipt belongs to another source commit".into(),
+                ));
+            }
+            verify_running_release(&request.source_commit, ports).await?;
+            return Ok(existing.receipt);
+        }
+    }
     let prior_release_identity = probe_running_release_identity(ports).await?;
     if prior_release_identity
         == (PriorReleaseIdentity::FullSha {
@@ -310,8 +360,10 @@ pub async fn activate_local_release_pair(
     let identity_for_worker = identity.clone();
     let target_for_worker = target_triple.clone();
     let previous_for_worker = prior_release_identity.clone();
-    let transaction = tokio::task::spawn_blocking(move || {
-        prepare_swap_and_restart(
+    let requested_transaction_id = request.transaction_id;
+    let transaction = tokio::task::spawn_blocking(move || match requested_transaction_id {
+        Some(transaction_id) => prepare_swap_and_restart_with_id(
+            transaction_id,
             pair,
             identity_for_worker,
             request_owned,
@@ -322,7 +374,19 @@ pub async fn activate_local_release_pair(
             previous_for_worker,
             &SystemCommandRunner,
             None,
-        )
+        ),
+        None => prepare_swap_and_restart(
+            pair,
+            identity_for_worker,
+            request_owned,
+            target_for_worker,
+            platform,
+            ports,
+            home,
+            previous_for_worker,
+            &SystemCommandRunner,
+            None,
+        ),
     })
     .await??;
 
@@ -344,6 +408,45 @@ pub async fn activate_local_release_pair(
 
     tokio::task::spawn_blocking(move || commit_transaction(transaction, &SystemCommandRunner))
         .await?
+}
+
+/// Prove, without changing services or installed bytes, that a committed
+/// activation retains a complete exact predecessor pair for explicit rollback.
+pub async fn prove_local_release_rollback(
+    pool: &PgPool,
+    request: &LocalReleaseRollbackRequest,
+) -> Result<ReleaseRollbackProof> {
+    let identity = resolve_this_computer_identity_strict(pool)
+        .await
+        .map_err(ReleaseActivationError::Refused)?;
+    if identity.name.eq_ignore_ascii_case("vinny") {
+        return Err(ReleaseActivationError::Refused(
+            "release rollback proof is forbidden on Vinny".into(),
+        ));
+    }
+    let home = authority_home_dir().ok_or_else(|| {
+        ReleaseActivationError::Refused("effective-user home is unavailable".into())
+    })?;
+    let ports = resolve_service_ports(pool, &home).await?;
+    let platform = current_service_platform()?;
+    let transaction_id = request.transaction_id;
+    let inspected = tokio::task::spawn_blocking(move || {
+        inspect_committed_activation(
+            transaction_id,
+            identity,
+            platform,
+            home,
+            &SystemCommandRunner,
+        )
+    })
+    .await??
+    .ok_or_else(|| {
+        ReleaseActivationError::Refused(
+            "rollback proof requires a committed activation receipt".into(),
+        )
+    })?;
+    verify_running_release(&inspected.receipt.source_commit, ports).await?;
+    Ok(inspected.proof)
 }
 
 /// Restore the exact predecessor pair retained by a committed activation.
@@ -1170,7 +1273,35 @@ fn prepare_swap_and_restart(
     runner: &dyn CommandRunner,
     fail_after_installs: Option<usize>,
 ) -> Result<ActiveTransaction> {
-    let transaction_id = Uuid::new_v4();
+    prepare_swap_and_restart_with_id(
+        Uuid::new_v4(),
+        pair,
+        identity,
+        request,
+        target_triple,
+        platform,
+        ports,
+        home,
+        prior_release_identity,
+        runner,
+        fail_after_installs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_swap_and_restart_with_id(
+    transaction_id: Uuid,
+    pair: Vec<ResolvedArtifact>,
+    identity: LocalComputerIdentity,
+    request: CanonicalReleaseIdentity,
+    target_triple: String,
+    platform: ServicePlatform,
+    ports: ServicePorts,
+    home: PathBuf,
+    prior_release_identity: PriorReleaseIdentity,
+    runner: &dyn CommandRunner,
+    fail_after_installs: Option<usize>,
+) -> Result<ActiveTransaction> {
     let activation_dir = home.join(".forgefleet").join("release-activations");
     ensure_activation_directory(&activation_dir)?;
     let operation_lock = acquire_operation_lock(&activation_dir)?;
@@ -1546,6 +1677,95 @@ enum RollbackPathState {
     CandidateInstalled,
     CandidateParked,
     PreviousRestored,
+}
+
+fn inspect_committed_activation(
+    transaction_id: Uuid,
+    identity: LocalComputerIdentity,
+    platform: ServicePlatform,
+    home: PathBuf,
+    runner: &dyn CommandRunner,
+) -> Result<Option<InspectedCommittedActivation>> {
+    if identity.name.eq_ignore_ascii_case("vinny") {
+        return Err(ReleaseActivationError::Refused(
+            "release activation inspection is forbidden on Vinny".into(),
+        ));
+    }
+    let activation_dir = home.join(".forgefleet").join("release-activations");
+    ensure_activation_directory(&activation_dir)?;
+    let operation_lock = acquire_operation_lock(&activation_dir)?;
+    let manifest_path = activation_dir.join(format!("{transaction_id}.manifest.json"));
+    let journal_path = activation_dir.join(format!("{transaction_id}.journal.jsonl"));
+    let receipt_path = activation_dir.join(format!("{transaction_id}.receipt.json"));
+    let present = [
+        manifest_path.exists(),
+        journal_path.exists(),
+        receipt_path.exists(),
+    ];
+    if present.iter().all(|value| !value) {
+        return Ok(None);
+    }
+    if present.iter().any(|value| !value) {
+        return Err(ReleaseActivationError::Refused(
+            "coordinator activation authority is partial or crash-incomplete".into(),
+        ));
+    }
+
+    let manifest_raw =
+        read_private_authority_text(&manifest_path, 4 * 1024 * 1024, "rollback manifest")?;
+    let receipt_raw =
+        read_private_authority_text(&receipt_path, 4 * 1024 * 1024, "activation receipt")?;
+    let manifest: RollbackManifest = serde_json::from_str(&manifest_raw)?;
+    let receipt: ReleaseActivationReceipt = serde_json::from_str(&receipt_raw)?;
+    validate_explicit_rollback_authority(
+        transaction_id,
+        &identity,
+        platform,
+        &home,
+        &manifest,
+        &receipt,
+        &receipt_path,
+    )?;
+    validate_latest_activation_receipt(&activation_dir, transaction_id, receipt.activated_at)?;
+    ensure_no_other_unfinished_transaction(&activation_dir, transaction_id)?;
+    if last_journal_state(&journal_path)?.as_deref() != Some("committed") {
+        return Err(ReleaseActivationError::Refused(
+            "coordinator activation is not durably committed or already entered rollback".into(),
+        ));
+    }
+    let entries = entries_from_manifest(&manifest, &home)?;
+    validate_activation_receipt_entries(&receipt, &entries)?;
+    for entry in &entries {
+        if classify_rollback_paths(entry)? != RollbackPathState::CandidateInstalled {
+            return Err(ReleaseActivationError::Refused(
+                "committed activation no longer retains the exact candidate/predecessor pair"
+                    .into(),
+            ));
+        }
+        if platform == ServicePlatform::Macos {
+            verify_codesign_path(
+                &entry.dir_path.join(os_from_cstr(&entry.backup)),
+                &entry.artifact_name,
+                runner,
+            )?;
+        }
+    }
+
+    let proof = ReleaseRollbackProof {
+        transaction_id,
+        source_commit: receipt.source_commit.clone(),
+        prior_release_identity: receipt.prior_release_identity.clone(),
+        computer_id: identity.id,
+        computer_name: identity.name,
+        manifest_sha256: format!("{:x}", Sha256::digest(manifest_raw.as_bytes())),
+        activation_receipt_sha256: format!("{:x}", Sha256::digest(receipt_raw.as_bytes())),
+        verified_at: Utc::now(),
+    };
+    Ok(Some(InspectedCommittedActivation {
+        receipt,
+        proof,
+        _operation_lock: operation_lock,
+    }))
 }
 
 fn prepare_explicit_rollback(
@@ -4752,6 +4972,55 @@ mod tests {
             prepare_explicit_rollback(id, identity, platform, ports, home, &runner, None).unwrap();
         assert!(retried.receipt_already_committed);
         assert_eq!(retried.receipt, committed);
+    }
+
+    #[test]
+    fn coordinator_inspection_proves_committed_predecessor_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        let prior = PriorReleaseIdentity::LegacyReported {
+            short_sha: "5c1b63fb".into(),
+        };
+        let (id, identity, platform, _ports) = committed_activation_fixture(&home, prior.clone());
+        let before_ff = fs::read(home.join(".local/bin/ff")).unwrap();
+        let before_daemon = fs::read(home.join(".local/bin/forgefleetd")).unwrap();
+        let inspected = inspect_committed_activation(
+            id,
+            identity.clone(),
+            platform,
+            home.clone(),
+            &FakeRunner::new(home.clone()),
+        )
+        .unwrap()
+        .expect("committed activation must be adoptable");
+        assert_eq!(inspected.receipt.transaction_id, id);
+        assert_eq!(inspected.proof.prior_release_identity, prior);
+        assert_eq!(inspected.proof.manifest_sha256.len(), 64);
+        assert_eq!(inspected.proof.activation_receipt_sha256.len(), 64);
+        drop(inspected);
+        assert_eq!(fs::read(home.join(".local/bin/ff")).unwrap(), before_ff);
+        assert_eq!(
+            fs::read(home.join(".local/bin/forgefleetd")).unwrap(),
+            before_daemon
+        );
+
+        fs::write(
+            home.join(".local/bin")
+                .join(format!(".ff.release-{id}.rollback")),
+            b"tampered",
+        )
+        .unwrap();
+        assert!(
+            inspect_committed_activation(
+                id,
+                identity,
+                platform,
+                home.clone(),
+                &FakeRunner::new(home),
+            )
+            .is_err(),
+            "rollback proof must fail on retained predecessor tamper"
+        );
     }
 
     #[test]

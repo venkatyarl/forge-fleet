@@ -4,10 +4,16 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use uuid::Uuid;
 
 use ff_agent::artifact_registry::{LocalReleaseArtifactSpec, register_local_release_artifact};
 use ff_agent::release_artifact_activation::{
-    LocalReleaseActivationRequest, activate_local_release_pair,
+    LocalReleaseActivationRequest, LocalReleaseRollbackRequest, activate_local_release_pair,
+    prove_local_release_rollback, rollback_local_release_transaction,
+};
+use ff_agent::release_rollout_coordinator::{
+    PgReleaseRolloutDatabase, ReleaseRolloutCoordinator, RolloutCoordinatorConfig,
+    SystemReleaseRolloutTransport,
 };
 use ff_db::ReleaseArtifactRegistrationOutcome;
 
@@ -49,7 +55,76 @@ pub enum ArtifactCommand {
         /// target platform, custody source, and all destinations are derived.
         #[arg(long)]
         source_commit: String,
+        /// Exact durable transaction identity supplied by the sealed fleet
+        /// coordinator. Omit for a standalone local activation.
+        #[arg(long)]
+        transaction_id: Option<Uuid>,
         /// Emit the immutable activation receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore the exact predecessor pair retained by one local activation.
+    Rollback {
+        /// Exact local activation transaction UUID. All paths and bytes are
+        /// re-derived from private durable authority; there is no force mode.
+        #[arg(long)]
+        transaction_id: Uuid,
+        /// Emit the immutable rollback receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Prove that one committed activation retains exact predecessor bytes.
+    #[command(hide = true)]
+    RollbackProof {
+        #[arg(long)]
+        transaction_id: Uuid,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Plan or synchronously drive an exact V295 fleet rollout.
+    Rollout {
+        #[command(subcommand)]
+        command: ArtifactRolloutCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ArtifactRolloutCommand {
+    /// Probe the fixed fleet roster and seal exact V291 artifacts into V295.
+    Plan {
+        #[arg(long)]
+        source_commit: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create and synchronously drive one leased rollout transaction.
+    Start {
+        #[arg(long)]
+        authority_id: Uuid,
+        /// Required idempotency identity for safe command replay.
+        #[arg(long)]
+        request_id: Uuid,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read the durable rollout and per-target receipts without mutation.
+    Status {
+        #[arg(long)]
+        transaction_id: Uuid,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resume one crash-interrupted transaction, taking over only an expired lease.
+    Resume {
+        #[arg(long)]
+        transaction_id: Uuid,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explicitly roll back succeeded targets in reverse exact order.
+    Rollback {
+        #[arg(long)]
+        transaction_id: Uuid,
         #[arg(long)]
         json: bool,
     },
@@ -131,6 +206,7 @@ pub async fn handle_artifact(command: ArtifactCommand) -> Result<()> {
         }
         ArtifactCommand::Activate {
             source_commit,
+            transaction_id,
             json,
         } => {
             let pool = ff_agent::fleet_info::get_fleet_pool()
@@ -138,7 +214,10 @@ pub async fn handle_artifact(command: ArtifactCommand) -> Result<()> {
                 .map_err(|error| anyhow::anyhow!("connect Postgres: {error}"))?;
             let receipt = activate_local_release_pair(
                 &pool,
-                &LocalReleaseActivationRequest { source_commit },
+                &LocalReleaseActivationRequest {
+                    source_commit,
+                    transaction_id,
+                },
             )
             .await
             .context("acquire custody and activate exact release pair")?;
@@ -161,5 +240,128 @@ pub async fn handle_artifact(command: ArtifactCommand) -> Result<()> {
             }
             Ok(())
         }
+        ArtifactCommand::Rollback {
+            transaction_id,
+            json,
+        } => {
+            let pool = ff_agent::fleet_info::get_fleet_pool()
+                .await
+                .map_err(|error| anyhow::anyhow!("connect Postgres: {error}"))?;
+            let receipt = rollback_local_release_transaction(
+                &pool,
+                &LocalReleaseRollbackRequest { transaction_id },
+            )
+            .await
+            .context("restore exact predecessor release pair")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+            } else {
+                println!("{GREEN}✓ exact predecessor pair restored{RESET}");
+                println!("  transaction: {}", receipt.transaction_id);
+                println!("  computer:    {}", receipt.computer_name);
+                println!("  replaced:    {}", receipt.replaced_source_commit);
+                println!("  receipt:     {}", receipt.receipt_path);
+            }
+            Ok(())
+        }
+        ArtifactCommand::RollbackProof {
+            transaction_id,
+            json,
+        } => {
+            let pool = ff_agent::fleet_info::get_fleet_pool()
+                .await
+                .map_err(|error| anyhow::anyhow!("connect Postgres: {error}"))?;
+            let proof = prove_local_release_rollback(
+                &pool,
+                &LocalReleaseRollbackRequest { transaction_id },
+            )
+            .await
+            .context("prove exact predecessor release authority")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&proof)?);
+            } else {
+                println!("{GREEN}✓ exact rollback authority verified{RESET}");
+                println!("  transaction: {}", proof.transaction_id);
+                println!("  computer:    {}", proof.computer_name);
+                println!("  source:      {}", proof.source_commit);
+            }
+            Ok(())
+        }
+        ArtifactCommand::Rollout { command } => handle_rollout(command).await,
     }
+}
+
+async fn handle_rollout(command: ArtifactRolloutCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|error| anyhow::anyhow!("connect Postgres: {error}"))?;
+    let database = PgReleaseRolloutDatabase::new(&pool);
+    let transport = SystemReleaseRolloutTransport;
+    let coordinator =
+        ReleaseRolloutCoordinator::new(&database, &transport, RolloutCoordinatorConfig::default());
+    let (value, json, label) = match command {
+        ArtifactRolloutCommand::Plan {
+            source_commit,
+            json,
+        } => (
+            serde_json::to_value(coordinator.plan(&source_commit).await?)?,
+            json,
+            "exact rollout authority sealed",
+        ),
+        ArtifactRolloutCommand::Start {
+            authority_id,
+            request_id,
+            json,
+        } => (
+            serde_json::to_value(coordinator.start(authority_id, request_id).await?)?,
+            json,
+            "synchronous rollout command finished",
+        ),
+        ArtifactRolloutCommand::Status {
+            transaction_id,
+            json,
+        } => (
+            serde_json::to_value(coordinator.status(transaction_id).await?)?,
+            json,
+            "rollout status loaded",
+        ),
+        ArtifactRolloutCommand::Resume {
+            transaction_id,
+            json,
+        } => (
+            serde_json::to_value(coordinator.resume(transaction_id).await?)?,
+            json,
+            "rollout resume command finished",
+        ),
+        ArtifactRolloutCommand::Rollback {
+            transaction_id,
+            json,
+        } => (
+            serde_json::to_value(coordinator.rollback(transaction_id).await?)?,
+            json,
+            "rollout rollback command finished",
+        ),
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("{GREEN}✓ {label}{RESET}");
+        if let Some(id) = value
+            .get("transaction")
+            .and_then(|transaction| transaction.get("id"))
+            .or_else(|| value.get("authority_id"))
+        {
+            println!("  id: {id}");
+        }
+        if let Some(state) = value
+            .get("transaction")
+            .and_then(|transaction| transaction.get("state"))
+        {
+            println!("  state: {state}");
+        }
+        if let Some(targets) = value.get("targets").and_then(|targets| targets.as_array()) {
+            println!("  targets: {}", targets.len());
+        }
+    }
+    Ok(())
 }

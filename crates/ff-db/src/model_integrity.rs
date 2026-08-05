@@ -111,7 +111,7 @@ pub struct ReleaseArtifactAssertion {
     pub relative_path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReleaseArtifactRow {
     pub id: Uuid,
     pub artifact_name: String,
